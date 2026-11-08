@@ -12,20 +12,31 @@
 //! instead, inside whatever lock the engine holds at that point, until the
 //! session's next entry is due. A request no entry names runs at once.
 //!
-//! While a session waits on the script the block drives the paused clock
-//! itself (RFC 0045 §Concurrent block): one tick per scheduler turn up to
-//! [`STUCK_VIRTUAL_BUDGET`] past the last cursor move or request, so the
-//! other sessions' modeled request costs elapse and no engine timer fires;
-//! past that budget the clock stands still and the wall clock decides
-//! starvation (the block's budget, half the case's `timeout_ms`, at most
-//! [`MAX_STARVE_BUDGET`]).
+//! Nothing drives the paused clock (RFC 0045 §Concurrent block): while a
+//! session waits on the script the runtime idles, and tokio moves the clock
+//! only to the earliest pending timer (a request sleeping its modeled cost,
+//! a commit backoff) and never while a task of the runtime's blocking pool
+//! runs, so a session's work on a foreign thread takes no virtual time and
+//! a wait is a function of the model and the request sequence, up to the
+//! one-tick window where a hop onto Lance's CPU pool (a second runtime the
+//! paused clock does not see) wakes before or after a jump to another
+//! session's pending sleep. A far
+//! timer would fire the moment a session parks with nothing nearer pending,
+//! which is why the engine's commits run without Lance's commit timeout
+//! under simulation (`omnigraph_core::lance_commit`); any other far timer
+//! ends the block as its own timeout. Starvation is the wall clock's
+//! verdict, read off the runtime by a guard thread so the runtime can idle:
+//! neither an entry nor a request for the block's budget, half the case's
+//! `timeout_ms`, at most [`MAX_STARVE_BUDGET`], while a session waits on
+//! the script.
 
 use std::fmt;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -39,468 +50,29 @@ use object_store::{
 };
 use omnigraph::object_store_seam::{DecorateObjectStore, OBJECT_STORE};
 use omnigraph::seams::{Behavior, Global, Installed};
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
 use crate::measure::SESSION;
 
 /// The most sessions one block declares.
-pub(crate) const MAX_SESSIONS: usize = 4;
+pub(crate) use omnigraph_gqt_core::concurrent::*;
 
 /// The longest a block waits, in wall time, with neither a cursor move nor a
 /// request before it is starved; the budget is half the case's `timeout_ms`
 /// below this, so the parent's kill never precedes the block's own verdict.
 pub(crate) const MAX_STARVE_BUDGET: Duration = Duration::from_secs(10);
 
-/// Virtual time the block drives the clock past the last cursor move or
-/// request while a session waits on the script: enough for the running
-/// sessions' modeled request costs, short of any engine timer.
-const STUCK_VIRTUAL_BUDGET: Duration = Duration::from_secs(10);
-
-/// The clock step while the block drives the clock: the measure tick.
-const CLOCK_STEP: Duration = crate::measure::TICK;
-
-/// The wall pause per driver turn once the clock stands still, so a stuck
-/// block does not spin a core while it waits out its budget.
-const SPIN_SLEEP: Duration = Duration::from_millis(1);
+/// How often the guard thread reads the wall clock: the latest a starved
+/// block is called, past its budget.
+const GUARD_POLL: Duration = Duration::from_millis(10);
 
 /// The cursor value that aborts every waiter.
 const ABORTED: usize = usize::MAX;
-
-/// Session labels the measure report keys its own rows by, and the script
-/// keyword; a session named like one would merge into that row or be read
-/// as the script.
-const RESERVED_LABELS: [&str; 4] = ["setup", "runner", "step", "order"];
 
 /// The starvation budget for a case: half its `timeout_ms`, at most
 /// [`MAX_STARVE_BUDGET`].
 pub(crate) fn starve_budget(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms / 2).min(MAX_STARVE_BUDGET)
-}
-
-/// The store verbs an `order:` entry may name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Verb {
-    Get,
-    Head,
-    Put,
-    List,
-    Delete,
-    Copy,
-}
-
-impl Verb {
-    const ALL: [Verb; 6] = [
-        Verb::Get,
-        Verb::Head,
-        Verb::Put,
-        Verb::List,
-        Verb::Delete,
-        Verb::Copy,
-    ];
-
-    fn name(self) -> &'static str {
-        match self {
-            Verb::Get => "get",
-            Verb::Head => "head",
-            Verb::Put => "put",
-            Verb::List => "list",
-            Verb::Delete => "delete",
-            Verb::Copy => "copy",
-        }
-    }
-}
-
-impl FromStr for Verb {
-    type Err = String;
-
-    fn from_str(word: &str) -> Result<Self, Self::Err> {
-        Verb::ALL
-            .into_iter()
-            .find(|verb| verb.name() == word)
-            .ok_or_else(|| {
-                let names: Vec<&str> = Verb::ALL.iter().map(|verb| verb.name()).collect();
-                format!("`order:` verb `{word}` is not one of {}", names.join(", "))
-            })
-    }
-}
-
-impl fmt::Display for Verb {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-/// What a session's statement is: the executor and the comparator differ.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SessionKind {
-    Query,
-    Mutation,
-}
-
-impl SessionKind {
-    /// The step-kind word the labels and evidence rows carry.
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            SessionKind::Query => "query",
-            SessionKind::Mutation => "mutate",
-        }
-    }
-}
-
-/// One session of a block: a labeled statement on a branch, and the outcome
-/// the `--- expect` section after the block names for it.
-#[derive(Debug)]
-pub(crate) struct SessionOp {
-    pub label: String,
-    pub branch: String,
-    pub source: String,
-    pub name: String,
-    pub kind: SessionKind,
-    pub expect: SessionExpect,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SessionExpect {
-    Ok,
-    Error { needle: String },
-}
-
-/// A `--- concurrent` step: its sessions and the script.
-#[derive(Debug)]
-pub(crate) struct ConcurrentStep {
-    pub ordinal: usize,
-    pub sessions: Vec<SessionOp>,
-    pub order: Vec<Entry>,
-}
-
-/// One `order:` entry: which session, and what event of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Entry {
-    pub session: usize,
-    pub event: Event,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Event {
-    /// The session's statement begins: the runner holds the session before
-    /// it, so a session can be made to start inside another's hold without
-    /// naming a request the engine makes under a lock.
-    Start,
-    /// The session's completion, written as the bare label.
-    Done,
-    /// The session's next request of `verb` on a key containing `suffix`.
-    /// `park` holds the session at the request's arrival until its next
-    /// entry is due, instead of running the request in turn.
-    Call {
-        park: bool,
-        verb: Verb,
-        suffix: String,
-    },
-}
-
-impl Event {
-    /// Whether `self` is the un-parked form of the parked request `parked`.
-    fn releases(&self, parked: &Event) -> bool {
-        match (self, parked) {
-            (
-                Event::Call {
-                    park: false,
-                    verb,
-                    suffix,
-                },
-                Event::Call {
-                    park: true,
-                    verb: parked_verb,
-                    suffix: parked_suffix,
-                },
-            ) => verb == parked_verb && suffix == parked_suffix,
-            (Event::Done, Event::Call { park: true, .. }) => true,
-            _ => false,
-        }
-    }
-}
-
-impl fmt::Display for Event {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Event::Start => f.write_str("start"),
-            Event::Done => f.write_str("done"),
-            Event::Call { park, verb, suffix } => {
-                if *park {
-                    write!(f, "park {verb} {suffix}")
-                } else {
-                    write!(f, "{verb} {suffix}")
-                }
-            }
-        }
-    }
-}
-
-/// A session line of the block body before its statement is parsed: the
-/// label, the branch (`main` unless `on <branch>`), the statement text and
-/// the line the statement starts on.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SessionLine {
-    pub label: String,
-    pub branch: String,
-    pub text: String,
-    pub line: usize,
-}
-
-/// The block body split into session lines and the script. A session starts
-/// at column 0 as `<label>[ on <branch>]: <statement>`; every other line
-/// continues the open session's statement (a GQ body closes with `}` at
-/// column 0, so continuation is not a matter of indentation); `order:` at
-/// column 0 is the script and closes the sessions.
-pub(crate) fn parse_block(
-    body: &[(usize, &str)],
-) -> Result<(Vec<SessionLine>, Vec<Entry>), String> {
-    let mut sessions: Vec<SessionLine> = Vec::new();
-    let mut order: Option<(usize, &str)> = None;
-    for (idx, raw) in body {
-        let line = idx + 1;
-        if raw.trim().is_empty() {
-            continue;
-        }
-        if let Some(rest) = raw.strip_prefix("order:") {
-            if order.is_some() {
-                return Err(format!("line {line}: a block has one `order:` line"));
-            }
-            order = Some((line, rest));
-            continue;
-        }
-        match session_start(raw) {
-            None if order.is_some() => {
-                return Err(format!(
-                    "line {line}: `order:` closes the sessions; a session statement cannot continue after it"
-                ));
-            }
-            None => {
-                if looks_like_order(raw) {
-                    return Err(format!(
-                        "line {line}: the script line is `order:` at column 0, got `{raw}`"
-                    ));
-                }
-                let Some(current) = sessions.last_mut() else {
-                    return Err(format!(
-                        "line {line}: a block opens with `<label>[ on <branch>]: <statement>` at column 0, got `{raw}`"
-                    ));
-                };
-                current.text.push('\n');
-                current.text.push_str(raw);
-            }
-            Some(_) if order.is_some() => {
-                return Err(format!(
-                    "line {line}: `order:` is the last line of a block; sessions come before it"
-                ));
-            }
-            Some((label, branch, text)) => {
-                if RESERVED_LABELS.contains(&label) {
-                    return Err(format!(
-                        "line {line}: `{label}` is reserved (the measure report's own rows and the script keyword); name the session otherwise"
-                    ));
-                }
-                if sessions.iter().any(|s| s.label == label) {
-                    return Err(format!("line {line}: session `{label}` is declared twice"));
-                }
-                if sessions.len() == MAX_SESSIONS {
-                    return Err(format!(
-                        "line {line}: a block declares at most {MAX_SESSIONS} sessions"
-                    ));
-                }
-                sessions.push(SessionLine {
-                    label: label.to_string(),
-                    branch: branch.to_string(),
-                    text: text.trim_start().to_string(),
-                    line,
-                });
-            }
-        }
-    }
-    if sessions.len() < 2 {
-        return Err("a concurrent block declares at least two sessions".into());
-    }
-    let Some((order_line, order_text)) = order else {
-        return Err(
-            "a concurrent block needs an `order:` line; sessions with no named interleaving belong to the DST fleet"
-                .into(),
-        );
-    };
-    let labels: Vec<&str> = sessions.iter().map(|s| s.label.as_str()).collect();
-    let entries =
-        parse_order(order_text, &labels).map_err(|e| format!("line {order_line}: {e}"))?;
-    Ok((sessions, entries))
-}
-
-fn is_label(word: &str) -> bool {
-    let mut chars = word.chars();
-    chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-}
-
-/// A misspelled script line (`order :`, `Order:`), so the refusal names the
-/// script instead of a session that does not parse.
-fn looks_like_order(raw: &str) -> bool {
-    raw.split_once(':')
-        .is_some_and(|(head, _)| head.trim().eq_ignore_ascii_case("order"))
-}
-
-/// `(label, branch, statement)` when `raw` opens a session: column 0, a
-/// label (optionally `on <branch>`), a colon. Any other line is a
-/// continuation.
-fn session_start(raw: &str) -> Option<(&str, &str, &str)> {
-    if raw.starts_with([' ', '\t']) {
-        return None;
-    }
-    let (head, text) = raw.split_once(':')?;
-    let words: Vec<&str> = head.split_whitespace().collect();
-    let (label, branch) = match words.as_slice() {
-        [label] => (*label, "main"),
-        [label, "on", branch] => (*label, *branch),
-        _ => return None,
-    };
-    is_label(label).then_some((label, branch, text))
-}
-
-/// The `order:` line: comma-separated entries, each `<label> start` (the
-/// session's statement begins), `<label>` (the session's completion),
-/// `<label> <verb> <key-suffix>` (its next such request, run in turn) or
-/// `<label> park <verb> <key-suffix>` (held at arrival until the label's next
-/// entry is due). Every label must be declared; a `start` is its label's
-/// first entry; the entry after a `park` for its label is that request
-/// without `park` or the completion; a completion is its label's last.
-pub(crate) fn parse_order(text: &str, labels: &[&str]) -> Result<Vec<Entry>, String> {
-    let mut entries = Vec::new();
-    for item in text.split(',') {
-        let words: Vec<&str> = item.split_whitespace().collect();
-        let (label, event) = match words.as_slice() {
-            [] => return Err("an empty `order:` entry".into()),
-            [label] => (*label, Event::Done),
-            [label, "start"] => (*label, Event::Start),
-            [label, verb, suffix] => (
-                *label,
-                Event::Call {
-                    park: false,
-                    verb: verb.parse()?,
-                    suffix: (*suffix).to_string(),
-                },
-            ),
-            [label, "park", verb, suffix] => (
-                *label,
-                Event::Call {
-                    park: true,
-                    verb: verb.parse()?,
-                    suffix: (*suffix).to_string(),
-                },
-            ),
-            _ => {
-                return Err(format!(
-                    "an `order:` entry is `<label> start`, `<label>`, `<label> <verb> <key-suffix>` or `<label> park <verb> <key-suffix>`, got `{}`",
-                    item.trim()
-                ));
-            }
-        };
-        let Some(session) = labels.iter().position(|l| *l == label) else {
-            return Err(format!(
-                "`order:` names `{label}`, which is not a session of the block"
-            ));
-        };
-        entries.push(Entry { session, event });
-    }
-    if entries.is_empty() {
-        return Err("an `order:` line names at least one entry".into());
-    }
-    for (index, entry) in entries.iter().enumerate() {
-        let label = labels[entry.session];
-        let later = entries[index + 1..]
-            .iter()
-            .find(|e| e.session == entry.session);
-        if entry.event == Event::Start
-            && entries[..index].iter().any(|e| e.session == entry.session)
-        {
-            return Err(format!(
-                "`{label} start` must be the first entry of `{label}`"
-            ));
-        }
-        if matches!(entry.event, Event::Call { park: true, .. }) {
-            match later {
-                None => {
-                    return Err(format!(
-                        "`{}` parks `{label}` with no later entry of it to release the park",
-                        entry.event
-                    ));
-                }
-                Some(next) if !next.event.releases(&entry.event) => {
-                    return Err(format!(
-                        "`{}` parks `{label}`; the next entry of `{label}` must be that request without `park`, or its completion `{label}`, got `{}`",
-                        entry.event, next.event
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
-        if entry.event == Event::Done && later.is_some() {
-            return Err(format!("`{label}` completes before a later entry of it"));
-        }
-    }
-    Ok(entries)
-}
-
-/// The `--- expect` body after a block: one `<label>: ok` or
-/// `<label>: error: <needle>` line per session, every session named once.
-pub(crate) fn parse_expect_body(
-    body: &[(usize, &str)],
-    labels: &[&str],
-) -> Result<Vec<SessionExpect>, String> {
-    let mut expects: Vec<Option<SessionExpect>> = vec![None; labels.len()];
-    for (idx, raw) in body {
-        let line = idx + 1;
-        if raw.trim().is_empty() {
-            continue;
-        }
-        let Some((label, rest)) = raw.split_once(':') else {
-            return Err(format!(
-                "line {line}: a block expect line is `<label>: ok` or `<label>: error: <needle>`, got `{raw}`"
-            ));
-        };
-        let label = label.trim();
-        let Some(session) = labels.iter().position(|l| *l == label) else {
-            return Err(format!(
-                "line {line}: `{label}` is not a session of the block"
-            ));
-        };
-        if expects[session].is_some() {
-            return Err(format!(
-                "line {line}: session `{label}` has two expect lines"
-            ));
-        }
-        let rest = rest.trim();
-        let expect = if rest == "ok" {
-            SessionExpect::Ok
-        } else if let Some(needle) = rest.strip_prefix("error:") {
-            let needle = needle.trim();
-            if needle.is_empty() {
-                return Err(format!(
-                    "line {line}: `error:` needs a substring; a bare any-error expectation is refused"
-                ));
-            }
-            SessionExpect::Error {
-                needle: needle.to_string(),
-            }
-        } else {
-            return Err(format!(
-                "line {line}: a session expects `ok` or `error: <needle>`, got `{rest}`"
-            ));
-        };
-        expects[session] = Some(expect);
-    }
-    expects
-        .into_iter()
-        .zip(labels)
-        .map(|(expect, label)| {
-            expect.ok_or_else(|| format!("session `{label}` has no expect line"))
-        })
-        .collect()
 }
 
 /// One block's run: the script, the cursor every gated request waits on, and
@@ -526,18 +98,31 @@ pub(crate) struct Run {
     /// aborted, so the measure ledger files the drain under `after_abort`.
     draining: Arc<AtomicBool>,
     began: Instant,
-    /// Sessions waiting on the cursor right now; the clock driver runs
-    /// while there is one.
+    /// Sessions waiting on the cursor right now; the budget counts while
+    /// there is one.
     waiters: AtomicUsize,
-    wake_driver: Notify,
-    /// When the cursor last moved or a request last arrived: virtual, then
-    /// wall.
-    moved: Mutex<(tokio::time::Instant, Instant)>,
+    /// When the cursor last moved or a request last arrived, on the wall
+    /// clock.
+    moved: Mutex<Instant>,
     starve_budget: Duration,
+    /// The guard thread and the channel whose drop ends it.
+    guard: Mutex<Option<(Sender<()>, JoinHandle<()>)>>,
+}
+
+/// Ends the guard thread when dropped before [`Run::end`] joined it: the
+/// sender goes, the thread's next poll sees it and returns, unjoined.
+pub(crate) struct StopGuard(Arc<Run>);
+
+impl Drop for StopGuard {
+    fn drop(&mut self) {
+        if let Some((stop, _thread)) = self.0.guard.lock().unwrap().take() {
+            drop(stop);
+        }
+    }
 }
 
 /// A registered waiter on the cursor; the count drops with it, so a wait
-/// the engine cancels (a dropped future) never leaves the driver running.
+/// the engine cancels (a dropped future) never keeps the budget counting.
 struct Waiting<'a>(&'a Run);
 
 impl Drop for Waiting<'_> {
@@ -590,9 +175,9 @@ impl Run {
             draining: Arc::new(AtomicBool::new(false)),
             began: Instant::now(),
             waiters: AtomicUsize::new(0),
-            wake_driver: Notify::new(),
-            moved: Mutex::new((tokio::time::Instant::now(), Instant::now())),
+            moved: Mutex::new(Instant::now()),
             starve_budget,
+            guard: Mutex::new(None),
         });
         let previous = ACTIVE.lock().unwrap().replace(Arc::clone(&run));
         assert!(
@@ -600,7 +185,20 @@ impl Run {
             "a concurrent block began while another block was still active"
         );
         LIVE.store(true, Ordering::Release);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let watched = Arc::clone(&run);
+        let thread = std::thread::Builder::new()
+            .name("gqt-starve-guard".into())
+            .spawn(move || watched.guard(stopped))
+            .expect("spawn the block's starvation guard");
+        *run.guard.lock().unwrap() = Some((stop, thread));
         run
+    }
+
+    /// A handle whose drop ends the guard thread, held by the step future
+    /// so a block that unwinds before [`Run::end`] leaves no thread polling.
+    pub(crate) fn stop_guard(self: &Arc<Run>) -> StopGuard {
+        StopGuard(Arc::clone(self))
     }
 
     /// The flag every session's task-local shares with this run.
@@ -608,49 +206,48 @@ impl Run {
         Arc::clone(&self.draining)
     }
 
-    /// Drive the clock while a session waits on the script (module doc).
-    /// Polled beside the sessions for the block's whole life; never returns.
-    pub(crate) async fn drive_clock(&self) {
-        loop {
+    /// The guard thread's loop (module doc): every [`GUARD_POLL`] of wall
+    /// time, a block with a session waiting on the script and no progress
+    /// for its budget is starved; ends when `end` drops the sender.
+    fn guard(&self, stopped: Receiver<()>) {
+        while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(GUARD_POLL) {
             if self.waiters.load(Ordering::SeqCst) == 0 || self.aborted() {
-                self.wake_driver.notified().await;
                 continue;
             }
-            let (moved_virtual, moved_wall) = *self.moved.lock().unwrap();
-            if tokio::time::Instant::now().saturating_duration_since(moved_virtual)
-                < STUCK_VIRTUAL_BUDGET
-            {
-                tokio::time::advance(CLOCK_STEP).await;
-            } else if moved_wall.elapsed() >= self.starve_budget {
-                let at = *self.cursor.borrow();
-                let position = match at.checked_sub(1) {
-                    Some(previous) if previous < self.entries.len() => {
-                        format!("after entry {at} `{}`", self.entries[previous].event)
-                    }
-                    _ => format!(
-                        "before entry 1 `{}`",
-                        self.entries
-                            .first()
-                            .map(|e| e.event.to_string())
-                            .unwrap_or_default()
-                    ),
-                };
-                self.fail(format!(
-                    "starved: neither an entry nor a request arrived for {:.1} s of wall time {position}",
-                    self.starve_budget.as_secs_f64()
-                ));
-            } else {
-                std::thread::sleep(SPIN_SLEEP);
+            if self.moved.lock().unwrap().elapsed() < self.starve_budget {
+                continue;
             }
-            tokio::task::yield_now().await;
+            let at = *self.cursor.borrow();
+            let position = match at.checked_sub(1) {
+                Some(previous) if previous < self.entries.len() => {
+                    format!("after entry {at} `{}`", self.entries[previous].event)
+                }
+                _ => format!(
+                    "before entry 1 `{}`",
+                    self.entries
+                        .first()
+                        .map(|e| e.event.to_string())
+                        .unwrap_or_default()
+                ),
+            };
+            self.fail(format!(
+                "starved: neither an entry nor a request arrived for {:.1} s of wall time {position}",
+                self.starve_budget.as_secs_f64()
+            ));
         }
     }
 
-    /// The block is over: no longer the active block; the outcome for the
-    /// evidence row.
+    /// The block is over: no longer the active block, the guard thread
+    /// joined; the outcome for the evidence row.
     pub(crate) fn end(self: &Arc<Run>) -> Outcome {
         LIVE.store(false, Ordering::Release);
         *ACTIVE.lock().unwrap() = None;
+        if let Some((stop, thread)) = self.guard.lock().unwrap().take() {
+            drop(stop);
+            thread
+                .join()
+                .expect("the block's starvation guard panicked");
+        }
         Outcome {
             stuck_at: *self.stuck_at.lock().unwrap(),
             failure: self.failure.lock().unwrap().clone(),
@@ -740,7 +337,6 @@ impl Run {
         drop(failure);
         self.draining.store(true, Ordering::SeqCst);
         self.cursor.send_replace(ABORTED);
-        self.wake_driver.notify_one();
     }
 
     async fn wait_for(&self, entry: usize) {
@@ -749,14 +345,13 @@ impl Run {
         }
         self.waiters.fetch_add(1, Ordering::SeqCst);
         let _waiting = Waiting(self);
-        self.wake_driver.notify_one();
         let mut rx = self.cursor.subscribe();
         let _ = rx.wait_for(|cursor| *cursor >= entry).await;
     }
 
-    /// Progress: the budgets count from here.
+    /// Progress: the budget counts from here.
     fn touch(&self) {
-        *self.moved.lock().unwrap() = (tokio::time::Instant::now(), Instant::now());
+        *self.moved.lock().unwrap() = Instant::now();
     }
 
     /// Entry `at` happened: the cursor moves past it and the session's next
@@ -829,7 +424,7 @@ impl Drop for Permit {
 
 /// A request outside the gate (the control realm's, through the engine's
 /// `StorageAdapter`, which a measured run wraps) is progress for a live
-/// block's budgets like a gated one.
+/// block's budget like a gated one.
 pub(crate) fn touch() {
     if let Some(run) = active() {
         run.touch();
@@ -837,7 +432,7 @@ pub(crate) fn touch() {
 }
 
 /// Hold the request until its turn, if the script names it. Every request
-/// of a live block, named or not, is progress for the budgets.
+/// of a live block, named or not, is progress for the budget.
 async fn gate(verb: Verb, key: &str) -> Permit {
     let Some(run) = active() else {
         return Permit(None);

@@ -1,5 +1,5 @@
 use omnigraph_compiler::error::CompilerError;
-use omnigraph_compiler::ir::{IRExpr, IROp, QueryIR};
+use omnigraph_compiler::ir::untyped::{IRExpr, IROp, QueryIR};
 use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal, Param};
 use omnigraph_core::error::OmniError;
 

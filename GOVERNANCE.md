@@ -8,6 +8,8 @@ what has to happen before code lands?* The practical how-to lives in
 
 ## Roles
 
+OmniGraph is maintained by EQTR, Inc.
+
 - **Maintainers** — triage issues, accept or decline proposals and RFCs,
   review and merge PRs, and set direction. Final decision authority.
 - **Contributors** — everyone else. Report bugs, propose features, author

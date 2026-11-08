@@ -4,7 +4,6 @@ use super::*;
 use crate::engine::context::QueryContext;
 use arrow_array::Int64Array;
 use arrow_schema::{DataType, Field, Schema};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use std::num::NonZeroU64;
 
 use arrow_array::StringArray;
@@ -40,36 +39,41 @@ async fn windowed(partitions: &[usize], cap: u64, stop_after_first: bool) -> (Ve
     )
     .unwrap();
     let mut offset = 0;
-    let batches: Vec<_> = partitions
+    let batches: Vec<RecordBatch> = partitions
         .iter()
         .map(|&size| {
             let piece = batch.slice(offset, size);
             offset += size;
-            Ok(piece)
+            piece
         })
         .collect();
-    let input = Box::pin(RecordBatchStreamAdapter::new(
-        Arc::clone(&schema),
-        futures::stream::iter(batches),
-    ));
     let ctx = QueryContext::with_traversal_limit(64 * 1024 * 1024, NonZeroU64::new(cap)).unwrap();
     let memory = Arc::new(WorkMemory::new(ctx.task_ctx(), "window test").unwrap());
-    let mut windows = SourceWindows::new(input, schema, Arc::clone(&memory));
+    let mut windows = SourceWindows::new(schema, Arc::clone(&memory)).unwrap();
     let mut output = Vec::new();
-    while let Some(window) = windows.next().await.unwrap() {
-        output.push(
-            window
-                .batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .values()
-                .to_vec(),
-        );
-        if stop_after_first {
-            break;
+    let values = |window: SourceWindow| {
+        window
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    };
+    let mut stopped = false;
+    'input: for batch in batches {
+        windows.feed(batch).unwrap();
+        while let Some(window) = windows.next_full().unwrap() {
+            output.push(values(window));
+            if stop_after_first {
+                stopped = true;
+                break 'input;
+            }
         }
+    }
+    if !stopped && let Some(window) = windows.flush().unwrap() {
+        output.push(values(window));
     }
     (output, memory.charge_traversal(1).is_err())
 }
@@ -113,10 +117,17 @@ edge Likes: Person -> Person { payload: String }
 "#;
 
 async fn graph_environment(seed: Vec<serde_json::Value>) -> (tempfile::TempDir, Arc<GraphEnv>) {
+    graph_environment_for(EDGE_SCHEMA, seed).await
+}
+
+async fn graph_environment_for(
+    schema: &str,
+    seed: Vec<serde_json::Value>,
+) -> (tempfile::TempDir, Arc<GraphEnv>) {
     let dir = tempfile::tempdir().unwrap();
     let db = Session::from_defaults(
         Arc::new(
-            Omnigraph::init(dir.path().to_str().unwrap(), EDGE_SCHEMA)
+            Omnigraph::init(dir.path().to_str().unwrap(), schema)
                 .await
                 .unwrap(),
         ),
@@ -447,4 +458,98 @@ async fn selected_bound_sort_spills_and_refuses_its_scratch_quota_issue_659() {
         "{error:?}"
     );
     released(&refused).await;
+}
+
+/// A list-valued edge property sizes each pair by its own elements: Arrow's
+/// one-row slice of a list keeps the whole child buffer, so sizing rows with
+/// `get_slice_memory_size` counted every row at the scan batch's entire list
+/// child and cut the bounded pairs into chunks of a few rows.
+#[tokio::test]
+async fn bound_pairs_size_a_list_property_by_its_own_elements_issue_1251() {
+    const EDGES: usize = 256;
+    let labels = |edge: usize| -> Vec<String> {
+        (0..4)
+            .map(|tag| format!("{edge:03}-{tag}-{}", "x".repeat(250)))
+            .collect()
+    };
+    let mut seed = people();
+    for edge in 0..EDGES {
+        seed.push(
+            serde_json::json!({"edge":"Tagged","id":format!("t{edge:03}"),
+            "from":"a","to":"b","data":{"labels":labels(edge)}}),
+        );
+    }
+    let (_dir, env) = graph_environment_for(
+        "node Person { name: String @key }\nedge Tagged: Person -> Person { labels: [String] }",
+        seed,
+    )
+    .await;
+    let ctx = QueryContext::new(64 * 1024 * 1024).unwrap();
+    let memory = Arc::new(WorkMemory::new(ctx.task_ctx(), "bound pair sizing").unwrap());
+    assert_eq!(memory.batch_bytes(), 1024 * 1024);
+    let member = EdgeMember {
+        edge_type: "Tagged".into(),
+        direction: Direction::Out,
+    };
+    let schema =
+        bound_edge_pair_schema(&env.catalog, std::slice::from_ref(&member), false).unwrap();
+    let wide = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "p.__id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec!["a"]))],
+    )
+    .unwrap();
+    let mut chunks = Vec::new();
+    produce_bound_edge_pairs(
+        &wide,
+        &env.snapshot,
+        &env.catalog,
+        "p",
+        &member,
+        None,
+        &schema,
+        &memory,
+        |batch, _lease| {
+            chunks.push(batch);
+            std::future::ready(Ok(()))
+        },
+    )
+    .await
+    .unwrap();
+    let mut pairs = Vec::new();
+    for chunk in &chunks {
+        let ids = chunk
+            .column_by_name("__id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let lists = chunk
+            .column_by_name("labels")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+        for row in 0..chunk.num_rows() {
+            let values = lists.value(row);
+            let values = values.as_any().downcast_ref::<StringArray>().unwrap();
+            pairs.push((
+                ids.value(row).to_owned(),
+                values.iter().map(|tag| tag.unwrap().to_owned()).collect(),
+            ));
+        }
+    }
+    pairs.sort();
+    let expected: Vec<(String, Vec<String>)> = (0..EDGES)
+        .map(|edge| (format!("t{edge:03}"), labels(edge)))
+        .collect();
+    assert_eq!(pairs, expected);
+    // 256 rows of about 1 KiB each fit one 1 MiB chunk.
+    assert_eq!(
+        chunks.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+        [EDGES]
+    );
 }

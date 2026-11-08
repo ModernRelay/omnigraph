@@ -16,6 +16,7 @@ cluster deployment state, and public CLI/HTTP surfaces.
 flowchart TB
     CLI[omnigraph CLI]
     HTTP[omnigraph-server]
+    MCP[omnigraph-mcp]
     CLUSTER[omnigraph-cluster]
     COMPILER[omnigraph-compiler]
     PLANNER[omnigraph-planner]
@@ -30,7 +31,9 @@ flowchart TB
     CLI --> CLUSTER
     CLI --> ENGINE
     HTTP --> ENGINE
+    HTTP --> CLUSTER
     HTTP --> POLICY
+    HTTP --> MCP
     CLUSTER --> ENGINE
     ENGINE --> COMPILER
     ENGINE --> PLANNER
@@ -53,6 +56,12 @@ embedded caller may use the engine directly; the CLI may use an embedded store
 or the HTTP API; the server hosts multiple graphs from one applied cluster
 revision.
 
+The CLI's [scope resolver](../../crates/omnigraph-cli/src/scope.rs) selects one
+profile for account operations or target for resource operations. Explicit
+selectors override their respective declarative defaults. `InvocationConfig`
+captures one complete operator file; repository/folder state never selects it. Applicability is checked before credentials and backend access.
+The resolved destination is retained through storage and HTTP execution.
+
 ## Authority model
 
 Three kinds of state must not be conflated:
@@ -62,8 +71,8 @@ Three kinds of state must not be conflated:
    branch heads, visible table versions, and graph lineage. One manifest
    publication makes a graph change visible.
 2. **Lance physical state.** Each node and edge table is a Lance dataset with
-   its own versions, branches, fragments, and indexes. A table HEAD may move
-   before graph publication only when a durable recovery record owns the gap.
+   its own versions, branches, fragments, and indexes. Graph writes stage detached
+   versions; a registered table's linear HEAD remains at its creation version.
 3. **Derived runtime state.** Topology indexes, physical index coverage,
    caches, fragment layout, and serving projections may be rebuilt. They never
    become a second authority for graph contents.
@@ -82,15 +91,160 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph` (`omnigraph-engine`) | The public facade (`Omnigraph`, `Snapshot`), the graph coordinator, query and mutation execution, the table store, graph topology, validation, and recovery. |
 | `omnigraph-catalog` | `__manifest` publication (multi-dataset publication), graph branch registrations and lineage, retention, and `commit_graph`. |
 | `omnigraph-core` | `OmniError`, Lance dataset access and instrumentation, native Lance branch ref control (`branch_control`), and dataset addressing. |
-| `omnigraph-storage` | Shared local/S3/Azure control-object access used for manifests' companion objects, cluster state, locks, approvals, and recovery artifacts. |
+| `omnigraph-storage` | Shared local/S3/Azure control-object access for cluster state, locks, immutable resources and legacy conversion evidence. |
 | Lance | Dataset files, transactions, versions, native refs, secondary indexes, compaction, and version cleanup. |
 | `omnigraph-policy` | Cedar compilation and the engine-facing action/scope/actor gate. |
-| `omnigraph-cluster` | Desired configuration, state ledger, plan/apply, approvals, cluster recovery, and immutable serving snapshots. |
-| `omnigraph-api-types` | Additive HTTP wire DTOs shared by server and CLI. |
-| `omnigraph-cli` | Operator commands, target resolution, output, embedded/remote dispatch, and local credential selection. |
-| `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, and multi-graph serving. |
+| `omnigraph-cluster` | Desired configuration, deployment ledger, plan/apply, exact recovery, and immutable serving snapshots. |
+| `omnigraph-api-types` | Shared HTTP contract identifiers, operation inventory and wire DTOs used by server and CLI. |
+| `omnigraph-cli` | Operator commands, target resolution, output, embedded/remote dispatch, and local credential selection. Client setup captures operator configuration for ordinary graph commands, aliases and served cluster commands; scope, endpoint, credential matching and direct-write actor selection use those captured values. Query and alias presentation uses the same captured configuration. |
+| `omnigraph-skill` | The `skills/omnigraph` agent skill, embedded byte for byte by its build script; the package root is `skills/`, so the skill tree stays its one copy. `omnigraph skill export` writes it. |
+| `omnigraph-mcp` | MCP SDK integration, boot settings, tool and resource catalog, argument decoding, result formatting and response deadlines. The server supplies execution through its adapter. |
+| `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, multi-graph serving and live deployment activation. |
 | `omnigraph-azure-admission` | Azure deployment wrapper that admits one mutation-capable server process through the root-derived Blob lease. It is not a storage backend. |
-| `omnigraph-reference-engine` | Engine v1, frozen (`publish = false`, hash-pinned by its `tests/frozen.rs`): the reference executor a GQT step's `--- expect same as v1` compares engine v2 against. It depends only on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and third-party crates; `omnigraph-gqt` is the only crate that may depend on it (`forbidden_apis.rs` guards both), and no production door reaches it. |
+| `omnigraph-gqt-core` | GQT format, embedded and served execution, and expectation checks shared by the GQT runner and benchmark harness. It has no build script or test-only engine dependency. |
+| `omnigraph-reference-engine` | Engine v1, frozen (`publish = false`, hash-pinned by its `tests/frozen.rs`): the reference executor a GQT step's `--- expect same as v1` compares engine v2 against. Its input is the pinned `omnigraph_compiler::ir::untyped` read IR, produced by one-way erasure only at the test reference door. It depends only on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and third-party crates; `omnigraph-gqt` is the only crate that may depend on it (`forbidden_apis.rs` guards both), and no production door reaches it. |
+
+The server mounts `omnigraph-mcp` at `/mcp` on its existing listener. Its adapter
+dispatches to the same handlers as HTTP and retains authentication, OAuth
+metadata, graph admission and execution ownership. The adapter projects both
+handler errors and protocol refusals through the server's canonical `ApiError`
+contract, preserving error codes and effect dispositions. The MCP crate bounds
+and wraps those bodies; it opens no graphs and owns no serving lifecycle.
+
+The CLI's [invocation parser](../../crates/omnigraph-cli/src/invocation.rs) owns
+command construction, explicit argument provenance and cross-level argument
+validation. It reads no operator configuration or command inputs. The
+[library](../../crates/omnigraph-cli/src/lib.rs) exposes the
+[application entry point](../../crates/omnigraph-cli/src/app.rs), which owns
+dispatch, invocation-scoped admission and outcome evidence, and completion
+reporting. A completion carries the exit status of an already handled invocation;
+an unrendered error remains a `Result` error. The
+[binary](../../crates/omnigraph-cli/src/main.rs) owns runtime startup, diagnostic
+hooks, process arguments and the final process exit status. After an already
+reported nonzero completion, runtime shutdown does not wait for lingering blocking
+tasks such as DNS lookups; successful completion keeps normal shutdown. Clap's
+help, version and argument-refusal statuses survive closed output streams.
+Completion flushes a returned result without appending a second machine response
+if flushing fails. Handlers flush nonzero reports before returning completion;
+completion does not touch their streams again. Failure rendering flushes only
+the stream carrying that failure, so an unused stream cannot invalidate a
+delivered refusal.
+
+Command handlers consume supplied input, terminal status and fallible output
+writers; the process-facing application wrapper supplies the actual standard
+streams. [`InvocationConfig`](../../crates/omnigraph-cli/src/operator.rs) captures
+the operator home once, then reads the strict versioned configuration lazily
+at its first consumer. Every consumer shares that result, including a failed
+load. [`operator_schema`](../../crates/omnigraph-cli/src/operator_schema.rs) owns
+strict `version: 1` grammar and whole-document validation; its published JSON
+Schema is a related contract, not a substitute for cross-reference validation.
+[`scope`](../../crates/omnigraph-cli/src/scope.rs) selects profile or resource
+by command class. [`operator_routing`](../../crates/omnigraph-cli/src/operator_routing.rs)
+resolves owner-local auth and transport into the invocation; source files never
+route execution. [`planes`](../../crates/omnigraph-cli/src/planes.rs) rejects
+unsupported command/backend combinations. Graph selection is explicit or target
+`default_graph`; discovery never selects one. Local tooling ignores defaults
+and rejects irrelevant routing flags. Diagnostics use stderr.
+
+Managed profiles and standalone server targets each own one provider object.
+`login --create-profile` is the CLI profile-creation flow; ordinary login uses
+an explicit profile or the profile default. Private mutable authentication state
+is namespaced by the selected configuration path under the captured operator home,
+so reading YAML does not require writing beside it. Stable owner IDs, credential
+generations and compatible rename journals survive the state relocation.
+Incompatible old server-auth rename journals must be recovered with the previous
+CLI before flattening YAML. Conflicting legacy metadata refuses instead of
+replacing credential ownership.
+
+[`credential_sources`](../../crates/omnigraph-cli/src/credential_sources.rs)
+owns bounded token sources and the exec protocol. Providers acquire credentials
+for frozen destinations; they cannot return routing authority. Managed acquisition
+exchanges control access for a verified cluster-bound data credential before
+constructing the common served `GraphClient`. There is no per-command managed
+allowlist or control credential at a graph endpoint. Real direct-only capability
+boundaries remain in dispatch. Operator direct targets support local files only;
+engine/server cloud-storage constructors retain their independent contracts.
+Acquired credentials retain their typed binding and expiry through client
+construction. HTTP dispatch checks expiry after public discovery and before
+recording submission; managed control and issued data credentials have independent
+lifetimes. An expiry refusal does not authorize replaying a mutation.
+
+[`operator_transport`](../../crates/omnigraph-cli/src/operator_transport.rs)
+captures declared proxy/CA inputs once. Direct routing ignores ambient proxies;
+control and data settings are independent, and identity-provider traffic does
+not inherit either. Version 1 rejects custom destination CA combined with an
+HTTPS proxy; HTTP CONNECT proxies support custom destination CAs. Workload federation, cloud-direct
+schemas, BYOC private-route attestation and additional transports are not implied
+by the config rewrite. See the
+[operator RFC](../rfcs/2026-10-20-operator-connections-and-credential-providers.md)
+for rationale and [user reference](../user/cli/targets.md) for the supported contract.
+
+`commands/query` owns `query`, `mutate` and alias execution. Its
+[pure preparation](../../crates/omnigraph-cli/src/commands/query/prepare.rs)
+classifies captured source and argument combinations without I/O. It enforces
+recognized statement restrictions while forwarding unrecognized source unchanged
+to its execution owner, preserving syntax supported by a newer server.
+[Read presentation](../../crates/omnigraph-cli/src/presentation.rs) captures the
+effective format and table options once; rendering does not reload configuration.
+The captured read format also selects structured execution-error output, while
+mutation error formatting remains tied to explicit `--json`.
+
+`commands/history` owns branch, commit, diff, change-feed and snapshot commands.
+Its preparation types distinguish a requested page from automatic pagination and
+preserve optional branch selection. Human and JSON renderers use fallible writers;
+streams flush each page before requesting another. Baseline capture holds its
+output-file lock through durable installation and resume-cursor delivery, including
+the cursor flush. Dedicated commit publication and drop share the application's
+write-outcome observation with their `mutate` statement forms.
+
+`commands/transfer` owns `load`, `export` and Blob commands. Blob input capture
+validates ranges and write preconditions before acquiring the graph client. Stdin comes
+from a supplied reader; file and stdin payloads retain the existing byte bound.
+Load retains its source path: `GraphClient` owns backend-specific input reads and managed limits,
+including the embedded writable open before the source read. Transfer handlers
+use supplied output writers; stream and receipt delivery failures return through
+application completion with any write evidence retained. Blob output files keep
+their existing deferred open and partial-transfer behavior.
+
+`commands/schema` owns initialization, schema commands and lint. The handlers
+receive the captured target and preserve cluster
+ownership refusals before init/apply source reads and offline lint without target
+resolution. They render through supplied writers. Schema apply keeps the existing
+client's write evidence; initialization and system-column upgrade retain their
+own execution paths and do not claim the data-write outcome envelope. The upgrade
+adapter keeps its separate read-only check and execution modes.
+
+`commands/maintenance` owns optimize, repair, cleanup, full-text index rebuilding
+and storage upgrade arguments and dispatch. Supplied output writers keep delivery
+failures in application completion. Cleanup retains preview and consent before
+write admission; rebuild retains its actor and branch; repair delivers its report
+before any refusal error. The storage-upgrade adapter retains its existing
+conversion and recovery owner. These commands do not use the data-write outcome
+envelope or replay an operation after delivery failure.
+
+`commands/cluster` owns direct cluster arguments and dispatch; `cluster_remote`
+owns served deployment submission and observation. `commands/control` owns applied
+stored-query inspection, policy tooling and graph listing. Their reports use the
+application's supplied writers. Served apply writes and flushes its original ID
+before sending the POST. Direct apply's core identity callback cannot return an
+error: the CLI captures any diagnostic delivery failure, lets that one core call
+finish, then returns the failure with its original ID, root and retained lock.
+Neither path replays work to recover output. Deployment and recovery authority
+remain in the cluster crate.
+
+`commands/local` owns version and bundled skill/embedding dispatch.
+`commands/targets` owns offline configuration validation, target editing and
+credential commands, including journaled owner/profile renames that preserve
+binding IDs and explicit rename recovery. `managed` owns platform onboarding,
+verified principal replacement, session lifecycle and
+authenticated resource registration. Static installation is `credentials set
+--stdin`, never login. Status must remain network/helper-free and noninteractive;
+export checks pipe-only output before acquiring any secret. Configuration,
+secret custody, derived data cache and unresolved operation journals have separate
+lifecycles. Skill export and embedding generation finish file work before reports;
+output failure does not undo or repeat it. `skill show` retains its narrow
+`BrokenPipe` exception. Managed handlers use the supplied output boundary,
+including identity diagnostics before dispatch.
 
 ## Principal flows
 
@@ -99,17 +253,18 @@ alias is reused. See [invariants.md](invariants.md) and
   scans/search with the scoped in-memory topology index. See
   [execution.md](execution.md).
 - A content write captures one accepted authority view, stages exact Lance
-  transactions, arms recovery, applies table effects, and publishes all table
-  pointers plus lineage in one manifest CAS. See [writes.md](writes.md) and
+  transactions as unreachable detached table versions, and publishes every table
+  pin, accepted schema and lineage change in one manifest CAS. See [writes.md](writes.md) and
   [recovery.md](recovery.md).
 - A merge performs a graph-level three-way comparison, validates the selected
-  result, stages its table effects, and uses the same publication boundary. See
-  [merge.md](merge.md).
+  result, stages its table effects, and uses the same publication boundary. A
+  fast forward that only inserts nodes of types with no `@unique`, `@range`,
+  `@check` or enum property skips the validation. See [merge.md](merge.md).
 - Blob cells use an engine-owned, snapshot-bound facade; callers never receive
   a raw Lance `BlobFile` or physical placement. See [blob.md](blob.md).
 - Cluster apply converges definitions and graph topology into a CAS-protected
-  ledger. Servers boot only from an applied serving snapshot and do not mutate
-  cluster state at runtime. See [control-plane.md](control-plane.md).
+  ledger. Servers boot from an applied serving snapshot and execute live
+  deployments under their existing exclusive cluster admission. See [control-plane.md](control-plane.md).
 
 ## Trust and policy boundaries
 
@@ -133,16 +288,20 @@ gates for single-writer ownership.
   an exclusive pass on any handle of the process (schema apply, the
   system-column upgrade, open, refresh, settle, reload, `sync_branch`,
   branch create), and, because the gate is write-preferring, from the
-  moment one is queued. It also takes its
-  handle's coordinator lock, which a publish on that handle's bound branch
-  holds for the manifest compare-and-swap: a read and a write sharing one
-  handle and branch (for example, the server's requests on `main`) still
-  wait for each other there.
+  moment one is queued. It takes no lock on its handle's coordinator: the
+  installed state is an immutable value a read loads with one atomic
+  pointer read, and a publish or refresh on that handle's bound branch does
+  its storage round trips on a clone and installs the result with one
+  pointer swap, refused when the installed state already supersedes it
+  (`Omnigraph::install_coordinator`). A read and a write sharing one handle
+  and branch (for example, the server's requests on `main`) no longer wait
+  for each other; a read that starts while a publish is in flight binds the
+  installed state and sees the publish once it is installed.
 - Write preparation may overlap. Durable effects are ordered by the shared
   schema, branch, and sorted-table gates, then fenced again by persisted
   authority and Lance transaction identity.
 - The gates prevent same-process races and deadlocks; manifest preconditions,
-  Lance transactions, and recovery records provide durable correctness.
+  Lance transactions, and accepted manifest identities provide durable correctness.
 - Some maintenance and destructive-recovery classifiers intentionally retain
   a one-mutation-process support boundary. Do not infer distributed writer
   safety from an in-process mutex. [recovery.md](recovery.md) names the modes.
@@ -172,3 +331,23 @@ for read-only qualification and tests, not writer ownership.
 
 Upstream behavior must be checked against the full matching Lance pages in
 [lance.md](lance.md) before changing a substrate-facing contract.
+
+## Index facts in read planning
+
+The engine gathers effective index metadata from each query table at its pinned
+version, including correlated inner reads. `PlanSource` exposes one fact per
+index name and keyed column. Coverage unions same-name segments and intersects
+current fragments; missing bitmaps remain unknown. The planner prices Expand
+as fully indexed only when every required endpoint has complete usable BTREE
+coverage across its candidates. See the [index-facts decision](../rfcs/2026-10-08-index-facts-as-planner-input.md).
+
+Saved Expand inputs carry coverage provenance. Fresh plans use pinned facts;
+accepted older plans with no provenance default to the legacy runtime probe.
+Execution still adjusts for frontier size and warm CSR state. Explain statistics
+are diagnostics and do not select the replay path. Root scans finalize their access through the same Lance read builder used by
+execution. Static scans record a Boolean index query and residual or disable
+indexing. A filtered scan whose table has no fact that could narrow it (no
+index, or only indexes covering no current fragment, such as an untrained
+full-text segment) records sequential access without building that read. Dynamic and dependent reads keep their explicit runtime paths.
+Single String key equality can gain a canonical identity predicate before
+finalization; historical IDs prevent broader key narrowing.

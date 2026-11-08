@@ -1,0 +1,116 @@
+# issue: none
+# notes: Bounded traversal representative: 16 people with directed ring and four-step chord edges (32 total). This deterministic topology, scale and publication batching differ from the former random Rust graph and have a new timing identity.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key age: I32? }
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 16
+    commits: 1
+    batch_rows: 16
+    columns:
+      name: {kind: key, prefix: p, width: 0}
+      age: {kind: ordinal, start: 18, step: 1}
+  - kind: edge
+    name: Knows
+    rows: 32
+    commits: 1
+    batch_rows: 32
+    id: {kind: key, prefix: e, width: 3}
+    from:
+      kind: ranges
+      ranges:
+        - {end: 1, value: "p0"}
+        - {end: 2, value: "p0"}
+        - {end: 3, value: "p1"}
+        - {end: 4, value: "p1"}
+        - {end: 5, value: "p2"}
+        - {end: 6, value: "p2"}
+        - {end: 7, value: "p3"}
+        - {end: 8, value: "p3"}
+        - {end: 9, value: "p4"}
+        - {end: 10, value: "p4"}
+        - {end: 11, value: "p5"}
+        - {end: 12, value: "p5"}
+        - {end: 13, value: "p6"}
+        - {end: 14, value: "p6"}
+        - {end: 15, value: "p7"}
+        - {end: 16, value: "p7"}
+        - {end: 17, value: "p8"}
+        - {end: 18, value: "p8"}
+        - {end: 19, value: "p9"}
+        - {end: 20, value: "p9"}
+        - {end: 21, value: "p10"}
+        - {end: 22, value: "p10"}
+        - {end: 23, value: "p11"}
+        - {end: 24, value: "p11"}
+        - {end: 25, value: "p12"}
+        - {end: 26, value: "p12"}
+        - {end: 27, value: "p13"}
+        - {end: 28, value: "p13"}
+        - {end: 29, value: "p14"}
+        - {end: 30, value: "p14"}
+        - {end: 31, value: "p15"}
+        - {end: 32, value: "p15"}
+      fallback: "p15"
+    to:
+      kind: ranges
+      ranges:
+        - {end: 1, value: "p1"}
+        - {end: 2, value: "p4"}
+        - {end: 3, value: "p2"}
+        - {end: 4, value: "p5"}
+        - {end: 5, value: "p3"}
+        - {end: 6, value: "p6"}
+        - {end: 7, value: "p4"}
+        - {end: 8, value: "p7"}
+        - {end: 9, value: "p5"}
+        - {end: 10, value: "p8"}
+        - {end: 11, value: "p6"}
+        - {end: 12, value: "p9"}
+        - {end: 13, value: "p7"}
+        - {end: 14, value: "p10"}
+        - {end: 15, value: "p8"}
+        - {end: 16, value: "p11"}
+        - {end: 17, value: "p9"}
+        - {end: 18, value: "p12"}
+        - {end: 19, value: "p10"}
+        - {end: 20, value: "p13"}
+        - {end: 21, value: "p11"}
+        - {end: 22, value: "p14"}
+        - {end: 23, value: "p12"}
+        - {end: 24, value: "p15"}
+        - {end: 25, value: "p13"}
+        - {end: 26, value: "p0"}
+        - {end: 27, value: "p14"}
+        - {end: 28, value: "p1"}
+        - {end: 29, value: "p15"}
+        - {end: 30, value: "p2"}
+        - {end: 31, value: "p0"}
+        - {end: 32, value: "p3"}
+      fallback: "p3"
+    columns: {}
+
+--- query
+query fixture_people() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n":16}
+--- expect shape
+n: I64
+
+--- query
+query fixture_edges() { match { $p: Person $p knows $q } return { count($q) as n } }
+--- expect unordered
+{"n":32}
+--- expect shape
+n: I64

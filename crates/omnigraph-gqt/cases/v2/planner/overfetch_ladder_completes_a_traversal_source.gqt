@@ -42,4 +42,4 @@ query nearest_citing_docs($q: Vector(2)) {
 --- expect shape
 d.slug: String
 --- expect plan
-scan Doc as $d: ranked nearest fetch 3
+scan Doc as $d: ranked nearest fetch 3 diagnostics present

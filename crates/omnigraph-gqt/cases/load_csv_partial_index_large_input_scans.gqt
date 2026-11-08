@@ -1,0 +1,57 @@
+# issue: none
+# traversal: auto
+# notes: Partial BTREE coverage of the endpoint table (index built, then one node appended) must not
+# notes: keep the probe for a large input: the planner reads the 72-byte file as 18 input rows and
+# notes: prices an indexed probe at 9 per row (162) against a 27-row scan, so it scans; a probe here hands the filter
+# notes: one literal per edge, the shape that resident memory grows with at SF30.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { id: String @key }
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 1
+    columns:
+      id: {kind: key, prefix: p, width: 6}
+
+--- load generate: v1 seed: 43 mode: append
+tables:
+  - kind: node
+    name: Person
+    rows: 1
+    commits: 1
+    columns:
+      id: {kind: key, prefix: extra, width: 6}
+--- expect ok
+
+--- csv edges.csv
+from,to
+p000000,p000000
+p000001,p000007
+p000002,p000005
+p000005,p000003
+
+--- mutate
+load csv "edges.csv" into edge:Knows mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:Knows from Person: access scan
+load validate edge_ri edge:Knows to Person: access scan
+load executed: partitions 1 rows 4
+
+--- query
+query loaded() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n": 4}
+--- expect shape
+n: I64

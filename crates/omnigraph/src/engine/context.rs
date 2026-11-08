@@ -4,8 +4,12 @@
 //! sorts and aggregates may spill within the scratch quota.
 
 use std::fmt;
+use std::future::Future;
 use std::num::{NonZero, NonZeroU64};
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
@@ -15,18 +19,24 @@ use datafusion::execution::memory_pool::{
     FairSpillPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation, TrackConsumersPool,
 };
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use futures::FutureExt;
+use tokio::sync::Notify;
 
-use super::operators::memory::QueryResources;
+use super::operators::memory::{QueryResources, locked};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ORDERED_SCAN_EXECUTION_BATCH_ROWS, ORDERED_SCAN_MEMORY_BYTES, ORDERED_SCAN_SCRATCH_BYTES,
-    sort_spill_reservation_bytes,
+    ORDERED_SCAN_EXECUTION_BATCH_ROWS, ORDERED_SCAN_SCRATCH_BYTES, sort_spill_reservation_bytes,
 };
 
-/// The query pool's size: the ordered scan's constant unless a test installed
-/// `instrumentation::with_query_memory_limit` on the task.
+/// The pool size for tests that build a context without a plan: the ordered
+/// scan's constant unless a test installed
+/// `instrumentation::with_query_memory_limit` on the task. A real query's
+/// pool is the plan's `memory_limit`, captured by `QuerySource::gather` from
+/// the session's `query_memory_bytes`.
+#[cfg(test)]
 pub(super) fn query_memory_limit() -> u64 {
-    crate::instrumentation::query_memory_limit().unwrap_or(ORDERED_SCAN_MEMORY_BYTES)
+    crate::instrumentation::query_memory_limit()
+        .unwrap_or(crate::table_store::ORDERED_SCAN_MEMORY_BYTES)
 }
 
 pub(super) struct QueryContext {
@@ -34,6 +44,142 @@ pub(super) struct QueryContext {
     pool: Arc<SpillHeadroomPool>,
     memory_limit: u64,
     scratch_limit: u64,
+    work: QueryWorkScope,
+}
+
+/// Owns one query's graph-operator producers and blocking workers, not opaque
+/// DataFusion tasks or native storage I/O, so it cannot authorize engine reuse.
+/// Closing refuses `register`; a live lease still adds workers through `child`.
+#[derive(Clone, Debug, Default)]
+pub(in crate::engine) struct QueryWorkScope(Arc<QueryWorkState>);
+
+#[derive(Debug, Default)]
+struct QueryWorkState {
+    state: Mutex<QueryWorkCounts>,
+    changed: Notify,
+}
+
+#[derive(Debug, Default)]
+struct QueryWorkCounts {
+    closed: bool,
+    active: usize,
+}
+
+/// A live child is the only authority to create descendants after closure.
+pub(in crate::engine) struct QueryWorkLease(Arc<QueryWorkState>);
+
+/// Observing settlement keeps no child alive and grants no work admission.
+#[derive(Clone)]
+pub(in crate::engine) struct QueryWorkSettlement(Arc<QueryWorkState>);
+
+impl QueryWorkScope {
+    pub(in crate::engine) fn register(&self) -> DfResult<QueryWorkLease> {
+        let mut state = locked(&self.0.state);
+        if state.closed {
+            return Err(DataFusionError::Internal(
+                "query work admission is closed".into(),
+            ));
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("query child count overflow");
+        Ok(QueryWorkLease(Arc::clone(&self.0)))
+    }
+
+    fn close(&self) {
+        locked(&self.0.state).closed = true;
+        self.0.changed.notify_waiters();
+    }
+
+    /// Admit work again once a run settled: `run_owned` closes the scope
+    /// at its end, and a load's rerun runs under the same pool.
+    fn reopen(&self) {
+        let mut state = locked(&self.0.state);
+        debug_assert_eq!(state.active, 0, "query work reopened before it settled");
+        state.closed = false;
+    }
+
+    fn settlement(&self) -> QueryWorkSettlement {
+        QueryWorkSettlement(Arc::clone(&self.0))
+    }
+}
+
+impl QueryWorkLease {
+    pub(in crate::engine) fn child(&self) -> Self {
+        let mut state = locked(&self.0.state);
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("query child count overflow");
+        Self(Arc::clone(&self.0))
+    }
+
+    /// Fields drop in declaration order: actual work and captured resources
+    /// disappear before the registration can announce settlement.
+    pub(in crate::engine) fn own<T>(self, value: T) -> OwnedQueryWork<T> {
+        OwnedQueryWork {
+            value,
+            _lease: self,
+        }
+    }
+}
+
+impl Drop for QueryWorkLease {
+    fn drop(&mut self) {
+        let mut state = locked(&self.0.state);
+        state.active -= 1;
+        let settled = state.closed && state.active == 0;
+        drop(state);
+        if settled {
+            self.0.changed.notify_waiters();
+        }
+    }
+}
+
+pub(in crate::engine) struct OwnedQueryWork<T> {
+    pub(in crate::engine) value: T,
+    _lease: QueryWorkLease,
+}
+
+impl<T> OwnedQueryWork<T> {
+    /// A completed poll's output can own resources too, and a cancelled
+    /// JoinHandle abandons it: the output joins `value` under the same lease.
+    pub(in crate::engine) fn with_output<U>(self, output: U) -> OwnedQueryWork<(T, U)> {
+        OwnedQueryWork {
+            value: (self.value, output),
+            _lease: self._lease,
+        }
+    }
+
+    pub(in crate::engine) fn into_inner(self) -> T {
+        self.value
+    }
+}
+
+impl<F: Future> Future for OwnedQueryWork<Pin<Box<F>>> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().value.as_mut().poll(cx)
+    }
+}
+
+impl QueryWorkSettlement {
+    pub(in crate::engine) async fn wait(&self) {
+        loop {
+            let changed = self.0.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = locked(&self.0.state);
+                if state.closed && state.active == 0 {
+                    return;
+                }
+            }
+            changed.await;
+        }
+    }
 }
 
 impl QueryContext {
@@ -71,6 +217,7 @@ impl QueryContext {
             .with_batch_size(ORDERED_SCAN_EXECUTION_BATCH_ROWS)
             .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes(memory_limit));
         let pool = Arc::new(SpillHeadroomPool::new(memory_limit as usize));
+        let work = QueryWorkScope::default();
         let runtime = RuntimeEnvBuilder::new()
             .with_disk_manager_builder(
                 DiskManagerBuilder::default().with_max_temp_directory_size(scratch_limit),
@@ -84,17 +231,50 @@ impl QueryContext {
                     Arc::clone(&runtime.memory_pool),
                     memory_limit,
                     traversal_limit,
+                    work.clone(),
                 ))),
                 runtime,
             ),
             pool,
             memory_limit,
             scratch_limit,
+            work,
         })
     }
 
     pub(super) fn task_ctx(&self) -> Arc<TaskContext> {
         self.session.task_ctx()
+    }
+
+    /// Call once, after the complete query has dropped its execution streams
+    /// and plans: a search's successive passes share this context, so a pass
+    /// boundary must not close it.
+    async fn wait_owned_workers(&self) {
+        self.work.close();
+        self.work.settlement().wait().await;
+    }
+
+    /// Finish the complete execution future, then close registration and wait,
+    /// on success, error and panic: an early LIMIT or unwinding execution can
+    /// leave a cancelled producer's blocking poll running. Resume the original
+    /// panic only after those workers settle. An abandoned caller closes via Drop.
+    pub(super) async fn run_owned<F: Future>(&self, future: F) -> F::Output {
+        // Await inside the unwind boundary so dropping a completed execution
+        // future is caught too, before worker registration closes.
+        #[allow(clippy::redundant_async_block)] // The wrapper catches future Drop panics.
+        let result = AssertUnwindSafe(async move { future.await })
+            .catch_unwind()
+            .await;
+        self.wait_owned_workers().await;
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn owned_workers(&self) -> QueryWorkSettlement {
+        self.work.settlement()
     }
 
     #[cfg(test)]
@@ -112,6 +292,12 @@ impl QueryContext {
             self.memory_limit,
             self.scratch_limit,
         )
+    }
+}
+
+impl Drop for QueryContext {
+    fn drop(&mut self) {
+        self.work.close();
     }
 }
 
@@ -138,6 +324,112 @@ pub(super) fn classify_failure(
         return OmniError::resource_limit("query_memory_bytes", memory_limit, actual);
     }
     OmniError::datafusion(error)
+}
+
+/// One load statement's admitted read-reuse allowance: a named reservation on
+/// the statement's pool, held until the statement's reuse caches drop (RFC
+/// 2026-10-15 bulk load as a query plan).
+pub(crate) struct LoadReuseReservation {
+    reservation: MemoryReservation,
+}
+
+impl LoadReuseReservation {
+    pub(in crate::engine) fn admit(pool: Arc<dyn MemoryPool>, limit: u64) -> Option<Self> {
+        let available = limit.saturating_sub(pool.reserved() as u64);
+        let want = (available / 4).min(64 * 1024 * 1024);
+        if want < 1024 * 1024 {
+            return None;
+        }
+        let reservation = MemoryConsumer::new("load read reuse").register(&pool);
+        reservation.try_grow(usize::try_from(want).ok()?).ok()?;
+        Some(Self { reservation })
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.reservation.size()
+    }
+}
+
+/// One load statement's tracked memory: the engine's pool sized by
+/// `query_memory_bytes`, shared by the read-reuse caches, the retained
+/// source, every decoded batch, validation state and the staging working
+/// set, so several individually small parts still exhaust one allowance.
+pub(crate) struct LoadMemory {
+    context: QueryContext,
+}
+
+impl LoadMemory {
+    pub(crate) fn new(query_memory_bytes: u64) -> Result<Self> {
+        Ok(Self {
+            context: QueryContext::with_traversal_limit(query_memory_bytes, None)?,
+        })
+    }
+
+    pub(crate) fn limit(&self) -> u64 {
+        self.context.memory_limit
+    }
+
+    /// The context a load plan runs under: this statement's pool.
+    pub(super) fn context(&self) -> &QueryContext {
+        &self.context
+    }
+
+    /// Admit the plan's workers again for a rerun: `execute_load` closes
+    /// admission when its run settles; the pool and its charges stay.
+    pub(crate) fn reopen(&self) {
+        self.context.work.reopen();
+    }
+
+    /// Admit optional caches from the pool's currently unreserved bytes.
+    pub(crate) fn admit_read_reuse(&self) -> Option<LoadReuseReservation> {
+        LoadReuseReservation::admit(
+            Arc::clone(&self.context.pool) as Arc<dyn MemoryPool>,
+            self.limit(),
+        )
+    }
+
+    /// A named charge on the statement's pool, freed when dropped.
+    pub(crate) fn charge(&self, name: &str) -> Result<LoadCharge> {
+        super::operators::memory::WorkMemory::new(self.context.task_ctx(), name)
+            .map(LoadCharge)
+            .map_err(|error| self.context.classify(error))
+    }
+}
+
+/// One named charge of a load statement: grows by bytes or by held batches,
+/// each refusal the typed `query_memory_bytes` resource error.
+pub(crate) struct LoadCharge(super::operators::memory::WorkMemory);
+
+impl fmt::Debug for LoadCharge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadCharge").finish_non_exhaustive()
+    }
+}
+
+impl LoadCharge {
+    /// Release temporary capture headroom after only the final bytes remain.
+    pub(crate) fn shrink_to(&self, bytes: u64) {
+        self.0
+            .shrink_to(usize::try_from(bytes).unwrap_or(usize::MAX));
+    }
+    pub(crate) fn grow(&self, bytes: u64) -> Result<()> {
+        self.0
+            .grow(usize::try_from(bytes).unwrap_or(usize::MAX))
+            .map_err(|error| self.0.error(error))
+    }
+
+    /// Charge `count` entries of a collection of `T`, hash overhead included.
+    pub(crate) fn entries<T>(&self, count: usize) -> Result<()> {
+        self.0
+            .entries::<T>(count)
+            .map_err(|error| self.0.error(error))
+    }
+
+    /// Hold `batch`'s buffers for this charge's lifetime, each shared buffer
+    /// charged once across every holder.
+    pub(crate) fn hold(&self, batch: &arrow_array::RecordBatch) -> Result<()> {
+        self.0.hold(batch).map_err(|error| self.0.error(error))
+    }
 }
 
 /// The sizes of one refused reservation: what the pool held and what was asked.
@@ -283,6 +575,43 @@ impl MemoryPool for SpillHeadroomPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
+
+    #[test]
+    fn load_reuse_uses_only_headroom_after_mandatory_admission() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+        const MIB: usize = 1024 * 1024;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16 * MIB));
+        let mandatory = MemoryConsumer::new("validation facts").register(&pool);
+        mandatory.try_grow(12 * MIB).unwrap();
+        let reuse = LoadReuseReservation::admit(Arc::clone(&pool), (16 * MIB) as u64).unwrap();
+        assert_eq!(reuse.bytes(), MIB);
+        assert_eq!(pool.reserved(), 13 * MIB);
+        drop(reuse);
+        assert_eq!(pool.reserved(), 12 * MIB);
+        mandatory.try_grow(3 * MIB).unwrap();
+        assert!(LoadReuseReservation::admit(Arc::clone(&pool), (16 * MIB) as u64).is_none());
+        assert_eq!(pool.reserved(), 15 * MIB);
+        drop(mandatory);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    /// Child registration and closure race inside the executor, not in GQ.
+    #[tokio::test]
+    async fn settlement_requires_closed_admission_and_all_descendants() {
+        let scope = QueryWorkScope::default();
+        let settlement = scope.settlement();
+        assert!(settlement.wait().now_or_never().is_none());
+        let parent = scope.register().unwrap();
+        scope.close();
+        assert!(scope.register().is_err());
+        let child = parent.child();
+        drop(parent);
+        assert!(settlement.wait().now_or_never().is_none());
+        drop(child);
+        assert!(settlement.wait().now_or_never().is_some());
+    }
 
     /// Compares both error boundaries under one injected pool and disk manager.
     #[test]
@@ -295,15 +624,20 @@ mod tests {
             )
             .build_arc()
             .unwrap();
-        let config = SessionConfig::new().with_extension(Arc::new(QueryResources::new(
-            Arc::clone(&runtime.memory_pool),
-            1_024,
-        )));
+        let scope = QueryWorkScope::default();
+        let config =
+            SessionConfig::new().with_extension(Arc::new(QueryResources::with_traversal_limit(
+                Arc::clone(&runtime.memory_pool),
+                1_024,
+                None,
+                scope.clone(),
+            )));
         let query = QueryContext {
             session: SessionContext::new_with_config_rt(config, runtime),
             pool,
             memory_limit: 1_024,
             scratch_limit: 1,
+            work: scope,
         };
         let work =
             crate::engine::operators::memory::WorkMemory::new(query.task_ctx(), "boundary test")

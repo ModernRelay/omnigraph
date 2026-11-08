@@ -1,0 +1,69 @@
+# issue: none
+# notes: Hot row stays fixed while idle table, branch and unrelated-history axes are isolated: tables-4.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Hot { key: String @key value: I64 }
+node Idle0 { key: String @key value: I64 }
+node Idle1 { key: String @key value: I64 }
+node Idle2 { key: String @key value: I64 }
+node Idle3 { key: String @key value: I64 }
+
+--- seed
+{"type":"Hot","data":{"key":"hot","value":0}}
+{"type":"Idle0","data":{"key":"sentinel","value":0}}
+{"type":"Idle1","data":{"key":"sentinel","value":0}}
+{"type":"Idle2","data":{"key":"sentinel","value":0}}
+{"type":"Idle3","data":{"key":"sentinel","value":0}}
+
+--- query branch: main
+query current_rows() { match { $r: Hot } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"hot","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: Idle0 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"sentinel","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: Idle1 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"sentinel","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: Idle2 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"sentinel","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: Idle3 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"sentinel","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+--- expect shape
+name: String

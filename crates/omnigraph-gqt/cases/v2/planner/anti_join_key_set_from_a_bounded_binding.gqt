@@ -1,0 +1,289 @@
+# issue: none
+# red_on: e5c14da7: `anti join $x: key_set` is no plan line; the inner tree started from every outer row.
+# notes: A correlated block that reaches the outer rows only through `$x`'s identity and binds
+# notes: one of its own nodes by a key equality runs once from that binding (`key_set`): the
+# notes: excluded source's touchpoints, then their identities. Count, sum and bound-edge blocks
+# notes: keep each outer row by its key's matches. A block whose bindings carry no bound filter,
+# notes: and a block that reads another outer binding, stay `correlated`. Rows agree either way.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Channel { slug: String @key }
+node Source { slug: String @key }
+node Touchpoint {
+    slug: String @key
+    action: String
+    weight: I64?
+}
+node ExternalID { slug: String @key }
+edge ChannelWatchesSource: Channel -> Source
+edge TouchpointOnSource: Touchpoint -> Source { via: String? }
+edge TouchpointByIdentity: Touchpoint -> ExternalID
+
+--- seed
+{"type":"Channel","data":{"slug":"c1"}}
+{"type":"Source","data":{"slug":"s1"}}
+{"type":"Source","data":{"slug":"s2"}}
+{"type":"Source","data":{"slug":"s3"}}
+{"type":"Source","data":{"slug":"excluded"}}
+{"type":"ExternalID","data":{"slug":"x1"}}
+{"type":"ExternalID","data":{"slug":"x2"}}
+{"type":"ExternalID","data":{"slug":"x3"}}
+{"type":"ExternalID","data":{"slug":"x4"}}
+{"type":"ExternalID","data":{"slug":"x5"}}
+{"type":"Touchpoint","data":{"slug":"t1","action":"star","weight":1}}
+{"type":"Touchpoint","data":{"slug":"t2","action":"star","weight":3}}
+{"type":"Touchpoint","data":{"slug":"t3","action":"star","weight":1}}
+{"type":"Touchpoint","data":{"slug":"t4","action":"star","weight":1}}
+{"type":"Touchpoint","data":{"slug":"t5","action":"star","weight":1}}
+{"type":"Touchpoint","data":{"slug":"t6","action":"star","weight":2}}
+{"type":"Touchpoint","data":{"slug":"t7","action":"fork","weight":4}}
+{"type":"Touchpoint","data":{"slug":"t8","action":"star","weight":1}}
+{"type":"Touchpoint","data":{"slug":"t9","action":"fork","weight":1}}
+{"type":"Touchpoint","data":{"slug":"t10","action":"star","weight":10}}
+{"type":"Touchpoint","data":{"slug":"t11","action":"fork","weight":9}}
+{"edge":"ChannelWatchesSource","from":"c1","to":"s1"}
+{"edge":"ChannelWatchesSource","from":"c1","to":"s2"}
+{"edge":"TouchpointOnSource","from":"t1","to":"s1"}
+{"edge":"TouchpointOnSource","from":"t2","to":"excluded","data":{"via":"web"}}
+{"edge":"TouchpointOnSource","from":"t3","to":"s1"}
+{"edge":"TouchpointOnSource","from":"t4","to":"s2"}
+{"edge":"TouchpointOnSource","from":"t5","to":"s2"}
+{"edge":"TouchpointOnSource","from":"t6","to":"excluded","data":{"via":"api"}}
+{"edge":"TouchpointOnSource","from":"t7","to":"excluded","data":{"via":"web"}}
+{"edge":"TouchpointOnSource","from":"t8","to":"s1"}
+{"edge":"TouchpointOnSource","from":"t9","to":"s3"}
+{"edge":"TouchpointOnSource","from":"t10","to":"s1"}
+{"edge":"TouchpointOnSource","from":"t11","to":"excluded","data":{"via":"api"}}
+{"edge":"TouchpointByIdentity","from":"t1","to":"x1"}
+{"edge":"TouchpointByIdentity","from":"t2","to":"x1"}
+{"edge":"TouchpointByIdentity","from":"t3","to":"x2"}
+{"edge":"TouchpointByIdentity","from":"t4","to":"x2"}
+{"edge":"TouchpointByIdentity","from":"t5","to":"x3"}
+{"edge":"TouchpointByIdentity","from":"t6","to":"x3"}
+{"edge":"TouchpointByIdentity","from":"t7","to":"x3"}
+{"edge":"TouchpointByIdentity","from":"t8","to":"x4"}
+{"edge":"TouchpointByIdentity","from":"t9","to":"x4"}
+{"edge":"TouchpointByIdentity","from":"t10","to":"x5"}
+{"edge":"TouchpointByIdentity","from":"t11","to":"x5"}
+
+--- query
+query lookalikes($channel: String, $exclude: String) {
+    match {
+        $c: Channel { slug: $channel }
+        $s: Source
+        $c channelWatchesSource $s
+        $t: Touchpoint { action: "star" }
+        $t touchpointOnSource $s
+        $x: ExternalID
+        $t touchpointByIdentity $x
+        not {
+            $s0: Source { slug: $exclude }
+            $t0: Touchpoint
+            $t0 touchpointOnSource $s0
+            $t0 touchpointByIdentity $x
+        }
+    }
+    return { $x.slug, count($t) as repos }
+}
+
+--- params
+{"channel": "c1", "exclude": "excluded"}
+
+--- expect unordered
+{"x.slug": "x2", "repos": 2}
+{"x.slug": "x4", "repos": 1}
+
+--- expect shape
+x.slug: String
+repos: I64
+
+--- expect plan
+anti join $x: key_set
+pass anti_join_strategy
+
+--- expect same as v1
+
+--- query
+query twice_on_excluded($channel: String, $exclude: String) {
+    match {
+        $c: Channel { slug: $channel }
+        $s: Source
+        $c channelWatchesSource $s
+        $t: Touchpoint { action: "star" }
+        $t touchpointOnSource $s
+        $x: ExternalID
+        $t touchpointByIdentity $x
+        count {
+            $s0: Source { slug: $exclude }
+            $t0: Touchpoint
+            $t0 touchpointOnSource $s0
+            $t0 touchpointByIdentity $x
+        } >= 2
+    }
+    return { $x.slug, count($t) as repos }
+}
+
+--- params
+{"channel": "c1", "exclude": "excluded"}
+
+--- expect unordered
+{"x.slug": "x3", "repos": 1}
+
+--- expect shape
+x.slug: String
+repos: I64
+
+--- expect plan
+anti join $x: key_set
+
+--- query
+query heavy_on_excluded($channel: String, $exclude: String) {
+    match {
+        $c: Channel { slug: $channel }
+        $s: Source
+        $c channelWatchesSource $s
+        $t: Touchpoint { action: "star" }
+        $t touchpointOnSource $s
+        $x: ExternalID
+        $t touchpointByIdentity $x
+        sum($t0.weight) {
+            $s0: Source { slug: $exclude }
+            $t0: Touchpoint
+            $t0 touchpointOnSource $s0
+            $t0 touchpointByIdentity $x
+        } > 3
+    }
+    return { $x.slug, count($t) as repos }
+}
+
+--- params
+{"channel": "c1", "exclude": "excluded"}
+
+--- expect unordered
+{"x.slug": "x3", "repos": 1}
+{"x.slug": "x5", "repos": 1}
+
+--- expect shape
+x.slug: String
+repos: I64
+
+--- expect plan
+anti join $x: key_set
+
+--- query
+query not_through_the_web($channel: String, $exclude: String) {
+    match {
+        $c: Channel { slug: $channel }
+        $s: Source
+        $c channelWatchesSource $s
+        $t: Touchpoint { action: "star" }
+        $t touchpointOnSource $s
+        $x: ExternalID
+        $t touchpointByIdentity $x
+        not {
+            $s0: Source { slug: $exclude }
+            $t0: Touchpoint
+            $t0 $e:touchpointOnSource $s0
+            $e.via = "web"
+            $t0 touchpointByIdentity $x
+        }
+    }
+    return { $x.slug, count($t) as repos }
+}
+
+--- params
+{"channel": "c1", "exclude": "excluded"}
+
+--- expect unordered
+{"x.slug": "x2", "repos": 2}
+{"x.slug": "x4", "repos": 1}
+{"x.slug": "x5", "repos": 1}
+
+--- expect shape
+x.slug: String
+repos: I64
+
+--- expect plan
+anti join $x: key_set
+
+--- expect same as v1
+
+--- query
+query never_forked($channel: String) {
+    match {
+        $c: Channel { slug: $channel }
+        $s: Source
+        $c channelWatchesSource $s
+        $t: Touchpoint { action: "star" }
+        $t touchpointOnSource $s
+        $x: ExternalID
+        $t touchpointByIdentity $x
+        not {
+            $t0: Touchpoint { action: "fork" }
+            $t0 touchpointByIdentity $x
+        }
+    }
+    return { $x.slug, count($t) as repos }
+}
+
+--- params
+{"channel": "c1"}
+
+--- expect unordered
+{"x.slug": "x1", "repos": 1}
+{"x.slug": "x2", "repos": 2}
+
+--- expect shape
+x.slug: String
+repos: I64
+
+--- expect plan
+anti join $x: correlated
+not pass anti_join_strategy
+
+--- expect same as v1
+
+--- query
+query no_heavier_on_excluded($channel: String, $exclude: String) {
+    match {
+        $c: Channel { slug: $channel }
+        $s: Source
+        $c channelWatchesSource $s
+        $t: Touchpoint { action: "star" }
+        $t touchpointOnSource $s
+        $x: ExternalID
+        $t touchpointByIdentity $x
+        not {
+            $s0: Source { slug: $exclude }
+            $t0: Touchpoint
+            $t0 touchpointOnSource $s0
+            $t0 touchpointByIdentity $x
+            $t0.weight > $t.weight
+        }
+    }
+    return { $x.slug, count($t) as repos }
+}
+
+--- params
+{"channel": "c1", "exclude": "excluded"}
+
+--- expect unordered
+{"x.slug": "x2", "repos": 2}
+{"x.slug": "x4", "repos": 1}
+{"x.slug": "x5", "repos": 1}
+
+--- expect shape
+x.slug: String
+repos: I64
+
+--- expect plan
+anti join $x: correlated
+not pass anti_join_strategy
+
+--- expect same as v1

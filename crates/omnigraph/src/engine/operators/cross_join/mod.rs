@@ -5,20 +5,21 @@
 use std::fmt;
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use datafusion::common::Result as DfResult;
+use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use futures::StreamExt;
+use futures::future::BoxFuture;
 use omnigraph_compiler::ir::{IRExpr, ParamMap};
 
 use super::memory::WorkMemory;
-use super::pair_buffer::{PairBuffer, collect_left};
-use super::producer::producer_stream;
-use super::{external, joined_schema, polled, streaming_properties};
+use super::pair_buffer::PairBuffer;
+use super::shape::{BatchSender, CollectedSide, Flow, Streamed, Streaming, work};
+use super::{external, joined_schema};
 
 #[derive(Debug)]
 pub(crate) struct CrossJoinExec {
@@ -26,7 +27,7 @@ pub(crate) struct CrossJoinExec {
     right: Arc<dyn ExecutionPlan>,
     filters: Vec<IRExpr>,
     params: Arc<ParamMap>,
-    properties: Arc<PlanProperties>,
+    shape: Streaming,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -43,7 +44,7 @@ impl CrossJoinExec {
             right,
             filters,
             params,
-            properties: streaming_properties(schema),
+            shape: Streaming::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -69,7 +70,7 @@ impl ExecutionPlan for CrossJoinExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -95,45 +96,88 @@ impl ExecutionPlan for CrossJoinExec {
         ctx: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         assert_eq!(partition, 0, "CrossJoinExec has one partition");
-        let schema: SchemaRef = self.schema();
-        let declared = Arc::clone(&schema);
-        let left_schema = self.left.schema();
-        let left = self.left.execute(0, Arc::clone(&ctx))?;
+        let memory = work(Arc::clone(&ctx), "CrossJoinExec", &self.metrics)?;
+        memory.metric("input_rows", 0);
+        memory.metric("input_batches", 0);
         let right = Arc::clone(&self.right);
-        let filters = self.filters.clone();
-        let params = Arc::clone(&self.params);
-        let mut work = WorkMemory::new(ctx, "CrossJoinExec")?;
-        work.set_metrics(self.metrics.clone());
-        work.metric("input_rows", 0);
-        work.metric("input_batches", 0);
-        let memory = Arc::new(work);
-        let stream = producer_stream(
-            schema,
-            memory,
-            Some(&self.metrics),
-            move |memory, sender| async move {
-                let left = collect_left(left, &left_schema, &memory, "cross join left").await?;
-                if left.num_rows() == 0 {
-                    return Ok(());
-                }
-                let size = memory.ctx.session_config().batch_size();
-                let mut buffer = PairBuffer::new(left, declared, filters, params, size, &memory)?;
-                let mut right = right.execute(0, Arc::clone(&memory.ctx))?;
-                while let Some(batch) = right.next().await {
-                    let batch = batch?;
-                    memory.metric("input_rows", batch.num_rows());
-                    memory.metric("input_batches", 1);
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    buffer.start(&batch)?;
-                    buffer.push_all(&sender).await?;
-                    buffer.flush(&sender).await?;
-                }
-                buffer.finish(&sender).await
-            },
-        );
-        Ok(polled(&self.metrics, stream))
+        let body = Pairs {
+            left: Arc::clone(&self.left),
+            declared: self.schema(),
+            filters: self.filters.clone(),
+            params: Arc::clone(&self.params),
+            buffer: None,
+        };
+        Ok(self
+            .shape
+            .produce(memory, &self.metrics, move || right.execute(0, ctx), body))
+    }
+}
+
+/// The per-batch body over the right side: the left collected before the
+/// right executes, each right batch paired through the buffer.
+struct Pairs {
+    left: Arc<dyn ExecutionPlan>,
+    declared: SchemaRef,
+    filters: Vec<IRExpr>,
+    params: Arc<ParamMap>,
+    /// The buffer over the collected left and the reservation holding it.
+    buffer: Option<(PairBuffer, WorkMemory)>,
+}
+
+impl Streamed for Pairs {
+    fn open<'a>(&'a mut self, memory: &'a Arc<WorkMemory>) -> BoxFuture<'a, DfResult<bool>> {
+        Box::pin(async move {
+            let side = CollectedSide::collect(&self.left, memory, "cross join left").await?;
+            if side.batch.num_rows() == 0 {
+                return Ok(false);
+            }
+            let size = memory.ctx.session_config().batch_size();
+            let buffer = PairBuffer::new(
+                side.batch,
+                Arc::clone(&self.declared),
+                self.filters.clone(),
+                Arc::clone(&self.params),
+                size,
+                memory,
+            )?;
+            self.buffer = Some((buffer, side.held));
+            Ok(true)
+        })
+    }
+
+    fn batch<'a>(
+        &'a mut self,
+        batch: RecordBatch,
+        memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, DfResult<Flow>> {
+        Box::pin(async move {
+            memory.metric("input_rows", batch.num_rows());
+            memory.metric("input_batches", 1);
+            if batch.num_rows() == 0 {
+                return Ok(Flow::Continue);
+            }
+            let (buffer, _) = self.buffer.as_mut().ok_or_else(|| {
+                DataFusionError::Internal("cross join paired before its left was collected".into())
+            })?;
+            buffer.start(&batch)?;
+            buffer.push_all(sender).await?;
+            buffer.flush(sender).await?;
+            Ok(Flow::Continue)
+        })
+    }
+
+    fn finish<'a>(
+        &'a mut self,
+        _memory: &'a Arc<WorkMemory>,
+        sender: &'a BatchSender,
+    ) -> BoxFuture<'a, DfResult<()>> {
+        Box::pin(async move {
+            match self.buffer.as_mut() {
+                Some((buffer, _)) => buffer.finish(sender).await,
+                None => Ok(()),
+            }
+        })
     }
 }
 
@@ -141,6 +185,7 @@ impl ExecutionPlan for CrossJoinExec {
 mod tests {
     use super::*;
     use crate::engine::operators::fixtures::{context, texts};
+    use futures::StreamExt;
 
     /// A filterless join of `(mid, number)` matters and `(pid, text)` passage
     /// batches.

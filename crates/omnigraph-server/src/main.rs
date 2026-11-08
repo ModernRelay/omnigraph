@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use clap::Parser;
 use color_eyre::eyre::Result;
 use omnigraph_server::{
-    init_tracing, load_server_settings, load_server_settings_with_identity_trust,
-    resolve_shutdown_grace, serve, serve_with_data_token_trust,
+    McpSettings, load_server_settings, load_server_settings_with_bootstrap_handoff,
+    load_server_settings_with_identity_trust, resolve_shutdown_grace, serve_with_data_token_trust,
+    serve_with_mcp_settings,
 };
 
 #[derive(Debug, Parser)]
@@ -22,6 +23,11 @@ struct Cli {
     /// The server's only boot source (RFC-011 cluster-only).
     #[arg(long)]
     cluster: Option<PathBuf>,
+    /// Claim the exact receipt of a fresh empty S3 bootstrap. Administrator-only
+    /// boot input, at most 16 KiB of strict JSON. Not a restart or recovery path;
+    /// any failure retains ownership and requires operator investigation.
+    #[arg(long, requires = "cluster")]
+    bootstrap_handoff: Option<PathBuf>,
     #[arg(long)]
     bind: Option<String>,
     /// Public JSON trust for offline signed data credentials (RFC 0053).
@@ -50,14 +56,41 @@ struct Cli {
     /// termination grace must be longer.
     #[arg(long)]
     shutdown_grace_seconds: Option<u64>,
+    /// A `Host` value `/mcp` admits, as `host` or `host:port`, besides the
+    /// loopback names and the OIDC resource authority. Repeatable; also read
+    /// comma-separated from `OMNIGRAPH_MCP_ALLOWED_HOSTS`.
+    #[arg(long = "mcp-allowed-host", value_name = "HOST")]
+    mcp_allowed_hosts: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    init_tracing();
-
     let cli = Cli::parse();
+    let telemetry = tokio::task::spawn_blocking(omnigraph_server::telemetry::init).await??;
+    let result = run(cli).await;
+    telemetry.shutdown_in_background();
+    result
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    let mcp = McpSettings::resolve(cli.mcp_allowed_hosts)?;
+    if let Some(receipt_path) = cli.bootstrap_handoff.as_deref() {
+        let shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
+        let settings = load_server_settings_with_bootstrap_handoff(
+            cli.cluster.as_ref(),
+            cli.bind,
+            cli.unauthenticated,
+            cli.require_all_graphs,
+            receipt_path,
+            cli.data_token_trust.as_deref(),
+            cli.oidc_identity_trust.as_deref(),
+        )
+        .await?
+        .with_shutdown_grace(shutdown_grace)
+        .with_mcp_settings(mcp);
+        return serve_with_data_token_trust(settings).await;
+    }
     match (cli.data_token_trust, cli.oidc_identity_trust) {
         (data, oidc) if data.is_some() || oidc.is_some() => {
             let settings = load_server_settings_with_identity_trust(
@@ -69,7 +102,8 @@ async fn main() -> Result<()> {
                 oidc.as_deref(),
             )
             .await?
-            .with_shutdown_grace(resolve_shutdown_grace(cli.shutdown_grace_seconds)?);
+            .with_shutdown_grace(resolve_shutdown_grace(cli.shutdown_grace_seconds)?)
+            .with_mcp_settings(mcp);
             serve_with_data_token_trust(settings).await
         }
         _ => {
@@ -81,7 +115,39 @@ async fn main() -> Result<()> {
             )
             .await?;
             settings.shutdown_grace = resolve_shutdown_grace(cli.shutdown_grace_seconds)?;
-            serve(settings).await
+            serve_with_mcp_settings(settings, mcp).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_handoff_requires_an_explicit_cluster() {
+        assert!(
+            Cli::try_parse_from(["omnigraph-server", "--bootstrap-handoff", "receipt.json"])
+                .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "omnigraph-server",
+            "--cluster",
+            "s3://example/cluster",
+            "--bootstrap-handoff",
+            "receipt.json",
+            "--data-token-trust",
+            "trust.json",
+        ])
+        .unwrap();
+        assert_eq!(cli.bootstrap_handoff, Some(PathBuf::from("receipt.json")));
+        assert_eq!(cli.cluster, Some(PathBuf::from("s3://example/cluster")));
+        assert_eq!(cli.data_token_trust, Some(PathBuf::from("trust.json")));
+        assert!(
+            Cli::try_parse_from(["omnigraph-server", "--cluster", "./cluster"])
+                .unwrap()
+                .bootstrap_handoff
+                .is_none()
+        );
     }
 }

@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-09-30
-updated: 2026-09-30
+updated: 2026-10-13
 discussion: null
 supersedes: []
 superseded_by: []
@@ -40,9 +40,10 @@ Nullable metadata retains the publication's value. Fast-forward publishes its
 own target commit with the source head as merged parent; it does not return the
 source commit. `already_up_to_date` explicitly returns `commit: null`.
 
-The dedicated CLI trims source and target names before opening storage or
-submitting HTTP work, matching the engine's canonical names. Empty names refuse
-before dispatch. Receipt validation and optional deletion use those same names.
+The dedicated CLI refuses a source or target name that is empty, padded or
+holds a control character before opening storage or submitting HTTP work, as
+the engine and the server refuse it; no name is trimmed. Receipt validation and
+optional deletion use the names as given.
 
 Optional source deletion remains a subsequent, separately authorized effect.
 When requested, `branch_deleted` is `true` on success or `false` on failure.
@@ -61,8 +62,8 @@ Whole-command retry classification remains A3; server-owned writes remain B.
 
 ## Compatibility and invariants
 
-This is the coordinated v0.12 contract admitted by
-[v0.12 HTTP admission](2026-09-30-v012-http-admission.md). HTTP integrations must
+These receipts belong to the single current contract admitted by
+[HTTP contract admission](2026-09-30-v012-http-admission.md). HTTP integrations must
 consume the required merge receipt and structured deletion error. Embedded Rust
 callers adapt to `MergeResult`; no old-return-type wrapper or wire alias remains.
 No migration, graph reset or additional publication is required.
@@ -112,3 +113,11 @@ executed gates before marking implementation complete.
 
 - 2026-09-30: Qualified canonical branch names at the dedicated CLI boundary
   while hardening the reviewed stack.
+
+- 2026-10-07: Replaced the Compatibility sentence tying receipts to v0.12 with the current HTTP admission decision; receipt semantics are unchanged.
+
+- 2026-10-13: Branch names are refused, not trimmed, at the CLI as at the
+  engine and the server. This supersedes "The dedicated CLI trims source and
+  target names before opening storage or submitting HTTP work, matching the
+  engine's canonical names. Empty names refuse before dispatch. Receipt
+  validation and optional deletion use those same names."

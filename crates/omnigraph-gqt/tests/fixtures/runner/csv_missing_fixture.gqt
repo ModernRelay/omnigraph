@@ -1,0 +1,13 @@
+# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+--- schema
+node Person { name: String @key }
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+--- mutate
+load csv "people.csv" into node:Person mode append header
+--- expect error: absolute URI

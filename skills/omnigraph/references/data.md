@@ -24,6 +24,7 @@ edits.
 | Additive-only bulk | `load --mode append` | fails on key collision |
 | Replace complete batches by type | `load --mode overwrite` | **destructive for represented types**; absent types remain |
 | Bulk load onto a fresh review branch | `load --from main --mode merge --branch <name>` | forks `<name>` from `main`, loads onto it, leaves it for review |
+| Load one CSV object into one type | `mutate -e 'load csv "<uri>" into node:<Type> mode merge header'` | typed by the `.pg`; `omnigraph load` reads JSONL only; the source must sit under the graph's external Blob policy (a direct run admits its own `file://` directory) and within `load_source_max_bytes` |
 
 > **`--mode` is required** — there is no default. Overwrite is destructive, so
 > the CLI never picks a mode for you.
@@ -31,10 +32,19 @@ edits.
 > **Per-load bounds.** One keyed load (`append`/`merge`)
 > stages at most **8,192 entities and 32 MiB of Arrow memory per touched type**; a larger
 > batch is refused up front (HTTP 413, typed `resource_limit`) with no durable
-> effect — split it into chunks, each an atomic graph commit. The strict NDJSON
+> effect — split it into chunks, each an atomic graph commit. Two further
+> 32 MiB limits apply to the whole keyed load, summed over every touched type:
+> the staged Arrow memory and the parsed-payload estimate. Separately, the ids
+> an `overwrite` or a delete removes share one 32 MiB limit per operation (each
+> id counts its UTF-8 length plus 24 bytes); an `overwrite` that removes more
+> ids than that is refused and cannot be split. The strict NDJSON
 > input path also limits its request body and decoded Arrow memory to 32 MiB,
 > including `overwrite`; ordinary streamed overwrite can exceed the keyed
 > envelope. Check the selected transport's limits before splitting an import.
+> Each 32 MiB allowance above, except the HTTP request body, is the
+> `write_max_bytes` setting (default 32 MiB). Raise it for a direct load with
+> `--set write_max_bytes=<bytes>` or `OMNIGRAPH_WRITE_MAX_BYTES`; a served JSONL
+> load uses the server's value and refuses `--set`.
 > Against a non-local
 > target, `--mode overwrite` (like `cleanup` and `branch delete`) requires
 > explicit `--yes` consent in non-interactive runs.
@@ -47,7 +57,7 @@ edits.
 
 ## `mutate` — Single Edits
 
-Runs either directly (`--store`) or through a server (`--server`/profile):
+Runs either directly or through a server, selected by `--target`:
 
 ```bash
 omnigraph mutate add_signal \
@@ -58,7 +68,7 @@ omnigraph mutate add_signal \
 Or invoke a served stored mutation by name:
 
 ```bash
-omnigraph mutate add_signal --server intel-dev --graph spike \
+omnigraph mutate add_signal --target intel-dev --graph spike \
   --params '{"slug":"sig-foo","name":"Foo","brief":"...","stagingTimestamp":"2026-04-14T00:00:00Z","createdAt":"2026-04-14T00:00:00Z","updatedAt":"2026-04-14T00:00:00Z"}'
 ```
 
@@ -83,16 +93,17 @@ JSONL format:
   string such as `["alice","bob"]`; omit `id` or supply exactly that value. An
   unkeyed edge gets a generated id unless top-level `id` supplies one.
 
-`data` holds user properties. On new v9 graphs, `data.id` is a declared user
-property and `data.__id` is refused. v8 also accepts legacy `data.id` as identity
-when top-level `id` is absent; supplying both identity placements is refused.
-Exports put entity `id` at the top level on both vintages. Before loading a
-predecessor export into a new graph, relocate its identity as described in
-[migration guidance](migrations.md).
+`data` holds user properties. On new graphs, `data.id` is a declared user
+property and `data.__id` is refused. A legacy graph (physical `id`/`src`/`dst`)
+also accepts `data.id` as identity when top-level `id` is absent; supplying
+both identity placements is refused.
+Exports put entity `id` at the top level on both vintages.
 
 `Date` accepts integer day counts or calendar-date strings; a datetime string is
-refused. `DateTime` accepts integer millisecond counts or datetime strings.
-Whole-number floats (`19723.0`), booleans, objects, and counts outside the
+refused. `DateTime` accepts integer millisecond counts or datetime strings; a
+string with a non-zero digit past the third fractional digit (`.123456`) is
+refused, here and in `mutate --params`, and trailing zeros (`.123000`) are
+accepted. Whole-number floats (`19723.0`), booleans, objects, and counts outside the
 renderable calendar range are refused; `mutate --params` takes date strings
 only. Rows stored with out-of-range counts by an earlier release fail reads and
 exports of that column until corrected.
@@ -102,7 +113,7 @@ and omits null-valued property keys; change images keep explicit nulls.
 Load command:
 
 ```bash
-omnigraph load --data seed.jsonl --mode merge s3://my-bucket/repos/spike-intel
+omnigraph load --data seed.jsonl --mode merge --target ./spike-intel.omni
 ```
 
 `--from <base>` forks a missing `--branch` from `<base>` before loading (the
@@ -151,19 +162,23 @@ Branches exist for **data review**, not schema changes. Schema goes straight to 
 ### The review loop
 
 ```bash
-REPO=s3://my-bucket/repos/spike-intel
+REPO=./spike-intel.omni
 
 # 1. Create feature branch from main
-omnigraph branch create --from main staging-2026-04-14 --store $REPO
+omnigraph branch create --from main staging-2026-04-14 --target $REPO
 
 # 2. Load delta onto the branch (merge mode is typical for review)
-omnigraph load --data delta.jsonl --branch staging-2026-04-14 --mode merge $REPO
+omnigraph load --data delta.jsonl --branch staging-2026-04-14 --mode merge --target $REPO
 
 # 3. Verify on the branch (reads can target --branch or --snapshot)
-omnigraph query recent_signals --query queries/signals.gq --branch staging-2026-04-14 --store $REPO
+omnigraph query recent_signals --query queries/signals.gq --branch staging-2026-04-14 --target $REPO
+
+# 3b. Review what changed and whether the merge would succeed (writes nothing)
+omnigraph branch diff staging-2026-04-14 --into main --target $REPO --json
+omnigraph branch merge staging-2026-04-14 --into main --dry-run --target $REPO --json
 
 # 4. Merge to main and delete the source only after publication
-omnigraph branch merge staging-2026-04-14 --into main --delete-branch --store $REPO
+omnigraph branch merge staging-2026-04-14 --into main --delete-branch --target $REPO
 ```
 
 ### Fork a branch in one shot with `--from`
@@ -181,7 +196,8 @@ happens after a successful merge publication.
 
 Deleting a parent branch is supported while descendants remain. Logical deletion
 retains the native history descendants need; only explicit `cleanup` reclaims
-unneeded table forks and retired refs. `optimize` does not perform that collection.
+unretained table versions, deleted branches' refs and table forks.
+`optimize` does not perform that collection.
 
 ### Merge conflicts
 
@@ -192,9 +208,9 @@ HTTP `409`). The same edge inserted on both branches depends on its identity:
 unkeyed edges are both kept; `@unique(@src, @dst)` reports `unique_violation`;
 `@key(@src, @dst)` converges identical inserts to one row and reports
 `divergent_insert` (with the derived id) when non-key properties differ —
-re-insert the agreed values on one branch, then merge again. If a branch both
-sides merged earlier has since been deleted, an entity both received from it
-can still report `divergent_update`.
+re-insert the agreed values on one branch, then merge again. A branch both
+sides merged earlier stays their merge base after it is deleted, and `cleanup`
+keeps the history that base needs.
 
 ### Schema apply blocks non-main branches
 
@@ -208,36 +224,45 @@ type), use a feature branch:
 
 ```bash
 omnigraph load --data risky.jsonl --branch recovery-2026-04-14 \
-  --from main --mode overwrite $REPO
+  --from main --mode overwrite --target $REPO
 # inspect, diff, verify reads
-omnigraph branch merge recovery-2026-04-14 --into main --delete-branch --store $REPO
+omnigraph branch merge recovery-2026-04-14 --into main --delete-branch --target $REPO
 ```
 
 ## Branch Commands (quick reference)
 
 ```bash
-omnigraph branch create --from main <branch-name> --store $REPO
-omnigraph branch list --store $REPO
-omnigraph branch merge <branch-name> --into main --delete-branch --store $REPO
-omnigraph branch delete <branch-name> --store $REPO
+omnigraph branch create --from main <branch-name> --target $REPO
+omnigraph branch create fix/import --from-commit <commit-id> --target $REPO
+omnigraph branch list --target $REPO
+omnigraph branch list --detailed --target $REPO          # head, start commit, created/updated times
+omnigraph branch diff <branch-name> --into main --target $REPO --json
+omnigraph branch merge <branch-name> --into main --dry-run --target $REPO --json
+omnigraph branch merge <branch-name> --into main --delete-branch --target $REPO
+omnigraph branch delete <branch-name> --target $REPO
 ```
 
-All support `--json` for automation-friendly output. Address the graph with a
-positional `file://`/`s3://`/preview `az://` URI (shown), `--store <uri>`, or
-`--server <name>`.
+All support `--json` for automation-friendly output. Address the graph with
+`--target NAME|ADDRESS`; a named or inline root additionally requires a graph
+selection.
 
 ## Inspecting State After Changes
 
 ```bash
-omnigraph snapshot $REPO --branch main --json           # node/edge entity counts
-omnigraph export $REPO --branch main > graph.jsonl      # full JSONL dump
-omnigraph commit list $REPO --branch main --json        # history
+omnigraph snapshot --target $REPO --branch main --json           # node/edge entity counts
+omnigraph export --target $REPO --branch main > graph.jsonl      # full JSONL dump
+omnigraph commit list --target $REPO --branch main --json        # history
 ```
 
 `export` is the right tool for large-snapshot inspection — don't try to page through the whole graph with read queries.
 
-> **Cluster note:** everything in this file applies unchanged in cluster
-> deployments — the control plane owns schema/queries/policies; rows, loads,
-> and branches stay on the data plane against the derived graph roots
-> (`<dir>/graphs/<id>.omni`, or `<storage>/graphs/<id>.omni` for an S3-backed
-> cluster).
+> **Cluster note:** `cluster apply` owns schema/queries/policies; rows,
+> loads and branches use the same data commands with a registered server or
+> managed target and `--graph ID` (or its default graph). For direct local
+> access, stop the server, select the cluster root with `--target ROOT --graph
+> ID`, and before restarting the server release the lock the direct write
+> keeps: once that write has finished and its I/O has settled, read its
+> `lock_id` from `cluster status --target ROOT --json`, then
+> `cluster force-unlock <LOCK_ID> --target ROOT`. Data commands refuse an
+> inline cloud URI; an `s3://` root reaches only cluster and maintenance
+> commands.

@@ -1,8 +1,9 @@
-# Changes and Change Feeds
+# Changes, Diffs and Change Feeds
 
-OmniGraph can describe what one commit changed or deliver an ordered feed of
-changes on a branch. Both surfaces report logical nodes and edges, not storage
-details.
+OmniGraph can describe what one commit changed, compare any two points in
+history, review what a branch changed, or deliver an ordered feed of changes
+on a branch. Every surface reports logical nodes and edges, not storage
+details, in one change shape.
 
 HTTP calls follow the [HTTP contract](../operations/server.md#http-contract),
 including the required request header and response check before consuming a
@@ -11,7 +12,7 @@ JSON or streamed body.
 ## Inspect one commit
 
 ```bash
-omnigraph commit changes <commit-id> --store graph.omni --json
+omnigraph commit changes <commit-id> --target ./graph.omni --json
 ```
 
 The equivalent HTTP route is
@@ -22,34 +23,131 @@ with its first parent. Each response includes:
   optional actor, and authorship time in Unix microseconds.
 - `changes`: inserts with `after`, updates with `before` and `after`,
   and deletes with `before`. Each image contains `properties`; an edge image
-  also contains `endpoints: {from, to}`.
+  also contains `endpoints: {from, to}`. A Blob property holds its export
+  value (`base64:…` or an external URI), or, for a stored reference to a byte
+  range of an object, `{"uri", "offset", "length"}` (see
+  [Blobs](../blobs.md)).
 
 Filter with repeatable `--kind node|edge`, `--type <name>`, and
-`--op insert|update|delete` options. `--limit` defaults to 1,000 and may be
-at most 8,192. Results are deterministic by entity kind, type identity, logical
-id, and operation.
+`--op insert|update|delete` options. A page holds at most 8,192 changes; the
+HTTP routes default to 1,000. Results are deterministic by entity kind, type
+identity, logical id, and operation.
 
 Large results are paginated. The CLI normally follows every
-`next_page_token`; passing `--page-token` fetches exactly one page. A page
-token continues that one commit result and is not a change-feed cursor.
+`next_page_token` and asks for 8,192 changes per page, because every page
+restarts its comparison and fewer, larger pages cost less; passing
+`--page-token` fetches exactly one page, of 1,000 changes unless `--limit`
+sets the size. A page token continues that one commit result and is not a
+change-feed cursor.
 
 A parentless commit returns `409` with reason `parentless_commit`. A diff
 that crosses a schema boundary returns `409` with reason
 `schema_boundary`; take a new baseline instead of treating either response
 as an empty change.
 
+## Compare two points
+
+```bash
+omnigraph diff --from <commit-id> --to main --target ./graph.omni --json
+```
+
+Each side is a branch name, meaning its head when the diff starts, or a commit
+id: a published commit, an unpublished proposal, or an unattached snapshot. A
+string that names both a branch and a commit is refused; name the branch's
+head by its commit id instead. The equivalent HTTP route is
+`GET /graphs/{graph_id}/diff?from=<side>&to=<side>`, and the GQ statement
+`branch diff <from> to <to>` answers the same comparison at `POST /query`,
+a commit id quoted (`branch diff "<commit-id>" to main`).
+
+The result is the net change from the `from` state to the `to` state, in the
+`commit changes` change shape and order, with `from_commit_id` and
+`to_commit_id` naming the exact commits the sides resolved to. There is no
+`cause`: a range of commits has no single author. Intermediate history is not
+replayed, so an update that was later reverted produces nothing, and a delete
+followed by an equal reinsert produces nothing. A diff from a commit's first
+parent to the commit equals that commit's `commit changes`, without the cause.
+
+Comparing two branch heads also shows what the target changed since the
+branches diverged, reversed. To review a branch, use the branch form below.
+
+The kind, type and operation filters, `--limit` and `--page-token` work as for
+`commit changes`. A page token keeps the commits the first page resolved, so
+later pages answer for them even after the branches move. Each continuation is
+checked against the request's sides, on the server and in the embedded CLI
+alike. A side spelled as a commit id reaches only that commit. A branch side
+reaches its head now, any of its earlier heads within its last 1,024 commits,
+and any commit the caller may read as a side of its own. A token naming any
+other commit is refused with `400`; start the diff again without it. A diff
+across a
+schema change returns `409` with reason `schema_boundary`, and a side whose
+history was reclaimed returns `410` with `change_feed_gap`.
+
+Types unchanged between the two points are skipped. A changed type is
+compared row by row. For a single commit the engine reads the fragments that
+commit wrote. Across several commits it pairs the two versions' live rows by
+Lance's stable row id and reads only the rows whose version stamp differs or
+that exist on one side alone, so the cost follows the changed rows and the
+fragments that hold them, not the table's size, and stays flat across a
+compaction. That pairing applies when the `from` side is on the `to` side's
+history with no merge commit after it: a branch review whose merge base is on
+the source's first-parent history, and a two-point diff whose `to` names a
+branch whose first-parent chain holds `from`. A merge, a fast forward included,
+can give a type the merged branch's rows, whose history never passed through
+`from`. A diff of two diverged heads compares every row of each changed type,
+and so do a review of a branch that has merged its target since the fork, a
+window that crosses a merge commit, and a merge commit's own changes, except
+for a type the merge wrote in one step. The `change_lineage`
+[session setting](../queries/settings.md) selects the comparison for every
+change read: `on` (the default) pairs rows by id, `off` compares every row,
+and `verify` runs both and fails the page where they disagree, which a debug
+build does by default.
+
+## Review a branch
+
+```bash
+omnigraph branch diff feature --into main --target ./graph.omni --json
+omnigraph branch merge-base feature --into main --target ./graph.omni --json
+```
+
+`branch diff` reports what `feature` changed since its merge base with `main`
+(`main` when `--into` is omitted): the net change from the merge base to the
+head of `feature`. Changes `main` made after the merge base do not appear. The
+response also names the base as `base_commit_id`. `branch merge-base` prints
+that commit alone, the one a merge of `feature` into `main` would classify
+against. While `feature` has never merged `main` in, the base is on its
+first-parent history, and `changes poll --branch feature --start
+after:<merge-base>` replays its commits since then; a merge commit in that
+range still carries the changes it brought in. A base off `feature`'s
+first-parent history is refused as a start: for example, after `main` is
+merged into a `feature` that had diverged from it, the base is the `main`
+commit that merge brought in. `branch diff` gives the net change from any
+base.
+
+The HTTP routes are `GET /graphs/{graph_id}/branches/diff?source=&target=` and
+`GET /graphs/{graph_id}/branches/merge-base?source=&target=`; the GQ statements
+are `branch diff feature into main` and `branch merge-base feature into main`.
+
+A statement answers rows through `POST /query` or `omnigraph query -e`. A
+`branch diff` row has `kind`, `type` (the type's name), `id`, `op`, `before`
+and `after`; the compared commits and the token for the next page travel in
+the answer's `page` object, and `after page "<token>"` (then `limit <n>`)
+continues it. A `branch merge-base` row names `source`, `target`, both heads
+and `merge_base_commit_id`. Statements take no kind, type or operation filter
+yet; use the routes or CLI commands for those. To see whether
+the merge would succeed, run it as a [dry run](merge.md#preview-a-merge).
+
 ## Follow a branch
 
 ```bash
 # Start at the current head. Existing history is not replayed.
-omnigraph changes poll --start now --store graph.omni --json
+omnigraph changes poll --start now --target ./graph.omni --json
 
 # Replay the branch's first-parent history.
-omnigraph changes poll --start beginning --store graph.omni --json
+omnigraph changes poll --start beginning --target ./graph.omni --json
 
 # Continue after a known commit, or resume from a saved cursor.
-omnigraph changes poll --start after:<commit-id> --store graph.omni --json
-omnigraph changes poll --cursor <cursor> --store graph.omni --json
+omnigraph changes poll --start after:<commit-id> --target ./graph.omni --json
+omnigraph changes poll --cursor <cursor> --target ./graph.omni --json
 ```
 
 `now` is the default when neither `--start` nor `--cursor` is supplied.
@@ -80,14 +178,14 @@ and `page_token` parameters are mutually exclusive.
 
 ## Recover from a retention gap
 
-A cursor does not prevent `cleanup` from reclaiming old history. When a feed
-or commit diff can no longer be read, the server returns `410` with
+A cursor does not prevent `cleanup` from reclaiming old history. When a feed,
+commit diff or diff can no longer be read, the server returns `410` with
 `change_feed_gap`, including `first_unreadable_commit_id` and, when
 available, the rejected `cursor`. Retrying the same cursor cannot close the
 gap; install a new baseline:
 
 ```bash
-omnigraph changes baseline --out snapshot.jsonl --store graph.omni --json
+omnigraph changes baseline --out snapshot.jsonl --target ./graph.omni --json
 ```
 
 If a poll has already accumulated complete readable blocks before it reaches a
@@ -103,15 +201,41 @@ one terminal record:
 {"baseline":{"snapshot_commit_id":"...","resume_cursor":"..."}}
 ```
 
+Snapshot records use the export line format, and a Blob property holds the
+same value shapes as a change image. That includes the
+`{"uri", "offset", "length"}` object for a stored reference to a byte range of
+an object, which export refuses; a snapshot holding one does not reload with
+`load` (see [Blobs](../blobs.md)).
+
 An interrupted stream has no terminal record and therefore no usable cursor.
 Install the complete snapshot durably before saving `resume_cursor`; the
 resumed feed begins with commits after the captured snapshot.
 
 Baseline kind and type filters select the snapshot contents. An operation
 filter applies only to the resumed feed. Baselines require the `export`
-policy action; commit changes and feed polling require `read`.
+policy action; commit changes, diffs and feed polling require `read`. A diff
+needs `read` on the branch each side resolves to; a side the actor cannot read
+answers `404` exactly as a side that names nothing, whatever the other side
+names. The engine reads a commit whose branch was deleted while a live
+branch retains it (a stacked branch's merge base after its parent was merged
+and deleted): diffs, commit changes, reads at the commit and the feed open the
+retired incarnation by its exact commit. The HTTP `commit changes` route still
+needs `read` on the branch that wrote the commit, so a policy that does not
+grant the deleted name answers `404` there. A commit that no live branch retains,
+or whose recorded incarnation was reclaimed, answers the same `404` as a
+commit that names nothing; the error names the spelling the caller used, never
+the deleted branch. Branch creation from such a commit still refuses with
+`branch_deleted`.
+`branch diff` and `branch merge-base` need `read` on both branches, every
+page included, and answer `403` otherwise. On a later page, a commit the
+token names that its side no longer resolves to needs `read` on the branch
+that wrote it, unless it was an earlier head of the side's branch, such as a
+fork's first head that `main` wrote. An unknown or unreadable one answers the
+same `400`.
 
 The CLI's durable `--out` installation is available on POSIX platforms. The
 file contains only snapshot entity records, not the terminal handshake. The CLI
 syncs and atomically replaces it before printing
-`{"snapshot_commit_id":"...","resume_cursor":"..."}` to JSON stdout.
+`{"snapshot_commit_id":"...","resume_cursor":"..."}` to JSON stdout. Concurrent
+captures to the same path stay serialized until the cursor output is flushed.
+A cursor-output failure returns an error; the installed snapshot remains in place.

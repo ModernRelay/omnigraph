@@ -1,0 +1,15 @@
+# issue: none
+# notes: Shared benchmark dataset/query contract.
+
+--- runner
+timeout_ms: 600000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item { key: String @key val: I64 }
+
+--- seed
+{"type":"Item","data":{"key":"a","val":1}}
+{"type":"Item","data":{"key":"b","val":2}}

@@ -1,0 +1,121 @@
+# issue: none
+# notes: A declaration `as unattached branch on $base` keeps its clause across invocations and takes the base per
+# notes: invocation from params; a request setting beside it changes nothing, and the recorded target is unchanged.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+query root_bob() as unattached branch {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $r
+
+--- mutate
+query extend($base: String, $n: String) as unattached branch on $base {
+    insert Person { name: $n, age: 52 }
+}
+
+--- params
+{"base": "${r}", "n": "carol"}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $a
+
+--- mutate
+set merge_lineage = off;
+query extend($base: String, $n: String) as unattached branch on $base {
+    insert Person { name: $n, age: 63 }
+}
+
+--- params
+{"base": "${r}", "n": "dave"}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $b
+
+--- mutate
+query extend($base: String, $n: String) as unattached branch on $base {
+    insert Person { name: $n, age: 27 }
+}
+
+--- params
+{"base": "${a}", "n": "erin"}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $c
+
+--- query snapshot: $a
+query names_at_a() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- query snapshot: $b
+query names_at_b() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "dave"}
+
+--- expect shape
+p.name: String
+
+--- query snapshot: $c
+query names_at_c() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+{"p.name": "carol"}
+{"p.name": "erin"}
+
+--- expect shape
+p.name: String
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

@@ -142,7 +142,9 @@ pub struct ConcurrentScenario {
     /// their exact draw sequences. Refused together with `branch_cycles`
     /// (apply's mono-branch refusal would make every cycle a vacuous
     /// conflict). This is the deterministic coverage of the
-    /// shared/exclusive boundary: writers-racing-apply had none before.
+    /// shared/exclusive boundary: writers-racing-apply had none before. In
+    /// plain mode the `SchemaContention` handshake guarantees the first
+    /// apply lands between two writer commits.
     pub schema_ops: usize,
     /// ARM 3 — branch verbs under concurrency: a dedicated BRANCH ACTOR
     /// (writer id = `writers`, one past the data writers) runs this many
@@ -206,7 +208,8 @@ pub struct ConcurrentReport {
     /// Empty person-diff commits (maintenance, schema applies) that landed
     /// with a writer's data commit both before and after them in main's
     /// lineage: evidence that such a commit interleaved with the writers
-    /// rather than running entirely before or after them.
+    /// rather than running entirely before or after them. With a schema
+    /// actor in plain mode, `>= 1` by construction (`SchemaContention`).
     pub era_commits_between_data: usize,
     /// Era commits legally unreadable at final audit because a concurrent
     /// Cleanup retired their versions (the retention horizon, live). The
@@ -1288,14 +1291,62 @@ impl StorageAdapter for ScheduledStorage {
 
 /// Per-writer context: (own kill wrapper if dying, RecoveryRequired-is-legal
 /// — true when any peer can die or faults are injected, own fault wrapper to
-/// ARM after the barrier, the universe's arbiter — armed after
-/// the barrier and finished when the life ends).
+/// ARM after the barrier, the universe's arbiter, the schema handshake).
 type WriterCtx = (
     Option<Arc<WriterKillStorage>>,
     bool,
     Option<Arc<WriterFaultStorage>>,
     Option<Arc<SeamScheduler>>,
+    Option<Arc<SchemaContention>>,
 );
+
+/// Plain-mode handshake between the schema actor and the data writers. It
+/// makes "an apply landed between two writer commits" a fact of the
+/// universe instead of a wall-clock outcome: the first apply waits for the
+/// first data commit, and every writer holds its LAST op until that apply
+/// committed, so the apply has a data commit on both sides in main's
+/// lineage (`era_commits_between_data >= 1` by construction). Every other
+/// op and every later apply race freely, so the interleaving dimension is
+/// still explored. Plain mode only: under the seam scheduler a waiting
+/// actor is a drawn actor that never arrives at the gate — a stall-budget
+/// hit and a counted escape, which the hunt forbids. Before it, the
+/// first-contact pin's per-seed `>= 1` was a timing claim: a loaded CI
+/// runner saw seed 24303 land all three applies outside the writers' span.
+pub struct SchemaContention {
+    data_commits: std::sync::atomic::AtomicUsize,
+    applies: std::sync::atomic::AtomicUsize,
+}
+
+impl SchemaContention {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            data_commits: std::sync::atomic::AtomicUsize::new(0),
+            applies: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    pub fn note_data_commit(&self) {
+        self.data_commits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn note_apply(&self) {
+        self.applies
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// The schema actor's wait before its first apply.
+    pub async fn wait_first_data_commit(&self) {
+        while self.data_commits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Self::POLL).await;
+        }
+    }
+    /// A writer's wait before its last op.
+    pub async fn wait_first_apply(&self) {
+        while self.applies.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Self::POLL).await;
+        }
+    }
+}
 
 /// One writer's whole life: its own OS thread, runtime, seams, handle, and
 /// seeded op stream against the shared root. Returns (claim log, recovery
@@ -1311,7 +1362,7 @@ fn writer_life(
     kill_ctx: WriterCtx,
 ) -> (Vec<ClaimedWrite>, usize, usize) {
     let (runtime_seed, ulid_seed, workload_seed) = seeds3;
-    let (kill, recovery_legal, fault, sched) = kill_ctx;
+    let (kill, recovery_legal, fault, sched, contention) = kill_ctx;
     // ThreadRng is thread-local: reseed inside this thread.
     let _ = rand::rng().reseed();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1376,6 +1427,11 @@ fn writer_life(
         let mut died = false;
 
         for op in 0..ops {
+            if op + 1 == ops
+                && let Some(handshake) = &contention
+            {
+                handshake.wait_first_apply().await;
+            }
             // Disjoint-then-overlapping key ranges (the originally specified shape):
             // op 0 births the writer's private key; the first half stays on
             // it; the second half contends on the shared fixture keys.
@@ -1512,6 +1568,9 @@ fn writer_life(
                 outcome: ClaimOutcome::Committed,
                 occ_retries,
             });
+            if let Some(handshake) = &contention {
+                handshake.note_data_commit();
+            }
             // Seeded think-time. Without it, the writers serialize WHOLESALE
             // (measured on first contact: alternations == writers-1 in every
             // universe — each writer streaks its whole life; unfair-lock
@@ -1548,6 +1607,7 @@ fn schema_life(
     seeds3: (u64, u64, u64),
     start: Arc<std::sync::Barrier>,
     sched_ctx: Option<(Arc<SeamScheduler>, usize)>,
+    contention: Option<Arc<SchemaContention>>,
 ) -> (usize, usize) {
     let (runtime_seed, ulid_seed, workload_seed) = seeds3;
     let _ = rand::rng().reseed();
@@ -1597,6 +1657,11 @@ fn schema_life(
         for count in 1..=ops {
             let pause_ms = 2 + stream.next_u64() % 30;
             tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+            if count == 1
+                && let Some(handshake) = &contention
+            {
+                handshake.wait_first_data_commit().await;
+            }
             let desired = schema_with_extras(count);
             let mut occ_retries = 0usize;
             loop {
@@ -1619,6 +1684,9 @@ fn schema_life(
                 }
             }
             committed += 1;
+            if let Some(handshake) = &contention {
+                handshake.note_apply();
+            }
         }
         (committed, retries)
     }))
@@ -1989,6 +2057,12 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
     // Drawn last so every existing scenario keeps its exact draw sequence.
     let schema_seeds =
         (sc.schema_ops > 0).then(|| (seeds.next_u64(), seeds.next_u64(), seeds.next_u64()));
+    let contention = (sc.schema_ops > 0 && !sc.seam_schedule).then(SchemaContention::new);
+    assert!(
+        contention.is_none() || sc.ops_per_writer >= 2,
+        "the schema handshake holds each writer's last op until the first apply, \
+         which waits for a first data commit: one op per writer would deadlock"
+    );
 
     crate::harness::clear_process_slots();
     crate::env_knobs::require_pool_env();
@@ -2147,6 +2221,7 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                                 None => writer_storage,
                             };
                             let sched = scheduler.clone();
+                            let contention = contention.clone();
                             std::thread::Builder::new()
                                 .name(format!("dst-writer-{w}"))
                                 .stack_size(crate::harness::UNIVERSE_STACK_BYTES)
@@ -2158,7 +2233,7 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                                         sc.ops_per_writer,
                                         seeds3,
                                         start,
-                                        (kill, recovery_legal, fault, sched),
+                                        (kill, recovery_legal, fault, sched, contention),
                                     )
                                 })
                                 .expect("spawn writer thread")
@@ -2203,11 +2278,20 @@ pub fn run_concurrent_universe(root: &str, sc: &ConcurrentScenario) -> Concurren
                         };
                         let sched_ctx = scheduler.clone().map(|s| (s, schema_actor));
                         let start = start.clone();
+                        let contention = contention.clone();
                         std::thread::Builder::new()
                             .name("dst-schema-actor".into())
                             .stack_size(crate::harness::UNIVERSE_STACK_BYTES)
                             .spawn_scoped(writers, move || {
-                                schema_life(root, storage, sc.schema_ops, seeds3, start, sched_ctx)
+                                schema_life(
+                                    root,
+                                    storage,
+                                    sc.schema_ops,
+                                    seeds3,
+                                    start,
+                                    sched_ctx,
+                                    contention,
+                                )
                             })
                             .expect("spawn schema actor thread")
                     });

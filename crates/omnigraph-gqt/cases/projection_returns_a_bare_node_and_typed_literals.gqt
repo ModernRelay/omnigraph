@@ -34,3 +34,54 @@ one: I64
 ratio: F64
 tag: String
 flag: Bool
+
+
+--- query
+query numeric_list_literals() {
+    match { $p: Person { name: "alice" } }
+    return {
+        [1, 2.5] as integer_first,
+        [2.5, 1] as float_first
+    }
+}
+
+--- expect unordered
+{"integer_first":[1.0,2.5],"float_first":[2.5,1.0]}
+
+--- expect shape
+integer_first: [F64]
+float_first: [F64]
+
+--- expect plan
+result columns [integer_first: [F64], float_first: [F64]]
+
+--- query
+query empty_list_literal() {
+    match { $p: Person { name: "alice" } }
+    return { [] as empty }
+}
+
+--- expect unordered
+{"empty":[]}
+
+--- expect shape
+empty: [String]
+
+--- expect plan
+result columns [empty: [String]]
+
+--- query
+query incompatible_list_literal() {
+    match { $p: Person }
+    return { [1, "x"] as xs }
+}
+
+--- expect error: T53: list literal elements must share a compatible scalar type
+
+--- query
+query nested_list_literal() {
+    match { $p: Person }
+    return { [[1], [2]] as xs }
+}
+
+--- expect error: T52: nested list literals are not supported

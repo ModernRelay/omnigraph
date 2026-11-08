@@ -416,6 +416,113 @@ async fn fault(
     Ok(turn)
 }
 
+/// A targeted rule for the two requests the seeded weather cannot aim at:
+/// the put-if-absent of a numbered `__manifest` version, the graph's one
+/// publication request, and the `__manifest` transaction-file put Lance
+/// sends before it. Slot-based and default-None, like the bytes canary: zero
+/// cost and zero draw impact for every other test.
+#[derive(Debug)]
+pub struct PublicationFault {
+    pub target: PublicationTarget,
+    pub mode: PublicationFaultMode,
+    remaining: AtomicUsize,
+    hits: AtomicUsize,
+}
+
+/// Which publication request a [`PublicationFault`] aims at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicationTarget {
+    /// `__manifest/_versions/<n>.manifest`, created only if absent.
+    ManifestVersion,
+    /// `__manifest/_transactions/*.txn`, written before the manifest.
+    TransactionFile,
+}
+
+/// What a [`PublicationFault`] does to a request it hits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicationFaultMode {
+    /// Fail unapplied with an error the caller cannot tell from a request
+    /// that applied: a 5xx, a timeout, a reset.
+    Unanswered,
+    /// Fail unapplied as a throttled request does.
+    Throttled,
+    /// Apply, then lose the acknowledgement.
+    LostAck,
+    /// Fail at once, and apply the request this long after its caller gave
+    /// up on it: an abandoned request that lands late.
+    LandsLate(Duration),
+}
+
+impl PublicationFault {
+    /// Hit the next `times` matching requests.
+    pub fn new(target: PublicationTarget, mode: PublicationFaultMode, times: usize) -> Arc<Self> {
+        Arc::new(Self {
+            target,
+            mode,
+            remaining: AtomicUsize::new(times),
+            hits: AtomicUsize::new(0),
+        })
+    }
+
+    /// How many requests the rule hit.
+    pub fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+
+    /// Stop hitting requests: the store answers again.
+    pub fn heal(&self) {
+        self.remaining.store(0, Ordering::SeqCst);
+    }
+
+    fn take(&self, location: &str, opts: &PutOptions) -> bool {
+        let target = if location.contains("__manifest/_transactions/") && location.ends_with(".txn")
+        {
+            PublicationTarget::TransactionFile
+        } else if location.contains("__manifest/_versions/")
+            && matches!(opts.mode, object_store::PutMode::Create)
+            && location
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.strip_suffix(".manifest"))
+                .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()))
+        {
+            PublicationTarget::ManifestVersion
+        } else {
+            return false;
+        };
+        if target != self.target {
+            return false;
+        }
+        let taken = self
+            .remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if taken {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+        }
+        taken
+    }
+}
+
+static PUBLICATION_FAULT: RwLock<Option<Arc<PublicationFault>>> = RwLock::new(None);
+
+pub fn set_publication_fault(fault: Option<Arc<PublicationFault>>) {
+    *PUBLICATION_FAULT.write().unwrap() = fault;
+}
+
+fn publication_fault() -> Option<Arc<PublicationFault>> {
+    PUBLICATION_FAULT.read().unwrap().clone()
+}
+
+fn publication_error(text: &str) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "dst-lance-realm",
+        source: format!("{FAULT_MARKER}: {text}").into(),
+    }
+}
+
 static INSTALLED: OnceLock<Installed<dyn DecorateObjectStore, Global<dyn DecorateObjectStore>>> =
     OnceLock::new();
 
@@ -502,7 +609,32 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        crate::cost::tally("l.put", payload.content_length() as u64);
+        crate::cost::tally_at("l.put", payload.content_length() as u64, location.as_ref());
+        if let Some(rule) = publication_fault()
+            && rule.take(location.as_ref(), &opts)
+        {
+            return match rule.mode {
+                PublicationFaultMode::Unanswered => {
+                    Err(publication_error("publication request unanswered"))
+                }
+                PublicationFaultMode::Throttled => Err(publication_error(
+                    "<Code>SlowDown</Code><Message>Please reduce your request rate.</Message>",
+                )),
+                PublicationFaultMode::LostAck => {
+                    self.inner.put_opts(location, payload, opts).await?;
+                    Err(publication_error("publication acknowledgement lost"))
+                }
+                PublicationFaultMode::LandsLate(delay) => {
+                    let inner = Arc::clone(&self.inner);
+                    let location = location.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = inner.put_opts(&location, payload, opts).await;
+                    });
+                    Err(publication_error("publication request abandoned"))
+                }
+            };
+        }
         let _in_flight = kill_state().map(|k| k.enter_write());
         let _turn = fault(false, "put", location.as_ref()).await?;
         let out = self.inner.put_opts(location, payload, opts).await;
@@ -518,7 +650,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         location: &OsPath,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        crate::cost::tally("l.put_multipart", 0);
+        crate::cost::tally_at("l.put_multipart", 0, location.as_ref());
         let _turn = fault(false, "put_multipart", location.as_ref()).await?;
         assert!(
             kill_state().is_none(),
@@ -535,8 +667,19 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         let _turn = fault(true, "get", location.as_ref()).await?;
+        let head = options.head;
         let result = self.inner.get_opts(location, options).await?;
-        crate::cost::tally("l.get", result.meta.size);
+        // The golden counts a HEAD as `l.get`; only the instrument's path
+        // log tells the two apart, and carries the byte range read.
+        if head {
+            crate::cost::tally_at("l.get", result.meta.size, &format!("{location}#head"));
+        } else {
+            crate::cost::tally_at(
+                "l.get",
+                result.meta.size,
+                &format!("{location}#{:?}", result.range),
+            );
+        }
         // The violation-tier canary: flip one seeded byte in
         // the targeted response. Rebuild the GetResult around the mutated
         // payload (same meta/range/attributes — a LIE, not a truncation).
@@ -548,6 +691,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
                 let meta = result.meta.clone();
                 let range = result.range.clone();
                 let attributes = result.attributes.clone();
+                let extensions = result.extensions.clone();
                 let mut data = result.bytes().await?.to_vec();
                 if !data.is_empty() {
                     let off = (canary.offset_seed as usize) % data.len();
@@ -562,6 +706,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
                     meta,
                     range,
                     attributes,
+                    extensions,
                 });
             }
         }
@@ -586,7 +731,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
                 let inner = Arc::clone(&inner);
                 async move {
                     let path = path_res?;
-                    crate::cost::tally("l.delete", 0);
+                    crate::cost::tally_at("l.delete", 0, path.as_ref());
                     let _in_flight = kill_state().map(|k| k.enter_write());
                     let _turn = fault(false, "delete", path.as_ref()).await?;
                     inner.delete(&path).await?;
@@ -608,7 +753,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
             let label = prefix.as_ref().map(|p| p.to_string()).unwrap_or_default();
             match fault(true, "list", &label).await {
                 Ok(_turn) => {
-                    crate::cost::tally("l.list", 0);
+                    crate::cost::tally_at("l.list", 0, &label);
                     inner.list(prefix.as_ref())
                 }
                 Err(e) => futures::stream::once(futures::future::ready(Err(e))).boxed(),
@@ -623,7 +768,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         prefix: Option<&OsPath>,
     ) -> object_store::Result<ListResult> {
         let label = prefix.map(|p| p.to_string()).unwrap_or_default();
-        crate::cost::tally("l.list", 0);
+        crate::cost::tally_at("l.list", 0, &label);
         let _turn = fault(true, "list_with_delimiter", &label).await?;
         self.inner.list_with_delimiter(prefix).await
     }
@@ -634,7 +779,7 @@ impl object_store::ObjectStore for FaultInjectingOsStore {
         to: &OsPath,
         options: CopyOptions,
     ) -> object_store::Result<()> {
-        crate::cost::tally("l.copy", 0);
+        crate::cost::tally_at("l.copy", 0, from.as_ref());
         let _in_flight = kill_state().map(|k| k.enter_write());
         let _turn = fault(false, "copy", from.as_ref()).await?;
         let out = self.inner.copy_opts(from, to, options).await;

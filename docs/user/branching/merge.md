@@ -5,7 +5,7 @@ atomically across the whole graph.
 
 ```bash
 omnigraph branch merge review/2026-04-25 --into main \
-  --store s3://bucket/graph.omni
+  --target ./graph.omni
 ```
 
 The source is positional. `--into` defaults to `main`.
@@ -37,7 +37,14 @@ it with a `table version … already exists` error.
 ## Outcomes
 
 - **Already up to date**: the target already contains the source changes.
-- **Fast-forward**: the target has not diverged and advances to the source state.
+- **Fast-forward**: the target still has the merge base's schema and table
+  versions, so it takes the source's state. The check reads state, not
+  history: a target merged again from a branch it fast-forwarded before, with
+  no write in between, fast-forwards again. One exception: when a
+  fast-forward into `main` carried a table whose changes cancel out on the
+  branch, or a table on a fork left by a branch created before storage format
+  v11, `main` ends on its own version of that table, so a later merge from
+  that branch can report **Merged**. The merged data is the same.
 - **Merged**: both branches changed, so OmniGraph performs a three-way,
   entity-level merge and creates a commit with two parents.
 
@@ -69,7 +76,7 @@ normal review-branch lifecycle:
 
 ```bash
 omnigraph branch merge review/2026-04-25 --into main --delete-branch \
-  --store s3://bucket/graph.omni
+  --target ./graph.omni
 ```
 
 Deletion happens after a successful merge and has its own authorization check.
@@ -83,6 +90,27 @@ string. Inspect and retry deletion separately; do not replay a successful merge.
 
 Deleting a branch is irreversible and may make branch-only commits unavailable.
 It also releases old history for a later cleanup.
+
+## Preview a merge
+
+```bash
+omnigraph branch merge feature --into main --dry-run --target ./graph.omni --json
+```
+
+A dry run runs the merge through classification and constraint validation,
+then stops. It reports the outcome the merge would have now, or fails with the
+same structured conflict list, and writes nothing: `commit` is `null` and
+`dry_run` is `true`. It is a read of both branches, so it needs `read` on each
+and no `branch_merge` grant. It refuses `--as-commit` and `--delete-branch`.
+Over HTTP, send `dry_run: true` to `POST /graphs/{graph_id}/branches/merge`.
+The GQ statement `branch merge feature into main dry run` is the same read at
+`POST /query`: it answers one row with `source`, `target` and `outcome`, and a
+conflict is the 409 a merge answers.
+
+A dry run answers whether the merge would succeed. To see what it would change,
+use [`branch diff`](changes.md#review-a-branch). To review the exact result
+before it lands, merge `--as-commit` and inspect the proposal with
+`commit changes`; the proposal expires once the target branch moves.
 
 ## Conflicts
 
@@ -99,11 +127,17 @@ structured conflict list and publishes nothing.
 | `cardinality_violation` | The result would violate edge cardinality. |
 | `value_constraint_violation` | The result would violate an enum, range, or other value constraint. |
 
-A merge classifies both sides against their merge base, the nearest commit
-both branches descend from, counting a merged branch as an ancestor. Two
-branches that each merged the same third branch therefore share that
-branch's commit as their base, and an entity only one of them changed after
-that import merges cleanly. The record of such a commit lives in the branch
+A merge classifies both sides against their merge base, the newest commit
+both branches descend from, counting a merged branch as an ancestor: a
+commit both branches descend from that no other such commit descends from.
+When two such commits are each not an ancestor of the other, the base is the
+one nearest the two heads (the fewest commits between it and the heads,
+summed), then the one with the higher generation (its distance from the
+first commit along the longest path), then the one with the smaller commit
+id. Two branches that
+each merged the same third branch therefore share that branch's commit as
+their base, and an entity only one of them changed after that import merges
+cleanly. The record of such a commit lives in the branch
 it was merged from, and the merge can read it from a live branch or retained
 retired history. Cleanup preserves the exact selected base and the retired
 histories needed to resolve it. Recreating the logical branch name cannot
@@ -142,7 +176,9 @@ The `merge_lineage` [session setting](../queries/index.md#session-settings)
 merge_lineage=off`, or the request's `settings` field; process default
 `OMNIGRAPH_MERGE_LINEAGE`) selects how a branch merge finds what changed. `on`
 (the release default) discovers candidates from Lance version metadata —
-fragment lists and deletion files — and compares candidate rows. Known deleted
+fragment lists and deletion files — and compares candidate rows, for tables
+both branches changed and for tables only the source changed (including a
+fast forward), so its cost follows what changed rather than the table size. Known deleted
 row positions use bounded direct reads. Candidate filtering may still scan data
 when an applicable index is absent; a fail-closed
 precondition gate falls back to the full three-way scan whenever any
@@ -170,5 +206,8 @@ Indexes do not define merge correctness. Newly merged entities remain queryable 
 when index coverage has not caught up, but some searches may scan them. Run
 `omnigraph optimize` after a large merge to restore efficient layout and index
 coverage.
+
+A merge that writes rows is also bounded by the Blob payload it copies; see
+[Blob limits](../blobs.md#limits).
 
 See [Branches, Commits, and History](index.md) for the complete branch workflow.

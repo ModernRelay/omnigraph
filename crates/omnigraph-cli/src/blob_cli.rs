@@ -1,20 +1,20 @@
-//! CLI-only shaping for graph-level Blob reads.
+//! CLI-only shaping for graph-level Blob reads and writes.
 //!
 //! The engine and server own descriptor interpretation, snapshot fencing, and
 //! bounded payload reads. This module keeps the command line's selector,
 //! range, and error vocabulary identical across the embedded and served arms.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use color_eyre::Report;
 use color_eyre::eyre::{Result, eyre};
 use omnigraph::db::{ReadTarget, SnapshotId};
 use omnigraph::error::{ManifestErrorKind, OmniError};
-use omnigraph::{BlobCell, EntityKind, ExternalBlobRef};
-use omnigraph_api_types::{BlobEntityKind, BlobReadQuery};
+use omnigraph::{BlobCell, BlobPrecondition, EntityKind as EngineEntityKind, ExternalBlobRef};
+use omnigraph_api_types::{BlobReadQuery, BlobWriteQuery, EntityKind};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, ETAG, HeaderMap, HeaderName};
 
@@ -108,7 +108,7 @@ impl BlobRangeRequest {
 }
 
 pub(crate) fn blob_query(
-    entity: BlobEntityKind,
+    entity: EntityKind,
     type_name: String,
     id: String,
     property: String,
@@ -135,8 +135,8 @@ pub(crate) fn blob_read_target(query: &BlobReadQuery) -> ReadTarget {
 pub(crate) fn blob_cell(query: &BlobReadQuery) -> BlobCell {
     BlobCell {
         entity: match query.entity {
-            BlobEntityKind::Node => EntityKind::Node,
-            BlobEntityKind::Edge => EntityKind::Edge,
+            EntityKind::Node => EngineEntityKind::Node,
+            EntityKind::Edge => EngineEntityKind::Edge,
         },
         type_name: query.r#type.clone(),
         id: query.id.clone(),
@@ -146,8 +146,8 @@ pub(crate) fn blob_cell(query: &BlobReadQuery) -> BlobCell {
 
 pub(crate) fn blob_url(base_url: &str, query: &BlobReadQuery) -> Result<String> {
     let entity = match query.entity {
-        BlobEntityKind::Node => "node",
-        BlobEntityKind::Edge => "edge",
+        EntityKind::Node => "node",
+        EntityKind::Edge => "edge",
     };
     let mut params = vec![
         ("entity", entity),
@@ -164,11 +164,110 @@ pub(crate) fn blob_url(base_url: &str, query: &BlobReadQuery) -> Result<String> 
     crate::helpers::remote_url(base_url, &["blob"], &params)
 }
 
-pub(crate) fn whole_external_uri(reference: &ExternalBlobRef) -> Result<&str> {
-    if reference.offset != 0 || reference.length.is_some() {
-        return Err(eyre!("Blob delivery failed"));
+pub(crate) fn blob_write_query(
+    entity: EntityKind,
+    type_name: String,
+    id: String,
+    property: String,
+    branch: Option<String>,
+) -> BlobWriteQuery {
+    BlobWriteQuery {
+        entity,
+        r#type: type_name,
+        id,
+        property,
+        branch,
     }
-    Ok(&reference.uri)
+}
+
+pub(crate) fn blob_write_cell(query: &BlobWriteQuery) -> BlobCell {
+    BlobCell {
+        entity: match query.entity {
+            EntityKind::Node => EngineEntityKind::Node,
+            EntityKind::Edge => EngineEntityKind::Edge,
+        },
+        type_name: query.r#type.clone(),
+        id: query.id.clone(),
+        property: query.property.clone(),
+    }
+}
+
+pub(crate) fn blob_write_url(base_url: &str, query: &BlobWriteQuery) -> Result<String> {
+    let entity = match query.entity {
+        EntityKind::Node => "node",
+        EntityKind::Edge => "edge",
+    };
+    let mut params = vec![
+        ("entity", entity),
+        ("type", query.r#type.as_str()),
+        ("id", query.id.as_str()),
+        ("property", query.property.as_str()),
+    ];
+    if let Some(branch) = query.branch.as_deref() {
+        params.push(("branch", branch));
+    }
+    crate::helpers::remote_url(base_url, &["blob"], &params)
+}
+
+/// Parse `--if-match` with the parser the server applies to the `If-Match`
+/// header, so a malformed value is refused before any graph is addressed.
+pub(crate) fn parse_if_match(raw: Option<&str>) -> Result<Option<BlobPrecondition>> {
+    omnigraph_api_types::parse_blob_if_match(raw.map(str::as_bytes)).map_err(|error| eyre!(error))
+}
+
+/// Read `blob put`'s bytes from `--file` or stdin, never both, before any
+/// graph is addressed. Input over the put limit is refused with the resource
+/// the engine and the server report, without reading past one more byte;
+/// an interactive stdin is refused rather than waited on.
+pub(crate) fn read_put_input(
+    file: Option<&Path>,
+    stdin: &mut dyn Read,
+    stdin_is_terminal: bool,
+) -> Result<bytes::Bytes> {
+    let limit = omnigraph::BLOB_WRITE_MAX_BYTES;
+    let too_large = |actual: u64| -> Report {
+        OmniError::resource_limit(omnigraph::BLOB_WRITE_PAYLOAD_RESOURCE, limit, actual).into()
+    };
+    let mut buffer = Vec::new();
+    match file {
+        Some(path) => {
+            let file = File::open(path)
+                .map_err(|error| eyre!("cannot read --file {}: {error}", path.display()))?;
+            let length = file
+                .metadata()
+                .map_err(|error| eyre!("cannot read --file {}: {error}", path.display()))?
+                .len();
+            if length > limit {
+                return Err(too_large(length));
+            }
+            buffer.reserve(usize::try_from(length).unwrap_or(0));
+            file.take(limit + 1)
+                .read_to_end(&mut buffer)
+                .map_err(|error| eyre!("cannot read --file {}: {error}", path.display()))?;
+        }
+        None => {
+            if stdin_is_terminal {
+                return Err(eyre!(
+                    "blob put reads its bytes from stdin; pipe them in or pass --file PATH"
+                ));
+            }
+            stdin
+                .take(limit + 1)
+                .read_to_end(&mut buffer)
+                .map_err(|error| eyre!("cannot read stdin: {error}"))?;
+        }
+    }
+    let read = buffer.len() as u64;
+    if read > limit {
+        return Err(too_large(read));
+    }
+    Ok(bytes::Bytes::from(buffer))
+}
+
+pub(crate) fn whole_external_uri(reference: &ExternalBlobRef) -> Result<&str> {
+    reference
+        .whole_object_uri()
+        .map_err(|_| eyre!("Blob delivery failed"))
 }
 
 pub(crate) fn map_embedded_blob_error(error: OmniError) -> Report {
@@ -192,17 +291,24 @@ pub(crate) fn map_embedded_blob_error(error: OmniError) -> Report {
     }
 }
 
-pub(crate) fn remote_blob_error(status: StatusCode) -> Report {
-    match status {
-        StatusCode::BAD_REQUEST => eyre!("invalid Blob selector"),
-        StatusCode::UNAUTHORIZED => eyre!("Blob read requires authentication"),
-        StatusCode::FORBIDDEN => eyre!("Blob read is forbidden"),
-        StatusCode::NOT_FOUND => eyre!("Blob cell not found"),
-        StatusCode::CONFLICT => eyre!("Blob read target changed; retry the command"),
-        StatusCode::RANGE_NOT_SATISFIABLE => eyre!("Blob range is not satisfiable"),
-        StatusCode::INTERNAL_SERVER_ERROR => eyre!("Blob delivery failed"),
-        other => eyre!("Blob server request failed with status {other}"),
-    }
+pub(crate) fn remote_blob_error(
+    status: StatusCode,
+    missing: Option<&crate::helpers::MissingCredential>,
+) -> Report {
+    let message = match status {
+        StatusCode::BAD_REQUEST => "invalid Blob selector".to_string(),
+        StatusCode::UNAUTHORIZED => "Blob read requires authentication".to_string(),
+        StatusCode::FORBIDDEN => "Blob read is forbidden".to_string(),
+        StatusCode::NOT_FOUND => "Blob cell not found".to_string(),
+        StatusCode::CONFLICT => "Blob read target changed; retry the command".to_string(),
+        StatusCode::RANGE_NOT_SATISFIABLE => "Blob range is not satisfiable".to_string(),
+        StatusCode::INTERNAL_SERVER_ERROR => "Blob delivery failed".to_string(),
+        other => format!("Blob server request failed with status {other}"),
+    };
+    eyre!(
+        "{}",
+        crate::helpers::with_missing_credential(message, missing)
+    )
 }
 
 #[derive(Debug)]
@@ -251,6 +357,123 @@ fn required_header<'a>(headers: &'a HeaderMap, name: &HeaderName, label: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct InterruptedInput<'a> {
+        remaining: &'a [u8],
+        interrupted: bool,
+    }
+
+    impl Read for InterruptedInput<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.remaining.read(buffer)
+        }
+    }
+
+    struct UnreadInput;
+
+    impl Read for UnreadInput {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("stdin must not be read");
+        }
+    }
+
+    #[test]
+    fn put_input_preserves_empty_and_binary_stdin_after_interruption() {
+        for input in [b"".as_slice(), b"\0\xff\nblob\r\n".as_slice()] {
+            let mut stdin = InterruptedInput {
+                remaining: input,
+                interrupted: false,
+            };
+            assert_eq!(read_put_input(None, &mut stdin, false).unwrap(), input);
+            assert!(stdin.interrupted);
+            assert!(stdin.remaining.is_empty());
+        }
+    }
+
+    #[test]
+    fn put_input_refuses_terminal_before_reading_and_file_ignores_stdin() {
+        assert_eq!(
+            read_put_input(None, &mut UnreadInput, true)
+                .unwrap_err()
+                .to_string(),
+            "blob put reads its bytes from stdin; pipe them in or pass --file PATH"
+        );
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"file\0bytes").unwrap();
+        assert_eq!(
+            read_put_input(Some(file.path()), &mut UnreadInput, true).unwrap(),
+            b"file\0bytes".as_slice()
+        );
+    }
+
+    #[test]
+    fn put_input_stops_at_the_existing_limit_plus_one_byte() {
+        struct CountingInput {
+            remaining: u64,
+            read: u64,
+        }
+
+        impl Read for CountingInput {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = self.remaining.min(buffer.len() as u64) as usize;
+                buffer[..count].fill(b'b');
+                self.remaining -= count as u64;
+                self.read += count as u64;
+                Ok(count)
+            }
+        }
+
+        let limit = omnigraph::BLOB_WRITE_MAX_BYTES;
+        for length in [limit, limit + 2] {
+            let mut stdin = CountingInput {
+                remaining: length,
+                read: 0,
+            };
+            let result = read_put_input(None, &mut stdin, false);
+            if length == limit {
+                assert_eq!(result.unwrap().len() as u64, limit);
+                assert_eq!(stdin.read, limit);
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(
+                    error.downcast_ref::<OmniError>(),
+                    Some(OmniError::ResourceLimitExceeded {
+                        resource,
+                        limit: reported_limit,
+                        actual,
+                    }) if resource == omnigraph::BLOB_WRITE_PAYLOAD_RESOURCE
+                        && *reported_limit == limit
+                        && *actual == limit + 1
+                ));
+                assert_eq!(stdin.read, limit + 1);
+                assert_eq!(stdin.remaining, 1, "the oversized suffix stays unread");
+            }
+        }
+    }
+
+    #[test]
+    fn put_input_read_failure_does_not_accept_a_delivered_prefix() {
+        struct FailedInput;
+
+        impl Read for FailedInput {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("input closed"))
+            }
+        }
+
+        let mut stdin = b"prefix".as_slice().chain(FailedInput);
+        assert_eq!(
+            read_put_input(None, &mut stdin, false)
+                .unwrap_err()
+                .to_string(),
+            "cannot read stdin: input closed"
+        );
+    }
 
     #[test]
     fn range_flags_reject_zero_and_overflow_before_resolution() {
@@ -301,8 +524,39 @@ mod tests {
     #[test]
     fn remote_conflict_matches_embedded_target_change_diagnostic() {
         assert_eq!(
-            remote_blob_error(StatusCode::CONFLICT).to_string(),
+            remote_blob_error(StatusCode::CONFLICT, None).to_string(),
             "Blob read target changed; retry the command"
         );
+    }
+
+    #[test]
+    fn remote_unauthorized_names_the_missing_credential() {
+        use crate::helpers::MissingCredential;
+        for (missing, hint, expected) in [
+            (
+                MissingCredential::AnonymousTarget("prod".into()),
+                "target `prod` uses anonymous authentication: configure a token or exec provider; for a token provider with source: store, run `omnigraph credentials set --target prod --stdin`",
+                serde_json::json!({"target":"prod","auth":"anonymous"}),
+            ),
+            (
+                MissingCredential::Unbound {
+                    server_root: "https://graph.example".into(),
+                    config: None,
+                },
+                "no credential is bound to https://graph.example: declare a server target and explicit auth provider under `targets:` in ~/.omnigraph/config.yaml; select it with --target",
+                serde_json::json!({"unbound":"https://graph.example"}),
+            ),
+        ] {
+            assert_eq!(
+                remote_blob_error(StatusCode::UNAUTHORIZED, Some(&missing)).to_string(),
+                format!("Blob read requires authentication\n{hint}")
+            );
+            let mut serialized = serde_json::to_value(&missing).unwrap();
+            assert_eq!(
+                serialized.as_object_mut().unwrap().remove("hint"),
+                Some(serde_json::json!(hint))
+            );
+            assert_eq!(serialized, expected);
+        }
     }
 }

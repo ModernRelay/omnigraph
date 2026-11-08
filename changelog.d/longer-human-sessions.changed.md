@@ -1,0 +1,1 @@
+- Human logins can renew for 30 days without extending saved deadlines. Transient refresh and identity checks retry within fixed bounds; graph operations are never replayed.

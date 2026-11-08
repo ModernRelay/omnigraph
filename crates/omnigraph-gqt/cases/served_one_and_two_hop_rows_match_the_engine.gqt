@@ -1,0 +1,61 @@
+# issue: none
+# notes: 0322.2 P14: traversal-served keeps only unpinned, search-free hop shapes; served hop rows must equal
+# notes: the in-process rows so the served variants share the embedded row expectations.
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"type":"Person","data":{"name":"Charlie"}}
+{"type":"Person","data":{"name":"Diana"}}
+{"edge":"Knows","from":"Alice","to":"Bob"}
+{"edge":"Knows","from":"Alice","to":"Charlie"}
+{"edge":"Knows","from":"Bob","to":"Diana"}
+
+--- query
+query hop1() {
+    match {
+        $p: Person
+        $p knows $f
+    }
+    return { $p.name as person, $f.name as friend }
+}
+
+--- expect unordered
+{"person": "Alice", "friend": "Bob"}
+{"person": "Alice", "friend": "Charlie"}
+{"person": "Bob", "friend": "Diana"}
+
+--- expect shape
+person: String
+friend: String
+
+--- query
+query hop2() {
+    match {
+        $p: Person
+        $p knows $f
+        $f knows $g
+    }
+    return { $p.name as person, $g.name as friend_of_friend }
+}
+
+--- expect unordered
+{"person": "Alice", "friend_of_friend": "Diana"}
+
+--- expect shape
+person: String
+friend_of_friend: String

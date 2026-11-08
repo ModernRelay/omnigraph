@@ -4,10 +4,12 @@
 //! use the engine's read runner. The change-feed/merge callers are not wired
 //! to this executor yet.
 //!
-//! One operator per change-feed or merge node, and only here: the planner's
-//! `PhysicalNode` enum is the catalog and [`executor::build`]'s match names
-//! every variant, the read ones in one refusing arm with no catch-all, so a
-//! node without an operator does not compile. Operators
+//! One operator per change-feed or merge node, and only here:
+//! [`executor::build`] consumes the planner's `PhysicalPlan::pipelines`
+//! decomposition, the one explain serializes, and the executor's role
+//! classification names every `PhysicalNode` variant, the read ones in one
+//! refusing arm with no catch-all, so a node without a decision does not
+//! compile. Operators
 //! work on [`chunk::Chunk`]s of Arrow vectors; a chunk carries a selection
 //! vector so a filter marks rows and the next operator applies the mark.
 //! Everything the engine keeps for itself, its typed errors, its probes and

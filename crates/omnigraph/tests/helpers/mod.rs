@@ -7,6 +7,7 @@ pub mod expand_projection;
 pub mod failpoint;
 pub mod recovery;
 pub mod transfer_aggregation;
+pub mod wide_rows;
 
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
 pub use omnigraph::Session;
-use omnigraph::changes::{ChangeFilter, ChangeSet};
+use omnigraph::changes::{ChangeEntityKind, ChangeFeedScope, ChangeOpKind};
 use omnigraph::db::{Omnigraph, ReadTarget, Snapshot, SnapshotId};
 use omnigraph::error::Result;
 use omnigraph::loader::LoadMode;
@@ -332,8 +333,17 @@ pub fn with_traversal(db: &Session, mode: Traversal) -> Session {
 
 /// Init a graph and load the standard test data.
 pub async fn init_and_load(dir: &tempfile::TempDir) -> Session {
-    let uri = dir.path().to_str().unwrap();
-    let db = session(Omnigraph::init(uri, TEST_SCHEMA).await.unwrap());
+    init_and_load_with_schema(dir, TEST_SCHEMA).await
+}
+
+/// The standard rows under a compatible schema, for schema-size instruments.
+pub async fn init_and_load_with_schema(dir: &tempfile::TempDir, schema: &str) -> Session {
+    init_and_load_at(dir.path().to_str().unwrap(), schema).await
+}
+
+/// [`init_and_load_with_schema`] at a graph uri on any backend.
+pub async fn init_and_load_at(uri: &str, schema: &str) -> Session {
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
     // Mutation/load publish only exact data effects; physical indexes are
     // reconciled separately as derived state.
@@ -562,18 +572,116 @@ pub async fn snapshot_id(db: &Omnigraph, branch: &str) -> Result<SnapshotId> {
     db.resolve_snapshot(branch).await
 }
 
+/// One change of a graph diff flattened for assertions: the entity's kind,
+/// type, id and operation, and an edge's endpoints from its newest image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetChange {
+    pub kind: ChangeEntityKind,
+    pub type_name: String,
+    pub id: String,
+    pub op: ChangeOpKind,
+    pub endpoints: Option<NetEndpoints>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetEndpoints {
+    pub src: String,
+    pub dst: String,
+}
+
+impl NetChange {
+    /// `node:<Type>` or `edge:<Type>`.
+    pub fn type_key(&self) -> String {
+        let prefix = match self.kind {
+            ChangeEntityKind::Node => "node",
+            ChangeEntityKind::Edge => "edge",
+        };
+        format!("{prefix}:{}", self.type_name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetStats {
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+}
+
+/// A whole graph diff: its resolved endpoints and every change of every page.
+#[derive(Debug, Clone)]
+pub struct NetDiff {
+    pub from_commit_id: String,
+    pub to_commit_id: String,
+    pub changes: Vec<NetChange>,
+    pub stats: NetStats,
+}
+
+/// The graph diff `from` → `to` (branch names or commit ids) within `scope`,
+/// every page.
+pub async fn graph_diff(
+    db: &Omnigraph,
+    from: &str,
+    to: &str,
+    scope: &ChangeFeedScope,
+) -> Result<NetDiff> {
+    let mut request = omnigraph::changes::GraphDiffRequest {
+        sides: omnigraph::changes::GraphDiffSides::Between {
+            from: from.to_string(),
+            to: to.to_string(),
+        },
+        scope: scope.clone(),
+        page_token: None,
+        max_changes: None,
+        max_bytes: None,
+    };
+    let mut diff = NetDiff {
+        from_commit_id: String::new(),
+        to_commit_id: String::new(),
+        changes: Vec::new(),
+        stats: NetStats::default(),
+    };
+    loop {
+        let page = db.diff_page(&request).await?;
+        diff.from_commit_id = page.from_commit_id;
+        diff.to_commit_id = page.to_commit_id;
+        for change in page.changes {
+            match change.op {
+                ChangeOpKind::Insert => diff.stats.inserts += 1,
+                ChangeOpKind::Update => diff.stats.updates += 1,
+                ChangeOpKind::Delete => diff.stats.deletes += 1,
+            }
+            let endpoints = change
+                .after
+                .as_ref()
+                .or(change.before.as_ref())
+                .and_then(|image| image.endpoints.as_ref())
+                .map(|endpoints| NetEndpoints {
+                    src: endpoints.from.clone(),
+                    dst: endpoints.to.clone(),
+                });
+            diff.changes.push(NetChange {
+                kind: change.kind,
+                type_name: change.entity_type.name,
+                id: change.id,
+                op: change.op,
+                endpoints,
+            });
+        }
+        match page.next_page_token {
+            Some(token) => request.page_token = Some(token),
+            None => return Ok(diff),
+        }
+    }
+}
+
+/// The graph diff from `from_snapshot` to the head of `branch`.
 pub async fn diff_since_branch(
     db: &Omnigraph,
     branch: &str,
     from_snapshot: SnapshotId,
-    filter: &ChangeFilter,
-) -> Result<ChangeSet> {
-    db.diff_between(
-        ReadTarget::Snapshot(from_snapshot),
-        ReadTarget::branch(branch),
-        filter,
-    )
-    .await
+    scope: &ChangeFeedScope,
+) -> Result<NetDiff> {
+    graph_diff(db, from_snapshot.as_str(), branch, scope).await
 }
 
 /// Advance a Lance dataset HEAD directly from tests without going through
@@ -601,7 +709,7 @@ pub fn int_params(pairs: &[(&str, i64)]) -> ParamMap {
         .iter()
         .map(|(k, v)| {
             let key = k.strip_prefix('$').unwrap_or(k);
-            (key.to_string(), Literal::Integer(*v))
+            (key.to_string(), Literal::Integer(i128::from(*v)))
         })
         .collect()
 }
@@ -611,7 +719,7 @@ pub fn mixed_params(str_pairs: &[(&str, &str)], int_pairs: &[(&str, i64)]) -> Pa
     let mut map = params(str_pairs);
     for (k, v) in int_pairs {
         let key = k.strip_prefix('$').unwrap_or(k);
-        map.insert(key.to_string(), Literal::Integer(*v));
+        map.insert(key.to_string(), Literal::Integer(i128::from(*v)));
     }
     map
 }
@@ -679,4 +787,117 @@ pub fn s3_test_graph_uri(suite: &str) -> Option<String> {
         .ok()?
         .as_nanos();
     Some(format!("s3://{}/{}/{}/{}", bucket, prefix, suite, unique))
+}
+
+/// Append one `Document` row, id and title `ranged`, whose `content` is the
+/// external descriptor `s3://bucket/object` at offset 4, length 8, then
+/// publish that table head. No public write path creates a ranged descriptor,
+/// so the fixture writes it raw. The schema must be exactly
+/// `Document { title: String @key, content: Blob? }`. Returns the table URI.
+#[cfg(feature = "failpoints")]
+pub async fn seed_ranged_external_blob_row(db: &Omnigraph, uri: &str) -> String {
+    write_ranged_external_blob_row(db, uri, 4, 8).await
+}
+
+/// Replace the `ranged` row written by [`seed_ranged_external_blob_row`] with
+/// one naming the same object through another byte range, in one graph
+/// commit. Call it before any engine write to `Document`: it writes the
+/// table's linear head, which is the published version only until then.
+#[cfg(feature = "failpoints")]
+pub async fn replace_ranged_external_blob_range(
+    db: &Omnigraph,
+    uri: &str,
+    offset: u64,
+    size: u64,
+) -> String {
+    write_ranged_external_blob_row(db, uri, offset, size).await
+}
+
+#[cfg(feature = "failpoints")]
+async fn write_ranged_external_blob_row(
+    db: &Omnigraph,
+    uri: &str,
+    offset: u64,
+    size: u64,
+) -> String {
+    use arrow_array::ArrayRef;
+    use lance::blob::{BlobDescriptorArrayBuilder, BlobRange};
+
+    let entry = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset("node:Document")
+        .unwrap()
+        .clone();
+    let table_uri = format!("{uri}/{}", entry.dataset_path);
+    let mut raw = lance::Dataset::open(&table_uri).await.unwrap();
+    assert_eq!(
+        raw.version().version,
+        entry.published_dataset_version,
+        "the ranged-descriptor fixture writes the linear head, which must be the published version"
+    );
+    raw.delete("__id = 'ranged'").await.unwrap();
+    let logical_schema = arrow_schema::Schema::from(raw.schema());
+    let mut descriptor_builder = BlobDescriptorArrayBuilder::new("content");
+    descriptor_builder
+        .push_external("s3://bucket/object", Some(BlobRange { offset, size }))
+        .unwrap();
+    let (descriptor_field, descriptor) = descriptor_builder.finish().unwrap().into_parts();
+    let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        logical_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name() == "content" {
+                    Arc::new(descriptor_field.clone())
+                } else {
+                    field.clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+        logical_schema.metadata().clone(),
+    ));
+    let mut field_names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<Vec<_>>();
+    field_names.sort_unstable();
+    assert_eq!(
+        field_names,
+        ["__id", "content", "title"],
+        "ranged-descriptor fixture is physical-schema specific"
+    );
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "__id" | "title" => Arc::new(StringArray::from(vec!["ranged"])) as ArrayRef,
+            "content" => descriptor.clone(),
+            other => panic!("unexpected ranged-descriptor fixture field {other}"),
+        })
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(schema, columns).unwrap();
+    lance_append_inline(&mut raw, batch).await;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Document", None)
+        .await
+        .unwrap();
+    table_uri
+}
+
+/// `token` with its payload edited and its checksum recomputed, as any caller
+/// can: a continuation's envelope is `base64url(json ‖ sha256(json))`.
+pub fn resign_change_token(token: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let bytes = engine.decode(token).unwrap();
+    let (payload, _) = bytes.split_at(bytes.len() - 32);
+    let mut payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    edit(&mut payload);
+    let mut encoded = serde_json::to_vec(&payload).unwrap();
+    let checksum = sha2::Sha256::digest(&encoded);
+    encoded.extend_from_slice(&checksum);
+    engine.encode(encoded)
 }

@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - azimafroozeh
 created: 2026-09-30
-updated: 2026-09-30
+updated: 2026-10-08
 discussion: "https://github.com/ModernRelay/omnigraph/issues/659"
 supersedes: []
 superseded_by: []
@@ -66,9 +66,10 @@ members must all be compatible with those types. Direction is resolved per
 member using the existing endpoint rule. Wildcard requires both endpoint node
 types to be explicitly declared in the same block or a visible outer scope.
 Local declarations may follow the traversal; future outer declarations do not
-change an earlier nested scope. Recursive selections and undirected traversal
-require the same node type at both ends. Named cross-type hop ranges retain
-their existing one-hop cap. Every traversal component needs an executable
+change an earlier nested scope. Undirected traversal and any hop bound above
+one, on a named edge or a selection, require the same node type at both ends;
+a wider named cross-type range is refused rather than capped at one hop. Every
+traversal component needs an executable
 endpoint binding. Ambiguous mixed-orientation alternatives require a declared
 endpoint type.
 
@@ -265,3 +266,12 @@ wildcards.
 recursive bounds, strict common-property typing and explicit resource refusal.
 Retain conservative full-table scan admission until storage can provide a safe
 selective work bound.
+
+2026-10-08: refuse a named traversal whose hop bound allows more than one hop
+when its edge connects two different node types (`T5`, as for recursive
+selections), and remove the engine's one-hop cap. The cap answered `{1,n}`
+with the one-hop rows and a range starting above one with none, both
+consistent with the range, but it accepted a bound no path can reach without
+saying so. Supersedes, in User and operational behavior, "Recursive selections
+and undirected traversal require the same node type at both ends." and "Named
+cross-type hop ranges retain their existing one-hop cap."

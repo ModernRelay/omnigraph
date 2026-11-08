@@ -33,7 +33,9 @@ constraint_arg = { range_bound | literal | meta_field | ident }
 // A system field named by role (RFC 0040): `@id`, `@src`, `@dst`. Never a user
 // property, so a constraint list can name an endpoint on every vintage.
 meta_field = @{ "@" ~ ident }
-range_bound = { (signed_float | signed_integer) ~ ".." ~ (signed_float | signed_integer)? | ".." ~ (signed_float | signed_integer) }
+range_bound = { range_min ~ ".." ~ range_max? | ".." ~ range_max }
+range_min = { signed_float | signed_integer }
+range_max = { signed_float | signed_integer }
 
 type_ref = { core_type ~ "?"? }
 core_type = { list_type | enum_type | vector_type | base_type }

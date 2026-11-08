@@ -20,4 +20,5 @@
 /crates/omnigraph-seams/                @azimafroozeh @aaltshuler
 /crates/omnigraph-server/               @aaltshuler
 /crates/omnigraph-storage/              @azimafroozeh @aaltshuler
+/skills/                                @aaltshuler
 /tools/omnigraph-vocabulary-guard/      @azimafroozeh @aaltshuler

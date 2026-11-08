@@ -1,0 +1,43 @@
+# issue: none
+# notes: One checked warmup precedes one measured query per fresh process; a restart and exact result check follow. This repetition boundary differs from the former repeated Rust timing loop.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query destination_search() {
+    match { $p: Person $p knows $q search($q.body, "needle") }
+    return { $q.name }
+}
+--- expect unordered
+{"q.name":"p000000"}
+{"q.name":"p000010"}
+--- expect shape
+q.name: String
+
+--- query
+query destination_search() {
+    match { $p: Person $p knows $q search($q.body, "needle") }
+    return { $q.name }
+}
+--- expect unordered
+{"q.name":"p000000"}
+{"q.name":"p000010"}
+--- expect shape
+q.name: String
+
+--- restart
+
+--- query
+query destination_search() {
+    match { $p: Person $p knows $q search($q.body, "needle") }
+    return { $q.name }
+}
+--- expect unordered
+{"q.name":"p000000"}
+{"q.name":"p000010"}
+--- expect shape
+q.name: String

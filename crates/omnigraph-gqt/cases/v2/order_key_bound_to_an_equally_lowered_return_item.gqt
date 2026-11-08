@@ -1,0 +1,51 @@
+# issue: none
+# notes: Two return items written differently can lower to one expression: `"a" in $d.tags` and
+# notes: `$d.tags contains "a"` are the same list membership. An order key binds to the first
+# notes: return item it lowers equal to, and ordering by either spelling, or by the alias of the
+# notes: first, is accepted and orders the rows by that membership.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    tags: [String]
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","tags":["a"]}}
+{"type":"Doc","data":{"slug":"d2","tags":["b"]}}
+
+--- query
+query by_contains() {
+    match { $d: Doc }
+    return { "a" in $d.tags as a, $d.tags contains "a" as b }
+    order { $d.tags contains "a" }
+}
+
+--- expect ordered
+{"a": false, "b": false}
+{"a": true, "b": true}
+
+--- expect shape
+a: Bool
+b: Bool
+
+--- query
+query by_alias() {
+    match { $d: Doc }
+    return { "a" in $d.tags as a, $d.tags contains "a" as b }
+    order { a desc }
+}
+
+--- expect ordered
+{"a": true, "b": true}
+{"a": false, "b": false}
+
+--- expect shape
+a: Bool
+b: Bool

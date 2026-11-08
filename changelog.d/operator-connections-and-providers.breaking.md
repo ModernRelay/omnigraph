@@ -1,0 +1,3 @@
+- Operator configuration now uses `version: 1` connections, resource targets and owner-local authentication providers, with no backward compatibility or import command. Rebuild old configuration and aliases, use `credentials set --stdin` instead of static-token login, register remote endpoints, and replace CLI cloud-direct access with a supported access path. Credential status is offline and helper-free; access export is pipe-only. Preserve old operator homes and reconcile unresolved operations with compatible tooling before retiring them; see the [operator configuration reference][operator-connections-reference].
+
+[operator-connections-reference]: ../docs/user/cli/targets.md

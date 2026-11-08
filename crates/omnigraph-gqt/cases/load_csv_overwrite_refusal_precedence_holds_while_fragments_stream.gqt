@@ -1,0 +1,307 @@
+# issue: none
+# csv_slice_bytes: 4096
+# overwrite_chunk_rows: 10
+# notes: Partition 0 carries a key repeated inside its first fragment (records 3 and 5),
+# notes: partition 1 a bad integer at record 95; the refusal is the validate operator's,
+# notes: ranked over every partition after the drain, not the sink's check that met the
+# notes: repeat first; the committed rows stay.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item {
+    id: I64 @key
+    note: String
+    n: I64
+}
+
+--- seed
+{"type":"Item","data":{"id":1,"note":"s1","n":10}}
+{"type":"Item","data":{"id":2,"note":"s2","n":20}}
+{"type":"Item","data":{"id":3,"note":"s3","n":30}}
+
+--- csv mixed.csv
+id,note,n
+1000,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,0
+1001,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,1
+1002,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,2
+1003,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,3
+1002,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,4
+1005,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,5
+1006,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,6
+1007,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,7
+1008,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,8
+1009,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,9
+1010,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,10
+1011,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,11
+1012,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,12
+1013,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,13
+1014,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,14
+1015,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,15
+1016,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,16
+1017,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,17
+1018,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,18
+1019,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,19
+1020,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,20
+1021,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,21
+1022,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,22
+1023,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,23
+1024,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,24
+1025,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,25
+1026,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,26
+1027,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,27
+1028,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,28
+1029,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,29
+1030,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,30
+1031,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,31
+1032,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,32
+1033,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,33
+1034,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,34
+1035,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,35
+1036,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,36
+1037,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,37
+1038,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,38
+1039,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,39
+1040,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,40
+1041,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,41
+1042,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,42
+1043,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,43
+1044,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,44
+1045,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,45
+1046,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,46
+1047,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,47
+1048,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,48
+1049,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,49
+1050,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,50
+1051,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,51
+1052,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,52
+1053,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,53
+1054,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,54
+1055,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,55
+1056,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,56
+1057,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,57
+1058,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,58
+1059,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,59
+1060,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,60
+1061,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,61
+1062,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,62
+1063,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,63
+1064,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,64
+1065,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,65
+1066,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,66
+1067,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,67
+1068,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,68
+1069,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,69
+1070,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,70
+1071,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,71
+1072,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,72
+1073,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,73
+1074,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,74
+1075,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,75
+1076,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,76
+1077,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,77
+1078,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,78
+1079,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,79
+1080,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,80
+1081,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,81
+1082,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,82
+1083,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,83
+1084,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,84
+1085,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,85
+1086,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,86
+1087,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,87
+1088,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,88
+1089,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,89
+1090,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,90
+1091,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,91
+1092,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,92
+1093,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,93
+1094,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,abc
+1095,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,95
+1096,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,96
+1097,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,97
+1098,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,98
+1099,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,99
+1100,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,100
+1101,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,101
+1102,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,102
+1103,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,103
+1104,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,104
+1105,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,105
+1106,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,106
+1107,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,107
+1108,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,108
+1109,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,109
+1110,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,110
+1111,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,111
+1112,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,112
+1113,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,113
+1114,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,114
+1115,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,115
+1116,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,116
+1117,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,117
+1118,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,118
+1119,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,119
+
+--- mutate
+load csv "mixed.csv" into node:Item mode overwrite header
+
+--- expect error: Error while parsing value 'abc' as type 'Int64' for column 2 at line 95.
+
+--- query
+query after_mixed() {
+    match { $i: Item }
+    return { count($i) as c, sum($i.n) as s }
+}
+
+--- expect unordered
+{"c":3,"s":60}
+
+--- expect shape
+c: I64
+s: F64
+
+--- csv clean.csv
+id,note,n
+1000,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,0
+1001,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,1
+1002,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,2
+1003,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,3
+1004,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,4
+1005,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,5
+1006,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,6
+1007,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,7
+1008,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,8
+1009,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,9
+1010,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,10
+1011,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,11
+1012,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,12
+1013,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,13
+1014,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,14
+1015,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,15
+1016,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,16
+1017,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,17
+1018,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,18
+1019,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,19
+1020,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,20
+1021,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,21
+1022,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,22
+1023,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,23
+1024,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,24
+1025,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,25
+1026,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,26
+1027,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,27
+1028,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,28
+1029,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,29
+1030,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,30
+1031,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,31
+1032,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,32
+1033,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,33
+1034,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,34
+1035,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,35
+1036,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,36
+1037,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,37
+1038,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,38
+1039,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,39
+1040,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,40
+1041,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,41
+1042,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,42
+1043,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,43
+1044,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,44
+1045,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,45
+1046,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,46
+1047,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,47
+1048,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,48
+1049,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,49
+1050,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,50
+1051,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,51
+1052,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,52
+1053,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,53
+1054,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,54
+1055,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,55
+1056,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,56
+1057,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,57
+1058,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,58
+1059,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,59
+1060,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,60
+1061,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,61
+1062,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,62
+1063,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,63
+1064,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,64
+1065,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,65
+1066,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,66
+1067,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,67
+1068,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,68
+1069,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,69
+1070,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,70
+1071,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,71
+1072,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,72
+1073,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,73
+1074,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,74
+1075,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,75
+1076,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,76
+1077,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,77
+1078,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,78
+1079,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,79
+1080,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,80
+1081,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,81
+1082,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,82
+1083,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,83
+1084,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,84
+1085,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,85
+1086,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,86
+1087,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,87
+1088,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,88
+1089,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,89
+1090,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,90
+1091,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,91
+1092,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,92
+1093,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,93
+1094,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,94
+1095,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,95
+1096,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,96
+1097,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,97
+1098,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,98
+1099,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,99
+1100,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,100
+1101,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,101
+1102,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,102
+1103,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,103
+1104,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,104
+1105,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,105
+1106,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,106
+1107,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,107
+1108,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,108
+1109,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,109
+1110,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,110
+1111,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,111
+1112,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,112
+1113,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,113
+1114,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,114
+1115,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,115
+1116,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,116
+1117,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,117
+1118,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,118
+1119,xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx,119
+
+--- mutate
+load csv "clean.csv" into node:Item mode overwrite header
+
+--- expect ok
+
+--- query
+query reloaded() {
+    match { $i: Item }
+    return { count($i) as c, sum($i.n) as s }
+}
+
+--- expect unordered
+{"c":120,"s":7140}
+
+--- expect shape
+c: I64
+s: F64

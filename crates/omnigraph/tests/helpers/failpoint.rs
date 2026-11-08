@@ -58,6 +58,10 @@ impl Rendezvous {
         self.hold.reached()
     }
 
+    pub fn timed_out(&self) -> bool {
+        self.hold.timed_out()
+    }
+
     /// Release the parked thread so it resumes past the seam.
     pub fn release(&self) {
         self.hold.release();

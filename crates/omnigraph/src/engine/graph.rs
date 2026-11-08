@@ -40,7 +40,7 @@ impl<'a> EmbeddingResolver<'a> {
         Self::Client { cell, config }
     }
 
-    pub(super) fn explain() -> Self {
+    pub(crate) fn explain() -> Self {
         Self::Explain {
             requested: std::sync::atomic::AtomicBool::new(false),
         }
@@ -73,13 +73,31 @@ impl<'a> EmbeddingResolver<'a> {
     }
 }
 
+/// The fusion's output schema: the arm's columns, then the fused score.
+pub(super) fn fused_schema(
+    arm: &arrow_schema::SchemaRef,
+    fused_score: &str,
+) -> arrow_schema::SchemaRef {
+    let mut fields: Vec<arrow_schema::FieldRef> = arm.fields().iter().cloned().collect();
+    fields.push(Arc::new(arrow_schema::Field::new(
+        fused_score,
+        arrow_schema::DataType::Float64,
+        false,
+    )));
+    Arc::new(arrow_schema::Schema::new(fields))
+}
+
 /// Fuse arms sorted by search score and identity; BM25 arms must be uncapped.
-/// Rank each entity once and retain each winning entity's downstream rows.
+/// Rank each entity once, sum `1 / (k + rank)` over the arms that hold it,
+/// and emit every one of its rows with that sum in `fused_score`; the
+/// `Sort` above orders by the sum and the query's `limit` cuts rows there
+/// (RFC 0047 §Total order).
 pub(super) fn fuse_arms(
     primary_batch: &RecordBatch,
     secondary_batch: &RecordBatch,
     rrf: &RrfMode,
     id_col_name: &str,
+    fused_score: &str,
     memory: &WorkMemory,
 ) -> Result<RecordBatch> {
     let work = memory
@@ -131,7 +149,7 @@ pub(super) fn fuse_arms(
     }
 
     let k = rrf.k as f64;
-    let mut scored: Vec<(String, f64)> = all_ids
+    let scored: Vec<(String, f64)> = all_ids
         .iter()
         .map(|id| {
             let p = primary_rank
@@ -145,10 +163,6 @@ pub(super) fn fuse_arms(
             (id.clone(), p + s)
         })
         .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(rrf.limit);
-
-    let winning_ids: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
 
     let mut primary_rows: HashMap<String, Vec<u32>> = HashMap::new();
     for (i, id) in primary_ids.iter().enumerate() {
@@ -160,11 +174,12 @@ pub(super) fn fuse_arms(
     }
 
     build_fused_batch(
-        &winning_ids,
+        &scored,
         primary_batch,
         &primary_rows,
         secondary_batch,
         &secondary_rows,
+        fused_score,
         memory,
     )
 }
@@ -183,14 +198,15 @@ pub(super) fn extract_id_column_by_name(
     Ok((0..ids.len()).map(|i| ids.value(i).to_string()).collect())
 }
 
-/// Gather all rows for `ordered_ids` in entity order, preferring the primary
-/// arm for shared entities and preserving each entity's row order.
-pub(super) fn build_fused_batch(
-    ordered_ids: &[String],
+/// Gather primary rows, then secondary-only rows, in scored entity order
+/// within each arm, preserving each entity's row order and fused score.
+fn build_fused_batch(
+    scored: &[(String, f64)],
     primary_batch: &RecordBatch,
     primary_rows: &HashMap<String, Vec<u32>>,
     secondary_batch: &RecordBatch,
     secondary_rows: &HashMap<String, Vec<u32>>,
+    fused_score: &str,
     memory: &WorkMemory,
 ) -> Result<RecordBatch> {
     let work = memory
@@ -198,40 +214,70 @@ pub(super) fn build_fused_batch(
         .map_err(|error| memory.error(error))?;
     let memory = &work;
     memory.check().map_err(|error| memory.error(error))?;
-    if ordered_ids.is_empty() {
-        return Ok(RecordBatch::new_empty(primary_batch.schema()));
+    let empty = || RecordBatch::new_empty(fused_schema(&primary_batch.schema(), fused_score));
+    if scored.is_empty() {
+        return Ok(empty());
     }
 
-    memory
-        .entries::<RecordBatch>(
-            primary_batch
-                .num_rows()
-                .saturating_add(secondary_batch.num_rows()),
-        )
-        .map_err(|error| memory.error(error))?;
-    let mut row_slices: Vec<RecordBatch> = Vec::with_capacity(ordered_ids.len());
-    for id in ordered_ids {
+    let selected_rows = |id| match (primary_rows.get(id), secondary_rows.get(id)) {
+        (Some(rows), _) => Some((0, rows)),
+        (None, Some(rows)) => Some((1, rows)),
+        (None, None) => None,
+    };
+    let mut counts = [0usize; 2];
+    for (id, _) in scored {
         memory.check().map_err(|error| memory.error(error))?;
-        if let Some(rows) = primary_rows.get(id) {
-            row_slices.push(
-                memory
-                    .take(primary_batch, &UInt32Array::from(rows.clone()))
-                    .map_err(|error| memory.error(error))?,
-            );
-        } else if let Some(rows) = secondary_rows.get(id) {
-            row_slices.push(
-                memory
-                    .take(secondary_batch, &UInt32Array::from(rows.clone()))
-                    .map_err(|error| memory.error(error))?,
-            );
+        if let Some((arm, rows)) = selected_rows(id) {
+            counts[arm] = counts[arm].saturating_add(rows.len());
         }
+    }
+    let rows = counts[0].saturating_add(counts[1]);
+    memory
+        .entries::<RecordBatch>(2)
+        .map_err(|error| memory.error(error))?;
+    memory
+        .entries::<u32>(rows)
+        .map_err(|error| memory.error(error))?;
+    memory
+        .entries::<f64>(rows)
+        .map_err(|error| memory.error(error))?;
+    let mut arms = counts.map(|count| {
+        (
+            Vec::<u32>::with_capacity(count),
+            Vec::<f64>::with_capacity(count),
+        )
+    });
+    for (id, score) in scored {
+        memory.check().map_err(|error| memory.error(error))?;
+        let Some((arm, rows)) = selected_rows(id) else {
+            continue;
+        };
+        let (indices, scores) = &mut arms[arm];
+        indices.extend_from_slice(rows);
+        scores.extend(std::iter::repeat_n(*score, rows.len()));
+    }
+
+    let schema = fused_schema(&primary_batch.schema(), fused_score);
+    let mut row_slices = Vec::with_capacity(2);
+    for (batch, (indices, scores)) in [primary_batch, secondary_batch].into_iter().zip(arms) {
+        if indices.is_empty() {
+            continue;
+        }
+        let gathered = memory
+            .take(batch, &UInt32Array::from(indices))
+            .map_err(|error| memory.error(error))?;
+        let mut columns = gathered.columns().to_vec();
+        columns.push(Arc::new(arrow_array::Float64Array::from(scores)));
+        row_slices.push(
+            RecordBatch::try_new(Arc::clone(&schema), columns)
+                .map_err(OmniError::arrow_internal)?,
+        );
     }
 
     if row_slices.is_empty() {
-        return Ok(RecordBatch::new_empty(primary_batch.schema()));
+        return Ok(empty());
     }
 
-    let schema = row_slices[0].schema();
     memory
         .concat(&schema, &row_slices)
         .map_err(|error| memory.error(error))
@@ -242,8 +288,8 @@ pub(super) fn build_fused_batch(
 /// so a query that is entirely index-served and has no AntiJoin never pays the
 /// O(|E|) CSR build (the whole point of the indexed path). The `Cached` builder
 /// also reuses the cross-query `RuntimeCache` entry; `Direct` builds against an
-/// arbitrary snapshot (time-travel reads); `None` is for queries with no
-/// traversal at all.
+/// arbitrary snapshot (time-travel reads) through its graph's storage; `None`
+/// is for queries with no traversal at all.
 pub struct GraphIndexHandle {
     cell: tokio::sync::OnceCell<Option<Arc<GraphIndex>>>,
     builder: GraphIndexBuilder,
@@ -259,7 +305,12 @@ enum GraphIndexBuilder {
         HashMap<String, (String, String)>,
         SystemColumns,
     ),
-    Direct(Snapshot, HashMap<String, (String, String)>, SystemColumns),
+    Direct(
+        Arc<Omnigraph>,
+        Snapshot,
+        HashMap<String, (String, String)>,
+        SystemColumns,
+    ),
 }
 
 impl GraphIndexHandle {
@@ -283,13 +334,14 @@ impl GraphIndexHandle {
     }
 
     pub(crate) fn direct(
+        db: Arc<Omnigraph>,
         snapshot: Snapshot,
         edge_types: HashMap<String, (String, String)>,
         system_columns: SystemColumns,
     ) -> Self {
         Self {
             cell: tokio::sync::OnceCell::new(),
-            builder: GraphIndexBuilder::Direct(snapshot, edge_types, system_columns),
+            builder: GraphIndexBuilder::Direct(db, snapshot, edge_types, system_columns),
         }
     }
 
@@ -307,10 +359,15 @@ impl GraphIndexHandle {
                                 .await?,
                         ))
                     }
-                    GraphIndexBuilder::Direct(snapshot, edge_types, system_columns) => {
+                    GraphIndexBuilder::Direct(db, snapshot, edge_types, system_columns) => {
                         Ok(Some(Arc::new(
-                            GraphIndex::load_or_build(snapshot, edge_types, None, *system_columns)
-                                .await?,
+                            GraphIndex::load_or_build(
+                                snapshot,
+                                edge_types,
+                                db.storage_adapter(),
+                                *system_columns,
+                            )
+                            .await?,
                         )))
                     }
                 }
@@ -417,11 +474,71 @@ pub(super) fn endpoint_probes(
     probes
 }
 
-/// At most `batch_size` emitted ID pairs, charged to `_memory`.
+/// At most `batch_size` emitted pairs, charged to `_memory`: the source row
+/// ordinals and the destination ids as one `Utf8` column built from the
+/// walk's dictionary.
 pub(super) struct ExpandedPairs {
     pub(super) source_rows: Vec<u32>,
-    pub(super) destination_ids: Vec<String>,
+    pub(super) destination: ArrayRef,
     _memory: WorkMemory,
+}
+
+/// A per-source set member as one key: the source row in the high half, the
+/// dense node in the low half, so every source's visited and emitted sets
+/// share one table instead of one allocation per source row.
+fn source_node_key(source: usize, node: u32) -> u64 {
+    ((source as u64) << 32) | u64::from(node)
+}
+
+/// The destination column of one chunk: `dense` resolved through `ids`, the
+/// dictionary of the walk's destination space, charged to `memory` first.
+fn destination_column(dense: &[u32], ids: &[String], memory: &WorkMemory) -> Result<ArrayRef> {
+    // One pass checks every id against the dictionary and sums the bytes;
+    // the column is then built straight from the dictionary.
+    let mut bytes = 0usize;
+    for &d in dense {
+        let id = ids.get(d as usize).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "dense destination id {d} is outside its dictionary of {} ids",
+                ids.len()
+            ))
+        })?;
+        bytes = bytes.saturating_add(id.len());
+    }
+    memory.string(bytes).map_err(|error| memory.error(error))?;
+    memory
+        .grow((dense.len() + 1).saturating_mul(std::mem::size_of::<i32>()))
+        .map_err(|error| memory.error(error))?;
+    Ok(Arc::new(StringArray::from_iter_values(
+        dense.iter().map(|&d| ids[d as usize].as_str()),
+    )))
+}
+
+/// The pending chunk as pairs ready to emit: its destinations resolved
+/// through `ids`, the dictionary of the source that found them, the buffers
+/// and the emission charge swapped for fresh ones.
+fn take_pending_pairs(
+    emitted_src: &mut Vec<u32>,
+    emitted_dst: &mut Vec<u32>,
+    emission_memory: &mut WorkMemory,
+    ids: &[String],
+    memory: &WorkMemory,
+    chunk_rows: usize,
+) -> Result<ExpandedPairs> {
+    let next_emission = memory
+        .child("expand emissions")
+        .map_err(|error| memory.error(error))?;
+    next_emission
+        .entries::<(u32, u32)>(chunk_rows)
+        .map_err(|error| memory.error(error))?;
+    memory.metric("expand_pairs", emitted_src.len());
+    let destination = destination_column(emitted_dst, ids, emission_memory)?;
+    emitted_dst.clear();
+    Ok(ExpandedPairs {
+        source_rows: std::mem::replace(emitted_src, Vec::with_capacity(chunk_rows)),
+        destination,
+        _memory: std::mem::replace(emission_memory, next_emission),
+    })
 }
 
 pub(super) struct PreparedEdge {
@@ -439,11 +556,20 @@ pub(super) async fn prepare_selected_edges(
         .map_err(|error| memory.error(error))?;
     let mut prepared = Vec::with_capacity(step.members().len());
     for member in step.members() {
+        let table = format!("edge:{}", member.edge_type);
+        let dataset = env.snapshot.open_lance_dataset(&table).await?;
+        super::typed_value::check_stored_schema(
+            &dataset,
+            &env.catalog.edge_types[&member.edge_type].arrow_schema,
+            &table,
+            env.snapshot.contract_covers(&table),
+            [
+                env.catalog.system_columns.src,
+                env.catalog.system_columns.dst,
+            ],
+        )?;
         prepared.push(PreparedEdge {
-            dataset: env
-                .snapshot
-                .open_lance_dataset(&format!("edge:{}", member.edge_type))
-                .await?,
+            dataset,
             probes: endpoint_probes(member.direction, env.catalog.system_columns),
         });
     }
@@ -485,7 +611,7 @@ where
                 .iter()
                 .map(|edge| (edge.dataset.clone(), edge.probes.clone()))
                 .collect();
-            (Some(datasets), HopPolicy::Off)
+            (Some((datasets, None)), HopPolicy::Off)
         }
         ExpandExecution::Named(named) => {
             let start = decide_expand_start(
@@ -506,13 +632,17 @@ where
                 ExpandStart::Indexed {
                     edge_ds,
                     hop_policy,
+                    pushdown,
                 } => {
                     Switch::IndexedScan.record(switch);
                     (
-                        Some(vec![(
-                            *edge_ds,
-                            endpoint_probes(named.member.direction, env.catalog.system_columns),
-                        )]),
+                        Some((
+                            vec![(
+                                *edge_ds,
+                                endpoint_probes(named.member.direction, env.catalog.system_columns),
+                            )],
+                            Some(pushdown),
+                        )),
                         hop_policy,
                     )
                 }
@@ -538,6 +668,10 @@ pub(super) enum ExpandStart {
     Indexed {
         edge_ds: Box<Dataset>,
         hop_policy: HopPolicy,
+        /// Whether the key column's BTREE coverage, as the plan's pinned
+        /// index facts or the runtime probe judged it, makes a pushed
+        /// `key IN (keys)` list index lookups (`scan_edges_stream`).
+        pushdown: bool,
     },
 }
 
@@ -548,11 +682,23 @@ pub(crate) enum ModeOrigin {
     Uncosted,
 }
 
-/// The start the plan recorded on `step`, with the two runtime corrections:
-/// a probed index coverage (or a CSR warmed by an earlier operator) re-runs
-/// the cost model before an indexed start, and the indexed start carries the
-/// per-hop policy that switches mid-flight (issue #533). `frontier_rows` is
-/// the breaker's retained frontier; the streaming single hop has none yet.
+impl ModeOrigin {
+    async fn runtime_coverage(
+        &self,
+        probe: impl Future<Output = Result<crate::table_store::IndexCoverage>>,
+    ) -> Option<Result<crate::table_store::IndexCoverage>> {
+        if matches!(self, Self::Costed(inputs)
+            if inputs.coverage_provenance == omnigraph_planner::CoverageProvenance::PinnedIndexFacts)
+        {
+            None
+        } else {
+            Some(probe.await)
+        }
+    }
+}
+
+/// Correct the recorded mode for the observed frontier and warm CSR, probing
+/// coverage only for legacy plans. The indexed start retains its per-hop policy.
 pub(super) async fn decide_expand_start(
     frontier_rows: Option<usize>,
     graph_index: &GraphIndexHandle,
@@ -602,18 +748,33 @@ pub(super) async fn decide_expand_start(
     }
 
     let edge_ds = snapshot.open_lance_dataset(&edge_table_key).await?;
-    let mut coverage = crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
-    for orientation in endpoint_probes(direction, catalog.system_columns)
-        .iter()
-        .skip(1)
-    {
-        let extra =
-            crate::dataset_index::key_column_index_coverage(&edge_ds, orientation.key).await;
-        coverage = match (coverage, extra) {
-            (Ok(a), Ok(b)) => Ok(worse_coverage(a, b)),
-            (Err(e), _) | (_, Err(e)) => Err(e),
-        };
-    }
+    super::typed_value::check_stored_schema(
+        &edge_ds,
+        &catalog.edge_types[edge_type].arrow_schema,
+        &edge_table_key,
+        snapshot.contract_covers(&edge_table_key),
+        [catalog.system_columns.src, catalog.system_columns.dst],
+    )?;
+    let coverage = named
+        .origin
+        .runtime_coverage(async {
+            let mut coverage =
+                crate::dataset_index::key_column_index_coverage(&edge_ds, key_col).await;
+            for orientation in endpoint_probes(direction, catalog.system_columns)
+                .iter()
+                .skip(1)
+            {
+                let extra =
+                    crate::dataset_index::key_column_index_coverage(&edge_ds, orientation.key)
+                        .await;
+                coverage = match (coverage, extra) {
+                    (Ok(a), Ok(b)) => Ok(worse_coverage(a, b)),
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                };
+            }
+            coverage
+        })
+        .await;
 
     let corrected = match &named.origin {
         ModeOrigin::Costed(inputs) => {
@@ -621,7 +782,9 @@ pub(super) async fn decide_expand_start(
             if let Some(observed) = frontier_rows {
                 inputs.frontier_rows = inputs.frontier_rows.min(observed as u64);
             }
-            inputs.coverage = coverage_for_decision(&coverage);
+            if let Some(coverage) = &coverage {
+                inputs.coverage = coverage_for_decision(coverage);
+            }
             inputs.csr_cached = inputs.csr_cached || graph_index.is_built();
             Some(inputs)
         }
@@ -657,7 +820,16 @@ pub(super) async fn decide_expand_start(
     );
     crate::instrumentation::record_expand_path(true);
     memory.metric("expand_indexed", 1);
-    warn_on_degraded_coverage(&coverage, key_col, edge_type);
+    if let Some(coverage) = &coverage {
+        warn_on_degraded_coverage(coverage, key_col, edge_type);
+    }
+    let pushdown = match &coverage {
+        Some(Ok(crate::table_store::IndexCoverage::Indexed)) => true,
+        Some(_) => false,
+        None => corrected
+            .as_ref()
+            .is_none_or(|inputs| inputs.coverage == omnigraph_planner::IndexCoverage::Indexed),
+    };
     let hop_policy = match corrected {
         Some(inputs) => HopPolicy::Full(inputs),
         None if matches!(named.origin, ModeOrigin::Pinned) => HopPolicy::Off,
@@ -670,6 +842,7 @@ pub(super) async fn decide_expand_start(
     Ok(ExpandStart::Indexed {
         edge_ds: Box::new(edge_ds),
         hop_policy,
+        pushdown,
     })
 }
 
@@ -705,6 +878,9 @@ pub(super) fn bound_edge_pair_schema(
         fields.push(Field::new(EDGE_TYPE_COLUMN, DataType::Utf8, false));
     }
     for (name, prop) in common_edge_properties(catalog, &names) {
+        // Blob properties are never projected, as in node scans: typecheck
+        // refuses a Blob as a `.gq` read value, so this scan leaves its
+        // descriptors unread, and Blob values are read through `read_blob_at`.
         if members.iter().any(|member| {
             catalog.edge_types[&member.edge_type]
                 .blob_properties
@@ -783,14 +959,20 @@ where
     source_memory
         .checkpoint()
         .map_err(|error| memory.error(error))?;
+    let edge_table_key = format!("edge:{edge_type}");
     let dataset = match prepared {
         Some(dataset) => dataset.clone(),
-        None => {
-            snapshot
-                .open_lance_dataset(&format!("edge:{edge_type}"))
-                .await?
-        }
+        None => snapshot.open_lance_dataset(&edge_table_key).await?,
     };
+    super::typed_value::check_stored_schema(
+        &dataset,
+        &catalog.edge_types[edge_type].arrow_schema,
+        &edge_table_key,
+        snapshot.contract_covers(&edge_table_key),
+        [catalog.system_columns.src, catalog.system_columns.dst]
+            .into_iter()
+            .chain(attach_columns.iter().copied()),
+    )?;
     let row_limit = memory.batch_rows();
     let byte_limit = memory.batch_bytes();
     for (probe, orientation) in endpoint_probes(direction, catalog.system_columns)
@@ -804,8 +986,15 @@ where
         let scan_memory = memory
             .child("bound edge scan")
             .map_err(|error| memory.error(error))?;
-        let mut stream =
-            scan_edges_stream(&dataset, orientation, &attach_columns, &keys, &scan_memory).await?;
+        let mut stream = scan_edges_stream(
+            &dataset,
+            orientation,
+            &attach_columns,
+            &keys,
+            None,
+            &scan_memory,
+        )
+        .await?;
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(|error| memory.error(error))?;
             let input_memory = scan_memory
@@ -872,11 +1061,9 @@ where
                 columns,
             )
             .map_err(OmniError::arrow_internal)?;
-            let data: Vec<_> = attach
-                .columns()
-                .iter()
-                .map(|column| column.to_data())
-                .collect();
+            let attach_bytes = memory
+                .row_bytes(&attach)
+                .map_err(|error| memory.error(error))?;
             let mut source_rows = Vec::new();
             let mut edge_rows = Vec::new();
             let mut chunk_bytes = 0usize;
@@ -885,7 +1072,7 @@ where
                     .child("bound edge pairs")
                     .map_err(|error| memory.error(error))?,
             );
-            for row in 0..batch.num_rows() {
+            for (row, attached_bytes) in attach_bytes.into_iter().enumerate() {
                 memory
                     .charge_traversal(1)
                     .map_err(|error| memory.error(error))?;
@@ -898,15 +1085,7 @@ where
                 let edge_row = u32::try_from(row).map_err(|_| {
                     OmniError::manifest_internal("edge batch ordinal exceeds UInt32")
                 })?;
-                let row_bytes = data
-                    .iter()
-                    .try_fold(4usize, |size, column| {
-                        column
-                            .slice(row, 1)
-                            .get_slice_memory_size()
-                            .map(|bytes| size.saturating_add(bytes))
-                    })
-                    .map_err(OmniError::arrow_internal)?;
+                let row_bytes = attached_bytes.saturating_add(4);
                 for &source_row in wide_rows {
                     memory
                         .charge_traversal(1)
@@ -1032,14 +1211,14 @@ pub(super) fn resolve_csr<'g>(
 
 /// Shared BFS keeps one visited set across member orientations and source kinds.
 /// Budgeted indexed hops admit full physical-table rows before endpoint scans.
-/// Only legacy Named can switch to CSR; Named cross-type hops are capped at one.
+/// Only legacy Named can switch to CSR.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_expand_bfs<F>(
     wide: &RecordBatch,
     graph_index: &GraphIndexHandle,
     catalog: &Catalog,
     step: &ExpandStep,
-    start_indexed: Option<Vec<(Dataset, Vec<EndpointColumns>)>>,
+    start_indexed: Option<IndexedStart>,
     hop_policy: HopPolicy,
     side: &Gauge,
     memory: &WorkMemory,
@@ -1080,11 +1259,12 @@ where
         ExpandExecution::Budgeted(_) => None,
     };
     let budgeted = step.budgeted();
-    let max = omnigraph_planner::cost::executed_hops(min_hops, Some(step.max_hops), same_type);
+    let max = step.max_hops;
 
     let mut active = match start_indexed {
-        Some(datasets) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
+        Some((datasets, pushdown)) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
             datasets,
+            pushdown,
             interner: crate::graph_index::TypeIndex::new(),
             neighbor_map: HashMap::new(),
         })),
@@ -1106,11 +1286,13 @@ where
 
     let n = src_ids.len();
     memory
-        .entries::<(Vec<u32>, HashSet<u32>, HashSet<u32>, u32)>(n)
+        .entries::<(Vec<u32>, u64, u32)>(n)
         .map_err(|error| memory.error(error))?;
     let mut frontiers: Vec<Vec<u32>> = Vec::with_capacity(n);
-    let mut visited: Vec<HashSet<u32>> = Vec::with_capacity(n);
-    let mut seen_dst: Vec<HashSet<u32>> = Vec::with_capacity(n);
+    // One table per set over every source row (`source_node_key`): the nodes
+    // a source reached and the destinations it emitted.
+    let mut visited: HashSet<u64, ahash::RandomState> = HashSet::default();
+    let mut seen_dst: HashSet<u64, ahash::RandomState> = HashSet::default();
     for i in 0..n {
         let seed = match &mut active {
             ActiveExpandSource::Indexed(src) => {
@@ -1120,15 +1302,12 @@ where
                 src_idx.to_dense(src_ids.value(i))
             }
         };
-        let mut v = HashSet::new();
         if same_type {
             if let Some(s) = seed {
-                v.insert(s);
+                visited.insert(source_node_key(i, s));
             }
         }
         frontiers.push(seed.map(|s| vec![s]).unwrap_or_default());
-        visited.push(v);
-        seen_dst.push(HashSet::new());
     }
 
     memory.checkpoint().map_err(|error| memory.error(error))?;
@@ -1139,9 +1318,21 @@ where
     let mut frontier_memory = memory
         .child("expand frontier")
         .map_err(|error| memory.error(error))?;
+    emission_memory
+        .entries::<(u32, u32)>(chunk_rows)
+        .map_err(|error| memory.error(error))?;
     let mut emitted_src: Vec<u32> = Vec::with_capacity(chunk_rows);
-    let mut emitted_dst: Vec<String> = Vec::with_capacity(chunk_rows);
+    let mut emitted_dst: Vec<u32> = Vec::with_capacity(chunk_rows);
     let mut prev_union_len: usize = 0;
+    // What one examined neighbour may add: a visited entry, a frontier
+    // entry, an emitted-set entry and a pair. A node admits that bound for
+    // all its neighbours before its slice is walked and settles to what the
+    // walk added once it is done: two pool calls per node, none per edge,
+    // and the held charge is the live state.
+    let per_neighbour_bytes = WorkMemory::entry_bytes::<u64>()
+        .saturating_mul(2)
+        .saturating_add(WorkMemory::entry_bytes::<u32>())
+        .saturating_add(WorkMemory::entry_bytes::<(u32, u32)>());
 
     for hop in 1..=max {
         memory.check().map_err(|error| memory.error(error))?;
@@ -1192,6 +1383,23 @@ where
                 let gi = graph_index.get().await?.ok_or_else(|| {
                     OmniError::manifest("graph index required for CSR traversal".to_string())
                 })?;
+                // The pending chunk's destinations are dense ids of the
+                // interner: they leave now, as strings, before the
+                // dictionaries change. A `Utf8` column has no id space.
+                if !emitted_src.is_empty() {
+                    let ActiveExpandSource::Indexed(src) = &active else {
+                        unreachable!("switch only fires while the Indexed source is active");
+                    };
+                    let pairs = take_pending_pairs(
+                        &mut emitted_src,
+                        &mut emitted_dst,
+                        &mut emission_memory,
+                        src.interner.ids(),
+                        memory,
+                        chunk_rows,
+                    )?;
+                    emit(pairs).await?;
+                }
                 let csr_source = ActiveExpandSource::Csr(resolve_csr(
                     gi,
                     edge_def,
@@ -1210,26 +1418,33 @@ where
                     unreachable!("active source was just replaced with Csr");
                 };
                 hop_memory
-                    .entries::<u32>(
+                    .entries::<u64>(
                         frontiers.iter().map(Vec::len).sum::<usize>()
-                            + visited.iter().map(HashSet::len).sum::<usize>()
-                            + seen_dst.iter().map(HashSet::len).sum::<usize>(),
+                            + visited.len()
+                            + seen_dst.len(),
                     )
                     .map_err(|error| memory.error(error))?;
-                let translate_set =
-                    |set: &HashSet<u32>, idx: &crate::graph_index::TypeIndex| -> HashSet<u32> {
-                        set.iter()
-                            .filter_map(|&d| interner.to_id(d).and_then(|id| idx.to_dense(id)))
-                            .collect()
-                    };
-                for i in 0..n {
-                    frontiers[i] = frontiers[i]
+                let translate_set = |set: &HashSet<u64, ahash::RandomState>,
+                                     idx: &crate::graph_index::TypeIndex|
+                 -> HashSet<u64, ahash::RandomState> {
+                    set.iter()
+                        .filter_map(|&key| {
+                            let (source, dense) = ((key >> 32) as usize, key as u32);
+                            interner
+                                .to_id(dense)
+                                .and_then(|id| idx.to_dense(id))
+                                .map(|dense| source_node_key(source, dense))
+                        })
+                        .collect()
+                };
+                for frontier in frontiers.iter_mut() {
+                    *frontier = frontier
                         .iter()
                         .filter_map(|&d| interner.to_id(d).and_then(|id| src_idx.to_dense(id)))
                         .collect();
-                    visited[i] = translate_set(&visited[i], src_idx);
-                    seen_dst[i] = translate_set(&seen_dst[i], dst_idx);
                 }
+                visited = translate_set(&visited, src_idx);
+                seen_dst = translate_set(&seen_dst, dst_idx);
                 tracing::debug!(
                     target: "omnigraph::traverse",
                     edge = %member.edge_type,
@@ -1267,6 +1482,7 @@ where
                     dataset,
                     probes,
                     &union_keys,
+                    src.pushdown,
                     &mut src.interner,
                     &mut src.neighbor_map,
                     &hop_memory,
@@ -1276,8 +1492,8 @@ where
             }
         }
 
-        for i in 0..n {
-            let cur = std::mem::take(&mut frontiers[i]);
+        for (i, frontier) in frontiers.iter_mut().enumerate() {
+            let cur = std::mem::take(frontier);
             let mut next: Vec<u32> = Vec::new();
             for &node in &cur {
                 let (fwd, rev): (&[u32], &[u32]) = match &active {
@@ -1293,83 +1509,75 @@ where
                         adj_rev.map(|a| a.neighbors(node)).unwrap_or(&[]),
                     ),
                 };
+                let ids: &[String] = match &active {
+                    ActiveExpandSource::Indexed(src) => src.interner.ids(),
+                    ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => dst_idx.ids(),
+                };
+                // Admit what this node's neighbours can add before the walk.
+                let before = memory.charged();
+                memory
+                    .grow((fwd.len() + rev.len()).saturating_mul(per_neighbour_bytes))
+                    .map_err(|error| memory.error(error))?;
+                let mut added = 0usize;
                 for &neighbor in fwd.iter().chain(rev) {
                     if budgeted {
                         memory
                             .charge_traversal(1)
                             .map_err(|error| memory.error(error))?;
-                    } else {
-                        memory.check().map_err(|error| memory.error(error))?;
                     }
                     let is_self = same_type && hop == 1 && neighbor == node;
                     if !is_self && same_type {
-                        if visited[i].contains(&neighbor) {
+                        if !visited.insert(source_node_key(i, neighbor)) {
                             continue;
                         }
-                        memory
-                            .entries::<u32>(1)
-                            .map_err(|error| memory.error(error))?;
-                        visited[i].insert(neighbor);
+                        added = added.saturating_add(WorkMemory::entry_bytes::<u64>());
                     }
                     if !is_self {
-                        next_memory
-                            .entries::<u32>(1)
-                            .map_err(|error| memory.error(error))?;
                         next.push(neighbor);
+                        added = added.saturating_add(WorkMemory::entry_bytes::<u32>());
                     }
-                    if hop >= min_hops && !seen_dst[i].contains(&neighbor) {
-                        memory
-                            .entries::<u32>(1)
-                            .map_err(|error| memory.error(error))?;
-                        seen_dst[i].insert(neighbor);
-                        let dst_id = match &active {
-                            ActiveExpandSource::Indexed(src) => Some(
-                                src.interner
-                                    .to_id(neighbor)
-                                    .expect("interned dst id must resolve"),
-                            ),
-                            ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => {
-                                dst_idx.to_id(neighbor)
-                            }
-                        };
-                        if let Some(dst_id) = dst_id {
-                            emission_memory
-                                .entries::<(u32, String)>(1)
-                                .map_err(|error| memory.error(error))?;
-                            emission_memory
-                                .string(dst_id.len())
-                                .map_err(|error| memory.error(error))?;
-                            emitted_src.push(i as u32);
-                            emitted_dst.push(dst_id.to_string());
-                            if emitted_src.len() >= chunk_rows {
-                                let next = memory
-                                    .child("expand emissions")
-                                    .map_err(|error| memory.error(error))?;
-                                memory.metric("expand_pairs", emitted_src.len());
-                                emit(ExpandedPairs {
-                                    source_rows: std::mem::replace(
-                                        &mut emitted_src,
-                                        Vec::with_capacity(chunk_rows),
-                                    ),
-                                    destination_ids: std::mem::replace(
-                                        &mut emitted_dst,
-                                        Vec::with_capacity(chunk_rows),
-                                    ),
-                                    _memory: std::mem::replace(&mut emission_memory, next),
-                                })
-                                .await?;
-                            }
+                    if hop >= min_hops
+                        && (neighbor as usize) < ids.len()
+                        && seen_dst.insert(source_node_key(i, neighbor))
+                    {
+                        added = added.saturating_add(
+                            WorkMemory::entry_bytes::<u64>()
+                                .saturating_add(WorkMemory::entry_bytes::<(u32, u32)>()),
+                        );
+                        emitted_src.push(i as u32);
+                        emitted_dst.push(neighbor);
+                        if emitted_src.len() >= chunk_rows {
+                            let pairs = take_pending_pairs(
+                                &mut emitted_src,
+                                &mut emitted_dst,
+                                &mut emission_memory,
+                                ids,
+                                memory,
+                                chunk_rows,
+                            )?;
+                            emit(pairs).await?;
                         }
                     }
                 }
+                memory.shrink_to(before.saturating_add(added));
+                memory.check().map_err(|error| memory.error(error))?;
             }
-            frontiers[i] = next;
+            *frontier = next;
         }
         drop(std::mem::replace(&mut frontier_memory, next_memory));
         if let ActiveExpandSource::Indexed(src) = &mut active {
             src.neighbor_map = HashMap::new();
         }
     }
+    let destination = if emitted_src.is_empty() {
+        None
+    } else {
+        let ids: &[String] = match &active {
+            ActiveExpandSource::Indexed(src) => src.interner.ids(),
+            ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => dst_idx.ids(),
+        };
+        Some(destination_column(&emitted_dst, ids, &emission_memory)?)
+    };
     drop(active);
     drop(frontiers);
     drop(visited);
@@ -1377,13 +1585,13 @@ where
     drop(frontier_memory);
     memory.release_work();
 
-    if emitted_src.is_empty() {
+    let Some(destination) = destination else {
         return Ok(());
-    }
+    };
     memory.metric("expand_pairs", emitted_src.len());
     emit(ExpandedPairs {
         source_rows: emitted_src,
-        destination_ids: emitted_dst,
+        destination,
         _memory: emission_memory,
     })
     .await
@@ -1433,9 +1641,9 @@ pub(super) fn bulk_anti_join_mask(
         return Ok(None);
     };
     memory
-        .entries::<bool>(outer_ids.len())
+        .entries::<u64>(outer_ids.len())
         .map_err(|error| memory.error(error))?;
-    let mut keep_mask = Vec::with_capacity(outer_ids.len());
+    let mut counts = Vec::with_capacity(outer_ids.len());
     let mut targets = Vec::new();
     for i in 0..outer_ids.len() {
         memory.check().map_err(|error| memory.error(error))?;
@@ -1453,9 +1661,12 @@ pub(super) fn bulk_anti_join_mask(
             }
             None => 0,
         };
-        keep_mask.push(row_count.holds(matches)?);
+        counts.push(matches);
     }
-    Ok(Some(BooleanArray::from(keep_mask)))
+    memory
+        .entries::<(i64, bool)>(counts.len())
+        .map_err(|error| memory.error(error))?;
+    Ok(Some(row_count.holds_all(&counts)?))
 }
 
 /// Where the shared BFS core reads each hop's neighbors from. The two sources
@@ -1464,16 +1675,24 @@ pub(super) fn bulk_anti_join_mask(
 /// state across the swap instead of restarting.
 ///
 /// Id spaces differ per source: Indexed owns a per-traversal interner (both
-/// endpoint types in ONE dense space — see the cross-type single-hop guard in
-/// `execute_expand_bfs`), Csr borrows the graph index's per-type dictionaries.
+/// endpoint types in ONE dense space, which is sound because
+/// `validate_expand_structure` refuses a cross-type expand a second hop), Csr
+/// borrows the graph index's per-type dictionaries.
 /// A swap therefore translates all live state through the id strings once.
 pub(super) enum ActiveExpandSource<'g> {
     Indexed(Box<IndexedExpandSource>),
     Csr(CsrSource<'g>),
 }
 
+/// An indexed walk's edge datasets with their probes, and the pushdown
+/// verdict the start decision reached (`None`: each scan probes).
+pub(super) type IndexedStart = (Vec<(Dataset, Vec<EndpointColumns>)>, Option<bool>);
+
 pub(super) struct IndexedExpandSource {
     pub(super) datasets: Vec<(Dataset, Vec<EndpointColumns>)>,
+    /// The known coverage verdict for the pushed key list, when the start
+    /// decision judged it; `None` lets each scan probe.
+    pub(super) pushdown: Option<bool>,
     pub(super) interner: crate::graph_index::TypeIndex,
     /// This hop's dense key -> dense neighbors (scan order; duplicates
     /// preserved, like CSR multi-edges). Rebuilt per hop.
@@ -1491,10 +1710,12 @@ pub(super) enum HopPolicy {
 /// One `key IN (keys)` scan per probe, every row's endpoints interned into
 /// `interner` and the opposite appended to `neighbor_map[key]` in scan order
 /// (probe 0's rows, then probe 1's; parallel edges kept, like the CSR).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn scan_neighbor_map(
     edge_ds: &Dataset,
     probes: &[EndpointColumns],
     keys: &[String],
+    pushdown: Option<bool>,
     interner: &mut crate::graph_index::TypeIndex,
     neighbor_map: &mut HashMap<u32, Vec<u32>>,
     hop_memory: &WorkMemory,
@@ -1505,7 +1726,7 @@ pub(super) async fn scan_neighbor_map(
             key: key_col,
             opposite: opp_col,
         } = orientation;
-        let batches = scan_edges(edge_ds, orientation, &[], keys, hop_memory).await?;
+        let batches = scan_edges(edge_ds, orientation, &[], keys, pushdown, hop_memory).await?;
         for batch in &batches {
             let keys = utf8_column(batch, key_col)?;
             let opposites = utf8_column(batch, opp_col)?;
@@ -1553,12 +1774,13 @@ async fn scan_edges(
     orientation: EndpointColumns,
     extras: &[&str],
     keys: &[String],
+    pushdown: Option<bool>,
     memory: &WorkMemory,
 ) -> Result<Vec<RecordBatch>> {
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let stream = scan_edges_stream(ds, orientation, extras, keys, memory).await?;
+    let stream = scan_edges_stream(ds, orientation, extras, keys, pushdown, memory).await?;
     memory
         .collect(stream)
         .await
@@ -1585,11 +1807,19 @@ fn physical_scan_rows<E: std::fmt::Display>(
     })
 }
 
+/// The longest key list an unindexed edge scan still pushes into Lance; see
+/// the pushdown rule in `scan_edges_stream`. The indexed expand path's
+/// frontier ceiling (`OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER`, 1,024 by
+/// default) is this size: a frontier the plan sends to per-hop scans stays
+/// pushed, a bound edge over a larger source set is sieved.
+const PUSHDOWN_KEYS_MAX: usize = 1024;
+
 async fn scan_edges_stream(
     ds: &Dataset,
     orientation: EndpointColumns,
     extras: &[&str],
     keys: &[String],
+    pushdown: Option<bool>,
     memory: &WorkMemory,
 ) -> Result<SendableRecordBatchStream> {
     if memory.traversal_limited() {
@@ -1619,14 +1849,34 @@ async fn scan_edges_stream(
             .copied()
             .filter(|column| *column != key_col && *column != opposite_col),
     );
-    let filter = id_in_list_expr(keys, key_col);
+    // A `key IN (keys)` filter reaches Lance where a BTREE on the key column
+    // turns it into index lookups, and where the list is small: Lance 13
+    // clones a pushed list for every fragment it reads (`filtered_read.rs`
+    // clones `full_filter` per fragment; the physical expression is built
+    // once per distinct expression), but a pushed filter also lets it read
+    // a fragment's other columns only for the rows the key column admits,
+    // one read fewer per fragment no key is in. Up to `PUSHDOWN_KEYS_MAX`
+    // keys the per-fragment clone is cheaper than that read; past it the
+    // engine sieves the batches itself through one set of the keys.
+    let pushdown = match pushdown {
+        Some(true) => true,
+        _ if keys.len() <= PUSHDOWN_KEYS_MAX => true,
+        Some(false) => false,
+        None => matches!(
+            omnigraph_core::dataset_index::key_column_index_coverage(ds, key_col).await,
+            Ok(omnigraph_core::dataset_index::IndexCoverage::Indexed)
+        ),
+    };
+    let filter = pushdown.then(|| id_in_list_expr(keys, key_col));
     let plan = crate::table_store::TableStore::scan_plan_with(
         ds,
         Some(&projection),
         None,
         false,
         |scanner| {
-            scanner.filter_expr(filter);
+            if let Some(filter) = filter {
+                scanner.filter_expr(filter);
+            }
             scanner.batch_size(memory.batch_rows());
             scanner.batch_size_bytes(memory.batch_bytes() as u64);
             Ok(())
@@ -1634,7 +1884,31 @@ async fn scan_edges_stream(
     )
     .await?;
     let (_, stream) = memory.stream(plan).map_err(|error| memory.error(error))?;
-    Ok(stream)
+    if pushdown {
+        return Ok(stream);
+    }
+    let wanted: hashbrown::HashSet<String> = keys.iter().cloned().collect();
+    let schema = stream.schema();
+    let key_col = key_col.to_string();
+    let sieved = stream.map(move |batch| {
+        let batch = batch?;
+        let keys = batch
+            .column_by_name(&key_col)
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                datafusion::common::DataFusionError::Internal(format!(
+                    "edge batch has no Utf8 '{key_col}'"
+                ))
+            })?;
+        let mask = arrow_array::BooleanArray::from_iter(
+            keys.iter()
+                .map(|key| Some(key.is_some_and(|key| wanted.contains(key)))),
+        );
+        Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
+    });
+    Ok(Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, sieved),
+    ))
 }
 
 #[cfg(test)]
@@ -1674,5 +1948,52 @@ mod traversal_scan_admission_tests {
                 .to_string()
                 .contains("physical row count sum overflow")
         );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use omnigraph_planner::{CoverageProvenance, IndexCoverage};
+
+    /// GQT cannot detect a cached metadata probe; an unpolled future proves its absence.
+    #[tokio::test]
+    async fn pinned_facts_never_poll_the_runtime_probe() {
+        for coverage in [IndexCoverage::Indexed, IndexCoverage::Degraded] {
+            let mut inputs = ExpandCostInputs {
+                frontier_rows: 1,
+                edge_count: 10,
+                src_node_count: 10,
+                effective_max_hops: 2,
+                max_hops_cap: 10,
+                max_frontier_cap: 100,
+                coverage,
+                coverage_provenance: CoverageProvenance::PinnedIndexFacts,
+                csr_cached: false,
+                probe_factor: 1.0,
+            };
+            assert!(
+                ModeOrigin::Costed(inputs.clone())
+                    .runtime_coverage(async {
+                        panic!("pinned index facts must not trigger a runtime metadata probe")
+                    })
+                    .await
+                    .is_none()
+            );
+            inputs.coverage_provenance = CoverageProvenance::LegacyAssumed;
+            for origin in [
+                ModeOrigin::Costed(inputs),
+                ModeOrigin::Pinned,
+                ModeOrigin::Uncosted,
+            ] {
+                let probe = origin
+                    .runtime_coverage(async { Ok(crate::table_store::IndexCoverage::Indexed) })
+                    .await;
+                assert!(matches!(
+                    probe,
+                    Some(Ok(crate::table_store::IndexCoverage::Indexed))
+                ));
+            }
+        }
     }
 }

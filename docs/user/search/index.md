@@ -15,6 +15,13 @@ for nearest-neighbor ordering.
 | `bm25($d.body, $q)` | BM25 relevance score. |
 | `rrf(rank_a, rank_b [, k])` | Fuse two rankings with Reciprocal Rank Fusion. The default `k` is 60. |
 
+Search arguments use their declared types. `fuzzy` defaults `max_edits` to 2
+when omitted; a supplied value must be an integer from 0 to 4,294,967,295.
+`rrf` defaults `k` to 60 when omitted; a supplied value must be an integer
+from 1 to 4,294,967,295. A supplied null is an error, including a nullable
+parameter that was omitted from the parameter map. Query text and vectors
+must also be non-null; vector elements must convert to finite F32 values.
+
 Filters in the `match` block are applied before ranking, so `limit 10` means the
 top ten matches that satisfy the graph and property filters.
 
@@ -50,6 +57,12 @@ Raw vectors are ranked with L2 distance. Vectors produced by OmniGraph's
 embedding client are normalized, so L2 and cosine similarity produce the same
 ordering for those generated vectors. See [Embeddings](embeddings.md) for text
 queries and provider configuration.
+
+A `nearest` scan uses a vector index only when the index ranks exactly by L2:
+the IVF_FLAT index with the L2 metric that Omnigraph builds. A vector index
+written another way, for example by another tool (another metric, quantized
+vectors or HNSW), is not used: the scan ranks every row flat, which is exact
+and reads the whole column.
 
 IVF vector searches keep Lance's adaptive one-partition minimum and cap the
 partitions a `nearest` scan reads at 20 per index delta by default. The cap
@@ -89,10 +102,20 @@ Use full-text functions for token search, fuzzy terms, and relevance. Use the
 query language's exact `contains` and `starts_with` predicates for literal,
 case-sensitive substring and prefix matching.
 
+A full-text function needs a full-text index on its property: a one-column
+`@index` or `@key` on a free-text String property of a node. The index's
+analyzer folds case and stems, so `"deep"` matches `"Deep Learning"`. A call
+on any other String property is refused at type checking (`T27`); for an
+enum, compare its values with `=` instead. The check reads only the schema.
+
 `search`, `match_text`, and `fuzzy` are positive predicates in `match`: use
 a standalone call or compare the call to literal `true` with `=`. Other
 comparisons, including `= false`, `!= true`, a Boolean parameter, and a
 call on the right side, are refused at type checking (`T38`).
+
+Separate `not` blocks may reuse a local variable name for different node
+types. Each full-text call uses the index on the type and property bound
+within its own block.
 
 ```gq
 query relevant($q: String) {
@@ -107,10 +130,13 @@ query relevant($q: String) {
 the projected `bm25(...)` must repeat the leading `order` key (`T33`), and
 `nearest(...)` projects its distance the same way; that distance is the
 squared L2 distance Lance ranks by. Without an alias the column is
-`d._score` or `d._distance`. `rrf(...)` in `return` is refused until the
-fused score becomes a column (`T37`), and so is a `nearest(...)` or
-`bm25(...)` that appears only as an `rrf` arm, and so are the predicates
-`search(...)`, `fuzzy(...)` and `match_text(...)` (`T35`).
+`d._score` or `d._distance`. `rrf(...)` projects the fused score under the
+same rule, an `F64` named `d._rrf` after its first arm's binding without an
+alias. A `nearest(...)` or `bm25(...)` that appears only as an `rrf` arm is
+refused (`T33`), and so are the predicates `search(...)`, `fuzzy(...)` and
+`match_text(...)` (`T35`). A relevance ranking orders most relevant first:
+`asc` on a `bm25(...)` or `rrf(...)` order key is refused (`T54`), as any
+modifier on `nearest(...)` is at parse time.
 
 Exact String predicates remain correct without an index. A free-text index does
 not accelerate equality, `starts_with`, or literal substring `contains`.
@@ -131,8 +157,76 @@ query hybrid($vector: Vector(4), $text: String) {
 
 Ranking order is a contract, not a side effect: search-ordered results are
 sorted on the search score itself, including through multi-hop traversals, with
-secondary keys and the entity-id tie-break applied after the score. The full
+secondary keys and the entity-id tie-break applied after the score. A fused
+order sorts every row by the fused score, then the keys written after
+`rrf(...)`, then every binding's id, and `limit` counts rows after that order;
+an entity that fans out to several rows contributes each of them. The full
 ordering contract lives on the [queries page](../queries/index.md).
+
+## Ranking a traversal-reached binding
+
+A search order may rank any binding of the pattern, whichever binding the
+`match` block declares first, and whether or not the ranked binding is
+declared at all:
+
+```gq
+query passages($matter: String, $q: String) {
+  match {
+    $r: SourceRevision { matter_number: $matter }
+    $r hasPassage $p
+  }
+  return { $r.path, $p.locator }
+  order { bm25($p.text, $q) }
+  limit 5
+}
+```
+
+The ranking starts the traversal: the query scans every `Passage`, ranks it
+and keeps the passages the traversal reaches from the selected revision, in
+score order. Ranking a destination therefore costs a scan of the ranked type,
+however few entities the other end reaches. A `nearest()` ranking ranks the
+reached entities, never a global top list that the traversal later cuts.
+
+An `rrf()` whose two arms rank two different bindings one traversal connects,
+directly or over several hops, is refused at type checking (`T59`): a ranking
+starts the traversal at the binding it ranks, and one traversal cannot start
+at both. Rank one binding in both arms, or bindings no traversal joins.
+
+## What a ranked read reports
+
+A read whose order is a search carries a `ranking` object in its JSON
+envelope (`POST /query`, a stored-query call, `omnigraph query --json`, and
+the metadata line of `--format jsonl`). For `hybrid` above, with
+`rrf(...) as score` in `return`:
+
+```json
+"ranking": {
+  "by": "rrf",
+  "order": "descending",
+  "exhaustive": true,
+  "score_columns": ["score"]
+}
+```
+
+`by` is the search function the order names: `nearest`, `bm25` or `rrf`.
+`order` says which way the score ranks: `ascending` for a `nearest` distance,
+where smaller is nearer, and `descending` for a `bm25` or fused score, where
+larger is more relevant.
+
+`exhaustive` says what this run did. When it is `true`, no row the search
+admitted and did not return ranks above a returned row. `bm25` scores every
+match, so it is always exhaustive. A `nearest` search is exhaustive when it
+searched every partition of the vector index, scored every row without one,
+or returned every row it admitted. It is `false` when the `ann_nprobes` cap
+left partitions unsearched, so a nearer row may exist; raising the cap
+searches more. An `rrf(...)` is exhaustive when its `nearest` arm is.
+
+`score_columns` lists the returned columns that hold the ranking's own
+score, in return order. Two columns that return one score both appear; a
+column computed from the score, such as `bm25(...) > 0.0 as hit`, does not.
+It is empty when the read returns no score. The object never carries a query
+text, vector or other parameter value, and a read whose order is no search
+has no `ranking`.
 
 ## Indexes
 
@@ -151,13 +245,23 @@ declarations do not currently create property indexes.
 
 Indexes are derived performance data. A new declaration may still be pending,
 and newly written entities may fall outside existing coverage. Queries remain
-correct by scanning missing or uncovered data; vector search falls back to an
-exact scan when needed. Run:
+correct by scanning missing or uncovered data: full-text functions match the
+scanned rows with the index's analyzer, and vector search falls back to an
+exact scan when needed. Every write records a declared full-text index's
+analyzer before its postings are built. A table version written by an older
+release may hold rows and no part of the index at all; a full-text call on
+it is refused before any scan with HTTP `409` and a
+`full_text_index_required` detail naming `Type.property`, never answered
+with a case-sensitive scan. Build the index to lift it:
+`omnigraph index build --target <target> --branch <branch>`, on any branch.
+Historical snapshots of that version stay refused. Run:
 
 ```bash
-omnigraph optimize graph.omni
+omnigraph optimize --target ./graph.omni
 ```
 
 after a large load or merge, and on a regular maintenance cadence, to refresh
-coverage and compact data. An empty vector property remains pending until it has a
+coverage and compact data on `main`. On another branch, `index build` builds the
+branch's missing indexes and refreshes lagging BTREE and vector coverage; see
+[Build indexes](../operations/maintenance.md#build-indexes). An empty vector property remains pending until it has a
 non-null vector to index.

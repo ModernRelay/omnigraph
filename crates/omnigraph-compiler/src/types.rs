@@ -16,6 +16,29 @@ pub fn check_date_literal(value: &str) -> Result<(), String> {
     ))
 }
 
+/// Refuse a `DateTime` string with a non-zero fractional digit past the third.
+/// A `DateTime` is Arrow `Date64` milliseconds and its parsers floor the rest, so
+/// `00:00:00.123456Z` would store and compare as `00:00:00.123Z`.
+///
+/// # Errors
+///
+/// The refusal message naming `value`. Only precision is judged: a string that
+/// is not a `DateTime` at all can pass, and the parser refuses it.
+pub fn check_datetime_literal(value: &str) -> Result<(), String> {
+    let after_point = value.split_once('.').map_or("", |(_, rest)| rest);
+    let millisecond_exact = after_point
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .skip(3)
+        .all(|digit| digit == b'0');
+    if millisecond_exact {
+        return Ok(());
+    }
+    Err(format!(
+        "invalid DateTime literal '{value}': a DateTime has millisecond precision; fractional-second digits past the third must be zero"
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScalarType {
     String,
@@ -145,6 +168,15 @@ impl std::fmt::Display for ScalarType {
     }
 }
 
+/// The index a one-column `@index` or `@key` declaration builds on a node
+/// property: a scalar BTREE, a full-text inverted index or a vector index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropIndexKind {
+    Btree,
+    FullText,
+    Vector,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PropType {
     pub scalar: ScalarType,
@@ -200,6 +232,34 @@ impl PropType {
         self.enum_values.is_some()
     }
 
+    /// The index a one-column `@index`/`@key` declaration on a node property
+    /// of this type builds, `None` when the type is not indexable (a list or a
+    /// `Blob`). Enums are physically `String` but filtered by equality, so
+    /// they take a scalar BTREE, not a full-text index (Lance never consults
+    /// an inverted index for `=` or a range); free-text Strings take the
+    /// full-text index `search`, `fuzzy`, `match_text` and `bm25` read. The
+    /// one rule the type checker (`T27`) and index maintenance share.
+    pub fn index_kind(&self) -> Option<PropIndexKind> {
+        if self.list {
+            return None;
+        }
+        match self.scalar {
+            ScalarType::String if !self.is_enum() => Some(PropIndexKind::FullText),
+            ScalarType::Vector(_) => Some(PropIndexKind::Vector),
+            ScalarType::String
+            | ScalarType::DateTime
+            | ScalarType::Date
+            | ScalarType::I32
+            | ScalarType::I64
+            | ScalarType::U32
+            | ScalarType::U64
+            | ScalarType::F32
+            | ScalarType::F64
+            | ScalarType::Bool => Some(PropIndexKind::Btree),
+            ScalarType::Blob => None,
+        }
+    }
+
     pub fn to_arrow(&self) -> DataType {
         let scalar_dt = self.scalar.to_arrow();
         if self.list {
@@ -243,6 +303,139 @@ impl PropType {
             wrapped
         }
     }
+}
+
+/// An expression's value type and nullability, independent of enum membership.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExprType {
+    Value {
+        scalar: ScalarType,
+        list: bool,
+        nullable: bool,
+    },
+    Node {
+        type_name: String,
+    },
+    /// Internal exact comparison carrier, never a declared parameter or result.
+    ExactInteger {
+        list: bool,
+        nullable: bool,
+    },
+}
+
+impl ExprType {
+    pub fn from_prop(prop: &PropType) -> Self {
+        Self::Value {
+            scalar: prop.scalar,
+            list: prop.list,
+            nullable: prop.nullable,
+        }
+    }
+
+    pub fn nullable(&self) -> bool {
+        match self {
+            Self::Value { nullable, .. } | Self::ExactInteger { nullable, .. } => *nullable,
+            Self::Node { .. } => false,
+        }
+    }
+
+    pub fn is_list(&self) -> bool {
+        match self {
+            Self::Value { list, .. } | Self::ExactInteger { list, .. } => *list,
+            Self::Node { .. } => false,
+        }
+    }
+
+    /// Domain equality retains list shape and ignores only outer nullability.
+    pub fn same_domain(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Value {
+                    scalar: left,
+                    list: ll,
+                    ..
+                },
+                Self::Value {
+                    scalar: right,
+                    list: rl,
+                    ..
+                },
+            ) => left == right && ll == rl,
+            (Self::ExactInteger { list: left, .. }, Self::ExactInteger { list: right, .. }) => {
+                left == right
+            }
+            (Self::Node { type_name: left }, Self::Node { type_name: right }) => left == right,
+            _ => false,
+        }
+    }
+
+    /// The scalar comparison carrier shared by exact values and aggregate state.
+    pub const fn exact_integer_arrow() -> DataType {
+        DataType::Decimal128(38, 0)
+    }
+
+    pub fn spelling(&self) -> String {
+        match self {
+            Self::Value {
+                scalar,
+                list,
+                nullable,
+            } => PropType {
+                scalar: *scalar,
+                nullable: *nullable,
+                list: *list,
+                enum_values: None,
+            }
+            .display_name(),
+            Self::Node { type_name } => type_name.clone(),
+            Self::ExactInteger { list, nullable } => format!(
+                "{}{}",
+                if *list {
+                    "[exact_integer]"
+                } else {
+                    "exact_integer"
+                },
+                if *nullable { "?" } else { "" }
+            ),
+        }
+    }
+
+    /// Arrow type for values; node object fields are supplied by the catalog.
+    pub fn to_arrow(&self) -> Option<DataType> {
+        match self {
+            Self::Value {
+                scalar,
+                list,
+                nullable,
+            } => Some(
+                PropType {
+                    scalar: *scalar,
+                    nullable: *nullable,
+                    list: *list,
+                    enum_values: None,
+                }
+                .to_arrow(),
+            ),
+            Self::Node { type_name: _ } => None,
+            Self::ExactInteger { list, .. } => Some(if *list {
+                DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
+                    "item",
+                    Self::exact_integer_arrow(),
+                    true,
+                )))
+            } else {
+                Self::exact_integer_arrow()
+            }),
+        }
+    }
+}
+
+/// One aggregate call's logical signature, decided by typecheck.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AggSignature {
+    pub arg: ExprType,
+    pub result: ExprType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

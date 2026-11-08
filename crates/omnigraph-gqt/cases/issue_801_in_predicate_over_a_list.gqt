@@ -2,7 +2,7 @@
 # red_on: 8bc9aa5f; step 1 fails with `type error: T41: a filter must be Boolean, got String`: with no `in` operator the match body parses as three filter clauses `$m.number`, `in`, `$ms` (v0.11.0: parse error `expected comp_op` at `in`).
 # notes: `expr in $list` and `expr in [..]` select the members of the set and push the test into the scan, on a plain
 # notes: scan and a traversal destination; a null needle reads null and an empty set matches nothing, under `not` too,
-# notes: in a read and in a mutation `where`. On a filter `in` selects what `=` selects, an F32 column included.
+# notes: in a read and in a mutation `where`. Both `in` and `=` use the declared numeric domain; F32 0.1 differs from the F64 literal 0.1.
 # notes: The edge `In` is followed as `$p "in" $m`; a bare `$p in $m` is the membership test.
 
 --- runner
@@ -269,13 +269,14 @@ query member_of_an_f32_column() {
 }
 
 --- expect unordered
-{"m.mid": "m1"}
 
 --- expect shape
 m.mid: String
 
 --- expect plan
 scan Matter as $m: filter reads [m.weight]
+cast $m.weight: F32? -> F64?
+type [0.1, 0.7]: [F64]
 
 --- query
 set engine = v2;
@@ -288,10 +289,13 @@ query equal_on_an_f32_column() {
 }
 
 --- expect unordered
-{"m.mid": "m1"}
 
 --- expect shape
 m.mid: String
+
+--- expect plan
+cast $m.weight: F32? -> F64?
+type 0.1: F64
 
 --- query
 set engine = v2;

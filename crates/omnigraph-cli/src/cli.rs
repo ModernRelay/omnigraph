@@ -1,87 +1,62 @@
 //! The clap surface: every command, subcommand, and argument struct
-//! (moved verbatim from main.rs in the modularization).
+//! Profiles select control operations; targets select resources.
 
-use super::*;
+pub(crate) use crate::commands::cluster::{ClusterCommand, ClusterMembersCommand, ClusterRunArgs};
+pub(crate) use crate::commands::control::{GraphsCommand, PolicyCommand, QueriesCommand};
+pub(crate) use crate::commands::local::SkillCommand;
+pub(crate) use crate::commands::mcp::McpArgs;
+pub(crate) use crate::commands::studio::StudioArgs;
+pub(crate) use crate::commands::targets::{AccessArgs, CredentialCommand, TargetCommand};
+pub(crate) use crate::managed::args::{
+    OrganizationArgs, OrganizationCommand, OrganizationInvitationsCommand,
+    OrganizationMembersCommand,
+};
+use clap::{Parser, Subcommand};
 
-pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
+pub(crate) use crate::commands::history::{BranchCommand, ChangesCommand, CommitCommand};
+use crate::commands::history::{DiffArgs, SnapshotArgs};
+pub(crate) use crate::commands::maintenance::IndexCommand;
+use crate::commands::maintenance::{
+    CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
+};
+use crate::commands::query::{AliasArgs, CatalogueArgs, MutateArgs, QueryArgs};
+pub(crate) use crate::commands::schema::SchemaCommand;
+use crate::commands::schema::{InitArgs, LintArgs};
+pub(crate) use crate::commands::transfer::{BlobCommand, CliLoadMode};
+use crate::commands::transfer::{ExportArgs, LoadArgs};
+use crate::embed::EmbedArgs;
 
 #[derive(Debug, Parser)]
 #[command(name = "omnigraph")]
 #[command(about = "Omnigraph graph database CLI")]
-#[command(version = env!("CARGO_PKG_VERSION"), disable_version_flag = true)]
-// Subcommands render in declaration order (clap can't print labeled headings
-// between groups), so this legend names the capability each command needs —
-// the user-facing vocabulary (RFC-011). `Plane` stays the internal classifier.
-#[command(after_help = "\
-COMMANDS BY CAPABILITY:\n  \
-any — run against a graph, served (--server / --profile) or embedded (--store / a \
-URI): query, mutate, load, blob, branch, snapshot, export, commit, changes, schema show/apply.\n  \
-served — require a server: graphs (registry scope).\n  \
-direct — direct storage access; reject --server (init, upgrade, optimize, rebuild-full-text-indexes, \
-repair, cleanup, schema plan, lint).\n  \
-control — manage or inspect a cluster (cluster via --config; policy & queries via \
---cluster).\n  \
-local — no explicit graph scope; local config & tooling: alias, embed, login, logout, profile, version.\n\
-MANAGED FOLDERS: cluster commands use .omnigraph/context; data commands acquire identity credentials automatically.\n\
-Implicit query, mutate, load and commit list/show use folder context and require --graph.\n\
-Explicit target selectors retain ordinary addressing; competing ambient targets refuse.\n\
---direct selects ordinary addressing, including operator profiles and defaults.\n\
-See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
+#[command(version = crate::commands::local::output::PACKAGE_VERSION.as_str(), disable_version_flag = true)]
+#[command(
+    after_help = "Select resources with --target and account operations with --profile.
+--operator-config selects one operator file.
+--config supplies deployment sources. Use config validate and target inspect for offline checks.
+First time using Omnigraph: call the omnigraph skill (`omnigraph skill show`) before a schema or query."
+)]
 pub(crate) struct Cli {
-    /// Explicitly use legacy addressing and credentials, ignoring folder context.
-    #[arg(long, global = true)]
-    pub(crate) direct: bool,
+    #[arg(long, global = true, help = "Named profile for control-plane operations; otherwise defaults.profile", conflicts_with = "target", value_parser = crate::invocation::single_selector("--profile"))]
+    pub(crate) profile: Option<String>,
+    #[arg(long, global = true, help = "Use this operator configuration file instead of the default, without merging", value_parser = crate::invocation::single_selector("--operator-config"))]
+    pub(crate) operator_config: Option<String>,
+    /// Named resource target or inline local storage address; otherwise defaults.target.
+    #[arg(long, global = true, value_name = "NAME|ADDRESS", value_parser = crate::invocation::single_selector("--target"))]
+    pub(crate) target: Option<String>,
 
     /// Actor id for direct-engine writes and actor-bound cluster operations;
-    /// overrides `operator.actor`. No effect on remote writes (the server
-    /// resolves the actor from the bearer token). With a policy configured
-    /// but no actor set, the operation is denied — see
-    /// docs/user/operations/policy.md.
-    #[arg(long = "as", global = true, value_name = "ACTOR")]
+    /// On a served write, and on every request `mcp` relays, it is an assertion:
+    /// the request carries `omnigraph-if-actor`, and the server refuses it
+    /// before anything runs when the bearer token resolves to another actor.
+    /// With a policy configured but no actor set, a direct operation is
+    /// denied — see docs/user/operations/policy.md.
+    #[arg(long = "as", global = true, value_name = "ACTOR", value_parser = crate::invocation::single_selector("--as"))]
     pub(crate) as_actor: Option<String>,
 
-    /// Address a server by name (resolves to its `url` from `servers:` in
-    /// ~/.omnigraph/config.yaml) or by a literal `http(s)://` URL. Exclusive
-    /// with a positional URI.
-    #[arg(long, global = true, value_name = "NAME|URL")]
-    pub(crate) server: Option<String>,
-
-    /// Select a graph within a multi-graph scope: on a `--server` it appends
-    /// `/graphs/<id>` to the server url; on `--cluster` it picks which cluster
-    /// graph to maintain. Rejected on a single-graph address (a positional URI /
-    /// `--store`). Required for managed queries, mutations, loads, commit reads,
-    /// and legacy restricted token issuance with `--actions`.
-    #[arg(long, global = true, value_name = "GRAPH_ID")]
+    /// Graph within a server or direct-root target; overrides default_graph.
+    #[arg(long, global = true, value_name = "GRAPH_ID", value_parser = crate::invocation::single_selector("--graph"))]
     pub(crate) graph: Option<String>,
-
-    /// Select a named scope bundle from `profiles:` in
-    /// ~/.omnigraph/config.yaml: fills in this command's omitted addressing
-    /// (server/cluster/store + default graph). Falls back to
-    /// $OMNIGRAPH_PROFILE. Config data, not state — every command resolves
-    /// scope fresh.
-    #[arg(long, global = true, value_name = "NAME")]
-    pub(crate) profile: Option<String>,
-
-    /// Address a single graph's storage directly: a `file://`, `s3://`, or
-    /// `az://` store URI. Azure is a qualification preview: code, Azurite,
-    /// and a safe live managed-identity smoke are complete; adversarial
-    /// qualification remains pending.
-    /// Explicit, ad-hoc direct access — bypasses any server. Azure write
-    /// commands still require the root-scoped external admission wrapper.
-    /// Exclusive with a positional URI / `--server`.
-    #[arg(long, global = true, value_name = "URI")]
-    pub(crate) store: Option<String>,
-
-    /// Address a cluster-managed graph's storage for maintenance:
-    /// a cluster directory or storage-root URI — named via `clusters:` in
-    /// ~/.omnigraph/config.yaml, or a literal `file://`/`s3://`/`az://` root. Pair
-    /// with `--graph <id>` to select the graph. Used by optimize /
-    /// rebuild-full-text-indexes / repair / cleanup. Azure is a qualification
-    /// preview pending adversarial live qualification, and its maintenance still
-    /// requires the cluster-root external admission wrapper. Exclusive with a
-    /// positional URI / `--store` / `--server`.
-    #[arg(long, global = true, value_name = "DIR|URI")]
-    pub(crate) cluster: Option<String>,
 
     /// Skip the confirmation prompt for a destructive write (`cleanup`,
     /// overwrite `load`, `branch delete`) against a non-local scope.
@@ -90,196 +65,61 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) yes: bool,
 
-    /// Suppress the one-line resolved-write-target diagnostic that write
-    /// commands echo to stderr.
-    #[arg(long, global = true)]
-    pub(crate) quiet: bool,
-
     #[command(subcommand)]
     pub(crate) command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    // ── Data plane ── run against a graph (embedded or via --server).
-    /// Execute a read query, `branch list`, or an `explain` statement against a branch or snapshot.
-    ///
-    /// Canonical read endpoint, paired with `mutate`; `read` is a visible alias that warns.
-    #[command(visible_alias = "read")]
-    Query {
-        /// Query name. With no `--query`/`-e`, the stored query to invoke from
-        /// the catalog (served — addressed via --server/--profile). With
-        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
-        name: Option<String>,
-        /// Ad-hoc query file (a `.gq` you're authoring / break-glass), one
-        /// `branch list` statement, or one `explain query …` statement, which
-        /// answers the plan the query would run under as results.
-        #[arg(long, conflicts_with = "query_string")]
-        query: Option<PathBuf>,
-        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
-        /// the `branch list` statement, which takes no name, params, --branch
-        /// or --snapshot, or an `explain query …` statement.
-        #[arg(
-            short = 'e',
-            long = "query-string",
-            value_name = "GQ",
-            conflicts_with = "query"
-        )]
-        query_string: Option<String>,
+    /// Manage people and invitations in the selected organization.
+    #[command(visible_alias = "org")]
+    Organization {
         #[command(flatten)]
-        params: ParamsArgs,
-        #[arg(long, conflicts_with = "snapshot")]
-        branch: Option<String>,
-        #[arg(long, conflicts_with = "branch")]
-        snapshot: Option<String>,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long, conflicts_with = "json")]
-        format: Option<ReadOutputFormat>,
-        #[arg(long, conflicts_with = "format")]
-        json: bool,
+        args: OrganizationArgs,
+        #[command(subcommand)]
+        command: OrganizationCommand,
     },
+    // Graph operations.
+    /// Execute a read query, a branch read (`branch list`, `branch diff`, `branch merge-base`, `branch merge … dry run`), or an `explain` statement against a branch or snapshot.
+    ///
+    /// Run a read query.
+    Query(QueryArgs),
+    /// Query this binary's engine catalogue without storage, configuration or credentials.
+    Catalogue(CatalogueArgs),
     /// Execute a mutation, or one `branch create`/`delete`/`merge` statement.
     ///
-    /// Canonical mutation endpoint, paired with `query`; `change` is a visible alias that warns.
-    #[command(visible_alias = "change")]
-    Mutate {
-        /// Query name. With no `--query`/`-e`, the stored mutation to invoke
-        /// from the catalog (served — addressed via --server/--profile). With
-        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
-        name: Option<String>,
-        /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass), or
-        /// one `branch create`/`branch delete`/`branch merge` statement.
-        #[arg(long, conflicts_with = "query_string")]
-        query: Option<PathBuf>,
-        /// Inline ad-hoc GQ source — alternative to `--query <path>`. May be
-        /// one `branch create`/`branch delete`/`branch merge` statement, which
-        /// takes no name, params, --branch or --if-commit.
-        #[arg(
-            short = 'e',
-            long = "query-string",
-            value_name = "GQ",
-            conflicts_with = "query"
-        )]
-        query_string: Option<String>,
-        #[command(flatten)]
-        params: ParamsArgs,
-        #[arg(long)]
-        branch: Option<String>,
-        /// Compare-and-swap precondition: run only if the branch's head
-        /// commit id (from `omnigraph query --json` or `omnigraph commit list`)
-        /// still equals this value.
-        /// A lost race exits with code 4 and, with --json, the structured
-        /// `precondition_failure` body — re-read the branch and decide again.
-        #[arg(long = "if-commit", value_name = "COMMIT_ID")]
-        if_commit: Option<String>,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    /// Run a mutation.
+    Mutate(MutateArgs),
     /// Invoke an operator alias.
     ///
     /// An alias is a personal binding under `aliases:` in
-    /// ~/.omnigraph/config.yaml — name → (server, graph, stored-query name,
-    /// default params). `omnigraph alias <name> [args]` invokes the bound
+    /// ~/.omnigraph/config.yaml — name → (target, graph, stored-query name,
+    /// default params). `omnigraph alias <name> --params '{"key":"value"}'` invokes the bound
     /// stored query on its server. Living in its own namespace, an alias can
     /// never shadow or be shadowed by a built-in verb. Replaces the removed
     /// `--alias` flag on `query`/`mutate`.
-    Alias {
-        /// Alias name (a key under `aliases:` in ~/.omnigraph/config.yaml).
-        name: String,
-        /// Positional args bound to the alias's declared `args` params, in order.
-        args: Vec<String>,
-        #[command(flatten)]
-        params: ParamsArgs,
-        #[arg(long, conflicts_with = "json")]
-        format: Option<ReadOutputFormat>,
-        #[arg(long, conflicts_with = "format")]
-        json: bool,
-    },
+    Alias(AliasArgs),
     /// Load data into a graph (local, remote, or the selected managed cluster)
-    Load {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        data: PathBuf,
-        /// Target branch (defaults to main). Without --from it must exist.
-        #[arg(long)]
-        branch: Option<String>,
-        /// Base branch to fork --branch from when it doesn't exist yet.
-        /// Without this flag a missing branch is an error, never a fork.
-        #[arg(long)]
-        from: Option<String>,
-        /// How existing entities are handled: overwrite | append | merge.
-        /// Required — overwrite is destructive, so there is no default.
-        #[arg(long)]
-        mode: CliLoadMode,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
-        /// stores only: no served load route carries a `settings` field.
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Deprecated permissive loader (defaults: --mode merge, --from main; canonical current output)
-    #[command(hide = true)]
-    Ingest {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        data: PathBuf,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        from: Option<String>,
-        #[arg(long, default_value = "merge")]
-        mode: CliLoadMode,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set stage_write_concurrency=8`. Embedded
-        /// stores only: no served load route carries a `settings` field.
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Load(LoadArgs),
     /// Branch operations
     Branch {
         #[command(subcommand)]
         command: BranchCommand,
     },
     /// Show graph snapshot
-    Snapshot {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Snapshot(SnapshotArgs),
     /// Export a full graph snapshot as JSONL
-    Export {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long, hide = true)]
-        jsonl: bool,
-        #[arg(long = "type")]
-        type_names: Vec<String>,
-    },
-    /// Read one logical node or edge Blob cell.
+    Export(ExportArgs),
+    /// Read, replace or clear one logical node or edge Blob cell.
     Blob {
         #[command(subcommand)]
         command: BlobCommand,
     },
+    /// Net entity changes between two read targets: a branch (its head now)
+    /// or a graph commit id. Auto-paginates; `branch diff` reviews a branch
+    /// against its merge base, `commit changes` reports one commit with its
+    /// cause.
+    Diff(DiffArgs),
     /// Commit history operations
     Commit {
         #[command(subcommand)]
@@ -301,107 +141,28 @@ pub(crate) enum Command {
         command: GraphsCommand,
     },
 
-    // ── Storage / local graph ops ── direct storage or local files; reject --server.
+    // ── Storage / local graph ops ── direct storage or local files.
     /// Initialize a new graph from a schema
-    Init {
-        #[arg(long)]
-        schema: PathBuf,
-        /// Graph URI (local path, s3://, or az://). Azure is a qualification
-        /// preview pending adversarial live qualification; initialization is
-        /// a write and requires the root-scoped external admission wrapper.
-        uri: String,
-        /// Replace orphan schema artifacts only after proving that the URI
-        /// has no `__manifest`. Without this flag, init refuses a URI that
-        /// already holds a graph manifest or any schema artifact. This flag never
-        /// overwrites an initialized graph or purges its Lance datasets.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Upgrade graph storage offline using registered migration handlers
-    Upgrade {
-        /// Standalone graph storage URI; alternatively use --store
-        uri: Option<String>,
-        /// Run read-only preflight without conversion or recovery writes
-        #[arg(long)]
-        check: bool,
-        /// Requested storage format (defaults to the binary's declared target)
-        #[arg(long, value_name = "N")]
-        to_format: Option<u32>,
-        #[arg(long)]
-        json: bool,
-    },
+    Init(InitArgs),
+    /// Convert a standalone graph's storage offline from format v8, v9 or v13 to
+    /// the current format this binary serves (v16); other formats are rebuilt by export and load
+    Upgrade(UpgradeArgs),
     /// Compact small Lance fragments in every backing dataset of the graph
-    Optimize {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        json: bool,
+    Optimize(OptimizeArgs),
+    /// Build or rebuild one branch's declared indexes
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
     },
-    /// Rebuild all full-text indexes from one branch's current rows
-    ///
-    /// Uses the default English analyzer; replaces any custom tokenizer settings.
-    RebuildFullTextIndexes {
-        /// Graph storage URI; alternatively use --store or --cluster/--graph
-        uri: Option<String>,
-        /// Branch to rebuild; other branches and historical snapshots are unchanged
-        #[arg(long, default_value = "main")]
-        branch: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Classify and explicitly repair graph-manifest/Lance-HEAD drift
-    Repair {
-        /// Graph URI
-        uri: Option<String>,
-        /// Publish verified maintenance drift. Without this flag, repair only
-        /// previews what it would do.
-        #[arg(long)]
-        confirm: bool,
-        /// Also publish suspicious or unverifiable drift. Requires
-        /// `--confirm`; use only after operator review.
-        #[arg(long, requires = "confirm")]
-        force: bool,
-        #[arg(long)]
-        json: bool,
-    },
+    /// Deprecated spelling of `index rebuild --kind full-text`
+    #[command(hide = true)]
+    RebuildFullTextIndexes(RebuildFullTextIndexesArgs),
+    /// Diagnose foreign Lance HEAD movement without adopting it.
+    Repair(RepairArgs),
     /// Remove old Lance versions from every backing dataset of the graph (destructive)
-    Cleanup {
-        /// Graph URI
-        uri: Option<String>,
-        /// Number of recent versions to keep per dataset. Either `--keep` or
-        /// `--older-than` (or both) must be set.
-        #[arg(long)]
-        keep: Option<u32>,
-        /// Only remove versions older than this duration. Accepts Go-style
-        /// durations: `7d`, `24h`, `90m`. At least one of --keep / --older-than.
-        #[arg(long)]
-        older_than: Option<String>,
-        /// Required to actually run; without it, prints what would be removed
-        #[arg(long)]
-        confirm: bool,
-        #[arg(long)]
-        json: bool,
-    },
+    Cleanup(CleanupArgs),
     /// Validate queries against a schema (offline) or repo (repo-backed).
-    ///
-    /// Canonical name is `lint` (matches the `omnigraph_compiler::lint`
-    /// module and the `OG-XXX-NNN` lint-code vocabulary). Replaces the
-    /// deprecated `omnigraph query lint` / `omnigraph query check` /
-    /// `omnigraph check` invocations — each is kept as an argv-level
-    /// shim that prints a one-line stderr warning and rewrites to
-    /// `omnigraph lint`. Aliases are deliberately *not* exposed via
-    /// clap's `visible_alias` because that would advertise two
-    /// equivalent canonical names, which agents emit interchangeably.
-    Lint {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        query: PathBuf,
-        #[arg(long)]
-        schema: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
+    Lint(LintArgs),
     /// Operate on the server-side stored-query registry (`queries:`).
     Queries {
         #[command(subcommand)]
@@ -409,7 +170,7 @@ pub(crate) enum Command {
     },
 
     // ── Control plane ── manage a cluster directory (--config <dir>).
-    /// Manage cluster configuration or the folder's selected managed cluster.
+    /// Deploy and inspect the selected cluster target.
     Cluster {
         #[command(subcommand)]
         command: ClusterCommand,
@@ -422,723 +183,79 @@ pub(crate) enum Command {
     },
     /// Generate, clean, or refresh explicit seed embeddings
     Embed(EmbedArgs),
-    /// Store a bearer token for a named server (0600 credentials file). Token
-    /// via --token or piped on stdin; see the CLI reference for token resolution.
+    /// Sign in to an existing managed profile, or explicitly create one.
     Login {
-        /// Server name (keys the credential; declare its url under
-        /// `servers:` in ~/.omnigraph/config.yaml)
-        #[arg(required_unless_present = "api", conflicts_with = "api")]
-        name: Option<String>,
-        /// Reuse or renew a managed session; use browser device authorization when needed.
-        #[arg(long, conflicts_with = "token")]
+        #[arg(long, conflicts_with_all = ["create_profile", "api", "organization"])]
+        replace_principal: Option<String>,
+        /// Create a new local profile after verifying login and organization selection.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["profile", "target"], value_parser = crate::invocation::single_selector("--create-profile"))]
+        create_profile: Option<String>,
+        /// Control-plane endpoint for the new profile; defaults to https://platform.omnigraph.dev.
+        #[arg(long, requires = "create_profile", conflicts_with_all = ["profile", "target"])]
         api: Option<String>,
-        /// The token. Prefer piping via stdin over this flag (shell
-        /// history).
-        #[arg(long)]
-        token: Option<String>,
+        /// Organization to verify when creating the profile; otherwise discover it during login.
+        #[arg(long, requires = "create_profile", conflicts_with_all = ["profile", "target"])]
+        organization: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Remove a named server's stored credential. Idempotent.
+    /// Remove the selected managed session and attempt remote revocation.
     Logout {
-        #[arg(required_unless_present = "api", conflicts_with = "api")]
-        name: Option<String>,
-        /// Revoke the managed session and remove its OS keychain entry.
-        #[arg(long)]
-        api: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Select a managed cluster for this config directory.
-    Use {
-        cluster_id: String,
-        #[arg(long)]
-        api: String,
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Inspect the scope profiles in ~/.omnigraph/config.yaml (read-only).
-    Profile {
+    /// Inspect or edit complete target entries in operator configuration.
+    Target {
         #[command(subcommand)]
-        command: ProfileCommand,
+        command: TargetCommand,
     },
-    /// Print the CLI version
-    Version,
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ProfileCommand {
-    /// List the profiles defined in ~/.omnigraph/config.yaml.
-    List {
-        #[arg(long)]
-        json: bool,
+    /// Say who you are at a target and what you may do there: the actions
+    /// the graph's policy grants, graph-wide and on a branch.
+    Access(AccessArgs),
+    /// Manage an explicitly selected owner/profile credential or export access through a pipe.
+    #[command(name = "credentials")]
+    Credential {
+        #[command(subcommand)]
+        command: CredentialCommand,
     },
-    /// Show a profile's resolved scope. With no name, shows the active
-    /// (`$OMNIGRAPH_PROFILE`) profile, else the flat operator defaults.
-    Show {
-        /// Profile name (optional).
-        name: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum BlobEntityArg {
-    Node,
-    Edge,
-}
-
-impl From<BlobEntityArg> for omnigraph_api_types::BlobEntityKind {
-    fn from(entity: BlobEntityArg) -> Self {
-        match entity {
-            BlobEntityArg::Node => Self::Node,
-            BlobEntityArg::Edge => Self::Edge,
-        }
-    }
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum BlobCommand {
-    /// Stream one managed Blob to stdout or a file.
-    Get {
-        /// Logical entity namespace.
-        #[arg(value_name = "ENTITY")]
-        entity: BlobEntityArg,
-        /// Accepted-schema node or edge type.
-        #[arg(value_name = "TYPE")]
-        type_name: String,
-        /// Logical entity id.
-        #[arg(value_name = "ID")]
-        id: String,
-        /// Blob property name.
-        #[arg(value_name = "PROPERTY")]
-        property: String,
-        /// Read a named branch (defaults to main).
-        #[arg(long, conflicts_with = "snapshot")]
-        branch: Option<String>,
-        /// Read an immutable graph snapshot.
-        #[arg(long, conflicts_with = "branch")]
-        snapshot: Option<String>,
-        /// First byte to return.
-        #[arg(long)]
-        offset: Option<u64>,
-        /// Number of bytes to return; must be greater than zero.
-        #[arg(long)]
-        length: Option<u64>,
-        /// Write bytes to a file instead of stdout.
-        #[arg(long, value_name = "PATH")]
-        out: Option<PathBuf>,
-    },
-    /// Inspect one Blob descriptor without reading payload bytes.
-    Stat {
-        /// Logical entity namespace.
-        #[arg(value_name = "ENTITY")]
-        entity: BlobEntityArg,
-        /// Accepted-schema node or edge type.
-        #[arg(value_name = "TYPE")]
-        type_name: String,
-        /// Logical entity id.
-        #[arg(value_name = "ID")]
-        id: String,
-        /// Blob property name.
-        #[arg(value_name = "PROPERTY")]
-        property: String,
-        /// Read a named branch (defaults to main).
-        #[arg(long, conflicts_with = "snapshot")]
-        branch: Option<String>,
-        /// Read an immutable graph snapshot.
-        #[arg(long, conflicts_with = "branch")]
-        snapshot: Option<String>,
-        /// Emit stable JSON metadata.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ClusterCommand {
-    /// Create an empty managed cluster and bind an unbound folder to its identity.
-    Create {
-        name: String,
-        #[arg(long)]
-        api: String,
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        managed: ManagedRunArgs,
-    },
-    /// Upload only referenced configuration files to the managed repository.
-    Push {
-        #[arg(long)]
-        expected_revision: String,
-        #[arg(long)]
-        message: String,
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Delete this exact managed incarnation; nonzero retention waits to tombstone.
-    Delete {
-        #[arg(long)]
-        incarnation: String,
-        #[arg(long, default_value_t = 86400, value_parser = clap::value_parser!(u32).range(0..=2592000))]
-        retention_seconds: u32,
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        managed: ManagedRunArgs,
-    },
-    /// Undo an exact retained deletion through the ordinary managed bootstrap.
-    UndoDelete {
-        #[arg(long)]
-        incarnation: String,
-        #[arg(long)]
-        deletion_id: String,
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        #[arg(long)]
-        json: bool,
-        #[command(flatten)]
-        managed: ManagedRunArgs,
-    },
-    /// Cache an identity credential for this cluster, or forget it locally.
-    Token {
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        #[arg(long)]
-        json: bool,
-        /// Legacy restricted profile: exact comma-separated actions; requires --graph.
-        #[arg(long, conflicts_with = "clear")]
-        actions: Option<String>,
-        /// Credential lifetime, 60 seconds to 24 hours (default 1h).
-        #[arg(long, value_parser = crate::managed::data::parse_ttl, conflicts_with = "clear")]
-        ttl: Option<u64>,
-        /// Forget this cluster's cached data credential; does not revoke it at the server.
-        #[arg(long)]
-        clear: bool,
-    },
-    /// Validate cluster.yaml and referenced schemas, queries, and policy files.
-    Validate {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Produce a read-only plan by diffing cluster.yaml against __cluster/state.json.
-    Plan {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-        /// Plan without taking the cluster lock: read the ledger once, report
-        /// any lock instead of refusing, and label the output `observed`.
-        #[arg(long)]
-        observe: bool,
-        /// Managed: select a pushed revision; omission uses the bound head.
-        #[arg(long = "rev", alias = "revision")]
-        revision: Option<String>,
-        #[command(flatten)]
-        managed: ManagedRunArgs,
-    },
-    /// Converge the cluster to its config: create graphs, apply schema updates
-    /// (soft drops), write stored-query/policy catalog resources, and execute
-    /// approved graph deletes, in one ordered run. Serving picks up the applied
-    /// revision after an `omnigraph-server --cluster` restart.
-    Apply {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-        /// Managed: apply this exact saved plan run. Required in managed mode.
-        #[arg(long)]
-        plan: Option<String>,
-        #[command(flatten)]
-        managed: ManagedRunArgs,
-    },
-    /// Record a digest-bound approval for a gated (irreversible) change,
-    /// e.g. a graph delete. Requires the global --as actor.
-    Approve {
-        /// Typed resource address of the gated change (e.g. graph.scratch).
-        resource: String,
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Read the local JSON state ledger without scanning live graph resources.
-    Status {
-        /// Managed: inspect a run instead of the cluster projections.
-        #[arg(conflicts_with = "operation")]
-        run_id: Option<String>,
-        /// Managed: inspect a service lifecycle operation instead of a run.
-        #[arg(long)]
-        operation: Option<String>,
-        /// Managed operation recovery before a folder context exists.
-        #[arg(long, requires = "operation")]
-        api: Option<String>,
-        /// Poll a lifecycle operation to its canonical outcome.
-        #[arg(long, requires = "operation")]
-        wait: bool,
-        /// Managed operation wait deadline (default 300, maximum 3600 seconds).
-        #[arg(long, requires = "wait", value_parser = clap::value_parser!(u64).range(1..=3600))]
-        timeout: Option<u64>,
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Read managed run history with its provenance and outcomes.
-    History {
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        #[arg(long)]
-        json: bool,
-        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
-        limit: u16,
-        /// Include runs since this RFC 3339 timestamp.
-        #[arg(long)]
-        since: Option<String>,
-    },
-    /// Cancel a pending managed run, or abandon an unused saved plan.
-    Cancel {
-        run_id: String,
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Observe declared graphs and catalog payloads without the lock, the
-    /// recovery sweep, or a write: what `refresh` would record, labeled
-    /// `observed`, with the exact ledger CAS it read.
-    Observe {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Refresh existing local JSON state from declared graph observations.
-    Refresh {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Import initial local JSON state from declared graph observations.
-    Import {
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove a held local JSON state lock after operator confirmation.
-    ForceUnlock {
-        /// Exact lock id from cluster status or a state_lock_held diagnostic.
-        lock_id: String,
-        /// Cluster config directory containing cluster.yaml.
-        #[arg(long, default_value = ".")]
-        config: PathBuf,
-        /// Emit JSON instead of human text.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Default, Args)]
-pub(crate) struct ManagedRunArgs {
-    /// Return the accepted managed run without waiting for its outcome.
-    #[arg(long)]
-    pub(crate) no_wait: bool,
-    /// Managed wait deadline in seconds (default 300, maximum 3600).
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
-    pub(crate) timeout: Option<u64>,
-    /// Reuse this key to safely replay the same managed request.
-    #[arg(long)]
-    pub(crate) idempotency_key: Option<String>,
-}
-
-/// Operations on the graph registry of a multi-graph server (MR-668).
-///
-/// Registry scope (RFC-011): these address the server itself, not a graph
-/// within it — `--server <name|url>` / `--profile <name>` apply, while
-/// `--graph`, `--store`, and `--as` are rejected by the addressing guard.
-/// To add or remove graphs, operators run `cluster apply` and restart the
-/// server — runtime mutation is not exposed.
-#[derive(Debug, Subcommand)]
-pub(crate) enum GraphsCommand {
-    /// List every graph registered with the multi-graph server.
-    List {
-        #[arg(long)]
-        json: bool,
-        /// Minimal authenticated graph existence; requires an identity credential.
-        #[arg(long)]
-        discovery: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum BranchCommand {
-    /// Create a new branch
-    Create {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(long)]
-        from: Option<String>,
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// List branches
-    List {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Delete a branch
-    Delete {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Merge a source branch into a target branch
-    Merge {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        source: String,
-        #[arg(long)]
-        into: Option<String>,
-        /// Delete the source branch after a successful merge. Runs under its
-        /// own branch_delete policy check; a refusal is reported as a warning
-        /// and never fails the already-landed merge.
-        #[arg(long)]
-        delete_branch: bool,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum SchemaCommand {
-    /// Plan a schema migration against the accepted persisted schema
-    Plan {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        schema: PathBuf,
-        #[arg(long)]
-        json: bool,
-        /// Show the plan as it would execute with `--allow-data-loss`.
-        /// Promotes every `DropMode::Soft` step to `DropMode::Hard`
-        /// so the plan output reflects the destructive intent.
-        #[arg(long, default_value_t = false)]
-        allow_data_loss: bool,
-    },
-    /// Apply a supported schema migration
-    Apply {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        schema: PathBuf,
-        #[arg(long)]
-        json: bool,
-        /// Allow destructive (data-loss) schema changes.
-        ///
-        /// Without this flag, drops are "soft": the property or type
-        /// is removed from the current graph-manifest version but prior
-        /// versions are retained, so `snapshot_at_graph_manifest_version(pre_drop)`
-        /// can still read the dropped data until `omnigraph cleanup`
-        /// runs. With this flag, drops are "hard": `cleanup_old_versions`
-        /// runs on the affected datasets immediately after the apply,
-        /// making the prior data unreachable.
-        #[arg(long, default_value_t = false)]
-        allow_data_loss: bool,
-    },
-    /// Show the current accepted schema source
-    #[command(alias = "get")]
-    Show {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Respell a legacy graph's system columns in place (`id`/`src`/`dst` to
-    /// `__id`/`__src`/`__dst`, storage format v8 to v9; RFC 0040)
-    #[command(name = "upgrade-system-columns")]
-    UpgradeSystemColumns {
-        /// Standalone graph storage URI; alternatively use --store
-        uri: Option<String>,
-        /// Run the preflight only; write nothing
-        #[arg(long)]
-        check: bool,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-
-pub(crate) enum CommitCommand {
-    /// List graph commits
-    List {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show a graph commit
-    Show {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        commit_id: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// List the entity changes one commit made relative to its first parent
-    Changes {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        commit_id: String,
-        /// Changes per page (the server clamps at its public ceiling)
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Fetch exactly one page starting at this opaque token
-        /// (auto-paginates when omitted)
-        #[arg(long)]
-        page_token: Option<String>,
-        /// Filter by entity kind (repeatable): node | edge
-        #[arg(long = "kind", value_enum)]
-        kinds: Vec<ChangeKindArg>,
-        /// Filter by type name (repeatable)
-        #[arg(long = "type")]
-        types: Vec<String>,
-        /// Filter by operation (repeatable): insert | update | delete
-        #[arg(long = "op", value_enum)]
-        ops: Vec<ChangeOpArg>,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum ChangeKindArg {
-    Node,
-    Edge,
-}
-
-impl From<ChangeKindArg> for omnigraph_api_types::EntityKindOutput {
-    fn from(kind: ChangeKindArg) -> Self {
-        match kind {
-            ChangeKindArg::Node => Self::Node,
-            ChangeKindArg::Edge => Self::Edge,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum ChangeOpArg {
-    Insert,
-    Update,
-    Delete,
-}
-
-impl From<ChangeOpArg> for omnigraph_api_types::ChangeOpOutput {
-    fn from(op: ChangeOpArg) -> Self {
-        match op {
-            ChangeOpArg::Insert => Self::Insert,
-            ChangeOpArg::Update => Self::Update,
-            ChangeOpArg::Delete => Self::Delete,
-        }
-    }
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ChangesCommand {
-    /// Poll the change feed of a branch. Auto-consumes page tokens and prints
-    /// the durable cursor from the terminal page.
-    Poll {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        /// Durable cursor from a previous poll or baseline
-        #[arg(long, conflicts_with = "start")]
-        cursor: Option<String>,
-        /// Start mode: now | beginning | after:<commit_id> (default now)
-        #[arg(long, conflicts_with = "cursor")]
-        start: Option<String>,
-        /// Changes per page (the server clamps at its public ceiling)
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Filter by entity kind (repeatable): node | edge
-        #[arg(long = "kind", value_enum)]
-        kinds: Vec<ChangeKindArg>,
-        /// Filter by type name (repeatable)
-        #[arg(long = "type")]
-        types: Vec<String>,
-        /// Filter by operation (repeatable): insert | update | delete
-        #[arg(long = "op", value_enum)]
-        ops: Vec<ChangeOpArg>,
-        /// Session setting for this invocation (repeatable): `name=value` in
-        /// GQ spelling, e.g. `--set merge_lineage=off` — the request's
-        /// `settings` field (the Session settings RFC).
-        #[arg(long = "set", value_name = "NAME=VALUE")]
-        settings: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Capture an exact entity snapshot plus its resume cursor (POSIX only).
-    /// Non-POSIX platforms fail before capture until a durable write-through
-    /// namespace replacement is available.
-    Baseline {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(long)]
-        branch: Option<String>,
-        /// Snapshot scope by entity kind (repeatable): node | edge
-        #[arg(long = "kind", value_enum)]
-        kinds: Vec<ChangeKindArg>,
-        /// Snapshot scope by type name (repeatable)
-        #[arg(long = "type")]
-        types: Vec<String>,
-        /// Feed scope by operation (repeatable); binds the resume cursor only
-        #[arg(long = "op", value_enum)]
-        ops: Vec<ChangeOpArg>,
-        /// Write the NDJSON snapshot here; the handshake prints to stdout
-        #[arg(long, value_name = "PATH")]
-        out: std::path::PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum PolicyCommand {
-    /// Compile and validate the Cedar policy bundle(s) applied in a cluster.
+    /// Relay an agent's MCP over stdio to an existing server or managed target's `/mcp`.
     ///
-    /// Sources the bundle(s) from the cluster's applied policies
-    /// (`--cluster <dir>`); pass the global `--graph <id>` to pick one
-    /// graph's bundle when several apply.
-    Validate {},
-    /// Run declarative policy tests against a cluster's applied bundle.
+    /// For agents that start their tools as child processes. The bridge sends
+    /// the target's stored credential, which the agent never sees, and is
+    /// bound to one graph: `--graph`, else the target's `default_graph`.
+    /// It only connects: a direct target refuses, and it never starts,
+    /// discovers or hosts a server. stdout carries only MCP messages and
+    /// diagnostics go to stderr.
+    Mcp(McpArgs),
+    /// Open OmniGraph Studio on an existing server target, print its link
+    /// and exit.
     ///
-    /// The cluster model has no per-bundle tests file, so the cases are
-    /// supplied explicitly with `--tests <file>` and checked against the
-    /// bundle selected by `--cluster` (+ optional `--graph`).
-    Test {
-        /// Path to a policy.tests.yaml file.
-        #[arg(long)]
-        tests: PathBuf,
+    /// The `omnigraph-studio://open` link names the target, `--graph` when
+    /// given, and digests of the target's binding and of this operator home,
+    /// which Studio checks against its own resolution of the target. It
+    /// carries no secret and acquires no credential. Direct and managed
+    /// targets refuse. Without Studio, or anything on this platform that
+    /// handles its links, it prints the link and refuses with
+    /// `studio_unavailable`; it never opens a browser.
+    Studio(StudioArgs),
+    #[command(
+        about = "Validate operator configuration, rename bindings, or recover interrupted edits"
+    )]
+    Config {
+        #[command(subcommand)]
+        command: crate::commands::targets::ConfigCommand,
     },
-    /// Explain one policy decision against a cluster's applied bundle.
-    Explain {
-        #[arg(long)]
-        actor: String,
-        #[arg(long)]
-        action: PolicyAction,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long = "target-branch")]
-        target_branch: Option<String>,
+    /// Export or print the agent skill built into this binary, which matches
+    /// this CLI's commands and HTTP contract.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
     },
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum QueriesCommand {
-    /// Type-check a cluster's stored-query registry against its schemas.
-    ///
-    /// Distinct from `omnigraph lint` (which lints one `.gq` file): this
-    /// validates the whole `queries:` registry of a cluster (`--cluster
-    /// <dir>`, optional `--graph <id>`) by reading each graph's applied
-    /// schema and confirming every stored query still type-checks. Exits
-    /// non-zero on any breakage.
-    Validate {
+    /// Print the CLI version, the HTTP contract it speaks, and the storage
+    /// formats it writes and serves.
+    Version {
+        /// Emit the same facts as one JSON object.
         #[arg(long)]
         json: bool,
     },
-    /// List a cluster's registered stored queries (name, params).
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Args, Clone)]
-pub(crate) struct ParamsArgs {
-    #[arg(long, conflicts_with = "params_file")]
-    pub(crate) params: Option<String>,
-    #[arg(long, conflicts_with = "params")]
-    pub(crate) params_file: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CliLoadMode {
-    Overwrite,
-    Append,
-    Merge,
-}
-
-impl From<CliLoadMode> for LoadMode {
-    fn from(value: CliLoadMode) -> Self {
-        match value {
-            CliLoadMode::Overwrite => LoadMode::Overwrite,
-            CliLoadMode::Append => LoadMode::Append,
-            CliLoadMode::Merge => LoadMode::Merge,
-        }
-    }
-}
-impl CliLoadMode {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            CliLoadMode::Overwrite => "overwrite",
-            CliLoadMode::Append => "append",
-            CliLoadMode::Merge => "merge",
-        }
-    }
 }

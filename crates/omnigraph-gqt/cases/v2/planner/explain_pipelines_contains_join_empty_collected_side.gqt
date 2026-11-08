@@ -1,0 +1,39 @@
+# issue: none
+# notes: A contains join drains its whole left side before the right side runs, whatever that side holds: with no Matter row the needle set is empty, so no Paper pairs with anything and the query returns no rows, while explain still prints the left side as the build pipeline the probe waits on.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Paper {
+    slug: String @key
+    text: String
+}
+node Matter {
+    number: String @key
+}
+
+--- seed
+{"type":"Paper","data":{"slug":"p1","text":"see case 12 here"}}
+{"type":"Paper","data":{"slug":"p2","text":"nothing cited"}}
+
+--- query
+set engine = v2;
+query cites() {
+    match {
+        $p: Paper
+        $m: Matter
+        $p.text contains $m.number
+    }
+    return { $p.slug, $m.number }
+}
+--- expect unordered
+--- expect shape
+p.slug: String
+m.number: String
+--- expect plan
+pipeline 0: Scan => ContainsJoin(build)
+pipeline 1: Scan -> ContainsJoin(probe) -> Projection => consumer after 0

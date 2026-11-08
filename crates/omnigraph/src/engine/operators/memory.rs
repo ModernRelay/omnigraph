@@ -3,30 +3,24 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
-use arrow_array::{Array, RecordBatch, UInt32Array};
+use arrow_array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{DataType, SchemaRef};
 use datafusion::arrow::array::ArrayData;
 use datafusion::arrow::buffer::Buffer;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DataFusionError, Result as DfResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::sorts::{
-    sort::SortExec, sort_preserving_merge::SortPreservingMergeExec,
-};
-use datafusion::physical_plan::{
-    ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream,
-};
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::StreamExt;
-use lance_datafusion::exec::HardCapBatchSizeExec;
 
+use super::load_budget::{LoadBudget, ShareClass};
+use crate::engine::context::{QueryWorkLease, QueryWorkScope};
 use crate::error::OmniError;
 use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
 
-fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(in crate::engine) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -35,9 +29,13 @@ pub(in crate::engine) struct QueryResources {
     pool: Arc<dyn MemoryPool>,
     limit: u64,
     probes: Option<crate::instrumentation::QueryMemoryProbes>,
+    read_seams: crate::instrumentation::ExternalReadSeams,
     buffers: Mutex<BufferRegistry>,
     registry_memory: MemoryReservation,
     traversal: TraversalWork,
+    work: QueryWorkScope,
+    /// A csv load's shares of this pool, carved per run by `ValidateExec`.
+    load_budget: Mutex<Option<Arc<LoadBudget>>>,
 }
 
 /// Monotonic statement-wide work admission. Child operators and repeated
@@ -99,6 +97,60 @@ impl BufferRegistry {
 struct BufferCharge {
     _buffer: Buffer,
     reservation: MemoryReservation,
+    share: Option<LoadShare>,
+}
+
+impl BufferCharge {
+    /// The same allocation charged wider, under the share it was registered in.
+    fn grow(&self, more: usize) -> DfResult<()> {
+        match &self.share {
+            Some(share) => {
+                share.charge("graph Arrow allocation", more)?;
+                self.reservation.grow(more);
+                Ok(())
+            }
+            None => self.reservation.try_grow(more),
+        }
+    }
+}
+
+impl Drop for BufferCharge {
+    fn drop(&mut self) {
+        if let Some(share) = &self.share {
+            share.release(self.reservation.size());
+        }
+    }
+}
+
+/// One memory's share of the run's load budget: the class it charges and
+/// the budget it charged, which its releases return to.
+#[derive(Clone, Debug)]
+struct LoadShare {
+    budget: Arc<LoadBudget>,
+    class: ShareClass,
+}
+
+impl LoadShare {
+    fn charge(&self, consumer: &str, bytes: usize) -> DfResult<()> {
+        self.budget.charge(self.class, bytes).map_err(|actual| {
+            tracing::debug!(
+                consumer,
+                class = ?self.class,
+                bytes,
+                actual,
+                "load memory share refused"
+            );
+            super::external(OmniError::resource_limit(
+                "query_memory_bytes",
+                self.budget.limit(),
+                actual,
+            ))
+        })
+    }
+
+    fn release(&self, bytes: usize) {
+        self.budget.release(self.class, bytes);
+    }
 }
 
 fn charged_size(buffer: &Buffer) -> usize {
@@ -106,6 +158,30 @@ fn charged_size(buffer: &Buffer) -> usize {
         .capacity()
         .max(buffer.len())
         .saturating_add(std::mem::size_of::<BufferCharge>() + 32)
+}
+
+/// The Arrow bytes `hold` registers for `batch`: every buffer, null bitmap
+/// and child buffer at its charged size, shared buffers counted once each
+/// time they appear; what a copy of the batch costs its holder.
+pub(in crate::engine) fn batch_bytes(batch: &RecordBatch) -> usize {
+    fn bytes(data: &ArrayData) -> usize {
+        data.buffers()
+            .iter()
+            .chain(data.nulls().map(|nulls| nulls.buffer()))
+            .map(charged_size)
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(
+                data.child_data()
+                    .iter()
+                    .map(bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+    batch
+        .columns()
+        .iter()
+        .map(|column| bytes(&column.to_data()))
+        .fold(0usize, usize::saturating_add)
 }
 
 #[derive(Debug, Default)]
@@ -117,13 +193,14 @@ pub(in crate::engine) struct BatchLease {
 impl QueryResources {
     #[cfg(test)]
     pub(in crate::engine) fn new(pool: Arc<dyn MemoryPool>, limit: u64) -> Self {
-        Self::with_traversal_limit(pool, limit, None)
+        Self::with_traversal_limit(pool, limit, None, QueryWorkScope::default())
     }
 
     pub(in crate::engine) fn with_traversal_limit(
         pool: Arc<dyn MemoryPool>,
         limit: u64,
         traversal_limit: Option<NonZeroU64>,
+        work: QueryWorkScope,
     ) -> Self {
         crate::instrumentation::record_query_memory_pool(&pool);
         let registry_memory = MemoryConsumer::new("graph allocation registry").register(&pool);
@@ -132,9 +209,20 @@ impl QueryResources {
             pool,
             limit,
             probes: crate::instrumentation::current_query_memory_probes(),
+            read_seams: crate::instrumentation::capture_external_read_seams(),
             buffers: Mutex::new(BufferRegistry::default()),
             traversal: TraversalWork::new(traversal_limit),
+            work,
+            load_budget: Mutex::new(None),
         }
+    }
+
+    fn load_budget(&self) -> Option<Arc<LoadBudget>> {
+        locked(&self.load_budget).clone()
+    }
+
+    fn set_load_budget(&self, budget: Arc<LoadBudget>) {
+        *locked(&self.load_budget) = Some(budget);
     }
 
     fn refused(&self, owner: &str) {
@@ -155,7 +243,18 @@ impl QueryResources {
         Ok(reservation)
     }
 
-    fn batch(&self, batch: &RecordBatch) -> DfResult<BatchLease> {
+    /// A lease's handle metadata: tried on the pool for a query; under a load
+    /// share counted past it, within the budget's uncharged sixty-fourths.
+    fn handles(&self, bytes: usize, shared: bool) -> DfResult<MemoryReservation> {
+        if !shared {
+            return self.unrecorded("graph batch handles", bytes);
+        }
+        let reservation = MemoryConsumer::new("graph batch handles").register(&self.pool);
+        reservation.grow(bytes);
+        Ok(reservation)
+    }
+
+    fn batch(&self, batch: &RecordBatch, share: Option<&LoadShare>) -> DfResult<BatchLease> {
         fn buffers(data: &ArrayData) -> usize {
             data.buffers().len()
                 + usize::from(data.nulls().is_some())
@@ -166,15 +265,12 @@ impl QueryResources {
             .iter()
             .map(|column| buffers(&column.to_data()))
             .sum();
-        let metadata = self.unrecorded(
-            "graph batch handles",
-            count.saturating_add(1).saturating_mul(64),
-        )?;
+        let metadata = self.handles(count.saturating_add(1).saturating_mul(64), share.is_some())?;
         let mut leases = Vec::with_capacity(count);
         let mut registry = locked(&self.buffers);
         registry.sweep();
         for column in batch.columns() {
-            self.array(&column.to_data(), &mut registry, &mut leases)?;
+            self.array(&column.to_data(), &mut registry, &mut leases, share)?;
         }
         Ok(BatchLease {
             _charges: leases,
@@ -187,6 +283,7 @@ impl QueryResources {
         data: &ArrayData,
         registry: &mut BufferRegistry,
         leases: &mut Vec<Arc<BufferCharge>>,
+        share: Option<&LoadShare>,
     ) -> DfResult<()> {
         for buffer in data
             .buffers()
@@ -198,7 +295,7 @@ impl QueryResources {
             if let Some(charge) = registry.charges.get(&key).and_then(Weak::upgrade) {
                 let recorded = charge.reservation.size();
                 if size > recorded {
-                    charge.reservation.try_grow(size - recorded)?;
+                    charge.grow(size - recorded)?;
                 }
                 leases.push(charge);
             } else {
@@ -212,19 +309,33 @@ impl QueryResources {
                     .saturating_mul(2)
                     .saturating_mul(std::mem::size_of::<(usize, Weak<BufferCharge>)>() + 1);
                 if target > self.registry_memory.size() {
-                    self.registry_memory
-                        .try_grow(target - self.registry_memory.size())?;
+                    let growth = target - self.registry_memory.size();
+                    match share {
+                        Some(_) => self.registry_memory.grow(growth),
+                        None => self.registry_memory.try_grow(growth)?,
+                    }
                 }
+                let reservation = match share {
+                    Some(share) => {
+                        share.charge("graph Arrow allocation", size)?;
+                        let reservation =
+                            MemoryConsumer::new("graph Arrow allocation").register(&self.pool);
+                        reservation.grow(size);
+                        reservation
+                    }
+                    None => self.unrecorded("graph Arrow allocation", size)?,
+                };
                 let charge = Arc::new(BufferCharge {
                     _buffer: buffer.clone(),
-                    reservation: self.unrecorded("graph Arrow allocation", size)?,
+                    reservation,
+                    share: share.cloned(),
                 });
                 registry.charges.insert(key, Arc::downgrade(&charge));
                 leases.push(charge);
             }
         }
         for child in data.child_data() {
-            self.array(child, registry, leases)?;
+            self.array(child, registry, leases, share)?;
         }
         Ok(())
     }
@@ -253,6 +364,19 @@ pub(in crate::engine) struct WorkMemory {
     checkpoint: WorkCheckpoint,
     batches: Mutex<Vec<BatchLease>>,
     cancelled: Arc<QueryCancellation>,
+    /// The load share class this memory charges, inherited by its children;
+    /// `share` is the run's budget resolved at the first charge.
+    class: Option<ShareClass>,
+    share: OnceLock<Option<LoadShare>>,
+}
+
+impl Drop for WorkMemory {
+    fn drop(&mut self) {
+        let held = self.scratch.size();
+        if held > 0 {
+            self.release_share(held);
+        }
+    }
 }
 
 impl WorkMemory {
@@ -274,7 +398,58 @@ impl WorkMemory {
             checkpoint: Arc::new(Mutex::new(HashMap::new())),
             batches: Mutex::new(Vec::new()),
             cancelled: Arc::new(QueryCancellation::default()),
+            class: None,
+            share: OnceLock::new(),
         })
+    }
+
+    /// Charge this memory's work on `class`'s share of the run's load budget,
+    /// children included; the budget is the one set when the memory first
+    /// charges, so a run's releases reach its own shares.
+    pub(in crate::engine) fn in_share(mut self, class: ShareClass) -> Self {
+        self.class = Some(class);
+        self
+    }
+
+    fn share(&self) -> Option<&LoadShare> {
+        let class = self.class?;
+        self.share
+            .get_or_init(|| {
+                self.resources
+                    .load_budget()
+                    .map(|budget| LoadShare { budget, class })
+            })
+            .as_ref()
+    }
+
+    fn release_share(&self, bytes: usize) {
+        if let Some(share) = self.share.get().and_then(Option::as_ref) {
+            share.release(bytes);
+        }
+    }
+
+    /// Carve the run's load budget from the pool's room now, `partitions`
+    /// ways (`holders` when the plan sizes unique holders); `Err` is the
+    /// refusal when a partition's share is under `floor`, the source bytes
+    /// it needs before it can cut a slice.
+    pub(in crate::engine) fn carve_load_budget(
+        &self,
+        partitions: usize,
+        holders: bool,
+        floor: usize,
+    ) -> DfResult<()> {
+        let reserved = u64::try_from(self.resources.pool.reserved()).unwrap_or(u64::MAX);
+        let budget = LoadBudget::carve(self.resources.limit, reserved, partitions, holders);
+        budget.admit(floor).map_err(|actual| {
+            self.resources.refused(&self.name);
+            super::external(OmniError::resource_limit(
+                "query_memory_bytes",
+                self.resources.limit,
+                actual,
+            ))
+        })?;
+        self.resources.set_load_budget(Arc::new(budget));
+        Ok(())
     }
 
     /// Run each CPU poll on a blocking worker, releasing that thread on Pending.
@@ -288,12 +463,48 @@ impl WorkMemory {
         T: Send + 'static,
         F: std::future::Future<Output = DfResult<T>> + Send + 'static,
     {
+        let owner = self.register_owned_work()?;
+        self.blocking_owned(owner, body).await
+    }
+
+    pub(in crate::engine) fn register_owned_work(&self) -> DfResult<QueryWorkLease> {
+        self.resources.work.register()
+    }
+
+    /// The producer already registered before spawning. Its registration can
+    /// still hand work to a blocking child after the query closes admission.
+    pub(in crate::engine) async fn blocking_owned<T, F>(
+        self: &Arc<Self>,
+        owner: QueryWorkLease,
+        body: impl FnOnce(Arc<Self>) -> F + Send + 'static,
+    ) -> DfResult<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = DfResult<T>> + Send + 'static,
+    {
+        let child = owner.child();
+        owner.own(Box::pin(self.blocking_body(child, body))).await
+    }
+
+    async fn blocking_body<T, F>(
+        self: &Arc<Self>,
+        owner: QueryWorkLease,
+        body: impl FnOnce(Arc<Self>) -> F + Send + 'static,
+    ) -> DfResult<T>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = DfResult<T>> + Send + 'static,
+    {
         let cancellation = self.cancel_on_drop();
         let memory = Arc::clone(self);
         let io_probes = crate::instrumentation::capture_query_io_probes();
+        let read_seams = self.resources.read_seams.clone();
         let memory_probes = self.resources.probes.clone();
         let mut work = Box::pin(async move {
-            let body = body(memory);
+            let body = crate::instrumentation::with_external_read_seams(
+                read_seams,
+                Box::pin(body(memory)),
+            );
             let observed = async move {
                 match io_probes {
                     Some(probes) => {
@@ -317,7 +528,12 @@ impl WorkMemory {
             let worker_wake = Arc::clone(&wake);
             let elapsed = elapsed.clone();
             let mut guard = crate::instrumentation::query_blocking_work_guard();
+            let owned = owner.child().own((work, memory));
+            let span = tracing::Span::current();
             let job = tokio::task::spawn_blocking(move || {
+                let mut owned = owned;
+                let _span = span.enter();
+                let (work, memory) = &mut owned.value;
                 guard.started();
                 let guard = Arc::new(guard);
                 let checkpoint_guard = Arc::clone(&guard);
@@ -329,14 +545,15 @@ impl WorkMemory {
                     Ok(()) => work.as_mut().poll(&mut context),
                     Err(error) => std::task::Poll::Ready(Err(error)),
                 };
-                (work, state)
+                owned.with_output(state)
             });
             let abort = AbortBlockingOnDrop(job.abort_handle());
-            let (returned, state) = job.await.map_err(|error| {
+            let returned = job.await.map_err(|error| {
                 DataFusionError::Execution(format!("graph worker failed: {error}"))
             })?;
             drop(abort);
-            work = returned;
+            let ((returned_work, _), state) = returned.into_inner();
+            work = returned_work;
             match state {
                 std::task::Poll::Ready(result) => {
                     cancellation.disarm();
@@ -412,7 +629,23 @@ impl WorkMemory {
             checkpoint: Arc::clone(&self.checkpoint),
             batches: Mutex::new(Vec::new()),
             cancelled: Arc::clone(&self.cancelled),
+            class: self.class,
+            share: OnceLock::new(),
         })
+    }
+
+    /// The query pool's size, which the plan's assumed memory limit set.
+    pub(in crate::engine) fn pool_bytes(&self) -> u64 {
+        self.resources.limit
+    }
+
+    pub(in crate::engine) fn admit_read_reuse(
+        &self,
+    ) -> Option<crate::engine::LoadReuseReservation> {
+        crate::engine::LoadReuseReservation::admit(
+            Arc::clone(&self.resources.pool),
+            self.resources.limit,
+        )
     }
 
     /// Target bytes per producer batch, leaving room for queued batches and consumers.
@@ -447,33 +680,71 @@ impl WorkMemory {
 
     pub(in crate::engine) fn grow(&self, bytes: usize) -> DfResult<()> {
         self.check()?;
-        self.scratch
-            .try_grow(bytes)
-            .inspect_err(|_| self.resources.refused(&self.name))
+        match self.share() {
+            Some(share) => {
+                share
+                    .charge(&self.name, bytes)
+                    .inspect_err(|_| self.resources.refused(&self.name))?;
+                self.scratch.grow(bytes);
+                Ok(())
+            }
+            None => self
+                .scratch
+                .try_grow(bytes)
+                .inspect_err(|_| self.resources.refused(&self.name)),
+        }
+    }
+
+    /// Raise this work's charge to `bytes` where it is lower; a charge already
+    /// at or above `bytes` grows nothing.
+    pub(in crate::engine) fn ensure(&self, bytes: usize) -> DfResult<()> {
+        let held = self.scratch.size();
+        if bytes > held {
+            self.grow(bytes - held)
+        } else {
+            self.check()
+        }
     }
 
     /// `grow` for a charge the caller does without when the pool refuses it:
     /// `false` then, with no refusal recorded, since the query goes on.
     pub(in crate::engine) fn grow_if_free(&self, bytes: usize) -> DfResult<bool> {
         self.check()?;
-        Ok(self.scratch.try_grow(bytes).is_ok())
+        Ok(match self.share() {
+            Some(share) => {
+                let admitted = share.charge(&self.name, bytes).is_ok();
+                if admitted {
+                    self.scratch.grow(bytes);
+                }
+                admitted
+            }
+            None => self.scratch.try_grow(bytes).is_ok(),
+        })
     }
 
     /// Lower this work's charge to `bytes` once its peak has passed; a charge
     /// already at or under `bytes`, or freed meanwhile, stays as it is.
+    /// This work's current scratch charge, the number `shrink_to` lowers.
+    pub(in crate::engine) fn charged(&self) -> usize {
+        self.scratch.size()
+    }
+
     pub(in crate::engine) fn shrink_to(&self, bytes: usize) {
         let excess = self.scratch.size().saturating_sub(bytes);
-        let _ = self.scratch.try_shrink(excess);
+        if self.scratch.try_shrink(excess).is_ok() {
+            self.release_share(excess);
+        }
     }
 
     /// Reserve conservative capacity for collection entries, including element
     /// storage, growth and hash-table overhead.
     pub(in crate::engine) fn entries<T>(&self, count: usize) -> DfResult<()> {
-        self.grow(
-            count
-                .saturating_mul(std::mem::size_of::<T>().saturating_add(1))
-                .saturating_mul(4),
-        )
+        self.grow(count.saturating_mul(Self::entry_bytes::<T>()))
+    }
+
+    /// What [`Self::entries`] charges per entry of `T`.
+    pub(in crate::engine) fn entry_bytes<T>() -> usize {
+        std::mem::size_of::<T>().saturating_add(1).saturating_mul(4)
     }
 
     pub(in crate::engine) fn string(&self, bytes: usize) -> DfResult<()> {
@@ -484,7 +755,7 @@ impl WorkMemory {
         self.check()?;
         let lease = self
             .resources
-            .batch(batch)
+            .batch(batch, self.share())
             .inspect_err(|_| self.resources.refused(&self.name))?;
         locked(&self.batches).push(lease);
         Ok(())
@@ -492,16 +763,18 @@ impl WorkMemory {
 
     pub(in crate::engine) fn release_work(&self) {
         locked(&self.batches).clear();
-        self.scratch.free();
+        let freed = self.scratch.free();
+        self.release_share(freed);
     }
 
     pub(in crate::engine) fn output(&self, batch: &RecordBatch) -> DfResult<()> {
         let lease = self
             .resources
-            .batch(batch)
+            .batch(batch, self.share())
             .inspect_err(|_| self.resources.refused(&self.name))?;
         *locked(&self.batches) = vec![lease];
-        self.scratch.free();
+        let freed = self.scratch.free();
+        self.release_share(freed);
         Ok(())
     }
 
@@ -552,30 +825,7 @@ impl WorkMemory {
         plan: Arc<dyn ExecutionPlan>,
     ) -> DfResult<(Arc<dyn ExecutionPlan>, SendableRecordBatchStream)> {
         let input_limit = crate::table_store::sort_input_batch_bytes(self.resources.limit);
-        let plan = plan
-            .transform_down(|node| {
-                if node.downcast_ref::<SortExec>().is_some() {
-                    let children = node
-                        .children()
-                        .into_iter()
-                        .map(|child| {
-                            Arc::new(HardCapBatchSizeExec::new(Arc::clone(child), input_limit))
-                                as Arc<dyn ExecutionPlan>
-                        })
-                        .collect();
-                    Ok(Transformed::yes(node.with_new_children(children)?))
-                } else {
-                    Ok(Transformed::no(node))
-                }
-            })?
-            .data;
-        let plan: Arc<dyn ExecutionPlan> = if plan.output_partitioning().partition_count() == 1 {
-            plan
-        } else if let Some(ordering) = plan.output_ordering() {
-            Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
-        } else {
-            Arc::new(CoalescePartitionsExec::new(plan))
-        };
+        let plan = crate::table_store::cap_sort_inputs_and_merge_partitions(plan, input_limit)?;
         let stream = plan.execute(0, Arc::clone(&self.ctx))?;
         Ok((plan, stream))
     }
@@ -589,6 +839,19 @@ impl WorkMemory {
         batch.columns().iter().try_fold(0usize, |bytes, column| {
             Ok(bytes.saturating_add(slice_memory_size(&column.to_data(), offset, len)?))
         })
+    }
+
+    /// `slice_bytes(batch, row, 1)` for every row of `batch` in one pass per
+    /// column: the same numbers, read off each column's layout (a constant per
+    /// row for fixed-width columns, the offset deltas for variable-width ones,
+    /// children summed for structs) instead of one `ArrayData` slice per row
+    /// per column.
+    pub(in crate::engine) fn row_bytes(&self, batch: &RecordBatch) -> DfResult<Vec<usize>> {
+        let mut rows = vec![0usize; batch.num_rows()];
+        for column in batch.columns() {
+            add_row_bytes(&column.to_data(), &mut rows)?;
+        }
+        Ok(rows)
     }
 
     pub(in crate::engine) fn take(
@@ -645,13 +908,13 @@ impl WorkMemory {
         self.take_admitted(batch, indices, name, 1)
     }
 
-    fn take_admitted(
+    /// The picked bytes of a take and its scratch bytes. A null index copies
+    /// no row: it costs what a null row of the column costs.
+    fn take_estimate(
         &self,
         batch: &RecordBatch,
         indices: &UInt32Array,
-        name: &str,
-        factor: usize,
-    ) -> DfResult<RecordBatch> {
+    ) -> DfResult<(usize, usize)> {
         let mut bytes = 0usize;
         let mut scratch_bytes = 0usize;
         for column in batch.columns() {
@@ -661,18 +924,38 @@ impl WorkMemory {
             let picked = match flat_take_size(&data, indices) {
                 Some(flat) => flat,
                 None => {
+                    let mut null_row = None;
                     let mut picked = 0usize;
-                    for row in indices.values() {
+                    for row in indices.iter() {
                         self.check()?;
-                        picked = picked
-                            .saturating_add(slice_memory_size(&data, *row as usize, 1)?)
-                            .saturating_add(16);
+                        let row_bytes = match row {
+                            Some(row) => slice_memory_size(&data, row as usize, 1)?,
+                            None => match null_row {
+                                Some(bytes) => bytes,
+                                None => {
+                                    let null = ArrayData::new_null(data.data_type(), 1);
+                                    *null_row.insert(slice_memory_size(&null, 0, 1)?)
+                                }
+                            },
+                        };
+                        picked = picked.saturating_add(row_bytes).saturating_add(16);
                     }
                     picked
                 }
             };
             bytes = bytes.saturating_add(picked).saturating_add(128);
         }
+        Ok((bytes, scratch_bytes))
+    }
+
+    fn take_admitted(
+        &self,
+        batch: &RecordBatch,
+        indices: &UInt32Array,
+        name: &str,
+        factor: usize,
+    ) -> DfResult<RecordBatch> {
+        let (bytes, scratch_bytes) = self.take_estimate(batch, indices)?;
         let admitted = self.resources.reservation(
             name,
             bytes.saturating_mul(factor).saturating_add(scratch_bytes),
@@ -687,11 +970,92 @@ impl WorkMemory {
         self.hold(&result)?;
         Ok(result)
     }
+
+    /// The bytes `interleave_once` admits for the rows of `batches` at
+    /// `picks` (`(batch, row)`) before Arrow builds them: each pick copies its
+    /// row once, a row picked twice is copied twice, plus Arrow's scratch. A
+    /// caller sizes a window by it before it interleaves.
+    pub(in crate::engine) fn interleave_bytes(
+        &self,
+        batches: &[RecordBatch],
+        picks: &[(usize, usize)],
+    ) -> DfResult<usize> {
+        let (picked, scratch) = self.interleave_estimate(batches, picks)?;
+        Ok(picked.saturating_add(scratch))
+    }
+
+    /// The picked bytes of an interleave and its scratch bytes, column by
+    /// column as `take_estimate` counts a take.
+    fn interleave_estimate(
+        &self,
+        batches: &[RecordBatch],
+        picks: &[(usize, usize)],
+    ) -> DfResult<(usize, usize)> {
+        let Some(first) = batches.first() else {
+            return Ok((0, 0));
+        };
+        let mut bytes = 0usize;
+        let mut scratch_bytes = 0usize;
+        for column in 0..first.num_columns() {
+            let data: Vec<ArrayData> = batches
+                .iter()
+                .map(|batch| batch.column(column).to_data())
+                .collect();
+            scratch_bytes = scratch_bytes.saturating_add(take_scratch_size(&data[0], picks.len()));
+            let mut picked = 0usize;
+            for &(batch, row) in picks {
+                self.check()?;
+                let data = data.get(batch).ok_or_else(|| {
+                    DataFusionError::Internal(format!("interleave pick of absent batch {batch}"))
+                })?;
+                picked = picked
+                    .saturating_add(slice_memory_size(data, row, 1)?)
+                    .saturating_add(16);
+            }
+            bytes = bytes.saturating_add(picked).saturating_add(128);
+        }
+        Ok((bytes, scratch_bytes))
+    }
+
+    /// The rows of `batches` at `picks`, in pick order, under `schema`: the
+    /// copy is admitted once at `interleave_bytes` while Arrow builds it, then
+    /// only the result is held.
+    pub(in crate::engine) fn interleave_once(
+        &self,
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+        picks: &[(usize, usize)],
+        name: &str,
+    ) -> DfResult<RecordBatch> {
+        let (bytes, scratch_bytes) = self.interleave_estimate(batches, picks)?;
+        let admitted = self
+            .resources
+            .reservation(name, bytes.saturating_add(scratch_bytes))?;
+        let columns = (0..schema.fields().len())
+            .map(|column| {
+                let arrays: Vec<&dyn Array> = batches
+                    .iter()
+                    .map(|batch| batch.column(column).as_ref())
+                    .collect();
+                arrow_select::interleave::interleave(&arrays, picks)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let result = RecordBatch::try_new_with_options(
+            Arc::clone(schema),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(picks.len())),
+        )?;
+        drop(admitted);
+        self.hold(&result)?;
+        Ok(result)
+    }
 }
 
 /// An upper bound on the picked bytes of a flat or fixed-size-list column
 /// without a slice per row: 16 per row, 2 more when nullable, the row's own
-/// bytes and offset. `None` for the variable nested and dictionary kinds.
+/// bytes and offset. A null index copies no bytes of a variable-width value
+/// (Arrow's byte take skips it); fixed-width values are allocated for every
+/// index. `None` for the variable nested and dictionary kinds.
 fn flat_take_size(data: &ArrayData, indices: &UInt32Array) -> Option<usize> {
     let rows = indices.len();
     let per_row = if data.nulls().is_some() { 18 } else { 16 };
@@ -702,18 +1066,22 @@ fn flat_take_size(data: &ArrayData, indices: &UInt32Array) -> Option<usize> {
             .saturating_mul(field.data_type().primitive_width()?),
         DataType::Utf8 | DataType::Binary => {
             let offsets = data.buffers()[0].typed_data::<i32>();
-            indices.values().iter().fold(0usize, |sum, &row| {
-                let row = base + row as usize;
-                sum.saturating_add((offsets[row + 1] - offsets[row]) as usize)
-                    .saturating_add(4)
+            indices.iter().fold(0usize, |sum, row| {
+                let value = row.map_or(0, |row| {
+                    let row = base + row as usize;
+                    (offsets[row + 1] - offsets[row]) as usize
+                });
+                sum.saturating_add(value).saturating_add(4)
             })
         }
         DataType::LargeUtf8 | DataType::LargeBinary => {
             let offsets = data.buffers()[0].typed_data::<i64>();
-            indices.values().iter().fold(0usize, |sum, &row| {
-                let row = base + row as usize;
-                sum.saturating_add((offsets[row + 1] - offsets[row]) as usize)
-                    .saturating_add(8)
+            indices.iter().fold(0usize, |sum, row| {
+                let value = row.map_or(0, |row| {
+                    let row = base + row as usize;
+                    (offsets[row + 1] - offsets[row]) as usize
+                });
+                sum.saturating_add(value).saturating_add(8)
             })
         }
         DataType::Boolean => rows,
@@ -788,6 +1156,66 @@ fn take_scratch_size(data: &ArrayData, rows: usize) -> usize {
 /// Bytes copied from an Arrow range, including nested child ranges. Arrow's
 /// ArrayData slice keeps list child buffers whole, so recursing through its
 /// get_slice_memory_size would count the entire vector column per picked row.
+/// Add each row's `slice_memory_size(data, row, 1)` to `rows`, one pass over
+/// the column; a layout with no shortcut falls back to the per-row slice.
+fn add_row_bytes(data: &ArrayData, rows: &mut [usize]) -> DfResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let validity = usize::from(data.nulls().is_some());
+    match data.data_type() {
+        DataType::Utf8 | DataType::Binary => {
+            let offsets = &data.buffers()[0].typed_data::<i32>()[data.offset()..];
+            for (row, bytes) in rows.iter_mut().enumerate() {
+                let value = (offsets[row + 1] - offsets[row]) as usize;
+                *bytes = bytes.saturating_add(4 + value + validity);
+            }
+        }
+        DataType::LargeUtf8 | DataType::LargeBinary => {
+            let offsets = &data.buffers()[0].typed_data::<i64>()[data.offset()..];
+            for (row, bytes) in rows.iter_mut().enumerate() {
+                let value = (offsets[row + 1] - offsets[row]) as usize;
+                *bytes = bytes.saturating_add(8 + value + validity);
+            }
+        }
+        DataType::Struct(_) => {
+            for child in data.child_data() {
+                add_row_bytes(&child.slice(data.offset(), rows.len()), rows)?;
+            }
+            for bytes in rows.iter_mut() {
+                *bytes = bytes.saturating_add(validity);
+            }
+        }
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::Map(_, _)
+        | DataType::FixedSizeList(_, _) => {
+            for (row, bytes) in rows.iter_mut().enumerate() {
+                *bytes = bytes.saturating_add(slice_memory_size(data, row, 1)?);
+            }
+        }
+        _ => {
+            if data.data_type().is_primitive()
+                || matches!(
+                    data.data_type(),
+                    DataType::Boolean | DataType::FixedSizeBinary(_) | DataType::Null
+                )
+            {
+                // Fixed-width layouts cost the same for every row.
+                let each = slice_memory_size(data, 0, 1)?;
+                for bytes in rows.iter_mut() {
+                    *bytes = bytes.saturating_add(each);
+                }
+            } else {
+                for (row, bytes) in rows.iter_mut().enumerate() {
+                    *bytes = bytes.saturating_add(slice_memory_size(data, row, 1)?);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn slice_memory_size(data: &ArrayData, offset: usize, len: usize) -> DfResult<usize> {
     let data = data.slice(offset, len);
     let validity = if data.nulls().is_some() {
@@ -871,10 +1299,12 @@ impl Drop for CancelOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::context::QueryContext;
     use arrow_array::{BooleanArray, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::context::SessionConfig;
     use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use futures::FutureExt;
 
     #[test]
     fn traversal_work_is_shared_by_children_and_repeated_workers_issue_659() {
@@ -883,6 +1313,7 @@ mod tests {
             pool,
             65_536,
             NonZeroU64::new(5),
+            QueryWorkScope::default(),
         ));
         let ctx = Arc::new(
             TaskContext::default()
@@ -1106,6 +1537,74 @@ mod tests {
         }
     }
 
+    /// A take admits one copy per index and a null row per null index, in the
+    /// flat path (a text column) and the per-row path (a struct over it): 64
+    /// null slots whose raw value names a 512 KiB row admit a few KiB, and
+    /// four repetitions of that row admit four copies per column, which a
+    /// 4 MiB pool holding the batch refuses before Arrow builds them; an
+    /// interleave over one-row batches admits each pick the same way. A case
+    /// cannot write null indices.
+    #[test]
+    fn a_take_admits_a_copy_per_index_and_a_null_row_per_null_index() {
+        use arrow_array::{StringArray, StructArray};
+        use datafusion::arrow::buffer::NullBuffer;
+        let wide = "x".repeat(512 * 1024);
+        let text: Arc<dyn Array> =
+            Arc::new(StringArray::from(vec![Some(wide.as_str()), Some("y")]));
+        let field = Arc::new(Field::new("text", DataType::Utf8, true));
+        let nested: Arc<dyn Array> = Arc::new(StructArray::from(vec![(
+            Arc::clone(&field),
+            Arc::clone(&text),
+        )]));
+        let schema = Arc::new(Schema::new(vec![
+            field.as_ref().clone(),
+            Field::new("nested", nested.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![text, nested]).unwrap();
+        let (pool, memory) = test_memory(4 * 1_048_576);
+        memory.hold(&batch).unwrap();
+        let nulls = UInt32Array::new(vec![0u32; 64].into(), Some(NullBuffer::new_null(64)));
+        let (picked, scratch) = memory.take_estimate(&batch, &nulls).unwrap();
+        let admitted = picked + scratch;
+        assert!(
+            admitted < 16 * 1024,
+            "null indices admitted {admitted} bytes"
+        );
+        let taken = memory.take_once(&batch, &nulls, "test take").unwrap();
+        assert_eq!(taken.num_rows(), 64);
+        assert!(
+            taken
+                .columns()
+                .iter()
+                .all(|column| column.null_count() == 64)
+        );
+        let repeated = UInt32Array::from(vec![0u32; 4]);
+        assert!(memory.take_estimate(&batch, &repeated).unwrap().0 >= 8 * 512 * 1024);
+        assert!(
+            memory.take_once(&batch, &repeated, "test take").is_err(),
+            "four copies of the row in two columns exceed the pool"
+        );
+        // An interleave over one-row batches counts each pick the same way.
+        let rows = [batch.slice(0, 1), batch.slice(1, 1)];
+        let picks = [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)];
+        assert!(memory.interleave_bytes(&rows, &picks[..2]).unwrap() < 2 * 1_048_576);
+        assert!(memory.interleave_bytes(&rows, &picks).unwrap() >= 8 * 512 * 1024);
+        let two = memory
+            .interleave_once(&batch.schema(), &rows, &picks[..2], "test interleave")
+            .unwrap();
+        assert_eq!(two, batch);
+        assert!(
+            memory
+                .interleave_once(&batch.schema(), &rows, &picks, "test interleave")
+                .is_err(),
+            "four copies of the wide row in two columns exceed the pool"
+        );
+        drop(two);
+        drop(taken);
+        drop(memory);
+        assert_eq!(pool.reserved(), 0);
+    }
+
     /// Pins the runtime to one blocking thread; a case cannot size the runtime.
     #[test]
     fn one_blocking_thread_can_poll_nested_work_and_async_io() {
@@ -1170,5 +1669,188 @@ mod tests {
             .await
             .expect("cancelled pending chunk retained its future");
         });
+    }
+
+    /// Cancels a submitted worker behind a busy blocking thread; GQT cannot
+    /// control the runtime queue or distinguish submission from execution.
+    #[test]
+    fn cancelling_queued_work_keeps_ownership_until_the_job_is_dropped() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, held) = std::sync::mpsc::channel();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                held.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            });
+            ready.await.unwrap();
+            let context = QueryContext::new(1_048_576).unwrap();
+            let settlement = context.owned_workers();
+            let memory = Arc::new(WorkMemory::new(context.task_ctx(), "queued worker").unwrap());
+            let pool = Arc::clone(&memory.resources.pool);
+            memory.grow(4_096).unwrap();
+            let ran = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&ran);
+            let (submitted, ready) = tokio::sync::oneshot::channel();
+            let query = tokio::spawn(async move {
+                submitted.send(()).unwrap();
+                memory
+                    .blocking(move |_| async move {
+                        observed.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            });
+            ready.await.unwrap();
+            query.abort();
+            assert!(query.await.unwrap_err().is_cancelled());
+            drop(context);
+            assert!(settlement.wait().now_or_never().is_none());
+            assert!(pool.reserved() >= 4_096);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), settlement.wait())
+                .await
+                .expect("aborted queued closure must release its registration");
+            assert!(!ran.load(Ordering::SeqCst));
+            assert_eq!(pool.reserved(), 0);
+        });
+    }
+
+    /// A cancelled blocking job can finish with a value that itself owns
+    /// resources; settlement must follow destruction of that abandoned output.
+    /// Its destructor tolerates a closed channel so a failed assertion cannot panic twice.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_worker_retains_ownership_through_output_destruction() {
+        struct HeldOutput {
+            _memory: Arc<WorkMemory>,
+            dropping: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for HeldOutput {
+            fn drop(&mut self) {
+                let _ = self.dropping.take().unwrap().send(());
+                let _ = self.release.recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }
+        let context = QueryContext::new(1_048_576).unwrap();
+        let settlement = context.owned_workers();
+        let memory = Arc::new(WorkMemory::new(context.task_ctx(), "abandoned output").unwrap());
+        let pool = Arc::clone(&memory.resources.pool);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release_worker, worker_held) = std::sync::mpsc::channel();
+        let (dropping, drop_started) = tokio::sync::oneshot::channel();
+        let (release_output, release) = std::sync::mpsc::channel();
+        let query = tokio::spawn(async move {
+            memory
+                .blocking(move |memory| async move {
+                    memory.grow(4_096)?;
+                    started.send(()).unwrap();
+                    worker_held
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    Ok(HeldOutput {
+                        _memory: memory,
+                        dropping: Some(dropping),
+                        release,
+                    })
+                })
+                .await
+        });
+        ready.await.unwrap();
+        query.abort();
+        assert!(matches!(query.await, Err(error) if error.is_cancelled()));
+        drop(context);
+        release_worker.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), drop_started)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            settlement.wait().now_or_never().is_none(),
+            "a completed poll's output remains owned until its destructor finishes"
+        );
+        assert!(pool.reserved() >= 4_096);
+        release_output.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), settlement.wait())
+            .await
+            .unwrap();
+        assert_eq!(pool.reserved(), 0);
+    }
+}
+
+#[cfg(test)]
+mod row_bytes_tests {
+    use super::*;
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder, StringBuilder};
+    use arrow_array::{ArrayRef, BooleanArray, Int64Array, StringArray, StructArray};
+    use arrow_schema::{Field, Fields};
+    use datafusion::execution::context::SessionConfig;
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+    /// One pass per column gives every row the bytes a one-row slice gives.
+    #[test]
+    fn row_bytes_equals_the_per_row_slice_for_every_layout() {
+        let limit = 1 << 20;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let resources = Arc::new(QueryResources::new(pool, limit as u64));
+        let ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_extension(resources)),
+        );
+        let memory = WorkMemory::new(ctx, "row bytes").unwrap();
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3), Some(4)]));
+        let flags: ArrayRef = Arc::new(BooleanArray::from(vec![true, false, true, true]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("longer value"),
+            None,
+            Some(""),
+        ]));
+        let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+        for row in 0..4 {
+            vectors.values().append_slice(&[row as f32; 3]);
+            vectors.append(row != 1);
+        }
+        let vectors: ArrayRef = Arc::new(vectors.finish());
+        let mut lists = ListBuilder::new(StringBuilder::new());
+        lists.values().append_value("x");
+        lists.values().append_value("yy");
+        lists.append(true);
+        lists.append(false);
+        lists.append(true);
+        lists.values().append_value("zzz");
+        lists.append(true);
+        let lists: ArrayRef = Arc::new(lists.finish());
+        let nested: ArrayRef = Arc::new(StructArray::new(
+            Fields::from(vec![
+                Field::new("n", DataType::Int64, true),
+                Field::new("s", DataType::Utf8, true),
+            ]),
+            vec![Arc::clone(&ints), Arc::clone(&names)],
+            None,
+        ));
+        let batch = RecordBatch::try_from_iter([
+            ("ints", ints),
+            ("flags", flags),
+            ("names", names),
+            ("vectors", vectors),
+            ("lists", lists),
+            ("nested", nested),
+        ])
+        .unwrap();
+        let sliced = batch.slice(1, 3);
+        for batch in [batch, sliced] {
+            let expected: Vec<usize> = (0..batch.num_rows())
+                .map(|row| memory.slice_bytes(&batch, row, 1).unwrap())
+                .collect();
+            assert_eq!(memory.row_bytes(&batch).unwrap(), expected);
+            assert!(expected.iter().all(|bytes| *bytes > 0));
+        }
     }
 }

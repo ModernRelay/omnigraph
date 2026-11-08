@@ -8,15 +8,16 @@ fix names the decision instead.
 
 | Field | Meaning |
 |---|---|
-| `code` | Stable identifier: `Q…` from the parser, `T…` from the type checker. A code's meaning is frozen; its message text may improve. |
+| `code` | Stable identifier: `Q…` from the parser, `T…` from the type checker, `P…` from the planner. A code's meaning is frozen; its message text may improve. |
 | `position` | For a parse refusal: `line` and `column` (1-based, in characters) and the `byte` offset. |
-| `stage` and `expression` | For a refusal after parsing: the compiler stage (`typecheck`) and, when the site can render it, the expression it refused. |
+| `stage` and `expression` | For a refusal after parsing: the stage (`typecheck` or `plan`) and, when the site can render it, the expression it refused. |
 | `expected` | What was expected or violated, one line, without a position. |
 | `fix` | One concrete fix, absent when `expected` names the decision. |
 | `suggestion` | Optional source edits with `applicability`, plus `start`, `end` and `replacement` for each edit. |
 
 The one-line `error` text is the code and the expectation in the legacy form
-(`parse error: …`, `type error: T33: …`); the other fields travel beside it.
+(`parse error: …`, `type error: T33: …`, `plan error: P002: …`); the other
+fields travel beside it.
 
 ## The measured case
 
@@ -71,9 +72,11 @@ do not mean there is no possible fix.
 ## Where the fields appear
 
 - **CLI, human formats** (`table`, `kv`, `csv`): the form above on stderr,
-  exit status 1, with no colour codes and no backtrace footer.
+  then `HTTP 400` when served and the `disposition` line, exit status 1, with no
+  colour codes and no backtrace footer.
 - **CLI, machine formats**: `--json` and `--format json` print the API's error
-  body pretty, `--format jsonl` prints it as one line, both on stdout with
+  body pretty with its `disposition`, `--format jsonl` prints it as one line, and
+  `--format toon` prints that same body as TOON. All of them go on stdout with
   exit status 1. A served refusal keeps the server's `code` field
   (`bad_request`); an embedded one has none.
 - **HTTP**: a `400` that refuses a query carries the additive `diagnostic`
@@ -114,3 +117,21 @@ do not mean there is no possible fix.
 
 Type codes are listed where the construct they guard is described, in
 [Query language](index.md).
+
+## Planner codes
+
+A planner code refuses a well-formed, type-checked query shape by design. It
+is the caller's error, answered as a bad request with the diagnostic, never as
+an internal error.
+
+| Code | Meaning |
+|---|---|
+| `P002` | An edge alternation or wildcard traversal has no finite traversal work limit. The fix sets `traversal_work_limit` before the query. |
+| `P003` | The traversal work limit is outside `1..=9223372036854775807`, or a plan records it twice. |
+| `P004` | An edge alternation or wildcard traversal was asked to run in CSR traversal mode; it runs in `auto` or `indexed` mode. |
+
+`P001` and `P005` are withdrawn. A search order ranks the binding it names
+whatever the `match` block declares first, so a ranking on a binding a
+traversal reaches is no longer refused, and an `rrf()` whose arms rank two
+bindings one traversal connects is the type error `T59`
+([Search](../search/index.md#ranking-a-traversal-reached-binding)).

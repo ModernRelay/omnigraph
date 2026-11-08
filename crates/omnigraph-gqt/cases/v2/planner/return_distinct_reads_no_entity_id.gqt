@@ -1,0 +1,44 @@
+# issue: none
+# notes: A `return distinct` ordered by some of its columns is total through
+# notes: the other projected columns, so the Sort appends no entity id and the
+# notes: scan never reads one (`sort_tiebreak_declared.gqt` shows the plain
+# notes: `return { $p.name, $p.age } order { $p.name }` reading `__id` and
+# notes: appending `$p`). The rows pin the appended key: equal ages sort by name.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+    age: I64
+}
+
+--- seed
+{"type":"Person","data":{"slug":"p1","name":"bob","age":30}}
+{"type":"Person","data":{"slug":"p2","name":"alice","age":40}}
+{"type":"Person","data":{"slug":"p3","name":"alice","age":30}}
+{"type":"Person","data":{"slug":"p4","name":"alice","age":30}}
+
+--- query
+set engine = v2;
+query ages_then_names() {
+    match { $p: Person }
+    return distinct { $p.age, $p.name }
+    order { $p.age }
+}
+--- expect ordered
+{"p.age":30,"p.name":"alice"}
+{"p.age":30,"p.name":"bob"}
+{"p.age":40,"p.name":"alice"}
+--- expect shape
+p.age: I64
+p.name: String
+--- expect plan
+scan Person as $p: not columns [__id]
+sort no tiebreak
+result columns [p.age: I64, p.name: String]

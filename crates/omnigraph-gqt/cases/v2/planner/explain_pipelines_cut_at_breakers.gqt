@@ -1,0 +1,101 @@
+# issue: none
+# notes: A query's explain prints `pipelines`, the physical plan cut at every operator that emits nothing before it has seen its whole input and at a join's build side: a Sort ends the scan's pipeline and sources the one above it; a one-hop traversal streams through its hash join's probe side while the build side is a pipeline of its own; a multi-hop Expand holds its input; a negated block's AntiJoin drains its inner tree and its input before it emits; a Sort over an Aggregate stacks two breakers, each pipeline after the one below it.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    name: String
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"slug":"p1","name":"alice"}}
+{"type":"Person","data":{"slug":"p2","name":"bob"}}
+{"edge":"Knows","from":"p1","to":"p2"}
+
+--- query
+set engine = v2;
+query sorted() {
+    match { $p: Person }
+    return { $p.name }
+    order { $p.name }
+}
+--- expect ordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+--- expect plan
+pipeline 0: Scan -> Projection => Sort
+pipeline 1: Sort => consumer after 0
+
+--- query
+set engine = v2;
+query one_hop() {
+    match { $p: Person $p knows $q }
+    return { $q.name }
+}
+--- expect unordered
+{"q.name":"bob"}
+--- expect shape
+q.name: String
+--- expect plan
+pipeline 0: Scan => HashJoin(build)
+pipeline 1: Scan -> Expand -> HashJoin(probe) -> Projection => consumer after 0
+
+--- query
+set engine = v2;
+query two_hops() {
+    match { $p: Person $p knows{1,2} $q }
+    return { $q.name }
+}
+--- expect unordered
+{"q.name":"bob"}
+--- expect shape
+q.name: String
+--- expect plan
+pipeline 0: Scan => HashJoin(build)
+pipeline 1: Scan => Expand
+pipeline 2: Expand -> HashJoin(probe) -> Projection => consumer after 0, 1
+
+--- query
+set engine = v2;
+query knows_nobody() {
+    match {
+        $p: Person
+        not { $p knows $q }
+    }
+    return { $p.name }
+}
+--- expect unordered
+{"p.name":"bob"}
+--- expect shape
+p.name: String
+--- expect plan
+pipeline 0: OuterReference -> Expand -> Scan(input_ids) => AntiJoin(inner)
+pipeline 1: Scan => AntiJoin
+pipeline 2: AntiJoin -> Projection => consumer after 0, 1
+
+--- query
+set engine = v2;
+query counted() {
+    match { $p: Person }
+    return { $p.name, count($p) as n }
+    order { n desc }
+}
+--- expect unordered
+{"p.name":"alice","n":1}
+{"p.name":"bob","n":1}
+--- expect shape
+p.name: String
+n: I64
+--- expect plan
+pipeline 0: Scan => Aggregate
+pipeline 1: Aggregate => Sort after 0
+pipeline 2: Sort => consumer after 1

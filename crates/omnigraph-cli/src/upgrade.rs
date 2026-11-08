@@ -1,44 +1,32 @@
-use super::*;
+use std::io::Write;
+
+use color_eyre::eyre::{Result, bail};
+
+use crate::app::Completion;
+use crate::commands::maintenance::args::UpgradeArgs;
+use crate::output::write_json;
+use crate::scope;
 
 pub(crate) async fn run(
-    profile: &Option<String>,
-    store: &Option<String>,
-    uri: Option<String>,
-    check: bool,
-    to_format: Option<u32>,
-    json: bool,
-    quiet: bool,
-) -> Result<()> {
-    let target = scope::resolve_scope(
-        &operator::load_operator_config()?,
-        planes::Capability::Direct,
-        scope::ScopeFlags {
-            profile: profile.as_deref(),
-            store: store.as_deref(),
-            server: None,
-            cluster: None,
-            graph: None,
-            uri,
-        },
-    )?;
-    if target.cluster.is_some() {
-        bail!(
-            "upgrade refuses cluster-managed graphs; a qualified cluster upgrade operation is required"
-        );
+    target: &crate::targets::ResolvedTarget,
+    args: UpgradeArgs,
+    stdout: &mut dyn Write,
+    _stderr: &mut dyn Write,
+) -> Result<Completion> {
+    let UpgradeArgs {
+        check,
+        to_format,
+        json,
+    } = args;
+    if !matches!(
+        target.binding,
+        crate::targets::TargetBinding::DirectGraph { .. }
+    ) {
+        bail!("upgrade requires a direct graph target; cluster graph upgrades are not qualified");
     }
-    let uri = resolve_local_uri(target.uri, "upgrade")?;
-    let uri = omnigraph::storage::normalize_root_uri(&uri)?;
-    let uri = if omnigraph::storage::storage_kind_for_uri(&uri)?
-        == omnigraph::storage::StorageKind::Local
-    {
-        std::fs::canonicalize(&uri)?
-            .to_str()
-            .ok_or_else(|| color_eyre::eyre::eyre!("upgrade path is not valid UTF-8"))?
-            .to_owned()
-    } else {
-        uri
-    };
-    if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(&uri)
+    let uri = scope::direct_graph_uri(target, None).await?;
+    let binding = scope::capture_storage_binding(target)?.for_uri(&uri)?;
+    if let Some(root) = omnigraph_cluster::cluster_root_for_graph_binding(&binding)
         .await
         .map_err(|diagnostic| {
             color_eyre::eyre::eyre!("{}: {}", diagnostic.path, diagnostic.message)
@@ -48,37 +36,51 @@ pub(crate) async fn run(
             "upgrade refuses graph `{uri}` inside cluster `{root}`; a qualified cluster upgrade operation is required"
         );
     }
-    if !check {
-        echo_write_target(quiet, "upgrade", &uri, false);
-    }
-    let report =
-        omnigraph::db::upgrade_storage(&uri, omnigraph::db::UpgradeOptions { check, to_format })
-            .await?;
-    if json {
-        print_json(&report)?;
-    } else {
-        print_human(&report)?;
-    }
-    if !report.success() {
-        std::process::exit(1);
-    }
-    Ok(())
+    let report = omnigraph::db::upgrade_storage_as_with_storage(
+        binding.uri(),
+        omnigraph::db::UpgradeOptions { check, to_format },
+        None,
+        None,
+        omnigraph::storage::storage_for_binding(&binding)?,
+    )
+    .await?;
+    finish_report(&report, json, stdout)
 }
 
-fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
+fn finish_report(
+    report: &omnigraph::db::UpgradeReport,
+    json: bool,
+    stdout: &mut dyn Write,
+) -> Result<Completion> {
+    if json {
+        write_json(report, stdout)?;
+    } else {
+        write_human(report, stdout)?;
+    }
+    if !report.success() {
+        stdout.flush()?;
+        return Ok(Completion::exit(1));
+    }
+    Ok(Completion::success())
+}
+
+fn write_human(report: &omnigraph::db::UpgradeReport, writer: &mut dyn Write) -> Result<()> {
     let mode = serde_json::to_value(report.mode)?;
     let outcome = serde_json::to_value(report.outcome)?;
-    println!(
+    writeln!(
+        writer,
         "upgrade {}: {} ({})",
         report.location,
         outcome.as_str().unwrap_or("unknown"),
         mode.as_str().unwrap_or("unknown")
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "graph identity: {}",
         report.graph_identity.as_deref().unwrap_or("unknown")
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "format: {} -> {}{}",
         report
             .observed_format
@@ -89,112 +91,259 @@ fn print_human(report: &omnigraph::db::UpgradeReport) -> Result<()> {
         } else {
             ""
         }
-    );
-    println!("route: {}", report.route.join(" -> "));
-    println!(
+    )?;
+    writeln!(writer, "route: {}", joined(&report.route, " -> "))?;
+    writeln!(
+        writer,
         "completed handlers: {}",
-        report.completed_handlers.join(", ")
-    );
-    println!(
+        joined(&report.completed_handlers, ", ")
+    )?;
+    writeln!(
+        writer,
         "last durable completed boundary: {}",
         report
             .last_durable_completed_boundary
             .as_deref()
-            .unwrap_or("unknown")
-    );
-    println!(
-        "work: {} metadata rows, {} retained snapshots, {} payload bytes copied, {} payload bytes rewritten",
-        report.work.metadata_rows,
-        report.work.retained_snapshots,
-        report.work.payload_bytes_copied,
-        report.work.payload_bytes_rewritten
-    );
-    println!(
-        "validation bytes: {}",
-        report
-            .work
-            .validation_bytes
-            .map_or_else(|| "unknown".into(), |v| v.to_string())
-    );
-    for check in &report.work.deferred_checks {
-        println!("validation deferred until the preceding conversion completes: {check}");
-    }
-    for exclusion in &report.work.external_blob_exclusions {
-        println!("external bytes excluded from preservation: {exclusion}");
-    }
-    for property in &report.work.historical_blob_identity_limits {
-        println!(
-            "historical Blob delivery retains the pre-0.10 property-lifetime restriction: {property}"
-        );
-    }
+            .unwrap_or("none")
+    )?;
+    let work = &report.work;
+    writeln!(
+        writer,
+        "source: {} live refs, {} retired refs, {} orphan writers, {} legacy commits, \
+         {} bookkeeping versions, {} absent parents",
+        work.live_refs,
+        work.retired_refs,
+        work.orphan_writers,
+        work.legacy_commits,
+        work.bookkeeping_versions,
+        work.absent_parents
+    )?;
+    writeln!(
+        writer,
+        "legacy objects: {} data files, {} id shards, {} writer shards, {} schema contents, \
+         {} bytes",
+        work.data_files,
+        work.id_shards,
+        work.writer_shards,
+        work.schema_contents,
+        work.legacy_bytes
+    )?;
+    writeln!(
+        writer,
+        "census: {} reads, {} cells",
+        work.census_reads, work.census_cells
+    )?;
     for finding in &report.findings {
-        println!("{}: {}", finding.code, finding.message);
+        writeln!(writer, "{}: {}", finding.code, finding.message)?;
     }
     if let Some(recovery) = &report.recovery {
-        println!("failed handler: {}", recovery.failed_handler);
-        println!("recovery executable: {}", recovery.executable_compatibility);
-        println!("recovery action: {}", recovery.action);
+        writeln!(writer, "failed handler: {}", recovery.failed_handler)?;
+        writeln!(
+            writer,
+            "recovery executable: {}",
+            recovery.executable_compatibility
+        )?;
+        writeln!(writer, "recovery action: {}", recovery.action)?;
     }
     if matches!(report.mode, omnigraph::db::UpgradeMode::Check) {
-        println!(
-            "Check is advisory. Stop all writers and maintenance and retain a verified backup before execution."
-        );
+        writeln!(
+            writer,
+            "Check is advisory. Keep the graph offline: stop all readers, writers and \
+             maintenance, retain a verified backup of the whole root, then run `omnigraph \
+             upgrade --target <graph>` without `--check`."
+        )?;
     }
     Ok(())
+}
+
+fn joined(items: &[String], separator: &str) -> String {
+    if items.is_empty() {
+        "none".to_owned()
+    } else {
+        items.join(separator)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{Cli, Command};
+    use clap::Parser;
 
     #[test]
-    fn storage_upgrade_parses_explicit_route_and_check_options() {
-        let cli = Cli::try_parse_from([
-            "omnigraph",
-            "upgrade",
-            "graph.omni",
-            "--check",
-            "--to-format",
-            "8",
-            "--json",
-        ])
-        .unwrap();
-        assert!(
-            matches!(&cli.command, Command::Upgrade { uri: Some(uri), check: true, to_format: Some(8), json: true } if uri == "graph.omni")
-        );
-        assert_eq!(
-            planes::command_capability(&cli.command),
-            planes::Capability::Direct
-        );
-        assert!(planes::guard_addressing(&cli).is_ok());
-        let cli = Cli::try_parse_from(["omnigraph", "--store", "graph.omni", "upgrade"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Upgrade {
-                uri: None,
-                check: false,
-                to_format: None,
-                json: false
+    fn upgrade_report_preserves_recovery_details_and_propagates_output_failure() {
+        use omnigraph::db::{
+            UpgradeFinding, UpgradeMode, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
+            UpgradeWork,
+        };
+        use std::io;
+
+        #[derive(Default)]
+        struct ReportWriter {
+            bytes: Vec<u8>,
+            flushes: usize,
+            fail_flush: bool,
+        }
+
+        impl Write for ReportWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
             }
-        ));
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                if self.fail_flush {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "output closed"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let mut report = UpgradeReport {
+            mode: UpgradeMode::Check,
+            outcome: UpgradeOutcome::CheckFailed,
+            location: "graph".into(),
+            graph_identity: None,
+            observed_format: None,
+            target_format: 16,
+            target_defaulted: true,
+            route: Vec::new(),
+            completed_handlers: Vec::new(),
+            findings: vec![UpgradeFinding {
+                code: "unsupported_source".into(),
+                message: "inspect the source".into(),
+            }],
+            last_durable_completed_boundary: None,
+            recovery: None,
+            work: UpgradeWork::default(),
+        };
+        let mut bytes = Vec::new();
+        write_human(&report, &mut bytes).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            concat!(
+                "upgrade graph: check_failed (check)\n",
+                "graph identity: unknown\nformat: unknown -> 16 (default target)\n",
+                "route: none\ncompleted handlers: none\nlast durable completed boundary: none\n",
+                "source: 0 live refs, 0 retired refs, 0 orphan writers, 0 legacy commits, 0 bookkeeping versions, 0 absent parents\n",
+                "legacy objects: 0 data files, 0 id shards, 0 writer shards, 0 schema contents, 0 bytes\n",
+                "census: 0 reads, 0 cells\nunsupported_source: inspect the source\n",
+                "Check is advisory. Keep the graph offline: stop all readers, writers and maintenance, retain a verified backup of the whole root, then run `omnigraph upgrade --target <graph>` without `--check`.\n",
+            )
+        );
+
+        report.mode = UpgradeMode::Execute;
+        report.outcome = UpgradeOutcome::RecoveryRequired;
+        report.graph_identity = Some("original-identity".into());
+        report.observed_format = Some(13);
+        report.target_defaulted = false;
+        report.route = vec!["convert".into(), "activate".into()];
+        report.completed_handlers = vec!["convert".into()];
+        report.findings.clear();
+        report.last_durable_completed_boundary = Some("converted".into());
+        report.recovery = Some(UpgradeRecovery {
+            failed_handler: "activate".into(),
+            executable_compatibility: "the original executable".into(),
+            action: "keep offline and inspect".into(),
+        });
+        let mut bytes = Vec::new();
+        write_human(&report, &mut bytes).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            concat!(
+                "upgrade graph: recovery_required (execute)\n",
+                "graph identity: original-identity\nformat: 13 -> 16\n",
+                "route: convert -> activate\ncompleted handlers: convert\nlast durable completed boundary: converted\n",
+                "source: 0 live refs, 0 retired refs, 0 orphan writers, 0 legacy commits, 0 bookkeeping versions, 0 absent parents\n",
+                "legacy objects: 0 data files, 0 id shards, 0 writer shards, 0 schema contents, 0 bytes\n",
+                "census: 0 reads, 0 cells\nfailed handler: activate\n",
+                "recovery executable: the original executable\nrecovery action: keep offline and inspect\n",
+            )
+        );
+        let mut prefix = [0_u8; 7];
+        let error = write_human(&report, &mut prefix.as_mut_slice()).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::WriteZero
+        );
+        assert_eq!(&prefix, b"upgrade");
+
+        for outcome in [UpgradeOutcome::RecoveryRequired, UpgradeOutcome::Completed] {
+            report.outcome = outcome;
+            if report.success() {
+                report.recovery = None;
+            }
+            for json in [false, true] {
+                let mut expected = Vec::new();
+                if json {
+                    write_json(&report, &mut expected).unwrap();
+                } else {
+                    write_human(&report, &mut expected).unwrap();
+                }
+
+                for fail_flush in [false, true] {
+                    let mut writer = ReportWriter {
+                        fail_flush,
+                        ..ReportWriter::default()
+                    };
+                    let result = finish_report(&report, json, &mut writer);
+                    if fail_flush && !report.success() {
+                        assert_eq!(
+                            result
+                                .unwrap_err()
+                                .downcast_ref::<io::Error>()
+                                .unwrap()
+                                .kind(),
+                            io::ErrorKind::BrokenPipe
+                        );
+                    } else {
+                        assert_eq!(result.unwrap().code(), i32::from(!report.success()));
+                    }
+                    assert_eq!(writer.bytes, expected);
+                    assert_eq!(writer.flushes, usize::from(!report.success()));
+                }
+
+                let mut prefix = [0_u8; 7];
+                let error = finish_report(&report, json, &mut prefix.as_mut_slice()).unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<io::Error>().unwrap().kind(),
+                    io::ErrorKind::WriteZero
+                );
+                assert_eq!(prefix.as_slice(), &expected[..7]);
+            }
+        }
     }
 
     #[test]
-    fn storage_upgrade_rejects_served_and_cluster_addressing() {
-        for flag in ["--server", "--cluster", "--graph"] {
-            let cli =
-                Cli::try_parse_from(["omnigraph", flag, "prod", "upgrade", "graph.omni"]).unwrap();
-            assert!(planes::guard_addressing(&cli).is_err(), "{flag}");
+    fn storage_upgrade_parses_target_and_check_options() {
+        let cli = Cli::try_parse_from([
+            "omnigraph",
+            "upgrade",
+            "--target",
+            "./graph.omni",
+            "--check",
+            "--to-format",
+            "15",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(cli.target.as_deref(), Some("./graph.omni"));
+        assert!(matches!(
+            cli.command,
+            Command::Upgrade(UpgradeArgs {
+                check: true,
+                to_format: Some(15),
+                json: true
+            })
+        ));
+        for args in [
+            vec!["upgrade", "graph.omni"],
+            vec!["upgrade", "--store", "graph.omni"],
+            vec!["upgrade", "--to-format", "not-a-version"],
+        ] {
+            assert!(Cli::try_parse_from(std::iter::once("omnigraph").chain(args)).is_err());
         }
-        assert!(
-            Cli::try_parse_from([
-                "omnigraph",
-                "upgrade",
-                "graph.omni",
-                "--to-format",
-                "not-a-version"
-            ])
-            .is_err()
-        );
     }
 }

@@ -1,0 +1,81 @@
+# issue: none
+# notes: `Date` and `DateTime` cells are read as text and pass the loader's literal checks
+# notes: before conversion: sub-millisecond digits and a time of day on a Date are refused as the
+# notes: JSONL route refuses them, nothing is loaded, and the accepted spellings (milliseconds,
+# notes: trailing zeros, the LDBC `+0000` offset and a nonzero colonless offset) store the instant.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Event {
+    id: I64 @key
+    day: Date?
+    at: DateTime?
+}
+
+--- seed
+{"type":"Event","data":{"id":1,"day":"2024-01-01","at":"2024-01-01T00:00:00.000Z"}}
+
+--- csv sub_millisecond.csv
+id|at
+2|2024-01-01T00:00:00.123456Z
+
+--- mutate
+load csv "sub_millisecond.csv" into node:Event mode append delimiter "|" header
+
+--- expect error: fractional-second digits past the third must be zero
+
+--- csv day_with_time.csv
+id|day
+3|2024-01-01T02:00:00+05:00
+
+--- mutate
+load csv "day_with_time.csv" into node:Event mode append delimiter "|" header
+
+--- expect error: a Date is a calendar day
+
+--- query
+query after_refusals() {
+    match { $e: Event }
+    return { $e.id }
+}
+
+--- expect unordered
+{"e.id": 1}
+
+--- expect shape
+e.id: I64
+
+--- csv offsets.csv
+id|at|day
+4|2010-02-14T15:32:10.447+0000|2010-02-14
+5|2010-02-14T15:32:10.447+0100|
+6|2010-02-14T15:32:10.000Z|
+7|2010-02-14T15:32:10.4470000Z|
+
+--- mutate
+load csv "offsets.csv" into node:Event mode append delimiter "|" header
+
+--- expect ok
+
+--- query
+query instants() {
+    match { $e: Event }
+    return { $e.id, $e.at, $e.day }
+}
+
+--- expect unordered
+{"e.id": 1, "e.at": "2024-01-01T00:00:00", "e.day": "2024-01-01"}
+{"e.id": 4, "e.at": "2010-02-14T15:32:10.447", "e.day": "2010-02-14"}
+{"e.id": 5, "e.at": "2010-02-14T14:32:10.447"}
+{"e.id": 6, "e.at": "2010-02-14T15:32:10"}
+{"e.id": 7, "e.at": "2010-02-14T15:32:10.447"}
+
+--- expect shape
+e.id: I64
+e.at: DateTime?
+e.day: Date?

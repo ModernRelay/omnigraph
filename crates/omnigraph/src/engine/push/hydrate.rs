@@ -28,7 +28,7 @@ use super::chunk::{Chunk, prefixed};
 use super::context::{ExecContext, Probe, side_name};
 use super::error::{ExecError, Result};
 use super::roles::{Operator, OperatorResult};
-use crate::exec::merge::{
+use crate::ordered_cursor::{
     HYDRATION_CHUNK_HARD_BYTES, HYDRATION_CHUNK_SEED_ROWS, HYDRATION_CHUNK_TARGET_BYTES, row_id_at,
 };
 use crate::storage_layer::KEYED_WRITE_MAX_ROWS;

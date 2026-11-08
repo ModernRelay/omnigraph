@@ -1,0 +1,216 @@
+# issue: none
+# notes: One public loader call updates 16 existing keys and inserts 16 new keys; exact 80-row result. One operation on a fresh handle is timed; checks and restart are outside the timer.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- load generate: v1 seed: 0 mode: merge branch: main
+tables:
+  - kind: node
+    name: Chunk
+    rows: 32
+    commits: 1
+    batch_rows: 32
+    start: 48
+    columns:
+      slug: {kind: key, prefix: base, width: 3}
+      embedding: {kind: literal, value: [300.0,0.0,0.0,0.0]}
+--- expect ok
+
+--- query
+branch list
+
+--- expect unordered
+{"name":"main"}
+--- expect shape
+name: String
+
+--- query branch: main
+query chunk_rows() { match { $c: Chunk } return { $c.slug as slug, $c.embedding as embedding } }
+
+--- expect unordered
+{"slug":"base000","embedding":[0.0,1.0,0.0,0.0]}
+{"slug":"base001","embedding":[1.0,1.0,0.0,0.0]}
+{"slug":"base002","embedding":[2.0,1.0,0.0,0.0]}
+{"slug":"base003","embedding":[3.0,1.0,0.0,0.0]}
+{"slug":"base004","embedding":[4.0,1.0,0.0,0.0]}
+{"slug":"base005","embedding":[5.0,1.0,0.0,0.0]}
+{"slug":"base006","embedding":[6.0,1.0,0.0,0.0]}
+{"slug":"base007","embedding":[7.0,1.0,0.0,0.0]}
+{"slug":"base008","embedding":[8.0,1.0,0.0,0.0]}
+{"slug":"base009","embedding":[9.0,1.0,0.0,0.0]}
+{"slug":"base010","embedding":[10.0,1.0,0.0,0.0]}
+{"slug":"base011","embedding":[11.0,1.0,0.0,0.0]}
+{"slug":"base012","embedding":[12.0,1.0,0.0,0.0]}
+{"slug":"base013","embedding":[13.0,1.0,0.0,0.0]}
+{"slug":"base014","embedding":[14.0,1.0,0.0,0.0]}
+{"slug":"base015","embedding":[15.0,1.0,0.0,0.0]}
+{"slug":"base016","embedding":[16.0,1.0,0.0,0.0]}
+{"slug":"base017","embedding":[17.0,1.0,0.0,0.0]}
+{"slug":"base018","embedding":[18.0,1.0,0.0,0.0]}
+{"slug":"base019","embedding":[19.0,1.0,0.0,0.0]}
+{"slug":"base020","embedding":[20.0,1.0,0.0,0.0]}
+{"slug":"base021","embedding":[21.0,1.0,0.0,0.0]}
+{"slug":"base022","embedding":[22.0,1.0,0.0,0.0]}
+{"slug":"base023","embedding":[23.0,1.0,0.0,0.0]}
+{"slug":"base024","embedding":[24.0,1.0,0.0,0.0]}
+{"slug":"base025","embedding":[25.0,1.0,0.0,0.0]}
+{"slug":"base026","embedding":[26.0,1.0,0.0,0.0]}
+{"slug":"base027","embedding":[27.0,1.0,0.0,0.0]}
+{"slug":"base028","embedding":[28.0,1.0,0.0,0.0]}
+{"slug":"base029","embedding":[29.0,1.0,0.0,0.0]}
+{"slug":"base030","embedding":[30.0,1.0,0.0,0.0]}
+{"slug":"base031","embedding":[31.0,1.0,0.0,0.0]}
+{"slug":"base032","embedding":[32.0,1.0,0.0,0.0]}
+{"slug":"base033","embedding":[33.0,1.0,0.0,0.0]}
+{"slug":"base034","embedding":[34.0,1.0,0.0,0.0]}
+{"slug":"base035","embedding":[35.0,1.0,0.0,0.0]}
+{"slug":"base036","embedding":[36.0,1.0,0.0,0.0]}
+{"slug":"base037","embedding":[37.0,1.0,0.0,0.0]}
+{"slug":"base038","embedding":[38.0,1.0,0.0,0.0]}
+{"slug":"base039","embedding":[39.0,1.0,0.0,0.0]}
+{"slug":"base040","embedding":[40.0,1.0,0.0,0.0]}
+{"slug":"base041","embedding":[41.0,1.0,0.0,0.0]}
+{"slug":"base042","embedding":[42.0,1.0,0.0,0.0]}
+{"slug":"base043","embedding":[43.0,1.0,0.0,0.0]}
+{"slug":"base044","embedding":[44.0,1.0,0.0,0.0]}
+{"slug":"base045","embedding":[45.0,1.0,0.0,0.0]}
+{"slug":"base046","embedding":[46.0,1.0,0.0,0.0]}
+{"slug":"base047","embedding":[47.0,1.0,0.0,0.0]}
+{"slug":"base048","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base049","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base050","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base051","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base052","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base053","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base054","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base055","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base056","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base057","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base058","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base059","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base060","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base061","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base062","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base063","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base064","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base065","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base066","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base067","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base068","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base069","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base070","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base071","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base072","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base073","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base074","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base075","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base076","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base077","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base078","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base079","embedding":[300.0,0.0,0.0,0.0]}
+--- expect shape
+slug: String
+embedding: Vector(4)
+
+--- restart
+
+--- query
+branch list
+
+--- expect unordered
+{"name":"main"}
+--- expect shape
+name: String
+
+--- query branch: main
+query chunk_rows() { match { $c: Chunk } return { $c.slug as slug, $c.embedding as embedding } }
+
+--- expect unordered
+{"slug":"base000","embedding":[0.0,1.0,0.0,0.0]}
+{"slug":"base001","embedding":[1.0,1.0,0.0,0.0]}
+{"slug":"base002","embedding":[2.0,1.0,0.0,0.0]}
+{"slug":"base003","embedding":[3.0,1.0,0.0,0.0]}
+{"slug":"base004","embedding":[4.0,1.0,0.0,0.0]}
+{"slug":"base005","embedding":[5.0,1.0,0.0,0.0]}
+{"slug":"base006","embedding":[6.0,1.0,0.0,0.0]}
+{"slug":"base007","embedding":[7.0,1.0,0.0,0.0]}
+{"slug":"base008","embedding":[8.0,1.0,0.0,0.0]}
+{"slug":"base009","embedding":[9.0,1.0,0.0,0.0]}
+{"slug":"base010","embedding":[10.0,1.0,0.0,0.0]}
+{"slug":"base011","embedding":[11.0,1.0,0.0,0.0]}
+{"slug":"base012","embedding":[12.0,1.0,0.0,0.0]}
+{"slug":"base013","embedding":[13.0,1.0,0.0,0.0]}
+{"slug":"base014","embedding":[14.0,1.0,0.0,0.0]}
+{"slug":"base015","embedding":[15.0,1.0,0.0,0.0]}
+{"slug":"base016","embedding":[16.0,1.0,0.0,0.0]}
+{"slug":"base017","embedding":[17.0,1.0,0.0,0.0]}
+{"slug":"base018","embedding":[18.0,1.0,0.0,0.0]}
+{"slug":"base019","embedding":[19.0,1.0,0.0,0.0]}
+{"slug":"base020","embedding":[20.0,1.0,0.0,0.0]}
+{"slug":"base021","embedding":[21.0,1.0,0.0,0.0]}
+{"slug":"base022","embedding":[22.0,1.0,0.0,0.0]}
+{"slug":"base023","embedding":[23.0,1.0,0.0,0.0]}
+{"slug":"base024","embedding":[24.0,1.0,0.0,0.0]}
+{"slug":"base025","embedding":[25.0,1.0,0.0,0.0]}
+{"slug":"base026","embedding":[26.0,1.0,0.0,0.0]}
+{"slug":"base027","embedding":[27.0,1.0,0.0,0.0]}
+{"slug":"base028","embedding":[28.0,1.0,0.0,0.0]}
+{"slug":"base029","embedding":[29.0,1.0,0.0,0.0]}
+{"slug":"base030","embedding":[30.0,1.0,0.0,0.0]}
+{"slug":"base031","embedding":[31.0,1.0,0.0,0.0]}
+{"slug":"base032","embedding":[32.0,1.0,0.0,0.0]}
+{"slug":"base033","embedding":[33.0,1.0,0.0,0.0]}
+{"slug":"base034","embedding":[34.0,1.0,0.0,0.0]}
+{"slug":"base035","embedding":[35.0,1.0,0.0,0.0]}
+{"slug":"base036","embedding":[36.0,1.0,0.0,0.0]}
+{"slug":"base037","embedding":[37.0,1.0,0.0,0.0]}
+{"slug":"base038","embedding":[38.0,1.0,0.0,0.0]}
+{"slug":"base039","embedding":[39.0,1.0,0.0,0.0]}
+{"slug":"base040","embedding":[40.0,1.0,0.0,0.0]}
+{"slug":"base041","embedding":[41.0,1.0,0.0,0.0]}
+{"slug":"base042","embedding":[42.0,1.0,0.0,0.0]}
+{"slug":"base043","embedding":[43.0,1.0,0.0,0.0]}
+{"slug":"base044","embedding":[44.0,1.0,0.0,0.0]}
+{"slug":"base045","embedding":[45.0,1.0,0.0,0.0]}
+{"slug":"base046","embedding":[46.0,1.0,0.0,0.0]}
+{"slug":"base047","embedding":[47.0,1.0,0.0,0.0]}
+{"slug":"base048","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base049","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base050","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base051","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base052","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base053","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base054","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base055","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base056","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base057","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base058","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base059","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base060","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base061","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base062","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base063","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base064","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base065","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base066","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base067","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base068","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base069","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base070","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base071","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base072","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base073","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base074","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base075","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base076","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base077","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base078","embedding":[300.0,0.0,0.0,0.0]}
+{"slug":"base079","embedding":[300.0,0.0,0.0,0.0]}
+--- expect shape
+slug: String
+embedding: Vector(4)
+

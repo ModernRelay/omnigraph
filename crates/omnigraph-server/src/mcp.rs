@@ -1,85 +1,132 @@
-//! Read-only MCP transport over the existing graph discovery and stored-query handlers.
-//! The official SDK owns protocol framing, negotiation and cancellation.
+//! Server adapter for the MCP protocol crate. HTTP authentication, admission,
+//! handler dispatch, and execution ownership stay on the existing server.
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
-use axum::body::{Bytes, to_bytes};
-use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::body::Bytes;
+use axum::extract::{RawQuery, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
 use axum::{Extension, Json, Router};
-use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+use omnigraph_mcp::{
+    AdmissionError, ChangeFilters, Host, HostError, Pending, ProtocolError, ResourceOutput,
+    ResourceRequest, ToolCall, ToolRequest, ToolResult, change_query,
 };
-use rmcp::service::RequestContext;
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{RoleServer, ServerHandler};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
+use tokio::sync::OwnedSemaphorePermit;
 
-use crate::api::InvokeStoredQueryRequest;
+use crate::api::{ErrorCode, InvokeStoredQueryRequest};
+use crate::extract::{ApiJson, ApiPath, ApiQuery};
 use crate::handlers::{self, QueryNamePath};
-use crate::registry::{GraphHandle, RegistryLookup};
+use crate::ingress::McpGraphRequest;
+use crate::serving::GraphRequest;
 use crate::workload::IngressLease;
 use crate::{ApiError, AppState, AuthenticatedActor, GraphId, GraphKey};
 
-pub(crate) const REQUEST_BYTES: usize = 64 * 1024;
-const RESULT_BYTES: usize = 1024 * 1024;
-const READ_DEADLINE: Duration = Duration::from_secs(30);
+pub use omnigraph_mcp::McpSettings;
+pub(crate) use omnigraph_mcp::REQUEST_BYTES;
+const RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
 
-/// Mount only when an explicitly configured OIDC resource enables this surface.
-/// Every HTTP request authenticates again; no MCP session retains an actor.
-pub(crate) fn router(state: AppState) -> Router<AppState> {
-    let handler = GraphTools {
-        state: state.clone(),
-        slots: Arc::new(Semaphore::new(16)),
-    };
-    let mut config = StreamableHttpServerConfig::default();
-    config.legacy_session_mode = false;
-    config.json_response = true;
-    config.max_request_body_bytes = REQUEST_BYTES;
-    if let Some(resource) = state
-        .oidc_resource_url()
-        .and_then(|url| url::Url::parse(&url).ok())
-    {
-        // Retain the SDK's localhost protection; add only the configured public
-        // authority, never an origin or Host copied from an inbound request.
-        config
-            .allowed_hosts
-            .push(resource[url::Position::BeforeHost..url::Position::AfterPort].into());
-        config
-            .allowed_origins
-            .push(resource.origin().ascii_serialization());
-    }
-    let service = StreamableHttpService::new(
-        move || Ok(handler.clone()),
-        Arc::new(LocalSessionManager::default()),
-        config,
+/// Whether `path` is protected-resource metadata: the root document or the
+/// path-suffixed location the challenge advertises.
+pub(crate) fn is_resource_metadata_path(path: &str) -> bool {
+    path.strip_prefix(RESOURCE_METADATA_PATH)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The metadata URL a client derives from the resource identifier (RFC 9728
+/// §3.1): the well-known prefix inserted before the resource's path. Every
+/// 401's challenge names it.
+pub(crate) fn advertised_metadata_url(resource: &str) -> Option<url::Url> {
+    let mut url = url::Url::parse(resource).ok()?;
+    let path = format!(
+        "{RESOURCE_METADATA_PATH}{}",
+        url.path().trim_end_matches('/')
     );
-    let protected = Router::new()
-        .route_service("/mcp", service)
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            |State(state): State<AppState>, request: Request, next: Next| async move {
-                crate::ingress::admit(&state, request, next).await
-            },
-        ))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            handlers::require_bearer_auth,
-        ))
-        .route_layer(middleware::from_fn_with_state(state, resource_challenge));
-    Router::new()
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(resource_metadata),
-        )
-        .merge(protected)
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url)
+}
+
+/// The metadata path this server advertises, fixed by its boot binding.
+#[derive(Clone)]
+pub(crate) struct AdvertisedMetadataPath(Arc<str>);
+
+/// Mounted when the server has a bearer credential source. Discovery metadata
+/// exists only with an OIDC resource; the 401 challenge is the server's own
+/// (`crate::challenge`). Every HTTP request authenticates again; no MCP session
+/// retains an actor.
+pub(crate) fn router(state: AppState) -> Router<AppState> {
+    let resource_url = state.oidc_resource_url();
+    let oidc = resource_url.is_some();
+    let protected = omnigraph_mcp::router(
+        ServerHost {
+            state: state.clone(),
+        },
+        state.mcp_settings().clone(),
+        resource_url.as_deref(),
+        crate::api::build::reported_version(env!("CARGO_PKG_VERSION")),
+    )
+    .route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        |State(state): State<AppState>, request: Request, next: Next| async move {
+            crate::ingress::admit(&state, request, next).await
+        },
+    ))
+    .route_layer(middleware::from_fn(
+        move |request: Request, next: Next| async move {
+            // Without an OIDC resource there is no origin to allow. The
+            // SDK treats an empty origin list as unrestricted, so refuse
+            // browser requests here; native clients send no `Origin`.
+            if !oidc && request.headers().contains_key(header::ORIGIN) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "Forbidden: Origin header is not allowed",
+                )
+                    .into_response();
+            }
+            next.run(request).await
+        },
+    ))
+    .route_layer(middleware::from_fn(handlers::require_expected_actor))
+    .route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        handlers::require_bearer_auth,
+    ))
+    .route_layer(middleware::from_fn(no_store));
+    // Computed once from the fixed binding. A wildcard route compared with the
+    // raw request path keeps the configured path out of the router's syntax.
+    let advertised = state
+        .oidc_resource_url()
+        .and_then(|resource| advertised_metadata_url(&resource))
+        .map(|url| AdvertisedMetadataPath(Arc::from(url.path())));
+    metadata_routes(advertised).into_router().merge(protected)
+}
+
+/// The protocol-defined discovery routes keep their boot-time availability
+/// and layers while sharing registration with the operation inventory.
+fn metadata_routes(
+    advertised: Option<AdvertisedMetadataPath>,
+) -> crate::http_operations::HttpRoutes {
+    let mut discovery = crate::http_operations::HttpRoutes::new("")
+        .route("oauth protected resource metadata", resource_metadata);
+    if let Some(advertised) = advertised {
+        discovery = discovery.resource_metadata(resource_metadata_at_resource_path, |route| {
+            route.layer(Extension(advertised))
+        });
+    }
+    discovery
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_http_operations() -> Vec<(crate::api::operations::HttpMethod, String)> {
+    metadata_routes(Some(AdvertisedMetadataPath(Arc::from(
+        "/.well-known/oauth-protected-resource/mcp",
+    ))))
+    .registered()
 }
 
 #[utoipa::path(get, path = "/.well-known/oauth-protected-resource", tag = "management",
@@ -93,298 +140,1128 @@ pub(crate) async fn resource_metadata(State(state): State<AppState>) -> Response
     }
 }
 
-async fn resource_challenge(
+/// The same metadata at the location the `/mcp` challenge advertises for a
+/// resource identifier with a path: the well-known prefix followed by that
+/// path (`/.well-known/oauth-protected-resource/mcp` for `https://host/mcp`).
+/// Every other suffix is 404.
+#[utoipa::path(get, path = "/.well-known/oauth-protected-resource/{resource_path}", tag = "management",
+    operation_id = "oauthProtectedResourceMetadataAtResourcePath",
+    params(("resource_path" = String, Path, description = "The configured resource identifier's path, without its leading `/`")),
+    responses((status = 200, description = "Public OAuth protected resource metadata", body = Value),
+              (status = 404, description = "Not the configured resource's path, or OAuth resource identity is not configured")))]
+pub(crate) async fn resource_metadata_at_resource_path(
     State(state): State<AppState>,
-    request: Request,
-    next: Next,
+    Extension(AdvertisedMetadataPath(advertised)): Extension<AdvertisedMetadataPath>,
+    uri: Uri,
 ) -> Response {
-    let mut response = next.run(request).await;
-    if response.status() == StatusCode::UNAUTHORIZED {
-        if let Some(mut url) = state
-            .oidc_resource_url()
-            .and_then(|url| url::Url::parse(&url).ok())
-        {
-            let path = format!(
-                "/.well-known/oauth-protected-resource{}",
-                url.path().trim_end_matches('/')
-            );
-            url.set_path(&path);
-            url.set_query(None);
-            url.set_fragment(None);
-            if let Ok(value) = HeaderValue::from_str(&format!("Bearer resource_metadata=\"{url}\""))
-            {
-                response
-                    .headers_mut()
-                    .insert(header::WWW_AUTHENTICATE, value);
-            }
-        }
+    if uri.path() == &*advertised {
+        resource_metadata(State(state)).await
+    } else {
+        StatusCode::NOT_FOUND.into_response()
     }
+}
+
+/// MCP responses answer one credential's request; never cache them.
+async fn no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
+/// The admitted HTTP request's actor and reservations, which the SDK carries
+/// into its task as request extensions.
+struct Admitted {
+    actor: AuthenticatedActor,
+    observer: crate::operations::ReadObserver,
+    input: IngressLease,
+    graph: McpGraphRequest,
+}
+
+fn admitted(parts: Option<&axum::http::request::Parts>) -> Result<Admitted, AdmissionError> {
+    let actor = parts
+        .and_then(|parts| parts.extensions.get::<AuthenticatedActor>())
+        .cloned()
+        .ok_or(AdmissionError::Unauthenticated)?;
+    // Reuse the admitted request's one lease and observer instead of admitting
+    // again after collection or releasing them before the SDK task finishes.
+    let parts = parts.ok_or(AdmissionError::MissingContext)?;
+    let observer = parts.extensions.get::<crate::operations::ReadObserver>();
+    let input = parts.extensions.get::<IngressLease>();
+    let graph = parts.extensions.get::<McpGraphRequest>();
+    match (observer, input, graph) {
+        (Some(observer), Some(input), Some(graph)) => Ok(Admitted {
+            actor,
+            observer: observer.clone(),
+            input: input.clone(),
+            graph: graph.clone(),
+        }),
+        _ => Err(AdmissionError::MissingContext),
+    }
+}
+
 #[derive(Clone)]
-struct GraphTools {
+struct ServerHost {
     state: AppState,
-    slots: Arc<Semaphore>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NoArguments {}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GraphArguments {
-    graph: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QueryArguments {
-    graph: String,
-    name: String,
-    #[serde(default)]
-    params: Option<serde_json::Map<String, Value>>,
-    #[serde(default)]
-    branch: Option<String>,
-}
+impl Host for ServerHost {
+    type Context = Admitted;
 
-impl ServerHandler for GraphTools {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("omnigraph-server", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Discover graph names, list readable stored queries, then invoke a named read. Applied graph policy governs every read. Mutation tools are unavailable.")
-    }
-
-    async fn list_tools(
+    fn admit(
         &self,
-        _: Option<PaginatedRequestParams>,
-        _: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tools()))
+        parts: Option<&axum::http::request::Parts>,
+    ) -> Result<Admitted, AdmissionError> {
+        admitted(parts)
     }
 
-    fn get_tool(&self, name: &str) -> Option<Tool> {
-        tools().into_iter().find(|tool| tool.name == name)
+    fn error(&self, error: ProtocolError, write: bool) -> HostError {
+        project_error(protocol_error(error, write), write)
     }
 
-    async fn call_tool(
+    fn start_tool(
         &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResponse, ErrorData> {
-        if self.get_tool(&request.name).is_none() {
-            return Err(ErrorData::invalid_params("unknown MCP tool", None));
+        context: Admitted,
+        request: ToolRequest,
+        permit: OwnedSemaphorePermit,
+    ) -> Pending<ToolResult> {
+        let host = self.clone();
+        let actor = context.actor.clone();
+        let input = context.input.clone();
+        let graph = context.graph.clone();
+        let write = request.is_write();
+        start_owned(context, permit, write, async move {
+            host.execute(request, actor, input, graph).await
+        })
+    }
+
+    fn start_resource(
+        &self,
+        context: Admitted,
+        request: ResourceRequest,
+        permit: OwnedSemaphorePermit,
+    ) -> Pending<ResourceOutput> {
+        let host = self.clone();
+        let actor = context.actor.clone();
+        let graph = context.graph.clone();
+        start_owned(context, permit, false, async move {
+            host.read(request, actor, graph).await
+        })
+    }
+}
+
+/// Register before returning the observation future: a caller can cancel or
+/// expire without ever polling that future. Execution retains every reservation
+/// until its owned work settles, including graph selection after cancellation.
+fn start_owned<T, F>(
+    context: Admitted,
+    permit: OwnedSemaphorePermit,
+    write: bool,
+    operation: F,
+) -> Pending<T>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, ApiError>> + Send + 'static,
+{
+    let read = context
+        .observer
+        .spawn_read((context.input, permit, context.graph), operation);
+    Box::pin(async move {
+        read.result()
+            .await
+            .map_err(|error| host_error(error, write))
+    })
+}
+
+/// Project the canonical API contract before crossing the protocol boundary.
+/// A failed write receipt must preserve its unknown effects even when the error
+/// body itself cannot fit the MCP response bound.
+fn host_error(mut error: ApiError, write: bool) -> HostError {
+    if write && (error.completion_uncertain() || error.code == ErrorCode::ResultTooLarge) {
+        error = error.after_owned_write();
+    }
+    project_error(error, write)
+}
+
+fn project_error(error: ApiError, write: bool) -> HostError {
+    let output = error.into_output();
+    let status = output
+        .http_status()
+        .and_then(|status| StatusCode::from_u16(status).ok());
+    HostError::from_output(status, &output).unwrap_or_else(|failure| {
+        let mut error = protocol_error(failure, write);
+        if write {
+            error = error.after_owned_write();
         }
-        let parts = context.extensions.get::<axum::http::request::Parts>();
-        let actor = parts
-            .and_then(|parts| parts.extensions.get::<AuthenticatedActor>())
-            .cloned();
-        let Some(actor) = actor else {
-            return Ok(failure(
-                "unauthenticated",
-                "A verified bearer credential is required.",
-            )
-            .into());
-        };
-        // The SDK transports the admitted HTTP request's extensions into its
-        // task. Reuse that one lease and observer instead of admitting again
-        // after collection or releasing them before the SDK task finishes.
-        let Some((observer, input)) = parts.and_then(|parts| {
-            parts
-                .extensions
-                .get::<crate::operations::ReadObserver>()
-                .zip(parts.extensions.get::<IngressLease>())
-                .map(|(observer, input)| (observer.clone(), input.clone()))
-        }) else {
-            return Ok(failure("internal_error", "MCP admission context is missing.").into());
-        };
-        let _observer = observer;
-        let _input = input.clone();
-        let Ok(_permit) = self.slots.try_acquire() else {
-            return Ok(failure(
-                "capacity_exceeded",
-                "The server is handling its maximum concurrent MCP reads.",
-            )
-            .into());
-        };
-        let result = tokio::select! {
-            _ = context.ct.cancelled() => failure("cancelled", "The read was cancelled."),
-            result = tokio::time::timeout(READ_DEADLINE, self.execute(request, actor, input)) => {
-                match result {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(error)) => api_failure(error).await,
-                    Err(_) => failure("deadline_exceeded", "The read exceeded its 30 second deadline."),
-                }
+        let output = error.into_output();
+        let status = output
+            .http_status()
+            .and_then(|status| StatusCode::from_u16(status).ok());
+        HostError::from_output(status, &output).expect("fixed MCP refusal fits the result bound")
+    })
+}
+
+/// MCP refusals use the server's one error-code and disposition registry.
+fn protocol_error(error: ProtocolError, write: bool) -> ApiError {
+    let unknown = "The write keeps running and its outcome is unknown. Before replaying it, read the target (`query` or `snapshot`, comparing `graph_commit_id`) or list the branch with `commits_list`, and replay a `mutate` with `if_graph_commit`.";
+    let wait_ended = |code, reason: &str| {
+        let mut error = ApiError::new(code, format!("{reason} {unknown}")).after_owned_write();
+        error.completion_uncertain = true;
+        error
+    };
+    match error {
+        ProtocolError::Unauthenticated => ApiError::unauthorized(
+            crate::challenge::Unauthenticated::NoCredential,
+            "A verified bearer credential is required.",
+        ),
+        ProtocolError::MissingContext => ApiError::internal("MCP admission context is missing."),
+        ProtocolError::Capacity => ApiError::too_many_requests(
+            "The server is handling its maximum concurrent MCP tool calls.",
+        ),
+        ProtocolError::Cancelled if write => {
+            wait_ended(ErrorCode::Cancelled, "The write's call was cancelled.")
+        }
+        ProtocolError::Cancelled => ApiError::new(ErrorCode::Cancelled, "The read was cancelled."),
+        ProtocolError::Deadline if write => wait_ended(
+            ErrorCode::DeadlineExceeded,
+            "The write passed its 30 second wait.",
+        ),
+        ProtocolError::Deadline => ApiError::new(
+            ErrorCode::DeadlineExceeded,
+            "The read exceeded its 30 second deadline.",
+        ),
+        ProtocolError::ResultTooLarge | ProtocolError::InvalidResult => {
+            let error = if matches!(error, ProtocolError::ResultTooLarge) {
+                ApiError::new(
+                    ErrorCode::ResultTooLarge,
+                    "The result exceeds 1 MiB; use a narrower stored query.",
+                )
+            } else {
+                ApiError::internal("could not encode MCP result")
+            };
+            if write {
+                error.after_owned_write()
+            } else {
+                error
             }
-        };
-        Ok(fit_result(result).into())
+        }
     }
 }
 
-impl GraphTools {
+fn bounded_result<T: Serialize>(value: &T) -> Result<ToolResult, ApiError> {
+    omnigraph_mcp::bounded_result(value).map_err(|error| protocol_error(error, false))
+}
+
+impl ServerHost {
     async fn execute(
         &self,
-        request: CallToolRequestParams,
+        request: ToolRequest,
         actor: AuthenticatedActor,
         input: IngressLease,
-    ) -> Result<CallToolResult, ApiError> {
-        let arguments = Value::Object(request.arguments.unwrap_or_default());
-        match request.name.as_ref() {
-            "graphs" => {
-                let _: NoArguments = arguments_as(arguments)?;
-                let output = handlers::server_graphs_discovery(
-                    State(self.state.clone()),
-                    Some(Extension(actor)),
-                )
-                .await?
-                .0;
-                bounded_result(&output)
+        graph: McpGraphRequest,
+    ) -> Result<ToolResult, ApiError> {
+        // Reserve write ingress before decoding arguments, matching HTTP
+        // admission and preserving refusal precedence.
+        let ingress = if request.is_write() {
+            let bytes = request
+                .argument_bytes()
+                .map_err(|_| ApiError::bad_request("invalid MCP tool arguments"))?;
+            Some(self.write_ingress(bytes)?)
+        } else {
+            None
+        };
+        let write_ingress =
+            || ingress.ok_or_else(|| ApiError::internal("MCP write admission is missing"));
+        let call = request
+            .parse()
+            .map_err(|_| ApiError::bad_request("invalid MCP tool arguments"))?;
+        let state = || State(self.state.clone());
+        match call {
+            ToolCall::Health => bounded_result(&handlers::server_health().await.0),
+            ToolCall::Graphs => bounded_result(&self.discover(actor).await?),
+            ToolCall::Schema(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output =
+                    handlers::server_schema_get(Extension(handle), Some(Extension(actor))).await?;
+                bounded_result(&output.0)
             }
-            "queries" => {
-                let args: GraphArguments = arguments_as(arguments)?;
-                let (handle, actor) = self.graph(&args.graph, actor)?;
-                let mut output =
+            ToolCall::Queries(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output =
                     handlers::server_list_queries(Extension(handle), Some(Extension(actor)))
-                        .await?
-                        .0;
-                output.queries.retain(|query| !query.mutation);
-                bounded_result(&output)
+                        .await?;
+                bounded_result(&output.0)
             }
-            "query" => {
-                let args: QueryArguments = arguments_as(arguments)?;
-                let (handle, actor) = self.graph(&args.graph, actor)?;
-                let body = serde_json::to_vec(&InvokeStoredQueryRequest {
-                    params: args.params.map(Value::Object),
-                    branch: args.branch,
-                    snapshot: None,
-                    expect_mutation: Some(false),
-                })
-                .map_err(|_| ApiError::bad_request("invalid query parameters"))?;
-                let output = handlers::server_invoke_query(
-                    State(self.state.clone()),
+            ToolCall::Query(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let Some(query) = args.query else {
+                    // A stored read, as `omnigraph query NAME` runs it.
+                    let name = args.name.ok_or_else(|| {
+                        ApiError::bad_request(
+                            "query needs `query` (GQ source) or `name` (a stored read)",
+                        )
+                    })?;
+                    let body = serde_json::to_vec(&InvokeStoredQueryRequest {
+                        params: args.params.map(Value::Object),
+                        branch: args.branch,
+                        snapshot: args.snapshot,
+                        expect_mutation: Some(false),
+                    })
+                    .map_err(|_| ApiError::bad_request("invalid query parameters"))?;
+                    let output = handlers::server_invoke_query(
+                        state(),
+                        Extension(handle),
+                        Extension(input),
+                        Some(Extension(actor)),
+                        ApiPath(QueryNamePath { query_name: name }),
+                        HeaderMap::new(),
+                        Bytes::from(body),
+                    )
+                    .await?;
+                    return bounded_result(&output.0);
+                };
+                let request = request_body(json!({
+                    "query": query,
+                    "name": args.name,
+                    "params": args.params,
+                    "branch": args.branch,
+                    "snapshot": args.snapshot,
+                }))?;
+                let output = handlers::server_query(
+                    state(),
                     Extension(handle),
-                    Extension(input),
                     Some(Extension(actor)),
-                    Path(QueryNamePath { name: args.name }),
-                    HeaderMap::new(),
-                    Bytes::from(body),
+                    ApiJson(request),
                 )
-                .await?
-                .0;
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::Snapshot(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output = handlers::server_snapshot(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiQuery(crate::api::SnapshotQuery {
+                        branch: args.branch,
+                    }),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::Access(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output = handlers::access_body(
+                    &handle,
+                    Some(&actor),
+                    crate::api::AccessQuery {
+                        branch: args.branch,
+                        target_branch: args.target_branch,
+                    },
+                )?;
                 bounded_result(&output)
             }
-            _ => Err(ApiError::bad_request("unknown MCP tool")),
+            ToolCall::BranchesList(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output = handlers::server_branch_list(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiQuery(crate::api::BranchListQuery {
+                        detailed: args.detailed,
+                    }),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::CommitsList(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let listing = match args.listing {
+                    Some(listing) => request_body(Value::String(listing))?,
+                    None => crate::api::CommitListing::History,
+                };
+                let output = handlers::server_commit_list(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiQuery(crate::api::CommitListQuery {
+                        branch: args.branch,
+                        listing,
+                        limit: args.limit,
+                        page_token: args.page_token,
+                    }),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::CommitsGet(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output = handlers::server_commit_show(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiPath(handlers::CommitPath {
+                        commit_id: args.commit_id,
+                    }),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::CommitsChanges(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query = change_query(&[], &args.filters);
+                let output = handlers::server_commit_changes(
+                    state(),
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiPath(handlers::CommitPath {
+                        commit_id: args.commit_id,
+                    }),
+                    RawQuery(query),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::ChangesPoll(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query = change_query(
+                    &[
+                        ("branch", args.branch.as_deref()),
+                        ("cursor", args.cursor.as_deref()),
+                        ("start", args.start.as_deref()),
+                    ],
+                    &args.filters,
+                );
+                let output = handlers::server_changes_feed(
+                    state(),
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    RawQuery(query),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::Diff(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query = change_query(
+                    &[
+                        ("from", Some(args.from.as_str())),
+                        ("to", Some(args.to.as_str())),
+                    ],
+                    &args.filters,
+                );
+                let output = handlers::server_diff(
+                    state(),
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    RawQuery(query),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::BranchesDiff(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query = change_query(
+                    &[
+                        ("source", Some(args.source.as_str())),
+                        ("target", args.target.as_deref()),
+                    ],
+                    &args.filters,
+                );
+                let output = handlers::server_branch_diff(
+                    state(),
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    RawQuery(query),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::BranchesMergeBase(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query = change_query(
+                    &[
+                        ("source", Some(args.source.as_str())),
+                        ("target", args.target.as_deref()),
+                    ],
+                    &ChangeFilters::default(),
+                );
+                let output = handlers::server_merge_base(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    RawQuery(query),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::BlobsStat(args) => {
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query: crate::api::BlobReadQuery = request_body(json!({
+                    "entity": args.entity,
+                    "type": args.r#type,
+                    "id": args.id,
+                    "property": args.property,
+                    "branch": args.branch,
+                    "snapshot": args.snapshot,
+                }))?;
+                let response = handlers::server_blob_head(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    HeaderMap::new(),
+                    ApiQuery(query.clone()),
+                )
+                .await?;
+                bounded_result(&blob_stat_output(&query, &response)?)
+            }
+            ToolCall::Mutate(args) => {
+                let ingress = write_ingress()?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let precondition = args
+                    .if_graph_commit
+                    .as_deref()
+                    .map(graph_commit_precondition)
+                    .transpose()?;
+                let Some(query) = args.query else {
+                    // A stored mutation, as `omnigraph mutate NAME` runs it:
+                    // the precondition selects the conditional route that
+                    // requires it; the plain route refuses one.
+                    let name = args.name.ok_or_else(|| {
+                        ApiError::bad_request(
+                            "mutate needs `query` (GQ source) or `name` (a stored mutation)",
+                        )
+                    })?;
+                    let body = serde_json::to_vec(&InvokeStoredQueryRequest {
+                        params: args.params.map(Value::Object),
+                        branch: args.branch,
+                        snapshot: None,
+                        expect_mutation: Some(true),
+                    })
+                    .map_err(|_| ApiError::bad_request("invalid mutation parameters"))?;
+                    let path = ApiPath(QueryNamePath { query_name: name });
+                    let output = match precondition {
+                        Some(headers) => {
+                            handlers::server_invoke_query_if_graph_commit(
+                                state(),
+                                Extension(handle),
+                                Extension(ingress),
+                                Some(Extension(actor)),
+                                path,
+                                headers,
+                                Bytes::from(body),
+                            )
+                            .await?
+                        }
+                        None => {
+                            handlers::server_invoke_query(
+                                state(),
+                                Extension(handle),
+                                Extension(ingress),
+                                Some(Extension(actor)),
+                                path,
+                                HeaderMap::new(),
+                                Bytes::from(body),
+                            )
+                            .await?
+                        }
+                    };
+                    return bounded_result(&output.0);
+                };
+                let request = ApiJson(request_body(json!({
+                    "query": query,
+                    "name": args.name,
+                    "params": args.params,
+                    "branch": args.branch,
+                }))?);
+                let output = match precondition {
+                    Some(headers) => {
+                        handlers::server_mutate_if_graph_commit(
+                            state(),
+                            Extension(handle),
+                            Extension(ingress),
+                            Some(Extension(actor)),
+                            headers,
+                            request,
+                        )
+                        .await?
+                    }
+                    None => {
+                        handlers::server_mutate(
+                            state(),
+                            Extension(handle),
+                            Extension(ingress),
+                            Some(Extension(actor)),
+                            HeaderMap::new(),
+                            request,
+                        )
+                        .await?
+                    }
+                };
+                bounded_result(&output.0)
+            }
+            ToolCall::Load(args) => {
+                let ingress = write_ingress()?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let request = request_body(json!({
+                    "branch": args.branch,
+                    "from": args.from,
+                    "mode": args.mode,
+                    "data": args.data,
+                }))?;
+                let output = handlers::server_load(
+                    state(),
+                    Extension(handle),
+                    Extension(ingress),
+                    Some(Extension(actor)),
+                    ApiJson(request),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::BlobsClear(args) => {
+                let ingress = write_ingress()?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let query = request_body(json!({
+                    "entity": args.entity,
+                    "type": args.r#type,
+                    "id": args.id,
+                    "property": args.property,
+                    "branch": args.branch,
+                }))?;
+                // The route's `If-Match` field, parsed by the route's own rule.
+                let mut headers = HeaderMap::new();
+                if let Some(tags) = args.if_match {
+                    headers.insert(
+                        header::IF_MATCH,
+                        HeaderValue::from_str(&tags).map_err(|_| {
+                            ApiError::bad_request("if_match is not a valid If-Match value")
+                        })?,
+                    );
+                }
+                let output = handlers::blob_clear_body(
+                    &self.state,
+                    &handle,
+                    ingress,
+                    Some(&actor),
+                    &headers,
+                    query,
+                )
+                .await?;
+                bounded_result(&output)
+            }
+            ToolCall::BranchesCreate(args) => {
+                let ingress = write_ingress()?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output = handlers::server_branch_create(
+                    state(),
+                    Extension(handle),
+                    Extension(ingress),
+                    Some(Extension(actor)),
+                    ApiJson(crate::api::BranchCreateRequest {
+                        from: args.from,
+                        from_commit: args.from_commit,
+                        name: args.name,
+                    }),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::BranchesDelete(args) => {
+                let ingress = write_ingress()?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output = handlers::server_branch_delete(
+                    state(),
+                    Extension(handle),
+                    Extension(ingress),
+                    Some(Extension(actor)),
+                    ApiPath(handlers::BranchPath {
+                        branch_name: args.name,
+                    }),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::BranchesMerge(args) => {
+                let ingress = write_ingress()?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let request = request_body(json!({
+                    "source": args.source,
+                    "target": args.target,
+                }))?;
+                let output = handlers::server_branch_merge(
+                    state(),
+                    Extension(handle),
+                    Extension(ingress),
+                    Some(Extension(actor)),
+                    ApiJson(request),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::CommitsPublish(args) => {
+                let ingress = write_ingress()?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                let output = handlers::server_commit_publish(
+                    state(),
+                    Extension(handle),
+                    Extension(ingress),
+                    Some(Extension(actor)),
+                    ApiPath(handlers::CommitPath {
+                        commit_id: args.commit_id,
+                    }),
+                )
+                .await?;
+                bounded_result(&output.0)
+            }
+            ToolCall::CommitsDrop(args) => {
+                let ingress = write_ingress()?;
+                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                handlers::server_commit_drop(
+                    state(),
+                    Extension(handle),
+                    Extension(ingress),
+                    Some(Extension(actor)),
+                    ApiPath(handlers::CommitPath {
+                        commit_id: args.commit_id,
+                    }),
+                )
+                .await?;
+                // The route answers 204; structured content must be an object.
+                bounded_result(&json!({}))
+            }
         }
+    }
+
+    /// One resource body and its media type, from the same handler and policy
+    /// action as the matching tool.
+    async fn read(
+        &self,
+        resource: ResourceRequest,
+        actor: AuthenticatedActor,
+        graph: McpGraphRequest,
+    ) -> Result<(&'static str, String), ApiError> {
+        match resource {
+            ResourceRequest::Graphs => {
+                Ok(("application/json", pretty(&self.discover(actor).await?)?))
+            }
+            ResourceRequest::Schema(name) => {
+                let (handle, actor) = self.graph(&name, actor, &graph)?;
+                let output =
+                    handlers::server_schema_get(Extension(handle), Some(Extension(actor))).await?;
+                Ok(("text/plain", output.0.schema_source))
+            }
+            ResourceRequest::Branches(name) => {
+                let (handle, actor) = self.graph(&name, actor, &graph)?;
+                let output = handlers::server_branch_list(
+                    Extension(handle),
+                    Some(Extension(actor)),
+                    ApiQuery(Default::default()),
+                )
+                .await?;
+                Ok(("application/json", pretty(&output.0)?))
+            }
+        }
+    }
+
+    /// Graph ids and names. An identity credential uses `GET /graphs/discovery`,
+    /// which admits every identity; any other credential uses `GET /graphs`
+    /// under the `graph_list` action, narrowed to the same two fields.
+    async fn discover(
+        &self,
+        actor: AuthenticatedActor,
+    ) -> Result<crate::api::GraphDiscoveryOutput, ApiError> {
+        let state = State(self.state.clone());
+        if actor.is_identity() {
+            return Ok(
+                handlers::server_graphs_discovery(state, Some(Extension(actor)))
+                    .await?
+                    .0,
+            );
+        }
+        let listed = handlers::server_graphs_list(state, Some(Extension(actor)))
+            .await?
+            .0;
+        Ok(crate::api::GraphDiscoveryOutput {
+            graphs: listed
+                .graphs
+                .into_iter()
+                .map(|graph| crate::api::GraphDiscoveryEntry {
+                    display_name: graph.graph_id.clone(),
+                    graph_id: graph.graph_id,
+                })
+                .collect(),
+        })
+    }
+
+    /// A write reserves write ingress for its argument bytes, as the write's
+    /// HTTP route does at admission; the handler's per-actor admission and
+    /// owned-write registration follow unchanged.
+    fn write_ingress(&self, bytes: usize) -> Result<IngressLease, ApiError> {
+        self.state
+            .workload
+            .try_ingress(bytes as u64)
+            .map_err(ApiError::from_workload_reject)
     }
 
     fn graph(
         &self,
         name: &str,
-        mut actor: AuthenticatedActor,
-    ) -> Result<(Arc<GraphHandle>, AuthenticatedActor), ApiError> {
+        actor: AuthenticatedActor,
+        graph: &McpGraphRequest,
+    ) -> Result<(GraphRequest, AuthenticatedActor), ApiError> {
         let id = GraphId::try_from(name.to_string())
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        if !actor.select_graph(&id) {
-            return Err(ApiError::forbidden("credential does not permit this graph"));
+        let handle =
+            handlers::resolve_registered_graph(&self.state, &GraphKey::cluster(id), Some(&actor))?;
+        if graph.set(handle.clone()).is_err() {
+            return Err(ApiError::internal(
+                "MCP request selected its graph more than once",
+            ));
         }
-        match self.state.routing().registry.get(&GraphKey::cluster(id)) {
-            RegistryLookup::Ready(handle) => Ok((handle, actor)),
-            RegistryLookup::Gone => Err(ApiError::not_found("graph not found")),
-        }
+        Ok((handle, actor))
     }
 }
+fn pretty<T: Serialize>(value: &T) -> Result<String, ApiError> {
+    serde_json::to_string_pretty(value)
+        .map_err(|_| ApiError::internal("could not encode MCP resource"))
+}
 
-fn arguments_as<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ApiError> {
+/// A route's typed request body, built from tool arguments through the same
+/// deserializer its JSON extractor uses.
+fn request_body<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ApiError> {
     serde_json::from_value(value).map_err(|_| ApiError::bad_request("invalid MCP tool arguments"))
 }
 
-fn tools() -> Vec<Tool> {
-    let text = json!({"type":"string","minLength":1});
-    [
-        ("graphs", "List effective graph identifiers and display names.", json!({"type":"object","properties":{},"additionalProperties":false})),
-        ("queries", "List stored reads visible under the graph's applied read policy. Invocation is separately authorized.", json!({"type":"object","properties":{"graph":text},"required":["graph"],"additionalProperties":false})),
-        ("query", "Invoke a named stored read under the graph's applied policy. Defaults to the main branch; mutations are refused.", json!({"type":"object","properties":{"graph":text,"name":text,"params":{"type":"object"},"branch":text},"required":["graph","name"],"additionalProperties":false})),
-    ].into_iter().map(|(name, description, schema)| Tool::new(name, description, schema.as_object().expect("literal object").clone())
-        .with_annotations(ToolAnnotations::new().read_only(true))).collect()
+/// `if_graph_commit` as the one `Omnigraph-If-Graph-Commit` header a
+/// conditional route requires; that route judges the value, so an empty or
+/// malformed one is refused there rather than dropped here.
+fn graph_commit_precondition(head: &str) -> Result<HeaderMap, ApiError> {
+    let value = HeaderValue::from_str(head)
+        .map_err(|_| ApiError::bad_request("if_graph_commit is not a valid commit id"))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(crate::api::GRAPH_COMMIT_PRECONDITION_HEADER, value);
+    Ok(headers)
 }
 
-struct LimitedBytes(Vec<u8>);
-impl std::io::Write for LimitedBytes {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > RESULT_BYTES - self.0.len() {
-            return Err(std::io::Error::other("MCP result exceeds byte limit"));
+/// `blob stat`'s JSON for a `HEAD /blob` answer, read from its headers as the
+/// CLI reads them: a managed value's length, validator and snapshot, or an
+/// external value's location and snapshot. Without conditional request
+/// headers the route answers no other success.
+fn blob_stat_output(
+    query: &crate::api::BlobReadQuery,
+    response: &Response,
+) -> Result<crate::api::BlobStatOutput, ApiError> {
+    let value = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::internal("the Blob stat answer omitted a header"))
+    };
+    let snapshot = value(crate::api::SNAPSHOT_ID_HEADER)?;
+    match response.status() {
+        StatusCode::OK => {
+            let size = value(header::CONTENT_LENGTH.as_str())?
+                .parse::<u64>()
+                .map_err(|_| ApiError::internal("the Blob stat answer has an invalid length"))?;
+            Ok(crate::api::BlobStatOutput::managed(
+                query,
+                snapshot,
+                size,
+                value(header::ETAG.as_str())?,
+            ))
         }
-        self.0.write_all(bytes)?;
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-fn bounded_result<T: Serialize>(value: &T) -> Result<CallToolResult, ApiError> {
-    let mut bytes = LimitedBytes(Vec::new());
-    if serde_json::to_writer(&mut bytes, value).is_err() {
-        return Ok(failure(
-            "result_too_large",
-            "The result exceeds 1 MiB; use a narrower stored query.",
-        ));
-    }
-    let value = serde_json::from_slice(&bytes.0)
-        .map_err(|_| ApiError::internal("could not encode MCP result"))?;
-    Ok(fit_result(CallToolResult::structured(value)))
-}
-
-fn fit_result(result: CallToolResult) -> CallToolResult {
-    // Structured results also carry a text representation for older clients.
-    // Bound the complete tool result, including that duplicate representation.
-    if serde_json::to_writer(&mut LimitedBytes(Vec::new()), &result).is_err() {
-        return failure(
-            "result_too_large",
-            "The result exceeds 1 MiB; use a narrower stored query.",
-        );
-    }
-    result
-}
-
-fn failure(code: &str, message: &str) -> CallToolResult {
-    CallToolResult::structured_error(json!({"code":code,"message":message}))
-}
-
-async fn api_failure(error: ApiError) -> CallToolResult {
-    let response = error.into_response();
-    let status = response.status().as_u16();
-    match to_bytes(response.into_body(), RESULT_BYTES).await {
-        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-            Ok(error) => CallToolResult::structured_error(json!({"status":status,"error":error})),
-            Err(_) => failure("request_failed", "The graph request failed."),
-        },
-        Err(_) => failure("request_failed", "The graph request failed."),
+        StatusCode::FOUND => Ok(crate::api::BlobStatOutput::external(
+            query,
+            snapshot,
+            value(header::LOCATION.as_str())?,
+        )),
+        _ => Err(ApiError::internal("unexpected Blob stat answer")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    fn error_body(error: HostError) -> Value {
+        let result = error.into_tool_result();
+        assert_eq!(result.is_error, Some(true));
+        assert!(serde_json::to_vec(&result).unwrap().len() <= omnigraph_mcp::RESULT_BYTES);
+        let body = result.structured_content.unwrap();
+        assert!(body.get("outcome_unknown").is_none(), "{body}");
+        body
+    }
 
     #[test]
-    fn complete_tool_result_including_legacy_text_has_one_byte_bound() {
-        let small = json!({"rows":[{"name":"Alice"}]});
-        let result = bounded_result(&small).unwrap();
-        assert_eq!(result.is_error, Some(false));
-        assert_eq!(result.structured_content, Some(small));
-        // The source JSON fits, but the SDK's structured + legacy text
-        // compatibility representation exceeds the complete result bound.
-        let duplicate = json!({"text":"x".repeat(RESULT_BYTES * 3 / 4)});
-        let result = bounded_result(&duplicate).unwrap();
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(
-            result.structured_content.unwrap()["code"],
-            "result_too_large"
+    fn a_write_whose_wait_ends_first_reports_an_unknown_outcome() {
+        let unknown = json!({"effects": "unknown", "action": "reconcile"});
+        for refusal in [ProtocolError::Cancelled, ProtocolError::Deadline] {
+            let body = error_body(project_error(protocol_error(refusal, true), true));
+            assert_eq!(body["status"], 500, "{body}");
+            assert_eq!(body["error"]["code"], "outcome_unknown", "{body}");
+            assert_eq!(body["error"]["disposition"], unknown, "{body}");
+        }
+        // A handler failure the server cannot settle is an unknown outcome
+        // for a write only; a refusal before effects remains a known one.
+        for (error, write, code, disposition) in [
+            (ApiError::internal("lost"), true, "outcome_unknown", unknown),
+            (
+                ApiError::bad_request("refused"),
+                true,
+                "bad_request",
+                json!({"effects": "none", "action": "fix"}),
+            ),
+            (
+                ApiError::internal("lost"),
+                false,
+                "internal",
+                json!({"effects": "none", "action": "refresh"}),
+            ),
+        ] {
+            let body = error_body(host_error(error, write));
+            assert_eq!(body["error"]["code"], code, "{body}");
+            assert_eq!(body["error"]["disposition"], disposition, "{body}");
+        }
+    }
+
+    /// `blobs_stat` reads the HEAD answer's headers as the CLI does, for a
+    /// managed and an external value; a missing header or another status is
+    /// the server's own failure, never a guessed body.
+    #[test]
+    fn blob_stat_reads_a_head_answer_as_the_cli_does() {
+        let query: crate::api::BlobReadQuery = serde_json::from_value(
+            json!({"entity":"node","type":"Doc","id":"a","property":"body","branch":"main"}),
+        )
+        .unwrap();
+        let answer = |status, headers: &[(&'static str, &str)]| {
+            let mut response = StatusCode::into_response(status);
+            for (name, value) in headers {
+                response
+                    .headers_mut()
+                    .insert(*name, HeaderValue::from_str(value).unwrap());
+            }
+            response
+        };
+        let selector = json!({"entity":"node","type":"Doc","id":"a","property":"body"});
+        let target = json!({"branch":"main","resolved_snapshot":"s1"});
+        let managed = answer(
+            StatusCode::OK,
+            &[
+                ("content-length", "5"),
+                ("etag", "\"e1\""),
+                ("omnigraph-snapshot-id", "s1"),
+            ],
         );
-        let too_large = json!({"text":"x".repeat(RESULT_BYTES+1)});
-        assert_eq!(bounded_result(&too_large).unwrap().is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(blob_stat_output(&query, &managed).unwrap()).unwrap(),
+            json!({"selector":selector,"kind":"managed","size":5,"etag":"\"e1\"","target":target})
+        );
+        let external = answer(
+            StatusCode::FOUND,
+            &[
+                ("location", "s3://bucket/key"),
+                ("omnigraph-snapshot-id", "s1"),
+            ],
+        );
+        assert_eq!(
+            serde_json::to_value(blob_stat_output(&query, &external).unwrap()).unwrap(),
+            json!({"selector":selector,"kind":"external","uri":"s3://bucket/key","target":target})
+        );
+        for response in [
+            answer(
+                StatusCode::OK,
+                &[("etag", "\"e1\""), ("omnigraph-snapshot-id", "s1")],
+            ),
+            answer(StatusCode::FOUND, &[("omnigraph-snapshot-id", "s1")]),
+            answer(StatusCode::NOT_MODIFIED, &[("omnigraph-snapshot-id", "s1")]),
+        ] {
+            let error = blob_stat_output(&query, &response).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Internal);
+        }
+    }
+
+    #[test]
+    fn protocol_refusals_use_the_server_error_registry() {
+        for write in [false, true] {
+            for (refusal, status, code, action) in [
+                (
+                    ProtocolError::Unauthenticated,
+                    Some(401),
+                    "unauthorized",
+                    "fix",
+                ),
+                (
+                    ProtocolError::MissingContext,
+                    Some(500),
+                    "internal",
+                    "refresh",
+                ),
+                (
+                    ProtocolError::Capacity,
+                    Some(429),
+                    "too_many_requests",
+                    "retry",
+                ),
+            ] {
+                let body = error_body(project_error(protocol_error(refusal, write), write));
+                assert_eq!(body["status"], json!(status), "{body}");
+                assert_eq!(body["error"]["code"], code, "{body}");
+                assert_eq!(
+                    body["error"]["disposition"],
+                    json!({"effects": "none", "action": action}),
+                    "{body}"
+                );
+            }
+        }
+        for (refusal, code, action) in [
+            (ProtocolError::Cancelled, "cancelled", "retry"),
+            (ProtocolError::Deadline, "deadline_exceeded", "retry"),
+            (ProtocolError::ResultTooLarge, "result_too_large", "fix"),
+        ] {
+            let body = error_body(project_error(protocol_error(refusal, false), false));
+            assert!(body.get("status").is_none(), "{body}");
+            assert_eq!(body["error"]["code"], code, "{body}");
+            assert_eq!(
+                body["error"]["disposition"],
+                json!({"effects": "none", "action": action}),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_tool_results_and_error_bodies_preserve_write_effects() {
+        // The first DTO fits by itself, but not with the SDK's text copy.
+        // The second exceeds even the DTO bound. Both are call errors, so a
+        // write whose receipt cannot be delivered must be reconciled.
+        for length in [
+            omnigraph_mcp::RESULT_BYTES * 3 / 4,
+            omnigraph_mcp::RESULT_BYTES + 1,
+        ] {
+            let value = json!({"text": "x".repeat(length)});
+            for write in [false, true] {
+                let disposition = if write {
+                    json!({"effects": "unknown", "action": "reconcile"})
+                } else {
+                    json!({"effects": "none", "action": "fix"})
+                };
+                for error in [
+                    bounded_result(&value).unwrap_err(),
+                    // The refusal itself has to fit the complete result too.
+                    ApiError::bad_request("x".repeat(length)),
+                ] {
+                    let body = error_body(host_error(error, write));
+                    assert!(body.get("status").is_none(), "{body}");
+                    assert_eq!(body["error"]["code"], "result_too_large", "{body}");
+                    assert_eq!(body["error"]["disposition"], disposition, "{body}");
+                }
+                // The protocol's final response-size check uses the same
+                // server projection as a handler's bounded DTO conversion.
+                let body = error_body(project_error(
+                    protocol_error(ProtocolError::ResultTooLarge, write),
+                    write,
+                ));
+                assert_eq!(body["error"]["code"], "result_too_large", "{body}");
+                assert_eq!(body["error"]["disposition"], disposition, "{body}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_or_expired_mcp_read_retains_capacity_until_execution_finishes() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            use crate::operations::OperationRuntime;
+            use crate::workload::{WorkloadController, WorkloadSnapshot};
+
+            for cancelled in [false, true] {
+                let workload = WorkloadController::with_defaults();
+                let operations = OperationRuntime::with_read_limit(2);
+                let temp = tempfile::TempDir::new().unwrap();
+                let uri = temp.path().join("graph").to_string_lossy().into_owned();
+                let engine =
+                    omnigraph::db::Omnigraph::init(&uri, "node Person { name: String @key }\n")
+                        .await
+                        .unwrap();
+                let service = ServerHost {
+                    state: AppState::new_single(uri, engine, Vec::new(), None, workload.clone())
+                        .with_operations(operations.clone()),
+                };
+                let slots = Arc::new(Semaphore::new(1));
+                let key = GraphKey::cluster(GraphId::try_from("default").unwrap());
+                let registry = service.state.routing.registry.clone();
+                let execution_key = key.clone();
+                let execution_runtime = operations.clone();
+                let graph = McpGraphRequest::default();
+                let execution_graph = graph.clone();
+                let (select, selected) = tokio::sync::oneshot::channel();
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let (release, held) = tokio::sync::oneshot::channel();
+                let response = start_owned(
+                    Admitted {
+                        actor: AuthenticatedActor::cluster_static(Arc::from("mcp-test")),
+                        observer: operations.try_observe().unwrap(),
+                        input: workload.try_read_ingress(17).unwrap(),
+                        graph,
+                    },
+                    slots.clone().try_acquire_owned().unwrap(),
+                    false,
+                    async move {
+                        // Graph resolution can happen after MCP cancellation
+                        // has already returned its error to the HTTP task.
+                        selected.await.unwrap();
+                        let crate::registry::RegistryCapture::Ready(request) = registry
+                            .capture(&execution_runtime, &execution_key)
+                            .unwrap()
+                        else {
+                            panic!("fixture graph must be available");
+                        };
+                        assert!(execution_graph.set(request).is_ok());
+                        entered.send(()).unwrap();
+                        held.await.unwrap();
+                        bounded_result(&json!({"finished": true}))
+                    },
+                );
+                // The protocol crate owns cancellation/deadline replies. The
+                // adapter must retain work even if observation is never polled.
+                if cancelled {
+                    drop(response);
+                } else {
+                    assert!(
+                        tokio::time::timeout(Duration::ZERO, response)
+                            .await
+                            .is_err()
+                    );
+                }
+                select.send(()).unwrap();
+                started.await.unwrap();
+                let transition = service
+                    .state
+                    .prepare_same_view(&key, tokio::time::Instant::now() + Duration::from_secs(2))
+                    .unwrap()
+                    .close()
+                    .unwrap();
+                let settled = transition.wait_requests();
+                tokio::pin!(settled);
+                assert!(futures::poll!(&mut settled).is_pending());
+                assert_eq!(operations.snapshot().active_reads, 1);
+                assert_eq!(workload.snapshot().read_ingress_bytes, 17);
+                assert_eq!(slots.available_permits(), 0);
+                assert!(slots.clone().try_acquire_owned().is_err());
+                operations.close();
+                assert!(matches!(
+                    settled.await,
+                    Err(crate::serving::ServingTransitionError::ProcessClosed)
+                ));
+                let shutdown = operations.wait_logical_owners();
+                tokio::pin!(shutdown);
+                assert!(futures::poll!(&mut shutdown).is_pending());
+                release.send(()).unwrap();
+                assert!(shutdown.await);
+                assert_eq!(slots.available_permits(), 1);
+                assert_eq!(workload.snapshot(), WorkloadSnapshot::default());
+            }
+        })
+        .await
+        .expect("MCP read did not settle");
     }
 }

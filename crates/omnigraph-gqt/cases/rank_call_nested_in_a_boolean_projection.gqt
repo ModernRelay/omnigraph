@@ -1,6 +1,6 @@
 # issue: none
-# notes: A `bm25` or `nearest` call nested inside a Boolean projection reads the score column
-# notes: the leading `order` retrieval computed, as the bare projected call does (T33).
+# notes: Projected Boolean expressions over nearest, bm25 and rrf read the retrieval score column.
+# notes: Expression and alias secondary keys agree and preserve the leading retrieval order.
 
 --- runner
 timeout_ms: 10000
@@ -13,11 +13,12 @@ node Doc {
     slug: String @key
     text: String @index
     embedding: Vector(2)
+    n: I64?
 }
 
 --- seed
 {"type":"Doc","data":{"slug":"a","text":"needle","embedding":[1.0,0.0]}}
-{"type":"Doc","data":{"slug":"b","text":"needle filler","embedding":[0.0,1.0]}}
+{"type":"Doc","data":{"slug":"b","text":"needle filler","embedding":[0.0,1.0],"n":10}}
 
 --- query
 set engine = v2;
@@ -58,3 +59,158 @@ query nearest_threshold($v: Vector(2)) {
 --- expect shape
 d.slug: String
 close: Bool
+
+--- query
+set engine = v2;
+query nearest_threshold_expression($v: Vector(2)) {
+    match { $d: Doc }
+    return { $d.slug, nearest($d.embedding, $v) < 1.0 as close }
+    order { nearest($d.embedding, $v), (nearest($d.embedding, $v) < 1.0) asc }
+    limit 2
+}
+
+--- params
+{"v":[1.0,0.0]}
+
+--- expect ordered
+{"d.slug":"a","close":true}
+{"d.slug":"b","close":false}
+
+--- expect shape
+d.slug: String
+close: Bool
+
+--- query
+set engine = v2;
+query nearest_threshold_alias($v: Vector(2)) {
+    match { $d: Doc }
+    return { $d.slug, nearest($d.embedding, $v) < 1.0 as close }
+    order { nearest($d.embedding, $v), close asc }
+    limit 2
+}
+
+--- params
+{"v":[1.0,0.0]}
+
+--- expect ordered
+{"d.slug":"a","close":true}
+{"d.slug":"b","close":false}
+
+--- expect shape
+d.slug: String
+close: Bool
+
+--- query
+set engine = v2;
+query bm25_threshold_expression($q: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.text, $q) > 0.18 as hit }
+    order { bm25($d.text, $q) desc, (bm25($d.text, $q) > 0.18) asc }
+    limit 2
+}
+
+--- params
+{"q":"needle"}
+
+--- expect ordered
+{"d.slug":"a","hit":true}
+{"d.slug":"b","hit":false}
+
+--- expect shape
+d.slug: String
+hit: Bool
+
+--- query
+set engine = v2;
+query bm25_threshold_alias($q: String) {
+    match { $d: Doc }
+    return { $d.slug, bm25($d.text, $q) > 0.18 as hit }
+    order { bm25($d.text, $q) desc, hit asc }
+    limit 2
+}
+
+--- params
+{"q":"needle"}
+
+--- expect ordered
+{"d.slug":"a","hit":true}
+{"d.slug":"b","hit":false}
+
+--- expect shape
+d.slug: String
+hit: Bool
+
+--- query
+set engine = v2;
+query rrf_threshold_expression($v: Vector(2), $q: String) {
+    match { $d: Doc }
+    return { $d.slug, rrf(nearest($d.embedding, $v), bm25($d.text, $q)) > 0.0325 as high }
+    order { rrf(nearest($d.embedding, $v), bm25($d.text, $q)), (rrf(nearest($d.embedding, $v), bm25($d.text, $q)) > 0.0325) asc }
+    limit 2
+}
+
+--- params
+{"v":[1.0,0.0],"q":"needle"}
+
+--- expect ordered
+{"d.slug":"a","high":true}
+{"d.slug":"b","high":false}
+
+--- expect shape
+d.slug: String
+high: Bool
+
+--- query
+set engine = v2;
+query rrf_threshold_alias($v: Vector(2), $q: String) {
+    match { $d: Doc }
+    return { $d.slug, rrf(nearest($d.embedding, $v), bm25($d.text, $q)) > 0.0325 as high }
+    order { rrf(nearest($d.embedding, $v), bm25($d.text, $q)), high asc }
+    limit 2
+}
+
+--- params
+{"v":[1.0,0.0],"q":"needle"}
+
+--- expect ordered
+{"d.slug":"a","high":true}
+{"d.slug":"b","high":false}
+
+--- expect shape
+d.slug: String
+high: Bool
+
+--- query
+set engine = v2;
+query recursive_rank_keys($v: Vector(2)) {
+    match { $d: Doc }
+    return {
+        $d.slug,
+        not (nearest($d.embedding, $v) < 1.0) as far,
+        nearest($d.embedding, $v) is null as missing,
+        nearest($d.embedding, $v) in [0.0] as exact,
+        nearest($d.embedding, $v) < 1.0 and $d.n > 5 as eligible
+    }
+    order {
+        nearest($d.embedding, $v),
+        (not (nearest($d.embedding, $v) < 1.0)) desc,
+        (nearest($d.embedding, $v) is null) desc,
+        (nearest($d.embedding, $v) in [0.0]) asc,
+        (nearest($d.embedding, $v) < 1.0 and $d.n > 5) asc
+    }
+    limit 2
+}
+
+--- params
+{"v":[1.0,0.0]}
+
+--- expect ordered
+{"d.slug":"a","far":false,"missing":false,"exact":true}
+{"d.slug":"b","far":true,"missing":false,"exact":false,"eligible":false}
+
+--- expect shape
+d.slug: String
+far: Bool
+missing: Bool
+exact: Bool
+eligible: Bool?

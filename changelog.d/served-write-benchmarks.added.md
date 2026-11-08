@@ -1,0 +1,1 @@
+- `omnigraph-bench` admits served writes as unpublished commits: a workload writes `as commit`, reads at the bound snapshot and drops it, so no head moves and no reset is needed.

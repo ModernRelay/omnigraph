@@ -1,234 +1,243 @@
 # CLI guide
 
-The `omnigraph` CLI can work directly with a graph store, through a running
-server, or with a cluster definition. Start with the form that matches the
-resource you have:
+Upgrading an existing installation? Start with the
+[0.13 → 0.14 checklist](../operations/upgrade-0.14.md) for before/after YAML
+and command examples.
+
+Select resources with `--target NAME|LOCAL_PATH`, or `defaults.target` when
+omitted. Account operations use `--profile NAME` or `defaults.profile`.
+These selectors are mutually exclusive. Source files select what to run; they
+never choose where to run it.
 
 ```bash
-# One graph, opened directly
+# Open a graph directly; no registration needed.
 omnigraph query sources_for_claim --query queries.gq \
-  --params '{"claim":"lower-latency"}' --store ./graph.omni
+  --params '{"claim":"lower-latency"}' --target ./graph.omni
 
-# One graph on a multi-graph server
-omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
-  --server prod --graph knowledge
+# Run a stored query through a registered server target.
+omnigraph query sources_for_claim --target prod --graph knowledge \
+  --params '{"claim":"lower-latency"}'
 
-# A reusable scope from ~/.omnigraph/config.yaml
-omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
-  --profile prod-knowledge
+# Remote endpoints require a registered target.
+omnigraph graphs list --target prod
 ```
 
-Run `omnigraph <command> --help` for the flags supported by your installed
-version. The [CLI reference](reference.md) summarizes addressing, commands,
-configuration, and output formats.
+A bare word is a registered name. Write `./local` for a relative path named
+`local`. A direct root or server needs `--graph ID` for graph operations unless
+its registered target has `default_graph`. A direct graph already identifies
+the graph and rejects `--graph`. Commands reject incompatible backend kinds
+before making a request.
 
-For a managed cluster, first select it with `use` and cache an identity
-credential with `cluster token`. Run `graphs list` to discover graph names,
-then `query` or `mutate` from that folder with an explicit `--graph`. Applied
-Cedar policy determines your permissions. See [managed data access](managed-data.md)
-for legacy restricted credentials, expiry, offline operation, and clearing.
+The CLI prints its resolved destination to stderr before mutations. An invalid
+explicit target fails; it never falls back to the default. Folder context,
+credentials and discovery responses cannot change the destination.
+
+Run `omnigraph <command> --help` for available flags. The
+[CLI reference](reference.md) covers the complete command surface, and
+[operator configuration](targets.md) is the primary reference for profiles,
+targets, authentication providers and the breaking format change.
 
 ## Create, load, and query a graph
 
 ```bash
-omnigraph init --schema schema.pg ./graph.omni
-omnigraph load --data evidence.jsonl --mode overwrite ./graph.omni
-
-omnigraph query sources_for_claim \
-  --query queries.gq \
-  --params '{"claim":"lower-latency"}' \
-  --format table \
-  --store ./graph.omni
+omnigraph init ./graph.omni --schema schema.pg
+omnigraph load --target ./graph.omni --data evidence.jsonl --mode overwrite
+omnigraph query sources_for_claim --target ./graph.omni \
+  --query queries.gq --params '{"claim":"lower-latency"}' --format table
+omnigraph mutate add_source --target ./graph.omni --query mutations.gq \
+  --params '{"slug":"incident-review","title":"Incident review"}'
 ```
 
-`load` always requires a mode:
+`init URI` is the positional shorthand for an inline direct graph target.
+Other graph commands take their destination through `--target`.
+
+`load` requires a mode:
 
 - `overwrite` replaces each node or edge type represented in the batch. Types
   absent from the batch are unchanged.
 - `append` inserts new entities and rejects duplicate IDs.
 - `merge` inserts new IDs and updates existing IDs.
 
-Use `mutate` for `.gq` insert, update, and delete queries:
-
-```bash
-omnigraph mutate add_source \
-  --query mutations.gq \
-  --params '{"slug":"incident-review","title":"Incident review"}' \
-  --store ./graph.omni
-```
-
-For a stored server query, omit `--query`; the positional name selects the
-query from the server's registry:
-
-```bash
-omnigraph query sources_for_claim --server prod --graph knowledge \
-  --params '{"claim":"lower-latency"}'
-```
+For a stored query, omit `--query`; the positional name selects the query from
+the selected backend's registry.
 
 ## Work with branches
 
 ```bash
-omnigraph branch create review/new-data --from main --store ./graph.omni
-omnigraph load --data batch.jsonl --mode merge \
-  --branch review/new-data ./graph.omni
-omnigraph query inspect --query review.gq \
-  --branch review/new-data --store ./graph.omni
-omnigraph branch merge review/new-data --into main --store ./graph.omni
+omnigraph branch create review/new-data --from main --target ./graph.omni
+omnigraph load --target ./graph.omni --data batch.jsonl --mode merge \
+  --branch review/new-data
+omnigraph query inspect --target ./graph.omni --query review.gq \
+  --branch review/new-data
+omnigraph branch merge review/new-data --into main --target ./graph.omni
 ```
 
-Each branch operation is also a GQ statement, run through the same verbs that
-run any `.gq` source: the control writes through `mutate`, the listing through
-`query`. A statement names its branches itself, so it takes no `--branch`:
+Branch operations are also GQ statements. Statements name their branches
+internally and take no `--branch`:
 
 ```bash
-omnigraph mutate -e 'branch create "review/new-data" from main' --store ./graph.omni
-omnigraph query  -e 'branch list' --format table --store ./graph.omni
-omnigraph mutate -e 'branch merge "review/new-data" into main' --store ./graph.omni
-omnigraph mutate -e 'branch delete "review/new-data"' --store ./graph.omni
+omnigraph mutate -e 'branch create "review/new-data" from main' --target ./graph.omni
+omnigraph query -e 'branch list' --target ./graph.omni --format table
+omnigraph mutate -e 'branch merge "review/new-data" into main' --target ./graph.omni
 ```
 
-See [Branches and commits](../branching/index.md) for isolation, history, and
-merge behavior.
+See [Branches and commits](../branching/index.md).
 
 ## Session settings
 
 `--set NAME=VALUE`, repeatable, gives a [session
-setting](../queries/index.md#session-settings) a value for one invocation; the
-value is spelled as after `=` in a `set` line (`--set merge_lineage=off`). A `set`
-line in the source applies after `--set`, so the file wins.
-
-- `query --set`: applies to the read, `show` included.
-- `mutate --set`: applies to the mutation or branch statement.
-- `branch merge --set`: applies to the merge (`--set merge_lineage=verify`).
-- `commit changes --set`: sent as `set=NAME=VALUE` on the commit's change
-  read. The values are validated and select nothing in this release; a direct
-  run (`--store`) accepts them with no effect.
-- `changes poll --set`: sent as `set=NAME=VALUE` on the change feed read, with
-  the same validation and the same absence of effect.
-- `load --set` and `ingest --set`: a direct run (`--store`) applies them to the
-  staged write (`--set stage_write_concurrency=16`); a served run refuses any
-  `--set` before sending, since the served load and ingest routes carry no
-  `settings` field.
+setting](../queries/index.md#session-settings) a value for one invocation. A
+`set` line in source applies afterward, so the file wins.
 
 ```bash
-omnigraph query reports --query queries.gq --set merge_lineage=off --store ./graph.omni
-omnigraph branch merge review/new-data --into main --set merge_lineage=verify --store ./graph.omni
+omnigraph query reports --query queries.gq --set merge_lineage=off --target ./graph.omni
+omnigraph branch merge review/new-data --into main --set merge_lineage=verify --target ./graph.omni
 ```
 
-A direct run (`--store`) is the process, so it accepts a `process` setting
-from `--set`, the file and the environment. A served run (`--server`) sends
-`--set` values in the request's `settings` field, and a `--set` or `set` line
-naming a `process` setting is refused before anything is sent: `setting
-`<name>` is a process setting; it is read from the server's environment, not
-from a request`.
+`query`, `mutate` and `branch merge` apply settings to their operation.
+`commit changes` and `changes poll` validate settings but they currently have
+no effect. Direct `load` applies settings to its staged write; served `load`
+refuses `--set` because its HTTP contract has no settings field.
 
-A stored query takes no `--set`: `omnigraph query <name>` without `-e` or
-`--query` runs under the process defaults.
+A direct invocation accepts process settings from `--set`, source and the
+environment. A server or managed invocation refuses process settings in a
+request; those belong to the serving process. A stored query without `-e` or
+`--query` takes no `--set` and uses process defaults.
 
-## Read Blob values
-
-Read a managed Blob cell to a file or inspect its metadata:
+## Read and write Blob values
 
 ```bash
-omnigraph blob get node Document doc-42 body \
-  --store ./graph.omni --out body.bin
-
-omnigraph blob stat node Document doc-42 body \
-  --store ./graph.omni --json
+omnigraph blob get node Document doc-42 body --target ./graph.omni --out body.bin
+omnigraph blob stat node Document doc-42 body --target ./graph.omni --json
+omnigraph blob put node Document doc-42 body --target ./graph.omni --file body.bin
 ```
 
-`blob get` writes bytes to stdout when `--out` is omitted. Add `--offset` and
-`--length` for a range. The CLI reports external references but does not follow
-them. See [Blob values](../blobs.md) for the complete contract.
+`blob get` writes bytes to stdout when `--out` is omitted; `--offset` and
+`--length` select a range. The CLI reports external references without
+following them. `blob put` reads stdin when `--file` is omitted; `blob clear`
+sets a nullable cell to null. Both accept `--if-match`. See
+[Blob values](../blobs.md).
 
 ## Inspect and maintain a graph
 
 ```bash
-omnigraph snapshot ./graph.omni --json
-omnigraph commit list ./graph.omni --json
-omnigraph schema show ./graph.omni
-
-omnigraph optimize ./graph.omni
-omnigraph repair ./graph.omni                 # preview only
-omnigraph cleanup --keep 10 --older-than 7d ./graph.omni
-omnigraph cleanup --keep 10 --older-than 7d --confirm ./graph.omni
+omnigraph snapshot --target ./graph.omni --json
+omnigraph commit list --target ./graph.omni --json
+omnigraph schema show --target ./graph.omni
+omnigraph optimize --target ./graph.omni
+omnigraph repair --target ./graph.omni
+omnigraph cleanup --target ./graph.omni --keep 10 --older-than 7d
+omnigraph cleanup --target ./graph.omni --keep 10 --older-than 7d --confirm
 ```
 
-Maintenance commands open storage directly; they do not run through
-`--server`. For a cluster-managed graph, address it with
-`--cluster <root> --graph <id>`. Read the
+Maintenance uses direct storage. For a graph in a direct root, use
+`--target ./cluster-root --graph knowledge`. Recovery effects that require an
+explicit destination refuse a default-only selection. Read the
 [maintenance guide](../operations/maintenance.md) before repair or cleanup.
 
 ## Use a server
 
-Declare the server once, store its token, then address graphs by ID:
-
-```yaml
-# ~/.omnigraph/config.yaml
-servers:
-  prod:
-    url: https://graph.example.com
-```
+Configure a server target with `auth: {provider: token, source: {store: {}}}` as shown
+in [operator configuration](targets.md), then install its token explicitly:
 
 ```bash
-printf '%s' "$OMNIGRAPH_TOKEN" | omnigraph login prod
-omnigraph graphs list --server prod
-omnigraph query sources_for_claim --params '{"claim":"lower-latency"}' \
-  --server prod --graph knowledge
+printf '%s\n' "$SERVER_TOKEN" | omnigraph credentials set --target standalone --stdin
+omnigraph graphs list --target standalone
+omnigraph query sources_for_claim --target standalone --graph knowledge \
+  --params '{"claim":"lower-latency"}'
+omnigraph credentials status --target standalone --json
 ```
 
-The token is stored separately from `config.yaml`. A server resolves the actor
-from the token; clients cannot override it with `--as`.
+The server target's declared `auth` is the only credential source. There is no
+implicit environment override or plaintext credential fallback. `login` and `logout`
+manage platform sessions; static tokens use `credentials set/remove`.
+The server resolves the actor from authentication; on a served write `--as`
+only asserts it. Register remote endpoints rather than passing inline URLs.
+### Use a server through a Unix socket
+
+Operator version 1 does not accept `unix://` targets. Register an HTTPS server
+endpoint instead; anonymous loopback HTTP is the only plain-HTTP exception.
+Other clients with Unix socket support may use a
+[TCP relay gateway](../deployment.md#unix-socket-access). This does not enable
+Unix socket access in the current CLI.
 
 ## Manage a cluster
 
-Without a managed context, cluster commands read a directory containing
-`cluster.yaml`:
+`--config DIR` selects a directory containing `cluster.yaml`; it defaults to
+`.` for direct and server source operations. `.` means the current directory.
+`--target` independently selects the direct root, server or managed cluster.
 
 ```bash
 omnigraph cluster validate --config ./company-brain
-omnigraph cluster plan --config ./company-brain
-omnigraph cluster apply --config ./company-brain --as act-alice
+omnigraph cluster plan --config ./company-brain --target ./cluster-root
+omnigraph cluster apply --config ./company-brain --target ./cluster-root
+omnigraph cluster status --target ./cluster-root
 ```
 
-They manage graph definitions, schemas, stored queries, and policies—not graph
-data. See [Operating a cluster](../clusters/index.md).
+Validation is local and takes no target. Plan reads the selected destination
+without acquiring writer admission. Apply owns exclusive admission for direct
+storage or submits to the selected server. It manages graph definitions,
+schemas, stored queries, policies, embedding providers and external Blob rules.
+An optional `storage` in the bundle must agree with the target. See
+[deployment boundaries](../clusters/index.md#deployment-boundaries).
 
-For a managed cluster, log in to its Intent API and select the cluster for
-your config directory:
+An explicit source path distinguishes a fresh direct apply with a caller-chosen
+ID from source-free observation of that ID:
 
 ```bash
-omnigraph login --api https://control.example
-omnigraph use CLUSTER_ID --api https://control.example --config ./company-brain
-omnigraph cluster plan --config ./company-brain --json > plan.json
-omnigraph cluster apply --config ./company-brain --plan "$(jq -r .data.run_id plan.json)" --json
-omnigraph cluster status --config ./company-brain --json
-omnigraph cluster history --config ./company-brain --json
-omnigraph logout --api https://control.example
+omnigraph cluster apply --target ./cluster-root --config . --deployment-id ID
+omnigraph cluster apply --target ./cluster-root --deployment-id ID
 ```
 
-Commit and push external configuration before planning. The API plans its
-bound head, or the pushed revision selected with `--rev`. Apply uses the exact
-saved plan and your current permissions. To release an unused plan, run
-`omnigraph cluster cancel PLAN_RUN_ID --config ./company-brain`; its result
-remains in history and cannot be applied afterward.
+Reusing an existing ID only observes its original invocation. It never executes
+it again. Recovery that needs proof of stopped writers additionally requires
+`--writers-stopped` and an explicit target.
 
-The folder's `.omnigraph/context` selects the managed API. An unavailable API
-or malformed context causes an error. To intentionally use the direct
-`cluster.yaml` path, pass `--direct`. See [Managed cluster commands](reference.md#managed-cluster-commands)
-for credential storage, automation, bounded waits, and exit codes.
-
-## Validate source before running it
+For managed operations, register a profile and then a target using
+service-attested cluster identity:
 
 ```bash
-omnigraph lint --schema schema.pg --query queries.gq
-omnigraph queries validate --cluster ./company-brain --graph knowledge
+omnigraph login --create-profile work
+omnigraph cluster list --profile work --json
+omnigraph target add cloud --profile work --cluster CLUSTER_ID
+omnigraph cluster plan --target cloud --json > plan.json
+omnigraph cluster apply --target cloud --plan "$(jq -r .data.preview_id plan.json)" --json
+omnigraph cluster status --target cloud --json
 ```
 
-`lint` checks one `.gq` source. `queries validate` checks the applied stored
-query registry for a cluster graph.
+Managed planning uses pushed configuration. It takes no local `--config`;
+`cluster push --config DIR` uploads the declared sources. See
+[managed data access](managed-data.md), [team administration](managed-team.md)
+and the [managed command reference](reference.md#managed-cluster-commands).
 
-## Deprecated names
+## Output and errors
 
-`read`, `change`, `check`, and `ingest` remain compatibility shims. New scripts
-should use `query`, `mutate`, `lint`, and `load`.
+For `query` and `alias`, output selection follows `--json`, then `--format`,
+then operator `defaults.output`, then `table`. Aliases have no format field.
+Structured execution errors use the selected JSON, JSONL, or TOON format. Mutations
+require explicit `--json` for structured errors. Target diagnostics go to
+stderr and cannot be suppressed by a quiet flag.
+
+Each invocation reads operator configuration once when needed. Edits cannot
+change its destination or presentation defaults during execution. Unknown
+fields, duplicate YAML keys and legacy routing sections are errors. Local
+commands such as help, version, source validation and skill export do not load
+operator configuration.
+
+Output failures return nonzero without undoing completed work or automatically
+repeating it. An accepted managed operation retains its recovery identity even
+if its normal report cannot be delivered. See
+[output formats](reference.md#query-inputs-and-output) and
+[diagnostics](../queries/diagnostics.md).
+
+## Give an agent the matching skill
+
+```bash
+omnigraph skill export ~/.claude/skills/omnigraph --force --json
+omnigraph skill show references/queries.md
+```
+
+Running `omnigraph` or `omnigraph help` says to call that skill before a first schema or query. The binary carries the agent skill matching its commands and HTTP contract.
+Export refuses existing files unless `--force`; a later forced export removes
+obsolete recorded files only while their bytes remain unchanged. Neither
+command reads operator configuration or contacts a server.

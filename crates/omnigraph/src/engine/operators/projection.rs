@@ -11,15 +11,13 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::common::Result as DfResult;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use futures::StreamExt;
 
 use super::memory::WorkMemory;
-use super::{polled, streaming_properties};
+use super::shape::{Mapped, Streaming};
 
 /// The refusal name the pool reports when an output batch does not fit.
 const OUTPUT: &str = "projection output";
@@ -27,7 +25,7 @@ const OUTPUT: &str = "projection output";
 pub(crate) struct ProjectionExec {
     input: Arc<dyn ExecutionPlan>,
     exprs: Vec<(Arc<dyn PhysicalExpr>, String)>,
-    properties: Arc<PlanProperties>,
+    shape: Streaming,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -48,11 +46,11 @@ impl ProjectionExec {
                 ))
             })
             .collect::<DfResult<Vec<Field>>>()?;
-        let properties = streaming_properties(Arc::new(Schema::new(fields)));
+        let shape = Streaming::new(Arc::new(Schema::new(fields)));
         Ok(Self {
             input,
             exprs,
-            properties,
+            shape,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -87,7 +85,7 @@ impl ExecutionPlan for ProjectionExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -114,46 +112,24 @@ impl ExecutionPlan for ProjectionExec {
         let schema: SchemaRef = self.schema();
         let input = self.input.execute(0, Arc::clone(&ctx))?;
         let memory = WorkMemory::new(ctx, OUTPUT)?;
-        let baseline = BaselineMetrics::new(&self.metrics, 0);
         let exprs = self.exprs.clone();
-        let output_schema = Arc::clone(&schema);
-        let stream = futures::stream::try_unfold(
-            (input, memory, None::<WorkMemory>),
-            move |(mut input, memory, held)| {
-                let baseline = baseline.clone();
-                let exprs = exprs.clone();
-                let schema = Arc::clone(&output_schema);
-                async move {
-                    drop(held);
-                    match input.next().await {
-                        Some(Ok(batch)) => {
-                            let rows = batch.num_rows();
-                            let columns = exprs
-                                .iter()
-                                .map(|(expr, _)| expr.evaluate(&batch)?.into_array(rows))
-                                .collect::<DfResult<Vec<_>>>()?;
-                            let output = RecordBatch::try_new_with_options(
-                                schema,
-                                columns,
-                                &RecordBatchOptions::new().with_row_count(Some(rows)),
-                            )?;
-                            let lease = memory.child(OUTPUT)?;
-                            lease.hold(&output)?;
-                            baseline.record_output(rows);
-                            Ok(Some((output, (input, memory, Some(lease)))))
-                        }
-                        Some(Err(error)) => Err(error),
-                        None => {
-                            baseline.done();
-                            Ok(None)
-                        }
-                    }
-                }
-            },
-        );
-        Ok(polled(
-            &self.metrics,
-            Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
-        ))
+        Ok(self.shape.map(&self.metrics, input, move |batch| {
+            let rows = batch.num_rows();
+            let columns = exprs
+                .iter()
+                .map(|(expr, _)| expr.evaluate(&batch)?.into_array(rows))
+                .collect::<DfResult<Vec<_>>>()?;
+            let output = RecordBatch::try_new_with_options(
+                Arc::clone(&schema),
+                columns,
+                &RecordBatchOptions::new().with_row_count(Some(rows)),
+            )?;
+            let lease = memory.child(OUTPUT)?;
+            lease.hold(&output)?;
+            Ok(Mapped::Batch {
+                batch: output,
+                lease: Some(lease),
+            })
+        }))
     }
 }

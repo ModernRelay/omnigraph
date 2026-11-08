@@ -1,0 +1,1 @@
+- TLS connections reject distrusted emSign certificate chains after updating the certificate verifier and bundled root certificates. This addresses RUSTSEC-2026-0381, RUSTSEC-2026-0382, and RUSTSEC-2026-0383.

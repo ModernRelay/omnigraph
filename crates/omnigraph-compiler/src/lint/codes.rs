@@ -26,7 +26,7 @@ pub struct DiagnosticCode {
     pub short: &'static str,
 }
 
-// ─── Destructive (DS) — data-loss; always requires explicit opt-in ──────────
+// ─── Destructive (DS) — data-loss ────────────────────────────────────────────
 
 /// Reserved: dropping an entire graph (schema-level). Not yet emitted.
 pub const OG_DS_101: DiagnosticCode = DiagnosticCode {
@@ -88,14 +88,36 @@ pub const OG_MF_103: DiagnosticCode = DiagnosticCode {
 };
 
 /// Tighten nullable to non-nullable. May fail on existing entities with null.
-/// Reserved for a follow-up that wires the validated-tier scan; not
-/// emitted in v0.
+/// Not a planner code: schema apply emits it when its scan of the stored rows
+/// finds a live row holding a null (#721).
 pub const OG_MF_104: DiagnosticCode = DiagnosticCode {
     code: "OG-MF-104",
     family: Family::MF,
     tier: SafetyTier::Validated,
     default_severity: Severity::Error,
     short: "tighten nullable to non-nullable",
+};
+
+/// Add an edge type with a non-zero `@card` minimum whose source node type
+/// already exists. Existing source nodes have none of the new edges, so
+/// every one of them would sit below the minimum.
+pub const OG_MF_107: DiagnosticCode = DiagnosticCode {
+    code: "OG-MF-107",
+    family: Family::MF,
+    tier: SafetyTier::Validated,
+    default_severity: Severity::Error,
+    short: "add edge type with a @card minimum from populated node type",
+};
+
+/// Add `@unique` to a populated node type. May fail when two existing
+/// entities share the key. Not a planner code: schema apply emits it when its
+/// scan of the stored rows finds a repeated key (#721).
+pub const OG_MF_108: DiagnosticCode = DiagnosticCode {
+    code: "OG-MF-108",
+    family: Family::MF,
+    tier: SafetyTier::Validated,
+    default_severity: Severity::Error,
+    short: "add @unique to populated node type",
 };
 
 /// Narrow a scalar (e.g. I64 → I32, F64 → F32). Lossy cast that may
@@ -113,6 +135,7 @@ pub const OG_MF_106: DiagnosticCode = DiagnosticCode {
 /// (uniqueness, family coverage).
 pub const ALL_CODES: &[DiagnosticCode] = &[
     OG_DS_101, OG_DS_102, OG_DS_103, OG_DS_104, OG_DS_105, OG_MF_103, OG_MF_104, OG_MF_106,
+    OG_MF_107, OG_MF_108,
 ];
 
 /// Codes actually emitted by the planner in v0 (i.e. not reserved).
@@ -122,6 +145,7 @@ pub const EMITTED_IN_V0: &[&str] = &[
     "OG-DS-104",
     "OG-MF-103",
     "OG-MF-106",
+    "OG-MF-107",
 ];
 
 /// Look up a code by its string identifier.

@@ -1,0 +1,64 @@
+# issue: none
+# notes: User docs: a target merged again from a branch it fast-forwarded before, with no write in between,
+# notes: fast-forwards again; the base is the source head the first fast-forward recorded as merged parent.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"a","age":0}}
+{"type":"Person","data":{"name":"b","age":0}}
+
+--- mutate
+branch create s
+
+--- expect ok
+
+--- mutate branch: s
+query s_sets_a() {
+    update Person set { age: 1 } where name = "a"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge s
+
+--- expect outcome: fast_forward
+
+--- mutate branch: s
+query s_sets_b() {
+    update Person set { age: 1 } where name = "b"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- restart
+
+--- mutate
+branch merge s
+
+--- expect outcome: fast_forward
+
+--- query
+query main_rows() { match { $p: Person } return { $p.name, $p.age } }
+
+--- expect unordered
+{"p.name":"a","p.age":1}
+{"p.name":"b","p.age":1}
+
+--- expect shape
+p.name: String
+p.age: I32

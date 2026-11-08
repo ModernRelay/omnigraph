@@ -1,0 +1,29 @@
+# issue: none
+# notes: One checked warmup precedes one measured query against a long-running server; an exact result check follows.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- query
+query count_all() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n":100}
+--- expect shape
+n: I64
+
+--- query
+query count_all() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n":100}
+--- expect shape
+n: I64
+
+--- query
+query count_all() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n":100}
+--- expect shape
+n: I64

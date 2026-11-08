@@ -1,0 +1,79 @@
+# issue: none
+# notes: Two proposals from one head are independent until one publishes: each reads its own result,
+# notes: the first publish lands, and the second fails its precondition and is dropped.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+query propose_bob() as commit {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $bob
+
+--- mutate
+query propose_carol() as commit {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $carol
+
+--- query snapshot: $carol
+query names_at_carol() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "carol"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+commit publish "${bob}"
+
+--- expect ok
+
+--- mutate
+commit publish "${carol}"
+
+--- expect error: precondition failed on branch 'main'
+
+--- mutate
+commit drop "${carol}"
+
+--- expect ok
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String

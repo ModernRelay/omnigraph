@@ -1,0 +1,115 @@
+# issue: none
+# notes: `branch create <name> from commit "<id>"` starts a branch at a past commit of main: the branch reads that
+# notes: commit's rows, its merge base with main is the commit, and it merges back three ways while main keeps its
+# notes: later writes. Refusals are in branch_create_at_a_commit_refusals.gqt.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":40}}
+
+--- mutate
+query insert_carol() {
+    insert Person { name: "carol", age: 22 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $carol
+
+--- mutate
+query age_alice() {
+    update Person set { age: 31 } where name = "alice"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query remove_bob() {
+    delete Person where name = "bob"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $no_bob
+
+--- mutate
+branch create fix from commit "${carol}"
+
+--- expect ok
+
+--- query branch: fix
+query people() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name": "alice", "p.age": 30}
+{"p.name": "bob", "p.age": 40}
+{"p.name": "carol", "p.age": 22}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- mutate branch: fix
+query insert_dave() {
+    insert Person { name: "dave", age: 50 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $dave
+
+--- query
+branch merge-base fix
+
+--- expect ordered
+{"source": "fix", "target": "main", "source_commit_id": "${dave}", "target_commit_id": "${no_bob}", "merge_base_commit_id": "${carol}"}
+
+--- mutate
+branch merge fix into main
+
+--- expect outcome: merged
+
+--- query
+query people() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name": "alice", "p.age": 31}
+{"p.name": "carol", "p.age": 22}
+{"p.name": "dave", "p.age": 50}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- query
+branch list
+
+--- expect unordered
+{"name": "fix"}
+{"name": "main"}
+
+--- expect shape
+name: String

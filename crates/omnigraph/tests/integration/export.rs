@@ -1,0 +1,1411 @@
+use crate::helpers;
+
+use std::collections::HashSet;
+
+use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
+
+use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::error::OmniError;
+use omnigraph::loader::LoadMode;
+use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
+use omnigraph_compiler::ir::ParamMap;
+use omnigraph_compiler::query::ast::Literal;
+
+use crate::helpers::*;
+
+const EXPORT_MUTATIONS: &str = r#"
+query insert_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+
+query add_friend($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+"#;
+
+const NOTE_SCHEMA: &str = r#"
+node Note {
+    text: String
+}
+
+edge References: Note -> Note
+"#;
+
+const NOTE_DATA: &str = r#"
+{"type":"Note","id":"note-1","data":{"text":"Alpha"}}
+{"type":"Note","id":"note-2","data":{"text":"Beta"}}
+{"edge":"References","id":"edge-1","from":"note-1","to":"note-2","data":{}}
+"#;
+
+const U64_KEY_SCHEMA: &str = r#"
+node Counter {
+    sequence: U64 @key
+    label: String
+}
+"#;
+
+const U64_KEY_MUTATION: &str = r#"
+query insert_counter($sequence: U64, $label: String) {
+    insert Counter { sequence: $sequence, label: $label }
+}
+"#;
+
+const LEGACY_TEMPORAL_KEY_SCHEMA: &str = r#"
+node CalendarDay {
+    day: Date @key
+}
+
+node Instant {
+    happened_at: DateTime @key
+}
+
+edge OccursOn: Instant -> CalendarDay
+"#;
+
+const LEGACY_TEMPORAL_KEY_DATA: &str = r#"
+{"edge":"OccursOn","id":"legacy-edge","from":"2024-01-01T00:00:00Z","to":"2024-01-01","data":{}}
+{"type":"CalendarDay","id":"2024-01-01","data":{"day":19723}}
+{"type":"Instant","id":"2024-01-01T00:00:00Z","data":{"happened_at":"2024-01-01T00:00:00Z"}}
+"#;
+
+const LEGACY_TYPED_REMAP_SCHEMA: &str = r#"
+node Exact {
+    value: I32 @key
+}
+
+node Rounded {
+    value: F32 @key
+}
+
+node Padded {
+    value: U32 @key
+}
+
+edge Converts: Exact -> Rounded
+"#;
+
+const LEGACY_TYPED_REMAP_DATA: &str = r#"
+{"edge":"Converts","id":"conversion","from":"16777217","to":"16777217","data":{}}
+{"type":"Rounded","id":"16777217","data":{"value":16777217}}
+{"type":"Padded","id":"00042","data":{"value":42}}
+{"type":"Exact","id":"16777217","data":{"value":16777217}}
+"#;
+
+const COMPOSITE_KEY_SCHEMA: &str = r#"
+node Membership {
+    tenant: String
+    slot: U32
+    label: String
+    @key(tenant, slot)
+}
+
+edge Related: Membership -> Membership
+"#;
+
+const COMPOSITE_KEY_MUTATION: &str = r#"
+query put_membership($tenant: String, $slot: U32, $label: String) {
+    insert Membership { tenant: $tenant, slot: $slot, label: $label }
+}
+
+query move_membership($tenant: String, $next_slot: U32) {
+    update Membership set { slot: $next_slot } where tenant = $tenant
+}
+"#;
+
+const RENAMED_COMPOSITE_KEY_SCHEMA: &str = r#"
+node RenamedPair {
+    aaaa: Date @rename_from("zeta")
+    zzzz: U32 @rename_from("alpha")
+    label: String
+    @key(aaaa, zzzz)
+}
+
+edge Connects: RenamedPair -> RenamedPair
+"#;
+
+const NARROWING_SCHEMA: &str = r#"
+node SignedBoundary {
+    value: I32 @key
+}
+
+node UnsignedBoundary {
+    value: U32 @key
+}
+
+node FloatBoundary {
+    value: F32 @key
+}
+"#;
+
+const NARROWING_MUTATIONS: &str = r#"
+query put_signed($value: I32) {
+    insert SignedBoundary { value: $value }
+}
+
+query put_unsigned($value: U32) {
+    insert UnsignedBoundary { value: $value }
+}
+
+query put_float($value: F32) {
+    insert FloatBoundary { value: $value }
+}
+"#;
+
+fn collect_u64_key_rows(batches: &[RecordBatch]) -> Vec<(u64, String)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("__id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let keys = batch
+            .column_by_name("sequence")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        rows.extend((0..batch.num_rows()).map(|row| (keys.value(row), ids.value(row).to_string())));
+    }
+    rows.sort_by_key(|(key, _)| *key);
+    rows
+}
+
+async fn assert_exact_id_primary_key(db: &Omnigraph, table_key: &str) {
+    let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let dataset = snapshot.open_dataset(table_key).await.unwrap();
+    let primary_key = dataset
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        primary_key,
+        ["__id"],
+        "later import must preserve exactly `__id` as the Lance unenforced primary key for {table_key}"
+    );
+}
+
+#[tokio::test]
+async fn export_jsonl_round_trips_branch_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    db.mutate(
+        "feature",
+        EXPORT_MUTATIONS,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 29)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "feature",
+        EXPORT_MUTATIONS,
+        "add_friend",
+        &params(&[("$from", "Eve"), ("$to", "Alice")]),
+    )
+    .await
+    .unwrap();
+
+    let source_identity_domain = db
+        .catalog()
+        .bound_schema_ir()
+        .unwrap()
+        .schema_identity_domain
+        .as_str()
+        .to_string();
+    let source_commit_ids = db
+        .list_commits(Some("main"))
+        .await
+        .unwrap()
+        .into_iter()
+        .chain(db.list_commits(Some("feature")).await.unwrap())
+        .map(|commit| commit.graph_commit_id)
+        .collect::<HashSet<_>>();
+
+    let main_jsonl = db.export_jsonl("main", &[]).await.unwrap();
+    assert!(
+        main_jsonl.lines().any(
+            |line| line == r#"{"type":"Person","id":"Alice","data":{"age":30,"name":"Alice"}}"#
+        ),
+        "export line bytes: type, identity, then data in catalog column order: {main_jsonl}"
+    );
+    let feature_jsonl = db.export_jsonl("feature", &[]).await.unwrap();
+    let mut feature_unordered = Vec::new();
+    db.export_jsonl_unordered_to_writer("feature", &[], &mut feature_unordered)
+        .await
+        .unwrap();
+    let mut ordered_rows = feature_jsonl.lines().collect::<Vec<_>>();
+    let feature_unordered = String::from_utf8(feature_unordered).unwrap();
+    let mut unordered_rows = feature_unordered.lines().collect::<Vec<_>>();
+    ordered_rows.sort_unstable();
+    unordered_rows.sort_unstable();
+    assert_eq!(unordered_rows, ordered_rows);
+
+    let imported_main_dir = tempfile::tempdir().unwrap();
+    let imported_feature_dir = tempfile::tempdir().unwrap();
+    let imported_main = helpers::session(
+        Omnigraph::init(imported_main_dir.path().to_str().unwrap(), TEST_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let imported_feature = helpers::session(
+        Omnigraph::init(imported_feature_dir.path().to_str().unwrap(), TEST_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    imported_main
+        .load_jsonl(&main_jsonl, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    imported_feature
+        .load_jsonl(&feature_jsonl, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    assert_eq!(count_rows(&db, "node:Person").await, 4);
+    assert_eq!(count_rows_branch(&db, "feature", "node:Person").await, 5);
+    assert_eq!(count_rows(&imported_main, "node:Person").await, 4);
+    assert_eq!(count_rows(&imported_feature, "node:Person").await, 5);
+    assert_eq!(count_rows(&imported_main, "edge:Knows").await, 3);
+    assert_eq!(count_rows(&imported_feature, "edge:Knows").await, 4);
+
+    // A branch export is a data snapshot, not a clone of graph identity,
+    // branch refs, or commit ancestry. Each rebuild is therefore an
+    // independent graph root even when both use the same schema source.
+    assert_eq!(imported_main.branch_list().await.unwrap(), ["main"]);
+    assert_eq!(imported_feature.branch_list().await.unwrap(), ["main"]);
+    let imported_main_domain = imported_main
+        .catalog()
+        .bound_schema_ir()
+        .unwrap()
+        .schema_identity_domain
+        .as_str()
+        .to_string();
+    let imported_feature_domain = imported_feature
+        .catalog()
+        .bound_schema_ir()
+        .unwrap()
+        .schema_identity_domain
+        .as_str()
+        .to_string();
+    assert_ne!(imported_main_domain, source_identity_domain);
+    assert_ne!(imported_feature_domain, source_identity_domain);
+    assert_ne!(imported_main_domain, imported_feature_domain);
+
+    for (name, rebuilt) in [
+        ("main snapshot", &imported_main),
+        ("feature snapshot", &imported_feature),
+    ] {
+        let commits = rebuilt.list_commits(Some("main")).await.unwrap();
+        let rebuilt_ids = commits
+            .iter()
+            .map(|commit| commit.graph_commit_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(
+            rebuilt_ids
+                .iter()
+                .all(|commit_id| !source_commit_ids.contains(*commit_id)),
+            "{name} rebuild must not inherit source commit ids"
+        );
+        for commit in &commits {
+            assert!(
+                commit
+                    .parent_commit_id
+                    .as_deref()
+                    .is_none_or(|parent| rebuilt_ids.contains(parent)),
+                "{name} commit {} points outside its rebuilt history: {:?}",
+                commit.graph_commit_id,
+                commit.parent_commit_id
+            );
+            assert!(
+                commit.merged_parent_commit_id.is_none(),
+                "{name} rebuild must not import source merge ancestry"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn served_export_chunks_are_bounded_and_match_direct_export() {
+    const WIDE_SCHEMA: &str = r#"
+node Document {
+    key: String @key
+    body: String
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), WIDE_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let wide = serde_json::json!({
+        "type": "Document",
+        "data": { "key": "wide", "body": "λ".repeat(40_000) }
+    })
+    .to_string();
+    db.load_jsonl(&wide, LoadMode::Append).await.unwrap();
+    let small = (0..200)
+        .map(|row| {
+            serde_json::json!({
+                "type": "Document", "data": {"key": format!("small-{row:03}"), "body": "small"}
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    db.load_jsonl(&small, LoadMode::Append).await.unwrap();
+    let expected = db.export_jsonl("main", &[]).await.unwrap();
+    let cut = db.capture_served_export_cut("main", &[]).await.unwrap();
+    let mut chunks = Vec::new();
+    let (cut, result) = cut
+        .write_chunks(|chunk| {
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= omnigraph::db::EXPORT_CHUNK_MAX_BYTES);
+            assert!(chunk.capacity() <= omnigraph::db::EXPORT_CHUNK_MAX_BYTES);
+            chunks.push(chunk);
+            std::future::ready(Ok(()))
+        })
+        .await;
+    result.unwrap();
+    drop(cut);
+
+    assert!(chunks.len() > 1, "wide row must exercise chunk splitting");
+    assert_eq!(
+        chunks.len(),
+        expected
+            .len()
+            .div_ceil(omnigraph::db::EXPORT_CHUNK_MAX_BYTES),
+        "small rows share chunks; only the final chunk may be partial"
+    );
+    assert!(chunks.last().unwrap().len() < omnigraph::db::EXPORT_CHUNK_MAX_BYTES);
+    let joined = chunks.concat();
+    assert_eq!(joined, expected.as_bytes());
+    assert!(std::str::from_utf8(&joined).is_ok());
+}
+
+#[tokio::test]
+async fn export_jsonl_round_trips_typed_u64_key_and_rejects_id_mismatch() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = helpers::session(
+        Omnigraph::init(source_dir.path().to_str().unwrap(), U64_KEY_SCHEMA)
+            .await
+            .unwrap(),
+    );
+
+    // Exercise the mutation path at its current signed-literal ceiling, then
+    // exercise JSON import above that boundary. Both routes must derive the
+    // same physical string id from the stored U64 value.
+    source
+        .mutate(
+            "main",
+            U64_KEY_MUTATION,
+            "insert_counter",
+            &mixed_params(&[("$label", "mutation")], &[("$sequence", i64::MAX)]),
+        )
+        .await
+        .unwrap();
+    source
+        .load_jsonl(
+            &format!(
+                "{{\"type\":\"Counter\",\"data\":{{\"sequence\":{},\"label\":\"loader\"}}}}",
+                u64::MAX
+            ),
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+
+    let expected = vec![
+        (i64::MAX as u64, i64::MAX.to_string()),
+        (u64::MAX, u64::MAX.to_string()),
+    ];
+    assert_eq!(
+        collect_u64_key_rows(&read_table(&source, "node:Counter").await),
+        expected
+    );
+    assert_exact_id_primary_key(&source, "node:Counter").await;
+
+    let exported = source.export_jsonl("main", &[]).await.unwrap();
+    let mut exported_keys = Vec::new();
+    let mut mismatched_rows = Vec::new();
+    for line in exported.lines() {
+        let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+        let key = row["data"]["sequence"].as_u64().unwrap();
+        let id = row["id"].as_str().unwrap();
+        assert_eq!(id, key.to_string(), "exported id must match typed U64 key");
+        exported_keys.push(key);
+        if key == u64::MAX {
+            row["id"] = serde_json::Value::String("wrong-id".to_string());
+        }
+        mismatched_rows.push(serde_json::to_string(&row).unwrap());
+    }
+    exported_keys.sort_unstable();
+    assert_eq!(exported_keys, [i64::MAX as u64, u64::MAX]);
+
+    let rebuilt_dir = tempfile::tempdir().unwrap();
+    let rebuilt = helpers::session(
+        Omnigraph::init(rebuilt_dir.path().to_str().unwrap(), U64_KEY_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let mismatch = rebuilt
+        .load_jsonl(&mismatched_rows.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap_err();
+    assert!(
+        mismatch.to_string().contains("does not match @key"),
+        "explicit physical id mismatch must fail clearly: {mismatch}"
+    );
+    assert_eq!(count_rows(&rebuilt, "node:Counter").await, 0);
+
+    rebuilt
+        .load_jsonl(&exported, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_u64_key_rows(&read_table(&rebuilt, "node:Counter").await),
+        expected
+    );
+    assert_exact_id_primary_key(&rebuilt, "node:Counter").await;
+}
+
+#[tokio::test]
+async fn legacy_temporal_key_ids_are_canonicalized_with_edge_remap_and_round_trip() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = helpers::session(
+        Omnigraph::init(
+            source_dir.path().to_str().unwrap(),
+            LEGACY_TEMPORAL_KEY_SCHEMA,
+        )
+        .await
+        .unwrap(),
+    );
+
+    // This is the genuine old-export shape: the physical id retains the
+    // mutation literal spelling, while the key property is the exported typed
+    // Arrow value. The loader accepts typed equality, persists the canonical
+    // id, and rewrites edges even though the edge appears before its nodes.
+    source
+        .load_jsonl(LEGACY_TEMPORAL_KEY_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_column_strings(&read_table(&source, "node:CalendarDay").await, "__id"),
+        ["19723"]
+    );
+    assert_eq!(
+        collect_column_strings(&read_table(&source, "node:Instant").await, "__id"),
+        ["1704067200000"]
+    );
+
+    let source_edges = read_table(&source, "edge:OccursOn").await;
+    assert_eq!(
+        collect_column_strings(&source_edges, "__src"),
+        ["1704067200000"]
+    );
+    assert_eq!(collect_column_strings(&source_edges, "__dst"), ["19723"]);
+
+    for (table_key, canonical_id, duplicate_row) in [
+        (
+            "node:CalendarDay",
+            "19723",
+            r#"{"type":"CalendarDay","data":{"day":19723}}"#,
+        ),
+        (
+            "node:Instant",
+            "1704067200000",
+            r#"{"type":"Instant","data":{"happened_at":1704067200000}}"#,
+        ),
+    ] {
+        let duplicate = source
+            .load_jsonl(duplicate_row, LoadMode::Append)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                duplicate,
+                OmniError::KeyConflict {
+                    type_key: ref conflicted_type,
+                    entity_id: Some(ref entity_id)
+                } if conflicted_type == table_key && entity_id == canonical_id
+            ),
+            "post-rebuild append must conflict on canonical temporal id {canonical_id}: {duplicate}"
+        );
+        assert_eq!(count_rows(&source, table_key).await, 1);
+    }
+
+    let exported = source.export_jsonl("main", &[]).await.unwrap();
+    let rows = exported
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let day = rows
+        .iter()
+        .find(|row| row["type"] == "CalendarDay")
+        .unwrap();
+    assert_eq!(day["id"], "19723");
+    assert_eq!(day["data"]["day"], "2024-01-01");
+    let instant = rows.iter().find(|row| row["type"] == "Instant").unwrap();
+    assert_eq!(instant["id"], "1704067200000");
+    assert_eq!(
+        instant["data"]["happened_at"], "2024-01-01T00:00:00",
+        "Date64 exports as the DateTime string of RFC 0051"
+    );
+
+    let rejected_dir = tempfile::tempdir().unwrap();
+    let rejected = helpers::session(
+        Omnigraph::init(
+            rejected_dir.path().to_str().unwrap(),
+            LEGACY_TEMPORAL_KEY_SCHEMA,
+        )
+        .await
+        .unwrap(),
+    );
+    let mismatch = rejected
+        .load_jsonl(
+            r#"{"type":"CalendarDay","id":"2024-01-02","data":{"day":19723}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        mismatch.to_string().contains("does not match @key"),
+        "a different typed Date must still be rejected: {mismatch}"
+    );
+    assert_eq!(count_rows(&rejected, "node:CalendarDay").await, 0);
+
+    let rebuilt_dir = tempfile::tempdir().unwrap();
+    let rebuilt = helpers::session(
+        Omnigraph::init(
+            rebuilt_dir.path().to_str().unwrap(),
+            LEGACY_TEMPORAL_KEY_SCHEMA,
+        )
+        .await
+        .unwrap(),
+    );
+    rebuilt
+        .load_jsonl(&exported, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_column_strings(&read_table(&rebuilt, "node:CalendarDay").await, "__id"),
+        ["19723"]
+    );
+    assert_eq!(
+        collect_column_strings(&read_table(&rebuilt, "node:Instant").await, "__id"),
+        ["1704067200000"]
+    );
+    let rebuilt_edges = read_table(&rebuilt, "edge:OccursOn").await;
+    assert_eq!(
+        collect_column_strings(&rebuilt_edges, "__src"),
+        ["1704067200000"]
+    );
+    assert_eq!(collect_column_strings(&rebuilt_edges, "__dst"), ["19723"]);
+    assert_exact_id_primary_key(&rebuilt, "node:CalendarDay").await;
+    assert_exact_id_primary_key(&rebuilt, "node:Instant").await;
+}
+
+#[tokio::test]
+async fn legacy_numeric_ids_are_canonicalized_and_edge_remap_is_endpoint_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), LEGACY_TYPED_REMAP_SCHEMA)
+            .await
+            .unwrap(),
+    );
+
+    db.load_jsonl(LEGACY_TYPED_REMAP_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        collect_column_strings(&read_table(&db, "node:Exact").await, "__id"),
+        ["16777217"]
+    );
+    assert_eq!(
+        collect_column_strings(&read_table(&db, "node:Rounded").await, "__id"),
+        ["16777216"],
+        "the F32 key must use the value actually stored after width conversion"
+    );
+    assert_eq!(
+        collect_column_strings(&read_table(&db, "node:Padded").await, "__id"),
+        ["42"],
+        "a leading-zero legacy numeric id must rebuild to the typed canonical id"
+    );
+
+    let edges = read_table(&db, "edge:Converts").await;
+    assert_eq!(collect_column_strings(&edges, "__src"), ["16777217"]);
+    assert_eq!(collect_column_strings(&edges, "__dst"), ["16777216"]);
+
+    let duplicate = db
+        .load_jsonl(
+            r#"{"type":"Rounded","data":{"value":16777217}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            duplicate,
+            OmniError::KeyConflict {
+                ref type_key,
+                entity_id: Some(ref entity_id)
+            } if type_key == "node:Rounded" && entity_id == "16777216"
+        ),
+        "a later same-key append must conflict on the canonical id, not duplicate: {duplicate}"
+    );
+    assert_eq!(count_rows(&db, "node:Rounded").await, 1);
+
+    let collision_dir = tempfile::tempdir().unwrap();
+    let collision = helpers::session(
+        Omnigraph::init(
+            collision_dir.path().to_str().unwrap(),
+            LEGACY_TYPED_REMAP_SCHEMA,
+        )
+        .await
+        .unwrap(),
+    );
+    let collision_error = collision
+        .load_jsonl(
+            r#"
+{"type":"Padded","id":"00042","data":{"value":42}}
+{"type":"Padded","id":"42","data":{"value":42}}
+"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        collision_error.to_string().contains("duplicate")
+            || collision_error.to_string().contains("@unique violation")
+            || matches!(collision_error, OmniError::KeyConflict { .. }),
+        "distinct legacy spellings that collapse to one id must fail closed: {collision_error}"
+    );
+    assert_eq!(count_rows(&collision, "node:Padded").await, 0);
+}
+
+#[tokio::test]
+async fn composite_key_rebuild_uses_full_tuple_and_rejects_ambiguous_legacy_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), COMPOSITE_KEY_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    // Accepted SchemaIR canonicalizes constraint columns, so the bound catalog
+    // owns tuple order (`slot`, then `tenant`) on every write surface.
+    let canonical = r#"["7","acme"]"#;
+    let legacy = r#"
+{"edge":"Related","id":"related","from":"7","to":"7","data":{}}
+{"type":"Membership","id":"7","data":{"tenant":"acme","slot":7,"label":"legacy"}}
+"#;
+    db.load_jsonl(legacy, LoadMode::Overwrite).await.unwrap();
+
+    assert_eq!(
+        collect_column_strings(&read_table(&db, "node:Membership").await, "__id"),
+        [canonical]
+    );
+    let edges = read_table(&db, "edge:Related").await;
+    assert_eq!(collect_column_strings(&edges, "__src"), [canonical]);
+    assert_eq!(collect_column_strings(&edges, "__dst"), [canonical]);
+
+    let duplicate = db
+        .load_jsonl(
+            r#"{"type":"Membership","data":{"tenant":"acme","slot":7,"label":"append"}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(duplicate, OmniError::KeyConflict { .. }));
+    assert_eq!(count_rows(&db, "node:Membership").await, 1);
+
+    db.mutate(
+        "main",
+        COMPOSITE_KEY_MUTATION,
+        "put_membership",
+        &mixed_params(
+            &[("$tenant", "acme"), ("$label", "updated")],
+            &[("$slot", 7)],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(count_rows(&db, "node:Membership").await, 1);
+    let membership = read_table(&db, "node:Membership").await;
+    assert_eq!(collect_column_strings(&membership, "__id"), [canonical]);
+    assert_eq!(collect_column_strings(&membership, "label"), ["updated"]);
+
+    let key_update = db
+        .mutate(
+            "main",
+            COMPOSITE_KEY_MUTATION,
+            "move_membership",
+            &mixed_params(&[("$tenant", "acme")], &[("$next_slot", 8)]),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        key_update
+            .to_string()
+            .contains("cannot update @key property 'slot'"),
+        "every composite component is immutable: {key_update}"
+    );
+    assert_eq!(count_rows(&db, "node:Membership").await, 1);
+    assert_eq!(
+        collect_column_strings(&read_table(&db, "node:Membership").await, "__id"),
+        [canonical]
+    );
+
+    let ambiguous_dir = tempfile::tempdir().unwrap();
+    let ambiguous = helpers::session(
+        Omnigraph::init(ambiguous_dir.path().to_str().unwrap(), COMPOSITE_KEY_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let ambiguity = ambiguous
+        .load_jsonl(
+            r#"
+{"type":"Membership","id":"7","data":{"tenant":"acme","slot":7,"label":"one"}}
+{"type":"Membership","id":"7","data":{"tenant":"globex","slot":7,"label":"two"}}
+"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        ambiguity
+            .to_string()
+            .contains("ambiguous edge endpoint remap"),
+        "one legacy first-component id must not choose between tuple ids: {ambiguity}"
+    );
+    assert_eq!(count_rows(&ambiguous, "node:Membership").await, 0);
+}
+
+#[tokio::test]
+async fn composite_key_rebuild_accepts_mixed_pre_and_post_rename_scalar_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), RENAMED_COMPOSITE_KEY_SCHEMA)
+            .await
+            .unwrap(),
+    );
+
+    // In v5, physical identity used the first runtime @key component. Before
+    // the lexical-crossing rename that was `alpha` (now `zzzz`, U32), while a
+    // later row used `aaaa` (formerly `zeta`, Date). A genuine export can thus
+    // contain both scalar-id generations under the current schema. Rebuild must
+    // accept both by typed equality, persist full tuple ids, and rewrite edge
+    // endpoints that still name those old physical ids.
+    let legacy = r#"
+{"edge":"Connects","id":"mixed-generation","from":"7","to":"2024-01-02","data":{}}
+{"type":"RenamedPair","id":"7","data":{"aaaa":19723,"zzzz":7,"label":"pre-rename"}}
+{"type":"RenamedPair","id":"2024-01-02","data":{"aaaa":"2024-01-02","zzzz":8,"label":"post-rename"}}
+"#;
+    db.load_jsonl(legacy, LoadMode::Overwrite).await.unwrap();
+
+    let mut ids = collect_column_strings(&read_table(&db, "node:RenamedPair").await, "__id");
+    ids.sort();
+    assert_eq!(ids, [r#"["19723","7"]"#, r#"["19724","8"]"#]);
+
+    let edges = read_table(&db, "edge:Connects").await;
+    assert_eq!(
+        collect_column_strings(&edges, "__src"),
+        [r#"["19723","7"]"#]
+    );
+    assert_eq!(
+        collect_column_strings(&edges, "__dst"),
+        [r#"["19724","8"]"#]
+    );
+}
+
+#[tokio::test]
+async fn numeric_narrowing_rejects_out_of_range_loader_and_mutation_values_pre_effect() {
+    let load_dir = tempfile::tempdir().unwrap();
+    let loader = helpers::session(
+        Omnigraph::init(load_dir.path().to_str().unwrap(), NARROWING_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    let boundaries = [
+        serde_json::json!({"type":"SignedBoundary","data":{"value":i32::MAX}}),
+        serde_json::json!({"type":"UnsignedBoundary","data":{"value":u32::MAX}}),
+        serde_json::json!({"type":"FloatBoundary","data":{"value":f32::MAX as f64}}),
+    ]
+    .into_iter()
+    .map(|row| serde_json::to_string(&row).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n");
+    loader
+        .load_jsonl(&boundaries, LoadMode::Append)
+        .await
+        .unwrap();
+
+    for (table, bad_value) in [
+        ("SignedBoundary", serde_json::json!(i32::MAX as i64 + 1)),
+        ("UnsignedBoundary", serde_json::json!(u32::MAX as u64 + 1)),
+        ("UnsignedBoundary", serde_json::json!(-1)),
+        ("FloatBoundary", serde_json::json!(f64::MAX)),
+    ] {
+        let row = serde_json::json!({"type":table,"data":{"value":bad_value}}).to_string();
+        let error = loader.load_jsonl(&row, LoadMode::Append).await.unwrap_err();
+        assert!(
+            error.to_string().contains("range"),
+            "{table} out-of-range load must fail clearly: {error}"
+        );
+        assert_eq!(count_rows(&loader, &format!("node:{table}")).await, 1);
+    }
+
+    let mutation_dir = tempfile::tempdir().unwrap();
+    let mutation = helpers::session(
+        Omnigraph::init(mutation_dir.path().to_str().unwrap(), NARROWING_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    mutation
+        .mutate(
+            "main",
+            NARROWING_MUTATIONS,
+            "put_signed",
+            &int_params(&[("$value", i32::MAX as i64)]),
+        )
+        .await
+        .unwrap();
+    for value in [i32::MAX as i64 + 1] {
+        let error = mutation
+            .mutate(
+                "main",
+                NARROWING_MUTATIONS,
+                "put_signed",
+                &int_params(&[("$value", value)]),
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("param 'value':") && message.contains("exceeds I32 range"),
+            "{message}"
+        );
+    }
+    assert_eq!(count_rows(&mutation, "node:SignedBoundary").await, 1);
+
+    mutation
+        .mutate(
+            "main",
+            NARROWING_MUTATIONS,
+            "put_unsigned",
+            &int_params(&[("$value", u32::MAX as i64)]),
+        )
+        .await
+        .unwrap();
+    for value in [u32::MAX as i64 + 1, -1] {
+        let error = mutation
+            .mutate(
+                "main",
+                NARROWING_MUTATIONS,
+                "put_unsigned",
+                &int_params(&[("$value", value)]),
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("param 'value':") && message.contains("exceeds U32 range"),
+            "{message}"
+        );
+    }
+    assert_eq!(count_rows(&mutation, "node:UnsignedBoundary").await, 1);
+
+    let mut float_boundary = ParamMap::new();
+    float_boundary.insert("value".to_string(), Literal::Float(f32::MAX as f64));
+    mutation
+        .mutate("main", NARROWING_MUTATIONS, "put_float", &float_boundary)
+        .await
+        .unwrap();
+    let mut float_overflow = ParamMap::new();
+    float_overflow.insert("value".to_string(), Literal::Float(f64::MAX));
+    let error = mutation
+        .mutate("main", NARROWING_MUTATIONS, "put_float", &float_overflow)
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("param 'value':") && message.contains("exceeds F32 range"),
+        "{message}"
+    );
+    assert_eq!(count_rows(&mutation, "node:FloatBoundary").await, 1);
+}
+
+#[tokio::test]
+async fn export_jsonl_preserves_explicit_ids_for_non_key_graphs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(dir.path().to_str().unwrap(), NOTE_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    db.load_jsonl(NOTE_DATA, LoadMode::Overwrite).await.unwrap();
+
+    let exported = db.export_jsonl("main", &[]).await.unwrap();
+
+    let imported_dir = tempfile::tempdir().unwrap();
+    let imported = helpers::session(
+        Omnigraph::init(imported_dir.path().to_str().unwrap(), NOTE_SCHEMA)
+            .await
+            .unwrap(),
+    );
+    imported
+        .load_jsonl(&exported, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let node_batches = read_table(&imported, "node:Note").await;
+    let node_ids = collect_column_strings(&node_batches, "__id");
+    assert_eq!(node_ids, vec!["note-1".to_string(), "note-2".to_string()]);
+
+    let edge_batches = read_table(&imported, "edge:References").await;
+    let edge_ids = collect_column_strings(&edge_batches, "__id");
+    assert_eq!(edge_ids, vec!["edge-1".to_string()]);
+
+    let srcs = edge_batches[0]
+        .column_by_name("__src")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let dsts = edge_batches[0]
+        .column_by_name("__dst")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(srcs.value(0), "note-1");
+    assert_eq!(dsts.value(0), "note-2");
+}
+
+// ─── Regression: export with blob columns ────────────────────────────────────
+
+/// Export writes an external Blob as a bare URI, which reloads as the whole
+/// object. A ranged descriptor is refused instead of widened, and the refusal
+/// never echoes the stored URI.
+#[tokio::test]
+#[cfg(feature = "failpoints")]
+async fn export_jsonl_refuses_ranged_external_blob_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(
+        uri,
+        r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+"#,
+    )
+    .await
+    .unwrap();
+    helpers::seed_ranged_external_blob_row(&db, uri).await;
+
+    let mut unordered = Vec::new();
+    for (order, error) in [
+        ("ordered", db.export_jsonl("main", &[]).await.unwrap_err()),
+        (
+            "unordered",
+            db.export_jsonl_unordered_to_writer("main", &[], &mut unordered)
+                .await
+                .unwrap_err(),
+        ),
+    ] {
+        let message = error.to_string();
+        assert!(
+            matches!(
+                &error,
+                OmniError::Manifest(manifest)
+                    if manifest.kind == omnigraph::error::ManifestErrorKind::BadRequest
+            ),
+            "{order} ranged export must be a BadRequest refusal, got {error:?}"
+        );
+        assert!(
+            message.contains("ranged external Blob descriptor (offset 4, length 8) in 'content'"),
+            "{order}: {message}"
+        );
+        assert!(!message.contains("s3://bucket"), "{order}: {message}");
+    }
+
+    let entity = db
+        .entity_at_target(ReadTarget::branch("main"), "node:Document", "ranged")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        entity["content"],
+        serde_json::json!({"uri": "s3://bucket/object", "offset": 4, "length": 8})
+    );
+}
+
+#[tokio::test]
+async fn export_jsonl_with_blob_type() {
+    // Regression: export on types with blob columns failed with
+    // "Schema error: Can not append column _rowaddr on schema" because
+    // Lance 4's take_blobs duplicated _rowaddr on the unsorted path.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    const BLOB_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+"#;
+
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("external.bin");
+    std::fs::write(&external_path, b"External").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+    let canonical_external_uri =
+        url::Url::from_file_path(std::fs::canonicalize(&external_path).unwrap())
+            .expect("canonical external Blob path is absolute")
+            .to_string();
+    let external_policy = ExternalBlobPolicy::allow(vec![
+        ExternalBlobBase::new(
+            url::Url::from_directory_path(external_dir.path())
+                .expect("external blob base is absolute"),
+            ExternalBlobExecutionScope::EmbeddedOnly,
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+
+    let db = helpers::session(
+        Omnigraph::init(uri, BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(external_policy.clone())
+            .unwrap(),
+    );
+    let first_fragment = [
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "readme", "content": "base64:SGVsbG8="},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "null"},
+        }),
+        serde_json::json!({
+            "type": "Document",
+            "data": {"title": "external", "content": external_uri},
+        }),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    db.load_jsonl(&first_fragment, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    // Make valid-empty the first Blob in a later fragment. Lance encodes that
+    // cell as a valid Inline 0/0 descriptor, the exact shape OmniGraph's old
+    // field-value heuristic mistook for null.
+    db.load_jsonl(concat!(
+            "{\"type\":\"Document\",\"data\":{\"title\":\"valid-empty\",\"content\":\"base64:\"}}\n",
+            "{\"type\":\"Document\",\"data\":{\"title\":\"neighbor\",\"content\":\"base64:TmVpZ2hib3I=\"}}",
+        ), LoadMode::Append, )
+    .await
+    .unwrap();
+    // Export is descriptor-first for external references: reproducing the
+    // stored URI must not depend on the caller-owned target still existing.
+    std::fs::remove_file(&external_path).unwrap();
+    let exported = db.export_jsonl("main", &[]).await.unwrap();
+    let rows = exported
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let row = |title: &str| {
+        rows.iter()
+            .find(|row| row["data"]["title"] == title)
+            .unwrap()
+    };
+    assert_eq!(row("readme")["data"]["content"], "base64:SGVsbG8=");
+    assert_eq!(row("valid-empty")["data"]["content"], "base64:");
+    assert_eq!(row("neighbor")["data"]["content"], "base64:TmVpZ2hib3I=");
+    assert!(row("null")["data"]["content"].is_null());
+    assert_eq!(row("external")["data"]["content"], canonical_external_uri);
+
+    let readme = db
+        .entity_at_target(
+            ReadTarget::branch("main"),
+            "node:Document",
+            row("readme")["id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(readme["content"], "base64:SGVsbG8=");
+    let external = db
+        .entity_at_target(
+            ReadTarget::branch("main"),
+            "node:Document",
+            row("external")["id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(external["content"], canonical_external_uri);
+    let null = db
+        .entity_at_target(
+            ReadTarget::branch("main"),
+            "node:Document",
+            row("null")["id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        null.get("content").is_none(),
+        "entity fetch omits a null cell's key: {null}"
+    );
+
+    // Rebuild ingress is policy-aware. Restore the caller-owned source and
+    // explicitly authorize the import rather than relying on ambient file
+    // access.
+    std::fs::write(&external_path, b"External").unwrap();
+
+    // Round-trip: re-import and verify blob data survives
+    let imported_dir = tempfile::tempdir().unwrap();
+    let imported_uri = imported_dir.path().to_str().unwrap();
+    let imported = helpers::session(
+        Omnigraph::init(imported_uri, BLOB_SCHEMA)
+            .await
+            .unwrap()
+            .with_external_blob_policy(external_policy)
+            .unwrap(),
+    );
+    imported
+        .load_jsonl(&exported, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let bytes = read_managed_blob_bytes(
+        &imported,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "readme", "content"),
+    )
+    .await;
+    assert_eq!(&bytes[..], b"Hello");
+
+    let empty = read_managed_blob_bytes(
+        &imported,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "valid-empty", "content"),
+    )
+    .await;
+    assert!(empty.is_empty());
+    assert!(
+        imported
+            .read_blob_at(
+                ReadTarget::branch("main"),
+                node_blob_cell("Document", "null", "content"),
+            )
+            .await
+            .is_err(),
+        "a null Blob must stay null across export/import"
+    );
+    let external = imported
+        .read_blob_at(
+            ReadTarget::branch("main"),
+            node_blob_cell("Document", "external", "content"),
+        )
+        .await
+        .unwrap();
+    match external.content {
+        BlobContent::External(reference) => {
+            assert_eq!(reference.uri, canonical_external_uri);
+            assert_eq!(reference.offset, 0);
+            assert_eq!(reference.length, None);
+        }
+        BlobContent::Managed { .. } => {
+            panic!("export/import must preserve the external Blob descriptor")
+        }
+    }
+
+    // A later import into the already-populated v6 table must retain both the
+    // physical PK contract and blob-v2 fidelity.
+    imported
+        .load_jsonl(
+            r#"{"type":"Document","data":{"title":"later","content":"base64:AAECA/8="}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+    assert_exact_id_primary_key(&imported, "node:Document").await;
+    let later = read_managed_blob_bytes(
+        &imported,
+        ReadTarget::branch("main"),
+        node_blob_cell("Document", "later", "content"),
+    )
+    .await;
+    assert_eq!(&later[..], &[0, 1, 2, 3, 255]);
+}
+
+/// Export reads the managed Blob cells of a batch through one batched read per
+/// Blob column, not one read per row, and hands each row its own payload. The
+/// rows load in reverse id order, so an id-ordered chunk requests descending
+/// stable row ids. `thumb` holds a managed cell on `d000` only: one read for
+/// the batch that holds it, none for the others. The four-way fixture above has
+/// too few managed rows per batch to tell the two read shapes apart. The
+/// change-feed baseline shares the walk.
+#[tokio::test]
+async fn export_reads_each_batch_of_managed_blobs_in_one_read_per_column() {
+    use base64::Engine as _;
+    use omnigraph::changes::ChangeFeedScope;
+    use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+
+    const ROWS: u64 = 64;
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::session(
+        Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Document {\n    title: String @key\n    content: Blob?\n    thumb: Blob?\n}\n",
+        )
+        .await
+        .unwrap(),
+    );
+    let encoded = |bytes: &[u8]| {
+        format!(
+            "base64:{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    };
+    let content = |row: u64| encoded(format!("payload-{row:03}").as_bytes());
+    let thumb = |row: u64| {
+        if row == 0 {
+            serde_json::json!(encoded(b"T"))
+        } else {
+            serde_json::Value::Null
+        }
+    };
+    let input = (0..ROWS)
+        .rev()
+        .map(|row| {
+            serde_json::json!({
+                "type": "Document",
+                "data": {
+                    "title": format!("d{row:03}"),
+                    "content": content(row),
+                    "thumb": thumb(row),
+                },
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    db.load_jsonl(&input, LoadMode::Overwrite).await.unwrap();
+
+    let probes = MergeWriteProbes::default();
+    let ordered = with_merge_write_probes(probes.clone(), db.export_jsonl("main", &[]))
+        .await
+        .unwrap();
+    let rows = ordered
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len() as u64, ROWS);
+    for (row, line) in (0..ROWS).zip(&rows) {
+        assert_eq!(line["id"], format!("d{row:03}"));
+        assert_eq!(line["data"]["content"], content(row), "row {row}");
+        assert_eq!(line["data"]["thumb"], thumb(row), "row {row}");
+    }
+    let chunks = probes.ordered_cursor_hydration_calls();
+    assert!(
+        chunks > 0 && chunks < ROWS,
+        "the walk must hydrate several rows per chunk, got {chunks} chunks"
+    );
+    assert_eq!(
+        probes.blob_managed_batch_read_calls(),
+        chunks + 1,
+        "one `content` read per hydrated chunk and one `thumb` read for the chunk holding d000"
+    );
+    assert_eq!(
+        probes.blob_payload_read_calls(),
+        ROWS + 1,
+        "one payload per managed cell"
+    );
+
+    let probes = MergeWriteProbes::default();
+    let mut unordered = Vec::new();
+    with_merge_write_probes(
+        probes.clone(),
+        db.export_jsonl_unordered_to_writer("main", &[], &mut unordered),
+    )
+    .await
+    .unwrap();
+    let mut unordered = String::from_utf8(unordered)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut expected = ordered.lines().map(str::to_string).collect::<Vec<_>>();
+    unordered.sort();
+    expected.sort();
+    assert_eq!(
+        unordered, expected,
+        "the unordered walk renders the same rows"
+    );
+    assert_eq!(
+        probes.blob_managed_batch_read_calls(),
+        2,
+        "the table's one fragment scans as one batch: one read per Blob column"
+    );
+    assert_eq!(probes.blob_payload_read_calls(), ROWS + 1);
+
+    let probes = MergeWriteProbes::default();
+    let mut baseline = Vec::new();
+    with_merge_write_probes(
+        probes.clone(),
+        db.capture_change_baseline("main", &ChangeFeedScope::default(), &mut baseline),
+    )
+    .await
+    .unwrap();
+    assert_eq!(String::from_utf8(baseline).unwrap(), ordered);
+    assert_eq!(
+        probes.blob_managed_batch_read_calls(),
+        probes.ordered_cursor_hydration_calls() + 1
+    );
+    assert_eq!(probes.blob_payload_read_calls(), ROWS + 1);
+}
+
+/// Export orders each table by id. Sorting complete rows failed with
+/// `ordered_scan_input_batch_bytes` once a row was wider than the ordered-scan
+/// sort cap; the walk must sort keys only and still emit every row, the wide
+/// one complete, in id order.
+#[tokio::test]
+async fn export_jsonl_orders_rows_wider_than_the_sort_cap_issue_705() {
+    use crate::helpers::wide_rows::*;
+
+    let dir = tempfile::tempdir().unwrap();
+    let main = init_wide_row_graph(&dir, WIDE_PAYLOAD_BYTES).await;
+    let exported = main
+        .export_jsonl("main", &[])
+        .await
+        .expect("export beside a wide row must succeed");
+    let rows: Vec<serde_json::Value> = exported
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let keys: Vec<&str> = rows
+        .iter()
+        .map(|row| row["data"]["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["small-0", "small-1", "small-2", "wide"]);
+    assert_eq!(
+        rows[3]["data"]["payload"].as_str().unwrap().len(),
+        WIDE_PAYLOAD_BYTES
+    );
+}

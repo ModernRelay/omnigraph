@@ -62,7 +62,7 @@ impl BranchManifestNamespace {
 
     async fn version_entries(&self) -> Result<Vec<DatasetEntry>> {
         let dataset = self.dataset().await?;
-        read_manifest_entries(&dataset).await
+        read_manifest_entries(&self.root_uri, &dataset).await
     }
 }
 

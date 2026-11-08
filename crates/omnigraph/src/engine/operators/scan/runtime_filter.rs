@@ -20,9 +20,10 @@ const NEEDLES: &str = "runtime filter needles";
 /// The row width up to which `lance_batch_rows` keeps one decode in its bytes.
 const DECODED_ROW_BYTES: usize = 4096;
 
-/// Rows per Lance read of a pipelined scan, filter or none: Lance 11 decodes the
+/// Rows per Lance read of a pipelined scan, filter or none: Lance 13 decodes the
 /// lesser of this and the byte target over its row estimate (64 bytes a text
-/// until a batch is measured). `LANCE_DEFAULT_BATCH_SIZE` replaces this count.
+/// until a batch is measured). This explicit count takes precedence over the
+/// `LANCE_DEFAULT_BATCH_SIZE` fallback.
 pub(in crate::engine) fn lance_batch_rows(batch_bytes: usize) -> usize {
     (batch_bytes / DECODED_ROW_BYTES).clamp(1, 8192)
 }

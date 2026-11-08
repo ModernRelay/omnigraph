@@ -9,19 +9,19 @@
 //!   a task-local ([`QueryIoProbes`]) set by the test; production leaves it unset,
 //!   so the open helpers attach nothing (one unset-`Option` check per open).
 //! - **omnigraph `StorageAdapter`** — [`CountingStorageAdapter`], a decorator that
-//!   counts per-method calls (the schema-contract reads on the query path).
+//!   counts per-method calls at the adapter boundary.
 //! - **branch merge** — [`MergeWriteProbes`] reports structural route counters
 //!   and completed timing intervals without reading the clock when unset.
 //!
 //! The probes themselves only observe, and the decorator delegates every call.
-//! The shared dataset opener also supplies the process control session when a
+//! The shared dataset opener also supplies a zero-cache control session when a
 //! caller has no graph-scoped data session, so detached opens still reuse the
 //! process object-store registry without caching mutable metadata. `IOTracker`
 //! (the concrete counter) lives in tests via the `lance-io` dev-dependency; this
 //! module stays generic over the `lance::io`-re-exported trait, so it adds no
 //! production dependency.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -92,6 +92,9 @@ impl ProbedStores {
 #[derive(Clone, Default)]
 pub struct QueryIoProbes {
     pub manifest_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    /// Attached to the opens and the creation of `__history`, which carry
+    /// `manifest_wrapper` when this is absent.
+    pub history_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     /// Attached to the per-table data opens a query performs (the cache-miss
     /// path in `DatasetEntry::open`). Lets a cost test assert how many tables
     /// a query actually opened — N on a cold read, 0 on a warm repeat once the
@@ -170,6 +173,13 @@ pub struct QueryIoProbes {
     /// over all-changing rows should inspect only the emitted row plus one
     /// continuation sentinel.
     pub candidate_rows_examined: Arc<AtomicU64>,
+    /// Change intervals with no adjacent-transaction proof that paired their
+    /// live rows by stable row id (`change_lineage` on or verify), and those
+    /// that ran the exact ordered merge of both versions. A cost test asserts
+    /// the route a window shape took, since the read counts alone cannot tell
+    /// a flat route from a small table.
+    pub change_intervals_row_identity: Arc<AtomicU64>,
+    pub change_intervals_exact_merge: Arc<AtomicU64>,
     /// Largest row/byte scanner target requested by a candidate emitter in the
     /// measured operation. Both are maxima (not sums) because parent and child
     /// streams use the same current-page target.
@@ -189,16 +199,18 @@ pub struct QueryIoProbes {
     /// This must equal the newly deleted offset count; a fragment scan would
     /// make it grow with the compacted catalog's history instead.
     pub projection_identity_rows: Arc<AtomicU64>,
-    /// Pre-effect reprepares `Omnigraph::mutate` took after a `ReadSetChanged`
+    /// Pre-effect reprepares a mutation or a load took after a `ReadSetChanged`
     /// (bounded by `MAX_PRE_EFFECT_REPREPARES`). The caller sees only the
     /// exhaustion of that loop, so this is the one view of the attempts behind
     /// an acknowledged write.
     pub mutation_reprepares: Arc<AtomicU64>,
     /// The Lance `ObjectStore`s behind the opens that carried
-    /// `manifest_wrapper` / `table_wrapper`. A store's own `io_tracker` also
-    /// sees Lance's direct local reader and writer, which on `file://` never
-    /// reach a `WrappingObjectStore`; read it for backend-complete counts.
+    /// `manifest_wrapper` / `history_wrapper` / `table_wrapper`. A store's own
+    /// `io_tracker` also sees Lance's direct local reader and writer, which on
+    /// `file://` never reach a `WrappingObjectStore`; read it for
+    /// backend-complete counts.
     pub manifest_stores: ProbedStores,
+    pub history_stores: ProbedStores,
     pub table_stores: ProbedStores,
     /// Uncapped retries taken after a capped BM25 scan under-filled. Engine
     /// v2's BM25 scans carry no cap, so no engine path records one and the
@@ -391,6 +403,46 @@ pub fn query_memory_limit() -> Option<u64> {
     QUERY_MEMORY_LIMIT.try_with(|bytes| *bytes).ok()
 }
 
+tokio::task_local! {
+    static CSV_SLICE_BYTES: usize;
+}
+
+/// Run `fut` with every `load csv` source it parses cut into slices of
+/// `bytes` instead of the planner's partition size. Test-only entry point;
+/// nothing in production sets it.
+pub async fn with_csv_slice_bytes<F>(bytes: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CSV_SLICE_BYTES.scope(bytes, fut).await
+}
+
+/// The slice size a test installed for this task, if any; `None` in
+/// production.
+pub fn csv_slice_bytes() -> Option<usize> {
+    CSV_SLICE_BYTES.try_with(|bytes| *bytes).ok()
+}
+
+tokio::task_local! {
+    static OVERWRITE_CHUNK_ROWS: usize;
+}
+
+/// Run `fut` with every `load csv` overwrite chunk holding `rows` rows before
+/// its Lance writer takes it, instead of Lance's file target (1 Mi rows).
+/// Test-only entry point; nothing in production sets it.
+pub async fn with_overwrite_chunk_rows<F>(rows: usize, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    OVERWRITE_CHUNK_ROWS.scope(rows, fut).await
+}
+
+/// The chunk row count a test installed for this task, if any; `None` in
+/// production.
+pub fn overwrite_chunk_rows() -> Option<usize> {
+    OVERWRITE_CHUNK_ROWS.try_with(|rows| *rows).ok()
+}
+
 /// Reservations and execution metrics observed by v2 acceptance tests.
 /// Holding a pool here keeps the observer alive without retaining reservations.
 #[derive(Clone, Debug, Default)]
@@ -493,12 +545,16 @@ where
     QUERY_MEMORY_PROBES.scope(probes, fut).await
 }
 
+/// One checkpoint pause. The first body to reach it claims it, marks it
+/// waiting and only then marks it entered, so a test that has seen
+/// `entered()` also sees `is_paused()` until it releases the pause.
 #[derive(Debug, Default)]
 struct QueryBlockingPause {
     released: Mutex<bool>,
     wake: std::sync::Condvar,
-    entered: AtomicU64,
-    waiting: AtomicU64,
+    claimed: AtomicBool,
+    entered: AtomicBool,
+    waiting: AtomicBool,
 }
 
 /// Releases the test checkpoint even when an assertion unwinds.
@@ -507,11 +563,11 @@ pub struct QueryBlockingPauseGuard(Arc<QueryBlockingPause>);
 
 impl QueryBlockingPauseGuard {
     pub fn entered(&self) -> bool {
-        self.0.entered.load(Ordering::SeqCst) > 0
+        self.0.entered.load(Ordering::SeqCst)
     }
 
     pub fn is_paused(&self) -> bool {
-        self.0.waiting.load(Ordering::SeqCst) > 0
+        self.0.waiting.load(Ordering::SeqCst)
     }
 
     pub fn release(&self) {
@@ -634,10 +690,11 @@ impl QueryBlockingWorkGuard {
         else {
             return;
         };
-        if pause.entered.fetch_add(1, Ordering::SeqCst) > 0 {
+        if pause.claimed.swap(true, Ordering::SeqCst) {
             return;
         }
-        pause.waiting.store(1, Ordering::SeqCst);
+        pause.waiting.store(true, Ordering::SeqCst);
+        pause.entered.store(true, Ordering::SeqCst);
         let released = pause
             .released
             .lock()
@@ -650,7 +707,7 @@ impl QueryBlockingWorkGuard {
                 })
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        pause.waiting.store(0, Ordering::SeqCst);
+        pause.waiting.store(false, Ordering::SeqCst);
     }
 
     pub fn started(&mut self) {
@@ -705,6 +762,139 @@ pub fn rrf_gate_subset_drop() -> Option<String> {
 
 tokio::task_local! {
     static STAGE_WRITE_PROBES: StageWriteProbes;
+}
+
+tokio::task_local! {
+    static EXTERNAL_PAYLOAD_READ_STALL: ();
+}
+
+/// Run `fut` with every external object payload read parked forever at its
+/// request site, so a test can prove that a deadline around the read fires
+/// and nothing after it runs. Production leaves this task-local unset, so
+/// the read only pays the unset lookup.
+pub async fn with_external_payload_read_stalled<F>(fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    EXTERNAL_PAYLOAD_READ_STALL.scope((), fut).await
+}
+
+tokio::task_local! {
+    static EXTERNAL_PAYLOAD_READ_HOLD: ExternalPayloadReadHold;
+}
+
+/// A rendezvous at the external object payload request site: a read under
+/// the hold reports that it reached the site and waits for [`Self::release`],
+/// so a test can change the object between its metadata probe and its
+/// payload read. Production leaves the task-local unset.
+#[derive(Clone, Default)]
+pub struct ExternalPayloadReadHold {
+    state: Arc<ExternalPayloadReadHoldState>,
+}
+
+#[derive(Default)]
+struct ExternalPayloadReadHoldState {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl ExternalPayloadReadHold {
+    /// Resolve once a read under this hold has reached its request site.
+    pub async fn reached(&self) {
+        self.state.reached.notified().await;
+    }
+
+    /// Let the held read issue its request.
+    pub fn release(&self) {
+        self.state.release.notify_one();
+    }
+
+    async fn park(&self) {
+        self.state.reached.notify_one();
+        self.state.release.notified().await;
+    }
+}
+
+/// Run `fut` with every external object payload read parked at its request
+/// site until `hold` releases it.
+pub async fn with_external_payload_read_held<F>(hold: ExternalPayloadReadHold, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    EXTERNAL_PAYLOAD_READ_HOLD.scope(hold, fut).await
+}
+
+/// Park here before an external object payload read when a test asked for
+/// the stall or installed a hold; return at once otherwise.
+pub async fn external_payload_read_stall() {
+    if EXTERNAL_PAYLOAD_READ_STALL.try_with(|_| ()).is_ok() {
+        std::future::pending::<()>().await;
+    }
+    if let Ok(hold) = EXTERNAL_PAYLOAD_READ_HOLD.try_with(Clone::clone) {
+        hold.park().await;
+    }
+}
+
+/// The task-local seams an external object payload read answers to: the
+/// stall, the hold and the merge-write probes. A load plan's source
+/// partitions read on blocking workers under tasks DataFusion spawns, none of
+/// which inherits a task local, so the statement's task captures these when
+/// it builds its query resources and the worker reinstalls them with
+/// [`with_external_read_seams`]. Production captures three unset lookups.
+#[derive(Clone, Default)]
+pub struct ExternalReadSeams {
+    stalled: bool,
+    hold: Option<ExternalPayloadReadHold>,
+    probes: Option<MergeWriteProbes>,
+}
+
+impl std::fmt::Debug for ExternalReadSeams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalReadSeams")
+            .field("stalled", &self.stalled)
+            .field("hold", &self.hold.is_some())
+            .field("probes", &self.probes.is_some())
+            .finish()
+    }
+}
+
+/// Capture the external read seams of the current task.
+pub fn capture_external_read_seams() -> ExternalReadSeams {
+    ExternalReadSeams {
+        stalled: EXTERNAL_PAYLOAD_READ_STALL.try_with(|_| ()).is_ok(),
+        hold: EXTERNAL_PAYLOAD_READ_HOLD.try_with(Clone::clone).ok(),
+        probes: MERGE_WRITE_PROBES.try_with(Clone::clone).ok(),
+    }
+}
+
+/// Run `fut` under the seams `capture_external_read_seams` took on another
+/// task; an unset seam installs nothing.
+pub async fn with_external_read_seams<F>(seams: ExternalReadSeams, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let ExternalReadSeams {
+        stalled,
+        hold,
+        probes,
+    } = seams;
+    let probed = async move {
+        match probes {
+            Some(probes) => MERGE_WRITE_PROBES.scope(probes, fut).await,
+            None => fut.await,
+        }
+    };
+    let held = async move {
+        match hold {
+            Some(hold) => EXTERNAL_PAYLOAD_READ_HOLD.scope(hold, probed).await,
+            None => probed.await,
+        }
+    };
+    if stalled {
+        EXTERNAL_PAYLOAD_READ_STALL.scope((), held).await
+    } else {
+        held.await
+    }
 }
 
 /// Deterministic probe for the number of table-fragment staging futures that
@@ -791,6 +981,17 @@ pub fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
     current(|p| p.manifest_wrapper.clone()).flatten()
 }
 
+/// The wrapper of `__history`: its own plane when a probe installs one, the
+/// `__manifest` plane otherwise.
+pub fn history_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
+    current(|p| {
+        p.history_wrapper
+            .clone()
+            .or_else(|| p.manifest_wrapper.clone())
+    })
+    .flatten()
+}
+
 pub fn table_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
     current(|p| p.table_wrapper.clone()).flatten()
 }
@@ -804,7 +1005,7 @@ pub fn record_probe() {
 /// Internal/system table directory names. An open of one of these is a metadata
 /// open (publisher CAS), NOT a data-table open. Kept in sync with the dir
 /// constants in `omnigraph-catalog/src/layout.rs`.
-const INTERNAL_TABLE_DIRS: [&str; 1] = ["__manifest"];
+const INTERNAL_TABLE_DIRS: [&str; 2] = ["__manifest", "__history"];
 
 /// True when `uri`'s last path segment names an internal/system table.
 fn open_is_internal(uri: &str) -> bool {
@@ -837,13 +1038,19 @@ pub fn record_manifest_scan() {
 
 /// Register the store behind a probed open under the plane whose wrapper the
 /// open carried. No-op unless a cost probe is active.
-fn record_probed_store(wrapper: &Arc<dyn WrappingObjectStore>, store: Arc<lance::io::ObjectStore>) {
+pub fn record_probed_store(
+    wrapper: &Arc<dyn WrappingObjectStore>,
+    store: Arc<lance::io::ObjectStore>,
+) {
     let _ = current(|p| {
         let carried = |plane: &Option<Arc<dyn WrappingObjectStore>>| {
             plane.as_ref().is_some_and(|w| Arc::ptr_eq(w, wrapper))
         };
         if carried(&p.manifest_wrapper) {
             p.manifest_stores.register(store.clone());
+        }
+        if carried(&p.history_wrapper) {
+            p.history_stores.register(store.clone());
         }
         if carried(&p.table_wrapper) {
             p.table_stores.register(store);
@@ -1084,6 +1291,22 @@ pub fn record_candidate_row_examined() {
     let _ = current(|p| p.candidate_rows_examined.fetch_add(1, Ordering::Relaxed));
 }
 
+/// One change interval with no adjacency proof discovered by row identity.
+pub fn record_change_interval_row_identity() {
+    let _ = current(|p| {
+        p.change_intervals_row_identity
+            .fetch_add(1, Ordering::Relaxed)
+    });
+}
+
+/// One change interval with no adjacency proof read by the exact merge.
+pub fn record_change_interval_exact_merge() {
+    let _ = current(|p| {
+        p.change_intervals_exact_merge
+            .fetch_add(1, Ordering::Relaxed)
+    });
+}
+
 pub fn record_candidate_scan_targets(rows: usize, bytes: u64) {
     let _ = current(|p| {
         p.candidate_scan_target_rows_peak
@@ -1210,14 +1433,34 @@ pub struct MergeWriteProbes {
     /// Legacy whole-delta materializations. RFC-023's bounded keyed path must
     /// keep this at zero; retaining the probe makes regressions observable.
     pub scan_staged_combined_calls: Arc<AtomicU64>,
-    /// Blob payload reads performed while rebuilding descriptor rows into a
-    /// logical keyed-write source. Resource-limit tests use this to prove an
-    /// oversized descriptor is rejected from `BlobFile::size()` before the
-    /// payload allocation/read begins.
+    /// Tables a mutation statement opened for its read or staging (one per
+    /// statement that reaches `open_table_for_mutation`). A statement refused
+    /// while its assignments resolve must leave this at zero.
+    pub mutation_table_open_calls: Arc<AtomicU64>,
+    /// Blob payload values a rewrite consumed while rebuilding descriptor rows
+    /// into a logical source (a keyed write or a branch merge), or that
+    /// export, a change image or an entity read rendered: one per managed
+    /// value, counted after the batched managed read returned it and its
+    /// length matched, and one per external object read (rewrites only).
+    /// Zero does not prove that no payload I/O ran:
+    /// `blob_managed_batch_read_calls` counts the managed reads issued, before
+    /// any byte arrives.
     pub blob_payload_read_calls: Arc<AtomicU64>,
+    /// Batched managed Blob reads (`Dataset::read_blobs`) issued: one per
+    /// batch column holding a managed cell, however many managed values it
+    /// carries, recorded before the read is issued. A materializing rewrite,
+    /// export and the change-feed baseline read per batch; a change image and
+    /// an entity read per row. Distinguishes the batched read from one read
+    /// per value, which `blob_payload_read_calls` cannot.
+    pub blob_managed_batch_read_calls: Arc<AtomicU64>,
+    /// Compaction tasks executed over a table with a Blob field.
+    pub compaction_blob_batch_calls: Arc<AtomicU64>,
+    /// The scanner batch size the last such task ran with: the engine's
+    /// derived bound, or a smaller caller value.
+    pub compaction_blob_batch_rows: Arc<AtomicU64>,
     /// Payload reads issued against external sources specifically. Unlike the
-    /// aggregate Blob counter, this excludes managed Lance `BlobFile::read`
-    /// calls so normalized-alias GET deduplication is directly observable.
+    /// aggregate Blob counter, this excludes managed values, so
+    /// normalized-alias GET deduplication is directly observable.
     pub external_blob_payload_read_calls: Arc<AtomicU64>,
     /// External Blob cells presented to one operation-wide preflight and the
     /// distinct normalized object metadata probes that preflight performed.
@@ -1306,8 +1549,20 @@ impl MergeWriteProbes {
     pub fn scan_staged_combined_calls(&self) -> u64 {
         self.scan_staged_combined_calls.load(Ordering::Relaxed)
     }
+    pub fn mutation_table_open_calls(&self) -> u64 {
+        self.mutation_table_open_calls.load(Ordering::Relaxed)
+    }
     pub fn blob_payload_read_calls(&self) -> u64 {
         self.blob_payload_read_calls.load(Ordering::Relaxed)
+    }
+    pub fn blob_managed_batch_read_calls(&self) -> u64 {
+        self.blob_managed_batch_read_calls.load(Ordering::Relaxed)
+    }
+    pub fn compaction_blob_batch_calls(&self) -> u64 {
+        self.compaction_blob_batch_calls.load(Ordering::Relaxed)
+    }
+    pub fn compaction_blob_batch_rows(&self) -> u64 {
+        self.compaction_blob_batch_rows.load(Ordering::Relaxed)
     }
     pub fn external_blob_payload_read_calls(&self) -> u64 {
         self.external_blob_payload_read_calls
@@ -1484,7 +1739,7 @@ pub fn record_stage_append(rows: u64) {
     });
 }
 
-/// Record one `stage_merge_insert` of `rows` rows against the active probes.
+/// Record one merge-insert keyed stage of `rows` rows against the active probes.
 /// No-op in production (no probes installed).
 pub fn record_stage_merge_insert(rows: u64) {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
@@ -1532,11 +1787,40 @@ pub fn record_stage_vector_index() {
     });
 }
 
-/// Record one impending `BlobFile::read` while logical blob arrays are rebuilt.
-/// No-op in production (no probes installed).
+/// Record one table a mutation statement opens. No-op in production.
+pub fn record_mutation_table_open() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.mutation_table_open_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one Blob payload value a reader consumed: a managed value after the
+/// batched managed read returned it, or an external object read. It trails the
+/// managed I/O, which `record_blob_managed_batch_read` marks. No-op in
+/// production (no probes installed).
 pub fn record_blob_payload_read() {
     let _ = MERGE_WRITE_PROBES.try_with(|p| {
         p.blob_payload_read_calls.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one batched managed Blob read issued. No-op in production (no
+/// probes installed).
+pub fn record_blob_managed_batch_read() {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.blob_managed_batch_read_calls
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one compaction task of a Blob table and the scanner batch size set
+/// on it. No-op in production (no probes installed).
+pub fn record_compaction_blob_batch(batch_rows: usize) {
+    let _ = MERGE_WRITE_PROBES.try_with(|p| {
+        p.compaction_blob_batch_calls
+            .fetch_add(1, Ordering::Relaxed);
+        p.compaction_blob_batch_rows
+            .store(batch_rows as u64, Ordering::Relaxed);
     });
 }
 
@@ -1717,6 +2001,11 @@ pub enum VersionResolution {
     At(u64),
 }
 
+mod small_manifest_reads;
+pub use small_manifest_reads::manifest_scan_dataset;
+mod control_dataset;
+pub use control_dataset::{current_control_dataset, retain_control_dataset};
+
 /// Open a table pin (RFC 0067): a pin without a staged version opens its
 /// target, a staged pin above `last_linear_version` opens its detached
 /// version, and any older pin keeps the v10 twin rule for historical rows.
@@ -1812,7 +2101,7 @@ pub async fn open_pinned_dataset(
 ///    store). No wrapper (production) adds nothing.
 /// 3. A caller-provided graph data `Session` warms Lance's metadata/index
 ///    caches across data-table opens. When absent (for example a detached
-///    historical snapshot), the process-wide zero-cache
+///    historical snapshot), a fresh zero-cache
 ///    control session is attached instead. Every open therefore reuses the
 ///    shared object-store registry/client pool without letting mutable control
 ///    metadata become stale in a session cache.
@@ -1822,26 +2111,7 @@ pub async fn open_dataset(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    record_open(uri);
-    let mut builder = DatasetBuilder::from_uri(uri);
-    if let VersionResolution::At(version) = version {
-        builder = builder.with_version(version);
-    }
-    let session = session
-        .cloned()
-        .unwrap_or_else(crate::lance_access::control_session);
-    builder = builder.with_session(session);
-    let mut store_params = crate::storage::lance_store_params_for_uri(uri)?;
-    if let Some(wrapper) = &wrapper {
-        store_params.object_store_wrapper = Some(wrapper.clone());
-    }
-    let handler =
-        crate::lance_clone::configured_commit_handler(uri, &Some(store_params.clone()), None)
-            .await
-            .map_err(OmniError::storage)?;
-    builder = builder
-        .with_store_params(store_params)
-        .with_commit_handler(handler);
+    let builder = dataset_builder(uri, version, session, &wrapper).await?;
     let dataset = builder.load().await.map_err(|error| match error {
         // Only the two shapes cleanup/drop legitimately leaves behind for a
         // pinned historical read count as reclaimed history:
@@ -1877,6 +2147,59 @@ pub async fn open_dataset(
         record_probed_store(wrapper, store);
     }
     Ok(dataset)
+}
+
+/// [`open_dataset`] at the latest version of a dataset that may not exist:
+/// `None` when Lance finds no dataset at `uri`, every other failure as it is.
+pub async fn open_dataset_if_present(
+    uri: &str,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Option<Dataset>> {
+    let builder = dataset_builder(uri, VersionResolution::Latest, session, &wrapper).await?;
+    let dataset = match builder.load().await {
+        Ok(dataset) => dataset,
+        Err(lance::Error::DatasetNotFound { .. }) => return Ok(None),
+        Err(error) => return Err(OmniError::storage(error)),
+    };
+    if let Some(wrapper) = &wrapper {
+        let store = dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        record_probed_store(wrapper, store);
+    }
+    Ok(Some(dataset))
+}
+
+/// The builder of [`open_dataset`]: the open is recorded, and the session, the
+/// wrapper and the commit handler are attached.
+async fn dataset_builder(
+    uri: &str,
+    version: VersionResolution,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: &Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<DatasetBuilder> {
+    record_open(uri);
+    let mut builder = DatasetBuilder::from_uri(uri);
+    if let VersionResolution::At(version) = version {
+        builder = builder.with_version(version);
+    }
+    let session = session
+        .cloned()
+        .unwrap_or_else(crate::lance_access::control_session);
+    let mut store_params = crate::storage::lance_store_params_for_session(uri, &session)?;
+    builder = builder.with_session(session);
+    if let Some(wrapper) = wrapper {
+        store_params.object_store_wrapper = Some(wrapper.clone());
+    }
+    let handler =
+        crate::lance_clone::configured_commit_handler(uri, &Some(store_params.clone()), None)
+            .await
+            .map_err(OmniError::storage)?;
+    Ok(builder
+        .with_store_params(store_params)
+        .with_commit_handler(handler))
 }
 
 /// Per-method call counts for [`CountingStorageAdapter`].
@@ -1956,6 +2279,12 @@ impl CountingStorageAdapter {
 
 #[async_trait]
 impl StorageAdapter for CountingStorageAdapter {
+    fn binding(&self) -> Option<crate::storage::CapturedStorageBinding> {
+        self.inner.binding()
+    }
+    fn io_scope(&self) -> Option<crate::storage::StorageIoScope> {
+        self.inner.io_scope()
+    }
     async fn read_text(&self, uri: &str) -> Result<String> {
         self.counts.read_text.fetch_add(1, Ordering::Relaxed);
         self.inner.read_text(uri).await
