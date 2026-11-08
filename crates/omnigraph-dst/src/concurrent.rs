@@ -1753,12 +1753,15 @@ fn maintenance_life(
             let mut occ_retries = 0usize;
             loop {
                 let result = match kind {
-                    0 => Box::pin(db.ensure_indices()).await.map(|_| ()),
-                    1 => Box::pin(db.optimize()).await.map(|_| ()),
-                    _ => Box::pin(db.cleanup(CleanupPolicyOptions {
-                        keep_versions: Some(1),
-                        older_than: None,
-                    }))
+                    0 => Box::pin(db.ensure_indices_as(None)).await.map(|_| ()),
+                    1 => Box::pin(db.optimize_as(None)).await.map(|_| ()),
+                    _ => Box::pin(db.cleanup_as(
+                        CleanupPolicyOptions {
+                            keep_versions: Some(1),
+                            older_than: None,
+                        },
+                        None,
+                    ))
                     .await
                     .map(|_| ()),
                 };

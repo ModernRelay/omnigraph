@@ -36,13 +36,16 @@ pub(super) async fn graph_index_for_resolved(
         .await
 }
 
-pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<IndexBuildResult> {
+pub(super) async fn ensure_indices_as(
+    db: &Omnigraph,
+    actor: Option<&str>,
+) -> Result<IndexBuildResult> {
     let current_branch = db
         .coordinator
         .load_full()
         .current_branch()
         .map(str::to_string);
-    ensure_indices_on_as(db, current_branch.as_deref().unwrap_or("main"), None).await
+    ensure_indices_on_as(db, current_branch.as_deref().unwrap_or("main"), actor).await
 }
 
 pub(super) async fn ensure_indices_on_as(
@@ -53,7 +56,7 @@ pub(super) async fn ensure_indices_on_as(
     let branch = normalize_branch_name(branch)?;
     let public_branch = branch.as_deref().unwrap_or("main");
     db.enforce(
-        omnigraph_policy::PolicyAction::Change,
+        omnigraph_policy::PolicyAction::Maintain,
         &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
         actor,
     )?;
@@ -167,8 +170,13 @@ pub(super) async fn rebuild_full_text_indices_on_as(
 ) -> Result<FullTextIndexRebuildResult> {
     let branch = normalize_branch_name(branch)?;
     let public_branch = branch.as_deref().unwrap_or("main");
-    db.enforce(
-        omnigraph_policy::PolicyAction::Change,
+    // `maintain` is the rebuild's grant; `change`, its grant before
+    // `maintain` existed, still admits it so existing policies keep working.
+    db.enforce_any(
+        &[
+            omnigraph_policy::PolicyAction::Maintain,
+            omnigraph_policy::PolicyAction::Change,
+        ],
         &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
         actor,
     )?;

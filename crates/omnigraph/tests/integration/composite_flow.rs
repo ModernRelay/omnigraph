@@ -309,7 +309,7 @@ async fn composite_flow_canonical_lifecycle() {
     // version, and this flow exercises exactly that previously-failing
     // write below.
     // ─────────────────────────────────────────────────────────────────
-    let optimize_stats = db.optimize().await.unwrap();
+    let optimize_stats = db.optimize_as(None).await.unwrap();
     assert!(
         !optimize_stats.is_empty(),
         "optimize must return per-table stats"
@@ -362,10 +362,13 @@ async fn composite_flow_canonical_lifecycle() {
     use omnigraph::db::CleanupPolicyOptions;
     use std::time::Duration;
     let _cleanup_stats = db
-        .cleanup(CleanupPolicyOptions {
-            keep_versions: Some(10),
-            older_than: Some(Duration::from_secs(3600)),
-        })
+        .cleanup_as(
+            CleanupPolicyOptions {
+                keep_versions: Some(10),
+                older_than: Some(Duration::from_secs(3600)),
+            },
+            None,
+        )
         .await
         .unwrap();
 

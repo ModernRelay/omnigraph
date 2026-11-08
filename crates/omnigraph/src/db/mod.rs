@@ -23,12 +23,11 @@ pub use omnigraph::{
     ExportCut, FullTextIndexRebuildResult, GraphCreateReconciliation, IndexBuildResult,
     InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedGraphCreate,
     PreparedSchemaApply, PreparedSchemaSettlement, ReadCheck, RebuiltFullTextIndex, RepairAction,
-    RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
-    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
-    SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,
-    SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
-    SystemColumnUpgradeReport, TableCollectionPlan, UnattachedTagRecord, UnpublishedManifest,
-    unattached_release_order,
+    RepairClassification, RepairStats, RetainedManifestVersions, SYSTEM_COLUMNS_PREFLIGHT,
+    SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement, SchemaContractDigest,
+    SchemaNonPublicationProof, SkipReason, StagingVerdict, SystemColumnUpgradeFinding,
+    SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
+    TableCollectionPlan, UnattachedTagRecord, UnpublishedManifest, unattached_release_order,
 };
 pub(crate) use omnigraph::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
