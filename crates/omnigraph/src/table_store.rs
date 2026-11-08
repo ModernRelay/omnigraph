@@ -7091,10 +7091,12 @@ impl PendingScanAccount {
     /// so charging (or keeping) it as emitted could count rows stored beside
     /// a match. Copying first makes both the charge and the memory held
     /// depend only on the kept rows, never on storage layout (issue #1303).
-    /// There is deliberately no separate charge method, so a new retention
-    /// point cannot charge an uncopied batch. The copy is made before the
-    /// charge: its size is bounded by the input batch, not by the budget, so
-    /// an over-budget copy is made and then refused.
+    /// There is deliberately no separate batch charge method. Only `new` and
+    /// `retain` call `add_usage`, by convention rather than by the compiler,
+    /// so a new retention point should keep its batches through `retain`, and
+    /// must not charge an uncopied batch through `add_usage`. The copy is
+    /// made before the charge: its size is bounded by the input batch, not by
+    /// the budget, so an over-budget copy is made and then refused.
     fn retain(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
         let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
         let rows = u64::try_from(batch.num_rows())
