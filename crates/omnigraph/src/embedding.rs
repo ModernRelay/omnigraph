@@ -160,6 +160,15 @@ impl EmbeddingConfig {
         })
     }
 
+    /// Whether this config embeds in the space of vectors recorded by
+    /// `@embed("…", model = recorded)`: its resolved model id equals the
+    /// recorded one exactly. A text `nearest()` and the offline
+    /// `omnigraph embed` pipeline both refuse a property whose recorded model
+    /// fails this, so stored and query vectors come from the same model.
+    pub fn embeds_with_model(&self, recorded: &str) -> bool {
+        self.model == recorded
+    }
+
     fn mock() -> Self {
         Self {
             provider: Provider::Mock,

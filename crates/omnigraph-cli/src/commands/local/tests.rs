@@ -63,15 +63,15 @@ fn skill_export_delivery_failure_keeps_the_written_files_and_record() {
 async fn embed_report_failure_keeps_the_completed_output_file() {
     let home = tempfile::tempdir().unwrap();
     let input = home.path().join("input.jsonl");
-    let spec = home.path().join("spec.json");
+    let schema = home.path().join("schema.pg");
     std::fs::write(
         &input,
         "{\"type\":\"Doc\",\"data\":{\"text\":\"hello\",\"vector\":[1,2]}}\n",
     )
     .unwrap();
     std::fs::write(
-        &spec,
-        r#"{"dimension":2,"types":{"Doc":{"target":"vector","fields":["text"]}}}"#,
+        &schema,
+        "node Doc {\n    text: String?\n    vector: Vector(2)? @embed(\"text\")\n}\n",
     )
     .unwrap();
     for json in [false, true] {
@@ -82,10 +82,11 @@ async fn embed_report_failure_keeps_the_completed_output_file() {
             seed: None,
             input: Some(input.clone()),
             output: Some(output.clone()),
-            spec: Some(spec.clone()),
+            schema: Some(schema.clone()),
             clean: true,
             reembed_all: false,
             types: Vec::new(),
+            vectors: Vec::new(),
             selectors: Vec::new(),
             json,
         };

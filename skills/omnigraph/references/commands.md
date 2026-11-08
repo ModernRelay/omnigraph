@@ -243,8 +243,9 @@ omnigraph lint --query queries/foo.gq --target $REPO --json
 ## Embed
 
 ```bash
-omnigraph embed --input raw.jsonl --output embedded.jsonl --spec embeddings.json
-omnigraph embed --input raw.jsonl --output embedded.jsonl --spec embeddings.json --reembed-all
+omnigraph embed --schema schema.pg --input raw.jsonl --output embedded.jsonl
+omnigraph embed --schema schema.pg --input raw.jsonl --output embedded.jsonl --reembed-all
+omnigraph embed --schema schema.pg --input raw.jsonl --output embedded.jsonl --vector Doc.embedding
 omnigraph embed --seed embed-config.yaml --clean
 omnigraph embed --seed embed-config.yaml --select "Type:field=value"
 ```

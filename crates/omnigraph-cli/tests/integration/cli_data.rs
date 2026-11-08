@@ -874,7 +874,7 @@ fn embed_seed_fills_missing_and_preserves_existing_vectors_by_default() {
     );
     assert_eq!(
         embedded[1]["data"]["embedding"],
-        serde_json::json!([0.1, 0.2])
+        serde_json::json!([0.1, 0.2, 0.3, 0.4])
     );
 
     let human = stdout_string(&output_success(
@@ -885,6 +885,10 @@ fn embed_seed_fills_missing_and_preserves_existing_vectors_by_default() {
             .arg(&seed),
     ));
     assert!(human.contains("embedded 1 records (selected 2, cleaned 0)"));
+    assert!(
+        human.contains("[fill_missing: Decision.embedding 4d]"),
+        "{human}"
+    );
     assert!(!human.contains("embedded 1 rows"));
 }
 
@@ -936,7 +940,7 @@ fn embed_select_reembeds_only_matching_rows() {
     assert!(embedded[0]["data"].get("embedding").is_none());
     assert_ne!(
         embedded[1]["data"]["embedding"],
-        serde_json::json!([0.1, 0.2])
+        serde_json::json!([0.1, 0.2, 0.3, 0.4])
     );
     assert_eq!(
         embedded[1]["data"]["embedding"].as_array().unwrap().len(),
@@ -966,6 +970,159 @@ fn embed_seed_preserves_non_entity_rows() {
     assert_eq!(embedded[2]["edge"], "Triggered");
     assert_eq!(embedded[2]["from"], "sig-alpha");
     assert_eq!(embedded[2]["to"], "dec-alpha");
+}
+
+/// The schema states what to embed: the command reads the target, source and
+/// dimension from `@embed`, holds the provider to a recorded model before it
+/// writes anything, and no longer takes the spec that restated them. When one
+/// node declares vectors of two models, `--vector` selects the one a run
+/// fills, holds the provider to that vector's model alone, and leaves the
+/// other vector as it was.
+#[test]
+fn embed_reads_vectors_from_the_schema_and_refuses_another_model() {
+    let temp = tempdir().unwrap();
+    let schema = temp.path().join("schema.pg");
+    fs::write(
+        &schema,
+        concat!(
+            "node Decision {\n",
+            "    slug: String @key\n",
+            "    intent: String?\n",
+            "    embedding: Vector(4)? @embed(\"intent\", model=\"mock-model\")\n",
+            "    summary: Vector(4)? @embed(\"intent\", model=\"model-b\")\n",
+            "}\n"
+        ),
+    )
+    .unwrap();
+    let input = temp.path().join("raw.jsonl");
+    fs::write(
+        &input,
+        "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-alpha\",\"intent\":\"Alpha ship\"}}\n",
+    )
+    .unwrap();
+    let output = temp.path().join("embedded.jsonl");
+    let rerun = temp.path().join("rerun.jsonl");
+    let embed =
+        |model: &str, vector: Option<&str>, input: &std::path::Path, output: &std::path::Path| {
+            let mut command = cli();
+            command
+                .env("OMNIGRAPH_EMBEDDINGS_MOCK", "1")
+                .env("OMNIGRAPH_EMBED_MODEL", model)
+                .arg("embed")
+                .arg("--schema")
+                .arg(&schema)
+                .arg("--input")
+                .arg(input)
+                .arg("--output")
+                .arg(output)
+                .arg("--json");
+            if let Some(vector) = vector {
+                command.arg("--vector").arg(vector);
+            }
+            command
+        };
+    let refusal = |model: &str, property: &str, recorded: &str| {
+        format!(
+            "Decision.{property} records `@embed(model=\"{recorded}\")`, but the embedding \
+             provider resolves to model '{model}'"
+        )
+    };
+
+    // Without `--vector` every declared vector is filled, so each provider
+    // model is refused by the vector it does not match.
+    for (model, property, recorded) in [
+        ("other-model", "embedding", "mock-model"),
+        ("mock-model", "summary", "model-b"),
+    ] {
+        let refused = output_failure(&mut embed(model, None, &input, &output));
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains(&refusal(model, property, recorded)),
+            "{stderr}"
+        );
+        assert!(stderr.contains("--vector Type.property"), "{stderr}");
+        assert!(!output.exists(), "a refused run writes no output");
+    }
+
+    // A selected vector is held to its own model alone.
+    let refused = output_failure(&mut embed(
+        "mock-model",
+        Some("Decision.summary"),
+        &input,
+        &output,
+    ));
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&refusal("mock-model", "summary", "model-b")),
+        "{stderr}"
+    );
+    assert!(!output.exists(), "a refused run writes no output");
+
+    let payload: Value = serde_json::from_slice(
+        &output_success(&mut embed(
+            "mock-model",
+            Some("Decision.embedding"),
+            &input,
+            &output,
+        ))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(payload["model"], "mock-model");
+    assert_eq!(
+        payload["vectors"],
+        json!([{ "type": "Decision", "property": "embedding", "source": "intent", "dimension": 4 }])
+    );
+    assert!(payload.get("dimension").is_none(), "{payload}");
+    let first = read_embedded_rows(output.clone())[0]["data"].clone();
+    assert_eq!(first["embedding"].as_array().unwrap().len(), 4);
+    assert!(first.get("summary").is_none(), "{first}");
+
+    // The other model's run fills its own vector and keeps the first one.
+    let payload: Value = serde_json::from_slice(
+        &output_success(&mut embed(
+            "model-b",
+            Some("Decision.summary"),
+            &output,
+            &rerun,
+        ))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(payload["model"], "model-b");
+    assert_eq!(payload["embedded_records"], 1);
+    assert_eq!(
+        payload["vectors"],
+        json!([{ "type": "Decision", "property": "summary", "source": "intent", "dimension": 4 }])
+    );
+    let second = read_embedded_rows(rerun.clone())[0]["data"].clone();
+    assert_eq!(second["embedding"], first["embedding"]);
+    assert_eq!(second["summary"].as_array().unwrap().len(), 4);
+
+    let unknown = output_failure(&mut embed(
+        "mock-model",
+        Some("Decision.intent"),
+        &input,
+        &temp.path().join("unknown.jsonl"),
+    ));
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(
+        stderr.contains("--vector Decision.intent: the schema declares no `@embed` vector"),
+        "{stderr}"
+    );
+
+    let spec = output_failure(
+        cli()
+            .arg("embed")
+            .arg("--spec")
+            .arg(&schema)
+            .arg("--input")
+            .arg(&input)
+            .arg("--output")
+            .arg(&output),
+    );
+    let stderr = String::from_utf8_lossy(&spec.stderr);
+    assert!(stderr.contains("unexpected argument '--spec'"), "{stderr}");
 }
 
 #[test]
