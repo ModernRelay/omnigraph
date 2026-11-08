@@ -1246,6 +1246,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 PendingMode::StrictInsert => DeltaClass::Insert,
                 PendingMode::Upsert => DeltaClass::Upsert,
                 PendingMode::Overwrite => DeltaClass::Replace,
+                // A load never stages a column patch; an update's patch of
+                // present rows is an upsert to the judge.
+                PendingMode::ColumnPatch => DeltaClass::Upsert,
             },
             rows: pending.batches.iter().map(|b| b.num_rows() as u64).sum(),
             deleted_ids: Vec::new(),

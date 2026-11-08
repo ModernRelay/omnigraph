@@ -1,0 +1,401 @@
+# issue: none
+# notes: An update that assigns only scalars on a type with a Blob and a vector patches the assigned
+# notes: columns in place (issue #1264) when it is the mutation's only write to the type; beside a
+# notes: second statement on the type it rewrites whole rows. Both answer alike: the same rows,
+# notes: vectors and nearest ranking, the same graph diff, and a later whole-row update, a delete and
+# notes: a patch over a fragment with a deleted row read the same on both branches. Validation
+# notes: refuses a patched `@range` or `@unique` violation as it refuses a whole-row one, and a
+# notes: three-way branch merge of patched commits gives what one of whole-row commits gives.
+# notes: The rows cannot show which path ran. The patch on `main` is pinned by the Rust test
+# notes: `writes.rs::update_of_one_scalar_patches_instead_of_rewriting_blobs_and_vectors_issue_1264`
+# notes: (the committed transaction is `RewriteColumns`) and by the DST storage-cost golden rows
+# notes: `UpdatePatchBlob*` against `UpdateRowsBlob1M`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Doc {
+    slug: String @key
+    age: I32
+    score: I32?
+    code: String? @unique
+    content: Blob?
+    emb: Vector(4)?
+    @range(score, 0..100)
+}
+
+node Marker {
+    name: String @key
+}
+
+--- seed generate: v1 seed: 7
+tables:
+  - kind: node
+    name: Doc
+    rows: 6
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: d-, width: 2}
+      age: {kind: ordinal, start: 0, step: 1}
+      code: {kind: key, prefix: c-, width: 2}
+      content: {kind: blob, byte: 9, length: 64}
+      emb: {kind: vector, dimensions: 4}
+
+--- mutate
+query mark() {
+    insert Marker { name: "seeded" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $seeded
+
+--- mutate
+branch create rows
+
+--- expect ok
+
+--- mutate
+query patch_scores() {
+    update Doc set { score: 5 } where age >= 2
+}
+
+--- expect affected: nodes=4 edges=0
+
+--- mutate branch: rows
+query rewrite_scores() {
+    update Doc set { score: 5 } where age >= 2
+    update Doc set { score: 0 } where slug = "nobody"
+}
+
+--- expect affected: nodes=4 edges=0
+
+--- query
+query scores() {
+    match { $d: Doc }
+    return { $d.slug, $d.age, $d.score }
+    order { $d.slug asc }
+}
+
+--- expect ordered
+{"d.age":0,"d.slug":"d-00"}
+{"d.age":1,"d.slug":"d-01"}
+{"d.age":2,"d.score":5,"d.slug":"d-02"}
+{"d.age":3,"d.score":5,"d.slug":"d-03"}
+{"d.age":4,"d.score":5,"d.slug":"d-04"}
+{"d.age":5,"d.score":5,"d.slug":"d-05"}
+
+--- expect shape
+d.slug: String
+d.age: I32
+d.score: I32?
+
+--- query branch: rows
+query scores() {
+    match { $d: Doc }
+    return { $d.slug, $d.age, $d.score }
+    order { $d.slug asc }
+}
+
+--- expect ordered
+{"d.age":0,"d.slug":"d-00"}
+{"d.age":1,"d.slug":"d-01"}
+{"d.age":2,"d.score":5,"d.slug":"d-02"}
+{"d.age":3,"d.score":5,"d.slug":"d-03"}
+{"d.age":4,"d.score":5,"d.slug":"d-04"}
+{"d.age":5,"d.score":5,"d.slug":"d-05"}
+
+--- expect shape
+d.slug: String
+d.age: I32
+d.score: I32?
+
+--- query
+query vectors() {
+    match { $d: Doc }
+    return { $d.slug, $d.emb }
+    order { $d.slug asc }
+}
+
+--- expect ordered
+{"d.emb":[0.010628045,0.39011365,0.41423213,0.8522098],"d.slug":"d-00"}
+{"d.emb":[0.17014635,0.14906561,0.8977521,0.98422873],"d.slug":"d-01"}
+{"d.emb":[0.15189683,0.4854108,0.3783036,0.98714554],"d.slug":"d-02"}
+{"d.emb":[0.6239902,0.9526122,0.07110512,0.8400883],"d.slug":"d-03"}
+{"d.emb":[0.62109005,0.6752229,0.16009736,0.112051904],"d.slug":"d-04"}
+{"d.emb":[0.3980831,0.835567,0.6355809,0.97903705],"d.slug":"d-05"}
+
+--- expect shape
+d.slug: String
+d.emb: Vector(4)?
+
+--- query branch: rows
+query vectors() {
+    match { $d: Doc }
+    return { $d.slug, $d.emb }
+    order { $d.slug asc }
+}
+
+--- expect ordered
+{"d.emb":[0.010628045,0.39011365,0.41423213,0.8522098],"d.slug":"d-00"}
+{"d.emb":[0.17014635,0.14906561,0.8977521,0.98422873],"d.slug":"d-01"}
+{"d.emb":[0.15189683,0.4854108,0.3783036,0.98714554],"d.slug":"d-02"}
+{"d.emb":[0.6239902,0.9526122,0.07110512,0.8400883],"d.slug":"d-03"}
+{"d.emb":[0.62109005,0.6752229,0.16009736,0.112051904],"d.slug":"d-04"}
+{"d.emb":[0.3980831,0.835567,0.6355809,0.97903705],"d.slug":"d-05"}
+
+--- expect shape
+d.slug: String
+d.emb: Vector(4)?
+
+--- query
+query nearest_first($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.emb, $q) }
+    limit 6
+}
+
+--- params
+{"q": [0.5, 0.5, 0.5, 0.5]}
+
+--- expect ordered
+{"d.slug":"d-04"}
+{"d.slug":"d-05"}
+{"d.slug":"d-02"}
+{"d.slug":"d-00"}
+{"d.slug":"d-03"}
+{"d.slug":"d-01"}
+
+--- expect shape
+d.slug: String
+
+--- query branch: rows
+query nearest_first($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.emb, $q) }
+    limit 6
+}
+
+--- params
+{"q": [0.5, 0.5, 0.5, 0.5]}
+
+--- expect ordered
+{"d.slug":"d-04"}
+{"d.slug":"d-05"}
+{"d.slug":"d-02"}
+{"d.slug":"d-00"}
+{"d.slug":"d-03"}
+{"d.slug":"d-01"}
+
+--- expect shape
+d.slug: String
+
+--- query
+branch diff "${seeded}" to main
+
+--- expect ordered
+{"after":{"properties":{"age":2,"code":"c-02","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.15189683,0.4854108,0.3783036,0.98714554],"score":5,"slug":"d-02"}},"before":{"properties":{"age":2,"code":"c-02","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.15189683,0.4854108,0.3783036,0.98714554],"score":null,"slug":"d-02"}},"id":"d-02","kind":"node","op":"update","type":"Doc"}
+{"after":{"properties":{"age":3,"code":"c-03","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.6239902,0.9526122,0.07110512,0.8400883],"score":5,"slug":"d-03"}},"before":{"properties":{"age":3,"code":"c-03","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.6239902,0.9526122,0.07110512,0.8400883],"score":null,"slug":"d-03"}},"id":"d-03","kind":"node","op":"update","type":"Doc"}
+{"after":{"properties":{"age":4,"code":"c-04","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.62109005,0.6752229,0.16009736,0.112051904],"score":5,"slug":"d-04"}},"before":{"properties":{"age":4,"code":"c-04","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.62109005,0.6752229,0.16009736,0.112051904],"score":null,"slug":"d-04"}},"id":"d-04","kind":"node","op":"update","type":"Doc"}
+{"after":{"properties":{"age":5,"code":"c-05","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.3980831,0.835567,0.6355809,0.97903705],"score":5,"slug":"d-05"}},"before":{"properties":{"age":5,"code":"c-05","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.3980831,0.835567,0.6355809,0.97903705],"score":null,"slug":"d-05"}},"id":"d-05","kind":"node","op":"update","type":"Doc"}
+
+--- query
+branch diff "${seeded}" to rows
+
+--- expect ordered
+{"after":{"properties":{"age":2,"code":"c-02","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.15189683,0.4854108,0.3783036,0.98714554],"score":5,"slug":"d-02"}},"before":{"properties":{"age":2,"code":"c-02","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.15189683,0.4854108,0.3783036,0.98714554],"score":null,"slug":"d-02"}},"id":"d-02","kind":"node","op":"update","type":"Doc"}
+{"after":{"properties":{"age":3,"code":"c-03","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.6239902,0.9526122,0.07110512,0.8400883],"score":5,"slug":"d-03"}},"before":{"properties":{"age":3,"code":"c-03","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.6239902,0.9526122,0.07110512,0.8400883],"score":null,"slug":"d-03"}},"id":"d-03","kind":"node","op":"update","type":"Doc"}
+{"after":{"properties":{"age":4,"code":"c-04","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.62109005,0.6752229,0.16009736,0.112051904],"score":5,"slug":"d-04"}},"before":{"properties":{"age":4,"code":"c-04","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.62109005,0.6752229,0.16009736,0.112051904],"score":null,"slug":"d-04"}},"id":"d-04","kind":"node","op":"update","type":"Doc"}
+{"after":{"properties":{"age":5,"code":"c-05","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.3980831,0.835567,0.6355809,0.97903705],"score":5,"slug":"d-05"}},"before":{"properties":{"age":5,"code":"c-05","content":"base64:CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQ==","emb":[0.3980831,0.835567,0.6355809,0.97903705],"score":null,"slug":"d-05"}},"id":"d-05","kind":"node","op":"update","type":"Doc"}
+
+--- mutate
+query patch_out_of_range() {
+    update Doc set { score: 500 } where age = 0
+}
+
+--- expect error: @range violation on Doc.score
+
+--- mutate branch: rows
+query rewrite_out_of_range() {
+    update Doc set { score: 500 } where age = 0
+    update Doc set { score: 0 } where slug = "nobody"
+}
+
+--- expect error: @range violation on Doc.score
+
+--- mutate
+query patch_duplicate_code() {
+    update Doc set { code: "c-03" } where age = 0
+}
+
+--- expect error: @unique violation on Doc.code
+
+--- mutate branch: rows
+query rewrite_duplicate_code() {
+    update Doc set { code: "c-03" } where age = 0
+    update Doc set { score: 0 } where slug = "nobody"
+}
+
+--- expect error: @unique violation on Doc.code
+
+--- mutate
+query delete_one() {
+    delete Doc where slug = "d-01"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: rows
+query delete_one() {
+    delete Doc where slug = "d-01"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query patch_again() {
+    update Doc set { score: 7 } where age < 4
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- mutate branch: rows
+query rewrite_again() {
+    update Doc set { score: 7 } where age < 4
+    update Doc set { score: 0 } where slug = "nobody"
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- query
+query scores_after_delete() {
+    match { $d: Doc }
+    return { $d.slug, $d.score }
+    order { $d.slug asc }
+}
+
+--- expect ordered
+{"d.slug": "d-00", "d.score": 7}
+{"d.slug": "d-02", "d.score": 7}
+{"d.slug": "d-03", "d.score": 7}
+{"d.slug": "d-04", "d.score": 5}
+{"d.slug": "d-05", "d.score": 5}
+
+--- expect shape
+d.slug: String
+d.score: I32?
+
+--- query branch: rows
+query scores_after_delete() {
+    match { $d: Doc }
+    return { $d.slug, $d.score }
+    order { $d.slug asc }
+}
+
+--- expect ordered
+{"d.slug": "d-00", "d.score": 7}
+{"d.slug": "d-02", "d.score": 7}
+{"d.slug": "d-03", "d.score": 7}
+{"d.slug": "d-04", "d.score": 5}
+{"d.slug": "d-05", "d.score": 5}
+
+--- expect shape
+d.slug: String
+d.score: I32?
+
+--- mutate
+branch create feature from main
+
+--- expect ok
+
+--- mutate branch: feature
+query patch_on_feature() {
+    update Doc set { score: 9 } where age = 5
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query patch_on_main() {
+    update Doc set { score: 8 } where age = 0
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge feature into main
+
+--- expect outcome: merged
+
+--- mutate
+branch create feature_rows from rows
+
+--- expect ok
+
+--- mutate branch: feature_rows
+query rewrite_on_feature() {
+    update Doc set { score: 9 } where age = 5
+    update Doc set { score: 0 } where slug = "nobody"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: rows
+query rewrite_on_rows() {
+    update Doc set { score: 8 } where age = 0
+    update Doc set { score: 0 } where slug = "nobody"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge feature_rows into rows
+
+--- expect outcome: merged
+
+--- query
+query scores_after_merge() {
+    match { $d: Doc }
+    return { $d.slug, $d.score, $d.emb }
+    order { $d.slug asc }
+}
+
+--- expect ordered
+{"d.emb":[0.010628045,0.39011365,0.41423213,0.8522098],"d.score":8,"d.slug":"d-00"}
+{"d.emb":[0.15189683,0.4854108,0.3783036,0.98714554],"d.score":7,"d.slug":"d-02"}
+{"d.emb":[0.6239902,0.9526122,0.07110512,0.8400883],"d.score":7,"d.slug":"d-03"}
+{"d.emb":[0.62109005,0.6752229,0.16009736,0.112051904],"d.score":5,"d.slug":"d-04"}
+{"d.emb":[0.3980831,0.835567,0.6355809,0.97903705],"d.score":9,"d.slug":"d-05"}
+
+--- expect shape
+d.slug: String
+d.score: I32?
+d.emb: Vector(4)?
+
+--- query branch: rows
+query scores_after_merge() {
+    match { $d: Doc }
+    return { $d.slug, $d.score, $d.emb }
+    order { $d.slug asc }
+}
+
+--- expect ordered
+{"d.emb":[0.010628045,0.39011365,0.41423213,0.8522098],"d.score":8,"d.slug":"d-00"}
+{"d.emb":[0.15189683,0.4854108,0.3783036,0.98714554],"d.score":7,"d.slug":"d-02"}
+{"d.emb":[0.6239902,0.9526122,0.07110512,0.8400883],"d.score":7,"d.slug":"d-03"}
+{"d.emb":[0.62109005,0.6752229,0.16009736,0.112051904],"d.score":5,"d.slug":"d-04"}
+{"d.emb":[0.3980831,0.835567,0.6355809,0.97903705],"d.score":9,"d.slug":"d-05"}
+
+--- expect shape
+d.slug: String
+d.score: I32?
+d.emb: Vector(4)?
