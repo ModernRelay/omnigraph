@@ -7,12 +7,11 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-10-25
-updated: 2026-10-27
+updated: 2026-11-08
 discussion: https://github.com/ModernRelay/omnigraph/pull/1156
 supersedes: []
 superseded_by: []
-blocked_on:
-  - "PR #1150: the `index build` command and `TableStore::stage_index_reconciliation`"
+blocked_on: []
 ---
 
 # RFC: Incremental index reconciliation
@@ -31,25 +30,28 @@ under a bounded policy; rows an update moved are folded in by a filtered
 merge (BTREE) or a whole rebuild (full text, vector). One rule keeps
 every answer equal to a full build's.
 
-For BTREE and vector indexes the contract of `omnigraph index build` and
-`optimize` (PR #1150) does not change: they leave every buildable declared
-index present and covering every current fragment, and publish once per run.
-For full text it does: PR #1150 leaves full-text coverage pending, to be
-refreshed by `omnigraph index rebuild --kind full-text`, and this RFC has both
-commands maintain a certified full-text index like the other kinds. A
-full-text index without a certificate stays pending, as today. The storage
-format does not change; multi-segment indexes are native Lance.
+For BTREE and vector indexes the contract of `omnigraph index build` (#1150,
+shipped in v0.15.0) and `optimize` does not change: they leave every
+buildable declared index present and covering every current fragment, and
+publish once per run. For full text it does: both leave full-text coverage
+pending, to be refreshed by `omnigraph index rebuild --kind full-text`, and
+this RFC has both commands maintain a certified full-text index like the
+other kinds. A full-text index without a certificate stays pending, as today.
+The storage format does not change; multi-segment indexes are native Lance.
 
 The moved-row half of the design is a fence for Lance 13.0.0. Lance's fixes
 for stale entries from segmented scalar and full-text indexes (lance#9785,
-lance#9872) merged upstream on 2026-10-23 but are in no release OmniGraph
-pins; the bump that contains them can index moved rows the way it indexes
-appended ones and delete the fence.
+lance#9872) merged upstream on 2026-10-23 and are in no stable release; the
+bump that contains them can index moved rows the way it indexes appended ones
+and delete the fence. An earlier bump has its own obligation: Lance 14.0.0
+writes a new BTREE segment in the row-address domain, which today's
+compaction refuses on a graph table. That bump must remap such segments in the
+compaction's own `Rewrite` (see [The Lance fences](#the-lance-fences)).
 
 ## Motivation
 
-Optimize's index links after compaction, and the `index build` command PR
-#1150 adds (through `TableStore::stage_index_reconciliation`), have three
+Optimize's index links after compaction, and the `index build` command
+(#1150, through `TableStore::stage_index_reconciliation`), have three
 outcomes per index: build it if it is missing, rebuild it whole if its
 segments leave a current fragment uncovered (`TableStore::stage_index_fold`),
 or leave it alone. This includes the identity and endpoint BTREEs every node
@@ -62,11 +64,11 @@ run.
 Full text is worse. `TableStore::can_fold_index` excludes it from the
 coverage refresh, so a full-text index's uncovered tail grows until an
 operator runs `omnigraph index rebuild --kind full-text` (`omnigraph
-rebuild-full-text-indexes` on shipped releases), which rebuilds every
-full-text index of the branch. The tail is still answered correctly (Lance
-scans it with the index's analyzer), but a bm25 scan over a partly covered
-index applies its filter after scoring (`Eligibility::AfterScoring`) and every
-query pays the tail scan.
+rebuild-full-text-indexes` before v0.15.0, a deprecated spelling there),
+which rebuilds every full-text index of the branch. The tail is still answered
+correctly (Lance scans it with the index's analyzer), but a bm25 scan over a
+partly covered index applies its filter after scoring
+(`Eligibility::AfterScoring`) and every query pays the tail scan.
 
 Whole rebuilds were chosen for two reasons, both still true and both
 avoidable:
@@ -82,7 +84,7 @@ avoidable:
   Vector search filters each segment by its own coverage; scalar and
   full-text search do not in 13.0.0. Upstream fixed both on 2026-10-23
   (lance#9785 scalar, lance#9872 full text and the full-text merge), after
-  13.0.0 and outside v14.0.0-rc.2.
+  13.0.0 and outside v14.0.0; Lance's v15.0.0 betas contain both.
 - **Lance's own incremental fold commits linearly.** `optimize_indices`
   appends and merges segments inside its own commit, which a detached-only
   table (RFC 0067) cannot use, and it offers no point before publication to
@@ -154,15 +156,18 @@ fresh. An update keeps the row ID and writes the new copy to a new fragment,
 which is moved for every index that covered the old copy (also when the same
 write inserted other rows into it); that fragment stays uncovered, so the
 stale entry is masked and the row is answered by the scan of uncovered
-fragments, as today. Compaction keeps coverage: on a stable-row-ID table
-Lance's `Rewrite` apply moves each row-ID index's bitmap from the replaced
-fragments to their rewritten ones
+fragments, as today. On 13.0.0 compaction keeps coverage: on a stable-row-ID
+table Lance's `Rewrite` apply moves each row-ID index's bitmap from the
+replaced fragments to their rewritten ones
 (`lance-table-13.0.0/src/transaction/manifest_build.rs:1071-1094`; BTREE,
 full-text and vector indexes are row-ID indexes, `format/index.rs:142-153`),
 and it refuses a rewrite group that mixes covered and uncovered fragments
 (`transaction/index_maintenance.rs:657-689`). A compacted fragment is
 therefore covered exactly when its sources were, and a fragment compacted from
-fresh ones stays fresh. Deletions are masked by deletion vectors.
+fresh ones stays fresh. A BTREE segment the Lance 14 builder writes stores row
+addresses and does not follow its rows this way
+([The Lance fences](#the-lance-fences)). Deletions are masked by deletion
+vectors.
 
 The argument assumes that coverage leaves a fragment only when the fragment
 leaves the manifest, so that the covered fragments hold every live copy the
@@ -213,10 +218,14 @@ Graph compaction does not reach that arm: it commits its `Rewrite` with no
 rewritten indexes (`TableStore::stage_compaction`), and the apply above moves
 every row-ID bitmap to the rewritten fragments. Index work after a compaction
 is therefore only the fragments those bitmaps still omit, read from the bitmap
-Lance wrote like any other coverage; a fully covered index stays covered and
-is left alone, as today's optimize leaves it. A wrong "moved" costs the
-moved-fragment action (a merge for BTREE, a rebuild otherwise); under the
-assumption above, a wrong "fresh" is impossible from the sequences alone. An
+Lance wrote like any other coverage. A fully covered index stays covered and
+needs no coverage work: `foldable_index_lag` leaves alone a fully covered
+scalar index and a fully covered vector index with one segment. It rebuilds a
+vector index with more than one segment even when coverage is complete; under
+this RFC the merge policy decides that case instead (past `K`, a rebuild). A
+wrong "moved" costs the moved-fragment action (a merge for BTREE, a rebuild
+otherwise); under the assumption above, a wrong "fresh" is impossible from
+the sequences alone. An
 index with a segment whose `fragment_bitmap` is absent (coverage unknown) is
 left to explicit handling, as today: Lance cannot merge it, and unknown
 coverage is not evidence of work.
@@ -323,7 +332,72 @@ reports it without executing, so status and maintenance cannot disagree about
 what an index needs. The publication stays index-only: it moves no row, so a
 schema apply that counts row changes on a branch is unaffected.
 
-### The Lance 13.0.0 fence
+### The Lance fences
+
+Two Lance changes bear on this design, and Lance shipped them apart. Lance
+14.0.0 (2026-10-26) contains lance#9481 and lance#10041 and neither
+stale-entry fix. The stale-entry fixes, lance#9785 and lance#9872, are in
+Lance's v15.0.0 betas and in no stable release. Each bump carries its own
+obligation.
+
+#### Lance 14.0.0: address-domain BTREE compaction
+
+lance#9481 stores a BTREE segment's `ids` as row addresses from index format
+version 1; an older segment stores row IDs
+([BTREE format](https://lance.org/format/index/scalar/btree/)). Lance 13.0.0
+writes version 0 (`lance-index-13.0.0/src/scalar/btree.rs:98`). The 14.0.0
+builder writes version 1 on a stable-row-ID table (`BTREE_INDEX_VERSION =
+BTREE_ROW_ADDR_DOMAIN_VERSION`, `lance-index/src/scalar/btree.rs:119-122` at
+tag `v14.0.0`). lance#10041 remaps such a segment eagerly on compaction:
+`IndexMetadata::supports_eager_remap` is true only for a BTREE with
+`index_version >= 1` (`lance-table/src/format/index.rs:170-190`), and when a
+table holds one, `rewrite_files` fills `RewriteResult.row_addrs` on a
+stable-row-ID table too (`lance/src/dataset/optimize.rs:2656-2665`,
+`:2939-2940`).
+
+Current code refuses that result. `TableStore::stage_compaction` returns an
+error when any task result carries `row_addrs` ("produced an address-style
+rewrite; graph tables use stable row ids") and builds no `Rewrite`. The
+refusal is not limited to this RFC's extension. The builder that writes
+version 1 is the one today's `stage_index_fold` and
+`stage_index_reconciliation` call, so on 14.0.0 the first build or whole
+rebuild of any BTREE on a table, its identity BTREE included, makes every later
+compaction of that table fail.
+
+Removing the check alone does not keep coverage. With an empty
+`rewritten_indices`, the 14.0.0 `Rewrite` apply drops the rewritten fragments
+from a version-1 segment's bitmap (`drop_rewritten_fragments`,
+`lance-table/src/transaction/manifest_build.rs:1090-1137` at `v14.0.0`;
+OmniGraph commits no fragment-reuse index, so the deferred-remap arm does not
+apply). A version-0 segment keeps the 13.0.0 bitmap move
+(`recalculate_fragment_bitmap`), and so do full-text and vector segments, which
+are not address-domain on that tag.
+
+The bump to 14.0.0 therefore remaps. It runs Lance's public remapper
+(`lance::dataset::index::DatasetIndexRemapperOptions`, an `IndexRemapper` of
+`optimize::remapping`) over the tasks' row addresses, which writes each
+affected version-1 segment under a new UUID without committing, and passes the
+results as the `Rewrite`'s `rewritten_indices`. The apply installs them and
+moves every other bitmap as on 13.0.0, so index work after a compaction stays
+the fragments the bitmaps omit. The other two choices break this design's own
+rules. Keeping the refusal stops compaction of every table once its first
+BTREE is built on 14.0.0. Dropping coverage is correct but moves the work to
+the next build, which indexes the compacted rows again (by the BTREE moved-row
+merge over every entry whenever the fresh test calls those fragments moved),
+while queries scan them in between. That is the per-compaction index work the
+compaction paragraph above rules out. The remap reads and rewrites each
+affected segment, as Lance's own `commit_compaction` does.
+
+Two more obligations fall on that bump. Lance 14's BTREE merge refuses
+segments that disagree on the domain (`BTreeIndex::merge_segments`), so an
+index whose version-0 segments would be merged with a version-1 segment is
+rebuilt whole instead, which leaves one version-1 segment. And the rule's
+argument cites the 13.0.0 row-ID prefilter, so the bump reruns the rule's
+guards against version-1 segments. The remap is needed whether or not any
+phase of this RFC has shipped, because today's whole rebuild already writes
+the new segment.
+
+#### The moved-row fence: Lance 13.0.0 until lance#9785 and lance#9872
 
 The fresh test, the BTREE moved-row merge and the full-text whole rebuild for
 moved rows exist because 13.0.0's scalar and full-text search, and its
@@ -331,17 +405,12 @@ full-text merge, do not restrict a segment to its own fragments. The bump that
 contains lance#9785 and lance#9872 removes them: segments over moved
 fragments become safe for every kind, so the reconciler extends over every
 uncovered fragment and merges under the same policy. That bump is the one
-that turns `index_delta_segment_serves_stale_entries_of_an_updated_row` red.
-It also contains lance#9481, which stores BTREE entries as row addresses, and
-lance#10041, which remaps such an index inside Lance's own
-`commit_compaction`. OmniGraph executes compaction tasks itself and commits an
-empty `rewritten_indices`, and for an address-domain index that apply keeps
-only the fragments the rewrite did not touch (`drop_rewritten_fragments`). The
-bump must therefore pass remapped BTREE indexes through `rewritten_indices`,
-or every compaction leaves its BTREE fragments to the next build; the
-moved-row path can go only while compaction keeps coverage.
-Extension over appended rows, the merge policy and full-text certification
-are not part of the fence.
+that turns `index_delta_segment_serves_stale_entries_of_an_updated_row` red,
+and it is not 14.0.0. Deleting the moved-row path there is safe because
+compaction keeps coverage: row-ID segments move their bitmaps, and version-1
+BTREE segments are remapped from the 14.0.0 bump on. Extension over appended
+rows, the merge policy and full-text certification are not part of either
+fence.
 
 ## Invariants
 
@@ -349,8 +418,9 @@ are not part of the fence.
   snapshot plans every table, artifacts are built before the writer gates,
   authority is revalidated under them, and every table publishes in one
   manifest commit.
-- **Crash convergence (5).** New segments, and the intermediate BTREE segment
-  of a moved-row merge, are index directories that no manifest names until
+- **Crash convergence (5).** New segments, the intermediate BTREE segment
+  of a moved-row merge, and from the 14.0.0 bump the remapped BTREE segments
+  of a compaction, are index directories that no manifest names until
   publication (the intermediate one never); the collector's orphan sweep
   reclaims an unnamed `_indices/<uuid>` after its seven-day age, as it does
   for any staged index today.
@@ -422,11 +492,14 @@ moved fragments.
 
 Lance surfaces reviewed at 13.0.0: the index, BTREE, full-text, vector,
 fragment-reuse and distributed-indexing pages; the row-ID lineage and
-transaction specifications; and the source cited above. The row-ID lineage
-page says secondary indexes reference row addresses and that stable row IDs
-in indexes are in progress; the 13.0.0 source paths cited here
-(`do_create_deletion_mask_row_id`, `build_stable_row_id_filter`) work in
-stable row IDs, so the guards below pin the code, not the page.
+transaction specifications; and the source cited above. At tag `v14.0.0`: the
+BTREE format version, `rewrite_files`, `commit_compaction` and its remapper,
+and the `Rewrite` apply. The published BTREE page already describes the
+version-1 row-address `ids`. The row-ID lineage page says secondary indexes
+reference row addresses and that stable row IDs in indexes are in progress;
+the 13.0.0 source paths cited here (`do_create_deletion_mask_row_id`,
+`build_stable_row_id_filter`) work in stable row IDs, so the guards below pin
+the code, not the page.
 
 New `lance_surface_guards.rs` guards, each red when the fact changes:
 
@@ -439,11 +512,17 @@ New `lance_surface_guards.rs` guards, each red when the fact changes:
 - the BTREE merge drops a moved row's old entry; the full-text merge keeps it
   (a negative guard, red at the bump that contains lance#9872);
 - a certificate written on a subset build and on a certified merge verifies;
-- a compaction `Rewrite` with no rewritten indexes keeps every BTREE,
-  full-text and vector index covering the rewritten fragments (extending the
-  scalar assertion of
-  `compacting_a_chosen_fragment_drops_the_bytes_of_dropped_columns`; red at
-  the bump that makes BTREE address-domain, lance#9481).
+- a compaction `Rewrite` with no rewritten indexes keeps full-text and vector
+  indexes covering the rewritten fragments (extending the scalar assertion of
+  `compacting_a_chosen_fragment_drops_the_bytes_of_dropped_columns`); green
+  across 14.0.0;
+- the BTREE the pinned builder writes is version 0, `rewrite_files` returns no
+  `row_addrs` for its table, and the same `Rewrite` keeps it covering the
+  rewritten fragments. A separate assertion, because it goes red at 14.0.0
+  for a reason that does not apply to full text or vector. The 14.0.0 bump
+  replaces it: a newly built BTREE is version 1 and loses that coverage under
+  an empty `rewritten_indices`, a version-0 segment keeps it, and a segment
+  remapped through `rewritten_indices` keeps it.
 
 Engine owners (`integration/maintenance.rs`, `integration/branching.rs`):
 appends extend each index, including the identity and endpoint BTREEs,
@@ -479,6 +558,8 @@ extends to the new actions.
 
 Each phase keeps the rule and falls back to a whole rebuild for anything it
 does not handle, so each ships alone. `implementation` advances per phase.
+The 14.0.0 compaction remap is not a phase: it belongs to the pull request
+that bumps Lance to 14.0.0, whichever phases have shipped by then.
 
 ## Unresolved questions
 
@@ -509,3 +590,16 @@ does not handle, so each ships alone. `implementation` advances per phase.
   applies that break it and why graph writers do neither. The fence names
   lance#9481 and lance#10041, which change BTREE compaction coverage at the
   same bump. This RFC owns the segment policy.
+- 2026-11-08: third review. Lance 14.0.0 contains lance#9481 and lance#10041
+  but not lance#9785 or lance#9872, so the fence splits in two. On 14.0.0 a
+  newly built BTREE segment is address-domain (version 1), `rewrite_files`
+  returns `row_addrs` for its table, and `TableStore::stage_compaction`
+  refuses that result before it builds the `Rewrite`; today's
+  `stage_index_fold` uses the same builder, so the refusal does not wait for
+  extension. The 14.0.0 bump remaps such segments through `rewritten_indices`
+  rather than keeping the refusal (no compaction) or dropping coverage (a
+  BTREE merge after every compaction). A version-0 segment, full text and
+  vector keep the 13.0.0 bitmap move; the compaction guard splits so the
+  BTREE assertion alone goes red at 14.0.0. The moved-row fence stays for the
+  later bump. The fully covered case names the scalar index and the
+  one-segment vector index. #1150 merged in v0.15.0, so `blocked_on` is empty.
