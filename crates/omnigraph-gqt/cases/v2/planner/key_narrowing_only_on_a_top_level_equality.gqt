@@ -1,0 +1,111 @@
+# issue: none
+# traversal: auto
+# notes: narrow_key walks top-level conjuncts only; a key equality under or/not, a != comparison, or an and nested inside an or is never narrowed, and two key equalities stay a conjunction whichever comes first.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"slug":"alpha","age":11}}
+{"type":"Person","data":{"slug":"beta","age":22}}
+{"type":"Person","data":{"slug":"gamma","age":33}}
+
+--- query
+set engine = v2;
+query either() {
+    match { $p: Person $p.slug = "alpha" or $p.slug = "beta" }
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":11}
+{"p.age":22}
+--- expect shape
+p.age: I32
+--- expect plan
+not pass key_to_id
+
+--- query
+set engine = v2;
+query nested() {
+    match { $p: Person ($p.slug = "alpha" and $p.age = 11) or $p.slug = "gamma" }
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":11}
+{"p.age":33}
+--- expect shape
+p.age: I32
+--- expect plan
+not pass key_to_id
+
+--- query
+set engine = v2;
+query negated() {
+    match { $p: Person not $p.slug = "alpha" }
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":22}
+{"p.age":33}
+--- expect shape
+p.age: I32
+--- expect plan
+not pass key_to_id
+
+--- query
+set engine = v2;
+query unequal() {
+    match { $p: Person $p.slug != "alpha" }
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":22}
+{"p.age":33}
+--- expect shape
+p.age: I32
+--- expect plan
+not pass key_to_id
+
+--- query
+set engine = v2;
+query contradictory() {
+    match { $p: Person $p.slug = "alpha" and $p.slug = "beta" }
+    return { $p.age }
+}
+--- expect unordered
+
+--- expect shape
+p.age: I32
+
+--- query
+set engine = v2;
+query contradictory_reversed() {
+    match { $p: Person $p.slug = "beta" and $p.slug = "alpha" }
+    return { $p.age }
+}
+--- expect unordered
+
+--- expect shape
+p.age: I32
+
+--- query
+set engine = v2;
+query repeated() {
+    match { $p: Person $p.slug = "alpha" and $p.slug = "alpha" }
+    return { $p.age }
+}
+--- expect unordered
+{"p.age":11}
+--- expect shape
+p.age: I32
+--- expect plan
+pass key_to_id

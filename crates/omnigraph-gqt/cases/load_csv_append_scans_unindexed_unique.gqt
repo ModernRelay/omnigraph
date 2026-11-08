@@ -1,0 +1,54 @@
+# issue: none
+# notes: A CSV node append into a Person table whose @unique email has no index checks the new
+# notes: emails against the committed ones by one projected scan, the plan its receipt carries
+# notes: says so, and a second append repeating a committed email is refused with both holders named.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: String @key
+    email: String @unique
+}
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 4
+    columns:
+      id: {kind: key, prefix: p, width: 6}
+      email: {kind: key, prefix: e, width: 6}
+
+--- csv people.csv
+id,email
+q000001,e900001
+
+--- mutate
+load csv "people.csv" into node:Person mode append header
+--- expect ok
+--- expect plan
+load route: pipeline
+load validate unique node:Person key [id]: access delta
+load validate unique node:Person unique [email]: access scan
+load executed: partitions 1 rows 1
+
+--- csv repeat.csv
+id,email
+q000002,e000003
+
+--- mutate
+load csv "repeat.csv" into node:Person mode append header
+--- expect error: @unique violation on Person.email: value 'e000003' held by 'p000003' and 'q000002'
+
+--- query
+query loaded() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n": 9}
+--- expect shape
+n: I64

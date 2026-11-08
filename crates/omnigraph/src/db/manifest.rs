@@ -3,7 +3,7 @@
 pub use crate::db::snapshot::{Snapshot, SnapshotDataset, SnapshotScanner};
 pub use crate::db::upgrade::{
     UpgradeFinding, UpgradeMode, UpgradeOptions, UpgradeOutcome, UpgradeRecovery, UpgradeReport,
-    UpgradeWork, upgrade_storage, upgrade_storage_as,
+    upgrade_storage, upgrade_storage_as,
 };
 pub(crate) use omnigraph_catalog::Snapshot as CatalogSnapshot;
 pub(crate) use omnigraph_catalog::*;

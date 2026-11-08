@@ -1,0 +1,134 @@
+# issue: none
+# notes: Supplied search options must fit their API range; only absent options use defaults.
+# notes: Nullable query and option parameters refuse null before search execution.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    key: String @key
+    text: String @index
+    embedding: Vector(2)
+}
+
+--- seed
+{"type":"Doc","data":{"key":"a","text":"needle","embedding":[1.0,0.0]}}
+
+--- query
+set engine = v2;
+query omitted_nullable_fuzzy_option($edits: I64?) {
+    match { $d: Doc fuzzy($d.text, "needle", $edits) }
+    return { $d.key }
+}
+--- params
+{}
+--- expect error: search option must resolve to a non-null integer
+
+--- query
+set engine = v2;
+query negative_fuzzy_option($edits: I64) {
+    match { $d: Doc fuzzy($d.text, "needle", $edits) }
+    return { $d.key }
+}
+--- params
+{"edits":-1}
+--- expect error: fuzzy max_edits must fit U32
+
+--- query
+set engine = v2;
+query oversized_fuzzy_option($edits: U64) {
+    match { $d: Doc fuzzy($d.text, "needle", $edits) }
+    return { $d.key }
+}
+--- params
+{"edits":4294967296}
+--- expect error: fuzzy max_edits must fit U32
+
+--- query
+set engine = v2;
+query null_rrf_option($k: I64?) {
+    match { $d: Doc }
+    return { $d.key }
+    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    limit 1
+}
+--- params
+{"k":null}
+--- expect error: search option must resolve to a non-null integer
+
+--- query
+set engine = v2;
+query zero_rrf_option($k: I64) {
+    match { $d: Doc }
+    return { $d.key }
+    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    limit 1
+}
+--- params
+{"k":0}
+--- expect error: rrf k must be greater than 0 and fit U32
+
+--- query
+set engine = v2;
+query oversized_rrf_option($k: U64) {
+    match { $d: Doc }
+    return { $d.key }
+    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    limit 1
+}
+--- params
+{"k":4294967296}
+--- expect error: rrf k must be greater than 0 and fit U32
+
+--- query
+set engine = v2;
+query typed_rrf_option($k: U32) {
+    match { $d: Doc }
+    return { $d.key }
+    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    limit 1
+}
+--- params
+{"k":5}
+--- expect unordered
+{"d.key":"a"}
+--- expect shape
+d.key: String
+
+--- query
+set engine = v2;
+query null_search_query($q: String?) {
+    match { $d: Doc search($d.text, $q) }
+    return { $d.key }
+}
+--- params
+{"q":null}
+--- expect error: search query must resolve to a non-null String
+
+--- query
+set engine = v2;
+query null_bm25_query($q: String?) {
+    match { $d: Doc }
+    return { $d.key }
+    order { bm25($d.text, $q) }
+    limit 1
+}
+--- params
+{"q":null}
+--- expect error: search query must resolve to a non-null String
+
+--- query
+set engine = v2;
+query null_nearest_query($q: Vector(2)?) {
+    match { $d: Doc }
+    return { $d.key }
+    order { nearest($d.embedding, $q) }
+    limit 1
+}
+--- params
+{"q":null}
+--- expect error: nearest query must resolve to a non-null String or numeric vector

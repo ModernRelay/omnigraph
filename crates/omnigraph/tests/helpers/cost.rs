@@ -42,6 +42,11 @@ use omnigraph::settings::SessionSettings;
 
 use super::{MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, init_and_load, mixed_params};
 
+/// The deep point of every depth-swept cost gate (the shallow point stays per
+/// test): a per-commit regression over the span to this depth still exceeds
+/// every gate's slack, and each gate builds in well under a second.
+pub const DEEP_HISTORY_DEPTH: u64 = 40;
+
 /// Open a Lance dataset with its object-store tracker installed before the
 /// first manifest load. Cost fixtures must use this seam for cold-open evidence;
 /// wrapping an already-open handle misses latest-manifest resolution entirely.
@@ -120,6 +125,15 @@ impl AttemptTracker {
 }
 
 impl WrappingObjectStore for AttemptTracker {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // Keep listings on the wrapped path so faults and request accounting apply.
+        None
+    }
+
     fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         Arc::new(AttemptTrackingStore {
             target,
@@ -239,6 +253,9 @@ pub struct IoCounts {
     /// `__manifest` registry scans (publish state; includes the graph-lineage rows
     /// folded into `__manifest` by RFC-013 Phase 7).
     pub manifest_reads: u64,
+    /// `__manifest` object-store writes: published versions, transaction files
+    /// and tags (merge-input holds and proposals among them).
+    pub manifest_writes: u64,
     /// Bytes returned by those real object-store reads. This distinguishes a
     /// physical-address take from scanning a compacted history-sized fragment
     /// even when both use a similar number of requests.
@@ -270,6 +287,10 @@ pub struct IoCounts {
     pub candidate_scan_target_rows_peak: u64,
     pub candidate_scan_target_bytes_peak: u64,
     pub change_images_materialized: u64,
+    /// Change intervals with no adjacency proof, by the route that read them:
+    /// rows paired by stable row id, or the exact ordered merge.
+    pub change_intervals_row_identity: u64,
+    pub change_intervals_exact_merge: u64,
     /// Incremental vs full merge-authority projection refreshes and the exact
     /// number of physical manifest rows hydrated to classify DV additions.
     pub projection_incremental_refreshes: u64,
@@ -357,6 +378,15 @@ impl PrefixCounter {
 }
 
 impl WrappingObjectStore for PrefixCounter {
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // Keep listings on the wrapped path so faults and request accounting apply.
+        None
+    }
+
     fn wrap(&self, _store_prefix: &str, target: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
         Arc::new(PrefixCountingStore {
             target,
@@ -557,6 +587,8 @@ struct OpProbes {
     candidate_scan_target_rows_peak: Arc<AtomicU64>,
     candidate_scan_target_bytes_peak: Arc<AtomicU64>,
     change_images_materialized: Arc<AtomicU64>,
+    change_intervals_row_identity: Arc<AtomicU64>,
+    change_intervals_exact_merge: Arc<AtomicU64>,
     projection_incremental_refreshes: Arc<AtomicU64>,
     projection_full_refreshes: Arc<AtomicU64>,
     projection_identity_rows: Arc<AtomicU64>,
@@ -586,6 +618,8 @@ impl OpProbes {
             candidate_scan_target_rows_peak: Arc::new(AtomicU64::new(0)),
             candidate_scan_target_bytes_peak: Arc::new(AtomicU64::new(0)),
             change_images_materialized: Arc::new(AtomicU64::new(0)),
+            change_intervals_row_identity: Arc::new(AtomicU64::new(0)),
+            change_intervals_exact_merge: Arc::new(AtomicU64::new(0)),
             projection_incremental_refreshes: Arc::new(AtomicU64::new(0)),
             projection_full_refreshes: Arc::new(AtomicU64::new(0)),
             projection_identity_rows: Arc::new(AtomicU64::new(0)),
@@ -604,6 +638,8 @@ impl OpProbes {
             candidate_scan_target_rows_peak: Arc::clone(&h.candidate_scan_target_rows_peak),
             candidate_scan_target_bytes_peak: Arc::clone(&h.candidate_scan_target_bytes_peak),
             change_images_materialized: Arc::clone(&h.change_images_materialized),
+            change_intervals_row_identity: Arc::clone(&h.change_intervals_row_identity),
+            change_intervals_exact_merge: Arc::clone(&h.change_intervals_exact_merge),
             projection_incremental_refreshes: Arc::clone(&h.projection_incremental_refreshes),
             projection_full_refreshes: Arc::clone(&h.projection_full_refreshes),
             projection_identity_rows: Arc::clone(&h.projection_identity_rows),
@@ -634,6 +670,7 @@ impl OpProbes {
             data_opener_reads: t.opener_reads,
             data_scan_reads: t.scan_reads,
             manifest_reads: manifest.read_iops,
+            manifest_writes: manifest.write_iops,
             manifest_read_bytes: manifest.read_bytes,
             version_probes: self.probe_count.load(Ordering::Relaxed),
             data_open_count: self.data_open_count.load(Ordering::Relaxed),
@@ -652,6 +689,10 @@ impl OpProbes {
                 .candidate_scan_target_bytes_peak
                 .load(Ordering::Relaxed),
             change_images_materialized: self.change_images_materialized.load(Ordering::Relaxed),
+            change_intervals_row_identity: self
+                .change_intervals_row_identity
+                .load(Ordering::Relaxed),
+            change_intervals_exact_merge: self.change_intervals_exact_merge.load(Ordering::Relaxed),
             projection_incremental_refreshes: self
                 .projection_incremental_refreshes
                 .load(Ordering::Relaxed),
@@ -775,7 +816,7 @@ pub async fn local_graph(dir: &tempfile::TempDir) -> omnigraph::Session {
 
 /// Emulated-S3 graph, bucket-gated. Returns `None` **only** when
 /// `OMNIGRAPH_S3_TEST_BUCKET` is unset, so the caller logs + skips — the
-/// `tests/s3_storage.rs` graceful-skip pattern. Once the bucket *is* configured
+/// `tests/integration/s3_storage.rs` graceful-skip pattern. Once the bucket *is* configured
 /// (the rustfs CI job), any `init`/seed failure is a real failure and panics
 /// rather than silently skipping — otherwise a down/misconfigured store would let
 /// a bucket-gated gate pass vacuously. `name` disambiguates the prefix.

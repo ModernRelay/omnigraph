@@ -146,7 +146,6 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
     }
 
     db.ensure_schema_state_valid().await?;
-    db.ensure_schema_apply_idle("repair").await?;
 
     // Repair may adopt physical HEADs into graph authority. Bind the entire
     // attempt to one accepted view and revalidate after schema -> main -> table
@@ -160,7 +159,6 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
     // the replacement's same public alias and new identity.
     let _schema_permit = db.write_queue().acquire_schema_shared().await;
     db.refresh_coordinator_only().await?;
-    db.ensure_schema_apply_not_locked("repair").await?;
     let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
     let _main_branch_guard = db.write_queue().acquire_branch(None).await;
 
@@ -328,12 +326,14 @@ pub async fn repair_all_datasets(db: &Omnigraph, options: RepairOptions) -> Resu
         let PublishedSnapshot {
             graph_manifest_version: manifest_version,
             ..
-        } = db
-            .coordinator
-            .write()
-            .await
-            .commit_updates_with_actor_with_expected(&updates, &expected, actor)
-            .await?;
+        } = {
+            let (installed, mut next) = db.installed_coordinator_copy();
+            let outcome = next
+                .commit_updates_with_actor_with_expected(&updates, &expected, actor)
+                .await;
+            db.install_coordinator(next, &installed);
+            outcome?
+        };
         db.runtime_cache.invalidate_all().await;
         if updates
             .iter()

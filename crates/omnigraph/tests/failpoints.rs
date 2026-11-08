@@ -5,20 +5,29 @@ mod helpers;
 
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::Schema;
+use bytes::Bytes;
 use lance::Dataset;
-use omnigraph::db::{Omnigraph, ReadTarget, StagingVerdict};
-use omnigraph::error::{ManifestErrorKind, OmniError};
-use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
+use omnigraph::db::{
+    GraphCreateReconciliation, Omnigraph, PreparedGraphCreate, ReadTarget, SnapshotId,
+    StagingVerdict,
+};
+use omnigraph::error::{CompletionEvidence, ManifestErrorKind, OmniError};
+use omnigraph::instrumentation::{
+    MergeWriteProbes, QueryIoProbes, with_merge_write_probes, with_query_io_probes,
+};
 use omnigraph::loader::LoadMode;
 use omnigraph::seams::FailScenario;
 use omnigraph::seams::catalog;
+use omnigraph::{BlobCell, BlobContent, BlobEtag, BlobPrecondition, BlobWriteOutcome};
 use serial_test::serial;
 
 use helpers::collector::{
-    detached_versions, insert_person, keep_one, main_plan, merge_three_chunk_chain, staged_since,
+    detached_versions, insert_person, keep_one, main_plan, merge_three_chunk_chain,
+    pins_in_history, staged_since,
 };
 use helpers::recovery::{branch_head_commit_id, sidecar_operation_ids};
 use helpers::{
@@ -43,6 +52,64 @@ const RFC023_EXTERNAL_URI_ENV: &str = "OMNIGRAPH_RFC023_EXTERNAL_URI";
 const RFC023_EXTERNAL_MODE_ENV: &str = "OMNIGRAPH_RFC023_EXTERNAL_MODE";
 const RFC023_EXTERNAL_PAYLOAD_ENV: &str = "OMNIGRAPH_RFC023_EXTERNAL_PAYLOAD";
 const RFC023_EXTERNAL_ACTION_ENV: &str = "OMNIGRAPH_RFC023_EXTERNAL_ACTION";
+
+const BLOB_WRITE_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    preview: Blob?
+    note: String?
+}
+"#;
+
+/// `readme` carries content `Hello`, preview `P0` and note `n0`.
+const BLOB_WRITE_SEED: &str = r#"{"type":"Document","data":{"title":"readme","content":"base64:SGVsbG8=","preview":"base64:UDA=","note":"n0"}}"#;
+
+const BLOB_WRITE_MUTATIONS: &str = r#"
+query set_note($title: String, $note: String) {
+    update Document set { note: $note } where title = $title
+}
+"#;
+
+async fn seed_blob_write_graph(uri: &str) -> Session {
+    let db = helpers::session(Omnigraph::init(uri, BLOB_WRITE_SCHEMA).await.unwrap());
+    db.load_jsonl(BLOB_WRITE_SEED, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db
+}
+
+fn readme(property: &str) -> BlobCell {
+    node_blob_cell("Document", "readme", property)
+}
+
+/// The current validator of a managed cell on `branch`.
+async fn blob_etag(db: &Omnigraph, branch: &str, cell: BlobCell) -> BlobEtag {
+    match db
+        .read_blob_at(ReadTarget::branch(branch), cell)
+        .await
+        .unwrap()
+        .content
+    {
+        BlobContent::Managed { etag, .. } => etag,
+        BlobContent::External(external) => panic!("expected a managed value, got {external:?}"),
+    }
+}
+
+async fn set_readme_note(db: &Session, note: &str) {
+    db.mutate(
+        "main",
+        BLOB_WRITE_MUTATIONS,
+        "set_note",
+        &params(&[("$title", "readme"), ("$note", note)]),
+    )
+    .await
+    .unwrap();
+}
+
+async fn main_commit_count(db: &Omnigraph) -> usize {
+    db.list_commits(Some("main")).await.unwrap().len()
+}
 
 const OCC_UNIQUE_SCHEMA: &str = r#"
 node User {
@@ -85,11 +152,10 @@ async fn node_table_uri(db: &Omnigraph, type_name: &str) -> String {
     )
 }
 
-/// A graph with rows and no built indexes: the index writer has work on
-/// every table. `init_and_load` builds the indexes; this does not.
-async fn graph_with_unbuilt_indexes(dir: &tempfile::TempDir) -> Session {
+/// A graph at `uri` with rows and no built indexes: the index writer has
+/// work on every table. `init_and_load` builds the indexes; this does not.
+async fn graph_with_unbuilt_indexes(uri: &str) -> Session {
     use omnigraph::loader::LoadMode;
-    let uri = dir.path().to_str().unwrap();
     let db = helpers::session(Omnigraph::init(uri, helpers::TEST_SCHEMA).await.unwrap());
     db.load_jsonl(helpers::TEST_DATA, LoadMode::Overwrite)
         .await
@@ -123,7 +189,9 @@ fn run_rfc023_external_writer_action(
         LoadMode::Merge => "merge",
         LoadMode::Overwrite => "overwrite",
     };
-    let output = Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
+    let stdout = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+    let stderr = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+    let mut child = Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
         .arg("--exact")
         .arg("rfc023_external_writer_process")
         .arg("--ignored")
@@ -133,16 +201,43 @@ fn run_rfc023_external_writer_action(
         .env(RFC023_EXTERNAL_MODE_ENV, mode)
         .env(RFC023_EXTERNAL_PAYLOAD_ENV, payload)
         .env(RFC023_EXTERNAL_ACTION_ENV, action)
-        .output()
+        .stdout(stdout.reopen().map_err(|error| error.to_string())?)
+        .stderr(stderr.reopen().map_err(|error| error.to_string())?)
+        .spawn()
         .map_err(|error| error.to_string())?;
-    if output.status.success() {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(if action == "schema_apply_company" {
+            15
+        } else {
+            45
+        });
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().map_err(|error| error.to_string())?;
+            child.wait().map_err(|error| error.to_string())?;
+            return Err(format!(
+                "external writer timed out: {}",
+                std::fs::read_to_string(stderr.path()).unwrap_or_default()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let status = child.wait().map_err(|error| error.to_string())?;
+    if status.success() {
         return Ok(());
     }
     Err(format!(
         "external writer failed with {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        status,
+        std::fs::read_to_string(stdout.path()).unwrap_or_default(),
+        std::fs::read_to_string(stderr.path()).unwrap_or_default(),
     ))
 }
 
@@ -181,6 +276,18 @@ fn rfc023_external_writer_process() {
                 "load" => {
                     db.load("main", &payload, mode).await.unwrap();
                 }
+                "load_feature" => {
+                    db.load("feature", &payload, mode).await.unwrap();
+                }
+                "schema_apply_company" => {
+                    db.apply_schema(&payload).await.unwrap();
+                    let data = if payload.contains("slug: String") {
+                        r#"{"type":"Company","data":{"slug":"winner"}}"#
+                    } else {
+                        r#"{"type":"Company","data":{"name":"winner"}}"#
+                    };
+                    db.load_jsonl(data, LoadMode::Append).await.unwrap();
+                }
                 "collector_late_live" | "collector_late_retired" => {
                     db.branch_create("collector-late").await.unwrap();
                     db.load("collector-late", &payload, mode).await.unwrap();
@@ -218,6 +325,9 @@ fn rfc023_external_writer_process() {
                     let rows = db.cleanup(keep_one()).await.unwrap();
                     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
                 }
+                "collector_retired" => {
+                    db.branch_delete("collector-existing").await.unwrap();
+                }
                 "collector_mixed" => {
                     db.load("main", &payload, mode).await.unwrap();
                     db.branch_merge("main", "collector-existing").await.unwrap();
@@ -228,6 +338,11 @@ fn rfc023_external_writer_process() {
                     )
                     .await
                     .unwrap();
+                }
+                "merge_target_recreated" => {
+                    db.branch_delete("t").await.unwrap();
+                    db.branch_create("t").await.unwrap();
+                    db.load("t", &payload, mode).await.unwrap();
                 }
                 other => panic!("unknown external writer action '{other}'"),
             }
@@ -315,6 +430,150 @@ async fn native_branch_controls_reclassify_lost_acknowledgements() {
         db.list_commits(Some("main")).await.unwrap().len(),
         before_commits,
         "native branch controls must not manufacture graph lineage"
+    );
+
+    // A start at a past commit clones the version that published it through
+    // the same native create: a failure between the inventory and the create
+    // leaves nothing, and a lost acknowledgement classifies as success.
+    let loaded = db.list_commits(Some("main")).await.unwrap()[0]
+        .graph_commit_id
+        .clone();
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    let before_version = version_main(&db).await.unwrap();
+    let before_commits = db.list_commits(Some("main")).await.unwrap();
+    let at_load = ReadTarget::snapshot(SnapshotId::new(loaded.clone()));
+    {
+        let _fp = catalog::BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE.fire_always();
+        db.branch_create_from(at_load.clone(), "at-load")
+            .await
+            .expect_err("a failure before the native create creates nothing");
+    }
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+    {
+        let _fp = catalog::BRANCH_CREATE_POST_NATIVE.fire_always();
+        let created = db
+            .branch_create_from(at_load, "at-load")
+            .await
+            .expect("matching BranchContents must classify a lost create acknowledgement");
+        assert_eq!(created.from_commit_id, loaded);
+    }
+    assert_eq!(
+        helpers::count_rows_branch(&db, "at-load", "node:Person").await,
+        4,
+        "the branch holds the commit's rows, not main's head"
+    );
+    assert_eq!(version_main(&db).await.unwrap(), before_version);
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), before_commits);
+}
+
+/// Cleanup deletes a swept table version's files before its manifest, so a
+/// run stopped between the two leaves a manifest that still opens over
+/// objects that are gone. A branch cannot start at a commit pinning such a
+/// version: a start probes every object of each pin its source head does not
+/// hold, and refuses the commit as not retained before any effect. The
+/// cleanup retry removes that manifest, and the start stays refused, now
+/// because the version no longer opens; a start at the retained head works
+/// throughout.
+#[tokio::test]
+#[serial]
+async fn branch_start_refuses_a_commit_an_interrupted_cleanup_emptied() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    for name in ["Eve", "Frank"] {
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", 40)]),
+        )
+        .await
+        .unwrap();
+    }
+    let commits = db.list_commits(Some("main")).await.unwrap();
+    let eve = commits[1].graph_commit_id.clone();
+    let frank = commits[0].graph_commit_id.clone();
+    let at_eve = ReadTarget::snapshot(SnapshotId::new(eve.clone()));
+    let eve_person = db
+        .snapshot_of(at_eve.clone())
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .version_metadata
+        .staged_version()
+        .expect("Eve's insert pins a detached Person version");
+    let person_uri = node_table_uri(&db, "Person").await;
+
+    {
+        let _fp = catalog::CLEANUP_SWEEP_PRE_MANIFEST_DELETE.fire_always();
+        let _ = db.cleanup(keep_one()).await;
+    }
+    assert!(
+        detached_versions(&person_uri).await.contains(&eve_person),
+        "precondition: the interrupted sweep left Eve's Person manifest"
+    );
+    let main_version = version_main(&db).await.unwrap();
+    let assert_not_retained = |refused: OmniError| {
+        assert_eq!(
+            refused.completion_evidence(),
+            Some(CompletionEvidence::BeforeEffect),
+            "{refused}"
+        );
+        assert!(
+            matches!(
+                refused.into_completion_evidence().0,
+                OmniError::BranchStartRefused {
+                    reason: omnigraph::error::BranchStartRefusal::NotRetained { table_key, .. },
+                    ..
+                } if table_key == "node:Person"
+            ),
+            "the refusal names the emptied table"
+        );
+    };
+    assert_not_retained(
+        db.branch_create_from(at_eve.clone(), "at-eve")
+            .await
+            .expect_err("a manifest whose objects are gone proves nothing"),
+    );
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+    assert_eq!(version_main(&db).await.unwrap(), main_version);
+
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    let person = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(person.error.is_none(), "the retry converges: {person:?}");
+    assert!(
+        !detached_versions(&person_uri).await.contains(&eve_person),
+        "the retry removes the half-swept manifest"
+    );
+    assert_not_retained(
+        db.branch_create_from(at_eve, "at-eve")
+            .await
+            .expect_err("a reclaimed version starts no branch"),
+    );
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+
+    let created = db
+        .branch_create_from(
+            ReadTarget::snapshot(SnapshotId::new(frank.clone())),
+            "at-frank",
+        )
+        .await
+        .expect("the retained head starts a branch");
+    assert_eq!(created.from_commit_id, frank);
+    assert_eq!(
+        helpers::count_rows_branch(&db, "at-frank", "node:Person").await,
+        helpers::count_rows_branch(&db, "main", "node:Person").await,
     );
 }
 
@@ -874,17 +1133,10 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     }
 }
 
-// A fork collision must be classified by the manifest authority, not by Lance
-// branch versions. When a concurrent first-write legitimately wins the fork
-// race, the loser sees a changed read set — but that is a safe pre-effect
-// retry for Insert. RFC-022 discards and reprepares it automatically, never
-// misclassifying the live fork as an orphan that needs cleanup.
-//
-// Ordering is made deterministic (no fixed sleeps) via the shared rendezvous:
-// it parks the first arrival (writer A) at the fork point until released; later
-// arrivals (writer B) fall through. The test waits on the reached condition,
-// lets B win and commit the fork, then releases A.
-#[tokio::test(flavor = "multi_thread")]
+/// A fork collision is classified by the manifest authority, not by Lance
+/// branch versions: the first write that loses the fork race sees a changed
+/// read set and reprepares against the live fork instead of cleaning it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn fork_collision_with_live_concurrent_fork_reprepares() {
     let _scenario = FailScenario::setup();
@@ -895,42 +1147,50 @@ async fn fork_collision_with_live_concurrent_fork_reprepares() {
     main.branch_create("feature").await.unwrap();
 
     let rv = helpers::failpoint::Rendezvous::park_first(&catalog::FORK_BEFORE_CLASSIFY);
+    let probes = QueryIoProbes::default();
 
     let uri_a = uri.clone();
+    let writer_probes = probes.clone();
     let writer_a = tokio::spawn(async move {
         let a = helpers::session(Omnigraph::open(&uri_a).await.unwrap());
-        helpers::mutate_branch(
-            &a,
-            "feature",
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        with_query_io_probes(
+            writer_probes,
+            helpers::mutate_branch(
+                &a,
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+            ),
         )
         .await
     });
 
-    // Wait until A is parked at the fork point.
     rv.wait_until_reached().await;
 
-    // B wins the fork and commits it.
-    let b = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    helpers::mutate_branch(
-        &b,
-        "feature",
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
-    )
-    .await
-    .unwrap();
+    let external_uri = uri.clone();
+    let external = tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer_action(
+            external_uri,
+            LoadMode::Append,
+            r#"{"type":"Person","data":{"name":"Frank","age":41}}"#.to_string(),
+            "load_feature",
+        )
+    })
+    .await;
 
-    // Release A; it resumes, sees that B changed branch authority, discards its
-    // stale attempt, and reprepares Eve against the now-live feature fork.
     rv.release();
-    writer_a
-        .await
+    let writer_result = writer_a.await;
+    external.unwrap().expect("B must publish while A is parked");
+    assert!(!rv.timed_out(), "A must stay parked until B publishes");
+    writer_result
         .unwrap()
         .expect("A's retryable insert must reprepare after B wins the fork");
+    assert_eq!(
+        probes.mutation_reprepares.load(Ordering::Relaxed),
+        1,
+        "A must discard its stale attempt after the foreign writer publishes"
+    );
 
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(
@@ -1247,6 +1507,251 @@ async fn mutation_revalidates_unique_after_pre_effect_authority_change() {
     assert_eq!(collect_column_strings(&users, "name"), vec!["winner"]);
 }
 
+/// A Blob write re-prepared after a competing write evaluates its
+/// precondition against the fresh base, and an unconditional write carries
+/// the row's other cells from that fresh base, never from the stale one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn blob_put_reevaluates_its_precondition_and_recarries_the_row_after_a_competing_write() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(seed_blob_write_graph(dir.path().to_str().unwrap()).await);
+
+    // The competing write changes only the note, yet it moves the content
+    // cell's validator: the parked put's If-Match no longer holds.
+    let stale = blob_etag(&db, "main", readme("content")).await;
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer = {
+        let db = Arc::clone(&db);
+        let stale = stale.clone();
+        tokio::spawn(async move {
+            db.put_blob_at_as(
+                "main",
+                readme("content"),
+                Bytes::from_static(b"stale"),
+                Some(BlobPrecondition::Tags(vec![stale])),
+                None,
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    set_readme_note(&db, "n1").await;
+    let competing_commits = main_commit_count(&db).await;
+    rendezvous.release();
+    let error = writer
+        .await
+        .unwrap()
+        .expect_err("the stale If-Match fails against the fresh base");
+    let fresh = blob_etag(&db, "main", readme("content")).await;
+    assert_ne!(fresh, stale, "the competing write moved the validator");
+    assert!(
+        matches!(&error, OmniError::BlobWritePreconditionFailed { current_etag: Some(current) }
+            if current == fresh.as_str()),
+        "the refusal names the fresh validator: {error:?}"
+    );
+    assert_eq!(
+        main_commit_count(&db).await,
+        competing_commits,
+        "the refused put published nothing"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), readme("content")).await,
+        b"Hello"
+    );
+    drop(rendezvous);
+
+    // An unconditional put parked while another put replaces the preview and
+    // an update replaces the note: its retry carries both.
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            db.put_blob_at_as(
+                "main",
+                readme("content"),
+                Bytes::from_static(b"fresh"),
+                None,
+                None,
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    db.put_blob_at_as(
+        "main",
+        readme("preview"),
+        Bytes::from_static(b"P1"),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    set_readme_note(&db, "n2").await;
+    rendezvous.release();
+    let BlobWriteOutcome::Managed { etag, .. } = writer.await.unwrap().unwrap() else {
+        panic!("a put stores a managed value");
+    };
+    assert_eq!(etag, blob_etag(&db, "main", readme("content")).await);
+    assert_eq!(
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), readme("content")).await,
+        b"fresh"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), readme("preview")).await,
+        b"P1",
+        "the retry carried the competing preview, not the stale one"
+    );
+    let documents = read_table(&db, "node:Document").await;
+    assert_eq!(collect_column_strings(&documents, "note"), ["n2"]);
+}
+
+/// A Blob write that re-prepares across an accepted-schema change or a
+/// delete-and-recreate of its branch fails closed, without effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn blob_put_fails_closed_when_schema_or_branch_incarnation_changes_between_attempts() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(seed_blob_write_graph(dir.path().to_str().unwrap()).await);
+    let refused = |error: &OmniError| {
+        matches!(error, OmniError::Manifest(manifest)
+            if manifest.kind == ManifestErrorKind::Conflict
+                && manifest.message.contains("changed incarnation or accepted schema"))
+    };
+    let parked_put = |branch: &'static str| {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            db.put_blob_at_as(
+                branch,
+                readme("content"),
+                Bytes::from_static(b"lost"),
+                None,
+                None,
+            )
+            .await
+        })
+    };
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer = parked_put("main");
+    rendezvous.wait_until_reached().await;
+    db.apply_schema(&BLOB_WRITE_SCHEMA.replace("note: String?", "note: String?\n    tag: String?"))
+        .await
+        .unwrap();
+    let schema_commits = main_commit_count(&db).await;
+    rendezvous.release();
+    let error = writer
+        .await
+        .unwrap()
+        .expect_err("a schema change refuses the retry");
+    assert!(refused(&error), "{error:?}");
+    assert_eq!(main_commit_count(&db).await, schema_commits);
+    assert_eq!(
+        read_managed_blob_bytes(&db, ReadTarget::branch("main"), readme("content")).await,
+        b"Hello"
+    );
+    drop(rendezvous);
+
+    db.branch_create("feature").await.unwrap();
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer = parked_put("feature");
+    rendezvous.wait_until_reached().await;
+    db.branch_delete("feature").await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    rendezvous.release();
+    let error = writer
+        .await
+        .unwrap()
+        .expect_err("a recreated branch refuses the retry");
+    assert!(refused(&error), "{error:?}");
+    for branch in ["feature", "main"] {
+        assert_eq!(
+            read_managed_blob_bytes(&db, ReadTarget::branch(branch), readme("content")).await,
+            b"Hello"
+        );
+    }
+}
+
+/// The receipt of a Blob put is evidence from its own detached commit: a
+/// write by another process that lands between the put's manifest commit and
+/// its return does not change the ETag the put reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_write_after_publication_cannot_change_a_blob_put_receipt() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(seed_blob_write_graph(&uri).await);
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT);
+    let writer = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            db.put_blob_at_as(
+                "main",
+                readme("content"),
+                Bytes::from_static(b"mine"),
+                None,
+                None,
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    // "Zm9yZWlnbg==" is "foreign".
+    let foreign = r#"{"type":"Document","data":{"title":"readme","content":"base64:Zm9yZWlnbg==","preview":"base64:UDA=","note":"n0"}}"#;
+    let external_uri = uri.clone();
+    tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer(external_uri, LoadMode::Merge, foreign.to_string())
+    })
+    .await
+    .unwrap()
+    .expect("the foreign write publishes after the parked put's manifest commit");
+    rendezvous.release();
+    let BlobWriteOutcome::Managed {
+        length,
+        etag,
+        commit,
+    } = writer.await.unwrap().unwrap()
+    else {
+        panic!("a put stores a managed value");
+    };
+    assert_eq!(length, 4);
+
+    let fresh = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let at_commit = ReadTarget::snapshot(SnapshotId::new(commit.graph_commit_id.clone()));
+    let BlobContent::Managed {
+        etag: committed, ..
+    } = fresh
+        .read_blob_at(at_commit.clone(), readme("content"))
+        .await
+        .unwrap()
+        .content
+    else {
+        panic!("the put's commit holds a managed value");
+    };
+    assert_eq!(etag, committed, "the receipt names the put's own commit");
+    assert_eq!(
+        read_managed_blob_bytes(&fresh, at_commit, readme("content")).await,
+        b"mine"
+    );
+    assert_ne!(
+        etag,
+        blob_etag(&fresh, "main", readme("content")).await,
+        "the head now holds the foreign write"
+    );
+    assert_eq!(
+        read_managed_blob_bytes(&fresh, ReadTarget::branch("main"), readme("content")).await,
+        b"foreign"
+    );
+}
+
 /// The coarse token is branch-wide: a commit to a table that the prepared
 /// mutation does not write can still invalidate schema/cardinality/RI inputs.
 /// A strict update therefore reports `ReadSetChanged` before moving its Person
@@ -1256,15 +1761,43 @@ async fn mutation_revalidates_unique_after_pre_effect_authority_change() {
 async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+    let db = Arc::new(helpers::init_and_load(&dir).await);
+    assert_strict_update_refuses_head_change(db, "main").await;
+}
 
+/// The same refusal on a branch other than the handle's bound one, where
+/// revalidation trusts the captured manifest probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn named_branch_strict_mutation_rejects_head_change_before_effects() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(helpers::init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "OldFeatureCo")]),
+    )
+    .await
+    .unwrap();
+    assert_strict_update_refuses_head_change(db, "feature").await;
+}
+
+/// Parks a strict Person update on `branch`, commits a disjoint Company insert
+/// on the same branch, and requires the refusal before any table effect.
+async fn assert_strict_update_refuses_head_change(
+    db: Arc<omnigraph::Session>,
+    branch: &'static str,
+) {
     let rendezvous =
         helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
-    let writer_a_db = std::sync::Arc::clone(&db);
-    let writer_a = tokio::spawn(async move {
-        writer_a_db
+    let writer_db = Arc::clone(&db);
+    let writer = tokio::spawn(async move {
+        writer_db
             .mutate(
-                "main",
+                branch,
                 OCC_DISJOINT_MUTATIONS,
                 "set_age",
                 &helpers::mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
@@ -1274,61 +1807,103 @@ async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
 
     rendezvous.wait_until_reached().await;
     db.mutate(
-        "main",
+        branch,
         OCC_DISJOINT_MUTATIONS,
         "insert_company",
         &params(&[("$name", "ConcurrentCo")]),
     )
     .await
     .expect("the disjoint Company insert commits while Person update is parked");
-
-    let winner_person_pin = helpers::snapshot_main(&db)
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .unwrap()
-        .published_dataset_version;
-    let person_uri = node_table_uri(&db, "Person").await;
-    let winner_person_head = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .latest_version_id()
-        .await
-        .unwrap();
+    let _no_table_effect = catalog::MUTATION_POST_TABLE_COMMIT.fire_always();
     rendezvous.release();
 
-    let err = writer_a
+    let err = writer
         .await
         .unwrap()
         .expect_err("strict stale read set must fail rather than auto-reprepare");
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected a typed manifest conflict");
-    };
-    assert!(matches!(
-        manifest_err.details,
-        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
-            ref member,
-            ..
-        }) if member == "graph_head:main"
-    ));
+    assert_refused_before_effects(err, &format!("graph_head:{branch}"));
+}
 
-    let final_person_pin = helpers::snapshot_main(&db)
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .unwrap()
-        .published_dataset_version;
-    let final_person_head = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .latest_version_id()
-        .await
-        .unwrap();
-    assert_eq!(
-        (final_person_pin, final_person_head),
-        (winner_person_pin, winner_person_head),
-        "strict rejection must happen before any Person table effect"
+/// With `MUTATION_POST_TABLE_COMMIT` armed, a write that reached a table effect
+/// carries the injected error, which has no conflict details.
+fn assert_refused_before_effects(err: OmniError, member: &str) {
+    let refusal = err.to_string();
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected a typed manifest conflict, got {refusal}");
+    };
+    assert!(
+        matches!(
+            manifest_err.details,
+            Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
+                member: ref changed,
+                ..
+            }) if changed == member
+        ),
+        "the write must be refused with {member} before a table effect, got {refusal}"
     );
+}
+
+/// A write on a branch other than the handle's bound one keeps its captured
+/// authority only while the branch's version and identifier are unchanged. A
+/// delete and recreate of that name while the write is parked must refuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn named_branch_write_refuses_delete_recreate_before_effects() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "OldFeatureCo")]),
+    )
+    .await
+    .unwrap();
+    let old_ref = helpers::graph_native_ref(&uri, "feature").await;
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let _no_table_effect = catalog::MUTATION_POST_TABLE_COMMIT.fire_always();
+    let writer_db = std::sync::Arc::clone(&db);
+    let writer = tokio::spawn(async move {
+        writer_db
+            .mutate(
+                "feature",
+                OCC_DISJOINT_MUTATIONS,
+                "set_age",
+                &helpers::mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+            )
+            .await
+    });
+
+    rendezvous.wait_until_reached().await;
+    let recreated = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        db.branch_delete("feature").await?;
+        db.branch_create("feature").await
+    })
+    .await;
+    rendezvous.release();
+    recreated
+        .expect("delete and recreate must not wait for the parked write")
+        .unwrap();
+    let new_ref = helpers::graph_native_ref(&uri, "feature").await;
+    assert_ne!(new_ref, old_ref, "recreate must mint a new incarnation");
+
+    let err = writer
+        .await
+        .unwrap()
+        .expect_err("a write captured on the deleted incarnation must be refused");
+    assert_refused_before_effects(err, "branch_identifier:feature");
+
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Company").await,
+        helpers::count_rows_branch(&db, "main", "node:Company").await,
+        "the recreated branch must hold main's rows only"
+    );
+    assert_eq!(helpers::graph_native_ref(&uri, "feature").await, new_ref);
 }
 
 /// A caller graph-head precondition is terminal even when the race occurs
@@ -1895,6 +2470,675 @@ async fn cross_branch_writers_overlap_inside_schema_gate() {
     );
 }
 
+/// Create `source` and `target` from main and give each its own insert, so a
+/// merge between them is three-way and reaches its manifest commit.
+async fn diverged_merge_pair(db: &helpers::Session, source: &str, target: &str) {
+    db.branch_create(source).await.unwrap();
+    db.branch_create(target).await.unwrap();
+    for (branch, age) in [(source, 51), (target, 52)] {
+        db.mutate(
+            branch,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", &format!("On-{branch}"))], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// Issue 643: merges into independent targets overlap. Merge A parks after
+/// its table effects, before its manifest commit, holding the shared schema
+/// permit and its own source and target branch gates; merge B between two
+/// other branches must run to completion meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn independent_target_merges_overlap_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t1").await;
+    diverged_merge_pair(&db, "s2", "t2").await;
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_a_db = std::sync::Arc::clone(&db);
+    let merge_a = tokio::spawn(async move { merge_a_db.branch_merge("s1", "t1").await });
+    parked.wait_until_reached().await;
+
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t2").await });
+    let merged_b = tokio::time::timeout(std::time::Duration::from_secs(10), merge_b)
+        .await
+        .expect("a merge into another target must complete while A is parked")
+        .unwrap()
+        .expect("B must merge");
+    assert_eq!(merged_b.outcome, omnigraph::db::MergeOutcome::Merged);
+    assert!(
+        !merge_a.is_finished(),
+        "A must still be parked before its manifest commit while B published"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_a
+            .await
+            .unwrap()
+            .expect("A must merge after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and its source's"
+        );
+    }
+}
+
+/// Issue 643: merges into the same target stay serialized. With merge A
+/// parked before its manifest commit, holding the target's branch gate, a
+/// second merge into that target must wait; once A publishes, B merges on
+/// top of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn same_target_merges_serialize_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t").await;
+    db.branch_create("s2").await.unwrap();
+    db.mutate(
+        "s2",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "On-s2")], &[("$age", 53)]),
+    )
+    .await
+    .unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_a_db = std::sync::Arc::clone(&db);
+    let merge_a = tokio::spawn(async move { merge_a_db.branch_merge("s1", "t").await });
+    parked.wait_until_reached().await;
+
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let mut merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t").await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut merge_b)
+            .await
+            .is_err(),
+        "a merge into the same target must wait while A holds that target's gate"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_a
+            .await
+            .unwrap()
+            .expect("A must merge after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        merge_b
+            .await
+            .unwrap()
+            .expect("B must merge after A")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        7,
+        "t holds the seed rows, its own insert and both sources' inserts"
+    );
+}
+
+/// Issue 643, delete boundary. Deleting a merge's target while the merge is
+/// parked before its manifest commit waits on the target's gate; the merge
+/// publishes, then the delete succeeds. Deleting its source does not wait:
+/// the merge released the source's gate once its tagged source snapshot was
+/// captured. The merge still publishes that snapshot, and the target keeps
+/// reading the merged row after cleanup reclaims what the deletion retired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn merge_target_delete_waits_and_source_delete_does_not_issue_643() {
+    for victim in ["t", "s"] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = helpers::init_and_load(&dir).await;
+        diverged_merge_pair(&db, "s", "t").await;
+        // An edge only the source adds: the merge adopts the source's
+        // `edge:Knows` pin as the target's, the case a reclaimed source would
+        // break.
+        db.mutate(
+            "s",
+            MUTATION_QUERIES,
+            "add_friend",
+            &params(&[("$from", "Diana"), ("$to", "Alice")]),
+        )
+        .await
+        .unwrap();
+        let db = std::sync::Arc::new(db);
+
+        let parked = helpers::failpoint::Rendezvous::park_first(
+            &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+        );
+        let merge_db = std::sync::Arc::clone(&db);
+        let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+        parked.wait_until_reached().await;
+
+        let delete_db = std::sync::Arc::clone(&db);
+        let mut delete = tokio::spawn(async move { delete_db.branch_delete(victim).await });
+        let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut delete).await;
+        if victim == "t" {
+            assert!(
+                early.is_err(),
+                "deleting the target must wait while the merge holds its gate"
+            );
+        } else {
+            early
+                .expect("deleting the source must not wait for the merge")
+                .unwrap()
+                .unwrap_or_else(|error| panic!("deleting the source during the merge: {error}"));
+        }
+
+        parked.release();
+        assert_eq!(
+            merge
+                .await
+                .unwrap()
+                .expect("the merge must publish after release")
+                .outcome,
+            omnigraph::db::MergeOutcome::Merged,
+            "deleting {victim}"
+        );
+        if victim == "t" {
+            delete
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| panic!("deleting the target after the merge: {error}"));
+        } else {
+            let rows = db.cleanup(keep_one()).await.unwrap();
+            assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+            assert_eq!(
+                helpers::count_rows_branch(&db, "t", "node:Person").await,
+                6,
+                "t holds the seed rows, its own insert and the deleted source's"
+            );
+            assert_eq!(
+                helpers::count_rows_branch(&db, "t", "edge:Knows").await,
+                4,
+                "t reads the edge adopted from the deleted source after cleanup"
+            );
+        }
+        assert!(
+            !db.branch_list().await.unwrap().iter().any(|b| b == victim),
+            "{victim} is gone"
+        );
+    }
+}
+
+/// Issue 643, same-source case: with a merge from `s` into `t1` parked
+/// before its manifest commit, a merge from `s` into `t2` runs to
+/// completion, because a merge holds its source's gate only through
+/// capture. Both land, and each target gets the source's row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn same_source_merges_overlap_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s", "t1").await;
+    db.branch_create("t2").await.unwrap();
+    db.mutate(
+        "t2",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "On-t2")], &[("$age", 54)]),
+    )
+    .await
+    .unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let first_db = std::sync::Arc::clone(&db);
+    let first = tokio::spawn(async move { first_db.branch_merge("s", "t1").await });
+    parked.wait_until_reached().await;
+
+    let second_db = std::sync::Arc::clone(&db);
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::spawn(async move { second_db.branch_merge("s", "t2").await }),
+    )
+    .await
+    .expect("a second merge from the same source must complete while the first is parked")
+    .unwrap()
+    .expect("the second merge must land");
+    assert_eq!(second.outcome, omnigraph::db::MergeOutcome::Merged);
+    assert!(!first.is_finished(), "the first merge is still parked");
+
+    parked.release();
+    assert_eq!(
+        first
+            .await
+            .unwrap()
+            .expect("the first merge must land")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and the source's"
+        );
+    }
+}
+
+/// Issue 643, writes on a merge's source: with a merge from `s` into `t`
+/// parked before its manifest commit, an insert on `s` completes. The merge
+/// publishes the source snapshot it captured, so the concurrent insert is not
+/// in `t` until a second merge carries it. The second half parks earlier, at
+/// candidate validation, on a merge whose `Person` change is proven
+/// insert-only: the source table moving past the proven version must not
+/// refuse a merge whose input is the captured, tagged version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn source_write_proceeds_during_merge_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s", "t").await;
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_db = std::sync::Arc::clone(&db);
+    let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+    parked.wait_until_reached().await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        db.mutate(
+            "s",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "During-merge")], &[("$age", 63)]),
+        ),
+    )
+    .await
+    .expect("an insert on the merge's source must not wait for the merge")
+    .expect("the insert on the source must land");
+    assert!(!merge.is_finished(), "the merge is still parked");
+
+    parked.release();
+    assert_eq!(
+        merge
+            .await
+            .unwrap()
+            .expect("the merge must publish after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "s", "node:Person").await,
+        6,
+        "s holds the seed rows, its own insert and the concurrent one"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        6,
+        "t holds the seed rows, its own insert and the source as captured"
+    );
+    assert_eq!(
+        db.branch_merge("s", "t").await.unwrap().outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        7,
+        "a second merge carries the concurrent insert"
+    );
+
+    // The target diverges on `edge:Knows` only, so its `Person` equals the
+    // base and the source's `Person` inserts take the proven pure-insert path.
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    db.branch_create("s").await.unwrap();
+    db.branch_create("t").await.unwrap();
+    db.mutate(
+        "s",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "On-s")], &[("$age", 51)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "t",
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Diana"), ("$to", "Alice")]),
+    )
+    .await
+    .unwrap();
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_CANDIDATE_VALIDATION,
+    );
+    let probes = MergeWriteProbes::default();
+    let merge_db = std::sync::Arc::clone(&db);
+    let merge = tokio::spawn(with_merge_write_probes(probes.clone(), async move {
+        merge_db.branch_merge("s", "t").await
+    }));
+    parked.wait_until_reached().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        db.mutate(
+            "s",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "During-validation")], &[("$age", 64)]),
+        ),
+    )
+    .await
+    .expect("an insert on the merge's source must not wait for candidate validation")
+    .expect("the insert on the source must land");
+
+    parked.release();
+    assert_eq!(
+        merge
+            .await
+            .unwrap()
+            .expect("the source moving past the proven version must not refuse the merge")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert!(
+        probes.proven_insert_history_read_calls() >= 1,
+        "the merge must have certified the source's Person insertions"
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        5,
+        "t holds the seed rows and the source's Person as captured"
+    );
+    assert_eq!(
+        db.branch_merge("s", "t").await.unwrap().outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        helpers::count_rows_branch(&db, "t", "node:Person").await,
+        6,
+        "a second merge carries the insert made during validation"
+    );
+}
+
+/// Issue 643, failure boundary: merge A fails after its table effects,
+/// before its manifest commit, while merge B into an independent target is
+/// parked mid-merge holding its gates and the shared schema permit. A's
+/// target does not move, B still publishes, and A's gates are released: the
+/// same handle retries A to completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn failed_merge_beside_an_independent_merge_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s1", "t1").await;
+    diverged_merge_pair(&db, "s2", "t2").await;
+    let db = std::sync::Arc::new(db);
+    let t1_head = branch_head_commit_id(dir.path(), "t1").await.unwrap();
+    let t1_person = helpers::snapshot_branch(&db, "t1")
+        .await
+        .unwrap()
+        .dataset("node:Person")
+        .unwrap()
+        .published_dataset_version;
+
+    let parked =
+        helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+    let merge_b_db = std::sync::Arc::clone(&db);
+    let merge_b = tokio::spawn(async move { merge_b_db.branch_merge("s2", "t2").await });
+    parked.wait_until_reached().await;
+
+    {
+        let _failpoint = catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.branch_merge("s1", "t1"),
+        )
+        .await
+        .expect("A must not wait on B's gates")
+        .expect_err("A must fail at its injected fault");
+        assert!(
+            error.to_string().contains(
+                "injected failpoint triggered: branch_merge.post_phase_b_pre_manifest_commit"
+            ),
+            "A must fail at the injected fault, not earlier: {error}"
+        );
+    }
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "t1").await.unwrap(),
+        t1_head,
+        "the failed merge must not move its target's graph head"
+    );
+    assert_eq!(
+        helpers::snapshot_branch(&db, "t1")
+            .await
+            .unwrap()
+            .dataset("node:Person")
+            .unwrap()
+            .published_dataset_version,
+        t1_person,
+        "the failed merge's table effects must stay unpublished"
+    );
+    assert!(
+        !merge_b.is_finished(),
+        "B must still be parked after A failed"
+    );
+
+    parked.release();
+    assert_eq!(
+        merge_b
+            .await
+            .unwrap()
+            .expect("B must merge after release")
+            .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.branch_merge("s1", "t1"),
+        )
+        .await
+        .expect("the failed merge must have released its gates")
+        .expect("the same handle must retry A once the fault stops")
+        .outcome,
+        omnigraph::db::MergeOutcome::Merged
+    );
+    for target in ["t1", "t2"] {
+        assert_eq!(
+            helpers::count_rows_branch(&db, target, "node:Person").await,
+            6,
+            "{target} holds the seed rows, its own insert and its source's"
+        );
+    }
+}
+
+/// Issue 643, cancellation: a merge whose task is aborted while it is parked
+/// at a seam stops at its first await after the release. On a local store
+/// that falls before its manifest commit, after its table effects at the
+/// later seam; the assertions also accept a merge that published before the
+/// cancel took effect. Either way the target is whole (untouched, or merged
+/// with a new head), the handle stays live (the retry completes and another
+/// write lands), and cleanup succeeds afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn cancelled_merge_leaves_the_target_whole_issue_643() {
+    for seam in [
+        &catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE,
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    ] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = helpers::init_and_load(&dir).await;
+        diverged_merge_pair(&db, "s", "t").await;
+        let db = std::sync::Arc::new(db);
+        let head_before = branch_head_commit_id(dir.path(), "t").await.unwrap();
+
+        let parked = helpers::failpoint::Rendezvous::park_first(seam);
+        let merge_db = std::sync::Arc::clone(&db);
+        let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+        parked.wait_until_reached().await;
+        merge.abort();
+        parked.release();
+        let outcome = merge.await;
+        drop(parked);
+
+        let merged = branch_head_commit_id(dir.path(), "t").await.unwrap() != head_before;
+        let rows = helpers::count_rows_branch(&db, "t", "node:Person").await;
+        let seam = seam.name();
+        match &outcome {
+            Ok(result) => assert_eq!(
+                &result
+                    .as_ref()
+                    .expect("an uncancelled merge must land")
+                    .outcome,
+                &omnigraph::db::MergeOutcome::Merged,
+                "{seam}"
+            ),
+            Err(join) => assert!(join.is_cancelled(), "{seam}: {join}"),
+        }
+        if outcome.is_ok() {
+            assert!(
+                merged,
+                "{seam}: an acknowledged merge moves the target head"
+            );
+        }
+        assert_eq!(
+            rows,
+            if merged { 6 } else { 5 },
+            "{seam}: the target is merged whole or untouched"
+        );
+
+        let retried = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.branch_merge("s", "t"),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{seam}: the cancelled merge must have released its gates"))
+        .unwrap_or_else(|error| panic!("{seam}: the retry must merge: {error}"));
+        assert_eq!(
+            retried.outcome,
+            if merged {
+                omnigraph::db::MergeOutcome::AlreadyUpToDate
+            } else {
+                omnigraph::db::MergeOutcome::Merged
+            },
+            "{seam}"
+        );
+        db.mutate(
+            "t",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "After-cancel")], &[("$age", 56)]),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{seam}: a later write on the target: {error}"));
+        let rows = db.cleanup(keep_one()).await.unwrap();
+        assert!(
+            rows.iter().all(|row| row.error.is_none()),
+            "{seam}: {rows:?}"
+        );
+        assert_eq!(
+            helpers::count_rows_branch(&db, "t", "node:Person").await,
+            7,
+            "{seam}: seed rows, both inserts, the merged row and the later write"
+        );
+    }
+}
+
+/// Issue 643, branch recreation: another process deletes a merge's target
+/// and creates a branch of the same name while the merge is parked after its
+/// table effects, before its manifest commit. The name now denotes a new
+/// branch lifetime, so the merge must refuse rather than publish into it,
+/// and the recreated target keeps exactly what its own writer put there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn merge_refuses_a_target_recreated_by_another_process_issue_643() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    diverged_merge_pair(&db, "s", "t").await;
+    let db = std::sync::Arc::new(db);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(
+        &catalog::BRANCH_MERGE_POST_PHASE_B_PRE_MANIFEST_COMMIT,
+    );
+    let merge_db = std::sync::Arc::clone(&db);
+    let merge = tokio::spawn(async move { merge_db.branch_merge("s", "t").await });
+    parked.wait_until_reached().await;
+
+    let child_uri = uri.clone();
+    tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer_action(
+            child_uri,
+            LoadMode::Append,
+            r#"{"type":"Person","data":{"name":"On-t-recreated","age":55}}"#.to_string(),
+            "merge_target_recreated",
+        )
+    })
+    .await
+    .unwrap()
+    .expect("the other process recreates the target");
+    let recreated_head = branch_head_commit_id(dir.path(), "t").await.unwrap();
+
+    parked.release();
+    let error = merge
+        .await
+        .unwrap()
+        .expect_err("the merge must refuse a target recreated under its name");
+    assert!(
+        matches!(
+            &error,
+            OmniError::Manifest(manifest)
+                if manifest.publication_in_doubt.is_none()
+                    && matches!(
+                        &manifest.details,
+                        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged { member, .. })
+                            if member == "branch_identifier:t"
+                    )
+        ),
+        "the refusal must name the target's changed branch identity: {error:?}"
+    );
+    assert_eq!(
+        branch_head_commit_id(dir.path(), "t").await.unwrap(),
+        recreated_head,
+        "the refused merge must not move the recreated target"
+    );
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        helpers::count_rows_branch(&reader, "t", "node:Person").await,
+        5,
+        "the recreated target holds the seed rows and its own writer's row only"
+    );
+}
+
 /// Branch create takes the schema gate's EXCLUSIVE side: no CAS covers its
 /// namespace inventory, so a sibling create with disjoint branch gates must
 /// wait at the gate, then refuse on the collision the first leaves behind.
@@ -1914,18 +3158,20 @@ async fn sibling_branch_creates_exclude_at_the_schema_gate() {
     let first = tokio::spawn(async move { first_db.branch_create("feature").await });
     after_inventory.wait_until_reached().await;
 
+    let queued = helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_GATE_EXCLUSIVE_QUEUED);
     let second_db = std::sync::Arc::clone(&db);
-    let mut second = tokio::spawn(async move {
+    let second = tokio::spawn(async move {
         second_db
             .branch_create_from(ReadTarget::branch("b"), "feature/x")
             .await
     });
-    let overtaking = tokio::time::timeout(std::time::Duration::from_secs(1), &mut second).await;
+    queued.wait_until_reached().await;
     assert!(
-        overtaking.is_err(),
+        !second.is_finished(),
         "a sibling create must wait at the schema gate while the first create sits \
          between its inventory and its native create"
     );
+    queued.release();
 
     after_inventory.release();
     first
@@ -2000,25 +3246,20 @@ async fn read_capture_proceeds_while_writer_parked() {
     assert_eq!(count_rows(&db_b, "node:Person").await, 5);
 }
 
-// Atomic schema apply: schema apply writes staging files first, then commits
-// the manifest, then renames staging → final. Tests below inject crashes at
-// the two boundaries and assert that reopening the graph yields a consistent
-// state.
-
 #[tokio::test]
 #[serial]
-async fn schema_apply_pre_commit_crash_discards_staging_on_reopen() {
+async fn schema_apply_pre_commit_crash_preserves_published_contract() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
 
     {
         let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
-        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("injected failpoint triggered: schema_apply.after_staging_write"),
+                .contains("injected failpoint triggered: graph_publish.before_commit_append"),
             "got: {}",
             err
         );
@@ -2027,15 +3268,9 @@ async fn schema_apply_pre_commit_crash_discards_staging_on_reopen() {
             "a failure before publication needs no recovery: {err}"
         );
     }
-    assert!(
-        dir.path().join("__schema_state.json.staging").exists(),
-        "the staged contract outlives the writer"
-    );
+    assert_no_staging_files(dir.path());
     assert_no_recovery_sidecars(dir.path());
 
-    // RFC 0067: the staged contract names a graph commit that never landed,
-    // so the next read-write open discards it; the created Company dataset
-    // is unregistered garbage at the path the retry creates at.
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(db.schema_source().as_str(), SCHEMA_V1);
     assert_no_staging_files(dir.path());
@@ -2050,32 +3285,51 @@ async fn schema_apply_pre_commit_crash_discards_staging_on_reopen() {
     let company_uri = unregistered_node_table_uri(&db).await;
     assert!(
         std::path::Path::new(&company_uri).exists(),
-        "the abandoned create stays as unregistered garbage until the retry reclaims it"
+        "the abandoned create remains available for a non-destructive retry"
     );
 
     db.apply_schema(SCHEMA_V2_ADDED_TYPE)
         .await
-        .expect("the retry reclaims the leftover and publishes");
+        .expect("the retry reuses the leftover and publishes");
     assert_eq!(helpers::count_rows(&db, "node:Company").await, 0);
     assert_eq!(node_table_uri(&db, "Company").await, company_uri);
     assert_no_staging_files(dir.path());
     assert_no_recovery_sidecars(dir.path());
 }
 
-#[tokio::test]
-#[serial]
-async fn schema_apply_recovers_partial_schema_promotion_after_commit_crash() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
+/// A published contract needs neither root schema files nor recovery sidecars.
+async fn assert_no_schema_apply_residue(uri: &str) {
+    let storage = omnigraph_storage::storage_for_uri(uri).unwrap();
+    for name in [
+        "_schema.pg",
+        "_schema.ir.json",
+        "__schema_state.json",
+        "_schema.pg.staging",
+        "_schema.ir.json.staging",
+        "__schema_state.json.staging",
+    ] {
+        let path = omnigraph_storage::join_uri(uri, name);
+        assert!(
+            !storage.exists(&path).await.unwrap(),
+            "atomic schema publication must not leave {path}"
+        );
+    }
+    let recovery = omnigraph_storage::join_uri(uri, "__recovery");
+    assert!(
+        storage.list_dir(&recovery).await.unwrap().is_empty(),
+        "atomic schema publication must not leave recovery sidecars"
+    );
+}
 
+/// Both backend wrappers exercise publication, fresh admission and live-handle progress.
+async fn assert_schema_apply_post_commit_failure_leaves_readable_contract(uri: &str) {
+    let db = helpers::session(Omnigraph::init(uri, SCHEMA_V1).await.unwrap());
     {
-        let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
         let _failpoint = catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT.fire_always();
         let err = db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap_err();
         assert!(
             matches!(err, OmniError::RecoveryRequired { .. }),
-            "a failure after publication reports the pending contract installation: {err}"
+            "a failure after publication identifies the committed operation: {err}"
         );
         assert!(
             err.to_string()
@@ -2084,60 +3338,57 @@ async fn schema_apply_recovers_partial_schema_promotion_after_commit_crash() {
             err
         );
     }
-    assert_no_recovery_sidecars(dir.path());
+    assert_no_schema_apply_residue(uri).await;
 
-    // ReadOnly must remain non-mutating, but it also must not combine the
-    // already-published manifest delta with the old live schema contract.
-    // It fails closed until a read-write open performs the promotion.
-    let read_only_error = match Omnigraph::open_read_only(&uri).await {
-        Ok(_) => panic!("read-only open must refuse a committed-but-unpromoted SchemaApply"),
-        Err(error) => error,
-    };
+    let read_only = Omnigraph::open_read_only(uri).await.unwrap();
+    assert_eq!(read_only.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
     assert!(
-        matches!(read_only_error, OmniError::RecoveryRequired { .. }),
-        "{read_only_error}"
+        read_only
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .dataset("node:Company")
+            .is_some()
     );
-    assert!(
-        read_only_error
-            .to_string()
-            .contains("schema contract promotion is pending"),
-        "{read_only_error}"
-    );
-    assert!(dir.path().join("_schema.pg.staging").exists());
-    assert!(dir.path().join("_schema.ir.json.staging").exists());
-    assert!(dir.path().join("__schema_state.json.staging").exists());
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap(),
-        SCHEMA_V1,
-        "the read-only coherence guard must not promote schema files"
-    );
+    assert_eq!(helpers::count_rows(&read_only, "node:Company").await, 0);
+    let fresh = helpers::session(Omnigraph::open(uri).await.unwrap());
+    assert_eq!(fresh.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
+    assert_eq!(helpers::count_rows(&fresh, "node:Company").await, 0);
+    assert_no_schema_apply_residue(uri).await;
 
-    // Simulate a crash partway through promotion: source reached its final
-    // name, while the IR/state contract remains staged. Recovery must
-    // validate the mixed state as one target identity and finish it.
-    std::fs::rename(
-        dir.path().join("_schema.pg.staging"),
-        dir.path().join("_schema.pg"),
+    db.load_jsonl(
+        r#"{"type":"Company","data":{"name":"SameHandle"}}"#,
+        LoadMode::Merge,
     )
-    .unwrap();
-    assert!(!dir.path().join("_schema.pg.staging").exists());
-    assert!(dir.path().join("_schema.ir.json.staging").exists());
-    assert!(dir.path().join("__schema_state.json.staging").exists());
-
-    // Reopen: the publishing commit is in lineage, so recovery completes the
-    // remaining promotion and the live schema matches v2.
-    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    assert_eq!(db.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
-    assert_no_staging_files(dir.path());
-    assert_eq!(helpers::count_rows(&db, "node:Company").await, 0);
-    db.apply_schema(SCHEMA_V2_ADDED_TYPE)
+    .await
+    .expect("the same handle writes the published new type after the fault clears");
+    fresh
+        .load_jsonl(
+            r#"{"type":"Company","data":{"name":"FreshHandle"}}"#,
+            LoadMode::Merge,
+        )
         .await
-        .expect("the reclaimed sentinel admits the next apply, a no-op here");
+        .expect("a fresh handle writes the published new type after the fault clears");
+    let mut names = collect_column_strings(&read_table(&read_only, "node:Company").await, "name");
+    names.sort();
+    assert_eq!(names, vec!["FreshHandle", "SameHandle"]);
+    fresh
+        .apply_schema(SCHEMA_V2_ADDED_TYPE)
+        .await
+        .expect("the next apply recognizes the published contract");
+    assert_no_schema_apply_residue(uri).await;
 }
 
-/// The applying handle's coordinator observes the fixed manifest commit before
-/// schema files and the catalog ArcSwap are promoted. Query capture joins the
-/// schema gate so it cannot pair that new snapshot with the old catalog.
+#[tokio::test]
+#[serial]
+async fn schema_apply_post_commit_failure_leaves_readable_contract() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    assert_schema_apply_post_commit_failure_leaves_readable_contract(dir.path().to_str().unwrap())
+        .await;
+}
+
+/// Query capture joins the schema gate through coherent publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn schema_apply_live_query_waits_for_coherent_schema_publication() {
@@ -2225,96 +3476,7 @@ edge WorksAt: Person -> Company
 
 #[tokio::test]
 #[serial]
-async fn schema_apply_recovers_partial_rename() {
-    // Construct a partial-rename state: _schema.pg has been renamed in
-    // (matching v2), but _schema.ir.json.staging and __schema_state.json.staging
-    // were never renamed. Recovery should detect that the live source matches
-    // the staging state's hash and complete the remaining renames.
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-
-    {
-        let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
-        db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap();
-    }
-
-    // Simulate: one of the renames (the IR or state file) didn't complete by
-    // copying the live ir/state files back to their staging names.
-    std::fs::copy(
-        dir.path().join("_schema.ir.json"),
-        dir.path().join("_schema.ir.json.staging"),
-    )
-    .unwrap();
-    std::fs::copy(
-        dir.path().join("__schema_state.json"),
-        dir.path().join("__schema_state.json.staging"),
-    )
-    .unwrap();
-
-    // Reopen — recovery should complete the rename (overwriting final files
-    // with identical staging content) and remove the staging files.
-    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    assert_eq!(db.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
-    assert_no_staging_files(dir.path());
-}
-
-/// Azure implements schema-contract promotion as GET -> completed PUT ->
-/// DELETE. Model a crash after the destination PUT by leaving the identical
-/// live and staging objects together, then prove the ordinary open-time
-/// recovery completes the remaining source deletions.
-#[tokio::test]
-#[serial]
-async fn azure_schema_apply_recovers_source_and_destination_after_partial_rename() {
-    let Ok(container) = std::env::var("OMNIGRAPH_AZURE_TEST_CONTAINER") else {
-        eprintln!(
-            "skipping Azure schema rename recovery: OMNIGRAPH_AZURE_TEST_CONTAINER is not set"
-        );
-        return;
-    };
-    let _scenario = FailScenario::setup();
-    let uri = format!(
-        "az://{container}/engine-failpoints/schema-rename-{}",
-        ulid::Ulid::new()
-    );
-    let storage = omnigraph_storage::storage_for_uri(&uri).unwrap();
-
-    {
-        let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
-        db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap();
-    }
-
-    for name in ["_schema.ir.json", "__schema_state.json"] {
-        let live = format!("{uri}/{name}");
-        let staging = format!("{live}.staging");
-        let body = storage.read_text(&live).await.unwrap();
-        storage.write_text(&staging, &body).await.unwrap();
-        assert!(storage.exists(&live).await.unwrap());
-        assert!(storage.exists(&staging).await.unwrap());
-    }
-
-    let reopened = helpers::session(
-        Omnigraph::open(&uri)
-            .await
-            .expect("Azure open must complete the interrupted schema-contract rename"),
-    );
-    assert_eq!(reopened.schema_source().as_str(), SCHEMA_V2_ADDED_TYPE);
-    for name in ["_schema.ir.json", "__schema_state.json"] {
-        assert!(storage.exists(&format!("{uri}/{name}")).await.unwrap());
-        assert!(
-            !storage
-                .exists(&format!("{uri}/{name}.staging"))
-                .await
-                .unwrap()
-        );
-    }
-    drop(reopened);
-    storage.delete_prefix(&uri).await.unwrap();
-}
-
-#[tokio::test]
-#[serial]
-async fn schema_apply_retries_over_its_own_unpublished_staging_without_reopen() {
+async fn schema_apply_retries_after_unpublished_effects_without_reopen() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
@@ -2324,7 +3486,7 @@ async fn schema_apply_retries_over_its_own_unpublished_staging_without_reopen() 
         helpers::TEST_SCHEMA
     );
     {
-        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(&desired).await.unwrap_err();
         assert!(
             !matches!(err, OmniError::RecoveryRequired { .. }),
@@ -2332,7 +3494,7 @@ async fn schema_apply_retries_over_its_own_unpublished_staging_without_reopen() 
         );
     }
     assert_no_recovery_sidecars(dir.path());
-    assert!(dir.path().join("__schema_state.json.staging").exists());
+    assert_no_staging_files(dir.path());
 
     db.apply_schema(&desired)
         .await
@@ -2366,11 +3528,11 @@ async fn load_after_schema_apply_pre_publish_failure_keeps_the_accepted_catalog(
         schema_with_person_city()
     );
     {
-        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(&v2_schema).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("injected failpoint triggered: schema_apply.after_staging_write"),
+                .contains("injected failpoint triggered: graph_publish.before_commit_append"),
             "unexpected error: {err}"
         );
     }
@@ -2399,18 +3561,9 @@ async fn load_after_schema_apply_pre_publish_failure_keeps_the_accepted_catalog(
     assert_eq!(helpers::count_rows(&reopened, "node:Person").await, 2);
 }
 
-/// A concurrent write's entry heal must NOT promote a LIVE schema
-/// apply's staging files. The apply pauses just after writing its
-/// staging files (sidecar on disk from Phase A, staging on disk,
-/// manifest not yet committed); a load on the same handle fires the
-/// heal in that window. If the heal's schema-staging reconcile runs
-/// unserialized, it promotes the staging files from under the live
-/// apply — putting the NEW catalog live against the OLD manifest — and
-/// the resumed apply's own renames then fail on the missing sources:
-/// an error (and a corrupted catalog) for an otherwise-healthy apply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn heal_does_not_promote_live_schema_apply_staging() {
+async fn load_waits_for_schema_apply_publication() {
     use omnigraph::loader::LoadMode;
     use std::sync::Arc;
 
@@ -2422,9 +3575,8 @@ async fn heal_does_not_promote_live_schema_apply_staging() {
         Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap(),
     ));
 
-    // Park the apply right after its staging files land (its sidecar is
-    // already on disk from Phase A; the manifest commit has not run).
-    let rv = helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+    let rv =
+        helpers::failpoint::Rendezvous::park_first(&catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND);
 
     let apply_db = Arc::clone(&db);
     let desired = format!(
@@ -2433,17 +3585,9 @@ async fn heal_does_not_promote_live_schema_apply_staging() {
     );
     let apply = tokio::spawn(async move { apply_db.apply_schema(&desired).await });
 
-    // Wait until the apply is parked in the window (staging files written).
     rv.wait_until_reached().await;
-    let staging_pg = dir.path().join("_schema.pg.staging");
-    assert!(
-        staging_pg.exists(),
-        "schema apply never reached the paused window"
-    );
+    assert_no_staging_files(dir.path());
 
-    // Concurrent load on the same handle: its entry heal runs while the
-    // apply is paused. The load itself may fail (schema apply in
-    // progress) — what matters is what its heal does to the live apply.
     let load_db = Arc::clone(&db);
     let load = tokio::spawn(async move {
         load_db
@@ -2457,22 +3601,17 @@ async fn heal_does_not_promote_live_schema_apply_staging() {
             .await
     });
 
-    // Give the load's heal time to act inside the window. Broken code
-    // completes the load here (its heal promoted the staging files and
-    // stole the apply's commit); fixed code leaves the load blocked on
-    // the schema-apply serialization key until the apply finishes.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!load.is_finished(), "load waits for the schema gate");
     rv.release();
 
     let apply_result = apply.await.unwrap();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), load)
+    tokio::time::timeout(std::time::Duration::from_secs(30), load)
         .await
         .expect("load must complete once the apply releases its guards")
+        .unwrap()
         .unwrap();
-    apply_result.expect(
-        "a concurrent write's heal must not promote the live schema \
-         apply's staging files out from under it",
-    );
+    apply_result.expect("the apply publishes while the load waits for its schema gate");
 
     // The migration landed and nothing recovery-shaped remains.
     assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
@@ -2679,18 +3818,18 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
     );
     {
         let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
-        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(&v2_schema).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("injected failpoint triggered: schema_apply.before_staging_write"),
+                .contains("injected failpoint triggered: graph_publish.before_commit_append"),
             "unexpected error: {err}"
         );
     }
     assert_no_recovery_sidecars(dir.path());
     assert_no_staging_files(dir.path());
 
-    // The Person rewrite is a detached version and the Tag create is an
+    // The Person column add is a detached version and the Tag create is an
     // unregistered dataset: nothing moved the manifest or any linear HEAD,
     // so reopening has nothing to roll back.
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
@@ -2714,16 +3853,16 @@ async fn schema_apply_pre_staging_failure_leaves_no_residue() {
     assert_eq!(
         person_head.version().version,
         person_head_before,
-        "a detached rewrite never moves the linear HEAD"
+        "a detached schema evolution never moves the linear HEAD"
     );
     assert!(snapshot.dataset("node:Tag").is_none());
-    let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
+    let live_schema = db.schema_source();
     assert!(!live_schema.contains("city: String?"), "{live_schema}");
     assert!(!live_schema.contains("node Tag"), "{live_schema}");
 
     db.apply_schema(&v2_schema)
         .await
-        .expect("the retry rewrites from the pin and reclaims the Tag leftover");
+        .expect("the retry evolves from the pin and reclaims the Tag leftover");
     assert!(db.schema_source().contains("city: String?"));
     assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
@@ -2738,11 +3877,11 @@ async fn metadata_only_schema_apply_before_staging_leaves_no_residue() {
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
     {
         let db = helpers::session(Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap());
-        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("injected failpoint triggered: schema_apply.before_staging_write"),
+                .contains("injected failpoint triggered: graph_publish.before_commit_append"),
             "unexpected error: {err}"
         );
     }
@@ -2772,16 +3911,16 @@ async fn metadata_only_schema_apply_after_staging_discards_on_next_open() {
     let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
     {
         let db = helpers::session(Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap());
-        let _failpoint = catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE.fire_always();
+        let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
         let err = db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("injected failpoint triggered: schema_apply.after_staging_write"),
+                .contains("injected failpoint triggered: graph_publish.before_commit_append"),
             "unexpected error: {err}"
         );
     }
     assert_no_recovery_sidecars(dir.path());
-    assert!(dir.path().join("__schema_state.json.staging").exists());
+    assert_no_staging_files(dir.path());
 
     // Metadata-only applies have no table effect: the staged contract is
     // their only durable state, and its recorded commit never landed.
@@ -2814,14 +3953,17 @@ async fn metadata_only_schema_apply_post_publish_failure_heals_on_next_write() {
         let err = db.apply_schema(&indexed_schema).await.unwrap_err();
         assert!(
             matches!(err, OmniError::RecoveryRequired { .. }),
-            "a failure after publication reports the pending contract installation: {err}"
+            "a failure after publication identifies the committed operation: {err}"
+        );
+        assert_eq!(
+            err.completion_evidence(),
+            Some(CompletionEvidence::Uncertain),
+            "the post-publication failure retains uncertain completion: {err}"
         );
     }
-    assert!(dir.path().join("__schema_state.json.staging").exists());
+    assert_no_staging_files(dir.path());
     assert_no_recovery_sidecars(dir.path());
 
-    // The next write's entry heal finds the recorded commit in lineage,
-    // installs the contract and releases the dead apply's sentinel.
     db.load_jsonl(
         "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n",
         LoadMode::Append,
@@ -2836,65 +3978,200 @@ async fn metadata_only_schema_apply_post_publish_failure_heals_on_next_write() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
     db.apply_schema(&indexed_schema)
         .await
-        .expect("the released sentinel admits the next apply, a no-op here");
+        .expect("the next apply recognizes the published contract");
+
+    let invalid_branch = db.branch_create_from("main", "bad?name").await.unwrap_err();
+    let (invalid_branch, evidence) = invalid_branch.into_completion_evidence();
+    assert_eq!(evidence, Some(CompletionEvidence::BeforeEffect));
+    assert!(
+        matches!(invalid_branch, OmniError::Manifest(ref error)
+            if error.kind == ManifestErrorKind::BadRequest),
+        "the accepted contract leaves an ordinary name refusal: {invalid_branch}"
+    );
+    let invalid = mutate_main(&db, MUTATION_QUERIES, "missing_mutation", &params(&[]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        invalid.completion_evidence(),
+        None,
+        "successful completion does not poison later validation: {invalid}"
+    );
+    assert_no_staging_files(dir.path());
+    assert_no_recovery_sidecars(dir.path());
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
 }
 
 #[tokio::test]
 #[serial]
-async fn schema_apply_retry_reclaims_an_abandoned_add_type_dataset() {
+async fn schema_apply_retry_preserves_the_original_empty_create() {
     let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap().to_string();
-    let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
-
-    {
-        let _failpoint = catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE.fire_always();
-        db.apply_schema(SCHEMA_V2_ADDED_TYPE)
-            .await
-            .expect_err("the pre-staging failpoint must stop the apply after the create");
-    }
-    let company_uri = unregistered_node_table_uri(&db).await;
-    assert!(
-        std::path::Path::new(&company_uri).exists(),
-        "the version-one create is durable before the failure"
-    );
-    drop(db);
-    let recovered = helpers::session(
-        Omnigraph::open(&uri)
-            .await
-            .expect("an unregistered dataset is not recovery state"),
-    );
-    assert!(
+    for changed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = helpers::session(Omnigraph::init(&uri, SCHEMA_V1).await.unwrap());
+        {
+            let _failpoint = catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND.fire_always();
+            db.apply_schema(SCHEMA_V2_ADDED_TYPE).await.unwrap_err();
+        }
+        let company_uri = unregistered_node_table_uri(&db).await;
+        let original = lance::Dataset::open(&company_uri).await.unwrap();
+        let original_uuid = original.read_transaction().await.unwrap().unwrap().uuid;
+        let manifest_path = format!("/{}", original.manifest_location().path);
+        let original_bytes = std::fs::read(&manifest_path).unwrap();
+        drop(db);
+        let recovered = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        let desired = if changed {
+            SCHEMA_V2_ADDED_TYPE.replace(
+                "node Company { name: String @key }",
+                "node Company { slug: String @key }",
+            )
+        } else {
+            SCHEMA_V2_ADDED_TYPE.to_string()
+        };
+        recovered.apply_schema(&desired).await.unwrap();
+        assert_eq!(helpers::count_rows(&recovered, "node:Company").await, 0);
+        assert_eq!(node_table_uri(&recovered, "Company").await, company_uri);
+        let company = lance::Dataset::open(&company_uri).await.unwrap();
+        assert_eq!(company.version().version, 1);
+        assert_eq!(
+            company.read_transaction().await.unwrap().unwrap().uuid,
+            original_uuid
+        );
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
+        let snapshot = helpers::snapshot_main(&recovered).await.unwrap();
+        let entry = snapshot.dataset("node:Company").unwrap();
+        assert_eq!(entry.published_dataset_version, if changed { 2 } else { 1 });
+        assert_eq!(entry.version_metadata.staged_version().is_some(), changed);
+        assert_eq!(entry.version_metadata.last_linear_version(), Some(1));
         recovered
-            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .repair(omnigraph::db::RepairOptions {
+                confirm: true,
+                force: false,
+            })
+            .await
+            .unwrap();
+        recovered.ensure_indices().await.unwrap();
+        let cleaned = recovered.cleanup(keep_one()).await.unwrap();
+        assert!(cleaned.iter().all(|row| row.error.is_none()), "{cleaned:?}");
+        drop(recovered);
+        let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        assert_eq!(reopened.schema_source().as_str(), desired);
+        let data = if changed {
+            r#"{"type":"Company","data":{"slug":"winner"}}"#
+        } else {
+            r#"{"type":"Company","data":{"name":"winner"}}"#
+        };
+        reopened.load_jsonl(data, LoadMode::Append).await.unwrap();
+        assert_eq!(helpers::count_rows(&reopened, "node:Company").await, 1);
+        let export = reopened.export_jsonl("main", &[]).await.unwrap();
+        assert!(export.contains("winner"));
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn schema_apply_added_type_loser_preserves_a_concurrent_process_winner() {
+    let _scenario = FailScenario::setup();
+    for changed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = std::sync::Arc::new(helpers::session(
+            Omnigraph::init(&uri, SCHEMA_V1).await.unwrap(),
+        ));
+        let original_paths = std::fs::read_dir(dir.path().join("nodes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<std::collections::BTreeSet<_>>();
+        let parked =
+            helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT);
+        let loser = std::sync::Arc::clone(&db);
+        let apply = tokio::spawn(async move { loser.apply_schema(SCHEMA_V2_ADDED_TYPE).await });
+        parked.wait_until_reached().await;
+        let winner_source = if changed {
+            SCHEMA_V2_ADDED_TYPE.replace(
+                "node Company { name: String @key }",
+                "node Company { slug: String @key }",
+            )
+        } else {
+            SCHEMA_V2_ADDED_TYPE.to_string()
+        };
+        let child_uri = uri.clone();
+        let child_source = winner_source.clone();
+        tokio::task::spawn_blocking(move || {
+            run_rfc023_external_writer_action(
+                child_uri,
+                LoadMode::Append,
+                child_source,
+                "schema_apply_company",
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let company_path = std::fs::read_dir(dir.path().join("nodes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| !original_paths.contains(path))
+            .unwrap();
+        let company_uri = company_path.to_str().unwrap();
+        let before = lance::Dataset::open(company_uri).await.unwrap();
+        let manifest_path = format!("/{}", before.manifest_location().path);
+        let original_bytes = std::fs::read(&manifest_path).unwrap();
+        let paths_before_loser = std::fs::read_dir(dir.path().join("nodes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<std::collections::BTreeSet<_>>();
+        parked.release();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(15), apply)
             .await
             .unwrap()
-            .dataset("node:Company")
-            .is_none(),
-        "nothing registers the orphan target"
-    );
-    assert!(
-        std::path::Path::new(&company_uri).exists(),
-        "the open leaves the unregistered leftover for the retry"
-    );
-    assert_no_recovery_sidecars(dir.path());
-
-    recovered
-        .apply_schema(SCHEMA_V2_ADDED_TYPE)
-        .await
-        .expect("the retry reclaims the leftover under the sentinel and publishes");
-    assert_eq!(
-        helpers::count_rows(&recovered, "node:Company").await,
-        0,
-        "the retried AddType must be registered and queryable"
-    );
-    assert_eq!(node_table_uri(&recovered, "Company").await, company_uri);
-    let company = lance::Dataset::open(&company_uri).await.unwrap();
-    assert_eq!(
-        company.version().version,
-        1,
-        "the reclaimed path holds the retry's own version-one create"
-    );
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            !parked.timed_out(),
+            "the winner must finish before the loser resumes"
+        );
+        assert!(
+            !matches!(error, OmniError::RecoveryRequired { .. }),
+            "{error}"
+        );
+        assert!(error.is_read_set_changed(), "{error}");
+        let paths_after_loser = std::fs::read_dir(dir.path().join("nodes"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            paths_after_loser, paths_before_loser,
+            "both applies must use the same allocated table path"
+        );
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), original_bytes);
+        assert_eq!(
+            lance::Dataset::open(company_uri)
+                .await
+                .unwrap()
+                .version()
+                .version,
+            1
+        );
+        let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        assert_eq!(reopened.schema_source().as_str(), winner_source);
+        assert_eq!(helpers::count_rows(&reopened, "node:Company").await, 1);
+        assert!(
+            reopened
+                .export_jsonl("main", &[])
+                .await
+                .unwrap()
+                .contains("winner")
+        );
+        let data = if changed {
+            r#"{"type":"Company","data":{"slug":"after"}}"#
+        } else {
+            r#"{"type":"Company","data":{"name":"after"}}"#
+        };
+        reopened.load_jsonl(data, LoadMode::Append).await.unwrap();
+        assert_eq!(helpers::count_rows(&reopened, "node:Company").await, 2);
+    }
 }
 
 #[tokio::test]
@@ -2927,7 +4204,7 @@ edge WorksAt: Human -> Company
         let error = db
             .apply_schema(desired)
             .await
-            .expect_err("rename+rewrite must stop after its detached table effect");
+            .expect_err("rename + key-property rename must stop after its detached table effect");
         assert!(
             error.to_string().contains("schema_apply.post_table_commit"),
             "unexpected partial rename error: {error}"
@@ -2937,8 +4214,8 @@ edge WorksAt: Human -> Company
     assert_no_staging_files(dir.path());
     drop(db);
 
-    // The rewrite is a detached version behind the source alias's pin; the
-    // rename was never published. Reopening finds the graph untouched.
+    // The column rename is a detached Project behind the source alias's pin;
+    // the type rename was never published. Reopening finds the graph untouched.
     let recovered = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let snapshot = recovered
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
@@ -2955,7 +4232,7 @@ edge WorksAt: Human -> Company
     recovered
         .apply_schema(desired)
         .await
-        .expect("the retry publishes the rename and rewrite");
+        .expect("the retry publishes the type and property renames");
     assert_eq!(
         helpers::count_rows(&recovered, "node:Human").await,
         people_before
@@ -3020,7 +4297,7 @@ async fn schema_apply_partial_table_effect_leaves_no_residue() {
         assert_eq!(
             head.version().version,
             heads_before[type_name],
-            "{type_name}: a detached rewrite never moves the linear HEAD"
+            "{type_name}: a detached schema evolution never moves the linear HEAD"
         );
     }
     assert_eq!(
@@ -3046,10 +4323,7 @@ async fn schema_apply_partial_table_effect_leaves_no_residue() {
     );
 }
 
-/// A concurrent publication on main between the staged effects and the
-/// manifest commit: the apply loses its graph-head CAS, which is a plain
-/// refusal before publication. Its detached rewrite and staged contract are
-/// garbage, the winner is untouched, and the retry plans from the winner.
+/// A concurrent graph publication makes the schema writer lose its head CAS.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn schema_apply_loses_the_manifest_cas_to_a_concurrent_publication_without_residue() {
@@ -3063,7 +4337,7 @@ async fn schema_apply_loses_the_manifest_cas_to_a_concurrent_publication_without
     let schema_db = std::sync::Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
     let winner_db = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE);
+        helpers::failpoint::Rendezvous::park_first(&catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND);
     let desired = schema_with_person_city();
     let apply_handle = std::sync::Arc::clone(&schema_db);
     let apply_task = tokio::spawn(async move { apply_handle.apply_schema(&desired).await });
@@ -3129,7 +4403,7 @@ async fn schema_apply_loses_the_manifest_cas_to_a_concurrent_publication_without
             .version()
             .version,
         winner_lance_head,
-        "the abandoned detached rewrite never moved the linear HEAD"
+        "the abandoned detached schema evolution never moved the linear HEAD"
     );
     assert_eq!(
         branch_head_commit_id(dir.path(), "main").await.unwrap(),
@@ -3409,7 +4683,10 @@ node Embedding {
     );
     assert!(
         embedding.pending_indexes.iter().any(|index| {
-            index.property == "name" && index.reason.contains("rebuild-full-text-indexes")
+            index.property == "name"
+                && index
+                    .reason
+                    .contains("omnigraph index rebuild --kind full-text")
         }),
         "the deferred FTS tail must name its explicit rebuild remedy"
     );
@@ -3841,7 +5118,7 @@ async fn branch_merge_pointer_keeps_an_unregistered_target_ref() {
         "the source's write is its own detached pin"
     );
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::FastForward
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
@@ -3949,7 +5226,7 @@ async fn branch_merge_pointer_failure_retries_without_sidecar() {
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::FastForward
     );
     assert!(helpers::recovery::sidecar_operation_ids(dir.path()).is_empty());
@@ -4197,91 +5474,6 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
     );
 }
 
-// ─── MR-668 PR 2a: Omnigraph::init cleanup on partial failure ──────────────
-//
-// `init_with_storage` writes three schema artifacts before invoking
-// `GraphCoordinator::init`. Without cleanup, a failure between any of those
-// steps left orphan files behind, making the URI unusable for a retry of
-// `init` (it would refuse because `_schema.pg` already exists). The tests
-// below pin: on failpoint trigger at the two pre-commit phase boundaries,
-// the three schema files are removed before the error is returned.
-//
-// The third boundary (`init.after_coordinator_init`) sits past the graph's
-// commit point, where the cleanup must not run (issue #495 — deleting the
-// schema files there left a graph that could neither open nor re-init).
-// Its test asserts the graph survives an error at that window.
-//
-// Coverage note: orphan Lance directories after a failure DURING
-// `GraphCoordinator::init` are a known limitation — see the coverage-gap
-// comment in `init_with_storage`.
-
-#[tokio::test]
-#[serial]
-async fn init_failpoint_after_schema_pg_written_cleans_up_schema_file() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let _failpoint = catalog::INIT_AFTER_SCHEMA_PG_WRITTEN.fire_always();
-
-    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
-        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
-        Err(e) => e,
-    };
-    assert!(
-        err.to_string()
-            .contains("injected failpoint triggered: init.after_schema_pg_written"),
-        "got: {err}"
-    );
-
-    // Only `_schema.pg` was written at this phase boundary, but the
-    // cleanup attempts all three — `delete` treats not-found as Ok,
-    // so the other two deletes are no-ops.
-    assert!(
-        !dir.path().join("_schema.pg").exists(),
-        "_schema.pg must be cleaned up after init failure"
-    );
-    assert!(
-        !dir.path().join("__init_claim.json").exists(),
-        "pre-create failure must release the init claim after cleanup"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn init_failpoint_after_schema_contract_written_cleans_up_all_schema_files() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let _failpoint = catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN.fire_always();
-
-    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
-        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
-        Err(e) => e,
-    };
-    assert!(
-        err.to_string()
-            .contains("injected failpoint triggered: init.after_schema_contract_written"),
-        "got: {err}"
-    );
-
-    assert!(
-        !dir.path().join("_schema.pg").exists(),
-        "_schema.pg must be cleaned up"
-    );
-    assert!(
-        !dir.path().join("_schema.ir.json").exists(),
-        "_schema.ir.json must be cleaned up"
-    );
-    assert!(
-        !dir.path().join("__schema_state.json").exists(),
-        "__schema_state.json must be cleaned up"
-    );
-    assert!(
-        !dir.path().join("__init_claim.json").exists(),
-        "pre-create failure must release the init claim after cleanup"
-    );
-}
-
 #[tokio::test]
 #[serial]
 async fn init_failpoint_after_coordinator_init_leaves_completed_store_intact() {
@@ -4312,8 +5504,8 @@ async fn init_failpoint_after_coordinator_init_leaves_completed_store_intact() {
     // files must survive the failed init.
     for schema_file in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
         assert!(
-            dir.path().join(schema_file).exists(),
-            "{schema_file} must survive a post-commit-point init failure"
+            !dir.path().join(schema_file).exists(),
+            "{schema_file} is not part of a row-contract graph"
         );
     }
 
@@ -4365,8 +5557,8 @@ async fn init_failpoint_post_manifest_create_leaves_completed_graph_intact() {
 
     for schema_file in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
         assert!(
-            dir.path().join(schema_file).exists(),
-            "{schema_file} must survive a post-commit-point init failure"
+            !dir.path().join(schema_file).exists(),
+            "{schema_file} is not part of a row-contract graph"
         );
     }
 
@@ -4392,19 +5584,28 @@ async fn init_manifest_create_lost_ack_recovers_exact_genesis() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
+    let prepared = Omnigraph::prepare_graph_create(&uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
     let _lost_ack = catalog::INIT_MANIFEST_CREATE_POST_NATIVE.fire_always();
 
     let db = helpers::session(
-        Omnigraph::init(&uri, helpers::TEST_SCHEMA)
+        Omnigraph::apply_prepared_graph_create(&prepared)
             .await
             .expect("exact genesis probe must recover a lost Create acknowledgement"),
     );
+    assert_eq!(
+        Omnigraph::reconcile_prepared_graph_create(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Created {
+            graph_manifest_version: 1,
+            contract: prepared.desired_contract().clone(),
+        }
+    );
     drop(db);
     for artifact in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
-        assert!(
-            dir.path().join(artifact).exists(),
-            "lost-ack recovery must preserve {artifact}"
-        );
+        assert!(!dir.path().join(artifact).exists());
     }
     assert!(
         !dir.path().join("__init_claim.json").exists(),
@@ -4417,6 +5618,7 @@ async fn init_manifest_create_lost_ack_recovers_exact_genesis() {
     );
     let commits = db.list_commits(None).await.expect("list genesis commit");
     assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].graph_commit_id, prepared.graph_commit_id());
     assert!(commits[0].parent_commit_id.is_none());
     assert!(commits[0].actor_id.is_none());
 
@@ -4437,9 +5639,12 @@ async fn init_table_create_lost_ack_preserves_claim_and_schema() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
+    let prepared = Omnigraph::prepare_graph_create(&uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
     let _lost_ack = catalog::INIT_TABLE_CREATE_POST_NATIVE.fire_always();
 
-    let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
+    let err = match Omnigraph::apply_prepared_graph_create(&prepared).await {
         Ok(_) => panic!("a table Create acknowledgement failure must not return success"),
         Err(err) => err,
     };
@@ -4451,19 +5656,24 @@ async fn init_table_create_lost_ack_preserves_claim_and_schema() {
     else {
         panic!("a physical table Create outcome must remain indeterminate");
     };
-    assert_eq!(error_uri, uri);
+    assert_eq!(error_uri, prepared.root());
+    assert_eq!(
+        Omnigraph::reconcile_prepared_graph_create(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Unknown,
+        "a partial table creation is never absent or safe to replay"
+    );
+    assert!(
+        Omnigraph::apply_prepared_graph_create(&prepared)
+            .await
+            .is_err()
+    );
     assert!(source.to_string().contains("init.table_create_post_native"));
-    for artifact in [
-        "_schema.pg",
-        "_schema.ir.json",
-        "__schema_state.json",
-        "__init_claim.json",
-    ] {
-        assert!(
-            dir.path().join(artifact).exists(),
-            "physical-init ambiguity must preserve {artifact}"
-        );
-    }
+    assert!(
+        dir.path().join("__init_claim.json").exists(),
+        "physical-init ambiguity must preserve __init_claim.json"
+    );
     assert!(
         dir.path().join("nodes").exists() || dir.path().join("edges").exists(),
         "the injected error must follow a real durable table Create"
@@ -4471,6 +5681,174 @@ async fn init_table_create_lost_ack_preserves_claim_and_schema() {
     assert!(
         !dir.path().join("__manifest").exists(),
         "the table-Create test must fail before graph manifest creation"
+    );
+    drop(_lost_ack);
+    let claim_path = dir.path().join("__init_claim.json");
+    let claim = std::fs::read(&claim_path).unwrap();
+    std::fs::write(&claim_path, br#"{"version":2,"prepared_digest":"foreign"}"#).unwrap();
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Unknown,
+        "a foreign init claim is never cleaned up",
+    );
+    assert!(dir.path().join("nodes").exists() || dir.path().join("edges").exists());
+    std::fs::write(&claim_path, claim).unwrap();
+    // Any native manifest is authoritative evidence, including a damaged or
+    // foreign one. The settlement must refuse without deleting birth tables.
+    let versions = dir.path().join("__manifest/_versions");
+    std::fs::create_dir_all(&versions).unwrap();
+    let foreign_manifest = versions.join("1.manifest");
+    std::fs::write(&foreign_manifest, b"foreign publication evidence").unwrap();
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Unknown,
+    );
+    assert!(foreign_manifest.exists());
+    assert!(claim_path.exists());
+    std::fs::remove_file(foreign_manifest).unwrap();
+    let initial_table = std::fs::read_dir(dir.path().join("nodes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let native_manifest = std::fs::read_dir(initial_table.join("_versions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "manifest")
+        })
+        .unwrap();
+    let native_bytes = std::fs::read(&native_manifest).unwrap();
+    std::fs::write(&native_manifest, b"malformed native metadata").unwrap();
+    let malformed = Omnigraph::settle_prepared_graph_create_after_quiescence(&prepared).await;
+    assert!(matches!(
+        malformed,
+        Ok(GraphCreateReconciliation::Unknown) | Err(_)
+    ));
+    assert!(native_manifest.exists());
+    assert!(claim_path.exists());
+    std::fs::write(&native_manifest, native_bytes).unwrap();
+    for artifact in [
+        "tree/foreign/_versions/1.manifest",
+        "_refs/tags/retained",
+        "_indices/foreign",
+    ] {
+        let artifact = dir.path().join("__manifest").join(artifact);
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"foreign retained state").unwrap();
+        assert_eq!(
+            Omnigraph::settle_prepared_graph_create_after_quiescence(&prepared)
+                .await
+                .unwrap(),
+            GraphCreateReconciliation::Unknown
+        );
+        assert!(artifact.exists());
+        assert!(native_manifest.exists());
+        assert!(claim_path.exists());
+        // Remove only this test's foreign fixture before testing owned cleanup.
+        std::fs::remove_dir_all(dir.path().join("__manifest")).unwrap();
+    }
+    // This test owns the only initializer and awaited its error. Production
+    // callers must establish equivalent native/control-I/O quiescence before
+    // using the explicit settlement door.
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Absent,
+    );
+    assert!(!dir.path().join("__init_claim.json").exists());
+    let replacement = Omnigraph::prepare_graph_create(&uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
+    assert_ne!(replacement.graph_commit_id(), prepared.graph_commit_id());
+    Omnigraph::apply_prepared_graph_create(&replacement)
+        .await
+        .unwrap();
+
+    // A native writer advancing even an empty birth table revokes cleanup
+    // authority. This deliberately models an excluded raw writer in the fault
+    // owner; production code has no public raw-table writer.
+    let foreign_dir = tempfile::tempdir().unwrap();
+    let foreign_uri = foreign_dir.path().to_str().unwrap();
+    let foreign = Omnigraph::prepare_graph_create(foreign_uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
+    {
+        let _lost_ack = catalog::INIT_TABLE_CREATE_POST_NATIVE.fire_always();
+        assert!(
+            Omnigraph::apply_prepared_graph_create(&foreign)
+                .await
+                .is_err()
+        );
+    }
+    let table = std::fs::read_dir(foreign_dir.path().join("nodes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut dataset = Dataset::open(table.to_str().unwrap()).await.unwrap();
+    dataset
+        .update_metadata([("foreign", "movement")])
+        .await
+        .unwrap();
+    assert_eq!(dataset.version().version, 2);
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&foreign)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Unknown
+    );
+    assert!(foreign_dir.path().join("__init_claim.json").exists());
+    assert_eq!(
+        Dataset::open(table.to_str().unwrap())
+            .await
+            .unwrap()
+            .version()
+            .version,
+        2
+    );
+    let interrupted_dir = tempfile::tempdir().unwrap();
+    let interrupted_uri = interrupted_dir.path().to_str().unwrap();
+    let interrupted = Omnigraph::prepare_graph_create(interrupted_uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
+    {
+        let _lost_ack = catalog::INIT_TABLE_CREATE_POST_NATIVE.fire_always();
+        assert!(
+            Omnigraph::apply_prepared_graph_create(&interrupted)
+                .await
+                .is_err()
+        );
+    }
+    let table = std::fs::read_dir(interrupted_dir.path().join("nodes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Model a stopped settlement after deleting a previously verified owned
+    // empty table but before its final claim deletion. The claim is authority.
+    std::fs::remove_dir_all(table).unwrap();
+    assert!(interrupted_dir.path().join("__init_claim.json").exists());
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&interrupted)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Absent
+    );
+    assert_eq!(
+        Omnigraph::settle_prepared_graph_create_after_quiescence(&interrupted)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Absent
     );
 }
 
@@ -4480,10 +5858,13 @@ async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_sche
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
+    let prepared = Omnigraph::prepare_graph_create(&uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
     let lost_ack = catalog::INIT_MANIFEST_CREATE_POST_NATIVE.fire_always();
     let probe_failure = catalog::INIT_MANIFEST_CREATE_PROBE.fire_always();
 
-    let err = match Omnigraph::init(&uri, helpers::TEST_SCHEMA).await {
+    let err = match Omnigraph::apply_prepared_graph_create(&prepared).await {
         Ok(_) => panic!("an unavailable exact probe must leave the outcome indeterminate"),
         Err(err) => err,
     };
@@ -4495,27 +5876,30 @@ async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_sche
     else {
         panic!("unknown Create plus failed probe must remain typed");
     };
-    assert_eq!(error_uri, uri);
+    assert_eq!(error_uri, prepared.root());
     assert!(
         source
             .to_string()
             .contains("init.manifest_create_post_native")
     );
     assert!(probe.to_string().contains("init.manifest_create_probe"));
-    for artifact in [
-        "_schema.pg",
-        "_schema.ir.json",
-        "__schema_state.json",
-        "__init_claim.json",
-    ] {
-        assert!(
-            dir.path().join(artifact).exists(),
-            "indeterminate initialization must preserve {artifact}"
-        );
-    }
+    assert!(
+        dir.path().join("__init_claim.json").exists(),
+        "indeterminate initialization must preserve __init_claim.json"
+    );
 
     drop(probe_failure);
     drop(lost_ack);
+    assert_eq!(
+        Omnigraph::reconcile_prepared_graph_create(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Created {
+            graph_manifest_version: 1,
+            contract: prepared.desired_contract().clone(),
+        },
+        "a later observer authenticates the persisted exact birth without replay"
+    );
     let _db = Omnigraph::open(&uri)
         .await
         .expect("clearing the observation fault must reveal the committed graph");
@@ -4525,44 +5909,30 @@ async fn init_manifest_create_unknown_and_probe_failure_preserves_claim_and_sche
     );
 }
 
-// The floor under the schema-files-gone damage state: however a graph loses
-// its schema files while keeping its data and `__manifest`, `open` must
-// diagnose the state by name.
 #[tokio::test]
 #[serial]
-async fn open_missing_schema_pg_reports_schema_files_missing() {
+async fn open_serves_the_row_contract_without_the_schema_files() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     Omnigraph::init(&uri, helpers::TEST_SCHEMA)
         .await
         .expect("init must succeed");
-    std::fs::remove_file(dir.path().join("_schema.pg")).unwrap();
+    for name in ["_schema.pg", "_schema.ir.json", "__schema_state.json"] {
+        assert!(!dir.path().join(name).exists());
+    }
 
-    let err = match Omnigraph::open(&uri).await {
-        Ok(_) => panic!("open must fail without _schema.pg"),
-        Err(e) => e,
-    };
-    let OmniError::Manifest(manifest) = &err else {
-        panic!("missing schema source must remain a typed manifest error");
-    };
-    assert_eq!(manifest.kind, ManifestErrorKind::NotFound);
-    let msg = err.to_string();
-    assert!(
-        msg.contains("missing its schema files") && msg.contains("_schema.pg"),
-        "open must name the missing schema files, got: {msg}"
-    );
+    let db = Omnigraph::open(&uri)
+        .await
+        .expect("open reads the contract from main's __manifest, not the files");
+    assert_eq!(db.schema_source().as_str(), helpers::TEST_SCHEMA);
+    assert!(db.catalog().type_id("Person").is_some());
+    drop(db);
+    let read_only = Omnigraph::open_read_only(&uri)
+        .await
+        .expect("read-only open reads the contract from main's __manifest too");
+    assert_eq!(read_only.schema_source().as_str(), helpers::TEST_SCHEMA);
+    drop(read_only);
 
-    let read_only_err = match Omnigraph::open_read_only(&uri).await {
-        Ok(_) => panic!("read-only open must also fail without _schema.pg"),
-        Err(err) => err,
-    };
-    let OmniError::Manifest(manifest) = read_only_err else {
-        panic!("read-only missing schema source must remain a typed manifest error");
-    };
-    assert_eq!(manifest.kind, ManifestErrorKind::NotFound);
-
-    std::fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
-    std::fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
     let reinit = match Omnigraph::init(&uri, "node Replacement { key: String @key }\n").await {
         Ok(_) => panic!("strict init must not rebind a readable manifest with missing schema"),
         Err(err) => err,
@@ -4594,11 +5964,15 @@ async fn init_crash_after_manifest_create_leaves_openable_store() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
+    let prepared = Omnigraph::prepare_graph_create(&uri, helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
 
     let crash = catalog::INIT_POST_MANIFEST_CREATE.panic_at();
-    let cloned = uri.clone();
+    let encoded = serde_json::to_vec(&prepared).unwrap();
+    let cloned: PreparedGraphCreate = serde_json::from_slice(&encoded).unwrap();
     let died = tokio::spawn(async move {
-        Omnigraph::init(&cloned, helpers::TEST_SCHEMA)
+        Omnigraph::apply_prepared_graph_create(&cloned)
             .await
             .map(|_| ())
     })
@@ -4609,6 +5983,17 @@ async fn init_crash_after_manifest_create_leaves_openable_store() {
             .is_panic(),
         "the injected failpoint action is a panic"
     );
+
+    assert_eq!(
+        Omnigraph::reconcile_prepared_graph_create(&prepared)
+            .await
+            .unwrap(),
+        GraphCreateReconciliation::Created {
+            graph_manifest_version: 1,
+            contract: prepared.desired_contract().clone(),
+        }
+    );
+    assert!(dir.path().join("__init_claim.json").exists());
 
     // The Create commit carried the stamp, so the store is fully born: it
     // opens without the ancient-version misdiagnosis and serves a write and
@@ -4627,37 +6012,6 @@ async fn init_crash_after_manifest_create_leaves_openable_store() {
     .await
     .expect("store must accept writes after the crash");
     assert_eq!(count_rows(&db, "node:Person").await, 1);
-}
-
-#[tokio::test]
-#[serial]
-async fn init_failpoint_returns_original_error_not_cleanup_error() {
-    // A delete failure is outcome-unknown: retain the claim so a delayed
-    // delete cannot race a later initializer, but still return the original
-    // pre-physical init error rather than masking it with cleanup failure.
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let _failpoint = catalog::INIT_AFTER_SCHEMA_PG_WRITTEN.fire_always();
-    let _delete_failure = catalog::INIT_SCHEMA_CLEANUP_DELETE.fire_always();
-
-    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
-        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
-        Err(e) => e,
-    };
-    let msg = err.to_string();
-    assert!(
-        msg.contains("init.after_schema_pg_written"),
-        "init error must surface the failpoint cause, got: {msg}"
-    );
-    assert!(
-        dir.path().join("_schema.pg").exists(),
-        "the injected delete failure must leave the owned schema artifact"
-    );
-    assert!(
-        dir.path().join("__init_claim.json").exists(),
-        "an indeterminate schema delete must retain the init claim"
-    );
 }
 
 // Local roots probe create-if-absent on init and on read-write open (issue
@@ -5369,14 +6723,25 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
         "the target's write keeps main's registration: branch writes never fork"
     );
     let old_target_ref = helpers::graph_native_ref(&uri, "target").await;
+    let target_head_before = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let source_head_before = branch_head_commit_id(dir.path(), "source").await.unwrap();
 
     let merge_rv =
         helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_POST_AUTHORITY_CAPTURE);
+    let return_rv = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_MERGE_PRE_RETURN);
     let control_rv = helpers::failpoint::Rendezvous::park_first(&catalog::BRANCH_CONTROL_PRE_GATES);
 
     let merge_handle = std::sync::Arc::clone(&merge_db);
-    let merge_task =
-        tokio::spawn(async move { merge_handle.branch_merge("source", "target").await });
+    // Hold blocks its crossing thread. Keep A off B's runtime so releasing
+    // the branch gate cannot queue B in A's non-stealable Tokio LIFO slot
+    // immediately before A parks at the return seam.
+    let merge_task = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(merge_handle.branch_merge("source", "target"))
+    });
     merge_rv.wait_until_reached().await;
 
     let control_handle = std::sync::Arc::clone(&control_db);
@@ -5416,9 +6781,40 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
         "the target ref incarnation changed while merge authority was parked"
     );
 
-    let outcome = merge_task.await.unwrap().unwrap();
-    assert_eq!(outcome, omnigraph::db::MergeOutcome::Merged);
-    control_task.await.unwrap().unwrap();
+    // The operation result survives later control work: once publication has
+    // finished, the return boundary must not retain the branch write gates.
+    return_rv.wait_until_reached().await;
+    let control_result =
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut control_task).await;
+    let merge_still_held = !merge_task.is_finished();
+    return_rv.release();
+    let outcome = merge_task.join().unwrap().unwrap();
+    control_result
+        .expect("target replacement must finish while the merge receipt is held")
+        .unwrap()
+        .unwrap();
+    assert!(
+        merge_still_held,
+        "the merge must still be held before returning its receipt"
+    );
+    assert_eq!(outcome.outcome, omnigraph::db::MergeOutcome::Merged);
+    let commit = outcome
+        .commit
+        .expect("the original merge published a commit");
+    assert_eq!(commit.graph_branch.as_deref(), Some("target"));
+    assert_eq!(
+        commit.parent_commit_id.as_deref(),
+        Some(target_head_before.as_str())
+    );
+    assert_eq!(
+        commit.merged_parent_commit_id.as_deref(),
+        Some(source_head_before.as_str())
+    );
+    assert_ne!(
+        commit.graph_commit_id,
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        "the receipt must not identify the replacement branch's later writer"
+    );
 
     let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(
@@ -5457,6 +6853,25 @@ async fn branch_merge_fences_target_delete_recreate_aba() {
         (&old_entry.dataset_path, old_entry.published_dataset_version),
         "the regression fixture must exercise same-path/same-version ABA"
     );
+
+    // A fault at the same return boundary can lose an already-published
+    // result. It must not masquerade as an ordinary pre-effect refusal.
+    drop(return_rv);
+    let before_lost_receipt = branch_head_commit_id(dir.path(), "target").await.unwrap();
+    let lost = {
+        let _failure = catalog::BRANCH_MERGE_PRE_RETURN.fail_once_at(1);
+        reopened.branch_merge("source", "target").await.unwrap_err()
+    };
+    assert_eq!(
+        lost.completion_evidence(),
+        Some(CompletionEvidence::Uncertain),
+        "post-publication receipt failure must retain uncertainty: {lost}"
+    );
+    assert_ne!(
+        branch_head_commit_id(dir.path(), "target").await.unwrap(),
+        before_lost_receipt,
+        "the injected receipt failure must follow a real publication"
+    );
 }
 
 /// `sync_branch` replaces a handle's active coordinator. It must join the same
@@ -5491,7 +6906,7 @@ async fn branch_merge_fences_concurrent_sync_on_same_handle() {
     );
 
     assert_eq!(
-        merge_task.await.unwrap().unwrap(),
+        merge_task.await.unwrap().unwrap().outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     sync_task.await.unwrap().unwrap();
@@ -5603,7 +7018,7 @@ async fn branch_merge_source_advance_keeps_captured_source_parent() {
     merge_rv.release();
 
     assert_eq!(
-        merge_task.await.unwrap().unwrap(),
+        merge_task.await.unwrap().unwrap().outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
@@ -5689,7 +7104,10 @@ async fn branch_merge_captured_source_survives_concurrent_cleanup() {
     eprintln!(
         "captured pin {captured}: present after cleanup={captured_survived}; merge={merged:?}"
     );
-    assert_eq!(merged.unwrap(), omnigraph::db::MergeOutcome::FastForward);
+    assert_eq!(
+        merged.unwrap().outcome,
+        omnigraph::db::MergeOutcome::FastForward
+    );
 
     let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let published = pinned_version(&reader, "target", "node:Person").await;
@@ -5917,7 +7335,7 @@ async fn write_detached_person_pin(db: &Session, branch: &str, name: &str) {
 async fn ensure_indices_failure_before_publish_leaves_no_residue() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let db = graph_with_unbuilt_indexes(&dir).await;
+    let db = graph_with_unbuilt_indexes(dir.path().to_str().unwrap()).await;
     let before = person_head_and_published(&db, "main").await;
     let version = helpers::version_main(&db).await.unwrap();
     {
@@ -6138,6 +7556,154 @@ async fn assert_optimize_detached_pin_survives_next_write(uri: &str) {
     assert_person_pin_detached(&db, "main", head_before).await;
 }
 
+/// A Blob put and a Blob clear whose publication acknowledgement is lost are
+/// published exactly once: the caller's retry with its old validator is
+/// refused, the cell reads the same from the writer's handle and a fresh
+/// one, and the same handle writes again once the fault stops.
+#[tokio::test]
+#[serial]
+async fn blob_put_and_clear_publish_once_through_a_lost_acknowledgement() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = seed_blob_write_graph(&uri).await;
+    let original = blob_etag(&db, "main", readme("content")).await;
+    let before = main_commit_count(&db).await;
+
+    {
+        let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
+        let error = db
+            .put_blob_at_as(
+                "main",
+                readme("content"),
+                Bytes::from_static(b"Published"),
+                Some(BlobPrecondition::Tags(vec![original.clone()])),
+                None,
+            )
+            .await
+            .expect_err("the acknowledgement is lost after publication");
+        assert!(
+            error
+                .to_string()
+                .contains("graph_publish.after_manifest_commit"),
+            "the publication boundary must be reached: {error}"
+        );
+    }
+    assert_eq!(
+        main_commit_count(&db).await,
+        before + 1,
+        "published exactly once"
+    );
+    let published = blob_etag(&db, "main", readme("content")).await;
+    let fresh = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        blob_etag(&fresh, "main", readme("content")).await,
+        published
+    );
+    for handle in [&db, &fresh] {
+        assert_eq!(
+            read_managed_blob_bytes(handle, ReadTarget::branch("main"), readme("content")).await,
+            b"Published"
+        );
+    }
+    let retry = db
+        .put_blob_at_as(
+            "main",
+            readme("content"),
+            Bytes::from_static(b"Published"),
+            Some(BlobPrecondition::Tags(vec![original])),
+            None,
+        )
+        .await
+        .expect_err("a retry with the old validator finds the published value");
+    assert!(
+        matches!(&retry, OmniError::BlobWritePreconditionFailed { current_etag: Some(current) }
+            if current == published.as_str()),
+        "{retry:?}"
+    );
+    assert_eq!(
+        main_commit_count(&db).await,
+        before + 1,
+        "the retry published nothing"
+    );
+
+    {
+        let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
+        db.clear_blob_at_as(
+            "main",
+            readme("content"),
+            Some(BlobPrecondition::Tags(vec![published.clone()])),
+            None,
+        )
+        .await
+        .expect_err("the clear's acknowledgement is lost after publication");
+    }
+    assert_eq!(
+        main_commit_count(&db).await,
+        before + 2,
+        "the clear published exactly once"
+    );
+    let fresh = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    for handle in [&db, &fresh] {
+        let error = handle
+            .read_blob_at(ReadTarget::branch("main"), readme("content"))
+            .await
+            .expect_err("a cleared cell has no value and no validator");
+        assert!(
+            matches!(&error, OmniError::Manifest(manifest) if manifest.kind == ManifestErrorKind::NotFound),
+            "{error:?}"
+        );
+    }
+    let retry = db
+        .put_blob_at_as(
+            "main",
+            readme("content"),
+            Bytes::from_static(b"again"),
+            Some(BlobPrecondition::Tags(vec![published])),
+            None,
+        )
+        .await
+        .expect_err("the cleared cell rejects its old validator");
+    assert!(
+        matches!(
+            &retry,
+            OmniError::BlobWritePreconditionFailed { current_etag: None }
+        ),
+        "{retry:?}"
+    );
+    assert!(matches!(
+        db.clear_blob_at_as("main", readme("content"), None, None)
+            .await
+            .unwrap(),
+        BlobWriteOutcome::Null { commit: None }
+    ));
+    assert_eq!(
+        main_commit_count(&db).await,
+        before + 2,
+        "no duplicate clear"
+    );
+
+    let BlobWriteOutcome::Managed { etag, .. } = db
+        .put_blob_at_as(
+            "main",
+            readme("content"),
+            Bytes::from_static(b"Next"),
+            None,
+            None,
+        )
+        .await
+        .expect("the same handle writes again once the fault stops")
+    else {
+        panic!("a put stores a managed value");
+    };
+    assert_eq!(etag, blob_etag(&fresh, "main", readme("content")).await);
+    assert_eq!(
+        read_managed_blob_bytes(&fresh, ReadTarget::branch("main"), readme("preview")).await,
+        b"P0",
+        "every write carried the preview"
+    );
+}
+
 /// Exercise both shared backend contracts locally even without configured cloud fixtures.
 #[tokio::test]
 #[serial]
@@ -6222,6 +7788,21 @@ async fn azure_optimize_detached_pin_survives_next_write() {
     assert_optimize_detached_pin_survives_next_write(&uri).await;
     delete_azure_graph(&uri).await;
 }
+/// Atomic schema publication on configured Azure/Azurite, followed by fixture cleanup.
+#[tokio::test]
+#[serial]
+async fn azure_schema_apply_post_commit_failure_leaves_readable_contract() {
+    let Some(uri) = azure_test_graph_uri("schema-apply-post-commit") else {
+        eprintln!(
+            "skipping Azure atomic schema publication: OMNIGRAPH_AZURE_TEST_CONTAINER is not set"
+        );
+        return;
+    };
+    let _scenario = FailScenario::setup();
+    assert_schema_apply_post_commit_failure_leaves_readable_contract(&uri).await;
+    delete_azure_graph(&uri).await;
+}
+
 /// Person HEAD and published version on `branch`, with the linear HEAD read
 /// from the ref the entry names.
 async fn person_versions(db: &Omnigraph, branch: &str) -> (u64, u64) {
@@ -6426,7 +8007,8 @@ async fn assert_merge_onto_main_is_a_pointer_switch(seam: &'static omnigraph::se
         assert_eq!(
             with_merge_write_probes(probes.clone(), db.branch_merge("feature", "main"))
                 .await
-                .unwrap(),
+                .unwrap()
+                .outcome,
             omnigraph::db::MergeOutcome::FastForward,
             "a merge onto main never reaches {}",
             seam.name()
@@ -6567,7 +8149,7 @@ async fn assert_multichunk_merge_onto_main_is_a_pointer_switch(
     {
         let _fp = seam.fire_always();
         assert_eq!(
-            db.branch_merge("feature", "main").await.unwrap(),
+            db.branch_merge("feature", "main").await.unwrap().outcome,
             omnigraph::db::MergeOutcome::FastForward,
             "a merge onto main never reaches {}",
             seam.name()
@@ -6789,7 +8371,7 @@ async fn branch_merge_into_a_named_target_stages_on_the_inherited_table() {
     let inherited_pin = pinned_version(&db, "target", "node:Person").await;
     let (head_before, _) = person_versions(&db, "target").await;
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::Merged,
         "a merge into a named target whose target advanced is a three-way merge"
     );
@@ -6843,7 +8425,7 @@ async fn branch_merge_pointer_adoption_carries_the_source_pin() {
     let source_pin = pinned_version(&db, "source", "node:Person").await;
 
     assert_eq!(
-        db.branch_merge("source", "target").await.unwrap(),
+        db.branch_merge("source", "target").await.unwrap().outcome,
         omnigraph::db::MergeOutcome::FastForward
     );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
@@ -6941,14 +8523,14 @@ async fn rfc_0067_detached_pin_diff_keeps_the_acknowledged_insert() {
             .contains(&"detached-diff".to_string())
     );
     let after = helpers::snapshot_id(&db, "main").await.unwrap();
-    let changes = db
-        .diff_between(
-            ReadTarget::Snapshot(before),
-            ReadTarget::Snapshot(after),
-            &omnigraph::changes::ChangeFilter::default(),
-        )
-        .await
-        .unwrap();
+    let changes = helpers::graph_diff(
+        &db,
+        before.as_str(),
+        after.as_str(),
+        &omnigraph::changes::ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         changes.stats.inserts, 1,
         "acknowledged insert absent from public diff: {changes:?}"
@@ -6979,14 +8561,14 @@ async fn rfc_0067_foreign_linear_commit_diff_keeps_the_acknowledged_insert() {
         collect_column_strings(&read_table(&db, "node:Person").await, "name")
             .contains(&"blocked-diff-second".to_string())
     );
-    let changes = db
-        .diff_between(
-            ReadTarget::Snapshot(before),
-            ReadTarget::Snapshot(after),
-            &omnigraph::changes::ChangeFilter::default(),
-        )
-        .await
-        .unwrap();
+    let changes = helpers::graph_diff(
+        &db,
+        before.as_str(),
+        after.as_str(),
+        &omnigraph::changes::ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         changes.stats.inserts, 1,
         "acknowledged chain insert absent from public diff: {changes:?}"
@@ -7366,15 +8948,34 @@ async fn rfc_0067_unavailable_ack_readback_is_indeterminate_without_replay() {
     };
     let error = outcome.unwrap_err().to_string();
     assert!(error.contains("outcome is in doubt"), "{error}");
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "after_indeterminate")], &[("$age", 43)]),
+    )
+    .await
+    .expect("same handle continues before any read refresh");
     let fresh = Omnigraph::open_read_only(dir.path().to_str().unwrap())
         .await
         .unwrap();
     assert_eq!(
         count_rows(&fresh, "node:Person").await,
-        before + 1,
+        before + 2,
         "no automatic replay"
     );
-    assert_eq!(count_rows(&db, "node:Person").await, before + 1);
+    let people = read_table(&fresh, "node:Person").await;
+    let names = collect_column_strings(&people, "name");
+    for expected in ["indeterminate", "after_indeterminate"] {
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == expected)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(count_rows(&db, "node:Person").await, before + 2);
 }
 
 /// GENERALIZED LIVENESS, persistent pre-publish faults: the same live handle
@@ -7498,9 +9099,9 @@ async fn live_handle_keeps_writing_after_persistent_ack_loss_stops() {
 /// family the failure-window matrix does not already cover with its
 /// same-handle actor, fail the family's driver once at the seam on a live
 /// handle, then prove the SAME handle's next ordinary write succeeds —
-/// without reopening. The driver's own outcome is recorded, not asserted
-/// (some seams absorb, some drivers may not reach an armed seam); the
-/// liveness insert is the contract.
+/// without reopening. Most driver outcomes are recorded (some seams absorb,
+/// some drivers may not reach an armed seam); the post-archive deletion row
+/// also owns its completion evidence. The liveness insert is the common contract.
 #[tokio::test]
 #[serial]
 async fn live_handle_writes_after_every_write_family_seam_failure() {
@@ -7562,7 +9163,7 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
             Driver::Merge,
         ),
         ("schema_apply.post_lock_pre_effect", Driver::SchemaApply),
-        ("schema_apply.before_staging_write", Driver::SchemaApply),
+        ("graph_publish.before_commit_append", Driver::SchemaApply),
         ("schema_apply.after_manifest_commit", Driver::SchemaApply),
         (
             "ensure_indices.post_stage_pre_commit_btree",
@@ -7647,9 +9248,19 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
             Driver::BranchDelete => {
                 let name = format!("lv_d{index}");
                 db.branch_create(&name).await.expect("delete-row setup");
-                db.branch_delete(&name)
-                    .await
-                    .map_err(|error| error.to_string())
+                let commits_before = db.list_commits(Some("main")).await.unwrap();
+                let result = db.branch_delete(&name).await;
+                if *seam == "branch_delete.post_archive" {
+                    let error = result.as_ref().expect_err("post-archive fault is reached");
+                    assert_eq!(
+                        error.completion_evidence(),
+                        Some(CompletionEvidence::Uncertain),
+                        "retirement published before completion failed: {error}"
+                    );
+                    assert!(!db.branch_list().await.unwrap().contains(&name));
+                    assert_eq!(db.list_commits(Some("main")).await.unwrap(), commits_before);
+                }
+                result.map_err(|error| error.to_string())
             }
             Driver::BranchMutate => {
                 let name = format!("lv_m{index}");
@@ -7795,16 +9406,16 @@ async fn rfc_0067_merge_diff_keeps_every_chunk() {
     }
     let after = helpers::snapshot_id(&db, "main").await.unwrap();
     let after_rows = count_rows(&db, "node:Person").await;
-    let changes = db
-        .diff_between(
-            ReadTarget::Snapshot(before),
-            ReadTarget::Snapshot(after),
-            &omnigraph::changes::ChangeFilter::default(),
-        )
-        .await
-        .unwrap();
+    let changes = helpers::graph_diff(
+        &db,
+        before.as_str(),
+        after.as_str(),
+        &omnigraph::changes::ChangeFeedScope::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        changes.stats.inserts as usize,
+        changes.stats.inserts,
         after_rows - before_rows,
         "diff omitted acknowledged merge chunks: {} inserts for {} added rows",
         changes.stats.inserts,
@@ -7845,12 +9456,12 @@ async fn rfc_0067_cleanup_window_keeps_version_gc_on_a_written_table() {
         .unwrap();
     }
     let person_uri = node_table_uri(&db, "Person").await;
-    let raw = helpers::open_dataset_head_exact(&person_uri, None).await;
-    let detached_before = raw.list_detached_manifests().await.unwrap().len();
+    let detached_before = detached_versions(&person_uri).await;
     assert!(
-        detached_before >= 3,
+        detached_before.len() >= 3,
         "every write leaves its detached version"
     );
+    let pins = pins_in_history(&db, "main", "node:Person").await;
 
     for pass in 0..2 {
         let stats = db
@@ -7870,9 +9481,12 @@ async fn rfc_0067_cleanup_window_keeps_version_gc_on_a_written_table() {
         );
     }
 
-    let detached_after = raw.list_detached_manifests().await.unwrap().len();
+    // Every pinned version is a young proven copy and stays; only the first
+    // load's effect beneath its full-text declaration, a link no commit pins,
+    // is reclaimed.
     assert_eq!(
-        detached_after, detached_before,
+        detached_versions(&person_uri).await,
+        &detached_before & &pins,
         "young proven copies are kept, not reaped"
     );
     let fresh = Omnigraph::open_read_only(dir.path().to_str().unwrap())
@@ -8124,52 +9738,65 @@ async fn collector_keeps_pins_published_by_a_late_branch_in_another_process() {
     }
 }
 
-/// Revalidation refuses a cut whose later branch imports a publication that
-/// the earlier branch capture could not observe.
+/// Revalidation refuses a cut whose later branch imports an unseen publication
+/// or disappears after listing. In either case cleanup must report a retryable
+/// conflict before deleting anything, and a fresh attempt must converge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn collector_refuses_mixed_branch_captures_before_deleting() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-    db.branch_create("collector-existing").await.unwrap();
-    let person_uri = node_table_uri(&db, "Person").await;
-    let expected_rows = count_rows(&db, "node:Person").await + 1;
-    let cleaner = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
-    let (guard, hold) = catalog::CLEANUP_COLLECTOR_MID_BRANCH_READ.hold();
-    let cleanup = tokio::spawn(async move { cleaner.cleanup(keep_one()).await });
-    let reached = hold.clone();
-    tokio::task::spawn_blocking(move || reached.wait_until_reached())
+    for action in ["collector_mixed", "collector_retired"] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        db.branch_create("collector-existing").await.unwrap();
+        let person_uri = node_table_uri(&db, "Person").await;
+        let before = detached_versions(&person_uri).await;
+        let expected_rows =
+            count_rows(&db, "node:Person").await + usize::from(action == "collector_mixed");
+        let cleaner = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
+        let (guard, hold) = catalog::CLEANUP_COLLECTOR_MID_BRANCH_READ.hold();
+        let cleanup = tokio::spawn(async move { cleaner.cleanup(keep_one()).await });
+        let reached = hold.clone();
+        tokio::task::spawn_blocking(move || reached.wait_until_reached())
+            .await
+            .unwrap();
+        let uri = db.uri().to_string();
+        let child = tokio::task::spawn_blocking(move || {
+            run_rfc023_external_writer_action(
+                uri,
+                LoadMode::Append,
+                r#"{"type":"Person","data":{"name":"collector-main","age":40}}"#.to_string(),
+                action,
+            )
+        })
         .await
         .unwrap();
-    let uri = db.uri().to_string();
-    let child = tokio::task::spawn_blocking(move || {
-        run_rfc023_external_writer_action(
-            uri,
-            LoadMode::Append,
-            r#"{"type":"Person","data":{"name":"collector-main","age":40}}"#.to_string(),
-            "collector_mixed",
-        )
-    })
-    .await
-    .unwrap();
-    hold.release();
-    let result = cleanup.await.unwrap();
-    drop(guard);
-    child.unwrap();
-    assert!(
-        !hold.timed_out(),
-        "the child finished before releasing cleanup"
-    );
-    let error = result.expect_err("a mixed capture must fail before sweeping");
-    assert!(error.to_string().contains("collector branch"), "{error}");
-    let reader = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
-    let pin = pinned_version(&reader, "main", "node:Person").await;
-    assert!(detached_versions(&person_uri).await.contains(&pin));
-    assert_eq!(count_rows(&reader, "node:Person").await, expected_rows);
-    let retry = reader.cleanup(keep_one()).await.unwrap();
-    assert!(retry.iter().all(|row| row.error.is_none()), "{retry:?}");
-    assert!(detached_versions(&person_uri).await.contains(&pin));
+        hold.release();
+        let result = cleanup.await.unwrap();
+        drop(guard);
+        child.unwrap();
+        assert!(
+            !hold.timed_out(),
+            "the child finished before releasing cleanup"
+        );
+        let error = result.expect_err("a mixed capture must fail before sweeping");
+        assert!(
+            matches!(error, OmniError::Manifest(ref details) if details.kind == ManifestErrorKind::Conflict),
+            "{action}: {error:?}"
+        );
+        assert!(error.to_string().contains("collector branch"), "{error}");
+        assert!(
+            before.is_subset(&detached_versions(&person_uri).await),
+            "{action}: a refused capture must not delete any table version"
+        );
+        let reader = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
+        let pin = pinned_version(&reader, "main", "node:Person").await;
+        assert!(detached_versions(&person_uri).await.contains(&pin));
+        assert_eq!(count_rows(&reader, "node:Person").await, expected_rows);
+        let retry = reader.cleanup(keep_one()).await.unwrap();
+        assert!(retry.iter().all(|row| row.error.is_none()), "{retry:?}");
+        assert!(detached_versions(&person_uri).await.contains(&pin));
+    }
 }
 
 /// Detached-only collector, fixture 7: a pass interrupted inside its sweep
@@ -8207,8 +9834,9 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
         .unwrap();
     assert!(row.error.is_none(), "{row:?}");
     assert_eq!(
-        row.manifests_removed, 2,
-        "the retry sweeps what the first pass left of the two links and main's pruned base pin: {row:?}"
+        row.manifests_removed, 3,
+        "the retry sweeps what the first pass left of the two links, main's pruned base pin and the \
+         base load's effect beneath its full-text declaration: {row:?}"
     );
     let remaining = detached_versions(&person_uri).await;
     for link in &chain[..2] {
@@ -8220,6 +9848,474 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
     assert!(plan.errors.is_empty(), "{:?}", plan.errors);
     assert!(plan.would_remove().is_empty(), "{:?}", plan.would_remove());
     assert_eq!(plan.roots, std::collections::BTreeSet::from([chain[2]]));
+}
+
+/// Whether an object lies under `path` of the table at `table_uri`, on any
+/// backend: an index directory exists while it holds a file.
+async fn table_path_exists(db: &Omnigraph, table_uri: &str, path: &str) -> bool {
+    omnigraph_storage::storage_for_uri(db.uri())
+        .unwrap()
+        .exists(&omnigraph_storage::join_uri(table_uri, path))
+        .await
+        .unwrap()
+}
+
+/// A pass stopped before the files of its sweep deletes nothing, and the next
+/// pass plans the same sweep. One stopped after its file deletions and before
+/// the manifest that names them leaves that manifest with an index directory
+/// already gone. The next pass plans the same manifest again; deleting a
+/// directory an earlier pass removed is already done, so it removes the
+/// manifest and converges.
+async fn assert_collector_retry_treats_an_index_directory_an_interrupted_pass_removed_as_swept(
+    uri: &str,
+) {
+    let db = helpers::init_and_load_at(uri, helpers::TEST_SCHEMA).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let before = detached_versions(&person_uri).await;
+    insert_person(&db, "main", "swept-first").await;
+    let first = staged_since(&person_uri, &before).await;
+    insert_person(&db, "main", "swept-second").await;
+    let rows = count_rows(&db, "node:Person").await;
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.sweep.contains(&first), "{:?}", plan.sweep);
+    let swept_indices: Vec<_> = plan
+        .sweep_paths
+        .iter()
+        .filter(|path| path.starts_with("_indices/"))
+        .cloned()
+        .collect();
+    assert!(
+        !swept_indices.is_empty(),
+        "the fixture must sweep an index directory only the pruned pin names: {:?}",
+        plan.sweep_paths
+    );
+
+    let stats = {
+        let _fp = catalog::CLEANUP_SWEEP_PRE_FILE_DELETE.fire_always();
+        db.cleanup(keep_one()).await.unwrap()
+    };
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(
+        row.error
+            .as_deref()
+            .is_some_and(|error| error.contains("cleanup.sweep_pre_file_delete")),
+        "the interrupted pass reports the window: {row:?}"
+    );
+    assert_eq!(
+        (row.manifests_removed, row.bytes_removed),
+        (0, 0),
+        "{row:?}"
+    );
+    for path in &swept_indices {
+        assert!(
+            table_path_exists(&db, &person_uri, path).await,
+            "the pass stopped before deleting {path}"
+        );
+    }
+    let replanned = db.cleanup_plan(keep_one()).await.unwrap();
+    let replanned = main_plan(&replanned, "node:Person");
+    assert_eq!(
+        (replanned.would_remove(), &replanned.sweep_paths),
+        (plan.would_remove(), &plan.sweep_paths),
+        "a pass stopped before its files leaves the next pass the same sweep"
+    );
+
+    let stats = {
+        let _fp = catalog::CLEANUP_SWEEP_PRE_MANIFEST_DELETE.fire_always();
+        db.cleanup(keep_one()).await.unwrap()
+    };
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(
+        row.error
+            .as_deref()
+            .is_some_and(|error| error.contains("cleanup.sweep_pre_manifest_delete")),
+        "the interrupted pass reports the window: {row:?}"
+    );
+    assert_eq!(row.manifests_removed, 0, "{row:?}");
+    assert!(detached_versions(&person_uri).await.contains(&first));
+    for path in &swept_indices {
+        assert!(
+            !table_path_exists(&db, &person_uri, path).await,
+            "the interrupted pass deleted the files before stopping: {path}"
+        );
+    }
+
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(row.manifests_removed >= 1, "{row:?}");
+    assert!(
+        !detached_versions(&person_uri).await.contains(&first),
+        "the retry removes the half-swept manifest"
+    );
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    for plan in &report.tables {
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        assert!(
+            plan.would_remove().is_empty(),
+            "{}: {:?}",
+            plan.location,
+            plan.would_remove()
+        );
+    }
+    assert_eq!(
+        db.cleanup_plan_missing_paths(&report).await.unwrap(),
+        Vec::<(String, String)>::new(),
+        "every retained root's paths still exist"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, rows);
+}
+
+#[tokio::test]
+#[serial]
+async fn collector_retry_treats_an_index_directory_an_interrupted_pass_removed_as_swept() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    assert_collector_retry_treats_an_index_directory_an_interrupted_pass_removed_as_swept(
+        dir.path().to_str().unwrap(),
+    )
+    .await;
+}
+
+/// A pass stopped between two manifests of its sweep has deleted every file
+/// the sweep frees, index directories included, and its first manifest only.
+/// The manifests it left still name those directories, so the next pass plans
+/// them again; it finds them gone, removes the rest and converges.
+async fn assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep(
+    uri: &str,
+    scoped: bool,
+) {
+    let db = helpers::init_and_load_at(uri, helpers::TEST_SCHEMA).await;
+    // Serving scopes file I/O through Lance's file-object-store provider,
+    // whose list/delete path also removes the directory and can return NotFound.
+    let db = if scoped {
+        helpers::session(
+            Omnigraph::open_with_io_scope(uri, omnigraph::storage::StorageIoScope::new())
+                .await
+                .unwrap(),
+        )
+    } else {
+        db
+    };
+    let person_uri = node_table_uri(&db, "Person").await;
+    insert_person(&db, "main", "between-first").await;
+    insert_person(&db, "main", "between-second").await;
+    let rows = count_rows(&db, "node:Person").await;
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    let swept = plan.would_remove();
+    assert!(
+        swept.len() >= 2,
+        "the fixture must sweep a manifest after its first: {swept:?}"
+    );
+    let swept_indices: Vec<_> = plan
+        .sweep_paths
+        .iter()
+        .filter(|path| path.starts_with("_indices/"))
+        .cloned()
+        .collect();
+    assert!(
+        !swept_indices.is_empty(),
+        "the fixture must sweep an index directory: {:?}",
+        plan.sweep_paths
+    );
+
+    let stats = {
+        let _fp = catalog::CLEANUP_SWEEP_BETWEEN_MANIFESTS.fire_always();
+        db.cleanup(keep_one()).await.unwrap()
+    };
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(
+        row.error
+            .as_deref()
+            .is_some_and(|error| error.contains("cleanup.sweep_between_manifests")),
+        "the interrupted pass reports the window: {row:?}"
+    );
+    assert_eq!(
+        row.manifests_removed, 1,
+        "the pass stopped after its first manifest: {row:?}"
+    );
+    let remaining = detached_versions(&person_uri).await;
+    assert!(!remaining.contains(&swept[0]), "{remaining:?}");
+    for version in &swept[1..] {
+        assert!(
+            remaining.contains(version),
+            "{version} outlives the interrupted pass: {remaining:?}"
+        );
+    }
+    for path in &swept_indices {
+        assert!(
+            !table_path_exists(&db, &person_uri, path).await,
+            "the interrupted pass deleted the files before stopping: {path}"
+        );
+    }
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert_eq!(
+        plan.would_remove()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        swept[1..].iter().copied().collect(),
+        "the next pass plans the manifests the interrupted one left"
+    );
+    assert!(
+        swept_indices
+            .iter()
+            .any(|path| plan.sweep_paths.contains(path)),
+        "the next pass deletes again an index directory the interrupted one removed: {:?}",
+        plan.sweep_paths
+    );
+
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert_eq!(row.manifests_removed as usize, swept.len() - 1, "{row:?}");
+    let remaining = detached_versions(&person_uri).await;
+    for version in &swept {
+        assert!(!remaining.contains(version), "{version} is gone");
+    }
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    for plan in &report.tables {
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        assert!(
+            plan.would_remove().is_empty(),
+            "{}: {:?}",
+            plan.location,
+            plan.would_remove()
+        );
+    }
+    assert_eq!(
+        db.cleanup_plan_missing_paths(&report).await.unwrap(),
+        Vec::<(String, String)>::new(),
+        "every retained root's paths still exist"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, rows);
+}
+
+#[tokio::test]
+#[serial]
+async fn collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep() {
+    let _scenario = FailScenario::setup();
+    for scoped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep(
+            dir.path().to_str().unwrap(),
+            scoped,
+        )
+        .await;
+    }
+}
+
+/// A dead staging's files are deleted before its manifest as well. A pass
+/// stopped in between leaves the dead manifest with its index directory gone;
+/// the next pass judges the staging dead again, finds the directory gone,
+/// removes the manifest and converges.
+async fn assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_removes_them(
+    uri: &str,
+) {
+    let db = graph_with_unbuilt_indexes(uri).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let before = detached_versions(&person_uri).await;
+    {
+        let _fp = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
+        let outcome = db.ensure_indices().await;
+        assert!(
+            outcome.is_err(),
+            "the seam fails the index build before publish"
+        );
+    }
+    let stranded = &detached_versions(&person_uri).await - &before;
+    assert!(
+        !stranded.is_empty(),
+        "the interrupted index build strands its staging"
+    );
+    insert_person(&db, "main", "after").await;
+    let rows = count_rows(&db, "node:Person").await;
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert_eq!(
+        plan.dead_stagings()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        stranded,
+        "the head moved past the staging's recorded one: {:?}",
+        plan.unpublished
+    );
+    let dead_indices: Vec<_> = plan
+        .dead_paths
+        .iter()
+        .filter(|path| path.starts_with("_indices/"))
+        .cloned()
+        .collect();
+    assert!(
+        !dead_indices.is_empty(),
+        "the fixture must reclaim an index directory only the dead staging names: {:?}",
+        plan.dead_paths
+    );
+
+    let stats = {
+        let _fp = catalog::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE.fire_always();
+        db.cleanup(keep_one()).await.unwrap()
+    };
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert!(
+        row.error
+            .as_deref()
+            .is_some_and(|error| error.contains("cleanup.sweep_pre_dead_manifest_delete")),
+        "the interrupted pass reports the window: {row:?}"
+    );
+    assert!(
+        stranded.is_subset(&detached_versions(&person_uri).await),
+        "the dead manifests outlive the interrupted pass"
+    );
+    for path in &dead_indices {
+        assert!(
+            !table_path_exists(&db, &person_uri, path).await,
+            "the interrupted pass deleted the files before stopping: {path}"
+        );
+    }
+
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert_eq!(
+        plan.dead_stagings()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        stranded,
+        "the next pass judges the stagings dead again: {:?}",
+        plan.unpublished
+    );
+    assert!(
+        dead_indices
+            .iter()
+            .any(|path| plan.dead_paths.contains(path)),
+        "the next pass deletes again an index directory the interrupted one removed: {:?}",
+        plan.dead_paths
+    );
+
+    let stats = db.cleanup(keep_one()).await.unwrap();
+    assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
+    let row = stats
+        .iter()
+        .find(|row| row.type_key == "node:Person")
+        .unwrap();
+    assert_eq!(
+        row.manifests_removed as usize,
+        stranded.len(),
+        "the interrupted pass swept the published manifests; the retry removes the dead ones: {row:?}"
+    );
+    let remaining = detached_versions(&person_uri).await;
+    for version in &stranded {
+        assert!(!remaining.contains(version), "{version} is gone");
+    }
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    for plan in &report.tables {
+        assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+        assert!(
+            plan.would_remove().is_empty() && plan.unpublished.is_empty(),
+            "{}: {:?} {:?}",
+            plan.location,
+            plan.would_remove(),
+            plan.unpublished
+        );
+    }
+    assert_eq!(
+        db.cleanup_plan_missing_paths(&report).await.unwrap(),
+        Vec::<(String, String)>::new(),
+        "every retained root's paths still exist"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, rows);
+}
+
+#[tokio::test]
+#[serial]
+async fn collector_retry_after_a_pass_stopped_before_the_dead_manifests_removes_them() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_removes_them(
+        dir.path().to_str().unwrap(),
+    )
+    .await;
+}
+
+/// The sweep's crash windows on RustFS/S3, when its test bucket is
+/// configured: each file fixture above on a fresh graph root. An absent
+/// `_indices/` prefix lists empty there, so a retry's directory delete
+/// removes nothing and succeeds.
+#[tokio::test]
+#[serial]
+async fn s3_collector_retry_converges_after_every_sweep_window() {
+    let roots = [
+        "failpoints/sweep-before-manifests",
+        "failpoints/sweep-between",
+        "failpoints/sweep-dead",
+    ]
+    .map(helpers::s3_test_graph_uri);
+    let [Some(before_manifests), Some(between), Some(dead)] = roots else {
+        eprintln!(
+            "skipping s3_collector_retry_converges_after_every_sweep_window: OMNIGRAPH_S3_TEST_BUCKET is not set"
+        );
+        return;
+    };
+    let _scenario = FailScenario::setup();
+    assert_collector_retry_treats_an_index_directory_an_interrupted_pass_removed_as_swept(
+        &before_manifests,
+    )
+    .await;
+    assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep(
+        &between, false,
+    )
+    .await;
+    assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_removes_them(&dead).await;
+}
+
+/// The sweep's crash windows on configured Azure/Azurite, where an absent
+/// `_indices/` prefix lists empty as on S3: each file fixture above on a
+/// fresh graph root, followed by fixture cleanup.
+#[tokio::test]
+#[serial]
+async fn azure_collector_retry_converges_after_every_sweep_window() {
+    let roots = ["sweep-before-manifests", "sweep-between", "sweep-dead"].map(azure_test_graph_uri);
+    let [Some(before_manifests), Some(between), Some(dead)] = roots else {
+        eprintln!("skipping Azure sweep crash windows: OMNIGRAPH_AZURE_TEST_CONTAINER is not set");
+        return;
+    };
+    let _scenario = FailScenario::setup();
+    assert_collector_retry_treats_an_index_directory_an_interrupted_pass_removed_as_swept(
+        &before_manifests,
+    )
+    .await;
+    assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_the_sweep(
+        &between, false,
+    )
+    .await;
+    assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_removes_them(&dead).await;
+    for root in [before_manifests, between, dead] {
+        delete_azure_graph(&root).await;
+    }
 }
 
 /// A failed publish acknowledgement and unavailable readback leave publication
@@ -8287,6 +10383,673 @@ async fn branch_merge_in_doubt_keeps_input_tags_until_cleanup() {
         source_rows,
         "the landed merge remains readable without replay"
     );
+}
+
+/// A failed authority probe after the proposal tag of a merge `as commit`
+/// exists releases the observed tag but keeps the merge input holds: an
+/// earlier tag create may still land. Rust, not `.gqt`: the observable is
+/// native tags and uncertainty for a write that returned no id.
+#[tokio::test]
+#[serial]
+async fn merge_as_commit_probe_failure_retains_inputs_issue_1067() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("source").await.unwrap();
+    db.branch_create("target").await.unwrap();
+    db.load(
+        "source",
+        r#"{"type":"Person","data":{"name":"probe-failed","age":42}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    let native = helpers::open_dataset_head_exact(&format!("{uri}/__manifest"), None).await;
+    let target_pin = pinned_version(&db, "target", "node:Person").await;
+    let outcome = {
+        let _probe = catalog::PROPOSE_POST_TAG_PRE_PROBE.fail_once_at(1);
+        db.branch_merge_as_with_options("source", "target", None, true)
+            .await
+    };
+    let error = outcome.unwrap_err();
+    assert!(
+        error.is_manifest_publish_in_doubt(),
+        "a released tag does not fence a pending duplicate create: {error}"
+    );
+    assert!(
+        error.to_string().contains("propose.post_tag_pre_probe"),
+        "{error}"
+    );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::Uncertain)
+    );
+    assert_eq!(
+        pinned_version(&db, "target", "node:Person").await,
+        target_pin
+    );
+    let tags = native.tags().list().await.unwrap();
+    assert!(
+        !tags.keys().any(|name| name.starts_with("unpublished_")),
+        "rollback removed the observed proposal tag: {tags:?}"
+    );
+    assert_eq!(
+        tags.keys()
+            .filter(|name| name.starts_with("__omnigraph_merge_input_v1_"))
+            .count(),
+        2,
+        "an uncertain proposal keeps both merge inputs: {tags:?}"
+    );
+    assert!(
+        db.list_unpublished_commits(None).await.unwrap().is_empty(),
+        "the deleted proposal is absent until any delayed create lands"
+    );
+}
+
+const UNATTACHED_ROOT_QUERY: &str = r#"
+query insert_root($name: String, $age: I32) as unattached branch {
+    insert Person { name: $name, age: $age }
+}
+"#;
+
+const UNATTACHED_CHILD_QUERY: &str = r#"
+query insert_child($name: String, $age: I32, $base: String) as unattached branch on $base {
+    insert Person { name: $name, age: $age }
+}
+"#;
+
+/// The child declaration with its base spelled as a literal.
+fn unattached_child_on(base: &str) -> String {
+    format!(
+        r#"
+query insert_child($name: String, $age: I32) as unattached branch on "{base}" {{
+    insert Person {{ name: $name, age: $age }}
+}}
+"#
+    )
+}
+
+/// The parameters of one Person insert, with the base id of a child written
+/// by parameter.
+fn person_params(name: &str, age: i64, base: Option<&str>) -> omnigraph_compiler::ir::ParamMap {
+    let mut strings = vec![("$name", name)];
+    if let Some(base) = base {
+        strings.push(("$base", base));
+    }
+    mixed_params(&strings, &[("$age", age)])
+}
+
+async fn person_count_at(db: &Omnigraph, target: ReadTarget) -> usize {
+    db.snapshot_of(target)
+        .await
+        .unwrap()
+        .open_dataset("node:Person")
+        .await
+        .unwrap()
+        .count_rows(None)
+        .await
+        .unwrap()
+}
+
+fn manifest_kind(error: &OmniError) -> Option<ManifestErrorKind> {
+    match error {
+        OmniError::Manifest(error) => Some(error.kind),
+        _ => None,
+    }
+}
+
+/// The engine path of RFC "Unattached graph branches" end to end, in Rust
+/// until the GQT runner substitutes `on "${name}"` (plan step 8): root,
+/// children by literal and parameter, reads, refusals, publish refusal, drop.
+#[tokio::test]
+#[serial]
+async fn unattached_root_and_child_write_read_refuse_publish_and_drop() {
+    use omnigraph::db::GraphCommitKind;
+    use omnigraph::error::ManifestConflictDetails;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let main_commits = db.list_commits(Some("main")).await.unwrap();
+    let main_head = main_commits[0].graph_commit_id.clone();
+
+    let root = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_ROOT_QUERY,
+            "insert_root",
+            &person_params("root", 1, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(root.branch, "main");
+    assert_eq!(root.result.affected_nodes, 1);
+    let root = root
+        .commit
+        .expect("an effectful root write reports its snapshot");
+    assert_eq!(root.kind, GraphCommitKind::Unattached);
+    assert!(!root.published);
+    assert_eq!(
+        root.root_commit_id.as_deref(),
+        Some(root.graph_commit_id.as_str())
+    );
+    assert_eq!(root.parent_commit_id.as_deref(), Some(main_head.as_str()));
+    assert_eq!(root.graph_branch, None);
+    assert!(is_detached_version(root.graph_manifest_version));
+
+    let child = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&root.graph_commit_id),
+            "insert_child",
+            &person_params("child", 2, None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(child.branch, "main");
+    let child = child
+        .commit
+        .expect("an effectful child write reports its snapshot");
+    assert_eq!(child.kind, GraphCommitKind::Unattached);
+    assert_eq!(child.root_commit_id, root.root_commit_id);
+    assert_eq!(
+        child.parent_commit_id.as_deref(),
+        Some(root.graph_commit_id.as_str())
+    );
+    assert_ne!(child.graph_commit_id, root.graph_commit_id);
+
+    let grandchild = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_CHILD_QUERY,
+            "insert_child",
+            &person_params("grandchild", 3, Some(&child.graph_commit_id)),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("a child by parameter reports its snapshot");
+    assert_eq!(grandchild.root_commit_id, root.root_commit_id);
+    assert_eq!(
+        grandchild.parent_commit_id.as_deref(),
+        Some(child.graph_commit_id.as_str())
+    );
+
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id.to_string()));
+    assert_eq!(
+        person_count_at(&db, at(&root.graph_commit_id)).await,
+        main_before + 1
+    );
+    assert_eq!(
+        person_count_at(&db, at(&child.graph_commit_id)).await,
+        main_before + 2
+    );
+    assert_eq!(
+        person_count_at(&db, at(&grandchild.graph_commit_id)).await,
+        main_before + 3
+    );
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before
+    );
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), main_commits);
+    assert_eq!(db.get_commit(&child.graph_commit_id).await.unwrap(), child);
+    assert!(db.list_unpublished_commits(None).await.unwrap().is_empty());
+    let listed: Vec<String> = db
+        .list_unattached_commits(None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|commit| commit.graph_commit_id)
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            grandchild.graph_commit_id.clone(),
+            child.graph_commit_id.clone(),
+            root.graph_commit_id.clone()
+        ],
+        "live snapshots list newest first"
+    );
+    assert_eq!(
+        db.commit_target_branch(&child.graph_commit_id)
+            .await
+            .unwrap(),
+        "main"
+    );
+
+    let refused = db
+        .mutate_with_receipt(
+            "feature",
+            &unattached_child_on(&root.graph_commit_id),
+            "insert_child",
+            &person_params("elsewhere", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::BadRequest));
+    assert!(
+        refused.to_string().contains("is not the recorded target"),
+        "{refused}"
+    );
+    let refused = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&main_head),
+            "insert_child",
+            &person_params("published-base", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::BadRequest));
+    assert!(
+        refused
+            .to_string()
+            .contains("is not an unattached snapshot"),
+        "{refused}"
+    );
+    let refused = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            "insert_child",
+            &person_params("unknown-base", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::NotFound));
+    let refused = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_CHILD_QUERY,
+            "insert_child",
+            &person_params("no-base", 4, None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::BadRequest));
+    assert!(refused.to_string().contains("is missing"), "{refused}");
+
+    for id in [&root.graph_commit_id, &child.graph_commit_id] {
+        let refused = db.publish_commit_as(id, None).await.unwrap_err();
+        assert_eq!(
+            refused.to_string(),
+            format!("commit '{id}' is unattached and cannot publish")
+        );
+        let OmniError::Manifest(manifest_error) = refused else {
+            panic!("a publish refusal is a typed manifest conflict");
+        };
+        assert_eq!(manifest_error.kind, ManifestErrorKind::Conflict);
+        assert_eq!(
+            manifest_error.details,
+            Some(ManifestConflictDetails::UnattachedCannotPublish {
+                graph_commit_id: id.clone()
+            })
+        );
+    }
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), main_commits);
+
+    db.drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap();
+    for id in [
+        &root.graph_commit_id,
+        &child.graph_commit_id,
+        &grandchild.graph_commit_id,
+    ] {
+        let missing = db.snapshot_of(at(id)).await.unwrap_err();
+        assert_eq!(manifest_kind(&missing), Some(ManifestErrorKind::NotFound));
+        assert!(missing.to_string().contains("not found"), "{missing}");
+    }
+    assert!(db.list_unattached_commits(None).await.unwrap().is_empty());
+    let repeated = db
+        .drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap_err();
+    assert_eq!(manifest_kind(&repeated), Some(ManifestErrorKind::NotFound));
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before
+    );
+    assert_eq!(db.list_commits(Some("main")).await.unwrap(), main_commits);
+}
+
+/// A child write whose base is dropped between its resolution and its effect
+/// gates refuses under the gates, before any detached table commit: the
+/// table's detached manifests and main are as they were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn unattached_child_refuses_after_its_base_is_dropped_before_the_gates() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let root = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_ROOT_QUERY,
+            "insert_root",
+            &person_params("root", 1, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let person_uri = node_table_uri(&db, "Person").await;
+    let staged_before = detached_versions(&person_uri).await;
+
+    let parked =
+        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
+    let writer = {
+        let db = Arc::clone(&db);
+        let query = unattached_child_on(&root.graph_commit_id);
+        tokio::spawn(async move {
+            db.mutate_with_receipt(
+                "main",
+                &query,
+                "insert_child",
+                &person_params("child", 2, None),
+            )
+            .await
+        })
+    };
+    parked.wait_until_reached().await;
+    let dropper = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    dropper
+        .drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap();
+    parked.release();
+    let refused = writer.await.unwrap().unwrap_err();
+    assert_eq!(manifest_kind(&refused), Some(ManifestErrorKind::NotFound));
+    assert!(
+        refused.to_string().contains("dropped before the write"),
+        "{refused}"
+    );
+    assert_eq!(
+        detached_versions(&person_uri).await,
+        staged_before,
+        "the refused child committed no detached table version"
+    );
+    assert!(db.list_unattached_commits(None).await.unwrap().is_empty());
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before
+    );
+}
+
+/// A root and a child of it on main, written through the engine.
+async fn write_unattached_root_and_child(
+    db: &Session,
+) -> (omnigraph::db::GraphCommit, omnigraph::db::GraphCommit) {
+    let root = db
+        .mutate_with_receipt(
+            "main",
+            UNATTACHED_ROOT_QUERY,
+            "insert_root",
+            &person_params("root", 1, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("an effectful root write reports its snapshot");
+    let child = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&root.graph_commit_id),
+            "insert_child",
+            &person_params("child", 2, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .expect("an effectful child write reports its snapshot");
+    (root, child)
+}
+
+/// The detached Person version the snapshot `id` pins.
+async fn person_pin_at(db: &Omnigraph, id: &str) -> u64 {
+    db.snapshot_of(ReadTarget::snapshot(SnapshotId::new(id.to_string())))
+        .await
+        .unwrap()
+        .open_dataset("node:Person")
+        .await
+        .unwrap()
+        .published_dataset_version()
+}
+
+/// Keep one `__manifest` version per branch and reap at any age: what the
+/// collector roots is the only thing that survives.
+fn keep_one_at_any_age() -> omnigraph::db::CleanupPolicyOptions {
+    omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: Some(std::time::Duration::ZERO),
+    }
+}
+
+/// Every detached Person manifest aged to the epoch.
+fn age_detached_manifests(person_uri: &str) {
+    for entry in std::fs::read_dir(std::path::Path::new(person_uri).join("_versions")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.file_name().unwrap().to_string_lossy().starts_with('d') {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                )
+                .unwrap();
+        }
+    }
+}
+
+async fn unattached_tags(uri: &str) -> std::collections::BTreeSet<String> {
+    helpers::open_dataset_head_exact(&format!("{uri}/__manifest"), None)
+        .await
+        .tags()
+        .list()
+        .await
+        .unwrap()
+        .into_keys()
+        .filter(|name| name.starts_with("unattached_"))
+        .collect()
+}
+
+/// A live chain's complete result pins are roots: a cleanup that reaps at
+/// any age keeps the root's and the child's detached Person versions, their
+/// tags and their reads (RFC "Unattached graph branches", collector).
+#[tokio::test]
+#[serial]
+async fn unattached_live_chain_pins_are_rooted_and_survive_cleanup() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let uri = db.uri().to_string();
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let (root, child) = write_unattached_root_and_child(&db).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let root_pin = person_pin_at(&db, &root.graph_commit_id).await;
+    let child_pin = person_pin_at(&db, &child.graph_commit_id).await;
+    assert_ne!(root_pin, child_pin);
+    age_detached_manifests(&person_uri);
+
+    let report = db.cleanup_plan(keep_one_at_any_age()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert!(
+        plan.roots.contains(&root_pin) && plan.roots.contains(&child_pin),
+        "a live snapshot's pins are roots: {:?}",
+        plan.roots
+    );
+    assert!(report.expired_unattached_tags.is_empty());
+    assert_eq!(report.retained_unattached_tags.len(), 2);
+    assert!(
+        report.retained_unattached_tags.iter().any(|record| {
+            record.graph_commit_id == child.graph_commit_id
+                && record.parent_commit_id == root.graph_commit_id
+                && record.root_commit_id == root.graph_commit_id
+        }),
+        "{:?}",
+        report.retained_unattached_tags
+    );
+
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    let remaining = detached_versions(&person_uri).await;
+    assert!(
+        remaining.contains(&root_pin) && remaining.contains(&child_pin),
+        "the rooted pins survive the reap: {remaining:?}"
+    );
+    assert_eq!(unattached_tags(&uri).await.len(), 2);
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id.to_string()));
+    assert_eq!(
+        person_count_at(&db, at(&root.graph_commit_id)).await,
+        main_before + 1
+    );
+    assert_eq!(
+        person_count_at(&db, at(&child.graph_commit_id)).await,
+        main_before + 2
+    );
+    assert_eq!(db.list_unattached_commits(None).await.unwrap().len(), 2);
+
+    let grandchild = db
+        .mutate_with_receipt(
+            "main",
+            &unattached_child_on(&child.graph_commit_id),
+            "insert_child",
+            &person_params("grandchild", 3, None),
+        )
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let grandchild_pin = person_pin_at(&db, &grandchild.graph_commit_id).await;
+    let child_tag = format!(
+        "unattached_{}_{}",
+        root.graph_commit_id, child.graph_commit_id
+    );
+    let main = helpers::open_dataset_head_exact(&format!("{uri}/__manifest"), None).await;
+    main.tags().delete(&child_tag).await.unwrap();
+    insert_person(&db, "main", "after-missing-ancestor").await;
+    age_detached_manifests(&person_uri);
+    let report = db.cleanup_plan(keep_one_at_any_age()).await.unwrap();
+    assert!(report.expired_unattached_tags.is_empty());
+    assert_eq!(report.retained_unattached_tags.len(), 2);
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.roots.contains(&grandchild_pin));
+    assert!(plan.roots.contains(&root_pin));
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    let remaining = detached_versions(&person_uri).await;
+    assert!(remaining.contains(&grandchild_pin));
+    assert!(remaining.contains(&root_pin));
+    assert_eq!(unattached_tags(&uri).await.len(), 2);
+    let refused = db
+        .drop_commit_as(&root.graph_commit_id, None)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("required ancestor"),
+        "{refused}"
+    );
+    assert_eq!(unattached_tags(&uri).await.len(), 2);
+
+    let refused = db
+        .snapshot_of(at(&grandchild.graph_commit_id))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("required ancestor"),
+        "{refused}"
+    );
+}
+
+/// A head advance expires the chain: its pins are no longer roots, cleanup
+/// releases the child's tag before the root's with a readback each, and a
+/// failure between the two leaves the root addressable for the retry.
+#[tokio::test]
+#[serial]
+async fn cleanup_releases_expired_unattached_tags_descendants_first() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let uri = db.uri().to_string();
+    let main_before = person_count_at(&db, ReadTarget::branch("main")).await;
+    let (root, child) = write_unattached_root_and_child(&db).await;
+    let person_uri = node_table_uri(&db, "Person").await;
+    let root_pin = person_pin_at(&db, &root.graph_commit_id).await;
+    let child_pin = person_pin_at(&db, &child.graph_commit_id).await;
+    let root_tag = format!(
+        "unattached_{}_{}",
+        root.graph_commit_id, root.graph_commit_id
+    );
+    let child_tag = format!(
+        "unattached_{}_{}",
+        root.graph_commit_id, child.graph_commit_id
+    );
+    assert_eq!(
+        unattached_tags(&uri).await,
+        std::collections::BTreeSet::from([root_tag.clone(), child_tag.clone()])
+    );
+    insert_person(&db, "main", "after").await;
+    age_detached_manifests(&person_uri);
+
+    let report = db.cleanup_plan(keep_one_at_any_age()).await.unwrap();
+    let plan = main_plan(&report, "node:Person");
+    assert!(plan.errors.is_empty(), "{:?}", plan.errors);
+    assert!(
+        !plan.roots.contains(&root_pin) && !plan.roots.contains(&child_pin),
+        "an expired snapshot roots nothing: {:?}",
+        plan.roots
+    );
+    assert!(report.retained_unattached_tags.is_empty());
+    let order: Vec<&str> = omnigraph::db::unattached_release_order(
+        &report.expired_unattached_tags,
+        &report.retained_unattached_tags,
+    )
+    .into_iter()
+    .map(|record| record.name.as_str())
+    .collect();
+    assert_eq!(order, [child_tag.as_str(), root_tag.as_str()]);
+
+    let interrupted = {
+        let _fp = catalog::CLEANUP_POST_UNATTACHED_RELEASE.fail_once_at(1);
+        db.cleanup(keep_one_at_any_age()).await.unwrap_err()
+    };
+    assert!(
+        interrupted
+            .to_string()
+            .contains("cleanup.post_unattached_release"),
+        "{interrupted}"
+    );
+    assert_eq!(
+        unattached_tags(&uri).await,
+        std::collections::BTreeSet::from([root_tag.clone()]),
+        "the child's tag went first; the root's stays for the retry"
+    );
+
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
+    assert!(unattached_tags(&uri).await.is_empty());
+    let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id.to_string()));
+    for id in [&root.graph_commit_id, &child.graph_commit_id] {
+        let missing = db.snapshot_of(at(id)).await.unwrap_err();
+        assert_eq!(manifest_kind(&missing), Some(ManifestErrorKind::NotFound));
+    }
+    assert!(db.list_unattached_commits(None).await.unwrap().is_empty());
+    let remaining = detached_versions(&person_uri).await;
+    assert!(
+        !remaining.contains(&root_pin) && !remaining.contains(&child_pin),
+        "the unrooted pins are reaped: {remaining:?}"
+    );
+    assert_eq!(
+        person_count_at(&db, ReadTarget::branch("main")).await,
+        main_before + 1
+    );
+    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
 }
 
 /// Cancellation preserves accepted inputs until the target's exact publication
@@ -8443,7 +11206,11 @@ async fn cleanup_keeps_a_late_retired_merge_base_provider() {
     }
     let merger = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(
-        merger.branch_merge("source", "target").await.unwrap(),
+        merger
+            .branch_merge("source", "target")
+            .await
+            .unwrap()
+            .outcome,
         omnigraph::db::MergeOutcome::Merged
     );
     let snapshot = helpers::snapshot_branch(&merger, "target").await.unwrap();
@@ -8455,4 +11222,214 @@ async fn cleanup_keeps_a_late_retired_merge_base_provider() {
             .unwrap(),
         2
     );
+}
+
+/// A storage failure met while planning a read (opening a table for its
+/// index facts, or for the scan-access split) reaches the query door as the
+/// injected `Manifest` error itself, not a planner-error wrapper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn planning_source_failures_keep_their_error_class() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = helpers::init_and_load(&dir).await;
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Planned")], &[("$age", 7)]),
+    )
+    .await
+    .unwrap();
+    db.ensure_indices().await.unwrap();
+    let lookup = params(&[("$name", "Planned")]);
+    for seam in [
+        &catalog::QUERY_INDEX_FACTS_PRE_LOAD,
+        &catalog::QUERY_SCAN_ACCESS_PRE_TABLE_OPEN,
+    ] {
+        let _failpoint = seam.fire_always();
+        let error = db
+            .query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &lookup,
+            )
+            .await
+            .expect_err("the injected planning failure must surface");
+        assert!(
+            matches!(
+                &error,
+                OmniError::Manifest(manifest)
+                    if manifest.kind == ManifestErrorKind::BadRequest
+                        && manifest.message
+                            == format!("injected failpoint triggered: {}", seam.name())
+            ),
+            "{}: {error}",
+            seam.name()
+        );
+    }
+    let rows = db
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &lookup,
+        )
+        .await
+        .expect("the next read plans and runs");
+    assert_eq!(rows.num_rows(), 1);
+}
+
+/// A publish parked on either side of its `__manifest` commit holds no
+/// coordinator lock: a read on the same handle completes beside it, binding
+/// the installed state, and reads the published row once the publish returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn read_on_the_handle_completes_while_its_publish_is_parked() {
+    for (seam, published_while_parked) in [
+        (&catalog::GRAPH_PUBLISH_BEFORE_COMMIT_APPEND, false),
+        (&catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT, true),
+    ] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(init_and_load(&dir).await);
+        let lookup = params(&[("$name", "parked-publish")]);
+        let base_version = db
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .graph_manifest_version();
+
+        let rendezvous = helpers::failpoint::Rendezvous::park_first(seam);
+        let writer = {
+            let db = Arc::clone(&db);
+            tokio::spawn(async move { insert_person(&db, "main", "parked-publish").await })
+        };
+        rendezvous.wait_until_reached().await;
+
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.snapshot_of(ReadTarget::branch("main")),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{}: snapshot_of waits on the parked publish", seam.name()))
+        .unwrap();
+        let rows = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &lookup,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{}: a query waits on the parked publish", seam.name()))
+        .unwrap();
+        assert_eq!(
+            snapshot.graph_manifest_version() > base_version,
+            published_while_parked,
+            "{}: the read binds the `__manifest` head as it stands",
+            seam.name()
+        );
+        assert_eq!(
+            rows.num_rows(),
+            usize::from(published_while_parked),
+            "{}",
+            seam.name()
+        );
+        assert!(
+            !writer.is_finished(),
+            "{}: the publish is still parked",
+            seam.name()
+        );
+
+        rendezvous.release();
+        writer.await.unwrap();
+        assert!(
+            !rendezvous.timed_out(),
+            "{}: released, not timed out",
+            seam.name()
+        );
+        let rows = db
+            .query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &lookup,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.num_rows(), 1, "{}", seam.name());
+    }
+}
+
+/// Two reads on one handle refresh a stale coordinator concurrently; the one
+/// that read the older `__manifest` version installs last and is refused by
+/// `supersedes`, so the installed state stays at the newest version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn concurrent_stale_refreshes_on_one_handle_keep_the_newest_installed() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let writer = init_and_load(&dir).await;
+    let reader = Arc::new(helpers::session(
+        Omnigraph::open(writer.uri()).await.unwrap(),
+    ));
+    reader
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    insert_person(&writer, "main", "first-refresh").await;
+    let older = writer
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+
+    let rendezvous =
+        helpers::failpoint::Rendezvous::park_first(&catalog::READ_REFRESH_POST_STATE_PRE_LINEAGE);
+    let parked = {
+        let reader = Arc::clone(&reader);
+        tokio::spawn(async move { reader.snapshot_of(ReadTarget::branch("main")).await })
+    };
+    rendezvous.wait_until_reached().await;
+    insert_person(&writer, "main", "second-refresh").await;
+    let newest = writer
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .graph_manifest_version();
+    assert!(newest > older);
+    let racing = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reader.snapshot_of(ReadTarget::branch("main")),
+    )
+    .await
+    .expect("a second refresh waits on the parked one")
+    .unwrap();
+    assert_eq!(racing.graph_manifest_version(), newest);
+
+    rendezvous.release();
+    let late = parked.await.unwrap().unwrap();
+    assert!(!rendezvous.timed_out(), "released, not timed out");
+    assert_eq!(
+        late.graph_manifest_version(),
+        older,
+        "the parked refresh resolves the version it read"
+    );
+
+    for name in ["first-refresh", "second-refresh"] {
+        let rows = reader
+            .query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &params(&[("$name", name)]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.num_rows(), 1, "{name} after the newest install");
+    }
 }

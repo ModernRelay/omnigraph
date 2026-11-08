@@ -1,0 +1,128 @@
+# issue: 659
+# red_on: 7f1233bb
+# notes: Common edge properties normalize nullable vectors/lists and enum domains; Blob-bearing edges retain readable fields.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person { name: String @key }
+edge Knows: Person -> Person {
+    shape: String?
+    width: Vector(2)?
+    tags: [String]
+    embedding: Vector(2)
+    state: enum(open, shared)
+    label: enum(first, shared)
+    payload: Blob?
+}
+edge Likes: Person -> Person {
+    shape: [String]?
+    width: Vector(3)?
+    tags: [String]?
+    embedding: Vector(2)?
+    state: enum(closed, shared)?
+    label: String
+    payload: Blob?
+}
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"edge":"Knows","id":"known","from":"a","to":"b","data":{"tags":["x","y"],"embedding":[1.0,2.0],"state":"open","label":"first","payload":"base64:YWJj"}}
+{"edge":"Likes","id":"liked","from":"a","to":"b","data":{"tags":[],"state":"closed","label":"free"}}
+
+{"edge":"Likes","id":"nullable","from":"a","to":"b","data":{"embedding":[3.0,4.0],"label":"other"}}
+
+--- query
+query common_values() {
+    match { $a: Person $a $e:(knows | likes) $b }
+    return { $e.@type as kind, $e.tags as tags, $e.embedding as vector, $e.state as state, $e.label as label }
+}
+--- expect unordered
+{"kind":"Knows","tags":["x","y"],"vector":[1.0,2.0],"state":"open","label":"first"}
+{"kind":"Likes","tags":[],"state":"closed","label":"free"}
+{"kind":"Likes","vector":[3.0,4.0],"label":"other"}
+--- expect shape
+kind: String
+tags: [String]?
+vector: Vector(2)?
+state: String?
+label: String
+--- expect plan
+expand $a $b: selection alternation [Knows out, Likes out]
+
+--- query
+query selected_list_predicate() {
+    match { $a: Person $a $e:(knows | likes) $b $e.tags contains "x" }
+    return { $e.@type as kind }
+}
+--- expect unordered
+{"kind":"Knows"}
+--- expect shape
+kind: String
+
+--- query
+query selected_blob_is_not_a_read_value() {
+    match { $a: Person $a $e:(knows | likes) $b }
+    return { $e.payload }
+}
+--- expect error: Blob
+
+--- query
+query incompatible_scalar_and_list_property() {
+    match { $a: Person $a $e:(knows | likes) $b }
+    return { $e.shape }
+}
+--- expect error: must exist with compatible types on every selected edge
+
+--- query
+query incompatible_vector_dimensions() {
+    match { $a: Person $a $e:(knows | likes) $b }
+    return { $e.width }
+}
+--- expect error: must exist with compatible types on every selected edge
+
+--- query
+query nullable_block_argument_counts_nonnull_values() {
+    match {
+        $a: Person { name: "a" }
+        count($e.state contains "open") { $a $e:(knows | likes) $b } = 2
+    }
+    return { $a.name as name }
+}
+--- expect unordered
+{"name":"a"}
+--- expect shape
+name: String
+
+--- query
+query nullable_block_argument_parameter_counts_nonnull_values($term: String) {
+    match {
+        $a: Person { name: "a" }
+        count($e.state contains $term) { $a $e:(knows | likes) $b } = 2
+    }
+    return { $a.name as name }
+}
+--- params
+{"term":"open"}
+--- expect unordered
+{"name":"a"}
+--- expect shape
+name: String
+
+--- query
+query count_all_includes_null_property_edges() {
+    match {
+        $a: Person { name: "a" }
+        count { $a $e:(knows | likes) $b } = 3
+    }
+    return { $a.name as name }
+}
+--- expect unordered
+{"name":"a"}
+--- expect shape
+name: String

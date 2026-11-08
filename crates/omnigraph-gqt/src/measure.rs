@@ -1,14 +1,23 @@
-//! `--measure`: every Lance-realm object-store request a DST case makes,
-//! attributed to the step that made it.
+//! `--measure`: every object-store request a DST case makes, in both of the
+//! engine's realms, attributed to the step that made it.
 //!
-//! The worker installs one decorator on `omnigraph::object_store_seam::OBJECT_STORE`,
-//! the seam the DST fault decorator uses and the GQT worker otherwise leaves
-//! empty, so every store the engine's registry builds is wrapped: `__manifest`
-//! and table traffic, spawned tasks and cached handles all pass through one
-//! ledger. The ledger keeps every request of the run, each tagged with the
-//! label current when it was made (`setup`, `step` N, `runner` N); the runner
-//! only moves the label, and the report groups the ledger by it, so no
-//! request can fall outside a row.
+//! The Lance realm: the worker installs one decorator on
+//! `omnigraph::object_store_seam::OBJECT_STORE`, the seam the DST fault
+//! decorator uses and the GQT worker otherwise leaves empty, so every store
+//! the engine's registry builds is wrapped: `__manifest` and table traffic,
+//! spawned tasks and cached handles all pass through one ledger. The control
+//! realm: init claims, capability probes, manifest-root preflights and
+//! graph-index artifacts go through the engine's `StorageAdapter`; legacy
+//! schema and recovery paths also have control classes. The live schema
+//! contract is inline in `__manifest`, in the Lance realm. The adapter's
+//! DST store is a second in-memory
+//! object store the registry never builds; the worker wraps the adapter it
+//! hands the engine ([`wrap_adapter`], the `control` module) and logs each
+//! call as the requests that adapter makes for it, under `control_<kind>`
+//! classes. The ledger keeps
+//! every request of the run, each tagged with the label current when it was
+//! made (`setup`, `step` N, `runner` N); the runner only moves the label, and
+//! the report groups the ledger by it, so no request can fall outside a row.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,6 +37,10 @@ use object_store::{
 };
 use omnigraph::object_store_seam::DecorateObjectStore;
 use omnigraph::seams::Behavior;
+
+mod control;
+
+pub(crate) use control::wrap_adapter;
 
 /// One store request as the ledger keeps it. `path` is the object name with
 /// uuids redacted, so the two runs of one seed log the same text. `tick` is the
@@ -88,6 +101,9 @@ pub(crate) struct SessionCtx {
     /// Set by the block once it is aborted: every later request of the
     /// session is the drain, filed under [`AFTER_ABORT_PHASE`].
     pub draining: Arc<AtomicBool>,
+    /// The gate this session is waiting at and the virtual microsecond its
+    /// `acquire` crossed; the matching `hold` closes it into a [`Wait`].
+    pub pending_gate: Cell<Option<(&'static str, u64)>>,
 }
 
 impl SessionCtx {
@@ -97,8 +113,19 @@ impl SessionCtx {
             label,
             phase: Cell::new(START_PHASE),
             draining,
+            pending_gate: Cell::new(None),
         }
     }
+}
+
+/// One wait of a block session at an engine gate, `gate.<gate>.acquire` to
+/// `gate.<gate>.hold` on the virtual clock.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Wait {
+    pub gate: &'static str,
+    pub start_us: u64,
+    pub end_us: u64,
+    pub label: Label,
 }
 
 /// The measure phase of a request made while a block's sessions drain.
@@ -207,6 +234,8 @@ pub(crate) const START_PHASE: &str = "start";
 struct Measure {
     model: Model,
     ledger: Mutex<Vec<Request>>,
+    /// The gate waits of the block sessions, closed `acquire`/`hold` pairs.
+    waits: Mutex<Vec<Wait>>,
     label: Mutex<Label>,
     /// Every label the runner set, in order: the report has a row per label
     /// whether or not a request was made under it.
@@ -233,6 +262,7 @@ pub(crate) fn prepare(model: Model) -> Arc<dyn DecorateObjectStore> {
         Arc::new(Measure {
             model,
             ledger: Mutex::new(Vec::new()),
+            waits: Mutex::new(Vec::new()),
             label: Mutex::new(SETUP),
             labels: Mutex::new(vec![SETUP]),
             phase: Mutex::new(START_PHASE),
@@ -294,14 +324,64 @@ pub(crate) fn set_label(slot: &'static str, step: u64, line: Option<u64>, kind: 
 
 /// The engine crossed the decision seam `name`: every later request of the
 /// step is in that phase. Inside a concurrent block's session the phase is
-/// the session's own. A no-op when measuring is off.
+/// the session's own. A gate seam (`gate.<gate>.<event>`) is a wait event, not
+/// a phase: inside a session its `acquire` opens a wait, its `hold` closes it
+/// and its `refused` drops it; outside a session (one statement at a time on
+/// the handle, so a gate is uncontended) it is dropped. A no-op when
+/// measuring is off.
 pub(crate) fn cross(name: &'static str) {
+    if let Some((gate, event)) = gate_event(name) {
+        if let Some(measure) = MEASURE.get() {
+            gate_crossed(measure, gate, event);
+        }
+        return;
+    }
     if SESSION.try_with(|session| session.phase.set(name)).is_ok() {
         return;
     }
     if let Some(measure) = MEASURE.get() {
         *measure.phase.lock().unwrap() = name;
     }
+}
+
+/// `gate.<gate>.<event>` split into the gate and the event; `None` for every
+/// other seam.
+fn gate_event(name: &'static str) -> Option<(&'static str, &'static str)> {
+    let rest = name.strip_prefix("gate.")?;
+    let dot = rest.rfind('.')?;
+    Some((&rest[..dot], &rest[dot + 1..]))
+}
+
+/// `acquire` stamps the session's pending gate once (a lost CAS round keeps
+/// the first stamp); the same gate's `hold` closes the wait, its `refused`
+/// drops the stamp; another gate's event and a `release` change nothing.
+fn gate_crossed(measure: &Measure, gate: &'static str, event: &'static str) {
+    let _ = SESSION.try_with(|session| {
+        let pending = session.pending_gate.get();
+        match event {
+            "acquire" => {
+                if pending.is_none_or(|(held, _)| held != gate) {
+                    session.pending_gate.set(Some((gate, measure.now_us())));
+                }
+            }
+            "hold" | "refused" => {
+                if let Some((held, start_us)) = pending
+                    && held == gate
+                {
+                    session.pending_gate.set(None);
+                    if event == "hold" {
+                        measure.waits.lock().unwrap().push(Wait {
+                            gate,
+                            start_us,
+                            end_us: measure.now_us(),
+                            label: session.label,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
 }
 
 /// One group of the ledger: the requests made under one label.
@@ -319,6 +399,7 @@ pub(crate) fn finish() -> Vec<Group> {
         return Vec::new();
     };
     let requests = std::mem::take(&mut *measure.ledger.lock().unwrap());
+    let waits = std::mem::take(&mut *measure.waits.lock().unwrap());
     let mut order = std::mem::take(&mut *measure.labels.lock().unwrap());
     let mut groups: BTreeMap<Label, Vec<Request>> = BTreeMap::new();
     for request in requests {
@@ -331,7 +412,8 @@ pub(crate) fn finish() -> Vec<Group> {
         .into_iter()
         .map(|label| Group {
             label,
-            io: StepIo::from(groups.remove(&label).unwrap_or_default()),
+            io: StepIo::from(groups.remove(&label).unwrap_or_default())
+                .with_waits(waits.iter().filter(|wait| wait.label == label)),
         })
         .collect()
 }
@@ -451,6 +533,10 @@ pub(crate) struct StepIo {
     bytes_written: u64,
     by_class: BTreeMap<String, u64>,
     phases: Vec<PhaseIo>,
+    /// Ticks the group's session waited at each engine gate it crossed, the
+    /// `acquire`-to-`hold` spans summed per gate; a gate crossed without a
+    /// request moving the clock reads 0. Schedule-derived, like makespan.
+    waits: BTreeMap<&'static str, u64>,
     log: Vec<Request>,
 }
 
@@ -501,12 +587,24 @@ impl From<Vec<Request>> for StepIo {
             bytes_written,
             by_class,
             phases: phases(&log),
+            waits: BTreeMap::new(),
             log,
         }
     }
 }
 
 impl StepIo {
+    /// The group's gate waits, microseconds summed per gate then counted in
+    /// ticks, a started tick whole.
+    pub(crate) fn with_waits<'a>(mut self, waits: impl Iterator<Item = &'a Wait>) -> Self {
+        let mut us: BTreeMap<&'static str, u64> = BTreeMap::new();
+        for wait in waits {
+            *us.entry(wait.gate).or_default() += wait.end_us - wait.start_us;
+        }
+        self.waits = us.into_iter().map(|(gate, us)| (gate, ticks(us))).collect();
+        self
+    }
+
     /// The counts: a function of code and seed, compared across the two runs
     /// of one seed like every other evidence row. `span` is the critical path
     /// under the phase model (phases in sequence, tables independent within
@@ -526,15 +624,16 @@ impl StepIo {
         })
     }
 
-    /// Bytes, the model's time and price, and the request log. Lance stamps
-    /// manifests with wall-clock time, so sizes may differ between two runs;
-    /// these rows stay out of the replay comparison.
+    /// Bytes, the model's time and price, the gate waits and the request log.
+    /// Lance stamps manifests with wall-clock time, so sizes may differ
+    /// between two runs; these rows stay out of the replay comparison.
     pub(crate) fn detail(&self) -> serde_json::Value {
         serde_json::json!({
             "bytes_read": self.bytes_read,
             "bytes_written": self.bytes_written,
             "simulated_us": self.simulated_us,
             "usd_micro": self.usd_micro,
+            "waits": self.waits,
             "log": self.log,
         })
     }
@@ -565,6 +664,81 @@ fn classify(path: &str) -> String {
     format!("{realm}_{kind}")
 }
 
+/// The control realm: the objects the engine reaches through its
+/// `StorageAdapter`, a store of its own under DST.
+const CONTROL_REALM: &str = "control";
+
+/// The name the engine gives the transient object it writes and deletes to
+/// prove a local root supports create-if-absent (one per read-write bind).
+const PROBE_PREFIX: &str = "__create_if_absent_probe_";
+
+/// `control_<kind>`, the kind being the object's role read off its name
+/// (the control realm has no Lance directories); the roles are pinned by
+/// `control_objects_are_classed_by_their_role` and listed in the README.
+fn control_class(key: &str) -> String {
+    let name = key.rfind('/').map_or(key, |slash| &key[slash + 1..]);
+    let live_name = name.strip_suffix(".staging").unwrap_or(name);
+    let under = |dir: &str| key.split('/').any(|segment| segment == dir);
+    let kind = if matches!(
+        live_name,
+        "_schema.pg" | "_schema.ir.json" | "__schema_state.json"
+    ) {
+        "schema"
+    } else if under("__recovery") {
+        "recovery"
+    } else if under("__graph_index") {
+        "graph_index"
+    } else if under("__manifest") {
+        "manifest"
+    } else if name == "__init_claim.json" {
+        "claim"
+    } else if name.starts_with(PROBE_PREFIX) {
+        "probe"
+    } else {
+        "other"
+    };
+    format!("{CONTROL_REALM}_{kind}")
+}
+
+/// The object key the adapter's store sees for a URI: the scheme dropped,
+/// the way the in-memory adapter keys `shared-memory://<root>/<file>`.
+fn control_key(uri: &str) -> &str {
+    uri.split_once("://")
+        .map_or(uri, |(_, key)| key)
+        .trim_start_matches('/')
+}
+
+/// What a request was made on, as the ledger files it: a Lance object by its
+/// path, a control object by its role, its real name realm-prefixed so the
+/// repeat-read key never meets the same key of the other store.
+struct Object {
+    class: String,
+    dataset: String,
+    path: String,
+    raw_path: String,
+}
+
+impl Object {
+    fn lance(path: &str) -> Self {
+        Self {
+            class: classify(path),
+            dataset: dataset(path),
+            path: redact(path),
+            raw_path: path.to_string(),
+        }
+    }
+
+    fn control(uri: &str) -> Self {
+        let key = control_key(uri);
+        Self {
+            class: control_class(key),
+            dataset: CONTROL_REALM.to_string(),
+            path: redact(key),
+            raw_path: format!("{CONTROL_REALM}:{key}"),
+        }
+    }
+}
+
 /// The dataset directory the object belongs to: the segment before the first
 /// Lance directory (`_versions`, `data`, …), else the object's own directory
 /// (`_latest.manifest` at a dataset root, a file under `__recovery`).
@@ -584,10 +758,14 @@ fn dataset(path: &str) -> String {
 }
 
 /// Replace uuid segments (`data/<uuid>.lance`, `_transactions/<n>-<uuid>.txn`)
-/// so the log reads the same on every run of a seed.
+/// and the create-if-absent probe's ulid so the log reads the same on every
+/// run of a seed.
 fn redact(path: &str) -> String {
     path.split('/')
         .map(|segment| {
+            if segment.starts_with(PROBE_PREFIX) {
+                return format!("{PROBE_PREFIX}<ulid>");
+            }
             let (stem, ext) = match segment.rfind('.') {
                 Some(dot) => (&segment[..dot], &segment[dot..]),
                 None => (segment, ""),
@@ -656,7 +834,7 @@ fn range_bytes(range: Option<&GetRange>) -> Option<u64> {
 }
 
 impl Measure {
-    /// Append the request; its index names it for a later relabel.
+    /// Append a Lance-realm request; its index names it for a later relabel.
     fn note(
         &self,
         started: &Started,
@@ -665,22 +843,50 @@ impl Measure {
         bytes: u64,
         range: Option<String>,
     ) -> usize {
+        self.note_object(started, verb, Object::lance(path), bytes, range)
+    }
+
+    fn note_object(
+        &self,
+        started: &Started,
+        verb: &'static str,
+        object: Object,
+        bytes: u64,
+        range: Option<String>,
+    ) -> usize {
+        crate::trace::store_request(
+            verb,
+            &object.class,
+            &object.dataset,
+            &object.path,
+            range.as_deref(),
+            bytes,
+            started.label.slot,
+        );
         let mut ledger = self.ledger.lock().unwrap();
         ledger.push(Request {
             verb,
-            class: classify(path),
-            dataset: dataset(path),
-            path: redact(path),
+            class: object.class,
+            dataset: object.dataset,
+            path: object.path,
             range,
             bytes,
             tick: started.start_us / (TICK.as_micros() as u64),
             cost_us: started.cost_us,
             phase: started.phase,
             start_us: started.start_us,
-            raw_path: path.to_string(),
+            raw_path: object.raw_path,
             label: started.label,
         });
         ledger.len() - 1
+    }
+
+    /// Virtual microseconds since the first measured instant.
+    fn now_us(&self) -> u64 {
+        let epoch = *self.epoch.get_or_init(tokio::time::Instant::now);
+        tokio::time::Instant::now()
+            .saturating_duration_since(epoch)
+            .as_micros() as u64
     }
 
     /// A listing's first page is noted when the stream is asked for; the
@@ -721,10 +927,7 @@ impl Started {
     /// it is polled, `after_abort` once its block is aborted), then sleeps the
     /// request's cost on the paused clock: the bytes are known before the call.
     async fn enter(measure: &Arc<Measure>, bytes: u64) -> Self {
-        let epoch = *measure.epoch.get_or_init(tokio::time::Instant::now);
-        let start_us = tokio::time::Instant::now()
-            .saturating_duration_since(epoch)
-            .as_micros() as u64;
+        let start_us = measure.now_us();
         let (label, phase) = SESSION
             .try_with(|session| {
                 let phase = if session.draining.load(std::sync::atomic::Ordering::Relaxed) {
@@ -747,6 +950,16 @@ impl Started {
             cost_us,
             label,
             phase,
+        }
+    }
+
+    /// Bytes known only once the call returned (a whole-object read): their
+    /// time on the wire, charged after it.
+    async fn charge(&mut self, model: &Model, bytes: u64) {
+        let transfer = model.transfer_us(bytes);
+        if transfer > 0 {
+            tokio::time::sleep(Duration::from_micros(transfer)).await;
+            self.cost_us += transfer;
         }
     }
 }
@@ -873,11 +1086,7 @@ impl ObjectStore for MeasureStore {
             _ => 0,
         };
         if expected.is_none() {
-            let transfer = self.measure.model.transfer_us(bytes);
-            if transfer > 0 {
-                tokio::time::sleep(Duration::from_micros(transfer)).await;
-                started.cost_us += transfer;
-            }
+            started.charge(&self.measure.model, bytes).await;
         }
         self.measure.note(
             &started,
@@ -1173,6 +1382,82 @@ mod tests {
         assert!(io.phases.is_empty());
         assert_eq!(io.counts()["requests"], 0);
         assert!(io.counts()["span"].is_null());
+        assert!(io.detail()["waits"].as_object().unwrap().is_empty());
+    }
+
+    /// Gate seams are wait events, not phases: a session's `acquire`-to-`hold`
+    /// spans sum per gate into ticks in the detail, never into the counts; a
+    /// wait no request filled reads 0; a lost CAS round keeps the first stamp.
+    #[test]
+    fn gate_waits_are_ticks_per_gate_in_the_detail() {
+        assert_eq!(
+            super::gate_event("gate.schema_shared.acquire"),
+            Some(("schema_shared", "acquire"))
+        );
+        assert_eq!(super::gate_event("publish.pre_merge"), None);
+        let label = Label {
+            slot: "r1",
+            step: 2,
+            line: Some(35),
+            kind: "query",
+        };
+        let wait = |gate, start_us, end_us| super::Wait {
+            gate,
+            start_us,
+            end_us,
+            label,
+        };
+        let waits = [
+            wait("table", 1_000, 4_000),
+            wait("table", 10_000, 11_000),
+            wait("schema_shared", 0, 0),
+            wait("coordinator_cas", 20_000, 20_001),
+        ];
+        let io = super::StepIo::from(Vec::new()).with_waits(waits.iter());
+        assert_eq!(
+            io.detail()["waits"],
+            serde_json::json!({"coordinator_cas": 1, "schema_shared": 0, "table": 4})
+        );
+        assert!(io.counts().get("waits").is_none());
+        assert!(io.counts()["by_class"].as_object().unwrap().is_empty());
+    }
+
+    /// A refused install drops the pending stamp, so the session's next wait
+    /// at that gate starts at its own `acquire`; a `hold` of another gate
+    /// leaves a pending stamp alone; outside a session nothing is recorded.
+    #[test]
+    fn a_refused_install_drops_the_pending_stamp() {
+        let measure = measuring(Model::named("unit").unwrap());
+        let label = Label {
+            slot: "w1",
+            step: 1,
+            line: Some(7),
+            kind: "mutate",
+        };
+        super::gate_crossed(&measure, "table", "acquire");
+        super::gate_crossed(&measure, "table", "hold");
+        assert!(measure.waits.lock().unwrap().is_empty());
+        let ctx = super::SessionCtx::new(
+            0,
+            label,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        super::SESSION.sync_scope(ctx, || {
+            super::gate_crossed(&measure, "coordinator_cas", "acquire");
+            super::gate_crossed(&measure, "coordinator_cas", "refused");
+            super::gate_crossed(&measure, "table", "acquire");
+            super::gate_crossed(&measure, "coordinator_cas", "hold");
+            super::gate_crossed(&measure, "table", "hold");
+            super::gate_crossed(&measure, "table", "release");
+        });
+        let gates: Vec<&'static str> = measure
+            .waits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|w| w.gate)
+            .collect();
+        assert_eq!(gates, ["table"]);
     }
 
     #[test]
@@ -1254,10 +1539,11 @@ mod tests {
         assert!(Model::named("fast").is_none());
     }
 
-    fn measuring(model: Model) -> std::sync::Arc<super::Measure> {
+    pub(super) fn measuring(model: Model) -> std::sync::Arc<super::Measure> {
         std::sync::Arc::new(super::Measure {
             model,
             ledger: std::sync::Mutex::new(Vec::new()),
+            waits: std::sync::Mutex::new(Vec::new()),
             label: std::sync::Mutex::new(Label {
                 slot: "step",
                 step: 1,
@@ -1366,5 +1652,51 @@ mod tests {
             "t/_transactions/12-<uuid>.txn"
         );
         assert_eq!(redact("t/_versions/12.manifest"), "t/_versions/12.manifest");
+    }
+
+    /// A class is report output a case cannot assert.
+    #[test]
+    fn control_objects_are_classed_by_their_role() {
+        use super::{Object, control_class};
+        let classes: Vec<String> = [
+            "gqt-dst/case/_schema.pg",
+            "gqt-dst/case/_schema.ir.json.staging",
+            "gqt-dst/case/__schema_state.json",
+            "gqt-dst/case/__recovery/stale.json",
+            "gqt-dst/case/__graph_index/csr-current.bin",
+            "gqt-dst/case/__manifest",
+            "gqt-dst/case/__init_claim.json",
+            "gqt-dst/case/__create_if_absent_probe_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "gqt-dst/case/nodes/Person",
+        ]
+        .map(control_class)
+        .to_vec();
+        assert_eq!(
+            classes,
+            [
+                "control_schema",
+                "control_schema",
+                "control_schema",
+                "control_recovery",
+                "control_graph_index",
+                "control_manifest",
+                "control_claim",
+                "control_probe",
+                "control_other",
+            ]
+        );
+        let probe = Object::control(
+            "shared-memory://gqt-dst/case/__create_if_absent_probe_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        );
+        assert_eq!(probe.path, "gqt-dst/case/__create_if_absent_probe_<ulid>");
+        assert_eq!(
+            probe.raw_path,
+            "control:gqt-dst/case/__create_if_absent_probe_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        );
+        assert_eq!(probe.dataset, "control");
+        assert_eq!(
+            Object::control("shared-memory://gqt-dst/case/_schema.pg").raw_path,
+            "control:gqt-dst/case/_schema.pg"
+        );
     }
 }

@@ -1,0 +1,55 @@
+# issue: none
+# notes: Four sequential branches deletion/recreation cycles; live population stays bounded; no cleanup or thousand-cycle evidence.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item { key: String @key value: I64 }
+
+--- seed
+{"type":"Item","data":{"key":"baseline","value":0}}
+
+--- loop $cycle 0 4
+--- mutate
+branch create "recycled" from main
+--- expect ok
+
+--- mutate branch: recycled
+query add_temporary($v: I64) { insert Item { key: "temporary", value: $v } }
+--- params
+{"v": ${cycle}}
+--- expect affected: nodes=1 edges=0
+
+--- query branch: recycled
+query cycle_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"baseline","value":0}
+{"key":"temporary","value":${cycle}}
+--- expect shape
+key: String
+value: I64
+
+--- mutate
+branch delete "recycled"
+--- expect ok
+
+--- query branch: main
+query current_rows() { match { $r: Item } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"baseline","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- endloop
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+--- expect shape
+name: String

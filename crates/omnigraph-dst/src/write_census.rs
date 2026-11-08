@@ -262,6 +262,9 @@ pub fn classify(uri: &str) -> &'static str {
     if uri.contains("__create_if_absent_probe") {
         return "capability-probe";
     }
+    if uri.contains("__history/") {
+        return "history-file-untriaged";
+    }
     // INTENDED COLLAPSE: __manifest is itself a Lance dataset, so its
     // sub-artifacts (its _transactions/, _versions/, data files) all
     // classify as the coarse manifest-realm class by this early match —
@@ -289,12 +292,6 @@ pub fn classify(uri: &str) -> &'static str {
     }
     if uri.contains("_refs/") || uri.contains("_branches/") {
         return "branch-ref";
-    }
-    // Exact shapes only: a broad substring here would silently swallow
-    // the UNKNOWN red for a future artifact whose name merely contains
-    // the word (under-matching is safe, over-matching defeats the map).
-    if uri.contains("_schema.pg") || uri.contains("_schema.ir") || uri.contains("__schema_state") {
-        return "schema-artifact";
     }
     "UNKNOWN"
 }

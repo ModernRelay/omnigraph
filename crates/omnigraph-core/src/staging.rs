@@ -5,6 +5,7 @@ use lance::dataset::transaction::Transaction;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{OmniError, Result};
+use crate::graph_commit_id::is_valid_graph_commit_id;
 
 /// Stable identity of one Lance transaction.
 ///
@@ -121,8 +122,7 @@ impl StagingWitness {
         let graph_head = if recorded_head.is_empty() {
             None
         } else {
-            let head = ulid::Ulid::from_string(recorded_head).ok()?;
-            if head.to_string() != *recorded_head {
+            if !is_valid_graph_commit_id(recorded_head) {
                 return None;
             }
             Some(recorded_head.clone())

@@ -1,0 +1,131 @@
+# issue: 659
+# red_on: 7f1233bb
+# notes: Type and hop refusals, finite shared-work exhaustion and an empty wildcard retain explicit diagnostics and output shape.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+node Doc {
+    slug: String @key
+}
+edge Knows: Person -> Person {
+    weight: I64
+    since: I32?
+}
+edge Likes: Person -> Person {
+    weight: I64?
+}
+edge Owns: Person -> Doc
+
+--- seed
+{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"type":"Doc","data":{"slug":"doc"}}
+{"edge":"Knows","id":"shared","from":"a","to":"b","data":{"weight":1}}
+{"edge":"Knows","id":"ab2","from":"a","to":"b","data":{"weight":2}}
+{"edge":"Knows","id":"ac","from":"a","to":"c","data":{"weight":3}}
+{"edge":"Knows","id":"loop","from":"a","to":"a","data":{"weight":4}}
+{"edge":"Likes","id":"shared","from":"a","to":"b"}
+
+
+--- query
+query missing_common_property() { match { $p: Person $p $e:(knows | likes) $q } return { $e.since } }
+
+--- expect error: must exist with compatible types on every selected edge
+
+--- query
+query empty_has_no_property() { match { $a: Doc $b: Doc $a $e:* $b } return { $e.weight } }
+
+--- expect error: empty wildcard has no inferable property
+
+--- query
+query missing_wildcard_endpoint() { match { $p: Person $p * $q } return { $p.name } }
+
+--- expect error: requires explicitly declared source and destination node bindings
+
+--- query
+query inferred_wildcard_endpoint() { match { $p: Person $p knows $q $p * $q } return { $p.name } }
+
+--- expect error: requires explicitly declared source and destination node bindings
+
+--- query
+query incompatible_members() { match { $p: Person $p (knows | owns) $q } return { $p.name } }
+
+--- expect error: T5:
+
+--- query
+query recursive_edge_binding() { match { $p: Person $p $e:(knows | likes){1,2} $q } return { $e.@id } }
+
+--- expect error: T23:
+
+--- query
+query zero_hops() { match { $p: Person $p (knows | likes){0,1} $q } return { $p.name } }
+
+--- expect error: T15:
+
+--- query
+query unbounded_hops() { match { $p: Person $p (knows | likes){1,} $q } return { $p.name } }
+
+--- expect error: unbounded traversal is disabled
+
+--- query
+query reverse_bounds() { match { $p: Person $p (knows | likes){3,2} $q } return { $p.name } }
+
+--- expect error: max must be >= min
+
+--- query
+query unknown_member() { match { $p: Person $p (knows | missing) $q } return { $p.name } }
+
+--- expect error: unknown edge type `missing`
+
+--- query
+set traversal_work_limit = 1;
+query tiny_work_budget() { match { $p: Person { name: "a" } $p (knows | likes) $q } return { $q.name } }
+
+--- expect error: traversal_work_limit
+
+--- query
+query empty_wildcard_identity() {
+    match { $a: Doc $b: Doc $a $e:* $b }
+    return { $e.@type as edge_type, $e.@id as edge_id, $e.@src as source, $e.@dst as destination }
+}
+
+--- expect unordered
+
+--- expect shape
+edge_type: String
+edge_id: String
+source: String
+destination: String
+
+--- expect plan
+expand $a $b: selection wildcard []
+
+--- query
+query after_budget_error() {
+    match { $p: Person { name: "a" } $p (knows | likes) $q }
+    return { $q.name as destination }
+}
+
+--- expect unordered
+{"destination":"a"}
+{"destination":"b"}
+{"destination":"c"}
+
+--- expect shape
+destination: String
+
+--- query
+query single_name_group_is_not_edge_alternation() {
+    match { $a: Person $b: Person $a (knows) $b }
+    return { $a.name }
+}
+--- expect error: T41: a filter must be Boolean

@@ -1,0 +1,46 @@
+# issue: none
+# notes: The tiny insert as an unpublished commit (`as commit`): the new row is read at the commit's
+# notes: snapshot, `main` is read to show its head did not move, and the commit is dropped, so one
+# notes: provisioned graph serves every repetition on either target.
+
+--- runner
+timeout_ms: 600000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- mutate
+query add() as commit { insert Item { key: "c", val: 3 } }
+--- expect affected: nodes=1 edges=0
+--- bind commit $m
+
+--- query snapshot: $m
+query items_at_commit() {
+    match { $i: Item }
+    return { $i.key as key, $i.val as val }
+}
+--- expect unordered
+{"key":"a","val":1}
+{"key":"b","val":2}
+{"key":"c","val":3}
+--- expect shape
+key: String
+val: I64
+
+--- query branch: main
+query items_on_main() {
+    match { $i: Item }
+    return { $i.key as key, $i.val as val }
+}
+--- expect unordered
+{"key":"a","val":1}
+{"key":"b","val":2}
+--- expect shape
+key: String
+val: I64
+
+--- mutate
+commit drop "${m}"
+--- expect ok

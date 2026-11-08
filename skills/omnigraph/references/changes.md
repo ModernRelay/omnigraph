@@ -12,7 +12,8 @@ An effectful data `mutate --json` or `load --json` returns `commit` with the exa
 commit published by that attempt; a no-op mutation returns `"commit": null`.
 
 Protect a mutation derived from a read with `--if-commit <graph_commit_id>`.
-Any intervening branch commit fails without effects (CLI exit `4`, HTTP `412`).
+Any intervening branch commit fails without effects (HTTP `412`; CLI exit `4`,
+through a server or a direct `--target` open).
 Re-read and decide again rather than retrying the stale mutation.
 
 ## Branch statements
@@ -23,17 +24,19 @@ delete`, or `branch merge` statement without `name`, `params`, or a request
 outcome carries `merge` (`already_up_to_date`, `fast_forward`, or `merged`).
 Affected entity counts are zero because these are branch controls.
 
-Creation and deletion return `commit: null` despite changing branch state. A
-merge's optional `commit` is a target-head lookup after its gates are released,
-so another writer may already have moved it; it is not the data mutation's
-exact-attempt receipt. Inspect the outcome and relevant history. `branch list`
+Creation and deletion return `commit: null` despite changing branch state; a
+created outcome's `from_commit_id` names the commit the new branch starts at. A
+`fast_forward` or `merged` result returns `commit`, the exact commit that merge
+published, even when another writer has since advanced the target; an
+`already_up_to_date` merge publishes nothing and returns `commit: null`.
+`branch list`
 goes to canonical `POST /query` and returns sorted `name` rows; branch statements
-are refused on deprecated query/mutation routes and the conditional-write route.
+are refused on the conditional-write route.
 
 ## Inspect one commit
 
 ```bash
-omnigraph commit changes <commit-id> --store graph.omni --json
+omnigraph commit changes <commit-id> --target ./graph.omni --json
 ```
 
 The commit is compared with its first parent. Inserts contain `after`, updates
@@ -50,13 +53,35 @@ Large results use `next_page_token`. The CLI normally follows every page;
 is not a feed cursor. Parentless commits and unsupported schema-boundary diffs return `409`;
 capture a baseline instead of treating them as empty changes.
 
+## Compare two points or review a branch
+
+```bash
+omnigraph diff --from <commit-id> --to main --target ./graph.omni --json
+omnigraph branch diff feature --into main --target ./graph.omni --json
+omnigraph branch merge-base feature --into main --target ./graph.omni --json
+```
+
+`diff` reports the net change from `from` to `to` (each a branch head or a
+commit id) in the `commit changes` shape, with `from_commit_id`/`to_commit_id`
+and no `cause`; an update later reverted, or a delete followed by an equal
+reinsert, produces nothing. Comparing two branch heads also shows what the
+target changed since they diverged, reversed, so review a branch with
+`branch diff`: what `feature` changed since its merge base with `--into`
+(default `main`), naming `base_commit_id`. `merge-base` prints that commit.
+Both diffs take `--limit`/`--page-token`. A schema change between the sides is
+`409` `schema_boundary`, a side with reclaimed history `410`
+`change_feed_gap`. HTTP: `GET /graphs/{graph_id}/diff?from=&to=`,
+`GET /graphs/{graph_id}/branches/diff?source=&target=` and
+`/branches/merge-base?source=&target=`. To see whether a merge would succeed,
+use `branch merge --dry-run`.
+
 ## Follow a branch
 
 ```bash
-omnigraph changes poll --start now --store graph.omni --json
-omnigraph changes poll --start beginning --store graph.omni --json
-omnigraph changes poll --start after:<commit-id> --store graph.omni --json
-omnigraph changes poll --cursor <cursor> --store graph.omni --json
+omnigraph changes poll --start now --target ./graph.omni --json
+omnigraph changes poll --start beginning --target ./graph.omni --json
+omnigraph changes poll --start after:<commit-id> --target ./graph.omni --json
+omnigraph changes poll --cursor <cursor> --target ./graph.omni --json
 ```
 
 Each poll captures a fixed branch head and walks complete commits in first-parent
@@ -80,7 +105,7 @@ Cleanup can reclaim history needed by a cursor. A `410 change_feed_gap` cannot
 be repaired by retrying the same cursor. Capture and install a new baseline:
 
 ```bash
-omnigraph changes baseline --out snapshot.jsonl --store graph.omni --json
+omnigraph changes baseline --out snapshot.jsonl --target ./graph.omni --json
 ```
 
 The HTTP equivalent streams snapshot entity records followed by one terminal
@@ -98,5 +123,5 @@ On POSIX, CLI `--out` syncs and atomically replaces the snapshot file before it
 prints the handshake to JSON stdout. Baselines require Cedar `export`; commit
 changes and feed polling require `read`.
 
-Canonical contracts: [change feeds](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/branching/changes.md)
-and [conditional mutations](https://github.com/ModernRelay/omnigraph/blob/v0.11.0/docs/user/mutations/index.md#conditional-mutations).
+Canonical contracts: [change feeds](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/branching/changes.md)
+and [conditional mutations](https://github.com/ModernRelay/omnigraph/blob/main/docs/user/mutations/conditional.md).

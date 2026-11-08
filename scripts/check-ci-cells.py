@@ -196,15 +196,23 @@ def self_test() -> None:
         "            require_cell \"$test_name\"\n"
         "          done\n"
         "          for test_name in inline_owner; do require_cell \"$test_name\"; done\n"
+        # A module of a crate's `integration` binary is named with its
+        # `<module>::` prefix; the leaf is what the sources define.
+        "          run_cell s3::module_owner --test integration\n"
+        "          cargo test --locked -p b --test integration \\\n"
+        "            crossversion_upgrade::exact_module_owner \\\n"
+        "            -- --exact --nocapture 2>&1 | tee -a \"$log\"\n"
     )
     defined = defined_functions([
         "async fn alpha_owner() {}\nfn beta_owner() {}\npub fn quoted_owner<T>() {}\n",
         "#[test]\nfn gamma_owner() {}\nfn delta_owner() {}\nfn inline_owner() {}\n",
+        "async fn module_owner() {}\nfn exact_module_owner() {}\n",
     ])
     names, refused = required_names(workflow)
     assert refused == [], refused
     assert sorted(name for _, name in names) == [
-        "beta_owner", "delta_owner", "gamma_owner", "inline_owner", "quoted_owner", "tests::alpha_owner",
+        "beta_owner", "crossversion_upgrade::exact_module_owner", "delta_owner", "gamma_owner",
+        "inline_owner", "quoted_owner", "s3::module_owner", "tests::alpha_owner",
     ], names
     assert validate({"ci.yml": workflow}, defined) == []
     for missing in ("quoted_owner", "delta_owner", "inline_owner", "beta_owner"):
@@ -212,6 +220,12 @@ def self_test() -> None:
         assert failures and missing in failures[0], (missing, failures)
     prefixed = validate({"ci.yml": workflow}, defined - {"alpha_owner"})
     assert prefixed and "tests::alpha_owner" in prefixed[0], prefixed
+    # The prefix is discarded, so this check proves the leaf exists somewhere
+    # under crates/, never that the module path does; the compiled test
+    # inventory supplies that proof.
+    for qualified, leaf in (("s3::module_owner", "module_owner"), ("crossversion_upgrade::exact_module_owner", "exact_module_owner")):
+        failures = validate({"ci.yml": workflow}, defined - {leaf})
+        assert failures == [f"ci.yml:{dict((n, l) for l, n in names)[qualified]}: required test {qualified!r} is defined by no `fn` under crates/"], failures
     unclosed = validate({"ci.yml": "run_cell 'unterminated -p a\n"}, defined)
     assert any("cannot tokenize" in f for f in unclosed), unclosed
     assert validate({"ci.yml": "      run: cargo test\n"}, defined) == [

@@ -197,14 +197,8 @@ pub fn into_legacy_image_vintage(ir: SchemaIR) -> SchemaIR {
         FieldRefIR::Property(property) => names_removed(property),
         FieldRefIR::System(_) => false,
     };
-    let constraint_removed = |constraint: &ConstraintIR| match constraint {
-        ConstraintIR::Key { fields }
-        | ConstraintIR::Unique { fields }
-        | ConstraintIR::Index { fields } => fields.iter().any(field_removed),
-        ConstraintIR::Range { field, .. } | ConstraintIR::Check { field, .. } => {
-            field_removed(field)
-        }
-    };
+    let constraint_removed =
+        |constraint: &ConstraintIR| constraint.fields().iter().any(field_removed);
     for interface in &mut ir.interfaces {
         prune_removed_links(&mut interface.properties, &names_removed);
     }
@@ -490,6 +484,16 @@ pub enum ConstraintIR {
         field: FieldRefIR,
         pattern: String,
     },
+}
+
+impl ConstraintIR {
+    /// The fields the constraint names.
+    pub fn fields(&self) -> &[FieldRefIR] {
+        match self {
+            Self::Key { fields } | Self::Unique { fields } | Self::Index { fields } => fields,
+            Self::Range { field, .. } | Self::Check { field, .. } => std::slice::from_ref(field),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1894,17 +1898,11 @@ fn validate_constraints(
                 types[&owner_id].name
             ));
         }
-        let fields: Vec<&FieldRefIR> = match constraint {
-            ConstraintIR::Key { fields }
-            | ConstraintIR::Unique { fields }
-            | ConstraintIR::Index { fields } => fields.iter().collect(),
-            ConstraintIR::Range { field, .. } | ConstraintIR::Check { field, .. } => vec![field],
-        };
         let system_refs_allowed = !matches!(
             constraint,
             ConstraintIR::Range { .. } | ConstraintIR::Check { .. }
         );
-        for field in fields {
+        for field in constraint.fields() {
             match field {
                 FieldRefIR::Property(reference) => {
                     validate_property_ref(reference, Some(owner_id), types, properties)?;

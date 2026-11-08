@@ -1,0 +1,448 @@
+# issue: none
+# notes: One checked warmup precedes one measured query per fresh process; a restart and exact result check follow. This repetition boundary differs from the former repeated Rust timing loop.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query hop3() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $d: Person
+        $a knows $b
+        $b knows $c
+        $c knows $d
+    }
+    return { $a.name, $d.name }
+}
+--- expect unordered
+{"a.name":"p0","d.name":"p3"}
+{"a.name":"p0","d.name":"p6"}
+{"a.name":"p0","d.name":"p6"}
+{"a.name":"p0","d.name":"p9"}
+{"a.name":"p0","d.name":"p6"}
+{"a.name":"p0","d.name":"p9"}
+{"a.name":"p0","d.name":"p9"}
+{"a.name":"p0","d.name":"p12"}
+{"a.name":"p1","d.name":"p4"}
+{"a.name":"p1","d.name":"p7"}
+{"a.name":"p1","d.name":"p7"}
+{"a.name":"p1","d.name":"p10"}
+{"a.name":"p1","d.name":"p7"}
+{"a.name":"p1","d.name":"p10"}
+{"a.name":"p1","d.name":"p10"}
+{"a.name":"p1","d.name":"p13"}
+{"a.name":"p2","d.name":"p5"}
+{"a.name":"p2","d.name":"p8"}
+{"a.name":"p2","d.name":"p8"}
+{"a.name":"p2","d.name":"p11"}
+{"a.name":"p2","d.name":"p8"}
+{"a.name":"p2","d.name":"p11"}
+{"a.name":"p2","d.name":"p11"}
+{"a.name":"p2","d.name":"p14"}
+{"a.name":"p3","d.name":"p6"}
+{"a.name":"p3","d.name":"p9"}
+{"a.name":"p3","d.name":"p9"}
+{"a.name":"p3","d.name":"p12"}
+{"a.name":"p3","d.name":"p9"}
+{"a.name":"p3","d.name":"p12"}
+{"a.name":"p3","d.name":"p12"}
+{"a.name":"p3","d.name":"p15"}
+{"a.name":"p4","d.name":"p7"}
+{"a.name":"p4","d.name":"p10"}
+{"a.name":"p4","d.name":"p10"}
+{"a.name":"p4","d.name":"p13"}
+{"a.name":"p4","d.name":"p10"}
+{"a.name":"p4","d.name":"p13"}
+{"a.name":"p4","d.name":"p13"}
+{"a.name":"p4","d.name":"p0"}
+{"a.name":"p5","d.name":"p8"}
+{"a.name":"p5","d.name":"p11"}
+{"a.name":"p5","d.name":"p11"}
+{"a.name":"p5","d.name":"p14"}
+{"a.name":"p5","d.name":"p11"}
+{"a.name":"p5","d.name":"p14"}
+{"a.name":"p5","d.name":"p14"}
+{"a.name":"p5","d.name":"p1"}
+{"a.name":"p6","d.name":"p9"}
+{"a.name":"p6","d.name":"p12"}
+{"a.name":"p6","d.name":"p12"}
+{"a.name":"p6","d.name":"p15"}
+{"a.name":"p6","d.name":"p12"}
+{"a.name":"p6","d.name":"p15"}
+{"a.name":"p6","d.name":"p15"}
+{"a.name":"p6","d.name":"p2"}
+{"a.name":"p7","d.name":"p10"}
+{"a.name":"p7","d.name":"p13"}
+{"a.name":"p7","d.name":"p13"}
+{"a.name":"p7","d.name":"p0"}
+{"a.name":"p7","d.name":"p13"}
+{"a.name":"p7","d.name":"p0"}
+{"a.name":"p7","d.name":"p0"}
+{"a.name":"p7","d.name":"p3"}
+{"a.name":"p8","d.name":"p11"}
+{"a.name":"p8","d.name":"p14"}
+{"a.name":"p8","d.name":"p14"}
+{"a.name":"p8","d.name":"p1"}
+{"a.name":"p8","d.name":"p14"}
+{"a.name":"p8","d.name":"p1"}
+{"a.name":"p8","d.name":"p1"}
+{"a.name":"p8","d.name":"p4"}
+{"a.name":"p9","d.name":"p12"}
+{"a.name":"p9","d.name":"p15"}
+{"a.name":"p9","d.name":"p15"}
+{"a.name":"p9","d.name":"p2"}
+{"a.name":"p9","d.name":"p15"}
+{"a.name":"p9","d.name":"p2"}
+{"a.name":"p9","d.name":"p2"}
+{"a.name":"p9","d.name":"p5"}
+{"a.name":"p10","d.name":"p13"}
+{"a.name":"p10","d.name":"p0"}
+{"a.name":"p10","d.name":"p0"}
+{"a.name":"p10","d.name":"p3"}
+{"a.name":"p10","d.name":"p0"}
+{"a.name":"p10","d.name":"p3"}
+{"a.name":"p10","d.name":"p3"}
+{"a.name":"p10","d.name":"p6"}
+{"a.name":"p11","d.name":"p14"}
+{"a.name":"p11","d.name":"p1"}
+{"a.name":"p11","d.name":"p1"}
+{"a.name":"p11","d.name":"p4"}
+{"a.name":"p11","d.name":"p1"}
+{"a.name":"p11","d.name":"p4"}
+{"a.name":"p11","d.name":"p4"}
+{"a.name":"p11","d.name":"p7"}
+{"a.name":"p12","d.name":"p15"}
+{"a.name":"p12","d.name":"p2"}
+{"a.name":"p12","d.name":"p2"}
+{"a.name":"p12","d.name":"p5"}
+{"a.name":"p12","d.name":"p2"}
+{"a.name":"p12","d.name":"p5"}
+{"a.name":"p12","d.name":"p5"}
+{"a.name":"p12","d.name":"p8"}
+{"a.name":"p13","d.name":"p0"}
+{"a.name":"p13","d.name":"p3"}
+{"a.name":"p13","d.name":"p3"}
+{"a.name":"p13","d.name":"p6"}
+{"a.name":"p13","d.name":"p3"}
+{"a.name":"p13","d.name":"p6"}
+{"a.name":"p13","d.name":"p6"}
+{"a.name":"p13","d.name":"p9"}
+{"a.name":"p14","d.name":"p1"}
+{"a.name":"p14","d.name":"p4"}
+{"a.name":"p14","d.name":"p4"}
+{"a.name":"p14","d.name":"p7"}
+{"a.name":"p14","d.name":"p4"}
+{"a.name":"p14","d.name":"p7"}
+{"a.name":"p14","d.name":"p7"}
+{"a.name":"p14","d.name":"p10"}
+{"a.name":"p15","d.name":"p2"}
+{"a.name":"p15","d.name":"p5"}
+{"a.name":"p15","d.name":"p5"}
+{"a.name":"p15","d.name":"p8"}
+{"a.name":"p15","d.name":"p5"}
+{"a.name":"p15","d.name":"p8"}
+{"a.name":"p15","d.name":"p8"}
+{"a.name":"p15","d.name":"p11"}
+--- expect shape
+a.name: String
+d.name: String
+
+--- query
+query hop3() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $d: Person
+        $a knows $b
+        $b knows $c
+        $c knows $d
+    }
+    return { $a.name, $d.name }
+}
+--- expect unordered
+{"a.name":"p0","d.name":"p3"}
+{"a.name":"p0","d.name":"p6"}
+{"a.name":"p0","d.name":"p6"}
+{"a.name":"p0","d.name":"p9"}
+{"a.name":"p0","d.name":"p6"}
+{"a.name":"p0","d.name":"p9"}
+{"a.name":"p0","d.name":"p9"}
+{"a.name":"p0","d.name":"p12"}
+{"a.name":"p1","d.name":"p4"}
+{"a.name":"p1","d.name":"p7"}
+{"a.name":"p1","d.name":"p7"}
+{"a.name":"p1","d.name":"p10"}
+{"a.name":"p1","d.name":"p7"}
+{"a.name":"p1","d.name":"p10"}
+{"a.name":"p1","d.name":"p10"}
+{"a.name":"p1","d.name":"p13"}
+{"a.name":"p2","d.name":"p5"}
+{"a.name":"p2","d.name":"p8"}
+{"a.name":"p2","d.name":"p8"}
+{"a.name":"p2","d.name":"p11"}
+{"a.name":"p2","d.name":"p8"}
+{"a.name":"p2","d.name":"p11"}
+{"a.name":"p2","d.name":"p11"}
+{"a.name":"p2","d.name":"p14"}
+{"a.name":"p3","d.name":"p6"}
+{"a.name":"p3","d.name":"p9"}
+{"a.name":"p3","d.name":"p9"}
+{"a.name":"p3","d.name":"p12"}
+{"a.name":"p3","d.name":"p9"}
+{"a.name":"p3","d.name":"p12"}
+{"a.name":"p3","d.name":"p12"}
+{"a.name":"p3","d.name":"p15"}
+{"a.name":"p4","d.name":"p7"}
+{"a.name":"p4","d.name":"p10"}
+{"a.name":"p4","d.name":"p10"}
+{"a.name":"p4","d.name":"p13"}
+{"a.name":"p4","d.name":"p10"}
+{"a.name":"p4","d.name":"p13"}
+{"a.name":"p4","d.name":"p13"}
+{"a.name":"p4","d.name":"p0"}
+{"a.name":"p5","d.name":"p8"}
+{"a.name":"p5","d.name":"p11"}
+{"a.name":"p5","d.name":"p11"}
+{"a.name":"p5","d.name":"p14"}
+{"a.name":"p5","d.name":"p11"}
+{"a.name":"p5","d.name":"p14"}
+{"a.name":"p5","d.name":"p14"}
+{"a.name":"p5","d.name":"p1"}
+{"a.name":"p6","d.name":"p9"}
+{"a.name":"p6","d.name":"p12"}
+{"a.name":"p6","d.name":"p12"}
+{"a.name":"p6","d.name":"p15"}
+{"a.name":"p6","d.name":"p12"}
+{"a.name":"p6","d.name":"p15"}
+{"a.name":"p6","d.name":"p15"}
+{"a.name":"p6","d.name":"p2"}
+{"a.name":"p7","d.name":"p10"}
+{"a.name":"p7","d.name":"p13"}
+{"a.name":"p7","d.name":"p13"}
+{"a.name":"p7","d.name":"p0"}
+{"a.name":"p7","d.name":"p13"}
+{"a.name":"p7","d.name":"p0"}
+{"a.name":"p7","d.name":"p0"}
+{"a.name":"p7","d.name":"p3"}
+{"a.name":"p8","d.name":"p11"}
+{"a.name":"p8","d.name":"p14"}
+{"a.name":"p8","d.name":"p14"}
+{"a.name":"p8","d.name":"p1"}
+{"a.name":"p8","d.name":"p14"}
+{"a.name":"p8","d.name":"p1"}
+{"a.name":"p8","d.name":"p1"}
+{"a.name":"p8","d.name":"p4"}
+{"a.name":"p9","d.name":"p12"}
+{"a.name":"p9","d.name":"p15"}
+{"a.name":"p9","d.name":"p15"}
+{"a.name":"p9","d.name":"p2"}
+{"a.name":"p9","d.name":"p15"}
+{"a.name":"p9","d.name":"p2"}
+{"a.name":"p9","d.name":"p2"}
+{"a.name":"p9","d.name":"p5"}
+{"a.name":"p10","d.name":"p13"}
+{"a.name":"p10","d.name":"p0"}
+{"a.name":"p10","d.name":"p0"}
+{"a.name":"p10","d.name":"p3"}
+{"a.name":"p10","d.name":"p0"}
+{"a.name":"p10","d.name":"p3"}
+{"a.name":"p10","d.name":"p3"}
+{"a.name":"p10","d.name":"p6"}
+{"a.name":"p11","d.name":"p14"}
+{"a.name":"p11","d.name":"p1"}
+{"a.name":"p11","d.name":"p1"}
+{"a.name":"p11","d.name":"p4"}
+{"a.name":"p11","d.name":"p1"}
+{"a.name":"p11","d.name":"p4"}
+{"a.name":"p11","d.name":"p4"}
+{"a.name":"p11","d.name":"p7"}
+{"a.name":"p12","d.name":"p15"}
+{"a.name":"p12","d.name":"p2"}
+{"a.name":"p12","d.name":"p2"}
+{"a.name":"p12","d.name":"p5"}
+{"a.name":"p12","d.name":"p2"}
+{"a.name":"p12","d.name":"p5"}
+{"a.name":"p12","d.name":"p5"}
+{"a.name":"p12","d.name":"p8"}
+{"a.name":"p13","d.name":"p0"}
+{"a.name":"p13","d.name":"p3"}
+{"a.name":"p13","d.name":"p3"}
+{"a.name":"p13","d.name":"p6"}
+{"a.name":"p13","d.name":"p3"}
+{"a.name":"p13","d.name":"p6"}
+{"a.name":"p13","d.name":"p6"}
+{"a.name":"p13","d.name":"p9"}
+{"a.name":"p14","d.name":"p1"}
+{"a.name":"p14","d.name":"p4"}
+{"a.name":"p14","d.name":"p4"}
+{"a.name":"p14","d.name":"p7"}
+{"a.name":"p14","d.name":"p4"}
+{"a.name":"p14","d.name":"p7"}
+{"a.name":"p14","d.name":"p7"}
+{"a.name":"p14","d.name":"p10"}
+{"a.name":"p15","d.name":"p2"}
+{"a.name":"p15","d.name":"p5"}
+{"a.name":"p15","d.name":"p5"}
+{"a.name":"p15","d.name":"p8"}
+{"a.name":"p15","d.name":"p5"}
+{"a.name":"p15","d.name":"p8"}
+{"a.name":"p15","d.name":"p8"}
+{"a.name":"p15","d.name":"p11"}
+--- expect shape
+a.name: String
+d.name: String
+
+--- restart
+
+--- query
+query hop3() {
+    match {
+        $a: Person
+        $b: Person
+        $c: Person
+        $d: Person
+        $a knows $b
+        $b knows $c
+        $c knows $d
+    }
+    return { $a.name, $d.name }
+}
+--- expect unordered
+{"a.name":"p0","d.name":"p3"}
+{"a.name":"p0","d.name":"p6"}
+{"a.name":"p0","d.name":"p6"}
+{"a.name":"p0","d.name":"p9"}
+{"a.name":"p0","d.name":"p6"}
+{"a.name":"p0","d.name":"p9"}
+{"a.name":"p0","d.name":"p9"}
+{"a.name":"p0","d.name":"p12"}
+{"a.name":"p1","d.name":"p4"}
+{"a.name":"p1","d.name":"p7"}
+{"a.name":"p1","d.name":"p7"}
+{"a.name":"p1","d.name":"p10"}
+{"a.name":"p1","d.name":"p7"}
+{"a.name":"p1","d.name":"p10"}
+{"a.name":"p1","d.name":"p10"}
+{"a.name":"p1","d.name":"p13"}
+{"a.name":"p2","d.name":"p5"}
+{"a.name":"p2","d.name":"p8"}
+{"a.name":"p2","d.name":"p8"}
+{"a.name":"p2","d.name":"p11"}
+{"a.name":"p2","d.name":"p8"}
+{"a.name":"p2","d.name":"p11"}
+{"a.name":"p2","d.name":"p11"}
+{"a.name":"p2","d.name":"p14"}
+{"a.name":"p3","d.name":"p6"}
+{"a.name":"p3","d.name":"p9"}
+{"a.name":"p3","d.name":"p9"}
+{"a.name":"p3","d.name":"p12"}
+{"a.name":"p3","d.name":"p9"}
+{"a.name":"p3","d.name":"p12"}
+{"a.name":"p3","d.name":"p12"}
+{"a.name":"p3","d.name":"p15"}
+{"a.name":"p4","d.name":"p7"}
+{"a.name":"p4","d.name":"p10"}
+{"a.name":"p4","d.name":"p10"}
+{"a.name":"p4","d.name":"p13"}
+{"a.name":"p4","d.name":"p10"}
+{"a.name":"p4","d.name":"p13"}
+{"a.name":"p4","d.name":"p13"}
+{"a.name":"p4","d.name":"p0"}
+{"a.name":"p5","d.name":"p8"}
+{"a.name":"p5","d.name":"p11"}
+{"a.name":"p5","d.name":"p11"}
+{"a.name":"p5","d.name":"p14"}
+{"a.name":"p5","d.name":"p11"}
+{"a.name":"p5","d.name":"p14"}
+{"a.name":"p5","d.name":"p14"}
+{"a.name":"p5","d.name":"p1"}
+{"a.name":"p6","d.name":"p9"}
+{"a.name":"p6","d.name":"p12"}
+{"a.name":"p6","d.name":"p12"}
+{"a.name":"p6","d.name":"p15"}
+{"a.name":"p6","d.name":"p12"}
+{"a.name":"p6","d.name":"p15"}
+{"a.name":"p6","d.name":"p15"}
+{"a.name":"p6","d.name":"p2"}
+{"a.name":"p7","d.name":"p10"}
+{"a.name":"p7","d.name":"p13"}
+{"a.name":"p7","d.name":"p13"}
+{"a.name":"p7","d.name":"p0"}
+{"a.name":"p7","d.name":"p13"}
+{"a.name":"p7","d.name":"p0"}
+{"a.name":"p7","d.name":"p0"}
+{"a.name":"p7","d.name":"p3"}
+{"a.name":"p8","d.name":"p11"}
+{"a.name":"p8","d.name":"p14"}
+{"a.name":"p8","d.name":"p14"}
+{"a.name":"p8","d.name":"p1"}
+{"a.name":"p8","d.name":"p14"}
+{"a.name":"p8","d.name":"p1"}
+{"a.name":"p8","d.name":"p1"}
+{"a.name":"p8","d.name":"p4"}
+{"a.name":"p9","d.name":"p12"}
+{"a.name":"p9","d.name":"p15"}
+{"a.name":"p9","d.name":"p15"}
+{"a.name":"p9","d.name":"p2"}
+{"a.name":"p9","d.name":"p15"}
+{"a.name":"p9","d.name":"p2"}
+{"a.name":"p9","d.name":"p2"}
+{"a.name":"p9","d.name":"p5"}
+{"a.name":"p10","d.name":"p13"}
+{"a.name":"p10","d.name":"p0"}
+{"a.name":"p10","d.name":"p0"}
+{"a.name":"p10","d.name":"p3"}
+{"a.name":"p10","d.name":"p0"}
+{"a.name":"p10","d.name":"p3"}
+{"a.name":"p10","d.name":"p3"}
+{"a.name":"p10","d.name":"p6"}
+{"a.name":"p11","d.name":"p14"}
+{"a.name":"p11","d.name":"p1"}
+{"a.name":"p11","d.name":"p1"}
+{"a.name":"p11","d.name":"p4"}
+{"a.name":"p11","d.name":"p1"}
+{"a.name":"p11","d.name":"p4"}
+{"a.name":"p11","d.name":"p4"}
+{"a.name":"p11","d.name":"p7"}
+{"a.name":"p12","d.name":"p15"}
+{"a.name":"p12","d.name":"p2"}
+{"a.name":"p12","d.name":"p2"}
+{"a.name":"p12","d.name":"p5"}
+{"a.name":"p12","d.name":"p2"}
+{"a.name":"p12","d.name":"p5"}
+{"a.name":"p12","d.name":"p5"}
+{"a.name":"p12","d.name":"p8"}
+{"a.name":"p13","d.name":"p0"}
+{"a.name":"p13","d.name":"p3"}
+{"a.name":"p13","d.name":"p3"}
+{"a.name":"p13","d.name":"p6"}
+{"a.name":"p13","d.name":"p3"}
+{"a.name":"p13","d.name":"p6"}
+{"a.name":"p13","d.name":"p6"}
+{"a.name":"p13","d.name":"p9"}
+{"a.name":"p14","d.name":"p1"}
+{"a.name":"p14","d.name":"p4"}
+{"a.name":"p14","d.name":"p4"}
+{"a.name":"p14","d.name":"p7"}
+{"a.name":"p14","d.name":"p4"}
+{"a.name":"p14","d.name":"p7"}
+{"a.name":"p14","d.name":"p7"}
+{"a.name":"p14","d.name":"p10"}
+{"a.name":"p15","d.name":"p2"}
+{"a.name":"p15","d.name":"p5"}
+{"a.name":"p15","d.name":"p5"}
+{"a.name":"p15","d.name":"p8"}
+{"a.name":"p15","d.name":"p5"}
+{"a.name":"p15","d.name":"p8"}
+{"a.name":"p15","d.name":"p8"}
+{"a.name":"p15","d.name":"p11"}
+--- expect shape
+a.name: String
+d.name: String

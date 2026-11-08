@@ -1,0 +1,44 @@
+# issue: none
+# notes: RankFuse is a breaker with two inputs: each arm's ranked scan is its own pipeline into the fusion (the secondary arm first), the fused rows drain into the Sort above it, and the sorted page reaches the consumer.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+    embedding: Vector(4) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d000","embedding":[0.0,0.0,0.0,0.0],"text":"needle needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d001","embedding":[1.0,0.0,0.0,0.0],"text":"needle needle needle filler"}}
+{"type":"Doc","data":{"slug":"d002","embedding":[2.0,0.0,0.0,0.0],"text":"needle needle filler"}}
+{"type":"Doc","data":{"slug":"d003","embedding":[3.0,0.0,0.0,0.0],"text":"needle filler"}}
+{"type":"Doc","data":{"slug":"d004","embedding":[4.0,0.0,0.0,0.0],"text":"filler"}}
+
+--- query
+set engine = v2;
+query fused($q: Vector(4), $t: String) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    limit 3
+}
+--- params
+{"q": [0.0, 0.0, 0.0, 0.0], "t": "needle"}
+--- expect ordered
+{"d.slug":"d000"}
+{"d.slug":"d001"}
+{"d.slug":"d002"}
+--- expect shape
+d.slug: String
+--- expect plan
+pipeline 0: Scan => RankFuse(secondary)
+pipeline 1: Scan => RankFuse
+pipeline 2: RankFuse -> Projection => Sort after 0, 1
+pipeline 3: Sort -> Page => consumer after 2

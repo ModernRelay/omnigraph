@@ -100,7 +100,7 @@ return { $f.name }
     let q = qf.single_decl();
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
-            assert_eq!(t.edge_name, "knows");
+            assert_eq!(t.selector, EdgeSelector::Named("knows".to_string()));
             assert!(t.undirected, "bare undirected form");
             assert_eq!((t.min_hops, t.max_hops), (1, Some(1)));
         }
@@ -139,7 +139,7 @@ return { $f.name, $f.age }
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.src, "p");
-            assert_eq!(t.edge_name, "knows");
+            assert_eq!(t.selector, EdgeSelector::Named("knows".to_string()));
             assert_eq!(t.dst, "f");
             assert_eq!(t.min_hops, 1);
             assert_eq!(t.max_hops, Some(1));
@@ -170,7 +170,7 @@ return { $p.name }
             match &block.clauses[0] {
                 Clause::Traversal(t) => {
                     assert_eq!(t.src, "p");
-                    assert_eq!(t.edge_name, "worksAt");
+                    assert_eq!(t.selector, EdgeSelector::Named("worksAt".to_string()));
                     assert_eq!(t.dst, "_");
                     assert_eq!(t.min_hops, 1);
                     assert_eq!(t.max_hops, Some(1));
@@ -245,7 +245,7 @@ return { $p.name }
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.src, "p");
-            assert_eq!(t.edge_name, "worksAt");
+            assert_eq!(t.selector, EdgeSelector::Named("worksAt".to_string()));
             assert_eq!(t.dst, "c");
             assert_eq!(t.min_hops, 1);
             assert_eq!(t.max_hops, Some(1));
@@ -506,7 +506,7 @@ fn prop(variable: &str, property: &str) -> Expr {
 }
 
 fn int(value: i64) -> Expr {
-    Expr::Literal(Literal::Integer(value))
+    Expr::Literal(Literal::Integer(i128::from(value)))
 }
 
 fn and(left: Expr, right: Expr) -> Expr {
@@ -665,7 +665,7 @@ fn test_parse_boolean_words_are_word_bounded_and_reserved_words_never_edge_names
         parse_query("query q() { match { $p: Person  $p andy $f } return { $p.name } }").unwrap();
     assert!(matches!(
         &qf.single_decl().match_clause[1],
-        Clause::Traversal(traversal) if traversal.edge_name == "andy"
+        Clause::Traversal(traversal) if traversal.selector == EdgeSelector::Named("andy".to_string())
     ));
     for (clause, edge, undirected, binding) in [
         (r#"$p "in" $f"#, "in", false, None),
@@ -679,7 +679,11 @@ fn test_parse_boolean_words_are_word_bounded_and_reserved_words_never_edge_names
         let Clause::Traversal(traversal) = &qf.single_decl().match_clause[1] else {
             panic!("expected a traversal: {source}");
         };
-        assert_eq!(traversal.edge_name, edge, "{source}");
+        assert_eq!(
+            traversal.selector,
+            EdgeSelector::Named(edge.to_string()),
+            "{source}"
+        );
         assert_eq!(traversal.undirected, undirected, "{source}");
         assert_eq!(traversal.edge_binding.as_deref(), binding, "{source}");
     }
@@ -1420,7 +1424,7 @@ return { $p.name
 }
 "#;
     let err = parse_query_diagnostic(input).unwrap_err();
-    assert!(err.span.is_some());
+    assert!(err.position.is_some());
 }
 
 #[test]
@@ -1444,7 +1448,7 @@ return { $f.name }
     match &q.match_clause[1] {
         Clause::Traversal(t) => {
             assert_eq!(t.src, "p");
-            assert_eq!(t.edge_name, "knows");
+            assert_eq!(t.selector, EdgeSelector::Named("knows".to_string()));
             assert_eq!(t.dst, "f");
             assert!(!t.undirected);
             assert_eq!(t.edge_binding.as_deref(), Some("w"));
@@ -1474,14 +1478,25 @@ fn parse_branch(input: &str) -> BranchStmt {
             queries.len()
         ),
         FileBody::Show(id) => panic!("expected a branch statement, got show {id:?}"),
-        FileBody::Explain(_) => panic!("expected a branch statement, got an explain statement"),
+        FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
+            panic!("expected a branch statement, got an explain statement")
+        }
+        FileBody::Commit(write) => panic!("expected a branch statement, got {write:?}"),
+        FileBody::Load(stmt) => panic!("expected a branch statement, got {stmt:?}"),
     }
 }
 
 fn create(name: &str, from: Option<&str>) -> BranchStmt {
     BranchStmt::Write(BranchWrite::Create {
         name: name.to_string(),
-        from: from.map(str::to_string),
+        from: from.map(|from| BranchCreateFrom::Branch(from.to_string())),
+    })
+}
+
+fn create_at(name: &str, commit: &str) -> BranchStmt {
+    BranchStmt::Write(BranchWrite::Create {
+        name: name.to_string(),
+        from: Some(BranchCreateFrom::Commit(commit.to_string())),
     })
 }
 
@@ -1495,7 +1510,308 @@ fn merge(source: &str, into: Option<&str>) -> BranchStmt {
     BranchStmt::Write(BranchWrite::Merge {
         source: source.to_string(),
         into: into.map(str::to_string),
+        as_commit: false,
     })
+}
+
+fn parse_commit(input: &str) -> CommitWrite {
+    match parse_query(input).unwrap().body {
+        FileBody::Commit(write) => write,
+        other => panic!("expected a commit statement, got {other:?}"),
+    }
+}
+
+fn parse_load(input: &str) -> LoadStmt {
+    match parse_query(input).unwrap().body {
+        FileBody::Load(stmt) => stmt,
+        other => panic!("expected a load statement, got {other:?}"),
+    }
+}
+
+#[test]
+fn load_statement_parses_every_option() {
+    let stmt = parse_load(
+        "load csv \"s3://bucket/imports/knows.csv\" into edge:Knows mode append delimiter \"|\" header columns (from, to, creationDate);",
+    );
+    assert_eq!(
+        stmt,
+        LoadStmt {
+            source: "s3://bucket/imports/knows.csv".to_string(),
+            target: LoadTarget::Edge("Knows".to_string()),
+            mode: LoadStmtMode::Append,
+            delimiter: b'|',
+            header: true,
+            columns: Some(vec![
+                "from".to_string(),
+                "to".to_string(),
+                "creationDate".to_string()
+            ]),
+        }
+    );
+    assert_eq!(stmt.statement_name(), "load csv");
+    assert_eq!(stmt.target.table_key(), "edge:Knows");
+}
+
+#[test]
+fn load_statement_defaults_to_comma_and_header_names() {
+    let stmt =
+        parse_load("load csv \"file:///tmp/person.csv\" into node:Person mode overwrite header");
+    assert_eq!(stmt.target, LoadTarget::Node("Person".to_string()));
+    assert_eq!(stmt.mode, LoadStmtMode::Overwrite);
+    assert_eq!(stmt.delimiter, b',');
+    assert!(stmt.header);
+    assert_eq!(stmt.columns, None);
+}
+
+#[test]
+fn load_statement_refusals_name_the_missing_or_repeated_part() {
+    let cases = [
+        (
+            "load csv \"s3://b/p.csv\" into node:Person header",
+            "names its mode",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append",
+            "names its columns",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append mode merge header",
+            "`mode` is given twice",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append columns (a, a)",
+            "column `a` is named twice",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append header delimiter \"||\"",
+            "one printable ASCII character",
+        ),
+        (
+            "load csv \"\" into node:Person mode append header",
+            "non-empty URI",
+        ),
+        (
+            "load csv \"s3://b/p.csv\" into node:Person mode append header\nquery q() { match { $p: Person } return { $p.id } }",
+            "a load statement stands alone in its file",
+        ),
+    ];
+    for (input, expected) in cases {
+        let error = parse_query(input).unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "{input}: expected {expected:?} in {error:?}"
+        );
+    }
+}
+
+#[test]
+fn load_statement_is_not_a_declaration() {
+    let file = parse_query("load csv \"s3://b/p.csv\" into node:Person mode append header");
+    assert_eq!(
+        file.unwrap().into_declarations().unwrap_err(),
+        "`load csv` is a load statement, not a query declaration"
+    );
+}
+
+#[test]
+fn as_commit_marks_a_mutation_declaration_or_a_merge() {
+    let decl =
+        parse_query("query add($n: String) as commit {\n    insert Person { name: $n }\n}\n")
+            .unwrap();
+    let decl = decl.single_decl();
+    assert_eq!(decl.write_mode, MutationWriteMode::AsCommit);
+    assert_eq!(decl.mutations.len(), 1);
+    let plain =
+        parse_query("query add($n: String) {\n    insert Person { name: $n }\n}\n").unwrap();
+    assert_eq!(plain.single_decl().write_mode, MutationWriteMode::Publish);
+    let annotated = parse_query(
+        "query add($n: String) @description(\"adds\") as commit {\n    insert Person { name: $n }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        annotated.single_decl().write_mode,
+        MutationWriteMode::AsCommit
+    );
+
+    let err =
+        parse_query("query q() as commit {\n    match { $p: Person }\n    return { $p.name }\n}\n")
+            .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("`as commit` applies to a mutation; query `q` is read-only"),
+        "{err}"
+    );
+    let diagnostic = parse_query_diagnostic(
+        "query q() as commit {\n    match { $p: Person }\n    return { $p.name }\n}\n",
+    )
+    .unwrap_err();
+    assert_eq!(diagnostic.code, Q005);
+    assert_eq!(
+        diagnostic.position,
+        Some(Position::at("query q() as commit {", 10))
+    );
+
+    assert_eq!(
+        parse_branch("branch merge b0 into main as commit"),
+        BranchStmt::Write(BranchWrite::Merge {
+            source: "b0".to_string(),
+            into: Some("main".to_string()),
+            as_commit: true,
+        })
+    );
+    assert_eq!(
+        parse_branch("branch merge b0 as commit"),
+        BranchStmt::Write(BranchWrite::Merge {
+            source: "b0".to_string(),
+            into: None,
+            as_commit: true,
+        })
+    );
+    assert_eq!(
+        parse_branch(r#"branch merge "as" into commit"#),
+        merge("as", Some("commit"))
+    );
+    for input in [
+        "branch merge as commit",
+        "branch merge b0 as commitx",
+        "branch merge b0 ascommit",
+        "branch merge b0 as",
+        "branch create b0 as commit",
+        "query q() ascommit {\n    insert Person { name: \"a\" }\n}\n",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+}
+
+#[test]
+fn as_unattached_branch_marks_a_mutation_declaration_with_an_optional_base() {
+    let root = parse_query(
+        "query add($n: String) as unattached branch {\n    insert Person { name: $n }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        root.single_decl().write_mode,
+        MutationWriteMode::Unattached { base: None }
+    );
+    assert_eq!(root.single_decl().mutations.len(), 1);
+
+    let literal = parse_query(
+        "query add($n: String) as unattached branch on \"01ARZ3NDEKTSV4RRFFQ69G5FAV\" {\n    insert Person { name: $n }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        literal.single_decl().write_mode,
+        MutationWriteMode::Unattached {
+            base: Some(UnattachedBase::Literal(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()
+            )),
+        }
+    );
+
+    let param = parse_query(
+        "query add($n: String, $base: String) @description(\"adds\") as unattached branch on $base {\n    insert Person { name: $n }\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        param.single_decl().write_mode,
+        MutationWriteMode::Unattached {
+            base: Some(UnattachedBase::Param("base".to_string())),
+        }
+    );
+
+    let read_only =
+        "query q() as unattached branch {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let err = parse_query(read_only).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("`as unattached branch` applies to a mutation; query `q` is read-only"),
+        "{err}"
+    );
+    let diagnostic = parse_query_diagnostic(read_only).unwrap_err();
+    assert_eq!(diagnostic.code, Q005);
+    assert_eq!(
+        diagnostic.position,
+        Some(Position::at("query q() as unattached branch {", 10))
+    );
+
+    for operand in ["\"\"", "\" 01ARZ\"", "\"01ARZ \"", "\"01\\tARZ\""] {
+        let input = format!(
+            "query add($n: String) as unattached branch on {operand} {{\n    insert Person {{ name: $n }}\n}}\n"
+        );
+        let diagnostic = parse_query_diagnostic(&input).unwrap_err();
+        assert_eq!(diagnostic.code, Q004, "{input}");
+        assert!(
+            diagnostic.message.contains("is not a commit id"),
+            "{input}: {}",
+            diagnostic.message
+        );
+    }
+
+    for input in [
+        "branch merge b0 as unattached branch",
+        "branch merge b0 into main as unattached branch",
+        "query q() as unattached {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattachedbranch {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattached branch on {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattached branch on b0 {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as unattached branch onx \"01ARZ\" {\n    insert Person { name: \"a\" }\n}\n",
+        "query q() as commit as unattached branch {\n    insert Person { name: \"a\" }\n}\n",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+}
+
+#[test]
+fn commit_statements_name_one_graph_commit_id() {
+    let id = "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.3.01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    let publish = parse_commit(&format!("commit publish \"{id}\""));
+    assert_eq!(
+        publish,
+        CommitWrite::Publish {
+            graph_commit_id: id.to_string()
+        }
+    );
+    assert_eq!(publish.statement_name(), "commit publish");
+    assert_eq!(publish.graph_commit_id(), id);
+    let dropped = parse_commit(&format!("commit drop \"{id}\";"));
+    assert_eq!(
+        dropped,
+        CommitWrite::Drop {
+            graph_commit_id: id.to_string()
+        }
+    );
+    assert_eq!(dropped.statement_name(), "commit drop");
+    assert_eq!(
+        parse_commit(&format!("  commit\n  publish \"{id}\" // later\n")),
+        publish
+    );
+    for input in [
+        "commit publish",
+        "commit publish hb1.x",
+        "commit publish \"\"",
+        "commit publish \" id\"",
+        "commit publishx \"id\"",
+        "commit list",
+        "commitpublish \"id\"",
+        &format!("commit publish \"{id}\"\nbranch list"),
+        &format!("query q() {{\n    insert Person {{ name: \"a\" }}\n}}\ncommit publish \"{id}\""),
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+    let err = parse_query(&format!("commit publish \"{id}\"\nbranch list")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a commit statement stands alone in its file"),
+        "{err}"
+    );
+    assert_eq!(
+        parse_query(&format!("commit drop \"{id}\""))
+            .unwrap()
+            .into_declarations()
+            .unwrap_err(),
+        "`commit drop` is a commit statement, not a query declaration"
+    );
+    assert_eq!(parse_branch("branch create commit"), create("commit", None));
 }
 
 #[test]
@@ -1531,6 +1847,94 @@ fn branch_statements_parse_with_and_without_their_defaults() {
 }
 
 #[test]
+fn branch_control_reads_parse_as_reads() {
+    let read = |stmt: BranchStmt| match stmt {
+        BranchStmt::Read(read) => read,
+        other => panic!("expected a branch control read, got {other:?}"),
+    };
+    let names = |source: &str, into: Option<&str>| (source.to_string(), into.map(str::to_string));
+
+    let diff = parse_branch("branch diff feature");
+    assert!(!diff.is_write());
+    assert_eq!(diff.statement_name(), "branch diff");
+    assert_eq!(
+        read(diff),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Branch {
+                source: "feature".to_string(),
+                into: None,
+            },
+            page: DiffPageClause::default(),
+        }
+    );
+    assert_eq!(
+        read(parse_branch(
+            r#"branch diff feature into main after page "tok" limit 50"#
+        )),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Branch {
+                source: "feature".to_string(),
+                into: Some("main".to_string()),
+            },
+            page: DiffPageClause {
+                after_page: Some("tok".to_string()),
+                limit: Some(50),
+            },
+        }
+    );
+    // A commit id is quoted: it is not an identifier.
+    assert_eq!(
+        read(parse_branch(
+            r#"branch diff "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV" to main limit 1"#
+        )),
+        BranchRead::Diff {
+            sides: BranchDiffSides::Between {
+                from: "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.0.01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                to: "main".to_string(),
+            },
+            page: DiffPageClause {
+                after_page: None,
+                limit: Some(1),
+            },
+        }
+    );
+
+    let base = parse_branch("branch merge-base feature into main");
+    assert!(!base.is_write());
+    assert_eq!(base.statement_name(), "branch merge-base");
+    let (source, into) = names("feature", Some("main"));
+    assert_eq!(read(base), BranchRead::MergeBase { source, into });
+
+    let dry = parse_branch("branch merge feature dry run");
+    assert!(!dry.is_write());
+    assert_eq!(dry.statement_name(), "branch merge dry run");
+    let (source, into) = names("feature", None);
+    assert_eq!(read(dry), BranchRead::MergeDryRun { source, into });
+    let (source, into) = names("feature", Some("main"));
+    assert_eq!(
+        read(parse_branch("branch merge feature into main dry run")),
+        BranchRead::MergeDryRun { source, into }
+    );
+
+    // `dry run` is the clause, never a branch named `dry`; quoted, it is one.
+    assert_eq!(parse_branch(r#"branch merge "dry""#), merge("dry", None));
+    assert!(parse_query("branch merge dry run").is_err());
+    for input in [
+        "branch merge feature dry run as commit",
+        "branch merge feature as commit dry run",
+        "branch merge-base feature dry run",
+        "branch diff feature to",
+        "branch diff feature into main to other",
+        "branch diff feature limit 0",
+        "branch diff feature limit 5 after page \"tok\"",
+        "branch diffx feature",
+        "branch merge-basefeature",
+    ] {
+        assert!(parse_query(input).is_err(), "{input}");
+    }
+}
+
+#[test]
 fn branch_names_outside_the_identifier_alphabet_are_quoted() {
     assert_eq!(
         parse_branch(r#"branch create "review/add-benchmark""#),
@@ -1554,6 +1958,32 @@ fn branch_names_outside_the_identifier_alphabet_are_quoted() {
     );
     assert!(parse_query("branch create from main").is_err());
     assert!(parse_query("branch create b0 from").is_err());
+}
+
+#[test]
+fn branch_create_from_commit_names_a_graph_commit() {
+    let id = "hb1.01ARZ3NDEKTSV4RRFFQ69G5FAV.3.01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    assert_eq!(
+        parse_branch(&format!(r#"branch create fix from commit "{id}""#)),
+        create_at("fix", id)
+    );
+    assert_eq!(
+        parse_branch(r#"branch create "fix/import" from commit "01ARZ3NDEKTSV4RRFFQ69G5FAV""#),
+        create_at("fix/import", "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+    );
+    // A bare `commit` with no quoted id after it is a branch called `commit`.
+    assert_eq!(
+        parse_branch("branch create b0 from commit"),
+        create("b0", Some("commit"))
+    );
+    assert_eq!(
+        parse_branch(r#"branch create b0 from "commit""#),
+        create("b0", Some("commit"))
+    );
+    // The id is quoted; an unquoted word after `from commit` is refused.
+    assert!(parse_query("branch create b0 from commit main").is_err());
+    assert!(parse_query(r#"branch create b0 from commit """#).is_err());
+    assert!(parse_query(r#"branch create b0 from commit " x""#).is_err());
     assert!(parse_query("branch merge b0 into").is_err());
     assert!(parse_query("branch list all").is_err());
 }
@@ -1657,7 +2087,58 @@ fn explain_statement_never_shares_a_file_with_a_declaration() {
         format!("branch list\nexplain {decl}"),
     ] {
         let error = parse_query(&input).unwrap_err();
-        assert!(matches!(error, CompilerError::Parse(_)), "{input}: {error}");
+        assert!(
+            error.diagnostic().is_some_and(|diagnostic| {
+                diagnostic.kind == crate::query::diagnostic::QueryDiagnosticKind::Parse
+            }),
+            "{input}: {error}"
+        );
+    }
+}
+
+#[test]
+fn explain_load_statement_wraps_the_bare_load_statement() {
+    const LOAD: &str = "load csv \"s3://b/k.csv\" into edge:Knows mode overwrite header";
+    let bare = parse_load(LOAD);
+    let file = parse_query(&format!("explain {LOAD}")).unwrap();
+    let FileBody::ExplainLoad(stmt) = &file.body else {
+        panic!("expected an explain load statement, got {:?}", file.body);
+    };
+    assert_eq!(*stmt, bare);
+    assert!(!file.body.is_explain());
+    assert_eq!(
+        file.body.clone().into_read_declarations().unwrap_err(),
+        "`explain load csv` is answered as a load plan by the read doors, not as a query declaration"
+    );
+    assert_eq!(
+        file.body.into_declarations().unwrap_err(),
+        "`explain` is a statement, not a query declaration"
+    );
+}
+
+#[test]
+fn explain_load_statement_meets_the_load_and_explain_refusals() {
+    let decl = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let cases = [
+        (
+            "explain load csv \"s3://b/k.csv\" into edge:Knows header\n".to_string(),
+            "names its mode",
+        ),
+        (
+            format!("explain load csv \"s3://b/k.csv\" into edge:Knows mode overwrite header\n{decl}"),
+            "an `explain` statement stands alone in its file",
+        ),
+        (
+            "explain load csv \"s3://b/k.csv\" into edge:Knows mode overwrite header\nbranch list\n".to_string(),
+            "an `explain` statement stands alone in its file",
+        ),
+    ];
+    for (input, expected) in cases {
+        let error = parse_query(&input).unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "{input}: expected {expected:?} in {error:?}"
+        );
     }
 }
 
@@ -1672,7 +2153,12 @@ fn explain_keyword_ends_at_a_word_boundary_and_needs_a_declaration() {
         format!("explain explain {decl}"),
     ] {
         let error = parse_query(&input).unwrap_err();
-        assert!(matches!(error, CompilerError::Parse(_)), "{input}: {error}");
+        assert!(
+            error.diagnostic().is_some_and(|diagnostic| {
+                diagnostic.kind == crate::query::diagnostic::QueryDiagnosticKind::Parse
+            }),
+            "{input}: {error}"
+        );
     }
 }
 
@@ -1845,7 +2331,7 @@ fn settings_statements_are_checked_against_the_definition() {
             "{input}: {} (the full text is `settings::tests::messages_follow_the_definition`'s)",
             err.message
         );
-        assert!(err.span.is_some(), "{input} carries a position");
+        assert!(err.position.is_some(), "{input} carries a position");
     }
     let rendered = parse_query("set merge_lineage = v3;")
         .unwrap_err()
@@ -1939,4 +2425,193 @@ return { $p.set, $q.traversal as all }
     assert_eq!(file.single_decl().name, "q");
     assert_eq!(parse_branch("branch create set"), create("set", None));
     assert_eq!(parse_branch("branch create all"), create("all", None));
+}
+
+#[test]
+fn test_parse_edge_selectors_issue_659() {
+    for (spelling, selector, undirected) in [
+        (
+            "(knows | likes)",
+            EdgeSelector::Alternation(vec!["knows".into(), "likes".into()]),
+            false,
+        ),
+        (
+            "<knows | likes>",
+            EdgeSelector::Alternation(vec!["knows".into(), "likes".into()]),
+            true,
+        ),
+        ("*", EdgeSelector::Wildcard, false),
+        ("<*>", EdgeSelector::Wildcard, true),
+        (
+            "(knows | \"in\")",
+            EdgeSelector::Alternation(vec!["knows".into(), "in".into()]),
+            false,
+        ),
+    ] {
+        for bounds in ["", "{1,1}"] {
+            let source = format!(
+                "query q() {{ match {{ $a $e:{spelling}{bounds} $b }} return {{ $e.@type }} }}"
+            );
+            let parsed = parse_query(&source).unwrap();
+            let Clause::Traversal(traversal) = &parsed.single_decl().match_clause[0] else {
+                panic!("expected traversal");
+            };
+            assert_eq!(traversal.selector, selector, "{source}");
+            assert_eq!(traversal.undirected, undirected, "{source}");
+            assert_eq!((traversal.min_hops, traversal.max_hops), (1, Some(1)));
+            assert_eq!(traversal.edge_binding.as_deref(), Some("e"));
+        }
+    }
+    for selector in [
+        "(knows |)",
+        "(| knows)",
+        "(knows | \"bad name\")",
+        "(knows | *)",
+    ] {
+        let source = format!("query q() {{ match {{ $a {selector} $b }} return {{ $a }} }}");
+        assert!(parse_query(&source).is_err(), "{source}");
+    }
+    let parsed = parse_query("query q() { match { $a (knows) $b } return { $a } }").unwrap();
+    assert!(
+        parsed
+            .single_decl()
+            .match_clause
+            .iter()
+            .all(|clause| !matches!(clause, Clause::Traversal(_)))
+    );
+}
+
+#[test]
+fn query_without_parameter_list_reports_q002_at_the_name_end_with_fix() {
+    let err =
+        parse_query_diagnostic("query name {\n  match { $p: Person }\n  return { $p.name }\n}")
+            .unwrap_err();
+    assert_eq!(err.code.as_str(), "Q002");
+    assert_eq!(
+        err.message,
+        "expected `(`: a query declares its parameters even when it has none"
+    );
+    assert_eq!(err.fix.as_deref(), Some("query name()"));
+    let at = err.position.expect("positioned at the name's end");
+    assert_eq!((at.line, at.column, at.byte), (1, 11, 10));
+    assert!(err.stage.is_none());
+    let rendered = parse_query("query name {").unwrap_err().to_string();
+    assert_eq!(
+        rendered,
+        "parse error: expected `(`: a query declares its parameters even when it has none"
+    );
+    // A well-formed declaration before the broken one leaves the fix's
+    // subject the broken one.
+    let err =
+        parse_query_diagnostic("query a() { match { $p: Person } return { $p.name } }\nquery b {")
+            .unwrap_err();
+    assert_eq!(err.fix.as_deref(), Some("query b()"));
+    assert_eq!(err.position.unwrap().line, 2);
+    // The declaration keeps its parameter list when it has one.
+    assert!(parse_query("query a() { match { $p: Person } return { $p.name } }").is_ok());
+}
+
+#[test]
+fn query_diagnostic_suggestion_edits_preserve_source_and_reparse() {
+    for source in [
+        "query name { match { $p: Person } return { $p.name } }",
+        "/* café */\nquery name /* keep */ { match { $p: Person } return { $p.name } }",
+        "query name // keep\n{ match { $p: Person } return { $p.name } }",
+        "query first() { match { $p: Person } return { $p.name } }\nquery name { match { $p: Person } return { $p.name } }",
+        "query name @description(\"hello\") { match { $p: Person } return { $p.name } }",
+    ] {
+        let diagnostic = parse_query_diagnostic(source).unwrap_err();
+        assert_eq!(diagnostic.code, Q002, "{source}");
+        let json = serde_json::to_value(&diagnostic).unwrap();
+        let suggestion = &json["suggestion"];
+        assert_eq!(
+            suggestion["applicability"], "machine_applicable",
+            "{source}"
+        );
+        let edits = suggestion["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 1);
+        let edit = &edits[0];
+        let byte = source.find("query name").unwrap() + "query name".len();
+        assert_eq!(edit["start"], byte);
+        assert_eq!(edit["end"], byte);
+        assert_eq!(edit["replacement"], "()");
+        let mut repaired = source.to_string();
+        repaired.replace_range(byte..byte, edit["replacement"].as_str().unwrap());
+        parse_query_diagnostic(&repaired).unwrap();
+    }
+
+    for source in [
+        "query name garbage",
+        "query café {",
+        "query name {",
+        "query name { match { $p: Person } return { $p.name } } query second { match { $p: Person } return { $p.name } }",
+    ] {
+        let json = serde_json::to_value(parse_query_diagnostic(source).unwrap_err()).unwrap();
+        assert!(json.get("suggestion").is_none(), "{source}: {json}");
+    }
+    let source = "queryname { match { $p: Person } return { $p.name } }";
+    assert_eq!(parse_query_diagnostic(source).unwrap_err().code, Q001);
+    parse_query_diagnostic("query name /* keep */ () { match { $p: Person } return { $p.name } }")
+        .unwrap();
+}
+
+#[test]
+fn handwritten_query_diagnostics_locate_the_refused_token() {
+    for (source, token, code) in [
+        (
+            "/* café */\nquery q() { delete Person where in = 1 }",
+            "in =",
+            Q005,
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name as in } }",
+            "in }",
+            Q005,
+        ),
+        (
+            "query q() { match { $p: Person } return { 99999999999999999999999 as n } }",
+            "99999999999999999999999",
+            Q005,
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name } limit 99999999999999999999999 }",
+            "99999999999999999999999",
+            Q005,
+        ),
+        (
+            r#"query q() { match { $p: Person } return { "bad\x" as n } }"#,
+            r#""bad\x""#,
+            Q005,
+        ),
+        (r#"set engine = "bad\x";"#, r#""bad\x""#, Q003),
+        (r#"branch create "bad\x""#, r#""bad\x""#, Q004),
+        (
+            "query q() { match { $p: Person } return { $p.name } order { (nearest($p.embedding, [1.0])) desc } }",
+            "desc",
+            Q005,
+        ),
+    ] {
+        let diagnostic = parse_query_diagnostic(source).unwrap_err();
+        assert_eq!(diagnostic.code, code, "{source}: {diagnostic}");
+        assert_eq!(
+            diagnostic.position,
+            Some(Position::at(source, source.find(token).unwrap())),
+            "{source}"
+        );
+        assert!(diagnostic.stage.is_none());
+    }
+}
+
+#[test]
+fn grammar_mismatch_reports_q001_at_the_deepest_failure() {
+    let err = parse_query_diagnostic("mutation { insert Person { name: \"a\" } }").unwrap_err();
+    assert_eq!(err.code.as_str(), "Q001");
+    assert!(err.message.starts_with("expected "), "{}", err.message);
+    assert_eq!(err.position.unwrap().byte, 0);
+    assert!(err.fix.is_none());
+    // A settings refusal is positioned at the offending token.
+    let err = parse_query_diagnostic("set merge_lineage = v3;").unwrap_err();
+    assert_eq!(err.code.as_str(), "Q003");
+    let at = err.position.unwrap();
+    assert_eq!((at.line, at.column), (1, 21));
 }

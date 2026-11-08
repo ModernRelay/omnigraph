@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
 
@@ -22,6 +22,16 @@ pub struct Diagnostic {
     pub code: String,
     pub path: String,
     pub message: String,
+}
+
+impl std::fmt::Display for Diagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} at {}: {}",
+            self.code, self.path, self.message
+        )
+    }
 }
 
 impl Diagnostic {
@@ -86,7 +96,7 @@ struct VersionHeader {
 
 /// Read only the common version header before dispatching to a strict format.
 ///
-/// `serde_yaml` reports a duplicate `version` field here. Unknown fields are
+/// `yaml_serde` reports a duplicate `version` field here. Unknown fields are
 /// intentionally rejected only by the selected full-format DTO.
 pub(crate) fn declared_version(source: &str, noun: &str) -> Result<u32, Diagnostic> {
     if source.len() > MAX_YAML_BYTES {
@@ -99,7 +109,7 @@ pub(crate) fn declared_version(source: &str, noun: &str) -> Result<u32, Diagnost
     // A value projection avoids accepting a future document through a V1 DTO,
     // while the one-field wrapper keeps duplicate/missing version failures
     // typed. Deserialize into Value first because VersionHeader is strict.
-    let value: serde_yaml::Value = serde_yaml::from_str(source).map_err(|error| {
+    let value: yaml_serde::Value = yaml_serde::from_str(source).map_err(|error| {
         Diagnostic::error(
             format!("invalid_{noun}_yaml"),
             "$",
@@ -113,11 +123,11 @@ pub(crate) fn declared_version(source: &str, noun: &str) -> Result<u32, Diagnost
             "required field `version` is missing",
         ));
     };
-    let header_value = serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([(
-        serde_yaml::Value::String("version".to_string()),
+    let header_value = yaml_serde::Value::Mapping(yaml_serde::Mapping::from_iter([(
+        yaml_serde::Value::String("version".to_string()),
         version_value.clone(),
     )]));
-    let header: VersionHeader = serde_yaml::from_value(header_value).map_err(|error| {
+    let header: VersionHeader = yaml_serde::from_value(header_value).map_err(|error| {
         Diagnostic::error(
             format!("invalid_{noun}_yaml"),
             "version",
@@ -131,7 +141,7 @@ pub(crate) fn strict_yaml<T>(source: &str, noun: &str) -> Result<T, Diagnostic>
 where
     T: for<'de> Deserialize<'de>,
 {
-    serde_yaml::from_str(source).map_err(|error| {
+    yaml_serde::from_str(source).map_err(|error| {
         Diagnostic::error(
             format!("invalid_{noun}_yaml"),
             "$",
@@ -141,28 +151,51 @@ where
 }
 
 pub(crate) fn read_yaml_file(path: &Path, noun: &str) -> Result<String, Diagnostic> {
-    let file = File::open(path).map_err(|error| {
+    read_text_file(path, MAX_YAML_BYTES, noun)
+}
+
+pub(crate) fn read_text_file(
+    path: &Path,
+    max_bytes: usize,
+    noun: &str,
+) -> Result<String, Diagnostic> {
+    let failure = |message: String| {
         Diagnostic::error(
             format!("{noun}_read_error"),
             path.display().to_string(),
-            format!("could not open {noun} file: {error}"),
+            message,
         )
-    })?;
-    let mut source = String::new();
-    file.take(MAX_YAML_BYTES as u64 + 1)
-        .read_to_string(&mut source)
-        .map_err(|error| {
-            Diagnostic::error(
-                format!("{noun}_read_error"),
-                path.display().to_string(),
-                format!("could not read {noun} file as UTF-8: {error}"),
-            )
-        })?;
-    if source.len() > MAX_YAML_BYTES {
+    };
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| failure(format!("could not open {noun} file: {e}")))?;
+    let metadata = file.metadata().map_err(|e| failure(e.to_string()))?;
+    if !metadata.is_file() {
+        return Err(failure(format!("{noun} must be a regular file")));
+    }
+    if metadata.len() > max_bytes as u64 {
         return Err(Diagnostic::error(
             format!("{noun}_yaml_too_large"),
             path.display().to_string(),
-            format!("{noun} YAML must be <= {MAX_YAML_BYTES} bytes"),
+            format!("{noun} must be <= {max_bytes} bytes"),
+        ));
+    }
+    let mut source = String::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_string(&mut source)
+        .map_err(|e| failure(format!("could not read {noun} as UTF-8: {e}")))?;
+    if source.len() > max_bytes {
+        return Err(Diagnostic::error(
+            format!("{noun}_yaml_too_large"),
+            path.display().to_string(),
+            format!("{noun} must be <= {max_bytes} bytes"),
         ));
     }
     Ok(source)
@@ -184,6 +217,17 @@ pub(crate) fn typed_sha256<T: Serialize>(value: &T) -> Result<String, Diagnostic
     let mut digest = Sha256::new();
     digest.update(bytes);
     Ok(format!("{:x}", digest.finalize()))
+}
+
+/// True for exactly 64 lowercase hexadecimal characters.
+pub fn digest(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub(crate) fn valid_kebab_id(value: &str) -> bool {

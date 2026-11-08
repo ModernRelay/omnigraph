@@ -1,0 +1,1 @@
+- Endpoint and `@unique` checks of an append, merge or mutation on a node table without a full `@key` BTREE read its id column once, not a filter of every key, so memory stops growing with fragment count.

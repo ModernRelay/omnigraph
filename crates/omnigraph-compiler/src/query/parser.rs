@@ -1,13 +1,13 @@
 use pest::Parser;
-use pest::error::InputLocation;
+use pest::error::{ErrorVariant, InputLocation};
 use pest_derive::Parser;
 
-use crate::error::{
-    CompilerError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
-};
+use crate::error::{CompilerError, Result, decode_string_literal};
 use crate::settings::{SessionSettings, SessionSettingsError, SettingId, SettingValue};
 
 use super::ast::*;
+use super::codes::{Q001, Q002, Q003, Q004, Q005};
+use super::diagnostic::{Applicability, Position, QueryDiagnostic, Suggestion, TextEdit};
 
 #[derive(Parser)]
 #[grammar = "query/query.pest"]
@@ -32,20 +32,26 @@ impl NameScope<'_> {
     }
 }
 
-fn reserved_property_error(word: &str) -> CompilerError {
-    CompilerError::Parse(format!(
-        "`{word}` is a reserved word; a property of that name is written `$p.{word}` in a read and cannot be named bare in a mutation `where`"
-    ))
+fn reserved_property_error(at: &pest::iterators::Pair<Rule>) -> CompilerError {
+    let word = at.as_str();
+    query_error_at(
+        format!(
+            "`{word}` is a reserved word; a property of that name is written `$p.{word}` in a read and cannot be named bare in a mutation `where`"
+        ),
+        at,
+    )
 }
 
-fn reserved_alias_error(word: &str) -> CompilerError {
-    CompilerError::Parse(format!(
-        "`{word}` is a reserved word and cannot be a return alias"
-    ))
+fn reserved_alias_error(at: &pest::iterators::Pair<Rule>) -> CompilerError {
+    let word = at.as_str();
+    query_error_at(
+        format!("`{word}` is a reserved word and cannot be a return alias"),
+        at,
+    )
 }
 
 pub fn parse_query(input: &str) -> Result<QueryFile> {
-    parse_query_diagnostic(input).map_err(|e| CompilerError::Parse(e.to_string()))
+    parse_query_diagnostic(input).map_err(CompilerError::query)
 }
 
 /// Whether `input` opens with a settings statement: `set` or `reset` as the
@@ -77,8 +83,10 @@ fn skip_trivia(mut input: &str) -> &str {
     }
 }
 
-pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, ParseDiagnostic> {
-    let pairs = QueryParser::parse(Rule::query_file, input).map_err(pest_error_to_diagnostic)?;
+/// Parse `input` into its file body, refusing with a positioned diagnostic.
+pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, QueryDiagnostic> {
+    let pairs = QueryParser::parse(Rule::query_file, input)
+        .map_err(|error| pest_error_to_diagnostic(input, error))?;
 
     let mut settings = Vec::new();
     let mut queries = Vec::new();
@@ -91,26 +99,71 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Par
                     Rule::branch_stmt => {
                         statement = Some(FileBody::Branch(parse_branch_stmt(inner)?));
                     }
+                    Rule::commit_stmt => {
+                        statement = Some(FileBody::Commit(parse_commit_stmt(inner)?));
+                    }
+                    Rule::load_stmt => {
+                        statement = Some(FileBody::Load(parse_load_stmt(inner)?));
+                    }
                     Rule::show_stmt => {
                         statement = Some(FileBody::Show(parse_setting_target(inner)?));
                     }
                     Rule::explain_stmt => {
-                        statement = Some(FileBody::Explain(parse_explain_stmt(inner)?));
+                        statement = Some(parse_explain_stmt(inner)?);
                     }
                     Rule::statement_trailer => {
                         let subject = match statement {
                             Some(FileBody::Show(_)) => "a show statement",
-                            Some(FileBody::Explain(_)) => "an `explain` statement",
+                            Some(FileBody::Explain(_) | FileBody::ExplainLoad(_)) => {
+                                "an `explain` statement"
+                            }
+                            Some(FileBody::Commit(_)) => "a commit statement",
+                            Some(FileBody::Load(_)) => "a load statement",
                             _ => "a branch statement",
                         };
-                        return Err(ParseDiagnostic::new(
+                        return Err(diagnostic_at(
+                            Q004,
                             format!("{subject} stands alone in its file"),
-                            Some(pair_span(&inner)),
+                            &inner,
                         ));
                     }
+                    Rule::missing_param_list => {
+                        let name = inner
+                            .clone()
+                            .into_inner()
+                            .find(|part| part.as_rule() == Rule::ident)
+                            .expect("grammar: missing_param_list holds an ident");
+                        let byte = name.as_span().end();
+                        let mut diagnostic = QueryDiagnostic::parse(
+                            Q002,
+                            "expected `(`: a query declares its parameters even when it has none",
+                            Some(Position::at(input, byte)),
+                        )
+                        .with_fix(format!("query {}()", name.as_str()));
+                        let mut repaired = input.to_string();
+                        repaired.insert_str(byte, "()");
+                        if QueryParser::parse(Rule::query_file, &repaired).is_ok_and(|pairs| {
+                            !pairs
+                                .flatten()
+                                .any(|p| p.as_rule() == Rule::missing_param_list)
+                        }) {
+                            diagnostic = diagnostic.with_suggestion(Suggestion {
+                                applicability: Applicability::MachineApplicable,
+                                edits: vec![TextEdit {
+                                    start: byte,
+                                    end: byte,
+                                    replacement: "()".to_string(),
+                                }],
+                            });
+                        }
+                        return Err(diagnostic);
+                    }
                     Rule::query_decl => {
-                        queries
-                            .push(parse_query_decl(inner).map_err(compiler_error_to_diagnostic)?);
+                        let position = position_of(&inner);
+                        queries.push(
+                            parse_query_decl(inner)
+                                .map_err(|error| compiler_error_to_diagnostic(error, position))?,
+                        );
                     }
                     _ => {}
                 }
@@ -123,24 +176,48 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Par
     })
 }
 
+/// `explain` wraps one query declaration or one load statement; the wrapped
+/// statement parses exactly as it does bare.
 fn parse_explain_stmt(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<QueryDecl, ParseDiagnostic> {
-    let decl = pair
+) -> std::result::Result<FileBody, QueryDiagnostic> {
+    let wrapped = pair
         .into_inner()
-        .find(|inner| inner.as_rule() == Rule::query_decl)
-        .expect("grammar: explain_stmt holds one query_decl after kw_explain");
-    parse_query_decl(decl).map_err(compiler_error_to_diagnostic)
+        .find(|inner| matches!(inner.as_rule(), Rule::query_decl | Rule::load_stmt))
+        .expect("grammar: explain_stmt holds one query_decl or load_stmt after kw_explain");
+    match wrapped.as_rule() {
+        Rule::load_stmt => Ok(FileBody::ExplainLoad(parse_load_stmt(wrapped)?)),
+        Rule::query_decl => {
+            let position = position_of(&wrapped);
+            parse_query_decl(wrapped)
+                .map(FileBody::Explain)
+                .map_err(|error| compiler_error_to_diagnostic(error, position))
+        }
+        other => unreachable!("grammar: explain_stmt wraps no {other:?}"),
+    }
 }
 
-fn pair_span(pair: &pest::iterators::Pair<Rule>) -> SourceSpan {
+/// The position of `pair`'s start in the source it was parsed from.
+fn position_of(pair: &pest::iterators::Pair<Rule>) -> Position {
     let span = pair.as_span();
-    render_span(SourceSpan::new(span.start(), span.end()))
+    Position::at(span.get_input(), span.start())
+}
+
+fn diagnostic_at(
+    code: super::diagnostic::QueryCode,
+    message: impl Into<String>,
+    at: &pest::iterators::Pair<Rule>,
+) -> QueryDiagnostic {
+    QueryDiagnostic::parse(code, message, Some(position_of(at)))
+}
+
+fn query_error_at(message: impl Into<String>, at: &pest::iterators::Pair<Rule>) -> CompilerError {
+    CompilerError::query(diagnostic_at(Q005, message, at))
 }
 
 fn parse_setting_stmt(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<SettingStmt, ParseDiagnostic> {
+) -> std::result::Result<SettingStmt, QueryDiagnostic> {
     let form = pair
         .into_inner()
         .next()
@@ -173,7 +250,7 @@ fn parse_setting_stmt(
 /// The `<name>` or `all` after `reset` or `show`.
 fn parse_setting_target(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<Option<SettingId>, ParseDiagnostic> {
+) -> std::result::Result<Option<SettingId>, QueryDiagnostic> {
     let target = pair
         .into_inner()
         .find(|inner| matches!(inner.as_rule(), Rule::kw_all | Rule::setting_name))
@@ -187,14 +264,14 @@ fn parse_setting_target(
 
 fn parse_setting_id(
     name: &pest::iterators::Pair<Rule>,
-) -> std::result::Result<SettingId, ParseDiagnostic> {
+) -> std::result::Result<SettingId, QueryDiagnostic> {
     SettingId::parse(name.as_str()).map_err(|error| setting_diagnostic(error, name))
 }
 
 fn parse_setting_value(
     id: SettingId,
     pair: &pest::iterators::Pair<Rule>,
-) -> std::result::Result<SettingValue, ParseDiagnostic> {
+) -> std::result::Result<SettingValue, QueryDiagnostic> {
     let token = pair
         .clone()
         .into_inner()
@@ -215,9 +292,9 @@ fn parse_setting_value(
                 )
             }),
         Rule::ident => Ok(SettingValue::Ident(token.as_str().to_string())),
-        Rule::string_lit => parse_string_lit(token.as_str())
+        Rule::string_lit => decode_string_literal(token.as_str())
             .map(SettingValue::Str)
-            .map_err(compiler_error_to_diagnostic),
+            .map_err(|error| diagnostic_at(Q003, parse_error_message(error), &token)),
         other => unreachable!("grammar: setting_value admits no {other:?}"),
     }
 }
@@ -225,93 +302,397 @@ fn parse_setting_value(
 fn setting_diagnostic(
     error: SessionSettingsError,
     at: &pest::iterators::Pair<Rule>,
-) -> ParseDiagnostic {
-    ParseDiagnostic::new(error.to_string(), Some(pair_span(at)))
+) -> QueryDiagnostic {
+    diagnostic_at(Q003, error.to_string(), at)
 }
 
 fn parse_branch_stmt(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<BranchStmt, ParseDiagnostic> {
+) -> std::result::Result<BranchStmt, QueryDiagnostic> {
     let form = pair
         .into_inner()
         .find(|inner| inner.as_rule() != Rule::kw_branch)
         .expect("grammar: branch_stmt holds one form after kw_branch");
     let rule = form.as_rule();
+    let has = |wanted: Rule| {
+        form.clone()
+            .into_inner()
+            .any(|inner| inner.as_rule() == wanted)
+    };
+    let as_commit = has(Rule::as_commit_clause);
+    let dry_run = has(Rule::dry_run_clause);
+    let between = has(Rule::kw_to);
+    let page = parse_diff_page_clause(&form)?;
+    let from_commit = form
+        .clone()
+        .into_inner()
+        .find(|inner| inner.as_rule() == Rule::create_from_commit)
+        .map(|pair| {
+            let literal = pair
+                .into_inner()
+                .find(|inner| inner.as_rule() == Rule::string_lit)
+                .expect("grammar: create_from_commit names one string literal");
+            decode_graph_commit_id(&literal)
+        })
+        .transpose()?;
     let names = form
         .into_inner()
         .filter(|inner| inner.as_rule() == Rule::branch_name)
         .map(parse_branch_name)
-        .collect::<std::result::Result<Vec<_>, ParseDiagnostic>>()?;
+        .collect::<std::result::Result<Vec<_>, QueryDiagnostic>>()?;
     let mut names = names.into_iter();
     match (rule, names.next(), names.next()) {
-        (Rule::branch_create, Some(name), from) => {
-            Ok(BranchStmt::Write(BranchWrite::Create { name, from }))
-        }
+        (Rule::branch_create, Some(name), from) => Ok(BranchStmt::Write(BranchWrite::Create {
+            name,
+            from: from_commit
+                .map(BranchCreateFrom::Commit)
+                .or(from.map(BranchCreateFrom::Branch)),
+        })),
         (Rule::branch_delete, Some(name), None) => {
             Ok(BranchStmt::Write(BranchWrite::Delete { name }))
         }
-        (Rule::branch_merge, Some(source), into) => {
-            Ok(BranchStmt::Write(BranchWrite::Merge { source, into }))
+        (Rule::branch_merge, Some(source), into) if dry_run => {
+            Ok(BranchStmt::Read(BranchRead::MergeDryRun { source, into }))
         }
+        (Rule::branch_merge, Some(source), into) => Ok(BranchStmt::Write(BranchWrite::Merge {
+            source,
+            into,
+            as_commit,
+        })),
         (Rule::branch_list, None, None) => Ok(BranchStmt::List),
+        (Rule::branch_merge_base, Some(source), into) => {
+            Ok(BranchStmt::Read(BranchRead::MergeBase { source, into }))
+        }
+        (Rule::branch_diff, Some(from), Some(to)) if between => {
+            Ok(BranchStmt::Read(BranchRead::Diff {
+                sides: BranchDiffSides::Between { from, to },
+                page,
+            }))
+        }
+        (Rule::branch_diff, Some(source), into) => Ok(BranchStmt::Read(BranchRead::Diff {
+            sides: BranchDiffSides::Branch { source, into },
+            page,
+        })),
         (other, _, _) => {
             unreachable!("grammar: every branch form fixes its name arity, got {other:?}")
         }
     }
 }
 
+/// The `after page "<token>"` and `limit <n>` clauses of `branch diff`; both
+/// absent on every other form. A limit is at least one (`Q004` otherwise).
+fn parse_diff_page_clause(
+    form: &pest::iterators::Pair<Rule>,
+) -> std::result::Result<DiffPageClause, QueryDiagnostic> {
+    let mut page = DiffPageClause::default();
+    for clause in form.clone().into_inner() {
+        match clause.as_rule() {
+            Rule::diff_after_page => {
+                let literal = clause
+                    .into_inner()
+                    .find(|inner| inner.as_rule() == Rule::string_lit)
+                    .expect("grammar: `after page` names one string literal");
+                let token = decode_string_literal(literal.as_str())
+                    .map_err(|error| diagnostic_at(Q004, parse_error_message(error), &literal))?;
+                page.after_page = Some(token);
+            }
+            Rule::diff_limit => {
+                let integer = clause
+                    .into_inner()
+                    .find(|inner| inner.as_rule() == Rule::integer)
+                    .expect("grammar: `limit` names one integer");
+                let limit = integer
+                    .as_str()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|limit| *limit > 0)
+                    .ok_or_else(|| {
+                        diagnostic_at(
+                            Q004,
+                            format!("diff limit {} must be a positive integer", integer.as_str()),
+                            &integer,
+                        )
+                    })?;
+                page.limit = Some(limit);
+            }
+            _ => {}
+        }
+    }
+    Ok(page)
+}
+
+fn parse_commit_stmt(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<CommitWrite, QueryDiagnostic> {
+    let form = pair
+        .into_inner()
+        .find(|inner| inner.as_rule() != Rule::kw_commit)
+        .expect("grammar: commit_stmt holds one form after kw_commit");
+    let rule = form.as_rule();
+    let literal = form
+        .into_inner()
+        .find(|inner| inner.as_rule() == Rule::string_lit)
+        .expect("grammar: every commit form names one string literal");
+    let graph_commit_id = decode_graph_commit_id(&literal)?;
+    match rule {
+        Rule::commit_publish => Ok(CommitWrite::Publish { graph_commit_id }),
+        Rule::commit_drop => Ok(CommitWrite::Drop { graph_commit_id }),
+        other => unreachable!("grammar: commit_stmt admits no {other:?}"),
+    }
+}
+
+fn parse_load_stmt(
+    pair: pest::iterators::Pair<Rule>,
+) -> std::result::Result<LoadStmt, QueryDiagnostic> {
+    let at = pair.clone();
+    let mut source = None;
+    let mut target = None;
+    let mut mode = None;
+    let mut delimiter = None;
+    let mut header = None;
+    let mut columns = None;
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::string_lit => {
+                let decoded = decode_string_literal(inner.as_str())
+                    .map_err(|error| diagnostic_at(Q004, parse_error_message(error), &inner))?;
+                if decoded.is_empty() || decoded.chars().any(char::is_control) {
+                    return Err(diagnostic_at(
+                        Q004,
+                        "a load source is a non-empty URI without control characters",
+                        &inner,
+                    ));
+                }
+                source = Some(decoded);
+            }
+            Rule::load_target => {
+                let mut parts = inner.clone().into_inner();
+                let kind = parts
+                    .next()
+                    .expect("grammar: load_target opens with load_kind");
+                let name = parts
+                    .next()
+                    .expect("grammar: load_target closes with type_name")
+                    .as_str()
+                    .to_string();
+                target = Some(match kind.as_str() {
+                    "node" => LoadTarget::Node(name),
+                    "edge" => LoadTarget::Edge(name),
+                    other => unreachable!("grammar: load_kind admits no {other}"),
+                });
+            }
+            Rule::load_option => {
+                let option = inner
+                    .clone()
+                    .into_inner()
+                    .next()
+                    .expect("grammar: load_option holds one form");
+                match option.as_rule() {
+                    Rule::load_mode => {
+                        refuse_repeated_load_option(mode.is_some(), "mode", &option)?;
+                        let name = option
+                            .into_inner()
+                            .find(|part| part.as_rule() == Rule::load_mode_name)
+                            .expect("grammar: load_mode names its mode");
+                        mode = Some(match name.as_str() {
+                            "overwrite" => LoadStmtMode::Overwrite,
+                            "append" => LoadStmtMode::Append,
+                            "merge" => LoadStmtMode::Merge,
+                            other => unreachable!("grammar: load_mode_name admits no {other}"),
+                        });
+                    }
+                    Rule::load_delimiter => {
+                        refuse_repeated_load_option(delimiter.is_some(), "delimiter", &option)?;
+                        let literal = option
+                            .into_inner()
+                            .find(|part| part.as_rule() == Rule::string_lit)
+                            .expect("grammar: load_delimiter holds one string literal");
+                        let decoded = decode_string_literal(literal.as_str()).map_err(|error| {
+                            diagnostic_at(Q004, parse_error_message(error), &literal)
+                        })?;
+                        let bytes = decoded.as_bytes();
+                        if bytes.len() != 1 || !bytes[0].is_ascii() || bytes[0].is_ascii_control() {
+                            return Err(diagnostic_at(
+                                Q004,
+                                "a load delimiter is one printable ASCII character",
+                                &literal,
+                            ));
+                        }
+                        delimiter = Some(bytes[0]);
+                    }
+                    Rule::load_header => {
+                        refuse_repeated_load_option(header.is_some(), "header", &option)?;
+                        header = Some(true);
+                    }
+                    Rule::load_columns => {
+                        refuse_repeated_load_option(columns.is_some(), "columns", &option)?;
+                        let mut names: Vec<String> = Vec::new();
+                        for part in option
+                            .into_inner()
+                            .filter(|part| part.as_rule() == Rule::ident)
+                        {
+                            let name = part.as_str().to_string();
+                            if names.contains(&name) {
+                                return Err(diagnostic_at(
+                                    Q004,
+                                    format!("column `{name}` is named twice"),
+                                    &part,
+                                ));
+                            }
+                            names.push(name);
+                        }
+                        columns = Some(names);
+                    }
+                    other => unreachable!("grammar: load_option admits no {other:?}"),
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(mode) = mode else {
+        return Err(diagnostic_at(
+            Q004,
+            "a load statement names its mode: `mode overwrite`, `mode append` or `mode merge`",
+            &at,
+        ));
+    };
+    let header = header.unwrap_or(false);
+    if !header && columns.is_none() {
+        return Err(diagnostic_at(
+            Q004,
+            "a load without `header` names its columns: `columns (a, b, …)`",
+            &at,
+        ));
+    }
+    Ok(LoadStmt {
+        source: source.expect("grammar: load_stmt names one source literal"),
+        target: target.expect("grammar: load_stmt names one target"),
+        mode,
+        delimiter: delimiter.unwrap_or(b','),
+        header,
+        columns,
+    })
+}
+
+fn refuse_repeated_load_option(
+    seen: bool,
+    option: &str,
+    at: &pest::iterators::Pair<Rule>,
+) -> std::result::Result<(), QueryDiagnostic> {
+    if seen {
+        return Err(diagnostic_at(
+            Q004,
+            format!("`{option}` is given twice in one load statement"),
+            at,
+        ));
+    }
+    Ok(())
+}
+
+/// A quoted graph commit id operand: decoded, non-empty, untrimmed-equal
+/// and free of control characters (`Q004` otherwise).
+fn decode_graph_commit_id(
+    literal: &pest::iterators::Pair<Rule>,
+) -> std::result::Result<String, QueryDiagnostic> {
+    let graph_commit_id = decode_string_literal(literal.as_str())
+        .map_err(|error| diagnostic_at(Q004, parse_error_message(error), literal))?;
+    if graph_commit_id.is_empty()
+        || graph_commit_id.trim() != graph_commit_id
+        || graph_commit_id.chars().any(char::is_control)
+    {
+        return Err(diagnostic_at(
+            Q004,
+            format!("graph commit id {graph_commit_id:?} is not a commit id"),
+            literal,
+        ));
+    }
+    Ok(graph_commit_id)
+}
+
 fn parse_branch_name(
     pair: pest::iterators::Pair<Rule>,
-) -> std::result::Result<String, ParseDiagnostic> {
-    let span = pair_span(&pair);
+) -> std::result::Result<String, QueryDiagnostic> {
+    let position = position_of(&pair);
     let token = pair
         .into_inner()
         .next()
         .expect("grammar: branch_name wraps an ident or a string_lit");
     let name = match token.as_rule() {
-        Rule::string_lit => {
-            parse_string_lit(token.as_str()).map_err(compiler_error_to_diagnostic)?
-        }
+        Rule::string_lit => decode_string_literal(token.as_str())
+            .map_err(|error| diagnostic_at(Q004, parse_error_message(error), &token))?,
         Rule::ident => token.as_str().to_string(),
         other => unreachable!("grammar: branch_name admits no {other:?}"),
     };
     if name.chars().any(char::is_control) {
-        return Err(ParseDiagnostic::new(
+        return Err(QueryDiagnostic::parse(
+            Q004,
             format!("branch name {name:?} contains a control character"),
-            Some(span),
+            Some(position),
         ));
     }
     if name.trim() != name {
-        return Err(ParseDiagnostic::new(
+        return Err(QueryDiagnostic::parse(
+            Q004,
             format!("branch name {name:?} has leading or trailing whitespace"),
-            Some(span),
+            Some(position),
         ));
     }
     if name.is_empty() {
-        return Err(ParseDiagnostic::new(
+        return Err(QueryDiagnostic::parse(
+            Q004,
             format!("branch name {name:?} cannot be empty"),
-            Some(span),
+            Some(position),
         ));
     }
     Ok(name)
 }
 
-fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {
-    let span = match err.location {
-        InputLocation::Pos(pos) => Some(render_span(SourceSpan::new(pos, pos))),
-        InputLocation::Span((start, end)) => Some(render_span(SourceSpan::new(start, end))),
+/// A grammar mismatch: positioned at pest's deepest failure, naming the
+/// rules it expected there (pest tracks attempts per rule, so the names are
+/// the grammar's, not tokens).
+fn pest_error_to_diagnostic(input: &str, err: pest::error::Error<Rule>) -> QueryDiagnostic {
+    let byte = match err.location {
+        InputLocation::Pos(pos) => pos,
+        InputLocation::Span((start, _)) => start,
     };
-    ParseDiagnostic::new(err.to_string(), span)
+    let message = match &err.variant {
+        ErrorVariant::ParsingError {
+            positives,
+            negatives,
+        } => {
+            let names = |rules: &[Rule]| {
+                rules
+                    .iter()
+                    .map(|rule| format!("{rule:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            match (positives.is_empty(), negatives.is_empty()) {
+                (false, _) => format!("expected {}", names(positives)),
+                (true, false) => format!("unexpected {}", names(negatives)),
+                (true, true) => "unexpected input".to_string(),
+            }
+        }
+        ErrorVariant::CustomError { message } => message.clone(),
+    };
+    QueryDiagnostic::parse(Q001, message, Some(Position::at(input, byte)))
 }
 
-/// A parse refusal keeps its bare message: `parse_query` adds the one
-/// `parse error:` prefix when it wraps the diagnostic.
-fn compiler_error_to_diagnostic(err: CompilerError) -> ParseDiagnostic {
-    let message = match err {
+/// A declaration body the hand-written parser refused: its bare message
+/// names the construct and `Display` adds the one `parse error:` prefix; a
+/// diagnostic it already carries passes through.
+fn compiler_error_to_diagnostic(err: CompilerError, position: Position) -> QueryDiagnostic {
+    match err {
+        CompilerError::Query(diagnostic) => *diagnostic,
+        other => QueryDiagnostic::parse(Q005, parse_error_message(other), Some(position)),
+    }
+}
+
+fn parse_error_message(error: CompilerError) -> String {
+    match error {
         CompilerError::Parse(message) => message,
         other => other.to_string(),
-    };
-    ParseDiagnostic::new(message, None)
+    }
 }
 
 fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
@@ -323,12 +704,15 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
     let mut params = Vec::new();
     let mut match_clause = Vec::new();
     let mut return_clause = Vec::new();
+    let mut distinct = false;
     let mut order_clause = Vec::new();
     let mut limit = None;
     let mut mutations = Vec::new();
+    let mut write_clause = None;
 
     for item in inner {
         match item.as_rule() {
+            Rule::as_commit_clause | Rule::as_unattached_clause => write_clause = Some(item),
             Rule::param_list => {
                 for p in item.into_inner() {
                     if let Rule::param = p.as_rule() {
@@ -337,22 +721,29 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                 }
             }
             Rule::query_annotation => {
+                let at = item.clone();
                 let (annotation_name, value) = parse_query_annotation(item)?;
                 match annotation_name {
                     "description" => {
                         if description.replace(value).is_some() {
-                            return Err(CompilerError::Parse(format!(
-                                "query `{}` cannot include duplicate @description annotations",
-                                name
-                            )));
+                            return Err(query_error_at(
+                                format!(
+                                    "query `{}` cannot include duplicate @description annotations",
+                                    name
+                                ),
+                                &at,
+                            ));
                         }
                     }
                     "instruction" => {
                         if instruction.replace(value).is_some() {
-                            return Err(CompilerError::Parse(format!(
-                                "query `{}` cannot include duplicate @instruction annotations",
-                                name
-                            )));
+                            return Err(query_error_at(
+                                format!(
+                                    "query `{}` cannot include duplicate @instruction annotations",
+                                    name
+                                ),
+                                &at,
+                            ));
                         }
                     }
                     other => {
@@ -380,8 +771,12 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                                 }
                                 Rule::return_clause => {
                                     for proj in section.into_inner() {
-                                        if let Rule::projection = proj.as_rule() {
-                                            return_clause.push(parse_projection(proj)?);
+                                        match proj.as_rule() {
+                                            Rule::kw_distinct => distinct = true,
+                                            Rule::projection => {
+                                                return_clause.push(parse_projection(proj)?);
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -396,7 +791,10 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                                     let int_pair = section.into_inner().next().unwrap();
                                     limit =
                                         Some(int_pair.as_str().parse::<u64>().map_err(|e| {
-                                            CompilerError::Parse(format!("invalid limit: {}", e))
+                                            query_error_at(
+                                                format!("invalid limit: {}", e),
+                                                &int_pair,
+                                            )
                                         })?);
                                 }
                                 _ => {}
@@ -421,6 +819,28 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
             _ => {}
         }
     }
+    let write_mode = match write_clause {
+        None => MutationWriteMode::Publish,
+        Some(clause) => {
+            if mutations.is_empty() {
+                let spelled = match clause.as_rule() {
+                    Rule::as_commit_clause => "as commit",
+                    _ => "as unattached branch",
+                };
+                return Err(query_error_at(
+                    format!("`{spelled}` applies to a mutation; query `{name}` is read-only"),
+                    &clause,
+                ));
+            }
+            match clause.as_rule() {
+                Rule::as_commit_clause => MutationWriteMode::AsCommit,
+                Rule::as_unattached_clause => MutationWriteMode::Unattached {
+                    base: parse_unattached_base(clause).map_err(CompilerError::query)?,
+                },
+                other => unreachable!("grammar: query_decl admits no write clause {other:?}"),
+            }
+        }
+    };
 
     Ok(QueryDecl {
         name,
@@ -429,10 +849,35 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
         params,
         match_clause,
         return_clause,
+        distinct,
         order_clause,
         limit,
         mutations,
+        write_mode,
     })
+}
+
+/// The `on` operand of an `as_unattached_clause`, `None` when unspelled. A
+/// literal passes the commit-id checks of a commit statement; a variable
+/// records its name for the typechecker to resolve against the parameters.
+fn parse_unattached_base(
+    clause: pest::iterators::Pair<Rule>,
+) -> std::result::Result<Option<UnattachedBase>, QueryDiagnostic> {
+    let Some(operand) = clause
+        .into_inner()
+        .find(|inner| matches!(inner.as_rule(), Rule::string_lit | Rule::variable))
+    else {
+        return Ok(None);
+    };
+    match operand.as_rule() {
+        Rule::variable => Ok(Some(UnattachedBase::Param(
+            operand.as_str()[1..].to_string(),
+        ))),
+        Rule::string_lit => Ok(Some(UnattachedBase::Literal(decode_graph_commit_id(
+            &operand,
+        )?))),
+        other => unreachable!("grammar: as_unattached_clause admits no operand {other:?}"),
+    }
 }
 
 fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static str, String)> {
@@ -448,7 +893,7 @@ fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static
                 .ok_or_else(|| {
                     CompilerError::Parse("@description requires a string literal".to_string())
                 })
-                .map(|value| parse_string_lit(value.as_str()))??;
+                .map(|value| parse_string_lit(&value))??;
             Ok(("description", value))
         }
         Rule::instruction_annotation => {
@@ -458,7 +903,7 @@ fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static
                 .ok_or_else(|| {
                     CompilerError::Parse("@instruction requires a string literal".to_string())
                 })
-                .map(|value| parse_string_lit(value.as_str()))??;
+                .map(|value| parse_string_lit(&value))??;
             Ok(("instruction", value))
         }
         other => Err(CompilerError::Parse(format!(
@@ -732,13 +1177,16 @@ fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
         None
     };
     let edge_pair = next;
-    let (edge_name, undirected) = match edge_pair.as_rule() {
-        // `<edge>` — the inner edge_ident carries the name.
+    let (selector, undirected) = match edge_pair.as_rule() {
         Rule::undirected_edge => (
-            parse_edge_name(edge_pair.into_inner().next().unwrap())?,
+            parse_edge_selector(edge_pair.into_inner().next().ok_or_else(|| {
+                CompilerError::Parse(
+                    "undirected traversal is missing its edge selection".to_string(),
+                )
+            })?)?,
             true,
         ),
-        _ => (parse_edge_name(edge_pair)?, false),
+        _ => (parse_edge_selector(edge_pair)?, false),
     };
     let mut min_hops = 1u32;
     let mut max_hops = Some(1u32);
@@ -760,7 +1208,7 @@ fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
 
     Ok(Traversal {
         src,
-        edge_name,
+        selector,
         dst,
         min_hops,
         max_hops,
@@ -769,13 +1217,30 @@ fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
     })
 }
 
+fn parse_edge_selector(pair: pest::iterators::Pair<Rule>) -> Result<EdgeSelector> {
+    match pair.as_rule() {
+        Rule::edge_wildcard => Ok(EdgeSelector::Wildcard),
+        Rule::edge_alternation => {
+            parse_edge_selector(pair.into_inner().next().ok_or_else(|| {
+                CompilerError::Parse("edge alternation is missing its members".to_string())
+            })?)
+        }
+        Rule::edge_alternatives => pair
+            .into_inner()
+            .map(parse_edge_name)
+            .collect::<Result<Vec<_>>>()
+            .map(EdgeSelector::Alternation),
+        _ => parse_edge_name(pair).map(EdgeSelector::Named),
+    }
+}
+
 /// The edge a traversal names, bare or as a string; the string holds what the
 /// bare form would, so `"in"` names the edge a reserved word cannot.
 fn parse_edge_name(pair: pest::iterators::Pair<Rule>) -> Result<String> {
     if pair.as_rule() != Rule::string_lit {
         return Ok(pair.as_str().to_string());
     }
-    let name = parse_string_lit(pair.as_str())?;
+    let name = parse_string_lit(&pair)?;
     let mut chars = name.chars();
     let starts = chars
         .next()
@@ -783,27 +1248,31 @@ fn parse_edge_name(pair: pest::iterators::Pair<Rule>) -> Result<String> {
     if starts && chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
         Ok(name)
     } else {
-        Err(CompilerError::Parse(format!(
-            "`{}` is not an edge name; a quoted edge is its bare name in quotes, as in `$a \"in\" $b`",
-            pair.as_str()
-        )))
+        Err(query_error_at(
+            format!(
+                "`{}` is not an edge name; a quoted edge is its bare name in quotes, as in `$a \"in\" $b`",
+                pair.as_str()
+            ),
+            &pair,
+        ))
     }
 }
 
 fn parse_traversal_bounds(pair: pest::iterators::Pair<Rule>) -> Result<(u32, Option<u32>)> {
     let mut inner = pair.into_inner();
-    let min = inner
+    let min_pair = inner
         .next()
-        .ok_or_else(|| CompilerError::Parse("traversal bound missing min hop".to_string()))?
+        .ok_or_else(|| CompilerError::Parse("traversal bound missing min hop".to_string()))?;
+    let min = min_pair
         .as_str()
         .parse::<u32>()
-        .map_err(|e| CompilerError::Parse(format!("invalid traversal min bound: {}", e)))?;
+        .map_err(|e| query_error_at(format!("invalid traversal min bound: {}", e), &min_pair))?;
     let max = inner
         .next()
         .map(|p| {
             p.as_str()
                 .parse::<u32>()
-                .map_err(|e| CompilerError::Parse(format!("invalid traversal max bound: {}", e)))
+                .map_err(|e| query_error_at(format!("invalid traversal max bound: {}", e), &p))
         })
         .transpose()?;
     Ok((min, max))
@@ -913,9 +1382,19 @@ fn parse_operand(pair: pest::iterators::Pair<Rule>, scope: NameScope<'_>) -> Res
         Rule::agg_call => {
             let mut parts = inner.into_inner();
             let func = parse_agg_func(parts.next().unwrap().as_str())?;
-            let arg = parse_expr(parts.next().unwrap(), scope)?;
+            let mut distinct = false;
+            let mut arg = None;
+            for part in parts {
+                match part.as_rule() {
+                    Rule::kw_distinct => distinct = true,
+                    _ => arg = Some(parse_expr(part, scope)?),
+                }
+            }
+            let arg =
+                arg.ok_or_else(|| CompilerError::Parse(format!("{func} needs an argument")))?;
             Ok(Expr::Aggregate {
                 func,
+                distinct,
                 arg: Box::new(arg),
             })
         }
@@ -926,7 +1405,7 @@ fn parse_operand(pair: pest::iterators::Pair<Rule>, scope: NameScope<'_>) -> Res
         Rule::bm25_call => parse_bm25_call(inner, scope),
         Rule::rrf_call => parse_rrf_call(inner, scope),
         Rule::meta_field | Rule::expr_ident => Ok(scope.bare_name(inner.as_str())),
-        Rule::reserved_property => Err(reserved_property_error(inner.as_str())),
+        Rule::reserved_property => Err(reserved_property_error(&inner)),
         _ => Err(CompilerError::Parse(format!(
             "unexpected operand rule: {:?}",
             inner.as_rule()
@@ -1082,19 +1561,19 @@ fn parse_filter_op(pair: pest::iterators::Pair<Rule>) -> Result<CompOp> {
 fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
-        Rule::string_lit => Ok(Literal::String(parse_string_lit(inner.as_str())?)),
+        Rule::string_lit => Ok(Literal::String(parse_string_lit(&inner)?)),
         Rule::integer => {
             let n: i64 = inner
                 .as_str()
                 .parse()
-                .map_err(|e| CompilerError::Parse(format!("invalid integer: {}", e)))?;
-            Ok(Literal::Integer(n))
+                .map_err(|e| query_error_at(format!("invalid integer: {}", e), &inner))?;
+            Ok(Literal::Integer(i128::from(n)))
         }
         Rule::float_lit => {
             let f: f64 = inner
                 .as_str()
                 .parse()
-                .map_err(|e| CompilerError::Parse(format!("invalid float: {}", e)))?;
+                .map_err(|e| query_error_at(format!("invalid float: {}", e), &inner))?;
             Ok(Literal::Float(f))
         }
         Rule::bool_lit => {
@@ -1114,7 +1593,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
             let date_str = inner
                 .into_inner()
                 .next()
-                .map(|s| parse_string_lit(s.as_str()))
+                .map(|s| parse_string_lit(&s))
                 .ok_or_else(|| {
                     CompilerError::Parse("date literal requires a string".to_string())
                 })?;
@@ -1124,7 +1603,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
             let dt_str = inner
                 .into_inner()
                 .next()
-                .map(|s| parse_string_lit(s.as_str()))
+                .map(|s| parse_string_lit(&s))
                 .ok_or_else(|| {
                     CompilerError::Parse("datetime literal requires a string".to_string())
                 })?;
@@ -1146,8 +1625,9 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
     }
 }
 
-fn parse_string_lit(raw: &str) -> Result<String> {
-    decode_string_literal(raw)
+fn parse_string_lit(at: &pest::iterators::Pair<Rule>) -> Result<String> {
+    decode_string_literal(at.as_str())
+        .map_err(|error| query_error_at(parse_error_message(error), at))
 }
 
 fn parse_projection(pair: pest::iterators::Pair<Rule>) -> Result<Projection> {
@@ -1156,7 +1636,7 @@ fn parse_projection(pair: pest::iterators::Pair<Rule>) -> Result<Projection> {
     let alias = match inner.next() {
         None => None,
         Some(alias) if alias.as_rule() == Rule::reserved_alias => {
-            return Err(reserved_alias_error(alias.as_str()));
+            return Err(reserved_alias_error(&alias));
         }
         Some(alias) => Some(alias.as_str().to_string()),
     };
@@ -1169,18 +1649,26 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
     let first = inner
         .next()
         .ok_or_else(|| CompilerError::Parse("ordering cannot be empty".to_string()))?;
-    let (expr, descending) = match first.as_rule() {
-        Rule::nearest_ordering => (parse_nearest_ordering(first, NameScope::Alias)?, false),
+    let (expr, descending, explicit) = match first.as_rule() {
+        Rule::nearest_ordering => (
+            parse_nearest_ordering(first, NameScope::Alias)?,
+            false,
+            false,
+        ),
         Rule::expr => {
             let expr = parse_expr(first, NameScope::Alias)?;
-            let direction = inner.next().map(|p| p.as_str().to_string());
-            if matches!(expr, Expr::Nearest { .. }) && direction.is_some() {
-                return Err(CompilerError::Parse(
-                    "nearest() ordering does not accept asc/desc modifiers".to_string(),
+            let direction = inner.next();
+            if matches!(expr, Expr::Nearest { .. })
+                && let Some(direction) = &direction
+            {
+                return Err(query_error_at(
+                    "nearest() ordering does not accept asc/desc modifiers",
+                    direction,
                 ));
             }
-            let descending = matches!(direction.as_deref(), Some("desc"));
-            (expr, descending)
+            let explicit = direction.is_some();
+            let descending = direction.is_some_and(|p| p.as_str() == "desc");
+            (expr, descending, explicit)
         }
         other => {
             return Err(CompilerError::Parse(format!(
@@ -1190,7 +1678,11 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
         }
     };
 
-    Ok(Ordering { expr, descending })
+    Ok(Ordering {
+        expr,
+        descending,
+        explicit,
+    })
 }
 
 fn parse_nearest_ordering(pair: pest::iterators::Pair<Rule>, scope: NameScope<'_>) -> Result<Expr> {

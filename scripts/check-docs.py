@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from urllib.parse import unquote
 
+from markdown_links import link_targets
+
 ROOT = Path(__file__).resolve().parent.parent
 RFC_DIR = ROOT / "docs" / "rfcs"
 SKILL_DIR = ROOT / "skills" / "omnigraph"
@@ -97,18 +99,7 @@ def strip_fenced_code(text: str) -> str:
 
 
 def local_link_targets(text: str) -> list[tuple[int, str]]:
-    clean = strip_fenced_code(text)
-    found: list[tuple[int, str]] = []
-    patterns = (
-        re.compile(r"!?\[[^\]]*\]\(([^)]+)\)"),
-        re.compile(r"^\s*\[[^\]]+\]:\s*(\S+)", re.MULTILINE),
-    )
-    for pattern in patterns:
-        for match in pattern.finditer(clean):
-            raw = match.group(1).strip()
-            line = clean.count("\n", 0, match.start()) + 1
-            found.append((line, raw))
-    return found
+    return link_targets(text)
 
 
 def markdown_destination(raw: str) -> str:
@@ -133,9 +124,12 @@ def normalize_link(raw: str) -> str | None:
 
 
 def heading_anchors(path: Path) -> set[str]:
+    return heading_anchors_text(path.read_text(encoding="utf-8"))
+
+
+def heading_anchors_text(text: str) -> set[str]:
     anchors: set[str] = set()
     counts: dict[str, int] = {}
-    text = path.read_text(encoding="utf-8")
     for line in text.splitlines():
         match = re.match(r"^#{1,6}\s+(.+?)\s*#*\s*$", line)
         if not match:
@@ -509,8 +503,35 @@ def check_skill_version(errors: list[str]) -> None:
             f"{version.group(1)!r} != omnigraph-cli {cli_version.group(1)!r}"
         )
 
+    # The CLI reports its HTTP contract beside the skill it exports, so the
+    # skill's declared contract must be the one the binary speaks.
+    api_types = ROOT / "crates" / "omnigraph-api-types" / "src" / "lib.rs"
+    contract = re.search(
+        r'(?m)^pub const HTTP_API_CONTRACT: &str = "([^"]+)";',
+        api_types.read_text(encoding="utf-8"),
+    )
+    compatibility = re.search(r"(?m)^compatibility:\s*(.*)$", text[4:end])
+    declared = (
+        re.search(r"\bHTTP contract (\S+?)[.,;]?(?:\s|$)", compatibility.group(1))
+        if compatibility
+        else None
+    )
+    if contract is None:
+        errors.append(f"{api_types.relative_to(ROOT)}: HTTP_API_CONTRACT is required")
+    elif declared is None:
+        errors.append(
+            "skills/omnigraph/SKILL.md: compatibility must name the 'HTTP contract' it covers"
+        )
+    elif declared.group(1) != contract.group(1):
+        errors.append(
+            "skills/omnigraph/SKILL.md: compatibility names HTTP contract "
+            f"{declared.group(1)!r} != omnigraph-api-types {contract.group(1)!r}"
+        )
+
 
 def main() -> int:
+    from release_notes import check_working_notes
+
     errors: list[str] = []
     files = tracked_markdown()
     check_locations(files, errors)
@@ -526,6 +547,7 @@ def main() -> int:
     check_conflict_markers(files, errors)
     check_user_boundary(files, errors)
     check_skill_version(errors)
+    check_working_notes(ROOT, errors)
 
     if errors:
         for error in errors:

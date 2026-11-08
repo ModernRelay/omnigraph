@@ -7,13 +7,41 @@ rules and decision authority behind it live in [GOVERNANCE.md](GOVERNANCE.md).
 
 | I want to… | Go to | Notes |
 |---|---|---|
-| **Report a bug** or wrong behavior | **[Open an Issue](../../issues/new/choose)** — bug form | Concrete and reproducible. A maintainer triages it; once labelled **`accepted`** it's open for a PR. |
-| **Propose a feature / share an idea** | **[Open an Issue](../../issues/new/choose)** — feature form | A maintainer triages it. **`accepted`** means a PR may follow; a larger design gets **`needs-rfc`** and goes through an RFC first. |
-| **Propose a design / RFC** | **An Issue first**, then an RFC pull request | Get the issue `accepted` before investing in the RFC. Merge may publish a draft for review; only `status: accepted` authorizes implementation — see [docs/rfcs/README.md](docs/rfcs/README.md). |
+| **Report broken existing functionality**, incorrect results, or a regression | **[Bug report](../../issues/new?template=bug_report.yml)** | Include a concrete reproduction. Maintainers review classification and decide acceptance. |
+| **Request a new capability or change to intended behavior or architecture** | **[Feature or design proposal](../../issues/new?template=feature_request.yml)** | Includes RFC ideas and amendments. Maintainers decide whether the same issue needs an RFC. |
 | **Fix something / implement a change** | **A pull request** | Must link an `accepted` issue or accepted RFC — unless it's trivial (below). |
 | **Report a security vulnerability** | **[SECURITY.md](SECURITY.md)** | Do **not** open a public Issue. |
 
 GitHub Discussions are not used — Issues are the only inbound channel.
+
+Choose one form for the underlying problem; a suggested fix does not turn a bug
+report into a feature proposal. If an issue already covers the problem or idea,
+add details there. If unsure which form applies, describe the behavior and
+expectation once; maintainers review its classification during triage.
+
+Both forms automatically apply `needs-triage`. The bug form also applies `bug`,
+and the feature or design proposal form applies `feature`. These initial labels
+do not imply acceptance; maintainers can correct them during triage.
+
+An RFC is a later design step, not a separate intake form. Wait for maintainer
+agreement before writing one. Maintainers apply `needs-rfc` to the existing issue,
+which then tracks the RFC and implementation. Do not open a second issue for it.
+Implementation requires the RFC's explicit `status: accepted`; merging a draft
+does not accept it. See the [RFC process](docs/rfcs/README.md).
+
+### Bug reports
+
+Include the actual and expected results, exact version (and commit for source
+builds), execution path, and environment. Provide a minimal, complete
+[GQT reproduction](crates/omnigraph-gqt/README.md) with setup and assertions.
+Before filing, use `# issue: none` in the case header and a filename such as
+`repro.gqt`.
+If GQT cannot express the issue, explain why and provide exact alternative
+steps and commands. Maintainers decide whether an exception is appropriate.
+Running GQT before filing is optional because the runner requires a source
+checkout. If you ran it, include the command and failure output.
+
+A reproduction does not automatically accept a report; maintainers decide acceptance.
 
 ### When can I just open a PR?
 The **trivial fast-lane** — open directly, no prior issue/RFC needed, when the
@@ -42,7 +70,7 @@ gate:
 
 ```bash
 cargo check -p omnigraph-engine --locked
-cargo test -p omnigraph-engine --test traversal
+cargo test -p omnigraph-engine --test integration traversal_indexed::
 ```
 
 Substitute the owning package and existing test target; the coverage map in
@@ -50,12 +78,12 @@ Substitute the owning package and existing test target; the coverage map in
 non-trivial change, run the canonical feature-superset gate:
 
 ```bash
-cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-dst --locked \
+cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked \
   --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints
 ```
 
-The GQT corpus and the DST suite are excluded by name: each has its own
-command and process environment, listed in
+The embedded and served GQT suites and the DST suite are excluded by name;
+their commands and process environments are listed in
 [`docs/dev/testing.md`](docs/dev/testing.md).
 
 If you touch S3-backed flows, the CI model uses a local RustFS instance for
@@ -70,7 +98,7 @@ When your change touches the server API surface, regenerate locally and commit
 the result in the same PR:
 
 ```bash
-OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi openapi_spec_is_up_to_date
+OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test integration openapi::openapi_spec_is_up_to_date
 ```
 
 ### Cargo features
@@ -91,6 +119,30 @@ CI runs both.
 
 ## Pull Requests
 
+- **Title the PR `type(scope)!: description`** ([Conventional
+  Commits](https://www.conventionalcommits.org/en/v1.0.0/)). Every merge is a
+  squash whose subject is the title, so the title is the line `git log` keeps.
+  The `PR Title` check refuses anything else and re-runs when you edit the
+  title:
+  - `type` is one of `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `ci`,
+    `build`, `revert`, `rfc`, `release`; there is no `chore`, say what kind
+    of change it is.
+  - `(scope)` is optional: lowercase names, commas between several
+    (`refactor(blob,schema)!: …`).
+  - `!` marks a breaking change; the change also carries a
+    `changelog.d/<slug>.breaking.md` note.
+  - a `feat`, `fix` or `perf` change adds a `changelog.d` note
+    ([release notes](docs/dev/documentation.md#release-notes)); a maintainer
+    adds the `skip-changelog` label when users can see nothing of it.
+  - the description starts lowercase (a backtick or a digit is fine), has no
+    trailing period, and the whole title stays within 100 characters.
+  - an RFC PR is `rfc: <the RFC's subject>`, not `docs(rfc):`; RFC numbers
+    stay out of titles (RFCs are named by date and slug). A revert is
+    `revert: <what is undone>`; retitle GitHub's `Revert "…"` default.
+  - examples: `feat(server): return exact merge publication receipts`,
+    `fix(merge): decide fast_forward by the target's state`,
+    `test(gq): cover inherited indexes after fast-forward`,
+    `docs: fix a broken link in the upgrade guide`.
 - **Link the backing `accepted` issue or accepted RFC** (`Closes #123`, or
   reference the RFC) — or mark the PR as trivial per the fast-lane.
 - Keep changes focused; one logical change per PR.

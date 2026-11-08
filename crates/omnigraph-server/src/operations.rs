@@ -1,0 +1,1158 @@
+//! Process-owned HTTP operations. This tracks server futures and response
+//! producers, not arbitrary native I/O or a reusable engine-drain proof.
+
+use std::any::Any;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use futures::FutureExt;
+use tokio::sync::{Notify, oneshot};
+use tracing::Instrument;
+
+use crate::ApiError;
+
+tokio::task_local! {
+    /// Whether the request being served has submitted an owned write. An
+    /// error it returns afterwards, from the write or from anything the
+    /// handler does after it, may follow effects. The owned write itself runs
+    /// with it set.
+    static SUBMITTED_WRITE: std::cell::Cell<bool>;
+}
+
+/// Serve one request with its own record of whether it submitted a write.
+pub(crate) async fn scope_request<F: Future>(request: F) -> F::Output {
+    SUBMITTED_WRITE
+        .scope(std::cell::Cell::new(false), request)
+        .await
+}
+
+/// Whether the request being served has submitted an owned write; false
+/// outside a served request.
+pub(crate) fn request_submitted_write() -> bool {
+    SUBMITTED_WRITE
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(false)
+}
+
+pub const DEFAULT_READ_OBSERVERS: usize = 128;
+pub const DEFAULT_WRITE_OBSERVERS: usize = 64;
+
+#[derive(Clone)]
+pub struct OperationRuntime {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    state: Mutex<State>,
+    changed: Notify,
+    read_limit: usize,
+    write_response_limit: usize,
+}
+
+#[derive(Default)]
+struct State {
+    closed: bool,
+    startup_started: bool,
+    active_startup: bool,
+    startup_uncertain: bool,
+    active_writes: usize,
+    active_reads: usize,
+    active_write_responses: usize,
+    // Ambiguity never returns admission capacity to a live process. The list
+    // is bounded by admission; closing the epoch forbids further registration.
+    uncertain: Vec<Box<dyn Any + Send>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OperationSnapshot {
+    pub closed: bool,
+    pub active_startup: bool,
+    pub startup_uncertain: bool,
+    pub active_writes: usize,
+    pub active_reads: usize,
+    pub active_write_responses: usize,
+    pub uncertain_writes: usize,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl OperationRuntime {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_read_limit(read_limit: usize) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                state: Mutex::new(State::default()),
+                changed: Notify::new(),
+                read_limit,
+                write_response_limit: DEFAULT_WRITE_OBSERVERS,
+            }),
+        }
+    }
+
+    /// Permanently close both process lanes under the registration boundary.
+    /// Graph-only transitions retain this runtime and its admission limits.
+    pub fn close(&self) {
+        locked(&self.inner.state).closed = true;
+        self.inner.changed.notify_waiters();
+    }
+
+    pub fn snapshot(&self) -> OperationSnapshot {
+        let state = locked(&self.inner.state);
+        OperationSnapshot {
+            closed: state.closed,
+            active_startup: state.active_startup,
+            startup_uncertain: state.startup_uncertain,
+            active_writes: state.active_writes,
+            active_reads: state.active_reads,
+            active_write_responses: state.active_write_responses,
+            uncertain_writes: state.uncertain.len(),
+        }
+    }
+
+    /// The process has one initial startup batch, independent of HTTP lane
+    /// capacity. Its owner must survive listener failure and shutdown.
+    pub(crate) fn own_startup(&self) -> Result<StartupOwner, ApiError> {
+        let mut state = locked(&self.inner.state);
+        if state.closed {
+            return Err(ApiError::admission_closed());
+        }
+        if state.startup_started {
+            return Err(ApiError::internal("server startup already started"));
+        }
+        state.startup_started = true;
+        state.active_startup = true;
+        Ok(StartupOwner {
+            inner: Arc::clone(&self.inner),
+            finished: false,
+        })
+    }
+
+    /// Contain the process for a reason outside any one operation: its
+    /// cluster admission lease fenced. Admission closes; known owners drain;
+    /// the process exits nonzero without releasing the lock.
+    pub(crate) fn contain(&self) {
+        let mut state = locked(&self.inner.state);
+        state.startup_uncertain = true;
+        state.closed = true;
+        drop(state);
+        self.inner.changed.notify_waiters();
+    }
+
+    pub(crate) fn contain_startup(&self) {
+        self.contain();
+    }
+
+    /// Serialize synchronous graph admission/transition against process closure.
+    /// The callback may take the registry lock, but must not await or re-enter
+    /// this runtime: the lock order is process, then registry.
+    pub(crate) fn while_open<T, E>(&self, operation: impl FnOnce() -> Result<T, E>) -> Result<T, E>
+    where
+        E: From<ApiError>,
+    {
+        let state = locked(&self.inner.state);
+        if state.closed {
+            return Err(ApiError::admission_closed().into());
+        }
+        operation()
+    }
+
+    /// Server read lifetime only. Clone into each producer and response body;
+    /// the last clone releases the observation.
+    pub fn try_observe(&self) -> Result<ReadObserver, ApiError> {
+        self.try_observe_response(false)
+    }
+
+    /// Writes have independent response capacity so slow readers cannot
+    /// prevent a write from reaching operation admission.
+    pub fn try_observe_write(&self) -> Result<ReadObserver, ApiError> {
+        self.try_observe_response(true)
+    }
+
+    fn try_observe_response(&self, write: bool) -> Result<ReadObserver, ApiError> {
+        let mut state = locked(&self.inner.state);
+        if state.closed {
+            return Err(ApiError::admission_closed());
+        }
+        let (active, limit, lane) = if write {
+            (
+                &mut state.active_write_responses,
+                self.inner.write_response_limit,
+                "write",
+            )
+        } else {
+            (&mut state.active_reads, self.inner.read_limit, "read")
+        };
+        if *active >= limit {
+            return Err(ApiError::too_many_requests(format!(
+                "server {lane} observer cap {limit} exceeded"
+            )));
+        }
+        *active += 1;
+        Ok(ReadObserver {
+            _life: Arc::new(ReadLife {
+                inner: Arc::clone(&self.inner),
+                write,
+            }),
+        })
+    }
+
+    /// Wait for known logical owners, refusing a clean result on ambiguity.
+    /// Callers impose the original process shutdown deadline. This is not an
+    /// engine-reuse or object-store-quiescence capability.
+    pub async fn wait_logical_owners(&self) -> bool {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let snapshot = self.snapshot();
+            if !snapshot.active_startup
+                && snapshot.active_writes == 0
+                && snapshot.active_reads == 0
+                && snapshot.active_write_responses == 0
+            {
+                return !snapshot.startup_uncertain && snapshot.uncertain_writes == 0;
+            }
+            changed.await;
+        }
+    }
+
+    /// Wake graph-transition waiters when shutdown or an uncertain write closes
+    /// process admission. Closure is not proof that existing owners settled.
+    pub(crate) async fn wait_closed(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.snapshot().closed {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Sticky notification for the production host's fail-stop path.
+    pub async fn fatal(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let snapshot = self.snapshot();
+            if snapshot.startup_uncertain || snapshot.uncertain_writes != 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    /// Synchronous registration precedes spawning and the operation's first
+    /// poll. The caller can drop its receiver without cancelling this owner.
+    pub(crate) fn submit<T, R, F>(
+        &self,
+        reservation: R,
+        operation: F,
+    ) -> Result<OwnedResponse<T>, ApiError>
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        F: Future<Output = OwnedResult<T>> + Send + 'static,
+    {
+        use tracing::instrument::WithSubscriber as _;
+
+        {
+            let mut state = locked(&self.inner.state);
+            if state.closed {
+                return Err(ApiError::admission_closed());
+            }
+            state.active_writes += 1;
+        }
+        let _ = SUBMITTED_WRITE.try_with(|submitted| submitted.set(true));
+        let owner = WriteOwner {
+            inner: Arc::clone(&self.inner),
+            reservation: Some(Box::new(reservation)),
+        };
+        let (sender, receiver) = oneshot::channel();
+        // A span retains its subscriber, but entering it does not install that
+        // subscriber for Span::current() or events on a detached task.
+        tokio::spawn(
+            async move {
+                // The write runs as its request's submitted write: an error it
+                // translates follows it, as its waiter judges it, and logs the
+                // status it answers with.
+                let operation = SUBMITTED_WRITE.scope(
+                    std::cell::Cell::new(true),
+                    AssertUnwindSafe(operation).catch_unwind(),
+                );
+                let OwnedResult { result, uncertain } = match operation.await {
+                    Ok(result) => result,
+                    Err(_) => OwnedResult {
+                        result: Err(ApiError::internal(
+                            "owned write panicked; effects are unknown and require reconciliation",
+                        )),
+                        uncertain: true,
+                    },
+                };
+                // Mark the error as its waiter receives it, so the log below
+                // records the status its response sends.
+                let result = result.map_err(ApiError::after_owned_write);
+                // Process containment and completion uncertainty are distinct:
+                // scoped storage uncertainty leaves admission open, but remains
+                // an uncertain outcome in telemetry.
+                let telemetry_uncertain =
+                    uncertain || result.as_ref().is_err_and(ApiError::completion_uncertain);
+                crate::telemetry::operation_finished("write", result.is_ok(), telemetry_uncertain);
+                // A known result carries its reservation through pending delivery.
+                // Consumption releases admission before the handler can respond;
+                // abandonment destroys the output before releasing its ownership.
+                // Uncertainty closes admission before its result is observable.
+                // An owned write whose outcome is unknown is logged once,
+                // whether or not it contains the process. The failure's class
+                // was logged in this request's span when the engine error was
+                // mapped.
+                if let Err(error) = &result
+                    && error.completion_uncertain()
+                {
+                    tracing::error!(
+                        status = %error.status(),
+                        contained = uncertain,
+                        "owned write ended without a definite outcome"
+                    );
+                }
+                let owner = if uncertain {
+                    owner.finish(true);
+                    None
+                } else {
+                    Some(owner)
+                };
+                let _ = sender.send(WriteDelivery {
+                    result: Some(result),
+                    owner,
+                });
+            }
+            .instrument(crate::telemetry::operation_span("write"))
+            .with_current_subscriber(),
+        );
+        Ok(OwnedResponse(receiver))
+    }
+}
+
+pub(crate) struct StartupOwner {
+    inner: Arc<Inner>,
+    finished: bool,
+}
+
+impl StartupOwner {
+    pub(crate) fn finish(mut self) {
+        self.finished = true;
+        locked(&self.inner.state).active_startup = false;
+        self.inner.changed.notify_waiters();
+    }
+}
+
+impl Drop for StartupOwner {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut state = locked(&self.inner.state);
+            state.active_startup = false;
+            state.startup_uncertain = true;
+            state.closed = true;
+            drop(state);
+            self.inner.changed.notify_waiters();
+        }
+    }
+}
+
+impl Default for OperationRuntime {
+    fn default() -> Self {
+        Self::with_read_limit(DEFAULT_READ_OBSERVERS)
+    }
+}
+
+pub(crate) struct OwnedResponse<T>(oneshot::Receiver<WriteDelivery<T>>);
+
+impl<T> OwnedResponse<T> {
+    /// The write's result; an error is one the owned write returned.
+    pub(crate) async fn result(self) -> Result<T, ApiError> {
+        match self.0.await {
+            Ok(delivery) => delivery.into_result(),
+            Err(_) => Err(ApiError::internal(
+                "owned write result was lost; effects are unknown and require reconciliation",
+            )
+            .after_owned_write()),
+        }
+    }
+}
+
+/// The single bounded result slot owns completion until the request takes it.
+struct WriteDelivery<T> {
+    result: Option<Result<T, ApiError>>,
+    owner: Option<WriteOwner>,
+}
+
+impl<T> WriteDelivery<T> {
+    fn into_result(mut self) -> Result<T, ApiError> {
+        // The receiving request still holds its graph/response lease. Release
+        // write admission synchronously, before the handler exposes its result.
+        if let Some(owner) = self.owner.take() {
+            owner.finish(false);
+        }
+        self.result.take().expect("delivery is consumed once")
+    }
+}
+
+impl<T> Drop for WriteDelivery<T> {
+    fn drop(&mut self) {
+        // If output destruction panics, the owner's own Drop fails closed.
+        drop(self.result.take());
+        if let Some(owner) = self.owner.take() {
+            owner.finish(false);
+        }
+    }
+}
+
+/// Optional work can fail after an exact successful primary result. Preserve
+/// that result while independently flagging an uncertain completion.
+pub(crate) struct OwnedResult<T> {
+    pub(crate) result: Result<T, ApiError>,
+    pub(crate) uncertain: bool,
+}
+
+impl<T> From<Result<T, ApiError>> for OwnedResult<T> {
+    /// An unknown outcome the engine scopes to its storage keys
+    /// is reported, not contained; every other uncertain completion contains
+    /// the process.
+    fn from(result: Result<T, ApiError>) -> Self {
+        let uncertain = result.as_ref().is_err_and(|error| error.contains_process());
+        Self { result, uncertain }
+    }
+}
+
+struct WriteOwner {
+    inner: Arc<Inner>,
+    reservation: Option<Box<dyn Any + Send>>,
+}
+
+impl WriteOwner {
+    fn finish(mut self, uncertain: bool) {
+        let reservation = self.reservation.take().expect("owner finishes once");
+        if uncertain {
+            let mut state = locked(&self.inner.state);
+            state.active_writes -= 1;
+            state.closed = true;
+            state.uncertain.push(reservation);
+        } else {
+            drop(reservation);
+            locked(&self.inner.state).active_writes -= 1;
+        }
+        self.inner.changed.notify_waiters();
+    }
+}
+
+impl Drop for WriteOwner {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            // Runtime cancellation and unwinding cannot masquerade as clean
+            // completion. Retain the reservation until the process is gone.
+            let mut state = locked(&self.inner.state);
+            state.active_writes -= 1;
+            state.closed = true;
+            state.uncertain.push(reservation);
+            self.inner.changed.notify_waiters();
+        }
+    }
+}
+
+#[derive(Clone)]
+/// A response/producer lifetime in either independent observer lane.
+pub struct ReadObserver {
+    _life: Arc<ReadLife>,
+}
+
+impl ReadObserver {
+    /// Transfer an already admitted read to a process task. Losing the result
+    /// waiter cannot drop its engine future or release its input reservation.
+    /// Descendants of this observer may finish after admission closes; no new
+    /// observer or queue entry is acquired here. Native tails outside the
+    /// engine future remain outside this logical ownership boundary.
+    ///
+    /// The task serves a request, or a part of one such as an MCP tool call,
+    /// so it keeps its own record of the writes that request submits, and an
+    /// error leaving it carries that record to the waiter. The caller's engine
+    /// io probes, a test's, cross with it: a Tokio task local does not.
+    pub(crate) fn spawn_read<T, R, F>(self, reservation: R, operation: F) -> OwnedReadResponse<T>
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        F: Future<Output = Result<T, ApiError>> + Send + 'static,
+    {
+        use tracing::instrument::WithSubscriber as _;
+
+        let (sender, receiver) = oneshot::channel();
+        let response_observer = self.clone();
+        let callers_probes = omnigraph::instrumentation::capture_query_io_probes();
+        tokio::spawn(
+            async move {
+                let _observer = self;
+                let _reservation = reservation;
+                let operation = async move {
+                    match callers_probes {
+                        Some(probes) => {
+                            omnigraph::instrumentation::with_query_io_probes(probes, operation)
+                                .await
+                        }
+                        None => operation.await,
+                    }
+                };
+                let result = scope_request(async move {
+                    // Catch completed future Drop panics too.
+                    #[allow(clippy::redundant_async_block)]
+                    let result = AssertUnwindSafe(async move { operation.await })
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| Err(ApiError::internal("owned read panicked")));
+                    result.map_err(ApiError::with_request_facts)
+                })
+                .await;
+                crate::telemetry::operation_finished("read", result.is_ok(), false);
+                // No result history: an absent waiter drops the result here.
+                let _ = sender.send(result);
+            }
+            .instrument(crate::telemetry::operation_span("read"))
+            .with_current_subscriber(),
+        );
+        OwnedReadResponse {
+            receiver,
+            _observer: response_observer,
+        }
+    }
+}
+
+pub(crate) struct OwnedReadResponse<T> {
+    receiver: oneshot::Receiver<Result<T, ApiError>>,
+    // The one completed result slot remains bounded even before it is polled.
+    _observer: ReadObserver,
+}
+
+impl<T> OwnedReadResponse<T> {
+    pub(crate) async fn result(self) -> Result<T, ApiError> {
+        self.receiver
+            .await
+            .unwrap_or_else(|_| Err(ApiError::internal("owned read result was lost")))
+    }
+}
+
+struct ReadLife {
+    inner: Arc<Inner>,
+    write: bool,
+}
+
+impl Drop for ReadLife {
+    fn drop(&mut self) {
+        let mut state = locked(&self.inner.state);
+        if self.write {
+            state.active_write_responses -= 1;
+        } else {
+            state.active_reads -= 1;
+        }
+        drop(state);
+        self.inner.changed.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Reservation(Arc<AtomicUsize>);
+
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_loss_preserves_reservation_and_executes_once() {
+        struct DroppedOutput {
+            releases: Arc<AtomicUsize>,
+            observed: Arc<AtomicUsize>,
+        }
+
+        impl Drop for DroppedOutput {
+            fn drop(&mut self) {
+                self.observed
+                    .store(self.releases.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+        }
+
+        for delivery in ["disconnect_before", "disconnect_after", "consume"] {
+            let runtime = OperationRuntime::new();
+            let releases = Arc::new(AtomicUsize::new(0));
+            let effects = Arc::new(AtomicUsize::new(0));
+            let observed_effects = Arc::clone(&effects);
+            let output_drop = Arc::new(AtomicUsize::new(usize::MAX));
+            let output = DroppedOutput {
+                releases: Arc::clone(&releases),
+                observed: Arc::clone(&output_drop),
+            };
+            let (release, held) = oneshot::channel();
+            let (executed, execution_finished) = oneshot::channel();
+            let mut response = Some(
+                runtime
+                    .submit(Reservation(Arc::clone(&releases)), async move {
+                        held.await.unwrap();
+                        observed_effects.fetch_add(1, Ordering::SeqCst);
+                        executed.send(()).unwrap();
+                        Ok::<_, ApiError>(output).into()
+                    })
+                    .unwrap(),
+            );
+            if delivery == "disconnect_before" {
+                drop(response.take());
+            }
+            let closed = runtime.wait_closed();
+            tokio::pin!(closed);
+            assert!(futures::poll!(&mut closed).is_pending());
+            runtime.close();
+            assert!(futures::poll!(&mut closed).is_ready());
+            let already_closed = runtime.wait_closed();
+            tokio::pin!(already_closed);
+            assert!(futures::poll!(&mut already_closed).is_ready());
+            assert_eq!(runtime.snapshot().active_writes, 1);
+            assert_eq!(releases.load(Ordering::SeqCst), 0);
+            assert!(runtime.try_observe().is_err());
+            assert!(
+                runtime
+                    .while_open::<(), ApiError>(|| panic!("closed process must not enter registry"))
+                    .is_err()
+            );
+            release.send(()).unwrap();
+            // On this current-thread runtime, delivery's synchronous tail runs
+            // before this receiver can wake. No timer or scheduler race is needed.
+            execution_finished.await.unwrap();
+            if let Some(response) = response {
+                assert_eq!(runtime.snapshot().active_writes, 1, "{delivery}");
+                assert_eq!(releases.load(Ordering::SeqCst), 0, "{delivery}");
+                assert_eq!(output_drop.load(Ordering::SeqCst), usize::MAX);
+                if delivery == "consume" {
+                    let output = response.result().await.unwrap();
+                    assert_eq!(runtime.snapshot().active_writes, 0);
+                    assert_eq!(releases.load(Ordering::SeqCst), 1);
+                    drop(output);
+                } else {
+                    drop(response);
+                }
+            }
+            assert!(runtime.wait_logical_owners().await);
+            assert_eq!(effects.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                output_drop.load(Ordering::SeqCst),
+                usize::from(delivery == "consume"),
+                "abandoned output must drop before its graph reservation: {delivery}"
+            );
+            assert_eq!(releases.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn panic_retains_capacity_and_poisoned_epoch_never_reopens() {
+        let runtime = OperationRuntime::new();
+        let releases = Arc::new(AtomicUsize::new(0));
+        let response = runtime
+            .submit(Reservation(Arc::clone(&releases)), async {
+                panic!("contained write failure");
+                #[allow(unreachable_code)]
+                OwnedResult::from(Ok::<_, ApiError>(()))
+            })
+            .unwrap();
+        assert!(response.result().await.is_err());
+        runtime.fatal().await;
+        let closed = runtime.wait_closed();
+        tokio::pin!(closed);
+        assert!(futures::poll!(&mut closed).is_ready());
+        assert!(!runtime.wait_logical_owners().await);
+        assert_eq!(runtime.snapshot().uncertain_writes, 1);
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        assert!(
+            runtime
+                .while_open::<(), ApiError>(|| panic!("uncertain process must not enter registry"))
+                .is_err()
+        );
+        assert!(
+            runtime
+                .submit((), async { Ok::<_, ApiError>(()).into() })
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_read_result_remains_charged_until_delivery_or_abandonment() {
+        struct Finished(Option<oneshot::Sender<()>>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+
+        let runtime = OperationRuntime::with_read_limit(1);
+        let (finished, completed) = oneshot::channel();
+        let read = runtime
+            .try_observe()
+            .unwrap()
+            .spawn_read(Finished(Some(finished)), async { Ok(42) });
+        tokio::time::timeout(std::time::Duration::from_secs(2), completed)
+            .await
+            .expect("owned read did not complete")
+            .unwrap();
+        assert!(runtime.try_observe().is_err());
+        assert_eq!(runtime.snapshot().active_reads, 1);
+        drop(read);
+        assert_eq!(runtime.snapshot().active_reads, 0);
+        assert!(runtime.try_observe().is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_completion_releases_capacity_without_poisoning_writes() {
+        for outcome in ["success", "error", "panic"] {
+            let runtime = OperationRuntime::with_read_limit(1);
+            let releases = Arc::new(AtomicUsize::new(0));
+            let read = runtime.try_observe().unwrap().spawn_read(
+                Reservation(Arc::clone(&releases)),
+                async move {
+                    match outcome {
+                        "success" => Ok(()),
+                        "error" => Err(ApiError::internal("ordinary read failure")),
+                        "panic" => panic!("read execution failed"),
+                        _ => unreachable!(),
+                    }
+                },
+            );
+            assert_eq!(read.result().await.is_ok(), outcome == "success");
+            assert!(runtime.wait_logical_owners().await);
+            assert_eq!(releases.load(Ordering::SeqCst), 1);
+            assert_eq!(runtime.snapshot().active_reads, 0);
+            assert!(!runtime.snapshot().closed);
+            runtime
+                .submit((), async { Ok::<_, ApiError>(()).into() })
+                .unwrap()
+                .result()
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn read_observation_waits_for_the_last_producer_or_body() {
+        let runtime = OperationRuntime::new();
+        let body = runtime.try_observe().unwrap();
+        let producer = body.clone();
+        runtime.close();
+        drop(body);
+        assert_eq!(runtime.snapshot().active_reads, 1);
+        drop(producer);
+        assert!(runtime.wait_logical_owners().await);
+        assert_eq!(runtime.snapshot().active_reads, 0);
+    }
+
+    #[tokio::test]
+    async fn compound_uncertainty_keeps_success_but_closes_admission_before_delivery() {
+        let runtime = OperationRuntime::new();
+        let releases = Arc::new(AtomicUsize::new(0));
+        let response = runtime
+            .submit(Reservation(Arc::clone(&releases)), async {
+                OwnedResult {
+                    result: Ok::<_, ApiError>("exact primary receipt"),
+                    uncertain: true,
+                }
+            })
+            .unwrap();
+        assert_eq!(response.result().await.unwrap(), "exact primary receipt");
+        assert!(runtime.snapshot().closed);
+        assert_eq!(runtime.snapshot().uncertain_writes, 1);
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        assert!(!runtime.wait_logical_owners().await);
+    }
+
+    #[tokio::test]
+    async fn uncertainty_waits_for_other_logical_owners_before_nonclean_completion() {
+        let runtime = OperationRuntime::new();
+        let startup = runtime.own_startup().unwrap();
+        assert!(runtime.own_startup().is_err(), "startup cannot be replayed");
+        let releases = Arc::new(AtomicUsize::new(0));
+        let (release, held) = oneshot::channel();
+        let healthy = runtime
+            .submit(Reservation(Arc::clone(&releases)), async move {
+                held.await.unwrap();
+                Ok::<_, ApiError>(()).into()
+            })
+            .unwrap();
+        let uncertain = runtime
+            .submit(Reservation(Arc::clone(&releases)), async {
+                Err::<(), _>(ApiError::internal("completion lost")).into()
+            })
+            .unwrap();
+        assert!(uncertain.result().await.is_err());
+        let wait = runtime.wait_logical_owners();
+        tokio::pin!(wait);
+        assert!(futures::poll!(&mut wait).is_pending());
+        release.send(()).unwrap();
+        healthy.result().await.unwrap();
+        assert!(
+            futures::poll!(&mut wait).is_pending(),
+            "startup is still owned"
+        );
+        startup.finish();
+        assert!(!wait.await);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        let abandoned = OperationRuntime::new();
+        drop(abandoned.own_startup().unwrap());
+        assert!(abandoned.snapshot().closed);
+        assert!(abandoned.snapshot().startup_uncertain);
+        assert!(!abandoned.wait_logical_owners().await);
+        abandoned.fatal().await;
+        // A fenced lease contains a running process the same way: admission
+        // closes, the fail-stop path fires, and the epoch never reopens.
+        let fenced = OperationRuntime::new();
+        fenced.own_startup().unwrap().finish();
+        fenced.contain();
+        assert!(fenced.snapshot().closed);
+        assert!(!fenced.wait_logical_owners().await);
+        fenced.fatal().await;
+        assert!(
+            fenced
+                .while_open::<(), ApiError>(|| panic!("a fenced process admits nothing"))
+                .is_err()
+        );
+        let completed = OperationRuntime::new();
+        completed.own_startup().unwrap().finish();
+        assert!(completed.wait_logical_owners().await);
+        assert!(
+            completed.own_startup().is_err(),
+            "completion does not enable reopening"
+        );
+        assert_eq!(runtime.snapshot().uncertain_writes, 1);
+    }
+
+    #[test]
+    fn disconnected_owned_operation_keeps_its_request_span() {
+        fn request_parent() -> Option<tracing::Id> {
+            use tracing_subscriber::registry::LookupSpan;
+            tracing::Span::current()
+                .with_subscriber(|(id, dispatch)| {
+                    let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
+                    let operation = registry.span(id)?;
+                    assert_eq!(operation.name(), "native.operation");
+                    operation.parent().map(|parent| parent.id())
+                })
+                .flatten()
+        }
+
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::DEBUG);
+        use tracing_subscriber::prelude::*;
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let runtime = OperationRuntime::new();
+                    let span = tracing::debug_span!("request", graph = "owned");
+                    let expected = span.id().unwrap();
+                    let (sent, observed) = oneshot::channel();
+                    let response = {
+                        let _entered = span.enter();
+                        runtime
+                            .submit((), async move {
+                                sent.send(request_parent()).unwrap();
+                                Ok::<_, ApiError>(()).into()
+                            })
+                            .unwrap()
+                    };
+                    drop(response);
+                    assert_eq!(observed.await.unwrap(), Some(expected.clone()));
+                    let (sent, observed) = oneshot::channel();
+                    let response = {
+                        let _entered = span.enter();
+                        runtime.try_observe().unwrap().spawn_read((), async move {
+                            sent.send(request_parent()).unwrap();
+                            Ok::<_, ApiError>(())
+                        })
+                    };
+                    drop(response);
+                    assert_eq!(observed.await.unwrap(), Some(expected));
+                    assert!(runtime.wait_logical_owners().await);
+                });
+        });
+    }
+
+    #[tokio::test]
+    async fn typed_engine_uncertainty_controls_capacity_independently_of_status() {
+        use omnigraph::error::OmniError;
+        // (error, it contains the process). An unknown storage outcome, a
+        // publication in doubt or an opaque storage or I/O failure, is
+        // scoped to its keys and does not contain.
+        for (error, contained) in [
+            (
+                OmniError::Io(std::io::Error::other("schema read failed")).before_effect(),
+                false,
+            ),
+            (
+                OmniError::DataFusion("plan refusal".into()).before_effect(),
+                false,
+            ),
+            (
+                OmniError::manifest("post-publication fault")
+                    .with_completion_evidence(omnigraph::error::CompletionEvidence::Uncertain),
+                true,
+            ),
+            (
+                OmniError::manifest_publish_in_doubt("01JCOMMIT", "uncertain publication")
+                    .before_effect(),
+                false,
+            ),
+            (
+                OmniError::RecoveryRequired {
+                    operation_id: "published".into(),
+                    reason: "pending".into(),
+                }
+                .before_effect(),
+                true,
+            ),
+            (
+                OmniError::Io(std::io::Error::other("I/O completion failure")),
+                false,
+            ),
+            (OmniError::DataFusion("execution failure".into()), true),
+            (
+                OmniError::RecoveryRequired {
+                    operation_id: "published".into(),
+                    reason: "contract installation pending".into(),
+                },
+                true,
+            ),
+            (OmniError::manifest_internal("internal failure"), true),
+            (
+                OmniError::manifest_publish_in_doubt(
+                    "01JCOMMIT",
+                    "publication acknowledgement unavailable",
+                ),
+                false,
+            ),
+            (OmniError::manifest("invalid request"), false),
+            (OmniError::manifest_conflict("authority conflict"), false),
+            (
+                OmniError::PreconditionFailed {
+                    branch: "main".into(),
+                    expected: "old".into(),
+                    actual: Some("current".into()),
+                },
+                false,
+            ),
+            (OmniError::Policy("denied".into()), false),
+        ] {
+            let runtime = OperationRuntime::new();
+            let releases = Arc::new(AtomicUsize::new(0));
+            let response = runtime
+                .submit(Reservation(Arc::clone(&releases)), async move {
+                    OwnedResult::from(Err::<(), _>(ApiError::from_omni(error)))
+                })
+                .unwrap();
+            assert!(response.result().await.is_err());
+            assert_eq!(runtime.wait_logical_owners().await, !contained);
+            assert_eq!(runtime.snapshot().closed, contained);
+            assert_eq!(runtime.snapshot().uncertain_writes, usize::from(contained));
+            assert_eq!(releases.load(Ordering::SeqCst), usize::from(!contained));
+        }
+    }
+
+    /// A storage failure the engine proves left the graph unchanged (its
+    /// effects are detached versions no manifest names) is a 500 the caller
+    /// can act on, not an unknown outcome: admission stays open, the
+    /// reservation is released and nothing contains the process. The same
+    /// error without that evidence reports an unknown outcome scoped to its
+    /// storage keys, which does not contain either; an unknown
+    /// outcome the engine does not scope still contains.
+    #[tokio::test]
+    async fn definite_unpublished_storage_failure_keeps_admission_open_issue_1067() {
+        use omnigraph::error::{CompletionEvidence, OmniError};
+        // (error, its outcome is unknown, it contains the process, status)
+        for (error, uncertain, contained, status) in [
+            (
+                OmniError::Io(std::io::Error::other("detached manifest put failed")).unpublished(),
+                false,
+                false,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                OmniError::manifest_internal("table reached commit without a staged transaction")
+                    .unpublished(),
+                false,
+                false,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            // An unknown storage outcome is scoped to its keys:
+            // reported, never contained.
+            (
+                OmniError::Io(std::io::Error::other("detached manifest put failed")),
+                true,
+                false,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                OmniError::manifest_publish_in_doubt(
+                    "01JCOMMIT",
+                    "manifest publish outcome is in doubt",
+                )
+                .unpublished(),
+                true,
+                false,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            // An unknown outcome the engine does not scope still contains.
+            (
+                OmniError::DataFusion("execution failed".to_string()),
+                true,
+                true,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let message = error.to_string();
+            let evidence = error.completion_evidence();
+            let api = ApiError::from_omni(error);
+            assert_eq!(api.status(), status, "{message}");
+            assert_eq!(api.completion_uncertain(), uncertain, "{message}");
+            assert_eq!(api.contains_process(), contained, "{message}");
+            if !uncertain && status == StatusCode::INTERNAL_SERVER_ERROR {
+                assert_eq!(evidence, Some(CompletionEvidence::Unpublished));
+            }
+            let runtime = OperationRuntime::new();
+            let releases = Arc::new(AtomicUsize::new(0));
+            let response = runtime
+                .submit(Reservation(Arc::clone(&releases)), async move {
+                    OwnedResult::from(Err::<(), _>(api))
+                })
+                .unwrap();
+            assert!(response.result().await.is_err());
+            assert_eq!(runtime.wait_logical_owners().await, !contained, "{message}");
+            assert_eq!(runtime.snapshot().closed, contained, "{message}");
+            assert_eq!(
+                runtime.snapshot().uncertain_writes,
+                usize::from(contained),
+                "{message}"
+            );
+            assert_eq!(
+                releases.load(Ordering::SeqCst),
+                usize::from(!contained),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_owner_retains_its_reservation_without_a_supervisor_task() {
+        let operations = OperationRuntime::new();
+        let releases = Arc::new(AtomicUsize::new(0));
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let response = operations
+                .submit(Reservation(Arc::clone(&releases)), async {
+                    std::future::pending::<()>().await;
+                    Ok::<_, ApiError>(()).into()
+                })
+                .unwrap();
+            drop(response);
+            tokio::task::yield_now().await;
+            assert_eq!(operations.snapshot().active_writes, 1);
+        });
+        drop(executor);
+        assert!(operations.snapshot().closed);
+        assert_eq!(operations.snapshot().active_writes, 0);
+        assert_eq!(operations.snapshot().uncertain_writes, 1);
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn read_cap_is_released_only_by_the_last_observer() {
+        let runtime = OperationRuntime::with_read_limit(1);
+        let first = runtime.try_observe().unwrap();
+        let producer = first.clone();
+        assert_eq!(
+            runtime.try_observe().err().unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        drop(first);
+        assert!(runtime.try_observe().is_err());
+        drop(producer);
+        assert!(runtime.try_observe().is_ok());
+    }
+
+    #[tokio::test]
+    async fn saturated_read_and_write_response_lanes_are_independent() {
+        let runtime = OperationRuntime::with_read_limit(1);
+        let read = runtime.try_observe().unwrap();
+        assert!(runtime.try_observe().is_err());
+        let writes = (0..DEFAULT_WRITE_OBSERVERS)
+            .map(|_| runtime.try_observe_write().unwrap())
+            .collect::<Vec<_>>();
+        assert!(runtime.try_observe_write().is_err());
+        assert_eq!(
+            runtime.snapshot().active_write_responses,
+            DEFAULT_WRITE_OBSERVERS
+        );
+        drop(read);
+        let read = runtime.try_observe().unwrap();
+        runtime.close();
+        drop(writes);
+        assert_eq!(runtime.snapshot().active_write_responses, 0);
+        drop(read);
+        assert!(runtime.wait_logical_owners().await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closed_registration_race_never_executes_a_refused_operation() {
+        let runtime = OperationRuntime::new();
+        let gate = Arc::new(tokio::sync::Barrier::new(33));
+        let effects = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let runtime = runtime.clone();
+            let gate = Arc::clone(&gate);
+            let effects = Arc::clone(&effects);
+            tasks.push(tokio::spawn(async move {
+                gate.wait().await;
+                match runtime.submit((), async move {
+                    effects.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ApiError>(()).into()
+                }) {
+                    Ok(response) => {
+                        response.result().await.unwrap();
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }));
+        }
+        gate.wait().await;
+        runtime.close();
+        let mut accepted = 0;
+        for task in tasks {
+            accepted += usize::from(task.await.unwrap());
+        }
+        assert!(runtime.wait_logical_owners().await);
+        assert_eq!(effects.load(Ordering::SeqCst), accepted);
+        assert!(
+            runtime
+                .submit((), async { Ok::<_, ApiError>(()).into() })
+                .is_err()
+        );
+    }
+}

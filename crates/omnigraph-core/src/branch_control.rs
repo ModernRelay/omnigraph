@@ -14,7 +14,7 @@ use lance::dataset::refs::{
 };
 use object_store::{ObjectStoreExt, PutMode, PutOptions};
 
-use crate::error::{OmniError, Result};
+use crate::error::{CompletionEvidence, OmniError, Result};
 use crate::seams::{decide_seam, fail};
 
 /// Result of a recoverable native create attempt.
@@ -73,11 +73,51 @@ pub async fn list_branch_contents(dataset: &Dataset) -> Result<HashMap<String, B
 /// Read one physical ref through the same bounded retry boundary; the caller
 /// maps `RefNotFound` to its own public miss.
 pub async fn get_branch_contents(dataset: &Dataset, branch: &str) -> lance::Result<BranchContents> {
+    check_valid_branch(branch)?;
+    let root = dataset.branch_location().find_main()?;
+    let store = dataset.object_store(None).await?;
+    let path = branch_contents_path(&root.path, branch);
+    let (path, store) = (&path, &store);
     read_branch_refs(
-        || async move { dataset.branches().get(branch).await },
+        || async move {
+            match read_ref_contents(store, path, branch).await {
+                Err(lance::Error::NotFound { .. }) => Err(lance::Error::RefNotFound {
+                    message: format!("branch {branch} does not exist"),
+                }),
+                result => result,
+            }
+        },
         is_raced_ref_read,
     )
     .await
+}
+
+/// Read one ref object in a single GET. Lance's `BranchContents::from_path`
+/// heads the object for its size and then reads that range, and
+/// `Branches::get` heads it once more for existence: three requests, and the
+/// head/range pair can observe a rewrite between them (the torn read the
+/// retry boundary above absorbs). One GET returns one whole object version.
+/// A ref written before identifiers existed falls back to Lance's reader,
+/// which derives its private synthetic identifier.
+pub(crate) async fn read_ref_contents(
+    store: &lance::io::ObjectStore,
+    path: &object_store::path::Path,
+    name: &str,
+) -> lance::Result<BranchContents> {
+    let bytes = store
+        .inner
+        .get(path)
+        .await
+        .map_err(lance::Error::from)?
+        .bytes()
+        .await
+        .map_err(lance::Error::from)?;
+    let contents: BranchContents = serde_json::from_slice(&bytes)
+        .map_err(|error| lance::Error::corrupt_file(path.clone(), error.to_string()))?;
+    if contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
+        return BranchContents::from_path(path, store, name).await;
+    }
+    Ok(contents)
 }
 
 /// Read one physical ref's exact lifetime identity; same boundary and
@@ -86,17 +126,19 @@ pub async fn get_branch_identifier(
     dataset: &Dataset,
     native: &str,
 ) -> lance::Result<BranchIdentifier> {
-    read_branch_refs(
-        || async move { dataset.branches().get_identifier(Some(native)).await },
-        is_raced_ref_read,
-    )
-    .await
+    get_branch_contents(dataset, native)
+        .await
+        .map(|contents| contents.identifier)
 }
 
 /// The identity of the ref a dataset handle is checked out on, through the
 /// same boundary; every engine read of `Dataset::branch_identifier` goes here.
 pub async fn dataset_branch_identifier(dataset: &Dataset) -> lance::Result<BranchIdentifier> {
-    read_branch_refs(|| dataset.branch_identifier(), is_raced_ref_read).await
+    match dataset.manifest().branch.as_deref() {
+        // `Dataset::branch_identifier` answers main without a read.
+        None => Ok(BranchIdentifier::main()),
+        Some(native) => get_branch_identifier(dataset, native).await,
+    }
 }
 
 /// Resolve a logical branch to its single live native ref by reading only that
@@ -108,12 +150,6 @@ pub async fn resolve_live_native_branch(
 ) -> Result<Option<String>> {
     let live = live_manifest_branches_matching(dataset, |candidate| candidate == logical).await?;
     crate::branch_names::resolve_native_branch(live.iter().map(String::as_str), logical)
-}
-
-pub async fn schema_apply_locked(dataset: &Dataset) -> Result<bool> {
-    live_manifest_branches_matching(dataset, crate::branch_names::is_schema_apply_lock_branch)
-        .await
-        .map(|branches| !branches.is_empty())
 }
 
 async fn live_manifest_branches_matching(
@@ -135,7 +171,7 @@ async fn live_manifest_branches_matching(
         }
         let path = lance::dataset::refs::branch_contents_path(&root.path, &native);
         let (path, store, name) = (&path, &store, native.as_str());
-        let read = || async move { BranchContents::from_path(path, store, name).await };
+        let read = || async move { read_ref_contents(store, path, name).await };
         match read_branch_refs(read, is_torn_ref_read).await {
             Ok(contents) => {
                 if manifest_branch_is_live(&native, &contents)? {
@@ -551,7 +587,9 @@ pub async fn retire_branch_recoverably(
     let mut contents = match get_branch_contents(dataset, branch).await {
         Ok(contents) => contents,
         Err(lance::Error::RefNotFound { .. }) => {
-            let archive = archived_manifest_branch(dataset, branch).await?;
+            let archive = archived_manifest_branch(dataset, branch)
+                .await
+                .map_err(OmniError::before_effect)?;
             return match archive {
                 Some(archive) if archive.identifier == *expected_identifier => Ok(()),
                 _ => Err(OmniError::manifest_conflict(format!(
@@ -559,15 +597,17 @@ pub async fn retire_branch_recoverably(
                 ))),
             };
         }
-        Err(error) => return Err(OmniError::storage(error)),
+        Err(error) => return Err(OmniError::storage(error).before_effect()),
     };
     if contents.identifier != *expected_identifier {
         return Err(OmniError::manifest_conflict(format!(
             "branch '{branch}' changed before retirement"
         )));
     }
-    if !manifest_branch_is_live(branch, &contents)? {
-        return archive_retired_ref(dataset, branch, &contents).await;
+    if !manifest_branch_is_live(branch, &contents).map_err(OmniError::before_effect)? {
+        return archive_retired_ref(dataset, branch, &contents)
+            .await
+            .map_err(|error| error.with_completion_evidence(CompletionEvidence::Uncertain));
     }
     if expected_identifier == &BranchIdentifier::main()
         || expected_identifier == &BranchIdentifier::missing_identifier_sentinel()
@@ -576,15 +616,22 @@ pub async fn retire_branch_recoverably(
             "branch '{branch}' has no exact retirement identity"
         )));
     }
-    let tags = dataset.tags().list().await.map_err(OmniError::storage)?;
+    let tags = dataset
+        .tags()
+        .list()
+        .await
+        .map_err(|error| OmniError::storage(error).before_effect())?;
     if let Some((tag, _)) = tags.iter().find(|(name, tag)| {
-        tag.branch.as_deref() == Some(branch) && !crate::branch_names::is_merge_input_tag(name)
+        tag.branch.as_deref() == Some(branch)
+            && !crate::branch_names::is_merge_input_tag(name)
+            && !crate::branch_names::is_unpublished_tag(name)
+            && !crate::branch_names::is_unattached_tag(name)
     }) {
         return Err(OmniError::storage(lance::Error::RefConflict {
             message: format!(
                 "cannot retire graph branch '{branch}' while native manifest tag '{tag}' pins it; remove the tag first"
             ),
-        }));
+        }).before_effect());
     }
     let record = RetiredManifestBranch {
         version: 1,
@@ -593,33 +640,40 @@ pub async fn retire_branch_recoverably(
     };
     let value = serde_json::to_string(&record).map_err(|error| {
         OmniError::manifest_internal(format!("failed to encode branch retirement: {error}"))
+            .before_effect()
     })?;
     contents
         .metadata
         .insert(RETIRED_MANIFEST_BRANCH_KEY.to_string(), value);
-    let result = match dataset
-        .branches()
-        .replace_metadata(branch, contents.metadata.clone())
-        .await
-    {
-        Ok(()) => fail(&BRANCH_DELETE_POST_NATIVE),
-        Err(error) => Err(OmniError::storage(error)),
-    };
-    if let Err(error) = result {
-        let observed = get_branch_contents(dataset, branch)
+    // From submission onward, a refusal-shaped cause cannot establish that
+    // retirement and its required archive/unlink completion made no effects.
+    let completion = async {
+        let result = match dataset
+            .branches()
+            .replace_metadata(branch, contents.metadata.clone())
             .await
-            .map_err(OmniError::storage)?;
-        if observed.identifier != *expected_identifier {
-            return Err(OmniError::manifest_conflict(format!(
-                "branch '{branch}' changed during retirement"
-            )));
+        {
+            Ok(()) => fail(&BRANCH_DELETE_POST_NATIVE),
+            Err(error) => Err(OmniError::storage(error)),
+        };
+        if let Err(error) = result {
+            let observed = get_branch_contents(dataset, branch)
+                .await
+                .map_err(OmniError::storage)?;
+            if observed.identifier != *expected_identifier {
+                return Err(OmniError::manifest_conflict(format!(
+                    "branch '{branch}' changed during retirement"
+                )));
+            }
+            if manifest_branch_is_live(branch, &observed)? {
+                return Err(error);
+            }
+            contents = observed;
         }
-        if manifest_branch_is_live(branch, &observed)? {
-            return Err(error);
-        }
-        contents = observed;
+        archive_retired_ref(dataset, branch, &contents).await
     }
-    archive_retired_ref(dataset, branch, &contents).await
+    .await;
+    completion.map_err(|error| error.with_completion_evidence(CompletionEvidence::Uncertain))
 }
 
 /// Pinned Lance treats an already-absent target tree as success. OmniGraph
@@ -819,10 +873,14 @@ pub async fn create_branch_recoverably(
     source: &mut Dataset,
     branch: &str,
     source_version: u64,
+    binding: Option<&crate::storage::CapturedStorageBinding>,
 ) -> Result<BranchCreateOutcome> {
     // Lance validates inside phase 2 today. Validate before phase 1 so an
-    // invalid name cannot leave a clone-only zombie.
-    check_valid_branch(branch).map_err(OmniError::storage)?;
+    // invalid name cannot leave a clone-only zombie. This validation and the
+    // inventory below precede even orphan-tree reclamation, our first possible
+    // durable effect; native create errors do not carry this proof.
+    check_valid_branch(branch)
+        .map_err(|error| OmniError::manifest(error.to_string()).before_effect())?;
     if source.version().version != source_version {
         return Err(OmniError::manifest_conflict(format!(
             "branch source moved before native create: expected version {}, current {}",
@@ -834,11 +892,16 @@ pub async fn create_branch_recoverably(
     let parent_branch = source.manifest().branch.clone();
     let parent_identifier = dataset_branch_identifier(source)
         .await
-        .map_err(OmniError::storage)?;
+        .map_err(|error| OmniError::storage(error).before_effect())?;
 
-    let initial_branches = branch_ref_names(source).await?;
+    let initial_branches = branch_ref_names(source)
+        .await
+        .map_err(OmniError::before_effect)?;
     if initial_branches.iter().any(|name| name == branch)
-        && branch_contents(source, branch).await?.is_some()
+        && branch_contents(source, branch)
+            .await
+            .map_err(OmniError::before_effect)?
+            .is_some()
     {
         return Ok(BranchCreateOutcome::RefAlreadyExists);
     }
@@ -848,27 +911,40 @@ pub async fn create_branch_recoverably(
              physical Lance path; live graph branch names may not be ancestors or descendants"
         )));
     }
-    refuse_archived_path_ancestor(source, branch).await?;
-    if branch_contents(source, branch).await?.is_some() {
-        return Err(authority_appeared_after_absence(source, branch).await?);
-    }
-    if branch_tree_exists(source, branch).await? && !reclaim_ref_absent_tree(source, branch).await?
+    refuse_archived_path_ancestor(source, branch)
+        .await
+        .map_err(OmniError::before_effect)?;
+    if branch_contents(source, branch)
+        .await
+        .map_err(OmniError::before_effect)?
+        .is_some()
     {
+        return Err(authority_appeared_after_absence(source, branch)
+            .await
+            .map_err(OmniError::before_effect)?);
+    }
+    let tree_exists = branch_tree_exists(source, branch)
+        .await
+        .map_err(OmniError::before_effect)?;
+    // Reclamation can delete durable files. Nothing from this boundary or a
+    // later native attempt is certified as a pre-effect failure.
+    if tree_exists && !reclaim_ref_absent_tree(source, branch).await? {
         return Err(authority_appeared_after_absence(source, branch).await?);
     }
     fail(&BRANCH_CREATE_POST_INVENTORY_PRE_NATIVE)?;
 
     for attempt in 0..2 {
-        let native_error = match crate::lance_clone::create_branch(source, branch, source_version)
-            .await
-            .map_err(OmniError::storage)
-        {
-            Ok(_) => match fail(&BRANCH_CREATE_POST_NATIVE) {
-                Ok(()) => return Ok(BranchCreateOutcome::Created),
+        let native_error =
+            match crate::lance_clone::create_branch(source, branch, source_version, binding)
+                .await
+                .map_err(OmniError::storage)
+            {
+                Ok(_) => match fail(&BRANCH_CREATE_POST_NATIVE) {
+                    Ok(()) => return Ok(BranchCreateOutcome::Created),
+                    Err(error) => error,
+                },
                 Err(error) => error,
-            },
-            Err(error) => error,
-        };
+            };
 
         let observed = branch_contents(source, branch).await.map_err(|classifier_error| {
             OmniError::manifest_internal(format!(
@@ -969,6 +1045,9 @@ mod tests {
         /// `head` reports a size that cuts the object inside its first
         /// multi-byte character, so the prefix is not UTF-8 at all.
         StaleHeadSizeMidChar,
+        /// A whole-object GET answers the object less its last two bytes:
+        /// an unreadable ref for a reader that sends no HEAD.
+        TruncatedBody,
     }
 
     impl InjectedRefRead {
@@ -1034,6 +1113,15 @@ mod tests {
                 target,
                 fault: self.clone(),
             })
+        }
+
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            // Listings must pass through the fault store and its accounting.
+            None
         }
     }
 
@@ -1103,6 +1191,27 @@ mod tests {
                         result.meta.size -= 2;
                         return Ok(result);
                     }
+                    InjectedRefRead::TruncatedBody if !options.head => {
+                        let result = self.target.get_opts(location, options).await?;
+                        let (meta, range, attributes, extensions) = (
+                            result.meta.clone(),
+                            result.range.clone(),
+                            result.attributes.clone(),
+                            result.extensions.clone(),
+                        );
+                        let bytes = result.bytes().await?;
+                        let cut = bytes.slice(..bytes.len().saturating_sub(2));
+                        return Ok(GetResult {
+                            payload: object_store::GetResultPayload::Stream(Box::pin(
+                                futures::stream::once(async move { Ok(cut) }),
+                            )),
+                            meta,
+                            range,
+                            attributes,
+                            extensions,
+                        });
+                    }
+                    InjectedRefRead::TruncatedBody => {}
                     InjectedRefRead::StaleHeadSizeMidChar => {
                         let mut result = self.target.get_opts(location, options).await?;
                         let bytes = self.target.get(location).await?.bytes().await?;
@@ -1284,7 +1393,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(contents.parent_version, version);
-        assert_eq!(fault.injected_failures(), 2);
+        // An exact ref read is one GET of the whole object: it sends no HEAD,
+        // so the stale size this fault answers a HEAD with is never observed
+        // and the rewrite race between a HEAD and a ranged GET cannot occur.
+        assert_eq!(fault.injected_failures(), 0);
     }
 
     #[tokio::test]
@@ -1336,7 +1448,8 @@ mod tests {
 
         let identifier = get_branch_identifier(&wrapped, "retiring").await.unwrap();
         assert_eq!(identifier, expected);
-        assert_eq!(fault.injected_failures(), 2);
+        // One GET, no HEAD: the stale-size answer is never requested.
+        assert_eq!(fault.injected_failures(), 0);
     }
 
     /// The nightly's failure shape: resolving one branch read every ref, so
@@ -1432,29 +1545,17 @@ mod tests {
         assert_eq!(vanish.injected_failures(), 1);
     }
 
-    /// The scoped sentinel check is a writer fence: unrelated damaged refs
-    /// must not block it, but a damaged sentinel cannot mean "unlocked". Keep
-    /// legacy and generated lifetimes, retirement, and read races in one fixture.
+    /// Relevant damaged refs fail authority reads; unrelated refs do not.
     #[tokio::test]
-    async fn schema_lock_lookup_preserves_authority_while_ignoring_unrelated_refs() {
+    async fn live_branch_lookup_preserves_authority_while_ignoring_unrelated_refs() {
         let dir = tempfile::tempdir().unwrap();
         let mut dataset = test_dataset(&dir).await;
         let version = dataset.version().version;
-        let sentinel = crate::branch_names::SCHEMA_APPLY_LOCK_BRANCH;
+        let logical = "guarded";
         let generated = crate::branch_names::native_branch_name(
-            sentinel,
+            logical,
             &crate::branch_names::mint_incarnation(),
         );
-
-        for logical in [sentinel.to_string(), format!("/{sentinel}")] {
-            let native = crate::branch_names::native_branch_name(
-                &logical,
-                &crate::branch_names::mint_incarnation(),
-            );
-            assert!(crate::branch_names::is_schema_apply_lock_branch(
-                crate::branch_names::logical_branch_name(&native)
-            ));
-        }
 
         dataset
             .create_branch("unrelated", version, None)
@@ -1464,16 +1565,18 @@ mod tests {
         let store = dataset.object_store(None).await.unwrap();
         let unrelated = lance::dataset::refs::branch_contents_path(&root, "unrelated");
         store.put(&unrelated, b"{").await.unwrap();
-        assert!(
-            !schema_apply_locked(&dataset).await.unwrap(),
-            "an unrelated malformed ref must not turn an idle schema into a lock error"
+        assert_eq!(
+            resolve_live_native_branch(&dataset, logical).await.unwrap(),
+            None,
+            "an unrelated malformed ref must not turn an absent branch into a lookup error"
         );
 
-        for native in [sentinel.to_string(), generated] {
+        for native in [logical.to_string(), generated] {
             dataset.create_branch(&native, version, None).await.unwrap();
-            assert!(
-                schema_apply_locked(&dataset).await.unwrap(),
-                "a live sentinel must block writers: {native}"
+            assert_eq!(
+                resolve_live_native_branch(&dataset, logical).await.unwrap(),
+                Some(native.clone()),
+                "a live ref must resolve: {native}"
             );
 
             let transient = Arc::new(VanishingBranchRefFault::stale_head_size_once(&format!(
@@ -1482,19 +1585,23 @@ mod tests {
             let wrapped = dataset.with_object_store_wrappers(vec![
                 Arc::clone(&transient) as Arc<dyn WrappingObjectStore>
             ]);
-            assert!(
-                schema_apply_locked(&wrapped).await.unwrap(),
-                "a torn sentinel read must retry without admitting a writer"
+            assert_eq!(
+                resolve_live_native_branch(&wrapped, logical).await.unwrap(),
+                Some(native.clone()),
+                "a ref rewritten during the read must not report the branch absent"
             );
-            assert_eq!(transient.injected_failures(), 1);
+            // Resolution reads each candidate ref in one GET, so no HEAD
+            // answers a stale size and no torn read occurs.
+            assert_eq!(transient.injected_failures(), 0);
 
             let identity = dataset.branches().get(&native).await.unwrap().identifier;
             retire_branch_recoverably(&dataset, &native, &identity)
                 .await
                 .unwrap();
-            assert!(
-                !schema_apply_locked(&dataset).await.unwrap(),
-                "a validated retired sentinel must no longer block writers: {native}"
+            assert_eq!(
+                resolve_live_native_branch(&dataset, logical).await.unwrap(),
+                None,
+                "a validated retired ref must no longer resolve: {native}"
             );
 
             let retired = archived_manifest_branch(&dataset, &native)
@@ -1521,9 +1628,9 @@ mod tests {
                     .replace_metadata(&native, metadata)
                     .await
                     .unwrap();
-                let error = schema_apply_locked(&dataset)
+                let error = resolve_live_native_branch(&dataset, logical)
                     .await
-                    .expect_err("malformed or mismatched sentinel retirement must fail closed");
+                    .expect_err("malformed or mismatched retirement must fail closed");
                 assert!(error.to_string().contains("retirement metadata"), "{error}");
                 dataset
                     .branches()
@@ -1535,18 +1642,19 @@ mod tests {
             let persistent = Arc::new(VanishingBranchRefFault::new(
                 &format!("{native}.json"),
                 usize::MAX,
-                InjectedRefRead::StaleHeadSize,
+                InjectedRefRead::TruncatedBody,
             ));
             let wrapped = dataset.with_object_store_wrappers(vec![
                 Arc::clone(&persistent) as Arc<dyn WrappingObjectStore>
             ]);
-            schema_apply_locked(&wrapped)
+            resolve_live_native_branch(&wrapped, logical)
                 .await
-                .expect_err("an unreadable relevant sentinel must never be treated as absent");
+                .expect_err("an unreadable relevant ref must never be treated as absent");
             assert!(persistent.injected_failures() >= BRANCH_REF_READ_MAX_ATTEMPTS);
             assert_eq!(persistent.branch_lists(), 1);
-            assert!(
-                !schema_apply_locked(&dataset).await.unwrap(),
+            assert_eq!(
+                resolve_live_native_branch(&dataset, logical).await.unwrap(),
+                None,
                 "the read-only failures must leave the validated retirement intact"
             );
         }
@@ -1644,7 +1752,9 @@ mod tests {
             .await
             .unwrap();
 
-        let error = match create_branch_recoverably(&mut dataset, "feature/child", version).await {
+        let error = match create_branch_recoverably(&mut dataset, "feature/child", version, None)
+            .await
+        {
             Ok(_) => panic!("the lower branch-control surface must enforce prefix disjointness"),
             Err(error) => error,
         };
@@ -1686,7 +1796,7 @@ mod tests {
             .identifier
             .clone();
 
-        let outcome = create_branch_recoverably(&mut dataset, "feature", version)
+        let outcome = create_branch_recoverably(&mut dataset, "feature", version, None)
             .await
             .unwrap();
         assert!(matches!(outcome, BranchCreateOutcome::RefAlreadyExists));

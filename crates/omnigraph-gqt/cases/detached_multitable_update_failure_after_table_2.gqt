@@ -1,0 +1,166 @@
+# issue: none
+# notes: A four-table update fails at the second table's detached commit while the other commits run: every table
+# notes: still reads its seeded values before and after a restart, and the retry applies every update once. Under an update, not an insert.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    note: String?
+}
+node Company {
+    name: String @key
+    note: String?
+}
+node Marker {
+    name: String @key
+    note: String?
+}
+node Tag {
+    name: String @key
+    note: String?
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"eve"}}
+{"type":"Company","data":{"name":"acme"}}
+{"type":"Company","data":{"name":"initech"}}
+{"type":"Marker","data":{"name":"initial"}}
+{"type":"Tag","data":{"name":"t0"}}
+
+--- seam
+at: mutation.post_table_commit
+occurrence: 2
+action: fail
+scope: next_step
+
+--- mutate branch: main
+query w() {
+    update Person set { note: "u" } where name = "alice"
+    update Marker set { note: "u" } where name = "initial"
+    update Company set { note: "u" } where name = "acme"
+    update Tag set { note: "u" } where name = "t0"
+}
+--- expect error: injected failpoint triggered: mutation.post_table_commit
+
+--- query
+query before_restart_person() { match { $p: Person } return { $p.name, $p.note } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"eve"}
+--- expect shape
+p.name: String
+p.note: String?
+
+--- query
+query before_restart_marker() { match { $m: Marker } return { $m.name, $m.note } }
+--- expect unordered
+{"m.name":"initial"}
+--- expect shape
+m.name: String
+m.note: String?
+
+--- query
+query before_restart_company() { match { $c: Company } return { $c.name, $c.note } }
+--- expect unordered
+{"c.name":"acme"}
+{"c.name":"initech"}
+--- expect shape
+c.name: String
+c.note: String?
+
+--- query
+query before_restart_tag() { match { $t: Tag } return { $t.name, $t.note } }
+--- expect unordered
+{"t.name":"t0"}
+--- expect shape
+t.name: String
+t.note: String?
+
+--- restart
+
+--- query
+query after_restart_person() { match { $p: Person } return { $p.name, $p.note } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"eve"}
+--- expect shape
+p.name: String
+p.note: String?
+
+--- query
+query after_restart_marker() { match { $m: Marker } return { $m.name, $m.note } }
+--- expect unordered
+{"m.name":"initial"}
+--- expect shape
+m.name: String
+m.note: String?
+
+--- query
+query after_restart_company() { match { $c: Company } return { $c.name, $c.note } }
+--- expect unordered
+{"c.name":"acme"}
+{"c.name":"initech"}
+--- expect shape
+c.name: String
+c.note: String?
+
+--- query
+query after_restart_tag() { match { $t: Tag } return { $t.name, $t.note } }
+--- expect unordered
+{"t.name":"t0"}
+--- expect shape
+t.name: String
+t.note: String?
+
+--- mutate branch: main
+query w() {
+    update Person set { note: "u" } where name = "alice"
+    update Marker set { note: "u" } where name = "initial"
+    update Company set { note: "u" } where name = "acme"
+    update Tag set { note: "u" } where name = "t0"
+}
+--- expect affected: nodes=4 edges=0
+
+--- restart
+
+--- query
+query landed_person() { match { $p: Person } return { $p.name, $p.note } }
+--- expect unordered
+{"p.name":"alice","p.note":"u"}
+{"p.name":"eve"}
+--- expect shape
+p.name: String
+p.note: String?
+
+--- query
+query landed_marker() { match { $m: Marker } return { $m.name, $m.note } }
+--- expect unordered
+{"m.name":"initial","m.note":"u"}
+--- expect shape
+m.name: String
+m.note: String?
+
+--- query
+query landed_company() { match { $c: Company } return { $c.name, $c.note } }
+--- expect unordered
+{"c.name":"acme","c.note":"u"}
+{"c.name":"initech"}
+--- expect shape
+c.name: String
+c.note: String?
+
+--- query
+query landed_tag() { match { $t: Tag } return { $t.name, $t.note } }
+--- expect unordered
+{"t.name":"t0","t.note":"u"}
+--- expect shape
+t.name: String
+t.note: String?

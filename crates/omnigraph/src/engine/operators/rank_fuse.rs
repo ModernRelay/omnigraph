@@ -1,9 +1,7 @@
-//! `RankFuseExec`: `rrf()` as a pipeline breaker over two child plans, the
-//! same pipeline lowered under the primary and the secondary arm modes. Each
-//! arm is drained and ranked here, by its score, then the fused binding's id,
-//! then every other binding's id; the body is the copied fusion of
-//! `execute_rrf_fusion`: entity ranks from each leg's row order, `1/(k+rank)`
-//! summed, the winners' rows reconstructed in fused order (`build_fused_batch`).
+//! `RankFuseExec` drains and ranks both arms by score, fused identity, and
+//! downstream row keys. `fuse_arms` sums reciprocal ranks per entity and
+//! emits every arm row with that sum in the fused score column; the `Sort`
+//! above orders and cuts (RFC 0047 §Total order).
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use std::fmt;
@@ -19,8 +17,9 @@ use datafusion::physical_plan::{
 };
 
 use super::memory::WorkMemory;
-use super::{breaker_properties, breaker_stream, conform_positional, drain_one, external, polled};
-use crate::engine::graph::fuse_arms;
+use super::shape::{Breaker, work};
+use super::{conform_positional, drain_one, external};
+use crate::engine::graph::{fuse_arms, fused_schema};
 use crate::engine::search::RrfMode;
 use crate::error::OmniError;
 
@@ -37,8 +36,11 @@ pub(crate) struct RankFuseExec {
     secondary: Arc<dyn ExecutionPlan>,
     rrf: RrfMode,
     id_column: String,
+    /// The fused score column appended after the primary arm's columns.
+    fused_score: String,
     orders: [ArmOrder; 2],
-    properties: Arc<PlanProperties>,
+    row_tiebreak: Vec<String>,
+    shape: Breaker,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -48,16 +50,20 @@ impl RankFuseExec {
         secondary: Arc<dyn ExecutionPlan>,
         rrf: RrfMode,
         id_column: String,
+        fused_score: String,
         orders: [ArmOrder; 2],
+        row_tiebreak: Vec<String>,
     ) -> Self {
-        let schema = primary.schema();
+        let schema = fused_schema(&primary.schema(), &fused_score);
         Self {
             primary,
             secondary,
             rrf,
             id_column,
+            fused_score,
             orders,
-            properties: breaker_properties(schema),
+            row_tiebreak,
+            shape: Breaker::new(schema),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -67,8 +73,8 @@ impl fmt::Debug for RankFuseExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RankFuseExec")
             .field("id_column", &self.id_column)
+            .field("fused_score", &self.fused_score)
             .field("k", &self.rrf.k)
-            .field("limit", &self.rrf.limit)
             .finish_non_exhaustive()
     }
 }
@@ -77,10 +83,10 @@ impl DisplayAs for RankFuseExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "RankFuseExec: on={}, k={}, limit={}, arms=[{} {}, {} {}]",
+            "RankFuseExec: on={}, score={}, k={}, arms=[{} {}, {} {}]",
             self.id_column,
+            self.fused_score,
             self.rrf.k,
-            self.rrf.limit,
             self.orders[0].score_column,
             direction(self.orders[0].descending),
             self.orders[1].score_column,
@@ -94,12 +100,13 @@ fn direction(descending: bool) -> &'static str {
 }
 
 /// `batch` in the arm's rank order: its score, the fused binding's id, then
-/// every other `<binding>.<id>` column by name, nulls last on every key, so
+/// the declared downstream row columns, nulls last on every key, so
 /// equal scores fuse the same way on every run.
 fn ranked(
     batch: &RecordBatch,
     order: &ArmOrder,
     id_column: &str,
+    row_tiebreak: &[String],
     memory: &WorkMemory,
 ) -> DfResult<RecordBatch> {
     let column = |name: &str| {
@@ -125,23 +132,7 @@ fn ranked(
             }),
         },
     ];
-    let id_suffix = id_column
-        .rfind('.')
-        .map(|dot| &id_column[dot..])
-        .ok_or_else(|| {
-            external(OmniError::manifest_internal(format!(
-                "the fused id column '{id_column}' is not a `<binding>.<id>` column"
-            )))
-        })?;
-    let schema = batch.schema();
-    let mut others: Vec<&str> = schema
-        .fields()
-        .iter()
-        .map(|field| field.name().as_str())
-        .filter(|name| name.ends_with(id_suffix) && *name != id_column)
-        .collect();
-    others.sort_unstable();
-    for name in others {
+    for name in row_tiebreak {
         keys.push(SortColumn {
             values: column(name)?,
             options: Some(SortOptions {
@@ -165,7 +156,7 @@ impl ExecutionPlan for RankFuseExec {
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
+        self.shape.properties()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -188,7 +179,9 @@ impl ExecutionPlan for RankFuseExec {
             secondary,
             self.rrf,
             self.id_column.clone(),
+            self.fused_score.clone(),
             self.orders.clone(),
+            self.row_tiebreak.clone(),
         )))
     }
 
@@ -205,27 +198,108 @@ impl ExecutionPlan for RankFuseExec {
         let secondary = self.secondary.execute(0, Arc::clone(&ctx))?;
         let rrf = self.rrf;
         let id_column = self.id_column.clone();
+        let fused_score = self.fused_score.clone();
         let orders = self.orders.clone();
+        let row_tiebreak = self.row_tiebreak.clone();
         let declared = Arc::clone(&schema);
-        let stream = breaker_stream(
-            "RankFuseExec",
-            schema,
-            &ctx,
-            &self.metrics,
-            move |reservation| async move {
+        let memory = work(ctx, "RankFuseExec", &self.metrics)?;
+        Ok(self
+            .shape
+            .stream(memory, &self.metrics, move |reservation| async move {
                 let primary = drain_one(primary, &primary_schema, &reservation).await?;
                 let secondary = drain_one(secondary, &secondary_schema, &reservation).await?;
                 reservation
                     .blocking(move |reservation| async move {
-                        let primary = ranked(&primary, &orders[0], &id_column, &reservation)?;
-                        let secondary = ranked(&secondary, &orders[1], &id_column, &reservation)?;
-                        let fused = fuse_arms(&primary, &secondary, &rrf, &id_column, &reservation)
-                            .map_err(external)?;
+                        let primary = ranked(
+                            &primary,
+                            &orders[0],
+                            &id_column,
+                            &row_tiebreak,
+                            &reservation,
+                        )?;
+                        let secondary = ranked(
+                            &secondary,
+                            &orders[1],
+                            &id_column,
+                            &row_tiebreak,
+                            &reservation,
+                        )?;
+                        let fused = fuse_arms(
+                            &primary,
+                            &secondary,
+                            &rrf,
+                            &id_column,
+                            &fused_score,
+                            &reservation,
+                        )
+                        .map_err(external)?;
                         conform_positional(fused, &declared).map_err(external)
                     })
                     .await
+            }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Float32Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
+
+    #[test]
+    fn issue_659_rrf_arm_orders_equal_edge_ids_by_declared_concrete_type() {
+        let edge_type = format!("e.{EDGE_TYPE_COLUMN}");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("p._score", DataType::Float32, false),
+            Field::new("p.__id", DataType::Utf8, false),
+            Field::new("e.__id", DataType::Utf8, false),
+            Field::new(&edge_type, DataType::Utf8, false),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Float32Array::from(vec![1.0, 1.0, 1.0])),
+            Arc::new(StringArray::from(vec!["p", "p", "p"])),
+            Arc::new(StringArray::from(vec!["shared", "z", "shared"])),
+            Arc::new(StringArray::from(vec!["Likes", "Knows", "Knows"])),
+        ];
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
+        let (_, ctx) = super::super::fixtures::context(1_048_576, 16);
+        let memory = WorkMemory::new(ctx, "typed RRF order test").unwrap();
+        let ranked = ranked(
+            &batch,
+            &ArmOrder {
+                score_column: "p._score".into(),
+                descending: true,
             },
+            "p.__id",
+            &[edge_type.clone(), "e.__id".into()],
+            &memory,
+        )
+        .unwrap();
+        let types = crate::engine::graph::extract_id_column_by_name(&ranked, &edge_type).unwrap();
+        let ids = crate::engine::graph::extract_id_column_by_name(&ranked, "e.__id").unwrap();
+        assert_eq!(types, vec!["Knows", "Knows", "Likes"]);
+        assert_eq!(ids, vec!["shared", "z", "shared"]);
+        let fused = fuse_arms(
+            &ranked,
+            &ranked,
+            &RrfMode { k: 60 },
+            "p.__id",
+            "p._rrf",
+            &memory,
+        )
+        .unwrap();
+        assert_eq!(fused.num_rows(), 3);
+        assert_eq!(
+            crate::engine::graph::extract_id_column_by_name(&fused, &edge_type).unwrap(),
+            types
         );
-        Ok(polled(&self.metrics, stream))
+        let scores = fused
+            .column_by_name("p._rrf")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        assert_eq!(scores.values(), &[2.0 / 61.0; 3]);
     }
 }

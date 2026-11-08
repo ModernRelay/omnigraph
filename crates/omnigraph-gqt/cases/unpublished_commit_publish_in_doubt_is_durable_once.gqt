@@ -1,0 +1,96 @@
+# issue: none
+# notes: A `commit publish` whose acknowledgement and readback both fail reports in doubt; the publication is
+# notes: durable once, a repeated publish answers the established commit, and a drop of it is refused.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+query propose_bob() as commit {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $bob
+
+--- seam
+at: publish.post_merge_pre_ack
+occurrence: 1
+action: fail
+scope: next_step
+
+--- seam
+at: publish.read_back
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate
+commit publish "${bob}"
+
+--- expect error: outcome is in doubt
+
+--- query
+query names_after_in_doubt() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- restart
+
+--- query
+query names_after_restart() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+commit publish "${bob}"
+
+--- expect ok
+
+--- mutate
+commit drop "${bob}"
+
+--- expect error: is published
+
+--- query
+query names_still_once() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String

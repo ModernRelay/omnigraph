@@ -1,0 +1,64 @@
+# issue: none
+# notes: An edge file loaded onto integer-keyed node types is admitted against
+# notes: `query_memory_bytes` for the bytes it holds: the retained source, the decoded
+# notes: batches, the two integer key sets and the staged rows. The text-keyed check's
+# notes: per-row reservation (owned endpoint strings and their predicate literals) is not
+# notes: charged, so 16 edge rows land under an allowance of 86,016 bytes and a count
+# notes: query sees every row.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person { id: I64 @key }
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 1024
+    commits: 1
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+
+--- csv knows.csv
+from,to
+0,0
+1,7
+2,14
+3,21
+4,28
+5,35
+6,42
+7,49
+8,56
+9,63
+10,70
+11,77
+12,84
+13,91
+14,98
+15,105
+
+--- mutate
+set query_memory_bytes = 86016;
+load csv "knows.csv" into edge:Knows mode overwrite header
+--- expect ok
+--- expect plan
+load validate edge_ri edge:Knows from Person: access scan
+load validate edge_ri edge:Knows to Person: access scan
+load executed: partitions 1 rows 16
+
+--- query
+query loaded() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n": 16}
+--- expect shape
+n: I64

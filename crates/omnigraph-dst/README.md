@@ -89,7 +89,7 @@ The five GROUPS below are the reader's map; the enforced census counts
 3. **OCC invariant** — no two commits share a `graph_commit_id`.
 4. **Replay meta-test** — same scenario ⇒ byte-equal `UniverseReport`s,
    including commit ids and the raw row-ordered JSON of a full
-   compiler→DataFusion query.
+   compiler→engine query.
 5. **Conservation** — batched two-statement transfers preserve the balance
    sum (multi-statement atomicity).
 
@@ -97,13 +97,13 @@ The five GROUPS below are the reader's map; the enforced census counts
 
 Three distinct instruments, complementary — none subsumes another:
 
-1. **Fault plans** (weather): seeded per-call fault rates in BOTH storage
-   realms (the `StorageAdapter` seam and Lance's interposed provider) —
-   clean errors and latency, read-path corruption (bit rot, truncation,
-   latent sector errors), write-side weather (corrupted, lost, misdirected
-   writes), ack-loss, and bounded staleness. Unaimed — discovers handling
-   bugs statistically across the whole run.
-2. **Crash-window hunt**: a named failpoint (72 in `catalog::CRASH_WINDOWS`)
+1. **Fault plans** (weather): seeded errors, latency and lost acknowledgements
+   in the adapter realm and, when enabled, Lance's provider. The adapter also
+   models text corruption, lost or misdirected writes, and bounded staleness;
+   each verb needs a workload that reaches its supported methods. Seeded
+   engine-effect failures use existing pre-publication decision seams.
+   Lance-call weather retains the semantic oracles but is outside strict replay.
+2. **Crash-window hunt**: a named failpoint (53 in `catalog::CRASH_WINDOWS`)
    armed at a seeded op index. Aimed — guarantees a specific dangerous
    moment is exercised.
 3. **Crash-state enumeration** (ALICE-style): kill at completion #k for
@@ -115,24 +115,43 @@ crash: the storage wrapper stops forwarding, same process judges) and
 **lane B** (real death: a parent spawns `dst_child`, waits on the fsync'd
 barrier line at completion #k, SIGKILLs, then recovers and judges from the
 oplog). Lane B ships as a labeled preview; see `src/lane_b.rs`
-and `tests/lane_b.rs`.
+and `tests/integration/lane_b.rs`.
 
 ## Fault axes
 
-- **Crash windows**: `Scenario::crash_at` arms any of the engine's 72 named
-  failpoints (`catalog::CRASH_WINDOWS`) at a seeded op index. The ignored
-  `dst_hunt_crash_window_sweep` test sweeps the whole catalog.
+- **Crash windows**: `Scenario::crash_at` arms a named engine failpoint at a
+  seeded op index. The ignored `dst_hunt_crash_window_sweep` test sweeps the
+  53 windows in `catalog::CRASH_WINDOWS`. A window
+  inside `cleanup`'s per-table pass defers that table instead of failing the
+  op; the universe records `deferred:<window>@op<i>` and runs the obligation
+  pass a crashed cleanup gets. A window whose precondition is an earlier
+  crash's aftermath names that crash in `harness::setup_crash_for`;
+  `Scenario::setup_crash` schedules it before the window, and the reach
+  census, the hunt and the fleet all use it. A setup attempt that succeeds,
+  is legally rejected or defers cleanup work leaves setup pending; the
+  target starts matching after a recorded crash. The active dead-staging pin
+  exercises the same constructors as the hunt and fleet, including the
+  hunt's probe pass. Returned table errors are attributed; native-fork
+  reconciliation failures reported only through tracing are outside this
+  deferral channel. Windows no universe can cross are named with their
+  reasons in `harness::REACH_EXPECTED_DARK`: the reach census asserts that
+  list, and the hunt and the fleet do not schedule its windows.
 - **Injected storage faults**: `Scenario::faults` installs a seeded `FaultPlan`
-  over both realms — marked errors + latency charged in VIRTUAL
-  time (`start_paused` clock, so faulty universes still run in milliseconds),
-  plus the corruption/ack-loss/staleness axes listed under Failure models.
+  on the adapter and optionally Lance. Latency uses virtual time. Lance supports
+  errors, latency and lost acknowledgements; adapter text corruption and
+  staleness do not extend to Lance or binary graph-index artifacts.
+- **Engine-effect failures**: `FaultPlan::engine_effect_error_pct` selects an
+  existing pre-publication seam from a separate seeded stream. The atomicity
+  and live-handle owners require counted delivery and full report replay;
+  the latter also requires later model-changing writes without reopening.
+  These process-wide decision seams require serialized scenario ownership.
 
 ## Known limits
 
 Racing-writer determinism is blocked on the upstream Lance deterministic-mode
 proposal (4 flag-gated items) — the
-`#[ignore]`d instruments flip on when it lands. Crash-mode universes cannot
-yet run in parallel threads (failpoint-registry threading is a planned follow-up).
+`#[ignore]`d instruments flip on when it lands. Crash-mode universes and engine-effect weather use process-wide decision
+seams and must be serialized within a test process.
 
 ## Deferred work (#527 review)
 

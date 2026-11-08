@@ -1,0 +1,36 @@
+# issue: 855
+# red_on: 2026-10-03, main @ 7fe1789a: the restart failed: schema_contract row schema_ir_hash is not the hash of its IR text
+# notes: The schema contract stores the @range bound 123456789.12345679 as JSON; a reopen parses it back and re-hashes
+# notes: the IR, so the bound must parse to the same double the schema source named.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Reading {
+    name: String @key
+    x: F64
+    @range(x, 0.0..123456789.12345679)
+}
+
+--- seed
+{"type":"Reading","data":{"name":"a","x":1.5}}
+
+--- restart
+
+--- query
+query all() {
+    match {
+        $r: Reading
+    }
+    return { $r.name }
+}
+
+--- expect unordered
+{"r.name": "a"}
+
+--- expect shape
+r.name: String

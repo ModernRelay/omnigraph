@@ -1,0 +1,118 @@
+# issue: none
+# notes: Dropping a root discards every descendant: afterwards the root, its child and its grandchild are not
+# notes: found by a read, a drop or a publish, and the recorded target is unchanged.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- mutate
+query root_bob() as unattached branch {
+    insert Person { name: "bob", age: 41 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $r
+
+--- mutate
+query child_carol() as unattached branch on "${r}" {
+    insert Person { name: "carol", age: 52 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $c1
+
+--- mutate
+query grandchild_dave() as unattached branch on "${c1}" {
+    insert Person { name: "dave", age: 63 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $c2
+
+--- mutate
+commit drop "${r}"
+
+--- expect ok
+
+--- query snapshot: $r
+query names_at_root() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: not found
+
+--- query snapshot: $c1
+query names_at_child() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: not found
+
+--- query snapshot: $c2
+query names_at_grandchild() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect error: not found
+
+--- mutate
+commit drop "${r}"
+
+--- expect error: not found
+
+--- mutate
+commit drop "${c1}"
+
+--- expect error: not found
+
+--- mutate
+commit drop "${c2}"
+
+--- expect error: not found
+
+--- mutate
+commit publish "${r}"
+
+--- expect error: not found
+
+--- mutate
+commit publish "${c1}"
+
+--- expect error: not found
+
+--- mutate
+commit publish "${c2}"
+
+--- expect error: not found
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String

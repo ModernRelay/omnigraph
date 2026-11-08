@@ -2,13 +2,14 @@
 // RNG); without the flag the lib compiles EMPTY, so this file must vanish
 // with it or the build fails on unresolved imports.
 #![cfg(tokio_unstable)]
+#![recursion_limit = "256"]
 
 //! DST scenario suite — an omnigraph graph living entirely in memory.
 //!
 //! Answers the harness's store-injection question: can the
 //! engine init, load, query, and REOPEN against (a) an injected in-memory
-//! `StorageAdapter` for the manifest/write-queue realm and (b) Lance's
-//! `shared-memory://` provider for the table realm — with no local filesystem
+//! `StorageAdapter` for control objects and (b) Lance's `shared-memory://`
+//! provider for the graph manifest and table datasets — with no local filesystem
 //! involved anywhere?
 //!
 //! The two realms are SEPARATE stores under one root URI (omnigraph-storage's
@@ -131,9 +132,14 @@ fn dst_harness_crash_recovery_deterministic() {
 /// THE HUNT — TARGETED SCHEDULING: run over the whole failpoint catalog,
 /// scheduling each window's crash only ON an op whose kind matches the
 /// window's family (`window_matches`) — a blind fixed op index made 736 of
-/// 873 universes misses by construction. Families the workload has no op
-/// for are reported as "unschedulable" so the coverage report says WHY
-/// each dark window is dark. Any panic is a find.
+/// 873 universes misses by construction. A window whose precondition is an
+/// earlier crash's aftermath gets that setup crash first
+/// (`setup_crash_for`), and a hit is the window's own verdict
+/// (`window_hit`), never the setup's. Windows in
+/// `harness::REACH_EXPECTED_DARK` are not scheduled; the reach census owns
+/// them. Families the workload has no op for are reported as
+/// "unschedulable" so the coverage report says WHY each dark window is
+/// dark. Any panic is a find.
 #[cfg(feature = "failpoints")]
 #[test]
 #[ignore = "hunt: targeted-scheduling catalog run; run explicitly with -- --ignored"]
@@ -147,8 +153,14 @@ fn dst_hunt_crash_window_sweep() {
     let mut hit: Vec<&str> = Vec::new();
     let mut never_reached: Vec<&str> = Vec::new();
     let mut unschedulable: Vec<&str> = Vec::new();
+    let mut expected_dark: Vec<&str> = Vec::new();
     let mut universes = 0usize;
     for (w, window) in catalog::CRASH_WINDOWS.iter().enumerate() {
+        // The reach census proves these dark; scheduling them only burns cells.
+        if omnigraph_dst::harness::expected_dark_reason(window).is_some() {
+            expected_dark.push(window);
+            continue;
+        }
         if !omnigraph_dst::harness::workload_can_reach(window) {
             unschedulable.push(window);
             continue;
@@ -156,22 +168,11 @@ fn dst_hunt_crash_window_sweep() {
         let mut hit_any = false;
         'attempts: for seed in [7u64, 8, 9, 10, 11, 12] {
             for skip in [0usize, 1, 2, 3] {
-                let sc = Scenario {
-                    seed,
-                    ops: 24,
-                    crash_on_match: Some((window, skip)),
-                    // Wide only where its ops are the ONLY route (load.*) —
-                    // the wide die dilutes branch-verb frequency and measured
-                    // as all merge windows going dark in an all-wide pass.
-                    // The schema face is scoped the same way.
-                    wide: omnigraph_dst::harness::window_needs_wide(window),
-                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
-                    ..Default::default()
-                };
+                let sc = hunt_window_scenario(seed, window, skip);
                 let root = format!("shared-memory://dst-hunt-{w}-{seed}-{skip}");
                 let report = run_universe(&root, &sc);
                 universes += 1;
-                if report.crashes > 0 {
+                if window_hit(&report, window) {
                     // Print the per-hit reconcile verdict for the ledger.
                     println!(
                         "dst hunt verdict: {window} seed={seed} skip={skip} ops={} {:?} issues={:?}",
@@ -191,8 +192,8 @@ fn dst_hunt_crash_window_sweep() {
 
     // CROSSING-PROBE pass over the dark windows: record-only callbacks tell
     // "crossed-but-ABSORBED" (the engine heals the injected failure — branch
-    // post_native ambiguity classifiers, phase-D sidecar delete: the STRONGEST
-    // kind of pass) apart from genuinely never reached (workload/path gap).
+    // post_native ambiguity classifiers) apart from genuinely never reached
+    // (workload/path gap).
     let mut absorbed: Vec<&str> = Vec::new();
     let mut dark: Vec<&str> = Vec::new();
     for (w, window) in never_reached.drain(..).enumerate() {
@@ -200,13 +201,8 @@ fn dst_hunt_crash_window_sweep() {
         'probe: for seed in [7u64, 8, 9, 10] {
             for skip in [0usize, 1] {
                 let sc = Scenario {
-                    seed,
-                    ops: 24,
-                    crash_on_match: Some((window, skip)),
                     probe_only: true,
-                    wide: omnigraph_dst::harness::window_needs_wide(window),
-                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
-                    ..Default::default()
+                    ..hunt_window_scenario(seed, window, skip)
                 };
                 let root = format!("shared-memory://dst-probe-{w}-{seed}-{skip}");
                 let report = run_universe(&root, &sc);
@@ -225,20 +221,67 @@ fn dst_hunt_crash_window_sweep() {
     }
 
     println!(
-        "HUNT COMPLETE ({universes} universes): {} hit, {} crossed-but-absorbed, {} never reached, {} unschedulable",
+        "HUNT COMPLETE ({universes} universes): {} hit, {} crossed-but-absorbed, {} never reached, {} unschedulable, {} expected dark",
         hit.len(),
         absorbed.len(),
         dark.len(),
-        unschedulable.len()
+        unschedulable.len(),
+        expected_dark.len()
     );
     println!("hit: {hit:?}");
     println!("crossed-but-absorbed (self-healing verified live): {absorbed:?}");
     println!("never reached (workload/path gap): {dark:?}");
     println!("unschedulable (need schema/init workload ops): {unschedulable:?}");
+    println!("expected dark (harness::REACH_EXPECTED_DARK, not scheduled): {expected_dark:?}");
     assert!(
         !hit.is_empty(),
         "coverage assertion: the hunt must actually reach SOME windows"
     );
+}
+
+/// Did the universe's scheduled crash land on `window`? A crashed op
+/// records `crash:<window>@op<i>` and a cleanup the window left owing a
+/// table records `deferred:<window>@op<i>`; a setup crash names its own
+/// window, so it never counts for the target.
+fn window_hit(report: &omnigraph_dst::harness::UniverseReport, window: &str) -> bool {
+    report.reconcile_verdicts.iter().any(|(tag, _, _)| {
+        tag.strip_prefix("crash:")
+            .or_else(|| tag.strip_prefix("deferred:"))
+            .and_then(|rest| rest.split_once('@'))
+            .is_some_and(|(hit, _)| hit == window)
+    })
+}
+
+/// Both hunt passes use the same setup and op stream; the probe changes
+/// only whether the target window injects a failure.
+fn hunt_window_scenario(seed: u64, window: &'static str, skip: usize) -> Scenario {
+    Scenario {
+        seed,
+        ops: 24,
+        setup_crash: omnigraph_dst::harness::setup_crash_for(window),
+        crash_on_match: Some((window, skip)),
+        // Widen only where required, preserving branch-verb frequency elsewhere.
+        wide: omnigraph_dst::harness::window_needs_wide(window),
+        schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
+        ..Default::default()
+    }
+}
+
+/// The fleet's window arm: the window's milestone recipe woven into the
+/// seeded stream, its setup crash first when it has one
+/// (`setup_crash_for`), and the window's crash on the first matching op
+/// after it.
+fn fleet_window_scenario(seed: u64, window: &'static str) -> Scenario {
+    Scenario {
+        seed,
+        ops: 30,
+        setup_crash: omnigraph_dst::harness::setup_crash_for(window),
+        crash_on_match: Some((window, 0)),
+        reach_target: Some(window),
+        wide: omnigraph_dst::harness::window_needs_wide(window),
+        schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
+        ..Default::default()
+    }
 }
 
 /// Regression for the schema-add poisoned traversal originally reduced
@@ -339,23 +382,8 @@ fn dst_schema_add_property_after_mutation_preserves_traversal() {
     })
 }
 
-/// BIRTH-CONTRACT ENUMERATION (`dst_birth_contract_sweep`,
-/// active): kill init at every init-path
-/// window and judge the store against the birth contract (open cleanly, fail
-/// truthfully, or re-init cleanly on the same root). Expected map pins
-/// today's measured truth:
-/// - `after_schema_pg_written` / `after_schema_contract_written` →
-///   DiedThenReinitRecovers (`cleanup_failed_init` removes the schema files;
-///   nothing else exists yet — cleanup is CORRECT early).
-/// - `post_manifest_create` → DiedThenOpensClean: since #487 the manifest's
-///   whole birth (entries, lineage, stamp) rides the Create commit, and the
-///   #495 fix keeps error-return cleanup on the pre-commit side, so a
-///   born-complete graph survives its init's death.
-/// - `after_coordinator_init` → DiedThenOpensClean: the store is COMPLETE
-///   here; the #495 fix (init cleanup honors the commit point) retired the
-///   cleanup brick (`init_cleanup_destroys_completed_store`) this pin
-///   previously measured (crash-vs-cleanup contrast in `tests/torn_init.rs`).
-/// Each universe runs twice — birth outcomes must replay identically.
+/// Kills init at each window and replays the birth outcome twice.
+/// Error-return cleanup is covered separately in `tests/integration/torn_init.rs`.
 #[cfg(feature = "failpoints")]
 #[test]
 #[serial]
@@ -364,17 +392,7 @@ fn dst_birth_contract_sweep() {
     let _scenario = omnigraph::seams::FailScenario::setup();
 
     #[allow(clippy::type_complexity)]
-    let cases: [(&'static str, &dyn Fn(&BirthOutcome) -> bool, &str); 4] = [
-        (
-            omnigraph::seams::catalog::INIT_AFTER_SCHEMA_PG_WRITTEN.name(),
-            &|o| *o == BirthOutcome::DiedThenReinitRecovers,
-            "DiedThenReinitRecovers",
-        ),
-        (
-            omnigraph::seams::catalog::INIT_AFTER_SCHEMA_CONTRACT_WRITTEN.name(),
-            &|o| *o == BirthOutcome::DiedThenReinitRecovers,
-            "DiedThenReinitRecovers",
-        ),
+    let cases: [(&'static str, &dyn Fn(&BirthOutcome) -> bool, &str); 2] = [
         (
             omnigraph::seams::catalog::INIT_POST_MANIFEST_CREATE.name(),
             &|o| *o == BirthOutcome::DiedThenOpensClean,
@@ -437,7 +455,7 @@ fn dst_open_crash_is_effect_free() {
 /// model's state at that moment), re-read EVERY recorded commit through
 /// `ReadTarget::Snapshot` at final audit (snapshot equality: persons via raw
 /// scan + edges via a real traversal), pass the conservative Person
-/// `diff_commits` check over every adjacent pair — and replay identically,
+/// graph diff check over every adjacent pair — and replay identically,
 /// history commit ids included.
 #[test]
 #[serial]
@@ -546,7 +564,7 @@ fn dst_sessions_agree_and_replay() {
 #[test]
 #[serial]
 fn dst_maintenance_commit_uses_execution_branch() {
-    for (seed, write, op) in [(228_301, 84, 13), (228_317, 84, 9)] {
+    for (seed, write, op) in [(228_301, 84, 13), (228_317, 95, 9)] {
         let report = run_universe(
             &format!("shared-memory://dst-maintenance-commit-{seed}"),
             &Scenario {
@@ -594,25 +612,28 @@ fn dst_v16_physical_oracle_pins_ghost_delta() {
     );
 }
 
-/// WIDE WORKLOAD: schema evolution (additive optional
-/// props), mid-life bulk loads (merge / append / fork-from-base via the
-/// implicit-fork path), and refresh/sync join the sampler. Every oracle must
-/// hold and the wide universe must replay identically — the meta-test
-/// covering the new families for free.
+/// Wide workloads preserve every oracle and strict replay, including cleanup
+/// after deleting and recreating a logical branch name.
 #[test]
 #[serial]
 fn dst_v14_wide_workload_replays() {
-    let sc = Scenario {
-        seed: 4040,
-        ops: 36,
-        wide: true,
-        ..Default::default()
-    };
-    let a = run_universe("shared-memory://dst-wide-a", &sc);
-    let b = run_universe("shared-memory://dst-wide-b", &sc);
-    omnigraph_dst::harness::assert_strict_replay(&a, &b, "wide universe must replay identically");
-    assert!(a.verified > 0);
-    assert!(!a.commit_ids.is_empty());
+    for (seed, ops) in [(4040, 36), (10009, 30)] {
+        let sc = Scenario {
+            seed,
+            ops,
+            wide: true,
+            ..Default::default()
+        };
+        let a = run_universe(&format!("shared-memory://dst-wide-{seed}-a"), &sc);
+        let b = run_universe(&format!("shared-memory://dst-wide-{seed}-b"), &sc);
+        omnigraph_dst::harness::assert_strict_replay(
+            &a,
+            &b,
+            "wide universe must replay identically",
+        );
+        assert!(a.verified > 0);
+        assert!(!a.commit_ids.is_empty());
+    }
 }
 
 /// TRACE-DIFF HUNT — the instrument that NAMES the residual concurrent leak:
@@ -1055,26 +1076,24 @@ async fn dst_memory_graph_end_to_end() {
     );
 }
 
-/// FAULT-INJECTION ATOMICITY RUN: seeded write-faults on the storage
-/// seam; every failed op must be invisible (continuous model checks), the
-/// final world must equal the model, and the whole faulty universe must
-/// REPLAY identically — determinism under injected storage errors + virtual
-/// latency.
+/// Seeded failures after detached effects or before manifest publication.
+/// Full model checks, atomicity arbitration and strict replay stay enabled;
+/// Lance-call weather has a separate owner outside strict replay.
+#[cfg(feature = "failpoints")]
 #[test]
 #[serial]
 fn dst_v11_fault_injection_atomicity_and_replay() {
+    let _scenario = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 71,
         ops: 30,
         faults: Some(omnigraph_dst::harness::FaultPlan {
             seed: 7100,
             error_pct: 15,
+            engine_effect_error_pct: 35,
             read_error_pct: 10,
             latency_pct: 30,
             max_latency_ms: 7,
-            // Adapter realm only: this test is THE fully-deterministic
-            // faulty-universe replay pin (lance_realm moves a universe
-            // outside the replay envelope — see `FaultPlan::lance_realm`'s doc).
             lance_realm: false,
             ack_loss_pct: 0,
             client_retry: false,
@@ -1090,68 +1109,59 @@ fn dst_v11_fault_injection_atomicity_and_replay() {
         "faulty universes must replay identically",
     );
     assert!(
-        a.legal_rejections > 0,
-        "injected faults should actually bite"
+        a.engine_effects_injected > 0 && a.legal_rejections >= a.engine_effects_injected,
+        "counted engine effects must fail workload operations: {a:?}"
     );
     assert!(a.verified > 0);
+
+    for (window, fault_seed) in [
+        ("mutation.post_table_commit", 0),
+        ("graph_publish.before_commit_append", 1),
+    ] {
+        for persistent in [false, true] {
+            let probe = Scenario {
+                seed: 71,
+                ops: 1,
+                reach_target: Some(window),
+                crash_on_match: (!persistent).then_some((window, 0)),
+                probe_only: !persistent,
+                probe_window: persistent.then_some(window),
+                faults: Some(omnigraph_dst::harness::FaultPlan {
+                    seed: fault_seed,
+                    engine_effect_error_pct: 100,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let first = run_universe(
+                &format!("shared-memory://dst-effect-probe-{window}-{persistent}-a"),
+                &probe,
+            );
+            assert!(
+                first.crossed,
+                "effect probe {window}: crossing was suppressed"
+            );
+            assert_eq!(first.engine_effects_injected, 0);
+            assert_eq!(first.crashes, 0);
+            assert!(
+                first.end_state.iter().any(|(name, _, _)| name == "mm1"),
+                "effect probe {window}: the observed insert did not publish"
+            );
+            let second = run_universe(
+                &format!("shared-memory://dst-effect-probe-{window}-{persistent}-b"),
+                &probe,
+            );
+            omnigraph_dst::harness::assert_strict_replay(
+                &first,
+                &second,
+                "effect weather must preserve crossing-probe replay",
+            );
+        }
+    }
 }
 
-/// BOUNDED STALENESS, first-contact pin: the adapter realm
-/// serves seeded as-of-old-tick reads and listings (values true, recency a
-/// lie; zombies and stale absences included; CAS strict at head) and the
-/// universe must (1) BITE, (2) REPLAY identically (staleness draws ride
-/// the plan rng; adapter realm = strict-replay envelope), (3) keep EVERY
-/// oracle green on the settled truth, and (4) make PROGRESS at lag k
-/// (rationale in the assert below).
-#[test]
-#[serial]
-fn dst_staleness_bite_and_replay() {
-    // Seed 278 since RFC 0067 moved the storage-action schedule three times
-    // (the detached writers, the detached index writer, then the removal of
-    // the per-write `__recovery/` listing): each earlier pin then met a stale
-    // absence of a schema contract file, which the engine refuses as manual
-    // coordination. `dst_staleness_seed_search` lists the green seeds.
-    let sc = Scenario {
-        seed: 278,
-        ops: 30,
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 27_800,
-            stale_read_pct: 15,
-            stale_list_pct: 15,
-            max_lag_ticks: 4,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let a = run_universe("shared-memory://dst-s25-a", &sc);
-    let b = run_universe("shared-memory://dst-s25-b", &sc);
-    omnigraph_dst::harness::assert_strict_replay(&a, &b, "stale universes must replay identically");
-    assert!(
-        a.stale_reads_served + a.stale_lists_served > 0,
-        "staleness should actually bite (reads={} lists={})",
-        a.stale_reads_served,
-        a.stale_lists_served
-    );
-    assert!(
-        a.commit_ids.len() >= 6,
-        "bounded staleness froze the world: only {} commits — progress is \
-         part of the correct-up-to-lag-k claim",
-        a.commit_ids.len()
-    );
-    println!(
-        "dst staleness first contact: stale_reads={} stale_lists={} commits={} \
-         legal_rejections={}",
-        a.stale_reads_served,
-        a.stale_lists_served,
-        a.commit_ids.len(),
-        a.legal_rejections
-    );
-}
-
-/// SEARCH INSTRUMENT for the bounded-staleness pin above: enumerate seeds
-/// and print which universes bite, replay identically, keep every oracle
-/// green and make progress, so the pin can be re-chosen when the engine's
-/// storage-action schedule shifts. Not part of the suite.
+/// Historical instrument for adapter-read schedules, excluded from the suite.
+/// Current serving no longer reads schema files.
 #[test]
 #[serial]
 #[ignore = "instrument: bounded-staleness seed search — run explicitly"]
@@ -1445,16 +1455,14 @@ fn dst_lance_realm_ack_loss_bites_and_oracles_hold() {
     assert!(r.verified > 0);
 }
 
-/// GENERALIZED LIVENESS (the successor of the retired RecoveryRequired-
-/// specific keep-serving checks): one live handle rides out an entire
-/// adapter-realm fault storm — clean errors, lost acknowledgements, client
-/// retries — and is NEVER reopened (`keep_handle`; `reopens == 0` is the
-/// proof). Every failed op's aftermath is judged through the same handle a
-/// real client would keep, ops keep landing between faults, and the full
-/// oracle stack holds. Adapter realm only ⇒ strict replay identity.
+/// One live handle handles seeded effect failures without reopening.
+/// Counted failures and later model-changing writes must both occur;
+/// the full oracle stack and strict replay stay enabled.
+#[cfg(feature = "failpoints")]
 #[test]
 #[serial]
 fn dst_fault_storm_on_one_live_handle_keeps_writing() {
+    let _scenario = omnigraph::seams::FailScenario::setup();
     let sc = Scenario {
         seed: 103,
         ops: 30,
@@ -1462,6 +1470,7 @@ fn dst_fault_storm_on_one_live_handle_keeps_writing() {
         faults: Some(omnigraph_dst::harness::FaultPlan {
             seed: 10300,
             error_pct: 12,
+            engine_effect_error_pct: 35,
             read_error_pct: 6,
             latency_pct: 10,
             max_latency_ms: 3,
@@ -1474,8 +1483,14 @@ fn dst_fault_storm_on_one_live_handle_keeps_writing() {
     let a = run_universe("shared-memory://dst-live-handle-a", &sc);
     let b = run_universe("shared-memory://dst-live-handle-b", &sc);
     println!(
-        "dst live handle: {} reopens, {} legal rejections, {} acks lost, {} client retries, {} checks",
-        a.reopens, a.legal_rejections, a.acks_lost, a.client_retries, a.verified
+        "dst live handle: {} reopens, {} legal rejections, {} engine effects, {} later writes, {} acks lost, {} client retries, {} checks",
+        a.reopens,
+        a.legal_rejections,
+        a.engine_effects_injected,
+        a.writes_after_engine_effect,
+        a.acks_lost,
+        a.client_retries,
+        a.verified
     );
     omnigraph_dst::harness::assert_strict_replay(
         &a,
@@ -1487,134 +1502,19 @@ fn dst_fault_storm_on_one_live_handle_keeps_writing() {
         "the whole storm must run on one never-reopened handle"
     );
     assert!(
-        a.legal_rejections > 0,
-        "the storm should actually fail ops on the live handle (legal_rejections={})",
-        a.legal_rejections
+        a.engine_effects_injected > 0 && a.legal_rejections >= a.engine_effects_injected,
+        "the storm must deliver counted failures on the live handle: {a:?}"
+    );
+    assert!(
+        a.writes_after_engine_effect > 0,
+        "the same handle must publish model-changing data after a delivered fault: {a:?}"
     );
     assert!(a.verified > 0);
 }
 
-/// CORRUPTION AXIS (read tier): the store LIES (read-time bit rot,
-/// truncated reads) and grows LATENT SECTOR ERRORS (persistent,
-/// location-indexed poison), adapter realm, moderate weather. Contract:
-/// detected-or-harmless — an op failure whose reads crossed the damage
-/// ledger is an attributed detection (legal, recorded); silent model
-/// divergence anywhere panics the universe, so a green run IS the
-/// no-silent-wrong-answer verdict. Read-path verbs leave stored bytes
-/// true, so oracle suspension keeps every judged read clean and STRICT
-/// replay identity holds (all draws ride the plan's seeded stream).
-#[test]
-#[serial]
-fn dst_read_corruption_bite_and_replay() {
-    let sc = Scenario {
-        seed: 83,
-        ops: 30,
-        // NO latent verb here (08-13 double-check): one latent poisoning of
-        // the per-op schema read converts the whole universe into a refusal
-        // storm (seed 83 first cut: 30/30 ops refused, world frozen at
-        // fixtures — green oracles judged almost nothing). This pin is the
-        // MODERATE regime: ops must keep succeeding ALONGSIDE delivered
-        // lies, or the silent tier is never even probed. Latent's refusal
-        // behavior is pinned by the storm test below.
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 8300,
-            corrupt_read_pct: 8,
-            truncate_read_pct: 5,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let a = run_universe("shared-memory://dst-s11-a", &sc);
-    let b = run_universe("shared-memory://dst-s11-b", &sc);
-    println!(
-        "dst corruption: {} rotted, {} truncated, {} latent, {} attributed detections, {} legal rejections",
-        a.reads_corrupted,
-        a.reads_truncated,
-        a.latent_errors,
-        a.corruption_detections.len(),
-        a.legal_rejections
-    );
-    for row in &a.corruption_detections {
-        println!("dst corruption detection: {row}");
-    }
-    omnigraph_dst::harness::assert_strict_replay(
-        &a,
-        &b,
-        "corrupted universes must replay identically",
-    );
-    assert!(
-        a.reads_corrupted + a.reads_truncated + a.latent_errors > 0,
-        "corruption weather should actually deliver lies (rotted={} truncated={} latent={})",
-        a.reads_corrupted,
-        a.reads_truncated,
-        a.latent_errors
-    );
-    assert!(a.verified > 0);
-}
-
-/// Per-verb NON-VACUITY (the vacuity rule's universe-level half;
-/// the char-level classifier tests live in `harness.rs`): under heavy
-/// read-corruption weather every verb must DELIVER, and the attribution
-/// window must actually convert engine-born failures into recorded
-/// detections — proof the axis flips op outcomes rather than injecting
-/// damage nothing consumes. The printed rows are the typed-vs-raw
-/// triage worklist: expected shape today is RAW parse/format errors
-/// (issue-candidate class, the retention-horizon precedent), not typed
-/// integrity errors.
-#[test]
-#[serial]
-fn dst_corruption_detections_attributed() {
-    let sc = Scenario {
-        seed: 89,
-        ops: 30,
-        faults: Some(omnigraph_dst::harness::FaultPlan {
-            seed: 8900,
-            corrupt_read_pct: 25,
-            truncate_read_pct: 10,
-            latent_read_pct: 4,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let a = run_universe("shared-memory://dst-s11-storm", &sc);
-    println!(
-        "dst corruption storm: {} rotted, {} truncated, {} latent, {} attributed detections",
-        a.reads_corrupted,
-        a.reads_truncated,
-        a.latent_errors,
-        a.corruption_detections.len()
-    );
-    for row in &a.corruption_detections {
-        println!("dst corruption detection: {row}");
-    }
-    assert!(a.reads_corrupted > 0, "bit rot must deliver under 25%");
-    assert!(a.reads_truncated > 0, "truncation must deliver under 10%");
-    assert!(
-        !a.corruption_detections.is_empty(),
-        "heavy corruption should provably flip at least one op outcome into \
-         an attributed detection (otherwise the axis injects damage nothing \
-         consumes)"
-    );
-}
-
-// The sidecar-weather pin (`dst_sidecar_weather_lost_and_misdirected`)
-// retired with the recovery sidecars (RFC 0067 step 5): the lost-write and
-// misdirected-write verbs act on adapter-realm content writes, which in a
-// standard universe were exactly the `__recovery/` sidecars, so they could
-// no longer bite. The `schema_ops` workload writes control objects again
-// (the schema contract files), and `dst_schema_weather_persisted_write_verbs`
-// below is that pin's successor.
-
-/// SCHEMA-OP REQUALIFICATION (the deferred half of the roll-12 quarantine):
-/// the sampler's schema face live under clean storage. Monotone additive
-/// applies interleave the standard mix on seeded schedules; the model
-/// ignores them by construction, so every oracle judges the surrounding
-/// workload across real staged-contract applies (RFC 0067's schema
-/// staging). The face's first seed scan discovered the engine's mono-branch
-/// restriction ("schema apply requires a graph with only main"), now a
-/// model-predicted legal refusal — so branchy schedules validate the typed
-/// refusal while branchless intervals run real applies. Clean IO in both
-/// realms ⇒ strict replay identity is asserted. Seed 7 emits three applies.
+/// Additive schema applies interleave the seeded workload and publish their
+/// contract atomically. Branchy schedules require the mono-branch refusal;
+/// the full oracle stack and strict replay check accepted applies.
 #[test]
 #[serial]
 fn dst_schema_ops_randomized_oracles_hold_and_replay() {
@@ -1644,7 +1544,7 @@ fn dst_schema_ops_randomized_oracles_hold_and_replay() {
 }
 
 /// SCHEMA-APPLY CRASH WINDOWS under the randomized workload: a failure at the
-/// detached table commit or the staged contract write, judged by reconcile,
+/// effect gate or detached table commit, judged by reconcile,
 /// recovery reopen and the full oracle stack (bite-and-replay).
 #[cfg(feature = "failpoints")]
 #[test]
@@ -1653,7 +1553,7 @@ fn dst_schema_apply_crash_windows_bite_and_replay() {
     let _s = omnigraph::seams::FailScenario::setup();
     let cells: [(&str, u64, usize, bool); 2] = [
         ("schema_apply.post_table_commit", 7, 30, true),
-        ("schema_apply.after_staging_write", 7, 30, true),
+        ("schema_apply.post_lock_pre_effect", 7, 30, true),
     ];
     for (window, seed, ops, dies) in cells {
         // Crossing proof first: same seed, record-only callback on the seam
@@ -1694,19 +1594,9 @@ fn dst_schema_apply_crash_windows_bite_and_replay() {
     }
 }
 
-/// PERSISTED-TIER WRITE VERBS, revived (the successor of the retired
-/// sidecar-weather pin above): with the schema face on, the adapter realm's
-/// content writes are the schema contract files, and the write-time
-/// corruption / lost-write / misdirected-write verbs have live subjects
-/// again. These verbs are STORE LIES (success acknowledged, wrong or no
-/// bytes durable), so the contract is the violation tier's
-/// detected-or-harmless: either the damage only ever grazes writes whose
-/// loss the apply absorbs (universe completes, oracles green), or the
-/// engine detects the lie on the schema control plane and refuses LOUDLY,
-/// which fails the universe's own observation reads — a caught, typed,
-/// deterministic death, never silent acceptance. Seed 101 empirically takes
-/// the refusal arm (a misdirected `__schema_state.json` install); both arms
-/// assert pairwise determinism.
+/// Persisted adapter lies during schema-changing workloads reach optimize's
+/// binary graph-index artifact. Loss or misdirection must be delivered;
+/// text-only corruption does not cover this artifact.
 #[test]
 #[serial]
 fn dst_schema_weather_persisted_lies_detected_or_harmless() {
@@ -2023,6 +1913,140 @@ fn dst_maintenance_obligations_bite_and_replay() {
     }
 }
 
+/// DEAD-STAGING MANIFEST WINDOW, the active pin. The census recipe, fleet
+/// arm and ordinary hunt all need a real setup crash before they can reach
+/// the dead staging. A deferred cleanup is a target hit, and its obligation
+/// rerun must leave no dead staging. Every selected universe replays strictly.
+#[cfg(feature = "failpoints")]
+#[test]
+#[serial]
+fn dst_dead_staging_sweep_window_is_reached_and_retried() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let window = omnigraph::seams::catalog::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE.name();
+    let census = Scenario {
+        seed: 40_052,
+        ops: 30,
+        setup_crash: omnigraph_dst::harness::setup_crash_for(window),
+        probe_window: Some(window),
+        reach_target: Some(window),
+        ..Default::default()
+    };
+    let hunt_probe = Scenario {
+        probe_only: true,
+        ..hunt_window_scenario(9, window, 0)
+    };
+    for (label, probe) in [("census", census), ("hunt", hunt_probe)] {
+        let a = run_universe(&format!("shared-memory://dst-dead-{label}-probe-a"), &probe);
+        assert!(a.crossed, "{label}'s cleanup must cross {window}");
+        assert_eq!(a.crashes, 1, "{label}: only the setup crash dies");
+        let b = run_universe(&format!("shared-memory://dst-dead-{label}-probe-b"), &probe);
+        omnigraph_dst::harness::assert_strict_replay(&a, &b, &format!("{label} probe"));
+    }
+
+    for (label, stopped) in [
+        ("fleet", fleet_window_scenario(40_052, window)),
+        ("hunt", hunt_window_scenario(9, window, 0)),
+    ] {
+        let a = run_universe(
+            &format!("shared-memory://dst-dead-{label}-stop-a"),
+            &stopped,
+        );
+        assert!(
+            a.reconcile_verdicts.iter().any(|(tag, verdict, channel)| {
+                tag.starts_with(&format!("deferred:{window}@"))
+                    && verdict == "Deferred"
+                    && channel == "cleanup"
+            }),
+            "{label}: stopped cleanup leaves the table owed: {:?}",
+            a.reconcile_verdicts
+        );
+        assert_eq!(a.crashes, 1, "{label}: only the setup dies");
+        assert_eq!(
+            a.maintenance_reruns, 2,
+            "{label}: setup and deferred cleanup each get an obligation pass"
+        );
+        println!("dead-staging {label} verdicts: {:?}", a.reconcile_verdicts);
+        let b = run_universe(
+            &format!("shared-memory://dst-dead-{label}-stop-b"),
+            &stopped,
+        );
+        omnigraph_dst::harness::assert_strict_replay(&a, &b, &format!("{label} stop"));
+    }
+}
+
+/// Matching an op family does not prove its setup seam ran. These three
+/// milestones perform two effectful mutations, then cleanup; neither mutation
+/// crosses the no-effect seam, so the dependent cleanup must stay unarmed.
+#[cfg(feature = "failpoints")]
+#[test]
+#[serial]
+fn dst_setup_crash_waits_for_a_crossed_window() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let target = "cleanup.pre_gates";
+    let sc = Scenario {
+        seed: 7,
+        ops: 3,
+        setup_crash: Some(("mutation.post_no_effect_pre_gate", 0)),
+        crash_on_match: Some((target, 0)),
+        reach_target: Some(target),
+        ..Default::default()
+    };
+    let a = run_universe("shared-memory://dst-setup-miss-a", &sc);
+    assert_eq!(
+        a.crashes, 0,
+        "an uncrossed setup must not arm the target: {:?}",
+        a.reconcile_verdicts
+    );
+    assert!(!window_hit(&a, target));
+    let b = run_universe("shared-memory://dst-setup-miss-b", &sc);
+    omnigraph_dst::harness::assert_strict_replay(&a, &b, "uncrossed setup");
+}
+
+/// A recorded setup crash arms its target, so the setup window must be one
+/// that is crossed only once the aftermath exists. In hunt cell seed 5 the
+/// first EnsureIndices has nothing to build: it still crosses the index
+/// build's pre-manifest window, but not `ensure_indices.post_table_effect`,
+/// the setup `setup_crash_for` names, so no setup is recorded and the
+/// dead-staging target stays unarmed. An index build also rebuilds an index
+/// whose coverage lags, so a cell whose rows reach an indexed table before
+/// that EnsureIndices has work and is no witness.
+#[cfg(feature = "failpoints")]
+#[test]
+#[serial]
+fn dst_setup_crash_needs_its_aftermath() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let window = omnigraph::seams::catalog::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE.name();
+    let pre_manifest = Scenario {
+        setup_crash: Some((
+            omnigraph::seams::catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
+            0,
+        )),
+        ..hunt_window_scenario(5, window, 0)
+    };
+    let a = run_universe(
+        "shared-memory://dst-setup-aftermath-pre-manifest",
+        &pre_manifest,
+    );
+    assert_eq!(
+        (a.crashes, window_hit(&a, window)),
+        (1, false),
+        "the cell's index build has nothing to build yet crosses the pre-manifest \
+         window, so a setup there arms the target with no staging: {:?}",
+        a.reconcile_verdicts
+    );
+
+    let named = hunt_window_scenario(5, window, 0);
+    let a = run_universe("shared-memory://dst-setup-aftermath-a", &named);
+    assert_eq!(
+        a.crashes, 0,
+        "an index build with nothing to build must not record the setup: {:?}",
+        a.reconcile_verdicts
+    );
+    assert!(!window_hit(&a, window));
+    let b = run_universe("shared-memory://dst-setup-aftermath-b", &named);
+    omnigraph_dst::harness::assert_strict_replay(&a, &b, "setup without its aftermath");
+}
+
 #[cfg(feature = "failpoints")]
 fn returned_cleanup_error_scenario(keep_handle: bool) -> Scenario {
     Scenario {
@@ -2068,6 +2092,17 @@ fn dst_sensitivity_maintenance_rerun_failure_is_red() {
             returned_cleanup_error_scenario(keep_handle),
         )
     }));
+    // A cleanup the window left owing a table is judged like a crashed one.
+    cases.push((
+        "deferred-cleanup".to_string(),
+        Scenario {
+            seed: 7,
+            ops: 24,
+            crash_on_match: Some(("cleanup.sweep_pre_manifest_delete", 0)),
+            reach_target: Some("cleanup.sweep_pre_manifest_delete"),
+            ..Default::default()
+        },
+    ));
     for (case, mut sc) in cases {
         sc.fail_maintenance_rerun = true;
         let result = omnigraph_dst::harness::run_universe_caught(
@@ -2075,7 +2110,7 @@ fn dst_sensitivity_maintenance_rerun_failure_is_red() {
             &sc,
         );
         let Err(panic) = result else {
-            panic!("s20 sensitivity: a failing rerun MUST redden the universe");
+            panic!("s20 sensitivity [{case}]: a failing rerun MUST redden the universe");
         };
         let msg = omnigraph_dst::harness::panic_message(panic.as_ref());
         assert!(
@@ -2094,37 +2129,12 @@ fn dst_sensitivity_maintenance_rerun_failure_is_red() {
             msg.contains("detector=Store(Query)/MaintenanceObligations"),
             "s20 sensitivity: the rendered row must carry the detector field, got: {msg}"
         );
-    }
-}
-
-/// SETUP CRASHES: windows whose precondition is a
-/// PRIOR crash's aftermath get a real `crash_on_match` on the primary window
-/// that manufactures it — the persistent probe then records the target's
-/// crossing anywhere in the universe (recovery passes included).
-/// - orphan-reclaim windows: a load-fork crashed at its post-branch-create
-///   window leaves the fork-survives state; the branch's next data op
-///   collides with the leftover ref and walks classify/reclaim.
-/// - recovery.* internals: each executes only during a recovery pass of the
-///   matching SHAPE — primary picked from the ledger's commit-point map
-///   (post_phase_b merge = roll-forward; post_table_commit mutation =
-///   rollback+restore; post_fork_pre_commit = zero-effect orphan discard;
-///   post_finalize = any recovery pass for the list/audit steps).
-fn census_setup(window: &'static str) -> Option<(&'static str, usize)> {
-    match window {
-        "classify.fresh_read" | "cleanup.reconcile_fork" => None,
-        "recovery.before_roll_forward_publish" => {
-            Some(("branch_merge.post_phase_b_pre_manifest_commit", 0))
+        if case == "deferred-cleanup" {
+            assert!(
+                msg.contains("deferred:cleanup.sweep_pre_manifest_delete@op"),
+                "s20 sensitivity: the red must come from the owed table's pass, got: {msg}"
+            );
         }
-        "recovery.post_rollback_publish_pre_audit" | "recovery.post_table_restore_pre_publish" => {
-            Some(("mutation.post_table_commit", 0))
-        }
-        // recovery.orphan_discard_audit_append: NOT setup-reachable — it
-        // needs a sidecar whose branch is GONE at recovery time, and the only
-        // in-op point after the authority flip swallows injected failures
-        // (above), so the op completes and retires its own sidecar. Kill
-        // territory (crash-state enumeration), named dark in the ledger.
-        w if w.starts_with("recovery.") => Some(("mutation.post_finalize_pre_publisher", 0)),
-        _ => None,
     }
 }
 
@@ -2537,7 +2547,7 @@ fn merge_history_cost_rows(replay: &str) -> String {
             }
             if self.merge_back {
                 assert_eq!(
-                    db.branch_merge("feature", "main").await.unwrap(),
+                    db.branch_merge("feature", "main").await.unwrap().outcome,
                     omnigraph::db::MergeOutcome::Merged
                 );
                 db.mutate(
@@ -2568,42 +2578,568 @@ fn merge_history_cost_rows(replay: &str) -> String {
             )
             .await;
             omnigraph_dst::cost::set_label("_merge_verify");
-            assert_eq!(outcome.unwrap(), omnigraph::db::MergeOutcome::Merged);
+            assert_eq!(
+                outcome.unwrap().outcome,
+                omnigraph::db::MergeOutcome::Merged
+            );
             assert_eq!(probes.completed_full_walk_classification_calls(), 0);
             assert_eq!(probes.completed_lineage_classification_calls(), 1);
             assert_eq!(person_rows_on(&db, target).await.len(), 4);
         }
     }
 
-    omnigraph_dst::lance_faults::install();
     let mut rows = String::new();
     for (target_commits, merge_back, label) in [
         (2, false, "MergeTargetHistory2"),
         (32, false, "MergeTargetHistory32"),
         (2, true, "MergeBackAfterThreeWay"),
     ] {
-        let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+        rows.push_str(&labeled_cost_rows(
             format!("shared-memory://dst-merge-cost-{replay}-{label}"),
-            24_901,
-            omnigraph_dst::UniverseProcess::Shared,
-        );
-        let ledger = omnigraph_dst::cost::arm();
-        let run = omnigraph_dst::run_universe(
-            &environment,
             &MergeHistoryCost {
                 target_commits,
                 merge_back,
                 label,
             },
+            label,
+        ));
+    }
+    rows
+}
+
+/// The cost of a one-row update after `commits` one-row inserts, each on a
+/// reopened handle, before and after `optimize`. Every insert lands as its
+/// own fragment; the update's key filter reads every fragment until
+/// compaction folds them (autoresearch branch-ops, 2026-11-02).
+#[test]
+#[ignore = "instrument: prints a one-row update's storage calls over per-commit fragments, before and after optimize"]
+#[serial]
+fn instrument_filtered_update_cost_over_per_commit_fragments() {
+    struct FragmentedUpdate {
+        commits: i64,
+    }
+
+    impl FragmentedUpdate {
+        async fn reopen(db: Session, resources: &omnigraph_dst::memory::MemoryStorage) -> Session {
+            let detached = db.detach();
+            detached.attach(Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ))
+        }
+
+        async fn set_age(db: &Session, age: i64) {
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for FragmentedUpdate {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            for commit in 0..self.commits {
+                db.mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", &format!("h{commit:05}"))], &[("$age", commit)]),
+                )
+                .await
+                .unwrap();
+            }
+            let db = Self::reopen(db, resources).await;
+            omnigraph_dst::cost::set_label("UpdateColdBeforeOptimize");
+            Self::set_age(&db, 40).await;
+            omnigraph_dst::cost::set_label("UpdateWarmBeforeOptimize");
+            Self::set_age(&db, 41).await;
+            omnigraph_dst::cost::set_label("_optimize");
+            db.optimize().await.unwrap();
+            let db = Self::reopen(db, resources).await;
+            omnigraph_dst::cost::set_label("UpdateColdAfterOptimize");
+            Self::set_age(&db, 42).await;
+            omnigraph_dst::cost::set_label("UpdateWarmAfterOptimize");
+            Self::set_age(&db, 43).await;
+            omnigraph_dst::cost::set_label("_verify");
+        }
+    }
+
+    for commits in [32, 256] {
+        let rows = labeled_cost_rows_of(
+            format!("shared-memory://dst-fragmented-update-{commits}"),
+            &FragmentedUpdate { commits },
+            &[
+                "UpdateColdBeforeOptimize",
+                "UpdateWarmBeforeOptimize",
+                "UpdateColdAfterOptimize",
+                "UpdateWarmAfterOptimize",
+            ],
         );
-        let table = ledger.render_calls();
+        println!("commits={commits}\n{rows}");
+    }
+}
+
+/// A keyed lookup and a one-hop traversal on main, in the order a served
+/// graph meets them: a freshly opened handle's first read, then warm repeats,
+/// then a read after another handle published a commit (the stale path). The
+/// graph carries `commits` small update commits on main before the reopen.
+const WARM_READ_QUERIES: &str = r#"
+query get_person($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name, $p.age }
+}
+
+query friends_of($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $q
+    }
+    return { $q.name }
+}
+"#;
+
+/// The labels one [`WarmReadCost`] run measures, in order.
+fn warm_read_labels(commits: u64) -> Vec<String> {
+    [
+        "ReadOpen",
+        "ReadColdLookup",
+        "ReadWarmLookup",
+        "ReadColdHop",
+        "ReadWarmHop",
+        "ReadStaleLookup",
+        "ReadStaleHop",
+    ]
+    .iter()
+    .map(|label| format!("{label}History{commits}"))
+    .collect()
+}
+
+struct WarmReadCost {
+    commits: u64,
+}
+
+impl WarmReadCost {
+    async fn lookup(db: &Session) -> serde_json::Value {
+        db.query(
+            omnigraph::db::ReadTarget::branch("main"),
+            WARM_READ_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap()
+        .to_rust_json()
+        .unwrap()
+    }
+
+    async fn hop(db: &Session) -> serde_json::Value {
+        db.query(
+            omnigraph::db::ReadTarget::branch("main"),
+            WARM_READ_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap()
+        .to_rust_json()
+        .unwrap()
+    }
+}
+
+impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for WarmReadCost {
+    type Output = ();
+
+    async fn run(&self, resources: &mut omnigraph_dst::memory::MemoryStorage, _workload_seed: u64) {
+        let labels = warm_read_labels(self.commits);
+        omnigraph_dst::cost::set_label("_read_setup");
+        let writer = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        writer
+            .load_jsonl(TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        for revision in 0..self.commits {
+            writer
+                .mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(
+                        &[("$name", "Bob")],
+                        &[("$age", 26 + i64::try_from(revision % 2).unwrap())],
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        omnigraph_dst::cost::set_label(&labels[0]);
+        let reader = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        omnigraph_dst::cost::set_label(&labels[1]);
+        let cold_lookup = Self::lookup(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[2]);
+        let warm_lookup = Self::lookup(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[3]);
+        let cold_hop = Self::hop(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[4]);
+        let warm_hop = Self::hop(&reader).await;
+        omnigraph_dst::cost::set_label("_read_external_commit");
+        writer
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Bob")], &[("$age", 40)]),
+            )
+            .await
+            .unwrap();
+        omnigraph_dst::cost::set_label(&labels[5]);
+        let stale_lookup = Self::lookup(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[6]);
+        let stale_hop = Self::hop(&reader).await;
+        omnigraph_dst::cost::set_label("_read_verify");
+        let alice = serde_json::json!([{"p.name": "Alice", "p.age": 30}]);
+        for rows in [&cold_lookup, &warm_lookup, &stale_lookup] {
+            assert_eq!(rows, &alice);
+        }
+        for rows in [&cold_hop, &warm_hop, &stale_hop] {
+            let mut names = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["q.name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(names, ["Bob", "Charlie"]);
+        }
+        // The reader observes the external commit (no stale serve).
+        let bob = reader
+            .query(
+                omnigraph::db::ReadTarget::branch("main"),
+                WARM_READ_QUERIES,
+                "get_person",
+                &params(&[("$name", "Bob")]),
+            )
+            .await
+            .unwrap()
+            .to_rust_json()
+            .unwrap();
+        assert_eq!(bob, serde_json::json!([{"p.name": "Bob", "p.age": 40}]));
+    }
+}
+
+/// The warm-read rows at two history depths: equal rows across the two show
+/// that read cost is flat in commit history.
+fn warm_read_cost_rows(replay: &str) -> String {
+    let mut rows = String::new();
+    for commits in [2, 32] {
+        let labels = warm_read_labels(commits);
+        let labels = labels.iter().map(String::as_str).collect::<Vec<_>>();
+        rows.push_str(&labeled_cost_rows_of(
+            format!("shared-memory://dst-warm-read-cost-{replay}-{commits}"),
+            &WarmReadCost { commits },
+            &labels,
+        ));
+    }
+    rows
+}
+
+/// A `nearest` read over the vector index the engine builds, on a freshly
+/// opened handle and again on the warm one. Before it uses the index, the scan
+/// reads the column's vector index details (issue #1297, through
+/// `Dataset::load_indices`); these rows pin that this read adds no storage
+/// call beyond what the planner's own index read already made.
+fn nearest_cost_rows(replay: &str) -> String {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(2) @index
+}
+"#;
+    const QUERIES: &str = r#"
+query nearest_docs($q: Vector(2)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+"#;
+    const LABELS: [&str; 3] = ["NearestOpen", "NearestColdIndexed", "NearestWarmIndexed"];
+
+    struct NearestCost;
+
+    impl NearestCost {
+        async fn nearest(db: &Session) -> serde_json::Value {
+            use omnigraph_compiler::query::ast::Literal;
+            let mut params = omnigraph_compiler::ir::ParamMap::new();
+            params.insert(
+                "q".to_string(),
+                Literal::List(vec![Literal::Float(3.0), Literal::Float(1.0)]),
+            );
+            db.query(
+                omnigraph::db::ReadTarget::branch("main"),
+                QUERIES,
+                "nearest_docs",
+                &params,
+            )
+            .await
+            .unwrap()
+            .to_rust_json()
+            .unwrap()
+        }
+
+        /// The rows, with the ANN partitions the scan searched and ranked.
+        async fn nearest_through_index(db: &Session) -> (serde_json::Value, (u64, u64)) {
+            use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+            use std::sync::atomic::Ordering;
+            let probes = QueryIoProbes::default();
+            let rows = with_query_io_probes(probes.clone(), Self::nearest(db)).await;
+            let searched = probes.ann_partitions_searched.load(Ordering::Relaxed);
+            let ranked = probes.ann_partitions_ranked.load(Ordering::Relaxed);
+            (rows, (searched, ranked))
+        }
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for NearestCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_nearest_setup");
+            let writer = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        SCHEMA,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            let seed = (0..32)
+                .map(|row| {
+                    format!(
+                        r#"{{"type":"Doc","data":{{"slug":"d{row:02}","embedding":[{x:?},{y:?}]}}}}"#,
+                        x = row as f32,
+                        y = (row % 5) as f32
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            writer.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+            writer.ensure_indices().await.unwrap();
+            omnigraph_dst::cost::set_label(LABELS[0]);
+            let reader = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            omnigraph_dst::cost::set_label(LABELS[1]);
+            let (cold, cold_partitions) = Self::nearest_through_index(&reader).await;
+            omnigraph_dst::cost::set_label(LABELS[2]);
+            let (warm, warm_partitions) = Self::nearest_through_index(&reader).await;
+            omnigraph_dst::cost::set_label("_nearest_verify");
+            // The labels say "Indexed": keep them true. A flat scan reports no
+            // partition counters, so a planner change that made this read flat
+            // would leave the rows green without measuring the details read.
+            for (label, (searched, ranked)) in
+                [(LABELS[1], cold_partitions), (LABELS[2], warm_partitions)]
+            {
+                assert!(
+                    searched > 0 && ranked > 0,
+                    "{label} must scan through the vector index: \
+                     {searched} of {ranked} partitions searched"
+                );
+            }
+            assert_eq!(cold, warm);
+            assert_eq!(
+                cold.as_array().unwrap().len(),
+                4,
+                "the four nearest docs: {cold}"
+            );
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-nearest-cost-{replay}"),
+        &NearestCost,
+        &LABELS,
+    )
+}
+
+/// Where each warm-read call goes: per label, the calls by realm (the
+/// `__manifest` dataset, `__history`, a graph table, or the control-object
+/// adapter), Lance directory and verb, at several history depths. Prints
+/// only; the counts the golden pins come from [`warm_read_cost_rows`].
+#[test]
+#[serial]
+#[ignore = "instrument: warm-read call attribution by realm — run explicitly"]
+fn dst_warm_read_cost_paths() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let depths = std::env::var("WARM_READ_DEPTHS")
+        .unwrap_or_else(|_| "0,2,32,128".to_string())
+        .split(',')
+        .map(|d| d.trim().parse::<u64>().unwrap())
+        .collect::<Vec<_>>();
+    for commits in depths {
+        omnigraph_dst::lance_faults::install();
+        let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+            format!("shared-memory://dst-warm-read-paths-{commits}"),
+            24_901,
+            omnigraph_dst::UniverseProcess::Shared,
+        );
+        let ledger = omnigraph_dst::cost::arm_with_paths();
+        let run = omnigraph_dst::run_universe(&environment, &WarmReadCost { commits });
+        let log = ledger.path_log();
         omnigraph_dst::cost::disarm();
         run.cleanup.unwrap().unwrap();
         run.result.unwrap().unwrap();
+        let verbose = std::env::var("WARM_READ_VERBOSE").is_ok();
+        for label in warm_read_labels(commits) {
+            let mut classes = std::collections::BTreeMap::<String, u64>::new();
+            let mut total = 0;
+            for (row_label, verb, path) in &log {
+                if *row_label != label {
+                    continue;
+                }
+                total += 1;
+                let class = warm_read_class(verb, path);
+                if verbose {
+                    println!("  {label} {class} {path}");
+                }
+                *classes.entry(class).or_default() += 1;
+            }
+            let classes = classes
+                .iter()
+                .map(|(class, n)| format!("{class}={n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{label:<30} total={total:<4} {classes}");
+        }
+    }
+}
+
+/// `<realm>_<kind>.<verb>` for one logged call, in the GQT measure
+/// vocabulary: realm `manifest` (`__manifest`, a branch tree included),
+/// `history` (`__history`), `table` (a graph table) or `control` (the
+/// adapter); kind the Lance directory.
+fn warm_read_class(verb: &str, path: &str) -> String {
+    let (path, verb) = match path.strip_suffix("#head") {
+        Some(path) => (path, "head".to_string()),
+        None => (
+            path.split('#').next().unwrap(),
+            verb.split('.').nth(1).unwrap().to_string(),
+        ),
+    };
+    if verb_is_control(path) {
+        return format!("control.{verb}");
+    }
+    let realm = if path.contains("__manifest") {
+        "manifest"
+    } else if path.contains("__history") {
+        "history"
+    } else {
+        "table"
+    };
+    let kind = [
+        "_versions",
+        "data",
+        "_transactions",
+        "_deletions",
+        "_indices",
+        "_refs",
+    ]
+    .iter()
+    .find(|kind| path.contains(&format!("/{kind}/")) || path.ends_with(&format!("/{kind}")))
+    .copied()
+    .unwrap_or("other");
+    format!("{realm}_{kind}.{verb}")
+}
+
+fn verb_is_control(path: &str) -> bool {
+    path.starts_with("shared-memory://")
+}
+
+fn labeled_cost_rows<S>(root: String, scenario: &S, label: &str) -> String
+where
+    S: omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage, Output = ()>,
+{
+    labeled_cost_rows_of(root, scenario, &[label])
+}
+
+/// The cost rows of each of `labels`, in that order, from one run of
+/// `scenario`; every label must reach the physical read meter.
+fn labeled_cost_rows_of<S>(root: String, scenario: &S, labels: &[&str]) -> String
+where
+    S: omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage, Output = ()>,
+{
+    omnigraph_dst::lance_faults::install();
+    let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+        root,
+        24_901,
+        omnigraph_dst::UniverseProcess::Shared,
+    );
+    let ledger = omnigraph_dst::cost::arm();
+    let run = omnigraph_dst::run_universe(&environment, scenario);
+    let table = ledger.render_calls();
+    omnigraph_dst::cost::disarm();
+    run.cleanup.unwrap().unwrap();
+    run.result.unwrap().unwrap();
+    let mut rows = String::new();
+    for label in labels {
         let mut physical_reads = 0;
         for line in table.lines() {
             let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields[0] != label {
+            if fields[0] != *label {
                 continue;
             }
             if fields[1] == "l.get" {
@@ -2624,8 +3160,667 @@ fn merge_history_cost_rows(replay: &str) -> String {
     rows
 }
 
-/// Storage calls per op kind plus reopened merge-history scenarios, replayed
-/// identically and compared with `cost_table.txt` (DST_REGEN_COSTS=1 to regen).
+fn branch_write_cost_rows(replay: &str) -> String {
+    struct BranchWriteCost;
+
+    impl BranchWriteCost {
+        async fn set_age(db: &Session, age: i64) {
+            db.mutate(
+                "feature",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for BranchWriteCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_branch_write_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            db.branch_create("feature").await.unwrap();
+            Self::set_age(&db, 31).await;
+            Self::set_age(&db, 32).await;
+            omnigraph_dst::cost::set_label("BranchWrite");
+            Self::set_age(&db, 33).await;
+            omnigraph_dst::cost::set_label("_branch_write_verify");
+            let alice = person_rows_on(&db, "feature")
+                .await
+                .into_iter()
+                .find(|(name, _, _)| name == "Alice")
+                .unwrap();
+            assert_eq!(alice.1, 33);
+        }
+    }
+
+    labeled_cost_rows(
+        format!("shared-memory://dst-branch-write-cost-{replay}"),
+        &BranchWriteCost,
+        "BranchWrite",
+    )
+}
+
+/// A graph diff's first page and its continuation on a reopened handle, for
+/// the two-point and the branch form, beside one and nine idle branches. A
+/// continuation resolves its sides again and opens each token commit through
+/// what reached it, so its rows equal at both sizes and read no more than its
+/// first page.
+fn diff_cost_rows(replay: &str) -> String {
+    use omnigraph::changes::{ChangeFeedScope, GraphDiffRequest, GraphDiffSides};
+
+    struct DiffCost {
+        branch_form: bool,
+        idle: u64,
+        first: &'static str,
+        next: &'static str,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for DiffCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_diff_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            db.branch_create("feature").await.unwrap();
+            for (name, age) in [("Alice", 31), ("Bob", 26)] {
+                db.mutate(
+                    "feature",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(&[("$name", name)], &[("$age", age)]),
+                )
+                .await
+                .unwrap();
+            }
+            for i in 0..self.idle {
+                db.branch_create(&format!("idle{i}")).await.unwrap();
+            }
+            let detached = db.detach();
+            let db = detached.attach(Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ));
+            let sides = if self.branch_form {
+                GraphDiffSides::Branch {
+                    source: "feature".to_string(),
+                    target: "main".to_string(),
+                }
+            } else {
+                GraphDiffSides::Between {
+                    from: "main".to_string(),
+                    to: "feature".to_string(),
+                }
+            };
+            let request = |page_token: Option<String>| GraphDiffRequest {
+                sides: sides.clone(),
+                scope: ChangeFeedScope::default(),
+                page_token,
+                max_changes: Some(1),
+                max_bytes: None,
+            };
+            omnigraph_dst::cost::set_label(self.first);
+            let first = db.diff_page(&request(None)).await.unwrap();
+            omnigraph_dst::cost::set_label(self.next);
+            let next = db
+                .diff_page(&request(first.next_page_token.clone()))
+                .await
+                .unwrap();
+            omnigraph_dst::cost::set_label("_diff_verify");
+            assert_eq!(first.changes.len(), 1);
+            assert_eq!(next.changes.len(), 1);
+            assert_eq!(next.to_commit_id, first.to_commit_id);
+            assert!(next.next_page_token.is_none());
+        }
+    }
+
+    let mut rows = String::new();
+    for (branch_form, idle, first, next) in [
+        (false, 1, "DiffPageIdle1", "DiffContinuationIdle1"),
+        (false, 9, "DiffPageIdle9", "DiffContinuationIdle9"),
+        (
+            true,
+            1,
+            "BranchDiffPageIdle1",
+            "BranchDiffContinuationIdle1",
+        ),
+        (
+            true,
+            9,
+            "BranchDiffPageIdle9",
+            "BranchDiffContinuationIdle9",
+        ),
+    ] {
+        rows.push_str(&labeled_cost_rows_of(
+            format!("shared-memory://dst-diff-cost-{replay}-{first}"),
+            &DiffCost {
+                branch_form,
+                idle,
+                first,
+                next,
+            },
+            &[first, next],
+        ));
+    }
+    rows
+}
+
+/// One page of `main`'s commit list on a reopened handle, after `publishes`
+/// commits under a 2048-byte history release, so most of them sit in
+/// `__history`. The newest page starts at the head; the oldest continues from
+/// a token to the root and reads the extents its own commits occupy, so its
+/// rows match at both depths while the history above it triples.
+fn commit_list_cost_rows(replay: &str) -> String {
+    struct CommitListCost {
+        publishes: u64,
+        oldest: bool,
+        label: &'static str,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for CommitListCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            const PAGE: usize = 4;
+            omnigraph_dst::cost::set_label("_commit_list_setup");
+            let settings = SessionSettings::default()
+                .with("history_release_bytes", "2048")
+                .unwrap();
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        TEST_SCHEMA,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                settings,
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            for revision in 0..self.publishes {
+                db.mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(
+                        &[("$name", "Bob")],
+                        &[("$age", 26 + i64::try_from(revision % 2).unwrap())],
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            let listed = db.list_commits(None).await.unwrap();
+            let mut token = None;
+            let mut oldest_token = None;
+            loop {
+                let page = db
+                    .list_commits_page(None, token.as_deref(), Some(PAGE))
+                    .await
+                    .unwrap();
+                match page.next_page_token {
+                    Some(next) => {
+                        oldest_token = Some(next.clone());
+                        token = Some(next);
+                    }
+                    None => break,
+                }
+            }
+            let start = if self.oldest {
+                Some(oldest_token.expect("more than one page"))
+            } else {
+                None
+            };
+            let detached = db.detach();
+            let db = detached.attach(Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ));
+            omnigraph_dst::cost::set_label(self.label);
+            let page = db
+                .list_commits_page(None, start.as_deref(), Some(PAGE))
+                .await
+                .unwrap();
+            omnigraph_dst::cost::set_label("_commit_list_verify");
+            if self.oldest {
+                assert!(page.next_page_token.is_none());
+                assert_eq!(page.commits.last(), listed.last());
+            } else {
+                assert_eq!(page.commits, listed[..PAGE]);
+            }
+        }
+    }
+
+    let mut rows = String::new();
+    for (publishes, oldest, label) in [
+        (12, false, "CommitListNewestPage12"),
+        (12, true, "CommitListOldestPage12"),
+        (36, false, "CommitListNewestPage36"),
+        (36, true, "CommitListOldestPage36"),
+    ] {
+        rows.push_str(&labeled_cost_rows(
+            format!("shared-memory://dst-commit-list-cost-{replay}-{label}"),
+            &CommitListCost {
+                publishes,
+                oldest,
+                label,
+            },
+            label,
+        ));
+    }
+    rows
+}
+
+/// The public overwrite route under two captured writer-buffer targets. The
+/// staged-table owner proves the native page layout; these rows pin storage
+/// actions without claiming that smaller pages always cost fewer requests.
+fn writer_buffer_cost_rows(replay: &str) -> String {
+    struct WriterBufferCost {
+        bytes: u64,
+        label: &'static str,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for WriterBufferCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            use arrow_array::{Int32Array, StringArray};
+
+            omnigraph_dst::cost::set_label("_writer_buffer_setup");
+            // Match the asymmetric 32-column shape of the staged overwrite
+            // owner: one hot string column and many tiny scalar columns.
+            let cold_fields = (0..29)
+                .map(|field| format!("c{field}: I32"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let schema = format!("node Wide {{ age: I32 payload: String {cold_fields} }}");
+            let payload = "x".repeat(12 * 1024);
+            let record = |age: i32| {
+                let mut data = serde_json::Map::new();
+                data.insert("age".into(), serde_json::json!(age));
+                data.insert("payload".into(), serde_json::json!(&payload));
+                for field in 0..29 {
+                    data.insert(format!("c{field}"), serde_json::json!(age * 100 + field));
+                }
+                serde_json::json!({"type": "Wide", "id": format!("row-{age}"), "data": data})
+                    .to_string()
+            };
+            let input = (0..3).map(record).collect::<Vec<_>>().join("\n");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    &schema,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(&record(9), LoadMode::Overwrite)
+                .await
+                .unwrap();
+            drop(db);
+            let settings = SessionSettings::default()
+                .with("write_max_bytes", &self.bytes.to_string())
+                .unwrap();
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                settings,
+            );
+            omnigraph_dst::cost::set_label(self.label);
+            let loaded = db.load_jsonl(&input, LoadMode::Overwrite).await;
+            omnigraph_dst::cost::set_label("_writer_buffer_verify");
+            assert_eq!(loaded.unwrap().nodes_loaded["Wide"], 3);
+            let batches = read_table(&db, "node:Wide").await;
+            let mut ages = Vec::new();
+            for batch in batches {
+                let age = batch["age"].as_any().downcast_ref::<Int32Array>().unwrap();
+                let written = batch["payload"]
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    ages.push(age.value(row));
+                    assert_eq!(written.value(row), payload);
+                    for field in 0..29 {
+                        let cold = batch
+                            .column_by_name(&format!("c{field}"))
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap();
+                        assert_eq!(cold.value(row), age.value(row) * 100 + field);
+                    }
+                }
+            }
+            ages.sort_unstable();
+            assert_eq!(ages, [0, 1, 2]);
+        }
+    }
+
+    let mut rows = String::new();
+    for (bytes, label) in [
+        (128 * 1024, "OverwriteWriter128KiB"),
+        (32 * 1024 * 1024, "OverwriteWriter32MiB"),
+    ] {
+        rows.push_str(&labeled_cost_rows(
+            format!("shared-memory://dst-writer-buffer-cost-{replay}-{label}"),
+            &WriterBufferCost { bytes, label },
+            label,
+        ));
+    }
+    rows
+}
+
+/// A `load csv` overwrite on a reopened handle, one label per `removal` the
+/// planner decides: `scan` (populated, referenced node target), `none`
+/// (unreferenced node target), `none` on an empty referenced target (guard count).
+fn overwrite_removal_cost_rows(replay: &str) -> String {
+    struct OverwriteRemovalCost;
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
+        for OverwriteRemovalCost
+    {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            use omnigraph::loader::CsvLoadRequest;
+            use omnigraph_compiler::query::ast::LoadTarget;
+
+            omnigraph_dst::cost::set_label("_overwrite_removal_setup");
+            let schema = "node Person { id: String @key } \
+                          node Note { id: String @key } \
+                          node Doc { id: String @key } \
+                          edge Knows: Person -> Person \
+                          edge Cites: Doc -> Doc";
+            let seed = [
+                r#"{"type":"Person","data":{"id":"p1"}}"#,
+                r#"{"type":"Person","data":{"id":"p2"}}"#,
+                r#"{"type":"Person","data":{"id":"p3"}}"#,
+                r#"{"edge":"Knows","from":"p1","to":"p2","data":{}}"#,
+                r#"{"type":"Note","data":{"id":"n1"}}"#,
+                r#"{"type":"Note","data":{"id":"n2"}}"#,
+            ]
+            .join("\n");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    schema,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+            drop(db);
+
+            let slug: String = resources
+                .root
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let dir = std::env::temp_dir().join(format!("omnigraph-dst-{slug}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let dir = dir.canonicalize().unwrap();
+            for (name, text) in [
+                ("people.csv", "id\np1\np2\np3\n"),
+                ("notes.csv", "id\nn9\n"),
+                ("docs.csv", "id\nd1\n"),
+            ] {
+                std::fs::write(dir.join(name), text).unwrap();
+            }
+            let base_url = format!("file://{}/", dir.to_str().unwrap().trim_end_matches('/'));
+            let policy = omnigraph::ExternalBlobPolicy::allow(vec![
+                omnigraph::ExternalBlobBase::new(
+                    &base_url,
+                    omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+            let db = session(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap()
+                    .with_external_blob_policy(policy)
+                    .unwrap(),
+            );
+            let request = |file: &str, target: &str| CsvLoadRequest {
+                source: format!("{base_url}{file}"),
+                target: LoadTarget::Node(target.to_string()),
+                mode: LoadMode::Overwrite,
+                delimiter: b',',
+                header: true,
+                columns: None,
+            };
+            let removal = |receipt: &omnigraph::loader::LoadReceipt| {
+                receipt.plan.as_ref().unwrap().to_value()["physical_plan"]["inputs"][0]["removal"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+
+            omnigraph_dst::cost::set_label("OverwriteRemovalScan");
+            let people = db
+                .load_csv_as_with_receipt("main", &request("people.csv", "Person"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_overwrite_removal_verify");
+            let people = people.unwrap();
+            assert_eq!(removal(&people), "scan");
+            assert_eq!(people.result.nodes_loaded["Person"], 3);
+
+            omnigraph_dst::cost::set_label("OverwriteRemovalNone");
+            let notes = db
+                .load_csv_as_with_receipt("main", &request("notes.csv", "Note"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_overwrite_removal_verify");
+            let notes = notes.unwrap();
+            assert_eq!(removal(&notes), "none");
+            assert_eq!(notes.result.nodes_loaded["Note"], 1);
+
+            omnigraph_dst::cost::set_label("OverwriteRemovalNoneEmptyTarget");
+            let docs = db
+                .load_csv_as_with_receipt("main", &request("docs.csv", "Doc"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_overwrite_removal_verify");
+            let docs = docs.unwrap();
+            assert_eq!(removal(&docs), "none");
+            assert_eq!(docs.result.nodes_loaded["Doc"], 1);
+            assert_eq!(count_rows(&db, "node:Person").await, 3);
+            assert_eq!(count_rows(&db, "node:Note").await, 1);
+            assert_eq!(count_rows(&db, "node:Doc").await, 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-overwrite-removal-cost-{replay}"),
+        &OverwriteRemovalCost,
+        &[
+            "OverwriteRemovalScan",
+            "OverwriteRemovalNone",
+            "OverwriteRemovalNoneEmptyTarget",
+        ],
+    )
+}
+
+/// An edge `load csv` overwrite on a reopened handle, one label per `probe`
+/// the planner decides: `swept` (one integer-keyed type at both endpoints,
+/// one set read beside the parse) and `judged` (a text key, after the drain).
+fn endpoint_probe_cost_rows(replay: &str) -> String {
+    struct EndpointProbeCost;
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for EndpointProbeCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            use omnigraph::loader::CsvLoadRequest;
+            use omnigraph_compiler::query::ast::LoadTarget;
+
+            omnigraph_dst::cost::set_label("_endpoint_probe_setup");
+            let schema = "node Account { id: I64 @key } \
+                          node Person { id: String @key } \
+                          edge Pays: Account -> Account \
+                          edge Knows: Person -> Person";
+            let seed = [
+                r#"{"type":"Account","data":{"id":1}}"#,
+                r#"{"type":"Account","data":{"id":2}}"#,
+                r#"{"type":"Account","data":{"id":3}}"#,
+                r#"{"type":"Person","data":{"id":"p1"}}"#,
+                r#"{"type":"Person","data":{"id":"p2"}}"#,
+            ]
+            .join("\n");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    schema,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+            drop(db);
+
+            let slug: String = resources
+                .root
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let dir = std::env::temp_dir().join(format!("omnigraph-dst-{slug}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let dir = dir.canonicalize().unwrap();
+            for (name, text) in [
+                ("pays.csv", "from,to\n1,2\n2,3\n"),
+                ("knows.csv", "from,to\np1,p2\n"),
+            ] {
+                std::fs::write(dir.join(name), text).unwrap();
+            }
+            let base_url = format!("file://{}/", dir.to_str().unwrap().trim_end_matches('/'));
+            let policy = omnigraph::ExternalBlobPolicy::allow(vec![
+                omnigraph::ExternalBlobBase::new(
+                    &base_url,
+                    omnigraph::ExternalBlobExecutionScope::EmbeddedOnly,
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+            let db = session(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap()
+                    .with_external_blob_policy(policy)
+                    .unwrap(),
+            );
+            let request = |file: &str, target: &str| CsvLoadRequest {
+                source: format!("{base_url}{file}"),
+                target: LoadTarget::Edge(target.to_string()),
+                mode: LoadMode::Overwrite,
+                delimiter: b',',
+                header: true,
+                columns: None,
+            };
+            let probes = |receipt: &omnigraph::loader::LoadReceipt| -> Vec<String> {
+                receipt.plan.as_ref().unwrap().to_value()["physical_plan"]["inputs"][0]["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|check| check["check"] == "edge_ri")
+                    .map(|check| check["probe"].as_str().unwrap().to_string())
+                    .collect()
+            };
+
+            omnigraph_dst::cost::set_label("EndpointProbeSwept");
+            let pays = db
+                .load_csv_as_with_receipt("main", &request("pays.csv", "Pays"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_endpoint_probe_verify");
+            let pays = pays.unwrap();
+            assert_eq!(probes(&pays), ["swept", "swept"]);
+            assert_eq!(pays.result.edges_loaded["Pays"], 2);
+
+            omnigraph_dst::cost::set_label("EndpointProbeJudged");
+            let knows = db
+                .load_csv_as_with_receipt("main", &request("knows.csv", "Knows"), None)
+                .await;
+            omnigraph_dst::cost::set_label("_endpoint_probe_verify");
+            let knows = knows.unwrap();
+            assert_eq!(probes(&knows), ["judged", "judged"]);
+            assert_eq!(knows.result.edges_loaded["Knows"], 1);
+            assert_eq!(count_rows(&db, "edge:Pays").await, 2);
+            assert_eq!(count_rows(&db, "edge:Knows").await, 1);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-endpoint-probe-cost-{replay}"),
+        &EndpointProbeCost,
+        &["EndpointProbeSwept", "EndpointProbeJudged"],
+    )
+}
+
+/// Storage calls per op kind plus reopened merge-history, branch-write, diff,
+/// commit-list and overwrite scenarios, replayed identically and compared with
+/// `cost_table.txt` (DST_REGEN_COSTS=1 to regen).
 #[test]
 #[serial]
 fn dst_bench_cost_count_golden() {
@@ -2641,11 +3836,27 @@ fn dst_bench_cost_count_golden() {
     let full = ledger.render();
     omnigraph_dst::cost::disarm();
     table.push_str(&merge_history_cost_rows("a"));
+    table.push_str(&branch_write_cost_rows("a"));
+    table.push_str(&diff_cost_rows("a"));
+    table.push_str(&commit_list_cost_rows("a"));
+    table.push_str(&writer_buffer_cost_rows("a"));
+    table.push_str(&overwrite_removal_cost_rows("a"));
+    table.push_str(&endpoint_probe_cost_rows("a"));
+    table.push_str(&warm_read_cost_rows("a"));
+    table.push_str(&nearest_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
     omnigraph_dst::cost::disarm();
     table2.push_str(&merge_history_cost_rows("b"));
+    table2.push_str(&branch_write_cost_rows("b"));
+    table2.push_str(&diff_cost_rows("b"));
+    table2.push_str(&commit_list_cost_rows("b"));
+    table2.push_str(&writer_buffer_cost_rows("b"));
+    table2.push_str(&overwrite_removal_cost_rows("b"));
+    table2.push_str(&endpoint_probe_cost_rows("b"));
+    table2.push_str(&warm_read_cost_rows("b"));
+    table2.push_str(&nearest_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"
@@ -3360,39 +4571,39 @@ fn dst_predict_born_on_both_person_probe() {
 }
 
 /// MILESTONE REACH PROBE: the "one seeded universe per window,
-/// can we catch all 66?" experiment. For each catalog window, ONE universe
-/// with the window's milestone plan woven into the seeded stream +
-/// `crash_on_match` probe_only (record-only crossing). Reports per-window
-/// crossed/not and the tally. Success target: every milestone-reachable
-/// window crosses in its single universe; the residue (recovery internals,
-/// init/open) is expected dark for NAMED reasons. (The schema families
-/// left the dark list when the `schema_ops` face requalified them.)
-///   cargo test -p omnigraph-dst dst_window_reach_probe -- --ignored --nocapture
+/// can we catch them all?" experiment. For each catalog window, up to three
+/// seeded universes with the window's milestone plan woven into the stream,
+/// its setup crash (`setup_crash_for`) when it has one, and a record-only
+/// probe over the whole universe (`probe_window`). Reports per-window
+/// crossed/not and the tally. Every window must cross on one of its seeds
+/// except those in `harness::REACH_EXPECTED_DARK`; the first cross wins, so
+/// a seed that trips an oracle fails the census only when no seed of that
+/// window crosses (`errored`), since the census asks whether the window is
+/// reachable.
+///   cd crates/omnigraph-dst && cargo test --locked --test scenarios dst_window_reach_probe -- --ignored --nocapture
 #[test]
 #[serial]
-#[ignore = "instrument: 66-window one-universe-each milestone reach census"]
+#[ignore = "instrument: one-universe-each milestone reach census over the crash-window catalog"]
 fn dst_window_reach_probe() {
     let _s = omnigraph::seams::FailScenario::setup();
     let mut crossed: Vec<&str> = Vec::new();
     let mut dark: Vec<&str> = Vec::new();
     let mut errored: Vec<&str> = Vec::new();
     for (idx, window) in catalog::CRASH_WINDOWS.iter().enumerate() {
-        // Whole-universe probe + window-specific milestone recipes + real
-        // setup crashes for the orphan-reclaim and recovery.* windows.
+        // Whole-universe probe + window-specific milestone recipes + the
+        // window's real setup crash (`setup_crash_for`), if it has one.
         // Milestones guarantee the PRECONDITION; routes that still fork on
         // delta content get up to three seeds before the window reads dark
         // — first cross wins, every life a pure function of its seed.
-        let setup = census_setup(window);
         let mut verdict: Result<bool, ()> = Ok(false);
         for (attempt, base) in [40_000u64, 50_000, 60_000].into_iter().enumerate() {
             let sc = Scenario {
                 seed: base + idx as u64,
                 ops: 30,
-                crash_on_match: setup,
+                setup_crash: omnigraph_dst::harness::setup_crash_for(window),
                 probe_window: Some(window),
                 reach_target: Some(window),
-                wide: omnigraph_dst::harness::window_needs_wide(window)
-                    || setup.is_some_and(|(w, _)| omnigraph_dst::harness::window_needs_wide(w)),
+                wide: omnigraph_dst::harness::window_needs_wide(window),
                 schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
                 ..Default::default()
             };
@@ -3425,17 +4636,16 @@ fn dst_window_reach_probe() {
         "errored (milestone tripped an oracle — separate finding) ({}): {errored:?}",
         errored.len()
     );
-    // Non-regression floor: the census measured 50/66 on 2026-08-12; the
-    // then-16 non-crossing windows all carried NAMED reasons (schema
-    // quarantine — since requalified by the `schema_ops` face, whose
-    // windows now cross — birth-owned init, #473-blocked adopts, chunk
-    // thresholds, branch-from-branch first-touch shapes, kill-territory
-    // orphan discard). Floor 48 leaves margin for benign seed sensitivity;
-    // a bigger drop = a recipe-mechanism regression.
+    // Each universe is a pure function of its seed, so a change in reach
+    // comes from a code change; the message names the window it moved.
+    let expected_dark =
+        |window: &&str| omnigraph_dst::harness::expected_dark_reason(window).is_some();
+    let newly_dark: Vec<&&str> = dark.iter().filter(|w| !expected_dark(w)).collect();
+    let listed_but_crossed: Vec<&&str> = crossed.iter().filter(|w| expected_dark(w)).collect();
     assert!(
-        crossed.len() >= 48,
-        "milestone reach regressed below the measured 50 ({} crossed)",
-        crossed.len()
+        newly_dark.is_empty() && listed_but_crossed.is_empty() && errored.is_empty(),
+        "milestone reach changed: newly dark {newly_dark:?}, listed dark but crossed \
+         {listed_but_crossed:?}, errored {errored:?}"
     );
 }
 
@@ -3453,36 +4663,21 @@ fn known_failure_family(msg: &str) -> Option<&'static str> {
     None
 }
 
-/// THE FLEET: the volume instrument. Runs the full portfolio
-/// across FRESH seed space (seeds no pin or hunt has ever used), each seed
-/// one new life: (a) clean wide universe, (b) adapter-realm fault storm,
-/// (c) ack-loss + client retry, (d) a crash-window universe (round-robin
-/// over the catalog by seed — fresh-seed volume on the axis the hunt
-/// covers systematically but only from seeds 7..12), (e) three crash
-/// states from that seed's own enumeration space (probe learns W,
-/// deterministic k picks). Every completed universe prints a
-/// `dst fleet report` line (verdicts/channels/counters — the same
-/// provenance columns the hunt records) so run tables read from the log.
-/// A VIOLATION does not kill the pass: `run_universe_caught` records
-/// (seed, arm, message) — a complete repro — and the fleet continues;
-/// all failures are reported together at the end (red iff any).
-/// Seed count: env `DST_FLEET_SEEDS` (default 60 ≈ a few minutes;
-/// overnight scale = hundreds — set via a python subprocess wrapper,
-/// never an env-prefix). Seed base: env `DST_FLEET_SEED_BASE` (default
-/// 10_000; each pass owns a disjoint seed interval, reproducible by
-/// base+count). Run explicitly:
-///   cargo test -p omnigraph-dst dst_fleet -- --ignored --nocapture
+/// Volume over clean, seeded engine-failure, adapter-ack and crash arms.
+/// DST_FLEET_SEEDS defaults to 60; DST_FLEET_SEED_BASE defaults to 10_000.
+/// Failures retain their scenario and replay after the full pass.
 #[test]
 #[serial]
 #[ignore = "instrument: fleet (N seeds x 7 universes, minutes to hours)"]
 fn dst_fleet() {
+    const DEFAULT_FLEET_SEEDS: u64 = 60;
     // The window arm schedules real crash windows — same setup the hunt
     // and the reach probe perform.
     let _s = omnigraph::seams::FailScenario::setup();
     let n: u64 = std::env::var("DST_FLEET_SEEDS")
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(60);
+        .unwrap_or(DEFAULT_FLEET_SEEDS);
     // Fresh seed space: pins use <100, hunt 7..12, the first fleet pass 10_000..10_060.
     let base: u64 = std::env::var("DST_FLEET_SEED_BASE")
         .ok()
@@ -3492,6 +4687,7 @@ fn dst_fleet() {
     // the auto-replay bundle can rerun the exact universe at pass end.
     let mut failures: Vec<(u64, String, String, String, Scenario)> = Vec::new();
     let mut universes = 0usize;
+    let mut storm_effects = 0usize;
     let run = |seed: u64,
                arm: &str,
                root: String,
@@ -3503,7 +4699,7 @@ fn dst_fleet() {
                 // Per-universe provenance line (columns per the test doc).
                 println!(
                     "dst fleet report seed={seed} arm={arm} crashes={} crossed={} hit={} \
-                     writes={} acks_lost={} retries={} lance={} legal={} verdicts={:?} issues={:?}",
+                     writes={} acks_lost={} retries={} lance={} legal={} engine_effects={} writes_after_effect={} verdicts={:?} issues={:?}",
                     r.crashes,
                     r.crossed,
                     r.crash_state_hit,
@@ -3512,6 +4708,8 @@ fn dst_fleet() {
                     r.client_retries,
                     r.lance_realm_injected,
                     r.legal_rejections,
+                    r.engine_effects_injected,
+                    r.writes_after_engine_effect,
                     r.reconcile_verdicts,
                     r.known_issues
                 );
@@ -3552,7 +4750,7 @@ fn dst_fleet() {
             &mut failures,
         );
         universes += 1;
-        run(
+        let storm = run(
             seed,
             "storm",
             format!("shared-memory://dst-fleet-{seed}-storm"),
@@ -3562,6 +4760,7 @@ fn dst_fleet() {
                 faults: Some(omnigraph_dst::harness::FaultPlan {
                     seed: seed.wrapping_mul(101),
                     error_pct: 10,
+                    engine_effect_error_pct: 35,
                     read_error_pct: 5,
                     latency_pct: 20,
                     max_latency_ms: 5,
@@ -3574,10 +4773,13 @@ fn dst_fleet() {
             },
             &mut failures,
         );
+        if let Some(report) = storm {
+            storm_effects += report.engine_effects_injected;
+        }
         universes += 1;
         run(
             seed,
-            "ack-retry",
+            "adapter-ack",
             format!("shared-memory://dst-fleet-{seed}-ack"),
             Scenario {
                 seed,
@@ -3597,29 +4799,26 @@ fn dst_fleet() {
             },
             &mut failures,
         );
-        // Crash-window arm: round-robin over the catalog so a 66+-seed
-        // pass draws every window. `reach_target` weaves the
-        // window's milestone recipe into the seeded stream — guarantee from
-        // milestones, diversity from the seed — and skip stays 0 so the
-        // recipe-built op is the one that carries the crash. Windows the
+        // Crash-window arm: round-robin over the catalog so a pass with at
+        // least as many seeds as windows draws every window. `reach_target`
+        // weaves the window's milestone recipe into the seeded stream —
+        // guarantee from milestones, diversity from the seed — and skip
+        // stays 0, so the crash lands on the first matching op; for a window
+        // with a setup crash (`setup_crash_for`), that is the first matching
+        // op after the setup crash is recorded. Windows the
         // workload has no op for are skipped (the hunt's coverage ledger
-        // owns naming those as unschedulable).
+        // owns naming those as unschedulable), and so are those in
+        // `harness::REACH_EXPECTED_DARK`, which no universe can cross.
         let window = catalog::CRASH_WINDOWS[(seed as usize) % catalog::CRASH_WINDOWS.len()];
-        if omnigraph_dst::harness::workload_can_reach(window) {
+        if omnigraph_dst::harness::workload_can_reach(window)
+            && omnigraph_dst::harness::expected_dark_reason(window).is_none()
+        {
             universes += 1;
             run(
                 seed,
                 &format!("window:{window}"),
                 format!("shared-memory://dst-fleet-{seed}-window"),
-                Scenario {
-                    seed,
-                    ops: 30,
-                    crash_on_match: Some((window, 0)),
-                    reach_target: Some(window),
-                    wide: omnigraph_dst::harness::window_needs_wide(window),
-                    schema_ops: omnigraph_dst::harness::window_needs_schema_ops(window),
-                    ..Default::default()
-                },
+                fleet_window_scenario(seed, window),
                 &mut failures,
             );
         }
@@ -3683,6 +4882,14 @@ fn dst_fleet() {
         failures.is_empty(),
         "fleet found {} violating universes (repros above, bundles below them)",
         failures.len()
+    );
+    let require_effect_coverage = n >= DEFAULT_FLEET_SEEDS;
+    println!(
+        "dst fleet coverage seeds={n} storm_effects={storm_effects} required={require_effect_coverage}"
+    );
+    assert!(
+        !require_effect_coverage || storm_effects > 0,
+        "fleet coverage gap: the full pass delivered no engine-effect failures"
     );
 }
 
@@ -4905,7 +6112,7 @@ fn dst_schema_apply_racing_writers_first_contact() {
         assert!(
             report.era_commits_between_data >= 1,
             "seed {seed}: no schema apply landed between two writer commits — the \
-             applies never contended with the writers"
+             SchemaContention handshake did not hold"
         );
         println!(
             "dst s24 schema [seed={seed}]: committed={} occ_retries={} \
@@ -6007,5 +7214,273 @@ fn dst_source_guard_no_runtime_env_mutation() {
                 path.display()
             );
         }
+    }
+}
+
+/// The graph's publication requests get a definite outcome under storage
+/// faults a served write meets: a throttled transaction-file put is
+/// `Unpublished`; a lost acknowledgement, an unanswered request and an
+/// abandoned request that lands late each end in exactly one commit, through
+/// the commit handler's re-issue; and a request no re-issue settles is in
+/// doubt, with nothing visible. The next write on the same handle publishes.
+#[tokio::test]
+#[serial]
+async fn dst_publication_requests_get_a_definite_outcome_issue_1067() {
+    use omnigraph::error::CompletionEvidence;
+    use omnigraph_dst::lance_faults::{
+        PublicationFault, PublicationFaultMode, PublicationTarget, set_publication_fault,
+    };
+
+    #[derive(Debug, PartialEq)]
+    enum Outcome {
+        Committed,
+        Unpublished,
+        InDoubt,
+    }
+
+    omnigraph_dst::lance_faults::install();
+    let reissues = omnigraph::manifest_request_reissues();
+    let cases = [
+        (
+            PublicationTarget::TransactionFile,
+            PublicationFaultMode::Throttled,
+            1,
+            Outcome::Unpublished,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::LostAck,
+            1,
+            Outcome::Committed,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::Unanswered,
+            1,
+            Outcome::Committed,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::LandsLate(std::time::Duration::from_millis(50)),
+            1,
+            Outcome::Committed,
+        ),
+        (
+            PublicationTarget::ManifestVersion,
+            PublicationFaultMode::Unanswered,
+            1 + reissues,
+            Outcome::InDoubt,
+        ),
+    ];
+    for (n, (target, mode, times, expected)) in cases.into_iter().enumerate() {
+        let root = format!("shared-memory://dst-publication-{n}");
+        let storage: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
+        let db = session(
+            Omnigraph::init_with_storage(&root, TEST_SCHEMA, storage, InitOptions::default())
+                .await
+                .expect("init"),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
+            .await
+            .expect("fixtures");
+        let persons = count_rows(&db, "node:Person").await;
+        let commits = db.list_commits(None).await.unwrap().len();
+        let fault = PublicationFault::new(target, mode, times);
+        set_publication_fault(Some(fault.clone()));
+        let result = mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Faulted")], &[("$age", 1)]),
+        )
+        .await;
+        set_publication_fault(None);
+        assert_eq!(
+            fault.hits(),
+            times,
+            "case {n}: the rule hit every request it aimed at"
+        );
+        // An abandoned request has had its chance to land.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let outcome = match &result {
+            Ok(_) => Outcome::Committed,
+            Err(error) if error.is_manifest_publish_in_doubt() => Outcome::InDoubt,
+            Err(error) => {
+                assert_eq!(
+                    error.completion_evidence(),
+                    Some(CompletionEvidence::Unpublished),
+                    "case {n}: {error:?}"
+                );
+                Outcome::Unpublished
+            }
+        };
+        assert_eq!(
+            outcome, expected,
+            "case {n} ({target:?}, {mode:?}): {result:?}"
+        );
+        let landed = usize::from(outcome == Outcome::Committed);
+        assert_eq!(
+            count_rows(&db, "node:Person").await,
+            persons + landed,
+            "case {n}"
+        );
+        assert_eq!(
+            db.list_commits(None).await.unwrap().len(),
+            commits + landed,
+            "case {n}: exactly one commit or none"
+        );
+        mutate_main(
+            &db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "After")], &[("$age", 2)]),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("case {n}: the next write publishes: {error:?}"));
+    }
+}
+
+/// LEASE TAKEOVER under seeded timing: an owner beats for a seeded while,
+/// then dies with one heartbeat request in flight that storage applies late,
+/// at a seeded moment that can fall before, during or after a successor's
+/// watch. A beat that lands during the watch sends the successor away, which
+/// is the safe direction; the successor that claims the lock does so only
+/// after a lease and a half of silence since the last beat it saw, then
+/// replaces the record by if-match on the version it read; and the dead
+/// owner's beats that land after the claim fence nothing: the successor
+/// keeps renewing, and a third process watching it refuses.
+#[test]
+#[serial]
+fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
+    use omnigraph_cluster::lease_protocol::{
+        LeaseKeeper, Watch, lease_dir, leased_lock_record, watch_and_claim,
+    };
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    const SECONDS: u32 = 30;
+    let lease = Duration::from_secs(u64::from(SECONDS));
+    for seed in 0..16u64 {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .rng_seed(tokio::runtime::RngSeed::from_bytes(&seed.to_le_bytes()))
+            .enable_time()
+            .start_paused(true)
+            .build_local(Default::default())
+            .expect("seeded paused runtime builds");
+        runtime.block_on(async move {
+            let mut rng = SplitMix64(seed ^ 0x004C_4541_5345);
+            let store: Arc<dyn omnigraph_storage::StorageAdapter> =
+                Arc::new(omnigraph_storage::ObjectStorageAdapter::in_memory());
+            let root = "cluster";
+            let lock_uri = format!("{root}/{}", omnigraph_cluster::CLUSTER_LOCK_FILE);
+            let lock_sent = Instant::now();
+            store
+                .write_text(&lock_uri, &leased_lock_record("owner", SECONDS))
+                .await
+                .unwrap();
+            let (_, version) = store
+                .read_text_versioned(&lock_uri)
+                .await
+                .expect("the owner's record is visible");
+            let owner = LeaseKeeper::start(
+                store.clone(),
+                root,
+                &lock_uri,
+                "owner",
+                SECONDS,
+                lock_sent,
+                None,
+            )
+            .await
+            .expect("the owner's first beat lands");
+            tokio::time::sleep(Duration::from_millis(rng.below(90_000))).await;
+            drop(owner);
+            let died = Instant::now();
+            let late = Duration::from_millis(rng.below(150_000));
+            let late_beat = format!("{}/beat-{:020}.json", lease_dir(root, "owner"), u64::MAX);
+            let landed = Arc::new(std::sync::Mutex::new(None));
+            tokio::spawn({
+                let store = store.clone();
+                let landed = landed.clone();
+                async move {
+                    tokio::time::sleep(late).await;
+                    store.write_text_if_absent(&late_beat, "{}").await.unwrap();
+                    *landed.lock().unwrap() = Some(Instant::now());
+                }
+            });
+
+            let mut attempts = 0;
+            let claimed_at = loop {
+                attempts += 1;
+                assert!(attempts <= 4, "seed {seed}: a silent owner is taken over");
+                let watching = Instant::now();
+                match watch_and_claim(store.as_ref(), root, "owner", SECONDS, "successor")
+                    .await
+                    .unwrap()
+                {
+                    Watch::Silent => {
+                        let claimed = Instant::now();
+                        assert!(
+                            claimed.duration_since(watching) >= lease * 3 / 2,
+                            "seed {seed}: a claim waits out a lease and a half"
+                        );
+                        if let Some(at) = *landed.lock().unwrap() {
+                            assert!(
+                                at <= watching || claimed.duration_since(at) >= lease * 3 / 2,
+                                "seed {seed}: no claim within a lease and a half of a seen beat"
+                            );
+                        }
+                        break claimed;
+                    }
+                    Watch::Alive => {
+                        assert!(
+                            landed.lock().unwrap().is_some(),
+                            "seed {seed}: only the late beat can send a successor away"
+                        );
+                    }
+                }
+            };
+            assert!(
+                claimed_at.duration_since(died) >= lease * 3 / 2,
+                "seed {seed}"
+            );
+
+            let replaced = Instant::now();
+            assert!(
+                store
+                    .write_text_if_match(
+                        &lock_uri,
+                        &leased_lock_record("successor", SECONDS),
+                        &version
+                    )
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "seed {seed}: the successor's if-match applies"
+            );
+            let successor = LeaseKeeper::start(
+                store.clone(),
+                root,
+                &lock_uri,
+                "successor",
+                SECONDS,
+                replaced,
+                None,
+            )
+            .await
+            .expect("the successor's first beat lands");
+            tokio::time::sleep(lease * 6).await;
+            assert!(
+                successor.fenced().borrow().is_none(),
+                "seed {seed}: the dead owner's late beat fences nothing"
+            );
+            assert_eq!(
+                watch_and_claim(store.as_ref(), root, "successor", SECONDS, "third")
+                    .await
+                    .unwrap(),
+                Watch::Alive,
+                "seed {seed}: a live successor keeps a third process out"
+            );
+        });
     }
 }

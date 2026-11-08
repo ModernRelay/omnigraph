@@ -1,0 +1,40 @@
+# issue: 762
+# red_on: 2026-10-17, main 9575b044: step 1 is refused at planning with `P001: nearest() orders $d, a traversal destination` instead of answering `d1`.
+# notes: An rrf() whose two arms rank one binding a traversal reaches from a declared, key-selected node ranks that binding: it roots the traversal there, as a nearest or bm25 order does.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    body: String @index
+    embedding: Vector(2) @index
+}
+node Topic {
+    name: String @key
+}
+edge About: Doc -> Topic
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","body":"needle","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d2","body":"filler","embedding":[0.0,1.0]}}
+{"type":"Topic","data":{"name":"storage"}}
+{"edge":"About","from":"d1","to":"storage"}
+{"edge":"About","from":"d2","to":"storage"}
+
+--- query
+query ranked_destination() {
+    match { $t: Topic { name: "storage" } $d about $t }
+    return { $d.slug }
+    order { rrf(nearest($d.embedding, [1.0, 0.0]), bm25($d.body, "needle")) }
+    limit 1
+}
+--- expect ordered
+{"d.slug":"d1"}
+--- expect shape
+d.slug: String
+--- expect same as v1

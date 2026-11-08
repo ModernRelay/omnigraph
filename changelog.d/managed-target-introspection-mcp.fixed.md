@@ -1,0 +1,1 @@
+- Managed `access`, `queries list` and `mcp` use scoped credentials. MCP renews expired helpers without replay or identity switches, and redacts credentials from upstream errors and challenges.

@@ -7,8 +7,6 @@
 
 mod helpers;
 
-use std::fs;
-
 use helpers::recovery::sidecar_operation_ids;
 use helpers::*;
 use omnigraph::Session;
@@ -77,28 +75,14 @@ async fn legacy_graph_with_data(dir: &tempfile::TempDir) -> Session {
     db
 }
 
-fn schema_ir(dir: &tempfile::TempDir) -> serde_json::Value {
-    serde_json::from_str(&fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap()).unwrap()
-}
-
-/// The lock is a native `__manifest` branch: its ref file is
-/// `__schema_apply_lock__.<ULID>.json` under the dataset's branch refs, and
-/// a deleted branch keeps that file with a retirement marker inside.
-fn schema_apply_lock_present(dir: &tempfile::TempDir) -> bool {
-    let refs = dir.path().join("__manifest").join("_refs").join("branches");
-    fs::read_dir(&refs)
-        .map(|entries| {
-            entries.filter_map(Result::ok).any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("__schema_apply_lock__")
-                    && !fs::read_to_string(entry.path())
-                        .unwrap()
-                        .contains("omnigraph.retired_manifest_branch")
-            })
-        })
-        .unwrap_or_else(|error| panic!("{}: {error}", refs.display()))
+async fn schema_ir(dir: &tempfile::TempDir) -> serde_json::Value {
+    let row = omnigraph_catalog::ManifestCoordinator::open(dir.path().to_str().unwrap())
+        .await
+        .unwrap()
+        .read_schema_contract()
+        .await
+        .unwrap();
+    serde_json::from_str(&row.ir).unwrap()
 }
 
 async fn assert_history_readable(db: &Session, version_before: u64, snapshot_before: &SnapshotId) {
@@ -149,7 +133,7 @@ async fn assert_upgraded(db: &Session, dir: &tempfile::TempDir, expected_export:
             .unwrap(),
         omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
     );
-    let ir = schema_ir(dir);
+    let ir = schema_ir(dir).await;
     assert_eq!(ir["ir_version"].as_u64(), Some(5));
     assert!(
         ir["features"]
@@ -159,7 +143,7 @@ async fn assert_upgraded(db: &Session, dir: &tempfile::TempDir, expected_export:
             .any(|feature| feature == "system-columns"),
         "the promoted IR must record the current vintage: {ir}"
     );
-    let source = fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
+    let source = db.schema_source();
     assert!(
         source.contains("@unique(@src, @dst)"),
         "the promoted source must spell its endpoints as meta-fields: {source}"
@@ -283,7 +267,7 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
         omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION,
         "check mode writes nothing"
     );
-    assert_eq!(schema_ir(&dir)["ir_version"].as_u64(), Some(2));
+    assert_eq!(schema_ir(&dir).await["ir_version"].as_u64(), Some(2));
 
     let report = db
         .upgrade_system_columns(SystemColumnUpgradeOptions::default())
@@ -343,62 +327,6 @@ async fn system_column_upgrade_respells_a_legacy_graph_in_place() {
             .unwrap(),
         omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
     );
-}
-
-/// A legacy-column graph reaches this binary at v11 (every upgrade route ends
-/// there) and is respelled as it is; the respelling's own publish converts
-/// main to v12 like any publish, and the report says so.
-#[tokio::test]
-async fn system_column_upgrade_respells_a_v11_graph_and_its_publish_converts_it() {
-    let _scenario = FailScenario::setup();
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = legacy_graph_with_data(&dir).await;
-    let export_before = db.export_jsonl("main", &[]).await.unwrap();
-    drop(db);
-    let mut manifest = lance::Dataset::open(&format!("{uri}/__manifest"))
-        .await
-        .unwrap();
-    omnigraph_catalog::migrations::restamp_flat_for_test(&mut manifest, 11)
-        .await
-        .unwrap();
-    drop(manifest);
-
-    let db = helpers::session(Omnigraph::open(uri).await.unwrap());
-    let check = db
-        .upgrade_system_columns(SystemColumnUpgradeOptions { check: true })
-        .await
-        .unwrap();
-    assert_eq!(
-        check.outcome,
-        SystemColumnUpgradeOutcome::CheckPassed,
-        "{check:?}"
-    );
-    assert_eq!((check.stamp_before, check.stamp_after), (11, 11));
-
-    let report = db
-        .upgrade_system_columns(SystemColumnUpgradeOptions::default())
-        .await
-        .unwrap();
-    assert_eq!(
-        report.outcome,
-        SystemColumnUpgradeOutcome::Completed,
-        "{report:?}"
-    );
-    assert_eq!((report.stamp_before, report.stamp_after), (11, 12));
-    assert_eq!(
-        db.internal_schema_version_of(omnigraph::db::ReadTarget::branch("main"))
-            .await
-            .unwrap(),
-        12,
-        "the respelling's publish converts main like any publish"
-    );
-    assert_eq!(db.export_jsonl("main", &[]).await.unwrap(), export_before);
-    assert_eq!(count_rows(&db, "node:Person").await, 2);
-    let result = query_main(&db, COMPANY_QUERY, "company_identity", &ParamMap::new())
-        .await
-        .unwrap();
-    assert_eq!(collect_column_strings(result.batches(), "c.name"), ["Acme"]);
 }
 
 #[tokio::test]
@@ -554,7 +482,7 @@ async fn system_column_upgrade_refuses_before_any_effect() {
         omnigraph::db::manifest::INTERNAL_MANIFEST_SCHEMA_VERSION
     );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
-    assert_eq!(schema_ir(&dir)["ir_version"].as_u64(), Some(2));
+    assert_eq!(schema_ir(&dir).await["ir_version"].as_u64(), Some(2));
 
     let reserved_dir = tempfile::tempdir().unwrap();
     let reserved_uri = reserved_dir.path().to_str().unwrap();
@@ -603,11 +531,7 @@ fn assert_no_staging(dir: &tempfile::TempDir) {
     }
 }
 
-/// A failure before the upgrade's one manifest commit leaves the graph
-/// exactly as it was: the plain error, no sidecar, the sentinel released, the
-/// legacy contract still served (a read-only open included), every linear
-/// HEAD at its pin, any staged contract discarded by the next read-write
-/// open, and the retry completes.
+/// Pre-publication failure preserves the old contract and admits a retry.
 async fn crash_before_publication_leaves_no_residue(seam: &'static DecideSeam) {
     let failpoint = seam.name();
     let _scenario = FailScenario::setup();
@@ -632,10 +556,6 @@ async fn crash_before_publication_leaves_no_residue(seam: &'static DecideSeam) {
         "nothing was published at {failpoint}, so nothing needs recovery: {error}"
     );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
-    assert!(
-        !schema_apply_lock_present(&dir),
-        "a failed upgrade releases its sentinel"
-    );
     assert_eq!(
         person_head_and_pin(&db, &dir).await,
         (head_before, pin_before),
@@ -676,21 +596,9 @@ async fn system_column_upgrade_failure_after_the_first_rename_leaves_no_residue(
     crash_before_publication_leaves_no_residue(&catalog::SCHEMA_APPLY_POST_TABLE_COMMIT).await;
 }
 
+/// A failure after publication leaves the complete contract readable in both modes.
 #[tokio::test]
-async fn system_column_upgrade_failure_before_staging_leaves_no_residue() {
-    crash_before_publication_leaves_no_residue(&catalog::SCHEMA_APPLY_BEFORE_STAGING_WRITE).await;
-}
-
-#[tokio::test]
-async fn system_column_upgrade_failure_after_staging_leaves_no_residue() {
-    crash_before_publication_leaves_no_residue(&catalog::SCHEMA_APPLY_AFTER_STAGING_WRITE).await;
-}
-
-/// A failure after the manifest commit reports the published commit. The
-/// manifest already names the renamed tables, so a read-only open refuses
-/// the uninstalled contract and the next read-write open installs it.
-#[tokio::test]
-async fn system_column_upgrade_post_commit_failure_is_finished_by_the_next_open() {
+async fn system_column_upgrade_post_commit_failure_is_readable_in_both_open_modes() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -704,21 +612,22 @@ async fn system_column_upgrade_post_commit_failure_is_finished_by_the_next_open(
     };
     assert!(
         matches!(error, omnigraph::error::OmniError::RecoveryRequired { .. }),
-        "a published upgrade whose contract is not installed names its commit: {error}"
+        "a post-publication failure names its committed upgrade: {error}"
     );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
     drop(db);
 
-    let read_only = Omnigraph::open_read_only(uri)
-        .await
-        .err()
-        .expect("a read-only open must not serve a published upgrade under the old contract");
-    assert!(read_only.to_string().contains("read-write"), "{read_only}");
+    let read_only = helpers::session(Omnigraph::open_read_only(uri).await.unwrap());
+    assert!(read_only.schema_source().contains("@unique(@src, @dst)"));
+    assert_eq!(
+        read_only.export_jsonl("main", &[]).await.unwrap(),
+        export_before
+    );
 
     let recovered = helpers::session(
         Omnigraph::open(uri)
             .await
-            .expect("the read-write open installs the published contract"),
+            .expect("the read-write open reads the published contract"),
     );
     assert_no_staging(&dir);
     assert_upgraded(&recovered, &dir, &export_before).await;
@@ -781,13 +690,13 @@ async fn system_column_upgrade_writes_no_control_object() {
     assert_eq!(report.outcome, SystemColumnUpgradeOutcome::Completed);
     assert_eq!(
         counts.write_text() - before_write_text,
-        6,
-        "the upgrade writes the staged and live contract files and no sidecar"
+        0,
+        "the upgrade publishes its contract without control-object writes"
     );
     assert_eq!(
         counts.delete() - before_delete,
-        3,
-        "the upgrade deletes only its three staging files"
+        0,
+        "the upgrade has no contract files to delete"
     );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
 }
@@ -815,10 +724,9 @@ async fn system_column_upgrade_retries_on_the_same_handle_after_a_crash() {
     assert_upgraded(&db, &dir, &export_before).await;
 }
 
-/// A writer that dies holding the sentinel leaves it behind with nothing
-/// published; the next read-write open reclaims it and the upgrade runs.
+/// A panicking writer releases its process gate without publishing.
 #[tokio::test]
-async fn system_column_upgrade_open_reclaims_a_dead_writers_lock() {
+async fn system_column_upgrade_crashed_writer_releases_process_gate() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -835,23 +743,15 @@ async fn system_column_upgrade_open_reclaims_a_dead_writers_lock() {
     };
     assert!(
         crashed
-            .expect_err("the writer dies under its sentinel, releasing nothing")
+            .expect_err("the writer panics while holding its process gate")
             .is_panic()
-    );
-    assert!(
-        schema_apply_lock_present(&dir),
-        "a dead writer leaves its lock behind"
     );
     assert!(sidecar_operation_ids(dir.path()).is_empty());
 
     let recovered = helpers::session(
         Omnigraph::open(uri)
             .await
-            .expect("the read-write open reclaims the stale sentinel"),
-    );
-    assert!(
-        !schema_apply_lock_present(&dir),
-        "the open reclaims the dead writer's lock"
+            .expect("the graph remains readable after the panic"),
     );
     assert_eq!(
         recovered.export_jsonl("main", &[]).await.unwrap(),

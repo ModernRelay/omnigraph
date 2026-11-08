@@ -1,0 +1,1322 @@
+{
+  "branch-merge-d50-process-cold-xfs": {
+    "planned_sha256": "ccdd6fe31f024747a44d0911bc915e5c8285d9590d870bf4fe7eedff3c3652b4",
+    "recipe_sha256": "15da6902a942b5e48e9549b9a5c73d6eea42f4a49f146ff478b364a75b7c8fb9",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "092ba8772837527e545a3aad9ef880ada7837f476fb2543d51cd1fce3d00e877",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nbranch merge \"bench-source\" into \"bench-target\"\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "xfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "plain-copy",
+      "timer": "monotonic"
+    },
+    "repetitions": 5,
+    "bound_point_id": "58f5ae4950087b6f9578398df9ec741c0426ae4c7a938c93f0ed85b6e95b922c"
+  },
+  "branch-merge-d50-warm": {
+    "planned_sha256": "e8a4f0e4761ff264ee41e72613d3d431f8d65b02bc68c957096098fac752077e",
+    "recipe_sha256": "15da6902a942b5e48e9549b9a5c73d6eea42f4a49f146ff478b364a75b7c8fb9",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "warmed-by-program",
+      "page_cache": "program-conditioned",
+      "program": "gqt-read-set-v1",
+      "iterations": 24
+    },
+    "workload_sha256": "a6ffc729893c731dd1199374af15ac8f1de8ef1c1c7e4cfe9f651282a5ca04ba",
+    "measured_step": {
+      "ordinal": 25,
+      "text": "--- mutate\nbranch merge \"bench-source\" into \"bench-target\"\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 5,
+    "bound_point_id": "05561cc1bfc25ee6a98317ddb71c85ed5f1baecf2aefdb04be0e15e226a2bc83"
+  },
+  "equal-current-narrow-one-batch": {
+    "planned_sha256": "944da755d2f8bba63769c901d2fe8a6507cf8448b39c60c6a0037131d373c901",
+    "recipe_sha256": "7628893a2bd794a4e2bd2250c24a61c0fc948032f1b06771bd3d4fc5161c6e69",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "2cd410e611ef5545b7f29e5191833d42aa754b0e2f5ec34415c35effb9c86c46",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- query branch: main\nquery current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "e0bb1c2effb7c90fc153fc0148e5b14038973b9aa663237c72e9a165fa9a3d00"
+  },
+  "equal-current-wide-four-batches": {
+    "planned_sha256": "7c733a8d16f7faddf0baf1bac0f14e0c13de2ab409d4bbec62a770b1f77d938b",
+    "recipe_sha256": "b6d202f55ff66dbaa80de913c9c3873240df659d6c6395003997d2ad67966795",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "2cd410e611ef5545b7f29e5191833d42aa754b0e2f5ec34415c35effb9c86c46",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- query branch: main\nquery current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "f03599f77637072742bd06b1abb397b69bc5547c3002330198a4f126b2d918ec"
+  },
+  "equal-current-wide-one-batch": {
+    "planned_sha256": "11e4f0979b96e09251f0630b1b294fa441703e382fbed87c5821543337a9ca50",
+    "recipe_sha256": "ed6bdf9e457b79db751b006d11bd61ff7e5f9c89af65d906c835e51135861522",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "2cd410e611ef5545b7f29e5191833d42aa754b0e2f5ec34415c35effb9c86c46",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- query branch: main\nquery current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "75b32416fb1b9d01e413265fcf1d9332b8d27416406d23d92c4eb39ad2dd6cda"
+  },
+  "finbench-disjoint-merge": {
+    "planned_sha256": "fa68eb6e74a3297d5e2014c9e7d868e36fd79b41102044bbff219bf9b10b7ef4",
+    "recipe_sha256": "41476a6e797e77f131c6146c40c9ef8f89d54340a0c66c722a50be65493653cb",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "a8140565e4595e5b5824f5bbb3dcdebb6fa9ba4e87319452fdd132e0fd7c6ec3",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nbranch merge \"bench-source\" into \"bench-target\"\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 600,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 5,
+    "bound_point_id": "cf41d8ea8f6c34dff16def2a502ed38d6efeb5d60f904aa3ad4b9ac285887e29"
+  },
+  "hot-table-idle-base": {
+    "planned_sha256": "fc09c57c5f42905335ec0e902e242465f9e1a2fb3d24cbde07d1afa36c116796",
+    "recipe_sha256": "b4e3ef173926410d1c747f0a859cdcceadbe1d717b41efc50970db3eacba318b",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "41a30481a7c81300f0f1ba2637ccfe5f894b65f9b39e20e7c002ed79b85eb1fa",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery hot_write() { update Hot set { value: 1 } where key = \"hot\" }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "558a4433e0852cea05f1a27f5f97589894ef6d946d2bdf7d64615f6f94298945"
+  },
+  "hot-table-idle-branches-4-aged": {
+    "planned_sha256": "b9b29f234de2c8c18641ae1c50c928558ebe256a380768cb7d9300c6f191a3c0",
+    "recipe_sha256": "84b87d96ecee06c11f418996e5ecb273d8f08f59955fdf4c16a3be74fba5fa22",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "23592c6c9ab32fd56cc0dca1216a09ef7f48d099cba75370b0e49b0a9db45610",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery hot_write() { update Hot set { value: 1 } where key = \"hot\" }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "473abbfcf26c56ff14ea9f026ee2ec2391f1542060cfab56255fc42476dbc940"
+  },
+  "hot-table-idle-branches-4": {
+    "planned_sha256": "5873062f8101e26671ca396a606dda74fa458d53d3075a794f8473fcbd062394",
+    "recipe_sha256": "5925ef4f593121c780c599aecde366707ed6f2e0b8826172d6c835f9155e3411",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "23592c6c9ab32fd56cc0dca1216a09ef7f48d099cba75370b0e49b0a9db45610",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery hot_write() { update Hot set { value: 1 } where key = \"hot\" }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "b954972b30a9a7c48c906e071bda8c98337bca79c120e037f0937b71412d9da1"
+  },
+  "hot-table-idle-tables-4": {
+    "planned_sha256": "d8e31bbe7783a5217c3bb491196e055f6a05fdde0b814343c7b3fc643f866830",
+    "recipe_sha256": "9788e0e6579a7b00ce11fce0ff8842a9f0ddefb9f84609de6bf38dfb59b9627a",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "875d141e4e8650fb14a57d5f1bc60b8107f288eee9fba42bee36452863a1694e",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery hot_write() { update Hot set { value: 1 } where key = \"hot\" }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "17733b0cc4f5dc6e9d198af04e744e08fbf3a3de8164eebdd42dbcad6ce6eea5"
+  },
+  "identity-lifecycle": {
+    "planned_sha256": "ce1b027e275d6cdb332deb840db63de46f3e8e774deaad88fd01bf81838df4f8",
+    "recipe_sha256": "bbe06c0e7f7c9b34d68553ef0c0f7cfe4fe4428e36be9733127b2ca00ed5aa2b",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "368843ea03dded64beeb77c225f11f12c44c42432364ae220e4f9b78e8cd4517",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate branch: feature\nquery new_lifetime_write() { update Item set { value: 1 } where key = \"alice\" }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "2197f0eb6a1cf8e5d148ddedce8302b46b489c6d593b23d5eff3358ce6b17d76"
+  },
+  "nearest-ranks-updated-embedding": {
+    "planned_sha256": "3924c636aecde87cea376f46e01ed44255fd06105efdb3b48e200f7367af8a6c",
+    "recipe_sha256": "a1046296a47d6a5318dcd6d55850dbf91afec416bd14599588c3d688f3ba09a7",
+    "needs_indices": true,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "9f6e3b64c4ce9380c85a4f5e3bc2384c535da1102f81b0abd6a765eef4fd5cd5",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- query\nquery nearest_after_update($q: Vector(4)) {\n    match { $d: Doc }\n    return { $d.slug }\n    order { nearest($d.embedding, $q) }\n    limit 6\n}\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "59558ec916cb798ea37a1a48fb8bf8496e2e923f1ffd389503bbda6265ec1a6e"
+  },
+  "nearest-skips-deleted-rows-and-fills-limit": {
+    "planned_sha256": "fdb29ab01b91ddbb1494f971aa12cc9005f094315d6798f58ba2f1b8f858283e",
+    "recipe_sha256": "9b79ab2b36bb3e9aa93e174dc3236b78c2cca9904ac1513baf4006a28d46159b",
+    "needs_indices": true,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "bcd3e6440e4f0e707cdc11de097216038fa589fc8a7af2f4176d9e17971f1f6c",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- query\nquery nearest_after_delete($q: Vector(4)) {\n    match { $d: Doc }\n    return { $d.slug }\n    order { nearest($d.embedding, $q) }\n    limit 3\n}\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "b03372d8a3a224a3121981d34cfd0bd0ca0807f5062ec92745fe90841d8f4a47"
+  },
+  "parallel-tables-1": {
+    "planned_sha256": "6a809ebafdbaeb2e63c357068070650e87f83ff96c6dcebdfe38c808126cb705",
+    "recipe_sha256": "a93baf07c040c531b3b7b5b9e17662f6f495bc8ddc74b512e2dcce1e7d0c4fb4",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "c5eb4a1edad883f1ae31662edca7e267effd01a5873e27b9962eb5df7bd61ac9",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery update_tables() {\n    update T0 set { value: 1 } where key = \"row\"\n}\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "97ab7587e284aebea3bb3b85bf72dea4b820169a6099b4248451cb724915ac78"
+  },
+  "parallel-tables-2": {
+    "planned_sha256": "0725c0eb1bf62980de62fb51afda22fa2b7bb996872b0b6a19f55a68a7eb5316",
+    "recipe_sha256": "a93baf07c040c531b3b7b5b9e17662f6f495bc8ddc74b512e2dcce1e7d0c4fb4",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "89792d9649cfd72864278101478028fca899f5a7256747a26221c136512c257f",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery update_tables() {\n    update T0 set { value: 1 } where key = \"row\"\n    update T1 set { value: 1 } where key = \"row\"\n}\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "dc454b7effa6acac773946c5785aee0d8d1c03f01cc9325aafceca081e5602fe"
+  },
+  "parallel-tables-4": {
+    "planned_sha256": "e44c54a970697ec1fdae65b13ac5010c6c3e57f05bfbb77566507cfdfaf37918",
+    "recipe_sha256": "a93baf07c040c531b3b7b5b9e17662f6f495bc8ddc74b512e2dcce1e7d0c4fb4",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "c70501f2c099eb3ad05317073669c1d8aab64c3d4dd86e56ed9a80d1cdeb9d8b",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery update_tables() {\n    update T0 set { value: 1 } where key = \"row\"\n    update T1 set { value: 1 } where key = \"row\"\n    update T2 set { value: 1 } where key = \"row\"\n    update T3 set { value: 1 } where key = \"row\"\n}\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "f40a90fef2bfeda934b708e07f0429309666f343885ee2b909f6f5439e99e1d7"
+  },
+  "repeated-deletion-recreation-branches": {
+    "planned_sha256": "c7efbf5c5147fc5884955f8e80dee1f8a63cd115fb9f3fbdd491b4d8e544bbc9",
+    "recipe_sha256": "56da50274b729be1b7601b30959cb29764e6d50d61923ffc412cbc722bc4c24a",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "e8a478f6b239595767a108dd829c5cb313ba4e67ce984f2d72bbcf2d6aa0d0e6",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nbranch create \"recycled\" from main\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "7bf85e25523ad239aa8aebd2da48a15b2786070b17f218f848b5119eb49ba538"
+  },
+  "repeated-deletion-recreation-rows": {
+    "planned_sha256": "8fca672576ac37395b90a6104cb5149e0e887b55d72314c0db34ca26fe785b79",
+    "recipe_sha256": "8371a66502f86d582f8e22a544185a55f167df8097bf48a3ee59a4ab4e2aac90",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "c7c83aad1fba5497e2967546b864e7925954ea76179ddfa8cc8757b3d01b55f3",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery recreate_row() { insert Item { key: \"temporary\", value: 99 } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "ba04e2377b6a646b1541b01bd5d13601820d460b450ee6a1cc3843c6ae7f0bf3"
+  },
+  "threshold-crossings-after": {
+    "planned_sha256": "816a7ab57ff1c8c452c90fa91b21d3fa11a6a17737538c2f2fa8e94031a37c74",
+    "recipe_sha256": "d2dd8680bef590f8220c29e1023ccda47e95013af346d1163235dce093dd98e6",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "2f264bedac246dbd8c798c31bfeb1d8f273de002118049e7047e0f0c829a185c",
+    "measured_step": {
+      "ordinal": 2,
+      "text": "--- mutate branch: b\nquery next_publish() { insert Person { name: \"carol\", age: 1 } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "e2bb568ed7242120e06c6fa9449c209cf82d5af82d2e5bbce23231a93017dfcd"
+  },
+  "threshold-crossings-at": {
+    "planned_sha256": "76b6ab70aeb9138f55b2340925c55932992d24419f9855af3904987e2e3a9499",
+    "recipe_sha256": "08705667a0439cd0507831c3c55c74eff1f9c98d20140066d17c2bb2f8a3b734",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "2e71d38c22f1c287b33b5c2dde7becd2cbfd57a6aec8c4e7656c65e62a4d4283",
+    "measured_step": {
+      "ordinal": 2,
+      "text": "--- mutate branch: b\nquery next_publish() { insert Person { name: \"carol\", age: 1 } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "eaf136a2d8a42fce0ae6ae61b2d56c07f9426e6f52518a32c7cdbe6260b916b4"
+  },
+  "threshold-crossings-before": {
+    "planned_sha256": "11e22c2493a374f1f79e327cf14923b35b75378f5e2711408b617654cb0ba680",
+    "recipe_sha256": "d964d0f0e9e7fe8ddd9982e7a2144af6597cab8803290b7910559bf91f8c8920",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "f6b48d1c7ed4d3c15e67bfcf331b92f6846ca1ceb51ad187266943cbb6368f2a",
+    "measured_step": {
+      "ordinal": 2,
+      "text": "--- mutate branch: b\nquery next_publish() { insert Person { name: \"carol\", age: 1 } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "d631107c5bd456586723cc9b20702e539a0038fb478c96a5b295b379e21d85f1"
+  },
+  "threshold-crossings-production-control": {
+    "planned_sha256": "1017c799cc1785d9ca3080c3d26b7d50c7ce805f4db8c98b4abd5dbbdf13c303",
+    "recipe_sha256": "71d701e25eca6fc0fcb1a223008a09c2c035c389f1a6541a05603823d651b4da",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "afcf0001d2fb5af0dfa38cc2cbc7694b9747612c0bf97958c58b7c5821adc3b8",
+    "measured_step": {
+      "ordinal": 2,
+      "text": "--- mutate branch: b\nquery next_publish() { insert Person { name: \"carol\", age: 1 } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "cf2dd956484e7c25f246a23cc750284d928104a746e3d5a9368c660b0b0ca224"
+  },
+  "tiny-branch": {
+    "planned_sha256": "7ee3201f7763dbff290a6503f1d5d92e848eedcf422375d22c6da7915b40c581",
+    "recipe_sha256": "1d10330d0bb50c068ec5e433870473b6ddee6e5e2613e31fb6504e40826c0b9f",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "fb3dbc37b64c5adeb40ba4067a075bd133b15d04e1aca62d4379d03aa4a1d6a4",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nbranch create \"child\" from main\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "cff4d6a67a719eaa7172bc9de183c61b879e2f282f8ad0ca1932e131bf02f3fe"
+  },
+  "tiny-load": {
+    "planned_sha256": "47231690406745afee59fad8a61237be68aa2accac36c8c2fe166a6eff89abf3",
+    "recipe_sha256": "1d10330d0bb50c068ec5e433870473b6ddee6e5e2613e31fb6504e40826c0b9f",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "4abdf63aedfc03580b6375ef27f049c9dd1f8789e9678ba29254cfd355049eaa",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- load generate: v1 seed: 0 mode: append\ntables:\n  - kind: node\n    name: Item\n    rows: 1\n    commits: 1\n    batch_rows: 1\n    columns:\n      key: {kind: key, prefix: c, width: 1}\n      val: {kind: literal, value: 3}\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "241e592a3046118b0c496292201f834143fbd10af2f0687cebd590905322880d"
+  },
+  "tiny-mutate": {
+    "planned_sha256": "053419882a5a0e8695c2877bf132c7704d844b340b165045fb484d2458ecc9ef",
+    "recipe_sha256": "1d10330d0bb50c068ec5e433870473b6ddee6e5e2613e31fb6504e40826c0b9f",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "da588c79ed2cc82c98438e46a9c4efdc3d33bcc471a0a570195e7e6e3948ea92",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery add() { insert Item { key: \"c\", val: 3 } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "0de2d97dcb6d60102f6281a6411f41a4b389b065a7f3a6c7de620b03b0bc993d"
+  },
+  "tiny-post-reopen": {
+    "planned_sha256": "e9e8911625e1905294d629c47e5d9ea831c0e83041a48886b1abbc2d72854d1f",
+    "recipe_sha256": "1d10330d0bb50c068ec5e433870473b6ddee6e5e2613e31fb6504e40826c0b9f",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "reopened-after-program",
+      "page_cache": "program-conditioned",
+      "program": "gqt-read-set-v1",
+      "iterations": 1
+    },
+    "workload_sha256": "0dafe18908eebbd8a00ce11fd76689d3c1a1466a2e14cc66f1ed670bca0e0609",
+    "measured_step": {
+      "ordinal": 3,
+      "text": "--- query branch: main\nquery items() {\n    match { $i: Item }\n    return { $i.key as key, $i.val as val }\n}\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "5803462bd7fece3f40df52eaf15114c2274a8c997555a6f1028d9705cf1d5246"
+  },
+  "tiny-read": {
+    "planned_sha256": "fc4bfbd20cafacc800b01941141885f8f1a42f93bd3002ceb0d263b813c0f081",
+    "recipe_sha256": "1d10330d0bb50c068ec5e433870473b6ddee6e5e2613e31fb6504e40826c0b9f",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "cecbf5383cb61d652ad1e69eb96691441b2cb3eebeb732a0cba077f0a03c972d",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- query branch: main\nquery items() {\n    match { $i: Item }\n    return { $i.key as key, $i.val as val }\n}\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "341e492f636cd3ea6228ca235b1cc1ef7fd45b1fa847c3a7338739384cf9749d"
+  },
+  "tiny-restart": {
+    "planned_sha256": "4c9c06a103acc5bbcf5d490b2795cd3d65655a80a62b7a3e3fe8c90e9b2b3522",
+    "recipe_sha256": "1d10330d0bb50c068ec5e433870473b6ddee6e5e2613e31fb6504e40826c0b9f",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "653038c536b9f795bd807ae8d29beaa7a8290eb9ae0b9e28178becde929fdd98",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- restart\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "5cea5d0175028cce37ae18fd1127230deec68588b88ffddfd43368bba5002760"
+  },
+  "very-long-history-1000-read": {
+    "planned_sha256": "8632c258ed5512d2fb27e8f4e0c5340d3cb9bd2d9fed146003c2ef0acdecb3d2",
+    "recipe_sha256": "702aee2a81b264606e2ca936b2a27816f5b1e6f45b62ae525c559d11b73b7cbc",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "2cacff7b790f1d1758fb365aaff53184cd98591d1cb3a2fc7b0ebe17ba5c70e9",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- query branch: main\nquery current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "566d461ac80b9a7f951bb2080941bd9d6b72aa7d4a5860d448c58043c385da12"
+  },
+  "very-long-history-1000-reopen": {
+    "planned_sha256": "d9ce9bab827d737d2edef00930df5c2263777221db69f7d4a3f1a953441c81c7",
+    "recipe_sha256": "702aee2a81b264606e2ca936b2a27816f5b1e6f45b62ae525c559d11b73b7cbc",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "cf7ca965aaf3f1f21b86f15d404d076e9e32cb8f3f731613a365f9860e750bc0",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- restart\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "7bdbb6de0708ebee2933dc3b3208d974a9120b68f132fb298b66dec0d0d45f4c"
+  },
+  "very-long-history-1000-write": {
+    "planned_sha256": "bfa976efb74a7b8fcfa7f64204017a2f8164168e999a94de38956587d822de94",
+    "recipe_sha256": "702aee2a81b264606e2ca936b2a27816f5b1e6f45b62ae525c559d11b73b7cbc",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "0dce5117f90efb547b88a13fcf26ba7a1ae1c906394f8ca834488efc46ac9d40",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery next_write() { update HistoryRow set { value: 1 } where key = \"hot\" }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "e500048d07712d34f3b2f928c09c9f19a9af0c39fd24770a5c2fc178b5bea8ed"
+  },
+  "very-long-history-10000-read": {
+    "planned_sha256": "fbd05e9a8d754620859a4f4091b13bafef89195b5f5b71192371561a1d6332ec",
+    "recipe_sha256": "20289499361183e537bf67c7c9ab50337ec3147d8303bebf93e9e93366242865",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "2cacff7b790f1d1758fb365aaff53184cd98591d1cb3a2fc7b0ebe17ba5c70e9",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- query branch: main\nquery current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "8caef27559bd7a4b68cf915f771d546dc685690921357645d94fe56edfd8ebba"
+  },
+  "very-long-history-10000-reopen": {
+    "planned_sha256": "48c6c5b1fe51d500750362cc2ff4702588341e9796607ed8bda9a40db50513a5",
+    "recipe_sha256": "20289499361183e537bf67c7c9ab50337ec3147d8303bebf93e9e93366242865",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "cf7ca965aaf3f1f21b86f15d404d076e9e32cb8f3f731613a365f9860e750bc0",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- restart\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "ca7d63bf804e7a89fc6c99938c455d7bd8a1f84dcb0d5845cf29353fc107f5d0"
+  },
+  "very-long-history-10000-write": {
+    "planned_sha256": "a5e2e906c9859ffec534ace301ecaa0461c862f28b9e081ac586cc55709bb357",
+    "recipe_sha256": "20289499361183e537bf67c7c9ab50337ec3147d8303bebf93e9e93366242865",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "0dce5117f90efb547b88a13fcf26ba7a1ae1c906394f8ca834488efc46ac9d40",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery next_write() { update HistoryRow set { value: 1 } where key = \"hot\" }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "9632a510a3daa6ce8638ce94309bd5cd6de5f260bc2a59afc5346bff2ab55f93"
+  },
+  "very-long-history-100000-read": {
+    "planned_sha256": "596d6b25c1f395a7af86419457920c4d2f0068a9f0198f87e9321902acd695cb",
+    "recipe_sha256": "916364ba4b48d699405af7c35ade449c6116e3726718073545131e7720a53134",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "2cacff7b790f1d1758fb365aaff53184cd98591d1cb3a2fc7b0ebe17ba5c70e9",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- query branch: main\nquery current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "983bdd0e2e2aef4ae4aea9d6a25a2d733f6581ddad483cb884271583d379fce2"
+  },
+  "very-long-history-100000-reopen": {
+    "planned_sha256": "314c64f1d8245069077a984f2880e1c18629fba298c0a0ad6589978f80cc8d4e",
+    "recipe_sha256": "916364ba4b48d699405af7c35ade449c6116e3726718073545131e7720a53134",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "cf7ca965aaf3f1f21b86f15d404d076e9e32cb8f3f731613a365f9860e750bc0",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- restart\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "c7471c25a0e8bf90fc2b84aadbc63da31820bf51375f15a699cd3091b163c8d3"
+  },
+  "very-long-history-100000-write": {
+    "planned_sha256": "61d1a62b2520508c876b5cd4336d507727bffcbb65b30cd3f454c317ffe56ba9",
+    "recipe_sha256": "916364ba4b48d699405af7c35ade449c6116e3726718073545131e7720a53134",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "0dce5117f90efb547b88a13fcf26ba7a1ae1c906394f8ca834488efc46ac9d40",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery next_write() { update HistoryRow set { value: 1 } where key = \"hot\" }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "d4e7ac49cf8901991016475921275b60877ad01bb781a22e616806b20e632576"
+  },
+  "very-long-history-32-read": {
+    "planned_sha256": "44b689c167d9927d4de356372cea0a22d0eb45b9e8c85f159cec4b349a8adf75",
+    "recipe_sha256": "ba69422e67a458a8461c55f67ccab8202288ba0e0ba8cdd127e4e3f1a76d5ff6",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "2cacff7b790f1d1758fb365aaff53184cd98591d1cb3a2fc7b0ebe17ba5c70e9",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- query branch: main\nquery current_rows() { match { $r: HistoryRow } return { $r.key as key, $r.value as value, $r.payload as payload } }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "b83aa66b368c52be894df39a5a6c3a6d915d281bcb43fb79a0325261587cf52d"
+  },
+  "very-long-history-32-reopen": {
+    "planned_sha256": "a85f951e4ee851aec468544db60d27fc9de16cf14298aacd857539df5e846f41",
+    "recipe_sha256": "ba69422e67a458a8461c55f67ccab8202288ba0e0ba8cdd127e4e3f1a76d5ff6",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "cf7ca965aaf3f1f21b86f15d404d076e9e32cb8f3f731613a365f9860e750bc0",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- restart\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "003540c32207370748a2fc16f7d174c4692dbbaa3510ca83538b95270fecd992"
+  },
+  "very-long-history-32-write": {
+    "planned_sha256": "15fcb19c7aad26eed7ebed80b4c48b88e25ca1018840859dd3f347022a00c1d4",
+    "recipe_sha256": "ba69422e67a458a8461c55f67ccab8202288ba0e0ba8cdd127e4e3f1a76d5ff6",
+    "needs_indices": false,
+    "cache_condition": {
+      "process": "fresh-per-repetition",
+      "engine": "preparation-only",
+      "page_cache": "uncontrolled",
+      "program": "none",
+      "iterations": 0
+    },
+    "workload_sha256": "0dce5117f90efb547b88a13fcf26ba7a1ae1c906394f8ca834488efc46ac9d40",
+    "measured_step": {
+      "ordinal": 1,
+      "text": "--- mutate\nquery next_write() { update HistoryRow set { value: 1 } where key = \"hot\" }\n"
+    },
+    "environment": {
+      "backend": {
+        "kind": "local-fs",
+        "filesystem": "apfs",
+        "storage_class": "nvme-ssd"
+      }
+    },
+    "protocol": {
+      "deadline_seconds": 60,
+      "attribution": "per-phase",
+      "schedule": "manual",
+      "reset": "local-clonefile",
+      "timer": "monotonic"
+    },
+    "repetitions": 1,
+    "bound_point_id": "b7763606305654dbeeb984b352cc8ddfe35ffe47e73e12f3b161ab493a37428f"
+  }
+}

@@ -1,0 +1,88 @@
+# issue: none
+# notes: One checked warmup precedes one measured query per fresh process; a restart and exact result check follow. This repetition boundary differs from the former repeated Rust timing loop.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query destination_projection() { match { $p: Person $p knows $q } return { $q.name } }
+--- expect unordered
+{"q.name":"p000000"}
+{"q.name":"p000001"}
+{"q.name":"p000002"}
+{"q.name":"p000003"}
+{"q.name":"p000004"}
+{"q.name":"p000005"}
+{"q.name":"p000006"}
+{"q.name":"p000007"}
+{"q.name":"p000008"}
+{"q.name":"p000009"}
+{"q.name":"p000010"}
+{"q.name":"p000011"}
+{"q.name":"p000012"}
+{"q.name":"p000013"}
+{"q.name":"p000014"}
+{"q.name":"p000015"}
+{"q.name":"p000016"}
+{"q.name":"p000017"}
+{"q.name":"p000018"}
+{"q.name":"p000019"}
+--- expect shape
+q.name: String
+
+--- query
+query destination_projection() { match { $p: Person $p knows $q } return { $q.name } }
+--- expect unordered
+{"q.name":"p000000"}
+{"q.name":"p000001"}
+{"q.name":"p000002"}
+{"q.name":"p000003"}
+{"q.name":"p000004"}
+{"q.name":"p000005"}
+{"q.name":"p000006"}
+{"q.name":"p000007"}
+{"q.name":"p000008"}
+{"q.name":"p000009"}
+{"q.name":"p000010"}
+{"q.name":"p000011"}
+{"q.name":"p000012"}
+{"q.name":"p000013"}
+{"q.name":"p000014"}
+{"q.name":"p000015"}
+{"q.name":"p000016"}
+{"q.name":"p000017"}
+{"q.name":"p000018"}
+{"q.name":"p000019"}
+--- expect shape
+q.name: String
+
+--- restart
+
+--- query
+query destination_projection() { match { $p: Person $p knows $q } return { $q.name } }
+--- expect unordered
+{"q.name":"p000000"}
+{"q.name":"p000001"}
+{"q.name":"p000002"}
+{"q.name":"p000003"}
+{"q.name":"p000004"}
+{"q.name":"p000005"}
+{"q.name":"p000006"}
+{"q.name":"p000007"}
+{"q.name":"p000008"}
+{"q.name":"p000009"}
+{"q.name":"p000010"}
+{"q.name":"p000011"}
+{"q.name":"p000012"}
+{"q.name":"p000013"}
+{"q.name":"p000014"}
+{"q.name":"p000015"}
+{"q.name":"p000016"}
+{"q.name":"p000017"}
+{"q.name":"p000018"}
+{"q.name":"p000019"}
+--- expect shape
+q.name: String

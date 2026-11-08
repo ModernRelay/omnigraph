@@ -1,0 +1,101 @@
+# issue: 773
+# red_on: 2026-10-10, main 26ef1609: step 11 outcome mismatch, `branch merge b1` returns `merged`, not `fast_forward`; with that check relaxed, main keeps `w`. Same on 80406fee (2026-09-25).
+# notes: main merges b0, b1 forks at that merge commit and deletes w, then b1 merges a
+# notes: later b0 commit. The merge commit is the base of b1 and main; b0's first commit
+# notes: (y) is nearer by the pre-fix distance sum and lies below it only through its merged parent.
+# notes: Three commits on b1 are the minimum: with two the sums tie and the pre-fix version tie-break picks the merge commit.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+
+--- mutate
+branch create b0
+
+--- expect ok
+
+--- mutate branch: b0
+query insert_y() {
+    insert Person { name: "y" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_w() {
+    insert Person { name: "w" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b0
+
+--- expect outcome: merged
+
+--- mutate
+branch create b1
+
+--- expect ok
+
+--- mutate branch: b1
+query delete_w() {
+    delete Person where name = "w"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: b1
+query insert_x1() {
+    insert Person { name: "x1" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: b1
+query insert_x2() {
+    insert Person { name: "x2" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: b0
+query insert_z() {
+    insert Person { name: "z" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b0 into b1
+
+--- expect outcome: merged
+
+--- mutate
+branch merge b1
+
+--- expect outcome: fast_forward
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "x1"}
+{"p.name": "x2"}
+{"p.name": "y"}
+{"p.name": "z"}
+
+--- expect shape
+p.name: String

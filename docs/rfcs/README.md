@@ -48,7 +48,8 @@ RFCs 0001 to 0068 use `NNNN-kebab-title.md`, the heading
 closed at 0068: no new number is allocated, and `scripts/check-docs.py`
 rejects any numbered filename outside the allocated and reserved numbers it
 lists. Numbers reserved by PRs that were open
-when the namespace closed (0047 and 0048 by PR #606; 0050 by the
+when the namespace closed (0047 and 0048 by PR #606, carried on by PR #791
+and PR #793; 0050 by the
 `rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0059 by PR #675;
 0060 by PR #677; 0067 and 0068 by PR #725) may still land under their
 reserved numbers. Every other gap
@@ -107,9 +108,9 @@ context rather than restating metadata.
 ## Lifecycle
 
 ```text
-draft ──maintainer decision──▶ accepted ──later replacement──▶ superseded
-  │                                  │
-  └──maintainer decision──▶ rejected └──implementation progresses separately
+draft ──maintainer decision──▶ accepted ──accepted replacement──▶ superseded
+  ├──maintainer decision──▶ rejected
+  └──maintainer-approved draft replacement────────────────────▶ superseded
 ```
 
 - **Draft**: under design and review. A draft may live on the main branch so
@@ -120,8 +121,17 @@ draft ──maintainer decision──▶ accepted ──later replacement──�
 - **Rejected**: the decision was not adopted. Keep the record and concise
   rationale; use `removed` if an experiment shipped and was later deleted,
   otherwise `n/a` or `not-started` as appropriate.
-- **Superseded**: another RFC owns the current decision. Link both directions
+- **Superseded**: another RFC owns the current decision or proposal. Link both directions
   and keep the old rationale intact.
+
+A maintainer may consolidate or replace an unaccepted draft with another draft
+and mark the previous draft `superseded`. This transfers the proposal's ownership,
+not acceptance or implementation authority; the disposition must say that the
+replacement is still a draft. Reserve `rejected` for a decision not to adopt the
+proposal, rather than merely moving its continuing design into a replacement.
+An accepted RFC remains authoritative until its replacement is accepted: a draft
+cannot retire an accepted contract. Record reciprocal supersession metadata only
+when that disposition takes effect.
 
 Acceptance requires all invariants, compatibility consequences, operational
 boundaries, and owned evidence gates to be explicit. A blocker owned by another
@@ -143,6 +153,9 @@ dependencies do.
 6. Implementation PRs link the accepted RFC and update `implementation` plus
    any durable evidence or support boundary in the canonical file.
 7. A later incompatible decision gets a new RFC and supersedes the old one.
+8. An accepted RFC that replaces only part of an earlier RFC keeps that RFC's
+   status. Its PR adds a `> **RFC NNNN disposition:**` note under the earlier
+   RFC's title: what changed, `Historical:` sections, `Current:` remainder.
 
 For Lance-dependent work, follow [the Lance reading protocol](../dev/lance.md)
 and record the exact upstream version and surfaces reviewed. For test planning,
@@ -159,7 +172,7 @@ then dated RFCs by date.
 |---|---|---|---|---|
 | [0001](0001-fragment-adopt-branch-merge.md) | Branch merge by fragment adoption | maintainer | draft | not-started |
 | [0002](0002-config-cli-architecture.md) | Config and CLI architecture | maintainer | superseded | partial |
-| [0003](0003-mcp-server-surface.md) | MCP server surface | maintainer | draft | not-started |
+| [0003](0003-mcp-server-surface.md) | MCP server surface | maintainer | draft | partial |
 | [0004](0004-cluster-graph-schema-apply.md) | Cluster graph and schema apply | maintainer | accepted | complete |
 | [0005](0005-server-cluster-boot.md) | Server boot from cluster state | maintainer | accepted | partial |
 | [0006](0006-object-storage-cluster-roots.md) | Object-storage cluster roots | maintainer | accepted | complete |
@@ -181,7 +194,7 @@ then dated RFCs by date.
 | [0027](0027-lineage-merge-deltas.md) | Lineage-based merge deltas | maintainer | draft | not-started |
 | [0028](0028-stable-schema-identity.md) | Stable schema identity and table incarnation | maintainer | accepted | complete |
 | [0029](0029-azure-blob-storage.md) | Native Azure Blob storage | public | accepted | in-progress |
-| [0030](0030-cdc-time-travel.md) | Graph change feed and retained-history contract | maintainer | accepted | partial |
+| [0030](0030-cdc-time-travel.md) | Graph diffs, change feeds and retained history | maintainer | accepted | partial |
 | [0031](0031-comparative-cost-harness.md) | Comparative cost harness | maintainer | draft | not-started |
 | [0032](0032-adversarial-correctness-harness.md) | Adversarial correctness harness | maintainer | draft | not-started |
 | [0033](0033-blob-management.md) | Blob management | maintainer | accepted | partial |
@@ -198,6 +211,7 @@ then dated RFCs by date.
 | [0044](0044-edge-keys.md) | Edge keys: derived edge identity | maintainer | draft | in-progress |
 | [0045](0045-gq-logic-tests.md) | GQ logic tests | maintainer | draft | partial |
 | [0046](0046-index-status.md) | Read-only index status | maintainer | draft | not-started |
+| [0047](0047-search-plan-truth.md) | Search plan validation and result guarantees | public | draft | in-progress |
 | [0049](0049-control-plane-seams.md) | Control-plane seams: observe, readiness witness, bounded shutdown | maintainer | accepted | partial |
 | [0051](0051-json-output-via-arrow.md) | JSON output via Arrow | maintainer | draft | partial |
 | [0052](0052-managed-control-plane-cli.md) | Managed control-plane CLI | maintainer | accepted | complete |
@@ -206,6 +220,7 @@ then dated RFCs by date.
 | [0055](0055-gq-branch-statements.md) | Branch statements in GQ | maintainer | draft | in-progress |
 | [0057](0057-bounded-merge-preparation.md) | Accepted-context reuse and bounded merge preparation | maintainer | accepted | in-progress |
 | [0058](0058-retained-merged-ancestry.md) | Retained merged ancestry | maintainer | draft | not-started |
+| [0059](0059-config-cli-coherency.md) | Named targets and CLI coherency | maintainer | accepted | complete |
 | [0061](0061-managed-cluster-lifecycle.md) | Managed cluster lifecycle and config preparation | maintainer | accepted | complete |
 | [0062](0062-manifest-version-clock.md) | Manifest version as the table registration clock | maintainer | draft | in-progress |
 | [0063](0063-self-contained-branch-lineage.md) | Self-contained branch lineage | maintainer | draft | in-progress |
@@ -222,4 +237,22 @@ then dated RFCs by date.
 | [2026-09-21](2026-09-21-detached-only-tables.md) | Detached-only tables | maintainer | accepted | in-progress |
 | [2026-09-24](2026-09-24-shared-expression-model.md) | Shared expression model | maintainer | draft | in-progress |
 | [2026-09-26](2026-09-26-self-contained-server-testing.md) | Self-contained server testing with GQT and DST | maintainer | draft | not-started |
-| [2026-09-29](2026-09-29-server-runtime-and-online-deployment.md) | Server runtime and online deployment | maintainer | draft | not-started |
+| [2026-09-29](2026-09-29-server-runtime-and-online-deployment.md) | Server runtime and online deployment | maintainer | accepted | in-progress |
+| [2026-09-30](2026-09-30-typed-edge-alternation.md) | Typed edge alternation and bounded wildcard traversal | maintainer | accepted | complete |
+| [2026-09-30](2026-09-30-v012-http-admission.md) | HTTP contract admission | maintainer | accepted | complete |
+| [2026-09-30](2026-09-30-exact-merge-receipts.md) | Exact merge receipts | maintainer | accepted | complete |
+| [2026-09-30](2026-09-30-owned-server-operations.md) | Owned server operations | maintainer | accepted | complete |
+| [2026-09-30](2026-09-30-schema-contract-in-manifest.md) | Schema contract in the manifest | maintainer | draft | in-progress |
+| [2026-10-01](2026-10-01-engine-settlement-and-resource-bounds.md) | Engine settlement and resource bounds | maintainer | accepted | partial |
+| [2026-10-08](2026-10-08-index-facts-as-planner-input.md) | Index facts as planner input | maintainer | accepted | complete |
+| [2026-10-10](2026-10-10-unpublished-graph-commits.md) | Unpublished graph commits | maintainer | accepted | partial |
+| [2026-10-10](2026-10-10-merge-base-block-registry.md) | Block registry for merge base lookup | maintainer | draft | in-progress |
+| [2026-10-11](2026-10-11-unattached-graph-branches.md) | Unattached graph branches | maintainer | draft | not-started |
+| [2026-10-15](2026-10-15-bulk-load-as-a-query-plan.md) | Bulk load as a query plan | maintainer | draft | partial |
+| [2026-10-16](2026-10-16-engine-catalogue.md) | Engine catalogue | maintainer | draft | in-progress |
+| [2026-10-16](2026-10-16-graph-access-serving-and-cross-process-writes.md) | Graph access and cross-process writes | maintainer | accepted | in-progress |
+| [2026-10-19](2026-10-19-http-api-conventions.md) | HTTP API conventions | maintainer | accepted | complete |
+| [2026-10-19](2026-10-19-storage-outcomes-and-restartable-ownership.md) | Storage outcomes per operation and restartable ownership | maintainer | accepted | in-progress |
+| [2026-10-20](2026-10-20-operator-connections-and-credential-providers.md) | Operator profiles and credential providers | maintainer | draft | in-progress |
+| [2026-10-26](2026-10-26-change-discovery-by-fragment-identity.md) | Change discovery by fragment and row identity | maintainer | draft | in-progress |
+| [2026-10-29](2026-10-29-remote-optimize-through-the-serving-owner.md) | Remote optimize through the serving owner | maintainer | accepted | in-progress |

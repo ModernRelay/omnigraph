@@ -1,0 +1,53 @@
+# issue: none
+# traversal: auto
+# notes: A branch merge refuses an edge inserted on the branch when main deleted its target node
+# notes: meanwhile, on an integer-keyed Person table whose key index covers only part of the rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: I64 @key
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 4
+    columns:
+      id: {kind: ordinal, start: 0, step: 1}
+
+--- load generate: v1 seed: 43 mode: append
+tables:
+  - kind: node
+    name: Person
+    rows: 1
+    commits: 1
+    columns:
+      id: {kind: ordinal, start: 1000, step: 1}
+--- expect ok
+
+--- mutate
+branch create b
+--- expect ok
+
+--- mutate branch: b
+query ins_b() { insert Knows { from: "0", to: "1" } }
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+query del_main() { delete Person where id = 1 }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b
+
+--- expect error: (orphan_edge): __dst '1' not found in Person
+

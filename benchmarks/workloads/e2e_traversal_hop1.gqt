@@ -1,0 +1,148 @@
+# issue: none
+# notes: One checked warmup precedes one measured query per fresh process; a restart and exact result check follow. This repetition boundary differs from the former repeated Rust timing loop.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+query hop1() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.name, $b.name }
+}
+--- expect unordered
+{"a.name":"p0","b.name":"p1"}
+{"a.name":"p0","b.name":"p4"}
+{"a.name":"p1","b.name":"p2"}
+{"a.name":"p1","b.name":"p5"}
+{"a.name":"p2","b.name":"p3"}
+{"a.name":"p2","b.name":"p6"}
+{"a.name":"p3","b.name":"p4"}
+{"a.name":"p3","b.name":"p7"}
+{"a.name":"p4","b.name":"p5"}
+{"a.name":"p4","b.name":"p8"}
+{"a.name":"p5","b.name":"p6"}
+{"a.name":"p5","b.name":"p9"}
+{"a.name":"p6","b.name":"p7"}
+{"a.name":"p6","b.name":"p10"}
+{"a.name":"p7","b.name":"p8"}
+{"a.name":"p7","b.name":"p11"}
+{"a.name":"p8","b.name":"p9"}
+{"a.name":"p8","b.name":"p12"}
+{"a.name":"p9","b.name":"p10"}
+{"a.name":"p9","b.name":"p13"}
+{"a.name":"p10","b.name":"p11"}
+{"a.name":"p10","b.name":"p14"}
+{"a.name":"p11","b.name":"p12"}
+{"a.name":"p11","b.name":"p15"}
+{"a.name":"p12","b.name":"p13"}
+{"a.name":"p12","b.name":"p0"}
+{"a.name":"p13","b.name":"p14"}
+{"a.name":"p13","b.name":"p1"}
+{"a.name":"p14","b.name":"p15"}
+{"a.name":"p14","b.name":"p2"}
+{"a.name":"p15","b.name":"p0"}
+{"a.name":"p15","b.name":"p3"}
+--- expect shape
+a.name: String
+b.name: String
+
+--- query
+query hop1() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.name, $b.name }
+}
+--- expect unordered
+{"a.name":"p0","b.name":"p1"}
+{"a.name":"p0","b.name":"p4"}
+{"a.name":"p1","b.name":"p2"}
+{"a.name":"p1","b.name":"p5"}
+{"a.name":"p2","b.name":"p3"}
+{"a.name":"p2","b.name":"p6"}
+{"a.name":"p3","b.name":"p4"}
+{"a.name":"p3","b.name":"p7"}
+{"a.name":"p4","b.name":"p5"}
+{"a.name":"p4","b.name":"p8"}
+{"a.name":"p5","b.name":"p6"}
+{"a.name":"p5","b.name":"p9"}
+{"a.name":"p6","b.name":"p7"}
+{"a.name":"p6","b.name":"p10"}
+{"a.name":"p7","b.name":"p8"}
+{"a.name":"p7","b.name":"p11"}
+{"a.name":"p8","b.name":"p9"}
+{"a.name":"p8","b.name":"p12"}
+{"a.name":"p9","b.name":"p10"}
+{"a.name":"p9","b.name":"p13"}
+{"a.name":"p10","b.name":"p11"}
+{"a.name":"p10","b.name":"p14"}
+{"a.name":"p11","b.name":"p12"}
+{"a.name":"p11","b.name":"p15"}
+{"a.name":"p12","b.name":"p13"}
+{"a.name":"p12","b.name":"p0"}
+{"a.name":"p13","b.name":"p14"}
+{"a.name":"p13","b.name":"p1"}
+{"a.name":"p14","b.name":"p15"}
+{"a.name":"p14","b.name":"p2"}
+{"a.name":"p15","b.name":"p0"}
+{"a.name":"p15","b.name":"p3"}
+--- expect shape
+a.name: String
+b.name: String
+
+--- restart
+
+--- query
+query hop1() {
+    match {
+        $a: Person
+        $b: Person
+        $a knows $b
+    }
+    return { $a.name, $b.name }
+}
+--- expect unordered
+{"a.name":"p0","b.name":"p1"}
+{"a.name":"p0","b.name":"p4"}
+{"a.name":"p1","b.name":"p2"}
+{"a.name":"p1","b.name":"p5"}
+{"a.name":"p2","b.name":"p3"}
+{"a.name":"p2","b.name":"p6"}
+{"a.name":"p3","b.name":"p4"}
+{"a.name":"p3","b.name":"p7"}
+{"a.name":"p4","b.name":"p5"}
+{"a.name":"p4","b.name":"p8"}
+{"a.name":"p5","b.name":"p6"}
+{"a.name":"p5","b.name":"p9"}
+{"a.name":"p6","b.name":"p7"}
+{"a.name":"p6","b.name":"p10"}
+{"a.name":"p7","b.name":"p8"}
+{"a.name":"p7","b.name":"p11"}
+{"a.name":"p8","b.name":"p9"}
+{"a.name":"p8","b.name":"p12"}
+{"a.name":"p9","b.name":"p10"}
+{"a.name":"p9","b.name":"p13"}
+{"a.name":"p10","b.name":"p11"}
+{"a.name":"p10","b.name":"p14"}
+{"a.name":"p11","b.name":"p12"}
+{"a.name":"p11","b.name":"p15"}
+{"a.name":"p12","b.name":"p13"}
+{"a.name":"p12","b.name":"p0"}
+{"a.name":"p13","b.name":"p14"}
+{"a.name":"p13","b.name":"p1"}
+{"a.name":"p14","b.name":"p15"}
+{"a.name":"p14","b.name":"p2"}
+{"a.name":"p15","b.name":"p0"}
+{"a.name":"p15","b.name":"p3"}
+--- expect shape
+a.name: String
+b.name: String

@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-06-12
-updated: 2026-08-23
+updated: 2026-10-05
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,6 +15,14 @@ blocked_on: []
 ---
 
 # RFC 0009: Unified embedded and remote access paths
+
+> **RFC 0011 disposition:** [RFC 0011](0011-cli-addressing-and-config.md) owns
+> addressing and the capability set. Historical: the Phase 3 sentence on
+> `RemoteClient` addressing inputs, Phase 4's `Storage | Server | Both`
+> declaration, and the Open question 3 answer on `graphs list`. Current: the
+> parity matrix, `omnigraph-api-types`, `GraphClient` with its embedded and
+> remote implementations, and the Phase 5 route alignment.
+
 **Audience:** engine/CLI/server maintainers
 **Builds on:** [RFC 0007](0007-operator-config.md)
 (landed — `--server` targeting and operator aliases are remote-addressing
@@ -176,12 +184,10 @@ literal `http(s)://` URIs.
 
 ### Phase 5 — Route alignment (landed)
 
-Added a canonical `POST /load` (shared `run_ingest` body; the deprecated
-`/ingest` is now a thin alias carrying `#[deprecated]` + RFC 9745/8288
-`Deprecation`/`Link: </load>` headers, exactly mirroring `/mutate`↔`/change`)
-and pointed the CLI's remote `load` arm at it; `/ingest` stays on its
-deprecation path. `/load` reuses `IngestRequest`/`IngestOutput` (as canonical
-`/mutate` reuses `Change*`); a DTO rename is a separate change.
+The served data routes are `POST /query`, `POST /mutate`, `POST /load`
+and strict `POST /load/ndjson`. Deprecated `/read`, `/change`, and `/ingest`
+are removed. JSON `/load` reuses `IngestRequest`/`IngestOutput`, and `/mutate`
+reuses `Change*`; the native CLI's load adapter uses `/load/ndjson`.
 
 Registration finding: the server **hand-mounts** routes (`.route(...)`) beside a
 manual `#[openapi(paths(...))]` list, not `utoipa-axum`'s `OpenApiRouter`/
@@ -218,8 +224,8 @@ registration — the migration is a worthwhile but orthogonal cleanup, deferred.
   through Phases 2–3 (the storage-collapse playbook).
 - Phase 2: `openapi.rs` byte-stability + existing server tests.
 - Phase 4: one test per capability class asserting the deliberate error.
-- Phase 5: parity matrix leg for `load` flips to `/load`; an `/ingest` shim
-  test stays until removal.
+- Phase 5: load parity covers canonical `/load/ndjson`; route tests refuse
+  removed aliases before graph effects.
 
 ## Open questions
 
@@ -247,3 +253,10 @@ consumes; RFC 0008 removed the competing config authority; RFC 0002 remains the
 umbrella whose remaining unimplemented pieces (`GraphLocator`, the State
 layer) would build on the trait introduced here rather than on per-command
 forks.
+
+## Decision log
+
+- 2026-10-05: The maintainer requested removal of compatibility interfaces.
+  This replaces Phase 5's retained `/ingest` alias and deprecation-header
+  sentences, and Testing's shim-retention rule. Canonical routes and CLI
+  dispatch remain shared; no storage or publication behavior changes.

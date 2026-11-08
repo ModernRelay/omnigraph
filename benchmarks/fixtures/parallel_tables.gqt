@@ -1,0 +1,52 @@
+# issue: none
+# notes: Four fixed registered tables; touched-table count is the independent query axis.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node T0 { key: String @key value: I64 }
+node T1 { key: String @key value: I64 }
+node T2 { key: String @key value: I64 }
+node T3 { key: String @key value: I64 }
+
+--- seed
+{"type":"T0","data":{"key":"row","value":0}}
+{"type":"T1","data":{"key":"row","value":0}}
+{"type":"T2","data":{"key":"row","value":0}}
+{"type":"T3","data":{"key":"row","value":0}}
+
+--- query branch: main
+query current_rows() { match { $r: T0 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: T1 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: T2 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":0}
+--- expect shape
+key: String
+value: I64
+
+--- query branch: main
+query current_rows() { match { $r: T3 } return { $r.key as key, $r.value as value } }
+--- expect unordered
+{"key":"row","value":0}
+--- expect shape
+key: String
+value: I64

@@ -1,0 +1,67 @@
+# issue: none
+# notes: The `load csv` source bound is the `load_source_max_bytes` session setting: a source
+# notes: over the statement's value is refused as `csv_source_bytes` before any row lands, the
+# notes: default stays 32 MiB, and a value above the old 32 MiB ceiling is accepted.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: I64 @key
+    name: String
+}
+
+--- seed
+{"type":"Person","data":{"id":1,"name":"alice"}}
+
+--- csv people.csv
+id,name
+2,bob
+3,carol
+
+--- mutate
+set load_source_max_bytes = 16;
+load csv "people.csv" into node:Person mode overwrite header
+
+--- expect error: resource limit exceeded for csv_source_bytes: actual 23, limit 16
+
+--- query
+query unchanged() {
+    match { $p: Person }
+    return { $p.id, $p.name }
+}
+
+--- expect unordered
+{"p.id": 1, "p.name": "alice"}
+
+--- expect shape
+p.id: I64
+p.name: String
+
+--- mutate
+load csv "people.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- mutate
+set load_source_max_bytes = 67108864;
+load csv "people.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- query
+query replaced() {
+    match { $p: Person }
+    return { $p.id }
+}
+
+--- expect unordered
+{"p.id": 2}
+{"p.id": 3}
+
+--- expect shape
+p.id: I64

@@ -184,6 +184,16 @@ query nobody_older() {
     }
     return { $p.name }
 }
+query skips_d1() {
+    match {
+        $p: Person
+        not {
+            $p likes $d
+            $d: Doc { title: "d1" }
+        }
+    }
+    return { $p.name }
+}
 query none_ordered() {
     match { $p: Person }
     return { $p.name }
@@ -432,6 +442,70 @@ fn counter(metrics: &[QueryExecutionMetrics], operator: &str, name: &str) -> Vec
         .filter(|metric| metric.operator == operator)
         .filter_map(|metric| metric.values.get(name).copied())
         .collect()
+}
+
+#[test]
+fn ann_diagnostics_join_attempts_without_changing_search_decisions() {
+    use crate::engine::search::{AnnAttemptMetrics, ProbeAttempt, ScanReport};
+
+    let mut report = ExecutionReport::default();
+    report.record_probes(4, 0, &ScanReport::default());
+    assert_eq!(
+        serde_json::to_value(&report).unwrap(),
+        serde_json::json!({"rows": []})
+    );
+
+    let mut scan = ScanReport {
+        probes: vec![
+            ProbeAttempt {
+                maximum_nprobes: Some(1),
+                flat: false,
+                rows: 0,
+            },
+            ProbeAttempt {
+                maximum_nprobes: None,
+                flat: true,
+                rows: 3,
+            },
+        ],
+        ann_metrics: vec![AnnAttemptMetrics {
+            attempt: 1,
+            counts: [("prefilter_row_ids", 3)].into(),
+            cumulative_times_ns: [("prefilter_load_time", 37)].into(),
+        }],
+        ..Default::default()
+    };
+    report.record_probes(4, 0, &scan);
+    let first = serde_json::to_value(&report).unwrap();
+    scan.ann_metrics[0]
+        .cumulative_times_ns
+        .insert("prefilter_load_time", 99);
+    let mut replay = ExecutionReport::default();
+    replay.record_probes(4, 0, &scan);
+    let replay = serde_json::to_value(&replay).unwrap();
+    assert_eq!(
+        first["search"], replay["search"],
+        "diagnostics are not replay decisions"
+    );
+    assert_ne!(first["ann_metrics"], replay["ann_metrics"]);
+
+    report.record_probes(4, 3, &scan);
+    let report = serde_json::to_value(&report).unwrap();
+    let metrics = report["ann_metrics"].as_array().unwrap();
+    assert_eq!(
+        metrics.len(),
+        2,
+        "one diagnostic per measured attempt, not per handoff"
+    );
+    for (metric, rung) in metrics.iter().zip([0, 3]) {
+        assert_eq!(metric["id"], 4);
+        assert_eq!(metric["rung"], rung);
+        assert_eq!(
+            metric["attempt"], 1,
+            "missing metrics never shift probe positions"
+        );
+        assert_eq!(metric["counts"]["prefilter_row_ids"], 3);
+    }
 }
 
 /// The scan of binding `binding` and the join (`CrossJoin` or
@@ -736,9 +810,10 @@ async fn a_hash_join_without_a_declared_fallback_lowers_to_the_same_one_operator
         },
     };
     let context = crate::engine::EngineContext {
-        snapshot: &view.snapshot,
+        snapshot: Some(&view.snapshot),
         catalog: &catalog,
         graph_index: Arc::new(crate::engine::GraphIndexHandle::none()),
+        load: None,
     };
     let lowering = crate::engine::lower::Lowering::new(&bound, &context);
     let lowered = lowering
@@ -793,6 +868,52 @@ async fn anti_join_inner_tree_is_skipped_under_the_bulk_check_and_executed_witho
         assert_eq!(operator(&run, leaf), "OuterReferenceExec");
         assert_eq!(row(&run, leaf).status, inner_status, "{name}");
     }
+}
+
+/// A key-set block's inner tree reads no outer rows: no `OuterReference`
+/// node, its table scan of the bounded binding and its reversed expand both
+/// executed, and the `AntiJoinMaskExec` keeps the persons d1 never met.
+#[tokio::test]
+async fn key_set_anti_join_executes_its_inner_tree_without_an_outer_leaf() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = graph(&dir, PEOPLE_SCHEMA, PEOPLE_SEED).await;
+    let (rows, run) = run(&db, PEOPLE_QUERIES, "skips_d1", &ParamMap::new()).await;
+    assert_eq!(rows, 2);
+    assert_covers(&run);
+    let anti = node_id(&run.plan, |node| {
+        matches!(
+            node,
+            PhysicalNode::AntiJoin {
+                strategy: omnigraph_planner::AntiJoinStrategy::KeySet,
+                ..
+            }
+        )
+    });
+    assert_eq!(operator(&run, anti), "AntiJoinMaskExec");
+    assert_eq!(row(&run, anti).status, RowStatus::Executed);
+    assert!(
+        !run.plan
+            .live()
+            .any(|(_, node)| matches!(node, PhysicalNode::OuterReference { .. }))
+    );
+    let root = node_id(&run.plan, |node| {
+        matches!(
+            node,
+            PhysicalNode::Scan {
+                source: omnigraph_planner::ScanInput::Table,
+                spec,
+                ..
+            } if spec.binding.as_deref() == Some("d")
+        )
+    });
+    assert_eq!(operator(&run, root), "ScanExec");
+    assert_eq!(row(&run, root).status, RowStatus::Executed);
+    let reversed = node_id(
+        &run.plan,
+        |node| matches!(node, PhysicalNode::Expand { src, dst, .. } if src == "d" && dst == "p"),
+    );
+    assert_eq!(operator(&run, reversed), "ExpandExec");
+    assert_eq!(row(&run, reversed).status, RowStatus::Executed);
 }
 
 #[tokio::test]
@@ -924,6 +1045,57 @@ async fn a_ranked_scan_a_sort_a_projection_and_a_limit_build_one_operator_each()
     assert_eq!(row(&run, returns).attempts[0].actual_rows, 10, "every doc");
     let limit = node_id(&run.plan, |node| matches!(node, PhysicalNode::Limit { .. }));
     assert_eq!(operator(&run, limit), "LimitExec");
+    for row in run.report.rows() {
+        assert_eq!(row.status, RowStatus::Executed, "{row:?}");
+    }
+}
+
+/// A top-k over ten docs whose output alone reads `text`: the scan reads the
+/// narrow columns and the row address, and one `HydrateExec` above the
+/// limit takes the two kept rows' text by address.
+#[tokio::test]
+async fn a_hydrating_top_k_builds_one_operator_above_its_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = doc_graph(&dir).await;
+    let source = r#"query two_texts() {
+        match { $d: Doc }
+        return { $d.slug, $d.text }
+        order { $d.slug desc }
+        limit 2
+    }"#;
+    let (result, run) = captured(db.query(
+        ReadTarget::branch("main"),
+        source,
+        "two_texts",
+        &ParamMap::new(),
+    ))
+    .await;
+    let run = run.expect("the query ran on engine v2");
+    let batch = result.unwrap().concat_batches().unwrap();
+    let texts: Vec<&str> = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(Option::unwrap)
+        .collect();
+    assert_eq!(texts, ["needle 9", "needle 8"]);
+    assert_covers(&run);
+    let hydrate = node_id(&run.plan, |node| {
+        matches!(node, PhysicalNode::HydrateColumns { .. })
+    });
+    assert_eq!(
+        hydrate,
+        run.plan.root(),
+        "the hydration sits above the limit"
+    );
+    assert_eq!(operator(&run, hydrate), "HydrateExec");
+    assert_eq!(row(&run, hydrate).attempts[0].actual_rows, 2);
+    let returns = node_id(&run.plan, |node| {
+        matches!(node, PhysicalNode::Projection { .. })
+    });
+    assert_eq!(row(&run, returns).attempts[0].actual_rows, 10, "every doc");
     for row in run.report.rows() {
         assert_eq!(row.status, RowStatus::Executed, "{row:?}");
     }

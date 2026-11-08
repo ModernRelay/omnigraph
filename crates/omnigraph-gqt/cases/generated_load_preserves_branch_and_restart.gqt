@@ -1,0 +1,96 @@
+# issue: none
+# notes: Generated append and keyed merge loads preserve values and branch isolation across restart.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [42]
+
+--- schema
+node Person { name: String @key val: I64 bucket: I64 embedding: Vector(3) }
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 3
+    commits: 2
+    columns:
+      name: {kind: key, prefix: person-, width: 3}
+      val: {kind: ordinal, start: 0, step: 1}
+      bucket: {kind: modulo, modulus: 2}
+      embedding: {kind: vector, dimensions: 3}
+
+--- mutate
+branch create work from main
+--- expect ok
+
+--- load generate: v1 seed: 42 mode: merge branch: work
+tables:
+  - kind: node
+    name: Person
+    rows: 1
+    commits: 1
+    start: 1
+    columns:
+      name: {kind: key, prefix: person-, width: 3}
+      val: {kind: ordinal, start: -1, step: -1}
+      bucket: {kind: modulo, modulus: 2}
+      embedding: {kind: vector, dimensions: 3}
+--- expect ok
+
+--- load generate: v1 seed: 42 mode: append branch: work
+tables:
+  - kind: node
+    name: Person
+    rows: 1
+    commits: 1
+    start: 3
+    columns:
+      name: {kind: key, prefix: person-, width: 3}
+      val: {kind: ordinal, start: 0, step: 1}
+      bucket: {kind: modulo, modulus: 2}
+      embedding: {kind: vector, dimensions: 3}
+--- expect ok
+
+--- restart
+
+--- query branch: work
+query changed() { match { $p: Person } return { $p.name, $p.val, $p.bucket } }
+--- expect unordered
+{"p.name":"person-000","p.val":0,"p.bucket":0}
+{"p.name":"person-001","p.val":-2,"p.bucket":1}
+{"p.name":"person-002","p.val":2,"p.bucket":0}
+{"p.name":"person-003","p.val":3,"p.bucket":1}
+--- expect shape
+p.name: String
+p.val: I64
+p.bucket: I64
+
+--- query
+query unchanged() { match { $p: Person } return { $p.name, $p.val, $p.bucket } }
+--- expect unordered
+{"p.name":"person-000","p.val":0,"p.bucket":0}
+{"p.name":"person-001","p.val":1,"p.bucket":1}
+{"p.name":"person-002","p.val":2,"p.bucket":0}
+--- expect shape
+p.name: String
+p.val: I64
+p.bucket: I64
+
+--- load generate: v1 seed: 42 mode: append branch: absent
+tables:
+  - kind: node
+    name: Person
+    rows: 1
+    commits: 1
+    columns:
+      name: {kind: literal, value: unused}
+      val: {kind: literal, value: 0}
+      bucket: {kind: literal, value: 0}
+      embedding: {kind: vector, dimensions: 3}
+--- expect error: absent

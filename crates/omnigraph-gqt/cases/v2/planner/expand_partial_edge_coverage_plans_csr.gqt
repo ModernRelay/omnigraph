@@ -1,0 +1,71 @@
+# issue: none
+# traversal: auto
+# notes: Writes never extend the edge BTREE, so the appended fragment is uncovered; PinnedIndexFacts prices that at planning since execution no longer probes coverage.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"start"}}
+{"type":"Person","data":{"name":"middle"}}
+{"type":"Person","data":{"name":"end"}}
+{"edge":"Knows","from":"start","to":"middle"}
+{"edge":"Knows","from":"middle","to":"end"}
+
+--- query
+set engine = v2;
+query two_hops() {
+    match {
+        $a: Person { name: "start" }
+        $a knows{1,2} $b
+    }
+    return { $b.name }
+}
+--- expect unordered
+{"b.name":"middle"}
+{"b.name":"end"}
+--- expect shape
+b.name: String
+--- expect plan
+expand $a Knows $b: mode indexed_scan ran indexed_scan
+pass expand_mode
+
+--- mutate
+query add_side() {
+    insert Person { name: "side" }
+}
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query link_side() {
+    insert Knows { from: "start", to: "side" }
+}
+--- expect affected: nodes=0 edges=1
+
+--- query
+set engine = v2;
+query two_hops() {
+    match {
+        $a: Person { name: "start" }
+        $a knows{1,2} $b
+    }
+    return { $b.name }
+}
+--- expect unordered
+{"b.name":"middle"}
+{"b.name":"side"}
+{"b.name":"end"}
+--- expect shape
+b.name: String
+--- expect plan
+expand $a Knows $b: mode csr ran csr
+pass expand_mode

@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::catalog::Catalog;
-use crate::error::ParseDiagnostic;
 use crate::query::ast::{Mutation, QueryDecl};
 use crate::query::descriptor::{QueryOperationDescriptor, describe_query_operation};
+use crate::query::diagnostic::QueryDiagnostic;
 use crate::query::parser::parse_query_diagnostic;
 
 const PARSE_ERROR_CODE: &str = "Q000";
@@ -123,7 +123,7 @@ pub fn lint_query_file(
     let query_path = query_path.into();
     let parsed = match parse_query_diagnostic(query_source) {
         Ok(file) => file.body.into_read_declarations(),
-        Err(diagnostic) => Err(parse_error_message(query_source, diagnostic)),
+        Err(diagnostic) => Err(parse_error_message(diagnostic)),
     };
     match parsed {
         Ok(queries) => {
@@ -223,19 +223,14 @@ pub fn lint_query_file(
 /// The parse message with its position, `line <n>, column <c>: <message>`,
 /// so a refused `set` line is reported where it stands; a spanless
 /// diagnostic keeps its message.
-fn parse_error_message(query_source: &str, diagnostic: ParseDiagnostic) -> String {
-    let ParseDiagnostic { message, span } = diagnostic;
-    let Some(span) = span else {
-        return message;
-    };
-    let prefix = query_source.get(..span.start).unwrap_or(query_source);
-    let line = prefix.matches('\n').count() + 1;
-    let column = prefix
-        .rsplit('\n')
-        .next()
-        .map_or(0, |last| last.chars().count())
-        + 1;
-    format!("line {line}, column {column}: {message}")
+fn parse_error_message(diagnostic: QueryDiagnostic) -> String {
+    let QueryDiagnostic {
+        message, position, ..
+    } = diagnostic;
+    match position {
+        Some(at) => format!("line {}, column {}: {message}", at.line, at.column),
+        None => message,
+    }
 }
 
 fn query_kind(query: &QueryDecl) -> QueryLintQueryKind {

@@ -1,0 +1,176 @@
+# issue: none
+# notes: One checked warmup precedes one measured query against a long-running server; an exact result check follows.
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- query
+query no_friends() { match { $p: Person not { $p knows $q } } return { $p.name } }
+--- expect unordered
+{"p.name":"p000501"}
+{"p.name":"p000503"}
+{"p.name":"p000505"}
+{"p.name":"p000507"}
+{"p.name":"p000509"}
+{"p.name":"p000511"}
+{"p.name":"p000513"}
+{"p.name":"p000515"}
+{"p.name":"p000517"}
+{"p.name":"p000519"}
+{"p.name":"p000521"}
+{"p.name":"p000523"}
+{"p.name":"p000525"}
+{"p.name":"p000527"}
+{"p.name":"p000529"}
+{"p.name":"p000531"}
+{"p.name":"p000533"}
+{"p.name":"p000535"}
+{"p.name":"p000537"}
+{"p.name":"p000539"}
+{"p.name":"p000541"}
+{"p.name":"p000543"}
+{"p.name":"p000545"}
+{"p.name":"p000547"}
+{"p.name":"p000549"}
+{"p.name":"p000551"}
+{"p.name":"p000553"}
+{"p.name":"p000555"}
+{"p.name":"p000557"}
+{"p.name":"p000559"}
+{"p.name":"p000561"}
+{"p.name":"p000563"}
+{"p.name":"p000565"}
+{"p.name":"p000567"}
+{"p.name":"p000569"}
+{"p.name":"p000571"}
+{"p.name":"p000573"}
+{"p.name":"p000575"}
+{"p.name":"p000577"}
+{"p.name":"p000579"}
+{"p.name":"p000581"}
+{"p.name":"p000583"}
+{"p.name":"p000585"}
+{"p.name":"p000587"}
+{"p.name":"p000589"}
+{"p.name":"p000591"}
+{"p.name":"p000593"}
+{"p.name":"p000595"}
+{"p.name":"p000597"}
+{"p.name":"p000599"}
+--- expect shape
+p.name: String
+
+--- query
+query no_friends() { match { $p: Person not { $p knows $q } } return { $p.name } }
+--- expect unordered
+{"p.name":"p000501"}
+{"p.name":"p000503"}
+{"p.name":"p000505"}
+{"p.name":"p000507"}
+{"p.name":"p000509"}
+{"p.name":"p000511"}
+{"p.name":"p000513"}
+{"p.name":"p000515"}
+{"p.name":"p000517"}
+{"p.name":"p000519"}
+{"p.name":"p000521"}
+{"p.name":"p000523"}
+{"p.name":"p000525"}
+{"p.name":"p000527"}
+{"p.name":"p000529"}
+{"p.name":"p000531"}
+{"p.name":"p000533"}
+{"p.name":"p000535"}
+{"p.name":"p000537"}
+{"p.name":"p000539"}
+{"p.name":"p000541"}
+{"p.name":"p000543"}
+{"p.name":"p000545"}
+{"p.name":"p000547"}
+{"p.name":"p000549"}
+{"p.name":"p000551"}
+{"p.name":"p000553"}
+{"p.name":"p000555"}
+{"p.name":"p000557"}
+{"p.name":"p000559"}
+{"p.name":"p000561"}
+{"p.name":"p000563"}
+{"p.name":"p000565"}
+{"p.name":"p000567"}
+{"p.name":"p000569"}
+{"p.name":"p000571"}
+{"p.name":"p000573"}
+{"p.name":"p000575"}
+{"p.name":"p000577"}
+{"p.name":"p000579"}
+{"p.name":"p000581"}
+{"p.name":"p000583"}
+{"p.name":"p000585"}
+{"p.name":"p000587"}
+{"p.name":"p000589"}
+{"p.name":"p000591"}
+{"p.name":"p000593"}
+{"p.name":"p000595"}
+{"p.name":"p000597"}
+{"p.name":"p000599"}
+--- expect shape
+p.name: String
+
+--- query
+query no_friends() { match { $p: Person not { $p knows $q } } return { $p.name } }
+--- expect unordered
+{"p.name":"p000501"}
+{"p.name":"p000503"}
+{"p.name":"p000505"}
+{"p.name":"p000507"}
+{"p.name":"p000509"}
+{"p.name":"p000511"}
+{"p.name":"p000513"}
+{"p.name":"p000515"}
+{"p.name":"p000517"}
+{"p.name":"p000519"}
+{"p.name":"p000521"}
+{"p.name":"p000523"}
+{"p.name":"p000525"}
+{"p.name":"p000527"}
+{"p.name":"p000529"}
+{"p.name":"p000531"}
+{"p.name":"p000533"}
+{"p.name":"p000535"}
+{"p.name":"p000537"}
+{"p.name":"p000539"}
+{"p.name":"p000541"}
+{"p.name":"p000543"}
+{"p.name":"p000545"}
+{"p.name":"p000547"}
+{"p.name":"p000549"}
+{"p.name":"p000551"}
+{"p.name":"p000553"}
+{"p.name":"p000555"}
+{"p.name":"p000557"}
+{"p.name":"p000559"}
+{"p.name":"p000561"}
+{"p.name":"p000563"}
+{"p.name":"p000565"}
+{"p.name":"p000567"}
+{"p.name":"p000569"}
+{"p.name":"p000571"}
+{"p.name":"p000573"}
+{"p.name":"p000575"}
+{"p.name":"p000577"}
+{"p.name":"p000579"}
+{"p.name":"p000581"}
+{"p.name":"p000583"}
+{"p.name":"p000585"}
+{"p.name":"p000587"}
+{"p.name":"p000589"}
+{"p.name":"p000591"}
+{"p.name":"p000593"}
+{"p.name":"p000595"}
+{"p.name":"p000597"}
+{"p.name":"p000599"}
+--- expect shape
+p.name: String

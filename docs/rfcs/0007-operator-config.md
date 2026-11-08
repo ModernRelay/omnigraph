@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-06-11
-updated: 2026-08-23
+updated: 2026-10-20
 discussion: null
 supersedes: []
 superseded_by: []
@@ -15,6 +15,25 @@ blocked_on: []
 ---
 
 # RFC 0007: Per-operator configuration
+
+> **RFC 0059 disposition:** [RFC 0059](0059-config-cli-coherency.md) replaces
+> routing with complete targets in the existing operator file. Historical: D2's
+> server/alias routing schema and warn-only unknown keys; D3's routing precedence
+> and field merging; D4's server-name login spelling; and D6's additive-only and
+> old-config compatibility promises. The legacy exceptions in D4/D5 remain
+> retired. Current: actor/output preferences, keyed environment/file credentials,
+> D5's endpoint ownership boundary, atomic edits and the single-owner rules.
+> This is the accepted replacement design; implementation cutover remains tracked
+> by RFC 0059, not implied by this disposition.
+
+> **RFC 0008 disposition:** [RFC 0008](0008-retire-omnigraph-yaml.md) retired
+> `./omnigraph.yaml` and [RFC 0011](0011-cli-addressing-and-config.md) completed
+> its removal. Historical: the legacy file in D1, the alias collision rule in
+> D2, the legacy hops in the D3 cascades, the legacy pair in D4 step 3, and the
+> `omnigraph.yaml` cases in D5 rules 1 and 2. At that cutover, the operator
+> surface, `--server` targeting, operator aliases, keyed credentials and D5 rule 3
+> remained; the RFC 0059 disposition above records the later targeting change.
+
 **Builds on:** [RFC 0002](0002-config-cli-architecture.md) (superseded umbrella;
 PRs #139/#162 closed over review findings),
 [RFC 0005](0005-server-cluster-boot.md), and
@@ -273,10 +292,13 @@ future checkout-supplied surface:
    the operator layer** — first-set-wins, operator-before-checkout (the
    existing real-env-wins rule, extended one layer down). Finding #5's
    injection becomes a no-op against any var the operator actually uses.
-3. **A token is sent only to the server it is keyed to.** The legacy
-   single `OMNIGRAPH_BEARER_TOKEN` fallback keeps working for the
-   single-server shape, but when a request resolves through a *named*
-   server, only that name's chain applies (finding #6's broadcast).
+3. **A token is sent only to the server it is keyed to.** A request carries
+   only the token of the operator-defined server it is sent to (§D4 steps
+   1–2); any other request carries none. The CLI reads no unkeyed token
+   (finding #6's broadcast). "Sent to" is where the transport delivers the
+   request: the same scheme, host and port, or the same Unix socket, and a
+   path under the server's `url` once `.` and `..` segments resolve. The
+   address as written is never the match.
 
 ### D6. Compatibility rules (the #139 findings as law)
 
@@ -349,3 +371,21 @@ RFC 0002 remains the umbrella architecture. This RFC implements its §2
 (`GraphLocator`/targets), §3 (roles), and the State layer. If/when the
 locator work resumes, it builds on these layers rather than re-landing
 them. RFC 0002's header should gain a pointer here once this merges.
+
+## Decision log
+
+- 2026-10-16: The CLI no longer reads `OMNIGRAPH_BEARER_TOKEN`. That
+  fallback reached every remote URL matching no operator server, including a
+  literal `--server` URL the operator does not control, and every declared
+  server without a keyed token
+  ([#1022](https://github.com/ModernRelay/omnigraph/issues/1022)). Superseded:
+  D5 rule 3's "The legacy single `OMNIGRAPH_BEARER_TOKEN` fallback keeps
+  working for the single-server shape, but when a request resolves through a
+  *named* server, only that name's chain applies". The Background section's
+  description of the variable is history and is not rewritten. The same
+  change matches a credential on the request's transport target instead of
+  the address text, which a `..` segment could carry to a sibling path prefix
+  or another socket, and accepts a served `--graph` only as one path segment
+  of ASCII letters, digits, `-` or `_`. Two `servers:` names that spell the
+  same `OMNIGRAPH_TOKEN_<NAME>` (D4 step 1) are refused at load, so one
+  variable never binds two servers.

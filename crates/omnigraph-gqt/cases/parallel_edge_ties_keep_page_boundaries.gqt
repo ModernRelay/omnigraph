@@ -10,6 +10,8 @@ environments:
   - target: omnigraph-engine-dst
     storage: in-memory-object-store
     seeds: [0]
+  - target: omnigraph-server
+    storage: local-filesystem
 
 --- schema
 node Person {

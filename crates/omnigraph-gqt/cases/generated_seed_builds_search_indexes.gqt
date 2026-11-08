@@ -1,0 +1,57 @@
+# issue: none
+# notes: A generated seed builds declared search indexes after all batches and keeps indexed search results after restart.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [42]
+
+--- schema
+node Doc { slug: String @key text: String @index }
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Doc
+    rows: 3
+    commits: 2
+    columns:
+      slug: {kind: key, prefix: doc-, width: 3}
+      text:
+        kind: ranges
+        ranges:
+          - end: 2
+            value: |-
+              needle
+
+              document
+        fallback: unrelated document
+
+--- query
+query search_seed() {
+    match { $d: Doc search($d.text, "needle") }
+    return { $d.slug, $d.text }
+}
+--- expect unordered
+{"d.slug":"doc-000","d.text":"needle\n\ndocument"}
+{"d.slug":"doc-001","d.text":"needle\n\ndocument"}
+--- expect shape
+d.slug: String
+d.text: String
+
+--- restart
+--- query
+query search_reopened_seed() {
+    match { $d: Doc search($d.text, "needle") }
+    return { $d.slug, $d.text }
+}
+--- expect unordered
+{"d.slug":"doc-000","d.text":"needle\n\ndocument"}
+{"d.slug":"doc-001","d.text":"needle\n\ndocument"}
+--- expect shape
+d.slug: String
+d.text: String

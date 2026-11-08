@@ -1,0 +1,1 @@
+- **Deployments:** `in_progress` remains true until the server releases deployment admission, including pending result delivery. Observing `in_progress: false` confirms that deployment has released its admission.

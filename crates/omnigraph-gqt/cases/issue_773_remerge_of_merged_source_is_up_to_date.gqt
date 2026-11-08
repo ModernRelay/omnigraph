@@ -1,0 +1,87 @@
+# issue: 773
+# red_on: 2026-10-10, main 26ef1609: step 9 outcome `merged` not `already_up_to_date`; main then holds `z` again. Same on 80406fee (2026-09-25).
+# notes: s and q fork from main's seed commit G. main fast-forwards to s (z), deletes z,
+# notes: inserts k, then merges q. s's head is now an ancestor of main, so re-merging s
+# notes: must be already_up_to_date. Under the pre-fix distance-sum search G is closer (1+2 through q)
+# notes: than s's head (0+4), and picking G as base re-adds z; k is the minimum padding, one fewer ties.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+
+--- mutate
+branch create s
+
+--- expect ok
+
+--- mutate
+branch create q
+
+--- expect ok
+
+--- mutate branch: s
+query insert_z() {
+    insert Person { name: "z" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge s
+
+--- expect outcome: fast_forward
+
+--- mutate
+query delete_z() {
+    delete Person where name = "z"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query insert_k() {
+    insert Person { name: "k" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate branch: q
+query insert_q1() {
+    insert Person { name: "q1" }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge q
+
+--- expect outcome: merged
+
+--- mutate
+branch merge s
+
+--- expect outcome: already_up_to_date
+
+--- query
+query names_on_main() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "k"}
+{"p.name": "q1"}
+
+--- expect shape
+p.name: String

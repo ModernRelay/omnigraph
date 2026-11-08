@@ -12,10 +12,19 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 
-pub use omnigraph_storage::{ListDirBounds, StorageKind, join_uri, redacted_storage_uri};
+pub use omnigraph_storage::{
+    CapturedStorageBinding, FrozenDirectory, ListDirBounds, StorageDestination, StorageIoScope,
+    StorageKind, join_uri, redacted_storage_uri,
+};
 
 #[async_trait]
 pub trait StorageAdapter: Debug + Send + Sync {
+    fn binding(&self) -> Option<CapturedStorageBinding> {
+        None
+    }
+    fn io_scope(&self) -> Option<StorageIoScope> {
+        None
+    }
     async fn read_text(&self, uri: &str) -> Result<String>;
     /// Read a text object if it exists using one backend GET.
     ///
@@ -113,6 +122,7 @@ pub trait StorageAdapter: Debug + Send + Sync {
 #[derive(Debug)]
 pub struct ObjectStorageAdapter {
     inner: omnigraph_storage::ObjectStorageAdapter,
+    binding: Option<CapturedStorageBinding>,
 }
 
 impl ObjectStorageAdapter {
@@ -122,6 +132,7 @@ impl ObjectStorageAdapter {
     pub fn local() -> Self {
         Self {
             inner: omnigraph_storage::ObjectStorageAdapter::local(),
+            binding: None,
         }
     }
 
@@ -142,6 +153,7 @@ impl ObjectStorageAdapter {
     pub fn s3_from_root_uri(root_uri: &str) -> Result<Self> {
         Ok(Self {
             inner: omnigraph_storage::ObjectStorageAdapter::s3_from_root_uri(root_uri)?,
+            binding: None,
         })
     }
 
@@ -151,6 +163,7 @@ impl ObjectStorageAdapter {
     pub fn azure_from_root_uri(root_uri: &str) -> Result<Self> {
         Ok(Self {
             inner: omnigraph_storage::ObjectStorageAdapter::azure_from_root_uri(root_uri)?,
+            binding: None,
         })
     }
 
@@ -159,12 +172,32 @@ impl ObjectStorageAdapter {
     pub fn in_memory() -> Self {
         Self {
             inner: omnigraph_storage::ObjectStorageAdapter::in_memory(),
+            binding: None,
+        }
+    }
+
+    /// The in-memory backend over a frozen directory mounted at `prefix`:
+    /// a prepared store under DST, read through and never written.
+    #[cfg(feature = "dst")]
+    pub fn read_through(
+        frozen: std::sync::Arc<FrozenDirectory>,
+        prefix: object_store::path::Path,
+    ) -> Self {
+        Self {
+            inner: omnigraph_storage::ObjectStorageAdapter::read_through(frozen, prefix),
+            binding: None,
         }
     }
 }
 
 #[async_trait]
 impl StorageAdapter for ObjectStorageAdapter {
+    fn binding(&self) -> Option<CapturedStorageBinding> {
+        self.binding.clone()
+    }
+    fn io_scope(&self) -> Option<StorageIoScope> {
+        omnigraph_storage::StorageAdapter::io_scope(&self.inner)
+    }
     async fn read_text(&self, uri: &str) -> Result<String> {
         Ok(omnigraph_storage::StorageAdapter::read_text(&self.inner, uri).await?)
     }
@@ -282,6 +315,58 @@ pub fn storage_for_uri(uri: &str) -> Result<Arc<dyn StorageAdapter>> {
         StorageKind::Local => Ok(Arc::new(ObjectStorageAdapter::local())),
         StorageKind::S3 => Ok(Arc::new(ObjectStorageAdapter::s3_from_root_uri(uri)?)),
         StorageKind::Azure => Ok(Arc::new(ObjectStorageAdapter::azure_from_root_uri(uri)?)),
+    }
+}
+
+/// Select a native adapter carrying the same explicit lifetime as its Lance clients.
+pub fn storage_for_uri_scoped(uri: &str, scope: StorageIoScope) -> Result<Arc<dyn StorageAdapter>> {
+    let inner = match storage_kind_for_uri(uri)? {
+        StorageKind::Local => omnigraph_storage::ObjectStorageAdapter::local_scoped(scope),
+        StorageKind::S3 => {
+            omnigraph_storage::ObjectStorageAdapter::s3_from_root_uri_scoped(uri, scope)?
+        }
+        StorageKind::Azure => {
+            omnigraph_storage::ObjectStorageAdapter::azure_from_root_uri_scoped(uri, scope)?
+        }
+    };
+    Ok(Arc::new(ObjectStorageAdapter {
+        inner,
+        binding: None,
+    }))
+}
+
+/// Construct control storage from the invocation's immutable provider selection.
+pub fn storage_for_binding(binding: &CapturedStorageBinding) -> Result<Arc<dyn StorageAdapter>> {
+    bound_storage(binding, None)
+}
+
+pub fn storage_for_binding_scoped(
+    binding: &CapturedStorageBinding,
+    scope: StorageIoScope,
+) -> Result<Arc<dyn StorageAdapter>> {
+    bound_storage(binding, Some(scope))
+}
+
+fn bound_storage(
+    binding: &CapturedStorageBinding,
+    scope: Option<StorageIoScope>,
+) -> Result<Arc<dyn StorageAdapter>> {
+    Ok(Arc::new(ObjectStorageAdapter {
+        inner: binding.adapter(scope)?,
+        binding: Some(binding.clone()),
+    }))
+}
+
+/// Session-owned providers already carry exact native options. Do not consult
+/// environment configuration while preparing a dataset on that registry.
+pub fn lance_store_params_for_session(
+    uri: &str,
+    session: &Arc<lance::session::Session>,
+) -> Result<lance::io::ObjectStoreParams> {
+    if crate::lance_access::has_captured_provider(session) {
+        Ok(lance::io::ObjectStoreParams::default())
+    } else {
+        lance_store_params_for_uri(uri)
     }
 }
 
