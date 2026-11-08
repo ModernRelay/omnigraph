@@ -194,18 +194,32 @@ jobs:
           zip -j "$archive" target/release/omnigraph target/release/omnigraph-server \
             target/release/omnigraph-azure-admission > /dev/null
           result="$RUNNER_TEMP/omnigraph-notary-result.json"
-          if ! xcrun notarytool submit "$archive" "${notary[@]}" --wait --timeout 30m --output-format json > "$result"; then
-            # Retain the submission ID/status in the log if Apple's wait times out.
-            cat "$result"
+          info="$RUNNER_TEMP/omnigraph-notary-info.json"
+          # A wait that times out exits nonzero and prints only the submission
+          # ID, so the outcome is read from Apple's record of the submission.
+          xcrun notarytool submit "$archive" "${notary[@]}" --wait --timeout 30m --output-format json > "$result" || true
+          cat "$result"; echo
+          submission=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("id", ""))' "$result" || true)
+          if [[ -z "$submission" ]]; then
+            echo "::error::Apple did not return a notarization submission ID"
             exit 1
           fi
-          status=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["status"])' "$result")
-          if [[ "$status" != Accepted ]]; then
-            submission=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["id"])' "$result")
-            xcrun notarytool log "$submission" "${notary[@]}"
-            echo "::error::Apple notarization status: $status"
-            exit 1
-          fi
+          xcrun notarytool info "$submission" "${notary[@]}" --output-format json > "$info"
+          status=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["status"])' "$info")
+          case "$status" in
+            Accepted) ;;
+            "In Progress")
+              # macOS looks up a standalone binary's ticket online, so an
+              # acceptance after publication still notarizes these bytes. A
+              # later rejection is not seen here: check the ID before announcing.
+              echo "::warning::Apple has not finished notarizing submission $submission; publishing the signed binaries. Check it with: xcrun notarytool info $submission"
+              ;;
+            *)
+              xcrun notarytool log "$submission" "${notary[@]}" || true
+              echo "::error::Apple notarization status: $status"
+              exit 1
+              ;;
+          esac
 
       - name: Package Unix release archive
         if: runner.os != 'Windows'
