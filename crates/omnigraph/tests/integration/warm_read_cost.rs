@@ -2451,11 +2451,54 @@ async fn by_id_read_of_a_block_found_before_scans_only_its_branch() {
             "the graph as of a commit read from the branch it was found on"
         );
 
+        // `task` releases the block to `__history`: the hint now names a
+        // branch that no longer buffers it.
+        let release_writer = with_setting(&writer, "history_release_bytes", "2048");
+        let control = omnigraph_core::lance_access::control_session();
+        for published in 0..=TAIL_MAX_COMMITS + 1 {
+            let released =
+                omnigraph_catalog::history::read_commit(uri, &control, &first.graph_commit_id)
+                    .await
+                    .unwrap();
+            if released.is_some() {
+                break;
+            }
+            assert!(
+                published <= TAIL_MAX_COMMITS,
+                "test setup: {published} publishes on `task` released nothing"
+            );
+            let name = format!("Release{published}");
+            let person = mixed_params(&[("$name", &name)], &[("$age", 30)]);
+            mutate_branch(
+                &release_writer,
+                "task",
+                MUTATION_QUERIES,
+                "insert_person",
+                &person,
+            )
+            .await
+            .unwrap();
+        }
+        let (found, io) = measure(reader.get_commit(&first.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), first);
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 1),
+            "the hinted branch, which no longer holds the block, then `__history`"
+        );
+        let (found, io) = measure(reader.get_commit(&second.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), second);
+        assert_eq!(
+            opens_and_scans(&io),
+            (0, 0),
+            "the miss dropped the hint: `__history` alone"
+        );
+
         writer.branch_delete("task").await.unwrap();
         let resolved = reader.get_commit(&first.graph_commit_id).await.unwrap();
         assert_eq!(
             resolved, first,
-            "a commit of a deleted branch is found in `__history`, past the stale hint"
+            "a commit of a deleted branch is found in `__history`"
         );
     })
     .await;
