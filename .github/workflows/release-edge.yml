@@ -123,6 +123,13 @@ jobs:
       source_sha: ${{ needs.vocabulary_gate.outputs.source_sha }}
       channel: edge
       check_stamp: true
+    secrets:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+      APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
 
   publish_edge_release:
     name: Publish edge release
@@ -215,7 +222,7 @@ jobs:
 
       - name: Attest build provenance
         if: steps.taggable.outputs.go == 'true' && steps.existing.outputs.published != 'true'
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/*.tar.gz
@@ -483,11 +490,14 @@ jobs:
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Attest image provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.ghcr.outputs.image }}
           subject-digest: ${{ steps.ghcr.outputs.digest }}
           push-to-registry: true
+          # Storage records need `artifact-metadata: write`, which this job does
+          # not grant; left on, every run would fail to create one and warn.
+          create-storage-record: false
 
       # The `edge` image tag follows the rolling release as it is now, not as
       # this run left it: a rerun of an older run's failed job must not move it
@@ -559,7 +569,7 @@ jobs:
       # oci://docker.io/...` reads by digest.
       - name: Attest Docker Hub image provenance
         if: steps.dockerhub.outputs.digest != ''
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.dockerhub.outputs.image }}
           subject-digest: ${{ steps.dockerhub.outputs.digest }}
@@ -597,7 +607,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-15, windows-latest]
     env:
       BUILD_TAG: ${{ needs.prepare_edge_release.outputs.build_tag }}
       SOURCE_SHA: ${{ needs.vocabulary_gate.outputs.source_sha }}

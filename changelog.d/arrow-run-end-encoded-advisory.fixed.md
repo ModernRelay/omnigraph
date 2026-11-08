@@ -1,0 +1,1 @@
+- Arrow crates 58.3.0 to 58.4.1 (RUSTSEC-2026-0442, RunEndEncoded array validation); the unmaintained `pin-utils` advisory (RUSTSEC-2026-0441) is ignored with its path, aws-smithy-http through lance-io.

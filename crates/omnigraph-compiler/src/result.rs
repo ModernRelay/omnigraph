@@ -18,11 +18,61 @@ pub struct MutationExecResult {
 pub struct QueryResult {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
+    ranking: Option<Ranking>,
+}
+
+/// How a ranked read ordered its rows (RFC 0047, "The ranking a read
+/// reports"): the search function its order names, whether the run's
+/// search compared every row it could rank, and the returned columns that
+/// hold the score it ordered by. A read whose order is no search has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ranking {
+    pub by: SearchFunction,
+    /// No row the search admitted and did not return outranks a returned
+    /// row. `bm25` scores every match. A `nearest` search is exhaustive when
+    /// its last attempt searched every partition of the vector index,
+    /// scored every row flat, or returned every row it admitted, and not
+    /// when a probe cap left partitions unsearched. An `rrf()` is exhaustive
+    /// when its `nearest` arms are.
+    pub exhaustive: bool,
+    /// The returned columns that hold the ranking's own score, in return
+    /// order; a column computed from the score is not one.
+    pub score_columns: Vec<String>,
+}
+
+/// The search function a ranked read orders by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchFunction {
+    Nearest,
+    Bm25,
+    Rrf,
+}
+
+impl SearchFunction {
+    /// Whether a larger score ranks first: a `nearest` distance ranks the
+    /// smallest first, a `bm25` or fused score the largest.
+    pub fn descending(self) -> bool {
+        self != Self::Nearest
+    }
 }
 
 impl QueryResult {
     pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
-        Self { schema, batches }
+        Self {
+            schema,
+            batches,
+            ranking: None,
+        }
+    }
+
+    /// This result with the ranking of the run that produced it.
+    pub fn with_ranking(mut self, ranking: Option<Ranking>) -> Self {
+        self.ranking = ranking;
+        self
+    }
+
+    pub fn ranking(&self) -> Option<&Ranking> {
+        self.ranking.as_ref()
     }
 
     pub fn schema(&self) -> &SchemaRef {

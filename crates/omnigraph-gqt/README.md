@@ -55,10 +55,23 @@ for each environment. These two target/storage combinations are implemented.
 With `--store`, direct engine execution opens an existing `file://`, `s3://`
 or `az://` root matching the declared `local-filesystem`, `s3-compatible` or
 `azure-blob-storage` backend. It skips initialization, seed loading and
-automatic index building; ordinary steps may change the supplied store.
-`--store` refuses files with schema and seed, DST and server targets, seams,
-and concurrent blocks. Direct-engine memory storage and cloud fixture
-initialization fail admission explicitly.
+automatic index building; ordinary steps may change the supplied store, and
+seams and concurrent blocks are refused there. An `omnigraph-engine-dst`
+environment takes `--store` with a `file://` root instead: the in-memory
+environment reads through to the root below the measure ledger and the seams
+(both the Lance store and the engine's control adapter), so a read of an
+object the root holds is one counted request and nothing is copied; the graph
+is opened there, and the case's steps, seams and concurrent blocks run on that
+view. Every write of the run stays in memory, and a delete masks the root's
+object for the rest of the run: the root is never written, since the store
+that reads it has no write path. A symlink anywhere under the root refuses
+the run by name, so nothing outside the root is ever read; a foreign file
+(a stray dotfile, say) is ignored. Each run of the replay pair starts from the
+root again, and the report's observations name the root; a saved report of
+such a run still does not replay, since the root is not frozen by the report.
+`--store` refuses files with schema and seed and server targets everywhere.
+Direct-engine memory storage and cloud fixture initialization fail admission
+explicitly.
 
 With `--server <URL> --graph <ID>` (plus `--token <TOKEN>` on a
 token-protected deployment), the declared `omnigraph-server` environments run
@@ -192,6 +205,11 @@ load csv "person.csv" into node:Person mode append delimiter "|" header
 A `--- expect plan` section directly after a `load csv` step's `--- expect ok`
 pins the load's planner document and executed report, read from the load's
 receipt ([explaining a load statement](../../docs/user/queries/explain-load.md)).
+The same section after a mutate step's `--- expect ok|affected` or a
+`branch merge` step's expect pins the write's `Validate` nodes, one planner
+document per table the write validated, read from the mutation's or the
+merge's receipt; a fact holds when any of those documents holds it, and the
+`executed` forms have no document to hold them.
 Each line is one fact; a fact the section does not mention is unchecked, as
 for a query plan. The forms: `load route: <plan|pipeline>` (the document's
 `engine` or `executor` route); `load scan: partitions <n> fallback
@@ -199,7 +217,8 @@ single_scan`; `load validate value <table> [a, b]`; `load validate unique
 <table> <key|unique> [a, b]: access <delta|probe|scan>`; `load validate
 edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`; `load validate
 cardinality <edge> <from|to> <Node>`; `load validate retained_edges <node>
-<edge> <from|to>: access <delta|probe|scan>`; `load write: <overwrite fragments|append strict_insert|
+<edge> <from|to>: access <delta|probe|scan>`; `load validate source_cardinality
+<node> <edge>: access <delta|probe|scan>`; `load write: <overwrite fragments|append strict_insert|
 merge upsert>`; `load executed: partitions <n> rows <m>`. The validate lines
 are the one `Validate` node's checks. Tables are qualified (`node:Person`, `edge:Knows`);
 an endpoint's referenced type is bare. A served environment refuses the
@@ -240,7 +259,8 @@ The schema declares the types and keys. A load requires `mode: append` or
 `mode: merge`; `branch:` defaults to `main` and must already exist. Its expect
 is `ok` or `error: <substring>`, with no params, affected-count, row or shape
 section. Table batches publish independently; a later failure does not undo
-earlier batches. A load in a loop repeats its unchanged recipe. Interpolation
+earlier batches. A node batch therefore carries no edges, and a node type that
+is the source of an edge type with a non-zero `@card` minimum refuses it. A load in a loop repeats its unchanged recipe. Interpolation
 in generator bodies and headers is refused. Seed headers require an explicit
 unsigned 64-bit seed and `generate: v1`; load headers additionally require a
 mode. A load requires at least one nonempty batch; empty recipes are admitted
@@ -464,14 +484,22 @@ For replay, session observations and result evidence are grouped in declaration
 order. Each session's event order and values are preserved; completion timing
 does not determine report order.
 
-While a session waits on the script the block drives the paused clock
-itself (RFC 0045 §Concurrent block says why) up to ten virtual seconds past
-the last cursor move or request; past that the clock stands still and the
+Nothing drives the paused clock while a session waits on the script (RFC
+0045 §Concurrent block says why): the runtime idles and tokio moves the
+clock only to the earliest pending timer, never while a task of its own
+blocking pool runs, so a session's work on a foreign thread takes no
+virtual time; Lance's CPU pool is a second runtime the paused clock does
+not see, so a hop onto it that overlaps another session's modeled sleep
+wakes before or after that one jump, a one-tick window Lance owns. A
+timer farther than the block's work fires the moment a session parks with
+nothing nearer pending, so the engine's commits run without Lance's commit
+timeout under simulation (`lance_commit::commit_builder`) and any other
+far timer ends the block as its own timeout, visibly. The
 block fails as starved when neither an entry nor a request arrives for half
-the case's `timeout_ms` of wall time, at most ten seconds, or when a
-session finishes without a request entry of its own. A session blocked in
-the engine while no session waits on the script ends as the case's
-timeout. The example above is the read-during-publish case: on an engine
+the case's `timeout_ms` of wall time, at most ten seconds, read off the
+runtime by a guard thread, or when a session finishes without a request
+entry of its own. A session blocked in the engine while no session waits
+on the script ends as the case's timeout. The example above is the read-during-publish case: on an engine
 whose publish holds the schema gate and the handle's coordinator lock
 across the manifest commit, `r1` waits behind `w1` (at the schema gate,
 before it reaches the coordinator lock) and the block starves at entry 3;
@@ -486,7 +514,23 @@ with its wall times and the count of requests made outside any session are
 in the report's measurements, not the cost table. Under `--measure` each
 session is its own row, labeled by its session label, and the block's own
 row holds the requests made outside any session, so a read's virtual time
-beside a write is a number. Once a block is starved its sessions drain, and
+beside a write is a number. So is its wait: every in-process lock the engine
+takes is a gate whose acquisition crosses the seams `gate.<gate>.acquire`,
+`gate.<gate>.hold` and `gate.<gate>.release`, plus `gate.coordinator_cas.refused`
+for an install that ends without a hold (`table`, `branch`,
+`schema_shared`, `schema_exclusive`, `export`, `coordinator_cas`; the
+engine's `write_queue` module doc §Gates), and a session's `acquire`-to-`hold`
+spans on the virtual clock are summed per gate into `wait.<gate>` ticks, in
+its row's `waiting` column and in the TSV. The clock rule: the virtual clock
+moves only while a request sleeps its cost (or an engine timer its distance),
+so a wait is the modeled cost of what the holder did meanwhile, the same on
+every run of a seed; a wait no request fills reads 0 and a 0 says the clock
+stood still, not that the gate was free; a wait at the front door
+(a read parked at the schema gate before its first request) is in the row
+all the same, since the span starts at the crossing, not at a request. A gate
+seam is a wait event, not a phase: the session's phase stays the last other
+seam it crossed. Outside a block one statement runs on the handle at a time,
+so no `wait.<gate>` row is written there. Once a block is starved its sessions drain, and
 the requests they make from then on are in phase `after_abort`: a starved
 block's rows are the drain, not the interleaving the script named. Store
 requests are the only points an entry can name in this version; seams and
@@ -607,6 +651,12 @@ the header, so a case of a few KiB cuts two or three partitions and pins what
 happens at their boundaries; the header's head range keeps its 64 KiB floor.
 An in-process pin: a server target refuses it.
 
+The optional `# overwrite_chunk_rows: <n>` header sets the rows one `load csv`
+overwrite chunk holds before a Lance writer takes it, Lance's file target
+(1 Mi rows) without the header, so a case of a few hundred records writes
+fragments before its last record is judged and pins what a late refusal leaves
+behind. An in-process pin: a server target refuses it.
+
 An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode
 indexed_scan`, the traversal mode the planner recorded (pass `expand_mode`
@@ -668,6 +718,12 @@ A `load csv` step may carry an `--- expect plan` section directly after its
 `--- expect ok`.
 Its lines are checked against the planner document in the executed load's
 receipt ([Explaining a load statement](../../docs/user/queries/explain-load.md)).
+A mutate step's `--- expect ok|affected` and a `branch merge` step's expect
+may carry the same section: its lines are checked against the write's
+`Validate` documents, one per table the write validated (a JSONL load, a
+mutation, a blob cell or a branch merge plans each table it stages), and a
+line holds when any of them holds it; the `load executed` forms claim a
+report only a `load csv` receipt carries.
 Each line is one fact claim, and a fact no line mentions is unchecked:
 
 ```text
@@ -678,6 +734,7 @@ load validate edge_ri <edge-table> from|to <node-type>: access probe|scan
 load validate edge_ri <edge-table> from|to <node-type>: probe swept|judged
 load validate cardinality <edge-table> from <node-type>
 load validate retained_edges <node-table> <edge-table> from|to: access delta|probe|scan
+load validate source_cardinality <node-table> <edge-table>: access delta|probe|scan
 load validate removal <table>: scan|none
 load write: overwrite fragments
 load write: append strict_insert
@@ -913,6 +970,14 @@ control realm's limits below are the exceptions). Per group it reports:
   share one unit under every model, and the printout shows the parallelism
   achieved (requests per makespan tick) beside the parallelism available
   (requests per span tick);
+- its gate waits, for a concurrent block's session: the engine's six
+  in-process gates cross `gate.<gate>.acquire` and `gate.<gate>.hold`
+  (§Concurrent block), and the session's spans between the two are summed
+  per gate into ticks, printed after `waiting` as `<gate> <ticks>` when
+  above 0 and carried in the TSV as `wait.<gate>` for every gate the session
+  crossed, 0 included (0 means no request moved the clock while it waited,
+  not that it did not wait); schedule-derived like makespan, so in the
+  measurements, never in the `io` evidence row;
 - `sim ms`, the group's virtual time under the latency model, and `u$`, its
   requests at S3 list prices in microdollars (PUT, COPY and LIST 5.0, GET and
   HEAD 0.4, DELETE free).

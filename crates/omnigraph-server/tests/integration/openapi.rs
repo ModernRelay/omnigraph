@@ -1047,6 +1047,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "BranchCreateOutput",
     "BranchCreateRequest",
     "BranchDeleteOutput",
+    "BranchDetailOutput",
     "BranchListOutput",
     "BranchMergeOutcome",
     "BranchMergeOutput",
@@ -1787,6 +1788,7 @@ fn error_code_schema_has_expected_variants() {
         HashSet::from([
             "unauthorized",
             "forbidden",
+            "not_admitted",
             "bad_request",
             "api_contract_mismatch",
             "actor_mismatch",

@@ -36,10 +36,21 @@ selected root. Direct commands resolve a relative assertion against the source
 directory. Server submission requires an absolute assertion or no `storage:`.
 Omitting `storage:` never sends writes to the source directory.
 
-Registered direct targets pin a local filesystem URI. Inline direct targets
-also accept only local paths and `file://` URIs. To operate a cloud-backed
-cluster through the CLI, select a registered server or managed target;
-cloud storage settings and credentials belong to the serving or embedded host.
+Registered direct targets pin a local `file://` URI. Inline direct targets
+accept local paths and `file://` URIs and, with the server stopped, an inline
+`s3://` cluster root for `cluster plan`, `apply`, `status`, `force-unlock` and
+`upgrade-ledger` and for direct maintenance with `--graph` (region from
+`AWS_REGION` or `AWS_DEFAULT_REGION`; see
+[S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
+Every direct writer on the root (`cluster apply`, maintenance) takes the
+cluster's admission lock and keeps it after it finishes; `cluster plan` and
+`cluster status` only observe the lock, and `cluster status --json` reports the
+current holder's `lock_id`. Before the next writer or the server starts,
+establish that the holder has stopped and its I/O has settled, then release
+that exact ID with `cluster force-unlock`. Never release a lock you only
+observed. Every other command and any `az://` address refuses an inline
+cloud target: select a registered server or managed target, whose host holds
+the cloud storage settings and credentials.
 
 ## Direct bootstrap
 
@@ -129,8 +140,7 @@ failure also leaves outcome uncertain, so retain the ID, root and lock.
 For recognized prior ledger formats or obsolete completed-result fields, stop
 all owners and run `cluster upgrade-ledger --target ROOT --writers-stopped`.
 This changes ledger representation only. Finish outstanding work with its
-originating build before upgrading. No legacy executor or automatic migration
-remains. Missing graph roots and schema drift require authoritative repair or
+originating build before upgrading. Missing graph roots and schema drift require authoritative repair or
 backup restoration; apply does not adopt or recreate them.
 
 ## Managed clusters

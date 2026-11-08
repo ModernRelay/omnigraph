@@ -92,35 +92,7 @@ fn failure() -> Failure {
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
-        Ok(_) => Err(failure()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                ensure_directory(parent)?;
-            }
-            match std::fs::create_dir(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return Err(failure()),
-            }
-            let metadata = std::fs::symlink_metadata(path).map_err(|_| failure())?;
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(failure());
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-                    .map_err(|_| failure())?;
-            }
-            if let Some(parent) = path.parent() {
-                crate::sync_dir(parent).map_err(|_| failure())?;
-            }
-            Ok(())
-        }
-        Err(_) => Err(failure()),
-    }
+    crate::managed::custody::ensure_directory(path).map_err(|_| failure())
 }
 
 pub(super) fn directory(
@@ -208,66 +180,22 @@ fn verify_retired_custody(source: &Path, home: &Path) -> Result<()> {
     Ok(())
 }
 
-fn open(path: &Path, write: bool) -> Result<File> {
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(write)
-        .create(write)
-        .truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .mode(0o600);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x0020_0000);
-    }
-    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink() || !m.is_file()) {
-        return Err(failure());
-    }
-    let file = options.open(path).map_err(|_| failure())?;
-    if !file.metadata().map_err(|_| failure())?.is_file() {
-        return Err(failure());
-    }
-    Ok(file)
-}
-
 fn read<T: serde::de::DeserializeOwned>(dir: &Path, name: &str) -> Result<Option<T>> {
-    let path = dir.join(name);
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(failure()),
-        Ok(_) => {}
-    }
-    let mut bytes = Vec::new();
-    open(&path, false)?
-        .take(MAX_RECORD_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| failure())?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(failure());
-    }
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|_| failure())
+    crate::managed::custody::read(dir, name, MAX_RECORD_BYTES).map_err(|_| failure())
 }
 
 /// One local submission at a time. This is not a cluster or graph-writer fence.
 pub(super) fn lock(dir: &Path) -> Result<File> {
-    ensure_directory(dir)?;
-    let file = open(&dir.join("lifecycle.lock"), true)?;
-    file.try_lock().map_err(|_| {
-        Failure::refused(
-            "lifecycle_submission_busy",
-            "another process is submitting for this account; retry after it returns",
-        )
-    })?;
-    Ok(file)
+    crate::managed::custody::lock(dir, "lifecycle.lock").map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            Failure::refused(
+                "lifecycle_submission_busy",
+                "another process is submitting for this account; retry after it returns",
+            )
+        } else {
+            failure()
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -367,15 +295,7 @@ pub(super) fn prepare(
 }
 
 fn save(dir: &Path, name: &str, value: &impl Serialize) -> Result<()> {
-    let bytes = serde_json::to_vec(value).map_err(|_| failure())?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(failure());
-    }
-    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|_| failure())?;
-    file.write_all(&bytes).map_err(|_| failure())?;
-    file.as_file().sync_all().map_err(|_| failure())?;
-    file.persist(dir.join(name)).map_err(|_| failure())?;
-    crate::sync_dir(dir).map_err(|_| failure())
+    crate::managed::custody::save(dir, name, value, MAX_RECORD_BYTES).map_err(|_| failure())
 }
 
 pub(super) fn record(dir: &Path, request: &Pending, identity: &Identity) -> Result<()> {
@@ -474,7 +394,8 @@ fn legacy(
         Err(_) => return Err(failure()),
         Ok(_) => {
             let mut bytes = Vec::new();
-            open(&path, false)?
+            crate::managed::custody::open(&path, false)
+                .map_err(|_| failure())?
                 .take(16 * 1024 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|_| failure())?;

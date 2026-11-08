@@ -564,7 +564,7 @@ fn dst_sessions_agree_and_replay() {
 #[test]
 #[serial]
 fn dst_maintenance_commit_uses_execution_branch() {
-    for (seed, write, op) in [(228_301, 84, 13), (228_317, 84, 9)] {
+    for (seed, write, op) in [(228_301, 84, 13), (228_317, 95, 9)] {
         let report = run_universe(
             &format!("shared-memory://dst-maintenance-commit-{seed}"),
             &Scenario {
@@ -2003,12 +2003,13 @@ fn dst_setup_crash_waits_for_a_crossed_window() {
 }
 
 /// A recorded setup crash arms its target, so the setup window must be one
-/// that is crossed only once the aftermath exists. In hunt cell seed 2 an
-/// Optimize builds the missing indexes before the first EnsureIndices, which
-/// then has nothing to build: it still crosses the index build's
-/// pre-manifest window, but not `ensure_indices.post_table_effect`, the
-/// setup `setup_crash_for` names, so no setup is recorded and the
-/// dead-staging target stays unarmed.
+/// that is crossed only once the aftermath exists. In hunt cell seed 5 the
+/// first EnsureIndices has nothing to build: it still crosses the index
+/// build's pre-manifest window, but not `ensure_indices.post_table_effect`,
+/// the setup `setup_crash_for` names, so no setup is recorded and the
+/// dead-staging target stays unarmed. An index build also rebuilds an index
+/// whose coverage lags, so a cell whose rows reach an indexed table before
+/// that EnsureIndices has work and is no witness.
 #[cfg(feature = "failpoints")]
 #[test]
 #[serial]
@@ -2020,7 +2021,7 @@ fn dst_setup_crash_needs_its_aftermath() {
             omnigraph::seams::catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.name(),
             0,
         )),
-        ..hunt_window_scenario(2, window, 0)
+        ..hunt_window_scenario(5, window, 0)
     };
     let a = run_universe(
         "shared-memory://dst-setup-aftermath-pre-manifest",
@@ -2034,7 +2035,7 @@ fn dst_setup_crash_needs_its_aftermath() {
         a.reconcile_verdicts
     );
 
-    let named = hunt_window_scenario(2, window, 0);
+    let named = hunt_window_scenario(5, window, 0);
     let a = run_universe("shared-memory://dst-setup-aftermath-a", &named);
     assert_eq!(
         a.crashes, 0,
@@ -2604,6 +2605,508 @@ fn merge_history_cost_rows(replay: &str) -> String {
         ));
     }
     rows
+}
+
+/// The cost of a one-row update after `commits` one-row inserts, each on a
+/// reopened handle, before and after `optimize`. Every insert lands as its
+/// own fragment; the update's key filter reads every fragment until
+/// compaction folds them (autoresearch branch-ops, 2026-11-02).
+#[test]
+#[ignore = "instrument: prints a one-row update's storage calls over per-commit fragments, before and after optimize"]
+#[serial]
+fn instrument_filtered_update_cost_over_per_commit_fragments() {
+    struct FragmentedUpdate {
+        commits: i64,
+    }
+
+    impl FragmentedUpdate {
+        async fn reopen(db: Session, resources: &omnigraph_dst::memory::MemoryStorage) -> Session {
+            let detached = db.detach();
+            detached.attach(Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ))
+        }
+
+        async fn set_age(db: &Session, age: i64) {
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for FragmentedUpdate {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            for commit in 0..self.commits {
+                db.mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", &format!("h{commit:05}"))], &[("$age", commit)]),
+                )
+                .await
+                .unwrap();
+            }
+            let db = Self::reopen(db, resources).await;
+            omnigraph_dst::cost::set_label("UpdateColdBeforeOptimize");
+            Self::set_age(&db, 40).await;
+            omnigraph_dst::cost::set_label("UpdateWarmBeforeOptimize");
+            Self::set_age(&db, 41).await;
+            omnigraph_dst::cost::set_label("_optimize");
+            db.optimize().await.unwrap();
+            let db = Self::reopen(db, resources).await;
+            omnigraph_dst::cost::set_label("UpdateColdAfterOptimize");
+            Self::set_age(&db, 42).await;
+            omnigraph_dst::cost::set_label("UpdateWarmAfterOptimize");
+            Self::set_age(&db, 43).await;
+            omnigraph_dst::cost::set_label("_verify");
+        }
+    }
+
+    for commits in [32, 256] {
+        let rows = labeled_cost_rows_of(
+            format!("shared-memory://dst-fragmented-update-{commits}"),
+            &FragmentedUpdate { commits },
+            &[
+                "UpdateColdBeforeOptimize",
+                "UpdateWarmBeforeOptimize",
+                "UpdateColdAfterOptimize",
+                "UpdateWarmAfterOptimize",
+            ],
+        );
+        println!("commits={commits}\n{rows}");
+    }
+}
+
+/// A keyed lookup and a one-hop traversal on main, in the order a served
+/// graph meets them: a freshly opened handle's first read, then warm repeats,
+/// then a read after another handle published a commit (the stale path). The
+/// graph carries `commits` small update commits on main before the reopen.
+const WARM_READ_QUERIES: &str = r#"
+query get_person($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name, $p.age }
+}
+
+query friends_of($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $q
+    }
+    return { $q.name }
+}
+"#;
+
+/// The labels one [`WarmReadCost`] run measures, in order.
+fn warm_read_labels(commits: u64) -> Vec<String> {
+    [
+        "ReadOpen",
+        "ReadColdLookup",
+        "ReadWarmLookup",
+        "ReadColdHop",
+        "ReadWarmHop",
+        "ReadStaleLookup",
+        "ReadStaleHop",
+    ]
+    .iter()
+    .map(|label| format!("{label}History{commits}"))
+    .collect()
+}
+
+struct WarmReadCost {
+    commits: u64,
+}
+
+impl WarmReadCost {
+    async fn lookup(db: &Session) -> serde_json::Value {
+        db.query(
+            omnigraph::db::ReadTarget::branch("main"),
+            WARM_READ_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap()
+        .to_rust_json()
+        .unwrap()
+    }
+
+    async fn hop(db: &Session) -> serde_json::Value {
+        db.query(
+            omnigraph::db::ReadTarget::branch("main"),
+            WARM_READ_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap()
+        .to_rust_json()
+        .unwrap()
+    }
+}
+
+impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for WarmReadCost {
+    type Output = ();
+
+    async fn run(&self, resources: &mut omnigraph_dst::memory::MemoryStorage, _workload_seed: u64) {
+        let labels = warm_read_labels(self.commits);
+        omnigraph_dst::cost::set_label("_read_setup");
+        let writer = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        writer
+            .load_jsonl(TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        for revision in 0..self.commits {
+            writer
+                .mutate(
+                    "main",
+                    MUTATION_QUERIES,
+                    "set_age",
+                    &mixed_params(
+                        &[("$name", "Bob")],
+                        &[("$age", 26 + i64::try_from(revision % 2).unwrap())],
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        omnigraph_dst::cost::set_label(&labels[0]);
+        let reader = Session::from_defaults(
+            Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ),
+            SessionSettings::default(),
+        );
+        omnigraph_dst::cost::set_label(&labels[1]);
+        let cold_lookup = Self::lookup(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[2]);
+        let warm_lookup = Self::lookup(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[3]);
+        let cold_hop = Self::hop(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[4]);
+        let warm_hop = Self::hop(&reader).await;
+        omnigraph_dst::cost::set_label("_read_external_commit");
+        writer
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "set_age",
+                &mixed_params(&[("$name", "Bob")], &[("$age", 40)]),
+            )
+            .await
+            .unwrap();
+        omnigraph_dst::cost::set_label(&labels[5]);
+        let stale_lookup = Self::lookup(&reader).await;
+        omnigraph_dst::cost::set_label(&labels[6]);
+        let stale_hop = Self::hop(&reader).await;
+        omnigraph_dst::cost::set_label("_read_verify");
+        let alice = serde_json::json!([{"p.name": "Alice", "p.age": 30}]);
+        for rows in [&cold_lookup, &warm_lookup, &stale_lookup] {
+            assert_eq!(rows, &alice);
+        }
+        for rows in [&cold_hop, &warm_hop, &stale_hop] {
+            let mut names = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["q.name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(names, ["Bob", "Charlie"]);
+        }
+        // The reader observes the external commit (no stale serve).
+        let bob = reader
+            .query(
+                omnigraph::db::ReadTarget::branch("main"),
+                WARM_READ_QUERIES,
+                "get_person",
+                &params(&[("$name", "Bob")]),
+            )
+            .await
+            .unwrap()
+            .to_rust_json()
+            .unwrap();
+        assert_eq!(bob, serde_json::json!([{"p.name": "Bob", "p.age": 40}]));
+    }
+}
+
+/// The warm-read rows at two history depths: equal rows across the two show
+/// that read cost is flat in commit history.
+fn warm_read_cost_rows(replay: &str) -> String {
+    let mut rows = String::new();
+    for commits in [2, 32] {
+        let labels = warm_read_labels(commits);
+        let labels = labels.iter().map(String::as_str).collect::<Vec<_>>();
+        rows.push_str(&labeled_cost_rows_of(
+            format!("shared-memory://dst-warm-read-cost-{replay}-{commits}"),
+            &WarmReadCost { commits },
+            &labels,
+        ));
+    }
+    rows
+}
+
+/// A `nearest` read over the vector index the engine builds, on a freshly
+/// opened handle and again on the warm one. Before it uses the index, the scan
+/// reads the column's vector index details (issue #1297, through
+/// `Dataset::load_indices`); these rows pin that this read adds no storage
+/// call beyond what the planner's own index read already made.
+fn nearest_cost_rows(replay: &str) -> String {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(2) @index
+}
+"#;
+    const QUERIES: &str = r#"
+query nearest_docs($q: Vector(2)) {
+    match { $d: Doc }
+    return { $d.slug }
+    order { nearest($d.embedding, $q) }
+    limit 4
+}
+"#;
+    const LABELS: [&str; 3] = ["NearestOpen", "NearestColdIndexed", "NearestWarmIndexed"];
+
+    struct NearestCost;
+
+    impl NearestCost {
+        async fn nearest(db: &Session) -> serde_json::Value {
+            use omnigraph_compiler::query::ast::Literal;
+            let mut params = omnigraph_compiler::ir::ParamMap::new();
+            params.insert(
+                "q".to_string(),
+                Literal::List(vec![Literal::Float(3.0), Literal::Float(1.0)]),
+            );
+            db.query(
+                omnigraph::db::ReadTarget::branch("main"),
+                QUERIES,
+                "nearest_docs",
+                &params,
+            )
+            .await
+            .unwrap()
+            .to_rust_json()
+            .unwrap()
+        }
+
+        /// The rows, with the ANN partitions the scan searched and ranked.
+        async fn nearest_through_index(db: &Session) -> (serde_json::Value, (u64, u64)) {
+            use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+            use std::sync::atomic::Ordering;
+            let probes = QueryIoProbes::default();
+            let rows = with_query_io_probes(probes.clone(), Self::nearest(db)).await;
+            let searched = probes.ann_partitions_searched.load(Ordering::Relaxed);
+            let ranked = probes.ann_partitions_ranked.load(Ordering::Relaxed);
+            (rows, (searched, ranked))
+        }
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for NearestCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_nearest_setup");
+            let writer = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::init_with_storage(
+                        &resources.root,
+                        SCHEMA,
+                        resources.adapter.clone(),
+                        InitOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            let seed = (0..32)
+                .map(|row| {
+                    format!(
+                        r#"{{"type":"Doc","data":{{"slug":"d{row:02}","embedding":[{x:?},{y:?}]}}}}"#,
+                        x = row as f32,
+                        y = (row % 5) as f32
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            writer.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+            writer.ensure_indices().await.unwrap();
+            omnigraph_dst::cost::set_label(LABELS[0]);
+            let reader = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                SessionSettings::default(),
+            );
+            omnigraph_dst::cost::set_label(LABELS[1]);
+            let (cold, cold_partitions) = Self::nearest_through_index(&reader).await;
+            omnigraph_dst::cost::set_label(LABELS[2]);
+            let (warm, warm_partitions) = Self::nearest_through_index(&reader).await;
+            omnigraph_dst::cost::set_label("_nearest_verify");
+            // The labels say "Indexed": keep them true. A flat scan reports no
+            // partition counters, so a planner change that made this read flat
+            // would leave the rows green without measuring the details read.
+            for (label, (searched, ranked)) in
+                [(LABELS[1], cold_partitions), (LABELS[2], warm_partitions)]
+            {
+                assert!(
+                    searched > 0 && ranked > 0,
+                    "{label} must scan through the vector index: \
+                     {searched} of {ranked} partitions searched"
+                );
+            }
+            assert_eq!(cold, warm);
+            assert_eq!(
+                cold.as_array().unwrap().len(),
+                4,
+                "the four nearest docs: {cold}"
+            );
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-nearest-cost-{replay}"),
+        &NearestCost,
+        &LABELS,
+    )
+}
+
+/// Where each warm-read call goes: per label, the calls by realm (the
+/// `__manifest` dataset, `__history`, a graph table, or the control-object
+/// adapter), Lance directory and verb, at several history depths. Prints
+/// only; the counts the golden pins come from [`warm_read_cost_rows`].
+#[test]
+#[serial]
+#[ignore = "instrument: warm-read call attribution by realm — run explicitly"]
+fn dst_warm_read_cost_paths() {
+    let _s = omnigraph::seams::FailScenario::setup();
+    let depths = std::env::var("WARM_READ_DEPTHS")
+        .unwrap_or_else(|_| "0,2,32,128".to_string())
+        .split(',')
+        .map(|d| d.trim().parse::<u64>().unwrap())
+        .collect::<Vec<_>>();
+    for commits in depths {
+        omnigraph_dst::lance_faults::install();
+        let environment = omnigraph_dst::memory::MemoryEnvironment::new(
+            format!("shared-memory://dst-warm-read-paths-{commits}"),
+            24_901,
+            omnigraph_dst::UniverseProcess::Shared,
+        );
+        let ledger = omnigraph_dst::cost::arm_with_paths();
+        let run = omnigraph_dst::run_universe(&environment, &WarmReadCost { commits });
+        let log = ledger.path_log();
+        omnigraph_dst::cost::disarm();
+        run.cleanup.unwrap().unwrap();
+        run.result.unwrap().unwrap();
+        let verbose = std::env::var("WARM_READ_VERBOSE").is_ok();
+        for label in warm_read_labels(commits) {
+            let mut classes = std::collections::BTreeMap::<String, u64>::new();
+            let mut total = 0;
+            for (row_label, verb, path) in &log {
+                if *row_label != label {
+                    continue;
+                }
+                total += 1;
+                let class = warm_read_class(verb, path);
+                if verbose {
+                    println!("  {label} {class} {path}");
+                }
+                *classes.entry(class).or_default() += 1;
+            }
+            let classes = classes
+                .iter()
+                .map(|(class, n)| format!("{class}={n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{label:<30} total={total:<4} {classes}");
+        }
+    }
+}
+
+/// `<realm>_<kind>.<verb>` for one logged call, in the GQT measure
+/// vocabulary: realm `manifest` (`__manifest`, a branch tree included),
+/// `history` (`__history`), `table` (a graph table) or `control` (the
+/// adapter); kind the Lance directory.
+fn warm_read_class(verb: &str, path: &str) -> String {
+    let (path, verb) = match path.strip_suffix("#head") {
+        Some(path) => (path, "head".to_string()),
+        None => (
+            path.split('#').next().unwrap(),
+            verb.split('.').nth(1).unwrap().to_string(),
+        ),
+    };
+    if verb_is_control(path) {
+        return format!("control.{verb}");
+    }
+    let realm = if path.contains("__manifest") {
+        "manifest"
+    } else if path.contains("__history") {
+        "history"
+    } else {
+        "table"
+    };
+    let kind = [
+        "_versions",
+        "data",
+        "_transactions",
+        "_deletions",
+        "_indices",
+        "_refs",
+    ]
+    .iter()
+    .find(|kind| path.contains(&format!("/{kind}/")) || path.ends_with(&format!("/{kind}")))
+    .copied()
+    .unwrap_or("other");
+    format!("{realm}_{kind}.{verb}")
+}
+
+fn verb_is_control(path: &str) -> bool {
+    path.starts_with("shared-memory://")
 }
 
 fn labeled_cost_rows<S>(root: String, scenario: &S, label: &str) -> String
@@ -3339,6 +3842,8 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&writer_buffer_cost_rows("a"));
     table.push_str(&overwrite_removal_cost_rows("a"));
     table.push_str(&endpoint_probe_cost_rows("a"));
+    table.push_str(&warm_read_cost_rows("a"));
+    table.push_str(&nearest_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -3350,6 +3855,8 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&writer_buffer_cost_rows("b"));
     table2.push_str(&overwrite_removal_cost_rows("b"));
     table2.push_str(&endpoint_probe_cost_rows("b"));
+    table2.push_str(&warm_read_cost_rows("b"));
+    table2.push_str(&nearest_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"
@@ -6838,13 +7345,16 @@ async fn dst_publication_requests_get_a_definite_outcome_issue_1067() {
 /// at a seeded moment that can fall before, during or after a successor's
 /// watch. A beat that lands during the watch sends the successor away, which
 /// is the safe direction; the successor that claims the lock does so only
-/// after a lease and a half of silence since the last beat it saw; and the
-/// dead owner's beats that land after the claim fence nothing: the
-/// successor keeps renewing, and a third process watching it refuses.
+/// after a lease and a half of silence since the last beat it saw, then
+/// replaces the record by if-match on the version it read; and the dead
+/// owner's beats that land after the claim fence nothing: the successor
+/// keeps renewing, and a third process watching it refuses.
 #[test]
 #[serial]
 fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
-    use omnigraph_cluster::lease_protocol::{LeaseKeeper, Watch, lease_dir, watch_and_claim};
+    use omnigraph_cluster::lease_protocol::{
+        LeaseKeeper, Watch, lease_dir, leased_lock_record, watch_and_claim,
+    };
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -6862,10 +7372,27 @@ fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
             let store: Arc<dyn omnigraph_storage::StorageAdapter> =
                 Arc::new(omnigraph_storage::ObjectStorageAdapter::in_memory());
             let root = "cluster";
-            let owner =
-                LeaseKeeper::start(store.clone(), root, "owner", SECONDS, Instant::now(), None)
-                    .await
-                    .expect("the owner's first beat lands");
+            let lock_uri = format!("{root}/{}", omnigraph_cluster::CLUSTER_LOCK_FILE);
+            let lock_sent = Instant::now();
+            store
+                .write_text(&lock_uri, &leased_lock_record("owner", SECONDS))
+                .await
+                .unwrap();
+            let (_, version) = store
+                .read_text_versioned(&lock_uri)
+                .await
+                .expect("the owner's record is visible");
+            let owner = LeaseKeeper::start(
+                store.clone(),
+                root,
+                &lock_uri,
+                "owner",
+                SECONDS,
+                lock_sent,
+                None,
+            )
+            .await
+            .expect("the owner's first beat lands");
             tokio::time::sleep(Duration::from_millis(rng.below(90_000))).await;
             drop(owner);
             let died = Instant::now();
@@ -6918,12 +7445,26 @@ fn dst_successor_takes_over_a_dead_owners_lease_issue_1067() {
                 "seed {seed}"
             );
 
+            let replaced = Instant::now();
+            assert!(
+                store
+                    .write_text_if_match(
+                        &lock_uri,
+                        &leased_lock_record("successor", SECONDS),
+                        &version
+                    )
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "seed {seed}: the successor's if-match applies"
+            );
             let successor = LeaseKeeper::start(
                 store.clone(),
                 root,
+                &lock_uri,
                 "successor",
                 SECONDS,
-                Instant::now(),
+                replaced,
                 None,
             )
             .await

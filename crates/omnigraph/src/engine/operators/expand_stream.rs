@@ -4,7 +4,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array, builder::StringBuilder};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
@@ -480,22 +480,8 @@ async fn emit_pairs(
         let end = (offset + rows).min(pairs.source_rows.len());
         work.entries::<u32>(end - offset)?;
         let source = UInt32Array::from(pairs.source_rows[offset..end].to_vec());
-        let ids = &pairs.destination_ids[offset..end];
-        let bytes = ids.iter().map(String::len).sum();
-        work.string(bytes)?;
-        let mut destination = StringBuilder::with_capacity(ids.len(), bytes);
-        for id in ids {
-            work.check()?;
-            destination.append_value(id);
-        }
-        let output = align_sources(
-            wide,
-            &source,
-            Arc::new(destination.finish()),
-            &[],
-            schema,
-            &work,
-        )?;
+        let destination = pairs.destination.slice(offset, end - offset);
+        let output = align_sources(wide, &source, destination, &[], schema, &work)?;
         sender.send_bounded(output, work).await?;
     }
     Ok(())

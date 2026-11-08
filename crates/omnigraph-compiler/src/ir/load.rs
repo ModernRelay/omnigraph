@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::catalog::Catalog;
 use crate::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
 
+use super::write::DeltaClass;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadIR {
     /// The statement as the grammar reads it back.
@@ -102,6 +104,15 @@ pub enum ValidateCheck {
         edge_table: String,
         endpoint: Endpoint,
     },
+    /// A node load's rows counted as sources of `edge_table`, whose `@card`
+    /// minimum is non-zero: each written node's committed edges of the type
+    /// must lie within the bounds, so a node loaded without its edges fails.
+    SourceCardinality {
+        edge_table: String,
+        min: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max: Option<u32>,
+    },
 }
 
 impl ValidateCheck {
@@ -113,6 +124,7 @@ impl ValidateCheck {
             ValidateCheck::EdgeRi { .. } => "edge_ri",
             ValidateCheck::Cardinality { .. } => "cardinality",
             ValidateCheck::RetainedEdges { .. } => "retained_edges",
+            ValidateCheck::SourceCardinality { .. } => "source_cardinality",
         }
     }
 }
@@ -151,21 +163,46 @@ fn mapped_columns(catalog: &Catalog, stmt: &LoadStmt) -> usize {
     }
 }
 
-/// Evaluator order: value, the target's `@key` then `@unique` groups, an
-/// edge's two endpoint references and its `@card`, and for a node overwrite
-/// the retained edges of every incident edge type in name order.
+/// A load's checks: its mode says whether the table is replaced; a load
+/// removes no id of its own.
 fn checks(catalog: &Catalog, target: &LoadTarget, mode: LoadStmtMode) -> Vec<LoadCheck> {
+    let delta = match mode {
+        LoadStmtMode::Overwrite => DeltaClass::Replace,
+        LoadStmtMode::Append => DeltaClass::Insert,
+        LoadStmtMode::Merge => DeltaClass::Upsert,
+    };
+    checks_for(catalog, target, delta, false)
+}
+
+/// The constraints a write judges on one table, in evaluation order, which
+/// is the refusal precedence: value, the target's `@key` then `@unique`
+/// groups, an edge's two endpoint references and its `@card`; for a node,
+/// per incident edge type in name order, the retained edges of a replaced or
+/// delete-touched table and then, when the node is the edge type's source
+/// and its `@card` minimum is non-zero, the written nodes' edge count. A
+/// delta without rows judges only what its removed ids can break: a node's
+/// retained edges, an edge type's `@card` recount.
+pub fn checks_for(
+    catalog: &Catalog,
+    target: &LoadTarget,
+    delta: DeltaClass,
+    deletes: bool,
+) -> Vec<LoadCheck> {
     let table = target.table_key();
-    let overwrite = mode == LoadStmtMode::Overwrite;
-    let mut checks = vec![LoadCheck {
-        check: ValidateCheck::Value {
-            columns: value_columns(catalog, target),
-        },
-        consults: None,
-    }];
+    let replaced = delta.replaces();
+    let rows = delta.has_rows();
+    let mut checks = Vec::new();
+    if rows {
+        checks.push(LoadCheck {
+            check: ValidateCheck::Value {
+                columns: value_columns(catalog, target),
+            },
+            consults: None,
+        });
+    }
     match target {
         LoadTarget::Node(name) => {
-            if let Some(node_type) = catalog.node_types.get(name) {
+            if rows && let Some(node_type) = catalog.node_types.get(name) {
                 let key = node_type.key.as_deref();
                 let subsumed = |columns: &Vec<String>| key == Some(columns.as_slice());
                 unique_checks(
@@ -173,29 +210,38 @@ fn checks(catalog: &Catalog, target: &LoadTarget, mode: LoadStmtMode) -> Vec<Loa
                     key,
                     node_type.unique_constraints.iter().filter(|c| !subsumed(c)),
                     &table,
-                    overwrite,
+                    replaced,
                 );
-            }
-            if !overwrite {
-                return checks;
             }
             let mut edge_types: Vec<_> = catalog.edge_types.iter().collect();
             edge_types.sort_by(|a, b| a.0.cmp(b.0));
             for (edge_name, edge_type) in edge_types {
                 let edge_table = format!("edge:{edge_name}");
-                for (endpoint, node_type) in [
-                    (Endpoint::From, &edge_type.from_type),
-                    (Endpoint::To, &edge_type.to_type),
-                ] {
-                    if node_type != name {
-                        continue;
+                if replaced || deletes {
+                    for (endpoint, node_type) in [
+                        (Endpoint::From, &edge_type.from_type),
+                        (Endpoint::To, &edge_type.to_type),
+                    ] {
+                        if node_type != name {
+                            continue;
+                        }
+                        checks.push(LoadCheck {
+                            check: ValidateCheck::RetainedEdges {
+                                edge_table: edge_table.clone(),
+                                endpoint,
+                            },
+                            consults: Some(edge_table.clone()),
+                        });
                     }
+                }
+                if rows && &edge_type.from_type == name && edge_type.cardinality.min > 0 {
                     checks.push(LoadCheck {
-                        check: ValidateCheck::RetainedEdges {
+                        check: ValidateCheck::SourceCardinality {
                             edge_table: edge_table.clone(),
-                            endpoint,
+                            min: edge_type.cardinality.min,
+                            max: edge_type.cardinality.max,
                         },
-                        consults: Some(edge_table.clone()),
+                        consults: Some(edge_table),
                     });
                 }
             }
@@ -204,28 +250,30 @@ fn checks(catalog: &Catalog, target: &LoadTarget, mode: LoadStmtMode) -> Vec<Loa
             let Some(edge_type) = catalog.edge_types.get(name) else {
                 return checks;
             };
-            let subsumed =
-                |columns: &Vec<String>| same_column_set(edge_type.key.as_deref(), columns);
-            unique_checks(
-                &mut checks,
-                edge_type.key.as_deref(),
-                edge_type.unique_constraints.iter().filter(|c| !subsumed(c)),
-                &table,
-                overwrite,
-            );
-            for (endpoint, node_type) in [
-                (Endpoint::From, &edge_type.from_type),
-                (Endpoint::To, &edge_type.to_type),
-            ] {
-                checks.push(LoadCheck {
-                    check: ValidateCheck::EdgeRi {
-                        endpoint,
-                        node_type: node_type.clone(),
-                    },
-                    consults: Some(format!("node:{node_type}")),
-                });
+            if rows {
+                let subsumed =
+                    |columns: &Vec<String>| same_column_set(edge_type.key.as_deref(), columns);
+                unique_checks(
+                    &mut checks,
+                    edge_type.key.as_deref(),
+                    edge_type.unique_constraints.iter().filter(|c| !subsumed(c)),
+                    &table,
+                    replaced,
+                );
+                for (endpoint, node_type) in [
+                    (Endpoint::From, &edge_type.from_type),
+                    (Endpoint::To, &edge_type.to_type),
+                ] {
+                    checks.push(LoadCheck {
+                        check: ValidateCheck::EdgeRi {
+                            endpoint,
+                            node_type: node_type.clone(),
+                        },
+                        consults: Some(format!("node:{node_type}")),
+                    });
+                }
             }
-            if !edge_type.cardinality.is_default() {
+            if !edge_type.cardinality.is_default() && (rows || deletes) {
                 checks.push(LoadCheck {
                     check: ValidateCheck::Cardinality {
                         endpoint: Endpoint::From,

@@ -44,18 +44,8 @@ claim, not a restart or recovery path; see
 
 ### Logs
 
-The server logs to standard output at `info` unless `RUST_LOG` sets other
-levels. `omnigraph_server::init_tracing()` limits three dependency targets, and
-their `::` children, to warnings and errors even with `RUST_LOG=trace`: `rmcp`,
-whose verbose SDK logs contain query arguments and results, and Lance's
-`lance::dataset_events` and `lance::file_audit`, which at `info` name every
-table's full storage URI, every file Lance creates or deletes, and each delete
-predicate with its entity IDs. Other targets keep their configured levels.
-Embedders using their own subscriber must enforce the same filter.
-
-A failed Blob delivery, change-route request or streamed response is logged by
-its error class, never by its message; see
-[HTTP errors](troubleshooting.md#http-errors).
+Use [server logs and traces](observability.md) for JSON logging, optional OTLP
+export and correlation with incoming W3C trace context.
 
 ## HTTP contract
 
@@ -106,8 +96,8 @@ Choose one static token source:
 
 Send `Authorization: Bearer secret-a` (the scheme is case-insensitive). The token selects the
 actor for authorization and commit attribution; clients cannot claim another actor. See
-[Authorization and actors](policy.md). Every 401 carries a `WWW-Authenticate: Bearer` challenge,
-with `error="invalid_token"` when the server refused the token sent.
+[Authorization and actors](policy.md). Every 401 carries a `WWW-Authenticate: Bearer` challenge, with `error="invalid_token"` when
+the server refused the token sent; a valid OIDC token it does not admit gets 403 ([MCP](mcp.md)).
 
 A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
@@ -231,7 +221,7 @@ describes sign-in, which resource identifier to choose, and the endpoint's tools
 | `/graphs/{graph_id}/queries` | List and invoke stored queries, including conditional mutations |
 | `/graphs/{graph_id}/load`, `/load/ndjson` | Bounded batch loading |
 | `/graphs/{graph_id}/blob` | GET/HEAD one Blob cell; PUT/DELETE to replace or clear it |
-| `/graphs/{graph_id}/branches` | Branch management and merge, a merge dry run (`dry_run: true`), a branch's diff against its merge base (`GET /branches/diff`) and that merge base (`GET /branches/merge-base`) |
+| `/graphs/{graph_id}/branches` | Branch management and merge, a detailed listing (`GET /branches?detailed=true`), a merge dry run (`dry_run: true`), a branch's diff against its merge base (`GET /branches/diff`) and that merge base (`GET /branches/merge-base`) |
 | `/graphs/{graph_id}/snapshot`, `/commits` | Snapshot (`internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version), history (paged with `limit` and `page_token`), per-commit changes, and the unpublished commits of a branch (`GET /commits?listing=unpublished`, `POST /commits/{commit_id}/publish`, `DELETE /commits/{commit_id}`) |
 | `/graphs/{graph_id}/changes`, `/diff` | Poll a branch feed, establish a baseline, or diff two points (branches or commit ids) |
 | `/graphs/{graph_id}/schema` | Show the accepted schema |

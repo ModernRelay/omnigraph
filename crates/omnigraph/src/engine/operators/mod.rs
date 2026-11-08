@@ -39,6 +39,7 @@ mod fragment_sink;
 mod hash_join;
 mod hydrate;
 mod limit;
+mod load_budget;
 pub(in crate::engine) mod memory;
 mod metadata_count;
 mod pair_buffer;
@@ -74,7 +75,7 @@ use scan::{Filled, Needles};
 pub(super) use scan::{RuntimeFilterSlot, ScanExec, ScanSource};
 pub(super) use sort::{SortExec, SortKey};
 pub(crate) use subquery_aggregate::RowCountPredicate;
-pub(super) use validate::{LoadJudge, ValidateExec};
+pub(super) use validate::ValidateExec;
 
 /// The `switch` gauge: the slot of the [`Switch`] side an operator with a
 /// declared switch took, 0 until it took one.

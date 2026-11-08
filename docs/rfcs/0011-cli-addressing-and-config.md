@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - OmniGraph maintainers
 created: 2026-06-14
-updated: 2026-10-20
+updated: 2026-10-29
 discussion: null
 supersedes: ["0010"]
 superseded_by: []
@@ -790,3 +790,11 @@ duplicated here.
 - 2026-10-05: `schema apply` is direct-only; the unused served schema-apply
   route is removed. Served changes use cluster deployment. Decision 10 and
   the capability taxonomy now reflect that boundary.
+
+- 2026-10-29: Pending amendment. [Remote optimize through the serving
+  owner](2026-10-29-remote-optimize-through-the-serving-owner.md), a draft, executes a served root's
+  `optimize` in the serving owner rather than an out-of-band worker. Once it
+  is accepted, Decision 11's "Runs out-of-band … never inline in serving"
+  gives way for `optimize` only; `cleanup` and `repair` are unchanged, and the
+  worker remains the later offload shape. Decision 11 stands unchanged until
+  acceptance.

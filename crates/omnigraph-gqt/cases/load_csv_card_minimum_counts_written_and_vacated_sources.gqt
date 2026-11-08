@@ -1,0 +1,115 @@
+# issue: none
+# notes: `load csv` judges a non-zero @card minimum from both sides. A node load counts each written
+# notes: node's committed edges, the `source_cardinality` check; a load csv cannot give a new node an
+# notes: edge, so a new node is refused in every mode, while loads of nodes that keep their committed
+# notes: edges are admitted. An edge overwrite recounts the sources of the edges it removes, although
+# notes: the overwritten table's committed view is empty.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0]
+
+--- schema
+node Person {
+    name: String @key
+    title: String?
+}
+node Company {
+    name: String @key
+}
+edge WorksAt: Person -> Company @card(1..)
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"bob"}}
+{"type":"Company","data":{"name":"acme"}}
+{"edge":"WorksAt","from":"alice","to":"acme","data":{}}
+{"edge":"WorksAt","from":"bob","to":"acme","data":{}}
+
+--- csv new_person.csv
+name,title
+carol,cfo
+
+--- mutate
+load csv "new_person.csv" into node:Person mode append header
+
+--- expect error: @card violation on edge WorksAt: source 'carol' has 0 edges (min 1)
+
+--- mutate
+load csv "new_person.csv" into node:Person mode merge header
+
+--- expect error: @card violation on edge WorksAt: source 'carol' has 0 edges (min 1)
+
+--- csv everyone_and_carol.csv
+name,title
+alice,cto
+bob,
+carol,cfo
+
+--- mutate
+load csv "everyone_and_carol.csv" into node:Person mode overwrite header
+
+--- expect error: @card violation on edge WorksAt: source 'carol' has 0 edges (min 1)
+
+--- csv retitle.csv
+name,title
+alice,cto
+
+--- mutate
+load csv "retitle.csv" into node:Person mode merge header
+
+--- expect ok
+
+--- expect plan
+load route: pipeline
+load validate source_cardinality node:Person edge:WorksAt: access probe
+load write: merge upsert
+
+--- csv everyone.csv
+name,title
+alice,cto
+bob,
+
+--- mutate
+load csv "everyone.csv" into node:Person mode overwrite header
+
+--- expect ok
+
+--- expect plan
+load route: plan
+load validate retained_edges node:Person edge:WorksAt from: access probe
+load validate source_cardinality node:Person edge:WorksAt: access probe
+load write: overwrite fragments
+
+--- csv bob_only.csv
+from,to
+bob,acme
+
+--- mutate
+load csv "bob_only.csv" into edge:WorksAt mode overwrite header
+
+--- expect error: @card violation on edge WorksAt: source 'alice' has 0 edges (min 1)
+
+--- query
+query employment() {
+    match {
+        $p: Person
+        $c: Company
+        $p worksAt $c
+    }
+    return { $p.name, $p.title, $c.name }
+}
+
+--- expect unordered
+{"p.name": "alice", "p.title": "cto", "c.name": "acme"}
+{"p.name": "bob", "c.name": "acme"}
+
+--- expect shape
+p.name: String
+p.title: String?
+c.name: String

@@ -441,7 +441,8 @@ async fn merge_load_edge_src_move_rechecks_vacated_src_cardinality() {
     let seed = r#"{"type":"Person","data":{"name":"Alice"}}
 {"type":"Person","data":{"name":"Bob"}}
 {"type":"Company","data":{"name":"Acme"}}
-{"edge":"WorksAt","id":"E1","from":"Alice","to":"Acme","data":{}}"#;
+{"edge":"WorksAt","id":"E1","from":"Alice","to":"Acme","data":{}}
+{"edge":"WorksAt","id":"E2","from":"Bob","to":"Acme","data":{}}"#;
     let (_dir, db) = init_with(CARD_MIN_SCHEMA, seed).await;
 
     let err = db
@@ -512,6 +513,165 @@ async fn mutation_delete_edge_below_card_min_rejected() {
         1,
         "the rejected delete must not have removed the edge"
     );
+}
+
+/// A non-zero @card minimum counts every source node a load writes, not only
+/// the sources whose edges it touches: Bob arrives with no WorksAt beside
+/// Carol, who arrives with hers, and the load must be refused for Bob. Before
+/// the fix only the sources of delta edges (Carol) were counted, so Bob
+/// published below the minimum.
+#[tokio::test]
+async fn jsonl_load_refuses_a_source_node_without_its_required_edge() {
+    let seed = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"edge":"WorksAt","id":"E1","from":"Alice","to":"Acme","data":{}}"#;
+    let (_dir, db) = init_with(CARD_MIN_SCHEMA, seed).await;
+
+    for mode in [LoadMode::Append, LoadMode::Merge] {
+        let err = db
+            .load_jsonl(
+                r#"{"type":"Person","data":{"name":"Bob"}}
+{"type":"Person","data":{"name":"Carol"}}
+{"edge":"WorksAt","id":"E3","from":"Carol","to":"Acme","data":{}}"#,
+                mode,
+            )
+            .await
+            .expect_err("Bob is written with no WorksAt, below @card(1..)");
+        assert_eq!(
+            err.to_string(),
+            "@card violation on edge WorksAt: source 'Bob' has 0 edges (min 1)",
+            "{mode:?}"
+        );
+    }
+    // A load of the node alone is refused the same way.
+    let err = db
+        .load_jsonl(
+            r#"{"type":"Person","data":{"name":"Bob"}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .expect_err("a source node loaded without its edges is below @card(1..)");
+    assert!(
+        err.to_string().contains("source 'Bob' has 0 edges (min 1)"),
+        "got: {err}"
+    );
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        1,
+        "no refused row was published"
+    );
+    assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
+
+    // The same node with its edge in the same load is admitted, and a re-upsert
+    // of a node that keeps its committed edge passes.
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"name":"Bob"}}
+{"edge":"WorksAt","id":"E2","from":"Bob","to":"Acme","data":{}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .expect("a source node and its required edge in one load meet @card(1..)");
+    db.load_jsonl(
+        r#"{"type":"Person","data":{"name":"Alice"}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("Alice keeps her committed WorksAt");
+    assert_eq!(count_rows(&db, "node:Person").await, 2);
+    assert_eq!(count_rows(&db, "edge:WorksAt").await, 2);
+}
+
+/// A write that counts more sources than one committed probe filters (8,192)
+/// counts them chunk by chunk. A node-table overwrite writes every row of its
+/// image, uncapped by the keyed-write row limit: 9,000 people who keep their
+/// committed WorksAt reload without a refusal, which needs the sources of the
+/// second chunk counted, and the same image with one more person who has none
+/// is refused for that person, who sorts into the second chunk.
+#[tokio::test]
+async fn card_minimum_counts_written_sources_across_probe_chunks() {
+    let people: Vec<String> = (0..9_000)
+        .map(|i| format!(r#"{{"type":"Person","data":{{"name":"p{i:05}"}}}}"#))
+        .collect();
+    let mut seed = vec![r#"{"type":"Company","data":{"name":"Acme"}}"#.to_string()];
+    seed.extend(people.iter().cloned());
+    seed.extend(
+        (0..9_000)
+            .map(|i| format!(r#"{{"edge":"WorksAt","from":"p{i:05}","to":"Acme","data":{{}}}}"#)),
+    );
+    let (_dir, db) = init_with(CARD_MIN_SCHEMA, &seed.join("\n")).await;
+
+    let mut reload = people.clone();
+    reload.push(r#"{"type":"Person","data":{"name":"p99999"}}"#.to_string());
+    let err = db
+        .load_jsonl(&reload.join("\n"), LoadMode::Overwrite)
+        .await
+        .expect_err("p99999 is written with no WorksAt");
+    assert_eq!(
+        err.to_string(),
+        "@card violation on edge WorksAt: source 'p99999' has 0 edges (min 1)"
+    );
+    db.load_jsonl(&people.join("\n"), LoadMode::Overwrite)
+        .await
+        .expect("every reloaded person keeps a committed WorksAt");
+    assert_eq!(count_rows(&db, "node:Person").await, 9_000);
+}
+
+/// An edge-table overwrite removes every committed edge its batch omits, so
+/// it must recount the sources those edges leave. Overwriting WorksAt with
+/// Bob's edge alone drops Alice to zero, below @card(1..). The overwritten
+/// table's committed view is empty, so before the fix the removed edges'
+/// sources were never read and Alice's underflow published.
+#[tokio::test]
+async fn jsonl_edge_overwrite_recounts_the_sources_it_empties() {
+    let seed = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"type":"Company","data":{"name":"Beta"}}
+{"edge":"WorksAt","id":"E1","from":"Alice","to":"Acme","data":{}}
+{"edge":"WorksAt","id":"E2","from":"Bob","to":"Acme","data":{}}"#;
+    let (_dir, db) = init_with(CARD_MIN_SCHEMA, seed).await;
+
+    // E1 omitted: a removal.
+    let err = db
+        .load_jsonl(
+            r#"{"edge":"WorksAt","id":"E2","from":"Bob","to":"Acme","data":{}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .expect_err("the overwrite removes Alice's only WorksAt");
+    assert!(
+        err.to_string()
+            .contains("source 'Alice' has 0 edges (min 1)"),
+        "got: {err}"
+    );
+    // E1 kept but moved to Bob: a re-placement.
+    let err = db
+        .load_jsonl(
+            r#"{"edge":"WorksAt","id":"E1","from":"Bob","to":"Beta","data":{}}
+{"edge":"WorksAt","id":"E2","from":"Bob","to":"Acme","data":{}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .expect_err("the overwrite moves Alice's only WorksAt to Bob");
+    assert!(
+        err.to_string()
+            .contains("source 'Alice' has 0 edges (min 1)"),
+        "got: {err}"
+    );
+    assert_eq!(
+        count_rows(&db, "edge:WorksAt").await,
+        2,
+        "the refused overwrites must not have replaced the edges"
+    );
+
+    db.load_jsonl(
+        r#"{"edge":"WorksAt","id":"E3","from":"Alice","to":"Beta","data":{}}
+{"edge":"WorksAt","id":"E2","from":"Bob","to":"Acme","data":{}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .expect("an overwrite that leaves every source an edge meets @card(1..)");
+    assert_eq!(count_rows(&db, "edge:WorksAt").await, 2);
 }
 
 /// A Merge load re-upserting an existing `@key` with its own `@unique` value is

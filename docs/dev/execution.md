@@ -75,7 +75,15 @@ not force a graph-wide scan and a lazy branch may reuse an identical inherited
 table view.
 
 An explicitly bound edge must scan its edge table because topology alone does
-not contain edge properties. It preserves incoming row/rank order and carries a
+not contain edge properties. Every edge probe (`graph.rs::scan_edges_stream`:
+the bound-edge producer, an indexed hop) pushes its `key IN (keys)` list into
+Lance when the key column has usable BTREE coverage, which turns it into
+index lookups, or when the list holds at most 1,024 keys; a longer list over
+an unindexed column is not pushed, because Lance 13 clones the pushed list
+for every fragment it reads (it builds the physical expression once per
+distinct expression), so that scan reads unfiltered and the engine keeps the
+rows whose key is in one set of the keys (one more column read per fragment
+no key is in, which only a long list pays for). It preserves incoming row/rank order and carries a
 deterministic edge tie-break. A correlated block (`not { ... }`,
 `exists { ... }`, `count { ... } > 2`, `sum($d.size) { ... } > 100`) is one
 anti-join over its typed inner pipeline, keeping each outer row by a
@@ -147,7 +155,8 @@ when opened; empty input need not open it. Bound plans use a versioned envelope
 and require regeneration when the stored version is unsupported.
 Envelope version 7 requires aggregate expressions to carry their `distinct`
 flag; version 8 types each node's ordering and declares ranked scans'
-eligibility and policy; version 9 records every `AntiJoin`'s `strategy`.
+eligibility and policy; version 9 records every `AntiJoin`'s `strategy`;
+version 11 carries an integer outside the `i64` range as its decimal text.
 Plans saved with earlier binaries must be regenerated before replay.
 
 ### Expand path selection
@@ -611,7 +620,22 @@ node's `NodeId`, its fields and its already lowered inputs. The trait has one
 method per `PhysicalNode` variant and no default body, and the walk's match
 has no catch-all arm, so a new variant does not compile until the walk and
 every `impl Lower` handle it. `Lower::Op` is an associated type; the planner
-crate does not depend on DataFusion. Two calls are not one per node:
+crate does not depend on DataFusion.
+
+A new variant is one line of the `physical_nodes!` declaration
+(`crates/omnigraph-planner/src/physical.rs`): its fields, its explain name,
+its child fields, and four classification tokens, `shape:` (its
+`PipelineShape` over the streamed input), `sides:` (the inputs its operator
+drains whole), `cut:` (the most rows it keeps) and `order:` (the order its
+output leaves in, `order_of(input)` for an order-preserving operator). The
+macro generates `shape`, `collected_sides`, `row_cut` and `order` as matches
+with one arm per kind, so a line without a token does not compile, at that
+line, and a constant per kind is never an arm elsewhere. The matches that read
+fields stay hand-written and are named in
+`crates/omnigraph-planner/tests/physical_node_matches.rs`, which parses the
+crate and refuses a default arm beside named kinds and a match over kinds at
+any other site; the `Lower` walk, the engine's lowering and the catalogue
+golden (`@Operator`) then report the behaviour the new kind still owes. Two calls are not one per node:
 `anti_join_outer` runs between the outer and the inner tree of an `AntiJoin`,
 and `finish` runs once with the lowered root. A `RankFuse` has two input
 subtrees, one per arm, and the walk lowers each once; a subtree reached
@@ -977,6 +1001,23 @@ required first hop of the query. The execution report records each gate's
 verdict with the counts it read and each probe attempt per overfetch rung
 (`search` decisions), and a replay must record the same.
 
+A ranked read reports its ranking (`QueryResult::ranking`). The planner
+derives what the accepted plan says of it (`omnigraph_planner::planned_ranking`):
+the search function of the one ranked `Scan` in the query's order or of the
+`RankFuse`, the return columns of the root's return list (a `return
+distinct`'s `Aggregate`) that read the ranking's `_distance`, `_score` or
+`_rrf` column on the ranked binding, and the ranked `nearest` scans; a stored
+property of a score column's name on a schema older than the reservation is
+no score column. The run supplies `exhaustive`: each `nearest` scan's
+`ScanReport::exact` says whether its last attempt in the pass whose rows the
+read returns ranked exactly (proven empty, flat, every partition of the
+IVF_FLAT index searched, or every admitted row returned, none at `+inf`).
+`engine::execute` attaches the ranking after the run from that pass's reports,
+so every door, replay included, reports the same ranking for one run, and
+`read_output` renders it as the envelope's `ranking`. Every vector index the
+engine builds is IVF_FLAT (`forbidden_apis.rs::vector_indexes_are_ivf_flat`),
+which is what makes a search of every partition exact.
+
 Lance 13 V2 row-stream payload hydration preserves input order and the valid
 prefixes of its ordering metadata. `WorkMemory` uses that metadata for the final
 sorted merge, so nearest keeps parallel output. Supported graph writers and
@@ -1023,9 +1064,15 @@ A `load csv` overwrite is the first write plan: the planner routes
 `Operation::Load` to the engine, which lowers `CsvSource → Validate →
 FragmentWrite` to `CsvSourceExec` (up to `max_partitions` readers over the
 captured source, each claiming the next record-aligned 8 MiB slice and tagging
-its batches with the slice index), `ValidateExec` (a pipeline breaker that
-drains every input partition and sorts the held batches back into slice
-order: one pass over the held delta extracts what
+its batches with the slice index), `ValidateExec` (every input partition
+drained at once; a streaming operator when the planner's `validate_streams`
+says no check reads the whole delta after the rows are in, each batch sent on
+to the sink right after its sweep with its slice tag, the judgment after the
+drain the stream's last word and the refusal the statement reports even when
+the sink's keyed-write check met the same repeated key in a fragment first
+(the sink follows its input to that verdict before deleting what it wrote);
+otherwise a pipeline breaker that holds the batches and
+sorts them back into slice order: one pass over the delta extracts what
 the value, uniqueness and cardinality checks need; the endpoint checks probe
 the batches' endpoint columns against each endpoint table's committed key set,
 on the parse partitions as the batches arrive when the plan marks them
@@ -1049,6 +1096,29 @@ these sets. Optional statement read caches are released before integer endpoint
 checks so their reservation cannot crowd out mandatory set allocations.
 Buckets larger than 32 keys are sorted and searched by binary
 search, bounding lookup work even when integer keys share a hash prefix.
+
+Once the sets are admitted, `ValidateExec` carves the run's load budget
+(`operators/load_budget.rs`) from the room `query_memory_bytes` leaves past
+the pool's total: one share per parse partition (52 of 64 parts between
+them), one for the unique holders (8, the partitions' when the plan sizes
+none), four uncharged for lease bookkeeping and the fragment sink's open
+chunks, a copy of rows each partition's reader already charged. A `WorkMemory`
+in a share (`in_share`) charges the share and then grows the pool infallibly,
+so the pool keeps counting beside the shares; the sink's `WorkMemory` is in the
+`Sink` class, which the pool counts and never refuses. A partition's share is
+charged only by its reader thread, which, once the slice's decode scratch is
+released, charges each decoded batch's bytes a second time (`batch_bytes`, the
+copy the sink's chunker will hold of it, since the breaker's re-materialized
+output is new buffers the registry cannot dedup) and each batch's validation
+facts ahead of the sweeper (`admit_facts_ahead`), so neither stacks on that
+transient, and the holders' share only by
+partition 0's sweeper, so a refusal and its `actual` (`LoadBudget::admitting_limit`,
+the smallest limit whose share admits the demand with the pool as it was at
+the carve) follow one thread's own sequence. A share under the admission floor (the partition's source admission
+plus one slice) refuses at the carve, before any partition is polled; a share
+refusal in a run of several partitions marks the source refused so the loader
+reruns it single-partitioned. Lease metadata and registry growth under a share
+are counted on the pool and never refused.
 
 Mutation insert/update and keyed Load retain the per-table limit of 8,192 rows.
 An immutable `WriteBudget` captures the session's `write_max_bytes` (default
@@ -1086,6 +1156,23 @@ edge referential integrity, and cardinality against the operation's pinned base
 plus its complete delta. A physical index may accelerate a probe but may never
 be a validation prerequisite.
 
+Cardinality counts the sources the delta can move out of bounds: the new
+source of every delta edge, the old committed source of every removed or moved
+edge, and, under a non-zero minimum, every source node row the delta writes. A
+source node row is recounted whether it is new or updated, as uniqueness and
+referential integrity recheck every row a delta writes. Committed edges are
+counted per source in sorted filtered scans of at most 8,192 sources each,
+streamed and kept as one count per source, as the uniqueness probe chunks its
+keys, since a merge delta is not row-capped. An overwritten edge
+table's committed view is empty, so under a minimum every source of its
+replaced image holds only its delta edges: one bounded scan of the replaced
+image's source column keeps the smallest source the delta leaves without an
+edge (`evaluate_replaced_cardinality`), and memory stays with the delta. A
+`load csv` plan names that scan as the `cardinality` check's `scan` access and
+the node-side count as the typed `source_cardinality` check; the overwrite
+judge (`validate/load.rs`) refuses a plan whose minimum lacks the scan, and
+append and merge reach the evaluator.
+
 Validation completes before recovery arm and table effects. For selected
 external Blob inputs, policy and retained-metadata accounting complete before
 target I/O; source probing, any required materialization, and payload-size
@@ -1107,7 +1194,8 @@ a separate design, not a hidden loader behavior.
 ## Derived indexes
 
 Schema apply, mutation, and Load publish logical data and index intent only.
-`ensure_indices` materializes declared missing indexes through the shared
-recovery protocol; `optimize` folds coverage as physical maintenance. Reads
+`ensure_indices` materializes declared missing indexes and rebuilds BTREE and
+vector indexes whose coverage lags, on any branch, through the shared recovery
+protocol; `optimize` does the same on `main` after compaction. Reads
 remain correct through Lance's indexed-plus-unindexed scan behavior while
 coverage converges.

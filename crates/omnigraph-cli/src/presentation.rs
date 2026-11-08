@@ -43,6 +43,7 @@ impl ReadPresentation {
         match self.format {
             ReadOutputFormat::Json => Some(MachineErrors::Json),
             ReadOutputFormat::Jsonl => Some(MachineErrors::Jsonl),
+            ReadOutputFormat::Toon => Some(MachineErrors::Toon),
             _ => None,
         }
     }
@@ -69,7 +70,7 @@ mod tests {
 
     #[test]
     fn format_precedence_also_selects_machine_errors() {
-        use ReadOutputFormat::{Arrow, Csv, Json, Jsonl, Kv, Table};
+        use ReadOutputFormat::{Arrow, Csv, Json, Jsonl, Kv, Table, Toon};
 
         for (default, alias, explicit, json, expected) in [
             (None, None, None, false, Table),
@@ -79,6 +80,8 @@ mod tests {
             (Some(Jsonl), Some(Kv), Some(Table), false, Table),
             (Some(Json), None, Some(Arrow), false, Arrow),
             (Some(Json), None, Some(Kv), false, Kv),
+            (Some(Json), None, Some(Toon), false, Toon),
+            (Some(Toon), Some(Jsonl), Some(Csv), true, Json),
             (Some(Kv), Some(Jsonl), Some(Csv), true, Json),
         ] {
             let mut operator = OperatorConfig::default();
@@ -90,6 +93,7 @@ mod tests {
                 match expected {
                     Json => Some(MachineErrors::Json),
                     Jsonl => Some(MachineErrors::Jsonl),
+                    Toon => Some(MachineErrors::Toon),
                     _ => None,
                 }
             );
@@ -131,6 +135,7 @@ mod tests {
                 .unwrap(),
             graph_commit_id: None,
             page: None,
+            ranking: None,
         }
     }
 

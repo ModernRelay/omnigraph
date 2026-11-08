@@ -39,7 +39,7 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::{DatasetUpdate, MutationOpKind};
 use crate::error::{OmniError, Result};
 use crate::seams::{catalog, decide_seam, fail};
-use crate::table_store::ExternalBlobUriCollector;
+use crate::table_store::{ExternalBlobUriCollector, OverwriteChunk};
 
 /// Logical semantics for one accumulated table write.
 ///
@@ -130,6 +130,12 @@ pub(crate) struct MutationStaging {
     /// rows: validation recounts the srcs a delete empties, and the staged
     /// delete records them on its transaction as the commit's change set.
     pub(crate) deleted_ids: HashMap<String, Vec<String>>,
+    /// Row addresses removed per table, captured by the same scans as
+    /// `deleted_ids`, at the table's pinned version: the staged delete
+    /// writes their deletion vectors without scanning the table again.
+    /// Every recorded delete predicate records its addresses, so their
+    /// union is exactly the rows the combined predicate selects.
+    pub(crate) deleted_row_addrs: HashMap<String, (u64, lance_select::mask::RowAddrTreeMap)>,
     pub(crate) deleted_id_budget: DeletedIdBudget,
     /// Strictest [`MutationOpKind`] seen per table within this query. Drives
     /// the op-kind-aware drift check in [`StagedMutation::commit_all`]: for
@@ -367,6 +373,30 @@ impl MutationStaging {
             .extend(ids);
     }
 
+    /// Record the row addresses, at table version `version`, of the rows a
+    /// delete op on `table_key` removes; see `deleted_row_addrs`. A second
+    /// version for one table is an internal contract failure (one pin per
+    /// table per query).
+    pub(crate) fn record_deleted_row_addrs(
+        &mut self,
+        table_key: &str,
+        version: u64,
+        addrs: lance_select::mask::RowAddrTreeMap,
+    ) -> Result<()> {
+        let entry = self
+            .deleted_row_addrs
+            .entry(table_key.to_string())
+            .or_insert_with(|| (version, lance_select::mask::RowAddrTreeMap::new()));
+        if entry.0 != version {
+            return Err(OmniError::manifest_internal(format!(
+                "delete row addresses for '{table_key}' captured at versions {} and {version}",
+                entry.0
+            )));
+        }
+        entry.1 |= addrs;
+        Ok(())
+    }
+
     /// Delete predicates already recorded for `table_key` by earlier delete
     /// statements in this query. Read before recording the current statement's
     /// predicate so its `affected_*` count can exclude rows a prior statement
@@ -387,37 +417,6 @@ impl MutationStaging {
             .get(table_key)
             .map(|p| p.batches.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// Build the validation [`ChangeSet`](crate::validate::ChangeSet) for this
-    /// staging: every touched table's accumulated rows as the `changed` delta
-    /// (record-batch clone is Arc-cheap — no data copy). Shared by the mutation
-    /// and loader write paths so their validation input cannot drift.
-    pub(crate) fn to_changeset(&self) -> crate::validate::ChangeSet {
-        let mut changeset = crate::validate::ChangeSet::new();
-        let mut __dst_pk: Vec<_> = self.pending.keys().collect();
-        __dst_pk.sort();
-        for table_key in __dst_pk {
-            let batches = self.pending_batches(table_key);
-            if batches.is_empty() {
-                continue;
-            }
-            let mut change = crate::validate::TableChange::default();
-            change.changed.extend(batches.iter().cloned());
-            changeset.insert(table_key.clone(), change);
-        }
-        // Deletes (disjoint from `pending` by D₂) carry their removed ids so the
-        // evaluator recounts the srcs a delete empties (`@card`) and sees removed
-        // rows for RI — the faithful change-set the merge path also builds.
-        let mut __dst_di: Vec<_> = self.deleted_ids.iter().collect();
-        __dst_di.sort_by(|a, b| a.0.cmp(b.0));
-        for (table_key, ids) in __dst_di {
-            if ids.is_empty() {
-                continue;
-            }
-            changeset.entry(table_key.clone()).or_default().deleted_ids = ids.clone();
-        }
-        changeset
     }
 
     /// Schema of the accumulated batches for `table_key`, or `None` if no
@@ -493,6 +492,7 @@ impl MutationStaging {
             write_budget,
             delete_predicates,
             deleted_ids,
+            mut deleted_row_addrs,
             deleted_id_budget: _,
             op_kinds: _,
             overwrite_writers,
@@ -672,41 +672,154 @@ impl MutationStaging {
                     table_key
                 ))
             })?;
-            let Some(combined) = predicates.into_iter().reduce(Expr::or) else {
+            let Some(combined) = combine_delete_predicates(predicates) else {
                 continue;
             };
             let removed_ids = deleted_ids.get(&table_key).cloned().unwrap_or_default();
-            if let Some(entry) =
-                stage_delete_table(db, table_key, combined, path, expected, removed_ids).await?
+            let row_addrs = deleted_row_addrs.remove(&table_key);
+            if let Some(entry) = stage_delete_table(
+                db,
+                table_key,
+                combined,
+                path,
+                expected,
+                removed_ids,
+                row_addrs,
+            )
+            .await?
             {
                 staged_entries.push(entry);
             }
         }
 
-        let expected_versions = expected_versions
-            .iter()
-            .map(|(table_key, table_version)| {
-                let path = paths.get(table_key).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "MutationStaging::stage_all: missing path for table '{table_key}'"
-                    ))
-                })?;
-                Ok((
-                    path.identity,
-                    crate::db::manifest::TableVersionExpectation {
-                        table_key: table_key.clone(),
-                        table_version: *table_version,
-                        native_ref: path.pinned_native_ref.clone(),
-                    },
-                ))
-            })
-            .collect::<Result<crate::db::manifest::ExpectedTableVersions>>()?;
+        let expected_versions = expected_table_versions(&expected_versions, &paths)?;
 
         Ok(StagedMutation {
             staged: staged_entries,
             expected_versions,
         })
     }
+}
+
+impl MutationStaging {
+    /// Stage one table's overwrite from chunks as the load's sink cuts them,
+    /// the table registered by [`Self::ensure_path`] and nothing else
+    /// pending: every batch passes the keyed-write contract and its external
+    /// Blob references are authorized per chunk before that chunk's writer
+    /// starts, then `TableStorage::stage_overwrite_stream` writes it. The
+    /// result is the [`StagedMutation`] `stage_all` would build for the table.
+    pub(crate) async fn stage_overwrite_stream<S>(
+        self,
+        db: &crate::db::Omnigraph,
+        table_key: &str,
+        chunks: S,
+        schema: SchemaRef,
+    ) -> Result<StagedMutation>
+    where
+        S: futures::Stream<Item = Result<OverwriteChunk>> + Send,
+    {
+        let MutationStaging {
+            expected_versions,
+            paths,
+            pending,
+            write_budget,
+            overwrite_writers,
+            ..
+        } = self;
+        if !pending.is_empty() {
+            return Err(OmniError::manifest_internal(
+                "MutationStaging::stage_overwrite_stream: the staging also holds pending batches",
+            ));
+        }
+        let path = paths.get(table_key).cloned().ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "MutationStaging::stage_overwrite_stream: missing path for table '{table_key}'"
+            ))
+        })?;
+        let expected = *expected_versions.get(table_key).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "MutationStaging::stage_overwrite_stream: missing expected version for table '{table_key}'"
+            ))
+        })?;
+        let ds = db
+            .open_pinned_for_write(&path.full_path, &path.entry)
+            .await?;
+        let system_columns = db.catalog().system_columns;
+        let prepared = chunks.then(|chunk| async move {
+            let mut chunk = chunk?;
+            let mut uris = ExternalBlobUriCollector::default();
+            for batch in &chunk.batches {
+                db.storage()
+                    .validate_keyed_write_batch(table_key, batch, system_columns)?;
+                uris.include_batch(batch)?;
+            }
+            if !uris.as_slice().is_empty() {
+                let preflight = db
+                    .storage()
+                    .preflight_external_blob_uris(uris.as_slice())
+                    .await?;
+                for batch in chunk.batches.iter_mut() {
+                    *batch = db
+                        .storage()
+                        .prepare_overwrite_blob_references_with_preflight(
+                            table_key,
+                            batch.clone(),
+                            &preflight,
+                            system_columns,
+                        )?;
+                }
+            }
+            Ok(chunk)
+        });
+        let staged = db
+            .storage()
+            .stage_overwrite_stream(
+                &ds,
+                Box::pin(prepared),
+                Some(schema),
+                write_budget,
+                overwrite_writers,
+            )
+            .await?;
+        let staged_entries = vec![StagedTableEntry {
+            table_key: table_key.to_string(),
+            path,
+            expected_version: expected,
+            dataset: ds,
+            staged_write: Some(staged),
+        }];
+        let expected_versions = expected_table_versions(&expected_versions, &paths)?;
+        Ok(StagedMutation {
+            staged: staged_entries,
+            expected_versions,
+        })
+    }
+}
+
+/// The publisher's CAS fence from the staging's pins: every touched table's
+/// identity with the version and native ref it was read at.
+fn expected_table_versions(
+    expected_versions: &HashMap<String, u64>,
+    paths: &HashMap<String, StagedTablePath>,
+) -> Result<crate::db::manifest::ExpectedTableVersions> {
+    expected_versions
+        .iter()
+        .map(|(table_key, table_version)| {
+            let path = paths.get(table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "MutationStaging::stage_all: missing path for table '{table_key}'"
+                ))
+            })?;
+            Ok((
+                path.identity,
+                crate::db::manifest::TableVersionExpectation {
+                    table_key: table_key.clone(),
+                    table_version: *table_version,
+                    native_ref: path.pinned_native_ref.clone(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// One table's input as its Lance writer consumes it: a keyed adapter takes
@@ -848,6 +961,19 @@ async fn stage_pending_table(
     }))
 }
 
+/// The rows of a table that any of a mutation's delete statements matched.
+/// One predicate is used as written. Several are joined as
+/// `p1 IS TRUE OR p2 IS TRUE`, which selects the same rows as `p1 OR p2`, but
+/// keeps one statement's tests from sitting beside another's: Lance's
+/// simplifier folds two disjoint `NOT IN` tests of one nullable column to
+/// `true`, which would also delete the rows whose value is null (#1277).
+fn combine_delete_predicates(predicates: Vec<Expr>) -> Option<Expr> {
+    if predicates.len() < 2 {
+        return predicates.into_iter().next();
+    }
+    predicates.into_iter().map(Expr::is_true).reduce(Expr::or)
+}
+
 /// Stage a delete on `table_key` from a combined predicate, mirroring
 /// [`stage_pending_table`] for the delete path. Reopens the dataset at the
 /// pinned `expected` version (strict Delete op) and stages a deletion-vector
@@ -863,11 +989,24 @@ async fn stage_delete_table(
     path: StagedTablePath,
     expected: u64,
     deleted_ids: Vec<String>,
+    row_addrs: Option<(u64, lance_select::mask::RowAddrTreeMap)>,
 ) -> Result<Option<StagedTableEntry>> {
     let ds = db
         .open_pinned_for_write(&path.full_path, &path.entry)
         .await?;
-    match db.storage().stage_delete(&ds, predicate).await? {
+    // The delete ops captured the matched rows' addresses at the pin; stage
+    // their deletion vectors directly. Addresses from another version than
+    // the one reopened here would name other rows, so that case (and a
+    // predicate recorded without addresses) takes Lance's scanning delete.
+    let staged = match row_addrs {
+        Some((version, addrs)) if version == ds.version() => {
+            db.storage()
+                .stage_delete_rows(&ds, &predicate, &addrs)
+                .await?
+        }
+        _ => db.storage().stage_delete(&ds, predicate).await?,
+    };
+    match staged {
         Some(mut staged) => {
             staged
                 .record_deleted_ids(ds.dataset(), &deleted_ids)
@@ -1070,9 +1209,8 @@ impl StagedMutation {
         fail(&catalog::FORK_BEFORE_CLASSIFY)?;
 
         let witness = txn.authority.staging_witness()?;
-        let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(staged.len());
-        let mut detached_tables = Vec::with_capacity(staged.len());
-        for entry in staged {
+        let witness = &witness;
+        let commits = staged.into_iter().map(|entry| async move {
             let StagedTableEntry {
                 table_key,
                 path,
@@ -1092,7 +1230,7 @@ impl StagedMutation {
             );
             let (detached, identity) = db
                 .storage()
-                .commit_staged_detached(dataset, staged_write, &witness, &declared_full_text)
+                .commit_staged_detached(dataset, staged_write, witness, &declared_full_text)
                 .await?;
             let state = db.storage().table_state(&path.full_path, &detached).await?;
             let target = expected_version + 1;
@@ -1101,16 +1239,24 @@ impl StagedMutation {
                 .with_table_fork_owner(table_fork_owner)
                 .with_staged(state.version, identity.uuid.clone())
                 .with_last_linear_version(path.entry.version_metadata.last_linear_version());
-            detached_tables.push((table_key.clone(), detached));
-            updates.push(DatasetUpdate {
+            let update = DatasetUpdate {
                 identity: path.identity,
-                type_key: table_key,
+                type_key: table_key.clone(),
                 published_dataset_version: target,
                 native_dataset_branch: path.table_branch,
                 entity_count: state.row_count,
                 version_metadata,
-            });
+            };
             fail(&MUTATION_POST_TABLE_COMMIT)?;
+            Ok::<_, OmniError>((table_key, detached, update))
+        });
+        let committed = futures::future::join_all(commits).await;
+        let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(committed.len());
+        let mut detached_tables = Vec::with_capacity(committed.len());
+        for result in committed {
+            let (table_key, detached, update) = result?;
+            detached_tables.push((table_key, detached));
+            updates.push(update);
         }
 
         Ok(CommittedMutation {
@@ -1232,4 +1378,31 @@ fn dedupe_merge_batches_by_id(
         return Ok(sliced.into_iter().next().unwrap());
     }
     arrow_select::concat::concat_batches(schema, &sliced).map_err(OmniError::arrow_internal)
+}
+
+#[cfg(test)]
+mod delete_predicate_tests {
+    use super::combine_delete_predicates;
+    use crate::engine::lance_filter_support::selected_rows;
+    use datafusion::prelude::{col, lit, not};
+
+    /// Two statements whose disjoint `NOT IN` tests are null for the row whose
+    /// `s` is null matched only the other rows, and the combined predicate
+    /// that Lance's scanning delete takes deletes only those.
+    #[test]
+    fn combined_disjoint_not_in_statements_leave_a_null_row_issue_1277() {
+        let combined = combine_delete_predicates(vec![
+            not(col("s").in_list(vec![lit("y")], false)),
+            not(col("s").in_list(vec![lit("x")], false)),
+        ])
+        .expect("two predicates");
+        assert_eq!(selected_rows(combined.clone(), false), vec![1, 2]);
+        assert_eq!(selected_rows(combined, true), vec![1, 2]);
+        let single = not(col("s").in_list(vec![lit("y")], false));
+        assert_eq!(
+            combine_delete_predicates(vec![single.clone()]),
+            Some(single)
+        );
+        assert_eq!(combine_delete_predicates(Vec::new()), None);
+    }
 }

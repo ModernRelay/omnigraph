@@ -1,0 +1,41 @@
+# issue: none
+# traversal: auto
+# notes: A GQ insert of an edge into a text-keyed Person table whose key index covers its one
+# notes: fragment checks both endpoints by index probe, not by a scan of the table, and the plan
+# notes: its receipt carries says so: the same write as the unindexed case, one fragment instead of four.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: String @key
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 1
+    columns:
+      id: {kind: key, prefix: p, width: 6}
+
+--- mutate
+query ins() { insert Knows { from: "p000000", to: "p000001" } }
+--- expect affected: nodes=0 edges=1
+--- expect plan
+load route: pipeline
+load validate edge_ri edge:Knows from Person: access probe
+load validate edge_ri edge:Knows to Person: access probe
+
+--- query
+query loaded() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n": 1}
+--- expect shape
+n: I64

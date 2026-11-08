@@ -857,7 +857,7 @@ async fn keyed_upsert_stamps_no_by_source_delete_marker_and_persists_it() {
 }
 
 #[tokio::test]
-async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
+async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode_issue_1261() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
@@ -943,6 +943,38 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
         collect_ids(&store.scan_batches(&committed).await.unwrap()),
         vec!["alice", "bob"]
     );
+
+    // Strict insertion has no merge-insert route (#1261): the merge-insert
+    // stager refuses it before handing anything to Lance.
+    let batch = person_pk_batch(&[("carol", Some(41))]);
+    let schema = batch.schema();
+    let reader = arrow_array::RecordBatchIterator::new([Ok(batch)], schema);
+    let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+    let probes = MergeWriteProbes::default();
+    let error = with_merge_write_probes(
+        probes.clone(),
+        store.stage_keyed_write_from_stream(
+            committed.clone(),
+            stream,
+            1,
+            KeyedWriteSemantics::StrictInsert,
+            committed.schema().field("id").unwrap().id,
+            SYSTEM_COLUMNS_LEGACY,
+            "issue_1261",
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == crate::error::ManifestErrorKind::Internal
+                    && manifest.message.contains("absence-proven insert writer")
+        ),
+        "strict insert must not stage through merge-insert, got {error:?}"
+    );
+    assert_eq!(probes.stage_merge_insert_calls(), 0);
 }
 
 #[tokio::test]
@@ -2748,6 +2780,69 @@ async fn stage_overwrite_batches_fans_out_writers_in_chunk_order() {
     assert_eq!(ids_in_order(&after), expected);
 }
 
+/// Chunks handed over out of source order, two writers in flight, are joined
+/// in `(partition, index)` order: one file per chunk, read back in source
+/// order before and after the commit.
+#[tokio::test]
+async fn stage_overwrite_stream_joins_chunks_in_partition_then_index_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let pre_version = ds.version().version;
+    let chunk = |order: (u32, u64), ids: &[&str]| -> Result<super::OverwriteChunk, OmniError> {
+        let rows: Vec<(&str, Option<i32>)> = ids.iter().map(|id| (*id, Some(1))).collect();
+        Ok(super::OverwriteChunk {
+            order,
+            batches: vec![person_batch(&rows)],
+            lease: None,
+        })
+    };
+    let arrival = vec![
+        chunk((1, 0), &["d"]),
+        chunk((0, 1), &["c"]),
+        chunk((1, 1), &["e", "f"]),
+        chunk((0, 0), &["a", "b"]),
+    ];
+    let expected = ["a", "b", "c", "d", "e", "f"];
+
+    let staged = store
+        .stage_overwrite_stream(
+            &ds,
+            futures::stream::iter(arrival),
+            None,
+            WriteBudget::default(),
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        staged
+            .new_fragments()
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap_or(0))
+            .collect::<Vec<_>>(),
+        vec![2, 1, 1, 2],
+        "one file per chunk, in (partition, index) order"
+    );
+    let before_commit = store
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
+        .await
+        .unwrap();
+    assert_eq!(ids_in_order(&before_commit), expected);
+    assert_eq!(ds.version().version, pre_version);
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.version().version, pre_version + 1);
+    let after = store.scan_batches(&new_ds).await.unwrap();
+    assert_eq!(ids_in_order(&after), expected);
+}
+
 /// Batches of two schemas are refused before any writer starts, as one Lance
 /// call refuses them (no data file written, HEAD stays), where Lance's own
 /// overwrite would publish a mixed table; a zero-row batch of another schema is dropped.
@@ -3464,7 +3559,7 @@ async fn schema_evolution_plans_metadata_only_steps_and_refuses_rewrites() {
             "without a rewrite",
         ),
         (
-            Schema::new(vec![pk_id(), marked("age", DataType::Int32, false, "1")]),
+            Schema::new(vec![pk_id(), marked("age", DataType::Int64, false, "1")]),
             Vec::new(),
             "without a rewrite",
         ),
@@ -3495,6 +3590,17 @@ async fn schema_evolution_plans_metadata_only_steps_and_refuses_rewrites() {
             "expected '{expected}', got: {error}"
         );
     }
+
+    // #721: making a nullable column required is metadata only, and the
+    // Project commit it plans stops preserving nullability.
+    let tightened = Schema::new(vec![pk_id(), marked("age", DataType::Int32, false, "1")]);
+    let plan = TableStore::plan_schema_evolution(&ds, &tightened, &[]).unwrap();
+    assert!(
+        plan.tightens,
+        "a nullable to required column is a tightening"
+    );
+    assert!(plan.merge.is_none());
+    assert!(plan.project.is_some());
 
     // A column written before property markers existed adopts its identity
     // from the target, as the replaced full-table rewrite did.

@@ -117,6 +117,7 @@ binary's rows.
 | ContainsJoin | [2] |
 | CrossJoin | [2] |
 | CsvSource | [0] |
+| DeltaSource | [0] |
 | Expand | [1] |
 | Filter | [1] |
 | FragmentWrite | [1] |
@@ -157,6 +158,7 @@ binary's rows.
 | name | kind | default | scope |
 |---|---|---|---|
 | ann_nprobes | integer(0..) | 20 | request |
+| change_lineage | enum(off, on, verify) | on | request |
 | engine | enum(v2) | v2 | request |
 | explain_dump_dir | text |  | process |
 | history_release_bytes | integer(1024..=262144) | 262144 | request |
@@ -175,6 +177,7 @@ binary's rows.
 | Aggregate | refused_by_name |
 | AntiJoin | refused_by_name |
 | CsvSource | refused_by_name |
+| DeltaSource | refused_by_name |
 | Expand | refused_by_name |
 | Filter | routable |
 | FragmentWrite | refused_by_name |
