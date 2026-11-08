@@ -1,3 +1,3 @@
-- Organization CLI users must add `--role` to new invitations and repeat it for every role a member should retain; member updates replace the full set. Saved older invitations keep their exact retry behavior. See the [team guide][organization-role-selection-guide].
+- Organization commands follow provider roles: service permissions come from each member's organization roles, and graph and deployment access from applied cluster policy. Replace `organization members apply` with `members set --role ROLE`, repeating `--role` for every role the member keeps; add `--role` to new invitations; offboard by email or user ID, without `--expected-version`. See [team administration][organization-role-selection-guide].
 
 [organization-role-selection-guide]: ../docs/user/cli/managed-team.md

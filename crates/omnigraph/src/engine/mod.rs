@@ -80,7 +80,11 @@ pub(crate) use plan_source::{
 pub(crate) use report::{Executed, PlanRun};
 use report::{ExecutionReport, ReportRow};
 use run::{pass_rows, run_plan};
-pub(crate) use scan::{id_in_list_expr, ir_expr_to_df_expr};
+#[cfg(test)]
+pub(crate) use scan::lance_filter_support;
+pub(crate) use scan::{
+    MAX_NULL_SPLIT_COLUMNS, exceeds_null_split_columns, id_in_list_expr, ir_expr_to_df_expr,
+};
 pub(crate) use search::referenced_edge_types;
 
 /// What `execute` takes beside the bound plan, each member data and not a
