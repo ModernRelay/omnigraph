@@ -1,12 +1,14 @@
 # issue: 1303
-# red_on: 2026-11-08, main ea4a16d5: step 4 `retitle_shared` fails with `resource limit exceeded for retained keyed batch bytes per operation: actual 6473, limit 2048`; steps 1-3 green. With step 4 removed, `retitle_shared_doc_carrying_its_blob` and then `clear_shared_doc` fail the same way, each with actual 6473.
+# red_on: 2026-11-08, main ea4a16d5: step 4 `retitle_shared` fails with `resource limit exceeded for retained keyed batch bytes per operation: actual 6473, limit 2048`; steps 1-3 green. With step 4 removed, `retitle_shared_doc_carrying_its_blob` and then `clear_shared_doc` fail the same way, each with actual 6473. On main 14753b56, run with only the seed steps, `retitle_shared_in_two_statements` fails the same way (actual 6473) and `retitle_apart_in_two_statements` passes.
 # notes: Whether an update is admitted under write_max_bytes depends only on the request and the
 # notes: matched rows, never on the rows stored beside them. `Shared` holds 301 rows in one fragment;
 # notes: `Apart` holds the same rows in two (row000 alone, the 300 others appended later). The same
-# notes: update of row000 is admitted on both at the same limit. A filtered scan returns the match as
-# notes: a slice of its decoded fragment batch; charged as a slice, the shared fragment cost 6,473 bytes.
+# notes: update of row000 is admitted on both at the same limit. A Lance scanner batch can share
+# notes: buffers with rows it does not contain; charged as emitted, the shared layout cost 6,473 bytes.
 # notes: The `Doc` pair covers the two Blob scans: one carries the unassigned Blob (its pre-charge
 # notes: measured the slice too), and one assigns every Blob, so the matched rows are carried as scanned.
+# notes: The two-statement steps keep the whole-row pending-aware scan covered even when a sole update
+# notes: stages a column patch instead (#1272): the second statement matches nothing.
 
 --- runner
 timeout_ms: 10000
@@ -147,6 +149,24 @@ query clear_shared_doc($c: Blob?) {
 
 --- expect affected: nodes=1 edges=0
 
+--- mutate
+set write_max_bytes = 2048;
+query retitle_apart_in_two_statements() {
+    update Apart set { title: "twice" } where slug = "row000"
+    update Apart set { title: "twice" } where slug = "nobody"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 2048;
+query retitle_shared_in_two_statements() {
+    update Shared set { title: "twice" } where slug = "row000"
+    update Shared set { title: "twice" } where slug = "nobody"
+}
+
+--- expect affected: nodes=1 edges=0
+
 --- query
 query titles_after_updates() {
     match {
@@ -157,7 +177,7 @@ query titles_after_updates() {
 }
 
 --- expect unordered
-{"s.title": "new", "a.title": "new"}
+{"s.title": "twice", "a.title": "twice"}
 
 --- expect shape
 s.title: String

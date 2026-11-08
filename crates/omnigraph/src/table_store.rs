@@ -6055,8 +6055,8 @@ impl TableStore {
             // This predicate scan contains every logical non-blob column and
             // `_rowid`, but no blob descriptors/payloads. Charge the logical
             // columns now so an already-overwide match fails before
-            // `take_rows` performs the second full-row read. The scanner's
-            // batch is a slice of its decoded fragment batch, so measure a
+            // `take_rows` performs the second full-row read. A scanner batch
+            // can share buffers with rows it does not contain, so measure a
             // copy of the matched rows, as `PendingScanAccount::retain` does.
             let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
             let non_blob_bytes = non_blob_column_bytes(committed_ds, &batch)?;
@@ -6499,26 +6499,23 @@ impl PendingScanAccount {
             .collect()
     }
 
-    /// The one way a pending-aware scan keeps a batch: copy its rows into
-    /// buffers of their own, then charge the copy, and return the copy to
-    /// keep.
+    /// The one way a pending-aware scan keeps a batch, and the only method
+    /// that charges one: copy its rows into buffers of their own, then charge
+    /// the copy, and return the copy to keep.
     ///
-    /// A filtered Lance scan returns matched rows as slices of the batch
-    /// decoded from their fragment, and a slice pins every buffer of its
-    /// parent, so charging (or keeping) the slice would count the rows stored
-    /// beside the match. Copying first makes both the charge and the memory
-    /// held depend only on the kept rows, never on fragment layout (issue
-    /// #1303). The copy is bounded by the same write budget it is charged to.
+    /// A Lance scanner batch can share buffers with rows it does not contain,
+    /// so charging (or keeping) it as emitted could count rows stored beside
+    /// a match. Copying first makes both the charge and the memory held
+    /// depend only on the kept rows, never on storage layout (issue #1303).
+    /// There is deliberately no separate charge method, so a new retention
+    /// point cannot charge an uncopied batch. The copy is made before the
+    /// charge: its size is bounded by the input batch, not by the budget, so
+    /// an over-budget copy is made and then refused.
     fn retain(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
         let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
-        self.add_batch(&batch)?;
-        Ok(batch)
-    }
-
-    fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let rows = u64::try_from(batch.num_rows())
             .map_err(|_| OmniError::manifest_internal("pending scan row count exceeds u64"))?;
-        let usage = write_batch_bytes(batch)?;
+        let usage = write_batch_bytes(&batch)?;
         let payload_bytes = self
             .payload_bytes
             .checked_add(usage.payload)
@@ -6527,7 +6524,7 @@ impl PendingScanAccount {
             .check(MATERIALIZED_BLOB_PAYLOAD_BYTES, payload_bytes)?;
         self.add_usage(rows, usage.rows)?;
         self.payload_bytes = payload_bytes;
-        Ok(())
+        Ok(batch)
     }
 
     fn add_usage(&mut self, rows: u64, bytes: u64) -> Result<()> {
