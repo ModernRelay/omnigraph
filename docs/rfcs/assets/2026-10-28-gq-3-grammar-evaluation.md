@@ -23,7 +23,9 @@ differed (the arrow spelling, a `contract` declaration, an `F64?` score
 column, a swap-fix refusal of an incoming triple, an HTTP contract bump)
 have been brought into line or marked as the first draft's choice. The
 programme RFC is the decision on the order; §11.1 to §11.5 record the
-additive-first order the project did not take, and §11.6 the order it took.
+additive-first order the project did not take, and §11.6 the break-first
+principle it took. The programme RFC's edge table refines §11.6's order and
+wins wherever the two differ; §11.6 now says so and points there.
 
 ---
 
@@ -3618,6 +3620,15 @@ single rewrite.
 
 ### 11.6 Breaking first: the revised sequence
 
+> **The order the project took is the programme RFC's edge table**
+> ([the sequence](../2026-10-31-gq-3-programme.md#the-sequence)), which
+> refines this section and wins wherever the two differ: `having` ships in
+> B, not C; `$x: Interface` waits for Poly instead of shipping under C; the
+> distributed sequence precedes I, which precedes Poly; F and C follow S; R
+> needs only B; A follows C and S; Fed follows Poly, C and the schema
+> namespaces RFC. The picture below is brought into line; §11.1's
+> dependency graph is replaced by that table.
+
 Sections 11.1 to 11.5 put the breaking stage last, the compatibility-
 preserving order. With a pre-stable language (the shared expression RFC's own
 words: "a better language wins over compatibility wherever the two conflict")
@@ -3630,7 +3641,8 @@ the skill, the docs and the fleet are rewritten once; and agents learn one
 spelling. What it costs is that the grammar must be decided before most of
 its semantics exist, so the break must land *slots* whose behaviour arrives
 later. This section supersedes rule 1 of 11.4 and the first-month plan in
-11.5; the dependency graph, the stage contents and the tracks stand.
+11.5; the stage contents and the tracks stand as the programme RFC amends
+them, and the dependency graph of 11.1 gives way to its edge table.
 
 #### The principle: break the grammar once, then only fill slots
 
@@ -3667,14 +3679,16 @@ plan nodes behind existing syntax.
 M0 measure ─► B  the break (grammar RFC, rewriter, corpus and fleet rewrite; one release)
                    │
                    ├──► parallel, additive, on the final grammar:
-                   │       S catalogue · N side channel · P paging · F function library
-                   │       C closure (fills optional/view/having/collect slots)
-                   │       L lexical (fills terms/@analyzed)  · R retrieve semantics (n arms, weights, norm, rerank)
-                   │       W1 writes (fills returning/invalidate)  · W2 computed writes
+                   │       S catalogue · N side channel · P paging
+                   │       L lexical (fills @analyzed; adds terms, match_terms)
+                   │       R retrieve semantics (n arms, weights, norm, rerank)
+                   │       W1 writes (fills returning; adds invalidate)
                    │
-                   ├──► I + Poly on the storage-upgrade clock
-                   ├──► A permissions after C
-                   └──► Fed after Poly and views
+                   ├──► after S: F function library · C closure (fills optional/view slots, adds collect)
+                   ├──► after F and W1: W2 computed writes
+                   ├──► Poly, after B and I (storage clock: distributed sequence ─► I ─► Poly)
+                   ├──► A permissions after C and S
+                   └──► Fed after Poly, C and the schema namespaces RFC
 ```
 
 **M0** is unchanged and becomes more important: the instrument must run on
