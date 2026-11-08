@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-09-28
-updated: 2026-10-03
+updated: 2026-11-08
 discussion: "https://github.com/ModernRelay/omnigraph/pull/785"
 supersedes: []
 superseded_by: []
@@ -244,6 +244,13 @@ waits for its outcome. An entry holds:
     expected head is compared against.
 - for each written table, the staged write, the pin it was staged from, and
   its class (below);
+- for each table execution opened, the strictest operation that opened it:
+  the `MutationOpKind` that `ensure_path` records in
+  `MutationStaging.op_kinds` (`exec/staging.rs`), where an update or delete
+  outranks an insert. Execution records it before any row is read, so an
+  update whose predicate matched nothing still records `Update`
+  (`execute_update` returns before staging a batch, `exec/mutation.rs`).
+  Today `stage_all_with_concurrency` drops `op_kinds`; the entry carries it;
 - the **footprint**: every table the write read or wrote, which is the union
   of:
   - its written tables;
@@ -262,10 +269,15 @@ waits for its outcome. An entry holds:
     Recording them is the first rollout step.
 - the actor and an arrival ticket.
 
-Each written table is in one of two classes:
+Each written table is in one of two classes. The class comes from the
+operations execution ran, not only from the transaction staging built: a
+staged transaction that only adds fragments shows what the request wrote,
+not what it read.
 
 - **Append-only**, when all of these hold:
-  - the write on that table is a strict insert, or an upsert;
+  - every operation execution ran on that table was a strict insert or an
+    upsert: its recorded `MutationOpKind` is neither an update, a delete
+    nor a schema rewrite;
   - its staged transaction on that table adds fragments and removes or
     updates none, so an upsert matched no existing key;
   - it carries the exact ids of its inserted rows, within the per-entry cap;
@@ -277,14 +289,20 @@ Each written table is in one of two classes:
   strict-insert probe, or the upsert's join that matched nothing) and, for
   an edge, the existence of its endpoints.
 - **Exclusive** covers everything else:
-  - updates, deletes, upserts that matched a key, and overwrites;
+  - every executed update or delete, whatever it staged: one whose predicate
+    matched no row and staged nothing, and one that changed only rows the
+    same entry inserted earlier in its request, are exclusive, because each
+    read the table through an arbitrary predicate;
+  - upserts that matched a key, and overwrites;
   - cascades;
   - non-key uniqueness;
   - bounded cardinality, whose check reads a fresh live version
     (`validate.rs`);
   - oversized id sets.
 
-  An entry with any exclusive table is an exclusive entry.
+  An entry with any exclusive table is an exclusive entry. So is an entry
+  that executed an update or delete on any table in its footprint, written
+  or not: a predicate read makes the entry exclusive.
 
 ### The publisher
 
@@ -378,6 +396,18 @@ three things:
 - the existence of its endpoints;
 - any tables its execution opened. For a write that only inserts, those are
   its written tables.
+
+That list holds only because the class comes from the executed operations.
+Classified by staged transactions alone, it would not. Take a keyed `Person`
+table that holds neither `Left` nor `Right`. T1 inserts `Left` with age 0,
+then updates `Right` to age 1. T2 inserts `Right` with age 0, then updates
+`Left` to age 1. Both run against the same base, so each update matches
+nothing, and each staged transaction only adds fragments, with disjoint
+inserted ids. Admitted together, both ages stay 0. T1 then T2 gives `(1, 0)`
+and T2 then T1 gives `(0, 1)`; no serial order gives `(0, 0)`. Each entry
+read the absence of the other's key through its update's predicate, which
+is not a key check on its own ids. The recorded `Update` makes both entries
+exclusive, so they never share a batch.
 
 Appends by other writers with other ids preserve all three; an exclusive
 write to any footprint table may not.
@@ -600,7 +630,8 @@ reclaims them.
 
 - **`lance_surface_guards.rs`: the composition guard, Lance half.**
   - Test: `group_commit_composes_inserts_staged_against_older_pins_onto_a_later_pin`,
-    passing on Lance 11.0.0 since 2026-09-30.
+    passing on Lance 11.0.0 since 2026-09-30, and on Lance 13.0.0 after
+    `main` was merged on 2026-11-08.
   - Setup: two keyed upserts of new keys staged against P0 and one staged
     against P1, where P1 is a third insert that landed detached from P0.
     The three are committed as one detached transaction from P1.
@@ -648,6 +679,14 @@ reclaims them.
   - Write skew through execution reads: T1 updates A and scans B for a value
     that matches nothing, and T2 does the reverse. They never share a batch,
     and the second fails with the conflict.
+  - A mixed insert and zero-match update on one keyed table: T1 inserts
+    `Left` and updates `Right`, T2 inserts `Right` and updates `Left`, both
+    from one base where neither key exists. Both staged transactions only
+    add fragments, and both entries are exclusive by their recorded
+    `Update`. They never share a batch, and the rows are one of the two
+    serial results, `(1, 0)` or `(0, 1)`, never `(0, 0)`.
+  - An insert followed by an update that matches only that insert's row,
+    in one request, is exclusive: it never composes with another append.
   - An edge insert against a delete on its endpoint type.
   - Bounded `@card` is exclusive.
   - An expected head publishes alone, including the first conditional write
@@ -680,7 +719,10 @@ Each step leaves `main` shippable.
 
 1. On the mutation and load staging, record:
    - the footprint, which is `expected_versions` plus the validation reads;
-   - each staged table's class;
+   - the executed operation per opened table: carry `op_kinds` through
+     `stage_all_with_concurrency` instead of dropping it;
+   - each staged table's class, from those operations and the staged
+     transaction together;
    - the exact ids of inserted rows on the staged write.
 
    Remove `StagedWrite`'s dangling doc comment for the id field that no
@@ -817,3 +859,24 @@ Each step leaves `main` shippable.
     owns, so it moves to Alternatives, and the unresolved question of where
     publication requests are attributed closes: they run on the leader's
     own task.
+
+- 2026-11-08 — Classification follows the executed operations, after the
+  review of `f2757800`.
+  - The review found that the append-only class could admit a mixed insert
+    and zero-match update. Each such request stages only appends, with
+    disjoint inserted ids, yet two of them read each other's keys through
+    their update predicates, and admitting both gives a result no serial
+    order gives. The review reproduced the premises in the existing mixed
+    insert/update test.
+  - A table's class now requires every operation execution ran on it to be
+    an insert or an upsert, from the `MutationOpKind` that `ensure_path`
+    records before any row is read. An executed update or delete makes its
+    entry exclusive, including one that matched no row or changed only the
+    entry's own pending inserts. Rollout step 1 carries `op_kinds` through
+    staging, which drops it today.
+  - The admission matrix gains the review's counterexample and the
+    insert-then-own-update case. The composition guard was re-run on Lance
+    13.0.0 after `main` was merged.
+  - Superseded: "updates, deletes, upserts that matched a key, and
+    overwrites" as the first exclusive item, which read as staged updates
+    only.
