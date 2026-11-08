@@ -469,7 +469,11 @@ the account's only batch charge, which copies its rows into buffers of their
 own before charging them: a Lance scanner batch can share buffers with rows it
 does not contain, and admission must not depend on the rows stored beside a
 match. A cumulative account always charges a compact copy; a per-candidate
-check may keep an uncopied batch that already fits.
+check may keep an uncopied batch that already fits. Because `retain` always
+copies, a row-rewrite trial in `scan_update_matches` briefly holds the carried
+columns twice: the admitted scan it keeps for the column-patch fallback, and
+the charged copies of the whole rows. Its peak can therefore reach about twice
+the write budget, although each account still stops at one budget.
 The keyed parse spool separately caps its row estimate and decoded Blob bytes.
 Inline and copied external payload lengths are admitted together before GETs;
 materialized row and payload accounts are checked again before staging.
