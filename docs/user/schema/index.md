@@ -106,10 +106,16 @@ Complete outstanding deployments containing affected schema source before
 upgrading the binary; deployment source validation uses the admission rules.
 
 `Blob`, list, and vector properties cannot be keys or unique, in the
-property-level or the body form. Blob properties also cannot be indexed. A graph
-whose accepted schema already declares a body-level `@unique` on one of them
-still opens, but a write that gives that property a value is refused; rebuild
-the graph without the constraint to store values there.
+property-level or the body form. Blob properties also cannot be indexed.
+
+Earlier releases admitted a body-level `@unique` on a list or vector property.
+A graph that already declares one still opens, but a write that gives the
+property a value is refused, and reapplying that source is refused at
+admission. To remove the constraint in place, drop every property it names in
+one schema change, then add the properties back without it; dropping a
+property discards its stored values. A constraint that also names another
+property or `@src`/`@dst` cannot be removed in place: rebuild the graph
+without it.
 
 Current automatic property indexes are created for single-property node declarations:
 orderable scalars and enums receive a scalar index, free-text Strings receive a
