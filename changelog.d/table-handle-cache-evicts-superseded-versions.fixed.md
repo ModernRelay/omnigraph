@@ -1,0 +1,1 @@
+- Steady writes to one branch no longer keep up to 64 superseded manifests of a hot table in memory: a write drops the cached handle of each table version it replaced.

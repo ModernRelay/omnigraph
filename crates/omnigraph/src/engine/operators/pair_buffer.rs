@@ -53,10 +53,7 @@ pub(super) struct PairBuffer {
 }
 
 fn row_bytes(memory: &WorkMemory, batch: &RecordBatch, rows: &mut Vec<usize>) -> DfResult<()> {
-    rows.clear();
-    for row in 0..batch.num_rows() {
-        rows.push(memory.slice_bytes(batch, row, 1)?);
-    }
+    *rows = memory.row_bytes(batch)?;
     Ok(())
 }
 

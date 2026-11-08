@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-storage"
-version = "0.14.1"
+version = "0.15.0"
 edition = "2024"
 description = "Shared local and object-store control-object storage boundary for Omnigraph."
 license = "MIT"
@@ -21,6 +21,8 @@ url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Paused time for the scope's deadline tests and the conditional re-issue tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

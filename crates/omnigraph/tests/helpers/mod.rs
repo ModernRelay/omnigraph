@@ -709,7 +709,7 @@ pub fn int_params(pairs: &[(&str, i64)]) -> ParamMap {
         .iter()
         .map(|(k, v)| {
             let key = k.strip_prefix('$').unwrap_or(k);
-            (key.to_string(), Literal::Integer(*v))
+            (key.to_string(), Literal::Integer(i128::from(*v)))
         })
         .collect()
 }
@@ -719,7 +719,7 @@ pub fn mixed_params(str_pairs: &[(&str, &str)], int_pairs: &[(&str, i64)]) -> Pa
     let mut map = params(str_pairs);
     for (k, v) in int_pairs {
         let key = k.strip_prefix('$').unwrap_or(k);
-        map.insert(key.to_string(), Literal::Integer(*v));
+        map.insert(key.to_string(), Literal::Integer(i128::from(*v)));
     }
     map
 }

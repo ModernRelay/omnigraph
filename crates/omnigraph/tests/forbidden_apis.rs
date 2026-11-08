@@ -156,6 +156,7 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "omnigraph-catalog/history.rs",
     "omnigraph-catalog/commit.rs",
     "omnigraph-core/lance_clone.rs",
+    "omnigraph-core/lance_commit.rs",
     "engine/plan_source/scan_access/tests.rs",
     "engine/plan_source/scan_access/planning_cost.rs",
 ];
@@ -521,7 +522,7 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
-        "first_parent_chain_holds",
+        "descends_linearly_from",
     ),
     (
         "omnigraph-catalog/lib.rs",
@@ -598,6 +599,26 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
         "ensure_incarnation_live",
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "incarnation_is_live",
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "native_incarnation_is_live",
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "live_branch_identifier",
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "ensure_retired_incarnation_opens",
     ),
     (
         "omnigraph-catalog/lib.rs",
@@ -865,7 +886,7 @@ gateway_surfaces! {
         "transaction_identity",
         "open_snapshot_at_entry", "open_snapshot_at_table", "open_dataset_head",
         "branch_identifier", "list_native_branches",
-        "ensure_expected_version", "scan", "scan_with_row_id", "scan_filtered", "scan_batches",
+        "ensure_expected_version", "scan", "scan_with_row_id", "scan_filtered", "scan_filtered_row_addrs", "scan_batches",
         "count_rows", "count_rows_with_staged",
         "scan_with_staged", "scan_with_pending", "scan_with_pending_materialized_blobs",
         "first_row_id_for_filter", "table_state", "has_btree_index",
@@ -879,8 +900,8 @@ gateway_surfaces! {
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
         "stage_overwrite_batches", "stage_overwrite_stream",
-        "stage_rename_columns", "stage_schema_evolution", "stage_delete", "stage_create_indices",
-        "stage_compaction", "stage_index_fold", "stage_index_reconciliation",
+        "stage_rename_columns", "stage_schema_evolution", "stage_delete", "stage_delete_rows", "stage_create_indices",
+        "stage_compaction", "stage_fragment_rewrite", "stage_index_fold", "stage_index_reconciliation",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
         "force_delete_branch",
@@ -910,7 +931,7 @@ gateway_surfaces! {
         "scan_proven_insert_delta_bounded", "include_proven_insert_blob_selection",
         "scan_stream", "scan_stream_bounded",
         "scan_stream_with", "scan_plan_with", "scan_plan_with_filter", "ordered_scan_error", "scan", "scan_with",
-        "count_rows",
+        "count_rows", "promotion_check",
         "dataset_version", "table_state", "scan_with_staged", "scan_with_pending",
         "scan_with_pending_materialized_blobs", "count_rows_with_staged",
         "has_btree_index", "has_fts_index", "has_fts_postings",
@@ -928,8 +949,8 @@ gateway_surfaces! {
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
         "stage_overwrite_batches", "stage_overwrite_stream",
         "stage_rename_columns", "renamed_schema", "stage_schema_evolution",
-        "plan_schema_evolution", "stage_delete", "stage_create_indices", "stage_compaction",
-        "stage_index_fold", "stage_index_reconciliation", "stage_full_text_declarations",
+        "plan_schema_evolution", "stage_delete", "stage_delete_rows", "stage_create_indices", "stage_compaction",
+        "stage_fragment_rewrite", "stage_index_fold", "stage_index_reconciliation", "stage_full_text_declarations",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
         "force_delete_branch",
@@ -1003,10 +1024,11 @@ durable_calls! {
     // deletion is last, so interrupted settlement can safely finish later.
     ("db/omnigraph/prepared_create.rs", ".delete_prefix(", 2, WriteProtocol::Exact("quiesced token-owned empty birth tables and unpublished manifest files; never graph root or foreign refs")),
     ("db/omnigraph/prepared_create.rs", ".delete(", 1, WriteProtocol::Exact("exact prepared init claim, removed only after all verified birth artifacts")),
-    ("db/upgrade.rs", "CommitBuilder::new(", 4, WriteProtocol::Exact("offline storage upgrade: fence, conversion and activation commits with zero retries under main-owned intent, and the per-ref stamp commit of the stamp-only route")),
+    ("db/upgrade.rs", "commit_builder(", 4, WriteProtocol::Exact("offline storage upgrade: fence, conversion and activation commits with zero retries under main-owned intent, and the per-ref stamp commit of the stamp-only route")),
     ("db/upgrade.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("manifest-only conversion rows staged under durable upgrade ownership")),
     ("db/upgrade.rs", ".execute_uncommitted_stream(", 1, WriteProtocol::Exact("manifest-only conversion rows staged under durable upgrade ownership")),
     ("omnigraph-core/fts_compat.rs", ".put(", 1, WriteProtocol::Composed("staged index artifact")),
+    ("omnigraph-core/lance_commit.rs", "CommitBuilder::new(", 1, WriteProtocol::Exact("the one commit constructor, which applies the commit-timeout policy (Lance's default in production, none while the simulation clock is installed); every commit the engine and the catalog make calls `commit_builder(` and is counted at its own site")),
     ("table_store.rs", ".put(", 1, WriteProtocol::Composed("deleted-ids record spilled to `_omnigraph/deleted_ids/<uuid>.json` before the detached delete commit that names it in its transaction properties; marked by the collector as one of the root's files")),
     // The `__manifest` Create write is the manifest's entire birth: entries,
     // genesis lineage, and the internal-schema stamp all ride the one commit,
@@ -1027,7 +1049,7 @@ durable_calls! {
     ("omnigraph-catalog/unattached.rs", ".delete(", 1, WriteProtocol::Composed("release one candidate tag: on an acknowledged drop, descendants before their base, or by cleanup of an expired snapshot; absence is the completed outcome")),
     ("omnigraph-catalog/commit.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/commit.rs", ".execute_uncommitted(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
-    ("omnigraph-catalog/commit.rs", "CommitBuilder::new(", 2, WriteProtocol::Exact("lowest manifest publisher gateway: the linear version with zero retries, or a detached candidate version whose only retry is the random version id")),
+    ("omnigraph-catalog/commit.rs", "commit_builder(", 2, WriteProtocol::Exact("lowest manifest publisher gateway: the linear version with zero retries, or a detached candidate version whose only retry is the random version id")),
     // The persisted CSR/CSC adjacency artifact (`__graph_index/csr-current.bin`):
     // derived, regenerable topology written ONLY from `optimize`'s tail (never
     // the query path, which only loads), outside graph visibility — a stale or
@@ -1057,7 +1079,7 @@ durable_calls! {
     // primitive (graph-index artifact), same atomic-visibility PUT contract
     // as `write_text`.
     ("omnigraph-storage/lib.rs", ".put(", 5, WriteProtocol::Composed("object storage put primitive, including Azure rename destination publication and the binary write_bytes primitive")),
-    ("omnigraph-storage/lib.rs", ".put_opts(", 2, WriteProtocol::Composed("object storage conditional put primitive")),
+    ("omnigraph-storage/lib.rs", ".put_opts(", 1, WriteProtocol::Composed("object storage conditional put primitive (`send_conditional_put`, shared by create-if-absent and if-match)")),
     ("omnigraph-storage/lib.rs", ".put_multipart(", 1, WriteProtocol::Composed("Azure multipart rename staging")),
     ("omnigraph-storage/lib.rs", ".put_part(", 1, WriteProtocol::Composed("Azure multipart rename staging")),
     ("omnigraph-storage/lib.rs", ".complete(", 1, WriteProtocol::Composed("Azure multipart rename destination publication")),
@@ -1067,6 +1089,8 @@ durable_calls! {
     ("omnigraph-storage/scoped.rs", ".put_part(", 1, WriteProtocol::Composed("tracked child of an owned multipart upload")),
     ("omnigraph-storage/scoped.rs", ".complete(", 1, WriteProtocol::Composed("owned multipart publication, never success after uncertain part completion")),
     ("omnigraph-storage/scoped.rs", ".abort(", 1, WriteProtocol::Composed("owned multipart cleanup retained across detached abort")),
+    ("omnigraph-storage/read_through.rs", ".put_opts(", 5, WriteProtocol::Composed("memory-layer put over a frozen directory (a prepared store under DST): overwrite, create, update of a layer object, update of a directory object landing as a create, and the copy's put")),
+    ("omnigraph-storage/read_through.rs", ".delete(", 1, WriteProtocol::Composed("memory-layer delete over a frozen directory, which it masks")),
     ("engine/operators/memory.rs", ".abort(", 1, WriteProtocol::ReadTaskCancellation),
     ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
@@ -1075,17 +1099,17 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 35, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 38, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
-    ("table_store.rs", ".raw_dataset_append(", 1, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
     ("table_store.rs", "DeleteBuilder::from_expr(", 1, WriteProtocol::Composed("staged delete primitive")),
-    ("table_store.rs", "InsertBuilder::new(", 3, WriteProtocol::Composed("staged insert primitive")),
+    ("table_store.rs", ".extend_deletions(", 1, WriteProtocol::Composed("staged delete primitive over row addresses its caller's scan captured: Lance's DeleteBuilder after its scan")),
+    ("table_store.rs", "InsertBuilder::new(", 4, WriteProtocol::Composed("staged insert primitive, and the branch-merge scratch append of `append_or_create_batch`, written uncommitted and committed through `commit_builder` so the scratch commit carries the same timeout policy")),
     ("table_store.rs", "MergeInsertBuilder::try_new(", 1, WriteProtocol::Composed("staged merge primitive")),
-    ("table_store.rs", "CommitBuilder::new(", 3, WriteProtocol::Composed("staged commit primitive")),
+    ("table_store.rs", "commit_builder(", 4, WriteProtocol::Composed("staged commit primitive, and the branch-merge scratch append's commit")),
     ("table_store.rs", ".create_index_builder(", 6, WriteProtocol::Composed("staged index primitive, RFC 0067 whole-rebuild fold and untrained full-text declaration")),
-    ("table_store.rs", ".execute_uncommitted(", 11, WriteProtocol::Composed("staged physical primitive")),
+    ("table_store.rs", ".execute_uncommitted(", 12, WriteProtocol::Composed("staged physical primitive, and the branch-merge scratch append's write")),
     ("table_store.rs", ".delete(", 1, WriteProtocol::Composed("discard of a refused overwrite's own uncommitted fragment files under the dataset's `data/`, named by the finished writers' transactions and referenced by no manifest; a file that stays is logged and left to cleanup, the refusal still wins")),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached rename-only system-column effect")),
     ("db/omnigraph/system_column_upgrade.rs", ".commit_changes_with_intent_and_expected(", 1, SYSTEM_COLUMNS_V9),
@@ -1093,7 +1117,7 @@ durable_calls! {
     ("exec/merge.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached merge chain")),
     ("exec/merge.rs", ".dataset()", 5, WriteProtocol::Exact("RFC 0067 detached merge chain, and the held source coordinates a merge `as commit` records")),
     ("db/omnigraph/schema_apply.rs", ".commit_staged_create_exact(", 1, SCHEMA_V9),
-    ("db/omnigraph/schema_apply.rs", ".commit_staged_detached(", 2, WriteProtocol::Exact("detached metadata-only schema evolution + incompatible original-empty-table retry")),
+    ("db/omnigraph/schema_apply.rs", ".commit_staged_detached(", 3, WriteProtocol::Exact("detached metadata-only schema evolution + #721 promotion fragment rewrite + incompatible original-empty-table retry")),
     ("db/omnigraph/table_ops.rs", ".commit_staged(", 1, WriteProtocol::Composed("shared merge/Optimize index tail")),
     ("db/omnigraph/table_ops.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("RFC 0067 detached index batch")),
     ("exec/staging.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("Mutation/Load detached staging (RFC 0067)")),
@@ -1230,9 +1254,11 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "Dataset::write(",
     "DeleteBuilder::new(",
     "DeleteBuilder::from_expr(",
+    ".extend_deletions(",
     "InsertBuilder::new(",
     "MergeInsertBuilder::try_new(",
     "CommitBuilder::new(",
+    "commit_builder(",
     ".create_index_builder(",
     ".execute_uncommitted(",
     ".execute_uncommitted_stream(",
@@ -2551,12 +2577,6 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         "lock release on local roots, where an unlink completes before it returns and a dead process sends nothing late, and on Azure, whose admission wrapper excludes other owners",
     ),
     (
-        "omnigraph-cluster/state_lock.rs",
-        ".delete_prefix(",
-        1,
-        "removes a superseded owner's lease directory after takeover; its lock id is never reused and its fence latched before the claim",
-    ),
-    (
         "omnigraph-cluster/store.rs",
         ".delete(",
         1,
@@ -2663,6 +2683,12 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         ".delete(",
         2,
         "the scope's own delete and rename-source delete; a mutable key's unknown outcome leaves it unsettled",
+    ),
+    (
+        "omnigraph-storage/read_through.rs",
+        ".delete(",
+        1,
+        "the read-through store's delete removes the memory layer's object in this process and masks the frozen directory's; DST only, nothing lands late",
     ),
     (
         "storage_layer.rs",
@@ -4465,6 +4491,338 @@ fn engine_code_does_not_call_forbidden_lance_apis() {
             report.join("\n\n")
         );
     }
+}
+
+/// The blocking primitives: in `db/` or `exec/` a constructor of one is a gate,
+/// and gates live in `db/write_queue.rs` where an acquisition crosses the
+/// `gate.<name>.*` seams; a non-gate (a cache) carries the sentinel's reason.
+const GATE_PRIMITIVES: &[&str] = &["Mutex", "RwLock", "Semaphore", "Notify"];
+
+const GATE_FUNNEL: &str = "db/write_queue.rs";
+
+/// `<primitive>::new(` or `<primitive>::const_new(` in a line of code, with or
+/// without a turbofish between the type and the constructor; the spelling hit,
+/// `Mutex::new(` or `Mutex::<..>::new(`.
+fn gate_constructor_hit(code: &str) -> Option<String> {
+    let bytes = code.as_bytes();
+    for primitive in GATE_PRIMITIVES {
+        let mut from = 0;
+        while let Some(pos) = code[from..].find(primitive) {
+            let start = from + pos;
+            from = start + 1;
+            if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+                continue;
+            }
+            let Some(mut rest) = code[start + primitive.len()..].strip_prefix("::") else {
+                continue;
+            };
+            let turbofish = rest.starts_with('<');
+            if turbofish {
+                let mut depth = 0i32;
+                let close = rest.char_indices().find_map(|(j, ch)| match ch {
+                    '<' => {
+                        depth += 1;
+                        None
+                    }
+                    '>' => {
+                        depth -= 1;
+                        (depth == 0).then_some(j + 1)
+                    }
+                    _ => None,
+                });
+                match close.and_then(|c| rest[c..].strip_prefix("::")) {
+                    Some(after) => rest = after,
+                    None => continue,
+                }
+            }
+            for constructor in ["new(", "const_new("] {
+                if rest.starts_with(constructor) {
+                    let path = if turbofish { "::<..>::" } else { "::" };
+                    return Some(format!("{primitive}{path}{constructor}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lex {
+    Code,
+    Comment,
+    Literal,
+}
+
+/// One tag per byte of `text`: code, a `//` or nested `/* */` comment, or a
+/// string, raw string, byte string or char literal.
+fn lex(text: &str) -> Vec<Lex> {
+    let bytes = text.as_bytes();
+    let mut tags = vec![Lex::Code; bytes.len()];
+    let mut i = 0;
+    let at = |i: usize| bytes.get(i).copied();
+    let ident_before =
+        |i: usize| i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+    while i < bytes.len() {
+        let start = i;
+        let tag = match bytes[i] {
+            b'/' if at(i + 1) == Some(b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                Lex::Comment
+            }
+            b'/' if at(i + 1) == Some(b'*') => {
+                let mut nesting = 1;
+                i += 2;
+                while i < bytes.len() && nesting > 0 {
+                    if bytes[i..].starts_with(b"*/") {
+                        nesting -= 1;
+                        i += 2;
+                    } else if bytes[i..].starts_with(b"/*") {
+                        nesting += 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                Lex::Comment
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                Lex::Literal
+            }
+            b'r' | b'b'
+                if !ident_before(i) && {
+                    let mut j = i + 1;
+                    if bytes[i] == b'b' && at(j) == Some(b'r') {
+                        j += 1;
+                    }
+                    if bytes[i] == b'b' && at(j) == Some(b'"') {
+                        false
+                    } else {
+                        while at(j) == Some(b'#') {
+                            j += 1;
+                        }
+                        j > i + usize::from(bytes[i] == b'b') && at(j) == Some(b'"')
+                    }
+                } =>
+            {
+                let mut j = i + 1 + usize::from(bytes[i] == b'b');
+                let hashes = bytes[j..].iter().take_while(|c| **c == b'#').count();
+                j += hashes + 1;
+                let close: Vec<u8> = std::iter::once(b'"')
+                    .chain(std::iter::repeat_n(b'#', hashes))
+                    .collect();
+                while j < bytes.len() && !bytes[j..].starts_with(&close) {
+                    j += 1;
+                }
+                i = j + close.len();
+                Lex::Literal
+            }
+            b'\'' => {
+                if at(i + 1) == Some(b'\\') {
+                    i += 3;
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if at(i + 2) == Some(b'\'') {
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+                Lex::Literal
+            }
+            _ => {
+                i += 1;
+                Lex::Code
+            }
+        };
+        for t in &mut tags[start..i.min(bytes.len())] {
+            *t = tag;
+        }
+    }
+    tags
+}
+
+/// The brace depth at the end of every line of `text`; braces inside string,
+/// raw string and char literals and inside comments do not count.
+fn brace_depth_by_line(text: &str) -> Vec<i64> {
+    let tags = lex(text);
+    let mut depths = Vec::new();
+    let mut depth = 0i64;
+    for (i, byte) in text.bytes().enumerate() {
+        match byte {
+            b'\n' => depths.push(depth),
+            b'{' if tags[i] == Lex::Code => depth += 1,
+            b'}' if tags[i] == Lex::Code => depth -= 1,
+            _ => {}
+        }
+    }
+    depths.push(depth);
+    depths
+}
+
+/// `text` with every comment byte replaced by a space, newlines kept, so a
+/// line-by-line scan reads code and literals only (a comment starts and ends
+/// on ASCII, so no multi-byte character is cut).
+fn code_only(text: &str) -> String {
+    let tags = lex(text);
+    let bytes: Vec<u8> = text
+        .bytes()
+        .enumerate()
+        .map(|(i, b)| {
+            if tags[i] == Lex::Comment && b != b'\n' {
+                b' '
+            } else {
+                b
+            }
+        })
+        .collect();
+    String::from_utf8(bytes).expect("comment bytes are replaced whole")
+}
+
+/// One flag per line: inside a `#[cfg(test)]` or `#[cfg(all(test, …))]` module
+/// of any visibility, attributes between the cfg and the `mod` allowed, from
+/// the cfg to the module's closing brace; the gate scan reads production only.
+fn in_test_module(contents: &str, lines: &[&str]) -> Vec<bool> {
+    let depths = brace_depth_by_line(contents);
+    let mut flags = vec![false; lines.len()];
+    let mut idx = 0;
+    while idx < lines.len() {
+        let cfg = lines[idx].trim();
+        let module = cfg == "#[cfg(test)]" || cfg.starts_with("#[cfg(all(test,");
+        let Some(module_line) = (module)
+            .then(|| {
+                (idx + 1..lines.len()).find(|&l| {
+                    let line = lines[l].trim();
+                    !line.is_empty() && !line.starts_with("#[")
+                })
+            })
+            .flatten()
+            .filter(|&l| {
+                let item = lines[l].trim_start();
+                let item = item
+                    .strip_prefix("pub")
+                    .map(|rest| rest.trim_start_matches(|c: char| c != ' ').trim_start())
+                    .unwrap_or(item);
+                item.starts_with("mod ") && item.ends_with('{')
+            })
+        else {
+            idx += 1;
+            continue;
+        };
+        let outer = module_line.checked_sub(1).map_or(0, |l| depths[l]);
+        let mut end = module_line;
+        while end < lines.len() && depths[end] > outer {
+            end += 1;
+        }
+        for flag in &mut flags[idx..=end.min(lines.len() - 1)] {
+            *flag = true;
+        }
+        idx = end + 1;
+    }
+    flags
+}
+
+fn gate_primitive_violations(relative: &str, contents: &str) -> Vec<String> {
+    let lines: Vec<&str> = contents.lines().collect();
+    let code = code_only(contents);
+    let test_lines = in_test_module(contents, &lines);
+    let mut violations = Vec::new();
+    for (idx, (line, code_line)) in lines.iter().zip(code.lines()).enumerate() {
+        if test_lines[idx] {
+            continue;
+        }
+        if line.contains(SENTINEL) || (idx > 0 && lines[idx - 1].contains(SENTINEL)) {
+            continue;
+        }
+        if let Some(pattern) = gate_constructor_hit(code_line) {
+            violations.push(format!(
+                "{relative}:{}: `{pattern}` — {}",
+                idx + 1,
+                line.trim()
+            ));
+        }
+    }
+    violations
+}
+
+#[test]
+fn in_process_waits_are_gates_in_write_queue() {
+    let src = engine_src_root();
+    let violations: Vec<String> = labeled_scan_files(&src, false)
+        .into_iter()
+        .filter(|(relative, _)| {
+            (relative.starts_with("db/") || relative.starts_with("exec/"))
+                && relative != GATE_FUNNEL
+        })
+        .flat_map(|(relative, file)| {
+            let contents = std::fs::read_to_string(&file)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+            gate_primitive_violations(&relative, &contents)
+        })
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "a blocking primitive outside `{GATE_FUNNEL}` is a gate no instrument sees: \
+         declare it there, where its acquisition crosses the `gate.<name>.*` seams, or \
+         mark the line `{SENTINEL} <why it is not a gate>` (a cache held across no \
+         round trip).\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+#[test]
+fn gate_primitive_scan_reads_production_code_and_honors_the_sentinel() {
+    let fixture = "struct S { m: tokio::sync::Mutex<()> }\n\
+        fn f() -> S {\n    S { m: tokio::sync::Mutex::new(()) }\n}\n\
+        // forbidden-api-allow: a cache, not a gate\n\
+        static C: std::sync::RwLock<u8> = std::sync::RwLock::new(0);\n\
+        // RwLock::new( in a comment\n\
+        #[cfg(test)]\nmod early_tests {\n    const B: &str = \"}\";\n    const C: char = '{';\n\
+        const R: &str = r#\"}}\"#; /* } */\n    fn g() { let _ = tokio::sync::Notify::new(); }\n}\n\
+        fn h() { let _ = tokio::sync::Semaphore::new(1); }\n\
+        /*\n * RwLock::new( on a block comment's inner line\n */\n\
+        fn i(slot: &mut std::sync::RwLock<u8>) { *slot = std::sync::RwLock::new(0); }\n\
+        fn j() { let _ = tokio::sync::Mutex::<Vec<u8>>::new(Vec::new()); }\n\
+        fn k() { let _ = MyMutex::new(); }\n\
+        #[cfg(all(test, feature = \"x\"))]\n#[allow(unused)]\npub mod extra {\n    fn g() { let _ = tokio::sync::Notify::new(); }\n}\n\
+        #[cfg(test)]\nmod tests {\n    fn g() { let _ = tokio::sync::Notify::new(); }\n}\n";
+    let violations = gate_primitive_violations("db/x.rs", fixture);
+    assert_eq!(violations.len(), 4, "{violations:?}");
+    assert!(
+        violations[0].starts_with("db/x.rs:3: `Mutex::new(`"),
+        "{violations:?}"
+    );
+    assert!(
+        violations[1].starts_with("db/x.rs:15: `Semaphore::new(`"),
+        "{violations:?}"
+    );
+    assert!(
+        violations[2].starts_with("db/x.rs:19: `RwLock::new(`"),
+        "a deref assignment is code, not a comment line: {violations:?}"
+    );
+    assert!(
+        violations[3].starts_with("db/x.rs:20: `Mutex::<..>::new(`"),
+        "a turbofish constructor is the same constructor: {violations:?}"
+    );
+    assert_eq!(
+        brace_depth_by_line("{ \"}\" '{' '\\'' '\\u{7d}' r##\"}\"##\n// }\n/* { */ }\n"),
+        [1, 1, 0, 0]
+    );
+    assert_eq!(
+        brace_depth_by_line("{ \"a continued \\\n string }\"\n}\n"),
+        [1, 1, 0, 0],
+        "an escaped line end inside a string is still a line"
+    );
 }
 
 /// `cfg(any(test, feature = "test-util"))` reads as test-only in both source guards,

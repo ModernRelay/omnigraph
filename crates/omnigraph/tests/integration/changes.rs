@@ -3392,6 +3392,181 @@ async fn change_feed_merge_commit_is_first_parent_relative_with_merged_parent_on
     );
 }
 
+/// A fast-forward merge commit takes the source's table pins, whose history
+/// never read the target's. Main and feature each insert one person in their
+/// first commit after the fork, which Lance gives one row id and one version
+/// stamp; feature merges main in, re-inserting main's person under a new row
+/// id, and main fast-forwards to feature. The fast forward's commit page, the
+/// feed across it and the two-point diff from its parent report feature's
+/// person alone, under every `change_lineage`.
+#[tokio::test]
+async fn commit_changes_feed_and_diff_across_a_fast_forward_report_the_source_rows() {
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedStart};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    let main_after_eve = write_on(&db, "main", "insert_person", &person("Eve", 22)).await;
+    write_on(&db, "feature", "insert_person", &person("Frank", 60)).await;
+    let caught_up = db.branch_merge("main", "feature").await.unwrap();
+    assert_eq!(caught_up.outcome, MergeOutcome::Merged);
+    let fast_forward = db.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(fast_forward.outcome, MergeOutcome::FastForward);
+    let fast_forward = fast_forward
+        .commit
+        .expect("a fast forward publishes one commit");
+    assert_eq!(
+        fast_forward.parent_commit_id.as_deref(),
+        Some(main_after_eve.graph_commit_id.as_str()),
+        "the fast forward's first parent is main's head"
+    );
+
+    let expected = vec![(
+        "Person".to_string(),
+        "Frank".to_string(),
+        ChangeOpKind::Insert,
+    )];
+    for value in ["off", "on", "verify"] {
+        let session = with_setting(&db, "change_lineage", value);
+        let page = session
+            .commit_changes_page(
+                &fast_forward.graph_commit_id,
+                &ChangeFeedScope::default(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            diff_ops(&page.block.changes),
+            expected,
+            "commit page, change_lineage = {value}"
+        );
+
+        let feed = session
+            .poll_change_feed(feed_request(
+                None,
+                ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(
+                    main_after_eve.graph_commit_id.clone(),
+                )),
+            ))
+            .await
+            .unwrap();
+        let blocks: Vec<(&str, _)> = feed
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.cause.graph_commit_id.as_str(),
+                    diff_ops(&block.changes),
+                )
+            })
+            .collect();
+        assert_eq!(
+            blocks,
+            vec![(fast_forward.graph_commit_id.as_str(), expected.clone())],
+            "feed, change_lineage = {value}"
+        );
+
+        let diff = session
+            .diff_page(&diff_request(
+                between(&main_after_eve.graph_commit_id, "main"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            diff_ops(&diff.changes),
+            expected,
+            "two-point diff, change_lineage = {value}"
+        );
+    }
+}
+
+/// A branch review's later page decides row pairing from the commits its
+/// token names, not from the merge base now. Feature and main each insert one
+/// person in their first commit after the fork, which Lance gives one row id
+/// and one version stamp, feature inserts another and merges main in. The
+/// review's first page takes the exact merge, since the source merged its
+/// target. Main then fast-forwards to feature, which makes the source head
+/// the merge base now, while the token's window still crosses feature's merge
+/// commit. The next page must report feature's first person under every
+/// `change_lineage`, not main's.
+#[tokio::test]
+async fn branch_diff_continuation_after_a_fast_forward_reports_the_source_rows() {
+    use omnigraph::changes::GraphDiffSides;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    write_on(&db, "feature", "insert_person", &person("Yara", 30)).await;
+    let main_after_xena = write_on(&db, "main", "insert_person", &person("Xena", 40)).await;
+    write_on(&db, "feature", "insert_person", &person("Abe", 50)).await;
+    assert_eq!(
+        db.branch_merge("main", "feature").await.unwrap().outcome,
+        MergeOutcome::Merged
+    );
+
+    let request = diff_request(
+        GraphDiffSides::Branch {
+            source: "feature".to_string(),
+            target: "main".to_string(),
+        },
+        Some(1),
+    );
+    let mut first_pages = Vec::new();
+    for value in ["off", "on", "verify"] {
+        let session = with_setting(&db, "change_lineage", value);
+        let first = session.diff_page(&request).await.unwrap();
+        assert_eq!(
+            first.from_commit_id, main_after_xena.graph_commit_id,
+            "feature merged main in, so the base is main's head"
+        );
+        first_pages.push((value, session, first));
+    }
+
+    assert_eq!(
+        db.branch_merge("feature", "main").await.unwrap().outcome,
+        MergeOutcome::FastForward
+    );
+    let base = db.merge_base("feature", "main").await.unwrap();
+    assert_eq!(
+        base.merge_base.graph_commit_id, base.source_commit_id,
+        "after the fast forward the source head is the merge base"
+    );
+
+    for (value, session, first) in first_pages {
+        let mut changes = diff_ops(&first.changes);
+        let mut token = first.next_page_token.clone();
+        let mut request = request.clone();
+        while let Some(next) = token {
+            request.page_token = Some(next);
+            let page = session.diff_page(&request).await.unwrap();
+            assert_eq!(page.from_commit_id, first.from_commit_id);
+            assert_eq!(page.to_commit_id, first.to_commit_id);
+            changes.extend(diff_ops(&page.changes));
+            token = page.next_page_token;
+        }
+        assert_eq!(
+            changes,
+            vec![
+                (
+                    "Person".to_string(),
+                    "Abe".to_string(),
+                    ChangeOpKind::Insert
+                ),
+                (
+                    "Person".to_string(),
+                    "Yara".to_string(),
+                    ChangeOpKind::Insert
+                ),
+            ],
+            "branch review across a later fast forward, change_lineage = {value}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn change_feed_cursor_scope_mismatches_are_typed() {
     use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart, ChangeOpKind};
@@ -4096,7 +4271,7 @@ async fn main_history(db: &Session) -> MainHistory {
 
 /// A history operation on main returns the same after a merged branch is
 /// deleted and after it is created again. The head a deleted branch wrote
-/// stays resolvable by id; the graph as of it is refused.
+/// stays resolvable by id, and the graph as of it opens while main retains it.
 #[tokio::test]
 async fn history_reads_are_the_same_after_a_merged_branch_is_deleted_and_recreated() {
     let dir = tempfile::tempdir().unwrap();
@@ -4195,13 +4370,22 @@ async fn history_reads_are_the_same_after_a_merged_branch_is_deleted_and_recreat
             unmerged_head_commit,
             "a head no branch merged is settled by the delete of its branch"
         );
-        let refused = handle
+        // Main merged the head, so it retains it: the retired incarnation
+        // opens by its exact commit (issue 1236).
+        handle
             .snapshot_of(ReadTarget::snapshot(feature_head.clone()))
+            .await
+            .unwrap();
+        let refused = handle
+            .snapshot_of(ReadTarget::snapshot(unmerged_head.clone()))
             .await
             .unwrap_err();
         assert!(
-            matches!(refused, omnigraph::error::OmniError::BranchNotFound { .. }),
-            "{refused}"
+            matches!(
+                refused,
+                omnigraph::error::OmniError::ReadTargetNotFound { .. }
+            ),
+            "no live branch retains the unmerged head: {refused}"
         );
     }
 
@@ -4227,16 +4411,12 @@ async fn history_reads_are_the_same_after_a_merged_branch_is_deleted_and_recreat
             handle.get_commit(feature_head.as_str()).await.unwrap(),
             feature_head_commit
         );
-        let refused = handle
+        // The recreated name cannot stand in for the retired incarnation,
+        // and cannot hide it: the exact commit still opens.
+        handle
             .snapshot_of(ReadTarget::snapshot(feature_head.clone()))
             .await
-            .unwrap_err();
-        assert!(
-            refused
-                .to_string()
-                .contains("has no persisted native-branch incarnation witness"),
-            "{refused}"
-        );
+            .unwrap();
     }
 }
 
@@ -4825,4 +5005,132 @@ async fn graph_diff_pages_answer_for_the_first_pages_endpoints() {
         .unwrap_err(),
         OmniError::ChangeCursorRejected { .. }
     ));
+}
+
+/// Issue 1236: a stacked branch's parent is fast-forward merged into main and
+/// deleted. The parent's commits stay readable through main, which retains
+/// them: `commit changes`, the change feed from the start and after the
+/// parent's commit, and a read at the commit open the retired incarnation by
+/// exact commit, as merge does. A commit no live branch retains stays unread.
+#[tokio::test]
+async fn stacked_branch_reads_survive_its_parents_delete_issue_1236() {
+    use omnigraph::changes::ChangeOpKind::Insert;
+    use omnigraph::changes::{ChangeFeedPosition, ChangeFeedScope, ChangeFeedStart};
+    use omnigraph::error::OmniError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("a").await.unwrap();
+    let a1 = write_on(&db, "a", "insert_person", &person("Una", 5)).await;
+    db.branch_create_from("a", "b").await.unwrap();
+    let b1 = write_on(&db, "b", "insert_person", &person("Bea", 7)).await;
+    // A child with no commit of its own: its head row still names `a`.
+    db.branch_create_from("a", "kid").await.unwrap();
+    // A handle bound to `a` before the delete captured a1 as its head.
+    let uri = dir.path().to_str().unwrap();
+    let stale = helpers::session(Omnigraph::open(uri).await.unwrap());
+    stale.sync_branch("a").await.unwrap();
+    let merged = db.branch_merge("a", "main").await.unwrap();
+    assert_eq!(
+        merged.outcome,
+        omnigraph::db::MergeOutcome::FastForward,
+        "main adopts a's commit"
+    );
+    db.branch_delete("a").await.unwrap();
+
+    let scope = ChangeFeedScope::default();
+    for (commit, name) in [(&a1, "Una"), (&b1, "Bea")] {
+        let page = db
+            .commit_changes_page(&commit.graph_commit_id, &scope, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            diff_ops(&page.block.changes),
+            vec![("Person".to_string(), name.to_string(), Insert)]
+        );
+    }
+
+    for position in [
+        ChangeFeedPosition::Start(ChangeFeedStart::Beginning),
+        ChangeFeedPosition::Start(ChangeFeedStart::AfterCommit(a1.graph_commit_id.clone())),
+    ] {
+        let page = db
+            .poll_change_feed(feed_request(Some("b"), position))
+            .await
+            .unwrap();
+        assert!(
+            page.blocks
+                .iter()
+                .any(|block| diff_ops(&block.changes).contains(&(
+                    "Person".to_string(),
+                    "Bea".to_string(),
+                    Insert
+                ))),
+            "the feed of b reports b's own commit"
+        );
+    }
+
+    db.snapshot_of(ReadTarget::snapshot(omnigraph::db::SnapshotId::new(
+        a1.graph_commit_id.clone(),
+    )))
+    .await
+    .unwrap();
+
+    // The feed of the live child that wrote nothing: its head is a1.
+    let page = db
+        .poll_change_feed(feed_request(
+            Some("kid"),
+            ChangeFeedPosition::Start(ChangeFeedStart::Beginning),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        page.blocks
+            .iter()
+            .any(|block| diff_ops(&block.changes).contains(&(
+                "Person".to_string(),
+                "Una".to_string(),
+                Insert
+            ))),
+        "the feed of a child with no commit of its own reports the parent's commit"
+    );
+
+    // The handle that captured a1 as its head before the delete.
+    stale
+        .snapshot_of(ReadTarget::snapshot(omnigraph::db::SnapshotId::new(
+            a1.graph_commit_id.clone(),
+        )))
+        .await
+        .unwrap();
+    let page = stale
+        .commit_changes_page(&a1.graph_commit_id, &scope, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        diff_ops(&page.block.changes),
+        vec![("Person".to_string(), "Una".to_string(), Insert)]
+    );
+
+    // A reclaimed name cannot stand in for the retired incarnation: the exact
+    // commit still opens after `a` is recreated.
+    db.branch_create("a").await.unwrap();
+    db.commit_changes_page(&a1.graph_commit_id, &scope, None, None, None)
+        .await
+        .unwrap();
+
+    // A commit that no live branch retains stays not found, naming the
+    // caller's spelling and never the deleted branch.
+    db.branch_create("gone").await.unwrap();
+    let on_gone = write_on(&db, "gone", "insert_person", &person("Gil", 31)).await;
+    db.branch_delete("gone").await.unwrap();
+    let error = db
+        .commit_changes_page(&on_gone.graph_commit_id, &scope, None, None, None)
+        .await
+        .unwrap_err();
+    match error {
+        OmniError::ReadTargetNotFound { target } => {
+            assert_eq!(target, on_gone.graph_commit_id, "the caller's spelling")
+        }
+        other => panic!("expected ReadTargetNotFound of the commit id, got {other:?}"),
+    }
 }

@@ -377,6 +377,26 @@ pub(super) async fn execute_node_scan(
         }
         _ => true,
     };
+    // A vector index that does not rank exactly by squared L2 (quantized,
+    // HNSW, another metric, unreadable details) is one the engine never
+    // builds; using it would return approximate or differently ranked rows
+    // as an exhaustive answer. Indexes are derived state, so the scan
+    // answers from the flat exact kNN instead (issue #1297). The details
+    // are read only when the scan would otherwise use the index.
+    if use_index && !scan_proven_empty {
+        if let Some((property, _, _)) = nearest_target.as_ref() {
+            if !super::plan_source::indexes::vector_indexes_rank_exactly_by_l2(&read.ds, property)
+                .await?
+            {
+                tracing::debug!(
+                    variable,
+                    "the vector index on the nearest column does not rank exactly by L2; \
+                     scanning flat"
+                );
+                use_index = false;
+            }
+        }
+    }
     scan_report.probes.clear();
     scan_report.ann_metrics.clear();
     scan_report.exact = false;
@@ -470,12 +490,13 @@ pub(super) async fn execute_node_scan(
             rows,
         });
         let unreached = batches_hold_infinite_distance(&batches);
-        // Every vector index the engine builds is IVF_FLAT, which scores
-        // every row of a partition it searches exactly, so an attempt that
-        // searched every partition ranked exactly; Lance reports neither
-        // partition counter when no index covers the column and it scores
-        // every row flat. A row the prefilter admitted and the search did
-        // not reach comes back at `+inf`, out of its place.
+        // The scan uses a vector index only when it is IVF_FLAT by L2 (any
+        // other runs flat, above), which scores every row of a partition it
+        // searches exactly, so an attempt that searched every partition
+        // ranked exactly; Lance reports neither partition counter when no
+        // index covers the column and it scores every row flat. A row the
+        // prefilter admitted and the search did not reach comes back at
+        // `+inf`, out of its place.
         let every_partition = match summary {
             Some((None, None)) => true,
             Some((Some(searched), Some(ranked))) => searched >= ranked,
@@ -1045,16 +1066,191 @@ pub(super) fn build_lance_filter_expr(
 }
 
 /// Lower recorded expression types and casts; the schema never selects a domain.
+///
+/// The lowered predicate is split on the nullness of each column it tests more
+/// than once (see [`split_on_repeatedly_tested_columns`]). `schema` decides
+/// only which columns need the split and the type of their null; whether the
+/// predicate lowers at all depends on the expression alone.
+///
+/// The result is a filter, not a value: it selects the same rows as the
+/// written predicate, but where that predicate is null it may be false. Use it
+/// only where true selects a row and null and false both reject it: a scanner
+/// or delete filter, a conjunct or disjunct of other filters, or under
+/// `IS TRUE` / `IS NOT TRUE`. Never negate it or read its value.
 pub(crate) fn ir_expr_to_df_expr(
     expr: &IRExpr,
     params: &ParamMap,
-    _schema: Option<&Schema>,
+    schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
     if is_search_filter(expr) {
         return None;
     }
     expr.check_types().ok()?;
-    typed_expr_to_df_expr(expr, params)
+    split_on_repeatedly_tested_columns(typed_expr_to_df_expr(expr, params)?, schema)
+}
+
+/// The most columns one pushed predicate is split on. Each split doubles the
+/// predicate, so a pushed predicate holds at most 2^4 = 16 copies of the
+/// written one; a predicate that tests more columns repeatedly is not pushed.
+pub(crate) const MAX_NULL_SPLIT_COLUMNS: usize = 4;
+
+/// Lance runs DataFusion's `ExprSimplifier` on every pushed filter
+/// (`Planner::optimize_expr`). In DataFusion 54 its IN-list set rules fold two
+/// tests of one operand whose lists leave nothing (`x IN (a) AND x IN (b)`,
+/// `x IN (a) AND x NOT IN (a, b)`, `x NOT IN (a) OR x NOT IN (b)`) to a bare
+/// `false` or `true`. That constant is wrong for a row whose `x` is null, where
+/// each test, and so the pair, is null; under a `NOT`, or as the `OR` form, the
+/// row is then selected (#1277). The simplifier first turns `x = a OR x = b`
+/// into `x IN (a, b)`, and `NOT (x != a)` into `x = a`, so `=` and `!=` feed the
+/// same rules. apache/datafusion#24258 keeps the null; no DataFusion release
+/// that Lance uses contains it.
+///
+/// For each nullable column `c` that two or more `=`, `!=` or `IN` tests read,
+/// the predicate `p` becomes `(c IS NOT NULL AND p) OR (c IS NULL AND p[c := NULL])`.
+/// That is the same predicate in three-valued logic. Every rewrite the
+/// simplifier makes in the first branch is exact when `c` is not null, and the
+/// branch is false when `c` is null; the second branch tests no `c` at all, so
+/// constant folding answers it. When `p[c := NULL]` reads no other column it
+/// is evaluated here (see [`constant_truth`]) and the predicate becomes
+/// `c IS NULL OR p` when it is true and `c IS NOT NULL AND p` when it is false
+/// or null, which keeps Lance's scalar index for the predicate; null becomes
+/// false only at the root of a filter, where both reject the row. A column the
+/// schema declares non-null needs no split. More than [`MAX_NULL_SPLIT_COLUMNS`] repeatedly tested columns,
+/// nullable or not, answer `None` (not pushable), so the verdict never depends
+/// on the schema. Remove the split at the Lance bump whose DataFusion contains
+/// #24258.
+fn split_on_repeatedly_tested_columns(
+    expr: datafusion::prelude::Expr,
+    schema: Option<&Schema>,
+) -> Option<datafusion::prelude::Expr> {
+    use datafusion::common::Column;
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::prelude::Expr;
+
+    let repeated = repeatedly_tested_columns(&expr);
+    if repeated.len() > MAX_NULL_SPLIT_COLUMNS {
+        return None;
+    }
+
+    let mut expr = expr;
+    for name in repeated {
+        let field = schema.and_then(|schema| schema.field_with_name(&name).ok());
+        if field.is_some_and(|field| !field.is_nullable()) {
+            continue;
+        }
+        let null = field
+            .and_then(|field| ScalarValue::try_from(field.data_type()).ok())
+            .unwrap_or(ScalarValue::Null);
+        let when_null = expr
+            .clone()
+            .transform(|node| {
+                Ok(match node {
+                    Expr::Column(column) if column.name == name => {
+                        Transformed::yes(Expr::Literal(null.clone(), None))
+                    }
+                    other => Transformed::no(other),
+                })
+            })
+            .ok()?
+            .data;
+        let column = Expr::Column(Column::from_name(name));
+        expr = match constant_truth(&when_null) {
+            // `p[c := NULL]` is true: `(c IS NULL OR p)` is exact.
+            Some(Some(true)) => column.is_null().or(expr),
+            // False, or null at the root of a filter, where null and false
+            // both reject the row: `(c IS NOT NULL AND p)`.
+            Some(Some(false) | None) => column.is_not_null().and(expr),
+            None => column
+                .clone()
+                .is_not_null()
+                .and(expr)
+                .or(column.is_null().and(when_null)),
+        };
+    }
+    Some(expr)
+}
+
+/// The value of an expression that reads no column, evaluated without the
+/// simplifier: `Some(Some(b))` for a boolean, `Some(None)` for null, and
+/// `None` when it reads a column or does not evaluate to one boolean.
+///
+/// A null branch `c IS NULL AND NULL` keeps Lance from using a scalar index:
+/// it has no index for a literal, so the branch carries a refine expression,
+/// and an `OR` with a refine on either side drops the index for the whole
+/// predicate (`IndexedExpression::maybe_or`). Folding the branch first keeps
+/// `x = a OR x = b` on a nullable indexed property an index probe.
+fn constant_truth(expr: &datafusion::prelude::Expr) -> Option<Option<bool>> {
+    use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchOptions};
+    use datafusion::common::DFSchema;
+    use datafusion::logical_expr::ColumnarValue;
+
+    if !expr.column_refs().is_empty() {
+        return None;
+    }
+    let physical = datafusion::physical_expr::create_physical_expr(
+        expr,
+        &DFSchema::empty(),
+        &Default::default(),
+    )
+    .ok()?;
+    let batch = RecordBatch::try_new_with_options(
+        std::sync::Arc::new(Schema::empty()),
+        Vec::new(),
+        &RecordBatchOptions::new().with_row_count(Some(1)),
+    )
+    .ok()?;
+    match physical.evaluate(&batch).ok()? {
+        ColumnarValue::Scalar(ScalarValue::Boolean(value)) => Some(value),
+        ColumnarValue::Scalar(_) => None,
+        ColumnarValue::Array(values) => {
+            let values = values.as_any().downcast_ref::<BooleanArray>()?;
+            (values.len() == 1).then(|| values.is_valid(0).then(|| values.value(0)))
+        }
+    }
+}
+
+/// The columns that two or more `=`, `!=` or `IN` tests with a literal read,
+/// in name order.
+fn repeatedly_tested_columns(expr: &datafusion::prelude::Expr) -> Vec<String> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::{BinaryExpr, Operator};
+    use datafusion::prelude::Expr;
+    use std::collections::BTreeMap;
+
+    let mut tests: BTreeMap<String, usize> = BTreeMap::new();
+    let _ = expr.apply(|node| {
+        let operand = match node {
+            Expr::InList(list) => Some(list.expr.as_ref()),
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Eq | Operator::NotEq,
+                right,
+            }) => match (left.as_ref(), right.as_ref()) {
+                (operand, Expr::Literal(..)) | (Expr::Literal(..), operand) => Some(operand),
+                _ => None,
+            },
+            _ => None,
+        };
+        for column in operand.map(Expr::column_refs).unwrap_or_default() {
+            *tests.entry(column.name.clone()).or_default() += 1;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    tests
+        .into_iter()
+        .filter_map(|(name, count)| (count > 1).then_some(name))
+        .collect()
+}
+
+/// Whether `expr` lowers but tests more than [`MAX_NULL_SPLIT_COLUMNS`]
+/// columns repeatedly, the one reason [`ir_expr_to_df_expr`] refuses a
+/// predicate it can otherwise express.
+pub(crate) fn exceeds_null_split_columns(expr: &IRExpr, params: &ParamMap) -> bool {
+    !is_search_filter(expr)
+        && expr.check_types().is_ok()
+        && typed_expr_to_df_expr(expr, params).is_some_and(|lowered| {
+            repeatedly_tested_columns(&lowered).len() > MAX_NULL_SPLIT_COLUMNS
+        })
 }
 
 fn typed_expr_to_df_expr(expr: &IRExpr, params: &ParamMap) -> Option<datafusion::prelude::Expr> {
@@ -1320,5 +1516,203 @@ mod coercion_tests {
             )
             .is_none()
         );
+    }
+}
+
+/// What Lance does to a pushed filter, on a three-row table with a nullable
+/// `s` (`null`, `"x"`, `"y"`), a nullable `n` (`null`, `1`, `2`) and a
+/// non-null `k` (`"a"`, `"b"`, `"c"`).
+#[cfg(test)]
+pub(crate) mod lance_filter_support {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::Expr;
+    use lance_datafusion::planner::Planner;
+
+    pub(crate) fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("k", DataType::Utf8, false),
+        ]))
+    }
+
+    /// The rows `expr` holds true for: as written when `optimize` is false,
+    /// and after Lance's `Planner::optimize_expr`, the preparation every
+    /// scanner filter gets, when it is true.
+    pub(crate) fn selected_rows(expr: Expr, optimize: bool) -> Vec<usize> {
+        let planner = Planner::new(schema());
+        let expr = if optimize {
+            planner
+                .optimize_expr(expr)
+                .expect("Lance prepares the filter")
+        } else {
+            expr
+        };
+        let batch = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(StringArray::from(vec![None, Some("x"), Some("y")])),
+                Arc::new(Int64Array::from(vec![None, Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("a valid batch");
+        let values = planner
+            .create_physical_expr(&expr)
+            .expect("a physical filter")
+            .evaluate(&batch)
+            .expect("the filter evaluates")
+            .into_array(batch.num_rows())
+            .expect("one value per row");
+        let values = values
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("a boolean filter");
+        (0..values.len())
+            .filter(|row| values.is_valid(*row) && values.value(*row))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod null_split_tests {
+    use super::lance_filter_support::{schema, selected_rows};
+    use super::{MAX_NULL_SPLIT_COLUMNS, split_on_repeatedly_tested_columns};
+    use datafusion::prelude::{Expr, col, lit, not};
+
+    fn shapes() -> Vec<(&'static str, Expr)> {
+        let s_in = |value: &str| col("s").in_list(vec![lit(value)], false);
+        let n_in =
+            |values: &[i64]| col("n").in_list(values.iter().map(|v| lit(*v)).collect(), false);
+        vec![
+            (
+                "not s in x or not s in y",
+                not(s_in("x")).or(not(s_in("y"))),
+            ),
+            ("not (s in x and s in y)", not(s_in("x").and(s_in("y")))),
+            (
+                "not (n in 1 and not n in 1,2,0,5)",
+                not(n_in(&[1]).and(not(n_in(&[1, 2, 0, 5])))),
+            ),
+            (
+                "not ((s = x or s = w) and (s = y or s = v))",
+                not((col("s").eq(lit("x")).or(col("s").eq(lit("w"))))
+                    .and(col("s").eq(lit("y")).or(col("s").eq(lit("v"))))),
+            ),
+            (
+                "not (s != x and s != y) and not (n = 1 and n = 2)",
+                not(col("s").not_eq(lit("x")).and(col("s").not_eq(lit("y"))))
+                    .and(not(col("n").eq(lit(1i64)).and(col("n").eq(lit(2i64))))),
+            ),
+            (
+                "n = 1 or n = 2",
+                col("n").eq(lit(1i64)).or(col("n").eq(lit(2i64))),
+            ),
+            (
+                "(n = 1 or n = 2) and k = b",
+                (col("n").eq(lit(1i64)).or(col("n").eq(lit(2i64)))).and(col("k").eq(lit("b"))),
+            ),
+        ]
+    }
+
+    /// Lance's preparation selects the null row for these shapes, and the
+    /// split predicate selects exactly the rows the written one does. When
+    /// the first assertion fails, Lance's DataFusion keeps the null
+    /// (apache/datafusion#24258) and the split can go.
+    #[test]
+    fn the_split_keeps_null_rows_out_of_a_prepared_filter_issue_1277() {
+        let mut lance_selects_the_null_row = false;
+        for (name, shape) in shapes() {
+            let written = selected_rows(shape.clone(), false);
+            assert!(!written.contains(&0), "{name}: the null row is never true");
+            lance_selects_the_null_row |= selected_rows(shape.clone(), true).contains(&0);
+            let split = split_on_repeatedly_tested_columns(shape, Some(&schema()))
+                .expect("within the column bound");
+            assert_eq!(selected_rows(split, true), written, "{name}");
+        }
+        assert!(
+            lance_selects_the_null_row,
+            "Lance no longer folds a disjoint IN pair to a bare literal"
+        );
+    }
+
+    #[test]
+    fn only_repeatedly_tested_nullable_columns_are_split() {
+        let once = col("s")
+            .in_list(vec![lit("x")], false)
+            .and(col("n").eq(lit(1i64)));
+        assert_eq!(
+            split_on_repeatedly_tested_columns(once.clone(), Some(&schema())),
+            Some(once)
+        );
+        let non_null = not(col("k").eq(lit("a")).or(col("k").eq(lit("b"))));
+        assert_eq!(
+            split_on_repeatedly_tested_columns(non_null.clone(), Some(&schema())),
+            Some(non_null)
+        );
+    }
+
+    /// A null branch that reads no other column is folded to a constant, so
+    /// the pushed predicate keeps one guard and Lance keeps its scalar index;
+    /// one that reads another column keeps both branches.
+    #[test]
+    fn a_constant_null_branch_folds_into_one_guard() {
+        let p = col("n").eq(lit(1i64)).or(col("n").eq(lit(2i64)));
+        assert_eq!(
+            split_on_repeatedly_tested_columns(p.clone(), Some(&schema())),
+            Some(col("n").is_not_null().and(p))
+        );
+        let p = col("s")
+            .is_null()
+            .or(not(col("s").eq(lit("x")).and(col("s").eq(lit("y")))));
+        let split = split_on_repeatedly_tested_columns(p.clone(), Some(&schema()));
+        assert_eq!(split, Some(col("s").is_null().or(p.clone())));
+        let written = selected_rows(p, false);
+        assert!(written.contains(&0), "the null row is selected as written");
+        assert_eq!(selected_rows(split.expect("split"), true), written);
+        let p = col("n")
+            .eq(lit(1i64))
+            .or(col("n").eq(lit(2i64)))
+            .or(col("k").eq(lit("a")));
+        let split = split_on_repeatedly_tested_columns(p.clone(), Some(&schema()))
+            .expect("within the column bound");
+        assert_ne!(split, col("n").is_not_null().and(p.clone()));
+        assert_ne!(split, col("n").is_null().or(p));
+    }
+
+    /// The bound is on repeatedly tested columns whatever their nullability,
+    /// so the verdict is the same with and without a schema.
+    #[test]
+    fn more_repeatedly_tested_columns_than_the_bound_are_not_pushed() {
+        let twice = |name: String| {
+            col(name.as_str())
+                .eq(lit("a"))
+                .or(col(name.as_str()).eq(lit("b")))
+        };
+        let predicate = |columns: usize| {
+            (0..columns)
+                .map(|column| twice(format!("p{column}")))
+                .reduce(Expr::and)
+                .expect("at least one column")
+        };
+        for schema in [None, Some(schema())] {
+            assert!(
+                split_on_repeatedly_tested_columns(
+                    predicate(MAX_NULL_SPLIT_COLUMNS),
+                    schema.as_deref()
+                )
+                .is_some()
+            );
+            assert!(
+                split_on_repeatedly_tested_columns(
+                    predicate(MAX_NULL_SPLIT_COLUMNS + 1),
+                    schema.as_deref()
+                )
+                .is_none()
+            );
+        }
     }
 }

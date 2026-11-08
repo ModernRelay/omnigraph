@@ -226,7 +226,7 @@ pub(super) async fn capture(
 ) -> Result<CapturedSchemaApply> {
     db.refresh_coordinator_only().await?;
     let (snapshot, branch_identifier, graph_head) = {
-        let coordinator = db.coordinator.read().await;
+        let coordinator = db.coordinator.load_full();
         (
             coordinator.snapshot(),
             coordinator.branch_identifier().await?,
@@ -298,7 +298,7 @@ pub(in crate::db::omnigraph) async fn reconcile_schema_apply(
         let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
         db.refresh_coordinator_only().await?;
         let (snapshot, branch_identifier, graph_head) = {
-            let coordinator = db.coordinator.read().await;
+            let coordinator = db.coordinator.load_full();
             (
                 coordinator.snapshot(),
                 coordinator.branch_identifier().await?,
@@ -309,8 +309,7 @@ pub(in crate::db::omnigraph) async fn reconcile_schema_apply(
         validate_schema_contract_row(&row)?;
         let only_main = db
             .coordinator
-            .read()
-            .await
+            .load_full()
             .all_branches()
             .await?
             .iter()

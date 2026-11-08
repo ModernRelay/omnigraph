@@ -13,6 +13,7 @@
 //! load validate edge_ri edge:Knows from Person: probe judged
 //! load validate cardinality edge:Knows from Person
 //! load validate retained_edges node:Person edge:Knows from: access probe
+//! load validate source_cardinality node:Person edge:WorksAt: access probe
 //! load validate removal node:Person: scan
 //! load write: overwrite fragments
 //! load pipeline 0: CsvSource => Validate
@@ -33,7 +34,7 @@ use omnigraph::loader::LoadExecuted;
 use serde::Serialize;
 use serde_json::Value;
 
-const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: probe <swept|judged>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load validate removal <table>: <scan|none>`, `load write: <overwrite fragments|append strict_insert|merge upsert>`, `load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]`, `load executed: partitions <n> rows <m>`, `load executed <Node>: rows <m>`";
+const FORMS: &str = "forms: `load route: <plan|pipeline>`, `load scan: partitions <n> fallback single_scan`, `load validate value <table> [a, b]`, `load validate unique <table> <key|unique> [a, b]: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: access <delta|probe|scan>`, `load validate edge_ri <edge> <from|to> <Node>: probe <swept|judged>`, `load validate cardinality <edge> <from|to> <Node>`, `load validate retained_edges <node> <edge> <from|to>: access <delta|probe|scan>`, `load validate source_cardinality <node> <edge>: access <delta|probe|scan>`, `load validate removal <table>: <scan|none>`, `load write: <overwrite fragments|append strict_insert|merge upsert>`, `load pipeline <n>: <Source>[ -> <Operator>]* => <sink>[ partitions <n>][ after <n>[, <m>]]`, `load executed: partitions <n> rows <m>`, `load executed <Node>: rows <m>`";
 
 const ACCESS: [&str; 3] = ["delta", "probe", "scan"];
 const REMOVALS: [&str; 2] = ["scan", "none"];
@@ -89,6 +90,11 @@ pub(crate) enum LoadFact {
         node: String,
         edge: String,
         endpoint: String,
+        access: String,
+    },
+    SourceCardinality {
+        node: String,
+        edge: String,
         access: String,
     },
     /// The `Validate` node's `removal`: whether the ids an overwrite removes
@@ -250,6 +256,9 @@ impl LoadFact {
                 endpoint,
                 access,
             } => format!("load validate retained_edges {node} {edge} {endpoint}: access {access}"),
+            LoadFact::SourceCardinality { node, edge, access } => {
+                format!("load validate source_cardinality {node} {edge}: access {access}")
+            }
             LoadFact::Removal { table, removal } => {
                 format!("load validate removal {table}: {removal}")
             }
@@ -435,6 +444,18 @@ fn parse_validate_fact(text: &str) -> Option<LoadFact> {
             access: access_word(access)?,
         });
     }
+    if let Some(source) = text.strip_prefix("source_cardinality ") {
+        let (identity, access) = source.rsplit_once(": access ")?;
+        let words: Vec<&str> = identity.split_whitespace().collect();
+        let [node, edge] = words.as_slice() else {
+            return None;
+        };
+        return Some(LoadFact::SourceCardinality {
+            node: table_key(node)?,
+            edge: table_key(edge)?,
+            access: access_word(access)?,
+        });
+    }
     if let Some(removal) = text.strip_prefix("removal ") {
         let (table, removal) = removal.rsplit_once(':')?;
         let removal = removal.trim();
@@ -575,6 +596,11 @@ fn node_facts(node: &Value, facts: &mut Vec<LoadFact>) {
                         endpoint: text(&check["endpoint"]),
                         access,
                     },
+                    Some("source_cardinality") => LoadFact::SourceCardinality {
+                        node: table.clone(),
+                        edge: text(&check["edge_table"]),
+                        access,
+                    },
                     _ => continue,
                 };
                 facts.push(fact);
@@ -593,6 +619,40 @@ fn node_facts(node: &Value, facts: &mut Vec<LoadFact>) {
         ))),
         _ => {}
     }
+}
+
+/// Every fact of a staged write's planner documents, one document per
+/// validated table, in document order and deduplicated: the mutate and
+/// `branch merge` receipts carry no executed report, so the executed facts
+/// are the default's and a section never claims them.
+pub(crate) fn write_plan_facts(documents: &[Value]) -> Vec<String> {
+    let executed = LoadExecuted::default();
+    let mut facts: Vec<String> = Vec::new();
+    for document in documents {
+        for fact in plan_facts(document, &executed) {
+            let line = fact.spell();
+            if !facts.contains(&line) {
+                facts.push(line);
+            }
+        }
+    }
+    facts
+}
+
+/// The first expected fact no document of a staged write holds, with every
+/// fact the documents do hold, or `None` when all hold.
+pub(crate) fn write_plan_mismatch(expected: &[LoadFact], documents: &[Value]) -> Option<String> {
+    let actual = write_plan_facts(documents);
+    let missing = expected
+        .iter()
+        .map(LoadFact::spell)
+        .find(|line| !actual.contains(line))?;
+    let mut message = format!("write plan does not hold `{missing}`; the validated tables' facts:");
+    for line in &actual {
+        message.push_str("\n  ");
+        message.push_str(line);
+    }
+    Some(message)
 }
 
 /// The first expected fact the executed plan does not hold, with every fact
@@ -637,6 +697,7 @@ mod tests {
             "load validate edge_ri edge:Knows from Person: probe judged",
             "load validate cardinality edge:Knows from Person",
             "load validate retained_edges node:Person edge:Knows to: access probe",
+            "load validate source_cardinality node:Person edge:WorksAt: access probe",
             "load validate removal node:Person: scan",
             "load validate removal edge:Knows: none",
             "load write: overwrite fragments",
@@ -671,6 +732,9 @@ mod tests {
             "load validate retained_edges node:Person edge:Knows",
             "load validate retained_edges node:Person edge:Knows from",
             "load validate retained_edges node:Person edge:Knows from: access index",
+            "load validate source_cardinality node:Person edge:WorksAt",
+            "load validate source_cardinality node:Person WorksAt: access probe",
+            "load validate source_cardinality node:Person edge:WorksAt from: access probe",
             "load validate removal node:Person",
             "load validate removal Person: scan",
             "load validate removal node:Person: probe",

@@ -1,0 +1,95 @@
+# issue: 1236
+# red_on: `ensure_incarnation_live` refused the merge base, a commit written by the deleted parent branch, so `branch diff`, the two-point diff and a read at the commit answered not found while `branch merge` (which opens retired refs by exact commit) succeeded.
+# notes: A stacked branch `b` forks from `a`; `a` fast-forward merges into main and is deleted. The
+# notes: merge base of `b` and main is `a`'s last commit, which only the retired native ref of `a`
+# notes: still opens. Review of `b` into main, the two-point diff from that commit, and a read at it
+# notes: must answer from the retired incarnation, as before the delete.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    title: String
+}
+
+--- seed
+{"type":"Person","data":{"name":"p5","title":"Eng"}}
+{"type":"Person","data":{"name":"p7","title":"Eng"}}
+
+--- mutate
+branch create a
+
+--- expect ok
+
+--- mutate branch: a
+query promote() {
+    update Person set { title: "Lead" } where name = "p5"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- bind commit $a1
+
+--- mutate
+branch create b from a
+
+--- expect ok
+
+--- mutate branch: b
+query promote() {
+    update Person set { title: "Principal" } where name = "p7"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge a into main
+
+--- expect outcome: fast_forward
+
+--- query
+branch diff b into main
+
+--- expect ordered
+{"before":{"properties":{"name":"p7","title":"Eng"}},"after":{"properties":{"name":"p7","title":"Principal"}},"id":"p7","kind":"node","op":"update","type":"Person"}
+
+--- mutate
+branch delete a
+
+--- expect ok
+
+--- query
+branch diff b into main
+
+--- expect ordered
+{"before":{"properties":{"name":"p7","title":"Eng"}},"after":{"properties":{"name":"p7","title":"Principal"}},"id":"p7","kind":"node","op":"update","type":"Person"}
+
+--- query
+branch diff "${a1}" to b
+
+--- expect ordered
+{"before":{"properties":{"name":"p7","title":"Eng"}},"after":{"properties":{"name":"p7","title":"Principal"}},"id":"p7","kind":"node","op":"update","type":"Person"}
+
+--- query snapshot: $a1
+query people() {
+    match { $p: Person }
+    return { $p.name, $p.title }
+}
+
+--- expect unordered
+{"p.name":"p5","p.title":"Lead"}
+{"p.name":"p7","p.title":"Eng"}
+
+--- expect shape
+p.name: String
+p.title: String

@@ -309,6 +309,10 @@ pub enum Unrouted {
     /// A load mode the executor's keyed adapters still own: the plan is
     /// built and explained, the executor runs the statement.
     ModeOnExecutor { mode: &'static str },
+    /// A write the executor stages (a JSONL load, a mutation, a blob cell, a
+    /// branch merge): the plan's `Validate` is built and decided here and run
+    /// by the executor's judge; the write itself never enters a plan.
+    WriteOnExecutor { kind: &'static str },
     /// A full-text call reads a declared index with no segment at the
     /// pinned snapshot (`PlanError::FullTextIndexRequired`): a conflict the
     /// engine returns with its typed detail.
@@ -341,6 +345,7 @@ impl Unrouted {
             Self::ValidationExhausted { .. } => "validation_exhausted",
             Self::SourceError { .. } => "source_error",
             Self::ModeOnExecutor { .. } => "mode_on_executor",
+            Self::WriteOnExecutor { .. } => "write_on_executor",
             Self::FullTextIndexRequired { .. } => "full_text_index_required",
         }
     }
@@ -366,6 +371,7 @@ impl Unrouted {
                 json!({ "kind": self.kind(), "limit": limit, "value": value })
             }
             Self::ModeOnExecutor { mode } => json!({ "kind": self.kind(), "mode": mode }),
+            Self::WriteOnExecutor { kind } => json!({ "kind": self.kind(), "write": kind }),
             Self::FullTextIndexRequired { index } => {
                 json!({ "kind": self.kind(), "index": index })
             }
@@ -397,6 +403,10 @@ pub enum Decision {
         /// The rewritten logical plan, when one was built before the miss;
         /// empty when the operation was refused before a plan existed.
         logical: LogicalPlan,
+        /// The physical plan the executor runs by hand: a write's `Validate`
+        /// node with its decided access, executed by the executor's judge
+        /// while the keyed adapters write; `None` when none was built.
+        physical: Option<PhysicalPlan>,
     },
 }
 
@@ -695,6 +705,38 @@ fn route_decision(
             ),
         };
     }
+    if let Operation::Write { kind, .. } = op {
+        let lowered = physical_plan(&mut plan, source, bounds, fired.clone());
+        let logical = LogicalView::of(&plan);
+        return match lowered {
+            Ok(mut optimized) => {
+                optimized
+                    .physical
+                    .set_assumptions(recorded.assumptions(bounds));
+                let explain = logical.explain(
+                    operation,
+                    override_,
+                    None,
+                    Some(&optimized),
+                    &fired,
+                    Some(&initial),
+                );
+                executor_planned(
+                    Unrouted::WriteOnExecutor {
+                        kind: kind.as_str(),
+                    },
+                    explain,
+                    plan,
+                    optimized.physical,
+                )
+            }
+            Err(error) => executor(
+                Unrouted::of(error),
+                logical.explain(operation, override_, None, None, &fired, Some(&initial)),
+                plan,
+            ),
+        };
+    }
     if let Operation::Load { ir, .. } = op {
         let lowered = physical_plan(&mut plan, source, bounds, fired.clone());
         let logical = LogicalView::of(&plan);
@@ -717,12 +759,13 @@ fn route_decision(
                         logical: plan,
                         explain: explain.engine(),
                     },
-                    LoadStmtMode::Append | LoadStmtMode::Merge => executor(
+                    LoadStmtMode::Append | LoadStmtMode::Merge => executor_planned(
                         Unrouted::ModeOnExecutor {
                             mode: ir.mode.as_str(),
                         },
                         explain,
                         plan,
+                        optimized.physical,
                     ),
                 }
             }
@@ -839,6 +882,24 @@ fn executor(reason: Unrouted, explain: Explain, logical: LogicalPlan) -> Decisio
         reason,
         explain,
         logical,
+        physical: None,
+    }
+}
+
+/// An executor decision that hands the executor the physical plan it runs by
+/// hand: a write's decided `Validate` node.
+fn executor_planned(
+    reason: Unrouted,
+    explain: Explain,
+    logical: LogicalPlan,
+    physical: PhysicalPlan,
+) -> Decision {
+    let explain = explain.with_reason(&reason);
+    Decision::Executor {
+        reason,
+        explain,
+        logical,
+        physical: Some(physical),
     }
 }
 

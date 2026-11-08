@@ -37,26 +37,26 @@ and `ab2` from `a` to `b`, `ac`, and `db`:
 query exact() { delete Knows where @src = "a" and @dst = "b" }
 ```
 
-removes `ab1` and `ab2` and nothing else: `affected: nodes=0 edges=2`. A
-binding variable in a `where` is refused at compile time (`T14`); an
-aggregate, search, or ranking call is `T44`, for example ``T44: `count` cannot
-appear in a mutation where; a where compares the row's own properties,
-parameters and now()``. A compound `where` runs under either `engine` setting.
+removes `ab1` and `ab2` and nothing else: `affected: nodes=0 edges=2`. A binding
+variable in a `where` is refused at compile time (`T14`); an aggregate, search,
+or ranking call is `T44`, for example ``T44: `count` cannot appear in a mutation
+where; a where compares the row's own properties, parameters and now()``. A
+compound `where` runs under either `engine` setting. A `where` that tests over
+four properties twice each with `=`, `!=` or `in` is refused.
 
-Assignment values are constants: literals, parameters, `now()`, and
-comparisons or Boolean operators over them, such as `adult: true or $flag`.
-A constant's value is fixed per invocation: parameters and `now()` are bound
-once before any retry, so a retried mutation computes the same value. It follows the read rules
-for null: with `$flag` null, `true or $flag` is `true` and `false and $flag`
-is `false`, and `$age > 30` with `$age` null is null. A null result assigned
-to a nullable property writes null; on a `Blob` property it clears the cell.
-`null` is a reserved word, so clear a Blob through a nullable parameter such
-as `$content: Blob?`. Assigned to a non-nullable property a
-null result is refused with a typed error that names the property, never
-written as a default. A
-property or system field in a value is refused, for example ``T45: `age`
-cannot appear in an assignment value; assignments and binding matches are
-constants per invocation``.
+Assignment values are constants: literals, parameters, `now()`, and comparisons
+or Boolean operators over them, such as `adult: true or $flag`. A constant's
+value is fixed per invocation: parameters and `now()` are bound once before any
+retry, so a retried mutation computes the same value. It follows the read rules
+for null: with `$flag` null, `true or $flag` is `true` and `false and $flag` is
+`false`, and `$age > 30` with `$age` null is null. A null result assigned to a
+nullable property writes null; on a `Blob` property it clears the cell. `null`
+is a reserved word, so clear a Blob through a nullable parameter such as
+`$content: Blob?`. Assigned to a non-nullable property a null result is refused
+with a typed error that names the property, never written as a default. A
+property or system field in a value is refused, for example ``T45: `age` cannot
+appear in an assignment value; assignments and binding matches are constants per
+invocation``.
 
 A mutation query may contain several inserts and updates, or several deletes,
 but it cannot mix inserts or updates with deletes. Split that workflow into two
@@ -92,7 +92,7 @@ visible on the target in one atomic step. See
   values (an upsert), and an unkeyed edge by delete and re-insert.
 
 All declared value, uniqueness, endpoint, and cardinality constraints are
-checked before publication.
+checked before publication; a node a `@card` minimum needs edges for arrives with them in one query or load ([edge cardinality](../schema/index.md#edge-cardinality)).
 
 ## Bulk loading
 

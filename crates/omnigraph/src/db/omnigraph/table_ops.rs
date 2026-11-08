@@ -39,8 +39,7 @@ pub(super) async fn graph_index_for_resolved(
 pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<IndexBuildResult> {
     let current_branch = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .current_branch()
         .map(str::to_string);
     ensure_indices_on_as(db, current_branch.as_deref().unwrap_or("main"), None).await
@@ -1412,15 +1411,13 @@ async fn commit_prepared_updates(
     updates: &[crate::db::DatasetUpdate],
     actor_id: Option<&str>,
 ) -> Result<u64> {
+    let (installed, mut next) = db.installed_coordinator_copy();
+    let outcome = next.commit_updates_with_actor(updates, actor_id).await;
+    db.install_coordinator(next, &installed);
     let PublishedSnapshot {
         graph_manifest_version: manifest_version,
         ..
-    } = db
-        .coordinator
-        .write()
-        .await
-        .commit_updates_with_actor(updates, actor_id)
-        .await?;
+    } = outcome?;
     Ok(manifest_version)
 }
 
@@ -1431,15 +1428,15 @@ async fn commit_prepared_updates_with_expected(
     expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
     actor_id: Option<&str>,
 ) -> Result<u64> {
+    let (installed, mut next) = db.installed_coordinator_copy();
+    let outcome = next
+        .commit_updates_with_actor_with_expected(updates, expected_table_versions, actor_id)
+        .await;
+    db.install_coordinator(next, &installed);
     let PublishedSnapshot {
         graph_manifest_version: manifest_version,
         ..
-    } = db
-        .coordinator
-        .write()
-        .await
-        .commit_updates_with_actor_with_expected(updates, expected_table_versions, actor_id)
-        .await?;
+    } = outcome?;
     Ok(manifest_version)
 }
 
@@ -1453,8 +1450,7 @@ pub(super) async fn commit_prepared_updates_on_branch_with_expected(
 ) -> Result<u64> {
     let current_branch = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .current_branch()
         .map(str::to_string);
     let requested_branch = branch.map(str::to_string);
@@ -1505,8 +1501,7 @@ pub(super) async fn commit_updates(
 ) -> Result<u64> {
     let current_branch = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .current_branch()
         .map(str::to_string);
     let prepared = prepare_updates_for_commit(db, current_branch.as_deref(), updates, None).await?;
@@ -1616,39 +1611,45 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         txn.authority.graph_head.clone(),
     );
 
-    // Choose and publish through one coordinator lock. A same-name cached
-    // coordinator can still hold another incarnation or incomplete lineage,
-    // so only an exact captured view is reused without a fresh open.
-    let mut active = db.coordinator.write().await;
-    let published = if branch == active.current_branch() {
-        let captured_view_matches = active
+    let advances_head = matches!(publication, Publication::Publish);
+    let installed = db.coordinator.load_full();
+    let bound_view = if branch == installed.current_branch() {
+        let captured_view_matches = installed
             .branch_identifier()
             .await
             .map_err(OmniError::unpublished)?
             == txn.authority.branch_identifier
-            && active.exact_graph_head() == txn.authority.graph_head
-            && active.version() == txn.base.graph_manifest_version();
-        if !captured_view_matches {
-            // Keep the handle's binding while replacing only stale state.
-            // The publisher still reads fresh authority and applies its CAS.
-            *active = db
+            && installed.exact_graph_head() == txn.authority.graph_head
+            && installed.version() == txn.base.graph_manifest_version();
+        Some(
+            captured_view_matches
+                .then(|| crate::db::graph_coordinator::GraphCoordinator::clone(&installed)),
+        )
+    } else {
+        None
+    };
+    let published = if let Some(captured) = bound_view {
+        let mut next = match captured {
+            Some(view) => view,
+            None => db
                 .open_coordinator_for_branch(branch)
                 .await
-                .map_err(OmniError::unpublished)?;
-        }
-        publish_prepared(
-            &mut active,
+                .map_err(OmniError::unpublished)?,
+        };
+        let outcome = publish_prepared(
+            &mut next,
             &changes,
             expected_table_versions,
             lineage_intent,
             expectation,
             publication,
         )
-        .await?
+        .await;
+        db.install_coordinator(next, &installed);
+        outcome?
     } else {
         // An operation on a non-bound branch owns its coordinator locally;
         // it must never temporarily change this handle's query/write binding.
-        drop(active);
         let cache_key = branch.unwrap_or("main");
         let captured = {
             let mut cache = db.merge_authority_cache.lock().await;
@@ -1694,7 +1695,44 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         *db.merge_authority_cache.lock().await = Some((cache_key.to_string(), coordinator));
         published
     };
+    if advances_head {
+        evict_superseded_handles(db, &txn.base, updates).await;
+    }
     Ok(published)
+}
+
+/// Drop the held handle of every pin this publication replaced on its
+/// branch. The branch now names the new pins, so the base versions left its
+/// working set; holding them kept one decoded manifest, which lists every
+/// fragment, per superseded version of a steadily written table (issue 859).
+/// Keys stay version-exact, so this is memory hygiene: another branch still
+/// at a base pin pays at most one reopen.
+async fn evict_superseded_handles(
+    db: &Omnigraph,
+    base: &crate::db::Snapshot,
+    updates: &[crate::db::DatasetUpdate],
+) {
+    let handles = &db.read_caches().handles;
+    for update in updates {
+        let Some(entry) = base.dataset(&update.type_key) else {
+            continue;
+        };
+        let replaced = entry.published_dataset_version != update.published_dataset_version
+            || entry.native_dataset_branch != update.native_dataset_branch
+            || entry.version_metadata.staged_version() != update.version_metadata.staged_version()
+            || entry.version_metadata.e_tag() != update.version_metadata.e_tag();
+        if replaced {
+            handles
+                .evict(&omnigraph_core::handle_cache::TableHandleKey::new(
+                    &entry.dataset_path,
+                    entry.native_dataset_branch.as_deref(),
+                    entry.published_dataset_version,
+                    entry.version_metadata.staged_version(),
+                    entry.version_metadata.e_tag(),
+                ))
+                .await;
+        }
+    }
 }
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {

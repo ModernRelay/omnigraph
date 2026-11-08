@@ -11,7 +11,9 @@ vector search.
 - An **edge type** connects two node types, such as `WorksAt: Person -> Company`.
 - A **property** has a declared type and can be nullable.
 - Constraints such as keys, uniqueness, ranges, and edge cardinality are checked
-  on every write path.
+  on every write path, for every node and edge the write changes and every node
+  whose edges it changes (see
+  [edge cardinality](../schema/index.md#edge-cardinality)).
 
 Schemas use the [`.pg` language](../schema/index.md). Reads and mutations use the
 [`.gq` language](../queries/index.md).
