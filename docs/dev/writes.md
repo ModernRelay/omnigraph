@@ -464,6 +464,22 @@ payload lengths have an independent allowance of the same size. Payload
 accounts count logical payload lengths; builder over-capacity (up to about one
 third) is outside them. Pending-aware
 update scans charge both accounts, including their initial pending input.
+Every batch such a scan keeps passes through `PendingScanAccount::retain`,
+the account's only batch charge, which copies its rows into buffers of their
+own before charging them: a Lance scanner batch can share buffers with rows it
+does not contain, and admission must not depend on the rows stored beside a
+match. A cumulative account always charges a compact copy; a per-candidate
+check may keep an uncopied batch that already fits. Because `retain` always
+copies, a row-rewrite trial in `scan_update_matches` briefly holds the carried
+columns twice: the admitted scan it keeps for the column-patch fallback, and
+the charged copies of the whole rows. Its peak can therefore reach about twice
+the write budget, although each account still stops at one budget. That bound
+is the trial's, not the whole scan's: when no Blob column is omitted, the
+match scan itself keeps the matched rows whole, vectors included, before the
+trial runs, and admission charges only the carried columns, so the number of
+matched rows times the vector width bounds that memory, not the budget. A
+refused copy is also made before its refusal (`retain` copies, then charges),
+so a trial can pass the budget by one batch before it falls back to the patch.
 The keyed parse spool separately caps its row estimate and decoded Blob bytes.
 Inline and copied external payload lengths are admitted together before GETs;
 materialized row and payload accounts are checked again before staging.
