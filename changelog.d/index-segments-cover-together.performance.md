@@ -1,0 +1,1 @@
+- An index that Lance keeps as several segments now covers the rows its segments cover together, so a traversal over such an edge table keeps its index lookups. Results are unchanged.
