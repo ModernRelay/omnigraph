@@ -91,7 +91,6 @@ pub(crate) fn operation_is_row_set_preserving(operation: &Operation) -> bool {
         | Operation::CreateIndex { .. }
         | Operation::Rewrite { .. }
         | Operation::DataReplacement { .. }
-        // forbidden-api-allow: a read-side classifier of a commit kind the engine never writes
         | Operation::DataOverlay { .. }
         | Operation::Merge { .. }
         | Operation::Restore { .. }
