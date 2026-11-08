@@ -1,0 +1,1 @@
+- A branch merge reads only the table fragments that changed, so its storage requests stay flat as one-row commits accumulate instead of growing with each table's fragment count.

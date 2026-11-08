@@ -14,8 +14,8 @@ node Person {
 {"type":"Person","data":{"name":"alice"}}
 --- concurrent
 w1: query add_bob() { insert Person { name: "bob" } }
-r1: query all() { match { $p: Person } return { $p.name } }
-order: w1 park put __manifest/_versions/, r1 start, r1, w1 put __manifest/_versions/
+w2: query add_carol() { insert Person { name: "carol" } }
+order: w1 park put __manifest/_versions/, w2 start, w2, w1 put __manifest/_versions/
 --- expect
 w1: ok
-r1: ok
+w2: ok

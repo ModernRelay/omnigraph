@@ -223,6 +223,10 @@ no vector contribution, so filtering through a traversal can shorten or change
 the fused answer. Full-text arms in `rrf` remain unbounded over their eligible
 matches.
 
+A `nearest` scan uses only the IVF_FLAT, L2 vector index Omnigraph builds; an
+index written another way (another metric, quantized vectors, HNSW) is
+skipped and every row is ranked flat.
+
 An indexed `nearest` scan reads a bounded number of partitions per index delta
 (`OMNIGRAPH_ANN_NPROBES`, default 20; `0` removes the cap) and widens only to
 fill the limit, so a filled limit does not make the ANN ranking exact. A scoped

@@ -683,6 +683,22 @@ release that reports it must agree with that source.
 
 Release archives and containers include the CLI, server, and Azure admission wrapper where their packaging contract requires all three. Keep the reusable package workflow, Dockerfile, and binary-contract check aligned.
 
+The shared archive builder requires six repository Actions secrets:
+`APPLE_CERTIFICATE_P12` (base64 Developer ID Application P12),
+`APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGN_IDENTITY` (the exact certificate
+name), `APPLE_NOTARY_KEY_P8` (base64 App Store Connect team API key),
+`APPLE_NOTARY_KEY_ID`, and `APPLE_NOTARY_ISSUER`. Both release callers pass
+only these six secrets to the builder. Its macOS job imports the identity
+into a temporary Keychain, signs all three executables with fixed
+`com.modernrelay.<binary>` identifiers, hardened runtime and a secure
+timestamp, and verifies the identifiers and signing team. It submits the
+same executables in a temporary ZIP to Apple and requires `Accepted` within
+30 minutes before packaging them in the existing tarball and computing
+checksums. Failure or missing credentials refuses the macOS release; there
+is no ad hoc fallback. Temporary credentials and the signing Keychain are
+removed on exit. Historical releases are not changed by configuring these
+secrets.
+
 Every release build sets `RUSTFLAGS` itself (`build-release-archives.yml`, `publish-image.yml`, `omnigraph-package.yml`, `scripts/install-source.sh`, `flake.nix`, the documented source build): empty everywhere except the macOS archive row's `-C code-model=large`. A set `RUSTFLAGS`, empty included, replaces the workspace `.cargo/config.toml` `[build] rustflags`, so shipped binaries never carry `--cfg tokio_unstable`. A plain `cargo build --release` outside these paths still inherits the cfg. The cfg serves the DST suite and the GQT DST runner only.
 
 ## Changing CI

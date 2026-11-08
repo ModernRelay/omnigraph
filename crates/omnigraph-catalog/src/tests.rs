@@ -15202,7 +15202,7 @@ async fn manifest_create_without_a_definite_answer_stays_in_doubt_issue_1067() {
         fault
             .manifest_puts
             .load(std::sync::atomic::Ordering::SeqCst),
-        1 + crate::manifest_request::MANIFEST_REQUEST_REISSUES as usize,
+        1 + crate::manifest_request::CONDITIONAL_REQUEST_REISSUES as usize,
         "the original request and every re-issue"
     );
 }
@@ -15496,5 +15496,43 @@ async fn candidate_tag_reappearing_after_rollback_stays_uncertain_issue_1067() {
             ),
         ],
         "deleting the acknowledged tag does not prove the candidate stayed unreachable"
+    );
+}
+
+#[test]
+fn manifest_incarnation_supersedes_newer_equal_and_other_lifetimes_but_not_older() {
+    let main = lance::dataset::refs::BranchIdentifier::main();
+    let recreated = lance::dataset::refs::BranchIdentifier::new(&main, 1);
+    let at = |version: u64,
+              branch_identifier: &lance::dataset::refs::BranchIdentifier,
+              e_tag: &str| ManifestIncarnation {
+        version,
+        e_tag: Some(e_tag.to_string()),
+        timestamp_nanos: None,
+        branch_identifier: branch_identifier.clone(),
+    };
+    let installed = at(5, &main, "a");
+    assert!(at(6, &main, "b").supersedes(&installed), "a later version");
+    assert!(
+        at(5, &main, "b").supersedes(&installed),
+        "another image at the same version"
+    );
+    assert!(at(5, &main, "a").supersedes(&installed), "the same image");
+    assert!(
+        !at(4, &main, "c").supersedes(&installed),
+        "an older version"
+    );
+    assert!(
+        !at(1, &recreated, "d").supersedes(&installed),
+        "another branch lifetime is never ordered by version"
+    );
+    assert!(
+        !at(9, &recreated, "e").supersedes(&installed),
+        "another branch lifetime at a later version is not ordered either"
+    );
+    assert!(
+        !at(9, &recreated, "e").same_lifetime(&installed)
+            && at(6, &main, "b").same_lifetime(&installed),
+        "same_lifetime compares the branch identifier alone"
     );
 }

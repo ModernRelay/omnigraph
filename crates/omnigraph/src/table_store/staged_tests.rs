@@ -857,7 +857,7 @@ async fn keyed_upsert_stamps_no_by_source_delete_marker_and_persists_it() {
 }
 
 #[tokio::test]
-async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
+async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode_issue_1261() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
     let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
@@ -943,6 +943,38 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode() {
         collect_ids(&store.scan_batches(&committed).await.unwrap()),
         vec!["alice", "bob"]
     );
+
+    // Strict insertion has no merge-insert route (#1261): the merge-insert
+    // stager refuses it before handing anything to Lance.
+    let batch = person_pk_batch(&[("carol", Some(41))]);
+    let schema = batch.schema();
+    let reader = arrow_array::RecordBatchIterator::new([Ok(batch)], schema);
+    let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+    let probes = MergeWriteProbes::default();
+    let error = with_merge_write_probes(
+        probes.clone(),
+        store.stage_keyed_write_from_stream(
+            committed.clone(),
+            stream,
+            1,
+            KeyedWriteSemantics::StrictInsert,
+            committed.schema().field("id").unwrap().id,
+            SYSTEM_COLUMNS_LEGACY,
+            "issue_1261",
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            OmniError::Manifest(ref manifest)
+                if manifest.kind == crate::error::ManifestErrorKind::Internal
+                    && manifest.message.contains("absence-proven insert writer")
+        ),
+        "strict insert must not stage through merge-insert, got {error:?}"
+    );
+    assert_eq!(probes.stage_merge_insert_calls(), 0);
 }
 
 #[tokio::test]
@@ -3527,7 +3559,7 @@ async fn schema_evolution_plans_metadata_only_steps_and_refuses_rewrites() {
             "without a rewrite",
         ),
         (
-            Schema::new(vec![pk_id(), marked("age", DataType::Int32, false, "1")]),
+            Schema::new(vec![pk_id(), marked("age", DataType::Int64, false, "1")]),
             Vec::new(),
             "without a rewrite",
         ),
@@ -3558,6 +3590,17 @@ async fn schema_evolution_plans_metadata_only_steps_and_refuses_rewrites() {
             "expected '{expected}', got: {error}"
         );
     }
+
+    // #721: making a nullable column required is metadata only, and the
+    // Project commit it plans stops preserving nullability.
+    let tightened = Schema::new(vec![pk_id(), marked("age", DataType::Int32, false, "1")]);
+    let plan = TableStore::plan_schema_evolution(&ds, &tightened, &[]).unwrap();
+    assert!(
+        plan.tightens,
+        "a nullable to required column is a tightening"
+    );
+    assert!(plan.merge.is_none());
+    assert!(plan.project.is_some());
 
     // A column written before property markers existed adopts its identity
     // from the target, as the replaced full-table rewrite did.

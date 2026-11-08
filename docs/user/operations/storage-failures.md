@@ -24,7 +24,9 @@ the time spent on each storage request. A re-issue that creates the version
 publishes the commit once. A version that already exists is read
 back: it holds either this commit, and the write succeeds, or another commit,
 and the write meets an ordinary conflict. Re-issuing the same conditional
-request never publishes a duplicate.
+request never publishes a duplicate. When a re-issue meets a version already
+held and the read-back then finds it missing, the outcome stays unknown rather
+than failed: on S3 that conflict can answer the first request, still landing.
 
 ## Unknown publications
 
@@ -53,9 +55,30 @@ retries. A conditional request, such as a manifest create, and a write to a
 reused key make one attempt each, and their owner resolves an ambiguous answer
 itself. `OBJECT_STORE_CLIENT_MAX_RETRIES`, if set, must be `0`.
 
+On S3 and Azure, a conditional write of a control object (the cluster lock and
+state, a deployment resource, a lease heartbeat or claim) whose answer was lost,
+timed out or throttled is re-issued unchanged, as a manifest request is: up to
+four times with about three seconds of pauses in total. A request the store
+refused before applying it, such as a missing bucket or container, fails at
+once, and so does a permission or authentication error on the server. When an
+earlier copy of the request may be what the object holds, the object is read
+back, and holding this request's bytes makes it this write's. An object still
+absent, or still at the expected version, once no re-issue settles the request
+leaves the write failed with its outcome unknown.
+
+A command that writes storage directly, without a server, uses a client that
+retries a request itself before any re-issue: up to its `max_retries` (10 by
+default), and on S3 an if-match that meets a conflicting write in flight too.
+Those attempts are not logged. Because one of them may have applied, that
+client's permission or authentication error is re-issued like a lost answer,
+and its first conflict is read back.
+
 A write to a reused key whose outcome is unknown refuses later writes to that
 key only, until a clean shutdown; a clean shutdown with such a key retains
-admission.
+admission. Its owner's re-issue of a conditional write is still admitted. The
+key settles when that re-issue applies, or when a read of the key shows its
+condition no longer holds. A request the store refused before applying it
+leaves its key settled.
 
 ## When the server stops
 
@@ -73,13 +96,16 @@ restart on failure (Railway `ON_FAILURE`, Kubernetes `restartPolicy: Always`).
 - The lock's owner renews the lease with heartbeat objects under
   `__cluster/lease/` every third of a lease. Heartbeats retry on their own, and
   one whose answer was lost counts once a retry finds it. When no heartbeat
-  is answered for two thirds of a lease, or a successor claims the lock, the
-  owner stops every storage write at once and exits 2 without releasing. A
-  server whose first heartbeat is not answered within that time does not
-  start serving.
+  is answered for two thirds of a lease, the owner stops every storage write,
+  even after a pause of its whole process, and exits 2 without releasing. It stops the same way at its next
+  heartbeat, at most a third of a lease later, when a successor has claimed
+  the lock or `lock.json` no longer names it (after a takeover or a
+  `cluster force-unlock` of its ID). A server whose first heartbeat is not
+  answered within that time does not start serving.
 - A restarted server that finds the lock held watches those heartbeats. It
   refuses with `state_lock_held` while they continue, and takes the lock over
-  once they have been silent for a lease and a half.
+  once they have been silent for a lease and a half. A takeover leaves the
+  previous owner's lease directory, its claim and last heartbeats, in place.
 - The lease is 30 seconds by default, so a restart after a crash waits about
   45 seconds. `OMNIGRAPH_CLUSTER_LEASE_SECONDS` sets it between 2 and 600
   seconds; a successor waits on the value the owner recorded.
@@ -112,8 +138,13 @@ paths; each records the failure's class.
 - `owned write ended without a definite outcome`: the status its response
   sends, 500 for `outcome_unknown`, and whether it contained the process.
 - `manifest request outcome unknown; re-issuing the identical conditional
-  request`, for each re-issue, and
-  `manifest request outcome unknown after every re-issue` when none settles.
+  request`, for each re-issue,
+  `manifest request outcome unknown after every re-issue` when none settles,
+  and `manifest version held after a re-issue` when a re-issue meets a
+  version that the earlier copy may hold, or may still be writing.
+- `re-issuing a conditional storage write whose answer was lost`, with the
+  operation and the failure's class, for each re-issue of a control-object
+  write.
 - `took over a silent owner's cluster lock` when a restarted server takes over
   its predecessor's lock, and an error when an owner's lease lapses or another
   server claims it.

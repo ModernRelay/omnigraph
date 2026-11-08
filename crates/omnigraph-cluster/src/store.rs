@@ -19,7 +19,8 @@ use omnigraph_storage::{
 
 use crate::deployment::{DeploymentBundle, MAX_BUNDLE_BYTES, MAX_LEDGER_BYTES, validate_state};
 use crate::state_lock::{
-    StateLockAcquire, StateLockError, StateLockGuard, acquire_state_lock, release_settled_lock,
+    LOCK_RECORD_MAX_BYTES, StateLockAcquire, StateLockError, StateLockGuard, acquire_state_lock,
+    release_settled_lock,
 };
 use crate::{
     CLUSTER_LOCK_FILE, CLUSTER_RECOVERIES_DIR, CLUSTER_RESOURCES_DIR, CLUSTER_STATE_FILE,
@@ -548,7 +549,7 @@ impl ClusterStore {
             .read_text_versioned_if_exists_bounded(
                 uri,
                 if uri == self.uri(CLUSTER_LOCK_FILE) {
-                    64 * 1024
+                    LOCK_RECORD_MAX_BYTES
                 } else {
                     MAX_LEDGER_BYTES as u64
                 },
