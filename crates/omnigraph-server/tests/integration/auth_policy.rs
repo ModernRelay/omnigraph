@@ -3131,12 +3131,14 @@ async fn branch_list_is_denied_by_a_branch_scoped_read_rule_as_the_route_is() {
             &format!("{statement} under a protected-only read rule"),
         );
     }
-    let (status, body) = json_response(&app, get_request(&g("/branches"), "team-token")).await;
-    assert_forbidden(
-        status,
-        body,
-        "GET /branches under a protected-only read rule",
-    );
+    for route in ["/branches", "/branches?detailed=true"] {
+        let (status, body) = json_response(&app, get_request(&g(route), "team-token")).await;
+        assert_forbidden(
+            status,
+            body,
+            &format!("GET {route} under a protected-only read rule"),
+        );
+    }
 }
 
 const SHOW_SOURCES: [&str; 1] = ["show all;"];

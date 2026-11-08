@@ -28,20 +28,141 @@ fn saved(origin: &str, seconds: i64) -> Session {
 
 #[tokio::test]
 async fn refresh_rotates_one_keychain_record_after_resource_verifies_same_identity() {
-    let api = IntentApiFixture::new(vec![metadata(120, "principal_one")]);
+    for (transient, verification_failure) in [
+        (None, None),
+        (Some(408), None),
+        (Some(429), None),
+        (Some(503), None),
+        (None, Some(408)),
+        (None, Some(429)),
+        (None, Some(502)),
+        (None, Some(503)),
+    ] {
+        let mut replies = Vec::new();
+        if let Some(status) = verification_failure {
+            replies.push(if status == 502 {
+                IntentReply {
+                    status,
+                    headers: Vec::new(),
+                    body: b"<html>Bad Gateway</html>".to_vec(),
+                }
+            } else if status == 503 {
+                IntentReply::json(status, json!({"message":"temporarily unavailable"}))
+            } else {
+                IntentReply::json(status, json!({"type":"temporarily_unavailable"}))
+            });
+        }
+        replies.push(metadata(120, "principal_one"));
+        let api = IntentApiFixture::new(replies);
+        crate::operator_routing::test_transport_scope(&[&api.origin], async {
+            let store = MemoryStore::default();
+            let mut original = saved(&api.origin, -1);
+            original.refresh_expires_at = (OffsetDateTime::now_utc() + time::Duration::hours(8))
+                .format(&Rfc3339)
+                .unwrap();
+            save(&store, &original).unwrap();
+            let mut responses = Vec::new();
+            if let Some(status) = transient {
+                responses.push((status, json!({"error":"unavailable"})));
+            }
+            responses.push((200, tokens(120, "user_one")));
+            let mut transport = MockTransport::with(responses);
+            if transient == Some(503) {
+                std::sync::Arc::get_mut(&mut transport)
+                    .unwrap()
+                    .raw_error_body = Some(b"<html>Service Unavailable</html>".to_vec());
+            }
+            let token = credential_with(&store, &api.origin, &transport.provider())
+                .await
+                .unwrap();
+            assert_ne!(token, original.access_token);
+            let next = load(&store, &api.origin).unwrap().unwrap();
+            assert_eq!(next.refresh_expires_at, original.refresh_expires_at);
+            assert_eq!(next.refresh_token, "rotated-refresh");
+            assert!(next.state == RefreshState::Ready);
+            let requests = transport.requests.lock().unwrap();
+            assert_eq!(requests.len(), if transient.is_some() { 2 } else { 1 });
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.body == requests[0].body)
+            );
+            let verification = api.requests();
+            assert_eq!(
+                verification.len(),
+                if verification_failure.is_some() { 2 } else { 1 }
+            );
+            assert!(verification.iter().all(|request| {
+                request.path == "/v1/auth/session"
+                    && request.headers["authorization"] == verification[0].headers["authorization"]
+            }));
+            api.assert_complete();
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn retry_backoff_refuses_ambiguous_headers_and_attempts_outside_the_budget() {
+    use reqwest::header::HeaderValue;
+    let future = (OffsetDateTime::now_utc() + time::Duration::days(1))
+        .format(&time::format_description::well_known::Rfc2822)
+        .unwrap();
+    let delay = retry_delay(
+        &[HeaderValue::from_str(&future).unwrap()],
+        Duration::from_millis(250),
+    )
+    .unwrap();
+    assert!(delay > Duration::from_secs(23 * 3600) && delay <= Duration::from_secs(24 * 3600));
+    assert_eq!(
+        retry_delay(
+            &[HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT")],
+            Duration::from_millis(250)
+        ),
+        Some(Duration::from_millis(250))
+    );
+    for (attempt, values, budget) in [
+        (2, vec![], Duration::from_secs(20)),
+        (0, vec![], Duration::from_secs(6)),
+        (0, vec!["20"], Duration::from_secs(20)),
+        (0, vec!["18446744073709551615"], Duration::from_secs(20)),
+        (
+            0,
+            vec!["Thu, 01 Jan 2099 00:00:00 GMT"],
+            Duration::from_secs(20),
+        ),
+        (0, vec!["invalid"], Duration::from_secs(20)),
+        (0, vec!["0", "0"], Duration::from_secs(20)),
+    ] {
+        let headers = values
+            .iter()
+            .map(|value| HeaderValue::from_str(value).unwrap())
+            .collect::<Vec<_>>();
+        assert!(!retry_pause(attempt, &headers, Instant::now() + budget, REFRESH_ATTEMPT).await);
+    }
+}
+
+#[tokio::test]
+async fn verification_retry_after_outside_budget_preserves_original_custody() {
+    let mut retry = IntentReply::json(429, json!({"type":"temporarily_unavailable"}));
+    retry.headers.push(("Retry-After".into(), "30".into()));
+    let api = IntentApiFixture::new(vec![retry]);
     crate::operator_routing::test_transport_scope(&[&api.origin], async {
         let store = MemoryStore::default();
         let original = saved(&api.origin, -1);
         save(&store, &original).unwrap();
         let transport = MockTransport::with(vec![(200, tokens(120, "user_one"))]);
-        let token = credential_with(&store, &api.origin, &transport.provider())
-            .await
-            .unwrap();
-        assert_ne!(token, original.access_token);
-        let next = load(&store, &api.origin).unwrap().unwrap();
-        assert_eq!(next.refresh_expires_at, original.refresh_expires_at);
-        assert_eq!(next.refresh_token, "rotated-refresh");
-        assert!(next.state == RefreshState::Ready);
+        assert_eq!(
+            credential_with(&store, &api.origin, &transport.provider())
+                .await
+                .unwrap_err()
+                .body["type"],
+            "refresh_outcome_unknown"
+        );
+        let retained = load(&store, &api.origin).unwrap().unwrap();
+        assert_eq!(retained.refresh_token, original.refresh_token);
+        assert_eq!(retained.refresh_expires_at, original.refresh_expires_at);
+        assert!(retained.state == RefreshState::Pending);
         assert_eq!(transport.requests.lock().unwrap().len(), 1);
         api.assert_complete();
     })
@@ -53,10 +174,13 @@ async fn unknown_exchange_keeps_pending_and_never_replays_the_refresh() {
     let store = MemoryStore::default();
     let origin = "https://api.example";
     save(&store, &saved(origin, -1)).unwrap();
-    let transport = MockTransport::with(vec![(
-        503,
-        json!({"error":"unavailable","message":"old-refresh"}),
-    )]);
+    let transport = MockTransport::with(vec![
+        (
+            503,
+            json!({"error":"unavailable","message":"old-refresh"}),
+        );
+        3
+    ]);
     for _ in 0..2 {
         let error = credential_with(&store, origin, &transport.provider())
             .await
@@ -65,7 +189,7 @@ async fn unknown_exchange_keeps_pending_and_never_replays_the_refresh() {
         assert!(!error.body.to_string().contains("old-refresh"));
     }
     assert!(load(&store, origin).unwrap().unwrap().state == RefreshState::Pending);
-    assert_eq!(transport.requests.lock().unwrap().len(), 1);
+    assert_eq!(transport.requests.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -93,7 +217,10 @@ async fn invalid_refresh_is_terminal_and_cannot_reuse_still_valid_access() {
 
 #[tokio::test]
 async fn identity_drift_cannot_replace_cached_credentials_after_provider_consumption() {
-    let api = IntentApiFixture::new(vec![metadata(120, "other_principal")]);
+    let api = IntentApiFixture::new(vec![
+        IntentReply::json(503, json!({"type":"temporarily_unavailable"})),
+        metadata(120, "other_principal"),
+    ]);
     crate::operator_routing::test_transport_scope(&[&api.origin], async {
         let store = MemoryStore::default();
         save(&store, &saved(&api.origin, -1)).unwrap();
@@ -164,7 +291,11 @@ fn access_and_absolute_session_bounds_reject_malformed_and_expired_profiles() {
         assert!(parse(&value.to_string(), &original.origin).is_err());
     }
     let mut over = original.clone();
-    over.refresh_expires_at = (OffsetDateTime::now_utc() + time::Duration::hours(9))
+    over.refresh_expires_at = (OffsetDateTime::now_utc() + time::Duration::days(29))
+        .format(&Rfc3339)
+        .unwrap();
+    parse(&serde_json::to_string(&over).unwrap(), &over.origin).unwrap();
+    over.refresh_expires_at = (OffsetDateTime::now_utc() + time::Duration::days(31))
         .format(&Rfc3339)
         .unwrap();
     assert!(parse(&serde_json::to_string(&over).unwrap(), &over.origin).is_err());

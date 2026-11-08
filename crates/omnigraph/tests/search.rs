@@ -511,6 +511,45 @@ query nearest_all_17000($q: Vector(4)) {
 }
 "#;
 
+/// Replaces the vector index on `column` of `table_key` with one built from
+/// `params` directly on the Lance dataset (an index the engine does not build
+/// itself), on the pin restored onto the linear HEAD, and publishes that head
+/// through the failpoint hook without an index rebuild.
+#[cfg(feature = "failpoints")]
+async fn publish_foreign_vector_index(
+    db: &Session,
+    uri: &str,
+    table_key: &str,
+    column: &str,
+    params: &lance::index::vector::VectorIndexParams,
+) {
+    use lance::index::DatasetIndexExt;
+    helpers::forge_linear_head_from_pin(db, "main", table_key, 0).await;
+    let table_path = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .dataset(table_key)
+        .unwrap()
+        .dataset_path
+        .clone();
+    let table_uri = format!("{}/{}", uri.trim_end_matches('/'), table_path);
+    // forbidden-api-allow: test builds a foreign vector index directly on the Lance dataset.
+    let mut ds = lance::Dataset::open(&table_uri).await.unwrap();
+    ds.create_index(
+        &[column],
+        lance_index::IndexType::Vector,
+        Some(format!("{column}_idx")),
+        params,
+        true,
+    )
+    .await
+    .unwrap();
+    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", table_key, None)
+        .await
+        .unwrap();
+}
+
 /// A four-partition IVF index on fixed centroids (the engine builds one-partition
 /// flat ones), built on the `node:Doc` pin restored onto the linear HEAD and
 /// published through the failpoint hook; a delete then tombstones rows under it.
@@ -562,59 +601,39 @@ query delete_middle() {
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     db.ensure_indices_as(None).await.unwrap();
-    helpers::forge_linear_head_from_pin(&db, "main", "node:Doc", 0).await;
-    {
-        use lance::index::DatasetIndexExt;
-        let doc_path = db
-            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .dataset("node:Doc")
-            .unwrap()
-            .dataset_path
-            .clone();
-        let doc_uri = format!("{}/{}", uri.trim_end_matches('/'), doc_path);
-        // forbidden-api-allow: test builds a partitioned vector index directly on the Lance dataset.
-        let mut ds = lance::Dataset::open(&doc_uri).await.unwrap();
-        let partitions = 4usize;
-        let step = ISSUE_567_ROWS as f32 / partitions as f32;
-        let mut values = Vec::with_capacity(partitions * 4);
-        for partition in 0..partitions {
-            values.extend([step * (partition as f32 + 0.5), 0.0, 0.0, 0.0]);
-        }
-        let centroids = arrow_array::FixedSizeListArray::try_new(
-            std::sync::Arc::new(arrow_schema::Field::new(
-                "item",
-                arrow_schema::DataType::Float32,
-                true,
-            )),
-            4,
-            std::sync::Arc::new(arrow_array::Float32Array::from(values)),
-            None,
-        )
-        .unwrap();
-        let ivf = lance_index::vector::ivf::IvfBuildParams::try_with_centroids(
-            partitions,
-            std::sync::Arc::new(centroids),
-        )
-        .unwrap();
-        let params = lance::index::vector::VectorIndexParams::with_ivf_flat_params(
+    let partitions = 4usize;
+    let step = ISSUE_567_ROWS as f32 / partitions as f32;
+    let mut values = Vec::with_capacity(partitions * 4);
+    for partition in 0..partitions {
+        values.extend([step * (partition as f32 + 0.5), 0.0, 0.0, 0.0]);
+    }
+    let centroids = arrow_array::FixedSizeListArray::try_new(
+        std::sync::Arc::new(arrow_schema::Field::new(
+            "item",
+            arrow_schema::DataType::Float32,
+            true,
+        )),
+        4,
+        std::sync::Arc::new(arrow_array::Float32Array::from(values)),
+        None,
+    )
+    .unwrap();
+    let ivf = lance_index::vector::ivf::IvfBuildParams::try_with_centroids(
+        partitions,
+        std::sync::Arc::new(centroids),
+    )
+    .unwrap();
+    publish_foreign_vector_index(
+        &db,
+        uri,
+        "node:Doc",
+        "embedding",
+        &lance::index::vector::VectorIndexParams::with_ivf_flat_params(
             lance_linalg::distance::MetricType::L2,
             ivf,
-        );
-        ds.create_index(
-            &["embedding"],
-            lance_index::IndexType::Vector,
-            Some("embedding_idx".to_string()),
-            &params,
-            true,
-        )
-        .await
-        .unwrap();
-    }
-    db.failpoint_publish_table_head_without_index_rebuild_for_test("main", "node:Doc", None)
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
     // The delete leaves the partitioned index with tombstoned rows: the
     // underfilled partitions the ladder and rescan cases exercise.
     let deleted = mutate_main(&db, delete_query, "delete_middle", &params(&[]))
@@ -909,6 +928,10 @@ async fn issue_567_unfiltered_nearest_climbs_the_ladder_to_the_whole_corpus() {
         Some(ranked),
         "the last rung read every ranked partition: rungs {rungs:?}"
     );
+    assert!(
+        result.ranking().unwrap().exhaustive,
+        "the last attempt searched every partition of the IVF_FLAT index"
+    );
     assert_eq!(
         probes
             .ann_overfetches
@@ -949,6 +972,10 @@ async fn issue_567_unfiltered_nearest_keeps_the_probe_cap() {
         result_slugs(&result),
         (0..10).map(|row| format!("n{row:05}")).collect::<Vec<_>>(),
         "the ten nearest docs, from the one partition nearest the query"
+    );
+    assert!(
+        !result.ranking().unwrap().exhaustive,
+        "three partitions went unsearched, so a nearer row may exist"
     );
     assert_eq!(
         probes
@@ -1015,6 +1042,10 @@ async fn issue_567_ladder_stops_when_the_prefilter_admits_fewer_rows_than_k() {
             .map(|row| format!("n{row:05}"))
             .collect::<Vec<_>>(),
         "every edge-bearing doc, nothing else, in distance order"
+    );
+    assert!(
+        result.ranking().unwrap().exhaustive,
+        "the flat scan scored every admitted row"
     );
     assert_eq!(
         probes
@@ -2893,4 +2924,169 @@ async fn a_full_text_index_with_no_segment_refuses_the_call_issue_747() {
         ["d1", "d2"],
         "the built index folds case"
     );
+}
+
+#[cfg(feature = "failpoints")]
+const ISSUE_1297_QUERIES: &str = r#"
+query nearest_scored($q: Vector(2)) {
+    match { $d: Doc }
+    return { $d.slug, nearest($d.embedding, $q) as distance }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+"#;
+
+/// Issue #1297: a `Doc` graph whose `embedding` index is replaced by one the
+/// engine never builds (`params`), through `publish_foreign_vector_index`.
+#[cfg(feature = "failpoints")]
+async fn issue_1297_docs_under_a_foreign_index(
+    uri: &str,
+    docs: &[(String, [f32; 2])],
+    params: lance::index::vector::VectorIndexParams,
+) -> Session {
+    let schema = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(2) @index
+}
+"#;
+    let seed = docs
+        .iter()
+        .map(|(slug, [x, y])| {
+            format!(r#"{{"type":"Doc","data":{{"slug":"{slug}","embedding":[{x:?},{y:?}]}}}}"#)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let db = session(Omnigraph::init(uri, schema).await.unwrap());
+    db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
+    publish_foreign_vector_index(&db, uri, "node:Doc", "embedding", &params).await;
+    db
+}
+
+#[cfg(feature = "failpoints")]
+fn issue_1297_distances(result: &QueryResult) -> Vec<f32> {
+    let batch = result.concat_batches().unwrap();
+    let column = batch.column_by_name("distance").unwrap();
+    column
+        .as_any()
+        .downcast_ref::<arrow_array::Float32Array>()
+        .unwrap_or_else(|| panic!("distance is F32, got {:?}", column.data_type()))
+        .values()
+        .to_vec()
+}
+
+/// Issue #1297: `nearest` ranks by squared L2 whatever metric the vector
+/// index on disk was built with. A cosine index ranks `far` (same direction
+/// as the query) first; L2 ranks it last.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn nearest_ranks_by_l2_over_a_cosine_index_issue_1297() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let docs = [
+        ("near".to_string(), [1.0, 0.2]),
+        ("mid".to_string(), [0.5, 0.5]),
+        ("far".to_string(), [10.0, 0.0]),
+    ];
+    let db = issue_1297_docs_under_a_foreign_index(
+        uri,
+        &docs,
+        lance::index::vector::VectorIndexParams::ivf_flat(
+            1,
+            lance_linalg::distance::MetricType::Cosine,
+        ),
+    )
+    .await;
+
+    let result = query_main(
+        &db,
+        ISSUE_1297_QUERIES,
+        "nearest_scored",
+        &vector_param("$q", &[1.0, 0.0]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result_slugs(&result),
+        ["near", "mid", "far"],
+        "ranked by L2, not by the index's cosine metric"
+    );
+    let distances = issue_1297_distances(&result);
+    let expected = [0.04_f32, 0.5, 81.0];
+    for (got, want) in distances.iter().zip(expected) {
+        assert!(
+            (got - want).abs() <= want * 1e-5,
+            "squared L2 distances {distances:?}, expected {expected:?}"
+        );
+    }
+    assert!(result.ranking().unwrap().exhaustive);
+}
+
+/// Issue #1297: a compressed (scalar-quantized) L2 index scores
+/// approximations, so searching all of its partitions is not exact. The
+/// engine must return the exact top `k` and squared L2 distances, and report
+/// the ranking exhaustive only when it is.
+#[cfg(feature = "failpoints")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn nearest_stays_exact_over_a_quantized_index_issue_1297() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let docs: Vec<(String, [f32; 2])> = (0..300)
+        .map(|row| {
+            let x = (row as f32 * 0.618_034).fract() * 100.0;
+            let y = (row as f32 * 0.414_213_6).fract() * 100.0;
+            (format!("d{row:03}"), [x, y])
+        })
+        .collect();
+    let db = issue_1297_docs_under_a_foreign_index(
+        uri,
+        &docs,
+        lance::index::vector::VectorIndexParams::with_ivf_sq_params(
+            lance_linalg::distance::MetricType::L2,
+            lance_index::vector::ivf::IvfBuildParams::new(1),
+            lance_index::vector::sq::builder::SQBuildParams::default(),
+        ),
+    )
+    .await;
+
+    let query = [37.3_f32, 61.9];
+    let mut exact: Vec<(f32, String)> = docs
+        .iter()
+        .map(|(slug, [x, y])| {
+            let (dx, dy) = (x - query[0], y - query[1]);
+            (dx * dx + dy * dy, slug.clone())
+        })
+        .collect();
+    exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+    exact.truncate(10);
+
+    let result = query_main(
+        &db,
+        ISSUE_1297_QUERIES,
+        "nearest_scored",
+        &vector_param("$q", &query),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result_slugs(&result),
+        exact
+            .iter()
+            .map(|(_, slug)| slug.clone())
+            .collect::<Vec<_>>(),
+        "the exact ten nearest, not the quantized index's approximation"
+    );
+    let distances = issue_1297_distances(&result);
+    for (got, (want, slug)) in distances.iter().zip(&exact) {
+        assert!(
+            (got - want).abs() <= want.max(1.0) * 1e-4,
+            "{slug}: distance {got}, exact squared L2 {want}"
+        );
+    }
+    assert!(result.ranking().unwrap().exhaustive);
 }

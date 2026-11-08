@@ -1691,6 +1691,21 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     assert_eq!(line["diagnostic"]["code"], "Q002");
     assert_eq!(line["diagnostic"]["suggestion"], suggestion);
 
+    let toon_output = output_failure(
+        embedded("query", &graph)
+            .arg("-e")
+            .arg(refused)
+            .args(["--format", "toon"]),
+    );
+    let toon = stdout_string(&toon_output);
+    assert!(toon.starts_with("error:"), "{toon}");
+    assert!(toon.contains("code: Q002"), "{toon}");
+    assert!(toon.contains("fix: query name()"), "{toon}");
+    assert!(
+        !stderr_string(&toon_output).contains("error[Q002]:"),
+        "the TOON lane does not also print the human diagnostic"
+    );
+
     let human = output_failure(embedded("query", &graph).arg("-e").arg(refused));
     let stderr = stderr_string(&human);
     assert!(
@@ -1760,6 +1775,15 @@ fn a_query_without_its_parameter_list_reports_q002_in_every_output_format() {
     assert_eq!(json["diagnostic"]["code"], "Q002");
     assert_eq!(json["diagnostic"]["suggestion"], suggestion);
     assert_eq!(json["diagnostic"]["fix"], "query name()");
+    let served_toon_output = output_failure(
+        served("query", &server)
+            .arg("-e")
+            .arg(refused)
+            .args(["--format", "toon"]),
+    );
+    let served_toon = stdout_string(&served_toon_output);
+    assert!(served_toon.contains("code: Q002"), "{served_toon}");
+    assert!(served_toon.contains("fix: query name()"), "{served_toon}");
     let served_human = output_failure(served("query", &server).arg("-e").arg(refused));
     let stderr = stderr_string(&served_human);
     assert!(stderr.contains("error[Q002]:"), "{stderr}");

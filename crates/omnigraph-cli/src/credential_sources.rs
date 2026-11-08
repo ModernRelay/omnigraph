@@ -8,10 +8,12 @@ use time::OffsetDateTime;
 
 mod binding;
 mod exec;
+mod oauth;
 mod store;
 
 pub(crate) use binding::{CredentialRequest, OwnerBinding, OwnerKind, Purpose, ResourceIdentity};
 pub(crate) use exec::{ExecSource, acquire_exec};
+pub(crate) use oauth::{acquire_client_credentials, validate_client_credentials};
 pub(crate) use store::{OsSecretStore, SecretStore, acquire_stored};
 
 #[cfg(test)]
@@ -54,6 +56,10 @@ pub(crate) enum CredentialError {
     HelperTimeout,
     HelperOutputLimit,
     HelperResponse,
+    InvalidClientCredentials,
+    ClientCredentialsUnavailable,
+    ClientCredentialsRefused,
+    ClientCredentialsResponse,
     Expired,
 }
 
@@ -105,6 +111,14 @@ impl fmt::Display for CredentialError {
             Self::HelperTimeout => "credential helper exceeded its timeout",
             Self::HelperOutputLimit => "credential helper output exceeded 64 KiB",
             Self::HelperResponse => "credential helper returned an invalid version-1 response",
+            Self::InvalidClientCredentials => "client-credentials configuration is invalid",
+            Self::ClientCredentialsUnavailable => {
+                "client-credentials token request failed; no retry was attempted"
+            }
+            Self::ClientCredentialsRefused => "the token endpoint refused the client credentials",
+            Self::ClientCredentialsResponse => {
+                "the token endpoint returned an invalid credential response"
+            }
             Self::Expired => "credential has expired",
         };
         f.write_str(message)
@@ -192,6 +206,18 @@ impl AcquiredCredential {
         self.expires_at
     }
 
+    pub(crate) fn bound_expiry(mut self, verified: OffsetDateTime) -> Self {
+        self.expires_at = Some(
+            self.expires_at
+                .map_or(verified, |expiry| expiry.min(verified)),
+        );
+        self
+    }
+
+    pub(crate) fn same_credential(&self, other: &Self) -> bool {
+        self.request == other.request && self.secret.expose() == other.secret.expose()
+    }
+
     pub(crate) fn request(&self) -> &CredentialRequest {
         &self.request
     }
@@ -246,6 +272,13 @@ pub(crate) fn acquire_environment_with(
     name: &str,
     read: impl FnOnce(&str) -> Option<OsString>,
 ) -> Result<AcquiredCredential> {
+    Ok(AcquiredCredential::new(
+        request,
+        BearerSecret::new(read_environment(name, read)?)?,
+    ))
+}
+
+fn read_environment(name: &str, read: impl FnOnce(&str) -> Option<OsString>) -> Result<String> {
     let mut bytes = name.bytes();
     if !bytes
         .next()
@@ -258,10 +291,20 @@ pub(crate) fn acquire_environment_with(
     let value = value
         .into_string()
         .map_err(|_| CredentialError::InvalidEnvironmentEncoding)?;
-    Ok(AcquiredCredential::new(request, BearerSecret::new(value)?))
+    if value.len() > MAX_CREDENTIAL_BYTES {
+        return Err(CredentialError::TooLarge);
+    }
+    Ok(value)
 }
 
 pub(crate) fn acquire_file(request: &CredentialRequest, path: &Path) -> Result<AcquiredCredential> {
+    Ok(AcquiredCredential::new(
+        request,
+        BearerSecret::from_input(read_file(path)?)?,
+    ))
+}
+
+fn read_file(path: &Path) -> Result<Vec<u8>> {
     if !path.is_absolute() {
         return Err(CredentialError::FileUnavailable);
     }
@@ -288,8 +331,8 @@ pub(crate) fn acquire_file(request: &CredentialRequest, path: &Path) -> Result<A
     file.take(MAX_CREDENTIAL_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| CredentialError::FileUnavailable)?;
-    Ok(AcquiredCredential::new(
-        request,
-        BearerSecret::from_input(bytes)?,
-    ))
+    if bytes.len() > MAX_CREDENTIAL_BYTES {
+        return Err(CredentialError::TooLarge);
+    }
+    Ok(bytes)
 }

@@ -621,6 +621,85 @@ mod tests {
         assert_eq!(map.len(), 0);
     }
 
+    /// Issue 859: every commit of a table is a new handle key, so steady
+    /// writes to one long-lived branch filled the cache with superseded
+    /// versions of the hot table, each holding a decoded manifest that lists
+    /// every fragment. A publication now evicts the pin it replaced, so each
+    /// table holds one version per graph branch in use.
+    #[tokio::test]
+    async fn steady_writes_hold_one_version_per_table_and_branch_issue_859() {
+        const SCHEMA: &str = r#"
+node Chunk { slug: String @key  n: I64 @index }
+"#;
+        const QUERIES: &str = r#"
+query put($slug: String, $n: I64) { insert Chunk { slug: $slug, n: $n } }
+query since($n: I64) { match { $c: Chunk  $c.n >= $n } return { $c.slug } }
+"#;
+        const COMMITS: i64 = 40;
+        let dir = tempfile::tempdir().unwrap();
+        let graph = Arc::new(
+            crate::db::Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+                .await
+                .unwrap(),
+        );
+        let session = crate::Session::from_defaults(
+            Arc::clone(&graph),
+            omnigraph_compiler::settings::SessionSettings::default(),
+        );
+        let params = |n: i64| {
+            std::collections::HashMap::from([
+                (
+                    "slug".to_string(),
+                    omnigraph_compiler::query::ast::Literal::String(format!("c{n}")),
+                ),
+                (
+                    "n".to_string(),
+                    omnigraph_compiler::query::ast::Literal::Integer(i128::from(n)),
+                ),
+            ])
+        };
+        session
+            .mutate("main", QUERIES, "put", &params(0))
+            .await
+            .unwrap();
+        graph.branch_create("session").await.unwrap();
+        session
+            .query("main", QUERIES, "since", &params(0))
+            .await
+            .unwrap();
+        for n in 1..=COMMITS {
+            session
+                .mutate("session", QUERIES, "put", &params(n))
+                .await
+                .unwrap();
+            let rows = session
+                .query("session", QUERIES, "since", &params(n))
+                .await
+                .unwrap();
+            assert_eq!(rows.num_rows(), 1);
+        }
+        session
+            .query("main", QUERIES, "since", &params(0))
+            .await
+            .unwrap();
+
+        let handles = &graph.read_caches().handles;
+        let mut per_table = std::collections::BTreeMap::<String, usize>::new();
+        for key in handles.held_keys().await {
+            *per_table.entry(key.table_path).or_default() += 1;
+        }
+        let occupancy = handles.occupancy().await;
+        assert!(
+            per_table.values().all(|held| *held <= 2),
+            "after {COMMITS} commits each table holds at most main's and the \
+             branch's version: {per_table:?} ({occupancy:?})"
+        );
+        assert!(
+            occupancy.fragments <= 2 * (COMMITS as usize + 1),
+            "held manifests list no superseded history: {occupancy:?}"
+        );
+    }
+
     /// PR #544 review finding 3 regression: two different edge scopes served
     /// from the persisted artifact must share ONE decoded allocation (the
     /// shelf), never retain independent full-catalog copies per scope key.

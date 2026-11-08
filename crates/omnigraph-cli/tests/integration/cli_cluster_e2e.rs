@@ -49,6 +49,133 @@ fn cluster_e2e_azure_live_apply_without_restart() {
     live_apply_changes_schema_queries_and_adds_graph_without_restart(Some(&root));
 }
 
+/// With no server, an inline S3 root takes the stopped-writer doors a local
+/// root has: deploy, observe and replay by ID, unlock by exact ID, and run
+/// direct maintenance on one of its graphs (#1163, #1082).
+#[test]
+fn cluster_e2e_s3_direct_root_deploys_unlocks_and_maintains_issue_1163() {
+    let Ok(bucket) = std::env::var("OMNIGRAPH_S3_TEST_BUCKET") else {
+        eprintln!("skipping s3 direct root: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+    let prefix = std::env::var("OMNIGRAPH_S3_TEST_PREFIX")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "omnigraph-itests".into());
+    let root = format!(
+        "s3://{bucket}/{prefix}/direct-root/{}",
+        uuid::Uuid::new_v4()
+    );
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let rooted = |args: &[&str]| {
+        let mut command = cli();
+        command.args(["--target", &root]).args(args);
+        command
+    };
+    let status = || {
+        parse_stdout_json(&output_success(&mut rooted(&[
+            "cluster", "status", "--json",
+        ])))
+    };
+    let unlock = |lock_id: &str| {
+        let unlocked = parse_stdout_json(&output_success(&mut rooted(&[
+            "cluster",
+            "force-unlock",
+            lock_id,
+            "--json",
+        ])));
+        assert_eq!(unlocked["unlocked"], true, "{unlocked}");
+    };
+
+    let output = output_success(
+        rooted(&[
+            "--as",
+            "act-cluster-test",
+            "cluster",
+            "apply",
+            "--json",
+            "--config",
+        ])
+        .arg(temp.path()),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("direct root") && stderr.contains("provider=S3"),
+        "{stderr}"
+    );
+    let deployed = parse_stdout_json(&output);
+    assert_eq!(deployed["status"], "complete", "{deployed}");
+    assert_eq!(deployed["result"]["converged"], true, "{deployed}");
+    let id = deployed["result"]["id"].as_str().unwrap();
+
+    let observed = parse_stdout_json(&output_success(&mut rooted(&[
+        "cluster",
+        "status",
+        "--deployment-id",
+        id,
+        "--json",
+    ])));
+    assert_eq!(observed["lookup"], deployed);
+    let lock_id = observed["lock_id"].as_str().unwrap().to_owned();
+    let replayed = parse_stdout_json(&output_success(&mut rooted(&[
+        "cluster",
+        "apply",
+        "--deployment-id",
+        id,
+        "--writers-stopped",
+        "--json",
+    ])));
+    assert_eq!(replayed, deployed, "a terminal ID is lookup only");
+    unlock(&lock_id);
+
+    let plan = parse_stdout_json(&output_success(
+        rooted(&["cluster", "plan", "--json", "--config"]).arg(temp.path()),
+    ));
+    assert!(plan["changes"].as_array().unwrap().is_empty(), "{plan}");
+
+    // A non-local cleanup still needs --yes, and refuses before admission.
+    let unconfirmed = output_failure(&mut rooted(&[
+        "cleanup",
+        "--graph",
+        "knowledge",
+        "--keep",
+        "1",
+        "--confirm",
+        "--json",
+    ]));
+    assert!(
+        String::from_utf8_lossy(&unconfirmed.stdout).contains("refusing destructive `cleanup`")
+            || String::from_utf8_lossy(&unconfirmed.stderr)
+                .contains("refusing destructive `cleanup`"),
+        "{unconfirmed:?}"
+    );
+    assert!(status()["lock_id"].is_null());
+
+    for maintenance in [
+        vec!["optimize", "--graph", "knowledge", "--json"],
+        vec![
+            "cleanup",
+            "--graph",
+            "knowledge",
+            "--keep",
+            "1",
+            "--confirm",
+            "--yes",
+            "--json",
+        ],
+    ] {
+        output_success(&mut rooted(&maintenance));
+        let retained = status();
+        unlock(
+            retained["lock_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{maintenance:?} retains its lock: {retained}")),
+        );
+    }
+    assert!(status()["lock_id"].is_null());
+}
+
 fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root: Option<&str>) {
     use std::sync::{
         Arc,

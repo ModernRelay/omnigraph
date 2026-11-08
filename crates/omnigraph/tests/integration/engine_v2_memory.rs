@@ -2099,3 +2099,87 @@ query all() {
     .unwrap();
     assert_eq!(emitted(&probes), pairs, "a full drain hands on every pair");
 }
+
+/// A bound expand over a list-valued edge property returns every pair with
+/// its own elements under a fixed pool and releases it. The pair producer's
+/// chunk sizing is pinned in-source by
+/// `expand_stream::tests::bound_pairs_size_a_list_property_by_its_own_elements_issue_1251`;
+/// GQT cannot set the pool.
+#[tokio::test]
+#[serial]
+async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Person { name: String @key } edge Knows: Person -> Person { labels: [String] }",
+        )
+        .await
+        .unwrap(),
+    );
+    let leaves = 4_096;
+    let labels = |leaf: usize| -> Vec<String> {
+        (0..4)
+            .map(|tag| format!("{leaf:05}-{tag}-{}", "x".repeat(56)))
+            .collect()
+    };
+    let mut lines = vec![serde_json::json!({"type":"Person","data":{"name":"hub"}}).to_string()];
+    for leaf in 0..leaves {
+        lines.push(
+            serde_json::json!({"type":"Person","data":{"name":format!("leaf{leaf:05}")}})
+                .to_string(),
+        );
+    }
+    for leaf in 0..leaves {
+        lines.push(
+            serde_json::json!({"edge":"Knows","from":"hub","to":format!("leaf{leaf:05}"),
+                "data":{"labels":labels(leaf)}})
+            .to_string(),
+        );
+    }
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let v2 = with_setting(&db, "engine", "v2");
+    let query = r#"query tagged() {
+        match { $a: Person { name: "hub" } $a $t:knows $b }
+        return { $b.name, $t.labels }
+    }"#;
+    let limit = 8 * MIB;
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(limit, query_main(&v2, query, "tagged", &params(&[]))),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}; refusals={:?}", probes.refusals()));
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column_by_name("b.name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let lists = batch
+        .column_by_name("t.labels")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::ListArray>()
+        .unwrap();
+    let mut rows: Vec<(String, Vec<String>)> = (0..batch.num_rows())
+        .map(|row| {
+            let values = lists.value(row);
+            let values = values.as_any().downcast_ref::<StringArray>().unwrap();
+            (
+                names.value(row).to_owned(),
+                values.iter().map(|tag| tag.unwrap().to_owned()).collect(),
+            )
+        })
+        .collect();
+    rows.sort();
+    let expected: Vec<(String, Vec<String>)> = (0..leaves)
+        .map(|leaf| (format!("leaf{leaf:05}"), labels(leaf)))
+        .collect();
+    assert_eq!(rows, expected);
+    assert_released(&probes);
+}

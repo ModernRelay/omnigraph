@@ -131,6 +131,44 @@ async fn adaptive_switch_returns_identical_rows() {
 // The switch under an UNDIRECTED traversal (Direction::Both — two endpoint
 // probes per hop, the probe-factor case, CSR+CSC merge after the swap). Same
 // clique, so the hop-2 policy check sees the same explosive growth.
+/// The same switch from a seed whose dense id differs between the walk's
+/// interner and the graph index's dictionary: a hop-1 chunk still buffered
+/// when hop 2 swaps the source must leave as the ids it was found under.
+#[tokio::test]
+async fn adaptive_switch_from_a_later_seed_returns_identical_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = clique_db(&dir).await;
+    let p = params(&[("$name", "p5")]);
+
+    let csr_db = with_traversal(&db, Traversal::Csr);
+    let indexed_db = with_traversal(&db, Traversal::Indexed);
+    let csr = first_column_sorted(&query_main(&csr_db, REACH_3, "reach", &p).await.unwrap());
+    let indexed =
+        first_column_sorted(&query_main(&indexed_db, REACH_3, "reach", &p).await.unwrap());
+    let switches = Arc::new(AtomicU64::new(0));
+    let probes = QueryIoProbes {
+        traversal_mid_switches: Arc::clone(&switches),
+        ..Default::default()
+    };
+    let auto = first_column_sorted(
+        &with_query_io_probes(probes, query_main(&db, REACH_3, "reach", &p))
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(csr.len(), 49, "p5 reaches every other clique member");
+    assert!(csr.iter().any(|name| name == "p0") && !csr.iter().any(|name| name == "p5"));
+    assert_eq!(indexed, csr, "forced modes agree");
+    assert_eq!(
+        auto, csr,
+        "auto (dispatch + mid-traversal re-decision) must match the forced paths"
+    );
+    assert!(
+        switches.load(Ordering::Relaxed) >= 1,
+        "the mid-traversal Indexed→CSR switch must actually fire on this shape"
+    );
+}
+
 #[tokio::test]
 async fn adaptive_switch_undirected_returns_identical_rows() {
     const REACH_3_UNDIRECTED: &str = r#"

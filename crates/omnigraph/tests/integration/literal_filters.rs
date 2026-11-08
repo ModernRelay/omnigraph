@@ -671,7 +671,7 @@ async fn unused_mutation_parameters_are_checked_before_a_noop() {
     for (type_name, invalid, valid) in [
         (
             "I32",
-            Literal::Integer(i64::from(i32::MAX) + 1),
+            Literal::Integer(i128::from(i32::MAX) + 1),
             Literal::Integer(1),
         ),
         (
@@ -725,7 +725,7 @@ async fn mutation_assignment_parameter_is_checked_before_an_empty_scan_after_hea
     let source = r#"query assigned($value: I32) {
         update Metric set { count: $value } where name = "missing"
     }"#;
-    let params = ParamMap::from([("value".into(), Literal::Integer(i64::from(i32::MAX) + 1))]);
+    let params = ParamMap::from([("value".into(), Literal::Integer(i128::from(i32::MAX) + 1))]);
     let error = db
         .mutate_as_with_expected_head(
             "main",
@@ -755,7 +755,7 @@ async fn mutation_assignment_parameter_is_checked_before_an_empty_scan_after_hea
             "main",
             source,
             "assigned",
-            &ParamMap::from([("value".into(), Literal::Integer(i64::from(i32::MAX)))]),
+            &ParamMap::from([("value".into(), Literal::Integer(i128::from(i32::MAX)))]),
         )
         .await
         .unwrap();

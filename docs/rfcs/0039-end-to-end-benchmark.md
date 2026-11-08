@@ -226,7 +226,11 @@ server lifecycle is long-running with no reset, engine preparation is
 uncontrolled without an executed read prefix, and server OS page-cache state
 is always uncontrolled. A fresh client process proves no server restart or
 cache reset. The complete query program must be read-only, including suffixes
-and loop bodies; provisioning and mutation remain outside acquisition.
+and loop bodies, or write only unpublished commits (`as commit`) that the
+suffix verifies at their snapshot and drops, so no repetition changes the graph
+the next one sees; provisioning and every write that advances a branch head
+remain outside acquisition. An unpublished write measures the write's engine
+work without its head publication; its receipt records `published: false`.
 The served interval includes request serialization on the client, the server's
 response encoding and the row decoding on the client; the embedded interval
 ends at the engine's Arrow batches, before any JSON rendering. Served and

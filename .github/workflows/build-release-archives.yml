@@ -22,6 +22,25 @@ on:
         description: Require the archives to report the stamp; false only for sources that predate it.
         required: true
         type: boolean
+    secrets:
+      APPLE_CERTIFICATE_P12:
+        description: Base64 Developer ID Application certificate and private key.
+        required: true
+      APPLE_CERTIFICATE_PASSWORD:
+        description: P12 export password.
+        required: true
+      APPLE_SIGN_IDENTITY:
+        description: Exact Developer ID Application signing identity.
+        required: true
+      APPLE_NOTARY_KEY_P8:
+        description: Base64 App Store Connect team API private key.
+        required: true
+      APPLE_NOTARY_KEY_ID:
+        description: App Store Connect API key ID.
+        required: true
+      APPLE_NOTARY_ISSUER:
+        description: App Store Connect API issuer ID.
+        required: true
 
 jobs:
   build:
@@ -42,7 +61,10 @@ jobs:
             asset_name: omnigraph-linux-x86_64
           - runner: ubuntu-24.04-arm
             asset_name: omnigraph-linux-arm64
-          - runner: macos-14
+          # macOS 14 images retired on 2026-11-02 (actions/runner-images#15226).
+          # No deployment target is set, so the archive keeps rustc's default
+          # minimum macOS whatever image builds it.
+          - runner: macos-15
             asset_name: omnigraph-macos-arm64
             # OmniGraph's release text exceeds arm64's +/-128 MiB direct-branch
             # range. Use long calls instead of relying on ld branch islands.
@@ -110,6 +132,80 @@ jobs:
       # base, so it adds one crate.
       - name: Build release binaries
         run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server -p omnigraph-azure-admission --features omnigraph-server/aws
+
+      # A fixed identifier and Developer ID preserve Keychain's code identity
+      # across updates. Sign before packaging so checksums cover the signature.
+      - name: Sign and notarize macOS binaries
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for name in APPLE_CERTIFICATE_P12 APPLE_CERTIFICATE_PASSWORD APPLE_SIGN_IDENTITY \
+            APPLE_NOTARY_KEY_P8 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER; do
+            [[ -n "${!name}" ]] || { echo "::error::$name is required for macOS releases"; exit 1; }
+          done
+          [[ "$APPLE_SIGN_IDENTITY" =~ ^Developer\ ID\ Application:\ .+\ \(([A-Z0-9]{10})\)$ ]] || {
+            echo "::error::APPLE_SIGN_IDENTITY must name a Developer ID Application certificate and team"
+            exit 1
+          }
+          team="${BASH_REMATCH[1]}"
+          keychain="$RUNNER_TEMP/omnigraph-signing.keychain-db"
+          p12="$RUNNER_TEMP/omnigraph-signing.p12"
+          p8="$RUNNER_TEMP/omnigraph-notary.p8"
+          archive="$RUNNER_TEMP/omnigraph-notary.zip"
+          keychains=()
+          while IFS= read -r path; do
+            keychains+=("$path")
+          done < <(security list-keychains -d user | python3 -c 'import shlex, sys; print("\n".join(shlex.split(sys.stdin.read())))')
+          cleanup() {
+            rm -f "$p12" "$p8" "$archive"
+            security delete-keychain "$keychain" > /dev/null 2>&1 || true
+            security list-keychains -d user -s "${keychains[@]}"
+          }
+          trap cleanup EXIT
+          password=$(openssl rand -hex 32)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 --decode > "$p12"
+          security import "$p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" "${keychains[@]}"
+          for binary in omnigraph omnigraph-server omnigraph-azure-admission; do
+            identifier="com.modernrelay.$binary"
+            codesign --force --timestamp --options runtime --identifier "$identifier" \
+              --sign "$APPLE_SIGN_IDENTITY" "target/release/$binary"
+            codesign --verify --strict --verbose=2 \
+              -R="identifier \"$identifier\" and anchor apple generic and certificate leaf[subject.OU] = \"$team\"" \
+              "target/release/$binary"
+          done
+          printf '%s' "$APPLE_NOTARY_KEY_P8" | base64 --decode > "$p8"
+          notary=(--key "$p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER")
+          # Apple accepts ZIP submissions, not tarballs. Its ticket covers the
+          # signed executables, which ship unchanged in the existing tar.gz.
+          zip -j "$archive" target/release/omnigraph target/release/omnigraph-server \
+            target/release/omnigraph-azure-admission > /dev/null
+          result="$RUNNER_TEMP/omnigraph-notary-result.json"
+          if ! xcrun notarytool submit "$archive" "${notary[@]}" --wait --timeout 30m --output-format json > "$result"; then
+            # Retain the submission ID/status in the log if Apple's wait times out.
+            cat "$result"
+            exit 1
+          fi
+          status=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["status"])' "$result")
+          if [[ "$status" != Accepted ]]; then
+            submission=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["id"])' "$result")
+            xcrun notarytool log "$submission" "${notary[@]}"
+            echo "::error::Apple notarization status: $status"
+            exit 1
+          fi
 
       - name: Package Unix release archive
         if: runner.os != 'Windows'

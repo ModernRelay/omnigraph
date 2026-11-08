@@ -1230,18 +1230,29 @@ bare and its body names each session once, `<label>: ok` or
 `<label>: error: <needle>`, compared as a mutate or query step's `ok` and
 `error:` are; rows are not compared inside a block.
 
-The paused clock is the block's one hazard: the runtime auto-advances it
-to the next pending timer whenever it is idle, and a session waiting on the
-script is idle, so a parked writer would let the clock reach the engine's
-own far timers and the engine would time itself out. While a session waits
-on the script the block therefore drives the clock itself, one tick per
-scheduler turn up to ten virtual seconds past the last cursor move or
-request, so the other sessions' modeled request costs elapse and nothing
-farther fires; past that budget the clock stands still. The block fails as
-starved when neither an entry nor a request arrives for half the case's
-`timeout_ms` of wall time, at most ten seconds, or when a session finishes
-without a request entry of its own; a session blocked in the engine while
-no session waits on the script ends as the case's timeout. The evidence
+The paused clock is the block's one subtlety: the runtime advances it to
+the earliest pending timer whenever it is idle, and never while a task of
+its blocking pool runs, so while a session waits on the script the other
+sessions' modeled request costs elapse, a commit backoff fires at its
+distance, and a session's work on a foreign thread (the Lance CPU pool)
+takes no virtual time when nothing is pending to advance to; when another
+session's modeled sleep is pending the clock jumps to it while the hop
+runs, and the hop's wake lands before or after that one jump, a one-tick
+window Lance owns (its CPU pool is a second runtime the paused clock does
+not see). Nothing else moves the clock, so a wait at a gate is the modeled
+cost of what the holder did meanwhile and replays exactly up to that
+window. A timer farther than the block's
+work would fire the moment a session parks with nothing nearer pending and
+end the block as a timeout, visibly: Lance's bound on one commit is such a
+timer, pending for as long as a parked commit stays open, so every commit
+the engine makes runs without it under simulation (`lance_commit`, the
+one constructor every commit site uses) and with Lance's default in
+production. The block fails as starved when
+neither an entry nor a request arrives for half the case's `timeout_ms` of
+wall time, at most ten seconds, read off the runtime by a guard thread, or
+when a session finishes without a request entry of its own; a session
+blocked in the engine while no session waits on the script ends as the
+case's timeout. The evidence
 row `concurrent_block` carries each session's outcome, the entry the
 cursor stopped at and the block's failure, replay-compared; the grant
 sequence with its wall times and the count of requests made outside any

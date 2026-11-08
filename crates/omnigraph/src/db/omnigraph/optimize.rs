@@ -677,7 +677,7 @@ async fn clear_manifest_auto_cleanup(db: &Omnigraph) -> Result<DatasetOptimizeSt
         match clear_stale_auto_cleanup_config(&mut ds).await {
             Ok(cleared) => {
                 if cleared {
-                    db.coordinator.write().await.refresh().await?;
+                    db.refresh_coordinator_only().await?;
                 }
                 return Ok(DatasetOptimizeStats::compacted(
                     "__manifest".to_string(),
@@ -934,8 +934,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
 pub(crate) async fn cleanup_graph_branches(db: &Omnigraph) -> Result<Vec<Option<String>>> {
     let mut branches = db
         .coordinator
-        .read()
-        .await
+        .load_full()
         .all_branches()
         .await?
         .into_iter()

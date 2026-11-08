@@ -1,10 +1,8 @@
-//! Judgment kernels of the integrity evaluator: synchronous functions over
-//! rows that are already in memory.
-//!
-//! The evaluator in the parent module fetches committed state and feeds these
-//! kernels; a load operator can feed them from its own scan. Every refusal
-//! rule (which row is reported, in which order, under which exemption) lives
-//! here, so the two routes cannot judge the same rows differently.
+//! Judgment kernels of the write judge: synchronous functions over rows that
+//! are already in memory. The judge fetches committed state and feeds them,
+//! from a `load csv` partition or a staged route's batches alike. Every
+//! refusal rule (which row is reported, in which order, under which
+//! exemption) lives here, so no route judges the same rows differently.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -17,7 +15,7 @@ use datafusion::scalar::ScalarValue;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::EdgeType;
 
-use super::{ChangeSet, TableChange, Violation, string_col};
+use super::{Violation, string_col};
 use crate::error::{MergeConflictKind, OmniError, Result};
 use crate::loader::{composite_unique_key, format_tuple};
 
@@ -33,8 +31,6 @@ pub(super) type HoldersByKey = HashMap<Vec<String>, Vec<String>>;
 #[derive(Debug, Default)]
 pub(super) struct UniqueImage {
     pub(super) entries: Vec<FinalKeyByIdEntry>,
-    /// A key repeated inside one batch was reported to the sink.
-    pub(super) within_batch_violation: bool,
 }
 
 /// The group's columns of `batch`, in declaration order.
@@ -53,75 +49,6 @@ fn group_columns(
             })
         })
         .collect()
-}
-
-/// Pass 1 of uniqueness, one batch at a time: report a key repeated inside
-/// ONE batch (two input records sharing a key, even under the same id, since
-/// a load has no row order) and coalesce the delta by id, last-wins, into
-/// each id's final key. A row whose key became null removes its id from the
-/// image. The typed values come from the row's Arrow columns so the
-/// committed lookup compares like-typed; a stringified key would push Utf8
-/// against a Date, Bool or Float column.
-#[derive(Debug, Default)]
-pub(super) struct UniqueImageBuilder {
-    final_by_id: HashMap<String, (Vec<String>, Vec<ScalarValue>)>,
-    input_keys: Option<HashMap<Vec<String>, String>>,
-    input_only: bool,
-    within_batch_violation: bool,
-}
-
-impl UniqueImageBuilder {
-    pub(super) fn observe<F>(
-        &mut self,
-        table_key: &str,
-        columns: &[String],
-        batch: &RecordBatch,
-        system_columns: SystemColumns,
-        sink: &mut F,
-    ) -> Result<()>
-    where
-        F: FnMut(Violation) -> Result<()>,
-    {
-        let group_columns = group_columns(batch, table_key, columns)?;
-        let ids = string_col(batch, system_columns.id)?;
-        let mut seen_in_batch: HashMap<Vec<String>, String> = HashMap::new();
-        let seen = self.input_keys.as_mut().unwrap_or(&mut seen_in_batch);
-        for row in 0..batch.num_rows() {
-            let id = ids.value(row).to_string();
-            let Some(key) = composite_unique_key(&group_columns, row)? else {
-                self.final_by_id.remove(&id);
-                continue;
-            };
-            if self.input_only {
-                if let Some(prior) = seen.get(&key) {
-                    sink(unique_violation(table_key, columns, &key, &id, prior))?;
-                    self.within_batch_violation = true;
-                }
-                seen.insert(key, id);
-                continue;
-            }
-            if let Some(prior) = seen.insert(key.clone(), id.clone()) {
-                sink(unique_violation(table_key, columns, &key, &id, &prior))?;
-                self.within_batch_violation = true;
-            }
-            let values = group_columns
-                .iter()
-                .map(|arr| ScalarValue::try_from_array(arr, row))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| OmniError::manifest(e.to_string()))?;
-            self.final_by_id.insert(id, (key, values));
-        }
-        Ok(())
-    }
-
-    pub(super) fn finish(self) -> UniqueImage {
-        let mut entries: Vec<FinalKeyByIdEntry> = self.final_by_id.into_iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        UniqueImage {
-            entries,
-            within_batch_violation: self.within_batch_violation,
-        }
-    }
 }
 
 /// A row's place in the delta, `partition << 48 | slice << 24 | row in
@@ -353,15 +280,24 @@ impl SharedFirstHolders {
     }
 }
 
-/// Pass 1 of uniqueness over the rows one partition saw: every key goes into
-/// the [`SharedFirstHolders`] all partitions insert into, bucketed by shard
-/// per batch, so repeats across partitions are judged as the rows arrive and
-/// nothing merges after the drain; each id's last key by position stays with
-/// the partition for the image ([`merge_unique_image`]).
+/// Where a partition judges a repeated key: in the [`SharedFirstHolders`]
+/// every partition inserts into, so a key repeated anywhere in the input is
+/// found as the rows arrive; or inside one batch only, the earliest repeat
+/// kept, for a write whose batches are statements in order.
+#[derive(Debug)]
+pub(super) enum Repeats {
+    Shared(Arc<SharedFirstHolders>),
+    WithinBatch(Option<(Position, Violation)>),
+}
+
+/// Pass 1 of uniqueness over the rows one partition saw: every key is judged
+/// for repeats per [`Repeats`], bucketed by shard per batch under the shared
+/// holders so nothing merges after the drain; each id's last key by position
+/// stays with the partition for the image ([`merge_unique_image`]).
 #[derive(Debug)]
 pub(super) struct UniquePartial {
     input_only: bool,
-    holders: Arc<SharedFirstHolders>,
+    repeats: Repeats,
     final_by_id: FinalKeys,
     buckets: Vec<Vec<Keyed>>,
 }
@@ -369,11 +305,14 @@ pub(super) struct UniquePartial {
 impl UniquePartial {
     /// `input_only` is the replacement's pass: a repeat inside the input is
     /// the only judgment and no image is kept.
-    pub(super) fn new(input_only: bool, holders: Arc<SharedFirstHolders>) -> Self {
-        let shards = holders.shards.len();
+    pub(super) fn new(input_only: bool, repeats: Repeats) -> Self {
+        let shards = match &repeats {
+            Repeats::Shared(holders) => holders.shards.len(),
+            Repeats::WithinBatch(_) => 0,
+        };
         Self {
             input_only,
-            holders,
+            repeats,
             final_by_id: HashMap::new(),
             buckets: (0..shards).map(|_| Vec::new()).collect(),
         }
@@ -391,6 +330,7 @@ impl UniquePartial {
         let group_columns = group_columns(batch, table_key, columns)?;
         let ids = string_col(batch, system_columns.id)?;
         let shards = self.buckets.len();
+        let mut seen_in_batch: HashMap<Vec<String>, String> = HashMap::new();
         for row in 0..batch.num_rows() {
             let position = base.saturating_add(row as Position);
             let id = ids.value(row).to_string();
@@ -409,22 +349,42 @@ impl UniquePartial {
                 self.final_by_id
                     .insert(id.clone(), (position, Some((key.clone(), values))));
             }
-            self.buckets[shard_of(&key, shards)].push((key, id, position));
+            match &mut self.repeats {
+                Repeats::Shared(_) => {
+                    self.buckets[shard_of(&key, shards)].push((key, id, position));
+                }
+                Repeats::WithinBatch(first) => {
+                    if let Some(prior) = seen_in_batch.insert(key.clone(), id.clone())
+                        && first.as_ref().is_none_or(|(at, _)| position < *at)
+                    {
+                        *first = Some((
+                            position,
+                            unique_violation(table_key, columns, &key, &id, &prior),
+                        ));
+                    }
+                }
+            }
         }
-        self.holders
-            .insert_buckets(table_key, columns, &mut self.buckets);
+        if let Repeats::Shared(holders) = &self.repeats {
+            holders.insert_buckets(table_key, columns, &mut self.buckets);
+        }
         Ok(())
     }
 
-    /// The partition's final keys, for the image.
-    pub(super) fn into_final_keys(self) -> FinalKeys {
-        self.final_by_id
+    /// The partition's final keys, for the image, and the earliest repeat it
+    /// judged inside one batch.
+    pub(super) fn into_parts(self) -> (FinalKeys, Option<(Position, Violation)>) {
+        let repeat = match self.repeats {
+            Repeats::Shared(_) => None,
+            Repeats::WithinBatch(first) => first,
+        };
+        (self.final_by_id, repeat)
     }
 }
 
 /// Every partition's final keys merged, the last by position winning and a
 /// null key removing its id: the group's image, entries sorted by id.
-pub(super) fn merge_unique_image(finals: Vec<FinalKeys>, repeated: bool) -> UniqueImage {
+pub(super) fn merge_unique_image(finals: Vec<FinalKeys>) -> UniqueImage {
     let mut merged: FinalKeys = HashMap::new();
     for map in finals {
         for (id, (position, key)) in map {
@@ -445,28 +405,7 @@ pub(super) fn merge_unique_image(finals: Vec<FinalKeys>, repeated: bool) -> Uniq
         .filter_map(|(id, (_, key))| key.map(|key| (id, key)))
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    UniqueImage {
-        entries,
-        within_batch_violation: repeated,
-    }
-}
-
-/// [`UniqueImageBuilder`] over every value batch of `change`.
-pub(super) fn unique_image<F>(
-    table_key: &str,
-    columns: &[String],
-    change: &TableChange,
-    system_columns: SystemColumns,
-    sink: &mut F,
-) -> Result<UniqueImage>
-where
-    F: FnMut(Violation) -> Result<()>,
-{
-    let mut builder = UniqueImageBuilder::default();
-    for batch in change.value_batches() {
-        builder.observe(table_key, columns, batch, system_columns, sink)?;
-    }
-    Ok(builder.finish())
+    UniqueImage { entries }
 }
 
 /// Pass 2 of uniqueness: two DISTINCT ids holding the same final key. Reported
@@ -544,7 +483,7 @@ pub(super) fn unique_committed_collisions<F>(
     entries: &[FinalKeyByIdEntry],
     holders_by_key: &HoldersByKey,
     delta_ids: &HashSet<String>,
-    deleted: &HashSet<&String>,
+    deleted: &HashSet<&str>,
     sink: &mut F,
 ) -> Result<()>
 where
@@ -555,117 +494,13 @@ where
             continue;
         };
         for holder in holders {
-            if !delta_ids.contains(holder) && !deleted.contains(holder) {
+            if !delta_ids.contains(holder) && !deleted.contains(holder.as_str()) {
                 sink(unique_violation(table_key, columns, key, id, holder))?;
                 break;
             }
         }
     }
     Ok(())
-}
-
-/// Append `(edge id, src, dst)` per raw row of one delta batch to `edges`.
-pub(super) fn edge_ri_batch(
-    batch: &RecordBatch,
-    system_columns: SystemColumns,
-    edges: &mut Vec<(String, String, String)>,
-) -> Result<()> {
-    let ids = string_col(batch, system_columns.id)?;
-    let srcs = string_col(batch, system_columns.src)?;
-    let dsts = string_col(batch, system_columns.dst)?;
-    for i in 0..batch.num_rows() {
-        edges.push((
-            ids.value(i).to_string(),
-            srcs.value(i).to_string(),
-            dsts.value(i).to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// `(edge id, src, dst)` per raw added or changed delta row.
-pub(super) fn edge_ri_delta(
-    change: &TableChange,
-    system_columns: SystemColumns,
-) -> Result<Vec<(String, String, String)>> {
-    let mut edges = Vec::new();
-    for batch in change.value_batches() {
-        edge_ri_batch(batch, system_columns, &mut edges)?;
-    }
-    Ok(edges)
-}
-
-/// Split endpoint `ids` by what the node delta settles: an added or changed
-/// id exists, a deleted id does not, and every other id goes to the
-/// committed lookup (`to_probe`, in input order, repeats kept).
-pub(super) fn partition_endpoints(
-    ids: &[String],
-    added_changed: &HashSet<String>,
-    deleted: &HashSet<String>,
-) -> (HashSet<String>, Vec<String>) {
-    let mut exist = HashSet::new();
-    let mut to_probe = Vec::new();
-    for id in ids {
-        if added_changed.contains(id) {
-            exist.insert(id.clone());
-        } else if !deleted.contains(id) {
-            to_probe.push(id.clone());
-        }
-    }
-    (exist, to_probe)
-}
-
-/// Path-a of edge RI: each delta edge whose src or dst is absent from the
-/// merged node universe, in delta row order, src before dst.
-pub(super) fn orphans_in_delta<F>(
-    edge_table: &str,
-    from_type: &str,
-    to_type: &str,
-    edges: &[(String, String, String)],
-    from_exist: &HashSet<String>,
-    to_exist: &HashSet<String>,
-    system_columns: SystemColumns,
-    sink: &mut F,
-) -> Result<()>
-where
-    F: FnMut(Violation) -> Result<()>,
-{
-    for (id, src, dst) in edges {
-        if !from_exist.contains(src) {
-            sink(orphan_violation(
-                edge_table,
-                id,
-                system_columns.src,
-                src,
-                from_type,
-            ))?;
-        }
-        if !to_exist.contains(dst) {
-            sink(orphan_violation(
-                edge_table,
-                id,
-                system_columns.dst,
-                dst,
-                to_type,
-            ))?;
-        }
-    }
-    Ok(())
-}
-
-/// The node ids `changeset` deletes from the edge's `from_table` and `to_table`.
-pub(super) fn deleted_endpoints(
-    changeset: &ChangeSet,
-    from_table: &str,
-    to_table: &str,
-) -> (Vec<String>, Vec<String>) {
-    let deleted_of = |table: &str| {
-        changeset
-            .get(table)
-            .map(|change| change.deleted_ids.clone())
-            .unwrap_or_default()
-    };
-    (deleted_of(from_table), deleted_of(to_table))
 }
 
 /// Path-b of edge RI: a committed edge that survives this change (neither in
@@ -729,85 +564,55 @@ pub(super) struct CardPlan {
     pub(super) changed_ids: Vec<String>,
 }
 
-/// Fold one delta batch into `delta_by_id`, last-wins per edge id.
-pub(super) fn card_observe(
-    batch: &RecordBatch,
-    system_columns: SystemColumns,
-    delta_by_id: &mut HashMap<String, String>,
-) -> Result<()> {
-    let ids = string_col(batch, system_columns.id)?;
-    let srcs = string_col(batch, system_columns.src)?;
-    for i in 0..batch.num_rows() {
-        delta_by_id.insert(ids.value(i).to_string(), srcs.value(i).to_string());
-    }
-    Ok(())
-}
-
-/// Coalesce the delta by edge id, last-wins. A Merge load can list the same
-/// edge id twice with different srcs; counting raw rows would place one id
-/// under several srcs.
-pub(super) fn card_plan(change: &TableChange, system_columns: SystemColumns) -> Result<CardPlan> {
-    let mut delta_by_id: HashMap<String, String> = HashMap::new();
-    for batch in change.value_batches() {
-        card_observe(batch, system_columns, &mut delta_by_id)?;
-    }
-    let changed_ids = delta_by_id.keys().cloned().collect();
-    Ok(CardPlan {
-        delta_by_id,
-        removed_ids: change.deleted_ids.clone(),
-        changed_ids,
-    })
-}
-
-/// The srcs whose edge count the change can move: the new src of every delta
-/// edge and the old committed src of every removed or changed edge, minus
-/// srcs that are themselves deleted nodes.
+/// The srcs a `@card` check counts: the new src of every delta edge, the old
+/// src of every removed or changed edge, and every source node the change
+/// writes (`written`, filled under a non-zero minimum), minus srcs that are
+/// themselves deleted nodes.
 pub(super) fn card_affected(
     plan: &CardPlan,
     removed_edges: &[(String, String)],
     moved_from: &[(String, String)],
+    written: &HashSet<String>,
     deleted_src_nodes: &HashSet<String>,
 ) -> HashSet<String> {
     let mut affected: HashSet<String> = plan.delta_by_id.values().cloned().collect();
     for (_, src) in removed_edges.iter().chain(moved_from.iter()) {
         affected.insert(src.clone());
     }
+    affected.extend(written.iter().cloned());
     affected.retain(|src| !deleted_src_nodes.contains(src));
     affected
 }
 
-/// Count the merged edge-id set per affected src and report each bound it
-/// breaks, srcs in sorted order, `max` before `min`. A committed edge leaves
-/// its src when the delta deletes or re-places it; the coalesced delta edges
-/// then count at their last-wins src.
+/// Count the merged edges per affected src and report each bound it breaks,
+/// srcs in sorted order, `max` before `min`. `committed_counts` holds each
+/// src's committed edges the delta neither deletes nor re-places; the
+/// coalesced delta edges then count at their last-wins src.
 pub(super) fn card_violations<F>(
     edge_table: &str,
     edge_type: &EdgeType,
     plan: &CardPlan,
     affected: &HashSet<String>,
-    committed_for_affected: &[(String, String)],
+    committed_counts: &HashMap<String, u32>,
     sink: &mut F,
 ) -> Result<()>
 where
     F: FnMut(Violation) -> Result<()>,
 {
     let card = &edge_type.cardinality;
-    let removed_id_set: HashSet<&String> = plan.removed_ids.iter().collect();
-    let mut per_src: HashMap<&String, HashSet<&String>> = HashMap::new();
-    for (id, src) in committed_for_affected {
-        if removed_id_set.contains(id) || plan.delta_by_id.contains_key(id) {
-            continue;
-        }
-        per_src.entry(src).or_default().insert(id);
-    }
-    for (id, src) in &plan.delta_by_id {
-        per_src.entry(src).or_default().insert(id);
+    let mut delta_counts: HashMap<&str, u32> = HashMap::new();
+    for src in plan.delta_by_id.values() {
+        *delta_counts.entry(src.as_str()).or_insert(0) += 1;
     }
 
     let mut srcs: Vec<&String> = affected.iter().collect();
     srcs.sort();
     for src in srcs {
-        let count = per_src.get(src).map(|ids| ids.len() as u32).unwrap_or(0);
+        let count = committed_counts
+            .get(src.as_str())
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(delta_counts.get(src.as_str()).copied().unwrap_or(0));
         if let Some(max) = card.max {
             if count > max {
                 sink(cardinality_violation(
@@ -933,112 +738,11 @@ mod tests {
         .unwrap()
     }
 
-    fn change_of(batches: Vec<RecordBatch>) -> TableChange {
-        TableChange {
-            added: batches,
-            changed: Vec::new(),
-            deleted_ids: Vec::new(),
-        }
-    }
-
     fn collect(violations: &mut Vec<Violation>) -> impl FnMut(Violation) -> Result<()> + '_ {
         move |violation| {
             violations.push(violation);
             Ok(())
         }
-    }
-
-    fn image_keys(image: &UniqueImage) -> Vec<(&str, &[String])> {
-        image
-            .entries
-            .iter()
-            .map(|(id, (key, _))| (id.as_str(), key.as_slice()))
-            .collect()
-    }
-
-    #[test]
-    fn unique_image_of_empty_delta_is_empty() {
-        let mut violations = Vec::new();
-        let image = unique_image(
-            TABLE,
-            &columns(),
-            &TableChange::default(),
-            SC,
-            &mut collect(&mut violations),
-        )
-        .unwrap();
-        assert!(image.entries.is_empty());
-        assert!(!image.within_batch_violation);
-        assert!(violations.is_empty());
-    }
-
-    #[test]
-    fn unique_image_drops_an_id_whose_key_goes_null() {
-        let mut violations = Vec::new();
-        let change = change_of(vec![
-            slug_batch(&[("a", Some("k1")), ("b", None)]),
-            slug_batch(&[("a", None)]),
-        ]);
-        let image = unique_image(
-            TABLE,
-            &columns(),
-            &change,
-            SC,
-            &mut collect(&mut violations),
-        )
-        .unwrap();
-        assert!(image.entries.is_empty(), "{:?}", image_keys(&image));
-        assert!(violations.is_empty());
-    }
-
-    #[test]
-    fn unique_image_keeps_the_last_key_of_a_repeated_id() {
-        let mut violations = Vec::new();
-        let change = change_of(vec![
-            slug_batch(&[("a", Some("k1")), ("b", Some("k2"))]),
-            slug_batch(&[("a", Some("k3"))]),
-        ]);
-        let image = unique_image(
-            TABLE,
-            &columns(),
-            &change,
-            SC,
-            &mut collect(&mut violations),
-        )
-        .unwrap();
-        assert_eq!(
-            image_keys(&image),
-            vec![
-                ("a", &["k3".to_string()][..]),
-                ("b", &["k2".to_string()][..])
-            ]
-        );
-        assert!(violations.is_empty());
-    }
-
-    #[test]
-    fn unique_image_reports_a_key_repeated_inside_one_batch_even_under_one_id() {
-        let mut violations = Vec::new();
-        let change = change_of(vec![slug_batch(&[("a", Some("k1")), ("a", Some("k1"))])]);
-        let image = unique_image(
-            TABLE,
-            &columns(),
-            &change,
-            SC,
-            &mut collect(&mut violations),
-        )
-        .unwrap();
-        assert!(image.within_batch_violation);
-        assert_eq!(
-            violations,
-            vec![unique_violation(
-                TABLE,
-                &columns(),
-                &["k1".to_string()],
-                "a",
-                "a"
-            )]
-        );
     }
 
     /// A charge guard whose drop records the release.
@@ -1065,7 +769,7 @@ mod tests {
         assert!(!released.load(Ordering::Relaxed));
         holders.size(5, 1, |_| panic!("sized twice"));
 
-        let mut partial = UniquePartial::new(true, Arc::clone(&holders));
+        let mut partial = UniquePartial::new(true, Repeats::Shared(Arc::clone(&holders)));
         partial
             .observe(TABLE, &columns(), &slug_batch(&[("a", Some("k1"))]), SC, 0)
             .unwrap();
@@ -1119,8 +823,7 @@ mod tests {
             ],
         );
         let delta_ids: HashSet<String> = ["z".to_string()].into_iter().collect();
-        let gone = "gone".to_string();
-        let deleted: HashSet<&String> = [&gone].into_iter().collect();
+        let deleted: HashSet<&str> = ["gone"].into_iter().collect();
         let mut violations = Vec::new();
         unique_committed_collisions(
             TABLE,
@@ -1139,66 +842,33 @@ mod tests {
     }
 
     #[test]
-    fn partition_endpoints_settles_delta_ids_and_probes_the_rest() {
-        let added: HashSet<String> = ["new".to_string()].into_iter().collect();
-        let deleted: HashSet<String> = ["old".to_string()].into_iter().collect();
-        let ids = [
-            "new".to_string(),
-            "old".to_string(),
-            "c".to_string(),
-            "c".to_string(),
-        ];
-        let (exist, to_probe) = partition_endpoints(&ids, &added, &deleted);
-        assert_eq!(exist, ["new".to_string()].into_iter().collect());
-        assert_eq!(to_probe, vec!["c".to_string(), "c".to_string()]);
-        assert_eq!(
-            partition_endpoints(&[], &added, &deleted),
-            (HashSet::new(), Vec::new())
-        );
-    }
-
-    #[test]
-    fn edge_ri_delta_of_empty_change_is_empty() {
-        assert!(
-            edge_ri_delta(&TableChange::default(), SC)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            card_plan(&TableChange::default(), SC)
-                .unwrap()
-                .delta_by_id
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn card_plan_keeps_the_last_src_of_a_repeated_edge_id() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(SC.id, DataType::Utf8, false),
-            Field::new(SC.src, DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["e1", "e1", "e2"])) as _,
-                Arc::new(StringArray::from(vec!["s1", "s2", "s3"])) as _,
-            ],
-        )
-        .unwrap();
-        let mut change = change_of(vec![batch]);
-        change.deleted_ids.push("e9".to_string());
-        let plan = card_plan(&change, SC).unwrap();
-        assert_eq!(plan.delta_by_id.get("e1").map(String::as_str), Some("s2"));
-        assert_eq!(plan.delta_by_id.len(), 2);
-        assert_eq!(plan.removed_ids, vec!["e9".to_string()]);
+    fn card_affected_counts_delta_removed_and_written_sources_minus_deleted() {
+        let plan = CardPlan {
+            delta_by_id: [("e1", "s2"), ("e2", "s3")]
+                .into_iter()
+                .map(|(id, src)| (id.to_string(), src.to_string()))
+                .collect(),
+            removed_ids: vec!["e9".to_string()],
+            changed_ids: vec!["e1".to_string(), "e2".to_string()],
+        };
 
         let removed_edges = vec![("e9".to_string(), "s9".to_string())];
         let deleted_src: HashSet<String> = ["s3".to_string()].into_iter().collect();
-        let affected = card_affected(&plan, &removed_edges, &[], &deleted_src);
+        let affected = card_affected(&plan, &removed_edges, &[], &HashSet::new(), &deleted_src);
         assert_eq!(
             affected,
             ["s2".to_string(), "s9".to_string()].into_iter().collect()
+        );
+
+        // A written source node with no delta edge is counted; a written
+        // source that is also a deleted node is not.
+        let written: HashSet<String> = ["s4".to_string(), "s3".to_string()].into_iter().collect();
+        let affected = card_affected(&plan, &removed_edges, &[], &written, &deleted_src);
+        assert_eq!(
+            affected,
+            ["s2".to_string(), "s4".to_string(), "s9".to_string()]
+                .into_iter()
+                .collect()
         );
     }
 }

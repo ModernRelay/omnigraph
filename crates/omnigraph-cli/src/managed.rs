@@ -19,6 +19,7 @@ mod deployment;
 mod lifecycle;
 mod members;
 mod organization;
+pub(crate) use auth::VerifiedIdentity;
 
 pub(crate) fn import_custody(
     source: &Path,
@@ -128,9 +129,11 @@ impl Output {
                     self.body["type"].as_str().unwrap_or("error")
                 )?;
                 for field in [
+                    "accepted_preview",
                     "accepted_deployment",
                     "requested_deployment_id",
                     "submission",
+                    "idempotency_key",
                 ] {
                     if let Some(value) = self.body.get(field) {
                         writeln!(stderr, "{field}: {value}")?;
@@ -139,6 +142,9 @@ impl Output {
                 if self.body["type"] == "output_delivery_failed" {
                     let recovery = recovery_evidence(&self.body);
                     for field in ["accepted_operation", "idempotency_key", "original_error"] {
+                        if field == "idempotency_key" && self.body.get(field).is_some() {
+                            continue;
+                        }
                         if let Some(value) = recovery.get(field) {
                             writeln!(stderr, "{field}: {value}")?;
                         }
@@ -191,6 +197,7 @@ fn accepted_recovery_output(body: &Value, recovery: Option<&Value>) -> Option<Va
     let mut output = Failure::output_delivery().body;
     let mut accepted = false;
     for (name, fields) in [
+        ("accepted_preview", &["preview_id", "revision"][..]),
         (
             "accepted_deployment",
             &["deployment_id", "native_deployment_id", "preview_id"][..],
@@ -252,6 +259,7 @@ fn recovery_evidence(body: &Value) -> Value {
         "title",
         "detail",
         "accepted_operation",
+        "accepted_preview",
         "accepted_deployment",
         "requested_deployment_id",
         "operation_id",
@@ -631,12 +639,14 @@ struct Api {
 struct Response {
     status: StatusCode,
     body: Value,
+    retry_after: Vec<reqwest::header::HeaderValue>,
 }
 
 struct ResponseLimits {
     timeout: Duration,
     max_body: usize,
     preserve_contents: bool,
+    auth_verification_status: bool,
 }
 
 impl Api {
@@ -768,6 +778,7 @@ impl Api {
                 timeout,
                 max_body: MAX_BODY,
                 preserve_contents: false,
+                auth_verification_status: false,
             },
         )
         .await
@@ -785,7 +796,11 @@ impl Api {
             timeout,
             max_body,
             preserve_contents,
+            auth_verification_status,
         } = limits;
+        if auth_verification_status && (method != Method::GET || path != "/v1/auth/session") {
+            return Err(Failure::protocol());
+        }
         let url = self.url(path)?;
         let mut request = self.client.request(method, url).timeout(timeout);
         if let Some(key) = key {
@@ -823,6 +838,27 @@ impl Api {
         };
         let mut response = request.send().await.map_err(|_| transport())?;
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get_all(reqwest::header::RETRY_AFTER)
+            .iter()
+            .cloned()
+            .collect();
+        // This read-only verification path may see a proxy's HTML error or a
+        // disconnected body. Retry authority is its status/header, never that body.
+        // Ordinary requests retain their exact response validation and no retries.
+        if auth_verification_status && matches!(status.as_u16(), 408 | 429 | 500..=599) {
+            return Ok(Response {
+                status,
+                body: Failure::new(
+                    "identity_verification_unavailable",
+                    "the session verification service is temporarily unavailable",
+                    1,
+                )
+                .body,
+                retry_after,
+            });
+        }
         if status.is_redirection() {
             return Err(Failure::new(
                 "api_redirect_refused",
@@ -902,7 +938,11 @@ impl Api {
             error.response_status = Some(status);
             error
         })?;
-        Ok(Response { status, body })
+        Ok(Response {
+            status,
+            body,
+            retry_after,
+        })
     }
 
     async fn request(
@@ -912,7 +952,21 @@ impl Api {
         body: Option<&Value>,
         key: Option<&str>,
     ) -> Result<Value> {
-        let response = self.raw(method, path, body, key).await?;
+        self.request_with_timeout(method, path, body, key, REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        key: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let response = self
+            .raw_with_timeout(method, path, body, key, timeout)
+            .await?;
         if response.status.is_success() {
             Ok(response.body)
         } else {

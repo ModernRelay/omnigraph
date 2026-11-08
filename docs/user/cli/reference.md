@@ -22,8 +22,9 @@ Machine results remain on stdout.
 
 A registered direct target declares `scope: graph` or `scope: root`; a root or
 server requires `--graph` or its own `default_graph` for graph operations. No
-request discovers a graph to select automatically. Inline addresses are local paths or `file://` URIs only. Register remote
-endpoints; cloud-direct and catalogue targets are unsupported. Use `./name` for a
+request discovers a graph to select automatically. Inline addresses are local paths or `file://` URIs, plus
+[S3 cluster roots](../operations/s3-cluster-roots.md) for deployment, recovery and maintenance commands. Register remote
+endpoints; other cloud-direct and catalogue targets are unsupported. Use `./name` for a
 relative filesystem address; a bare name selects a registered target.
 `init --schema graph.pg ./graph.omni` remains a creation convenience and refuses `--target`.
 
@@ -43,7 +44,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `mutate` | Run an insert/update/delete query (`as commit` leaves it unpublished; `as unattached branch [on "<id>"]` records a snapshot that never publishes), or a `branch create`, `branch delete`, `branch merge`, `commit publish`, `commit drop`, or [`load csv`](../mutations/index.md#csv-loading) statement | direct or served |
 | `load` | Load graph JSONL in `overwrite`, `append`, or `merge` mode | direct or served |
 | `blob get/stat/put/clear` | Read, inspect, replace or clear one Blob cell | direct or served |
-| `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
+| `branch create/list/delete/merge/diff/merge-base` | Manage graph branches; `create --from-commit` starts a branch at a commit, `list --detailed` adds each branch's head, start and times, `merge --as-commit` leaves the merge unpublished, `merge --dry-run` reports the outcome or conflicts and writes nothing, `diff` reviews what a branch changed since its merge base, `merge-base` prints that base | direct or served |
 | `snapshot` | Show a branch snapshot: `internal_schema_version`, `graph_manifest_version`, and the datasets of one captured graph version | direct or served |
 | `commit list/show/changes/publish/drop` | Inspect history (`list --limit`/`--page-token` for one page of it, `list --unpublished` for a branch's unpublished commits, `list --unattached` for its live unattached snapshots; the two flags exclude each other and paging) or one commit's entity changes; publish an unpublished commit onto its recorded target branch (an unattached snapshot refuses with `unattached_cannot_publish`), or drop it (an unattached snapshot takes every descendant with it); `publish` and `drop` take `--as`, the reads refuse it | direct or served |
 | `diff` | Net entity changes between two points: branches or commit ids (`--from`, `--to`) | direct or served |
@@ -96,16 +97,26 @@ params; see [Work with branches](index.md#work-with-branches)), or one
 `explain` statement, `query -e 'explain query q() { … }'`, answering the plan
 as rows under the query's own target and params; see [Explain](../queries/explain.md).
 
-Read output supports `table`, `json`, `jsonl`, `csv`, and `kv`. `--json` is the
+Read output supports `table`, `json`, `jsonl`, `csv`, `kv`, and `toon`. With no
+`--format`, no `--json`, and no `defaults.output`, a read prints a table. `--json` is the
 stable machine-readable form for commands that do not use `--format`. Result
 cells use the [JSON result spelling](../queries/index.md#json-result-spelling);
 `table`, `csv`, and `kv` print strings unquoted. `--format json` prints the
-envelope pretty and the `rows` array compact; a refusal follows [Diagnostics](../queries/diagnostics.md).
+envelope pretty and the `rows` array compact. `--format toon` encodes that same
+document as [TOON](https://github.com/toon-format/spec) (specification 4.4,
+comma delimiter, two-space indent). `rows` declares its fields once when every
+row has the same keys. A null cell omits its key, so one null makes the rows
+non-uniform and TOON repeats every key. Numbers use TOON's canonical spelling,
+so an integral value is `1` where the JSON writer may spell `1.0`. The CLI ends
+the TOON document with a newline. The HTTP API returns JSON. A refusal follows
+[Diagnostics](../queries/diagnostics.md).
 
 ### Machine-readable read and write positions
 
-`query --json` returns `graph_commit_id` when its read snapshot has a graph head. The id and
-rows share one pinned snapshot; use that id for a later conditional mutation.
+`query --json` and `query --format toon` return `graph_commit_id` when the read snapshot has a graph head. The id and
+rows share one pinned snapshot; use that id for a later conditional mutation. A ranked read also
+returns `ranking` on that document, and in the `--format jsonl` metadata line too
+([what a ranked read reports](../search/index.md#what-a-ranked-read-reports)).
 
 Successful `mutate --json` and `load --json` responses include `commit`, the exact commit published by
 that attempt: `graph_commit_id`, optional `graph_branch`, `graph_manifest_version`, optional parent and
@@ -113,7 +124,7 @@ merged-parent ids, optional `actor_id`, and `created_at` in Unix microseconds. A
 that changes no entities returns `"commit": null`. On every target `load --json` prints the body of
 `POST /graphs/{id}/load/ndjson`, with the write's `actor_id` and a `base_branch` that is `null` without `--from`.
 
-`--json` and read `--format json` preserve structured errors on stdout. Data-write and read failures
+`--json`, read `--format json`, and read `--format toon` preserve structured errors on stdout. `--format toon` encodes the same error document as `--format json`. Data-write and read failures
 report [whole-command outcomes and exits](../operations/troubleshooting.md#failed-data-write-commands); a refused command line exits 64.
 Verified conditional mismatches exit 4, embedded or served, when nothing else in the command ran.
 

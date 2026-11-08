@@ -316,15 +316,14 @@ const WRITE_TOOLS: [&str; 8] = [
 
 /// A served two-graph cluster, `knowledge` loaded with the standard fixture
 /// and `other` empty, whose policy lets `act-agent` read, change and list
-/// graphs. The server admits the ad-hoc `read` tool, and its write tools
-/// only when `writes`.
+/// graphs. The server lists every tool.
 struct Served {
     _cluster: TempDir,
     server: TestServer,
 }
 
 impl Served {
-    fn start(writes: bool) -> Self {
+    fn start() -> Self {
         let cluster = tempdir().unwrap();
         let dir = cluster.path();
         std::fs::copy(fixture("test.pg"), dir.join("people.pg")).unwrap();
@@ -361,14 +360,10 @@ impl Served {
         );
         unlock_cluster_fixture(dir);
         let tokens = format!(r#"{{"act-agent":"{AGENT_TOKEN}","act-other":"{OTHER_TOKEN}"}}"#);
-        let mut envs = vec![
-            ("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", tokens.as_str()),
-            ("OMNIGRAPH_MCP_ALLOW_ADHOC", "1"),
-        ];
-        if writes {
-            envs.push(("OMNIGRAPH_MCP_ALLOW_WRITES", "1"));
-        }
-        let server = spawn_server_with_cluster_env(dir, &envs);
+        let server = spawn_server_with_cluster_env(
+            dir,
+            &[("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", tokens.as_str())],
+        );
         Self {
             _cluster: cluster,
             server,
@@ -402,7 +397,7 @@ impl Served {
     fn people(&self) -> Vec<String> {
         let read = self.rpc(&tool_call(
             99,
-            "read",
+            "query",
             json!({"graph": "knowledge", "query": PEOPLE}),
         ));
         read["result"]["structuredContent"]["rows"]
@@ -515,82 +510,67 @@ fn mcp_refuses_what_it_cannot_relay_to_before_any_request() {
     assert!(!probe.connected(), "an endpoint was contacted");
 }
 
-/// The server is the ceiling and `--write` the agent's consent: a server
-/// without `--mcp-allow-writes` lists no write tools, and a bridge without
-/// `--write` lists and admits only the tools the server annotates read-only,
-/// refusing any other call before it is relayed. With both, a write tool
-/// runs on the bridge's graph.
+/// `--write` is the agent's consent: the server lists every tool, and a
+/// bridge without `--write` lists and admits only the tools the server
+/// annotates read-only, refusing any other call before it is relayed. With
+/// it, a write tool runs on the bridge's graph.
 #[test]
-fn mcp_lists_and_admits_tools_under_the_server_ceiling_and_the_agents_consent() {
-    let servers = [Served::start(false), Served::start(true)];
-    for (allows_writes, served) in [false, true].into_iter().zip(&servers) {
-        let listed = served.rpc(&tools_list(1));
-        let names = tool_names(&listed);
-        for tool in WRITE_TOOLS {
-            assert_eq!(
-                names.contains(&tool.to_string()),
-                allows_writes,
-                "{tool}: {names:?}"
-            );
-        }
-        let home = Home::server(served.url());
-        for write in [false, true] {
-            let mut args = vec!["--target", "staging"];
-            if write {
-                args.push("--write");
-            }
-            let mut bridge = home.bridge(&args, &[("OMNIGRAPH_TOKEN_STAGING", AGENT_TOKEN)]);
-            bridge.initialize();
-            let list = bridge.call(tools_list(1));
-            let expected: Vec<&Value> = listed["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|tool| write || tool["annotations"]["readOnlyHint"] == true)
-                .collect();
-            let relayed: Vec<&Value> = list["result"]["tools"].as_array().unwrap().iter().collect();
-            assert_eq!(relayed, expected, "writes {allows_writes}, --write {write}");
-
-            let name = format!("Eve{}{}", u8::from(allows_writes), u8::from(write));
-            let insert = bridge.tool(
-                2,
-                "mutate",
-                json!({
-                    "query": "query add($name: String) { insert Person { name: $name } }",
-                    "params": {"name": name},
-                }),
-            );
-            if allows_writes && write {
-                assert_ne!(insert["result"]["isError"], true, "{insert}");
-                assert!(insert.get("error").is_none(), "{insert}");
-            } else {
-                assert!(insert.get("result").is_none(), "{insert}");
-                assert_eq!(insert["error"]["code"], -32602, "{insert}");
-                let message = insert["error"]["message"].as_str().unwrap();
-                if allows_writes {
-                    // The agent did not consent.
-                    assert!(message.contains("--write"), "{insert}");
-                } else {
-                    // The server lists no such tool: its ceiling.
-                    assert!(message.contains("unknown MCP tool `mutate`"), "{insert}");
-                }
-                assert_eq!(insert["error"]["data"]["error"]["code"], "bad_request");
-            }
-            let finished = bridge.finish();
-            finished.assert_success();
-            finished.assert_never_shows(&[AGENT_TOKEN]);
-        }
-        // Only the write both consents admitted reached the graph.
-        let people = served.people();
-        assert_eq!(
-            people.iter().filter(|name| name.starts_with("Eve")).count(),
-            usize::from(allows_writes),
-            "{people:?}"
-        );
-        if allows_writes {
-            assert!(people.contains(&"Eve11".to_string()), "{people:?}");
-        }
+fn mcp_lists_and_admits_write_tools_only_with_the_agents_consent() {
+    let served = Served::start();
+    let listed = served.rpc(&tools_list(1));
+    let names = tool_names(&listed);
+    for tool in WRITE_TOOLS {
+        assert!(names.contains(&tool.to_string()), "{tool}: {names:?}");
     }
+    let home = Home::server(served.url());
+    for write in [false, true] {
+        let mut args = vec!["--target", "staging"];
+        if write {
+            args.push("--write");
+        }
+        let mut bridge = home.bridge(&args, &[("OMNIGRAPH_TOKEN_STAGING", AGENT_TOKEN)]);
+        bridge.initialize();
+        let list = bridge.call(tools_list(1));
+        let expected: Vec<&Value> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|tool| write || tool["annotations"]["readOnlyHint"] == true)
+            .collect();
+        let relayed: Vec<&Value> = list["result"]["tools"].as_array().unwrap().iter().collect();
+        assert_eq!(relayed, expected, "--write {write}");
+
+        let name = format!("Eve{}", u8::from(write));
+        let insert = bridge.tool(
+            2,
+            "mutate",
+            json!({
+                "query": "query add($name: String) { insert Person { name: $name } }",
+                "params": {"name": name},
+            }),
+        );
+        if write {
+            assert_ne!(insert["result"]["isError"], true, "{insert}");
+            assert!(insert.get("error").is_none(), "{insert}");
+        } else {
+            // The agent did not consent.
+            assert!(insert.get("result").is_none(), "{insert}");
+            assert_eq!(insert["error"]["code"], -32602, "{insert}");
+            let message = insert["error"]["message"].as_str().unwrap();
+            assert!(message.contains("--write"), "{insert}");
+            assert_eq!(insert["error"]["data"]["error"]["code"], "bad_request");
+        }
+        let finished = bridge.finish();
+        finished.assert_success();
+        finished.assert_never_shows(&[AGENT_TOKEN]);
+    }
+    // Only the consented write reached the graph.
+    let people = served.people();
+    let eves: Vec<&String> = people
+        .iter()
+        .filter(|name| name.starts_with("Eve"))
+        .collect();
+    assert_eq!(eves, [&"Eve1".to_string()], "{people:?}");
 }
 
 /// The bridge is bound to one graph: it fills `graph` where a call omits it,
@@ -601,7 +581,7 @@ fn mcp_lists_and_admits_tools_under_the_server_ceiling_and_the_agents_consent() 
 /// refuses before anything connects.
 #[test]
 fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
-    let served = Served::start(false);
+    let served = Served::start();
     let home = Home::server(served.url());
     let token = [("OMNIGRAPH_TOKEN_STAGING", AGENT_TOKEN)];
     let mut bridge = home.bridge(&["--target", "staging"], &token);
@@ -630,10 +610,10 @@ fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
     );
 
     // A call that omits its graph is the server's answer for the bound graph.
-    let read = bridge.tool(1, "read", json!({"query": PEOPLE}));
+    let read = bridge.tool(1, "query", json!({"query": PEOPLE}));
     let expected = served.rpc(&tool_call(
         1,
-        "read",
+        "query",
         json!({"graph": "knowledge", "query": PEOPLE}),
     ));
     assert_eq!(read, expected);
@@ -699,7 +679,7 @@ fn mcp_binds_one_graph_and_relays_its_reads_unchanged() {
     // `--as` asserts the actor on every request: a match changes nothing,
     // and another actor is refused by the server before anything runs.
     let mut bridge = home.bridge(&["--target", "staging", "--as", "act-agent"], &token);
-    let read = bridge.tool(1, "read", json!({"query": PEOPLE}));
+    let read = bridge.tool(1, "query", json!({"query": PEOPLE}));
     assert_eq!(
         read["result"]["structuredContent"]["row_count"], 4,
         "{read}"
@@ -1615,8 +1595,9 @@ fi
             "called\n"
         );
         api.set_session(json!({"data":{"principal_id":if changed_identity {"principal-two"} else {"principal-one"},
-            "account_id":"account-one","service_permissions":["changed-service-permission"]},
-            "meta":{"provenance":"service_db","assurance":"verified_workload"}}));
+            "account_id":"account-one","service_permissions":["changed-service-permission"],
+            "kind":"automation","subject":"rotated-key-subject","provider_client_id":"rotated-client"},
+            "meta":{"provenance":"service_db","assurance":"verified_human"}}));
         while OffsetDateTime::now_utc() < expiry {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1850,4 +1831,114 @@ fn stopped_with_calls_in_flight(mut bridge: Bridge, endpoint: &McpEndpoint) {
         "{read}"
     );
     assert_eq!(endpoint.received(4).len(), 1);
+}
+
+#[test]
+fn managed_mcp_client_credentials_renew_without_browser_or_effect_replay() {
+    use crate::support::managed_http::{IntentApiFixture, IntentReply};
+    let endpoint = McpEndpoint::start("not-issued");
+    let (api, tokens) = IntentApiFixture::workload_identity_issuer(&endpoint.url, 2);
+    let provider = IntentApiFixture::new(vec![
+        IntentReply::json(
+            200,
+            json!({"access_token":"oauth-initial", "token_type":"Bearer", "expires_in":15}),
+        ),
+        IntentReply::json(
+            200,
+            json!({"access_token":"oauth-renewed", "token_type":"Bearer", "expires_in":600}),
+        ),
+    ]);
+    endpoint.accept(&tokens[0]);
+    let config = tempdir().unwrap();
+    write_managed_data_target(config.path(), &api.origin, &endpoint.url);
+    let home = managed_home(config.path());
+    let operator = home.join("config.yaml");
+    let mut document: Value =
+        yaml_serde::from_str(&std::fs::read_to_string(&operator).unwrap()).unwrap();
+    document["profiles"]["managed-account"]["auth"] = json!({"provider":"oauth_client_credentials", "token_endpoint":format!("{}/oauth2/token", provider.origin), "client_id":"client-one", "client_secret":{"file":home.join("client-secret")}, "scope":"read write:graph"});
+    std::fs::write(&operator, yaml_serde::to_string(&document).unwrap()).unwrap();
+    std::fs::write(home.join("client-secret"), "initial:&=+ secret\n").unwrap();
+    let mut command = cli_process();
+    command
+        .env("OMNIGRAPH_HOME", &home)
+        .env("SSL_CERT_FILE", tls_gateway::ca_path())
+        .env_remove("OMNIGRAPH_CONTROL_TOKEN")
+        .env_remove("OMNIGRAPH_BEARER_TOKEN")
+        .args(["mcp", "--target", "managed-test"]);
+    let mut bridge = Bridge::start(command);
+    assert!(bridge.initialize()["result"].is_object());
+    assert_eq!(
+        bridge.tool(1, "fast", json!({}))["result"]["content"][0]["text"],
+        "fast"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "valid credentials remain cached"
+    );
+    std::fs::write(home.join("client-secret"), "rotated:&=+ secret\n").unwrap();
+    // No auth expiry margin: 15 seconds leaves room for process startup,
+    // TLS, session verification and the first read on a loaded CI worker.
+    // Only after proving that first grant was cached do we let it expire.
+    std::thread::sleep(Duration::from_secs(16));
+    assert_eq!(
+        bridge.tool(2, "fast", json!({}))["result"]["content"][0]["text"],
+        "fast"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "one acquisition after local expiry"
+    );
+    endpoint.accept(&tokens[1]);
+    let refused = bridge.tool(3, "fast", json!({}));
+    assert_eq!(refused["error"]["data"]["status"], 401, "{refused}");
+    assert_eq!(
+        endpoint.received(3),
+        [tokens[0].clone()],
+        "sent requests are never replayed"
+    );
+    assert_eq!(
+        bridge.tool(4, "fast", json!({}))["result"]["content"][0]["text"],
+        "fast"
+    );
+    assert_eq!(endpoint.received(4), [tokens[1].clone()]);
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "native renewal reuses valid OAuth authority"
+    );
+    let finished = bridge.finish();
+    finished.assert_success();
+    finished.assert_never_shows(&[
+        "oauth-initial",
+        "oauth-renewed",
+        "initial:&=+ secret",
+        "rotated:&=+ secret",
+        &tokens[0],
+        &tokens[1],
+    ]);
+    for (request, secret) in provider
+        .requests()
+        .iter()
+        .zip(["initial:&=+ secret", "rotated:&=+ secret"])
+    {
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/oauth2/token");
+        let form: std::collections::BTreeMap<_, _> = url::form_urlencoded::parse(&request.raw_body)
+            .into_owned()
+            .collect();
+        assert_eq!(form.len(), 4);
+        assert_eq!(form["grant_type"], "client_credentials");
+        assert_eq!(form["client_id"], "client-one");
+        assert_eq!(form["client_secret"], secret);
+        assert_eq!(form["scope"], "read write:graph");
+        assert!(!request.headers.contains_key("authorization"));
+    }
+    assert!(api.requests().iter().all(|request| {
+        ["Bearer oauth-initial", "Bearer oauth-renewed"]
+            .contains(&request.headers.get("authorization").unwrap().as_str())
+    }));
+    provider.assert_complete();
+    api.assert_complete();
 }

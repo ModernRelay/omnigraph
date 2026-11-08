@@ -1,6 +1,5 @@
 //! Complete target bindings and conservative operator-file administration.
 
-#[cfg(test)]
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
@@ -137,7 +136,14 @@ impl StorageProvider {
             _ => bail!("provider kind does not match the storage URI"),
         }
     }
-    #[cfg(test)]
+    /// An inline cloud address captures ambient destination settings once.
+    /// Registered targets never call this.
+    pub(crate) fn capture(uri: &str) -> Result<Self> {
+        let environment = std::env::vars_os()
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
+        Self::capture_from(uri, &environment)
+    }
     fn capture_from(uri: &str, environment: &BTreeMap<String, String>) -> Result<Self> {
         let nonempty = |names: &[&str]| {
             names.iter().find_map(|name| {
@@ -196,7 +202,7 @@ impl StorageProvider {
                 .or(aliases(&["AWS_ENDPOINT_URL", "AWS_ENDPOINT"])?);
             if nonempty(&["AWS_PROFILE"]).is_some() && endpoint.is_none() {
                 bail!(
-                    "inline S3 with AWS_PROFILE needs an explicit AWS_ENDPOINT_URL_S3 so its endpoint can be captured; alternatively register a target with provider settings"
+                    "inline S3 with AWS_PROFILE needs an explicit AWS_ENDPOINT_URL_S3 so its endpoint can be captured"
                 );
             }
             Self::S3 {

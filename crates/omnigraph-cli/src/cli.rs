@@ -33,7 +33,8 @@ use crate::embed::EmbedArgs;
 #[command(
     after_help = "Select resources with --target and account operations with --profile.
 --operator-config selects one operator file.
---config supplies deployment sources. Use config validate and target inspect for offline checks."
+--config supplies deployment sources. Use config validate and target inspect for offline checks.
+First time using Omnigraph: call the omnigraph skill (`omnigraph skill show`) before a schema or query."
 )]
 pub(crate) struct Cli {
     #[arg(long, global = true, help = "Named profile for control-plane operations; otherwise defaults.profile", conflicts_with = "target", value_parser = crate::invocation::single_selector("--profile"))]

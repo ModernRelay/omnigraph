@@ -1,0 +1,75 @@
+# issue: 918
+# red_on: main @ 4ba904d3; before the fix a `U64` parameter bound to 18446744073709551615 is refused with `param 'v': value 18446744073709551615 exceeds current engine range for U64 (max 9223372036854775807)`.
+# notes: A `U64` parameter carries its whole range; the value is narrowed only at a typed boundary, from the declared type.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item {
+    key: String @key
+    size: U64
+}
+
+--- seed
+{"type":"Item","data":{"key":"a","size":18446744073709551615}}
+{"type":"Item","data":{"key":"b","size":0}}
+
+--- query
+query item_above_the_signed_range($v: U64) {
+    match { $i: Item $i.size = $v }
+    return { $i.key }
+}
+
+--- params
+{"v": 18446744073709551615}
+
+--- expect unordered
+{"i.key": "a"}
+
+--- expect shape
+i.key: String
+
+--- query
+query item_above_the_signed_range_as_text($v: U64) {
+    match { $i: Item $i.size = $v }
+    return { $i.key }
+}
+
+--- params
+{"v": "18446744073709551615"}
+
+--- expect unordered
+{"i.key": "a"}
+
+--- expect shape
+i.key: String
+
+--- mutate
+query insert_item_above_the_signed_range($v: U64) {
+    insert Item { key: "c", size: $v }
+}
+
+--- params
+{"v": 18446744073709551615}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query inserted_item_keeps_the_whole_value($v: U64) {
+    match { $i: Item $i.size = $v }
+    return { $i.key }
+}
+
+--- params
+{"v": 18446744073709551615}
+
+--- expect unordered
+{"i.key": "a"}
+{"i.key": "c"}
+
+--- expect shape
+i.key: String

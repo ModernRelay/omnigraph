@@ -1,0 +1,48 @@
+# issue: none
+# notes: A branch merge bringing an edge inserted on the branch into a text-keyed Person table whose
+# notes: key index does not cover every fragment checks the edge's endpoints on the target by one
+# notes: projected scan of the id column, the plan its receipt carries says so, and the merge lands.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: String @key
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 4
+    columns:
+      id: {kind: key, prefix: p, width: 6}
+
+--- mutate
+branch create b
+--- expect ok
+
+--- mutate branch: b
+query ins_b() { insert Knows { from: "p000000", to: "p000001" } }
+--- expect affected: nodes=0 edges=1
+
+--- mutate
+branch merge b
+--- expect outcome: fast_forward
+--- expect plan
+load route: pipeline
+load validate edge_ri edge:Knows from Person: access scan
+load validate edge_ri edge:Knows to Person: access scan
+
+--- query
+query merged() { match { $a: Person $a knows $b } return { count($b) as n } }
+--- expect unordered
+{"n": 1}
+--- expect shape
+n: I64

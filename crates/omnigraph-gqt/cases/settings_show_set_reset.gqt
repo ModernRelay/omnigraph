@@ -1,6 +1,6 @@
 # issue: none
 # notes: Show values and their sources across set, reset and scoped prefixes.
-# notes: Debug builds start merge_lineage at verify; its declared default is on.
+# notes: Debug builds start merge_lineage and change_lineage at verify; their declared default is on.
 # notes: Pin engine so its row reads the same under any runner baseline.
 
 --- runner
@@ -28,6 +28,7 @@ show all;
 {"name": "engine", "value": "v2", "default": "v2", "source": "file", "scope": "request"}
 {"name": "rrf_plan", "value": "auto", "default": "auto", "source": "default", "scope": "process"}
 {"name": "merge_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
+{"name": "change_lineage", "value": "verify", "default": "on", "source": "default", "scope": "request"}
 {"name": "ann_nprobes", "value": "20", "default": "20", "source": "default", "scope": "request"}
 {"name": "stage_write_concurrency", "value": "8", "default": "8", "source": "default", "scope": "process"}
 {"name": "traversal_work_limit", "value": "1000000", "default": "1000000", "source": "default", "scope": "request"}

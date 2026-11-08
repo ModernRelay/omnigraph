@@ -1,0 +1,1 @@
+- A bound edge traversal (`$a $e:knows $b`) sizes each pair of a list or vector edge property by its own elements, so pairs no longer leave in chunks of a few rows. Results are unchanged.

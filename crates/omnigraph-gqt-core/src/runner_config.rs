@@ -49,12 +49,26 @@ impl Environment {
         let Some(uri) = store else {
             return self.admit(needs_dst);
         };
-        let Execution::Engine { storage } = self.execution else {
-            return Err("unsupported_environment: --store requires direct engine execution without DST or server targets".into());
+        let storage = match self.execution {
+            Execution::Engine { storage } => storage,
+            Execution::Dst { .. } => {
+                let root = uri.strip_prefix("file://").ok_or(
+                    "invalid_case: under omnigraph-engine-dst --store takes a file:// root, read through below the in-memory environment",
+                )?;
+                if !std::path::Path::new(root).is_dir() {
+                    return Err(format!(
+                        "invalid_case: --store root is not a directory: {root}"
+                    ));
+                }
+                return self.admit(needs_dst);
+            }
+            Execution::Server { .. } | Execution::ServerDst { .. } => {
+                return Err("unsupported_environment: --store requires direct engine or DST execution, not a server target".into());
+            }
         };
         if needs_dst {
             return Err(
-                "unsupported_environment: --store cannot execute seams or concurrent blocks".into(),
+                "unsupported_environment: --store cannot execute seams or concurrent blocks on the direct engine; select or declare omnigraph-engine-dst (--target omnigraph-engine-dst)".into(),
             );
         }
         if !["file://", "s3://", "az://"]
@@ -394,10 +408,6 @@ mod tests {
             }
         }
         for execution in [
-            Execution::Dst {
-                storage: Storage::InMemoryObjectStore,
-                seeds: vec![0],
-            },
             Execution::ServerDst {
                 storage: Storage::InMemoryObjectStore,
                 seeds: vec![0],
@@ -410,9 +420,34 @@ mod tests {
                 Environment { execution }
                     .admit_store(false, Some("file:///tmp/graph"))
                     .unwrap_err()
-                    .contains("--store requires direct engine")
+                    .contains("not a server target")
             );
         }
+        let dst = Environment {
+            execution: Execution::Dst {
+                storage: Storage::InMemoryObjectStore,
+                seeds: vec![0],
+            },
+        };
+        let existing = format!("file://{}", std::env::temp_dir().display());
+        for needs_dst in [false, true] {
+            let admitted = dst.admit_store(needs_dst, Some(&existing));
+            if cfg!(tokio_unstable) {
+                assert!(admitted.is_ok(), "{admitted:?}");
+            } else {
+                assert!(admitted.unwrap_err().contains("unavailable in this build"));
+            }
+        }
+        assert!(
+            dst.admit_store(false, Some("file:///nonexistent/prepared/root"))
+                .unwrap_err()
+                .contains("--store root is not a directory")
+        );
+        assert!(
+            dst.admit_store(false, Some("s3://bucket/graph"))
+                .unwrap_err()
+                .contains("takes a file:// root")
+        );
     }
 
     const ENGINE: &str = "timeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n";

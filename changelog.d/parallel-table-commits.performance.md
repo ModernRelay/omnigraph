@@ -1,0 +1,1 @@
+- A multi-table write commits its tables, and reads their index facts for validation, side by side instead of one after another; what is written and the storage format are unchanged.

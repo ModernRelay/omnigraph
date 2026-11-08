@@ -176,6 +176,7 @@ fn require_push_node(node: &PhysicalNode) -> Result<()> {
         | PhysicalNode::HydrateColumns { .. }
         | PhysicalNode::Limit { .. }
         | PhysicalNode::CsvSource { .. }
+        | PhysicalNode::DeltaSource { .. }
         | PhysicalNode::Validate { .. }
         | PhysicalNode::FragmentWrite { .. }) => Err(ExecError::internal(format!(
             "`{}` is a read node; the engine's runner executes it, not the push pipeline",

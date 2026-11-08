@@ -20,6 +20,22 @@ brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
 
+### macOS signing and Keychain access
+
+New macOS release archives are signed with EQTR INC's Developer ID and
+notarized by Apple, on both stable and edge channels. The CLI keeps the
+signing identifier `com.modernrelay.omnigraph` across updates so Keychain
+can recognize the new executable as the same application.
+
+When moving from an older ad hoc signed build, macOS may ask you once to
+authorize the signed CLI to access an existing credential. Signing does not
+grant access to an item you have not authorized. Source and Nix builds use
+their own local signing identity and do not inherit release trust.
+
+The release remains a tarball of three executables. Apple's notarization
+ticket is checked online: a ticket cannot be stapled to a standalone CLI
+binary or a tarball. Older published archives are unchanged.
+
 ## Nix
 
 The repository's flake builds the three release programs from source with the
@@ -181,7 +197,7 @@ http-contract 0.14
 ```
 
 An edge build reports a SemVer pre-release of the package version, such as
-`0.14.1-edge+9c2b367`. Edge builds are published only while the package version
+`0.15.0-edge+9c2b367`. Edge builds are published only while the package version
 is above the latest stable release, so an edge version sorts after every
 published stable release and before the release it precedes. `channel` is `stable`
 or `edge` for a GitHub release archive and null for any other build. `commit`

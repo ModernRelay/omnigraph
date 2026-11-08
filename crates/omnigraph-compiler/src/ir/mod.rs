@@ -5,9 +5,11 @@ pub mod load;
 pub(crate) mod lower;
 pub mod untyped;
 pub(crate) mod validate;
+pub mod write;
 
-pub use load::{Endpoint, LoadCheck, LoadIR, UniqueRole, ValidateCheck, lower_load};
+pub use load::{Endpoint, LoadCheck, LoadIR, UniqueRole, ValidateCheck, checks_for, lower_load};
 pub use lower::is_fresh_variable;
+pub use write::{DeltaClass, WriteKind, WriteTableIR, lower_write_table};
 
 use std::collections::HashMap;
 
@@ -875,7 +877,7 @@ mod render_tests {
 
     fn int(value: i64) -> IRExpr {
         IRExpr::Literal(
-            Literal::Integer(value),
+            Literal::Integer(i128::from(value)),
             crate::types::ExprType::from_prop(&crate::types::PropType::scalar(
                 crate::types::ScalarType::I64,
                 false,

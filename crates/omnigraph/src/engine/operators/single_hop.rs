@@ -54,6 +54,7 @@ enum Mode {
     Indexed {
         edge_ds: Box<lance::Dataset>,
         hop_policy: HopPolicy,
+        pushdown: bool,
     },
 }
 
@@ -118,11 +119,13 @@ impl SingleHop {
             ExpandStart::Indexed {
                 edge_ds,
                 hop_policy,
+                pushdown,
             } => {
                 Switch::IndexedScan.record(&self.switch);
                 Mode::Indexed {
                     edge_ds,
                     hop_policy,
+                    pushdown,
                 }
             }
         };
@@ -202,9 +205,7 @@ impl SingleHop {
             })?;
         let hop_memory = memory.child("expand hop")?;
         hop_memory.entries::<usize>(batch.num_rows())?;
-        let row_bytes = (0..batch.num_rows())
-            .map(|row| memory.slice_bytes(&batch, row, 1))
-            .collect::<Result<Vec<_>>>()?;
+        let row_bytes = memory.row_bytes(&batch)?;
         let source = match &started.mode {
             Mode::Csr => {
                 let gi = env
@@ -222,7 +223,12 @@ impl SingleHop {
                         .map_err(external)?,
                 }
             }
-            Mode::Indexed { edge_ds, .. } => Source::Indexed { edge_ds },
+            Mode::Indexed {
+                edge_ds, pushdown, ..
+            } => Source::Indexed {
+                edge_ds,
+                pushdown: *pushdown,
+            },
         };
         let (src_dense, ids, neighbours) = source
             .prepare(
@@ -274,8 +280,13 @@ impl Streamed for SingleHop {
 /// One batch's neighbour source: CSR slices borrowed from the index, or the
 /// edge dataset a batch-local scan reads.
 enum Source<'g> {
-    Csr { csr: CsrSource<'g> },
-    Indexed { edge_ds: &'g lance::Dataset },
+    Csr {
+        csr: CsrSource<'g>,
+    },
+    Indexed {
+        edge_ds: &'g lance::Dataset,
+        pushdown: bool,
+    },
 }
 
 /// One input batch's neighbour lists: CSR slices, or the batch's own scan.
@@ -327,7 +338,7 @@ impl<'g> Source<'g> {
                     },
                 ))
             }
-            Self::Indexed { edge_ds } => {
+            Self::Indexed { edge_ds, pushdown } => {
                 let mut interner = TypeIndex::new();
                 let src_dense = (0..src_ids.len())
                     .map(|row| intern(&mut interner, src_ids.value(row), hop_memory).map(Some))
@@ -341,6 +352,7 @@ impl<'g> Source<'g> {
                     edge_ds,
                     probes,
                     &keys,
+                    Some(*pushdown),
                     &mut interner,
                     &mut map,
                     hop_memory,

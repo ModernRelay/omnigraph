@@ -125,6 +125,21 @@ omnigraph cluster plan --target production --rev NEW_COMMIT --json
 omnigraph cluster apply --target production --plan PREVIEW_ID --json
 ```
 
+`plan` waits for the accepted preview by reading its original ID. `--no-wait`
+returns the accepted record immediately; `--timeout SECONDS` bounds only the
+local wait (300 seconds by default). A timeout or disconnect does not cancel
+the preview or submit another one. Progress goes to stderr; stdout contains
+the final response, including the native plan when ready.
+
+The `plan` and `apply` submissions also stay open until that deadline, so a
+service that captures the preview before answering is not cut off. Each
+source lookup and poll keeps its own 10-second bound.
+
+To resume waiting, repeat `plan` with the same `--rev` and
+`--idempotency-key` printed by the first invocation. The original preview's
+deadline does not change. A `failed` or `expired` preview requires a fresh
+plan with a new key; its `failure_code` explains the terminal outcome.
+
 `push` uploads only `cluster.yaml`, referenced schemas, stored queries and
 policy files. Query-directory declarations discover immediate `.gq` files;
 they do not recurse. Unrelated files, folder context and credentials are not

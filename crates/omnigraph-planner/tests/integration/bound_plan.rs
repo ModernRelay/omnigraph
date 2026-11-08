@@ -6,12 +6,13 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
+use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, ParamMap, QueryIR};
 use omnigraph_compiler::query::ast::{CompOp, Literal};
+use omnigraph_compiler::result::SearchFunction;
 use omnigraph_compiler::{ExprType, PropType, SYSTEM_COLUMNS_V3, ScalarType};
 use omnigraph_planner::{
     BOUND_PLAN_VERSION, BoundPlan, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan,
-    RankKind, RankScope, TableRef, ValueTable, plan_query,
+    RankKind, RankScope, TableRef, ValueTable, plan_query, planned_ranking,
 };
 
 use crate::fixture_bounds;
@@ -200,6 +201,23 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
 }
 
 #[test]
+fn a_wide_bound_value_reads_back_exactly_issue_918() {
+    let bound = BoundPlan {
+        plan: plan(prop("d", "slug")),
+        values: ValueTable {
+            params: Arc::new(ParamMap::from([
+                ("wide".to_string(), Literal::Integer(i128::from(u64::MAX))),
+                ("low".to_string(), Literal::Integer(i128::from(i64::MIN))),
+            ])),
+            vectors: BTreeMap::new(),
+        },
+    };
+    let text = serde_json::to_string(&bound).expect("the bound plan serializes");
+    assert!(text.contains("18446744073709551615"), "{text}");
+    assert_eq!(round_trip(&bound), bound);
+}
+
+#[test]
 fn fused_saved_node_refuses_a_reader_without_declared_row_keys() {
     let arm = IRExpr::Bm25 {
         field: Box::new(prop("d", "text")),
@@ -363,6 +381,32 @@ fn a_fused_plan_reads_back_with_both_arms() {
         ..back.clone()
     };
     assert_ne!(changed, bound, "the value table is part of equality");
+
+    // The plan read back reports the ranking the plan does: a fusion whose
+    // nearest arm alone decides whether a run was exhaustive.
+    let planned = planned_ranking(&bound.plan).unwrap().expect("rrf ranks");
+    assert_eq!(
+        planned_ranking(&back.plan).unwrap().as_ref(),
+        Some(&planned)
+    );
+    assert_eq!(planned.by(), SearchFunction::Rrf);
+    assert_eq!(planned.nearest_scans(), [primary]);
+    assert!(
+        planned.score_columns().is_empty(),
+        "no column returns the fused score"
+    );
+
+    // An arm whose ranked scan lost its ranking is a plan acceptance refuses,
+    // never a fusion reported over one arm.
+    let mut broken = bound.plan.clone();
+    let Some(PhysicalNode::Scan { ranked, .. }) = broken.node_mut(secondary) else {
+        panic!("the secondary arm ranks a scan");
+    };
+    *ranked = None;
+    assert!(matches!(
+        planned_ranking(&broken),
+        Err(omnigraph_planner::PlanError::Internal(_))
+    ));
 }
 
 fn doc_scan(variable: &str) -> IROp {
