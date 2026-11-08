@@ -103,6 +103,21 @@ pub(crate) fn operation_is_row_set_preserving(operation: &Operation) -> bool {
     }
 }
 
+/// An in-place column patch (`Update { RewriteColumns }`, as an `update`
+/// stages for issue #1264): data files attached to existing fragments, no
+/// fragment added or removed.
+fn is_column_patch(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Update {
+            removed_fragment_ids,
+            new_fragments,
+            update_mode: Some(UpdateMode::RewriteColumns),
+            ..
+        } if removed_fragment_ids.is_empty() && new_fragments.is_empty()
+    )
+}
+
 /// Whether one transaction is safe to derive by the touched-fragment candidate
 /// path.
 ///
@@ -246,6 +261,18 @@ pub(crate) async fn interval_candidate_plan(
             to_dataset,
             proof.stamp_window(),
         ));
+    }
+    if is_column_patch(&transaction.operation) {
+        // A column patch moves no row: it attaches data files to the fragments
+        // holding the rows it updated and restamps exactly those rows, so the
+        // candidate suffix above is empty. The transaction names the opened
+        // `from` as its parent, which is the lineage row identity needs: pair
+        // the touched fragments' rows by `_rowid` and read those whose stamp
+        // moved.
+        if !pair_rows_by_identity {
+            return Ok(None);
+        }
+        return row_identity_plan(from_dataset, to_dataset).await;
     }
     if proof != IntervalProof::Commit {
         return Ok(None);
