@@ -556,7 +556,9 @@ An index on the assigned column or the fragment a row shares therefore changes
 cost, never whether the write is admitted
 (`write_max_bytes_update_carried_blob.gqt`). Other pending-aware scans
 (`scan_with_pending`, which an update that rewrites whole rows uses) still
-charge the slices they keep.
+charge the slices they keep, so a whole-row update's admission still depends
+on the rows stored beside the match; that is tracked as debt in
+[#1303](https://github.com/ModernRelay/omnigraph/issues/1303).
 
 A patch may withdraw touched fragments from an index on an assigned column
 while they stay in the manifest, and the index keeps its old entries for them.
