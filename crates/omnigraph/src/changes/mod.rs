@@ -3,6 +3,7 @@ pub(crate) mod enumerate;
 pub(crate) mod feed;
 pub mod model;
 pub(crate) mod row_compare;
+pub(crate) mod row_identity;
 pub(crate) mod token;
 
 pub use model::{
@@ -17,11 +18,21 @@ pub use model::{
 
 use std::collections::BTreeMap;
 
+use omnigraph_compiler::settings::{ChangeLineage, SessionSettings};
+
 use crate::db::DatasetEntry;
 use crate::db::Snapshot;
 use crate::db::manifest::TableIdentity;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
+
+/// The `change_lineage` a change read runs under when no session names one:
+/// the definition's default, `verify` in a debug build. The settings-free
+/// doors of [`crate::db::Omnigraph`] run under it; a [`crate::Session`]
+/// passes its own.
+pub(crate) fn default_change_lineage() -> ChangeLineage {
+    SessionSettings::default().change_lineage()
+}
 
 /// The namespace of a graph entity: node or edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

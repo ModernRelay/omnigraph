@@ -243,6 +243,9 @@ jobs:
       - name: Check required test cells exist in the sources
         run: python3 scripts/check-ci-cells.py --self-test
 
+      - name: Self-test the release-note check
+        run: python3 scripts/check-release-note.py --self-test
+
       - name: Assert the classification copies match this workflow
         run: |
           python3 scripts/check-classify-copy.py --self-test
@@ -369,7 +372,7 @@ jobs:
         if: env.VOCABULARY_AUDIT_ENABLED == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Restore pinned public-Rust tooling
         if: env.VOCABULARY_AUDIT_ENABLED == 'true'
@@ -582,7 +585,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       # See the toolchain note in `fmt`. Before the cache step so the cache
       # key sees the pinned rustc.
@@ -655,10 +658,22 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
+      # A lock bump rebuilds the bumped layer beside the restored cache, two
+      # debug copies of most of the tree; PR 1270's merge-queue run died
+      # linking on a full disk. Drop the toolchains this job never uses and
+      # print the headroom before and after the build.
+      - name: Free the runner's disk of unused toolchains
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h /
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -694,6 +709,14 @@ jobs:
         run: |
           cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst --locked --no-run --timings \
             --features "$FAILPOINT_FEATURES"
+
+      # Printed red or green, so a full disk is named; `target` is absent when
+      # an earlier step failed.
+      - name: Report the disk headroom after the build
+        if: always()
+        run: |
+          df -h /
+          if [ -d target ]; then du -sh target; fi
 
       - name: Verify catalogue inventories against the built CLI
         run: python3 scripts/check-catalogue-docs.py --binary target/debug/omnigraph
@@ -842,7 +865,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -1030,7 +1053,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -1127,7 +1150,7 @@ jobs:
         if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         if: needs.classify_changes.outputs.run_full_ci == 'true'
@@ -1212,7 +1235,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-pip
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold python3-pip
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -1455,7 +1478,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev mold
 
       - name: Install pinned toolchain
         run: rustup toolchain install

@@ -70,6 +70,9 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
     if case.csv_slice_bytes.is_some() {
         refused.push("the `# csv_slice_bytes:` pin".to_string());
     }
+    if case.overwrite_chunk_rows.is_some() {
+        refused.push("the `# overwrite_chunk_rows:` pin".to_string());
+    }
     if case.needs_indices {
         refused.push("queries that need indices (search, fuzzy, nearest, rrf)".to_string());
     }
@@ -610,6 +613,13 @@ async fn mutate(
         }
         Err(error) => serde_json::json!({"error": error}),
     });
+    if let Ok(ChangeOutput {
+        commit: Some(commit),
+        ..
+    }) = &outcome
+    {
+        host.record("commit", || crate::commit_evidence(commit.published));
+    }
     host.observe(|| match &outcome {
         Ok(result) => format!(
             "actual affected: nodes={} edges={}",
@@ -803,10 +813,12 @@ async fn control(
     .map_err(&fail)?
     .map_err(&fail)?;
     host.observe(|| format!("actual control: {:?}", outcome.as_ref().map(|o| &o.outcome)));
-    let commit = outcome
-        .as_ref()
-        .ok()
-        .and_then(|output| output.commit.as_ref().map(|c| c.graph_commit_id.clone()));
+    let commit = outcome.as_ref().ok().and_then(|output| {
+        output.commit.as_ref().map(|c| {
+            host.record("commit", || crate::commit_evidence(c.published));
+            c.graph_commit_id.clone()
+        })
+    });
     match &step.write {
         ControlWrite::Create { expect, .. }
         | ControlWrite::Delete { expect, .. }

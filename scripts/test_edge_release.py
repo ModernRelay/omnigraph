@@ -146,9 +146,23 @@ class EdgeReleaseBodyTests(unittest.TestCase):
         self.assertNotIn("\n## Upgrade actions", text)
         self.assertLess(text.index("### Upgrade actions"), text.index("### Features"))
         empty = compose(preview="# OmniGraph v0.14.0\n\nUnreleased preview.\n\nNo user-visible changes recorded.\n")
+        format_two = compose(preview=PREVIEW.replace("# OmniGraph", "# Omnigraph"))
+        self.assertIn("as v0.14.0 will publish them", format_two)
+        self.assertNotIn("# Omnigraph v0.14.0", format_two)
         self.assertIn("No user-visible changes are recorded since the last stable release.", empty)
         with self.assertRaises(body.BodyError):
             compose(preview="## Features\n")
+
+    def test_drops_the_format_two_footer_that_links_an_unpublished_tag(self):
+        footer = ("**Full changelog:** [v0.13.0...v0.14.0](https://github.com/ModernRelay/omnigraph/compare/v0.13.0...v0.14.0)"
+                  " · [Upgrade guide](https://github.com/ModernRelay/omnigraph/blob/abc/docs/user/operations/upgrade.md)\n")
+        preview = PREVIEW.replace('"format":1', '"format":2') + "\n" + footer
+        text = compose(preview=preview)
+        self.assertNotIn("Full changelog", text)
+        self.assertNotIn("/compare/v0.13.0...v0.14.0", text)
+        self.assertTrue(text.endswith("- A new predicate.\n"), text[-200:])
+        alone = compose(preview=PREVIEW + "\n[Upgrade guide](https://example.invalid/upgrade.md)\n")
+        self.assertNotIn("example.invalid", alone)
 
     def test_a_long_release_keeps_upgrade_actions_and_links_the_rest(self):
         features = "".join(f"- Feature {index} " + "x" * 200 + ".\n\n" for index in range(1000))

@@ -203,7 +203,7 @@ pub struct AuthenticatedActor {
 #[derive(Debug, Clone)]
 enum VerifiedDataToken {
     Identity(Arc<crate::data_tokens::IdentityTokenClaims>),
-    Oidc,
+    Oidc { client_id: Arc<str> },
 }
 
 impl std::ops::Deref for AuthenticatedActor {
@@ -223,7 +223,9 @@ impl AuthenticatedActor {
                 scopes: vec![Scope::IdentityToken],
                 source: AuthSource::SignedData,
             },
-            data_token: Some(VerifiedDataToken::Oidc),
+            data_token: Some(VerifiedDataToken::Oidc {
+                client_id: Arc::from(claims.client_id),
+            }),
         }
     }
 
@@ -232,7 +234,7 @@ impl AuthenticatedActor {
     pub(crate) fn is_identity(&self) -> bool {
         matches!(
             self.data_token,
-            Some(VerifiedDataToken::Identity(_) | VerifiedDataToken::Oidc)
+            Some(VerifiedDataToken::Identity(_) | VerifiedDataToken::Oidc { .. })
         )
     }
     pub(crate) fn cluster_static(actor_id: Arc<str>) -> Self {
@@ -263,6 +265,16 @@ impl AuthenticatedActor {
     pub fn identity_claims(&self) -> Option<&crate::data_tokens::IdentityTokenClaims> {
         match &self.data_token {
             Some(VerifiedDataToken::Identity(claims)) => Some(claims),
+            _ => None,
+        }
+    }
+
+    /// The OAuth client a verified OIDC access token was issued to, an
+    /// attribute of this authentication beside the stable principal. Static
+    /// and signed data tokens name no client. Opaque text: render it escaped.
+    pub fn client_id(&self) -> Option<&str> {
+        match &self.data_token {
+            Some(VerifiedDataToken::Oidc { client_id }) => Some(client_id),
             _ => None,
         }
     }

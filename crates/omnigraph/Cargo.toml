@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-engine"
-version = "0.14.1"
+version = "0.15.0"
 edition = "2024"
 description = "Runtime engine for the Omnigraph graph database."
 license = "MIT"
@@ -30,17 +30,20 @@ dst = ["omnigraph-storage/dst", "omnigraph-seams/install", "omnigraph-core/dst",
 test-util = ["omnigraph-catalog/test-util"]
 
 [dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.14.1" }
-omnigraph-policy = { path = "../omnigraph-policy", version = "0.14.1" }
-omnigraph-storage = { path = "../omnigraph-storage", version = "0.14.1" }
-omnigraph-seams = { path = "../omnigraph-seams", version = "0.14.1" }
-omnigraph-core = { path = "../omnigraph-core", version = "0.14.1" }
-omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.14.1" }
-omnigraph-planner = { path = "../omnigraph-planner", version = "0.14.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.0" }
+omnigraph-policy = { path = "../omnigraph-policy", version = "0.15.0" }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.15.0" }
+omnigraph-seams = { path = "../omnigraph-seams", version = "0.15.0" }
+omnigraph-core = { path = "../omnigraph-core", version = "0.15.0" }
+omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.15.0" }
+omnigraph-planner = { path = "../omnigraph-planner", version = "0.15.0" }
 lance = { workspace = true }
 lance-core = { workspace = true }
 lance-select = { workspace = true }
 lance-datafusion = { workspace = true }
+ahash = { workspace = true }
+# The hash join's build side: the `HashTable` DataFusion's own join uses.
+hashbrown = "0.17"
 datafusion = { workspace = true }
 lance-file = { workspace = true }
 lance-index = { workspace = true }
@@ -78,9 +81,9 @@ csv-core = "0.1.13"
 arc-swap = { workspace = true }
 
 [dev-dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.14.1" }
-omnigraph-core = { path = "../omnigraph-core", version = "0.14.1", features = ["test-util"] }
-omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.14.1", features = ["test-util"] }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.0" }
+omnigraph-core = { path = "../omnigraph-core", version = "0.15.0", features = ["test-util"] }
+omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.15.0", features = ["test-util"] }
 tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,

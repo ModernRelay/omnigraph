@@ -2476,7 +2476,10 @@ query nullable_vectors() {
         &current,
         &["mutate", "revise", "--query", query_path, "--target", uri],
     );
-    run(&current, &["rebuild-full-text-indexes", "--target", uri]);
+    run(
+        &current,
+        &["index", "rebuild", "--kind", "full-text", "--target", uri],
+    );
     let rebuilt_files = graph_files(&graph);
     let new_certificates: Vec<_> = rebuilt_files
         .iter()

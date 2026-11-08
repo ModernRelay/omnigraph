@@ -37,26 +37,26 @@ and `ab2` from `a` to `b`, `ac`, and `db`:
 query exact() { delete Knows where @src = "a" and @dst = "b" }
 ```
 
-removes `ab1` and `ab2` and nothing else: `affected: nodes=0 edges=2`. A
-binding variable in a `where` is refused at compile time (`T14`); an
-aggregate, search, or ranking call is `T44`, for example ``T44: `count` cannot
-appear in a mutation where; a where compares the row's own properties,
-parameters and now()``. A compound `where` runs under either `engine` setting.
+removes `ab1` and `ab2` and nothing else: `affected: nodes=0 edges=2`. A binding
+variable in a `where` is refused at compile time (`T14`); an aggregate, search,
+or ranking call is `T44`, for example ``T44: `count` cannot appear in a mutation
+where; a where compares the row's own properties, parameters and now()``. A
+compound `where` runs under either `engine` setting. A `where` that tests over
+four properties twice each with `=`, `!=` or `in` is refused.
 
-Assignment values are constants: literals, parameters, `now()`, and
-comparisons or Boolean operators over them, such as `adult: true or $flag`.
-A constant's value is fixed per invocation: parameters and `now()` are bound
-once before any retry, so a retried mutation computes the same value. It follows the read rules
-for null: with `$flag` null, `true or $flag` is `true` and `false and $flag`
-is `false`, and `$age > 30` with `$age` null is null. A null result assigned
-to a nullable property writes null; on a `Blob` property it clears the cell.
-`null` is a reserved word, so clear a Blob through a nullable parameter such
-as `$content: Blob?`. Assigned to a non-nullable property a
-null result is refused with a typed error that names the property, never
-written as a default. A
-property or system field in a value is refused, for example ``T45: `age`
-cannot appear in an assignment value; assignments and binding matches are
-constants per invocation``.
+Assignment values are constants: literals, parameters, `now()`, and comparisons
+or Boolean operators over them, such as `adult: true or $flag`. A constant's
+value is fixed per invocation: parameters and `now()` are bound once before any
+retry, so a retried mutation computes the same value. It follows the read rules
+for null: with `$flag` null, `true or $flag` is `true` and `false and $flag` is
+`false`, and `$age > 30` with `$age` null is null. A null result assigned to a
+nullable property writes null; on a `Blob` property it clears the cell. `null`
+is a reserved word, so clear a Blob through a nullable parameter such as
+`$content: Blob?`. Assigned to a non-nullable property a null result is refused
+with a typed error that names the property, never written as a default. A
+property or system field in a value is refused, for example ``T45: `age` cannot
+appear in an assignment value; assignments and binding matches are constants per
+invocation``.
 
 A mutation query may contain several inserts and updates, or several deletes,
 but it cannot mix inserts or updates with deletes. Split that workflow into two
@@ -92,7 +92,7 @@ visible on the target in one atomic step. See
   values (an upsert), and an unkeyed edge by delete and re-insert.
 
 All declared value, uniqueness, endpoint, and cardinality constraints are
-checked before publication.
+checked before publication; a node a `@card` minimum needs edges for arrives with them in one query or load ([edge cardinality](../schema/index.md#edge-cardinality)).
 
 ## Bulk loading
 
@@ -261,16 +261,19 @@ A CSV load has no whole-statement input check.
 It applies `write_max_bytes` to each staged-write input instead.
 An overwrite stages the reader's 8,192-row batches, and a batch over the
 allowance refuses as `staged_write_input_bytes`.
+An overwrite writes a fragment per parse partition, up to 1 Mi rows each, as
+the rows drain; nothing commits before the publish, a refusal deletes them all.
 An append or merge keeps the keyed adapter's ceilings
 (`retained keyed batch bytes per operation`, `keyed entities for <table>`,
 `keyed entity bytes for <table>`).
 The [`query_memory_bytes`](../queries/settings.md) setting bounds one
 `load csv` statement's tracked memory as a whole: the retained source, every
-decoded batch, validation state and the staging working set.
-A statement the allowance cannot hold refuses with the `query_memory_bytes`
-resource error before any fragment write.
-A CSV load needs roughly the source plus twice its typed input under that
-allowance.
+decoded batch, validation state and the staging working set; a streaming
+overwrite's working set is its open fragments and the writers in flight.
+An overwrite admits that memory once, before any partition reads, one share per
+parse partition that only its own reader charges, so a refusal and its `actual`
+(the smallest admitting limit) are the same on every run (the shares: the
+settings reference); a statement it cannot hold refuses before any fragment write.
 The source object is bounded by `load_source_max_bytes` before it is read
 (refused as `csv_source_bytes`).
 An overwrite probes the object's metadata once, then each parse partition

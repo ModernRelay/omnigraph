@@ -56,8 +56,8 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, StagedTransactionIdentity,
-    StagedWrite, TableState, TableStore,
+    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, OverwriteChunk, RefreshedIndex,
+    StagedTransactionIdentity, StagedWrite, TableState, TableStore,
 };
 
 /// One fenced merge chunk is bounded in both rows and materialized Arrow
@@ -244,6 +244,16 @@ pub enum IndexBuildSpec {
     Vector {
         column: String,
     },
+}
+
+/// A staged index reconciliation
+/// ([`TableStorage::stage_index_reconciliation`]): the batch to commit
+/// detached, if any index had work, the lagging indexes it rebuilds whole,
+/// and the vector columns whose index could not be trained, with the reason.
+pub struct IndexReconciliation {
+    pub staged: Option<StagedHandle>,
+    pub refreshed: Vec<RefreshedIndex>,
+    pub skipped: Vec<(String, String)>,
 }
 
 /// Logical semantics for an RFC-023 keyed write.
@@ -565,6 +575,16 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         filter: Expr,
     ) -> Result<DatasetRecordBatchStream>;
 
+    /// [`Self::scan_filtered`] with Lance's `_rowaddr` as the last output
+    /// column: the exact rows a later [`Self::stage_delete_rows`] on the same
+    /// snapshot removes.
+    async fn scan_filtered_row_addrs(
+        &self,
+        snapshot: &SnapshotHandle,
+        projection: &[&str],
+        filter: Expr,
+    ) -> Result<DatasetRecordBatchStream>;
+
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>>;
 
     async fn count_rows(&self, snapshot: &SnapshotHandle, filter: Option<String>) -> Result<usize>;
@@ -642,6 +662,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         options: &lance::dataset::optimize::CompactionOptions,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>>;
 
+    /// #721: stage one detached-ready rewrite of exactly the named
+    /// fragments, deletions materialized, or `None` when none is named. See
+    /// `TableStore::stage_fragment_rewrite`.
+    async fn stage_fragment_rewrite(
+        &self,
+        snapshot: &SnapshotHandle,
+        fragment_ids: &[u64],
+    ) -> Result<Option<StagedHandle>>;
+
     /// RFC 0067: stage one detached-ready fold of every foldable index whose
     /// coverage lags the fragments, each rebuilt whole under its name; `None`
     /// when every index is current. The second value names the vector
@@ -650,6 +679,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
     ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)>;
+
+    /// Stage, as one detached-ready `CreateIndex`, the declared indexes the
+    /// table lacks (`specs`) and the whole rebuild of every lagging foldable
+    /// index; `staged` is `None` when neither has work.
+    async fn stage_index_reconciliation(
+        &self,
+        snapshot: &SnapshotHandle,
+        specs: &[IndexBuildSpec],
+    ) -> Result<IndexReconciliation>;
 
     /// Atomically create version 1 from a staged read-version-0 transaction.
     /// Lance conflict retries are disabled so a concurrently-created dataset
@@ -841,6 +879,18 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         writers: usize,
     ) -> Result<StagedHandle>;
 
+    /// Stage an overwrite from chunks as a producer cuts them, each written
+    /// as it arrives, the fragments joined in source order at the end; a
+    /// refusal deletes what was written. See `TableStore::stage_overwrite_stream`.
+    async fn stage_overwrite_stream(
+        &self,
+        snapshot: &SnapshotHandle,
+        chunks: futures::stream::BoxStream<'_, Result<OverwriteChunk>>,
+        schema: Option<SchemaRef>,
+        write_budget: WriteBudget,
+        writers: usize,
+    ) -> Result<StagedHandle>;
+
     /// Stage a rename-only column alteration; see
     /// `TableStore::stage_rename_columns`. Committed through `commit_staged_exact`.
     async fn stage_rename_columns(
@@ -865,6 +915,17 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         filter: Expr,
+    ) -> Result<Option<StagedHandle>>;
+
+    /// Stage a delete of exactly `row_addrs`, captured by
+    /// [`Self::scan_filtered_row_addrs`] on this snapshot, with no second
+    /// scan; `predicate` is the transaction's recorded text. See
+    /// `TableStore::stage_delete_rows`.
+    async fn stage_delete_rows(
+        &self,
+        snapshot: &SnapshotHandle,
+        predicate: &Expr,
+        row_addrs: &lance_select::mask::RowAddrTreeMap,
     ) -> Result<Option<StagedHandle>>;
 
     /// Stage every requested full-table index in one Lance transaction.
@@ -1041,6 +1102,29 @@ impl TableStorage for TableStore {
         .await
     }
 
+    async fn scan_filtered_row_addrs(
+        &self,
+        snapshot: &SnapshotHandle,
+        projection: &[&str],
+        filter: Expr,
+    ) -> Result<DatasetRecordBatchStream> {
+        TableStore::scan_stream_with(
+            snapshot.dataset(),
+            Some(projection),
+            None,
+            None,
+            false,
+            |scanner| {
+                scanner.filter_expr(filter);
+                scanner.with_row_address();
+                scanner.batch_size(ID_SCAN_BATCH_ROWS);
+                scanner.batch_size_bytes(ID_SCAN_BATCH_BYTES);
+                Ok(())
+            },
+        )
+        .await
+    }
+
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>> {
         TableStore::scan_batches(self, snapshot.dataset()).await
     }
@@ -1161,12 +1245,37 @@ impl TableStorage for TableStore {
         )
     }
 
+    async fn stage_fragment_rewrite(
+        &self,
+        snapshot: &SnapshotHandle,
+        fragment_ids: &[u64],
+    ) -> Result<Option<StagedHandle>> {
+        Ok(
+            TableStore::stage_fragment_rewrite(self, snapshot.dataset(), fragment_ids)
+                .await?
+                .map(|compaction| StagedHandle::new(compaction.staged)),
+        )
+    }
+
     async fn stage_index_fold(
         &self,
         snapshot: &SnapshotHandle,
     ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)> {
         let fold = TableStore::stage_index_fold(self, snapshot.dataset()).await?;
         Ok((fold.staged.map(StagedHandle::new), fold.skipped))
+    }
+
+    async fn stage_index_reconciliation(
+        &self,
+        snapshot: &SnapshotHandle,
+        specs: &[IndexBuildSpec],
+    ) -> Result<IndexReconciliation> {
+        let work = TableStore::stage_index_reconciliation(self, snapshot.dataset(), specs).await?;
+        Ok(IndexReconciliation {
+            staged: work.staged.map(StagedHandle::new),
+            refreshed: work.refreshed,
+            skipped: work.skipped,
+        })
     }
 
     async fn commit_staged_create_exact(
@@ -1425,6 +1534,26 @@ impl TableStorage for TableStore {
         .map(StagedHandle::new)
     }
 
+    async fn stage_overwrite_stream(
+        &self,
+        snapshot: &SnapshotHandle,
+        chunks: futures::stream::BoxStream<'_, Result<OverwriteChunk>>,
+        schema: Option<SchemaRef>,
+        write_budget: WriteBudget,
+        writers: usize,
+    ) -> Result<StagedHandle> {
+        TableStore::stage_overwrite_stream(
+            self,
+            snapshot.dataset(),
+            chunks,
+            schema,
+            write_budget,
+            writers,
+        )
+        .await
+        .map(StagedHandle::new)
+    }
+
     async fn stage_rename_columns(
         &self,
         snapshot: &SnapshotHandle,
@@ -1455,6 +1584,19 @@ impl TableStorage for TableStore {
         Ok(TableStore::stage_delete(self, snapshot.dataset(), filter)
             .await?
             .map(StagedHandle::new))
+    }
+
+    async fn stage_delete_rows(
+        &self,
+        snapshot: &SnapshotHandle,
+        predicate: &Expr,
+        row_addrs: &lance_select::mask::RowAddrTreeMap,
+    ) -> Result<Option<StagedHandle>> {
+        Ok(
+            TableStore::stage_delete_rows(self, snapshot.dataset(), predicate, row_addrs)
+                .await?
+                .map(StagedHandle::new),
+        )
     }
 
     async fn stage_create_indices(

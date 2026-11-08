@@ -70,6 +70,7 @@ pub(super) async fn pull(
                 // Preserve the immutable source bytes. They are written privately and
                 // removed from output; unsuccessful responses are still scrubbed.
                 preserve_contents: true,
+                auth_verification_status: false,
             },
         )
         .await?;

@@ -304,6 +304,26 @@ impl Streaming {
         )
     }
 
+    /// The produced stream of an operator that executes its inputs itself
+    /// (every partition of a load's source): `body` runs on the producer's
+    /// owned worker with the sender and sends each batch as it passes, so the
+    /// first output cannot wait for the input's end.
+    pub(super) fn drive<F>(
+        &self,
+        memory: Arc<WorkMemory>,
+        metrics: &ExecutionPlanMetricsSet,
+        body: impl FnOnce(Arc<WorkMemory>, BatchSender) -> F + Send + 'static,
+    ) -> SendableRecordBatchStream
+    where
+        F: Future<Output = DfResult<()>> + Send + 'static,
+    {
+        let schema = self.properties.eq_properties.schema().clone();
+        polled(
+            metrics,
+            producer_stream(schema, memory, Some(metrics), body),
+        )
+    }
+
     /// The produced stream of a per-batch operator: on the producer's owned
     /// worker the shape opens `body`, executes `input` (so a side the body
     /// collected or a filter it filled is in place first), and drives the

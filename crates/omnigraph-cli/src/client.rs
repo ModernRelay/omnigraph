@@ -9,18 +9,18 @@ use omnigraph::settings::{SessionSettings, SettingId, SettingValue, Source};
 use omnigraph::storage::{CapturedStorageBinding, storage_for_binding};
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobContent, Session};
 use omnigraph_api_types::{
-    BlobReadQuery, BlobStatOutput, BlobWriteOutput, BlobWriteQuery, BranchCreateOutput,
-    BranchCreateRequest, BranchDeleteOutput, BranchListOutput, BranchMergeOutcome,
-    BranchMergeOutput, BranchMergeRequest, BranchOutcomeOutput, ChangeBaselineOutput,
-    ChangeBaselineRecord, ChangeBaselineRequest, ChangeFeedOutput, ChangeOp, ChangeOutput,
-    ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, DiffOutput, EntityKind,
-    ExportRequest, GraphBatchLoadOutput, GraphDiscoveryOutput, GraphListOutput,
+    AccessOutput, BlobReadQuery, BlobStatOutput, BlobWriteOutput, BlobWriteQuery,
+    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
+    BranchMergeOutcome, BranchMergeOutput, BranchMergeRequest, BranchOutcomeOutput,
+    ChangeBaselineOutput, ChangeBaselineRecord, ChangeBaselineRequest, ChangeFeedOutput, ChangeOp,
+    ChangeOutput, ChangeRequest, CommitChangesOutput, CommitListOutput, CommitOutput, DiffOutput,
+    EntityKind, ExportRequest, GraphBatchLoadOutput, GraphDiscoveryOutput, GraphListOutput,
     InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput,
-    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_read_output,
-    branch_read_output, change_baseline_output, change_feed_output, change_scope,
-    commit_changes_output, commit_output, diff_output, graph_batch_load_receipt_output,
-    load_executed_output, merge_base_output, read_output, schema_apply_output, show_read_output,
-    snapshot_payload,
+    SchemaApplyOutput, SchemaOutput, SettingsRequest, SnapshotOutput, branch_list_output,
+    branch_list_read_output, branch_read_output, change_baseline_output, change_feed_output,
+    change_scope, commit_changes_output, commit_output, diff_output,
+    graph_batch_load_receipt_output, load_executed_output, merge_base_output, read_output,
+    schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
@@ -42,8 +42,8 @@ use crate::graph_http::GraphHttpClient;
 use crate::helpers::{
     PreconditionFailedCli, apply_bearer_token, branch_statement_change_request,
     branch_statement_query_request, missing_credential, precondition_failed_cli,
-    query_params_from_json, remote_json, remote_json_bounded, remote_no_content,
-    remote_response_json_bounded, remote_url, resolve_actor_with_config, select_named_query,
+    query_params_from_json, remote_json_bounded, remote_no_content, remote_response_json_bounded,
+    remote_url, resolve_actor_with_config, select_named_query,
 };
 use crate::operator::InvocationConfig;
 use crate::targets::{ResolvedTarget, TargetBinding};
@@ -502,6 +502,7 @@ impl GraphClient {
             match id {
                 SettingId::Engine => request.engine = Some(given.engine()),
                 SettingId::MergeLineage => request.merge_lineage = Some(given.merge_lineage()),
+                SettingId::ChangeLineage => request.change_lineage = Some(given.change_lineage()),
                 SettingId::AnnNprobes => {
                     request.ann_nprobes = Some(given.get(SettingId::AnnNprobes).parse()?)
                 }
@@ -564,14 +565,17 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::GET,
                     remote_url(base_url, &["branches"], &[])?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -579,7 +583,41 @@ impl GraphClient {
                 let session = Self::open_read_session(uri, binding, &[]).await?;
                 let mut branches = session.branch_list().await?;
                 branches.sort();
-                Ok(BranchListOutput { branches })
+                Ok(BranchListOutput {
+                    branches,
+                    details: None,
+                })
+            }
+            GraphClient::Catalogue => Err(catalogue_scope_refusal("branch list")),
+        }
+    }
+
+    /// [`Self::branch_list`] with each readable branch's details
+    /// (`GET /branches?detailed=true`).
+    pub(crate) async fn branch_list_detailed(&self) -> Result<BranchListOutput> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+                response_limit,
+                ..
+            } => {
+                remote_json_bounded(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, &["branches"], &[("detailed", "true")])?,
+                    None,
+                    token.as_deref(),
+                    None,
+                    *response_limit,
+                )
+                .await
+            }
+            GraphClient::Embedded { uri, binding, .. } => {
+                let session = Self::open_read_session(uri, binding, &[]).await?;
+                let listing = session.branch_list_detailed(&mut |_| true).await?;
+                Ok(branch_list_output(&listing))
             }
             GraphClient::Catalogue => Err(catalogue_scope_refusal("branch list")),
         }
@@ -591,14 +629,17 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::GET,
                     remote_url(base_url, &["snapshot"], &[("branch", branch)])?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -619,14 +660,17 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::GET,
                     remote_url(base_url, &["schema"], &[])?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -649,23 +693,61 @@ impl GraphClient {
         }
     }
 
+    /// The served graph's current authority, evaluated by its server.
+    pub(crate) async fn access(
+        &self,
+        branch: Option<&str>,
+        target_branch: Option<&str>,
+    ) -> Result<AccessOutput> {
+        let Self::Remote {
+            http,
+            base_url,
+            token,
+            response_limit,
+            ..
+        } = self
+        else {
+            bail!("remote access introspection requires a served graph");
+        };
+        let mut query = Vec::new();
+        if let Some(branch) = branch {
+            query.push(("branch", branch));
+        }
+        if let Some(target_branch) = target_branch {
+            query.push(("target_branch", target_branch));
+        }
+        remote_json_bounded(
+            http,
+            Method::GET,
+            remote_url(base_url, &["access"], &query)?,
+            None,
+            token.as_deref(),
+            None,
+            *response_limit,
+        )
+        .await
+    }
+
     /// A served graph's stored-query catalog, the body of `GET …/queries`.
     /// A direct root reads its registry from the applied cluster state
-    /// instead, so only a server target reaches this.
+    /// instead, so only a server or managed target reaches this.
     pub(crate) async fn list_queries(&self) -> Result<QueriesCatalogOutput> {
         match self {
             GraphClient::Remote {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::GET,
                     remote_url(base_url, &["queries"], &[])?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -918,6 +1000,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
                 let limit_value = limit.map(|limit| limit.to_string());
@@ -936,12 +1019,14 @@ impl GraphClient {
                         .map(|(name, value)| (*name, value.as_str())),
                 );
                 query.extend(set_values.iter().map(|value| ("set", value.as_str())));
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::GET,
                     remote_url(base_url, &["commits", commit_id, "changes"], &query)?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -981,6 +1066,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
                 let limit_value = limit.map(|limit| limit.to_string());
@@ -1008,12 +1094,14 @@ impl GraphClient {
                         .map(|(name, value)| (*name, value.as_str())),
                 );
                 query.extend(set_values.iter().map(|value| ("set", value.as_str())));
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::GET,
                     remote_url(base_url, &["changes"], &query)?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -1059,6 +1147,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
                 let request = apply_bearer_token(
@@ -1078,7 +1167,12 @@ impl GraphClient {
                 let status = response.status();
                 if !status.is_success() {
                     // Share structured status/backoff handling with JSON responses.
-                    return remote_response_json_bounded(response, token.as_deref(), None).await;
+                    return remote_response_json_bounded(
+                        response,
+                        token.as_deref(),
+                        *response_limit,
+                    )
+                    .await;
                 }
                 // Hold back the most recent complete line while streaming: at
                 // EOF it must be the terminal handshake record. Everything
@@ -1638,14 +1732,17 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::POST,
                     remote_url(base_url, &["commits", commit_id, "publish"], &[])?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await?
             }
@@ -1679,6 +1776,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
                 remote_no_content(
@@ -1686,6 +1784,7 @@ impl GraphClient {
                     Method::DELETE,
                     remote_url(base_url, &["commits", commit_id], &[])?,
                     token.as_deref(),
+                    *response_limit,
                 )
                 .await
             }
@@ -2008,9 +2107,10 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::POST,
                     remote_url(base_url, &["branches"], &[])?,
@@ -2027,6 +2127,8 @@ impl GraphClient {
                         },
                     })?),
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -2063,14 +2165,17 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::DELETE,
                     remote_url(base_url, &["branches", name], &[])?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -2112,9 +2217,10 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::POST,
                     remote_url(base_url, &["branches", "merge"], &[])?,
@@ -2127,6 +2233,8 @@ impl GraphClient {
                         settings: Self::remote_settings(settings)?,
                     })?),
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await?
             }
@@ -2206,6 +2314,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
                 let limit_value = limit.map(|limit| limit.to_string());
@@ -2229,12 +2338,14 @@ impl GraphClient {
                         .iter()
                         .map(|(name, value)| (*name, value.as_str())),
                 );
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::GET,
                     remote_url(base_url, segments, &query)?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -2277,9 +2388,10 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::GET,
                     remote_url(
@@ -2289,6 +2401,8 @@ impl GraphClient {
                     )?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -2350,6 +2464,7 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
                 let request = apply_bearer_token(
@@ -2364,7 +2479,12 @@ impl GraphClient {
                 let status = response.status();
                 if !status.is_success() {
                     // Share structured status/backoff handling with JSON responses.
-                    return remote_response_json_bounded(response, token.as_deref(), None).await;
+                    return remote_response_json_bounded(
+                        response,
+                        token.as_deref(),
+                        *response_limit,
+                    )
+                    .await;
                 }
                 while let Some(chunk) = response.chunk().await? {
                     writer.write_all(&chunk)?;
@@ -2642,14 +2762,17 @@ impl GraphClient {
                 http,
                 base_url,
                 token,
+                response_limit,
                 ..
             } => {
-                remote_json(
+                remote_json_bounded(
                     http,
                     Method::GET,
                     remote_url(base_url, &["graphs"], &[])?,
                     None,
                     token.as_deref(),
+                    None,
+                    *response_limit,
                 )
                 .await
             }
@@ -2825,7 +2948,7 @@ fn refuse_noncanonical_branches<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::{RemoteErrorCli, remote_json_with_graph_commit_precondition};
+    use crate::helpers::RemoteErrorCli;
     use crate::managed_http_fixture::{IntentApiFixture, IntentReply};
     use serde_json::json;
 
@@ -3076,12 +3199,14 @@ mod tests {
                     .await
                     .unwrap();
                     for (i, (status, _)) in cases.iter().enumerate() {
-                        let error = remote_json::<Value>(
+                        let error = remote_json_bounded::<Value>(
                             &http,
                             Method::POST,
                             format!("{}/graphs/knowledge/mutate", server.origin),
                             Some(json!({"query":"mutation m() {}"})),
                             Some("secret-bearer"),
+                            None,
+                            None,
                         )
                         .await
                         .unwrap_err();
@@ -3176,12 +3301,14 @@ mod tests {
         crate::operator_routing::test_transport_scope(&[&server.origin], async {
             let http = GraphHttpClient::new(&server.origin).unwrap();
             let started = std::time::Instant::now();
-            let error = remote_json::<Value>(
+            let error = remote_json_bounded::<Value>(
                 &http,
                 Method::GET,
                 format!("{}/graphs", server.origin),
                 None,
                 Some("secret"),
+                None,
+                None,
             )
             .await
             .unwrap_err();
@@ -3212,12 +3339,14 @@ mod tests {
             })
             .await
             .unwrap();
-            let error = remote_json::<Value>(
+            let error = remote_json_bounded::<Value>(
                 &http,
                 Method::POST,
                 remote_url(endpoint.as_str(), &["graphs", "knowledge", "change"], &[]).unwrap(),
                 Some(json!({})),
                 Some("secret-bearer"),
+                None,
+                None,
             )
             .await
             .unwrap_err();
@@ -3254,12 +3383,14 @@ mod tests {
             let http = GraphHttpClient::new(&root).unwrap();
             crate::helpers::require_graph_segment("knowledge").unwrap();
             let base = remote_url(&root, &["graphs", "knowledge"], &[]).unwrap();
-            let value: Value = remote_json(
+            let value: Value = remote_json_bounded(
                 &http,
                 Method::GET,
                 remote_url(&base, &["branches", "etl/run 1"], &[("branch", "a b")]).unwrap(),
                 None,
                 Some("data-bearer"),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -3308,12 +3439,14 @@ mod tests {
 
             // Removing the socket fails discovery before the data request.
             drop(gateway);
-            let error = remote_json::<Value>(
+            let error = remote_json_bounded::<Value>(
                 &http,
                 Method::GET,
                 remote_url(&base, &["snapshot"], &[]).unwrap(),
                 None,
                 Some("data-bearer"),
+                None,
+                None,
             )
             .await
             .unwrap_err();
@@ -3438,12 +3571,14 @@ mod tests {
                 let server = IntentApiFixture::graph(vec![reply]);
                 crate::operator_routing::test_transport_scope(&[&server.origin], async {
                     let http = GraphHttpClient::new(&server.origin).unwrap();
-                    let error = remote_json::<Value>(
+                    let error = remote_json_bounded::<Value>(
                         &http,
                         Method::POST,
                         format!("{}/graphs/knowledge/mutate", server.origin),
                         Some(json!({})),
                         Some("data-bearer"),
+                        None,
+                        None,
                     )
                     .await
                     .unwrap_err();
@@ -3505,17 +3640,19 @@ mod tests {
                     crate::command_outcome::CommandKind::Write,
                     async {
                         if earlier_request {
-                            remote_json::<Value>(
+                            remote_json_bounded::<Value>(
                                 &http,
                                 Method::POST,
                                 format!("{}/graphs/knowledge/branches", server.origin),
                                 Some(json!({"name":"review"})),
                                 None,
+                                None,
+                                None,
                             )
                             .await
                             .unwrap();
                         }
-                        remote_json_with_graph_commit_precondition::<Value>(
+                        remote_json_bounded::<Value>(
                             &http,
                             if read_refusal {
                                 Method::GET
@@ -3526,6 +3663,7 @@ mod tests {
                             Some(json!({"query":"mutation m() {}"})),
                             None,
                             conditional.then_some("head-a"),
+                            None,
                         )
                         .await
                         .unwrap_err()

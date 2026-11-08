@@ -233,14 +233,15 @@ declared policy: `node` `gate` (a pre-pass gate's `plan`, `prefilter`,
 overfetch `rung`. Explain itself runs nothing and carries no `profile` row; the
 profile is returned beside the rows by the run that produced them
 (`Session::query_inspected`, the v2 inspection door, through
-`Executed::profile`). The row schema is `explain_version` 7: `pipelines`
+`Executed::profile`). The row schema is `explain_version` 8 (version 8 added
+the `DeltaSource` node a staged write's plan starts from): `pipelines`
 entries (on every planner document since version 7, on diff and merge
 documents only before it) carry a pipeline `id` and `depends_on`, with
 `source`, `operators` and `sink` as objects whose `id` joins the
 `physical_plan` node ids; an operator's emission is set by the shape wrapper
 the engine builds its stream through, the one the planner's cut names, so the
 printed pipelines are the executed ones. Saved physical
-plans use a `bound_plan_version: 10` envelope whose `body` contains `plan` and
+plans use a `bound_plan_version: 11` envelope whose `body` contains `plan` and
 `values`. Unversioned plans and other versions are refused with a regeneration
 instruction, including plans without traversal nodes.
 

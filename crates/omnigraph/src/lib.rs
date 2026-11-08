@@ -36,6 +36,7 @@ pub mod graph_index;
 pub(crate) use omnigraph_core::handle_cache;
 pub mod instrumentation;
 pub(crate) use omnigraph_core::lance_access;
+pub(crate) use omnigraph_core::lance_commit;
 pub(crate) use omnigraph_core::{dataset_index, staging};
 pub mod loader;
 pub(crate) mod ordered_cursor;
@@ -68,6 +69,9 @@ pub struct MutationReceipt {
     /// unattached write the recorded target its base inherits (`"main"` for
     /// main).
     pub branch: String,
+    /// The planner's document per table the write validated, in table order;
+    /// empty when the mutation staged nothing.
+    pub plans: Vec<omnigraph_planner::explain::Explain>,
 }
 
 // DST seam: registry access for the harness's Lance-realm fault injector.
@@ -83,7 +87,7 @@ pub use lance_access::store_registry as dst_lance_store_registry;
 /// see `omnigraph_core::manifest_request`.
 #[cfg(feature = "dst")]
 pub fn manifest_request_reissues() -> usize {
-    omnigraph_core::manifest_request::MANIFEST_REQUEST_REISSUES as usize
+    omnigraph_core::manifest_request::CONDITIONAL_REQUEST_REISSUES as usize
 }
 
 /// The Lance-realm object-store seam; see `lance_access::object_store_seam`.

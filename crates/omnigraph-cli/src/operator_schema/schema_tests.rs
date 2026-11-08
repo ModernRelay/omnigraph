@@ -124,6 +124,10 @@ fn checked_in_schema_fields_and_required_lists_match_serde_records() {
         "execAuth",
         json!({"provider":"exec","command":["/helper"],"timeout":"30s"}),
     );
+    record::<AuthProfile>(
+        "oauthClientCredentialsAuth",
+        json!({"provider":"oauth_client_credentials","token_endpoint":"https://auth.example/token","client_id":"client","client_secret":{"env":"CLIENT_SECRET"},"scope":"read"}),
+    );
     record::<TokenSource>("storeSource", json!({"store":{}}));
     record::<TokenSource>("envSource", json!({"env":"TOKEN"}));
     record::<TokenSource>("fileSource", json!({"file":"token"}));
@@ -180,9 +184,15 @@ fn schema_discriminators_defaults_and_owner_variants_match_contract() {
         ),
         (
             "profileAuth",
-            vec!["omnigraphAuth", "tokenAuth", "execAuth"],
+            vec![
+                "omnigraphAuth",
+                "tokenAuth",
+                "execAuth",
+                "oauthClientCredentialsAuth",
+            ],
         ),
         ("serverAuth", vec!["anonymousAuth", "tokenAuth", "execAuth"]),
+        ("clientSecretSource", vec!["envSource", "fileSource"]),
         (
             "tokenSource",
             vec!["storeSource", "envSource", "fileSource"],
@@ -206,6 +216,11 @@ fn schema_discriminators_defaults_and_owner_variants_match_contract() {
         ("anonymousAuth", "provider", "anonymous"),
         ("tokenAuth", "provider", "token"),
         ("execAuth", "provider", "exec"),
+        (
+            "oauthClientCredentialsAuth",
+            "provider",
+            "oauth_client_credentials",
+        ),
         ("directProxy", "mode", "direct"),
         ("urlProxy", "mode", "url"),
         ("environmentProxy", "mode", "environment"),
@@ -218,6 +233,7 @@ fn schema_discriminators_defaults_and_owner_variants_match_contract() {
         OutputFormat::Jsonl,
         OutputFormat::Csv,
         OutputFormat::Kv,
+        OutputFormat::Toon,
     ];
     assert_eq!(
         defs["defaults"]["properties"]["output"]["enum"],

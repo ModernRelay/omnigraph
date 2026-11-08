@@ -13,7 +13,8 @@ use crate::aggregate::AggregateSpec;
 use crate::cost::{AccessPath, ExpandMode, ExpandPolicy, ValidateRemoval};
 use crate::error::PlanError;
 use crate::logical::{
-    ColumnRef, CsvSourceSpec, FragmentWriteSpec, KeyJoinKind, ScanSpec, ValidateSpec,
+    ColumnRef, CsvSourceSpec, DeltaSourceSpec, FragmentWriteSpec, KeyJoinKind, ScanSpec,
+    ValidateSpec,
 };
 use crate::physical::{
     HydratedBinding, NodeId, PhysicalNode, PhysicalPlan, RankArm, RankedAccess, ScanInput,
@@ -96,6 +97,12 @@ pub struct CsvSourceFields<'p> {
     pub spec: &'p CsvSourceSpec,
     pub max_partitions: u32,
     pub max_workers: u32,
+}
+
+/// The fields of [`PhysicalNode::DeltaSource`].
+#[derive(Debug, Clone, Copy)]
+pub struct DeltaSourceFields<'p> {
+    pub spec: &'p DeltaSourceSpec,
 }
 
 /// The fields of [`PhysicalNode::Validate`] beside its input.
@@ -279,6 +286,13 @@ pub trait Lower {
         &mut self,
         id: NodeId,
         fields: CsvSourceFields<'_>,
+    ) -> Result<Self::Op, Self::Error>;
+
+    /// A write's leaf, the executor's staged delta.
+    fn delta_source(
+        &mut self,
+        id: NodeId,
+        fields: DeltaSourceFields<'_>,
     ) -> Result<Self::Op, Self::Error>;
 
     fn validate(
@@ -582,6 +596,7 @@ impl PhysicalPlan {
                 let input = self.lower_node(*input, l)?;
                 l.sort(id, order_by, *fetch, tiebreak, input)
             }
+            PhysicalNode::DeltaSource { spec } => l.delta_source(id, DeltaSourceFields { spec }),
             PhysicalNode::CsvSource {
                 spec,
                 max_partitions,

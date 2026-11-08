@@ -110,14 +110,31 @@ fn served_identity_axes_and_read_only_suffix_are_enforced() {
     let mut invalid = plan("tiny-read");
     invalid.definition.protocol.reset = ResetMode::None;
     assert!(replan(invalid).is_err());
+    const PROPOSE: &str = "\n--- mutate\nquery propose() as commit { insert Person { name: \"zed\" } }\n--- expect affected: nodes=1 edges=0\n--- bind commit $w\n";
     for (suffix, refusal) in [
         (
-            "\n--- restart\n",
+            "\n--- restart\n".to_string(),
             "omnigraph-server has no door for step 4 (restart)",
         ),
         (
-            "\n--- mutate\nquery write() { delete Person where name = \"added\" }\n--- expect affected: nodes=0 edges=0\n",
-            "step 4 (mutate) is not read-only",
+            "\n--- mutate\nquery write() { delete Person where name = \"added\" }\n--- expect affected: nodes=0 edges=0\n".to_string(),
+            "step 4 (mutate) advances a branch head; reset:none admits a served write only as an unpublished commit",
+        ),
+        (
+            "\n--- mutate\nbranch merge \"b0\"\n--- expect outcome: merged\n".to_string(),
+            "step 4 (branch merge) advances a branch head",
+        ),
+        (
+            format!("{PROPOSE}--- mutate\ncommit publish \"${{w}}\"\n--- expect ok\n"),
+            "step 5 (commit publish) is not admissible served",
+        ),
+        (
+            "\n--- mutate\ncommit drop \"hb1-literal\"\n--- expect ok\n".to_string(),
+            "step 4 (commit drop) drops a commit this workload did not bind",
+        ),
+        (
+            "\n--- mutate\nbranch create \"scratch\"\n--- expect ok\n".to_string(),
+            "step 4 (branch create) is not admissible served",
         ),
     ] {
         let text = format!("{}{suffix}", p.queries.text);
@@ -130,6 +147,27 @@ fn served_identity_axes_and_read_only_suffix_are_enforced() {
         .unwrap_err();
         assert!(error.contains(refusal), "{error}");
     }
+    let unpublished = format!(
+        "{}{PROPOSE}--- query snapshot: $w\nquery at_proposal() {{ match {{ $p: Person }} return {{ $p.name }} }}\n--- expect unordered\n{{\"p.name\":\"zed\"}}\n--- expect shape\np.name: String\n--- mutate\ncommit drop \"${{w}}\"\n--- expect ok\n",
+        p.queries.text
+    );
+    let parsed = omnigraph_gqt_core::parse_case("served_unpublished", &unpublished).unwrap();
+    let condition = admit_target_queries(
+        &parsed,
+        &p.definition.workload.measured_step,
+        Target::Server,
+    )
+    .unwrap();
+    assert_eq!(condition.process, ProcessLifecycle::LongRunningServer);
+    assert_eq!(
+        parsed
+            .steps()
+            .iter()
+            .map(|s| s.kind)
+            .filter(|k| !SERVED_READ_KINDS.contains(k))
+            .collect::<Vec<_>>(),
+        [StepKind::Mutate, StepKind::CommitDrop]
+    );
     let measured = p
         .queries
         .text
@@ -341,6 +379,49 @@ fn served_redaction_covers_form_encoded_token() {
             crate::gqt_served::redact_error(format!("server said: {spelling}."), Some(token));
         assert_eq!(redacted, "server said: <redacted>.", "{spelling}");
     }
+}
+
+/// A served receipt is admitted as a read, as a write whose commit stayed
+/// unpublished, or as a drop; a published write, a publish, or a write with
+/// no commit evidence is not.
+#[test]
+fn served_receipts_admit_reads_unpublished_writes_and_drops() {
+    use crate::gqt_runner::{GqtOperationKind, GqtStepObservation, served_receipt_admitted};
+    let receipt = |kind, published| GqtStepObservation {
+        ordinal: 4,
+        occurrence: 1,
+        kind,
+        elapsed_us: 7,
+        published,
+    };
+    for (kind, published, admitted) in [
+        (GqtOperationKind::Query, None, true),
+        (GqtOperationKind::BranchList, None, true),
+        (GqtOperationKind::Show, None, true),
+        (GqtOperationKind::Mutate, Some(false), true),
+        (GqtOperationKind::BranchMerge, Some(false), true),
+        (GqtOperationKind::CommitDrop, None, true),
+        (GqtOperationKind::Mutate, None, false),
+        (GqtOperationKind::Mutate, Some(true), false),
+        (GqtOperationKind::BranchMerge, Some(true), false),
+        (GqtOperationKind::CommitPublish, Some(true), false),
+        (GqtOperationKind::Load, None, false),
+        (GqtOperationKind::BranchCreate, None, false),
+        (GqtOperationKind::Restart, None, false),
+    ] {
+        assert_eq!(
+            served_receipt_admitted(&receipt(kind, published)),
+            admitted,
+            "{kind:?} published={published:?}"
+        );
+    }
+    let bytes = serde_json::to_string(&receipt(GqtOperationKind::Query, None)).unwrap();
+    assert!(!bytes.contains("published"), "{bytes}");
+    assert!(
+        serde_json::to_string(&receipt(GqtOperationKind::Mutate, Some(false)))
+            .unwrap()
+            .contains("\"published\":false")
+    );
 }
 
 async fn served_record() -> GqtRunRecordV1 {
@@ -1104,6 +1185,7 @@ val: I64
                 occurrence: 1,
                 kind: step.kind.into(),
                 elapsed_us: 7,
+                published: None,
             })
             .collect();
         GqtRepObservation {
@@ -1299,7 +1381,10 @@ fn served_admission_rejects_loop_writes_and_wrong_environment() {
         Target::Server,
     )
     .unwrap_err();
-    assert!(error.contains("read-only"));
+    assert!(
+        error.contains("step 4 (mutate) advances a branch head"),
+        "{error}"
+    );
 
     for (from, to) in [
         ("target: omnigraph-server", "target: omnigraph-engine"),
@@ -1510,6 +1595,7 @@ exit 0
                     occurrence: 1,
                     kind: step.kind.into(),
                     elapsed_us: 0,
+                    published: None,
                 })
                 .collect(),
             verification: GqtVerification {

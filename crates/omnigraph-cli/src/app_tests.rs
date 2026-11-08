@@ -1507,7 +1507,10 @@ async fn maintenance_delivery_failure_preserves_one_rebuild_and_its_actor() {
                 .len();
             let parsed = crate::invocation::parse_from([
                 "omnigraph",
-                "rebuild-full-text-indexes",
+                "index",
+                "rebuild",
+                "--kind",
+                "full-text",
                 "--target",
                 &uri,
                 "--branch",

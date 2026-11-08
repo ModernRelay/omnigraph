@@ -79,6 +79,9 @@ pub struct Case {
     /// The `# csv_slice_bytes:` pin: the bytes one `load csv` parse partition
     /// owns and the slice it reads at once, so a small source cuts partitions.
     csv_slice_bytes: Option<usize>,
+    /// The `# overwrite_chunk_rows:` pin: the rows one `load csv` overwrite
+    /// chunk holds before its writer takes it.
+    overwrite_chunk_rows: Option<usize>,
     pub items: Vec<Item>,
     pub needs_indices: bool,
     /// `--- csv <name>` sections: the CSV text a `load csv "<name>"` step
@@ -259,6 +262,9 @@ pub struct MutateStep {
     name: String,
     /// The `branch: <name>` header argument, as `QueryStep::branch`.
     branch: String,
+    /// `as commit` on the declaration: the write is an unpublished commit
+    /// and advances no head.
+    as_commit: bool,
     ast_params: Vec<Param>,
     params_raw: Option<ParamsInput>,
     expect: MutateExpect,
@@ -271,6 +277,10 @@ pub struct MutateStep {
     /// Whether the header spelled `branch:`; an omitted branch lets a child
     /// write inherit its base's target.
     branch_spelled: bool,
+    /// `--- expect plan` after the step's `--- expect ok|affected`: facts of
+    /// the planner documents the mutation's receipt carries, one per table
+    /// the write validated.
+    plan: Option<LoadPlanExpect>,
 }
 
 /// A `--- mutate` step holding a control write. The expect lives inside
@@ -305,6 +315,9 @@ pub enum ControlWrite {
         /// `as commit`: the merge result is an unpublished commit.
         as_commit: bool,
         expect: MergeExpect,
+        /// `--- expect plan` after the step's expect: facts of the planner
+        /// documents the merge's receipt carries, one per validated table.
+        plan: Option<LoadPlanExpect>,
     },
     /// `commit publish "<id>"`.
     Publish {
@@ -575,6 +588,7 @@ struct Header {
     issue: IssueRef,
     traversal: Option<&'static str>,
     csv_slice_bytes: Option<usize>,
+    overwrite_chunk_rows: Option<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -583,8 +597,15 @@ enum IssueRef {
     Num(u64),
 }
 
-/// The five header keys, in the spelling the canonical form requires.
-const HEADER_KEYS: [&str; 5] = ["issue", "red_on", "notes", "traversal", "csv_slice_bytes"];
+/// The six header keys, in the spelling the canonical form requires.
+const HEADER_KEYS: [&str; 6] = [
+    "issue",
+    "red_on",
+    "notes",
+    "traversal",
+    "csv_slice_bytes",
+    "overwrite_chunk_rows",
+];
 
 /// Canonical spelling for one header key and its trimmed value.
 fn canonical_header_line(key: &str, value: &str) -> String {
@@ -623,6 +644,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
     let mut red_on = false;
     let mut traversal: Option<&'static str> = None;
     let mut csv_slice_bytes: Option<usize> = None;
+    let mut overwrite_chunk_rows: Option<usize> = None;
     for (idx, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -639,6 +661,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
             "red_on" => red_on,
             "traversal" => traversal.is_some(),
             "csv_slice_bytes" => csv_slice_bytes.is_some(),
+            "overwrite_chunk_rows" => overwrite_chunk_rows.is_some(),
             _ => false,
         };
         if duplicate {
@@ -689,6 +712,19 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
                     })?;
                 csv_slice_bytes = Some(bytes);
             }
+            "overwrite_chunk_rows" => {
+                let rows = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|rows| *rows > 0 && value == rows.to_string())
+                    .ok_or_else(|| {
+                        format!(
+                            "line {}: `# overwrite_chunk_rows:` takes a positive row count without sign or leading zeros, got `{value}`",
+                            idx + 1
+                        )
+                    })?;
+                overwrite_chunk_rows = Some(rows);
+            }
             other => unreachable!("split_header_line admits only HEADER_KEYS, got `{other}`"),
         }
     }
@@ -702,6 +738,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
         issue,
         traversal,
         csv_slice_bytes,
+        overwrite_chunk_rows,
     })
 }
 
@@ -949,6 +986,13 @@ pub fn read_target(step: &QueryStep, bindings: &Bindings) -> Result<ReadTarget, 
         Some(id) => ReadTarget::snapshot(SnapshotId::new(id)),
         None => ReadTarget::branch(&step.branch),
     })
+}
+
+/// The `commit` record a write that produced a graph commit hands the host:
+/// whether the commit advanced its branch head (`published`) or is an
+/// unpublished `as commit` proposal.
+pub fn commit_evidence(published: bool) -> serde_json::Value {
+    serde_json::json!({"published": published})
 }
 
 /// Record the commit a bound write published; a bound write that published
@@ -1761,6 +1805,7 @@ fn complete_control_step(
             into,
             as_commit,
             expect: complete_merge_expect(mode, section)?,
+            plan: None,
         },
         ControlSource::Commit(CommitWrite::Publish { graph_commit_id }) => ControlWrite::Publish {
             graph_commit_id,
@@ -1858,12 +1903,14 @@ fn complete_decl_step(
                     source: step.source,
                     name: step.name,
                     branch: step.branch,
+                    as_commit: step.decl.write_mode == MutationWriteMode::AsCommit,
                     ast_params: step.decl.params,
                     params_raw: step.params_raw,
                     expect: MutateExpect::Error { needle },
                     bind: None,
                     base_binding: step.base_binding,
                     branch_spelled: step.branch_spelled,
+                    plan: None,
                 })
             } else {
                 Step::Query(QueryStep {
@@ -1888,12 +1935,14 @@ fn complete_decl_step(
                 source: step.source,
                 name: step.name,
                 branch: step.branch,
+                as_commit: step.decl.write_mode == MutationWriteMode::AsCommit,
                 ast_params: step.decl.params,
                 params_raw: step.params_raw,
                 expect: MutateExpect::Ok,
                 bind: None,
                 base_binding: step.base_binding,
                 branch_spelled: step.branch_spelled,
+                plan: None,
             }))
         }
         (ExpectHeader::Affected { nodes, edges }, true) => {
@@ -1903,6 +1952,7 @@ fn complete_decl_step(
                 source: step.source,
                 name: step.name,
                 branch: step.branch,
+                as_commit: step.decl.write_mode == MutationWriteMode::AsCommit,
                 ast_params: step.decl.params,
                 params_raw: step.params_raw,
                 expect: MutateExpect::Affected {
@@ -1912,6 +1962,7 @@ fn complete_decl_step(
                 bind: None,
                 base_binding: step.base_binding,
                 branch_spelled: step.branch_spelled,
+                plan: None,
             }))
         }
     }
@@ -2597,7 +2648,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     let Some(mut step) = awaiting_plan.take() else {
                         if !awaiting_load_plan {
                             return Err(format!(
-                                "line {}: `--- expect plan` must directly follow a query step's `--- expect shape` or a `load csv` step's `--- expect ok`",
+                                "line {}: `--- expect plan` must directly follow a query step's `--- expect shape`, or the `--- expect` of a `load csv`, `branch merge` or mutate step that succeeds",
                                 section.header_line + 1
                             ));
                         }
@@ -2611,17 +2662,21 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                                 _ => None,
                             },
                         };
-                        let Some(Step::Control(ControlStep {
-                            write: ControlWrite::Load { plan, .. },
-                            ..
-                        })) = last
-                        else {
-                            return Err(format!(
-                                "line {}: internal: the step awaiting a load plan is not a `load csv` step",
-                                section.header_line + 1
-                            ));
+                        let slot = match last {
+                            Some(Step::Control(ControlStep {
+                                write:
+                                    ControlWrite::Load { plan, .. } | ControlWrite::Merge { plan, .. },
+                                ..
+                            })) => plan,
+                            Some(Step::Mutate(MutateStep { plan, .. })) => plan,
+                            _ => {
+                                return Err(format!(
+                                    "line {}: internal: the step awaiting a write plan is not a `load csv`, `branch merge` or mutate step",
+                                    section.header_line + 1
+                                ));
+                            }
                         };
-                        *plan = Some(LoadPlanExpect { lines });
+                        *slot = Some(LoadPlanExpect { lines });
                         continue;
                     };
                     let lines = parse_plan_body(&section.body)
@@ -2722,16 +2777,25 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     }
                 };
-                awaiting_load_plan = matches!(
-                    &completed,
+                awaiting_load_plan = match &completed {
                     Step::Control(ControlStep {
-                        write: ControlWrite::Load {
-                            expect: WriteExpect::Ok,
-                            ..
-                        },
+                        write:
+                            ControlWrite::Load {
+                                expect: WriteExpect::Ok,
+                                ..
+                            },
                         ..
-                    })
-                );
+                    }) => true,
+                    Step::Control(ControlStep {
+                        write: ControlWrite::Merge { expect, .. },
+                        ..
+                    }) => !matches!(expect, MergeExpect::Write(WriteExpect::Error { .. })),
+                    Step::Mutate(MutateStep {
+                        expect: MutateExpect::Ok | MutateExpect::Affected { .. },
+                        ..
+                    }) => true,
+                    _ => false,
+                };
                 if matches!(completed.read_expect(), Some(QueryExpect::Rows { .. })) {
                     substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
                     awaiting_shape = Some(completed);
@@ -2848,6 +2912,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         fixture,
         traversal: header.traversal,
         csv_slice_bytes: header.csv_slice_bytes,
+        overwrite_chunk_rows: header.overwrite_chunk_rows,
         items,
         needs_indices,
         csv_sections,
@@ -4066,6 +4131,7 @@ async fn run_control_step(
             into,
             as_commit,
             expect,
+            plan,
         } => {
             let target = into.as_deref().unwrap_or(MAIN_BRANCH);
             let outcome = operation(
@@ -4077,31 +4143,64 @@ async fn run_control_step(
             .map_err(&fail)?
             .inspect_err(|error| host.observe_fault(error));
             let commit = outcome.as_ref().ok().and_then(|result| {
-                result
-                    .commit
-                    .as_ref()
-                    .map(|commit| commit.graph_commit_id.clone())
+                result.commit.as_ref().map(|commit| {
+                    host.record("commit", || commit_evidence(commit.published));
+                    commit.graph_commit_id.clone()
+                })
             });
+            let plans: Vec<Value> = outcome
+                .as_ref()
+                .ok()
+                .map(|result| result.plans.iter().map(|plan| plan.to_value()).collect())
+                .unwrap_or_default();
             let outcome = outcome.map(|result| result.outcome);
             host.observe(|| format!("actual merge: {outcome:?}"));
             match expect {
                 MergeExpect::Write(expect) => {
                     host.observe(|| format!("actual control: {outcome:?}"));
-                    check_write_expect(host, name, expect, outcome)
-                        .map(|()| commit)
-                        .map_err(fail)
+                    check_write_expect(host, name, expect, outcome).map_err(&fail)?;
                 }
                 MergeExpect::Outcome(want) => match outcome {
-                    Ok(got) if got == *want => Ok(commit),
-                    Ok(got) => Err(fail(format!(
-                        "merge outcome mismatch: expected `{}`, got `{}`",
-                        merge_outcome_word(*want),
-                        merge_outcome_word(got)
-                    ))),
-                    Err(e) => Err(fail(format!("`{name}` failed: {e}"))),
+                    Ok(got) if got == *want => {}
+                    Ok(got) => {
+                        return Err(fail(format!(
+                            "merge outcome mismatch: expected `{}`, got `{}`",
+                            merge_outcome_word(*want),
+                            merge_outcome_word(got)
+                        )));
+                    }
+                    Err(e) => return Err(fail(format!("`{name}` failed: {e}"))),
                 },
             }
+            if let Some(expect) = plan {
+                check_write_plans(host, expect, &plans, "merge").map_err(fail)?;
+            }
+            Ok(commit)
         }
+    }
+}
+
+/// The `--- expect plan` of a mutate or `branch merge` step against the
+/// planner documents its receipt carries: a fact holds when any validated
+/// table's document holds it.
+fn check_write_plans(
+    host: &impl ExecutionHost,
+    expect: &LoadPlanExpect,
+    documents: &[Value],
+    what: &str,
+) -> Result<(), String> {
+    if documents.is_empty() {
+        return Err(format!(
+            "`--- expect plan` on a {what} whose receipt carries no plan: the write validated no table"
+        ));
+    }
+    host.observe(|| {
+        let facts: Vec<String> = load_plan::write_plan_facts(documents);
+        format!("actual {what} plans: {facts:?}")
+    });
+    match load_plan::write_plan_mismatch(&expect.lines, documents) {
+        Some(message) => Err(message),
+        None => Ok(()),
     }
 }
 
@@ -4165,6 +4264,13 @@ async fn run_mutate_step(
         }
         Err(error) => serde_json::json!({"error": error.to_string()}),
     });
+    if let Ok(MutationReceipt {
+        commit: Some(commit),
+        ..
+    }) = &outcome
+    {
+        host.record("commit", || commit_evidence(commit.published));
+    }
     host.observe(|| match &outcome {
         Ok(receipt) => format!(
             "actual affected: nodes={} edges={}",
@@ -4175,34 +4281,33 @@ async fn run_mutate_step(
     if let Some(violation) = check_pin(mode, &counts, false) {
         return Err(fail(violation));
     }
-    let commit_id = |receipt: &MutationReceipt| {
-        receipt
-            .commit
-            .as_ref()
-            .map(|commit| commit.graph_commit_id.clone())
-    };
-    match &step.expect {
-        MutateExpect::Ok => outcome
-            .map(|receipt| commit_id(&receipt))
-            .map_err(|e| fail(format!("mutation failed: {e}"))),
+    let receipt = match &step.expect {
+        MutateExpect::Ok => outcome.map_err(|e| fail(format!("mutation failed: {e}")))?,
         MutateExpect::Affected { nodes, edges } => {
             let receipt = outcome.map_err(|e| fail(format!("mutation failed: {e}")))?;
             let result = &receipt.result;
-            if result.affected_nodes == *nodes && result.affected_edges == *edges {
-                Ok(commit_id(&receipt))
-            } else {
-                Err(fail(format!(
+            if result.affected_nodes != *nodes || result.affected_edges != *edges {
+                return Err(fail(format!(
                     "affected counts mismatch: expected nodes={nodes} edges={edges}, got nodes={} edges={}",
                     result.affected_nodes, result.affected_edges
-                )))
+                )));
             }
+            receipt
         }
         MutateExpect::Error { needle } => {
-            check_error_expect(host, needle, outcome, "the mutation succeeded")
+            return check_error_expect(host, needle, outcome, "the mutation succeeded")
                 .map(|()| None)
-                .map_err(fail)
+                .map_err(fail);
         }
+    };
+    if let Some(expect) = &step.plan {
+        let plans: Vec<Value> = receipt.plans.iter().map(|plan| plan.to_value()).collect();
+        check_write_plans(host, expect, &plans, "mutation").map_err(fail)?;
     }
+    Ok(receipt
+        .commit
+        .as_ref()
+        .map(|commit| commit.graph_commit_id.clone()))
 }
 
 /// One session of a block: the statement on its branch through the case
@@ -4312,9 +4417,13 @@ pub fn execute_steps<'a, H: ExecutionHost>(
     host: &'a H,
 ) -> futures::future::BoxFuture<'a, Result<Session, String>> {
     let steps = execute_steps_inner(case, path, bless, session, uri, storage, host);
-    match case.csv_slice_bytes {
+    let steps = match case.csv_slice_bytes {
         Some(bytes) => omnigraph::instrumentation::with_csv_slice_bytes(bytes, steps).boxed(),
         None => steps.boxed(),
+    };
+    match case.overwrite_chunk_rows {
+        Some(rows) => omnigraph::instrumentation::with_overwrite_chunk_rows(rows, steps).boxed(),
+        None => steps,
     }
 }
 
@@ -4541,15 +4650,26 @@ fn expectation_evidence(step: &Step) -> Value {
             evidence
         }
         Step::List(l) => read_expect_evidence(&l.expect),
-        Step::Mutate(m) => match &m.expect {
-            MutateExpect::Ok => serde_json::json!({"kind": "ok"}),
-            MutateExpect::Affected { nodes, edges } => {
-                serde_json::json!({"kind": "affected", "nodes": nodes, "edges": edges})
+        Step::Mutate(m) => {
+            let mut evidence = match &m.expect {
+                MutateExpect::Ok => serde_json::json!({"kind": "ok"}),
+                MutateExpect::Affected { nodes, edges } => {
+                    serde_json::json!({"kind": "affected", "nodes": nodes, "edges": edges})
+                }
+                MutateExpect::Error { needle } => {
+                    serde_json::json!({"kind": "error", "contains": needle})
+                }
+            };
+            if let Some(plan) = &m.plan {
+                evidence["plan"] = serde_json::json!(
+                    plan.lines
+                        .iter()
+                        .map(load_plan::LoadFact::spell)
+                        .collect::<Vec<_>>()
+                );
             }
-            MutateExpect::Error { needle } => {
-                serde_json::json!({"kind": "error", "contains": needle})
-            }
-        },
+            evidence
+        }
         Step::Load(step) => {
             serde_json::json!({"kind": "load", "expectation": format!("{:?}", step.expect)})
         }
@@ -4723,6 +4843,47 @@ impl Case {
 }
 
 impl Step {
+    /// The step writes an unpublished commit: a mutation declared `as
+    /// commit` or a `branch merge … as commit`. Such a write advances no
+    /// head, so a graph nobody else writes to is unchanged by it.
+    pub fn as_commit(&self) -> bool {
+        match self {
+            Self::Mutate(step) => step.as_commit,
+            Self::Control(step) => {
+                matches!(
+                    step.write,
+                    ControlWrite::Merge {
+                        as_commit: true,
+                        ..
+                    }
+                )
+            }
+            Self::Query(_)
+            | Self::Load(_)
+            | Self::List(_)
+            | Self::Settings(_)
+            | Self::Show(_)
+            | Self::BranchRead(_)
+            | Self::Restart { .. }
+            | Self::Concurrent(_) => false,
+        }
+    }
+
+    /// `commit drop "${name}"`: the dropped commit is one this case bound,
+    /// never a literal id the case did not create.
+    pub fn drops_bound_commit(&self) -> bool {
+        match self {
+            Self::Control(ControlStep {
+                write:
+                    ControlWrite::Drop {
+                        graph_commit_id, ..
+                    },
+                ..
+            }) => bound_operand(graph_commit_id).is_some(),
+            _ => false,
+        }
+    }
+
     pub fn operation_kind(&self) -> StepKind {
         match self {
             Self::Query(_) => StepKind::Query,

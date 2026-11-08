@@ -50,7 +50,9 @@
      that could not run and why. Skip only when there is nothing.
 
   Precise terms. Name no command the checks tab runs. A user-visible change
-  carries a changelog.d/<slug>.<category>.md note.
+  carries a changelog.d/<slug>.<category>.md note; the `PR Title` check asks
+  one of every `feat`, `fix` and `perf` title unless the pull request carries
+  the `skip-changelog` label.
 -->
 
 Closes #

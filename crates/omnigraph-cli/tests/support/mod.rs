@@ -154,6 +154,20 @@ pub fn managed_command(config: &Path, origin: &str, target: &str) -> Command {
     command
 }
 
+pub fn write_managed_data_target(config: &Path, origin: &str, endpoint: &str) {
+    use std::io::Write;
+    write_managed_target(config, origin);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(managed_home(config).join("config.yaml"))
+        .unwrap();
+    writeln!(
+        file,
+        "    endpoint: {endpoint}\n    default_graph: knowledge"
+    )
+    .unwrap();
+}
+
 pub fn managed_cli(config: &Path, origin: &str) -> Command {
     let mut command = managed_command(config, origin, "managed-test");
     command.arg("cluster");
@@ -1668,6 +1682,7 @@ pub fn parity_accepts_actor(args: &[&str]) -> bool {
         (args.first().copied(), args.get(1).copied()),
         (Some("branch"), Some("create" | "delete" | "merge"))
             | (Some("blob"), Some("put" | "clear"))
+            | (Some("index"), Some("build" | "rebuild"))
             | (Some("commit"), Some("publish" | "drop"))
             | (Some("schema"), Some("apply"))
             | (Some("cluster"), Some("plan" | "apply" | "upgrade-ledger"))

@@ -3,9 +3,11 @@ name: PR Title
 # Every merge into `main` is a squash whose subject is the pull request
 # title, so the title is the line `git log` keeps. This is a policy check on
 # the pull request, so it must run code the pull request cannot edit:
-# `pull_request_target` takes this workflow and `scripts/check-pr-title.py`
-# from the base branch, and the head is never fetched or checked out. The
-# `edited` event re-runs the check when the title changes. On the merge
+# `pull_request_target` takes this workflow and its scripts from the base
+# branch; the head is fetched only as data for the release-note diff range
+# and is never checked out or executed. The `edited` event re-runs the check
+# when the title changes, `synchronize` when the notes may have, and
+# `labeled`/`unlabeled` when `skip-changelog` changes its answer. On the merge
 # queue the group commit's message already carries the squash subject the
 # queue will land, so the merge-group run checks that subject with the same
 # script; a title edit after queueing does not change the captured subject
@@ -17,6 +19,8 @@ on:
       - synchronize
       - reopened
       - edited
+      - labeled
+      - unlabeled
   merge_group:
 
 concurrency:
@@ -32,9 +36,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      # The base branch on a pull request; the queued commit on the merge group.
+      # The base branch on a pull request, with the history the release-note
+      # diff needs for its merge base; the queued commit on the merge group.
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request_target' && '0' || '1' }}
 
       - name: Self-test the checker
         run: python3 scripts/check-pr-title.py --self-test
@@ -44,6 +51,28 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: python3 scripts/check-pr-title.py --title "$PR_TITLE"
+
+      # The head as data only. `refs/pull/N/head` resolves for fork PRs too.
+      - name: Fetch the pull request head
+        if: github.event_name == 'pull_request_target'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+
+      - name: Check the release notes
+        if: github.event_name == 'pull_request_target'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/check-release-note.py --self-test
+          python3 scripts/check-release-note.py \
+            --title="$PR_TITLE" \
+            --labels="$PR_LABELS" \
+            --range "$BASE_SHA...$HEAD_SHA"
 
       - name: Check the subject the merge queue lands
         if: github.event_name == 'merge_group'

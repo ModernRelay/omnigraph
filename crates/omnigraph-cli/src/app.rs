@@ -343,6 +343,11 @@ fn write_machine<T: Serialize>(
             writeln!(writer, "{}", serde_json::to_string(value)?)?;
             Ok(())
         }
+        MachineErrors::Toon => {
+            let value = serde_json::to_value(value)?;
+            writeln!(writer, "{}", crate::toon::encode(&value))?;
+            Ok(())
+        }
     }
 }
 
@@ -856,6 +861,21 @@ async fn run_bound(
         Command::Optimize(args) => {
             return commands::maintenance::run_optimize(
                 args,
+                commands::maintenance::MaintenanceScope {
+                    operator: &operator,
+                    target: required_target(),
+                    graph: cli.graph.as_deref(),
+                    actor: cli.as_actor.as_deref(),
+                    yes: cli.yes,
+                },
+                stdout,
+                stderr,
+            )
+            .await;
+        }
+        Command::Index { command } => {
+            return commands::maintenance::run_index(
+                command,
                 commands::maintenance::MaintenanceScope {
                     operator: &operator,
                     target: required_target(),

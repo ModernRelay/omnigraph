@@ -4,10 +4,10 @@
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_planner::EmptyEligible;
 use omnigraph_planner::{
-    AggregateFields, ColumnRef, ContainsJoinFields, CsvSourceFields, ExpandFields,
-    FragmentWriteFields, HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode,
-    PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind, RankedAccess, ScanInput,
-    ScanSpec, SideId, SortMergeJoinFields, ValidateFields,
+    AggregateFields, ColumnRef, ContainsJoinFields, CsvSourceFields, DeltaSourceFields,
+    ExpandFields, FragmentWriteFields, HashJoinFields, HydratedBinding, Lower, NodeId,
+    PhysicalNode, PhysicalPlan, PlanError, Prefilter, RankArm, RankFuseFields, RankKind,
+    RankedAccess, ScanInput, ScanSpec, SideId, SortMergeJoinFields, ValidateFields,
 };
 
 fn no_prefilter() -> Prefilter {
@@ -213,6 +213,10 @@ impl Lower for Trace {
 
     fn csv_source(&mut self, id: NodeId, _: CsvSourceFields<'_>) -> Result<String, PlanError> {
         self.call("csv_source", id, &[])
+    }
+
+    fn delta_source(&mut self, id: NodeId, _: DeltaSourceFields<'_>) -> Result<String, PlanError> {
+        self.call("delta_source", id, &[])
     }
 
     fn validate(

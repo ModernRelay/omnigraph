@@ -81,10 +81,14 @@ pub struct ManifestError {
     pub kind: ManifestErrorKind,
     pub message: String,
     pub details: Option<ManifestConflictDetails>,
-    /// Publication may be durable despite an unavailable acknowledgement or
-    /// readback. Retention guards must remain until authority proves it cannot
-    /// still publish; the external error category remains `Internal`.
-    pub publication_in_doubt: bool,
+    /// The graph commit of a publication that may be durable despite an
+    /// unavailable acknowledgement or readback; `None` when no publication is
+    /// in doubt. Retention guards must remain until authority proves it cannot
+    /// still publish; the external error category remains `Internal`. The id
+    /// is an engine identifier, never a storage path, so a log may name it
+    /// where it names no message. A thin box keeps the field one word, so
+    /// every `Result<_, OmniError>` stays under the large-error bound.
+    pub publication_in_doubt: Option<Box<String>>,
 }
 
 impl ManifestError {
@@ -93,7 +97,7 @@ impl ManifestError {
             kind,
             message: message.into(),
             details: None,
-            publication_in_doubt: false,
+            publication_in_doubt: None,
         }
     }
 
@@ -265,6 +269,17 @@ fn format_merge_conflicts(conflicts: &[MergeConflict]) -> String {
         .join("; ")
 }
 
+/// The command that builds a branch's missing declared indexes, as errors and
+/// reports name it. `<target>` and `<branch>` are placeholders; the CLI
+/// parses every remedy command with them filled in.
+pub const INDEX_BUILD_COMMAND: &str = "omnigraph index build --target <target> --branch <branch>";
+
+/// The command that rebuilds a branch's full-text indexes from its rows with
+/// the engine's analyzer, as errors and reports name it; placeholders as in
+/// [`INDEX_BUILD_COMMAND`].
+pub const FULL_TEXT_REBUILD_COMMAND: &str =
+    "omnigraph index rebuild --kind full-text --target <target> --branch <branch>";
+
 #[derive(Debug, Error)]
 pub enum OmniError {
     /// Operation-local completion evidence. Composing callers must discard
@@ -287,7 +302,8 @@ pub enum OmniError {
     /// be proven compatible. Ordinary reads remain available; do not return a
     /// partial indexed result or infer provenance from the dataset writer.
     #[error(
-        "full-text index '{index}' requires rebuild: {reason}; run omnigraph rebuild-full-text-indexes <URI> --branch <branch> on the live branch (historical snapshots are unchanged)"
+        "full-text index '{index}' requires rebuild: {reason}; run {remedy} on the live branch (historical snapshots are unchanged)",
+        remedy = FULL_TEXT_REBUILD_COMMAND
     )]
     FullTextIndexRebuildRequired { index: String, reason: String },
     /// A full-text call reads a declared full-text index that has no segment
@@ -296,7 +312,8 @@ pub enum OmniError {
     /// before any scan rather than answered differently; `index` is
     /// `Type.property`.
     #[error(
-        "full-text index '{index}' has no segment at this snapshot; build it with omnigraph optimize <URI> on main or omnigraph rebuild-full-text-indexes <URI> --branch <branch> (historical snapshots are unchanged)"
+        "full-text index '{index}' has no segment at this snapshot; build it with {remedy} (historical snapshots are unchanged)",
+        remedy = INDEX_BUILD_COMMAND
     )]
     FullTextIndexRequired { index: String },
     /// The exact staged-commit adapter proved that Lance contention was
@@ -774,7 +791,7 @@ impl OmniError {
                 | Self::InitializationCommitted { .. }
                 | Self::InitializationIndeterminate { .. }
                 | Self::Manifest(ManifestError {
-                    publication_in_doubt: true,
+                    publication_in_doubt: Some(_),
                     ..
                 })
         ) {
@@ -1017,11 +1034,28 @@ impl OmniError {
         Self::Manifest(ManifestError::new(ManifestErrorKind::Internal, message))
     }
 
-    pub fn manifest_publish_in_doubt(message: impl Into<String>) -> Self {
+    /// A publication of graph commit `graph_commit_id` whose outcome is
+    /// unknown: it may be durable, now or later.
+    pub fn manifest_publish_in_doubt(
+        graph_commit_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self::Manifest(ManifestError {
-            publication_in_doubt: true,
+            publication_in_doubt: Some(Box::new(graph_commit_id.into())),
             ..ManifestError::new(ManifestErrorKind::Internal, message)
         })
+    }
+
+    /// The graph commit of a publication whose outcome is unknown, through
+    /// any completion evidence wrapped around it.
+    pub fn publication_id(&self) -> Option<&str> {
+        match self.without_evidence() {
+            Self::Manifest(ManifestError {
+                publication_in_doubt: Some(graph_commit_id),
+                ..
+            }) => Some(graph_commit_id.as_str()),
+            _ => None,
+        }
     }
 
     /// Whether a manifest publication lacks a definitive durable outcome.
@@ -1030,7 +1064,7 @@ impl OmniError {
         matches!(
             self.without_evidence(),
             Self::Manifest(ManifestError {
-                publication_in_doubt: true,
+                publication_in_doubt: Some(_),
                 ..
             })
         )
@@ -1426,7 +1460,7 @@ mod tests {
         );
 
         let explicit = [
-            OmniError::manifest_publish_in_doubt("publish acknowledgement lost"),
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "publish acknowledgement lost"),
             OmniError::recovery_required("commit", "contract pending"),
             OmniError::InitializationCommitted {
                 uri: "memory://graph".to_string(),
@@ -1557,7 +1591,7 @@ mod tests {
         }
 
         for uncertain in [
-            OmniError::manifest_publish_in_doubt("publish acknowledgement lost"),
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "publish acknowledgement lost"),
             OmniError::recovery_required("commit", "contract pending"),
             OmniError::manifest("returned after effects")
                 .with_completion_evidence(CompletionEvidence::Uncertain),
@@ -1657,7 +1691,7 @@ mod tests {
         assert!(matches!(cause, OmniError::KeyConflict { .. }));
 
         for uncertain in [
-            OmniError::manifest_publish_in_doubt("rows publish in doubt")
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "rows publish in doubt")
                 .after_earlier_publication(),
             refused()
                 .with_completion_evidence(CompletionEvidence::Uncertain)
@@ -1736,7 +1770,8 @@ mod tests {
                 Some("commit-before".to_string()),
                 Some("commit-after".to_string()),
             ),
-            OmniError::manifest_publish_in_doubt("exact in-doubt outcome").with_context("merge"),
+            OmniError::manifest_publish_in_doubt("01JCOMMIT", "exact in-doubt outcome")
+                .with_context("merge"),
             OmniError::ResourceLimitExceeded {
                 resource: "blob materialization bytes".to_string(),
                 limit: 10,
@@ -2208,6 +2243,24 @@ mod tests {
                 ..
             }) if message == "carried engine invariant"
         ));
+    }
+
+    /// An in-doubt publication names its graph commit, through context,
+    /// completion evidence and the DataFusion stream carrier, so a log can
+    /// name it without the message. Nothing else names one.
+    #[test]
+    fn an_in_doubt_publication_names_its_commit_issue_1067() {
+        let in_doubt = OmniError::manifest_publish_in_doubt("01JCOMMIT", "acknowledgement lost")
+            .with_context("merge");
+        assert_eq!(in_doubt.publication_id(), Some("01JCOMMIT"));
+        let wrapped = in_doubt.with_completion_evidence(CompletionEvidence::Uncertain);
+        assert_eq!(wrapped.publication_id(), Some("01JCOMMIT"));
+        let carried = OmniError::datafusion(wrapped.into_datafusion_external());
+        assert_eq!(carried.publication_id(), Some("01JCOMMIT"));
+        assert_eq!(
+            OmniError::manifest_internal("not a publication").publication_id(),
+            None
+        );
     }
 
     #[test]

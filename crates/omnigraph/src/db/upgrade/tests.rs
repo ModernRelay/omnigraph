@@ -521,6 +521,38 @@ async fn assert_converted(source: &Source) {
         let dataset = open(root, Some(branch)).await.unwrap();
         assert_eq!(dataset.version().version, version, "{branch}");
     }
+    // A detailed listing serves each converted branch's start from the legacy
+    // history: `feature` wrote its own head, so its start is read at the
+    // pre-upgrade version it was created from; `child` was forked from the
+    // retired `gone`.
+    let listing = crate::db::manifest::list_graph_branches_detailed(
+        root,
+        &crate::lance_access::control_session(),
+        &mut |_| true,
+    )
+    .await
+    .unwrap();
+    let details: Vec<_> = listing
+        .details
+        .iter()
+        .map(|detail| {
+            (
+                detail.name.as_str(),
+                detail.from.as_deref(),
+                detail.from_commit_id.clone(),
+                detail.head.graph_commit_id.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        details,
+        [
+            ("main", None, None, id(4)),
+            ("child", Some("gone"), Some(id(3)), id(3)),
+            ("feature", Some("main"), Some(id(2)), id(6)),
+            ("fresh", Some("feature"), Some(id(5)), id(5)),
+        ]
+    );
     assert_eq!(
         root_objects(source.dir.path()),
         root_objects_of(source),

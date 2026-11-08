@@ -58,10 +58,24 @@ With OIDC, the challenge names the protected-resource metadata:
 WWW-Authenticate: Bearer resource_metadata="https://graphs.example.com/.well-known/oauth-protected-resource/mcp"
 ```
 
-When a bearer credential was presented and refused (expired, wrong audience,
-unknown subject), the challenge also carries `error="invalid_token"`, which tells
-a client to refresh or sign in again. Without OIDC the challenge is `Bearer`,
-which advertises no sign-in flow.
+When a bearer credential was presented and refused (bad signature, expired,
+wrong audience or organization), the challenge also carries
+`error="invalid_token"`, which tells a client to refresh or sign in again.
+Without OIDC the challenge is `Bearer`, which advertises no sign-in flow.
+
+Two refusals of a valid token carry no challenge, because signing in again
+issues a token for the same person and cannot help:
+
+- the admission file names no principal for the token's subject: 403
+  `not_admitted`. The server's operator must admit the identity;
+- the admission snapshot has expired, for example during a publisher outage:
+  503 `service_unavailable` with `Retry-After`. Access returns with the next
+  publication.
+
+A token's `client_id` is kept beside the actor, which stays one `principal:<id>`
+for every client a person uses. The [access route](policy.md#learn-your-access)
+and the `policy decision` log line name it; commits do not yet. It is opaque
+client-chosen text: render it escaped.
 
 The server has one resource identifier, so every route's challenge names the
 same metadata. RFC 9728 §3.3 has a client that followed a challenge require the
@@ -99,27 +113,29 @@ Codex in a terminal, connects to an existing server through the CLI:
 ```
 
 `omnigraph mcp --target NAME [--graph G] [--write]` relays each JSON-RPC message
-on stdin to the server target's `/mcp`, one `POST` each, and writes each answer
+on stdin to a server or managed target's `/mcp`, one `POST` each, and writes each answer
 as one line on stdout; diagnostics go to stderr. Tools, their logic and their
 refusals stay the server's.
 
-- **Credential.** Requests carry the token of the target's `auth`, acquired as
-  every served command acquires it ([authentication providers](../cli/targets.md#authentication-providers));
+- **Credential.** Requests use the same credential acquisition as served graph
+  commands. Server targets use their `auth`; managed targets exchange the
+  pinned profile's credential for an identity bound to that cluster ([authentication providers](../cli/targets.md#authentication-providers));
   it never appears in the agent's configuration or output. A target whose
-  `auth` is `provider: anonymous` sends none. `--as ACTOR` sends `Omnigraph-If-Actor` with
-  every request, so another actor's token is refused with `412 actor_mismatch`.
+  `auth` is `provider: anonymous` sends none. On server targets, `--as ACTOR` sends
+  `Omnigraph-If-Actor` with every request, so another actor's token is refused
+  with `412 actor_mismatch`. Managed targets refuse `--as` before any I/O.
 - **One graph.** `--graph`, else the target's `default_graph`; without either the
   command refuses before any request. A tool call that omits `graph` gets it, a
   call or resource URI naming another graph is refused with a JSON-RPC error, and
   `graphs` and `omnigraph://graphs` list only this graph. Run one bridge per
   graph.
-- **Two consents for writes.** The server lists write tools only with
-  `--mcp-allow-writes`. Without `--write`, the bridge lists and admits only the
+- **Writes need `--write`.** Without it, the bridge lists and admits only the
   tools the server annotates `readOnlyHint: true`, and refuses a call to any
   other before sending it. The applied policy still decides every call.
-- **Existing servers only.** A direct graph, root or catalogue target, and a
-  managed target, refuse with `target_kind_unsupported` before any I/O. The
-  bridge opens no storage and never starts or discovers a server.
+- **Existing endpoints only.** A server or managed target must name its existing
+  endpoint. Direct graph, root and catalogue targets refuse with
+  `target_kind_unsupported` before any I/O. The bridge opens no storage and never
+  starts a server or enables its MCP route.
 
 The bridge relays up to 16 requests at once, the server's own limit, and
 answers them as they complete. It applies `notifications/cancelled` itself: the
@@ -129,7 +145,7 @@ before running it again. It never sends a request again:
 
 | Failure | JSON-RPC error `data` |
 |---|---|
-| The server refused the request over HTTP (401, 412, 429, …) | `status` and the server's error body as `error`. A 401 also carries the server's `WWW-Authenticate` challenge, verbatim, as `www_authenticate` when it sends one |
+| The server refused the request over HTTP (401, 412, 429, …) | `status` and the server's error body as `error`. A 401 also carries the server's `WWW-Authenticate` challenge as `www_authenticate` when it sends one. Managed credentials reflected in error bodies or challenges are redacted |
 | Nothing was sent: the server could not be reached, or speaks another HTTP contract | `error.code` `service_unavailable`, or `api_contract_mismatch`, with `effects: none` |
 | The answer was lost, or took longer than 45 seconds | `outcome_unknown` with `effects: unknown` for a call to a tool that may write; otherwise `service_unavailable`, `deadline_exceeded` or `result_too_large` with `effects: none` |
 
@@ -141,20 +157,35 @@ a restart. An `env` source is fixed when the bridge starts, and a token
 replaced with `omnigraph credentials set` belongs to a new credential
 generation, so both take a restart; the error says how to replace the token. A
 server that stays unreachable fails each request; the bridge keeps running
-until stdin closes.
+until stdin closes. Managed resource credentials renew through the selected
+profile's normal cache before expiry. A refused managed credential is removed
+only if it is still the cached one, and renewed for later messages; the refused
+message is never replayed. If an expiring credential runs out before a message
+is sent, including during discovery, the bridge renews it once before sending.
+If the replacement also expires, the message fails without being sent. Renewal
+never starts an interactive login.
+
+An expiring managed profile's `exec` credential is also renewed before later
+requests. The verified organization and principal must remain the same for the
+life of the bridge; a changed identity requires restarting it. Organization
+service permissions remain current provider facts. Managed error messages,
+including JSON-RPC tool errors, never expose a reflected resource credential.
 
 ## Settings
 
 | Flag | Environment | Default | Effect |
 |---|---|---|---|
-| `--mcp-allow-adhoc` | `OMNIGRAPH_MCP_ALLOW_ADHOC=1` | off | Lists and admits the `read` tool |
-| `--mcp-allow-writes` | `OMNIGRAPH_MCP_ALLOW_WRITES=1` | off | Lists and admits the write tools |
 | `--mcp-allowed-host <host[:port]>`, repeatable | `OMNIGRAPH_MCP_ALLOWED_HOSTS=a,b` | none | Adds allowed `Host` values |
 
-Settings are read once at boot. They enable tools; they grant nothing. A tool
-that is off is absent from `tools/list`, and a call to it is refused as an
-unknown tool. The opt-ins stay off even when a policy is applied: turn them on
-for a deployment whose policy was written with an LLM caller in mind.
+Settings are read once at boot. `/mcp` lists every tool below, and each call
+runs under the same policy action as its HTTP route, so a caller can do over
+MCP exactly what its credential may do over HTTP. To restrict what an agent
+may do, narrow the policy for the agent's credential.
+
+The removed `--mcp-allow-adhoc` and `--mcp-allow-writes` flags make
+`omnigraph-server` refuse to start; leftover `OMNIGRAPH_MCP_ALLOW_*` variables
+are ignored, so such a deployment lists every tool. A token with no applied
+policy still only reads: `query` answers, and a write tool returns 403.
 
 ## Tools
 
@@ -166,11 +197,10 @@ for a deployment whose policy was written with an LLM caller in mind.
 | `graphs` | none | `GET /graphs/discovery` for an identity credential; otherwise `GET /graphs`, narrowed to ids and names | identity, or `graph_list` |
 | `schema` | `graph` | `GET /graphs/{graph_id}/schema` | `read` |
 | `queries` | `graph` | `GET /graphs/{graph_id}/queries` | `read` |
-| `query` | `graph`, `name`, optional `params`, `branch` | `POST /graphs/{graph_id}/queries/{query_name}` as a read | `invoke_query`, then `read` |
-| `read` (opt-in) | `graph`, `query`, optional `name`, `params`, `branch`, `snapshot` | `POST /graphs/{graph_id}/query` | `read`; `change` for `explain load csv` |
+| `query` | `graph`, `query` (source) or `name` (stored), optional `params`, `branch`, `snapshot` | source: `POST /graphs/{graph_id}/query`; name: `POST /graphs/{graph_id}/queries/{query_name}` as a read | source: `read`, and `change` for `explain load csv`; name: `invoke_query`, then `read` |
 | `snapshot` | `graph`, optional `branch` | `GET /graphs/{graph_id}/snapshot` | `read` |
 | `access` | `graph`, optional `branch`, `target_branch` | `GET /graphs/{graph_id}/access` | none |
-| `branches_list` | `graph` | `GET /graphs/{graph_id}/branches` | `read` |
+| `branches_list` | `graph`, optional `detailed` | `GET /graphs/{graph_id}/branches` | `read`; with `detailed`, details only for branches the caller may `read` |
 | `branches_diff` | `graph`, `source`, optional `target`, `kind`, `type`, `op`, `page_token`, `limit` | `GET /graphs/{graph_id}/branches/diff` | `read` on both branches |
 | `branches_merge_base` | `graph`, `source`, optional `target` | `GET /graphs/{graph_id}/branches/merge-base` | `read` on both branches |
 | `commits_list` | `graph`, optional `branch`, `listing`, `limit`, `page_token` | `GET /graphs/{graph_id}/commits` | `read` |
@@ -186,14 +216,13 @@ token, `graphs` returns 403 until the cluster policy permits `graph_list`; the
 other tools still work with a graph id the user supplies.
 
 The server's `initialize` instructions tell a model to call `graphs`, then
-`schema`, then a stored read with `query` or, when enabled, its own GQ read with
-`read`.
+`schema`, then `query` with a stored read's `name` or its own GQ source.
 
 - `queries` lists every stored query with its typed parameters (`name`,
   `kind`, `nullable`, plus `item_kind` for lists and `vector_dim` for
   vectors). An entry with `mutation: true` is a stored mutation, which
-  `mutate` runs when write tools are enabled.
-- `query` refuses stored mutations.
+  `mutate` runs.
+- `query` refuses stored mutations; `mutate` runs them.
 - `commits_list` takes `listing`: `history` (the default), `unpublished` for
   proposals written `as commit` that await `commits_publish`, or `unattached`
   for snapshots written `as unattached branch`. Only `history` pages.
@@ -205,15 +234,16 @@ The server's `initialize` instructions tell a model to call `graphs`, then
   `omnigraph blob stat --json` prints: the `selector`, `kind` (`managed`, with
   `size` and `etag`, or `external`, with `uri`) and the resolved `target`. It
   reads no payload byte. The route's conditional headers are not arguments.
-- `read` takes GQ source with typed parameter declarations, the same body as
-  `POST /query`. It also answers `branch list`, `branch diff`,
+- `query` with `query` takes GQ source with typed parameter declarations, the
+  same body as `POST /query`; `name` alongside source picks one declared query.
+  Source also answers `branch list`, `branch diff`,
   `branch merge-base`, `branch merge … dry run` and `explain query …`.
   `explain load csv …` requires `change` on its target branch before probing
   source metadata; it reads no payload byte and publishes nothing. It accepts
   `branch`, while refusing `snapshot`, `name` and `params`.
   The tool refuses `insert`, `update`, `delete` and branch writes with the route's 400.
 
-### Write tools (opt-in)
+### Write tools
 
 | Tool | Arguments | Runs | Policy action |
 |---|---|---|---|
@@ -248,7 +278,7 @@ Write tools follow one contract:
   completion the server cannot confirm, returns `isError` with
   `code: outcome_unknown`. A write the client cancelled, timed out or lost the
   connection for returns nothing, and means the same. Before replaying it, read
-  the target with `read` or `snapshot` and compare `graph_commit_id`, or list the
+  the target with `query` or `snapshot` and compare `graph_commit_id`, or list the
   branch with `commits_list`; replay a `mutate` with `if_graph_commit`, so a write
   that did land fails with 412 instead of applying twice. The 30 second wait is
   below the MCP TypeScript SDK's default 60 second request timeout; a client with
