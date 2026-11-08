@@ -1,0 +1,133 @@
+# issue: none
+# notes: A three-table insert, two nodes and the edge between them, fails at the first table's detached commit while
+# notes: the other two commits run: nothing is visible before or after a restart, the retry lands once. The sibling case fails at the last of three.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+}
+node Company {
+    name: String @key
+}
+edge WorksAt: Person -> Company {
+    @key(@src, @dst)
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice"}}
+{"type":"Person","data":{"name":"eve"}}
+{"type":"Company","data":{"name":"acme"}}
+{"type":"Company","data":{"name":"initech"}}
+{"edge":"WorksAt","from":"alice","to":"acme"}
+{"edge":"WorksAt","from":"eve","to":"acme"}
+
+--- seam
+at: mutation.post_table_commit
+occurrence: 1
+action: fail
+scope: next_step
+
+--- mutate branch: main
+query w() {
+    insert Person { name: "bob" }
+    insert Company { name: "globex" }
+    insert WorksAt { from: "bob", to: "globex" }
+}
+--- expect error: injected failpoint triggered: mutation.post_table_commit
+
+--- query
+query before_restart_person() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"eve"}
+--- expect shape
+p.name: String
+
+--- query
+query before_restart_company() { match { $c: Company } return { $c.name } }
+--- expect unordered
+{"c.name":"acme"}
+{"c.name":"initech"}
+--- expect shape
+c.name: String
+
+--- query
+query before_restart_worksat() { match { $p: Person $p worksAt $c } return { $p.name, $c.name } }
+--- expect unordered
+{"c.name":"acme","p.name":"alice"}
+{"c.name":"acme","p.name":"eve"}
+--- expect shape
+p.name: String
+c.name: String
+
+--- restart
+
+--- query
+query after_restart_person() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"eve"}
+--- expect shape
+p.name: String
+
+--- query
+query after_restart_company() { match { $c: Company } return { $c.name } }
+--- expect unordered
+{"c.name":"acme"}
+{"c.name":"initech"}
+--- expect shape
+c.name: String
+
+--- query
+query after_restart_worksat() { match { $p: Person $p worksAt $c } return { $p.name, $c.name } }
+--- expect unordered
+{"c.name":"acme","p.name":"alice"}
+{"c.name":"acme","p.name":"eve"}
+--- expect shape
+p.name: String
+c.name: String
+
+--- mutate branch: main
+query w() {
+    insert Person { name: "bob" }
+    insert Company { name: "globex" }
+    insert WorksAt { from: "bob", to: "globex" }
+}
+--- expect affected: nodes=2 edges=1
+
+--- restart
+
+--- query
+query landed_person() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+{"p.name":"eve"}
+--- expect shape
+p.name: String
+
+--- query
+query landed_company() { match { $c: Company } return { $c.name } }
+--- expect unordered
+{"c.name":"acme"}
+{"c.name":"globex"}
+{"c.name":"initech"}
+--- expect shape
+c.name: String
+
+--- query
+query landed_worksat() { match { $p: Person $p worksAt $c } return { $p.name, $c.name } }
+--- expect unordered
+{"c.name":"acme","p.name":"alice"}
+{"c.name":"acme","p.name":"eve"}
+{"c.name":"globex","p.name":"bob"}
+--- expect shape
+p.name: String
+c.name: String

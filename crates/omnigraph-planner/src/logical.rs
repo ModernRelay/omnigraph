@@ -4,7 +4,9 @@ use std::hash::Hash;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::SystemColumns;
-use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate, ValidateCheck};
+use omnigraph_compiler::ir::{
+    DeltaClass, IRExpr, IROrdering, IRProjection, SubqueryPredicate, ValidateCheck,
+};
 use omnigraph_compiler::query::ast::LoadStmtMode;
 use omnigraph_compiler::traversal::EdgeSelection;
 use serde::{Deserialize, Serialize};
@@ -260,6 +262,7 @@ logical_kinds! {
     Aggregate => "Aggregate", RefusedByName;
     AntiJoin => "AntiJoin", RefusedByName;
     CsvSource => "CsvSource", RefusedByName;
+    DeltaSource => "DeltaSource", RefusedByName;
     Expand => "Expand", RefusedByName;
     Filter => "Filter", Routable;
     FragmentWrite => "FragmentWrite", RefusedByName;
@@ -446,6 +449,18 @@ impl CsvSourceSpec {
             .max(1);
         source_bytes / narrowest_row
     }
+}
+
+/// A write's staged delta of one table, already in memory on the executor:
+/// the table at the version the committed side pins, the exact rows, what
+/// the write does to them and whether it removes ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeltaSourceSpec {
+    pub table: String,
+    pub version: Option<u64>,
+    pub rows: u64,
+    pub delta: DeltaClass,
+    pub deletes: bool,
 }
 
 /// A committed table a validation reads beside the delta, at the version
@@ -638,13 +653,19 @@ pub enum LogicalNode {
     CsvSource {
         spec: Box<CsvSourceSpec>,
     },
-    /// Every constraint of the load judged over the whole delta in one pass,
-    /// in list order, which is the refusal precedence: the input passes
-    /// through unchanged or the statement is refused.
+    /// A write's leaf: the staged delta of one table, in memory on the
+    /// executor.
+    DeltaSource {
+        spec: Box<DeltaSourceSpec>,
+    },
+    /// Every constraint of the write judged over the whole delta in one pass,
+    /// in list order (the refusal precedence): the input passes through or the
+    /// statement is refused; `replaced` empties the table's committed image.
     Validate {
         input: LogicalId,
         table: String,
         checks: Vec<ValidateSpec>,
+        replaced: bool,
     },
     /// The validated delta written as fragments of the target; one row,
     /// `count`. Publication is the driver's epilogue, never a node.
@@ -658,6 +679,7 @@ impl LogicalNode {
     pub fn kind(&self) -> LogicalKind {
         match self {
             Self::CsvSource { .. } => LogicalKind::CsvSource,
+            Self::DeltaSource { .. } => LogicalKind::DeltaSource,
             Self::Validate { .. } => LogicalKind::Validate,
             Self::FragmentWrite { .. } => LogicalKind::FragmentWrite,
             Self::TableScan { .. } => LogicalKind::TableScan,
@@ -703,9 +725,10 @@ impl LogicalNode {
                 target,
             } => vec![*base, *source, *target],
             Self::TableScan { input, .. } => input.iter().copied().collect(),
-            Self::MetadataCount { .. } | Self::OuterReference { .. } | Self::CsvSource { .. } => {
-                Vec::new()
-            }
+            Self::MetadataCount { .. }
+            | Self::OuterReference { .. }
+            | Self::CsvSource { .. }
+            | Self::DeltaSource { .. } => Vec::new(),
         }
     }
 
@@ -733,9 +756,10 @@ impl LogicalNode {
                 target,
             } => vec![base, source, target],
             Self::TableScan { input, .. } => input.iter_mut().collect(),
-            Self::MetadataCount { .. } | Self::OuterReference { .. } | Self::CsvSource { .. } => {
-                Vec::new()
-            }
+            Self::MetadataCount { .. }
+            | Self::OuterReference { .. }
+            | Self::CsvSource { .. }
+            | Self::DeltaSource { .. } => Vec::new(),
         }
     }
 }
@@ -1079,6 +1103,7 @@ impl LogicalPlan {
                 "typed_exprs": crate::typed::returns(return_exprs),
             }),
             LogicalNode::CsvSource { spec } => csv_source_json(spec),
+            LogicalNode::DeltaSource { spec } => delta_source_json(spec),
             LogicalNode::Validate { table, checks, .. } => validate_json(table, checks),
             LogicalNode::FragmentWrite { spec, .. } => fragment_write_json(spec),
         };
@@ -1142,6 +1167,17 @@ pub(crate) fn csv_source_json(spec: &CsvSourceSpec) -> Value {
         "columns": spec.columns,
         "table": spec.table,
         "version": spec.version,
+    })
+}
+
+pub(crate) fn delta_source_json(spec: &DeltaSourceSpec) -> Value {
+    json!({
+        "node": "DeltaSource",
+        "table": spec.table,
+        "version": spec.version,
+        "rows": spec.rows,
+        "delta": spec.delta,
+        "deletes": spec.deletes,
     })
 }
 

@@ -20,6 +20,9 @@ use crate::error::Result;
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     inner: omnigraph_catalog::Snapshot,
+    /// Opened through a branch incarnation that was already retired, by its
+    /// exact commit, while a live branch retained the commit.
+    retired_incarnation: bool,
 }
 
 /// Read-only view of one backing dataset pinned by a [`Snapshot`].
@@ -216,7 +219,22 @@ impl Snapshot {
     }
 
     pub(crate) fn wrap(inner: omnigraph_catalog::Snapshot) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            retired_incarnation: false,
+        }
+    }
+
+    /// Mark this view as opened through an already retired incarnation. Its
+    /// native ref has a unique name no recreated branch can reuse, so there is
+    /// no live name to reprove after its tables open.
+    pub(crate) fn retired_incarnation(mut self) -> Self {
+        self.retired_incarnation = true;
+        self
+    }
+
+    pub(crate) fn is_retired_incarnation(&self) -> bool {
+        self.retired_incarnation
     }
 
     #[cfg(feature = "test-util")]

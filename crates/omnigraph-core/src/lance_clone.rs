@@ -15,9 +15,13 @@ use lance_table::io::commit::{
 use object_store::ObjectStore as RawObjectStore;
 use object_store::path::Path;
 
+use omnigraph_storage::conditional::{
+    Answer as RequestAnswer, ConditionalRequest, Resolution, Step,
+};
+
 use crate::manifest_request::{
-    FailedRequest, MANIFEST_REQUEST_REISSUES, ManifestRequest, ManifestRequestAttempt,
-    ManifestRequestProbe, classify_failed_request, reissue_pause, request_error_class,
+    FailedRequest, ManifestRequest, ManifestRequestAttempt, ManifestRequestProbe,
+    classify_failed_request, request_error_class,
 };
 
 #[cfg(test)]
@@ -212,16 +216,17 @@ pub async fn create_branch(
 }
 
 impl ManifestLocationCommitHandler {
-    /// Send the commit's manifest put-if-absent until the store answers it.
+    /// Send the commit's manifest put-if-absent until the store answers it,
+    /// by the shared conditional-request policy
+    /// ([`omnigraph_storage::conditional`]).
     ///
     /// A version the store holds goes back to Lance as a conflict, which Lance
     /// reads back by its complete transaction: this commit's own earlier
     /// request is then a success, another commit's a conflict. An ambiguous
     /// failure is re-issued with the same manifest and the same precondition,
-    /// so at most one copy applies, and the key's next definite answer
-    /// settles every earlier request for it. A request still ambiguous after
-    /// the last re-issue goes back to Lance as it failed, recorded as
-    /// unresolved for the committer.
+    /// so at most one copy applies. A request that a re-issue's conflict or
+    /// the last lost answer ends goes back to Lance as it failed, recorded as
+    /// unresolved for the committer: the earlier copy may still land.
     #[allow(clippy::too_many_arguments)]
     async fn resolve_manifest_request(
         &self,
@@ -239,9 +244,11 @@ impl ManifestLocationCommitHandler {
                 attempt.finish(outcome);
             }
         };
-        let mut reissues = 0;
+        // Lance reports a held version as a conflict and reads it back, so
+        // the first copy's conflict ends the request.
+        let mut request = ConditionalRequest::new(true);
         loop {
-            let result = self
+            let answer = match self
                 .inner
                 .commit(
                     manifest,
@@ -252,9 +259,42 @@ impl ManifestLocationCommitHandler {
                     naming_scheme,
                     transaction.clone(),
                 )
-                .await;
-            let error = match result {
-                Ok(location) => {
+                .await
+            {
+                Ok(location) => RequestAnswer::Applied(location),
+                Err(CommitError::CommitConflict) => {
+                    RequestAnswer::Conflict(CommitError::CommitConflict)
+                }
+                Err(CommitError::OtherError(error)) => match classify_failed_request(&error) {
+                    FailedRequest::Refused => {
+                        RequestAnswer::Refused(CommitError::OtherError(error))
+                    }
+                    FailedRequest::Ambiguous => RequestAnswer::Lost(CommitError::OtherError(error)),
+                },
+            };
+            let resolution = match request.answer(answer) {
+                Step::Done(resolution) => resolution,
+                Step::Reissue {
+                    error,
+                    reissue,
+                    pause,
+                } => {
+                    tracing::warn!(
+                        version = manifest.version,
+                        reissue,
+                        error_class = commit_error_class(&error),
+                        "manifest request outcome unknown; re-issuing the identical conditional \
+                         request"
+                    );
+                    tokio::time::sleep(pause).await;
+                    continue;
+                }
+            };
+            return match resolution {
+                Resolution::Applied {
+                    value: location,
+                    reissues,
+                } => {
                     if reissues > 0 {
                         tracing::info!(
                             version = manifest.version,
@@ -263,38 +303,50 @@ impl ManifestLocationCommitHandler {
                         );
                     }
                     finish(attempt, ManifestRequest::Landed);
-                    return Ok(location);
+                    Ok(location)
                 }
-                Err(CommitError::CommitConflict) => {
+                Resolution::Conflict(error) => {
                     finish(attempt, ManifestRequest::Held);
-                    return Err(CommitError::CommitConflict);
+                    Err(error)
                 }
-                Err(CommitError::OtherError(error)) => error,
-            };
-            if reissues == 0 && classify_failed_request(&error) == FailedRequest::Refused {
-                finish(attempt, ManifestRequest::Refused);
-                return Err(CommitError::OtherError(error));
-            }
-            if reissues == MANIFEST_REQUEST_REISSUES {
-                tracing::error!(
-                    version = manifest.version,
+                Resolution::Refused(error) => {
+                    finish(attempt, ManifestRequest::Refused);
+                    Err(error)
+                }
+                Resolution::Unsettled {
+                    error,
+                    conflict,
                     reissues,
-                    error_class = request_error_class(&error),
-                    "manifest request outcome unknown after every re-issue; the version may still \
-                     hold this commit"
-                );
-                finish(attempt, ManifestRequest::Unresolved);
-                return Err(CommitError::OtherError(error));
-            }
-            reissues += 1;
-            tracing::warn!(
-                version = manifest.version,
-                reissue = reissues,
-                error_class = request_error_class(&error),
-                "manifest request outcome unknown; re-issuing the identical conditional request"
-            );
-            tokio::time::sleep(reissue_pause(reissues)).await;
+                } => {
+                    if conflict {
+                        tracing::warn!(
+                            version = manifest.version,
+                            reissues,
+                            "manifest version held after a re-issue; the earlier copy may hold \
+                             it or still be in flight, so its absence on read-back proves nothing"
+                        );
+                    } else {
+                        tracing::error!(
+                            version = manifest.version,
+                            reissues,
+                            error_class = commit_error_class(&error),
+                            "manifest request outcome unknown after every re-issue; the version \
+                             may still hold this commit"
+                        );
+                    }
+                    finish(attempt, ManifestRequest::Unresolved);
+                    Err(error)
+                }
+            };
         }
+    }
+}
+
+/// A log-safe class of a failed manifest commit.
+fn commit_error_class(error: &CommitError) -> &'static str {
+    match error {
+        CommitError::CommitConflict => "commit_conflict",
+        CommitError::OtherError(error) => request_error_class(error),
     }
 }
 
@@ -779,14 +831,20 @@ mod tests {
 
     /// The handler re-issues an ambiguous manifest request until the store
     /// answers it; a definite refusal, a held version and a landed manifest
-    /// end it at once; and a request no answer settles stays unresolved.
+    /// end it at once; and a request no answer settles stays unresolved, as
+    /// does one whose re-issue meets a held version.
     #[tokio::test]
     async fn manifest_request_is_re_issued_until_the_store_answers_issue_1067() {
         use Answer::*;
         assert_eq!(resolve(&[Landed]).await, (true, 1, ManifestRequest::Landed));
         assert_eq!(
+            resolve(&[Held]).await,
+            (false, 1, ManifestRequest::Held),
+            "a held version goes to Lance's read-back, which tells this commit from another"
+        );
+        assert_eq!(
             resolve(&[LandedWithLocalError, NativeConditionalPut]).await,
-            (false, 2, ManifestRequest::Held),
+            (false, 2, ManifestRequest::Unresolved),
             "a local error after manifest creation must not be called a refusal"
         );
         assert_eq!(
@@ -796,8 +854,9 @@ mod tests {
         );
         assert_eq!(
             resolve(&[Ambiguous, Held]).await,
-            (false, 2, ManifestRequest::Held),
-            "a held version goes to Lance's read-back, which tells this commit from another"
+            (false, 2, ManifestRequest::Unresolved),
+            "a re-issue's conflict can answer the earlier copy still in flight (S3's 409): \
+             Lance's read-back decides, and a missing version is not proof of absence"
         );
         assert_eq!(
             resolve(&[Refused]).await,
@@ -809,7 +868,7 @@ mod tests {
             (true, 3, ManifestRequest::Landed),
             "after an ambiguous request, a refusal does not settle the key"
         );
-        let unanswered = [Ambiguous; 1 + MANIFEST_REQUEST_REISSUES as usize];
+        let unanswered = [Ambiguous; 1 + omnigraph_storage::CONDITIONAL_REQUEST_REISSUES as usize];
         assert_eq!(
             resolve(&unanswered).await,
             (false, unanswered.len(), ManifestRequest::Unresolved)
@@ -822,7 +881,8 @@ mod tests {
     /// still land keeps the transaction file its manifest would name.
     #[tokio::test]
     async fn a_shared_handler_never_calls_a_missing_version_definitive_issue_1067() {
-        let unanswered = [Answer::Ambiguous; 1 + MANIFEST_REQUEST_REISSUES as usize];
+        let unanswered =
+            [Answer::Ambiguous; 1 + omnigraph_storage::CONDITIONAL_REQUEST_REISSUES as usize];
         for answers in [&[Answer::Landed][..], &[Answer::Refused], &unanswered] {
             let handler = wrapped(Arc::new(ScriptedBackend::new(answers)), None);
             assert!(!handler.is_version_not_found_definitive(), "{answers:?}");

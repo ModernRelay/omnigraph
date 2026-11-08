@@ -1,0 +1,232 @@
+# issue: 1277
+# traversal: auto
+# red_on: f7a596cb; Lance 13 simplifies the disjoint IN pair to a literal, so null rows pass the filter.
+# notes: Two IN-list tests on one nullable property, joined so that the lists share no member.
+# notes: For a row whose property is null, every test is null, so no predicate below may select it,
+# notes: on a read, a delete or an update. Overlapping lists are the positive control.
+# notes: The null split must keep the scalar index of `n` for the `=` / `or` spelling (plan steps).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Item {
+    slug: String @key
+    s: String?
+    n: I64? @index
+    tag: String?
+}
+edge Next: Item -> Item
+
+--- seed
+{"type":"Item","data":{"slug":"a"}}
+{"type":"Item","data":{"slug":"b","s":"x","n":1}}
+{"type":"Item","data":{"slug":"c"}}
+{"edge":"Next","from":"c","to":"b","data":{}}
+{"edge":"Next","from":"b","to":"a","data":{}}
+
+--- query
+query overlapping_lists_control() {
+    match {
+        $i: Item
+        not ($i.s in ["y"]) or not ($i.s in ["x", "y"])
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "b"}
+
+--- expect shape
+i.slug: String
+
+--- query
+query or_of_negated_memberships() {
+    match {
+        $i: Item
+        not ($i.s in ["x"]) or not ($i.s in ["y"])
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "b"}
+
+--- expect shape
+i.slug: String
+
+--- query
+query negated_disjoint_conjunction() {
+    match {
+        $i: Item
+        not (($i.s in ["x"]) and ($i.s in ["y"]))
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "b"}
+
+--- expect shape
+i.slug: String
+
+--- query
+query negated_in_minus_superset_i64() {
+    match {
+        $i: Item
+        not (($i.n in [1]) and not ($i.n in [1, 2, 0, 5]))
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "b"}
+
+--- expect shape
+i.slug: String
+
+--- query
+query equality_disjunctions_without_in() {
+    match {
+        $i: Item
+        not ((($i.s = "x") or ($i.s = "w")) and (($i.s = "y") or ($i.s = "v")))
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "b"}
+
+--- expect shape
+i.slug: String
+
+--- query
+set engine = v2;
+query equality_disjunction_keeps_the_index() {
+    match {
+        $i: Item
+        $i.n = 1 or $i.n = 2
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "b"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: access index_probe n
+
+--- query
+set engine = v2;
+query overlapping_equality_disjunctions_keep_the_index() {
+    match {
+        $i: Item
+        ($i.n = 1 or $i.n = 2) and ($i.n = 1 or $i.n = 3)
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "b"}
+
+--- expect shape
+i.slug: String
+
+--- expect plan
+scan Item as $i: access index_probe n
+
+--- query
+query traversal_target() {
+    match {
+        $src: Item
+        $src next $t
+        not ($t.s in ["x"]) or not ($t.s in ["y"])
+    }
+    return { $src.slug, $t.slug }
+}
+
+--- expect unordered
+{"src.slug": "c", "t.slug": "b"}
+
+--- expect shape
+src.slug: String
+t.slug: String
+
+--- query
+query not_block() {
+    match {
+        $i: Item
+        not { $i next $t  not ($t.s in ["x"]) or not ($t.s in ["y"]) }
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "a"}
+{"i.slug": "b"}
+
+--- expect shape
+i.slug: String
+
+--- query
+query exists_block() {
+    match {
+        $i: Item
+        exists { $i next $t  not ($t.s in ["x"]) or not ($t.s in ["y"]) }
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "c"}
+
+--- expect shape
+i.slug: String
+
+--- mutate
+query update_or_of_negated_memberships() {
+    update Item set { tag: "hit" } where not (s in ["x"]) or not (s in ["y"])
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query tagged() {
+    match {
+        $i: Item
+        $i.tag = "hit"
+    }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "b"}
+
+--- expect shape
+i.slug: String
+
+--- mutate
+query delete_or_of_negated_memberships() {
+    delete Item where not (s in ["x"]) or not (s in ["y"])
+}
+
+--- expect affected: nodes=1 edges=2
+
+--- query
+query survivors() {
+    match { $i: Item }
+    return { $i.slug }
+}
+
+--- expect unordered
+{"i.slug": "a"}
+{"i.slug": "c"}
+
+--- expect shape
+i.slug: String

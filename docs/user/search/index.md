@@ -58,6 +58,12 @@ embedding client are normalized, so L2 and cosine similarity produce the same
 ordering for those generated vectors. See [Embeddings](embeddings.md) for text
 queries and provider configuration.
 
+A `nearest` scan uses a vector index only when the index ranks exactly by L2:
+the IVF_FLAT index with the L2 metric that Omnigraph builds. A vector index
+written another way, for example by another tool (another metric, quantized
+vectors or HNSW), is not used: the scan ranks every row flat, which is exact
+and reads the whole column.
+
 IVF vector searches keep Lance's adaptive one-partition minimum and cap the
 partitions a `nearest` scan reads at 20 per index delta by default. The cap
 prevents Lance's centroid-distance heuristic from expanding a small search

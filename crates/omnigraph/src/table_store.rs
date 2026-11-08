@@ -36,8 +36,8 @@ use lance::dataset::write::merge_insert::{
     MergeStats, SourceDedupeBehavior, UncommittedMergeInsert,
 };
 use lance::dataset::{
-    CommitBuilder, DeleteBuilder, InsertBuilder, MergeInsertBuilder, ReadBlobsStream, WhenMatched,
-    WhenNotMatched, WriteMode, WriteParams,
+    DeleteBuilder, InsertBuilder, MergeInsertBuilder, ReadBlobsStream, WhenMatched, WhenNotMatched,
+    WriteMode, WriteParams,
 };
 use lance::datatypes::Schema as LanceSchema;
 use lance::index::DatasetIndexExt;
@@ -57,11 +57,11 @@ use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams};
 use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
-use lance_select::mask::RowAddrTreeMap;
+use lance_select::mask::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use omnigraph_compiler::SystemColumns;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::{num::NonZero, sync::Arc};
 
 use crate::blob::{
@@ -143,6 +143,44 @@ pub(crate) const ID_SCAN_BATCH_BYTES: u64 = 1024 * 1024;
 /// The byte cap of one batch entering a `SortExec` under a pool of `memory_limit` bytes.
 pub(crate) fn sort_input_batch_bytes(memory_limit: u64) -> usize {
     (memory_limit / 4).clamp(1, ORDERED_SCAN_MAX_INPUT_BATCH_BYTES) as usize
+}
+
+/// `plan` with a `HardCapBatchSizeExec` of `input_batch_bytes` under every
+/// `SortExec`, its partitions merged into one stream: in order when the plan
+/// declares an output ordering, otherwise as they arrive.
+///
+/// DataFusion cannot spill a first `SortExec` input batch larger than its
+/// memory pool; Lance applies the same hard cap below the sorts of MergeInsert.
+pub(crate) fn cap_sort_inputs_and_merge_partitions(
+    plan: Arc<dyn ExecutionPlan>,
+    input_batch_bytes: usize,
+) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    let plan = plan
+        .transform_down(|node| {
+            if node.downcast_ref::<SortExec>().is_some() {
+                let children = node
+                    .children()
+                    .into_iter()
+                    .map(|child| {
+                        Arc::new(HardCapBatchSizeExec::new(
+                            Arc::clone(child),
+                            input_batch_bytes,
+                        )) as Arc<dyn ExecutionPlan>
+                    })
+                    .collect();
+                Ok(Transformed::yes(node.with_new_children(children)?))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })?
+        .data;
+    Ok(if plan.output_partitioning().partition_count() == 1 {
+        plan
+    } else if let Some(ordering) = plan.output_ordering() {
+        Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
+    } else {
+        Arc::new(CoalescePartitionsExec::new(plan))
+    })
 }
 
 /// DataFusion's sort spill reservation under a pool of `memory_limit` bytes.
@@ -305,6 +343,10 @@ impl ScanTuning<'_> {
         Ok(self)
     }
 
+    /// A kNN over `column` by squared L2, the metric `nearest` promises.
+    /// Without an explicit metric Lance ranks by the metric of whatever
+    /// vector index covers the column; with one it searches an index of
+    /// another metric flat instead (Lance 13 `Scanner::create_plan`).
     pub(crate) fn nearest(
         &mut self,
         column: &str,
@@ -312,6 +354,7 @@ impl ScanTuning<'_> {
         limit: usize,
     ) -> std::result::Result<&mut Self, lance::Error> {
         self.scanner.nearest(column, query, limit)?;
+        self.scanner.distance_metric(MetricType::L2);
         Ok(self)
     }
 
@@ -952,6 +995,36 @@ pub struct SchemaEvolution {
     /// The `(field id, name)` columns, in order, of the dataset the next step
     /// must be staged against: the planned base, then each step's result.
     expected: Vec<(i32, String)>,
+    /// #721: a column goes from nullable to required, so the `Project` commit
+    /// must not preserve nullability. The caller has judged that no live row
+    /// holds a null.
+    tightens: bool,
+    /// #721: fragments whose deleted rows still hold a null in a column the
+    /// evolution makes required. They are rewritten, deletions materialized,
+    /// before the `Project` ([`TableStore::stage_fragment_rewrite`]).
+    purge_fragments: Vec<u64>,
+}
+
+impl SchemaEvolution {
+    /// Record the fragments to rewrite before the evolution's first step.
+    pub(crate) fn set_purge_fragments(&mut self, fragments: Vec<u64>) {
+        self.purge_fragments = fragments;
+    }
+
+    /// Take the fragments to rewrite; empty after the first call.
+    pub(crate) fn take_purge_fragments(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.purge_fragments)
+    }
+}
+
+/// #721: what the stored rows of a table say about a schema promotion.
+#[derive(Debug, Default)]
+pub(crate) struct PromotionCheck {
+    /// The first rule a live row breaks, with its stable code.
+    pub(crate) violation: Option<String>,
+    /// Fragments whose deleted rows hold a null in a column about to become
+    /// required, sorted. No live row of them holds one.
+    pub(crate) purge_fragments: Vec<u64>,
 }
 
 /// A schema's columns as `(field id, name)` in pre-order: the identity a
@@ -1010,7 +1083,7 @@ async fn commit_detached(
     transaction: Transaction,
     affected_rows: Option<RowAddrTreeMap>,
 ) -> Result<Dataset> {
-    let mut builder = CommitBuilder::new(ds)
+    let mut builder = crate::lance_commit::commit_builder(ds)
         .with_skip_auto_cleanup(true)
         .with_detached(true);
     if let Some(affected_rows) = affected_rows {
@@ -2816,29 +2889,8 @@ impl TableStore {
 
         let input_batch_limit = sort_input_batch_bytes(memory_limit);
         let plan = scanner.create_plan().await.map_err(OmniError::storage)?;
-        // DataFusion cannot spill a first SortExec input batch that is larger
-        // than its memory pool. Lance applies this same hard-cap node below
-        // sorts in MergeInsert; ordered graph scans do so here as well.
-        let plan = plan
-            .transform_down(|node| {
-                if node.downcast_ref::<SortExec>().is_some() {
-                    let children = node
-                        .children()
-                        .into_iter()
-                        .map(|child| {
-                            Arc::new(HardCapBatchSizeExec::new(
-                                Arc::clone(child),
-                                input_batch_limit,
-                            )) as Arc<dyn ExecutionPlan>
-                        })
-                        .collect();
-                    Ok(Transformed::yes(node.with_new_children(children)?))
-                } else {
-                    Ok(Transformed::no(node))
-                }
-            })
-            .map_err(OmniError::datafusion_internal)?
-            .data;
+        let plan = cap_sort_inputs_and_merge_partitions(plan, input_batch_limit)
+            .map_err(OmniError::datafusion_internal)?;
 
         // Own one runtime context for this execution. Lance's general helper
         // caches contexts; after LRU eviction an active old context can coexist
@@ -2865,14 +2917,6 @@ impl TableStore {
         if let Some(batch_size) = options.batch_size {
             state.config_mut().options_mut().execution.batch_size = batch_size;
         }
-        let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1
-        {
-            plan
-        } else if let Some(ordering) = plan.output_ordering() {
-            Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
-        } else {
-            Arc::new(CoalescePartitionsExec::new(plan))
-        };
         let stream = plan
             .execute(0, state.task_ctx())
             .map_err(OmniError::datafusion_internal)?;
@@ -3008,27 +3052,33 @@ impl TableStore {
         Ok(!Self::foldable_index_lag(ds).await?.is_empty())
     }
 
-    /// The partition count Lance reports for a vector index, or one when the
-    /// statistics do not name it.
-    async fn vector_partition_count(ds: &Dataset, name: &str) -> usize {
-        fn first_num_partitions(value: &serde_json::Value) -> Option<usize> {
+    /// The partition count Lance reports for a vector index. A fold keeps
+    /// it, so a statistics read that fails or names no positive count is an
+    /// error, not a silent rebuild with one partition.
+    async fn vector_partition_count(ds: &Dataset, name: &str) -> Result<usize> {
+        fn first_num_partitions(value: &serde_json::Value) -> Option<u64> {
             match value {
                 serde_json::Value::Object(map) => map
                     .get("num_partitions")
                     .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
                     .or_else(|| map.values().find_map(first_num_partitions)),
                 serde_json::Value::Array(items) => items.iter().find_map(first_num_partitions),
                 _ => None,
             }
         }
-        ds.index_statistics(name)
-            .await
+        let stats = ds.index_statistics(name).await.map_err(|error| {
+            OmniError::storage_context(format!("index statistics of '{name}'"), error)
+        })?;
+        serde_json::from_str::<serde_json::Value>(&stats)
             .ok()
-            .and_then(|stats| serde_json::from_str::<serde_json::Value>(&stats).ok())
             .and_then(|stats| first_num_partitions(&stats))
             .filter(|partitions| *partitions >= 1)
-            .unwrap_or(1)
+            .and_then(|partitions| usize::try_from(partitions).ok())
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "the statistics of vector index '{name}' name no partition count"
+                ))
+            })
     }
 
     async fn foldable_index_lag(ds: &Dataset) -> Result<Vec<IndexLag>> {
@@ -3149,7 +3199,7 @@ impl TableStore {
                 // Keep the index's partition count: the engine builds one
                 // partition, but a partitioned index (Lance's split, or an
                 // explicit build) keeps its shape across folds.
-                let partitions = Self::vector_partition_count(ds, &item.name).await;
+                let partitions = Self::vector_partition_count(ds, &item.name).await?;
                 let params =
                     lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
                 ds_clone
@@ -3245,7 +3295,7 @@ impl TableStore {
     ) -> Result<Dataset> {
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         match dataset {
-            Some(mut ds) => {
+            Some(ds) => {
                 let params = WriteParams {
                     mode: WriteMode::Append,
                     allow_external_blob_outside_bases: true,
@@ -3253,10 +3303,17 @@ impl TableStore {
                     skip_auto_cleanup: true,
                     ..Default::default()
                 };
-                ds.append(reader, Some(params))
+                let ds = Arc::new(ds);
+                let transaction = InsertBuilder::new(Arc::clone(&ds))
+                    .with_params(&params)
+                    .execute_uncommitted(vec![batch])
                     .await
                     .map_err(OmniError::storage)?;
-                Ok(ds)
+                crate::lance_commit::commit_builder(ds)
+                    .with_skip_auto_cleanup(true)
+                    .execute(transaction)
+                    .await
+                    .map_err(OmniError::storage)
             }
             None => {
                 let control_session = crate::lance_access::control_session();
@@ -3328,6 +3385,70 @@ impl TableStore {
         Ok(Some(StagedWrite::with_commit_metadata(
             uncommitted.transaction,
             StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
+            new_fragments,
+            removed_fragment_ids,
+        )))
+    }
+
+    /// Stage the delete of exactly the rows at `row_addrs`, captured by the
+    /// caller's own filtered scan of `ds` at this same version, without
+    /// scanning again. This is Lance's `DeleteBuilder` after its scan:
+    /// each fragment holding an address extends its deletion vector
+    /// (`FileFragment::extend_deletions`, which drops a fragment it empties),
+    /// and the result is the same uncommitted `Operation::Delete`, with the
+    /// addresses as its `affected_rows`. `predicate` is only the transaction's
+    /// recorded predicate text, as `DeleteBuilder` records it. An empty
+    /// address set is a no-op (`None`); an address outside `ds`'s fragments
+    /// fails closed.
+    pub async fn stage_delete_rows(
+        &self,
+        ds: &Dataset,
+        predicate: &Expr,
+        row_addrs: &RowAddrTreeMap,
+    ) -> Result<Option<StagedWrite>> {
+        let num_deleted_rows = row_addrs.len().unwrap_or(0);
+        if num_deleted_rows == 0 {
+            return Ok(None);
+        }
+        let mut updated_fragments = Vec::new();
+        let mut deleted_fragment_ids = Vec::new();
+        for (fragment_id, _) in row_addrs.iter() {
+            let bitmap = row_addrs.get_fragment_bitmap(*fragment_id).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "stage_delete_rows: fragment {fragment_id} carries no row offsets"
+                ))
+            })?;
+            let fragment = ds.get_fragment(*fragment_id as usize).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "stage_delete_rows: fragment {fragment_id} is not in version {}",
+                    ds.version().version
+                ))
+                .unpublished()
+            })?;
+            match fragment
+                .extend_deletions(bitmap.iter())
+                .await
+                .map_err(|error| OmniError::storage(error).unpublished())?
+            {
+                Some(updated) => updated_fragments.push(updated.metadata().clone()),
+                None => deleted_fragment_ids.push(u64::from(*fragment_id)),
+            }
+        }
+        let mut removed_fragment_ids = deleted_fragment_ids.clone();
+        removed_fragment_ids.extend(updated_fragments.iter().map(|f| f.id));
+        let new_fragments = updated_fragments.clone();
+        let transaction = Transaction::new(
+            ds.manifest.version,
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                predicate: predicate.to_string(),
+            },
+            None,
+        );
+        Ok(Some(StagedWrite::with_commit_metadata(
+            transaction,
+            StagedCommitMetadata::affected_rows(Some(row_addrs.clone())),
             new_fragments,
             removed_fragment_ids,
         )))
@@ -3552,8 +3673,8 @@ impl TableStore {
             // completed statistics prove this execution inserted every row,
             // but an unfamiliar future transaction shape must disable the
             // history shortcut rather than fail an otherwise valid logical
-            // write. StrictInsert keeps the same check mandatory because its
-            // exact filter is part of the requested conflict semantics.
+            // write. StrictInsert returned above; its writer certifies every
+            // insertion unconditionally.
             tracing::debug!(
                 type_key,
                 error = %error,
@@ -3932,21 +4053,23 @@ impl TableStore {
         system_columns: SystemColumns,
         context: &'static str,
     ) -> Result<(StagedWrite, MergeStats)> {
+        // Strict insertion never reaches merge-insert: `stage_keyed_write`
+        // and `stage_proven_strict_insert` stage it through
+        // `stage_absence_proven_strict_insert`.
+        let when_not_matched = match semantics {
+            KeyedWriteSemantics::Upsert => WhenNotMatched::InsertAll,
+            KeyedWriteSemantics::KnownPresentUpdate => WhenNotMatched::DoNothing,
+            KeyedWriteSemantics::StrictInsert => {
+                return Err(OmniError::manifest_internal(format!(
+                    "{context}: strict insert must stage through the absence-proven insert writer"
+                )));
+            }
+        };
         let mut builder =
             MergeInsertBuilder::try_new(Arc::new(ds), vec![system_columns.id.to_string()])
                 .map_err(OmniError::lance_internal)?;
-        builder.when_matched(match semantics {
-            KeyedWriteSemantics::StrictInsert => WhenMatched::Fail,
-            KeyedWriteSemantics::Upsert | KeyedWriteSemantics::KnownPresentUpdate => {
-                WhenMatched::UpdateAll
-            }
-        });
-        builder.when_not_matched(match semantics {
-            KeyedWriteSemantics::KnownPresentUpdate => WhenNotMatched::DoNothing,
-            KeyedWriteSemantics::StrictInsert | KeyedWriteSemantics::Upsert => {
-                WhenNotMatched::InsertAll
-            }
-        });
+        builder.when_matched(WhenMatched::UpdateAll);
+        builder.when_not_matched(when_not_matched);
         if semantics != KeyedWriteSemantics::KnownPresentUpdate {
             // Lance's scalar-index v1 route omits the inserted-row key filter.
             // Every insertion-capable path therefore forces v2 and validates
@@ -3963,17 +4086,10 @@ impl TableStore {
             .await
             .map_err(OmniError::lance_stream)?;
 
-        match semantics {
-            KeyedWriteSemantics::StrictInsert => {
-                validate_exact_id_filter(&uncommitted, id_field_id, context)?;
-                validate_strict_insert_merge_stats(&uncommitted, merged_rows, context)?;
-            }
-            KeyedWriteSemantics::Upsert => {
-                validate_exact_id_filter(&uncommitted, id_field_id, context)?;
-            }
-            KeyedWriteSemantics::KnownPresentUpdate => {
-                validate_known_present_update(&uncommitted, id_field_id, merged_rows, context)?;
-            }
+        if semantics == KeyedWriteSemantics::KnownPresentUpdate {
+            validate_known_present_update(&uncommitted, id_field_id, merged_rows, context)?;
+        } else {
+            validate_exact_id_filter(&uncommitted, id_field_id, context)?;
         }
         let stats = uncommitted.stats.clone();
         if semantics == KeyedWriteSemantics::KnownPresentUpdate {
@@ -4405,7 +4521,7 @@ impl TableStore {
         )
         .await
         .map_err(OmniError::storage)?;
-        let dataset = CommitBuilder::new(dataset_uri)
+        let dataset = crate::lance_commit::commit_builder(dataset_uri)
             .with_commit_handler(handler)
             .use_stable_row_ids(true)
             .with_storage_format(LanceFileVersion::V2_2)
@@ -4445,7 +4561,7 @@ impl TableStore {
         // upgraded graphs. Skipping here covers the staged write path (the main
         // data path) for new and legacy datasets alike, preventing Lance from
         // GC'ing versions the __manifest still pins for snapshots/time-travel.
-        let mut builder = CommitBuilder::new(ds).with_skip_auto_cleanup(true);
+        let mut builder = crate::lance_commit::commit_builder(ds).with_skip_auto_cleanup(true);
         if mode == StagedCommitMode::EffectFreeExact {
             builder = builder.with_max_retries(0);
         }
@@ -4550,6 +4666,55 @@ impl TableStore {
         options: &CompactionOptions,
     ) -> Result<Option<StagedCompaction>> {
         let plan = Self::plan_table_compaction(ds, options).await?;
+        Self::stage_compaction_plan(ds, plan).await
+    }
+
+    /// #721: rewrite exactly the fragments `fragment_ids` names, one
+    /// single-fragment task each, so the rewrite materializes their deleted
+    /// rows whatever their deleted share (Lance's own shape for deletion
+    /// materialization; `materialize_deletions_threshold` only chooses
+    /// fragments at planning). Staged like [`Self::stage_compaction`];
+    /// `None` when `fragment_ids` is empty. Refuses an id `ds` does not hold.
+    pub async fn stage_fragment_rewrite(
+        &self,
+        ds: &Dataset,
+        fragment_ids: &[u64],
+    ) -> Result<Option<StagedCompaction>> {
+        if fragment_ids.is_empty() {
+            return Ok(None);
+        }
+        let mut tasks = Vec::with_capacity(fragment_ids.len());
+        for id in fragment_ids {
+            let fragment = ds
+                .manifest
+                .fragments
+                .iter()
+                .find(|fragment| fragment.id == *id)
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "fragment {id} to rewrite is not in {} version {}",
+                        ds.uri(),
+                        ds.manifest.version
+                    ))
+                })?;
+            tasks.push(TaskData {
+                fragments: vec![fragment.clone()],
+            });
+        }
+        let plan = CompactionPlan {
+            tasks,
+            read_version: ds.manifest.version,
+            options: CompactionOptions::default(),
+        };
+        Self::stage_compaction_plan(ds, plan).await
+    }
+
+    /// Execute a compaction plan against `ds` and stage its result as one
+    /// `Rewrite`; see [`Self::stage_compaction`].
+    async fn stage_compaction_plan(
+        ds: &Dataset,
+        plan: CompactionPlan,
+    ) -> Result<Option<StagedCompaction>> {
         if plan.num_tasks() == 0 {
             return Ok(None);
         }
@@ -4772,6 +4937,139 @@ impl TableStore {
         Ok(StagedWrite::new(transaction, Vec::new(), Vec::new()))
     }
 
+    /// Most memory, in estimated bytes, the keys of one `@unique` promotion
+    /// check may hold. A table whose keys need more is refused rather than
+    /// risking the process (#721).
+    pub(crate) const PROMOTION_UNIQUE_KEY_BYTES: usize = 1 << 30;
+
+    /// Estimated resident bytes of one held key: its strings plus a fixed
+    /// allowance for the set entry and the vector and string headers.
+    fn promotion_key_bytes(key: &[String]) -> usize {
+        64 + key.iter().map(|part| 24 + part.len()).sum::<usize>()
+    }
+
+    /// #721: judge the rows of `ds` against the constraints a schema promotion
+    /// would add. Reads only the named columns.
+    ///
+    /// The null check reads deleted rows too (`include_deleted_rows`): a
+    /// deleted row keeps its value in the data file, and the column is about
+    /// to become non-nullable in Lance (lance#10557 is the same rule in
+    /// Lance's own `alter_columns`). A null in a live row is a violation
+    /// (`OG-MF-104`). A null only in deleted rows is not: the fragments that
+    /// hold one come back in `purge_fragments`, for the caller to rewrite
+    /// before tightening the column. The key check reads live rows only and
+    /// reports the first key two of them share (`OG-MF-108`); it holds at
+    /// most `PROMOTION_UNIQUE_KEY_BYTES` of keys and refuses a larger table.
+    pub(crate) async fn promotion_check(
+        ds: &Dataset,
+        required: &[String],
+        unique: &[Vec<String>],
+    ) -> Result<PromotionCheck> {
+        let mut check = PromotionCheck::default();
+        let mut purge = BTreeSet::<u64>::new();
+        for column in required {
+            let mut scanner = ds.scan();
+            scanner
+                .project(&[column.as_str()])
+                .map_err(OmniError::storage)?;
+            scanner
+                .with_row_id()
+                .with_row_address()
+                .include_deleted_rows();
+            let mut stream = scanner
+                .try_into_stream()
+                .await
+                .map_err(OmniError::storage)?;
+            let mut live_nulls = 0usize;
+            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+                let lost = |name: &str| {
+                    OmniError::manifest_internal(format!("promotion scan lost column '{name}'"))
+                };
+                let values = batch.column_by_name(column).ok_or_else(|| lost(column))?;
+                if values.null_count() == 0 {
+                    continue;
+                }
+                // A deleted row comes back with a null `_rowid`.
+                let row_ids = batch
+                    .column_by_name("_rowid")
+                    .ok_or_else(|| lost("_rowid"))?;
+                let row_addrs = batch
+                    .column_by_name("_rowaddr")
+                    .ok_or_else(|| lost("_rowaddr"))?
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal("promotion scan: _rowaddr is not UInt64")
+                    })?;
+                for row in 0..batch.num_rows() {
+                    if values.is_valid(row) {
+                        continue;
+                    }
+                    if row_ids.is_null(row) {
+                        purge.insert(row_addrs.value(row) >> 32);
+                    } else {
+                        live_nulls += 1;
+                    }
+                }
+            }
+            if live_nulls > 0 {
+                check.violation = Some(format!(
+                    "[{}] {live_nulls} row(s) hold a null in '{column}'; backfill them before making it required",
+                    omnigraph_compiler::lint::codes::OG_MF_104.code
+                ));
+                return Ok(check);
+            }
+        }
+        for group in unique {
+            let mut scanner = ds.scan();
+            scanner.project(group).map_err(OmniError::storage)?;
+            let mut stream = scanner
+                .try_into_stream()
+                .await
+                .map_err(OmniError::storage)?;
+            let mut seen = HashSet::<Vec<String>>::new();
+            let mut held = 0usize;
+            while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
+                let columns = group
+                    .iter()
+                    .map(|name| {
+                        batch.column_by_name(name).cloned().ok_or_else(|| {
+                            OmniError::manifest_internal(format!(
+                                "promotion scan lost column '{name}'"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for row in 0..batch.num_rows() {
+                    let Some(key) = crate::loader::composite_unique_key(&columns, row)? else {
+                        continue;
+                    };
+                    let bytes = Self::promotion_key_bytes(&key);
+                    if seen.contains(&key) {
+                        check.violation = Some(format!(
+                            "[{}] value {} of {} is held by more than one row; make the values distinct before adding @unique",
+                            omnigraph_compiler::lint::codes::OG_MF_108.code,
+                            crate::loader::format_tuple(&key),
+                            crate::loader::format_tuple(group),
+                        ));
+                        return Ok(check);
+                    }
+                    held += bytes;
+                    if held > Self::PROMOTION_UNIQUE_KEY_BYTES {
+                        return Err(OmniError::manifest(format!(
+                            "@unique{} cannot be checked: its keys need more than an estimated {} bytes of memory",
+                            crate::loader::format_tuple(group),
+                            Self::PROMOTION_UNIQUE_KEY_BYTES
+                        )));
+                    }
+                    seen.insert(key);
+                }
+            }
+        }
+        check.purge_fragments = purge.into_iter().collect();
+        Ok(check)
+    }
+
     /// Plan the metadata-only commits that move a table from its dataset
     /// schema to `target`, the desired physical schema in catalog order, with
     /// `renames` naming each renamed column as `(from, to)`. Reads only the
@@ -4807,6 +5105,7 @@ impl TableStore {
         let mut consumed = HashSet::<&str>::new();
         let mut renamed = false;
         let mut added = false;
+        let mut tightens = false;
         for target_field in target.fields() {
             let name = target_field.name().as_str();
             let source = match source_of.get(name) {
@@ -4843,7 +5142,9 @@ impl TableStore {
                 .expect("the source column was found above");
             let desired = lance::datatypes::Field::try_from(target_field.as_ref())
                 .map_err(OmniError::lance_internal)?;
-            if existing.data_type() != desired.data_type() || existing.nullable != desired.nullable
+            let tightening = existing.nullable && !desired.nullable;
+            if existing.data_type() != desired.data_type()
+                || (existing.nullable != desired.nullable && !tightening)
             {
                 return Err(OmniError::manifest_internal(format!(
                     "column '{source}' cannot become '{name}' without a rewrite: {:?} (nullable {}) -> {:?} (nullable {})",
@@ -4854,6 +5155,10 @@ impl TableStore {
                 )));
             }
             let mut field = existing.clone();
+            if tightening {
+                field.nullable = false;
+                tightens = true;
+            }
             if source != name {
                 field.name = name.to_string();
                 renamed = true;
@@ -4915,6 +5220,8 @@ impl TableStore {
                 project,
                 merge: None,
                 expected,
+                tightens,
+                purge_fragments: Vec::new(),
             });
         }
         let project = if renamed || dropped {
@@ -4935,6 +5242,8 @@ impl TableStore {
             project,
             merge: Some(evolved),
             expected,
+            tightens,
+            purge_fragments: Vec::new(),
         })
     }
 
@@ -4966,7 +5275,7 @@ impl TableStore {
             evolution.expected = schema_columns(&schema);
             Operation::Project {
                 schema,
-                preserves_nullability: true,
+                preserves_nullability: !evolution.tightens,
             }
         } else if let Some(schema) = evolution.merge.take() {
             evolution.expected = schema_columns(&schema);
@@ -6947,7 +7256,8 @@ fn validate_keyed_write_batch_ids(
 
 /// Assert the exact RFC-023 substrate proof carried by pinned Lance's v2
 /// merge-insert route.  Checking both public copies makes a future Lance
-/// refactor that drops the transaction-level conflict filter fail closed.
+/// refactor that drops the transaction's inserted-row key filter fail closed;
+/// the insertion-absence certificate and the merge proof read that filter.
 fn validate_exact_id_filter(
     uncommitted: &UncommittedMergeInsert,
     id_field_id: i32,
@@ -6958,25 +7268,6 @@ fn validate_exact_id_filter(
     if uncommitted.inserted_rows_filter.as_ref() != Some(transaction_filter) {
         return Err(OmniError::manifest_internal(format!(
             "{context}: Lance uncommitted result and transaction disagree on the inserted-row key filter"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_strict_insert_merge_stats(
-    uncommitted: &UncommittedMergeInsert,
-    expected_rows: u64,
-    context: &'static str,
-) -> Result<()> {
-    let stats = &uncommitted.stats;
-    if !merge_stats_prove_pure_insert(stats, expected_rows) {
-        return Err(OmniError::manifest_internal(format!(
-            "{context}: strict insert merge stats were inserted={}, updated={}, deleted={}, skipped={}, attempts={}; expected inserted={expected_rows}, updated=0, deleted=0, skipped=0, attempts=1",
-            stats.num_inserted_rows,
-            stats.num_updated_rows,
-            stats.num_deleted_rows,
-            stats.num_skipped_duplicates,
-            stats.num_attempts,
         )));
     }
     Ok(())
@@ -7635,6 +7926,49 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
         let col = Arc::new(StringArray::from(ids.to_vec())) as ArrayRef;
         RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    /// Issue #1297: a fold keeps a vector index's partition count, and a
+    /// statistics read that names none is an error, not one partition.
+    #[tokio::test]
+    async fn vector_partition_count_reads_the_index_or_refuses_issue_1297() {
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use lance::index::DatasetIndexExt;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("{}/vectors", dir.path().to_str().unwrap());
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let values = Float32Array::from((0..64).map(|value| value as f32).collect::<Vec<_>>());
+        let vectors = FixedSizeListArray::try_new(item, 2, Arc::new(values), None).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            vectors.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+        // forbidden-api-allow: test writes a scratch Lance dataset, not a graph table.
+        let mut ds = Dataset::write(reader, &uri, None).await.unwrap();
+        ds.create_index(
+            &["embedding"],
+            IndexType::Vector,
+            Some("embedding_idx".to_string()),
+            &lance::index::vector::VectorIndexParams::ivf_flat(2, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            TableStore::vector_partition_count(&ds, "embedding_idx")
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            TableStore::vector_partition_count(&ds, "missing_idx")
+                .await
+                .is_err(),
+            "a failed statistics read must not fold the index with one partition"
+        );
     }
 
     #[tokio::test]

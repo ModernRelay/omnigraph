@@ -175,7 +175,7 @@ fn node_overwrite_resolves_to_source_validate_chain_and_write() {
         ]
     );
     let document = explain.to_value();
-    assert_eq!(document["explain_version"], 7);
+    assert_eq!(document["explain_version"], 8);
     assert!(document["logical_plan_initial"].is_object());
     assert_eq!(document["route"], "engine");
     assert_eq!(document["operation"]["kind"], "load");
@@ -485,8 +485,11 @@ fn card_minimum_declares_the_replaced_source_scan_and_the_source_count() {
     );
 }
 
+/// Without consulted statistics an overwrite's endpoint checks keep the
+/// probe at any input size; append and merge keep the endpoint table, so
+/// without index coverage they scan it.
 #[test]
-fn endpoint_checks_keep_probe_without_consulted_statistics() {
+fn endpoint_checks_without_consulted_statistics_probe_only_for_an_overwrite() {
     let mapped_columns = ["from", "to", "w"].len() as u64;
     let narrowest_row = 2 * mapped_columns;
     let within = PROBE_CHUNK_KEYS * narrowest_row;
@@ -494,8 +497,8 @@ fn endpoint_checks_keep_probe_without_consulted_statistics() {
     for (mode, source_bytes, expected) in [
         (LoadStmtMode::Overwrite, within, ValidateAccess::Probe),
         (LoadStmtMode::Overwrite, past, ValidateAccess::Probe),
-        (LoadStmtMode::Append, past, ValidateAccess::Probe),
-        (LoadStmtMode::Merge, past, ValidateAccess::Probe),
+        (LoadStmtMode::Append, past, ValidateAccess::Scan),
+        (LoadStmtMode::Merge, past, ValidateAccess::Scan),
     ] {
         let op = operation(LoadTarget::Edge("Knows".into()), mode, source_bytes);
         let decision = route(&op, &source(), RouteOverride::Registry, &BOUNDS);
@@ -509,8 +512,13 @@ fn endpoint_checks_keep_probe_without_consulted_statistics() {
                     reason,
                     explain,
                     logical,
+                    physical,
                 },
             ) => {
+                assert!(
+                    physical.is_some(),
+                    "an append or merge load hands the executor its physical plan"
+                );
                 assert_eq!(
                     reason,
                     Unrouted::ModeOnExecutor {

@@ -467,6 +467,14 @@ async fn reprove_named_branch_heads(store: &TableStore, snapshot: &Snapshot) -> 
     let Some(branch) = snapshot.graph_branch() else {
         return Ok(());
     };
+    // A snapshot opened through an already retired incarnation (its branch
+    // deleted while a live branch retained the commit) is an immutable native
+    // ref under a unique name: there is no live name to reprove, and a
+    // recreated branch cannot reuse it. A collector reclaim surfaces as a loud
+    // table-read gap.
+    if snapshot.is_retired_incarnation() {
+        return Ok(());
+    }
     // Reprove authority with fresh metadata while retaining the captured
     // provider registry; the data session may contain an earlier page's view.
     let control_session =

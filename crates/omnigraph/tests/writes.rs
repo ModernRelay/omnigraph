@@ -2681,11 +2681,12 @@ async fn overlapping_delete_predicates_do_not_double_count_affected() {
     );
 }
 
-/// Overwrite seeds the wide ids because bulk replacement has no keyed row or byte cap.
+/// Overwrite seeds the wide ids because bulk replacement has no keyed row or byte cap;
+/// the edge type makes the overwrite's plan scan the removed ids (`removal: scan`).
 /// Rust, not GQT: 16 MiB ids, the on-disk file listing and the stage-write probe.
 #[tokio::test]
 async fn removed_ids_summed_across_types_refuse_delete_and_overwrite_before_staging() {
-    const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\n";
+    const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\nedge WorksAt: Person -> Company\n";
     const TABLES: [&str; 2] = ["node:Person", "node:Company"];
     const CLEAR: &str = r#"query clear() {
         delete Person where name != ""

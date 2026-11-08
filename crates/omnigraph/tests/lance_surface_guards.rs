@@ -811,6 +811,94 @@ async fn rename_only_project_keeps_fragments_field_ids_pk_marker_and_indexes() {
     assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
 }
 
+/// Guard (#721): the promotion null check reads deleted rows. On a
+/// stable-row-id V2_2 table, a scan with `with_row_id` and
+/// `include_deleted_rows` returns a deleted row with a null `_rowid` and its
+/// stored value (here a null), and `_rowaddr` names its fragment, while an
+/// ordinary scan hides it. Schema apply relies on this to find the fragments
+/// whose deleted rows hold a null before it makes the column non-nullable.
+#[tokio::test]
+async fn include_deleted_rows_returns_a_deleted_rows_stored_null_issue_721() {
+    use arrow_array::Array;
+    use futures::TryStreamExt;
+    use lance::dataset::{WriteMode, WriteParams};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["kept", "gone"])),
+            Arc::new(Int32Array::from(vec![Some(1), None])),
+        ],
+    )
+    .unwrap();
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(params),
+    )
+    .await
+    .unwrap();
+    dataset.delete("id = 'gone'").await.unwrap();
+    assert_eq!(
+        dataset
+            .count_rows(Some("value IS NULL".to_string()))
+            .await
+            .unwrap(),
+        0,
+        "an ordinary count hides the deleted row"
+    );
+
+    let mut scanner = dataset.scan();
+    scanner.project(&["value"]).unwrap();
+    scanner
+        .with_row_id()
+        .with_row_address()
+        .include_deleted_rows();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let row_ids = batch.column_by_name("_rowid").unwrap();
+        let addrs = batch
+            .column_by_name("_rowaddr")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        let values = batch.column_by_name("value").unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                row_ids.is_null(row),
+                values.is_null(row),
+                addrs.value(row) >> 32,
+            ));
+        }
+    }
+    let fragment = dataset.get_fragments()[0].id() as u64;
+    assert_eq!(
+        rows,
+        vec![(false, false, fragment), (true, true, fragment)],
+        "the deleted row comes back with a null _rowid, its stored null and its fragment"
+    );
+}
+
 /// Guard: schema apply's metadata-only evolution. On a stable-row-id V2_2
 /// table holding inline, packed and dedicated Blob-v2 payloads, null and a
 /// valid empty value, a detached `Operation::Project` renames and drops

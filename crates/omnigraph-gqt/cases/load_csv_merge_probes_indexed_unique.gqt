@@ -1,0 +1,47 @@
+# issue: none
+# traversal: auto
+# notes: A CSV node merge checks a non-key integer @unique column whose @index built a BTREE over
+# notes: every fragment by index probe, not by a scan of the table, and the merge adds both new rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: String @key
+    code: I64 @unique @index
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 4
+    columns:
+      id: {kind: key, prefix: p, width: 6}
+      code: {kind: ordinal, start: 100, step: 1}
+
+--- csv people.csv
+id,code
+p000008,108
+p000009,109
+
+--- mutate
+load csv "people.csv" into node:Person mode merge header
+--- expect ok
+--- expect plan
+load route: pipeline
+load validate unique node:Person unique [code]: access probe
+load executed: partitions 1 rows 2
+
+--- query
+query people() { match { $p: Person } return { count($p) as n } }
+--- expect unordered
+{"n": 10}
+--- expect shape
+n: I64

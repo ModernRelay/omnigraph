@@ -2,7 +2,7 @@
 //! behind `PlanSource`, the parameters behind the scanner's pushability
 //! verdict, and the physical plan the engine's runner executes.
 
-mod indexes;
+pub(super) mod indexes;
 mod scan_access;
 
 use std::collections::{BTreeMap, HashMap};
@@ -552,7 +552,7 @@ fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
 /// The canonical id of the node of `type_key` whose single String key is
 /// `value` (typed `ty`), as every write path derives it; `None` when the
 /// type is not keyed by one String property or the value is no String.
-fn canonical_key_id_of(
+pub(crate) fn canonical_key_id_of(
     catalog: &Catalog,
     type_key: &str,
     value: &Literal,

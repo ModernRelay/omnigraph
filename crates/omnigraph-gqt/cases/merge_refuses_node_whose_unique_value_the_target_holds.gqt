@@ -1,0 +1,43 @@
+# issue: none
+# notes: A branch merge refuses a node inserted on the branch when main took the same @unique email
+# notes: meanwhile, naming both holders, on an unindexed text-keyed Person table.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    id: String @key
+    email: String @unique
+}
+edge Knows: Person -> Person
+
+--- seed generate: v1 seed: 42
+tables:
+  - kind: node
+    name: Person
+    rows: 8
+    commits: 4
+    columns:
+      id: {kind: key, prefix: p, width: 6}
+      email: {kind: key, prefix: e, width: 6}
+
+--- mutate
+branch create b
+--- expect ok
+
+--- mutate branch: b
+query ins_b() { insert Person { id: "p000008", email: "e000008" } }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query ins_main() { insert Person { id: "p000009", email: "e000008" } }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+branch merge b
+
+--- expect error: (unique_violation): @unique violation on Person.email: value 'e000008' held by 'p000009' and 'p000008'
