@@ -2482,6 +2482,18 @@ impl ManifestCoordinator {
         &self,
         graph_commit_id: &str,
     ) -> Result<Option<HistoryRecord>> {
+        Box::pin(self.record_in_hinted_branch_inner(graph_commit_id)).await
+    }
+
+    /// The body of [`Self::record_in_hinted_branch`], boxed there as
+    /// [`Self::refresh`] boxes its body: it is awaited inside the commit
+    /// lookups of the merge, snapshot and cluster futures, which already meet
+    /// the compiler's query depth limit, and the box keeps its layout out of
+    /// theirs.
+    async fn record_in_hinted_branch_inner(
+        &self,
+        graph_commit_id: &str,
+    ) -> Result<Option<HistoryRecord>> {
         let Some(block) = commit_block(graph_commit_id) else {
             return Ok(None);
         };

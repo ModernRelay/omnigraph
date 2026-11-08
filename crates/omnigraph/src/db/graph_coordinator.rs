@@ -756,7 +756,21 @@ impl GraphCoordinator {
         }
         let record = match self.manifest.held_record(id) {
             Some(record) => Some(record),
-            None => self.record_held_elsewhere(id).await?,
+            // The order of `record_held_elsewhere`, written out: awaiting
+            // that method here (or `published_record`), even boxed or behind
+            // a trait object, overflows the compiler's query depth limit in
+            // the cluster crate's `bootstrap_serving` from a clean build.
+            None => match self.manifest.record_in_hinted_branch(id).await? {
+                Some(record) => Some(record),
+                None => match self
+                    .history()
+                    .read_record(self.root_uri(), &session, id)
+                    .await?
+                {
+                    Some(record) => Some(record),
+                    None => self.record_in_live_branches(id).await?,
+                },
+            },
         };
         match record {
             Some(record) => {
