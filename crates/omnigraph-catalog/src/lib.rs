@@ -2474,7 +2474,10 @@ impl ManifestCoordinator {
     /// history block: one open of `__manifest` and one branch scan, before
     /// `__history` and [`Self::record_in_live_branches`]. `None` when no such
     /// branch is known or it no longer holds the commit, released, merged or
-    /// deleted since; the hint is then dropped and the caller looks as before.
+    /// deleted since, or its tree is gone (`cleanup` reclaims a retired
+    /// branch's tree after its commits reached `__history`); the hint is then
+    /// dropped and the caller looks as before. A stop-gap until a durable
+    /// commit-to-branch address (#972) removes both the hint and the scan.
     pub async fn record_in_hinted_branch(
         &self,
         graph_commit_id: &str,
@@ -2491,7 +2494,9 @@ impl ManifestCoordinator {
             None => main,
             Some(native) => match main.checkout_branch(native).await {
                 Ok(branch) => branch,
-                Err(lance::Error::RefNotFound { .. }) => {
+                // `NotFound`: the ref resolved but the tree has no
+                // `_versions` listing, as after `cleanup` reclaims it.
+                Err(lance::Error::RefNotFound { .. } | lance::Error::NotFound { .. }) => {
                     self.history.forget_block_home(block);
                     return Ok(None);
                 }
