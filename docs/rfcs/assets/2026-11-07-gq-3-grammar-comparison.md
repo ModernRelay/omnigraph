@@ -62,7 +62,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | `(e1 \| e2)` alternation, per-member orientation (`edge_alternation`) | `-[:E1\|E2]->` | `-[:E1\|E2]->` | `WHERE e.type IN (…)` | two rules, or a union relation |
 | `*` any edge (`edge_wildcard`) | `-[]->` | `-[]->`, `-->` | a union over the edge tables | `edge(X, Y, _)` |
 | `e{m,n}`, `*{m,n}`: bounded hops, one row per endpoint pair at its shortest distance (`traversal_bounds`) | `-[:E]->{m,n}`, `((a)-[:E]->(b)){m,n}`; one row per path; path modes `WALK \| TRAIL \| ACYCLIC \| SIMPLE`; `ANY SHORTEST`, `ALL SHORTEST`, `SHORTEST k`, `ANY k` | `-[:E*m..n]->`, one row per path (TRAIL: no relationship repeats); `shortestPath()`, `allShortestPaths()`; quantified path patterns `{m,n}` and `SHORTEST k` (Neo4j 5) | `WITH RECURSIVE` with a depth column | a recursive rule with a depth argument |
-| unbounded reachability: refused (an open upper bound on `Expand` is the named later change) | `-[:E]->+`, `->*`, `{1,}` | `-[:E*]->` | `WITH RECURSIVE` | native: `path(X, Y) :- edge(X, Z), path(Z, Y).` |
+| unbounded reachability: a declared read calling itself, compiled to `Fix` (stage Rec) | `-[:E]->+`, `->*`, `{1,}` | `-[:E*]->` | `WITH RECURSIVE` | native: `path(X, Y) :- edge(X, Z), path(Z, Y).` |
 | a path value: refused | `p = (a)-[]->*(b)`, `PATH_LENGTH(p)`, `NODES(p)` | `p = …`, `nodes(p)`, `length(p)` | none in `GRAPH_TABLE` | none (a list encoding) |
 | `$d "in" $coll`, a quoted edge name (`string_lit` in `edge_sel`) | `` `in` ``, backtick-delimited | `` `in` `` | `"in"` (a delimited identifier) | none |
 | `@edge` of the catalogue (`catalogue_edge`, stage S) | none | none | none | none |
@@ -92,7 +92,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | `from $r` | none | none | `FROM r` | an atom |
 | columns arrive under their inner names; a collision is `T68` | `CALL { RETURN x }` exports `x` by name; a clash is an error | same; "variable already declared" | `t.col`: qualified names make a clash legal | positional head arguments |
 | renaming only through a wrapper read's `return { $x as y }` | `RETURN x AS y` inside the nested query | same | `AS` anywhere; `t(a, b)` column alias list | head argument order |
-| a `Call` chain must be acyclic and fit a plan budget (`T70`) | n/a | n/a | a recursive view is refused; `WITH RECURSIVE` is the recursion door | recursion is the point |
+| a `Call` chain fits a plan budget; a monotone cycle is a recursion (`Fix`), a non-monotone one is `T70` | n/a | n/a | a recursive view is refused; `WITH RECURSIVE` is the recursion door | recursion is the point |
 | a relation-valued parameter: refused | none | a list parameter | a table-valued parameter (T-SQL), an array (PG) | an input relation |
 | a relation-valued column: refused | none; `LIST<…>` and `RECORD` values | lists and maps as values | arrays, `ROW`, JSON (PG) | records, ADTs (Soufflé) |
 | union of two reads: no surface form (the core `Union` is reached only by alternation, `<e>` and `optional`) | `UNION [ALL \| DISTINCT]`, `EXCEPT`, `INTERSECT`, `OTHERWISE` | `UNION [ALL]` | `UNION \| INTERSECT \| EXCEPT [ALL]` | two rules with one head |
@@ -208,18 +208,18 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | pattern matching | homomorphism: two triples may bind one node unless `!=` says otherwise; `Expand` is set-semantic over endpoint pairs | `REPEATABLE ELEMENTS` (homomorphism) or `DIFFERENT EDGES` (edge isomorphism), declared per `MATCH` | relationship isomorphism within one `MATCH`; nodes may repeat | homomorphism (joins) | homomorphism |
 | variable-length rows | one per endpoint pair at the shortest distance | one per path, mode declared | one per path (TRAIL) | whatever the recursion enumerates | the reachable set |
 | closure | a relation expression in `from` and `let`; no relation-valued cell | a nested query in `CALL` and `EXISTS` only; no relation value | the same, plus lists as pseudo-relations (`collect`, `UNWIND`) | subqueries anywhere, CTEs, derived tables; no relation-valued cell (arrays and JSON stand in) | every relation is named and first-class |
-| recursion | none; bounded `Expand`, `Call` acyclic | quantified paths only | none beyond `*` paths | `WITH RECURSIVE` | native, stratified |
+| recursion | a monotone self-calling read (`Fix`), `min`/`max` and a round budget for invented values; bounded `Expand` for a depth | quantified paths only | none beyond `*` paths | `WITH RECURSIVE` | native, stratified |
 | exact versus approximate | two operators, the text says which, recall declared | n/a | a function versus a procedure | the planner's choice, undeclared | n/a |
 | order ties | a total order over node identities | unspecified | unspecified | unspecified | n/a |
 | totality | every read terminates with a declared cost bound (A1) | terminates | terminates | `WITH RECURSIVE` need not | stratified Datalog terminates; functors can loop |
-| data complexity | polynomial, degree set by `Correlate` and `Expand` nesting | polynomial with path quantifiers | polynomial; lists widen it | polynomial, recursion included; procedures are Turing complete | polynomial; Turing complete with functors |
-| expressive class | first-order with counting and ordering, plus two declared-quality operators; below Datalog, above relational algebra | first-order with counting plus regular path queries | the same with list comprehension | relational algebra plus aggregation, windows and linear recursion | least fixpoint over Horn clauses |
+| data complexity | polynomial, degree set by `Correlate`, `Expand` and `Fix` nesting | polynomial with path quantifiers | polynomial; lists widen it | polynomial, recursion included; procedures are Turing complete | polynomial; Turing complete with functors |
+| expressive class | stratified Datalog with monotone aggregation, plus ordering and two declared-quality operators; invented values bounded | first-order with counting plus regular path queries | the same with list comprehension | relational algebra plus aggregation, windows and linear recursion | least fixpoint over Horn clauses |
 
 ## 15. Forms the four have and GQ 3 does not, classified
 
 | Form | Where it exists | GQ 3 status |
 |---|---|---|
-| unbounded reachability, `*`, `WITH RECURSIVE`, recursive rules | all four | refused by decision (A1); an open upper bound on `Expand` is the named later change |
+| unbounded reachability, `*`, `WITH RECURSIVE`, recursive rules | all four | present as a monotone self-calling read (`Fix`, stage Rec); non-monotone recursion and unbounded value invention refused (A1) |
 | path values | GQL, Cypher | refused by decision |
 | relation-valued columns, lists of rows, maps as values | GQL, Cypher, SQL (arrays, JSON), Datalog (records) | refused by decision (first-order algebra) |
 | reads feeding writes in one statement | GQL, Cypher, SQL | present since 2026-11-04: a write body's clauses feed its statements; a write inside a read stays refused (A7) |
@@ -258,7 +258,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | `@card(m..n)` on an edge type | SQL expresses one side through `UNIQUE` |
 | branches, commits, `as unattached branch`, `merge-base`, `diff` as statements | Dolt adds branches to SQL outside the standard |
 | a total order on ties through node identity | every other language leaves ties unspecified |
-| a plan budget on inlined calls (`T70`) | recursion limits exist (PG `max_stack_depth`), not a static budget |
+| a plan budget on inlined calls and a round budget on recursion (`T70`) | recursion limits exist (PG `max_stack_depth`), not a static budget |
 | a nullable-by-opt-in type system (`T?`) on a graph schema | GQL and SQL are nullable by default with `NOT NULL` |
 | `Vector(n)` and `Blob` as property types with `@embed` and `@index(fulltext)` on the declaration | pgvector adds the type; no language declares the embedding on the schema |
 | a catalogue (`@Type`, `@Property`) queried with the same traversal grammar | `information_schema` is tables; GQL has no reflection in the standard |

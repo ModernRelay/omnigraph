@@ -163,6 +163,21 @@ query around($h: String) {
 }
 ```
 
+**Unbounded reachability.** Edition 2: **Not supported.** Every traversal
+needs a bound.
+
+```gq
+// edition 3
+query reachable($from: String) {
+  match {
+    from union(
+      { match { $p: Person { handle: $from }  $p knows $q } return { $q } },
+      { match { from reachable($from)  $q knows $r } return { $r as q } })
+  }
+  return distinct { $q }
+}
+```
+
 **Edge whose name is a reserved word.** Unchanged: quoted in both editions.
 
 ```gq
