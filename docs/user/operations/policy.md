@@ -146,7 +146,12 @@ commit has does, so the id discloses nothing (see
 
 ## Validate and test
 
-Policy commands read the applied bundle from a cluster:
+Policy commands read the applied bundles from a cluster and ask the bundle a
+server asks: graph actions go to the bundle bound to `--graph`, and
+`graph_list` and `config_manage` go to the bundle bound to `cluster`.
+`validate` checks each of the two that is applied, as its own kind; `test`
+runs each case against the bundle for its action. An action whose scope has
+no applied bundle is refused; the other scope's bundle never answers it.
 
 ```bash
 omnigraph policy validate --target ./company-brain --graph knowledge
