@@ -208,11 +208,13 @@ its pin through the read-handle cache (the registration's `staged_version`
 when it carries one) and produces one exact transaction per table without
 moving HEAD. `commit_all` admits each dataset it commits to that cache under
 the key its publication will register, so the next read or write of the table
-opens no manifest; once a publication names the new pins, the writer evicts each
-replaced base pin from that cache, so a steadily written table holds its
-current version rather than its recent history; the cache also bounds the
-decoded manifest bytes its handles keep alive, since a manifest lists every
-fragment. `commit_all` enters the gates, revalidates the complete
+opens no manifest; once a publication names the new pins, the writer demotes
+each replaced base pin in that cache: it stays held for a reader or fork still
+at that version while the cache's byte budget has room, and is the first out
+under pressure, so a steadily written table's history never displaces a live
+pin; the budget bounds the decoded manifest bytes the handles keep alive,
+since a manifest lists every fragment. `commit_all` enters the gates,
+revalidates the complete
 authority (for the handle's bound branch, the probe taken beside the staging
 puts serves when it answered current and no publish has installed on the
 handle since; for another branch, the captured manifest probe first: an
