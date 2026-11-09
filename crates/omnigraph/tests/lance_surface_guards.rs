@@ -706,6 +706,19 @@ fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
         assert!(error.contains("reserved"), "unexpected error: {error}");
         assert!(error.contains(name), "unexpected error: {error}");
     }
+    // The engine drops exactly the names `is_system_column` matches from
+    // change images, export and push comparison. The match must stay exact,
+    // so a property a persisted contract may still declare is never hidden.
+    for name in [
+        "_row",
+        "_rowdy",
+        "_row_custom",
+        "_row_created_at",
+        "id",
+        "rowid",
+    ] {
+        assert!(!is_system_column(name), "Lance now reserves {name}");
+    }
 }
 
 /// Guard: a rename-only `Operation::Project` (the RFC 0040 system-column

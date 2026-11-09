@@ -2852,15 +2852,7 @@ fn validate_strict_input_fields(
 }
 
 fn is_reserved_physical_input_field(field: &str) -> bool {
-    matches!(
-        field,
-        "_tombstone"
-            | "_rowid"
-            | "_rowaddr"
-            | "_rowoffset"
-            | "_row_created_at_version"
-            | "_row_last_updated_at_version"
-    )
+    field == "_tombstone" || lance_core::is_system_column(field)
 }
 
 fn validate_optional_row_id(
