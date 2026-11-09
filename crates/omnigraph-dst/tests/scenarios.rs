@@ -2852,6 +2852,131 @@ query widen($title: String) {
     rows
 }
 
+/// One-row keyed writes on an indexed table, measured on a reopened handle at
+/// two table sizes: 2 and 16 fragments of 8 people, the id BTREE covering
+/// all of them (one index page at both sizes, so a lookup reads the same
+/// index bytes). A keyed `insert` (`KeyedInsert`), a whole-row `update`
+/// (`KeyedUpdate`) and a `load --mode merge` of one present and one new row
+/// (`MergeLoadPresent`, `MergeLoadNew`) reach their rows through the index:
+/// the update's `<key> = v` match adds the derived id conjunct, and an upsert
+/// whose rows are all new or all present skips Lance's full-table merge
+/// join. Their calls do not follow the fragment count, so the rows of the two
+/// sizes are equal, except one GET of `KeyedInsert`, the first write after
+/// the reopen, which the forced join paid as well (it read 10 and 25).
+fn keyed_write_table_size_cost_rows(replay: &str) -> String {
+    const SCHEMA: &str = "node Person {\n    slug: String @key\n    age: I32\n}\n";
+    const WRITES: &str = r#"
+query insert_one() {
+    insert Person { slug: "new-0", age: 1 }
+}
+query update_one() {
+    update Person set { age: 2 } where slug = "p0003"
+}
+"#;
+    const SIZES: [(u32, [&str; 4]); 2] = [
+        (
+            2,
+            [
+                "KeyedInsertFragments2",
+                "KeyedUpdateFragments2",
+                "MergeLoadPresentFragments2",
+                "MergeLoadNewFragments2",
+            ],
+        ),
+        (
+            16,
+            [
+                "KeyedInsertFragments16",
+                "KeyedUpdateFragments16",
+                "MergeLoadPresentFragments16",
+                "MergeLoadNewFragments16",
+            ],
+        ),
+    ];
+
+    struct KeyedWriteCost {
+        fragments: u32,
+        labels: [&'static str; 4],
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for KeyedWriteCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_keyed_write_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            for fragment in 0..self.fragments {
+                let rows = (0..8)
+                    .map(|row| {
+                        let n = fragment * 8 + row;
+                        format!(r#"{{"type":"Person","data":{{"slug":"p{n:04}","age":{n}}}}}"#)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                db.load_jsonl(&rows, LoadMode::Append).await.unwrap();
+            }
+            db.ensure_indices().await.unwrap();
+            drop(db);
+            let db = session(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            );
+            let params = omnigraph_compiler::ir::ParamMap::new();
+            omnigraph_dst::cost::set_label(self.labels[0]);
+            let inserted = db.mutate("main", WRITES, "insert_one", &params).await;
+            omnigraph_dst::cost::set_label("_keyed_write_verify");
+            assert_eq!(inserted.unwrap().affected_nodes, 1);
+            omnigraph_dst::cost::set_label(self.labels[1]);
+            let updated = db.mutate("main", WRITES, "update_one", &params).await;
+            omnigraph_dst::cost::set_label("_keyed_write_verify");
+            assert_eq!(updated.unwrap().affected_nodes, 1);
+            omnigraph_dst::cost::set_label(self.labels[2]);
+            db.load_jsonl(
+                r#"{"type":"Person","data":{"slug":"p0005","age":50}}"#,
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+            omnigraph_dst::cost::set_label(self.labels[3]);
+            db.load_jsonl(
+                r#"{"type":"Person","data":{"slug":"new-1","age":51}}"#,
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+            omnigraph_dst::cost::set_label("_keyed_write_verify");
+            assert_eq!(
+                count_rows(&db, "node:Person").await,
+                self.fragments as usize * 8 + 2
+            );
+        }
+    }
+
+    let mut rows = String::new();
+    for (fragments, labels) in SIZES {
+        rows.push_str(&labeled_cost_rows_of(
+            format!("shared-memory://dst-keyed-write-cost-{replay}-{fragments}"),
+            &KeyedWriteCost { fragments, labels },
+            &labels,
+        ));
+    }
+    rows
+}
+
 /// A keyed lookup and a one-hop traversal on main, in the order a served
 /// graph meets them: a freshly opened handle's first read, then warm repeats,
 /// then a read after another handle published a commit (the stale path). The
@@ -3994,6 +4119,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&endpoint_probe_cost_rows("a"));
     table.push_str(&warm_read_cost_rows("a"));
     table.push_str(&update_patch_cost_rows("a"));
+    table.push_str(&keyed_write_table_size_cost_rows("a"));
     table.push_str(&nearest_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
@@ -4008,6 +4134,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&endpoint_probe_cost_rows("b"));
     table2.push_str(&warm_read_cost_rows("b"));
     table2.push_str(&update_patch_cost_rows("b"));
+    table2.push_str(&keyed_write_table_size_cost_rows("b"));
     table2.push_str(&nearest_cost_rows("b"));
     assert_eq!(
         table, table2,
