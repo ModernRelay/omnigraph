@@ -134,8 +134,10 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Que
     }
 }
 
-/// The edition-2 front end, as it was before the edition line existed.
-pub(crate) fn parse_edition2(input: &str) -> std::result::Result<QueryFile, QueryDiagnostic> {
+/// The edition-2 front end, as it was before the edition line existed. Every
+/// caller goes through [`parse_query_diagnostic`]; this is public so the
+/// corpus walks can compare the two.
+pub fn parse_edition2(input: &str) -> std::result::Result<QueryFile, QueryDiagnostic> {
     let pairs = QueryParser::parse(Rule::query_file, input)
         .map_err(|error| pest_error_to_diagnostic(input, error))?;
 
