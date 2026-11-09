@@ -223,9 +223,11 @@ can update existing bundles and their bindings; the server drains affected
 requests before activating the new permissions. Current applied permissions
 authorize the deployment, so a newly granted administrator cannot authorize
 that grant.
-`--graph <id>` must match exactly one applied
-bundle; with both a graph bundle and a `cluster` bundle applied (as in the
-example above), the command refuses with "matches 2 policy bundles".
+Each action is answered by the bundle the server asks for it: a graph action
+by the bundle bound to `--graph <id>`, `graph_list` and `config_manage` by the
+bundle bound to `cluster`. `validate` checks both, each as its own kind, and
+`test` runs each case against its action's bundle. There is no fallback
+between the two: an action whose scope has no applied bundle is refused.
 
 ## Direct access is a separate trust boundary
 

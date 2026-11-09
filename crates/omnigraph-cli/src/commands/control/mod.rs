@@ -74,22 +74,50 @@ pub(crate) async fn run_policy(
         None => graph_resource_id_for_selection(None, "default"),
     };
     let policies = read_cluster_policies(&binding).await?;
+    let bundles = PolicyBundles::select(cluster, &policies, graph)?;
     match command {
         PolicyCommand::Validate {} => {
-            let bundle = select_cluster_policy(cluster, &policies, graph)?;
-            let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
-            writeln!(
-                stdout,
-                "policy valid: bundle '{}' [{} actors]",
-                bundle.name,
-                engine.known_actor_count()
-            )?;
+            if bundles.graph.is_none() && bundles.cluster.is_none() {
+                bail!("{}", bundles.missing_any());
+            }
+            if let Some(bundle) = bundles.graph {
+                let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
+                write_policy_valid(bundle, &engine, stdout)?;
+            }
+            if let Some(bundle) = bundles.cluster {
+                let engine = PolicyEngine::load_cluster_from_source(&bundle.source)?;
+                write_policy_valid(bundle, &engine, stdout)?;
+            }
         }
         PolicyCommand::Test { tests } => {
-            let bundle = select_cluster_policy(cluster, &policies, graph)?;
-            let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
             let tests = PolicyTestConfig::load(&tests)?;
-            engine.run_tests(&tests)?;
+            // Each case runs against the bundle that owns its action, as a
+            // server asks that bundle for the request.
+            let (graph_cases, cluster_cases): (Vec<_>, Vec<_>) = tests
+                .cases
+                .iter()
+                .cloned()
+                .partition(|case| scope_of(case.action) == PolicyScope::Graph);
+            let mut failures = Vec::new();
+            for (scope, cases) in [
+                (PolicyScope::Graph, graph_cases),
+                (PolicyScope::Cluster, cluster_cases),
+            ] {
+                if cases.is_empty() {
+                    continue;
+                }
+                let engine = bundles.engine(scope, &graph_id)?;
+                let subset = PolicyTestConfig {
+                    version: tests.version,
+                    cases,
+                };
+                if let Err(error) = engine.run_tests(&subset) {
+                    failures.push(error.to_string());
+                }
+            }
+            if !failures.is_empty() {
+                bail!("{}", failures.join("\n"));
+            }
             writeln!(stdout, "policy tests passed: {} cases", tests.cases.len())?;
         }
         PolicyCommand::Explain {
@@ -98,8 +126,7 @@ pub(crate) async fn run_policy(
             branch,
             target_branch,
         } => {
-            let bundle = select_cluster_policy(cluster, &policies, graph)?;
-            let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
+            let engine = bundles.engine(scope_of(action), &graph_id)?;
             let request = PolicyRequest {
                 action,
                 branch,
@@ -110,6 +137,20 @@ pub(crate) async fn run_policy(
         }
     }
     Ok(Completion::success())
+}
+
+fn write_policy_valid(
+    bundle: &omnigraph_cluster::ServingPolicy,
+    engine: &PolicyEngine,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    writeln!(
+        stdout,
+        "policy valid: bundle '{}' [{} actors]",
+        bundle.name,
+        engine.known_actor_count()
+    )?;
+    Ok(())
 }
 
 pub(crate) async fn run_graphs(
@@ -175,52 +216,136 @@ async fn read_cluster_policies(
     Ok(read_serving_snapshot_or_report(binding).await?.policies)
 }
 
-/// Pick the single policy bundle that applies to the selection. With `--graph`,
-/// the bundle bound to `graph.<id>` (or the cluster-wide one); without it, the
-/// sole bundle if there's exactly one. Ambiguity or absence is a loud error.
-fn select_cluster_policy<'p>(
-    cluster: &str,
-    policies: &'p [omnigraph_cluster::ServingPolicy],
-    graph: Option<&str>,
-) -> Result<&'p omnigraph_cluster::ServingPolicy> {
-    if let Some(graph_id) = graph {
-        let graph_ref = format!("graph.{graph_id}");
-        let matching: Vec<&omnigraph_cluster::ServingPolicy> = policies
-            .iter()
-            .filter(|p| {
-                p.applies_to
-                    .iter()
-                    .any(|s| s == &graph_ref || s == "cluster")
-            })
-            .collect();
-        return match matching.as_slice() {
-            [only] => Ok(only),
-            [] => bail!(
-                "cluster `{cluster}` has no policy bundle bound to graph `{graph_id}` \
-                 (or to the cluster scope)"
-            ),
-            many => bail!(
-                "graph `{graph_id}` in cluster `{cluster}` matches {} policy bundles ([{}]); \
-                 the cluster model expects one bundle per graph scope",
-                many.len(),
-                many.iter()
-                    .map(|p| p.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        };
+/// The scope whose bundle answers an action: the graph's bundle for a graph
+/// action, the `cluster` bundle for `graph_list` and `config_manage`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PolicyScope {
+    Graph,
+    Cluster,
+}
+
+fn scope_of(action: omnigraph_policy::PolicyAction) -> PolicyScope {
+    match action.resource_kind() {
+        omnigraph_policy::PolicyResourceKind::Graph => PolicyScope::Graph,
+        omnigraph_policy::PolicyResourceKind::Server
+        | omnigraph_policy::PolicyResourceKind::Cluster => PolicyScope::Cluster,
     }
-    match policies {
-        [only] => Ok(only),
-        [] => bail!("cluster `{cluster}` has no applied policy bundles"),
-        many => bail!(
-            "cluster `{cluster}` has {} policy bundles ([{}]); pass --graph <id> to select one",
-            many.len(),
+}
+
+/// The applied bundles a policy command can consult, routed by binding the
+/// way serving routes them (`omnigraph-server` `settings.rs`): at most one
+/// bundle per graph and one bound to `cluster`. There is no fallback between
+/// the two scopes.
+struct PolicyBundles<'p> {
+    cluster_uri: &'p str,
+    graph_id: Option<&'p str>,
+    graph: Option<&'p omnigraph_cluster::ServingPolicy>,
+    cluster: Option<&'p omnigraph_cluster::ServingPolicy>,
+}
+
+impl<'p> PolicyBundles<'p> {
+    /// With `--graph`, the graph's bundle is the one bound to `graph.<id>`;
+    /// without it, the sole graph-bound bundle when exactly one exists.
+    /// Two bundles for one scope are a loud error, as serving refuses them.
+    fn select(
+        cluster_uri: &'p str,
+        policies: &'p [omnigraph_cluster::ServingPolicy],
+        graph_id: Option<&'p str>,
+    ) -> Result<Self> {
+        let names = |many: &[&omnigraph_cluster::ServingPolicy]| {
             many.iter()
                 .map(|p| p.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
-        ),
+        };
+        let graph_bound: Vec<&omnigraph_cluster::ServingPolicy> = match graph_id {
+            Some(id) => {
+                let binding = format!("graph.{id}");
+                policies
+                    .iter()
+                    .filter(|p| p.applies_to.iter().any(|s| s == &binding))
+                    .collect()
+            }
+            None => policies
+                .iter()
+                .filter(|p| p.applies_to.iter().any(|s| s.starts_with("graph.")))
+                .collect(),
+        };
+        let graph = match (graph_bound.as_slice(), graph_id) {
+            ([], _) => None,
+            ([only], _) => Some(*only),
+            (many, Some(id)) => bail!(
+                "graph `{id}` in cluster `{cluster_uri}` matches {} policy bundles ([{}]); \
+                 the cluster model expects one bundle per graph scope",
+                many.len(),
+                names(many)
+            ),
+            (many, None) => bail!(
+                "cluster `{cluster_uri}` has {} graph policy bundles ([{}]); pass --graph <id> to select one",
+                many.len(),
+                names(many)
+            ),
+        };
+        let cluster_bound: Vec<&omnigraph_cluster::ServingPolicy> = policies
+            .iter()
+            .filter(|p| p.applies_to.iter().any(|s| s == "cluster"))
+            .collect();
+        let cluster = match cluster_bound.as_slice() {
+            [] => None,
+            [only] => Some(*only),
+            many => bail!(
+                "cluster `{cluster_uri}` binds {} policy bundles to the cluster scope ([{}]); \
+                 the cluster model expects one bundle per scope",
+                many.len(),
+                names(many)
+            ),
+        };
+        Ok(Self {
+            cluster_uri,
+            graph_id,
+            graph,
+            cluster,
+        })
+    }
+
+    /// Compile the bundle that answers `scope`, as its own kind.
+    fn engine(&self, scope: PolicyScope, graph_label: &str) -> Result<PolicyEngine> {
+        let cluster_uri = self.cluster_uri;
+        match scope {
+            PolicyScope::Graph => match self.graph {
+                Some(bundle) => Ok(PolicyEngine::load_graph_from_source(
+                    &bundle.source,
+                    graph_label,
+                )?),
+                None => match self.graph_id {
+                    Some(id) => {
+                        bail!("cluster `{cluster_uri}` has no policy bundle bound to graph `{id}`")
+                    }
+                    None => bail!(
+                        "cluster `{cluster_uri}` has no graph policy bundle; graph actions need one"
+                    ),
+                },
+            },
+            PolicyScope::Cluster => match self.cluster {
+                Some(bundle) => Ok(PolicyEngine::load_cluster_from_source(&bundle.source)?),
+                None => bail!(
+                    "cluster `{cluster_uri}` has no policy bundle bound to the cluster scope; \
+                     `graph_list` and `config_manage` are answered only by that bundle"
+                ),
+            },
+        }
+    }
+
+    /// The refusal when neither scope has a bundle.
+    fn missing_any(&self) -> String {
+        let cluster_uri = self.cluster_uri;
+        match self.graph_id {
+            Some(id) => format!(
+                "cluster `{cluster_uri}` has no policy bundle bound to graph `{id}` \
+                 (or to the cluster scope)"
+            ),
+            None => format!("cluster `{cluster_uri}` has no applied policy bundles"),
+        }
     }
 }
 
