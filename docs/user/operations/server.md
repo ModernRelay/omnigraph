@@ -91,7 +91,7 @@ Choose one static token source:
 |---|---|
 | `OMNIGRAPH_SERVER_BEARER_TOKEN` | One bearer token; actor is `default` |
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON` | Actor-to-token object, e.g. `{"act-alice":"secret-a"}` |
-| `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` | Path to that JSON object |
+| `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` | Path to that JSON object. On Unix a file other accounts can write is refused at startup, and one they can read logs a warning; use `chmod 600`, or `defaultMode: 0400` on a Kubernetes secret volume |
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` | Secrets Manager mapping; requires an AWS-enabled build: the container images, the release archives from v0.14.0 and every edge build, or a source build with `cargo build -p omnigraph-server --features aws` |
 
 Send `Authorization: Bearer secret-a` (the scheme is case-insensitive). The token selects the
