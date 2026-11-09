@@ -47,6 +47,8 @@ and invariants rather than duplicating those details.
 
 - [RFC process and registry](../rfcs/README.md)
 - [Release notes](../releases/)
+- [Simplification candidates, 2026-11-09](../simplify/20261109.md): code
+  ranked for removal, with what was taken and why the rest was not
 - Git history for superseded implementation plans and handoff notes
 
 An implemented RFC records why a decision was made; it does not replace the
