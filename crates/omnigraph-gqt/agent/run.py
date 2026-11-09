@@ -209,12 +209,22 @@ def bare_answer(text):
     return EDITION_LINE.sub("", text, count=1).rstrip("\n") if text.startswith("gq ") else text.rstrip("\n")
 
 
+def compact(verdict):
+    """A verdict as records keep it: each declaration's typed IR by its
+    SHA-256, since the IR is rebuilt by judging the stored answer again at the
+    recorded commit and would otherwise be most of a results directory."""
+    for decl in verdict.get("declarations") or []:
+        if "ir" in decl:
+            decl["ir_sha256"] = sha256(decl.pop("ir"))
+    return verdict
+
+
 def judge(bin_path, edition, jobs):
     if not jobs:
         return {}
     stdin = "\n".join(json.dumps({"id": i, "task": t, "text": x}) for i, (t, x) in enumerate(jobs)) + "\n"
     rows = json_lines(tool(bin_path, "judge", "--edition", str(edition), stdin=stdin))
-    return {row["id"]: row for row in rows}
+    return {row["id"]: compact(row) for row in rows}
 
 
 def signature(task):

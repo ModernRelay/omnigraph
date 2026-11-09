@@ -74,7 +74,8 @@ several queries would do.
 ## What each number means
 
 `run.py` writes `records.jsonl` (one record per agent call, with the prompt's
-digest, the raw reply, the extracted answer and the judge's verdict),
+digest, the raw reply, the extracted answer and the judge's verdict, each
+declaration's typed IR by its SHA-256),
 `meta.json` (model, card digests, `claude` version, git commit), and
 `summary.md` and `summary.json`, per edition, run and set:
 

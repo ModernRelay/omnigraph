@@ -1,0 +1,232 @@
+{
+  "e2-r1-corpus": {
+    "edition": 2,
+    "final_correct": "17/17",
+    "first_accepted": "30/30",
+    "first_correct": "17/17",
+    "first_correct_shared": "17/17",
+    "multi_query": 12,
+    "repair_bare_accepted": "-",
+    "repair_card_accepted": "-",
+    "run": 1,
+    "set": "corpus",
+    "tokens_in": 9074,
+    "tokens_out": 332,
+    "unjudged": 13
+  },
+  "e2-r1-seeded": {
+    "accepted": "17/18",
+    "correct": "17/17"
+  },
+  "e2-r1-tasks": {
+    "edition": 2,
+    "final_correct": "22/25",
+    "first_accepted": "38/45",
+    "first_correct": "22/24",
+    "first_correct_shared": "22/24",
+    "multi_query": 3,
+    "repair_bare_accepted": "1/7",
+    "repair_card_accepted": "6/7",
+    "run": 1,
+    "set": "tasks",
+    "tokens_in": 9223,
+    "tokens_out": 325,
+    "unjudged": 14
+  },
+  "e2-r2-corpus": {
+    "edition": 2,
+    "final_correct": "18/18",
+    "first_accepted": "30/30",
+    "first_correct": "18/18",
+    "first_correct_shared": "18/18",
+    "multi_query": 11,
+    "repair_bare_accepted": "-",
+    "repair_card_accepted": "-",
+    "run": 2,
+    "set": "corpus",
+    "tokens_in": 9074,
+    "tokens_out": 317,
+    "unjudged": 12
+  },
+  "e2-r2-seeded": {
+    "accepted": "17/18",
+    "correct": "17/17"
+  },
+  "e2-r2-tasks": {
+    "edition": 2,
+    "final_correct": "22/25",
+    "first_accepted": "39/45",
+    "first_correct": "21/23",
+    "first_correct_shared": "21/23",
+    "multi_query": 4,
+    "repair_bare_accepted": "2/6",
+    "repair_card_accepted": "6/6",
+    "run": 2,
+    "set": "tasks",
+    "tokens_in": 9223,
+    "tokens_out": 314,
+    "unjudged": 16
+  },
+  "e2-r3-corpus": {
+    "edition": 2,
+    "final_correct": "18/18",
+    "first_accepted": "30/30",
+    "first_correct": "18/18",
+    "first_correct_shared": "18/18",
+    "multi_query": 11,
+    "repair_bare_accepted": "-",
+    "repair_card_accepted": "-",
+    "run": 3,
+    "set": "corpus",
+    "tokens_in": 9074,
+    "tokens_out": 327,
+    "unjudged": 12
+  },
+  "e2-r3-seeded": {
+    "accepted": "16/18",
+    "correct": "16/16"
+  },
+  "e2-r3-tasks": {
+    "edition": 2,
+    "final_correct": "23/26",
+    "first_accepted": "39/45",
+    "first_correct": "22/24",
+    "first_correct_shared": "22/24",
+    "multi_query": 5,
+    "repair_bare_accepted": "2/6",
+    "repair_card_accepted": "6/6",
+    "run": 3,
+    "set": "tasks",
+    "tokens_in": 9223,
+    "tokens_out": 320,
+    "unjudged": 15
+  },
+  "e3-r1-corpus": {
+    "edition": 3,
+    "final_correct": "12/30",
+    "first_accepted": "30/30",
+    "first_correct": "12/30",
+    "first_correct_shared": "7/19",
+    "multi_query": 0,
+    "repair_bare_accepted": "-",
+    "repair_card_accepted": "-",
+    "run": 1,
+    "set": "corpus",
+    "tokens_in": 7499,
+    "tokens_out": 230,
+    "unjudged": 0
+  },
+  "e3-r1-seeded": {
+    "accepted": "24/29",
+    "correct": "21/24"
+  },
+  "e3-r1-tasks": {
+    "edition": 3,
+    "final_correct": "28/45",
+    "first_accepted": "45/45",
+    "first_correct": "28/45",
+    "first_correct_shared": "16/26",
+    "multi_query": 2,
+    "repair_bare_accepted": "-",
+    "repair_card_accepted": "-",
+    "run": 1,
+    "set": "tasks",
+    "tokens_in": 7648,
+    "tokens_out": 170,
+    "unjudged": 0
+  },
+  "e3-r2-corpus": {
+    "edition": 3,
+    "final_correct": "12/30",
+    "first_accepted": "30/30",
+    "first_correct": "12/30",
+    "first_correct_shared": "7/19",
+    "multi_query": 0,
+    "repair_bare_accepted": "-",
+    "repair_card_accepted": "-",
+    "run": 2,
+    "set": "corpus",
+    "tokens_in": 7499,
+    "tokens_out": 231,
+    "unjudged": 0
+  },
+  "e3-r2-seeded": {
+    "accepted": "23/29",
+    "correct": "21/23"
+  },
+  "e3-r2-tasks": {
+    "edition": 3,
+    "final_correct": "30/45",
+    "first_accepted": "45/45",
+    "first_correct": "30/45",
+    "first_correct_shared": "18/26",
+    "multi_query": 2,
+    "repair_bare_accepted": "-",
+    "repair_card_accepted": "-",
+    "run": 2,
+    "set": "tasks",
+    "tokens_in": 7648,
+    "tokens_out": 184,
+    "unjudged": 0
+  },
+  "e3-r3-corpus": {
+    "edition": 3,
+    "final_correct": "13/30",
+    "first_accepted": "30/30",
+    "first_correct": "13/30",
+    "first_correct_shared": "8/19",
+    "multi_query": 0,
+    "repair_bare_accepted": "-",
+    "repair_card_accepted": "-",
+    "run": 3,
+    "set": "corpus",
+    "tokens_in": 7499,
+    "tokens_out": 192,
+    "unjudged": 0
+  },
+  "e3-r3-seeded": {
+    "accepted": "23/29",
+    "correct": "21/23"
+  },
+  "e3-r3-tasks": {
+    "edition": 3,
+    "final_correct": "30/45",
+    "first_accepted": "44/45",
+    "first_correct": "29/44",
+    "first_correct_shared": "17/25",
+    "multi_query": 2,
+    "repair_bare_accepted": "0/1",
+    "repair_card_accepted": "1/1",
+    "run": 3,
+    "set": "tasks",
+    "tokens_in": 7648,
+    "tokens_out": 177,
+    "unjudged": 0
+  },
+  "gate": {
+    "acceptance_at_or_above": true,
+    "correctness_at_or_above": false,
+    "edition2_accepted": [
+      43,
+      43,
+      43
+    ],
+    "edition2_correct": [
+      39,
+      39,
+      40
+    ],
+    "edition3_accepted": [
+      45,
+      45,
+      44
+    ],
+    "edition3_correct": [
+      23,
+      25,
+      25
+    ],
+    "shared_tasks": 45,
+    "verdict": "fail"
+  }
+}
