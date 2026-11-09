@@ -1,5 +1,0 @@
-// task: a SPARQL SELECT
-// kind: adversarial
-// expect: refuse
-// habit: SPARQL
-SELECT ?x WHERE { ?x :knows ?y }

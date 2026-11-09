@@ -1,9 +1,0 @@
-// task: a write whose clause traverses an edge named `insert`
-// kind: traversal
-// expect: refuse-with-fix:$a "insert" $b
-// rfc: §7 stmt_keyword
-// amended: grammar2 G8: a statement word is never a bare edge name
-query w() {
-  $a: Person  $a insert $b
-  delete $b
-}

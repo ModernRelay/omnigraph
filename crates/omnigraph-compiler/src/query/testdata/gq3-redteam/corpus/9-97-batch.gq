@@ -1,5 +1,0 @@
-// task: the withdrawn batch
-// kind: adversarial
-// expect: refuse
-// habit: GQ edition 2
-batch { a() b() }

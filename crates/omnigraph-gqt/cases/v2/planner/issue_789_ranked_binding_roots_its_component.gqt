@@ -55,8 +55,6 @@ query bm25_on_an_undeclared_destination() {
 d.slug: String
 --- expect plan
 scan Doc as $d: ranked bm25
---- expect same as v1
-
 --- query
 query bm25_two_hops_from_the_source() {
     match {
@@ -76,8 +74,6 @@ x.slug: String
 d.slug: String
 --- expect plan
 scan Doc as $d: ranked bm25
---- expect same as v1
-
 --- query
 query bm25_on_a_traversal_source() {
     match {
@@ -94,8 +90,6 @@ query bm25_on_a_traversal_source() {
 d.slug: String
 --- expect plan
 scan Doc as $d: ranked bm25
---- expect same as v1
-
 --- query
 query bm25_over_an_undirected_traversal() {
     match {
@@ -113,4 +107,3 @@ query bm25_over_an_undirected_traversal() {
 d.slug: String
 --- expect plan
 scan Doc as $d: ranked bm25
---- expect same as v1

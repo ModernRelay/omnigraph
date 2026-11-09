@@ -1,6 +1,6 @@
 # issue: none
-# notes: inventory sweep, input class `engine`: the same query on the v2 plan runner
-# notes: and on the reference engine returns the same rows.
+# notes: inventory sweep, input class `engine`: the query's rows and its plan line
+# notes: under `set engine = v2`.
 
 --- runner
 timeout_ms: 10000
@@ -43,4 +43,3 @@ p.name: String
 q.name: String
 --- expect plan
 expand $p Knows $q: mode indexed_scan ran indexed_scan
---- expect same as v1

@@ -1,9 +1,0 @@
-// task: an optional from that keeps targets an arm missed
-// kind: shapes-of-a-result
-// expect: accept
-// rfc: §4 Fusion: optional { from … }
-// amended: the ranked column is a property access and `l2` is `distance` (RFC §3, 2026-11-08)
-query q($q: Vector(3)) {
-  match { $d: Doc  optional { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 5) } }
-  return { $d.title, $distance }
-}

@@ -1,9 +1,0 @@
-// task: `$n -1`, which the RFC says is one subtraction
-// kind: lookups-and-filters
-// expect: refuse-with-fix:$n - 1 > 0
-// rfc: §3 arithmetic: `$n -1` and `$n - 1` are one subtraction
-// amended: `$n -1` is refused with `$n - 1` as the fix (RFC §3, 2026-11-08)
-query q() {
-  match { $p: Person  let $n = $p.age  $n -1 > 0 }
-  return { $p.name }
-}

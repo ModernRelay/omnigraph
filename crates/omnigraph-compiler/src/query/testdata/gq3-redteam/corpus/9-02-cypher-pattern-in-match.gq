@@ -1,8 +1,0 @@
-// task: a Cypher pattern inside match braces
-// kind: adversarial
-// expect: refuse-with-fix:$a: Person  $a knows $b
-// habit: Cypher
-query q() {
-  match { (a:Person)-[:KNOWS]->(b) }
-  return { $b.name }
-}

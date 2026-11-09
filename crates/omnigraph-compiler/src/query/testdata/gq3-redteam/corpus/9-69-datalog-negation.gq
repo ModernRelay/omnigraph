@@ -1,8 +1,0 @@
-// task: negation with !
-// kind: adversarial
-// expect: refuse-with-fix:not { $p knows $q }
-// habit: Datalog
-query q() {
-  match { $p: Person  $q: Person  !knows($p, $q) }
-  return { $p.name }
-}

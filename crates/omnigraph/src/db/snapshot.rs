@@ -237,11 +237,6 @@ impl Snapshot {
         self.retired_incarnation
     }
 
-    #[cfg(feature = "test-util")]
-    pub(crate) fn raw(&self) -> &omnigraph_catalog::Snapshot {
-        &self.inner
-    }
-
     #[cfg(test)]
     pub(crate) fn raw_mut(&mut self) -> &mut omnigraph_catalog::Snapshot {
         &mut self.inner

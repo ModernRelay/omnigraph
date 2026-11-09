@@ -1,7 +1,7 @@
 # issue: 788
 # red_on: 2026-10-09, upstream main: a search-led aggregate planned no Sort at all, so the groups came back in the Aggregate's own order whatever keys followed bm25() or rrf().
 # notes: The leading search function selects the population an aggregate reads and does not order the groups; the keys after it order the groups, then every group key ascending (RFC 0047 §One total order), so the order is total and `expect ordered` holds.
-# notes: x has 1 doc, y has 2; the n desc / n asc pair is red whatever order the Aggregate emits groups in. Engine v1 drops the key too (exec/query.rs "historical no-sort behavior"), so no v1 step.
+# notes: x has 1 doc, y has 2; the n desc / n asc pair is red whatever order the Aggregate emits groups in.
 
 --- runner
 timeout_ms: 10000

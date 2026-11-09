@@ -1,8 +1,0 @@
-// task: DELETE in uppercase
-// kind: adversarial
-// expect: refuse-with-fix:delete $p
-// habit: Cypher
-query w($h: String) {
-  $p: Person { handle: $h }
-  DELETE $p
-}

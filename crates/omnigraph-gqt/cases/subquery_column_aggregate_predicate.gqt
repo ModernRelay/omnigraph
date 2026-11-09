@@ -4,7 +4,7 @@
 # notes: An outer row with no inner match has no aggregate and fails every comparison.
 # notes: min and max admit what they admit in a return: numbers, String, Bool, Date, DateTime.
 # notes: count over a column counts its non-null values; a null bound satisfies nothing; a U64 above the I64 range is kept.
-# notes: On v1 a block binding introduced by a scan must still load the argument's column.
+# notes: A block binding introduced by a scan must still load the argument's column.
 # notes: Shared row/error steps inherit the CI engine baseline; only plan assertions select v2.
 
 --- runner

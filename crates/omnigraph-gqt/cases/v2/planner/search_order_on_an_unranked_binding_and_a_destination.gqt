@@ -91,4 +91,3 @@ query nearest_on_a_traversal_destination($q: Vector(4)) {
 d.slug: String
 --- expect plan
 scan Doc as $d: ranked nearest fetch 1
---- expect same as v1

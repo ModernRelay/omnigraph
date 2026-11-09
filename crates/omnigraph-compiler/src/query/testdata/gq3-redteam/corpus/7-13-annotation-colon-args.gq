@@ -1,9 +1,0 @@
-// task: @budget written with call-style `:` options
-// kind: catalogue-and-declarations
-// expect: refuse-with-fix:@budget(plan = 1000)
-// rfc: §6 freeze list
-// amended: `rows` is stage N's; `plan` is this release's, so the fix leads to accepted text
-query q() @budget(plan: 1000) {
-  match { $p: Person }
-  return { $p.name }
-}

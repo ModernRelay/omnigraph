@@ -1181,75 +1181,6 @@ fn refuses_ok_expect_on_a_query_step() {
     assert!(refusal("x", &text).contains("a query step takes"));
 }
 
-const SAME: &str = "--- expect same as v1\n";
-
-#[test]
-fn same_as_v1_follows_a_query_steps_shape_or_plan() {
-    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{QUERY}{EXPECT}");
-    let case = parse_case("x", &text).unwrap();
-    let flags: Vec<bool> = case
-        .items
-        .iter()
-        .map(|item| match item {
-            Item::Step(Step::Query(step)) => step.same_as_v1,
-            other => panic!("expected query steps, got {other:?}"),
-        })
-        .collect();
-    assert_eq!(flags, [true, false]);
-    let after_plan = format!(
-        "{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect plan\npass projection_pushdown\n{SAME}"
-    );
-    let case = parse_case("x", &after_plan).unwrap();
-    let Some(Item::Step(Step::Query(step))) = case.items.first() else {
-        panic!("first item is the query step");
-    };
-    assert!(step.same_as_v1 && step.plan.is_some());
-}
-
-#[test]
-fn same_as_v1_is_refused_off_a_query_rows_expect() {
-    for text in [
-        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{SAME}"),
-        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{SAME}"),
-    ] {
-        let refused = refusal("x", &text);
-        assert!(
-            refused.starts_with("invalid_case: ") && refused.contains("refused on a mutate step"),
-            "{refused}"
-        );
-    }
-    let rows = "--- expect unordered\n{\"p.name\": \"alice\"}\n";
-    for (text, needle) in [
-        (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{SAME}{SHAPE}"),
-            "must directly follow",
-        ),
-        (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{rows}{SAME}{SHAPE}"),
-            "needs an `--- expect shape`",
-        ),
-        (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect error: boom\n{SAME}"),
-            "must directly follow",
-        ),
-        (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{SAME}"),
-            "must directly follow",
-        ),
-        (
-            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{{\"p.name\": \"alice\"}}\n"),
-            "carries no body",
-        ),
-        (
-            format!("{HDR}{SCHEMA}{SEED}{CREATE}{LIST}{SAME}"),
-            "only on a query declaration step",
-        ),
-    ] {
-        let refused = refusal("x", &text);
-        assert!(refused.contains(needle), "{needle}: {refused}");
-    }
-}
-
 #[test]
 fn refuses_query_step_without_expect() {
     let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}");
@@ -3119,12 +3050,7 @@ fn execute_case<'a>(
 #[test]
 fn core_manifest_has_no_runner_or_test_feature_dependency() {
     let manifest = include_str!("../Cargo.toml");
-    for forbidden in [
-        "omnigraph-dst",
-        "omnigraph-reference-engine",
-        "test-util",
-        "[build-dependencies]",
-    ] {
+    for forbidden in ["omnigraph-dst", "test-util", "[build-dependencies]"] {
         assert!(
             !manifest.contains(forbidden),
             "core dependency boundary: {forbidden}"

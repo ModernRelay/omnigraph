@@ -83,23 +83,6 @@ impl ExecutionHost for GqtHost {
     fn measure_step_end(&self, ordinal: u64) {
         dst_runner::measure_step_end(ordinal);
     }
-    fn reference_query<'a>(
-        &'a self,
-        session: &'a Session,
-        step: &'a QueryStep,
-        target: ReadTarget,
-        params: &'a ParamMap,
-    ) -> futures::future::BoxFuture<'a, Result<QueryResult, String>> {
-        async move {
-            session
-                .clone()
-                .with_read_executor(Arc::new(omnigraph_reference_engine::ReferenceEngine))
-                .query(target, &step.source, &step.name, params)
-                .await
-                .map_err(|error| error.to_string())
-        }
-        .boxed()
-    }
     fn concurrent_step<'a>(
         &'a self,
         session: &'a Session,

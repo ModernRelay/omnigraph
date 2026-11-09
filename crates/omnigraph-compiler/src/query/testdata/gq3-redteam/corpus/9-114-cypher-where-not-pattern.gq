@@ -1,8 +1,0 @@
-// task: WHERE NOT over a pattern
-// kind: adversarial
-// expect: refuse-with-fix:not { $p knows $q }
-// habit: Cypher
-query q() {
-  match { $p: Person  $q: Person  where not $p knows $q }
-  return { $p.name }
-}

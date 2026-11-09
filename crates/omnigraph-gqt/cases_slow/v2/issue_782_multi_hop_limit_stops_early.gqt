@@ -1,5 +1,5 @@
 # issue: 782
-# red_on: 3cdf10ef; step 1 (query) fails with `resource limit exceeded for query_memory_bytes: actual 157286414, limit 157286400`, while engine v1 returns the row.
+# red_on: 3cdf10ef; step 1 (query) fails with `resource limit exceeded for query_memory_bytes: actual 157286414, limit 157286400`.
 # notes: 1024 sources know one hub and the hub knows 1024 targets: 1,050,624
 # notes: one-or-two-hop pairs, more than the default 150 MiB query budget admits when
 # notes: the expand keeps every pair (about 214 bytes each on the red commit, 225 MB

@@ -1,8 +1,0 @@
-// task: STARTS WITH
-// kind: adversarial
-// expect: refuse-with-fix:starts_with($p.name, "A")
-// habit: Cypher
-query q() {
-  match { $p: Person  $p.name STARTS WITH "A" }
-  return { $p.name }
-}

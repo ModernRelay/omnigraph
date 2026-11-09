@@ -1,5 +1,5 @@
 # issue: none
-# red_on: a9aa2850 (v0.12.0); step 3 (query) fails with `resource limit exceeded for query_memory_bytes: actual 158237376, limit 157286400`, and step 4 run alone fails with `actual 158354916`, while engine v1 (`--- expect same as v1`) returns the expected rows for both.
+# red_on: a9aa2850 (v0.12.0); step 3 (query) fails with `resource limit exceeded for query_memory_bytes: actual 158237376, limit 157286400`, and step 4 run alone fails with `actual 158354916`.
 # notes: 5,000 Doc rows whose `body` is one 40,000-byte string (the 16 characters
 # notes: 0123456789abcdef repeated 2,500 times): 200 MB of `body` decoded, more than
 # notes: the default 150 MiB query budget, while each answer is one 40 KB row.

@@ -1,11 +1,11 @@
 //! The edition-3 parser tests of docs/rfcs/2026-11-07-gq-3.md, section 10
-//! ("Compiler parser tests"), plus the before-and-after asset, the rule-set
-//! pin and the edition-2 regression walk.
+//! ("Compiler parser tests"), the rule-set pin, and one repair per refusal
+//! shape.
 
 use super::ast::{CompOp, EdgeSelector, FileBody, MutationWriteMode};
 use super::ast3::*;
 use super::diagnostic::QueryDiagnostic;
-use super::parser::{parse_edition2, parse_query_diagnostic};
+use super::parser::parse_query_diagnostic;
 use super::parser3::parse_query3;
 
 pub(crate) fn parse3(src: &str) -> Result<File3, QueryDiagnostic> {
@@ -311,7 +311,7 @@ fn let_and_from_are_property_edge_alias_and_assignment_names() {
         ));
         assert_eq!(e.code.as_str(), "Q019", "{word}");
     }
-    // The asset's edge insert: `from` and `to` as assignment names.
+    // An edge insert: `from` and `to` as assignment names.
     let w =
         write("query hire($h: String, $slug: String) { insert WorksAt { from: $h, to: $slug } }");
     assert_eq!(w.all_statements().len(), 1);
@@ -885,183 +885,6 @@ fn calls_take_positionals_then_options_and_one_distinct_form() {
 }
 
 #[test]
-fn rfc_section_8_examples_parse() {
-    // Every `gq` block of the RFC (sections 3, 6 and 8), as the RFC writes
-    // it on 2026-11-08; the edition-2 block of section 6 through edition 2.
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/query/testdata/2026-11-07-gq-3-rfc-examples.txt");
-    let text = std::fs::read_to_string(&path).expect("RFC examples copy");
-    let mut blocks = 0;
-    for block in text.split("```gq\n").skip(1) {
-        let block = block.split("```").next().unwrap();
-        blocks += 1;
-        if block.starts_with("// edition 2") {
-            parse_query_diagnostic(block)
-                .unwrap_or_else(|e| panic!("edition 2 refused:\n{block}\n{e:?}"));
-            continue;
-        }
-        let body = block.strip_prefix("gq 3;\n").unwrap_or(block);
-        ok3(body);
-    }
-    assert_eq!(blocks, 8);
-}
-
-// ---------------------------------------------------------------------------
-// The before-and-after asset.
-
-/// The fenced `gq` blocks of the asset, each with its `// edition N` mark.
-fn asset_blocks() -> Vec<(usize, Option<String>, String)> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/query/testdata/2026-11-07-gq-3-before-and-after.txt");
-    let text = std::fs::read_to_string(&path).expect("asset copy");
-    let mut out = Vec::new();
-    let mut inside = false;
-    let mut block = String::new();
-    let mut n = 0;
-    for line in text.lines() {
-        if !inside && line.trim_start().starts_with("```gq") {
-            inside = true;
-            block.clear();
-        } else if inside && line.trim_start().starts_with("```") {
-            inside = false;
-            n += 1;
-            let mark = block
-                .lines()
-                .next()
-                .and_then(|l| l.trim().strip_prefix("// "))
-                .filter(|l| l.starts_with("edition"))
-                .map(str::to_string);
-            out.push((n, mark, block.clone()));
-        } else if inside {
-            block.push_str(line);
-            block.push('\n');
-        }
-    }
-    out
-}
-
-fn is_schema(block: &str) -> bool {
-    block
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with("//"))
-        .is_some_and(|l| {
-            l.starts_with("node ") || l.starts_with("edge ") || l.starts_with("interface ")
-        })
-}
-
-/// Split a block into its declarations, so one refused declaration does not
-/// hide the others.
-fn declarations(block: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    for line in block.lines() {
-        if line.starts_with("query ") && !current.trim().is_empty() {
-            out.push(std::mem::take(&mut current));
-        }
-        current.push_str(line);
-        current.push('\n');
-    }
-    if !current.trim().is_empty() {
-        out.push(current);
-    }
-    out
-}
-
-#[test]
-fn every_before_and_after_example_parses_in_its_edition() {
-    let mut report = Vec::new();
-    let mut failures = Vec::new();
-    for (n, mark, block) in asset_blocks() {
-        if is_schema(&block) {
-            // The shared schema is a `gq` block holding `.pg` text; it is not
-            // query text in either edition.
-            report.push(format!("block {n}: schema, skipped"));
-            continue;
-        }
-        let e2 = || {
-            parse_edition2(&block)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
-        let e3 = || {
-            parse_query3(&format!("gq 3;\n{block}"))
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
-        match mark.as_deref() {
-            Some("edition 2") => {
-                if let Err(e) = e2() {
-                    failures.push(format!("block {n} (edition 2): {e}"));
-                }
-            }
-            Some("edition 3") => {
-                if let Err(e) = e3() {
-                    failures.push(format!("block {n} (edition 3): {e}"));
-                }
-            }
-            Some(other)
-                if other.starts_with("edition 3, later")
-                    || other.starts_with("edition 3, stage") =>
-            {
-                // A later stage's form: some parse and are refused by the
-                // type checker naming the stage (an annotation, a catalogue
-                // edge, an interface binding), some are refused at parse.
-                for d in declarations(&block) {
-                    let outcome = parse_query3(&format!("gq 3;\n{d}"));
-                    report.push(format!(
-                        "block {n} later-stage `{}`: {}",
-                        d.lines().next().unwrap_or("").trim(),
-                        match outcome {
-                            Ok(_) => "parses".to_string(),
-                            Err(e) => format!("refused {}", e.code.as_str()),
-                        }
-                    ));
-                }
-            }
-            Some(other) => panic!("block {n}: unknown mark {other}"),
-            None => {
-                if let Err(e) = e2() {
-                    failures.push(format!("block {n} (shared, edition 2): {e}"));
-                }
-                if let Err(e) = e3() {
-                    failures.push(format!("block {n} (shared, edition 3): {e}"));
-                }
-            }
-        }
-    }
-    for line in &report {
-        eprintln!("{line}");
-    }
-    // Every block parses in the edition it is marked with.
-    let blocks = asset_blocks();
-    let name_of = |failure: &String| -> String {
-        let n: usize = failure
-            .strip_prefix("block ")
-            .and_then(|r| r.split_whitespace().next())
-            .and_then(|n| n.parse().ok())
-            .unwrap();
-        let block = &blocks.iter().find(|(m, _, _)| *m == n).unwrap().2;
-        let decl = block
-            .lines()
-            .find_map(|l| l.strip_prefix("query "))
-            .and_then(|l| l.split('(').next())
-            .unwrap_or("?")
-            .to_string();
-        let edition = if failure.contains("edition 2") { 2 } else { 3 };
-        format!("{decl} (edition {edition})")
-    };
-    let mut failing: Vec<String> = failures.iter().map(name_of).collect();
-    failing.sort();
-    assert_eq!(
-        failing,
-        Vec::<String>::new(),
-        "the asset of 2026-11-08 parses whole: {}",
-        failures.join("\n")
-    );
-}
-
-#[test]
 fn a_block_in_clause_position_is_a_filter() {
     // One tree for one text: `count { p } > 1 or $x` is the disjunction, as
     // the same text is anywhere else an expression stands; edition 2's
@@ -1459,4 +1282,912 @@ fn the_edition3_rule_set_is_pinned() {
         rules, EDITION3_RULES,
         "the edition-3 rule set moved; a grammar change after the break is an amendment to the GQ 3 RFC (section 11, rule 1)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Repairs: one row per distinct refusal shape agents' texts reached, each the
+// refused text, its code, and the text its suggestion must reparse to.
+
+/// `(shape, code, refused text, intended text)`. A text that opens with its
+/// own edition or settings line is taken as written; every other one is
+/// edition 3.
+const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
+    (
+        r#"a declaration without its parameter list"#,
+        "Q002",
+        r#"query q {
+  match { $p: Person }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"an exponent without a fraction"#,
+        "Q005",
+        r#"query q() {
+  match { $d: Doc  $d.year * 1.0 > 2e3 }
+  return { $d.title }
+}"#,
+        r#"query q() { match { $d: Doc $d.year * 1.0 > 2000.0 } return { $d.title } }"#,
+    ),
+    (
+        r#"a reserved word as an alias"#,
+        "Q005",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.age as in }
+  order { in desc }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.age as in_ } order { in_ desc } }"#,
+    ),
+    (
+        r#"an option before a positional argument"#,
+        "Q005",
+        r#"query q($q: Vector(3)) {
+  match { from nearest({ match { $d: Doc } return { $d } }, k: 20, $d.embedding, $q) }
+  return { $d.title }
+}"#,
+        r#"query q($q: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) } return { $d.title } }"#,
+    ),
+    (
+        r#"a write body wrapped in match"#,
+        "Q005",
+        r#"query w($h: String) {
+  match { $p: Person { handle: $h } }
+  delete $p
+}"#,
+        r#"query w($h: String) { $p: Person { handle: $h } delete $p }"#,
+    ),
+    (
+        r#"an endpoint written as a meta-field"#,
+        "Q005",
+        r#"query hire($h: String, $slug: String) {
+  insert WorksAt { @src: $h, @dst: $slug }
+}"#,
+        r#"query hire($h: String, $slug: String) { insert WorksAt { from: $h, to: $slug } }"#,
+    ),
+    (
+        r#"an assignment with ="#,
+        "Q005",
+        r#"query w($h: String) {
+  $p: Person { handle: $h }
+  update $p set { age = 3 }
+}"#,
+        r#"query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }"#,
+    ),
+    (
+        r#"a qualified assignment target"#,
+        "Q005",
+        r#"query w($h: String) {
+  $p: Person { handle: $h }
+  update $p set { $p.age: 3 }
+}"#,
+        r#"query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }"#,
+    ),
+    (
+        r#"update without set"#,
+        "Q005",
+        r#"query w($h: String) {
+  $p: Person { handle: $h }
+  update $p { age: 3 }
+}"#,
+        r#"query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }"#,
+    ),
+    (
+        r#"an untyped parameter"#,
+        "Q005",
+        r#"query q($h) {
+  match { $p: Person { handle: $h } }
+  return { $p.name }
+}"#,
+        r#"query q($h: String) { match { $p: Person { handle: $h } } return { $p.name } }"#,
+    ),
+    (
+        r#"an edition other than 3"#,
+        "Q006",
+        r#"gq 4;
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}"#,
+        r#"gq 3; query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"an edition line without its semicolon"#,
+        "Q006",
+        r#"gq 3
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}"#,
+        r#"gq 3; query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"an uppercase edition line"#,
+        "Q006",
+        r#"GQ 3;
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}"#,
+        r#"gq 3; query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"a settings line before the edition line"#,
+        "Q006",
+        r#"set ann_nprobes = 20;
+gq 3;
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}"#,
+        r#"gq 3; set ann_nprobes = 20; query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"an outgoing arrow"#,
+        "Q007",
+        r#"query q() {
+  match { $a: Person  $a -knows-> $b }
+  return { $b.name }
+}"#,
+        r#"query q() { match { $a: Person $a knows $b } return { $b.name } }"#,
+    ),
+    (
+        r#"an incoming arrow"#,
+        "Q007",
+        r#"query q() {
+  match { $a: Person  $a <-knows- $b }
+  return { $b.name }
+}"#,
+        r#"query q() { match { $a: Person $b knows $a } return { $b.name } }"#,
+    ),
+    (
+        r#"an undirected arrow"#,
+        "Q007",
+        r#"query q() {
+  match { $a: Person  $a -knows- $b }
+  return { $b.name }
+}"#,
+        r#"query q() { match { $a: Person $a <knows> $b } return { $b.name } }"#,
+    ),
+    (
+        r#"an arrow with an edge binding and bounds"#,
+        "Q007",
+        r#"query q() {
+  match { $a: Person  $a -$k:knows{1,2}-> $b }
+  return { $b.name }
+}"#,
+        r#"query q() { match { $a: Person $a $k:knows{1,2} $b } return { $b.name } }"#,
+    ),
+    (
+        r#"Cypher's bracketed edge"#,
+        "Q007",
+        r#"query q() {
+  match { $a: Person  $a -[:knows]-> $b }
+  return { $b.name }
+}"#,
+        r#"query q() { match { $a: Person $a knows $b } return { $b.name } }"#,
+    ),
+    (
+        r#"delete T where"#,
+        "Q008",
+        r#"query w($h: String) {
+  delete Person where handle = $h
+}"#,
+        r#"query w($h: String) { $x: Person $x.handle = $h delete $x }"#,
+    ),
+    (
+        r#"update T set where"#,
+        "Q008",
+        r#"query w($h: String) {
+  update Person set { age: 3 } where handle = $h
+}"#,
+        r#"query w($h: String) { $x: Person $x.handle = $h update $x set { age: 3 } }"#,
+    ),
+    (
+        r#"delete $x where"#,
+        "Q008",
+        r#"query w() {
+  $p: Person
+  delete $p where $p.age > 90
+}"#,
+        r#"query w() { $p: Person $p.age > 90 delete $p }"#,
+    ),
+    (
+        r#"delete over an edge type where"#,
+        "Q008",
+        r#"query w($h: String) {
+  delete WorksAt where @src = $h
+}"#,
+        r#"query w($h: String) { $x: WorksAt $x.@src = $h delete $x }"#,
+    ),
+    (
+        r#"a where fix that keeps a parameter"#,
+        "Q008",
+        r#"query w($x: String) {
+  delete Person where handle = $x
+}"#,
+        r#"query w($x: String) { $p: Person $p.handle = $x delete $p }"#,
+    ),
+    (
+        r#"a where fix that qualifies an assignment"#,
+        "Q008",
+        r#"query w() {
+  update Person set { name: handle } where age > 3
+}"#,
+        r#"query w() { $x: Person $x.age > 3 update $x set { name: $x.handle } }"#,
+    ),
+    (
+        r#"the mutation keyword"#,
+        "Q009",
+        r#"mutation hire($h: String) {
+  insert Person { handle: $h, name: $h }
+}"#,
+        r#"query hire($h: String) { insert Person { handle: $h, name: $h } }"#,
+    ),
+    (
+        r#"the view keyword"#,
+        "Q009",
+        r#"view big() {
+  match { $c: Company }
+  return { $c.name }
+}"#,
+        r#"query big() { match { $c: Company } return { $c.name } }"#,
+    ),
+    (
+        r#"a comparison inside binding braces"#,
+        "Q010",
+        r#"query q() {
+  match { $p: Person { age > 30 } }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.age > 30 } return { $p.name } }"#,
+    ),
+    (
+        r#"a colon comparison inside binding braces"#,
+        "Q010",
+        r#"query q() {
+  match { $p: Person { age: > 30 } }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.age > 30 } return { $p.name } }"#,
+    ),
+    (
+        r#"as commit on a read"#,
+        "Q011",
+        r#"query q() as commit {
+  match { $p: Person }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"unwind"#,
+        "Q012",
+        r#"query q($list: [String]) {
+  match { unwind $list as $x  $p: Person { city: $x } }
+  return { $p.name }
+}"#,
+        r#"query q($list: [String]) { match { $x in $list $p: Person { city: $x } } return { $p.name } }"#,
+    ),
+    (
+        r#"for over a list"#,
+        "Q012",
+        r#"query q($list: [String]) {
+  match { for $x in $list  $p: Person { city: $x } }
+  return { $p.name }
+}"#,
+        r#"query q($list: [String]) { match { $x in $list $p: Person { city: $x } } return { $p.name } }"#,
+    ),
+    (
+        r#"for over a relation"#,
+        "Q012",
+        r#"query q() {
+  match { for $x in { match { $p: Person } return { $p } } }
+  return { $x.name }
+}"#,
+        r#"query q() { match { from { match { $p: Person } return { $p } } } return { $x.name } }"#,
+    ),
+    (
+        r#"let … in a relation"#,
+        "Q012",
+        r#"query q() {
+  match { let $x in { match { $p: Person } return { $p } } }
+  return { $x.name }
+}"#,
+        r#"query q() { match { from { match { $p: Person } return { $p } } } return { $x.name } }"#,
+    ),
+    (
+        r#"let over a tuple"#,
+        "Q012",
+        r#"query q() {
+  match { let ($a, $b) in { match { $p worksAt $c } return { $p, $c } } }
+  return { $a.name }
+}"#,
+        r#"query q() { match { from { match { $p worksAt $c } return { $p, $c } } } return { $a.name } }"#,
+    ),
+    (
+        r#"CASE … END"#,
+        "Q012",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.name, CASE WHEN $p.age > 65 THEN "senior" ELSE "active" END as band }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name, if($p.age > 65, "senior", "active") as band } }"#,
+    ),
+    (
+        r#"|| concatenation"#,
+        "Q012",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.name || " " || $p.handle as label }
+}"#,
+        r#"query q() { match { $p: Person } return { concat($p.name, " ", $p.handle) as label } }"#,
+    ),
+    (
+        r#"a chained comparison"#,
+        "Q012",
+        r#"query q() {
+  match { $p: Person  18 <= $p.age < 65 }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person 18 <= $p.age and $p.age < 65 } return { $p.name } }"#,
+    ),
+    (
+        r#"a clause after the last statement"#,
+        "Q013",
+        r#"query w($h: String) {
+  delete $p
+  $p: Person { handle: $h }
+}"#,
+        r#"query w($h: String) { $p: Person { handle: $h } delete $p }"#,
+    ),
+    (
+        r#"a Cypher pattern in match"#,
+        "Q014",
+        r#"query q() {
+  match { (a:Person)-[:KNOWS]->(b) }
+  return { $b.name }
+}"#,
+        r#"query q() { match { $a: Person $a knows $b } return { $b.name } }"#,
+    ),
+    (
+        r#"an uppercase WHERE"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person WHERE $p.age > 30 }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.age > 30 } return { $p.name } }"#,
+    ),
+    (
+        r#"ORDER BY"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.name }
+  order by $p.age desc
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } order { $p.age desc } }"#,
+    ),
+    (
+        r#"count(*)"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person }
+  return { count(*) as n }
+}"#,
+        r#"query q() { match { $p: Person } return { count($p) as n } }"#,
+    ),
+    (
+        r#"Cypher's WITH"#,
+        "Q014",
+        r#"query q() {
+  match { $p worksAt $c  with $c, count($p) as n  $n > 3 }
+  return { $c.name }
+}"#,
+        r#"query q() { match { from { match { $p worksAt $c } return { $c, count($p) as n } } $n > 3 } return { $c.name } }"#,
+    ),
+    (
+        r#"an uppercase COALESCE"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person }
+  return { COALESCE($p.city, "none") as c }
+}"#,
+        r#"query q() { match { $p: Person } return { coalesce($p.city, "none") as c } }"#,
+    ),
+    (
+        r#"STARTS WITH"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  $p.name STARTS WITH "A" }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person starts_with($p.name, "A") } return { $p.name } }"#,
+    ),
+    (
+        r#"CREATE"#,
+        "Q014",
+        r#"query w() {
+  CREATE (p:Person {handle: "x", name: "x"})
+}"#,
+        r#"query w() { insert Person { handle: "x", name: "x" } }"#,
+    ),
+    (
+        r#"SET"#,
+        "Q014",
+        r#"query w($h: String) {
+  $p: Person { handle: $h }
+  set $p.age = 3
+}"#,
+        r#"query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }"#,
+    ),
+    (
+        r#"DETACH DELETE"#,
+        "Q014",
+        r#"query w($h: String) {
+  $p: Person { handle: $h }
+  detach delete $p
+}"#,
+        r#"query w($h: String) { $p: Person { handle: $h } delete $p }"#,
+    ),
+    (
+        r#"OPTIONAL MATCH"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  optional match { $p worksAt $c } }
+  return { $p.name, $c.name }
+}"#,
+        r#"query q() { match { $p: Person optional { $p worksAt $c } } return { $p.name, $c.name } }"#,
+    ),
+    (
+        r#"CALL { }"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  call { match { $p knows $q } return { $q } } }
+  return { $q.name }
+}"#,
+        r#"query q() { match { $p: Person from { match { $p knows $q } return { $q } } } return { $q.name } }"#,
+    ),
+    (
+        r#"!= null"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  $p.city != null }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.city is not null } return { $p.name } }"#,
+    ),
+    (
+        r#"<>"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  $p.city <> "Berlin" }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.city != "Berlin" } return { $p.name } }"#,
+    ),
+    (
+        r#"=="#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  $p.city == "Berlin" }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.city = "Berlin" } return { $p.name } }"#,
+    ),
+    (
+        r#"single quotes"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  $p.city = 'Berlin' }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.city = "Berlin" } return { $p.name } }"#,
+    ),
+    (
+        r#"GROUP BY"#,
+        "Q014",
+        r#"query q() {
+  match { $p worksAt $c }
+  return { $c.name, count($p) as n }
+  group by $c.name
+}"#,
+        r#"query q() { match { $p worksAt $c } return { $c.name, count($p) as n } }"#,
+    ),
+    (
+        r#"LIKE"#,
+        "Q014",
+        r#"query q() {
+  match { $d: Doc  $d.title LIKE '%graph%' }
+  return { $d.title }
+}"#,
+        r#"query q() { match { $d: Doc contains($d.title, "graph") } return { $d.title } }"#,
+    ),
+    (
+        r#"BETWEEN"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  $p.age BETWEEN 18 AND 65 }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.age >= 18 and $p.age <= 65 } return { $p.name } }"#,
+    ),
+    (
+        r#"in over a parenthesised list"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  $p.age in (30, 40) }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.age in [30, 40] } return { $p.name } }"#,
+    ),
+    (
+        r#"not in"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  $p.city not in ["Berlin"] }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person not $p.city in ["Berlin"] } return { $p.name } }"#,
+    ),
+    (
+        r#"&&"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  $p.age >= 18 && $p.age < 65 }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.age >= 18 and $p.age < 65 } return { $p.name } }"#,
+    ),
+    (
+        r#"! for not"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  !($p.age > 3) }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person not $p.age > 3 } return { $p.name } }"#,
+    ),
+    (
+        r#"a Cypher binding in parentheses"#,
+        "Q014",
+        r#"query q($h: String) {
+  match { $p: Person(handle: $h) }
+  return { $p.name }
+}"#,
+        r#"query q($h: String) { match { $p: Person { handle: $h } } return { $p.name } }"#,
+    ),
+    (
+        r#"a lowercase type"#,
+        "Q014",
+        r#"query q() {
+  match { $p: person }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"an uppercase variable"#,
+        "Q014",
+        r#"query q() {
+  match { $P: Person }
+  return { $P.name }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"a star projection"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.* }
+}"#,
+        r#"query q() { match { $p: Person } return { $p } }"#,
+    ),
+    (
+        r#"distinct inside return"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person }
+  return { distinct $p.city }
+}"#,
+        r#"query q() { match { $p: Person } return distinct { $p.city } }"#,
+    ),
+    (
+        r#"a string alias"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.name as "Name" }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name as name } }"#,
+    ),
+    (
+        r#"a SQL comment"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  -- adults only
+  $p.age > 18 }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.age > 18 } return { $p.name } }"#,
+    ),
+    (
+        r#"a semicolon after a declaration"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.name }
+};"#,
+        r#"query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"optional without braces"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  optional $p worksAt $c }
+  return { $p.name, $c.name }
+}"#,
+        r#"query q() { match { $p: Person optional { $p worksAt $c } } return { $p.name, $c.name } }"#,
+    ),
+    (
+        r#"not without braces"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  $q: Person  not $p knows $q }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $q: Person not { $p knows $q } } return { $p.name } }"#,
+    ),
+    (
+        r#"delete of two variables"#,
+        "Q014",
+        r#"query w() {
+  $p knows $q
+  delete $p, $q
+}"#,
+        r#"query w() { $p knows $q delete $p delete $q }"#,
+    ),
+    (
+        r#"null in a read filter"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person  $p.city = null }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.city is null } return { $p.name } }"#,
+    ),
+    (
+        r#"a direction before its key"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.name }
+  order { desc $p.age }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } order { $p.age desc } }"#,
+    ),
+    (
+        r#"a SQL alias = value"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person }
+  return { n = $p.name }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name as n } }"#,
+    ),
+    (
+        r#"returning, a later stage"#,
+        "Q015",
+        r#"query w($h: String) {
+  $p: Person { handle: $h }
+  delete $p
+  returning { @id }
+}"#,
+        r#"query w($h: String) { $p: Person { handle: $h } delete $p }"#,
+    ),
+    (
+        r#"a namespaced type, a later stage"#,
+        "Q015",
+        r#"query q() {
+  match { $o: crm::Person }
+  return { $o.name }
+}"#,
+        r#"query q() { match { $o: Person } return { $o.name } }"#,
+    ),
+    (
+        r#"offset, a later stage"#,
+        "Q015",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.name }
+  limit 10 offset 5
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } limit 10 }"#,
+    ),
+    (
+        r#"$n -1 after one space"#,
+        "Q016",
+        r#"query q() {
+  match { $p: Person  let $n = $p.age  $n -1 > 0 }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person let $n = $p.age $n - 1 > 0 } return { $p.name } }"#,
+    ),
+    (
+        r#"a leading minus on a new line in return"#,
+        "Q016",
+        r#"query q() {
+  match { $p: Person }
+  return {
+    $p.age
+    -$p.age as neg
+  }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.age, -$p.age as neg } }"#,
+    ),
+    (
+        r#"a leading minus after two spaces in match"#,
+        "Q016",
+        r#"query q() {
+  match { $p: Person  let $x = $p.age  -1 < $x }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person let $x = $p.age (-1 < $x) } return { $p.name } }"#,
+    ),
+    (
+        r#"from as a bare edge"#,
+        "Q017",
+        r#"query q() {
+  match { $a: Person  $a from $b }
+  return { $b.name }
+}"#,
+        r#"query q() { match { $a: Person $a "from" $b } return { $b.name } }"#,
+    ),
+    (
+        r#"insert as a bare edge in a write"#,
+        "Q017",
+        r#"query w() {
+  $a: Person  $a insert $b
+  delete $b
+}"#,
+        r#"query w() { $a: Person $a "insert" $b delete $b }"#,
+    ),
+    (
+        r#"a bare property name"#,
+        "Q018",
+        r#"query q() {
+  match { $p: Person  name = "x" }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.name = "x" } return { $p.name } }"#,
+    ),
+    (
+        r#"a bare parameter name"#,
+        "Q018",
+        r#"query q($h: String) {
+  match { $p: Person { handle: h } }
+  return { $p.name }
+}"#,
+        r#"query q($h: String) { match { $p: Person { handle: $h } } return { $p.name } }"#,
+    ),
+    (
+        r#"from with parentheses"#,
+        "Q019",
+        r#"query q() {
+  match { from ({ match { $p: Person } return { $p } }) }
+  return { $p.name }
+}"#,
+        r#"query q() { match { from { match { $p: Person } return { $p } } } return { $p.name } }"#,
+    ),
+    (
+        r#"a space before a call parenthesis"#,
+        "Q019",
+        r#"query colleagues($of: String) {
+  match { $p: Person { handle: $of }  $p worksAt $c  $q worksAt $c }
+  return { $q }
+}
+
+query q($h: String) {
+  match { from colleagues ($h) }
+  return { $q.name }
+}"#,
+        r#"query colleagues($of: String) { match { $p: Person { handle: $of } $p worksAt $c $q worksAt $c } return { $q } } query q($h: String) { match { from colleagues($h) } return { $q.name } }"#,
+    ),
+    (
+        r#"exists as a function"#,
+        "Q019",
+        r#"query q() {
+  match { $p: Person  exists($p.city) }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person $p.city is not null } return { $p.name } }"#,
+    ),
+    (
+        r#"an inline read without match"#,
+        "Q020",
+        r#"query q() {
+  match { $p: Person  from { match { $p knows $q } order { $q.age } } }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person from { match { $p knows $q } return { $p } order { $q.age } } } return { $p.name } }"#,
+    ),
+    (
+        r#"return without braces"#,
+        "Q020",
+        r#"query q() {
+  match { $p: Person }
+  return $p.name
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"match without braces"#,
+        "Q020",
+        r#"query q() {
+  match $p: Person
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"return before match"#,
+        "Q020",
+        r#"query q() {
+  return { $p.name }
+  match { $p: Person }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+    (
+        r#"limit before order"#,
+        "Q020",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.name }
+  limit 10
+  order { $p.age }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } order { $p.age } limit 10 }"#,
+    ),
+    (
+        r#"an annotation argument with a colon"#,
+        "Q021",
+        r#"query q() @budget(plan: 1000) {
+  match { $p: Person }
+  return { $p.name }
+}"#,
+        r#"query q() @budget(plan = 1000) { match { $p: Person } return { $p.name } }"#,
+    ),
+];
+
+/// `text` as a source: its own edition or settings line, or `gq 3;` before it.
+pub(crate) fn as_source(text: &str) -> String {
+    if text.starts_with("gq") || text.starts_with("GQ") || text.starts_with("set ") {
+        text.to_string()
+    } else {
+        format!("gq 3;\n{text}")
+    }
+}
+
+#[test]
+fn every_refusal_shape_prints_a_repair_that_reparses_to_the_intended_text() {
+    for (shape, code, refused, intended) in PARSE_REPAIRS {
+        let source = as_source(refused);
+        let diagnostic = parse_query_diagnostic(&source)
+            .err()
+            .unwrap_or_else(|| panic!("{shape}: accepted\n{source}"));
+        assert_eq!(diagnostic.code.as_str(), *code, "{shape}: {diagnostic}");
+        let suggestion = diagnostic
+            .suggestion
+            .as_ref()
+            .unwrap_or_else(|| panic!("{shape}: no suggestion: {diagnostic}"));
+        let repaired = super::parser3::apply_edits(&source, &suggestion.edits);
+        let got = parse_query3(&repaired)
+            .unwrap_or_else(|e| panic!("{shape}: the repair does not parse: {e}\n{repaired}"));
+        let want = parse_query3(&as_source(intended)).expect("the intended text parses");
+        assert_eq!(got, want, "{shape}: repaired to\n{repaired}");
+    }
 }

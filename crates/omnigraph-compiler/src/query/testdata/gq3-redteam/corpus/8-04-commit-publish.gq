@@ -1,5 +1,0 @@
-// task: publish a commit
-// kind: statements
-// expect: accept
-// rfc: asset §8
-commit publish "01J0000000000000000000000"

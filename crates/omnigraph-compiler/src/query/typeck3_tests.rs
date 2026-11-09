@@ -1,8 +1,6 @@
 //! The edition-3 type checker's tests (docs/rfcs/2026-11-07-gq-3.md, section
-//! 10, "Type-check tests"), the before-and-after asset type-checked against
-//! its schema, and the edition-2 corpus checked by both editions.
-
-use std::collections::BTreeMap;
+//! 10, "Type-check tests"), the RFC's examples type-checked, and one repair
+//! per type-level refusal shape.
 
 use super::parser3::parse_query3;
 use super::typeck3::{Checked3, compile3};
@@ -10,46 +8,36 @@ use crate::catalog::{Catalog, build_catalog};
 use crate::ir::core3::*;
 use crate::schema::parser::parse_schema;
 
-/// The asset's shared schema block (`pg`).
-pub(crate) fn asset_schema_text() -> String {
-    let text = asset_text();
-    let start = text.find("```pg\n").expect("schema block") + 6;
-    let end = start + text[start..].find("```").unwrap();
-    text[start..end].to_string()
+/// The schema of the RFC's section 8 in today's `.pg` spelling (a String's
+/// full-text index is `@index`), with the section 6 example's revisions and
+/// passages.
+pub(crate) const SCHEMA: &str = r#"
+interface Named { name: String }
+node Person implements Named { handle: String @key  name: String  age: I32?  city: String? }
+node Company implements Named { slug: String @key  name: String }
+node Doc { id: String @key  title: String  body: String @index  year: I32  tags: [String]  embedding: Vector(3)? }
+node Collection { slug: String @key  min_docs: I32 }
+node SourceRevision { path: String @key  matter_number: String }
+node Passage { locator: String @key  text: String @index }
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+edge In: Doc -> Collection
+edge HasPassage: SourceRevision -> Passage
+"#;
+
+pub(crate) fn catalog() -> Catalog {
+    build_catalog(&parse_schema(SCHEMA).expect("the schema parses")).unwrap()
 }
 
-pub(crate) fn asset_text() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/query/testdata/2026-11-07-gq-3-before-and-after.txt");
-    std::fs::read_to_string(path).expect("asset copy")
-}
-
-/// The asset's schema as today's `.pg` grammar reads it. The asset writes
-/// edition 3's additive `@index(fulltext)`, which today's schema parser
-/// refuses ("@index on Doc references unknown property 'fulltext'"): a String
-/// property's `@index` is already its full-text index.
-pub(crate) fn asset_schema_pg() -> String {
-    asset_schema_text().replace("@index(fulltext)", "@index")
-}
-
-pub(crate) fn asset_catalog() -> Catalog {
-    build_catalog(&parse_schema(&asset_schema_pg()).expect("asset schema parses")).unwrap()
-}
-
-#[test]
-fn the_asset_schema_is_not_todays_pg() {
-    let e = parse_schema(&asset_schema_text()).unwrap_err().to_string();
-    assert!(e.contains("unknown property 'fulltext'"), "{e}");
-}
-
-/// Check `src` (without the edition line) against the asset's schema; one
+/// Check `src` (without the edition line) against [`SCHEMA`]; one
 /// result per declaration.
 #[track_caller]
 pub(crate) fn check(
     src: &str,
 ) -> Vec<(String, Result<Checked3, super::diagnostic::QueryDiagnostic>)> {
-    compile3(&asset_catalog(), &format!("gq 3;\n{src}"))
-        .unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
+    compile3(&catalog(), &format!("gq 3;\n{src}")).unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
 }
 
 /// The code of the first refused declaration, or `ok`.
@@ -93,125 +81,118 @@ pub(crate) fn read_of(c: &CoreDecl) -> &CoreRead {
     }
 }
 
-fn asset_blocks() -> Vec<(Option<String>, String)> {
-    let mut out = Vec::new();
-    let mut inside = false;
-    let mut block = String::new();
-    for line in asset_text().lines() {
-        if !inside && line.trim_start().starts_with("```gq") {
-            inside = true;
-            block.clear();
-        } else if inside && line.trim_start().starts_with("```") {
-            inside = false;
-            let mark = block
-                .lines()
-                .next()
-                .and_then(|l| l.trim().strip_prefix("// "))
-                .filter(|l| l.starts_with("edition"))
-                .map(str::to_string);
-            out.push((mark, block.clone()));
-        } else if inside {
-            block.push_str(line);
-            block.push('\n');
-        }
-    }
-    out
-}
-
-/// Every edition-3 example of the before-and-after asset (the blocks marked
-/// `// edition 3` and the unchanged ones), type-checked against the asset's
-/// schema. The pinned map is the outcome per declaration; every refusal in
-/// it is a later stage's form.
+/// The RFC's examples (sections 3, 6 and 8), each type-checked (the second
+/// recursion of section 3 renamed); the edition-2 form of section 6's example
+/// through edition 2.
 #[test]
-fn every_edition3_example_of_the_asset_type_checks() {
-    let mut outcome: BTreeMap<String, String> = BTreeMap::new();
-    for (mark, block) in asset_blocks() {
-        if mark.as_deref() == Some("edition 2") {
-            continue;
-        }
-        let later = mark.as_deref().is_some_and(|m| m.contains("later"));
-        // One declaration at a time for the later-stage block, whose forms
-        // are refused at different layers.
-        let parts: Vec<String> = if later {
-            block
-                .split("\nquery ")
-                .filter(|p| p.contains('{'))
-                .map(|p| {
-                    if p.trim_start().starts_with("query ") || p.starts_with("//") {
-                        p.lines()
-                            .filter(|l| !l.starts_with("//"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    } else {
-                        format!("query {p}")
-                    }
-                })
-                .collect()
-        } else {
-            vec![block.clone()]
-        };
-        for part in parts {
-            let name = part
-                .lines()
-                .find_map(|l| l.trim_start().strip_prefix("query "))
-                .and_then(|l| l.split('(').next())
-                .unwrap_or("?")
-                .to_string();
-            let key = |n: String| {
-                if later {
-                    format!("{n} (later stage)")
-                } else {
-                    n
-                }
-            };
-            let file = match parse_query3(&format!("gq 3;\n{part}")) {
-                Ok(f) => f,
-                Err(e) => {
-                    outcome.insert(key(name), format!("parse {}", e.code.as_str()));
-                    continue;
-                }
-            };
-            for (name, r) in super::typeck3::typecheck_file3(&asset_catalog(), &file) {
-                let v = match r {
-                    Ok(_) => "ok".to_string(),
-                    Err(e) => format!("{} {}", e.code.as_str(), e.message),
-                };
-                outcome.insert(key(name), v);
-            }
-        }
-    }
-    for (k, v) in &outcome {
-        eprintln!("{k:40} {v}");
-    }
-    let refused: BTreeMap<&str, &str> = outcome
-        .iter()
-        .filter(|(_, v)| *v != "ok")
-        .map(|(k, v)| (k.as_str(), v.split_whitespace().next().unwrap()))
-        .collect();
-    // Every refusal is a later stage's form, refused at the layer the RFC
-    // names: `names` binds an interface (`T1`, stage Poly, as edition 2
-    // refuses it); `@if_commit`/`returning` and `crm::` at parse; the
-    // catalogue types and `@budget(rows = …)` at type check.
-    let want: BTreeMap<&str, &str> = [
-        ("bounded (later stage)", "T80"),
-        ("names", "T1"),
-        ("namespaced (later stage)", "parse"),
-        ("retract (later stage)", "parse"),
-        ("schema_types (later stage)", "T1"),
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(refused, want);
-    assert!(outcome.len() >= 50, "only {} declarations", outcome.len());
+fn the_rfc_examples_type_check() {
+    for text in [
+        "query reachable($from: String) {
+  match {
+    from union(
+      { match { $p: Person { handle: $from }  $p knows $q } return { $q } },
+      { match { from reachable($from)  $q knows $r } return { $r as q } })
+  }
+  return distinct { $q }
 }
 
-/// Edition 2's verdict on `src` against the asset's schema: `ok` or the code.
+query hops($from: String) @budget(rounds = 50) {
+  match {
+    from union(
+      { match { $p: Person { handle: $from }  $p knows $q } return { $q, 1 as d } },
+      { match { from hops($from)  $q knows $r } return { $r as q, $d + 1 as d } })
+  }
+  return { $q, min($d) as d }
+}",
+        "query close_company($slug: String) {
+  $c: Company { slug: $slug }
+  $p $k:worksAt $c
+  delete $k
+}
+
+query relocate_staff($slug: String) {
+  $c: Company { slug: $slug }
+  $p worksAt $c
+  update $p set { city: null }
+}",
+        "query passages($matter: String, $q: String, $k: I64 = 5) {
+  match {
+    from bm25(
+      { match { $r: SourceRevision { matter_number: $matter }  $r hasPassage $p  contains($p.text, \"tariff\") }
+        return { $r, $p } },
+      $p.text, $q)
+  }
+  return { $r.path, $p.locator, $score }
+  order { $score desc }
+  limit $k
+}",
+        "query big_employers() {
+  match {
+    from { match { $p worksAt $c } return { $c, count($p) as headcount } }
+    $headcount >= 100
+  }
+  return { $c.name, $headcount }
+  order { $headcount desc }
+}",
+        "query cited_near($coll: String, $q: Vector(3)) {
+  match {
+    from nearest(
+      { match { $d \"in\" $x  $x: Collection { slug: $coll } } return { $d } },
+      $d.embedding, $q, k: 20
+    )
+    $d cites $other
+  }
+  return { $d.title, $distance, count($other) as cites }
+  order { $distance }
+}",
+        "query retire($h: String) as commit {
+  $p: Person { handle: $h }
+  $p $k:worksAt $c
+  delete $k
+}
+
+query relocate($h: String) {
+  $p: Person { handle: $h }
+  update $p set { city: null }
+}",
+    ] {
+        ok(text);
+    }
+    // Section 3 names the second recursion `distance`, which section 5
+    // refuses: a declared read never shadows a registry row.
+    refused(
+        "query distance($from: String) @budget(rounds = 50) {
+  match {
+    from union(
+      { match { $p: Person { handle: $from }  $p knows $q } return { $q, 1 as d } },
+      { match { from distance($from)  $q knows $r } return { $r as q, $d + 1 as d } })
+  }
+  return { $q, min($d) as d }
+}",
+        "T74",
+    );
+    assert_eq!(
+        e2("query passages($matter: String, $q: String) {
+  match {
+    $r: SourceRevision { matter_number: $matter }
+    $r hasPassage $p
+    $p.text contains \"tariff\"
+  }
+  return { $r.path, $p.locator, bm25($p.text, $q) as score }
+  order { bm25($p.text, $q) desc }
+  limit 5
+}"),
+        "ok"
+    );
+}
+
+/// Edition 2's verdict on `src` against [`SCHEMA`]: `ok` or the code.
 pub(crate) fn e2(src: &str) -> String {
     let file = match super::parser::parse_edition2(src) {
         Ok(f) => f,
         Err(e) => return format!("parse {}", e.code.as_str()),
     };
-    let cat = asset_catalog();
+    let cat = catalog();
     let super::ast::FileBody::Queries(qs) = file.body else {
         return "statement".into();
     };
@@ -391,7 +372,7 @@ fn t69_both_ways() {
     }
 }
 
-/// Recursive reads in the asset's schema.
+/// Recursive reads.
 pub(crate) const REACHABLE: &str = "query reachable($from: String) {
   match {
     from union(
@@ -1110,4 +1091,76 @@ fn weighted_type_checks_with_the_population_renamed_before_d_is_bound() {
   order { s desc }
   limit 10
 }");
+}
+
+/// `(shape, code, refused text, intended text)`: the type-level refusals
+/// whose suggestion is an edit, each reparsing to the intended text.
+const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
+    (
+        r#"a bare in edge over a node"#,
+        "T7",
+        r#"query q($s: String) {
+  match { $x: Collection { slug: $s }  $d in $x }
+  return { $d.title }
+}"#,
+        r#"query q($s: String) { match { $x: Collection { slug: $s } $d "in" $x } return { $d.title } }"#,
+    ),
+    (
+        r#"infix contains over a list"#,
+        "T7",
+        r#"query q() {
+  match { $d: Doc  $d.tags contains "rust" }
+  return { $d.title }
+}"#,
+        r#"query q() { match { $d: Doc "rust" in $d.tags } return { $d.title } }"#,
+    ),
+    (
+        r#"infix contains over a String"#,
+        "T7",
+        r#"query q() {
+  match { $d: Doc  $d.title contains "graph" }
+  return { $d.title }
+}"#,
+        r#"query q() { match { $d: Doc contains($d.title, "graph") } return { $d.title } }"#,
+    ),
+    (
+        r#"infix starts_with"#,
+        "T7",
+        r#"query q() {
+  match { $p: Person  $p.name starts_with "A" }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person starts_with($p.name, "A") } return { $p.name } }"#,
+    ),
+    (
+        r#"an unknown annotation"#,
+        "T80",
+        r#"query q() @owner("search-team") {
+  match { $p: Person }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } }"#,
+    ),
+];
+
+#[test]
+fn every_type_refusal_shape_prints_a_repair_that_reparses_to_the_intended_text() {
+    for (shape, code, refused, intended) in TYPE_REPAIRS {
+        let source = format!("gq 3;\n{refused}");
+        let file = parse_query3(&source).unwrap_or_else(|e| panic!("{shape}: {e}"));
+        let diagnostic = super::typeck3::typecheck_file3(&catalog(), &file)
+            .into_iter()
+            .find_map(|(_, r)| r.err())
+            .unwrap_or_else(|| panic!("{shape}: accepted"));
+        assert_eq!(diagnostic.code.as_str(), *code, "{shape}: {diagnostic}");
+        let suggestion = diagnostic
+            .suggestion
+            .as_ref()
+            .unwrap_or_else(|| panic!("{shape}: no suggestion: {diagnostic}"));
+        let repaired = super::parser3::apply_edits(&source, &suggestion.edits);
+        let got = parse_query3(&repaired)
+            .unwrap_or_else(|e| panic!("{shape}: the repair does not parse: {e}\n{repaired}"));
+        let want = parse_query3(&format!("gq 3;\n{intended}")).expect("the intended text parses");
+        assert_eq!(got, want, "{shape}: repaired to\n{repaired}");
+    }
 }

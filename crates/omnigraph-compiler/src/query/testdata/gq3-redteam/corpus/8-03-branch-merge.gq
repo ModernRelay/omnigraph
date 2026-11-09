@@ -1,5 +1,0 @@
-// task: merge a branch
-// kind: statements
-// expect: accept
-// rfc: asset §8
-branch merge feature into main

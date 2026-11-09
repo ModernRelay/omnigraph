@@ -1,5 +1,5 @@
 # issue: 566
-# red_on: 545176bd; `order { count($d) desc }` is `unsupported ordering expression` on v2 and the door's order-key refusal on v1; `$p.age > 30 as adult` in return is `unsupported projection expression` on v2.
+# red_on: 545176bd; `order { count($d) desc }` is `unsupported ordering expression` on v2; `$p.age > 30 as adult` in return is `unsupported projection expression` on v2.
 # notes: Part 3 of issue 566: an order key that is not a property access binds
 # notes: against the return list. `order { count($d) desc }` sorts by the
 # notes: `count($d) as deals` column; an unaliased aggregate written the same way

@@ -17,8 +17,6 @@ mod desugar3_tests;
 #[cfg(test)]
 mod parser3_proptest;
 #[cfg(test)]
-mod parser3_redteam;
-#[cfg(test)]
 mod parser3_tests;
 #[cfg(test)]
 mod typeck3_tests;

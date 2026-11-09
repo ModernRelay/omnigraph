@@ -2,8 +2,7 @@
 //! 7).
 //!
 //! A separate tree from [`super::ast`], so the edition-2 nodes, which the
-//! planner, the GQT runner and the frozen reference engine match
-//! exhaustively, are untouched. The front door hands each declaration on as
+//! planner and the GQT runner match exhaustively, are untouched. The front door hands each declaration on as
 //! a [`super::ast::QueryDecl`] carrying this tree
 //! ([`super::ast::Edition3Decl`]); the edition-3 type checker
 //! ([`super::typeck3`]) reads it.

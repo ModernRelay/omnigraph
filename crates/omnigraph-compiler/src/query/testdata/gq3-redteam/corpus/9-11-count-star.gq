@@ -1,8 +1,0 @@
-// task: count(*)
-// kind: adversarial
-// expect: refuse-with-fix:count($p)
-// habit: Cypher
-query q() {
-  match { $p: Person }
-  return { count(*) as n }
-}

@@ -107,8 +107,6 @@ repos: I64
 anti join $x: key_set
 pass anti_join_strategy
 
---- expect same as v1
-
 --- query
 query twice_on_excluded($channel: String, $exclude: String) {
     match {
@@ -212,8 +210,6 @@ repos: I64
 --- expect plan
 anti join $x: key_set
 
---- expect same as v1
-
 --- query
 query never_forked($channel: String) {
     match {
@@ -246,8 +242,6 @@ repos: I64
 --- expect plan
 anti join $x: correlated
 not pass anti_join_strategy
-
---- expect same as v1
 
 --- query
 query no_heavier_on_excluded($channel: String, $exclude: String) {
@@ -285,5 +279,3 @@ repos: I64
 --- expect plan
 anti join $x: correlated
 not pass anti_join_strategy
-
---- expect same as v1

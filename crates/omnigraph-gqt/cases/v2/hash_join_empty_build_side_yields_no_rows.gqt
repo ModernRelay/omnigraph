@@ -1,5 +1,5 @@
 # issue: none
-# notes: A one-hop traversal's hash join drains its build side at the first non-empty probe batch. A build side that holds no row ends the probe with no output; an empty probe never drains the build; a build holding some of the probed ids joins exactly those; a source with no out-edge contributes nothing. Every step matches the reference engine.
+# notes: A one-hop traversal's hash join drains its build side at the first non-empty probe batch. A build side that holds no row ends the probe with no output; an empty probe never drains the build; a build holding some of the probed ids joins exactly those; a source with no out-edge contributes nothing.
 
 --- runner
 timeout_ms: 10000
@@ -37,8 +37,6 @@ query empty_build() {
 --- expect shape
 p.name: String
 q.name: String
---- expect same as v1
-
 --- query
 set engine = v2;
 query empty_probe() {
@@ -51,8 +49,6 @@ query empty_probe() {
 --- expect unordered
 --- expect shape
 q.name: String
---- expect same as v1
-
 --- query
 set engine = v2;
 query partial_build() {
@@ -69,8 +65,6 @@ query partial_build() {
 --- expect shape
 p.name: String
 q.name: String
---- expect same as v1
-
 --- query
 set engine = v2;
 query every_hop() {
@@ -87,4 +81,3 @@ query every_hop() {
 --- expect shape
 p.name: String
 q.name: String
---- expect same as v1

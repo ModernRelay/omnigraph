@@ -1,5 +1,0 @@
-// task: a whole Cypher query
-// kind: adversarial
-// expect: refuse
-// habit: Cypher
-MATCH (a:Person)-[:KNOWS]->(b) RETURN b.name

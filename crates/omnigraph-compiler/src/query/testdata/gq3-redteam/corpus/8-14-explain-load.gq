@@ -1,5 +1,0 @@
-// task: explain a load
-// kind: statements
-// expect: accept
-// rfc: asset §8
-explain load csv "people.csv" into node:Person mode merge header

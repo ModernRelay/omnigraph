@@ -1,10 +1,8 @@
 pub mod coerce;
 pub mod core3;
-mod erase;
 pub mod fold;
 pub mod load;
 pub(crate) mod lower;
-pub mod untyped;
 pub(crate) mod validate;
 pub mod write;
 

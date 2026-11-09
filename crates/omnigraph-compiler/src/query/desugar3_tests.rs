@@ -19,12 +19,12 @@ use crate::ir::core3::*;
 use crate::schema::parser::parse_schema;
 use crate::types::{Direction, PropType, ScalarType};
 
-/// The asset's schema plus a second Person → Person edge, so that an
+/// The checker tests' schema plus a second Person → Person edge, so that an
 /// alternation has two members of one orientation.
 fn catalog() -> Catalog {
     let schema = format!(
         "{}\nedge Likes: Person -> Person\n",
-        super::typeck3_tests::asset_schema_pg()
+        super::typeck3_tests::SCHEMA
     );
     build_catalog(&parse_schema(&schema).unwrap()).unwrap()
 }

@@ -211,13 +211,6 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   `.github/workflows/tests-slow-nightly.yml`, the nightly job that runs them
   with `--run-ignored only` and refuses a run in which an enrolled name did
   not pass.
-- Engine v1 is frozen: every file under
-  `crates/omnigraph-reference-engine/src/` is pinned by
-  `crates/omnigraph-reference-engine/tests/frozen.rs`. v1 is reachable only
-  through GQT's `--- expect same as v1`, which compares a query step's v2
-  rows with v1's. A defect seen on v1 is fixed on v2
-  (`crates/omnigraph/src/engine/`); a v1 edit needs the pin updated in the
-  same PR and a reviewer's eyes.
 - A change to what an operation reads or writes in storage adds or updates
   its row in the DST storage-cost golden,
   `crates/omnigraph-dst/cost_table.txt`, and the pull request explains every

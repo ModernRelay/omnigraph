@@ -66,7 +66,6 @@ Stable code owners:
 | Read doors | `crates/omnigraph/src/exec/query_doors.rs` |
 | Plan acceptance | `crates/omnigraph-planner/src/validate/` |
 | Plan lowering, operators and context (engine v2) | `crates/omnigraph/src/engine/` |
-| Frozen engine v1, the GQT test reference | `crates/omnigraph-reference-engine/` |
 | Lance scan boundary | `crates/omnigraph/src/table_store.rs` |
 | Topology build/cache | `crates/omnigraph/src/graph_index/`, `runtime_cache.rs` |
 | Mutation orchestration | `crates/omnigraph/src/exec/mutation.rs` |
@@ -270,22 +269,6 @@ value, `v2`, and refuses `v1` as an unknown value. The doors
 `exec/query_doors.rs`) plan every read through `engine::execute_query`. A
 query shape the planner refuses (`UnsupportedQuery`) is a `BadRequest` user
 error on execute, the error `explain_query` gives for it.
-
-Engine v1, the executor v2 replaced, is the crate
-`omnigraph-reference-engine` (`publish = false`). Its source and the compiler's
-`ir::untyped` read IR are frozen and pinned by the crate's `tests/frozen.rs`;
-it depends on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and
-third-party crates only, so it is
-independent of the production engine and planner in either direction; the
-compiler, core and catalog crates are shared. `omnigraph-gqt` is its one dependent: it
-installs `ReferenceEngine` on a session copy through
-`Session::with_read_executor` (the `ReadExecutor` trait in
-`omnigraph_catalog::read_executor`, both under the `test-util` feature) to run
-a step's `--- expect same as v1` comparison. Only this reference door converts
-the compiled query with `QueryIR::erase` into `ir::untyped`; erasure is one-way,
-and engine v2 keeps the compiler's normal IR. It answers `not { ... }` blocks
-only among the correlated blocks, and refuses count predicates and a string
-`nearest` argument. A defect is fixed on v2, never in the reference.
 
 Filter placement is a planner decision, the `predicate_pushdown` pass
 on a query plan (`place_query_filters`, per scope: the top-level tree and

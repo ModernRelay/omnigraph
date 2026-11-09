@@ -1,8 +1,0 @@
-// task: people with their employer when they have one
-// kind: shapes-of-a-result
-// expect: accept
-// rfc: §3 Kept: optional served
-query q() {
-  match { $p: Person  optional { $p worksAt $c } }
-  return { $p.name, $c.name }
-}

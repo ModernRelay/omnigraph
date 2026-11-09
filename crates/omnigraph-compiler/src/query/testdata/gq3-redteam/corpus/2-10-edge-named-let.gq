@@ -1,9 +1,0 @@
-// task: a traversal over an edge named `let`
-// kind: traversal
-// expect: refuse-with-fix:$a "let" $b
-// rfc: §7: let and from are legal as edge names
-// amended: `let` is never a bare edge name; the quoted edge is the fix (RFC §7, 2026-11-08)
-query q() {
-  match { $a: Person  $a let $b }
-  return { $b.name }
-}

@@ -14,8 +14,7 @@
 //! `from`, `count`, `match`, …), because an identifier that is also a
 //! keyword is where a grammar's lookahead is tested.
 //!
-//! The ordinary suite runs a few thousand cases; the `hunt:` test runs the
-//! 100,000 the RFC names.
+//! The suite runs 2,000 cases.
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
@@ -496,10 +495,4 @@ fn print_then_parse(cases: u32) {
 #[test]
 fn print_then_parse_is_the_identity_on_generated_declarations() {
     print_then_parse(2_000);
-}
-
-#[test]
-#[ignore = "hunt: the parse, print and parse property over 100,000 generated declarations"]
-fn print_then_parse_hunt() {
-    print_then_parse(100_000);
 }

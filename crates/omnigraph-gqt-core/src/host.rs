@@ -4,15 +4,15 @@ use std::sync::Arc;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use omnigraph::Session;
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::Omnigraph;
 use omnigraph::error::OmniError;
 use omnigraph::storage::StorageAdapter;
-use omnigraph_compiler::{ParamMap, QueryResult};
+use omnigraph_compiler::QueryResult;
 use serde_json::Value;
 
 use crate::concurrent::ConcurrentStep;
 use crate::runner_config::SeamDirective;
-use crate::{Case, Item, QueryStep, Step, StepFail};
+use crate::{Case, Step, StepFail};
 
 /// Runner-owned observation and execution facilities around ordinary GQT steps.
 pub trait ExecutionHost: Sync {
@@ -23,19 +23,6 @@ pub trait ExecutionHost: Sync {
             return Err(
                 "unsupported_environment: this executor cannot run seams or concurrent blocks"
                     .into(),
-            );
-        }
-        if case.items.iter().any(|item| {
-            let steps = match item {
-                Item::Step(step) => std::slice::from_ref(step),
-                Item::Loop { steps, .. } => steps,
-            };
-            steps
-                .iter()
-                .any(|step| matches!(step, Step::Query(query) if query.same_as_v1))
-        }) {
-            return Err(
-                "unsupported_environment: this executor cannot compare the reference engine".into(),
             );
         }
         Ok(())
@@ -80,19 +67,6 @@ pub trait ExecutionHost: Sync {
                 None => Omnigraph::open(uri).await,
             }
         }
-        .boxed()
-    }
-
-    fn reference_query<'a>(
-        &'a self,
-        _session: &'a Session,
-        _step: &'a QueryStep,
-        _target: ReadTarget,
-        _params: &'a ParamMap,
-    ) -> BoxFuture<'a, Result<QueryResult, String>> {
-        futures::future::ready(Err(
-            "unsupported_environment: reference comparison requires the GQT runner".into(),
-        ))
         .boxed()
     }
 

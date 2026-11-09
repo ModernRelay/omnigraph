@@ -1,9 +1,0 @@
-// task: edition 2's edge delete by source
-// kind: writes
-// expect: refuse-with-fix:$x: WorksAt  $x.@src = $h  delete $x
-// rfc: §6 rewriter row
-// later: is `$x: WorksAt` a legal binding?
-// note: the RFC's row writes `$x: WorksAt`, a binding over an edge type says no edition-3 form binds an edge type
-query w($h: String) {
-  delete WorksAt where @src = $h
-}

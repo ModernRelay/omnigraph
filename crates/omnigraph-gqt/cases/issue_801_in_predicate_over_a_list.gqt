@@ -55,8 +55,6 @@ m.number: String
 --- expect plan
 scan Matter as $m: filter reads [m.number]
 
---- expect same as v1
-
 --- query
 set engine = v2;
 query literal_list() {
@@ -100,8 +98,6 @@ p.pid: String
 
 --- expect plan
 scan Matter as $m: filter reads [m.number]
-
---- expect same as v1
 
 --- query
 set engine = v2;

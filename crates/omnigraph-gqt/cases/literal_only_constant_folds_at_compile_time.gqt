@@ -1,6 +1,6 @@
 # issue: none
-# notes: A literal-only constant folds at compile time, so `{ adult: true or false }` reaches
-# notes: the reference engine's door as `adult = true` and returns the v2 rows.
+# notes: A literal-only constant folds at compile time, so `{ adult: true or false }` matches
+# notes: as `adult = true`.
 
 --- runner
 timeout_ms: 10000
@@ -29,4 +29,3 @@ query folded_inline_match() {
 
 --- expect shape
 p.slug: String
---- expect same as v1

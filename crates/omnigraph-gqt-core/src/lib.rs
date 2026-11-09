@@ -250,9 +250,6 @@ pub struct QueryStep {
     /// The `--- expect plan` section, checked against the engine's explain
     /// document before the rows.
     plan: Option<PlanExpect>,
-    /// `--- expect same as v1`: the rows must also equal the reference
-    /// engine's rows for the same query, compared as `expect` compares.
-    same_as_v1: bool,
 }
 
 #[derive(Debug)]
@@ -1229,56 +1226,33 @@ fn validate_subst_tokens(
 /// Walks one expression for the index decision and the string-`nearest`
 /// refusal. Exhaustive over `Expr` so a newly added construct is a compile
 /// error, never a silent skip.
-fn walk_expr(
-    expr: &Expr,
-    params: &[Param],
-    needs_indices: &mut bool,
-    reject_edge_type: bool,
-) -> Result<(), String> {
+fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<(), String> {
     match expr {
-        Expr::PropAccess { property, .. }
-            if reject_edge_type && property == omnigraph_compiler::traversal::EDGE_TYPE_META =>
-        {
-            return Err(
-                "expect same as v1: the reference engine does not support edge @type access".into(),
-            );
-        }
         Expr::Now
         | Expr::PropAccess { .. }
         | Expr::Variable(_)
         | Expr::Literal(_)
         | Expr::AliasRef(_) => {}
-        Expr::Aggregate {
-            func,
-            distinct,
-            arg,
-        } => {
-            if reject_edge_type && *distinct {
-                return Err(format!(
-                    "expect same as v1: the reference engine does not support `{func}(distinct …)`"
-                ));
-            }
-            walk_expr(arg, params, needs_indices, reject_edge_type)?
-        }
+        Expr::Aggregate { arg, .. } => walk_expr(arg, params, needs_indices)?,
         Expr::Binary { left, op: _, right }
         | Expr::In {
             needle: left,
             list: right,
         } => {
-            walk_expr(left, params, needs_indices, reject_edge_type)?;
-            walk_expr(right, params, needs_indices, reject_edge_type)?;
+            walk_expr(left, params, needs_indices)?;
+            walk_expr(right, params, needs_indices)?;
         }
         Expr::Not(inner)
         | Expr::IsNull {
             expr: inner,
             negated: _,
-        } => walk_expr(inner, params, needs_indices, reject_edge_type)?,
+        } => walk_expr(inner, params, needs_indices)?,
         Expr::Search { field, query }
         | Expr::MatchText { field, query }
         | Expr::Bm25 { field, query } => {
             *needs_indices = true;
-            walk_expr(field, params, needs_indices, reject_edge_type)?;
-            walk_expr(query, params, needs_indices, reject_edge_type)?;
+            walk_expr(field, params, needs_indices)?;
+            walk_expr(query, params, needs_indices)?;
         }
         Expr::Fuzzy {
             field,
@@ -1286,10 +1260,10 @@ fn walk_expr(
             max_edits,
         } => {
             *needs_indices = true;
-            walk_expr(field, params, needs_indices, reject_edge_type)?;
-            walk_expr(query, params, needs_indices, reject_edge_type)?;
+            walk_expr(field, params, needs_indices)?;
+            walk_expr(query, params, needs_indices)?;
             if let Some(max_edits) = max_edits {
-                walk_expr(max_edits, params, needs_indices, reject_edge_type)?;
+                walk_expr(max_edits, params, needs_indices)?;
             }
         }
         Expr::Nearest {
@@ -1299,7 +1273,7 @@ fn walk_expr(
         } => {
             *needs_indices = true;
             refuse_string_nearest(query, params)?;
-            walk_expr(query, params, needs_indices, reject_edge_type)?;
+            walk_expr(query, params, needs_indices)?;
         }
         Expr::Rrf {
             primary,
@@ -1307,10 +1281,10 @@ fn walk_expr(
             k,
         } => {
             *needs_indices = true;
-            walk_expr(primary, params, needs_indices, reject_edge_type)?;
-            walk_expr(secondary, params, needs_indices, reject_edge_type)?;
+            walk_expr(primary, params, needs_indices)?;
+            walk_expr(secondary, params, needs_indices)?;
             if let Some(k) = k {
-                walk_expr(k, params, needs_indices, reject_edge_type)?;
+                walk_expr(k, params, needs_indices)?;
             }
         }
     }
@@ -1342,23 +1316,22 @@ fn walk_clauses(
     clauses: &[Clause],
     params: &[Param],
     needs_indices: &mut bool,
-    reject_edge_type: bool,
 ) -> Result<(), String> {
     for clause in clauses {
         match clause {
             Clause::Binding(binding) => {
                 for property in &binding.prop_matches {
-                    walk_expr(&property.value, params, needs_indices, reject_edge_type)?;
+                    walk_expr(&property.value, params, needs_indices)?;
                 }
             }
             Clause::Traversal(_) => {}
-            Clause::Filter(f) => walk_expr(f, params, needs_indices, reject_edge_type)?,
+            Clause::Filter(f) => walk_expr(f, params, needs_indices)?,
             Clause::Subquery(subquery) => {
-                walk_clauses(&subquery.clauses, params, needs_indices, reject_edge_type)?;
+                walk_clauses(&subquery.clauses, params, needs_indices)?;
                 if let Some(arg) = &subquery.arg {
-                    walk_expr(arg, params, needs_indices, reject_edge_type)?;
+                    walk_expr(arg, params, needs_indices)?;
                 }
-                walk_expr(&subquery.right, params, needs_indices, reject_edge_type)?;
+                walk_expr(&subquery.right, params, needs_indices)?;
             }
         }
     }
@@ -1414,40 +1387,12 @@ fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
 }
 
 fn inspect_decl(decl: &QueryDecl, needs_indices: &mut bool) -> Result<(), String> {
-    inspect_decl_with_policy(decl, needs_indices, false)
-}
-
-fn inspect_decl_with_policy(
-    decl: &QueryDecl,
-    needs_indices: &mut bool,
-    reject_edge_type: bool,
-) -> Result<(), String> {
-    if reject_edge_type && decl.distinct {
-        return Err(
-            "expect same as v1: the reference engine does not support `return distinct`".into(),
-        );
-    }
-    walk_clauses(
-        &decl.match_clause,
-        &decl.params,
-        needs_indices,
-        reject_edge_type,
-    )?;
+    walk_clauses(&decl.match_clause, &decl.params, needs_indices)?;
     for projection in &decl.return_clause {
-        walk_expr(
-            &projection.expr,
-            &decl.params,
-            needs_indices,
-            reject_edge_type,
-        )?;
+        walk_expr(&projection.expr, &decl.params, needs_indices)?;
     }
     for ordering in &decl.order_clause {
-        walk_expr(
-            &ordering.expr,
-            &decl.params,
-            needs_indices,
-            reject_edge_type,
-        )?;
+        walk_expr(&ordering.expr, &decl.params, needs_indices)?;
     }
     Ok(())
 }
@@ -1829,37 +1774,6 @@ fn complete_control_step(
     })
 }
 
-/// The expect word that adds the reference-engine comparison to a query
-/// step's rows expect.
-const SAME_AS_V1: &str = "same as v1";
-
-/// Why a `--- expect same as v1` section has no step to attach to; a mutate
-/// step, pending or just completed, gets its own refusal.
-fn same_as_v1_misplaced(
-    line: usize,
-    pending: Option<&Pending>,
-    items: &[Item],
-    open_loop: Option<&(String, Vec<String>, Vec<Step>)>,
-) -> String {
-    let last = match open_loop {
-        Some((_, _, steps)) => steps.last(),
-        None => match items.last() {
-            Some(Item::Step(step)) => Some(step),
-            Some(Item::Loop { .. }) | None => None,
-        },
-    };
-    let on_mutate = matches!(pending, Some(Pending::Decl(step)) if step.is_mutation)
-        || (pending.is_none() && matches!(last, Some(Step::Mutate(_))));
-    if on_mutate {
-        return format!(
-            "invalid_case: line {line}: `--- expect same as v1` is refused on a mutate step; the reference engine only reads, and a mutation returns no rows to compare"
-        );
-    }
-    format!(
-        "line {line}: `--- expect same as v1` must directly follow a query step's `--- expect shape` or `--- expect plan`; it adds the reference-engine comparison to the step's own rows expect"
-    )
-}
-
 /// The declaration of a step whose source the compiler refused at parse: no
 /// parameters and no body, so the step binds nothing and the door it runs
 /// through answers with the parse refusal.
@@ -1920,7 +1834,6 @@ fn complete_decl_step(
                 expects_expand: step.expects_expand,
                 expect: rows_expect(ordered, section, loop_var)?,
                 plan: None,
-                same_as_v1: false,
             }))
         }
         (ExpectHeader::Error(needle), is_mutation) => {
@@ -1953,7 +1866,6 @@ fn complete_decl_step(
                     expects_expand: step.expects_expand,
                     expect: QueryExpect::Error { needle },
                     plan: None,
-                    same_as_v1: false,
                 })
             })
         }
@@ -2053,7 +1965,6 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut pending: Option<Pending> = None;
     let mut awaiting_shape: Option<Step> = None;
     let mut awaiting_plan: Option<Step> = None;
-    let mut awaiting_same_as_v1: Option<Step> = None;
     let mut awaiting_load_plan = false;
     let mut ordinal = 0usize;
     let mut seams = BTreeMap::new();
@@ -2116,10 +2027,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         if expect_word != "plan" {
             awaiting_load_plan = false;
         }
-        if let Some(step) = awaiting_plan.take_if(|_| !matches!(expect_word, "plan" | SAME_AS_V1)) {
-            push_step(&mut items, &mut open_loop, step);
-        }
-        if let Some(step) = awaiting_same_as_v1.take_if(|_| expect_word != SAME_AS_V1) {
+        if let Some(step) = awaiting_plan.take_if(|_| expect_word != "plan") {
             push_step(&mut items, &mut open_loop, step);
         }
         if awaiting_seam_step && !matches!(kind, "mutate" | "load" | "seam") {
@@ -2739,28 +2647,6 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     };
                     query.plan = Some(PlanExpect { lines });
-                    awaiting_same_as_v1 = Some(step);
-                    continue;
-                }
-                if rest.trim() == SAME_AS_V1 {
-                    let line = section.header_line + 1;
-                    refuse_nonempty_body(&section.body, "an `expect same as v1` section")?;
-                    let Some(mut step) =
-                        awaiting_plan.take().or_else(|| awaiting_same_as_v1.take())
-                    else {
-                        return Err(same_as_v1_misplaced(
-                            line,
-                            pending.as_ref(),
-                            &items,
-                            open_loop.as_ref(),
-                        ));
-                    };
-                    let Step::Query(query) = &mut step else {
-                        return Err(format!(
-                            "line {line}: `--- expect same as v1` is supported only on a query declaration step"
-                        ));
-                    };
-                    query.same_as_v1 = true;
                     push_step(&mut items, &mut open_loop, step);
                     continue;
                 }
@@ -2941,7 +2827,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         return Err("the final step is missing its `--- expect`".into());
     }
     settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
-    if let Some(step) = awaiting_plan.take().or_else(|| awaiting_same_as_v1.take()) {
+    if let Some(step) = awaiting_plan.take() {
         push_step(&mut items, &mut open_loop, step);
     }
     if open_loop.is_some() {
@@ -3651,49 +3537,12 @@ async fn run_query_step(
             if let Some(drift) = drift {
                 return Err(fail(drift));
             }
-            check_rows(host, &label, &result, *ordered, body_raw, *span, binding)?;
-            if step.same_as_v1 && !host.active() {
-                check_same_as_v1(host, session, step, target, &params, &result, *ordered)
-                    .await
-                    .map_err(&fail)?;
-            }
-            Ok(())
+            check_rows(host, &label, &result, *ordered, body_raw, *span, binding)
         }
         QueryExpect::Error { needle } => {
             check_error_expect(host, needle, outcome, "the query succeeded").map_err(fail)
         }
     }
-}
-
-/// `--- expect same as v1`: the step's query again on a copy of the case
-/// session whose reads run on the reference engine; any v1 error, a gate
-/// refusal included, or a row difference fails the step.
-async fn check_same_as_v1(
-    host: &impl ExecutionHost,
-    session: &Session,
-    step: &QueryStep,
-    target: ReadTarget,
-    params: &omnigraph_compiler::ParamMap,
-    v2: &QueryResult,
-    ordered: bool,
-) -> Result<(), String> {
-    inspect_decl_with_policy(&step.decl, &mut false, true)?;
-    let v1 = host
-        .reference_query(session, step, target, params)
-        .await
-        .map_err(|e| format!("expect same as v1: v2 returned rows, v1 failed: {e}"))?;
-    let rows = |result: &QueryResult, engine: &str| match result.to_rust_json() {
-        Ok(Value::Array(rows)) => Ok(rows),
-        Ok(_) => Err(format!(
-            "expect same as v1: {engine} returned a non-array row set"
-        )),
-        Err(e) => Err(format!(
-            "expect same as v1: {engine} rows failed to render as JSON: {e}"
-        )),
-    };
-    compare_rows(&rows(&v1, "v1")?, &rows(v2, "v2")?, ordered).map_err(|(message, _)| {
-        format!("expect same as v1: the engines disagree (expected = v1, actual = v2): {message}")
-    })
 }
 
 /// Compares the executed rows with the expect body; a mismatch carries the

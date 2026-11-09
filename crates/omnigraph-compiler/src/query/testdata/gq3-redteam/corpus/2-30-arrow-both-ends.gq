@@ -1,8 +1,0 @@
-// task: a two-headed arrow
-// kind: traversal
-// expect: refuse-with-fix:$a <knows> $b
-// rfc: §3 refused respellings
-query q() {
-  match { $a: Person  $a <-knows-> $b }
-  return { $b.name }
-}

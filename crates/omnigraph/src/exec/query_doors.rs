@@ -1,6 +1,5 @@
 //! Session and compiled-query read entry points. Every read plans and runs
-//! through `crate::engine::execute_query`; a test session may carry a
-//! `ReadExecutor` that runs its reads instead (feature `test-util`).
+//! through `crate::engine::execute_query`.
 
 use std::sync::Arc;
 
@@ -341,9 +340,8 @@ impl Session {
         engine::execute(accepted, &context).await
     }
 
-    /// One compiled query through the engine, or through the installed
-    /// `ReadExecutor`. The lazy graph-index handle means an index-served query
-    /// with no `AntiJoin` never builds the CSR.
+    /// One compiled query through the engine. The lazy graph-index handle
+    /// means an index-served query with no `AntiJoin` never builds the CSR.
     async fn execute_on_route(
         &self,
         settings: &SessionSettings,
@@ -354,18 +352,6 @@ impl Session {
         catalog: &Arc<Catalog>,
     ) -> Result<QueryResult> {
         let ir: &QueryIR = &query.ir;
-        #[cfg(feature = "test-util")]
-        if let Some(executor) = self.read_executor() {
-            let erased = ir.erase();
-            let request = omnigraph_catalog::read_executor::ReadRequest {
-                ir: &erased,
-                params,
-                snapshot: snapshot.raw(),
-                catalog,
-                settings,
-            };
-            return executor.execute(request).await;
-        }
         let needs_graph = ir
             .pipeline
             .iter()

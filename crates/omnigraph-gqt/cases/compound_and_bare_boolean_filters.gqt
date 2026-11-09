@@ -1,6 +1,6 @@
 # issue: none
 # notes: A compound predicate, a bare Bool property or parameter and a comparison of comparisons each filter rows; one comparison with
-# notes: a leading `nearest` order gives the reference engine's rows; a type fault inside a compound is the plain type error, and a compound update `where` runs.
+# notes: a leading `nearest` order gives the pinned rows; a type fault inside a compound is the plain type error, and a compound update `where` runs.
 
 --- runner
 timeout_ms: 10000
@@ -52,8 +52,6 @@ query leading_nearest_runs($q: Vector(2)) {
 
 --- expect shape
 p.slug: String
---- expect same as v1
-
 --- query
 set engine = v2;
 query bare_boolean_property() {

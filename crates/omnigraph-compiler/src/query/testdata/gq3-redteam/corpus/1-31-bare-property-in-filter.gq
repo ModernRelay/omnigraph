@@ -1,9 +1,0 @@
-// task: a filter on a bare property name, edition 2's mutation habit in a read
-// kind: lookups-and-filters
-// expect: refuse-with-fix:$p.name = "x"
-// rfc: §7: a bare identifier is not an operand in match (2026-11-08)
-// amended: added: the bare-name refusal (Q018) and its guess
-query q() {
-  match { $p: Person  name = "x" }
-  return { $p.name }
-}

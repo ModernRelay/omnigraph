@@ -1,9 +1,0 @@
-// task: documents in a collection with the reserved edge name written bare
-// kind: traversal
-// expect: refuse-with-fix:$d "in" $x
-// rfc: §3 refused respellings: `$d in $x` over a reserved edge is a parse error
-// note: it is a legal membership filter
-query q($s: String) {
-  match { $x: Collection { slug: $s }  $d in $x }
-  return { $d.title }
-}

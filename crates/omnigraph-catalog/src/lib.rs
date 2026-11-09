@@ -59,7 +59,6 @@ pub mod migrations;
 pub mod namespace;
 pub mod publisher;
 #[cfg(feature = "test-util")]
-pub mod read_executor;
 pub mod retention;
 pub mod state;
 pub mod unattached;

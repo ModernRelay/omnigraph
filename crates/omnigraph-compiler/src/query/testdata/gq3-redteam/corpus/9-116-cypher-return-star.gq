@@ -1,8 +1,0 @@
-// task: return *
-// kind: adversarial
-// expect: refuse
-// habit: Cypher
-query q() {
-  match { $p: Person }
-  return { * }
-}

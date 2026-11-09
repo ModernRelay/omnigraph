@@ -1,8 +1,0 @@
-// task: an inline fragment
-// kind: adversarial
-// expect: refuse
-// habit: GraphQL
-query q() {
-  match { $n: Named }
-  return { ... on Person { handle } }
-}

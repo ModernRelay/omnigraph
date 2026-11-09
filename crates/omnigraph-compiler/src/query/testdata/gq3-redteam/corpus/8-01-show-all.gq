@@ -1,5 +1,0 @@
-// task: show every setting
-// kind: statements
-// expect: accept
-// rfc: asset §8
-show all;
