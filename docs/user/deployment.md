@@ -240,6 +240,23 @@ export AWS_S3_FORCE_PATH_STYLE=true
 Set `AWS_ALLOW_HTTP=true` only for a trusted local development endpoint. Do not
 put credentials in `cluster.yaml` or graph URIs.
 
+A graph's commit protocol relies on the store honouring conditional writes
+(`If-None-Match` and `If-Match` on `PUT`), which the server requests on every
+S3 binding. The project's S3 test suites run against RustFS; qualify any other
+S3-compatible service before production. Google Cloud Storage's S3
+interoperability endpoint is untested, and a store that ignores the conditions
+can let two writers publish the same graph version. Native `gs://`
+URIs are not supported.
+
+## Encryption at rest
+
+Omnigraph writes graph data, history and Blob payloads as ordinary objects and
+does not encrypt them itself. Encryption at rest is the storage's: enable
+default bucket encryption (SSE-S3 or SSE-KMS) on S3, the service's equivalent on
+other S3-compatible stores, Azure Storage service encryption, or an encrypted
+volume for a local root. There is no field-level encryption; keep secrets out
+of graph properties, or encrypt them before they are written.
+
 The same storage root must be visible to servers and out-of-band cluster or
 maintenance jobs. Submit schema/query changes and graph additions to the running
 server with `cluster apply --target`; the root's applied revision remains the

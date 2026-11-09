@@ -40,7 +40,7 @@ Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace
 | **Branching** | Agents propose reviewable changes instead of writing to main: a branch per agent or task, three-way merge, time travel across the whole graph. |
 | **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers and policies. `cluster plan` previews, `cluster apply` converges, Terraform-style. |
 | **Security as code** | Cedar policy enforced **server-side on every mutation**, per graph or server-wide; bearer auth, server-resolved actors, audit tracking. |
-| **Object-storage native, open format** | Decoupled storage and compute. Store graphs on local disk or S3-compatible storage: RustFS / MinIO, AWS S3 / R2 / GCS, or Azure preview. Graph data uses open, versioned [Lance](https://github.com/lance-format/lance), including Blob values. |
+| **Object-storage native, open format** | Decoupled storage and compute. Store graphs on local disk or S3-compatible storage: RustFS / MinIO, AWS S3 / R2, or Azure preview. Graph data uses open, versioned [Lance](https://github.com/lance-format/lance), including Blob values. |
 
 ## What you can build
 
