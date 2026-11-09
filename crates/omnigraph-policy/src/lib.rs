@@ -1116,35 +1116,6 @@ pub trait PolicyChecker: Send + Sync {
         scope: &ResourceScope,
         actor: &str,
     ) -> Result<(), PolicyError>;
-
-    /// Gate for an operation that any one of `actions` admits on `scope`,
-    /// such as the full-text rebuild, which `maintain` and its older grant
-    /// `change` both admit. Each action is decided as [`Self::check`] decides
-    /// it, in order, and the first allowed one admits the operation. An
-    /// evaluation failure is returned at once rather than passed over for
-    /// the next action, so a broken rule never widens access. When every
-    /// action is denied, the denial names each one.
-    fn check_any(
-        &self,
-        actions: &[PolicyAction],
-        scope: &ResourceScope,
-        actor: &str,
-    ) -> Result<(), PolicyError> {
-        if actions.is_empty() {
-            return Err(PolicyError::Internal(
-                "no policy action to check".to_string(),
-            ));
-        }
-        let mut denials = Vec::with_capacity(actions.len());
-        for &action in actions {
-            match self.check(action, scope, actor) {
-                Ok(()) => return Ok(()),
-                Err(PolicyError::Denied(message)) => denials.push(message),
-                Err(internal) => return Err(internal),
-            }
-        }
-        Err(PolicyError::Denied(denials.join("; ")))
-    }
 }
 
 impl PolicyChecker for PolicyEngine {
@@ -2154,72 +2125,5 @@ rules:
             "actions: [maintain]\n      target_branch_scope: any",
         );
         assert!(PolicyEngine::load_graph_from_source(&target_scoped_maintain, "graph").is_err());
-    }
-
-    #[test]
-    fn check_any_admits_on_any_allowed_action_and_names_every_denial() {
-        use super::{PolicyChecker, PolicyError, ResourceScope};
-
-        let policy = PolicyEngine::load_graph_from_source(
-            r#"
-version: 1
-groups:
-  maintainers: [act-maintainer]
-  writers: [act-writer]
-  readers: [act-reader]
-rules:
-  - id: maintainers
-    allow:
-      actors: { group: maintainers }
-      actions: [maintain]
-  - id: writers
-    allow:
-      actors: { group: writers }
-      actions: [change]
-"#,
-            "graph",
-        )
-        .unwrap();
-        let either = [PolicyAction::Maintain, PolicyAction::Change];
-        let scope = ResourceScope::Branch("main".to_string());
-        for actor in ["act-maintainer", "act-writer"] {
-            policy.check_any(&either, &scope, actor).unwrap();
-        }
-        match policy.check_any(&either, &scope, "act-reader") {
-            Err(PolicyError::Denied(message)) => {
-                assert!(
-                    message.contains("'maintain'") && message.contains("'change'"),
-                    "{message}"
-                );
-            }
-            other => panic!("expected a denial naming both actions, got {other:?}"),
-        }
-        assert!(matches!(
-            policy.check_any(&[], &scope, "act-maintainer"),
-            Err(PolicyError::Internal(_))
-        ));
-
-        /// Fails to evaluate `maintain` and allows everything else.
-        struct BrokenMaintain;
-        impl PolicyChecker for BrokenMaintain {
-            fn check(
-                &self,
-                action: PolicyAction,
-                _scope: &ResourceScope,
-                _actor: &str,
-            ) -> Result<(), PolicyError> {
-                match action {
-                    PolicyAction::Maintain => Err(PolicyError::Internal("broken".to_string())),
-                    _ => Ok(()),
-                }
-            }
-        }
-        assert!(
-            matches!(
-                BrokenMaintain.check_any(&either, &scope, "act"),
-                Err(PolicyError::Internal(message)) if message == "broken"
-            ),
-            "an evaluation failure must not fall through to the next action"
-        );
     }
 }

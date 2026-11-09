@@ -829,14 +829,14 @@ async fn non_canonical_branch_names_cannot_reach_a_protected_branch() {
 }
 
 #[tokio::test]
-async fn full_text_rebuild_enforces_change_or_maintain_on_the_selected_branch_and_records_actor() {
+async fn full_text_rebuild_enforces_maintain_on_the_selected_branch_and_records_actor() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     db.branch_create("feature").await.unwrap();
     drop(db);
-    // `act-allowed` can change unprotected feature, `act-maintainer` can
-    // maintain it, and neither reaches protected main. A hardcoded main scope
-    // or an action other than `change` or `maintain` must fail.
+    // `act-allowed` can change unprotected feature but not maintain it, and
+    // `act-maintainer` can maintain it; neither reaches protected main. A
+    // hardcoded main scope or an action other than `maintain` must fail.
     let policy = format!(
         "{}  - id: maintainers\n    allow:\n      actors: {{ group: maintainers }}\n      actions: [maintain]\n      branch_scope: unprotected\n",
         POLICY_YAML
@@ -854,16 +854,15 @@ async fn full_text_rebuild_enforces_change_or_maintain_on_the_selected_branch_an
 
     for (branch, actor) in [
         ("feature", "act-denied"),
+        ("feature", "act-allowed"),
         ("main", "act-allowed"),
         ("main", "act-maintainer"),
     ] {
         let result = db
             .rebuild_full_text_indices_on_as(branch, Some(actor))
             .await;
-        // Either grant would admit the rebuild, so the refusal names both.
         assert!(
-            matches!(&result, Err(OmniError::Policy(message))
-                if message.contains("'maintain'") && message.contains("'change'")),
+            matches!(&result, Err(OmniError::Policy(message)) if message.contains("'maintain'")),
             "{actor} on {branch}: {result:?}"
         );
         assert_denied(result, "rebuild_full_text_indices_on_as");
@@ -887,33 +886,26 @@ async fn full_text_rebuild_enforces_change_or_maintain_on_the_selected_branch_an
         "a missing actor must not bypass policy"
     );
 
-    let mut parent = feature_before[0].graph_commit_id.clone();
-    for (actor, grant) in [("act-allowed", "change"), ("act-maintainer", "maintain")] {
-        let result = db
-            .rebuild_full_text_indices_on_as("feature", Some(actor))
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{grant} on the selected unprotected branch must permit a real rebuild: {error}"
-                )
-            });
-        assert_eq!(result.branch, "feature");
-        assert_eq!(result.rebuilt_indexes.len(), 2);
-        let feature_after = db.list_commits(Some("feature")).await.unwrap();
-        assert_eq!(
-            result.graph_commit_id.as_deref(),
-            Some(feature_after[0].graph_commit_id.as_str())
-        );
-        assert_eq!(feature_after[0].actor_id.as_deref(), Some(actor));
-        assert_eq!(
-            feature_after[0].parent_commit_id.as_deref(),
-            Some(parent.as_str())
-        );
-        parent = feature_after[0].graph_commit_id.clone();
-    }
+    let result = db
+        .rebuild_full_text_indices_on_as("feature", Some("act-maintainer"))
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "maintain on the selected unprotected branch must permit a real rebuild: {error}"
+            )
+        });
+    assert_eq!(result.branch, "feature");
+    assert_eq!(result.rebuilt_indexes.len(), 2);
+    let feature_after = db.list_commits(Some("feature")).await.unwrap();
+    assert_eq!(feature_after.len(), feature_before.len() + 1);
     assert_eq!(
-        db.list_commits(Some("feature")).await.unwrap().len(),
-        feature_before.len() + 2
+        result.graph_commit_id.as_deref(),
+        Some(feature_after[0].graph_commit_id.as_str())
+    );
+    assert_eq!(feature_after[0].actor_id.as_deref(), Some("act-maintainer"));
+    assert_eq!(
+        feature_after[0].parent_commit_id.as_deref(),
+        Some(feature_before[0].graph_commit_id.as_str())
     );
     let main_after = db.list_commits(None).await.unwrap();
     assert_eq!(main_after.len(), main_before.len());

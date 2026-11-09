@@ -663,10 +663,9 @@ manifest CAS.
 
 Maintenance has no actor-less public form. `optimize_as`, `ensure_indices_as`,
 `ensure_indices_on_as` and `rebuild_full_text_indices_on_as` check `maintain`
-on the branch they maintain, `main` for optimize; the full-text rebuild also
-admits `change`, its grant before `maintain` existed (`Omnigraph::enforce_any`,
-`PolicyChecker::check_any`). `cleanup_as` checks `reclaim` with no branch, and
-the read-only `repair_report_as` checks `maintain` on `main`.
+on the branch they maintain, `main` for optimize. `cleanup_as` checks `reclaim`
+with no branch, and the read-only `repair_report_as` checks `maintain` on
+`main`.
 `forbidden_apis.rs::maintenance_entry_points_take_an_actor` keeps every
 registered maintenance surface an `_as` form with an `actor` parameter.
 

@@ -170,13 +170,8 @@ pub(super) async fn rebuild_full_text_indices_on_as(
 ) -> Result<FullTextIndexRebuildResult> {
     let branch = normalize_branch_name(branch)?;
     let public_branch = branch.as_deref().unwrap_or("main");
-    // `maintain` is the rebuild's grant; `change`, its grant before
-    // `maintain` existed, still admits it so existing policies keep working.
-    db.enforce_any(
-        &[
-            omnigraph_policy::PolicyAction::Maintain,
-            omnigraph_policy::PolicyAction::Change,
-        ],
+    db.enforce(
+        omnigraph_policy::PolicyAction::Maintain,
         &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
         actor,
     )?;
