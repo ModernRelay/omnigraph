@@ -1499,17 +1499,18 @@ impl Omnigraph {
         // effect is a fresh file or a detached version no manifest names: a
         // failure here is definite (`Unpublished`), whatever its cause, and a
         // server must not treat it as an outcome it cannot establish.
-        let staged = staging
-            .stage_all_with_concurrency(self, requested, stage_write_concurrency)
-            .await
-            .map_err(OmniError::unpublished)?;
+        let (staged, early) = futures::join!(
+            staging.stage_all_with_concurrency(self, requested, stage_write_concurrency),
+            self.early_revalidation(txn),
+        );
+        let staged = staged.map_err(OmniError::unpublished)?;
         fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
         let lineage_intent = self
             .new_lineage_intent_for_branch(requested, actor_id, history_release_bytes)
             .await
             .map_err(OmniError::unpublished)?;
         let committed = staged
-            .commit_all(self, requested, txn)
+            .commit_all(self, requested, txn, early)
             .await
             .map_err(OmniError::unpublished)?;
         Ok(CommittedStagedMutation {

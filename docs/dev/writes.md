@@ -206,14 +206,20 @@ in memory. It performs all type, value, uniqueness, endpoint, cardinality, and
 resource validation before staging. `stage_all` opens each touched table at
 its pin through the read-handle cache (the registration's `staged_version`
 when it carries one) and produces one exact transaction per table without
-moving HEAD. Once a publication names the new pins, the writer evicts each
-replaced base pin from that cache, so a steadily written table holds its
-current version rather than its recent history; the cache also bounds the
-decoded manifest bytes its handles keep alive, since a manifest lists every
-fragment. `commit_all` enters the gates, revalidates the complete
-authority (for a branch other than the handle's bound one, the captured
-manifest probe first: an unchanged version and branch identifier keep the
-captured authority, a mismatch is a fresh coherent capture), and commits
+moving HEAD. `commit_all` admits each dataset it commits to that cache under
+the key its publication will register, so the next read or write of the table
+opens no manifest; once a publication names the new pins, the writer demotes
+each replaced base pin in that cache: it stays held for a reader or fork still
+at that version while the cache's byte budget has room, and is the first out
+under pressure, so a steadily written table's history never displaces a live
+pin; the budget bounds the decoded manifest bytes the handles keep alive,
+since a manifest lists every fragment. `commit_all` enters the gates,
+revalidates the complete
+authority (for the handle's bound branch, the probe taken beside the staging
+puts serves when it answered current and no publish has installed on the
+handle since; for another branch, the captured manifest probe first: an
+unchanged version and branch identifier keep the captured authority, a
+mismatch is a fresh coherent capture), and commits
 every participant as a detached version of its pinned
 base: no recovery sidecar is armed, a table's linear HEAD never moves, and
 nothing can rebase. Every detached commit records the authority it was staged
@@ -225,7 +231,13 @@ removed under `omnigraph.deleted_ids` (inline up to 64 KiB) or
 discovery read them. The manifest then publishes every pin as
 `(base + 1, staged_version, transaction_uuid)` in one CAS; a publish that
 loses the CAS returns the plain `ReadSetChanged`, and the staging it leaves
-is unpublished until the collector reclaims it. The probe reads only the
+is unpublished until the collector reclaims it. A write carrying the caller's
+`--if-commit` head turns that loss into `PreconditionFailed` naming the head
+the publisher read, the answer the under-gate check gives, so the caller sees
+one refusal wherever the race lands. A publish by another handle or process
+between the beside-staging probe and the gates is refused there, after the
+detached commits, where the under-gate probe refused before them: the price of
+the lost race is one reclaimed detached commit per table. The probe reads only the
 held native ref, so a second live incarnation of the branch name (two
 processes creating it at once) is refused by the publisher's own branch
 resolution after the detached commits, not before them; the graph is
