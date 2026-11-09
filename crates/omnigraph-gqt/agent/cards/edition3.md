@@ -154,8 +154,11 @@ draw from is a bare variable or has an alias.
   `let $docs = { match { $d: Doc } return { $d } }` and
   `from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $q), k: 60)`.
   The fused rows carry `$d` and `$score` only; draw anything else again
-  after it. To combine scores yourself, draw each ranking through a wrapper
-  read that renames its columns, then join them with `$d = $d2`.
+  after it. To combine scores yourself, rename the second population's column
+  before ranking it, `let $docs2 = { match { from $docs } return { $d as d2 } }`,
+  draw each ranking through a wrapper read that renames its score
+  (`return { $d, $distance as vec }`, `return { $d2, $score as lex }`), then
+  join them with `$d = $d2`.
 
 ### Reuse and recursion
 

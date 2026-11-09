@@ -113,8 +113,7 @@ fresh `claude -p` in an empty directory with `--tools ""`, `--safe-mode` and
 `--no-session-persistence`, so the card is the only GQ reference the agent
 sees and no session carries over. The model is `manifest.json`'s; a reply
 that reports any other model stops the run. Before calling the agent, the
-runner checks both cards against their pins and asks the judge which editions
-it can judge; it refuses an edition it cannot. Each run of an edition makes
+runner checks both cards against their pins. Each run of an edition makes
 one agent call per task, two more for each refused first answer and one per
 seed; `--resume` continues an interrupted results directory.
 
@@ -141,10 +140,9 @@ above. A change to the skill's query sections therefore fails that test until
 `cards --write` regenerates the card, which also moves its pin: results
 measured with the older card keep the older digest in their `meta.json`.
 
-The edition-3 checks (every edition-3 ground truth accepted, every edition-3
-seed refused with the code the RFC names) are written and `#[ignore]`d until
-the edition-3 front end lands; `edition3_is_pending_in_this_build` fails on
-that day so the two switch on together.
+The same module checks that every edition-3 ground truth, alternatives
+included, is accepted by the edition-3 front end (the parser and the type
+checker), and every edition-3 seed refused with its code.
 
 ## Writing a task
 

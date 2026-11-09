@@ -15,7 +15,6 @@ const USAGE: &str = "usage: omnigraph-gqt-agent [--root <agent dir>] <command>
 commands:
   tasks                   every task, one JSON object per line
   seeds --edition <2|3>   the seeded answers of an edition
-  capabilities            the editions this build can judge
   judge --edition <2|3>   judge {\"id\", \"task\", \"text\"} lines from stdin
   cards --check|--write   the edition-2 card regenerated from skills/omnigraph, and both card digests
   record --check|--write  the edition-2 ground truths' rows on their seeds";
@@ -70,20 +69,6 @@ fn repo_root() -> PathBuf {
 
 async fn run(args: Args) -> Result<(), String> {
     match args.command.as_str() {
-        "capabilities" => {
-            let pending: serde_json::Map<String, Value> = [Edition::Two, Edition::Three]
-                .into_iter()
-                .filter(|e| !agent::available(*e))
-                .map(|e| (e.number().to_string(), json!(agent::EDITION3_PENDING)))
-                .collect();
-            let editions: Vec<u8> = [Edition::Two, Edition::Three]
-                .into_iter()
-                .filter(|e| agent::available(*e))
-                .map(Edition::number)
-                .collect();
-            print(&json!({"editions": editions, "pending": pending}));
-            Ok(())
-        }
         "tasks" => {
             let instrument = Instrument::load(&args.root)?;
             for task in &instrument.tasks {
@@ -95,6 +80,7 @@ async fn run(args: Args) -> Result<(), String> {
                     "answer": task.answer.as_str(),
                     "composition": task.composition,
                     "intent": task.intent,
+                    "signature": task.signature()?,
                     "write": task.is_write(),
                     "schema": instrument.datasets[&task.dataset].schema,
                     "edition2_queries": task.edition2.len(),

@@ -4,6 +4,7 @@
 
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
+use omnigraph_compiler::ir::core3::CoreDecl;
 use omnigraph_compiler::query::ast::FileBody;
 use omnigraph_compiler::query::parser::parse_query_diagnostic;
 use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query_decl};
@@ -35,18 +36,6 @@ impl Edition {
     }
 }
 
-/// Why this build cannot judge edition 3 yet.
-pub const EDITION3_PENDING: &str = "the edition-3 front end (GQ 3 RFC, stage B) is not in this build: \
-     edition-3 answers and ground truths cannot be accepted, refused or typed yet";
-
-/// Whether this build carries a front door for the edition.
-pub fn available(edition: Edition) -> bool {
-    match edition {
-        Edition::Two => true,
-        Edition::Three => false,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Read,
@@ -69,7 +58,6 @@ pub enum Verdict {
     Accepted(Vec<Declaration>),
     /// The diagnostic as the compiler reports it, in its JSON form.
     Refused(Value),
-    Pending(&'static str),
 }
 
 impl Verdict {
@@ -89,7 +77,6 @@ impl Verdict {
                 "diagnostic": diagnostic,
                 "rendered": render(diagnostic),
             }),
-            Verdict::Pending(reason) => json!({"accepted": Value::Null, "pending": reason}),
         }
     }
 
@@ -119,14 +106,13 @@ fn compiler_error_json(e: &CompilerError) -> Value {
 }
 
 /// Accept or refuse `text` under `edition` against `catalog`.
+///
+/// Both editions go through the one front door the engine uses: the edition
+/// line selects the parser, and the type checker types an edition-2
+/// declaration into the typed IR it lowers and an edition-3 one into the core
+/// IR. The text must be in the edition asked for, so an edition-2 answer that
+/// opens with `gq 3;`, or the reverse, is refused.
 pub fn accept(edition: Edition, catalog: &Catalog, text: &str) -> Verdict {
-    match edition {
-        Edition::Two => accept2(catalog, text),
-        Edition::Three => Verdict::Pending(EDITION3_PENDING),
-    }
-}
-
-fn accept2(catalog: &Catalog, text: &str) -> Verdict {
     let file = match parse_query_diagnostic(text) {
         Ok(file) => file,
         Err(d) => return Verdict::Refused(diagnostic_json(&d)),
@@ -139,6 +125,11 @@ fn accept2(catalog: &Catalog, text: &str) -> Verdict {
     let names = normalize::source_names(text);
     let mut out = Vec::with_capacity(decls.len());
     for decl in &decls {
+        if decl.edition3.is_some() != (edition == Edition::Three) {
+            return Verdict::Refused(json!({
+                "message": format!("the answer is not edition {}", edition.number()),
+            }));
+        }
         let checked = match typecheck_query_decl(catalog, decl) {
             Ok(checked) => checked,
             Err(e) => return Verdict::Refused(compiler_error_json(&e)),
@@ -151,6 +142,13 @@ fn accept2(catalog: &Catalog, text: &str) -> Verdict {
             CheckedQuery::Mutation(write) => (
                 Kind::Write,
                 lower_mutation_query(catalog, &write).map(|ir| format!("{ir:#?}")),
+            ),
+            CheckedQuery::Edition3(core) => (
+                match core.as_ref() {
+                    CoreDecl::Read(_) => Kind::Read,
+                    CoreDecl::Write(_) => Kind::Write,
+                },
+                Ok(format!("{core:#?}")),
             ),
         };
         let ir = match ir {

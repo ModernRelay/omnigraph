@@ -13,11 +13,15 @@ Score each document whose body matches the text `$q` as 0.7 times 1/(1 + its vec
 query weighted($q: String, $v: Vector(3)) {
   match {
     let $docs = { match { $d: Doc } return { $d } }
+    let $docs2 = { match { from $docs } return { $d as d2 } }
     from { match { from distance($docs, $d.embedding, $v) } return { $d, $distance as vec } }
-    from { match { from bm25($docs, $d.body, $q) } return { $d as d2, $score as lex } }
+    from { match { from bm25($docs2, $d2.body, $q) } return { $d2, $score as lex } }
     $d = $d2
   }
   return { $d.title, 0.7 * (1.0 / (1.0 + $vec)) + 0.3 * $lex as s }
   order { s desc }
   limit 10
 }
+
+--- note
+The second ranking's population is renamed before it is ranked, as the RFC's before-and-after corpus writes it: drawing a ranking of `$docs` a second time would bind `$d` inside an inline read while the first `from` already holds `$d` (`T68`).

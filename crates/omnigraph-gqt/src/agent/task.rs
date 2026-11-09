@@ -161,6 +161,36 @@ impl Task {
     pub fn is_write(&self) -> bool {
         self.check.is_some()
     }
+
+    /// The parameters the answer's entry declaration takes, as the canonical
+    /// edition-3 ground truth declares them: `$min: I32, $q: Vector(3)`.
+    /// The prompt states them, so the typed IR of a correct answer does not
+    /// depend on which width the agent guessed for an unstated type.
+    pub fn signature(&self) -> Result<String, String> {
+        entry_params(&super::edition3_text(&self.edition3[0]))
+            .map_err(|e| format!("{}: the canonical edition-3 truth: {e}", self.id))
+    }
+}
+
+/// The parameters of the last declaration of `source`, rendered as declared.
+pub fn entry_params(source: &str) -> Result<String, String> {
+    let file = omnigraph_compiler::query::parser::parse_query_diagnostic(source)
+        .map_err(|d| d.to_string())?;
+    let decls = file.body.into_declarations().map_err(|e| e.to_string())?;
+    let entry = decls.last().ok_or("no declaration")?;
+    Ok(entry
+        .params
+        .iter()
+        .map(|p| {
+            format!(
+                "${}: {}{}",
+                p.name,
+                p.type_name,
+                if p.nullable { "?" } else { "" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", "))
 }
 
 fn binding(word: &str, line: usize) -> Result<Binding, String> {

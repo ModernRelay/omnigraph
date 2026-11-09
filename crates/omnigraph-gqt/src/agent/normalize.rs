@@ -109,14 +109,20 @@ pub fn rename(ir: &str, names: &BTreeSet<String>, params: &[String]) -> String {
             return out;
         }
         let word = &after[..end];
-        // A derived column name, `p.name`, carries its variable's name.
-        let (head, tail) = match word.split_once('.') {
-            Some((head, _)) => (head, &word[head.len()..]),
-            None => (word, ""),
-        };
+        // A derived column name, `p.name`, carries its variable's name, and
+        // a column the compiler adds for itself marks it with a leading
+        // sigil (`^p.name`).
+        let sigil = word.len()
+            - word
+                .trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .len();
+        let (prefix, name) = word.split_at(sigil);
+        let head = name.split_once('.').map_or(name, |(head, _)| head);
+        let tail = &name[head.len()..];
         let chosen = names.contains(head) && !params.iter().any(|p| p == head);
         if chosen {
             let next = map.len();
+            out.push_str(prefix);
             out.push_str(map.entry(head).or_insert_with(|| format!("v{next}")));
             out.push_str(tail);
         } else {

@@ -7,7 +7,7 @@ pub mod card;
 mod exec;
 mod front;
 mod normalize;
-mod task;
+pub mod task;
 #[cfg(test)]
 mod tests;
 
@@ -19,7 +19,7 @@ use omnigraph_compiler::schema::parser::parse_schema;
 use serde_json::{Value, json};
 
 pub use exec::{Graph, Rows, run_answer, run_truth};
-pub use front::{Declaration, EDITION3_PENDING, Edition, Kind, Verdict, accept, available, render};
+pub use front::{Declaration, Edition, Kind, Verdict, accept, render};
 pub use task::{Answer, Dataset, Expect, Instrument, Seed, Task};
 
 pub fn catalog(dataset: &Dataset) -> Result<Catalog, String> {
@@ -119,8 +119,8 @@ impl<'a> Judge<'a> {
         out: &mut Value,
     ) -> Result<(Option<bool>, String), String> {
         if edition == Edition::Three {
-            // Typed-IR equality with a ground truth; reached only once the
-            // edition-3 front end accepts.
+            // Nothing in edition 3 executes: typed-IR equality with a ground
+            // truth, after normalisation.
             let catalog = self.catalog(&task.dataset)?;
             for truth in &task.edition3 {
                 if let Verdict::Accepted(truth) = accept(edition, catalog, &edition3_text(truth)) {

@@ -12,5 +12,11 @@ query average_headcount() {
   return { avg($n) as mean, max($n) as largest }
 }
 
+--- edition3
+query average_headcount() {
+  match { from { match { $p worksAt $c } return { $c, count($p) as n } } }
+  return { avg($n) as mean, max($n) as largest }
+}
+
 --- note
 As `t15`: the companies without employees are outside the question.

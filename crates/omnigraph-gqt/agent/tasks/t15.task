@@ -20,6 +20,13 @@ query headcount() {
   order { n desc }
 }
 
+--- edition3
+query headcount() {
+  match { $p worksAt $c }
+  return { $c.name, count($p) as n }
+  order { n desc }
+}
+
 --- expect ordered
 columns: ["c.name","n"]
 ["Acme",3]

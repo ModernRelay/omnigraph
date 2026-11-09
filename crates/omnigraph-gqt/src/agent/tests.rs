@@ -1,8 +1,8 @@
 //! The instrument's data stays valid: every edition-2 ground truth is
 //! accepted and returns its recorded rows on its seed, every edition-2 seed is
 //! refused with its code, every card matches its pin and the edition-2 card
-//! regenerates from the skill. The edition-3 checks wait for the edition-3
-//! front end and say so.
+//! regenerates from the skill, every edition-3 ground truth is accepted by
+//! the full front end and every edition-3 seed refused with its code.
 
 use std::path::Path;
 
@@ -37,6 +37,17 @@ fn the_instrument_has_the_shape_stage_m0_names() {
         (2..=3).contains(&datasets.len()),
         "the corpus runs against two or three datasets, not {datasets:?}"
     );
+    for task in &instrument.tasks {
+        let signature = task.signature().unwrap();
+        if let [step] = task.edition2.as_slice() {
+            assert_eq!(
+                task::entry_params(&step.query).unwrap(),
+                signature,
+                "{}: both editions' ground truths take the parameters the prompt states",
+                task.id
+            );
+        }
+    }
     for seed in instrument.seeds.iter().filter(|s| s.edition == 2) {
         let task = instrument.task(&seed.task).expect("seeds name tasks");
         assert!(
@@ -202,18 +213,33 @@ async fn the_judge_runs_answers_and_compares_rows_and_typed_ir() {
         "two declarations are judged by hand: {verdict}"
     );
 
+    // Edition 3 does not execute: typed-IR equality after normalisation.
+    let renamed3 = "gq 3;\nquery who($slug: String) {\n  match { $company: Company  $company.slug = $slug  \
+                    $person worksAt $company }\n  return { $person.name }\n}\n";
+    let verdict = judge.judge("t14", Edition::Three, renamed3).await;
+    assert_eq!(
+        verdict["correct"], true,
+        "other names, a filter for the braces: {verdict}"
+    );
+    let wrong3 = "gq 3;\nquery staff($slug: String) {\n  match { $c: Company { slug: $slug }  $p worksAt $c  \
+                  $p knows $q }\n  return { $q.name }\n}\n";
+    let verdict = judge.judge("t14", Edition::Three, wrong3).await;
+    assert_eq!(verdict["correct"], false, "{verdict}");
+    let verdict = judge.judge("t14", Edition::Two, renamed3).await;
+    assert_eq!(
+        verdict["accepted"], false,
+        "edition 3 text is no edition-2 answer: {verdict}"
+    );
+
     let refused = "query staff { match { $c: Company } return { $c.name } }";
     let verdict = judge.judge("t14", Edition::Two, refused).await;
     assert_eq!(verdict["accepted"], false, "{verdict}");
     assert_eq!(verdict["diagnostic"]["code"], "Q002", "{verdict}");
 }
 
-/// Turn on when the edition-3 front end lands: every edition-3 ground truth
-/// must be accepted, and every edition-3 seed refused with its code where
-/// the RFC names one.
+/// Every edition-3 ground truth, alternatives included, is accepted by the
+/// full front end, and every edition-3 seed is refused with its code.
 #[test]
-#[ignore = "gq3-front-end: needs the edition-3 front end (GQ 3 RFC, stage B); until it lands no \
-            edition-3 ground truth or seed can be accepted, refused or typed"]
 fn edition3_ground_truths_are_accepted_and_seeds_refused() {
     let instrument = instrument();
     let mut failures = Vec::new();
@@ -236,24 +262,10 @@ fn edition3_ground_truths_are_accepted_and_seeds_refused() {
         let catalog = catalog(&instrument.datasets[&task.dataset]).unwrap();
         let verdict = accept(Edition::Three, &catalog, &seed.text);
         let refused = matches!(verdict, Verdict::Refused(_));
-        let coded = seed.code.is_none() || verdict.code() == seed.code.as_deref();
+        let coded = seed.code.is_some() && verdict.code() == seed.code.as_deref();
         if !(refused && coded) {
             failures.push(format!("seed {}: {}", seed.id, verdict.to_json()));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-}
-
-#[test]
-fn edition3_is_pending_in_this_build() {
-    // The tripwire beside the ignored check above: when the edition-3 front
-    // end lands, this fails, and the ignored check is switched on with it.
-    assert!(!available(Edition::Three), "{EDITION3_PENDING}");
-    let instrument = instrument();
-    let task = instrument.task("t01").unwrap();
-    let catalog = catalog(&instrument.datasets[&task.dataset]).unwrap();
-    assert!(matches!(
-        accept(Edition::Three, &catalog, &edition3_text(&task.edition3[0])),
-        Verdict::Pending(_)
-    ));
 }

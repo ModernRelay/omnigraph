@@ -41,7 +41,7 @@ The graph's schema:
 {schema}
 ```
 
-Task: {intent}
+Task: {intent}{signature}
 
 {rule}"""
 
@@ -57,7 +57,7 @@ The graph's schema:
 {schema}
 ```
 
-Task: {intent}
+Task: {intent}{signature}
 
 Your previous answer was:
 
@@ -78,7 +78,7 @@ The GQ compiler refused it with this diagnostic:
 # the same prompt over a ground truth with one injected error.
 REPAIR_BARE = """You are writing GQ, the query language of the Omnigraph graph database.
 
-Task: {intent}
+Task: {intent}{signature}
 
 Your previous answer was:
 
@@ -217,6 +217,12 @@ def judge(bin_path, edition, jobs):
     return {row["id"]: row for row in rows}
 
 
+def signature(task):
+    """The parameters the task's query takes, stated so the agent does not
+    guess a type the typed IR depends on."""
+    return f"\n\nThe task's parameters, as the query declares them: `{task['signature']}`." if task["signature"] else ""
+
+
 def rule(task, repair):
     if task["answer"] == "fewest":
         return RULE_REPAIR_FEWEST if repair else RULE_FEWEST
@@ -246,7 +252,8 @@ def run_edition(args, agent, bin_path, edition, run, tasks, seeds, card, writer,
 
     def base(condition, task, prompt, reply, answer):
         return {"edition": edition, "run": run, "condition": condition, "task": task["id"],
-                "set": task["set"], "dataset": task["dataset"], "edition2_queries": task["edition2_queries"],
+                "set": task["set"], "dataset": task["dataset"], "kind": task["kind"],
+                "edition2_queries": task["edition2_queries"],
                 "prompt_sha256": sha256(prompt),
                 "agent": {k: v for k, v in reply.items() if k != "result"}, "raw": reply["result"],
                 "answer": answer}
@@ -263,7 +270,7 @@ def run_edition(args, agent, bin_path, edition, run, tasks, seeds, card, writer,
     todo = [t for t in tasks if (edition, run, "first", t["id"]) not in done]
 
     def first(task):
-        prompt = FIRST.format(card=card, schema=task["schema"].rstrip("\n"), intent=task["intent"],
+        prompt = FIRST.format(card=card, schema=task["schema"].rstrip("\n"), intent=task["intent"], signature=signature(task),
                               rule=rule(task, False))
         reply, answer = ask(prompt)
         return base("first", task, prompt, reply, answer)
@@ -287,7 +294,7 @@ def run_edition(args, agent, bin_path, edition, run, tasks, seeds, card, writer,
             if (edition, run, condition, task["id"]) in done:
                 continue
             template = REPAIR_WITH_CARD if condition == "repair_card" else REPAIR_BARE
-            prompt = template.format(card=card, schema=task["schema"].rstrip("\n"), intent=task["intent"],
+            prompt = template.format(card=card, schema=task["schema"].rstrip("\n"), intent=task["intent"], signature=signature(task),
                                      answer=bare_answer(first_record["answer"]["text"]),
                                      diagnostic=first_record["judge"]["rendered"], rule=rule(task, True))
 
@@ -311,7 +318,7 @@ def run_edition(args, agent, bin_path, edition, run, tasks, seeds, card, writer,
         if verdict.get("accepted") is not False:
             raise Refusal(f"seed {seed['id']} is not refused by the front door: {verdict}")
         task = by_id[seed["task"]]
-        prompt = REPAIR_BARE.format(intent=task["intent"], answer=bare_answer(seed["text"]),
+        prompt = REPAIR_BARE.format(intent=task["intent"], signature=signature(task), answer=bare_answer(seed["text"]),
                                     diagnostic=verdict["rendered"], rule=rule(task, True))
 
         def seeded(seed=seed, task=task, prompt=prompt, verdict=verdict):
@@ -340,12 +347,9 @@ def cmd_run(args):
         raise Refusal(f"`{args.claude}` is not on PATH")
     tool(bin_path, "cards", "--check")  # the cards match their pins and the skill
     manifest = json.load(open(os.path.join(HERE, "manifest.json")))
-    capabilities = json.loads(tool(bin_path, "capabilities"))
     editions = [int(e) for e in args.editions.split(",")]
-    for edition in editions:
-        if edition not in capabilities["editions"]:
-            raise Refusal(f"edition {edition} cannot be judged by this build: "
-                          f"{capabilities['pending'].get(str(edition))}")
+    if not set(editions) <= {2, 3}:
+        raise Refusal(f"editions are 2 and 3, not {args.editions}")
     tasks = json_lines(tool(bin_path, "tasks"))
     if args.only:
         keep = set(args.only.split(","))
@@ -469,12 +473,158 @@ def summarize(out):
         lines += ["", "| Seeded repairs | Accepted | Correct |", "|---|---|---|"]
         for k, v in seeded_rows:
             lines.append(f"| {k[:-7]} | {v['accepted']} | {v['correct']} |")
+    analysis = analyse(records)
+    lines += analysis["lines"]
+    numbers["gate"] = analysis["gate"]
     with open(os.path.join(out, "summary.md"), "w") as f:
         f.write("\n".join(lines) + "\n")
     with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump(numbers, f, indent=2, sort_keys=True)
         f.write("\n")
     print("\n".join(lines))
+
+
+def spread(values):
+    if not values:
+        return "-"
+    lo, hi = min(values), max(values)
+    mean = sum(values) / len(values)
+    return f"{lo}" if lo == hi else f"{lo}–{hi} (mean {mean:.1f})"
+
+
+def analyse(records):
+    """The cross-run sections: spread over runs, the RFC gate on the shared
+    tasks, gains and losses by task, and the codes behind every repair."""
+    editions = sorted({r["edition"] for r in records})
+    runs = sorted({r["run"] for r in records})
+    first = {(r["edition"], r["run"], r["task"]): r for r in records if r["condition"] == "first"}
+    tasks = {}
+    for r in records:
+        tasks.setdefault(r["task"], r)
+    lines = ["", "## Spread over runs", "",
+             "Counts per run; a range is the lowest and highest run. Shared tasks are those edition 2 "
+             "expresses in one query, where both editions are judged automatically.", "",
+             "| Edition | Set | Tasks | First try accepted | First try correct | Shared: accepted | Shared: correct "
+             "| Refused first | Repaired with card | Repaired without card | Seeded accepted | Seeded correct "
+             "| Tokens in | Tokens out |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    per_run = {}
+    for edition in editions:
+        for subset in ("tasks", "corpus", "all"):
+            cols = {k: [] for k in ("n", "acc", "cor", "sacc", "scor", "ref", "rc", "rb", "sa", "sc", "ti", "to", "sn")}
+            for run in runs:
+                fs = [r for (e, n, _), r in first.items() if e == edition and n == run
+                      and (subset == "all" or r["set"] == subset)]
+                if not fs:
+                    continue
+                ids = {r["task"] for r in fs}
+                rep = [r for r in records if r["edition"] == edition and r["run"] == run and r["task"] in ids]
+                shared = [r for r in fs if r["edition2_queries"] == 1]
+                seeded = [r for r in records if r["edition"] == edition and r["run"] == run
+                          and r["condition"] == "seeded"] if subset == "all" else []
+                cols["n"].append(len(fs))
+                cols["acc"].append(sum(1 for r in fs if r["judge"].get("accepted") is True))
+                cols["cor"].append(sum(1 for r in fs if r["judge"].get("correct") is True))
+                cols["sn"].append(len(shared))
+                cols["sacc"].append(sum(1 for r in shared if r["judge"].get("accepted") is True))
+                cols["scor"].append(sum(1 for r in shared if r["judge"].get("correct") is True))
+                cols["ref"].append(sum(1 for r in fs if r["judge"].get("accepted") is False))
+                cols["rc"].append(sum(1 for r in rep if r["condition"] == "repair_card" and r["judge"].get("accepted")))
+                cols["rb"].append(sum(1 for r in rep if r["condition"] == "repair_bare" and r["judge"].get("accepted")))
+                if seeded:
+                    cols["sa"].append(sum(1 for r in seeded if r["judge"].get("accepted")))
+                    cols["sc"].append(sum(1 for r in seeded if r["judge"].get("correct") is True))
+                cols["ti"].append(round(sum(r["agent"]["tokens_in"] for r in fs) / len(fs)))
+                cols["to"].append(round(sum(r["agent"]["tokens_out"] for r in fs) / len(fs)))
+            if not cols["n"]:
+                continue
+            per_run[(edition, subset)] = cols
+            seeds_n = len({r["seed"] for r in records if r["edition"] == edition and r["condition"] == "seeded"})
+            lines.append(
+                f"| {edition} | {subset} | {cols['n'][0]} | {spread(cols['acc'])} | {spread(cols['cor'])} "
+                f"| {spread(cols['sacc'])} of {cols['sn'][0]} | {spread(cols['scor'])} of {cols['sn'][0]} "
+                f"| {spread(cols['ref'])} | {spread(cols['rc'])} | {spread(cols['rb'])} "
+                f"| {spread(cols['sa']) + (f' of {seeds_n}' if cols['sa'] else '')} "
+                f"| {spread(cols['sc']) + (f' of {seeds_n}' if cols['sc'] else '')} "
+                f"| {spread(cols['ti'])} | {spread(cols['to'])} |")
+
+    gate = {}
+    if (2, "all") in per_run and (3, "all") in per_run:
+        e2, e3 = per_run[(2, "all")], per_run[(3, "all")]
+        mean = lambda xs: sum(xs) / len(xs)
+        acc_ok = mean(e3["sacc"]) >= mean(e2["sacc"])
+        cor_ok = mean(e3["scor"]) >= mean(e2["scor"])
+        gate = {
+            "shared_tasks": e2["sn"][0],
+            "edition2_accepted": e2["sacc"], "edition3_accepted": e3["sacc"],
+            "edition2_correct": e2["scor"], "edition3_correct": e3["scor"],
+            "acceptance_at_or_above": acc_ok, "correctness_at_or_above": cor_ok,
+            "verdict": "pass" if acc_ok and cor_ok else "fail",
+        }
+        lines += ["", "## The RFC gate", "",
+                  f"On the {e2['sn'][0]} shared tasks, per run: edition 3 first-try accepted {e3['sacc']} against "
+                  f"edition 2's {e2['sacc']}, correct {e3['scor']} against {e2['scor']}. Acceptance at or above "
+                  f"edition 2's: {'yes' if acc_ok else 'no'}; correctness at or above: {'yes' if cor_ok else 'no'}. "
+                  f"Verdict: **{gate['verdict']}** (means over the runs)."]
+
+    lines += ["", "## By task", "",
+              "First-try correct over the runs, per edition; `n/j` is correct of judged, `-` not judged "
+              "automatically (no edition-2 truth, or an edition-2 answer of several queries; `q` is the "
+              "most queries an edition-2 answer used). Rows where the editions differ, or where either "
+              "edition was refused or wrong at least once.", "",
+              "| Task | Kind | Edition 2 | Edition 3 | Difference |", "|---|---|---|---|---|"]
+    for tid in sorted(tasks, key=lambda t: (tasks[t]["set"], t)):
+        cells, scores = [], {}
+        for edition in (2, 3):
+            rs = [first[(edition, run, tid)] for run in runs if (edition, run, tid) in first]
+            judged = [r for r in rs if r["judge"].get("correct") is not None]
+            ok = sum(1 for r in judged if r["judge"]["correct"] is True)
+            refused = sum(1 for r in rs if r["judge"].get("accepted") is False)
+            most = max((r["judge"].get("queries") or 0 for r in rs), default=0)
+            cell = f"{ok}/{len(judged)}" if judged else "-"
+            if refused:
+                cell += f", {refused} refused"
+            if edition == 2 and most > 1:
+                cell += f", q{most}"
+            cells.append(cell if rs else "")
+            scores[edition] = (ok, len(judged), refused, len(rs))
+        (o2, j2, f2, n2), (o3, j3, f3, n3) = scores[2], scores[3]
+        if j2 and j3:
+            diff = "gained" if o3 / j3 > o2 / j2 else "lost" if o3 / j3 < o2 / j2 else ""
+        else:
+            diff = ""
+        imperfect = (j2 and o2 < j2) or (j3 and o3 < j3) or f2 or f3
+        if diff or imperfect:
+            lines.append(f"| {tid} | {tasks[tid]['kind']} | {cells[0]} | {cells[1]} | {diff} |")
+
+    lines += ["", "## Codes behind every repair", "",
+              "Every refused first answer, the code it was refused with, and whether one repair turn was "
+              "accepted with the card and without it; then the seeded answers by code.", "",
+              "| Edition | Run | Task | Code | With card | Without card |", "|---|---|---|---|---|---|"]
+    repairs = {(r["edition"], r["run"], r["task"], r["condition"]): r for r in records
+               if r["condition"] in ("repair_card", "repair_bare")}
+    for (edition, run, tid), r in sorted(first.items()):
+        if r["judge"].get("accepted") is not False:
+            continue
+        code = (r["judge"].get("diagnostic") or {}).get("code") or "none"
+        def verdict(cond):
+            rr = repairs.get((edition, run, tid, cond))
+            if not rr:
+                return ""
+            j = rr["judge"]
+            if not j.get("accepted"):
+                return f"refused ({(j.get('diagnostic') or {}).get('code') or 'none'})"
+            return {True: "accepted, correct", False: "accepted, wrong", None: "accepted"}[j.get("correct")]
+        lines.append(f"| {edition} | {run} | {tid} | {code} | {verdict('repair_card')} | {verdict('repair_bare')} |")
+    lines += ["", "| Edition | Seed code | Class | Accepted | Correct |", "|---|---|---|---|---|"]
+    seeded = {}
+    for r in records:
+        if r["condition"] == "seeded":
+            seeded.setdefault((r["edition"], r.get("seed_code") or "none", r["class"]), []).append(r)
+    for (edition, code, cls), rs in sorted(seeded.items()):
+        lines.append(f"| {edition} | {code} | {cls} | {sum(1 for r in rs if r['judge'].get('accepted'))}/{len(rs)} "
+                     f"| {sum(1 for r in rs if r['judge'].get('correct') is True)}/{len(rs)} |")
+    return {"lines": lines, "gate": gate}
 
 
 def main():

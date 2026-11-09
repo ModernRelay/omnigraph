@@ -2,7 +2,7 @@
 id: e3-01
 task: t03
 class: infix `contains` and `starts_with` (edition 2's spelling)
-code: -
+code: T7
 
 --- text
 gq 3;
@@ -15,7 +15,7 @@ query titled() {
 id: e3-02
 task: t05
 class: `contains` over a list property (edition 2's spelling)
-code: -
+code: T7
 
 --- text
 gq 3;
@@ -71,7 +71,7 @@ query about($q: String) {
 id: e3-06
 task: t33
 class: `delete T where` (edition 2's spelling)
-code: -
+code: Q008
 
 --- text
 gq 3;
@@ -83,7 +83,7 @@ query retire($h: String) {
 id: e3-07
 task: t35
 class: `update T set … where` (edition 2's spelling)
-code: -
+code: Q008
 
 --- text
 gq 3;
@@ -95,7 +95,7 @@ query birthday($h: String) {
 id: e3-08
 task: m3
 class: `having` (SQL)
-code: -
+code: Q014
 
 --- text
 gq 3;
@@ -110,7 +110,7 @@ query big_employers($min: I64) {
 id: e3-09
 task: t20
 class: `optional` without braces (Cypher)
-code: -
+code: Q014
 
 --- text
 gq 3;
@@ -123,7 +123,7 @@ query people_and_employers() {
 id: e3-10
 task: t09
 class: `CASE … END` (SQL)
-code: -
+code: Q012
 
 --- text
 gq 3;
@@ -136,7 +136,7 @@ query with_city() {
 id: e3-11
 task: t08
 class: a minus spaced on one side only
-code: -
+code: Q016
 
 --- text
 gq 3;
@@ -149,7 +149,7 @@ query doubled($min: I32) {
 id: e3-12
 task: t02
 class: a comparison inside binding braces
-code: -
+code: Q010
 
 --- text
 gq 3;
@@ -176,7 +176,7 @@ query person {
 id: e3-14
 task: t32
 class: the `mutation` keyword (GraphQL)
-code: -
+code: Q009
 
 --- text
 gq 3;
@@ -189,7 +189,7 @@ mutation hire($h: String, $slug: String) {
 id: e3-15
 task: t35
 class: a write body wrapped in `match { }`
-code: -
+code: Q005
 
 --- text
 gq 3;
@@ -215,7 +215,7 @@ query in_collection($slug: String) {
 id: e3-17
 task: t18
 class: `where` (SQL, Cypher)
-code: -
+code: Q014
 
 --- text
 gq 3;
@@ -228,7 +228,7 @@ query well_connected($min: I64) {
 id: e3-18
 task: t11
 class: an arrow traversal (Cypher)
-code: -
+code: Q007
 
 --- text
 gq 3;
@@ -241,7 +241,7 @@ query around($h: String) {
 id: e3-19
 task: t22
 class: `let … in` (a row-binding `let`)
-code: -
+code: Q012
 
 --- text
 gq 3;
@@ -257,7 +257,7 @@ query latest_per_author() {
 id: e3-20
 task: t16
 class: `count(*)` (SQL)
-code: -
+code: Q014
 
 --- text
 gq 3;
@@ -270,7 +270,7 @@ query distinct_cities() {
 id: e3-21
 task: t06
 class: a `null` literal in a read
-code: -
+code: Q014
 
 --- text
 gq 3;
@@ -283,7 +283,7 @@ query homeless() {
 id: e3-22
 task: t02
 class: an uppercase keyword
-code: -
+code: Q014
 
 --- text
 gq 3;
@@ -343,7 +343,7 @@ query similar($q: Vector(3)) {
 id: e3-26
 task: t21
 class: `union` between two reads (SQL)
-code: -
+code: Q001
 
 --- text
 gq 3;
@@ -357,7 +357,7 @@ query people_and_companies() {
 id: e3-27
 task: t04
 class: single-quoted strings and `==`
-code: -
+code: Q014
 
 --- text
 gq 3;
@@ -370,7 +370,7 @@ query in_cities() {
 id: e3-28
 task: m4
 class: a space before a call's parenthesis
-code: -
+code: Q019
 
 --- text
 gq 3;
@@ -385,4 +385,21 @@ query colleagues_of_colleagues($of: String) {
     from { match { from colleagues ($c.handle) } return { $q as r } }
   }
   return distinct { $r.name }
+}
+
+--- seed
+id: e3-29
+task: m3
+class: a drawn column that is neither a variable nor aliased
+code: T74
+
+--- text
+gq 3;
+query big_employers($min: I64) {
+  match {
+    from { match { $c: Company  $p worksAt $c } return { $c, count($p) } }
+    $n >= $min
+  }
+  return { $c.name, $n }
+  order { $n desc }
 }
