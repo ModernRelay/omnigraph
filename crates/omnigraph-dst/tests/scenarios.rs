@@ -2861,12 +2861,12 @@ query widen($title: String) {
 /// the update's `<key> = v` match adds the derived id conjunct, and an upsert
 /// whose rows are all new or all present skips Lance's full-table merge
 /// join. Their calls do not follow the fragment count. The rows of the two
-/// sizes differ in one GET of `KeyedInsert`, the first write after the
-/// reopen, which the forced join paid as well (it read 10 and 25), and in
-/// `MergeLoadNew`: at 2 fragments the two writes before it leave as many
-/// fragments uncovered as covered, so `MergeLoadPresent` keeps the join, and
-/// `MergeLoadNew` then reads 7 objects where it reads 5 at 16 fragments (the
-/// join read 10 and 24).
+/// sizes differ only in one GET of `KeyedInsert`, the first write after the
+/// reopen, which the forced join paid as well (it read 10 and 25). At 2
+/// fragments the two writes before `MergeLoadPresent` leave as many fragments
+/// uncovered as covered, so it keeps the join; each write after the first
+/// finds the dataset the previous one committed in the handle cache, so that
+/// join reads no more objects than the probe does at 16 fragments.
 fn keyed_write_table_size_cost_rows(replay: &str) -> String {
     const SCHEMA: &str = "node Person {\n    slug: String @key\n    age: I32\n}\n";
     const WRITES: &str = r#"
