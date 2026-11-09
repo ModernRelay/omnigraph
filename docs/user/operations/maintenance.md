@@ -138,8 +138,8 @@ omnigraph index rebuild --kind full-text --target ./cluster-root \
 ```
 
 `--kind` is required. The deprecated spelling `rebuild-full-text-indexes` still
-works for one release, and so does admitting the rebuild under `change` on the
-selected branch instead of `maintain`.
+works for one release. Under a policy, the rebuild needs `maintain` on the
+selected branch.
 
 The command fully replaces text-search indexes from current entities using the
 engine's default English analyzer, including already indexed entities. It builds

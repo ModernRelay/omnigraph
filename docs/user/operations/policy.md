@@ -49,9 +49,8 @@ can compact a graph without the right to write data, and can hold `maintain`
 without the right to delete history. `maintain` is judged on the branch the
 operation maintains (`main` for optimize and the repair report) and takes
 `branch_scope`; `reclaim` covers every branch's history and takes no branch
-scope. The full-text rebuild accepts `change` or `maintain` on its branch; a
-later release accepts `maintain` only, so grant `maintain` to the accounts that
-run it. The engine checks these actions whenever a policy is installed on the
+scope. `change` admits no maintenance: index builds and the full-text rebuild
+need `maintain` on their branch. The engine checks these actions whenever a policy is installed on the
 graph handle; the direct maintenance commands load no policy (see
 [maintenance](maintenance.md)).
 

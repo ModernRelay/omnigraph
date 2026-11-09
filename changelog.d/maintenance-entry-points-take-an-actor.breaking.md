@@ -1,5 +1,7 @@
 - An embedded host with a policy checker refuses maintenance until its policy
-  grants `maintain` or `reclaim`. Engine maintenance methods take an actor:
+  grants `maintain` or `reclaim`. Index builds and the full-text rebuild no
+  longer accept `change`: grant `maintain` on the branch to the accounts that
+  run them. Engine maintenance methods take an actor:
   `optimize_as`, `cleanup_as`, `ensure_indices_as`, `ensure_indices_on_as` and
   `rebuild_full_text_indices_on_as`. `repair` is the read-only
   `repair_report_as`, without `RepairOptions`, `healed`, `forced` or

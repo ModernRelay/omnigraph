@@ -1150,19 +1150,6 @@ impl Omnigraph {
         scope: &omnigraph_policy::ResourceScope,
         actor: Option<&str>,
     ) -> Result<()> {
-        self.enforce_any(&[action], scope, actor)
-    }
-
-    /// [`Self::enforce`] for an operation that any one of `actions` admits on
-    /// `scope`, decided by [`omnigraph_policy::PolicyChecker::check_any`]: the
-    /// first allowed action admits it, an evaluation failure refuses it, and a
-    /// refusal names every denied action.
-    pub(crate) fn enforce_any(
-        &self,
-        actions: &[omnigraph_policy::PolicyAction],
-        scope: &omnigraph_policy::ResourceScope,
-        actor: Option<&str>,
-    ) -> Result<()> {
         let (branch, target_branch) = scope.to_branch_pair();
         for name in [branch, target_branch].into_iter().flatten() {
             ensure_canonical_branch_name(name)?;
@@ -1179,7 +1166,7 @@ impl Omnigraph {
             ));
         };
         checker
-            .check_any(actions, scope, actor)
+            .check(action, scope, actor)
             .map_err(|err| OmniError::Policy(err.to_string()))
     }
 
