@@ -891,7 +891,7 @@ async fn static_token_app(settings: omnigraph_server::McpSettings) -> (tempfile:
 /// answers source, and a write is refused by the server's default deny with nothing
 /// written.
 #[tokio::test]
-async fn mcp_default_deny_lists_read_and_refuses_mutate_without_a_policy() {
+async fn mcp_default_deny_refuses_read_and_mutate_without_a_policy() {
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let state = AppState::open_with_bearer_tokens_and_policy(
@@ -912,6 +912,8 @@ async fn mcp_default_deny_lists_read_and_refuses_mutate_without_a_policy() {
     assert!(names.iter().any(|name| name == "query"), "{names:?}");
     assert!(names.iter().any(|name| name == "mutate"), "{names:?}");
 
+    // Tokens are not scoped to graphs, so a graph without a policy refuses
+    // `read` as it refuses every other action.
     let read = call(
         &app,
         "secret",
@@ -919,13 +921,8 @@ async fn mcp_default_deny_lists_read_and_refuses_mutate_without_a_policy() {
         json!({"graph":"default","query":"query q() { match { $p: Person } return { $p.name } }"}),
     )
     .await;
-    assert_eq!(read["result"]["isError"], false, "{read}");
-    assert!(
-        read["result"]["structuredContent"]["row_count"]
-            .as_u64()
-            .is_some_and(|rows| rows > 0),
-        "{read}"
-    );
+    assert_eq!(read["result"]["isError"], true, "{read}");
+    assert_eq!(read["result"]["structuredContent"]["status"], 403, "{read}");
 
     let before = manifest_dataset_version(&graph).await;
     let refused = call(

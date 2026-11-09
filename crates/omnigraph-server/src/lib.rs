@@ -229,6 +229,11 @@ pub struct ServerConfig {
     /// who set up auth and forgot the policy file would otherwise ship
     /// the illusion of protection.
     pub allow_unauthenticated: bool,
+    /// Operator opt-in, from `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` only,
+    /// that lets every static bearer token `read` a graph with no applied
+    /// policy. Off by default: tokens are not scoped to graphs, so the
+    /// permit reaches every policy-less graph on the server.
+    pub allow_reads_without_policy: bool,
     /// Operator opt-in for fail-fast cluster boot. By default, graph-local
     /// startup failures quarantine that graph and healthy graphs still serve.
     /// When true, any quarantined or failed graph aborts startup.
@@ -430,6 +435,9 @@ pub struct AppState {
     workload: Arc<workload::WorkloadController>,
     operations: operations::OperationRuntime,
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
+    /// Whether a static bearer token may `read` a graph with no applied
+    /// policy ([`ServerConfig::allow_reads_without_policy`]).
+    allow_reads_without_policy: bool,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
     /// MCP boot settings: the extra `Host` values `/mcp` admits.
@@ -868,6 +876,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            allow_reads_without_policy: false,
             mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
@@ -922,6 +931,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            allow_reads_without_policy: false,
             mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
@@ -1043,6 +1053,15 @@ impl AppState {
         self
     }
 
+    /// Let every static bearer token `read` a graph with no applied policy,
+    /// the behaviour before reads were denied like every other action
+    /// ([`ServerConfig::allow_reads_without_policy`]).
+    #[must_use]
+    pub fn with_reads_without_policy(mut self, allow: bool) -> Self {
+        self.allow_reads_without_policy = allow;
+        self
+    }
+
     pub(crate) fn mcp_settings(&self) -> &McpSettings {
         &self.mcp
     }
@@ -1105,7 +1124,8 @@ impl AppState {
             }
         }
         if let Some(actor) = matched {
-            return Ok(AuthenticatedActor::cluster_static(actor));
+            return Ok(AuthenticatedActor::cluster_static(actor)
+                .with_policy_less_reads(self.allow_reads_without_policy));
         }
         let Some(now) = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3990,12 +4010,18 @@ async fn serve_config(
         ),
         ServerRuntimeState::DefaultDeny => warn!(
             "bearer tokens are configured but no policy file is set — running in \
-             default-deny mode (static credentials permit `read`; signed data \
-             credentials require an explicit policy permit). Declare required policy \
-             bundles when bootstrapping; this deployment class keeps existing policy \
-             bindings fixed."
+             default-deny mode: every graph action is refused until a policy permits \
+             it. Declare required policy bundles when bootstrapping; this deployment \
+             class keeps existing policy bindings fixed."
         ),
         ServerRuntimeState::PolicyEnabled => {}
+    }
+    if config.allow_reads_without_policy {
+        warn!(
+            "OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY is set: every static bearer token \
+             may read every graph that has no applied policy. Tokens are not scoped \
+             to graphs; apply a policy to each graph instead."
+        );
     }
 
     let bind = config.bind.clone();
@@ -4054,7 +4080,8 @@ async fn serve_config(
             shutdown_grace,
         )
         .with_process_defaults(process_defaults)
-        .with_mcp_settings(mcp);
+        .with_mcp_settings(mcp)
+        .with_reads_without_policy(config.allow_reads_without_policy);
     deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();
     if let Some(admission) = retained_admission.as_ref() {
