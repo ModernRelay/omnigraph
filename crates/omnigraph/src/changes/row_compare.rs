@@ -17,11 +17,12 @@ use std::collections::{HashMap, HashSet};
 use arrow_array::{Array, RecordBatch, StringArray, StructArray, UInt64Array};
 use datafusion::prelude::{Expr, col, lit};
 use lance::Dataset;
+use lance_core::is_system_column;
 use lance_table::format::Fragment;
 
 use omnigraph_compiler::{SYSTEM_COLUMNS_META, SystemColumns};
 
-use super::model::{COMMIT_CHANGES_MAX_BYTES, is_reserved_storage_system_column};
+use super::model::COMMIT_CHANGES_MAX_BYTES;
 use crate::blob::{BlobDescriptor, BlobDescriptorDecoder};
 use crate::db::{
     LogicalBlobValue, RangedExternalBlobs, STABLE_PROPERTY_ID_METADATA_KEY, row_blob_values,
@@ -47,7 +48,7 @@ pub(crate) fn user_schema_fingerprint(
         .schema()
         .fields
         .iter()
-        .filter(|field| !is_reserved_storage_system_column(&field.name))
+        .filter(|field| !is_system_column(&field.name))
         .map(|field| {
             (
                 column_name_at_vintage(&field.name, system_columns, SYSTEM_COLUMNS_META, is_edge)
@@ -198,7 +199,7 @@ impl BatchCursor {
             .zip(batch.columns())
             .enumerate()
         {
-            if is_reserved_storage_system_column(field.name()) {
+            if is_system_column(field.name()) {
                 continue;
             }
             let lance_field = lance::datatypes::Field::try_from(field.as_ref())
@@ -545,7 +546,7 @@ async fn rows_equal_by_column(
         .zip(left.slice.columns())
     {
         let name = field.name();
-        if is_reserved_storage_system_column(name) || blob_columns.contains(name.as_str()) {
+        if is_system_column(name) || blob_columns.contains(name.as_str()) {
             continue;
         }
         let other = right

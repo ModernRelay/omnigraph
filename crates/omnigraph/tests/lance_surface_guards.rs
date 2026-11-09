@@ -706,6 +706,19 @@ fn compiler_rejects_five_surveyed_lance_virtual_system_columns() {
         assert!(error.contains("reserved"), "unexpected error: {error}");
         assert!(error.contains(name), "unexpected error: {error}");
     }
+    // The engine drops exactly the names `is_system_column` matches from
+    // change images, export and push comparison. The match must stay exact,
+    // so a property a persisted contract may still declare is never hidden.
+    for name in [
+        "_row",
+        "_rowdy",
+        "_row_custom",
+        "_row_created_at",
+        "id",
+        "rowid",
+    ] {
+        assert!(!is_system_column(name), "Lance now reserves {name}");
+    }
 }
 
 /// Guard: a rename-only `Operation::Project` (the RFC 0040 system-column
@@ -3966,10 +3979,13 @@ async fn filtered_scan_projects_blob_descriptors_on_indexed_multi_fragment_table
 
 // --- Guard 11: scalar-index coverage surface (physical_rows + index details) ---
 //
-// `table_store.rs::key_column_index_coverage` mirrors Lance's `create_filter_plan`
-// C6 fallback: it reads `fragment.physical_rows` (the field whose absence on ANY
-// fragment disables the scalar index for the whole scan) and sniffs the BTREE via
-// `load_indices()` → `index.fields` / `index.index_details.type_url`. This is the
+// `dataset_index::key_column_index_coverage` and the planner's index facts
+// (`engine/plan_source/indexes.rs`) mirror Lance's `create_filter_plan` C6
+// fallback: they read `fragment.physical_rows` (the field whose absence on ANY
+// fragment disables the scalar index for the whole scan), group `load_indices()`
+// segments by `index.name` and `index.keyed_field()`, classify a BTREE by the
+// plugin its details resolve to, and union the segments' `fragment_bitmap`s as
+// Lance's `scalar_index_info` does (`dataset_index::SegmentCoverage`). This is the
 // one real Lance-internal coupling on the indexed-traversal read path. If any of
 // these surfaces renames or changes type, the coverage check (and the cost-based
 // traversal chooser that consumes it) silently misclassifies. Compile-only.
@@ -3991,16 +4007,24 @@ async fn _compile_scalar_index_coverage_surface() -> lance::Result<()> {
         // index `fragment_bitmap`.
         let _id: u64 = frag.id;
     }
-    // The index sniff: BTREE presence is detected by single-field index whose
-    // details type_url ends with "BTreeIndexDetails". The fragment coverage check
-    // reads `fragment_bitmap` (Option<RoaringBitmap>) and calls `.contains(u32)`.
+    // The index sniff: segments group by name and keyed field; a BTREE is the
+    // segment whose details resolve to the "BTree" plugin (the `has_*_index_on`
+    // helpers still read the details type_url). The coverage union iterates each
+    // segment's `fragment_bitmap` (Option<RoaringBitmap>) as u32 fragment ids.
     let indices = ds.load_indices().await?;
     for index in indices.iter() {
         let _fields: &Vec<i32> = &index.fields;
+        let _name: &str = index.name.as_str();
+        let _keyed: Option<i32> = index.keyed_field();
         if let Some(details) = index.index_details.as_ref() {
             let _type_url: &str = details.type_url.as_str();
+            let _plugin: Option<String> = lance::index::scalar::IndexDetails(details.clone())
+                .get_plugin()
+                .ok()
+                .map(|plugin| plugin.name().to_string());
         }
         let _covered: Option<bool> = index.fragment_bitmap.as_ref().map(|b| b.contains(0u32));
+        let _ids: Option<Vec<u32>> = index.fragment_bitmap.as_ref().map(|b| b.iter().collect());
     }
     Ok(())
 }
@@ -9094,4 +9118,448 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
         surviving,
         "compaction carries every live row's id and stamp into the rewritten fragments"
     );
+}
+
+/// Issue #1295: a branch merge stages each delete chunk as `_rowid IN (...)`
+/// (`exec/merge.rs`, `DeleteIdChunk::delete_expr`), relying on Lance's
+/// `TakeOperation::try_from_expr` turning it into a take inside `DeleteJob`:
+/// one row read, no data column, no index. The `id IN (...)` form it replaced
+/// searches the `id` BTREE and scans the `id` column of every fragment the
+/// index does not cover. Measured with Lance's own `analyze_plan` on the scan
+/// `DeleteJob::execute_impl` builds (an object-store `IOTracker` does not see
+/// the scan scheduler's data reads). Paired with
+/// `merge_cost::merge_delete_selects_rows_by_rowid_issue_1295`.
+#[tokio::test]
+async fn delete_chunk_reads_by_filter_form_issue_1295() {
+    use datafusion::prelude::{col, lit};
+    use lance::dataset::DeleteBuilder;
+
+    const ROWS: usize = 2000;
+    fn batch(prefix: &str) -> (Arc<Schema>, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let ids = (0..ROWS)
+            .map(|i| format!("{prefix}-{i}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(Int32Array::from((0..ROWS as i32).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+    let params = |mode| WriteParams {
+        mode,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    for uncovered in [4usize, 16] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("t.lance");
+        let uri = uri.to_str().unwrap();
+        let (schema, first) = batch("covered");
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first)], schema),
+            uri,
+            Some(params(WriteMode::Create)),
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        for f in 0..uncovered {
+            let (schema, rows) = batch(&format!("tail{f}"));
+            ds.append(
+                RecordBatchIterator::new(vec![Ok(rows)], schema),
+                Some(params(WriteMode::Append)),
+            )
+            .await
+            .unwrap();
+        }
+        for target in ["covered-5", "tail0-5"] {
+            let row_id = ds
+                .scan()
+                .with_row_id()
+                .project(&["id"])
+                .unwrap()
+                .filter(&format!("id = '{target}'"))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .column_by_name(lance_core::ROW_ID)
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(0);
+            for (form, filter) in [
+                ("id IN", col("id").in_list(vec![lit(target)], false)),
+                (
+                    "_rowid IN",
+                    col(lance_core::ROW_ID).in_list(vec![lit(row_id)], false),
+                ),
+            ] {
+                let cold = DatasetBuilder::from_uri(uri)
+                    .with_session(Arc::new(Session::default()))
+                    .load()
+                    .await
+                    .unwrap();
+                // The scan `DeleteJob::execute_impl` runs, measured by Lance.
+                let mut scan = cold.scan();
+                scan.with_row_id()
+                    .project(&[lance_core::ROW_ID])
+                    .unwrap()
+                    .filter_expr(filter.clone());
+                let analyzed = scan.analyze_plan().await.unwrap();
+                let deleted = DeleteBuilder::from_expr(Arc::new(cold), filter)
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+                assert_eq!(deleted.num_deleted_rows, 1, "{form}");
+                let read = analyzed
+                    .lines()
+                    .find(|line| line.trim_start().starts_with("LanceRead:"))
+                    .unwrap_or_else(|| panic!("no LanceRead node: {analyzed}"));
+                eprintln!(
+                    "DELETE   uncovered_fragments={uncovered} target={target:<9} form={form:<9} {read}"
+                );
+                if form == "_rowid IN" {
+                    for metric in [
+                        "full_filter=--,",
+                        "rows_scanned=1,",
+                        "bytes_read=0,",
+                        "iops=0,",
+                    ] {
+                        assert!(
+                            read.contains(metric),
+                            "Lance no longer takes `_rowid IN` without reading data \
+                         ({metric} missing); branch-merge deletes rely on it: {analyzed}"
+                        );
+                    }
+                } else {
+                    let fragments_scanned = read
+                        .split("fragments_scanned=")
+                        .nth(1)
+                        .and_then(|rest| rest.split(',').next())
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or_else(|| panic!("no fragments_scanned metric: {analyzed}"));
+                    assert!(
+                        fragments_scanned >= uncovered,
+                        "an `id IN` delete scanned {fragments_scanned} fragments with {uncovered} \
+                     uncovered by the index: {analyzed}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Issue #1264: the column patch an `update` stages. A `RewriteColumns`
+/// merge-insert of `(id, score)` over a table with a Blob and a vector column
+/// attaches one data file per touched fragment and never touches the Blob or
+/// vector bytes; it lists the join key in `fields_modified`, so as Lance
+/// stages it the touched fragments leave the `id` index. With the key removed
+/// from `fields_modified`, which the engine does because the patch rewrites
+/// the key byte for byte and moves no row, the index keeps them and still
+/// finds every row. Only the patched rows are restamped, with the read
+/// version plus one, and every row keeps its stable row id. Goes red if
+/// Lance stops listing the key (drop `keep_key_index_coverage`) or stops
+/// restamping or keeping row ids (revisit the change-feed's row-identity
+/// route for column patches).
+#[tokio::test]
+async fn column_patch_keeps_blob_files_row_ids_and_key_index_coverage_issue_1264() {
+    use arrow_array::types::{Int32Type, UInt64Type};
+    use lance::dataset::MergeInsertWriteMode;
+    use lance::dataset::transaction::UpdateMode;
+
+    const DIM: i32 = 4;
+    const ROWS: usize = 8;
+
+    async fn commit_detached(ds: &Dataset, transaction: Transaction) -> Dataset {
+        CommitBuilder::new(Arc::new(ds.clone()))
+            .with_detached(true)
+            .with_skip_auto_cleanup(true)
+            .execute(transaction)
+            .await
+            .unwrap()
+    }
+
+    async fn id_coverage(ds: &Dataset) -> Vec<u32> {
+        let indices = ds.load_indices().await.unwrap();
+        let index = indices
+            .iter()
+            .find(|index| index.name == "id_idx")
+            .expect("the id index");
+        index
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// `(id, score, row id, stamp)` per row, and the Blob bytes.
+    async fn rows(ds: &Dataset) -> Vec<(String, Option<i32>, u64, u64, Vec<u8>)> {
+        let mut scanner = ds.scan();
+        scanner.with_row_id();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner
+            .project(&["id", "score", "content", ROW_LAST_UPDATED_AT_VERSION])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let stamps = batch
+            .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let contents = batch.column_by_name("content").unwrap().as_binary::<i64>();
+        let mut rows = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row).to_string(),
+                    scores.is_valid(row).then(|| scores.value(row)),
+                    row_ids.value(row),
+                    stamps.value(row),
+                    contents.value(row).to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    async fn lookup(ds: &Dataset, id: &str) -> Vec<(String, Option<i32>)> {
+        let mut scanner = ds.scan();
+        scanner.filter(&format!("id = '{id}'")).unwrap();
+        let batch = scanner
+            .project(&["id", "score"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch.column_by_name("id").unwrap().as_string::<i32>();
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        (0..batch.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row).to_string(),
+                    scores.is_valid(row).then(|| scores.value(row)),
+                )
+            })
+            .collect()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("patch.lance");
+    let uri = uri.to_str().unwrap();
+    let mut pk = HashMap::new();
+    pk.insert(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(pk),
+        Field::new("score", DataType::Int32, true),
+        lance::blob::blob_field("content", true),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+            true,
+        ),
+    ]));
+    let ids = (0..ROWS).map(|row| format!("k{row}")).collect::<Vec<_>>();
+    let mut content = BlobArrayBuilder::new(ROWS);
+    for row in 0..ROWS {
+        content.push_bytes(vec![row as u8; 64 * 1024]).unwrap();
+    }
+    let emb = arrow_array::FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM,
+        Arc::new(Float32Array::from(
+            (0..ROWS * DIM as usize)
+                .map(|value| value as f32)
+                .collect::<Vec<_>>(),
+        )),
+        None,
+    )
+    .unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(ids.clone())),
+            Arc::new(Int32Array::from(vec![None::<i32>; ROWS])),
+            content.finish().unwrap(),
+            Arc::new(emb),
+        ],
+    )
+    .unwrap();
+    let mut base = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    base.create_index(
+        &["id"],
+        IndexType::Scalar,
+        Some("id_idx".to_string()),
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(base.get_fragments().len(), 1);
+    let fragment = base.get_fragments()[0].metadata().clone();
+    assert_eq!(id_coverage(&base).await, vec![fragment.id as u32]);
+    let id_field = base.schema().field("id").unwrap().id as u32;
+    let score_field = base.schema().field("score").unwrap().id as u32;
+    let before = rows(&base).await;
+
+    // Stage the patch of two rows, as the engine's KnownPresentColumnPatch does.
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("score", DataType::Int32, true),
+    ]));
+    let source = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["k2", "k5"])),
+            Arc::new(Int32Array::from(vec![Some(20), Some(50)])),
+        ],
+    )
+    .unwrap();
+    let mut builder =
+        MergeInsertBuilder::try_new(Arc::new(base.clone()), vec!["id".into()]).unwrap();
+    builder.when_matched(WhenMatched::UpdateAll);
+    builder.when_not_matched(WhenNotMatched::DoNothing);
+    builder.write_mode(MergeInsertWriteMode::RewriteColumns);
+    builder.conflict_retries(0);
+    let staged = builder
+        .try_build()
+        .unwrap()
+        .execute_uncommitted(lance_datafusion::utils::reader_to_stream(Box::new(
+            RecordBatchIterator::new(vec![Ok(source)], source_schema),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(staged.stats.num_updated_rows, 2);
+    assert_eq!(staged.stats.num_inserted_rows, 0);
+    let Operation::Update {
+        removed_fragment_ids,
+        updated_fragments,
+        new_fragments,
+        fields_modified,
+        update_mode,
+        inserted_rows_filter,
+        updated_fragment_offsets,
+        ..
+    } = &staged.transaction.operation
+    else {
+        panic!("a column patch stages an Update");
+    };
+    assert!(removed_fragment_ids.is_empty() && new_fragments.is_empty());
+    assert_eq!(update_mode, &Some(UpdateMode::RewriteColumns));
+    assert!(inserted_rows_filter.is_none());
+    assert!(updated_fragment_offsets.is_some());
+    assert_eq!(updated_fragments.len(), 1);
+    let patched = &updated_fragments[0];
+    assert_eq!(patched.id, fragment.id);
+    assert_eq!(
+        patched.files.len(),
+        fragment.files.len() + 1,
+        "the patch attaches one data file"
+    );
+    for (old, new) in fragment.files.iter().zip(&patched.files) {
+        assert_eq!(old.path, new.path, "the existing data files are kept");
+    }
+    let mut patch_fields = patched.files.last().unwrap().fields.to_vec();
+    patch_fields.sort();
+    assert_eq!(
+        patch_fields,
+        vec![id_field as i32, score_field as i32],
+        "the patch file holds the key and the patched column, never the Blob or vector"
+    );
+    let mut modified = fields_modified.clone();
+    modified.sort();
+    assert_eq!(
+        modified,
+        vec![id_field, score_field],
+        "Lance lists the rewritten key in fields_modified"
+    );
+
+    // As staged, the touched fragment leaves the id index.
+    let as_staged = commit_detached(&base, staged.transaction.clone()).await;
+    assert!(
+        id_coverage(&as_staged).await.is_empty(),
+        "a listed key withdraws the touched fragment from the key's index"
+    );
+
+    // Without the key in fields_modified, the index keeps the fragment.
+    let mut transaction = staged.transaction.clone();
+    if let Operation::Update {
+        fields_modified, ..
+    } = &mut transaction.operation
+    {
+        fields_modified.retain(|field| *field != id_field);
+    }
+    let kept = commit_detached(&base, transaction).await;
+    assert_eq!(id_coverage(&kept).await, vec![fragment.id as u32]);
+    let after = rows(&kept).await;
+    for (old, new) in before.iter().zip(&after) {
+        assert_eq!(old.0, new.0);
+        assert_eq!(old.2, new.2, "{}: the row keeps its stable row id", old.0);
+        assert_eq!(old.4, new.4, "{}: the Blob bytes are unchanged", old.0);
+        if old.0 == "k2" || old.0 == "k5" {
+            assert_eq!(
+                new.3,
+                base.version().version + 1,
+                "{}: a patched row is stamped with the read version plus one",
+                old.0
+            );
+        } else {
+            assert_eq!(old.1, new.1);
+            assert_eq!(old.3, new.3, "{}: an unpatched row keeps its stamp", old.0);
+        }
+    }
+    assert_eq!(after[2].1, Some(20));
+    assert_eq!(after[5].1, Some(50));
+    for id in &ids {
+        let expected = match id.as_str() {
+            "k2" => Some(20),
+            "k5" => Some(50),
+            _ => None,
+        };
+        assert_eq!(
+            lookup(&kept, id).await,
+            vec![(id.clone(), expected)],
+            "{id}: the kept index finds the row once, with its patched value"
+        );
+    }
 }

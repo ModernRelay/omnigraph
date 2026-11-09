@@ -16,7 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
-rmcp = { version = "=3.3.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
 [lints]
 workspace = true

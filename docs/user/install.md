@@ -34,7 +34,11 @@ their own local signing identity and do not inherit release trust.
 
 The release remains a tarball of three executables. Apple's notarization
 ticket is checked online: a ticket cannot be stapled to a standalone CLI
-binary or a tarball. Older published archives are unchanged.
+binary or a tarball. A release can be published before Apple finishes
+notarizing it; its binaries count as notarized once Apple accepts the
+submission. Until then, macOS may refuse to open a copy downloaded with a web
+browser. The install script downloads with `curl`, which does not mark files
+for that check. Older published archives are unchanged.
 
 ## Nix
 

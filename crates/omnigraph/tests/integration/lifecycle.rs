@@ -511,56 +511,187 @@ async fn init_creates_graph() {
 }
 
 #[tokio::test]
-async fn open_accepts_historical_body_unique_blob_but_init_rejects_it() {
-    const BASE_SCHEMA: &str = r#"
+async fn open_accepts_historical_body_unique_but_init_rejects_it_issue_1305() {
+    // Body-level `@unique` was admitted on Blob, list and vector members, none
+    // of which the write path can enforce (issue 1305 for list and vector).
+    // New admission refuses each; a graph that already holds one still opens.
+    const CASES: [(&str, &str, &str); 3] = [
+        (
+            r#"
 node Document {
     title: String @key
     content: Blob?
 }
-"#;
-    const HISTORICAL_SCHEMA: &str = r#"
+"#,
+            r#"
 node Document {
     title: String @key
     content: Blob?
     @unique(content)
 }
-"#;
+"#,
+            "@unique is not supported on blob property Document.content",
+        ),
+        (
+            r#"
+node Document {
+    title: String @key
+    tags: [String]?
+}
+"#,
+            r#"
+node Document {
+    title: String @key
+    tags: [String]?
+    @unique(tags)
+}
+"#,
+            "@unique is not supported on list property Document.tags",
+        ),
+        (
+            r#"
+node Document {
+    title: String @key
+    embedding: Vector(2)?
+}
+"#,
+            r#"
+node Document {
+    title: String @key
+    embedding: Vector(2)?
+    @unique(embedding)
+}
+"#,
+            "@unique is not supported on vector property Document.embedding",
+        ),
+    ];
 
-    let rejected_dir = tempfile::tempdir().unwrap();
-    let rejected_uri = rejected_dir.path().to_str().unwrap();
-    let error = match Omnigraph::init(rejected_uri, HISTORICAL_SCHEMA).await {
-        Ok(_) => panic!("new init must reject body-level @unique(Blob)"),
-        Err(error) => error,
-    };
+    for (base_schema, historical_schema, refusal) in CASES {
+        let rejected_dir = tempfile::tempdir().unwrap();
+        let rejected_uri = rejected_dir.path().to_str().unwrap();
+        let error = match Omnigraph::init(rejected_uri, historical_schema).await {
+            Ok(_) => panic!("new init must refuse: {refusal}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(refusal), "{error}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, base_schema).await.unwrap();
+        let accepted = db.catalog().bound_schema_ir().unwrap().clone();
+        drop(db);
+
+        let historical_ir =
+            resolve_schema_ir(&accepted, &compile_persisted_shape(historical_schema))
+                .unwrap()
+                .schema_ir;
+        publish_schema_contract_row(uri, historical_schema, &historical_ir).await;
+
+        let reopened = Omnigraph::open(uri)
+            .await
+            .unwrap_or_else(|error| panic!("historically admitted schema must open: {error}"));
+        assert_eq!(reopened.schema_source().as_str(), historical_schema);
+        assert!(
+            reopened
+                .snapshot_of(ReadTarget::branch("main"))
+                .await
+                .unwrap()
+                .dataset("node:Document")
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn historical_body_unique_list_ends_by_dropping_its_property_issue_1305() {
+    // The guide's exit for a historically admitted `@unique` on a list:
+    // dropping every property it names removes it in one apply, and the
+    // property can then be added back without it and written. A constraint
+    // that also names a property that stays cannot be removed in place.
+    const BASE_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    label: String?
+    tags: [String]?
+}
+"#;
+    const UNIQUE_TAGS: &str = r#"
+node Document {
+    title: String @key
+    label: String?
+    tags: [String]?
+    @unique(tags)
+}
+"#;
+    const UNIQUE_LABEL_TAGS: &str = r#"
+node Document {
+    title: String @key
+    label: String?
+    tags: [String]?
+    @unique(label, tags)
+}
+"#;
+    const WITHOUT_TAGS: &str = r#"
+node Document {
+    title: String @key
+    label: String?
+}
+"#;
+    const TAGS_ROW: &str = r#"{"type":"Document","data":{"title":"a","tags":["x","y"]}}"#;
+
+    async fn historical_graph(dir: &tempfile::TempDir, historical_schema: &str) -> Session {
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, BASE_SCHEMA).await.unwrap();
+        let accepted = db.catalog().bound_schema_ir().unwrap().clone();
+        drop(db);
+        let historical_ir =
+            resolve_schema_ir(&accepted, &compile_persisted_shape(historical_schema))
+                .unwrap()
+                .schema_ir;
+        publish_schema_contract_row(uri, historical_schema, &historical_ir).await;
+        helpers::session(Omnigraph::open(uri).await.unwrap())
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = historical_graph(&dir, UNIQUE_TAGS).await;
+    let error = db
+        .load("main", TAGS_ROW, omnigraph::loader::LoadMode::Merge)
+        .await
+        .expect_err("the historical @unique(tags) refuses a write that sets tags");
+    assert!(
+        error.to_string().contains("unsupported column type List(")
+            && error.to_string().contains("for @unique/@key enforcement"),
+        "{error}"
+    );
+
+    db.db()
+        .apply_schema(WITHOUT_TAGS)
+        .await
+        .expect("dropping the only property @unique names removes the constraint");
+    db.db()
+        .apply_schema(BASE_SCHEMA)
+        .await
+        .expect("the property comes back without the constraint");
+    db.load("main", TAGS_ROW, omnigraph::loader::LoadMode::Merge)
+        .await
+        .expect("a write that sets tags succeeds once the constraint is gone");
+    assert_eq!(db.db().schema_source().as_str(), BASE_SCHEMA);
+    assert_eq!(count_rows(db.db(), "node:Document").await, 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = historical_graph(&dir, UNIQUE_LABEL_TAGS).await;
+    let error = db
+        .db()
+        .apply_schema(WITHOUT_TAGS)
+        .await
+        .expect_err("a constraint that also names a kept property cannot end in place");
     assert!(
         error
             .to_string()
-            .contains("@unique is not supported on blob property Document.content")
+            .contains("removing constraints from 'Document' is not supported"),
+        "{error}"
     );
-
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let db = Omnigraph::init(uri, BASE_SCHEMA).await.unwrap();
-    let accepted = db.catalog().bound_schema_ir().unwrap().clone();
-    drop(db);
-
-    let historical_ir = resolve_schema_ir(&accepted, &compile_persisted_shape(HISTORICAL_SCHEMA))
-        .unwrap()
-        .schema_ir;
-    publish_schema_contract_row(uri, HISTORICAL_SCHEMA, &historical_ir).await;
-
-    let reopened = Omnigraph::open(uri)
-        .await
-        .expect("historically admitted v6 schema must remain openable");
-    assert_eq!(reopened.schema_source().as_str(), HISTORICAL_SCHEMA);
-    assert!(
-        reopened
-            .snapshot_of(ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .dataset("node:Document")
-            .is_some()
-    );
+    assert_eq!(db.db().schema_source().as_str(), UNIQUE_LABEL_TAGS);
 }
 
 #[tokio::test]

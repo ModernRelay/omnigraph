@@ -33,10 +33,10 @@ pub use omnigraph::{
     SystemColumnUpgradeReport, TableCeilings, TableCollectionPlan, TableOptimizeOutcome,
     UnattachedTagRecord, UnpublishedManifest, unattached_release_order,
 };
+pub(crate) use omnigraph::{EarlyRevalidation, WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
-pub(crate) use omnigraph::{WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph_core::metadata::now_micros;
 pub(crate) use schema_state::SchemaContractIdentity;
 pub use snapshot::{Snapshot, SnapshotDataset, SnapshotScanner};

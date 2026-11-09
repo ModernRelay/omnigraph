@@ -1296,3 +1296,80 @@ async fn graph_diff_of_diverged_heads_takes_the_exact_merge() {
     })
     .await;
 }
+
+/// Issue #1264: an `update` that patches a column in place leaves the
+/// touched-fragment suffix empty, since no row moves, so a diff of that one
+/// commit pairs the touched fragment's rows by stable row id and reads only
+/// the patched ones: the row-identity route, never the exact merge. The
+/// images carry the unchanged vector, and in a debug build every answer is
+/// checked against the exact merge.
+#[tokio::test]
+async fn diff_of_a_column_patch_commit_takes_row_identity_issue_1264() {
+    use omnigraph::changes::{ChangeOpKind, GraphDiffRequest, GraphDiffSides};
+
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = helpers::session(
+            Omnigraph::init(
+                dir.path().to_str().unwrap(),
+                "node Doc {\n    slug: String @key\n    age: I32\n    score: I32?\n    emb: Vector(16)?\n}\n",
+            )
+            .await
+            .unwrap(),
+        );
+        let rows: Vec<String> = (0..64)
+            .map(|row| {
+                let emb = (0..16).map(|i| (row * 16 + i) as f32).collect::<Vec<_>>();
+                serde_json::json!({"type": "Doc", "data": {
+                    "slug": format!("d{row:02}"), "age": row, "emb": emb}})
+                .to_string()
+            })
+            .collect();
+        let seeded = db
+            .load_with_receipt("main", &rows.join("\n"), LoadMode::Overwrite)
+            .await
+            .unwrap()
+            .commit
+            .graph_commit_id;
+        db.mutate(
+            "main",
+            "query bump() { update Doc set { score: 3 } where age >= 32 }",
+            "bump",
+            &ParamMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let request = GraphDiffRequest {
+            sides: GraphDiffSides::Between {
+                from: seeded,
+                to: "main".to_string(),
+            },
+            scope: ChangeFeedScope::default(),
+            page_token: None,
+            max_changes: None,
+            max_bytes: None,
+        };
+        let (page, io) = measure(db.diff_page(&request)).await;
+        let page = page.unwrap();
+        assert_eq!(page.changes.len(), 32, "the thirty-two patched rows");
+        assert_eq!(
+            (
+                io.change_intervals_row_identity,
+                io.change_intervals_exact_merge
+            ),
+            (1, 0),
+            "the adjacent column patch took the row-identity route"
+        );
+        for change in &page.changes {
+            assert_eq!(change.op, ChangeOpKind::Update);
+            let before = &change.before.as_ref().unwrap().properties;
+            let after = &change.after.as_ref().unwrap().properties;
+            assert_eq!(before["score"], serde_json::Value::Null);
+            assert_eq!(after["score"], serde_json::json!(3));
+            assert_eq!(before["emb"], after["emb"], "{}: the vector is unchanged", change.id);
+            assert_eq!(before["age"], after["age"]);
+        }
+    })
+    .await;
+}
