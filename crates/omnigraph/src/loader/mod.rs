@@ -2205,18 +2205,24 @@ fn estimate_json_arrow_bytes(value: &JsonValue) -> Result<u64> {
         JsonValue::Number(_) => Ok(4),
         JsonValue::String(value) => u64::try_from(value.len())
             .map_err(|_| OmniError::manifest_internal("JSON string bytes exceed u64")),
-        JsonValue::Array(values) => {
-            let offsets = u64::try_from(values.len())
-                .map_err(|_| OmniError::manifest_internal("JSON array length exceeds u64"))?
-                .checked_add(1)
-                .and_then(|count| count.checked_mul(4))
-                .ok_or_else(|| OmniError::manifest_internal("JSON array offset bytes overflow"))?;
-            values.iter().try_fold(offsets, |bytes, value| {
-                bytes
-                    .checked_add(estimate_json_arrow_bytes(value)?)
-                    .ok_or_else(|| OmniError::manifest_internal("JSON array bytes overflow"))
-            })
-        }
+        // A list cell's item values, plus the four-byte offset each String
+        // item has in its child Utf8 array. Numeric items have no offset, and
+        // a vector (FixedSizeList) has no offsets at all; the list's own row
+        // offset is left out, as a top-level String's is. Charging an offset
+        // per element doubled a Float32 vector's estimate, so a load was
+        // refused at about half of `write_max_bytes`.
+        JsonValue::Array(values) => values.iter().try_fold(0_u64, |bytes, value| {
+            let item = estimate_json_arrow_bytes(value)?;
+            let item = if value.is_string() {
+                item.checked_add(4)
+                    .ok_or_else(|| OmniError::manifest_internal("JSON array bytes overflow"))?
+            } else {
+                item
+            };
+            bytes
+                .checked_add(item)
+                .ok_or_else(|| OmniError::manifest_internal("JSON array bytes overflow"))
+        }),
         // Property names are schema, not per-row Arrow payload. Count values
         // only so the early lower bound does not reject an otherwise-valid
         // wide schema; exact field buffers are charged after batch building.
@@ -3003,8 +3009,14 @@ fn projected_strict_column_bytes(data_type: &DataType, value: &JsonValue) -> Res
                     "strict-row vector has invalid dimension {dimension}"
                 ))
             })?;
+            // The child values at full width, present or null, and one
+            // validity bit per child slot: a null vector appends `dimension`
+            // null children. A whole byte per slot overstated a Float32
+            // vector by a quarter.
             let child_width = projected_strict_fixed_width(child.data_type())?;
-            ARRAY_BUFFER_OVERHEAD.saturating_add(dimension.saturating_mul(child_width + 1))
+            ARRAY_BUFFER_OVERHEAD
+                .saturating_add(dimension.saturating_mul(child_width))
+                .saturating_add(dimension.div_ceil(8))
         }
         other => {
             return Err(OmniError::manifest(format!(
