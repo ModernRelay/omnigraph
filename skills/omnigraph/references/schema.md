@@ -223,7 +223,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 **Group-level (inside body block):**
 - `@key(prop1, prop2)` — ordered node identity tuple
 - `@key(@src, @dst, prop)` — edge identity tuple including both endpoints and optional scalar members
-- `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(@src, @dst)`). Members must reduce to scalar keys. Blob is rejected at schema admission; list/vector declarations may parse but writes fail scalar-key validation.
+- `@unique(prop1, prop2)` — composite uniqueness, enforced as a true tuple key at intake and merge (works on edges too: `@unique(@src, @dst)`). Members must be scalar: Blob, list and vector members are rejected at schema admission.
 - `@index(prop1, prop2)` — composite index intent. Composite and edge intents are accepted but are not currently materialized as property indexes.
 - `@range(prop, min..max)` — node-only inclusive numeric bounds, compared exactly; a list property bounds each element; either bound may be omitted
 - `@check(prop, "regex")` — node-only String regular-expression constraint
