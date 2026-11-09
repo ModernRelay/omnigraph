@@ -222,6 +222,37 @@ pub async fn key_column_index_coverage(ds: &Dataset, column: &str) -> Result<Ind
     ))
 }
 
+/// How many current fragments of `ds` a `key_col IN (...)` filter reads by a
+/// filtered scan beside the BTREE, under [`key_column_index_coverage`]'s
+/// rule: `None` when Lance serves no part of the filter from a BTREE (no
+/// BTREE, another index kind on the column, unknown coverage, a fragment
+/// without `physical_rows`, or no fragment), else the largest count of
+/// fragments one index on the column leaves uncovered. Lance plans the
+/// filter once per uncovered fragment, so this counts the copies of the IN
+/// list a probe holds.
+pub async fn key_column_uncovered_fragments(ds: &Dataset, column: &str) -> Result<Option<usize>> {
+    let Some(field_id) = ds.schema().field(column).map(|field| field.id) else {
+        return Ok(None);
+    };
+    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+    Ok(key_column_tails(
+        &indices,
+        field_id,
+        column,
+        &current_fragments(ds),
+        ds.fragments()
+            .iter()
+            .all(|fragment| fragment.physical_rows.is_some()),
+    )
+    .ok()
+    .and_then(|tails| {
+        tails
+            .into_iter()
+            .map(|(_, tail)| tail.ok())
+            .try_fold(0, |widest, uncovered| Some(widest.max(uncovered?)))
+    }))
+}
+
 /// [`key_column_index_coverage`] over already-loaded metadata.
 pub fn key_column_coverage(
     indices: &[IndexMetadata],
@@ -230,7 +261,38 @@ pub fn key_column_coverage(
     current: &BTreeSet<u64>,
     physical_rows_known: bool,
 ) -> IndexCoverage {
-    let degraded = |reason: String| IndexCoverage::Degraded { reason };
+    match key_column_tails(indices, field_id, column, current, physical_rows_known) {
+        Err(reason) => IndexCoverage::Degraded { reason },
+        Ok(tails) => {
+            for (name, tail) in tails {
+                match tail {
+                    Err(reason) => return IndexCoverage::Degraded { reason },
+                    Ok(0) => {}
+                    Ok(uncovered) => {
+                        return IndexCoverage::Degraded {
+                            reason: format!(
+                                "{uncovered} fragment(s) not covered by the index '{name}' on '{column}'"
+                            ),
+                        };
+                    }
+                }
+            }
+            IndexCoverage::Indexed
+        }
+    }
+}
+
+/// Each index keyed on `field_id`, in name order, with the count of current
+/// fragments it leaves uncovered or why it cannot serve the column; `Err`
+/// when no BTREE can serve it at all.
+#[allow(clippy::type_complexity)]
+fn key_column_tails<'a>(
+    indices: &'a [IndexMetadata],
+    field_id: i32,
+    column: &str,
+    current: &BTreeSet<u64>,
+    physical_rows_known: bool,
+) -> std::result::Result<Vec<(&'a str, std::result::Result<usize, String>)>, String> {
     let mut by_name = BTreeMap::<&str, Vec<&IndexMetadata>>::new();
     for index in indices
         .iter()
@@ -242,35 +304,36 @@ pub fn key_column_coverage(
         .values()
         .any(|segments| segments.iter().all(|segment| is_btree_index(segment)))
     {
-        return degraded(format!("no BTREE index on '{}'", column));
+        return Err(format!("no BTREE index on '{}'", column));
     }
     if !physical_rows_known {
-        return degraded("a fragment is missing physical_rows".to_string());
+        return Err("a fragment is missing physical_rows".to_string());
     }
     if current.is_empty() {
-        return degraded(format!("no fragment to index on '{}'", column));
+        return Err(format!("no fragment to index on '{}'", column));
     }
-    for (name, segments) in by_name {
-        if !segments.iter().all(|segment| is_btree_index(segment)) {
-            return degraded(format!("index '{}' on '{}' is not a BTREE", name, column));
-        }
-        let coverage = SegmentCoverage::of(segments, current);
-        if !coverage.known {
-            return degraded(format!(
-                "index '{}' on '{}' does not report its fragment coverage",
-                name, column
-            ));
-        }
-        if !coverage.covers_every(current) {
-            return degraded(format!(
-                "{} fragment(s) not covered by the index '{}' on '{}'",
-                current.len() - coverage.covered.len(),
-                name,
-                column
-            ));
-        }
-    }
-    IndexCoverage::Indexed
+    Ok(by_name
+        .into_iter()
+        .map(|(name, segments)| {
+            if !segments.iter().all(|segment| is_btree_index(segment)) {
+                return (
+                    name,
+                    Err(format!("index '{}' on '{}' is not a BTREE", name, column)),
+                );
+            }
+            let coverage = SegmentCoverage::of(segments, current);
+            if !coverage.known {
+                return (
+                    name,
+                    Err(format!(
+                        "index '{}' on '{}' does not report its fragment coverage",
+                        name, column
+                    )),
+                );
+            }
+            (name, Ok(current.len() - coverage.covered.len()))
+        })
+        .collect())
 }
 
 /// True if any non-system index on `ds` leaves at least one current

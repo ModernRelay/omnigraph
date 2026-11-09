@@ -856,6 +856,79 @@ async fn keyed_upsert_stamps_no_by_source_delete_marker_and_persists_it() {
     );
 }
 
+/// Issue #1248: with an id BTREE, an upsert whose rows are all new stages the
+/// join-free absence-proven insert and one whose rows are all present stages a
+/// known-present update; neither pays Lance's full-table merge join. A mixed
+/// batch, or a table without the BTREE, keeps the join.
+#[tokio::test]
+async fn upsert_skips_the_merge_join_when_the_id_btree_decides_its_rows_issue_1248() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let mut ds = TableStore::write_dataset(
+        &uri,
+        person_pk_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+    )
+    .await
+    .unwrap();
+
+    let upsert = |ds: Dataset, rows: &'static [(&'static str, Option<i32>)]| {
+        let probes = MergeWriteProbes::default();
+        let staged = with_merge_write_probes(
+            probes.clone(),
+            store.stage_keyed_write(
+                ds,
+                "Person",
+                person_pk_batch(rows),
+                KeyedWriteSemantics::Upsert,
+                SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
+            ),
+        );
+        async move { (staged.await.unwrap(), probes) }
+    };
+    let routes = |probes: &MergeWriteProbes| {
+        (
+            probes.stage_merge_insert_calls(),
+            probes.stage_fenced_insert_calls(),
+            probes.stage_known_present_update_calls(),
+        )
+    };
+
+    let (_, unindexed) = upsert(ds.clone(), &[("carol", Some(40))]).await;
+    assert_eq!(
+        routes(&unindexed),
+        (1, 0, 0),
+        "without the BTREE the probe would read every id, so the join stays"
+    );
+
+    ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("id_idx".to_string())
+        .await
+        .unwrap();
+
+    let (staged, all_new) = upsert(ds.clone(), &[("carol", Some(40))]).await;
+    assert_eq!(routes(&all_new), (0, 1, 0), "all new: the fenced insert");
+    assert!(
+        super::has_insert_absence_certificate(&staged.transaction),
+        "the all-new upsert carries the absence certificate"
+    );
+
+    let (_, all_present) = upsert(ds.clone(), &[("alice", Some(31)), ("bob", Some(26))]).await;
+    assert_eq!(
+        routes(&all_present),
+        (0, 0, 1),
+        "all present: the known-present update"
+    );
+
+    let (_, mixed) = upsert(ds.clone(), &[("alice", Some(32)), ("dave", Some(50))]).await;
+    assert_eq!(routes(&mixed), (1, 0, 0), "a mixed batch keeps the join");
+}
+
 #[tokio::test]
 async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode_issue_1261() {
     let dir = tempfile::tempdir().unwrap();

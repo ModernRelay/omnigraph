@@ -3647,14 +3647,28 @@ impl TableStore {
         // Lance's insert-capable merge route joins the source against every
         // id of the table. An upsert whose rows are all new or all present
         // needs neither that join nor its inserted-key filter: the exact-id
-        // probe a strict insert runs decides which, through the id BTREE,
-        // and the write stages through the absence-proven insert writer or
-        // as a known-present update, which reaches its rows through the
-        // index. A mixed batch keeps the join, and so does a table without
-        // the BTREE, where the probe itself would read every id.
-        if semantics == KeyedWriteSemantics::Upsert
-            && has_btree_index_on(&ds, system_columns.id).await?
-        {
+        // probe a strict insert runs decides which, through the id BTREE.
+        // All new, it stages through the absence-proven insert writer and
+        // reads no more than the probe. All present, it stages as a
+        // known-present update, whose indexed merge reads each fragment the
+        // BTREE leaves uncovered once more, where the join reads every
+        // fragment once; so it does while the BTREE covers more fragments
+        // than it leaves. A mixed batch keeps the join, and so does a table
+        // without the BTREE, where the probe itself would read every id.
+        // Lance plans the probe's IN list once per uncovered fragment, so the
+        // probe runs only while those copies hold no more ids than one keyed
+        // batch (#1225).
+        let uncovered = match semantics {
+            KeyedWriteSemantics::Upsert => {
+                crate::dataset_index::key_column_uncovered_fragments(&ds, system_columns.id)
+                    .await?
+                    .filter(|uncovered| {
+                        uncovered.saturating_mul(source_ids.len()) <= KEYED_WRITE_MAX_ROWS
+                    })
+            }
+            _ => None,
+        };
+        if let Some(uncovered) = uncovered {
             let present = Self::existing_id_count(&ds, &source_ids, system_columns).await?;
             if present == 0 {
                 return self
@@ -3671,7 +3685,8 @@ impl TableStore {
                     )
                     .await;
             }
-            if present == source_ids.len() {
+            let covered = ds.fragments().len().saturating_sub(uncovered);
+            if present == source_ids.len() && uncovered < covered {
                 semantics = KeyedWriteSemantics::KnownPresentUpdate;
             }
         }

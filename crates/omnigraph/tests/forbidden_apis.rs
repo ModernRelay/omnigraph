@@ -978,7 +978,7 @@ gateway_surfaces! {
         "validate_full_text_scan", "validate_full_text_demand", "is_full_text_index",
         "is_untrained_full_text", "key_column_index_coverage", "has_unindexed_fragments", "user_indices_for_column",
         "has_btree_index_on", "has_fts_index_on", "has_fts_postings_on", "has_vector_index_on",
-        "current_fragments", "is_btree_index", "key_column_coverage",
+        "current_fragments", "is_btree_index", "key_column_coverage", "key_column_uncovered_fragments",
     ],
     "omnigraph-core/staging.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "is_detached_version",
