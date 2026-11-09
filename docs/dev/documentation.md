@@ -306,7 +306,9 @@ code at the release tag and explain the final shipped behavior and upgrade
 actions. Write it for a reader deciding whether and how to upgrade: for each
 upgrade action, who is affected, what changes for them and why, and what to do;
 for each other change, what was slow, refused or wrong before and what works
-now. Link the complete immutable `vX.Y.Z.md` snapshot from the overview;
+now. Keep the release page's sections, order and pull request links, so a
+reader finds each change where earlier releases put it. Link the complete
+immutable `vX.Y.Z.md` snapshot from the overview;
 do not edit the published snapshot or source notes to resolve contradictions.
 The overview is a maintained guide to that release, not a replacement for its
 recorded history. After adding it, regenerate the index with
