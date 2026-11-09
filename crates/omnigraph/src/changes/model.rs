@@ -37,22 +37,6 @@ pub const CHANGE_FEED_DEFAULT_COMMITS_PER_POLL: usize = 128;
 /// Public ceiling on graph commits examined by one feed poll.
 pub const CHANGE_FEED_MAX_COMMITS_PER_POLL: usize = 512;
 
-/// Engine mirror of the compiler's reserved Lance virtual column list. The
-/// compiler's `is_reserved_storage_system_column` is crate-private there, so
-/// this exact five-name list is pinned by a unit test below. Matching is
-/// exact: a legal user property such as `_rowdy` or `_row_custom` is never
-/// hidden by a prefix heuristic.
-pub(crate) fn is_reserved_storage_system_column(name: &str) -> bool {
-    matches!(
-        name,
-        "_rowid"
-            | "_rowaddr"
-            | "_rowoffset"
-            | "_row_created_at_version"
-            | "_row_last_updated_at_version"
-    )
-}
-
 /// Logical entity namespace of one change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -355,32 +339,6 @@ pub struct ChangeBaseline {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Pins the exact five reserved Lance virtual column names. If Lance adds
-    /// a sixth, the compiler's reserved list and this mirror must move
-    /// together in one audited change.
-    #[test]
-    fn reserved_storage_system_columns_are_exactly_the_five_lance_names() {
-        for name in [
-            "_rowid",
-            "_rowaddr",
-            "_rowoffset",
-            "_row_created_at_version",
-            "_row_last_updated_at_version",
-        ] {
-            assert!(is_reserved_storage_system_column(name), "{name}");
-        }
-        for name in [
-            "_row",
-            "_rowdy",
-            "_row_custom",
-            "_row_created_at",
-            "id",
-            "rowid",
-        ] {
-            assert!(!is_reserved_storage_system_column(name), "{name}");
-        }
-    }
 
     #[test]
     fn operation_ranks_are_frozen() {
