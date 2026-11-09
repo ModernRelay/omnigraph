@@ -101,7 +101,10 @@ the server refused the token sent; a valid OIDC token it does not admit gets 403
 
 A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
-on a trusted development network. Static tokens without a policy allow only the
+on a trusted development network. An unauthenticated server binds only a
+loopback address (`127.0.0.1`, `::1` or `localhost`); on any other `--bind`,
+including the container's `0.0.0.0:8080`, it refuses to start unless
+`OMNIGRAPH_UNAUTHENTICATED_ALLOW_REMOTE=1` is also set. Static tokens without a policy allow only the
 `read` action. Stored-query invocation, export, graph listing, writes, and other
 actions remain denied.
 

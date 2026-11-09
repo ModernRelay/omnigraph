@@ -3982,6 +3982,12 @@ async fn serve_config(
         has_policy_configured,
         config.allow_unauthenticated,
     )?;
+    if runtime_state == ServerRuntimeState::Open {
+        settings::refuse_remote_open_bind(
+            &config.bind,
+            settings::env_flag("OMNIGRAPH_UNAUTHENTICATED_ALLOW_REMOTE"),
+        )?;
+    }
     match runtime_state {
         ServerRuntimeState::Open => warn!(
             "running with --unauthenticated: no bearer tokens, no policy file, all \

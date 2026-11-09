@@ -249,7 +249,7 @@ For static token authentication:
 
 | Tokens | Policy | Startup and authorization |
 |---|---|---|
-| none | none | Requires explicit `--unauthenticated`; otherwise startup fails |
+| none | none | Requires explicit `--unauthenticated` and a loopback `--bind` (or `OMNIGRAPH_UNAUTHENTICATED_ALLOW_REMOTE=1`); otherwise startup fails |
 | configured | none | Only the `read` action is allowed; all other actions are denied |
 | configured | configured | The policy decides each action |
 | none | configured | Startup fails because no request could establish an actor |

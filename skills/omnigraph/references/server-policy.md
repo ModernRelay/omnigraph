@@ -106,7 +106,8 @@ omnigraph query get_person --target production --graph knowledge
 A server with no credential source (static tokens or signed-token trust) and no
 policy refuses to start unless explicitly
 given `--unauthenticated` (or `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only on a
-trusted development network. Tokens without a policy allow only `read`; other
+trusted development network; it binds only a loopback address unless
+`OMNIGRAPH_UNAUTHENTICATED_ALLOW_REMOTE=1` is also set. Tokens without a policy allow only `read`; other
 actions remain denied.
 
 Managed signed data credentials are a separate token source, enabled with

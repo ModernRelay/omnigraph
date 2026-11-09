@@ -503,7 +503,34 @@ fn required_cluster(cli_cluster: Option<&PathBuf>) -> Result<&PathBuf> {
     Ok(cluster_dir)
 }
 
-fn env_flag(name: &str) -> bool {
+/// Refuse open mode (`--unauthenticated`) on a non-loopback `bind` unless the
+/// operator also set `OMNIGRAPH_UNAUTHENTICATED_ALLOW_REMOTE=1`: an open server
+/// permits every graph action to anyone who reaches the port.
+pub fn refuse_remote_open_bind(bind: &str, allow_remote: bool) -> Result<()> {
+    if allow_remote || bind_is_loopback(bind) {
+        return Ok(());
+    }
+    bail!(
+        "--unauthenticated permits every graph action to anyone who reaches the server, \
+         so it binds only a loopback address (127.0.0.1, ::1 or localhost); `{bind}` is \
+         not one. Configure bearer tokens, bind a loopback address, or set \
+         OMNIGRAPH_UNAUTHENTICATED_ALLOW_REMOTE=1 to serve the open server on this \
+         address anyway."
+    )
+}
+
+/// Whether a `host:port` bind address names only the loopback interface.
+/// A hostname other than `localhost`, or an unspecified address such as
+/// `0.0.0.0`, is not loopback.
+fn bind_is_loopback(bind: &str) -> bool {
+    if let Ok(address) = bind.parse::<std::net::SocketAddr>() {
+        return address.ip().is_loopback();
+    }
+    bind.rsplit_once(':')
+        .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost"))
+}
+
+pub(crate) fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .ok()
         .map(|v| {
@@ -1224,6 +1251,37 @@ mod tests {
             classify_server_runtime_state(false, false, true).unwrap(),
             ServerRuntimeState::Open
         );
+    }
+
+    #[test]
+    fn open_mode_binds_only_loopback_unless_remote_is_allowed() {
+        use super::refuse_remote_open_bind;
+        for loopback in [
+            "127.0.0.1:8080",
+            "127.0.0.2:0",
+            "[::1]:8080",
+            "localhost:8080",
+        ] {
+            assert!(
+                refuse_remote_open_bind(loopback, false).is_ok(),
+                "{loopback}"
+            );
+        }
+        for remote in [
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "10.0.0.5:8080",
+            "graphs.internal:8080",
+            "localhost.example:8080",
+        ] {
+            let err = refuse_remote_open_bind(remote, false).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("OMNIGRAPH_UNAUTHENTICATED_ALLOW_REMOTE"),
+                "{remote}: {err}"
+            );
+            assert!(refuse_remote_open_bind(remote, true).is_ok(), "{remote}");
+        }
     }
 
     #[test]
