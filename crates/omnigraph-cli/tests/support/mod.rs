@@ -825,6 +825,66 @@ pub fn converged_loaded_cluster(graph_id: &str, policy_yaml: Option<&str>) -> Cl
     ClusterFixture { _temp: temp, dir }
 }
 
+/// Build a converged cluster with one graph `graph_id` and the policy layout
+/// `docs/user/operations/policy.md` documents: `graph_policy`, when given, is
+/// bound to the graph and `cluster_policy`, when given, to the `cluster`
+/// scope. The graph holds no data; the policy commands read only the ledger.
+pub fn converged_policy_cluster(
+    graph_id: &str,
+    graph_policy: Option<&str>,
+    cluster_policy: Option<&str>,
+) -> ClusterFixture {
+    let temp = tempdir().unwrap();
+    let dir = temp.path().to_path_buf();
+    fs::copy(fixture("test.pg"), dir.join("graph.pg")).unwrap();
+
+    let mut policies = String::new();
+    if let Some(source) = graph_policy {
+        fs::write(dir.join("graph.policy.yaml"), source).unwrap();
+        policies.push_str(&format!(
+            "  graph-access:\n    file: ./graph.policy.yaml\n    applies_to: [{graph_id}]\n"
+        ));
+    }
+    if let Some(source) = cluster_policy {
+        fs::write(dir.join("server.policy.yaml"), source).unwrap();
+        policies.push_str(
+            "  server-access:\n    file: ./server.policy.yaml\n    applies_to: [cluster]\n",
+        );
+    }
+    let policy_block = if policies.is_empty() {
+        String::new()
+    } else {
+        format!("policies:\n{policies}")
+    };
+    fs::write(
+        dir.join("cluster.yaml"),
+        format!(
+            "version: 1\nmetadata:\n  name: sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  {graph_id}:\n    schema: ./graph.pg\n{policy_block}"
+        ),
+    )
+    .unwrap();
+
+    apply_cluster_fixture(&dir);
+    ClusterFixture { _temp: temp, dir }
+}
+
+/// A `cluster`-scope bundle in the documented shape: configuration and
+/// inventory rules, each in its own rule.
+pub const CLUSTER_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  owners: [act-andrew]
+rules:
+  - id: owners-manage-config
+    allow:
+      actors: { group: owners }
+      actions: [config_manage]
+  - id: owners-list-graphs
+    allow:
+      actors: { group: owners }
+      actions: [graph_list]
+"#;
+
 // ---- helpers moved from the monolithic tests/cli.rs ----
 #[allow(unused_imports)]
 use lance::Dataset;
