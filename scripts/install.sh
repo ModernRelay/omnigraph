@@ -5,6 +5,10 @@ REPO_SLUG="${REPO_SLUG:-ModernRelay/omnigraph}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 RELEASE_CHANNEL="${RELEASE_CHANNEL:-stable}"
 VERSION="${VERSION:-}"
+# auto: verify the archive's build provenance with `gh attestation verify`
+# when the GitHub CLI is installed and signed in; require: refuse without it;
+# off: skip. Releases before v0.14 carry no attestation.
+VERIFY_ATTESTATION="${VERIFY_ATTESTATION:-auto}"
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR=""
 SELECTED_CHANNEL=""
@@ -111,6 +115,21 @@ verify_checksum() {
   [ "$actual" = "$expected" ] || die "checksum verification failed for $(basename "$archive")"
 }
 
+# Download one release file. Returns 2 when the release or the file is not
+# published (HTTP 404), 1 on any other failure.
+download_file() {
+  local url="$1"
+  local output="$2"
+  local status
+
+  status="$(curl -sSL -w '%{http_code}' -o "$output" "$url")" || return 1
+  case "$status" in
+    200) return 0 ;;
+    404) return 2 ;;
+    *) return 1 ;;
+  esac
+}
+
 download_release_files() {
   local base_url="$1"
   local asset_name="$2"
@@ -118,8 +137,52 @@ download_release_files() {
   local archive="$4"
   local checksum="$5"
 
-  curl -fsSL "$base_url/$asset_name" -o "$archive" || return 1
-  curl -fsSL "$base_url/$checksum_name" -o "$checksum" || return 1
+  download_file "$base_url/$asset_name" "$archive" || return $?
+  download_file "$base_url/$checksum_name" "$checksum" || return $?
+}
+
+# The tag the stable channel serves, from the redirect of releases/latest.
+stable_release_tag() {
+  local url
+  url="$(curl -sSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO_SLUG/releases/latest" 2>/dev/null)" || return 1
+  case "$url" in
+    */releases/tag/*) printf '%s\n' "${url##*/}" ;;
+    *) return 1 ;;
+  esac
+}
+
+verify_attestation() {
+  local archive="$1"
+
+  case "$VERIFY_ATTESTATION" in
+    off)
+      log "Skipping build provenance verification (VERIFY_ATTESTATION=off)"
+      return
+      ;;
+    auto|require) ;;
+    *) die "unsupported VERIFY_ATTESTATION '$VERIFY_ATTESTATION' (expected auto, require or off)" ;;
+  esac
+
+  if ! command -v gh >/dev/null 2>&1 \
+    || ! gh attestation verify --help >/dev/null 2>&1 \
+    || ! gh auth status >/dev/null 2>&1; then
+    if [ "$VERIFY_ATTESTATION" = "require" ]; then
+      die "VERIFY_ATTESTATION=require needs the GitHub CLI (gh) with gh attestation, signed in"
+    fi
+    log "Build provenance not verified: install and sign in to a GitHub CLI (gh) with gh attestation to check it"
+    return
+  fi
+
+  if gh attestation verify "$archive" --repo "$REPO_SLUG" >/dev/null; then
+    log "Verified build provenance of $(basename "$archive") with gh attestation verify"
+    return
+  fi
+  if [ "$VERIFY_ATTESTATION" = "auto" ] && [ -n "$VERSION" ]; then
+    # An explicitly named release may predate attestations (before v0.14).
+    log "warning: no valid build attestation for $VERSION; it may predate attestations. Set VERIFY_ATTESTATION=off to silence this, or require to refuse it"
+    return
+  fi
+  die "build provenance verification failed for $(basename "$archive"); refusing to install. Set VERIFY_ATTESTATION=off only if you trust this archive"
 }
 
 install_from_release() {
@@ -131,21 +194,31 @@ install_from_release() {
   archive="$WORKDIR/$asset"
   checksum="$WORKDIR/$asset_stem.sha256"
 
+  local status=0 tag
   if [ -n "$VERSION" ]; then
     SELECTED_CHANNEL="$VERSION"
     base_url="$(release_base_url)"
-    log "Downloading $asset from $VERSION"
+    log "Downloading $asset from release $VERSION"
     download_release_files "$base_url" "$asset" "$asset_stem.sha256" "$archive" "$checksum" || die "no published binary found for $asset at release $VERSION"
   else
     SELECTED_CHANNEL="$RELEASE_CHANNEL"
     base_url="$(release_base_url "$SELECTED_CHANNEL")"
+    if [ "$SELECTED_CHANNEL" = "stable" ] && tag="$(stable_release_tag)"; then
+      SELECTED_CHANNEL="stable ($tag)"
+    fi
     log "Downloading $asset from $SELECTED_CHANNEL"
-    if ! download_release_files "$base_url" "$asset" "$asset_stem.sha256" "$archive" "$checksum"; then
+    download_release_files "$base_url" "$asset" "$asset_stem.sha256" "$archive" "$checksum" || status=$?
+    if [ "$status" -ne 0 ]; then
       if [ "$RELEASE_CHANNEL" != "stable" ]; then
         die "no published binary found for $asset on channel $RELEASE_CHANNEL"
       fi
+      if [ "$status" -ne 2 ]; then
+        # Only a stable release that is not published falls back; a network
+        # or server failure must not switch the channel.
+        die "download of $asset from the stable channel failed; retry, or set RELEASE_CHANNEL=edge to install the edge build"
+      fi
 
-      log "Stable release binaries are not published yet; falling back to edge"
+      log "No stable release publishes $asset (HTTP 404); installing the edge build instead"
       SELECTED_CHANNEL="edge"
       base_url="$(release_base_url "$SELECTED_CHANNEL")"
       download_release_files "$base_url" "$asset" "$asset_stem.sha256" "$archive" "$checksum" || die "no published binary found for $asset on stable or edge; use scripts/install-source.sh or build from source"
@@ -153,6 +226,7 @@ install_from_release() {
   fi
 
   verify_checksum "$archive" "$checksum"
+  verify_attestation "$archive"
   tar -C "$WORKDIR" -xzf "$archive" || die "failed to unpack $asset"
   install_from_dir "$WORKDIR"
 }

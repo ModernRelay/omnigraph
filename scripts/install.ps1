@@ -44,13 +44,61 @@ function Download-ReleaseFiles {
     [string]$ChecksumPath
   )
 
+  # "ok"; "missing" when the release or a file is not published (HTTP 404);
+  # "failed" on any other error.
   try {
     Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/$assetName" -OutFile $ArchivePath
     Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/$assetStem.sha256" -OutFile $ChecksumPath
-    return $true
+    return "ok"
   } catch {
-    return $false
+    $response = $_.Exception.Response
+    if ($null -ne $response -and [int]$response.StatusCode -eq 404) {
+      return "missing"
+    }
+    return "failed"
   }
+}
+
+function Verify-Attestation {
+  param([string]$ArchivePath)
+
+  $mode = if ($env:VERIFY_ATTESTATION) { $env:VERIFY_ATTESTATION } else { "auto" }
+  if ($mode -eq "off") {
+    Write-Log "Skipping build provenance verification (VERIFY_ATTESTATION=off)"
+    return
+  }
+  if ($mode -ne "auto" -and $mode -ne "require") {
+    throw "unsupported VERIFY_ATTESTATION '$mode' (expected auto, require or off)"
+  }
+
+  $signedIn = $false
+  if (Get-Command gh -ErrorAction SilentlyContinue) {
+    # gh before 2.49 has no `attestation` command; treat it as absent.
+    & gh attestation verify --help *> $null
+    if ($LASTEXITCODE -eq 0) {
+      & gh auth status *> $null
+      $signedIn = ($LASTEXITCODE -eq 0)
+    }
+  }
+  if (!$signedIn) {
+    if ($mode -eq "require") {
+      throw "VERIFY_ATTESTATION=require needs the GitHub CLI (gh), signed in"
+    }
+    Write-Log "Build provenance not verified: install and sign in to the GitHub CLI (gh) to check it"
+    return
+  }
+
+  & gh attestation verify $ArchivePath --repo $RepoSlug *> $null
+  if ($LASTEXITCODE -eq 0) {
+    Write-Log "Verified build provenance of $assetName with gh attestation verify"
+    return
+  }
+  if ($mode -eq "auto" -and $Version -ne "") {
+    # An explicitly named release may predate attestations (before v0.14).
+    Write-Log "warning: no valid build attestation for $Version; it may predate attestations"
+    return
+  }
+  throw "build provenance verification failed for $assetName; refusing to install. Set VERIFY_ATTESTATION=off only if you trust this archive"
 }
 
 function Verify-Checksum {
@@ -99,28 +147,35 @@ function Install-FromRelease {
     $script:selectedChannel = $Version
     $baseUrl = Get-ReleaseBaseUrl -Channel $ReleaseChannel
     Write-Log "Downloading $assetName from $Version"
-    if (!(Download-ReleaseFiles -BaseUrl $baseUrl -ArchivePath $archivePath -ChecksumPath $checksumPath)) {
+    if ((Download-ReleaseFiles -BaseUrl $baseUrl -ArchivePath $archivePath -ChecksumPath $checksumPath) -ne "ok") {
       throw "no published binary found for $assetName at release $Version"
     }
   } else {
     $script:selectedChannel = $ReleaseChannel
     $baseUrl = Get-ReleaseBaseUrl -Channel $selectedChannel
     Write-Log "Downloading $assetName from $selectedChannel"
-    if (!(Download-ReleaseFiles -BaseUrl $baseUrl -ArchivePath $archivePath -ChecksumPath $checksumPath)) {
+    $download = Download-ReleaseFiles -BaseUrl $baseUrl -ArchivePath $archivePath -ChecksumPath $checksumPath
+    if ($download -ne "ok") {
       if ($ReleaseChannel -ne "stable") {
         throw "no published binary found for $assetName on channel $ReleaseChannel"
       }
+      if ($download -ne "missing") {
+        # Only a stable release that is not published falls back; a network
+        # or server failure must not switch the channel.
+        throw "download of $assetName from the stable channel failed; retry, or pass -ReleaseChannel edge"
+      }
 
-      Write-Log "Stable release binaries are not published yet; falling back to edge"
+      Write-Log "No stable release publishes $assetName (HTTP 404); installing the edge build instead"
       $script:selectedChannel = "edge"
       $baseUrl = Get-ReleaseBaseUrl -Channel $selectedChannel
-      if (!(Download-ReleaseFiles -BaseUrl $baseUrl -ArchivePath $archivePath -ChecksumPath $checksumPath)) {
+      if ((Download-ReleaseFiles -BaseUrl $baseUrl -ArchivePath $archivePath -ChecksumPath $checksumPath) -ne "ok") {
         throw "no published binary found for $assetName on stable or edge; build from source"
       }
     }
   }
 
   Verify-Checksum -ArchivePath $archivePath -ChecksumPath $checksumPath
+  Verify-Attestation -ArchivePath $archivePath
 
   $extractDir = Join-Path $workDir "extract"
   New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
