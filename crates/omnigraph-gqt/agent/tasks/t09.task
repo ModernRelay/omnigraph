@@ -1,0 +1,13 @@
+--- task
+id: t09
+dataset: section8
+kind: conditional and default values
+
+--- intent
+List every person's name, their city or "unknown" when it is missing (as `city`), and "senior" when they are 65 or older, otherwise "active" (as `band`).
+
+--- edition3
+query with_city() {
+  match { $p: Person }
+  return { $p.name, coalesce($p.city, "unknown") as city, if($p.age >= 65, "senior", "active") as band }
+}

@@ -1,0 +1,32 @@
+--- task
+id: m6
+dataset: section8
+kind: window versus population
+answer: fewest
+composition: the window-versus-population distinction
+
+--- intent
+Take the 10 documents nearest to the vector `$q` among all documents, and return the titles of those of the 10 that belong to the collection with slug `$coll`.
+
+--- params
+{"q": [1.0, 0.0, 0.0], "coll": "intro"}
+
+--- edition3
+query near_then_in($q: Vector(3), $coll: String) {
+  match {
+    from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 10)
+    $x: Collection { slug: $coll }
+    $d "in" $x
+  }
+  return { $d.title }
+}
+
+--- edition3
+query near_then_in($q: Vector(3), $coll: String) {
+  match {
+    from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 10)
+    $d "in" $x
+    $x: Collection { slug: $coll }
+  }
+  return { $d.title }
+}

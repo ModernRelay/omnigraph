@@ -1,0 +1,15 @@
+{"type":"Person","data":{"slug":"raf","name":"Rafael Alonso","city":"Madrid","age":40}}
+{"type":"Person","data":{"slug":"ann","name":"Ann Lee","city":"Berlin","age":30}}
+{"type":"Person","data":{"slug":"bob","name":"Bob Ray","age":30}}
+{"type":"Person","data":{"slug":"cyd","name":"Ann Lee","city":"Berlin","age":50}}
+{"type":"Comment","data":{"slug":"c1","length":10}}
+{"type":"Comment","data":{"slug":"c2","length":20}}
+{"type":"Comment","data":{"slug":"c3","length":20}}
+{"edge":"CommentHasCreator","from":"c1","to":"raf"}
+{"edge":"CommentHasCreator","from":"c2","to":"raf"}
+{"edge":"CommentHasCreator","from":"c3","to":"raf"}
+{"edge":"LikesComment","from":"ann","to":"c1"}
+{"edge":"LikesComment","from":"ann","to":"c2"}
+{"edge":"LikesComment","from":"ann","to":"c3"}
+{"edge":"LikesComment","from":"bob","to":"c1"}
+{"edge":"LikesComment","from":"cyd","to":"c2"}

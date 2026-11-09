@@ -1,0 +1,22 @@
+--- task
+id: t35
+dataset: section8
+kind: write with a computed value
+
+--- intent
+It is the birthday of the person with handle `$h`: increase their age by one.
+
+--- params
+{"h": "alice"}
+
+--- edition3
+query birthday($h: String) {
+  $p: Person { handle: $h }
+  update $p set { age: $p.age + 1 }
+}
+
+--- check
+query check($h: String) {
+  match { $p: Person { handle: $h } }
+  return { $p.age }
+}

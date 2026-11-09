@@ -1,0 +1,16 @@
+--- task
+id: t08
+dataset: section8
+kind: arithmetic
+
+--- intent
+List the people whose age doubled is at least `$min`, returning each name, the age times two as `twice`, and 2026 minus the age as `born_about`.
+
+--- params
+{"min": 100}
+
+--- edition3
+query doubled($min: I32) {
+  match { $p: Person  $p.age * 2 >= $min }
+  return { $p.name, $p.age * 2 as twice, 2026 - $p.age as born_about }
+}

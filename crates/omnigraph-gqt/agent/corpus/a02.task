@@ -1,0 +1,28 @@
+--- task
+id: a02
+dataset: attribution
+kind: two hops from a keyed node, counted
+answer: fewest
+
+--- intent
+Which sources does channel `$channel` watch, and how many touchpoints landed on each? Return the source slug and the count as `touchpoints`.
+
+--- params
+{"channel": "c1"}
+
+--- edition2
+query watched_activity($channel: String) {
+  match { $ch: Channel { slug: $channel }  $ch channelWatchesSource $s  $t touchpointOnSource $s }
+  return { $s.slug, count($t) as touchpoints }
+}
+
+--- edition3
+query watched_activity($channel: String) {
+  match { $ch: Channel { slug: $channel }  $ch channelWatchesSource $s  $t touchpointOnSource $s }
+  return { $s.slug, count($t) as touchpoints }
+}
+
+--- expect unordered
+columns: ["s.slug","touchpoints"]
+["s1",4]
+["s2",2]

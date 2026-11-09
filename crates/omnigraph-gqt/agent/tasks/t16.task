@@ -1,0 +1,23 @@
+--- task
+id: t16
+dataset: section8
+kind: distinct counts
+
+--- intent
+How many distinct cities do people live in? Return the number as `cities`.
+
+--- edition2
+query distinct_cities() {
+  match { $p: Person }
+  return { count(distinct $p.city) as cities }
+}
+
+--- edition3
+query distinct_cities() {
+  match { $p: Person }
+  return { count(distinct $p.city) as cities }
+}
+
+--- expect unordered
+columns: ["cities"]
+[4]

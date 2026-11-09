@@ -1,0 +1,30 @@
+--- task
+id: s01
+dataset: social
+kind: one hop, ordered
+answer: fewest
+
+--- intent
+Who liked the comment `$comment`? Return their names in alphabetical order.
+
+--- params
+{"comment": "c1"}
+
+--- edition2
+query likers($comment: String) {
+  match { $c: Comment { slug: $comment }  $p likesComment $c }
+  return { $p.name }
+  order { $p.name }
+}
+
+--- edition3
+query likers($comment: String) {
+  match { $c: Comment { slug: $comment }  $p likesComment $c }
+  return { $p.name }
+  order { $p.name }
+}
+
+--- expect ordered
+columns: ["p.name"]
+["Ann Lee"]
+["Bob Ray"]

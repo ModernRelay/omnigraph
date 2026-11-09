@@ -1,0 +1,429 @@
+# GQ reference card (edition 2)
+
+The query language as it ships today: the grammar notes of the Omnigraph agent skill and its query reference, section by section.
+
+### `.gq` grammar
+
+The non-obvious facts that bite, then the full grammar:
+
+- **Scalar param types**: `String Bool I32 I64 U32 U64 F32 F64 DateTime Date Blob`. Modifiers: `T?` (optional), `[T]` (list), `Vector(N)`. There is **no `Int`** — use `I64`. An integer parameter takes its type's whole range (`U64` up to `18446744073709551615`); send a 64-bit value above 2^53 in `--params` as a decimal string so no client rounds it through a double.
+- **A read query needs `match` *and* `return`** (`order`/`limit` optional); a mutation has neither — only `insert`/`update`/`delete`.
+- **`limit` takes an integer literal, not a param** — `limit 50`, never `limit $n`.
+- **Variable-hop traversal**: `$p knows{1,3} $f` — bounds are **required to be finite** (`{1,}` is rejected: "unbounded traversal is disabled"), and an edge whose endpoint types differ allows only one hop (`T5`). Hops are shortest-path distances; each `$_` is a distinct anonymous node; variables beginning `__` are reserved.
+- **Undirected traversal**: `$p <knows> $f` matches the edge in either direction, deduplicated (a pair connected both ways appears once). Same-endpoint-type edges only (e.g. `Related: Issue -> Issue`) — asymmetric edges are rejected (T22). Composes with bounds (`$p <knows>{1,3} $f`) and correlated blocks (`not { }`, `exists { }`, `count { } > 2`).
+- **Edge bindings**: an optional `$var:` prefix on the edge word — `$src $w:knows $dst`, undirected `$a $w:<related> $b` — binds the matched edge row, so edge properties work in filters (`$w.confidence = "asserted"`), projections (`return { $w.role }`), aggregates, and ordering. A bound traversal returns one row per edge (parallel edges stay distinct); binding a `{min,max}` multi-hop, rebinding a taken name, or projecting bare `$w` is rejected (T23).
+- **Literals & calls**: `now()`, `date("2026-04-29")`, `datetime("…T00:00:00Z")`, list `[…]`.
+`starts_with`, `contains`, `in`, `>=`, `<=`, `!=`, `>`, `<`, `=`, `is null`, `is not null`
+
+Those are the complete **filter operators** (`$m.number in $numbers` tests membership in a list parameter or literal); conditions compose with `and`, `or`, `not`, parentheses and `is null` / `is not null`, and a filter keeps only rows whose expression is true (a comparison with a null operand is null). String predicates are exact and
+case-sensitive. **Aggregates** are `count/sum/avg/min/max` (`count($f) as n`, `count(distinct $f.city) as cities`); `min`/`max` also accept String, Bool, Date, and DateTime. Alias aggregates and order by the alias. `return distinct { … }` keeps one row per distinct projected tuple.
+- **Result column names must be distinct** (`T25`): alias projections that would collide.
+- **Stored-query metadata**: `@description("…")` / `@instruction("…")` may follow the param list.
+- **Casing**: type names uppercase-initial (`Signal`); idents/edges lowercase-initial (`formsPattern`); variables `$`-prefixed. `//` and `/* */` comments only.
+
+The compiler grammar in `crates/omnigraph-compiler/src/query/query.pest` is the
+single source of truth.
+
+## Query Structure
+
+### Match → Return → Order → Limit
+
+```gq
+query recent_signals() {
+    match {
+        $s: Signal
+    }
+    return { $s.slug, $s.name, $s.stagingTimestamp }
+    order { $s.stagingTimestamp desc }
+    limit 50
+}
+```
+
+### Edge traversal (lowerCamelCase)
+
+Schema edges are PascalCase; traversal uses lowerCamelCase:
+
+```gq
+match {
+    $s: Signal { slug: $slug }
+    $s formsPattern $p         // edge FormsPattern: Signal -> Pattern
+}
+```
+
+### Multi-hop
+
+Chain traversal clauses:
+
+```gq
+query friends_of_friends($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $mid
+        $mid knows $fof
+    }
+    return { $fof.name }
+}
+```
+
+For variable length, put finite bounds on the edge: `$p knows{1,3} $f`.
+Bounds must be finite (`{1,}` is `T15`), and a bound above one needs an edge
+with the same node type at both ends (`$p worksAt{1,2} $c` over
+`Person -> Company` is `T5`). `$a (knows | likes) $b` follows either edge type,
+and `$a *{1,3} $b` any compatible type (declare both endpoint types); both
+share the `traversal_work_limit` setting.
+
+Hop counts are shortest-path distances from the start node (`{2,2}` returns
+nodes exactly two hops away); a node is not re-reached through a cycle, and
+only the start node's own self-loop counts, as one hop. Each `$_` is a distinct
+anonymous node. Binding `$p` again adds constraints on the same rows rather
+than introducing a second `$p`. Variable names beginning `__` are reserved.
+
+Without `order`, `limit n` may return any `n` valid rows, and the subset can
+change between releases. Add `order { … }` when a stable page matters.
+
+### Reverse traversal
+
+Flip the subject/object:
+
+```gq
+query employees_of($company: String) {
+    match {
+        $c: Company { name: $company }
+        $p worksAt $c
+    }
+    return { $p.name }
+}
+```
+
+### Undirected traversal
+
+For symmetric relations (same-endpoint-type edges like `IssueRelated: Issue -> Issue`),
+angle brackets match the edge in **either direction**, deduplicated — one
+pattern replaces querying both directions and merging:
+
+```gq
+query related_to($slug: String) {
+    match {
+        $i: Issue { slug: $slug }
+        $i <issueRelated> $r
+    }
+    return { $r.slug }
+}
+```
+
+### Edge bindings — filtering and projecting edge properties
+
+An optional `$var:` prefix on the edge word binds the matched edge *row*, so
+declared edge properties (confidence, role, provenance, …) become usable
+anywhere a node field is:
+
+```gq
+query asserted_links($slug: String) {
+    match {
+        $i: Issue { slug: $slug }
+        $i $w:issueRelated $r
+        $w.confidence = "asserted"
+    }
+    return { $r.slug, $w.confidence }
+}
+```
+
+Rules: composes with the undirected form (`$a $w:<related> $b`) and inside
+`not { }`. A bound traversal returns **one row per matching edge**, so
+parallel edges between the same endpoints appear individually (unbound
+traversals keep set-of-pairs semantics). Rejected with `T23`: binding a
+`{min,max}` multi-hop, rebinding a taken variable name, or projecting bare
+`$w` (project a property instead).
+
+Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in
+either direction"). Asymmetric edges (e.g. `Comment -> Issue`) are rejected at
+typecheck (T22) — use the directional form there.
+
+### Correlated blocks
+
+A block matches its pattern once per outer row and keeps the row by a
+comparison on the aggregate of its matches: `not { ... }` (no match),
+`exists { ... }` (at least one), `count { ... } > 2`, and
+`sum($d.size) { ... } > 100` (also `min`, `max`, `avg`). The block must read
+at least one outer variable; the right side is a literal, `now()` or a parameter.
+
+```gq
+query orphan_signals() {
+    match {
+        $s: Signal
+        not { $s formsPattern $_ }
+    }
+    return { $s.slug }
+}
+
+query busy_signals($least: I64) {
+    match {
+        $s: Signal
+        count { $s formsPattern $p } >= $least
+    }
+    return { $s.slug }
+}
+```
+
+## System Fields and Result Values
+
+Use `$p.@id` for a node's identity and `$w.@id`, `$w.@src`, `$w.@dst` for a
+bound edge's identity and endpoints. These meta-fields work in filters,
+projections, and ordering on both current and legacy graphs. `$p.id` always
+means a declared user property named `id`; it is not an identity shorthand.
+`$w.@type` is a bound edge's schema type name (read-only).
+
+`return { $p }` returns one column named `p` containing the node object:
+`{"@id":"alice","name":"Alice"}`. It includes declared properties except
+Blob and Vector properties. Project `$p.@id` for just the identity or
+`$p.embedding` for a vector; Blob values require the Blob API. Bare edge
+bindings cannot be projected.
+
+Each projection needs a distinct result column name (`T25`): use aliases when
+expressions would collide. Aliases can be used in `order`, including after a
+leading `nearest`/`bm25`/`rrf` key (`order { nearest($d.embedding, $q), title }`),
+but cannot be projected again in `return` (`T36`). Order an aggregate by its alias or by repeating
+the returned expression (`order { count($f) desc }`); an order key that is not
+a property, a system field, the leading search key, a `return` item, or an
+alias is refused at type checking (`T42`).
+
+In JSON results, null fields are omitted from rows and node objects; null
+elements within lists remain `null`. Dates are `"2026-04-29"`; DateTime values
+are UTC strings such as `"2026-04-29T10:00:00"`, without a trailing `Z` and
+with a fractional part only when nonzero. Read the `columns` in the JSON
+envelope to retain fields that are null in every row. Integers remain JSON
+numbers, so JavaScript consumers must account for values beyond 2^53. `F32`
+and vector values print at 32-bit width (`0.99`); integral floats carry `.0`;
+magnitudes from 1e10 up or below 1e-5 use exponent form (`1.0e20`); a
+non-finite computed float is `null`. A stored date count outside the writer's
+range fails the read instead of printing.
+
+## Search Functions
+
+### Text search
+
+```gq
+match {
+    $d: Doc
+    search($d.title, $q)       // full-text; needs @index or @key on the String (T27)
+}
+```
+
+```gq
+match {
+    $d: Doc
+    fuzzy($d.title, $q, 2)     // fuzzy match, max 2 edits
+}
+```
+
+```gq
+match {
+    $d: Doc
+    match_text($d.body, $q)    // regular full-text match (not phrase search)
+}
+```
+
+### Vector/ranking
+
+```gq
+query vector_search($q: Vector(3072)) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { nearest($d.embedding, $q) }
+    limit 10
+}
+```
+
+`nearest`, `bm25`, and `rrf` belong in `order`, but they also restrict rows: a
+`bm25` ordering returns only text matches, `nearest` skips rows whose vector is
+null, and `rrf` returns the union of its arms' candidates. `nearest` and `rrf`
+require `limit N`; BM25 alone does not, though a limit is recommended for
+bounded output.
+
+`nearest(...)`, `bm25(...)` and `rrf(...)` can also be projected as scores
+when the expression exactly repeats the leading `order` key (`T33`); see
+[`search.md`](search.md#projecting-scores). Search predicates (`search`,
+`fuzzy`, `match_text`) cannot be projected (`T35`). A ranked read's JSON
+carries a `ranking` object; see
+[`search.md`](search.md#what-a-ranked-read-reports).
+
+### Hybrid (reciprocal rank fusion)
+
+```gq
+query hybrid_search($vq: Vector(3072), $tq: String) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { rrf(nearest($d.embedding, $vq), bm25($d.title, $tq)) }
+    limit 10
+}
+```
+
+## Aggregations
+
+```gq
+query friend_counts() {
+    match {
+        $p: Person
+        $p knows $f
+    }
+    return {
+        $p.name
+        count($f) as friends
+    }
+    order { friends desc }
+    limit 20
+}
+```
+
+Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggregated return fields.
+`count(distinct $f)` counts distinct nodes and `count(distinct $f.city)`
+distinct non-null values; `distinct` under another aggregate is refused
+(`T57`). `return distinct { … }` keeps one row per distinct projected tuple
+before `order`/`limit` (with aggregates: `T56`). A comparison in `return`
+needs an alias (`T43`): `$p.age > 30 as adult`, or over aggregates
+`count($f) > 0 as any`.
+Return-clause integer `sum` accumulates exactly in 128 bits and rounds the total
+once to `F64`; `avg` uses a floating-point accumulator.
+
+- `min`/`max` accept numeric, String, Bool (`false` before `true`), Date, and
+  DateTime values and return the column's own type; lists, vectors, and Blobs
+  are refused (`T8`).
+- `sum`/`avg`/`min`/`max` over a bare node binding are refused (`T8`);
+  `count($f)` is fine.
+- An all-aggregate query over zero rows returns one row: `count` is 0 and the
+  other aggregates are null, so JSON omits their keys.
+- An unaliased aggregate takes its argument's column name, so
+  `return { $a.name, count($a.name) }` collides (`T25`). Alias aggregates.
+
+## Filter Operators
+
+`starts_with`, `contains`, `in`, `>=`, `<=`, `!=`, `>`, `<`, `=`, `is null`, `is not null`
+
+Combine filters with `and`, `or`, `not` and parentheses (`or` binds loosest,
+then `and`, then `not`); comparisons do not chain. A comparison with a null
+operand is null and a filter keeps only true rows, so `not ($p.age > 30)`
+skips null ages; add `or $p.age is null` to keep them. GQ has no `null`
+literal: `$p.x = null` is a parse error. On a list property, `contains` tests
+membership (`$p.tags contains "rust"`).
+
+Both String predicates are exact and case-sensitive: `contains` matches a
+substring and `starts_with` matches a prefix. They remain correct without an
+index; a free-text String index does not accelerate these exact predicates.
+
+`$m.number in $numbers` keeps the rows whose value is a member of a list
+parameter or literal, one query instead of one per candidate; the right side
+must be a list of the value's type.
+
+```gq
+match {
+    $p: Person
+    $p.age > 30
+    $p.name contains "Al"
+    $p.name starts_with "A"
+}
+```
+
+## Mutations
+
+> **No top-level `mutation { ... }` wrapper.** Agents trained on GraphQL reflexively write `mutation { insert T { ... } }` — that fails the parser at character 1 with `parse error: expected query_file`. Every executable block in a `.gq` file is a named `query`; the body's verb (`insert` / `update` / `delete`) determines whether it's a write. Dispatch via `omnigraph mutate` (not `query`).
+
+### Insert
+
+```gq
+query add_signal($slug: String, $name: String, $brief: String,
+                 $stagingTimestamp: DateTime, $createdAt: DateTime, $updatedAt: DateTime) {
+    insert Signal {
+        slug: $slug,
+        name: $name,
+        brief: $brief,
+        stagingTimestamp: $stagingTimestamp,
+        createdAt: $createdAt,
+        updatedAt: $updatedAt
+    }
+}
+```
+
+**Every non-nullable property must be provided.** Lint normally catches missing
+ones as:
+
+```
+type error: T12: insert for `Signal` must provide non-nullable property `brief`
+```
+
+For an `@embed` target the message ends ``… property `embedding` or @embed source `text` ``.
+
+Lint permits omission of a non-null Vector target annotated with
+`@embed(source)` when its source is supplied, but mutation execution does not
+auto-embed and still rejects the missing vector. Supply that target explicitly;
+use the offline embedding pipeline for generated values. A nullable target may
+remain null even when its source is present.
+
+### Insert edge
+
+```gq
+query link_signal_forms_pattern($signal: String, $pattern: String) {
+    insert FormsPattern { from: $signal, to: $pattern }
+}
+```
+
+A propertyless edge needs only `from` and `to`, which are logical endpoint IDs.
+GQ has no nested `data {}` block. These assignments are distinct from the
+endpoint meta-fields used in filters: `delete FormsPattern where @src = $signal`.
+
+### Update
+
+```gq
+query retitle_signal($slug: String, $new_title: String) {
+    update Signal set { name: $new_title } where slug = $slug
+}
+```
+
+An `update` cannot assign a `@key` property (refused when it runs, not by
+`lint`): delete and re-insert instead. A null assigned to a non-nullable
+property is refused before any row is matched.
+
+### Delete
+
+```gq
+query remove_signal($slug: String) {
+    delete Signal where slug = $slug
+}
+```
+
+### Multi-statement
+
+```gq
+query add_and_link($slug: String, $pattern: String, $createdAt: DateTime, $updatedAt: DateTime) {
+    insert Signal { slug: $slug, name: $slug, brief: $slug,
+                    stagingTimestamp: $createdAt, createdAt: $createdAt, updatedAt: $updatedAt }
+    insert FormsPattern { from: $slug, to: $pattern }
+}
+```
+
+There is no `upsert` keyword: `insert` on a node or edge with `@key` upserts
+the derived identity. Without a key, `insert` is strict; inserting an unkeyed
+edge twice creates two edges. Use `load --mode merge` for bulk upsert. Edge
+`update` is unsupported; reinsert a keyed edge to change non-key properties,
+or delete and reinsert an unkeyed edge.
+
+> **Insert/update-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`update` in the same query is refused when the mutation executes, before any effect — `lint` does not catch it. The split is deliberate: one mutation query is constructive XOR destructive. Split a delete-then-insert into two separate mutations.
+
+A mutation `where` may compare at most four properties more than once each with `=`, `!=` or `in` (for example `s in ["a"] or s in ["b"]` compares `s` twice). One that compares more is refused before any effect; split the condition across statements or simplify it.
+
+### Date and DateTime values
+
+Prefer ISO strings on both paths:
+
+| Path | Date | DateTime |
+|---|---|---|
+| `mutate --params` | ISO string `"2026-04-29"` | ISO string `"2026-04-29T10:00:00Z"` |
+| `load` JSONL | ISO string `"2026-04-29"` (integer epoch days also accepted) | ISO string `"2026-04-29T10:00:00Z"` (integer epoch milliseconds also accepted) |
+
+Integer epoch days remain useful for generated Arrow-oriented input, but are
+not required for hand-authored JSONL. A `Date` string must name a calendar day;
+a string containing a time of day is refused, even at midnight. Use `DateTime`
+for an instant. A `DateTime` holds milliseconds: a string with a non-zero digit
+past the third fractional digit (`"2026-04-29T10:00:00.123456Z"`) is refused on
+both paths and in `datetime(...)` literals; trailing zeros (`.123000`) are
+accepted. Loads refuse floats, booleans, and objects for either date
+type, and refuse counts outside the JSON writer's supported calendar range.

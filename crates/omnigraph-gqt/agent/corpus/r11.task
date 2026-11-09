@@ -1,0 +1,39 @@
+--- task
+id: r11
+dataset: reading
+kind: delete nodes selected by an anti-join
+answer: fewest
+composition: a write fed by a read: edition 2's `delete … where` cannot see an anti-join, so the client reads the slugs and deletes by key
+
+--- intent
+Delete the documents that nobody knows.
+
+--- edition2
+query unknown_docs() {
+  match { $d: Doc  not { $p knows $d } }
+  return { $d.slug }
+}
+
+--- edition2 bind ids=1:d.slug
+query drop_docs($ids: [String]) {
+  delete Doc where slug in $ids
+}
+
+--- edition3
+query drop_unknown() {
+  $d: Doc
+  not { $p knows $d }
+  delete $d
+}
+
+--- check
+query check() {
+  match { $d: Doc }
+  return { $d.slug }
+}
+
+--- expect unordered
+columns: ["d.slug"]
+["d0"]
+["d1"]
+["d2"]

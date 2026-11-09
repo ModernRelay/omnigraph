@@ -12,6 +12,12 @@ selects an engine.
 The format contract and future extensions live in
 [RFC 0045](../../docs/rfcs/0045-gq-logic-tests.md).
 
+`agent/` beside the corpus is the GQ agent instrument: tasks, ground truths
+and reference cards that measure how well a headless agent writes GQ in each
+edition, judged by this package's `omnigraph-gqt-agent` binary. It is not part
+of the corpus run; [its README](agent/README.md) says what it measures and
+how to run it.
+
 ## Slow cases
 
 A case too slow for the complete corpus lives under `cases_slow/`, beside

@@ -1,0 +1,31 @@
+--- task
+id: r06
+dataset: reading
+kind: insert an edge
+answer: fewest
+
+--- intent
+Record that `$who` knows the document `$doc`.
+
+--- params
+{"who": "p3", "doc": "d4"}
+
+--- edition2
+query learn($who: String, $doc: String) {
+  insert Knows { from: $who, to: $doc }
+}
+
+--- edition3
+query learn($who: String, $doc: String) {
+  insert Knows { from: $who, to: $doc }
+}
+
+--- check
+query check($who: String) {
+  match { $p: Person { name: $who }  $p knows $d }
+  return { $d.slug }
+}
+
+--- expect unordered
+columns: ["d.slug"]
+["d4"]

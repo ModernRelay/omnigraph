@@ -1,0 +1,26 @@
+--- task
+id: t01
+dataset: section8
+kind: key lookup
+
+--- intent
+Show the name and city of the person whose handle is `$h`.
+
+--- params
+{"h": "alice"}
+
+--- edition2
+query person($h: String) {
+  match { $p: Person { handle: $h } }
+  return { $p.name, $p.city }
+}
+
+--- edition3
+query person($h: String) {
+  match { $p: Person { handle: $h } }
+  return { $p.name, $p.city }
+}
+
+--- expect unordered
+columns: ["p.name","p.city"]
+["Alice","Berlin"]

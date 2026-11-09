@@ -1,0 +1,23 @@
+--- task
+id: t31
+dataset: section8
+kind: declared recall
+
+--- intent
+Find the 20 documents nearest to the vector `$q`, accepting 90% recall in exchange for speed; return titles and distances.
+
+--- params
+{"q": [1.0, 0.0, 0.0]}
+
+--- edition3
+query similar_fast($q: Vector(3)) {
+  match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20, recall: 0.9) }
+  return { $d.title, $distance }
+}
+
+--- edition3
+query similar_fast($q: Vector(3)) {
+  match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20, recall: 0.9) }
+  return { $d.title, $distance }
+  order { $distance }
+}

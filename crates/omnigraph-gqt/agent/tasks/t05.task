@@ -1,0 +1,25 @@
+--- task
+id: t05
+dataset: section8
+kind: membership in a list property
+
+--- intent
+List the titles of documents tagged "rust".
+
+--- edition2
+query tagged() {
+  match { $d: Doc  $d.tags contains "rust" }
+  return { $d.title }
+}
+
+--- edition3
+query tagged() {
+  match { $d: Doc  "rust" in $d.tags }
+  return { $d.title }
+}
+
+--- expect unordered
+columns: ["d.title"]
+["The graph primer"]
+["Rust in production"]
+["The search engine"]

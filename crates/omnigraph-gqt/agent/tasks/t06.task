@@ -1,0 +1,23 @@
+--- task
+id: t06
+dataset: section8
+kind: null test
+
+--- intent
+List the names of people whose city is not recorded.
+
+--- edition2
+query homeless() {
+  match { $p: Person  $p.city is null }
+  return { $p.name }
+}
+
+--- edition3
+query homeless() {
+  match { $p: Person  $p.city is null }
+  return { $p.name }
+}
+
+--- expect unordered
+columns: ["p.name"]
+["Carol"]

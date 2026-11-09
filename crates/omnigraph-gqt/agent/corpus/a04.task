@@ -1,0 +1,35 @@
+--- task
+id: a04
+dataset: attribution
+kind: insert a node and its edges
+answer: fewest
+
+--- intent
+Record a new `star` touchpoint `$slug` with weight `$weight` on the source `$source`, made by the identity `$identity`.
+
+--- params
+{"slug": "t12", "weight": 5, "source": "s3", "identity": "x2"}
+
+--- edition2
+query record_star($slug: String, $weight: I64, $source: String, $identity: String) {
+  insert Touchpoint { slug: $slug, action: "star", weight: $weight }
+  insert TouchpointOnSource { from: $slug, to: $source }
+  insert TouchpointByIdentity { from: $slug, to: $identity }
+}
+
+--- edition3
+query record_star($slug: String, $weight: I64, $source: String, $identity: String) {
+  insert Touchpoint { slug: $slug, action: "star", weight: $weight }
+  insert TouchpointOnSource { from: $slug, to: $source }
+  insert TouchpointByIdentity { from: $slug, to: $identity }
+}
+
+--- check
+query check($slug: String) {
+  match { $t: Touchpoint { slug: $slug }  $t touchpointOnSource $s  $t touchpointByIdentity $x }
+  return { $t.action, $t.weight, $s.slug, $x.slug }
+}
+
+--- expect unordered
+columns: ["t.action","t.weight","s.slug","x.slug"]
+["star",5,"s3","x2"]

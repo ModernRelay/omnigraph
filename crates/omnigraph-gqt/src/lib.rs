@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod agent;
 mod concurrent;
 mod discovery;
 mod dst_runner;

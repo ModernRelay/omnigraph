@@ -1,0 +1,11 @@
+node Channel { slug: String @key }
+node Source { slug: String @key }
+node Touchpoint {
+    slug: String @key
+    action: String
+    weight: I64?
+}
+node ExternalID { slug: String @key }
+edge ChannelWatchesSource: Channel -> Source
+edge TouchpointOnSource: Touchpoint -> Source { via: String? }
+edge TouchpointByIdentity: Touchpoint -> ExternalID

@@ -1,0 +1,43 @@
+--- task
+id: s06
+dataset: social
+kind: delete edges selected through a neighbour's property
+answer: fewest
+composition: a write fed by a read: edition 2's `delete … where` reads only the edge's own row, so the long comments come back first and the client passes their slugs on
+
+--- intent
+Remove the likes that `$who` gave to comments longer than `$min_length` characters.
+
+--- params
+{"who": "ann", "min_length": 15}
+
+--- edition2
+query long_comments($min_length: I64) {
+  match { $c: Comment  $c.length > $min_length }
+  return { $c.slug }
+}
+
+--- edition2 bind long=1:c.slug
+query unlike($who: String, $long: [String]) {
+  delete LikesComment where @src = $who and @dst in $long
+}
+
+--- edition3
+query unlike_long($who: String, $min_length: I64) {
+  $p: Person { slug: $who }
+  $p $k:likesComment $c
+  $c.length > $min_length
+  delete $k
+}
+
+--- check
+query check() {
+  match { $p: Person  $p likesComment $c }
+  return { $p.slug, $c.slug }
+}
+
+--- expect unordered
+columns: ["p.slug","c.slug"]
+["ann","c1"]
+["bob","c1"]
+["cyd","c2"]

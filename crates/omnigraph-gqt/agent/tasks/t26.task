@@ -1,0 +1,21 @@
+--- task
+id: t26
+dataset: section8
+kind: every document within a distance
+
+--- intent
+List the titles and distances of documents from 2025 or later whose vector is within distance `$r` of `$q`, closest first, at most 10.
+
+--- params
+{"q": [1.0, 0.0, 0.0], "r": 0.5}
+
+--- edition3
+query within_radius($q: Vector(3), $r: F32) {
+  match {
+    from distance({ match { $d: Doc  $d.year >= 2025 } return { $d } }, $d.embedding, $q)
+    $distance <= $r
+  }
+  return { $d.title, $distance }
+  order { $distance }
+  limit 10
+}

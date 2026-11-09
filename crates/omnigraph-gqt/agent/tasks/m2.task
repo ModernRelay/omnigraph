@@ -1,0 +1,15 @@
+--- task
+id: m2
+dataset: section8
+kind: count block compared with another binding's value
+answer: fewest
+composition: a group-specific threshold
+
+--- intent
+List the slugs of the collections that hold at least as many documents as their own `min_docs` value.
+
+--- edition3
+query full_collections() {
+  match { $x: Collection  count { $d "in" $x } >= $x.min_docs }
+  return { $x.slug }
+}

@@ -1,0 +1,43 @@
+--- task
+id: m4
+dataset: section8
+kind: reuse of a declared read with arguments
+answer: fewest
+composition: reuse with parameters
+
+--- intent
+Define a query `colleagues($of)` that returns the people working at the same company as the person with handle `$of`, and a query `colleagues_of_colleagues($of)` that reuses it to list the distinct names of the colleagues of those colleagues.
+
+--- params
+{"of": "alice"}
+
+--- edition3
+query colleagues($of: String) {
+  match { $p: Person { handle: $of }  $p worksAt $c  $q worksAt $c  $q != $p }
+  return { $q }
+}
+
+query colleagues_of_colleagues($of: String) {
+  match {
+    from { match { from colleagues($of) } return { $q.handle as h } }
+    from colleagues($h)
+  }
+  return distinct { $q.name }
+}
+
+--- edition3
+query colleagues($of: String) {
+  match { $p: Person { handle: $of }  $p worksAt $c  $q worksAt $c  $q != $p }
+  return { $q }
+}
+
+query colleagues_of_colleagues($of: String) {
+  match {
+    from { match { from colleagues($of) } return { $q as c } }
+    from { match { from colleagues($c.handle) } return { $q as r } }
+  }
+  return distinct { $r.name }
+}
+
+--- note
+The first truth calls the helper once through a wrapper whose `return` renames its column, then calls it again; the second wraps both calls, as the RFC's section 3 describes both.

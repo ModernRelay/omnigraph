@@ -1,0 +1,29 @@
+--- task
+id: t15
+dataset: section8
+kind: count per group
+
+--- intent
+For each company that has employees, return its name and its number of employees as `n`, largest first.
+
+--- edition2
+query headcount() {
+  match { $c: Company  $p worksAt $c }
+  return { $c.name, count($p) as n }
+  order { n desc }
+}
+
+--- edition3
+query headcount() {
+  match { $c: Company  $p worksAt $c }
+  return { $c.name, count($p) as n }
+  order { n desc }
+}
+
+--- expect ordered
+columns: ["c.name","n"]
+["Acme",3]
+["Globex",1]
+
+--- note
+Grouping drops a company with no employees; the intent names only companies that have employees, so the grouped form and the count-block form differ on no row the task asks for.

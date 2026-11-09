@@ -1,0 +1,22 @@
+--- task
+id: t36
+dataset: section8
+kind: write whose targets come from a ranked read
+
+--- intent
+Tag the 20 documents nearest to the vector `$q` with the single tag "near", replacing their existing tags.
+
+--- params
+{"q": [1.0, 0.0, 0.0]}
+
+--- edition3
+query tag_near($q: Vector(3)) {
+  from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20)
+  update $d set { tags: ["near"] }
+}
+
+--- check
+query check() {
+  match { $d: Doc }
+  return { $d.id, $d.tags }
+}

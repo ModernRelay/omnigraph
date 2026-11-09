@@ -1,0 +1,20 @@
+--- task
+id: t07
+dataset: section8
+kind: interface binding
+
+--- intent
+List the name of everything that has a name, people and companies alike, in one result.
+
+--- edition3
+query names() {
+  match {
+    from union(
+      { match { $p: Person } return { $p.name as name } },
+      { match { $c: Company } return { $c.name as name } })
+  }
+  return { $name }
+}
+
+--- note
+Both editions refuse an interface as a node type (`T1`): edition 2 today, and edition 3 until stage Poly adds the polymorphic `Scan` (the RFC's before-and-after corpus, "Interface binding"). The edition-3 answer is the `union` of the implementors; edition 2 has none in one query.

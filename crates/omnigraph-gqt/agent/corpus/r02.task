@@ -1,0 +1,41 @@
+--- task
+id: r02
+dataset: reading
+kind: a vector window, then a traversal from the hits
+answer: fewest
+composition: search followed by a graph operation: in edition 2 a traversal in the ranked read changes the population the window is cut from, so the hits come back first
+
+--- intent
+Find the 2 documents nearest to the vector `$v`, then list the documents each of them cites: return the document's slug and the cited document's slug.
+
+--- params
+{"v": [1.2, 0.0]}
+
+--- edition2
+query nearest_two($v: Vector(2)) {
+  match { $d: Doc }
+  return { $d.slug }
+  order { nearest($d.embedding, $v) }
+  limit 2
+}
+
+--- edition2 bind hits=1:d.slug
+query cited_by($hits: [String]) {
+  match { $d: Doc  $d.slug in $hits  $d cites $o }
+  return { $d.slug, $o.slug }
+}
+
+--- edition3
+query nearest_citations($v: Vector(2)) {
+  match {
+    from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2)
+    $d cites $o
+  }
+  return { $d.slug, $o.slug }
+}
+
+--- expect unordered
+columns: ["d.slug","o.slug"]
+["d1","d3"]
+["d1","d4"]
+["d2","d3"]

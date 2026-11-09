@@ -1,0 +1,32 @@
+--- task
+id: s05
+dataset: social
+kind: insert an edge
+answer: fewest
+
+--- intent
+Record that `$who` liked the comment `$comment`.
+
+--- params
+{"who": "raf", "comment": "c3"}
+
+--- edition2
+query like($who: String, $comment: String) {
+  insert LikesComment { from: $who, to: $comment }
+}
+
+--- edition3
+query like($who: String, $comment: String) {
+  insert LikesComment { from: $who, to: $comment }
+}
+
+--- check
+query check($comment: String) {
+  match { $c: Comment { slug: $comment }  $p likesComment $c }
+  return { $p.slug }
+}
+
+--- expect unordered
+columns: ["p.slug"]
+["ann"]
+["raf"]

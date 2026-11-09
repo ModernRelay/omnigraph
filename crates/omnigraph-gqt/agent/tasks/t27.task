@@ -1,0 +1,32 @@
+--- task
+id: t27
+dataset: section8
+kind: lexical ranking
+
+--- intent
+Rank documents by the BM25 relevance of their body to the text `$q`; return the top 10 titles with the score as `s`.
+
+--- params
+{"q": "graph databases"}
+
+--- edition2
+query about($q: String) {
+  match { $d: Doc }
+  return { $d.title, bm25($d.body, $q) as s }
+  order { bm25($d.body, $q) desc }
+  limit 10
+}
+
+--- edition3
+query about($q: String) {
+  match { from bm25({ match { $d: Doc } return { $d } }, $d.body, $q) }
+  return { $d.title, $score as s }
+  order { $score desc }
+  limit 10
+}
+
+--- expect ordered
+columns: ["d.title","s"]
+["The graph primer",2.0232522]
+["Rust in production",1.0116261]
+["The graph of cities",0.9156194]

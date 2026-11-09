@@ -1,0 +1,41 @@
+--- task
+id: t25
+dataset: section8
+kind: nearest with the distance returned
+
+--- intent
+Find the 20 documents most similar to the vector `$q`; return each title and its distance as `s`.
+
+--- params
+{"q": [1.0, 0.0, 0.0]}
+
+--- edition2
+query similar_scored($q: Vector(3)) {
+  match { $d: Doc }
+  return { $d.title, nearest($d.embedding, $q) as s }
+  order { nearest($d.embedding, $q) }
+  limit 20
+}
+
+--- edition3
+query similar_scored($q: Vector(3)) {
+  match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) }
+  return { $d.title, $distance as s }
+  order { $distance }
+}
+
+--- edition3
+query similar_scored($q: Vector(3)) {
+  match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) }
+  return { $d.title, $distance as s }
+  order { $distance }
+  limit 20
+}
+
+--- expect ordered
+columns: ["d.title","s"]
+["The graph primer",0.0]
+["Vector search notes",0.020000005]
+["Rust in production",0.32]
+["The search engine",1.81]
+["The graph of cities",2.0]

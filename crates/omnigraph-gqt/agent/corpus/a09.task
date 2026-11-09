@@ -1,0 +1,50 @@
+--- task
+id: a09
+dataset: attribution
+kind: update nodes selected through a neighbour
+answer: fewest
+composition: a write fed by a read: edition 2's `update … where` reads only the touchpoint's own row, so the client passes the slugs on
+
+--- intent
+Set the weight of every touchpoint on the source `$source` to `$weight`.
+
+--- params
+{"source": "s2", "weight": 7}
+
+--- edition2
+query on_source($source: String) {
+  match { $s: Source { slug: $source }  $t touchpointOnSource $s }
+  return { $t.slug }
+}
+
+--- edition2 bind ids=1:t.slug
+query reweigh($ids: [String], $weight: I64) {
+  update Touchpoint set { weight: $weight } where slug in $ids
+}
+
+--- edition3
+query reweigh($source: String, $weight: I64) {
+  $s: Source { slug: $source }
+  $t touchpointOnSource $s
+  update $t set { weight: $weight }
+}
+
+--- check
+query check() {
+  match { $t: Touchpoint }
+  return { $t.slug, $t.weight }
+}
+
+--- expect unordered
+columns: ["t.slug","t.weight"]
+["t1",1]
+["t2",3]
+["t3",1]
+["t6",2]
+["t7",4]
+["t8",1]
+["t9",1]
+["t10",10]
+["t11",9]
+["t4",7]
+["t5",7]

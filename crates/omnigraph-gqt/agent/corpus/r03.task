@@ -1,0 +1,42 @@
+--- task
+id: r03
+dataset: reading
+kind: a vector window over a traversal's population
+answer: fewest
+
+--- intent
+Among the documents that `$who` knows, which one is nearest to the vector `$v`? Return its slug.
+
+--- params
+{"who": "p1", "v": [3.0, 0.0]}
+
+--- edition2
+query nearest_known($who: String, $v: Vector(2)) {
+  match { $p: Person { name: $who }  $p knows $d }
+  return { $d.slug }
+  order { nearest($d.embedding, $v) }
+  limit 1
+}
+
+--- edition3
+query nearest_known($who: String, $v: Vector(2)) {
+  match { from nearest({ match { $p: Person { name: $who }  $p knows $d } return { $d } }, $d.embedding, $v, k: 1) }
+  return { $d.slug }
+}
+
+--- edition3
+query nearest_known($who: String, $v: Vector(2)) {
+  match { from nearest({ match { $p: Person { name: $who }  $p knows $d } return { $d } }, $d.embedding, $v, k: 1) }
+  return { $d.slug }
+  order { $distance }
+}
+
+--- edition3
+query nearest_known($who: String, $v: Vector(2)) {
+  match { from nearest({ match { $p: Person { name: $who }  $p knows $d } return { $p, $d } }, $d.embedding, $v, k: 1) }
+  return { $d.slug }
+}
+
+--- expect unordered
+columns: ["d.slug"]
+["d2"]

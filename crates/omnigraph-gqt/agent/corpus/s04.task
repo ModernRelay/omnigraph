@@ -1,0 +1,38 @@
+--- task
+id: s04
+dataset: social
+kind: count with zero for an empty group
+answer: fewest
+combine: concat
+composition: count plus projection: a grouped count in edition 2 drops the people who liked nothing, so a second query returns them with 0
+
+--- intent
+List every person's slug with the number of comments they have liked as `liked`, including people who have liked none, with 0.
+
+--- edition2
+query likers() {
+  match { $p: Person  $p likesComment $c }
+  return { $p.slug, count($c) as liked }
+}
+
+--- edition2
+query non_likers() {
+  match { $p: Person  not { $p likesComment $c } }
+  return { $p.slug, 0 as liked }
+}
+
+--- edition3
+query likes_given() {
+  match {
+    $p: Person
+    let $liked = count { $p likesComment $c }
+  }
+  return { $p.slug, $liked }
+}
+
+--- expect unordered
+columns: ["p.slug","liked"]
+["ann",3]
+["bob",1]
+["cyd",1]
+["raf",0]

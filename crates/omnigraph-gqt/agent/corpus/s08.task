@@ -1,0 +1,46 @@
+--- task
+id: s08
+dataset: social
+kind: filter on a count
+answer: fewest
+
+--- intent
+List the comments with at least `$min` likes, with their number of likes as `likes`.
+
+--- params
+{"min": 2}
+
+--- edition2
+query popular($min: I64) {
+  match { $c: Comment  count { $q likesComment $c } >= $min  $p likesComment $c }
+  return { $c.slug, count($p) as likes }
+}
+
+--- edition3
+query popular($min: I64) {
+  match {
+    from { match { $p likesComment $c } return { $c, count($p) as likes } }
+    $likes >= $min
+  }
+  return { $c.slug, $likes }
+}
+
+--- edition3
+query popular($min: I64) {
+  match {
+    from { match { $c: Comment  $p likesComment $c } return { $c, count($p) as likes } }
+    $likes >= $min
+  }
+  return { $c.slug, $likes }
+}
+
+--- edition3
+query popular($min: I64) {
+  match { $c: Comment  count { $q likesComment $c } >= $min  $p likesComment $c }
+  return { $c.slug, count($p) as likes }
+}
+
+--- expect unordered
+columns: ["c.slug","likes"]
+["c1",2]
+["c2",2]

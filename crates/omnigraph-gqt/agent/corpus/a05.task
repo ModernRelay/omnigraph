@@ -1,0 +1,43 @@
+--- task
+id: a05
+dataset: attribution
+kind: delete nodes selected by an anti-join
+answer: fewest
+composition: a write fed by a read: the touchpoints to delete are known only through their source's neighbours, so edition 2 reads their slugs and deletes by key
+
+--- intent
+Delete every touchpoint that landed on a source no channel watches.
+
+--- edition2
+query unwatched() {
+  match { $t: Touchpoint  $t touchpointOnSource $s  not { $c channelWatchesSource $s } }
+  return { $t.slug }
+}
+
+--- edition2 bind ids=1:t.slug
+query drop_unwatched($ids: [String]) {
+  delete Touchpoint where slug in $ids
+}
+
+--- edition3
+query drop_unwatched() {
+  $t: Touchpoint
+  $t touchpointOnSource $s
+  not { $c channelWatchesSource $s }
+  delete $t
+}
+
+--- check
+query check() {
+  match { $t: Touchpoint }
+  return { $t.slug }
+}
+
+--- expect unordered
+columns: ["t.slug"]
+["t1"]
+["t3"]
+["t4"]
+["t5"]
+["t8"]
+["t10"]

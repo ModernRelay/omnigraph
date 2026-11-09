@@ -1,0 +1,19 @@
+--- task
+id: m1
+dataset: section8
+kind: block as a value (count plus projection)
+answer: fewest
+composition: count plus projection
+
+--- intent
+For every person, return their name and how many people they know as `degree` (zero for people who know nobody), most connected first.
+
+--- edition3
+query degrees() {
+  match {
+    $p: Person
+    let $degree = count { $p knows $q }
+  }
+  return { $p.name, $degree }
+  order { $degree desc }
+}

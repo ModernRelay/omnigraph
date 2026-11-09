@@ -1,0 +1,29 @@
+--- task
+id: t37
+dataset: section8
+kind: unattached branch snapshot
+
+--- intent
+Create a person with handle `$h` (name also `$h`) as an unattached branch snapshot instead of writing to the branch.
+
+--- params
+{"h": "ivy"}
+
+--- edition2
+query propose($h: String) as unattached branch {
+  insert Person { handle: $h, name: $h }
+}
+
+--- edition3
+query propose($h: String) as unattached branch {
+  insert Person { handle: $h, name: $h }
+}
+
+--- check
+query check($h: String) {
+  match { $p: Person { handle: $h } }
+  return { $p.name }
+}
+
+--- expect unordered
+columns: ["p.name"]

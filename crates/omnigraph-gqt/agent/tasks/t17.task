@@ -1,0 +1,16 @@
+--- task
+id: t17
+dataset: section8
+kind: aggregate of an aggregate
+
+--- intent
+Across the companies that have employees, what is the average number of employees per company and the largest? Return them as `mean` and `largest`.
+
+--- edition3
+query average_headcount() {
+  match { from { match { $c: Company  $p worksAt $c } return { $c, count($p) as n } } }
+  return { avg($n) as mean, max($n) as largest }
+}
+
+--- note
+As `t15`: the companies without employees are outside the question.

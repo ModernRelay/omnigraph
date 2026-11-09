@@ -1,0 +1,40 @@
+--- task
+id: t33
+dataset: section8
+kind: delete by predicate
+
+--- intent
+Remove every employment link of the person with handle `$h`.
+
+--- params
+{"h": "alice"}
+
+--- edition2
+query retire($h: String) {
+  delete WorksAt where @src = $h
+}
+
+--- edition3
+query retire($h: String) {
+  $p: Person { handle: $h }
+  $p $k:worksAt $c
+  delete $k
+}
+
+--- edition3
+query retire($h: String) {
+  $x: WorksAt  $x.@src = $h
+  delete $x
+}
+
+--- check
+query check() {
+  match { $p: Person  $p worksAt $c }
+  return { $p.handle, $c.slug }
+}
+
+--- expect unordered
+columns: ["p.handle","c.slug"]
+["bob","acme"]
+["dave","acme"]
+["erin","globex"]

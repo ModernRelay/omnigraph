@@ -1,0 +1,41 @@
+--- task
+id: t34
+dataset: section8
+kind: write whose targets come from a traversal
+
+--- intent
+Close a company: delete the employment links of everyone who works at the company with slug `$slug`.
+
+--- params
+{"slug": "acme"}
+
+--- edition2
+query close_company($slug: String) {
+  delete WorksAt where @dst = $slug
+}
+
+--- edition3
+query close_company($slug: String) {
+  $c: Company { slug: $slug }
+  $p $k:worksAt $c
+  delete $k
+}
+
+--- edition3
+query close_company($slug: String) {
+  $x: WorksAt  $x.@dst = $slug
+  delete $x
+}
+
+--- check
+query check() {
+  match { $p: Person  $p worksAt $c }
+  return { $p.handle, $c.slug }
+}
+
+--- expect unordered
+columns: ["p.handle","c.slug"]
+["erin","globex"]
+
+--- note
+The asset marks this kind 'Not supported' in edition 2, but `delete WorksAt where @dst = $slug` expresses it: the company's key is the edge's destination id.

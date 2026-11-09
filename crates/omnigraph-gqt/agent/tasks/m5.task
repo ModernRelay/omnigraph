@@ -1,0 +1,22 @@
+--- task
+id: m5
+dataset: section8
+kind: a window over documents, then a traversal from the hits
+answer: fewest
+composition: search followed by a graph operation
+
+--- intent
+Find the 10 documents most similar to the vector `$q` and, for each, return its title, its distance and how many documents it cites as `cites` (zero when it cites none).
+
+--- params
+{"q": [1.0, 0.0, 0.0]}
+
+--- edition3
+query cited_near($q: Vector(3)) {
+  match {
+    from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 10)
+    let $cites = count { $d cites $other }
+  }
+  return { $d.title, $distance, $cites }
+  order { $distance }
+}

@@ -1,0 +1,15 @@
+--- task
+id: t23
+dataset: section8
+kind: parameterised limit with a default
+
+--- intent
+List the names of the `$k` oldest people, where `$k` defaults to 10.
+
+--- edition3
+query top_people($k: I64 = 10) {
+  match { $p: Person }
+  return { $p.name }
+  order { $p.age desc }
+  limit $k
+}

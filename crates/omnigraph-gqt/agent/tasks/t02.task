@@ -1,0 +1,31 @@
+--- task
+id: t02
+dataset: section8
+kind: comparison filter
+
+--- intent
+List the names of people aged at least `$min`, oldest first.
+
+--- params
+{"min": 40}
+
+--- edition2
+query adults($min: I32) {
+  match { $p: Person  $p.age >= $min }
+  return { $p.name }
+  order { $p.age desc }
+}
+
+--- edition3
+query adults($min: I32) {
+  match { $p: Person  $p.age >= $min }
+  return { $p.name }
+  order { $p.age desc }
+}
+
+--- expect ordered
+columns: ["p.name"]
+["Bob"]
+["Frank"]
+["Gina"]
+["Erin"]

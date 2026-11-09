@@ -1,0 +1,16 @@
+--- task
+id: t22
+dataset: section8
+kind: correlated subquery per group
+
+--- intent
+For each person, list the titles and years of their three most recent documents.
+
+--- edition3
+query latest_per_author() {
+  match {
+    $p: Person
+    from { match { $p authored $d } return { $d } order { $d.year desc } limit 3 }
+  }
+  return { $p.name, $d.title, $d.year }
+}

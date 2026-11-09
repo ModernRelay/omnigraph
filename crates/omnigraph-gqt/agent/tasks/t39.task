@@ -1,0 +1,27 @@
+--- task
+id: t39
+dataset: section8
+kind: annotations on a declaration
+
+--- intent
+Write a stored query returning the names of people older than `$cutoff`, with the description "People over a given age" and the instruction "Pass the age as an integer".
+
+--- params
+{"cutoff": 60}
+
+--- edition2
+query people_over($cutoff: I32) @description("People over a given age") @instruction("Pass the age as an integer") {
+  match { $p: Person  $p.age > $cutoff }
+  return { $p.name }
+}
+
+--- edition3
+query people_over($cutoff: I32) @description("People over a given age") @instruction("Pass the age as an integer") {
+  match { $p: Person  $p.age > $cutoff }
+  return { $p.name }
+}
+
+--- expect unordered
+columns: ["p.name"]
+["Bob"]
+["Frank"]

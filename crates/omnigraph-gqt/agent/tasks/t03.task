@@ -1,0 +1,24 @@
+--- task
+id: t03
+dataset: section8
+kind: string predicate
+
+--- intent
+Find the titles of documents whose title contains "graph" and starts with "The".
+
+--- edition2
+query titled() {
+  match { $d: Doc  $d.title contains "graph"  $d.title starts_with "The" }
+  return { $d.title }
+}
+
+--- edition3
+query titled() {
+  match { $d: Doc  contains($d.title, "graph")  starts_with($d.title, "The") }
+  return { $d.title }
+}
+
+--- expect unordered
+columns: ["d.title"]
+["The graph primer"]
+["The graph of cities"]

@@ -1,0 +1,24 @@
+--- task
+id: s03
+dataset: social
+kind: two aggregates over one traversal
+answer: fewest
+
+--- intent
+For each comment author, return their slug, how many of their comments someone liked as `liked_comments`, and how many likes their comments received in total as `likes`.
+
+--- edition2
+query author_engagement() {
+  match { $c: Comment  $c commentHasCreator $a  $p likesComment $c }
+  return { $a.slug, count(distinct $c) as liked_comments, count($p) as likes }
+}
+
+--- edition3
+query author_engagement() {
+  match { $c: Comment  $c commentHasCreator $a  $p likesComment $c }
+  return { $a.slug, count(distinct $c) as liked_comments, count($p) as likes }
+}
+
+--- expect unordered
+columns: ["a.slug","liked_comments","likes"]
+["raf",3,5]

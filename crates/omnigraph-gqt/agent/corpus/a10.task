@@ -1,0 +1,25 @@
+--- task
+id: a10
+dataset: attribution
+kind: count per value of a property
+answer: fewest
+
+--- intent
+How many touchpoints are there of each action? Return the action and the count as `n`.
+
+--- edition2
+query per_action() {
+  match { $t: Touchpoint }
+  return { $t.action, count($t) as n }
+}
+
+--- edition3
+query per_action() {
+  match { $t: Touchpoint }
+  return { $t.action, count($t) as n }
+}
+
+--- expect unordered
+columns: ["t.action","n"]
+["star",8]
+["fork",3]

@@ -1,0 +1,35 @@
+--- task
+id: t28
+dataset: section8
+kind: lexical filter without a score
+
+--- intent
+List the titles of documents whose body matches the search text `$s` and also matches the text `$q` allowing up to 2 typos.
+
+--- params
+{"s": "search", "q": "rankng"}
+
+--- edition2
+query mentions($s: String, $q: String) {
+  match { $d: Doc  search($d.body, $s)  fuzzy($d.body, $q, 2) }
+  return { $d.title }
+}
+
+--- edition3
+query mentions($s: String, $q: String) {
+  match { $d: Doc  search($d.body, $s)  fuzzy($d.body, $q, max_edits: 2) }
+  return { $d.title }
+}
+
+--- edition3
+query mentions($s: String, $q: String) {
+  match { $d: Doc  match_terms($d.body, terms($s, mode: any))  match_terms($d.body, terms($q, mode: any, max_edits: 2)) }
+  return { $d.title }
+}
+
+--- expect unordered
+columns: ["d.title"]
+["The search engine"]
+
+--- note
+The asset's `mentions` runs `fuzzy` over `Doc.title`, which its schema does not index (`T27`); the task uses the indexed body.

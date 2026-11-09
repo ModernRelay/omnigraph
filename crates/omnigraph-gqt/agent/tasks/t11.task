@@ -1,0 +1,29 @@
+--- task
+id: t11
+dataset: section8
+kind: either orientation
+
+--- intent
+List the names of the people linked to the person with handle `$h` by a `knows` edge in either direction.
+
+--- params
+{"h": "alice"}
+
+--- edition2
+query around($h: String) {
+  match { $p: Person { handle: $h }  $p <knows> $f }
+  return { $f.name }
+}
+
+--- edition3
+query around($h: String) {
+  match { $p: Person { handle: $h }  $p <knows> $f }
+  return { $f.name }
+}
+
+--- expect unordered
+columns: ["f.name"]
+["Bob"]
+["Dave"]
+["Carol"]
+["Erin"]

@@ -1,0 +1,24 @@
+--- task
+id: t38
+dataset: section8
+kind: the engine catalogue
+
+--- intent
+List the name and inputs of every physical operator the engine has.
+
+--- edition2
+query operators() {
+  match { $o: @Operator }
+  return { $o.name, $o.inputs }
+}
+
+--- edition3
+query operators() {
+  match { $o: @Operator }
+  return { $o.name, $o.inputs }
+}
+
+--- expect unordered live
+
+--- note
+The rows are the engine's operator catalogue, which changes with the engine, so they are compared live against the ground truth's rows instead of being recorded.

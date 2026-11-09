@@ -1,0 +1,29 @@
+--- task
+id: r09
+dataset: reading
+kind: bounded multi-hop
+answer: fewest
+
+--- intent
+Which documents can be reached from the document `$doc` by following at most 2 citations? Return their slugs.
+
+--- params
+{"doc": "d1"}
+
+--- edition2
+query within_two($doc: String) {
+  match { $d: Doc { slug: $doc }  $d cites{1,2} $o }
+  return { $o.slug }
+}
+
+--- edition3
+query within_two($doc: String) {
+  match { $d: Doc { slug: $doc }  $d cites{1,2} $o }
+  return { $o.slug }
+}
+
+--- expect unordered
+columns: ["o.slug"]
+["d3"]
+["d4"]
+["d0"]

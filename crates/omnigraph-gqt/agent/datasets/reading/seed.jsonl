@@ -1,0 +1,15 @@
+{"type":"Person","data":{"name":"p1"}}
+{"type":"Person","data":{"name":"p2"}}
+{"type":"Person","data":{"name":"p3"}}
+{"type":"Doc","data":{"slug":"d0","body":"needle needle needle","embedding":[0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d1","body":"needle","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"d2","body":"filler","embedding":[2.0,0.0]}}
+{"type":"Doc","data":{"slug":"d3","body":"needle needle","embedding":[3.0,0.0]}}
+{"type":"Doc","data":{"slug":"d4","body":"filler filler","embedding":[4.0,0.0]}}
+{"edge":"Knows","from":"p1","to":"d1"}
+{"edge":"Knows","from":"p1","to":"d2"}
+{"edge":"Knows","from":"p2","to":"d0"}
+{"edge":"Cites","from":"d1","to":"d3"}
+{"edge":"Cites","from":"d2","to":"d3"}
+{"edge":"Cites","from":"d1","to":"d4"}
+{"edge":"Cites","from":"d3","to":"d0"}

@@ -1,0 +1,47 @@
+--- task
+id: r05
+dataset: reading
+kind: hybrid search by fusion
+answer: fewest
+
+--- intent
+Fuse, by reciprocal rank fusion with constant 60, the 3 documents nearest to the vector `$v` and the BM25 ranking of the bodies against the text `$q`; return the 3 best slugs, best first.
+
+--- params
+{"v": [0.0, 0.0], "q": "needle"}
+
+--- edition2
+query hybrid($v: Vector(2), $q: String) {
+  match { $d: Doc }
+  return { $d.slug }
+  order { rrf(nearest($d.embedding, $v), bm25($d.body, $q), 60) }
+  limit 3
+}
+
+--- edition3
+query hybrid($v: Vector(2), $q: String) {
+  match {
+    let $docs = { match { $d: Doc } return { $d } }
+    from rrf(nearest($docs, $d.embedding, $v, k: 3), bm25($docs, $d.body, $q), k: 60)
+  }
+  return { $d.slug }
+  order { $score desc }
+  limit 3
+}
+
+--- edition3
+query hybrid($v: Vector(2), $q: String) {
+  match {
+    let $docs = { match { $d: Doc } return { $d } }
+    from rrf(nearest($docs, $d.embedding, $v, k: 3), bm25($docs, $d.body, $q))
+  }
+  return { $d.slug }
+  order { $score desc }
+  limit 3
+}
+
+--- expect ordered
+columns: ["d.slug"]
+["d0"]
+["d1"]
+["d3"]

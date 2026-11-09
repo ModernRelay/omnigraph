@@ -1,0 +1,54 @@
+--- task
+id: a07
+dataset: attribution
+kind: filter on a sum
+answer: fewest
+
+--- intent
+List the identities whose touchpoints weigh at least `$min` in total, with the total as `total`.
+
+--- params
+{"min": 5}
+
+--- edition2
+query heavy_identities($min: I64) {
+  match {
+    $x: ExternalID
+    sum($u.weight) { $u touchpointByIdentity $x } >= $min
+    $t touchpointByIdentity $x
+  }
+  return { $x.slug, sum($t.weight) as total }
+}
+
+--- edition3
+query heavy_identities($min: I64) {
+  match {
+    from { match { $t touchpointByIdentity $x } return { $x, sum($t.weight) as total } }
+    $total >= $min
+  }
+  return { $x.slug, $total }
+}
+
+--- edition3
+query heavy_identities($min: I64) {
+  match {
+    from { match { $x: ExternalID  $t touchpointByIdentity $x } return { $x, sum($t.weight) as total } }
+    $total >= $min
+  }
+  return { $x.slug, $total }
+}
+
+--- edition3
+query heavy_identities($min: I64) {
+  match {
+    $x: ExternalID
+    sum($u.weight) { $u touchpointByIdentity $x } >= $min
+    $t touchpointByIdentity $x
+  }
+  return { $x.slug, sum($t.weight) as total }
+}
+
+--- expect unordered
+columns: ["x.slug","total"]
+["x3",7.0]
+["x5",19.0]

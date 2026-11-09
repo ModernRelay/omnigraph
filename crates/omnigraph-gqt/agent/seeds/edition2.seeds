@@ -1,0 +1,226 @@
+--- seed
+id: e2-01
+task: t16
+class: a declaration without its parameter list
+code: Q002
+
+--- text
+query distinct_cities {
+  match { $p: Person }
+  return { count(distinct $p.city) as cities }
+}
+
+--- seed
+id: e2-02
+task: t04
+class: single-quoted strings
+code: Q001
+
+--- text
+query in_cities() {
+  match { $p: Person  $p.city in ['Berlin', 'Paris'] }
+  return { $p.name }
+}
+
+--- seed
+id: e2-03
+task: t14
+class: an unknown node type
+code: T1
+
+--- text
+query staff($slug: String) {
+  match { $c: Companies { slug: $slug }  $p worksAt $c }
+  return { $p.name }
+}
+
+--- seed
+id: e2-04
+task: t01
+class: an unknown property
+code: T6
+
+--- text
+query person($h: String) {
+  match { $p: Person { handle: $h } }
+  return { $p.name, $p.town }
+}
+
+--- seed
+id: e2-05
+task: t14
+class: an unknown edge type
+code: T4
+
+--- text
+query staff($slug: String) {
+  match { $c: Company { slug: $slug }  $p employedBy $c }
+  return { $p.name }
+}
+
+--- seed
+id: e2-06
+task: t15
+class: a traversal with no bound end
+code: T5
+
+--- text
+query headcount() {
+  match { $p worksAt $c }
+  return { $c.name, count($p) as n }
+  order { n desc }
+}
+
+--- seed
+id: e2-07
+task: t13
+class: a reserved edge name written bare
+code: T7
+
+--- text
+query in_collection($slug: String) {
+  match { $x: Collection { slug: $slug }  $d in $x }
+  return { $d.title }
+}
+
+--- seed
+id: e2-08
+task: t19
+class: an uncorrelated negation block
+code: T9
+
+--- text
+query uncited_authors() {
+  match {
+    $p: Person
+    exists { $p authored $d }
+    not { $q: Person  $q authored $d2  $other cites $d2 }
+  }
+  return { $p.name }
+}
+
+--- seed
+id: e2-09
+task: t32
+class: an insert without a required property
+code: T12
+
+--- text
+query hire($h: String, $slug: String) {
+  insert Person { handle: $h }
+  insert WorksAt { from: $h, to: $slug }
+}
+
+--- seed
+id: e2-10
+task: t33
+class: an undeclared parameter in a write
+code: T14
+
+--- text
+query retire($h: String) {
+  delete WorksAt where @src = $handle
+}
+
+--- seed
+id: e2-11
+task: t24
+class: nearest ordering without a limit
+code: T17
+
+--- text
+query similar($q: Vector(3)) {
+  match { $d: Doc  $d.year >= 2025 }
+  return { $d.title }
+  order { nearest($d.embedding, $q) }
+}
+
+--- seed
+id: e2-12
+task: t14
+class: an undirected traversal over an edge between two types
+code: T22
+
+--- text
+query staff($slug: String) {
+  match { $c: Company { slug: $slug }  $p <worksAt> $c }
+  return { $p.name }
+}
+
+--- seed
+id: e2-13
+task: t15
+class: two result columns with one name
+code: T25
+
+--- text
+query headcount() {
+  match { $c: Company  $p worksAt $c }
+  return { $c.name as n, count($p) as n }
+  order { n desc }
+}
+
+--- seed
+id: e2-14
+task: t28
+class: a full-text call on an unindexed property
+code: T27
+
+--- text
+query mentions($s: String, $q: String) {
+  match { $d: Doc  search($d.title, $s)  fuzzy($d.body, $q, 2) }
+  return { $d.title }
+}
+
+--- seed
+id: e2-15
+task: t27
+class: a projected rank that does not repeat the ordering
+code: T33
+
+--- text
+query about($q: String) {
+  match { $d: Doc }
+  return { $d.title, bm25($d.body, "graph") as s }
+  order { bm25($d.body, $q) desc }
+  limit 10
+}
+
+--- seed
+id: e2-16
+task: t15
+class: an order key that names nothing returned
+code: T42
+
+--- text
+query headcount() {
+  match { $c: Company  $p worksAt $c }
+  return { $c.name, count($p) as n }
+  order { headcount desc }
+}
+
+--- seed
+id: e2-17
+task: t39
+class: a parameter of the wrong type in a comparison
+code: T7
+
+--- text
+query people_over($cutoff: String) @description("People over a given age") @instruction("Pass the age as an integer") {
+  match { $p: Person  $p.age > $cutoff }
+  return { $p.name }
+}
+
+--- seed
+id: e2-18
+task: t02
+class: a limit given as a parameter
+code: Q001
+
+--- text
+query adults($min: I32, $n: I64) {
+  match { $p: Person  $p.age >= $min }
+  return { $p.name }
+  order { $p.age desc }
+  limit $n
+}

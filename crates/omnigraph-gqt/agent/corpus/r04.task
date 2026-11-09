@@ -1,0 +1,44 @@
+--- task
+id: r04
+dataset: reading
+kind: a lexical cut across the corpus, then a traversal
+answer: fewest
+composition: the window against the population: in edition 2 the traversal in the ranked read would rank only the known documents, so the corpus-wide top 2 come back first
+
+--- intent
+Take the 2 documents whose bodies are most relevant to the text `$q` by BM25 across all documents, and say who knows each of them: return the document's slug and the person's name.
+
+--- params
+{"q": "needle"}
+
+--- edition2
+query top_relevant($q: String) {
+  match { $d: Doc }
+  return { $d.slug }
+  order { bm25($d.body, $q) desc }
+  limit 2
+}
+
+--- edition2 bind hits=1:d.slug
+query knowers($hits: [String]) {
+  match { $d: Doc  $d.slug in $hits  $p knows $d }
+  return { $d.slug, $p.name }
+}
+
+--- edition3
+query relevant_knowers($q: String) {
+  match {
+    from {
+      match { from bm25({ match { $d: Doc } return { $d } }, $d.body, $q) }
+      return { $d }
+      order { $score desc }
+      limit 2
+    }
+    $p knows $d
+  }
+  return { $d.slug, $p.name }
+}
+
+--- expect unordered
+columns: ["d.slug","p.name"]
+["d0","p2"]

@@ -1,0 +1,32 @@
+--- task
+id: t32
+dataset: section8
+kind: insert a node and a keyed edge
+
+--- intent
+Hire someone: create a person with handle `$h` (whose name is also `$h`) and record that they work at the company with slug `$slug`.
+
+--- params
+{"h": "hank", "slug": "globex"}
+
+--- edition2
+query hire($h: String, $slug: String) {
+  insert Person { handle: $h, name: $h }
+  insert WorksAt { from: $h, to: $slug }
+}
+
+--- edition3
+query hire($h: String, $slug: String) {
+  insert Person { handle: $h, name: $h }
+  insert WorksAt { from: $h, to: $slug }
+}
+
+--- check
+query check($h: String) {
+  match { $p: Person { handle: $h }  $p worksAt $c }
+  return { $p.name, $c.slug }
+}
+
+--- expect unordered
+columns: ["p.name","c.slug"]
+["hank","globex"]

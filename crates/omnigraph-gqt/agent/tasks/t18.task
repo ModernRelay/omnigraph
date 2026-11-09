@@ -1,0 +1,26 @@
+--- task
+id: t18
+dataset: section8
+kind: count block with a parameter bound
+
+--- intent
+List the names of people who know at least `$min` people.
+
+--- params
+{"min": 2}
+
+--- edition2
+query well_connected($min: I64) {
+  match { $p: Person  count { $p knows $q } >= $min }
+  return { $p.name }
+}
+
+--- edition3
+query well_connected($min: I64) {
+  match { $p: Person  count { $p knows $q } >= $min }
+  return { $p.name }
+}
+
+--- expect unordered
+columns: ["p.name"]
+["Alice"]

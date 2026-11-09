@@ -1,0 +1,41 @@
+--- task
+id: r01
+dataset: reading
+kind: lexical ranking with the score
+answer: fewest
+
+--- intent
+Rank the documents by how relevant their body is to the text `$q` (BM25) and return the top 3 slugs with the score as `score`, best first.
+
+--- params
+{"q": "needle"}
+
+--- edition2
+query relevant($q: String) {
+  match { $d: Doc }
+  return { $d.slug, bm25($d.body, $q) as score }
+  order { bm25($d.body, $q) desc }
+  limit 3
+}
+
+--- edition3
+query relevant($q: String) {
+  match { from bm25({ match { $d: Doc } return { $d } }, $d.body, $q) }
+  return { $d.slug, $score }
+  order { $score desc }
+  limit 3
+}
+
+--- edition3
+query relevant($q: String) {
+  match { from bm25({ match { $d: Doc } return { $d } }, $d.body, $q) }
+  return { $d.slug, $score as score }
+  order { $score desc }
+  limit 3
+}
+
+--- expect ordered
+columns: ["d.slug","score"]
+["d0",0.7411202]
+["d3",0.71866196]
+["d1",0.65877354]

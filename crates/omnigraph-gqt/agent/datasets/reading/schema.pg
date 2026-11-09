@@ -1,0 +1,10 @@
+node Person {
+    name: String @key
+}
+node Doc {
+    slug: String @key
+    body: String @index
+    embedding: Vector(2) @index
+}
+edge Knows: Person -> Doc
+edge Cites: Doc -> Doc

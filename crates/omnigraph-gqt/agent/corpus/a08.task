@@ -1,0 +1,38 @@
+--- task
+id: a08
+dataset: attribution
+kind: a top-1 read feeding a traversal
+answer: fewest
+composition: a cut, then a traversal from what survives: edition 2 has no read whose `limit` applies before a later traversal, so the identity comes back first
+
+--- intent
+Which sources did the identity behind the single heaviest touchpoint touch? Return the distinct source slugs.
+
+--- edition2
+query heaviest_identity() {
+  match { $t: Touchpoint  $t touchpointByIdentity $x }
+  return { $x.slug }
+  order { $t.weight desc }
+  limit 1
+}
+
+--- edition2 bind top=1:x.slug
+query sources_of($top: [String]) {
+  match { $x: ExternalID  $x.slug in $top  $t touchpointByIdentity $x  $t touchpointOnSource $s }
+  return distinct { $s.slug }
+}
+
+--- edition3
+query heaviest_identity_sources() {
+  match {
+    from { match { $t: Touchpoint  $t touchpointByIdentity $x } return { $x } order { $t.weight desc } limit 1 }
+    $u touchpointByIdentity $x
+    $u touchpointOnSource $s
+  }
+  return distinct { $s.slug }
+}
+
+--- expect unordered
+columns: ["s.slug"]
+["s1"]
+["excluded"]

@@ -1,0 +1,40 @@
+--- task
+id: t24
+dataset: section8
+kind: nearest window
+
+--- intent
+Find the titles of the 20 documents from 2025 or later that are most similar to the vector `$q`.
+
+--- params
+{"q": [1.0, 0.0, 0.0]}
+
+--- edition2
+query similar($q: Vector(3)) {
+  match { $d: Doc  $d.year >= 2025 }
+  return { $d.title }
+  order { nearest($d.embedding, $q) }
+  limit 20
+}
+
+--- edition3
+query similar($q: Vector(3)) {
+  match { from nearest({ match { $d: Doc  $d.year >= 2025 } return { $d } }, $d.embedding, $q, k: 20) }
+  return { $d.title }
+  order { $distance }
+}
+
+--- edition3
+query similar($q: Vector(3)) {
+  match { from nearest({ match { $d: Doc  $d.year >= 2025 } return { $d } }, $d.embedding, $q, k: 20) }
+  return { $d.title }
+  order { $distance }
+  limit 20
+}
+
+--- expect ordered
+columns: ["d.title"]
+["The graph primer"]
+["Rust in production"]
+["The search engine"]
+["The graph of cities"]

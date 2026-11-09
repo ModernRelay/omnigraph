@@ -1,0 +1,38 @@
+--- task
+id: a03
+dataset: attribution
+kind: filter on an edge property
+answer: fewest
+
+--- intent
+Which identities have a touchpoint that reached the source `$source` via `$via` (the `via` property of the touchpoint's link to its source)? Return their slugs.
+
+--- params
+{"source": "excluded", "via": "web"}
+
+--- edition2
+query identities_via($source: String, $via: String) {
+  match {
+    $s: Source { slug: $source }
+    $t $e:touchpointOnSource $s
+    $e.via = $via
+    $t touchpointByIdentity $x
+  }
+  return { $x.slug }
+}
+
+--- edition3
+query identities_via($source: String, $via: String) {
+  match {
+    $s: Source { slug: $source }
+    $t $e:touchpointOnSource $s
+    $e.via = $via
+    $t touchpointByIdentity $x
+  }
+  return { $x.slug }
+}
+
+--- expect unordered
+columns: ["x.slug"]
+["x1"]
+["x3"]

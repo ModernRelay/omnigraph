@@ -1,0 +1,26 @@
+--- task
+id: r08
+dataset: reading
+kind: count per destination
+answer: fewest
+
+--- intent
+For each document that is cited at least once, how many documents cite it? Return the slug and the count as `cited_by`.
+
+--- edition2
+query citation_counts() {
+  match { $d: Doc  $o cites $d }
+  return { $d.slug, count($o) as cited_by }
+}
+
+--- edition3
+query citation_counts() {
+  match { $d: Doc  $o cites $d }
+  return { $d.slug, count($o) as cited_by }
+}
+
+--- expect unordered
+columns: ["d.slug","cited_by"]
+["d0",1]
+["d3",2]
+["d4",1]

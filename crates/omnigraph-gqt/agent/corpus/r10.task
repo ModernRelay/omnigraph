@@ -1,0 +1,37 @@
+--- task
+id: r10
+dataset: reading
+kind: count with zero for an empty group
+answer: fewest
+combine: concat
+composition: count plus projection: a grouped count in edition 2 drops the people who know nothing, so a second query returns them with 0
+
+--- intent
+For every person, how many documents do they know? Return the name and the count as `docs`, including people who know none, with 0.
+
+--- edition2
+query readers() {
+  match { $p: Person  $p knows $d }
+  return { $p.name, count($d) as docs }
+}
+
+--- edition2
+query non_readers() {
+  match { $p: Person  not { $p knows $d } }
+  return { $p.name, 0 as docs }
+}
+
+--- edition3
+query docs_known() {
+  match {
+    $p: Person
+    let $docs = count { $p knows $d }
+  }
+  return { $p.name, $docs }
+}
+
+--- expect unordered
+columns: ["p.name","docs"]
+["p1",2]
+["p2",1]
+["p3",0]

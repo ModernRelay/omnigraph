@@ -1,0 +1,28 @@
+--- task
+id: t14
+dataset: section8
+kind: traversal against schema order
+
+--- intent
+Who works at the company with slug `$slug`? Return their names.
+
+--- params
+{"slug": "acme"}
+
+--- edition2
+query staff($slug: String) {
+  match { $c: Company { slug: $slug }  $p worksAt $c }
+  return { $p.name }
+}
+
+--- edition3
+query staff($slug: String) {
+  match { $c: Company { slug: $slug }  $p worksAt $c }
+  return { $p.name }
+}
+
+--- expect unordered
+columns: ["p.name"]
+["Alice"]
+["Bob"]
+["Dave"]

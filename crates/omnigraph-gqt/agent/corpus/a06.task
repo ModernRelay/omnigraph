@@ -1,0 +1,21 @@
+--- task
+id: a06
+dataset: attribution
+kind: an aggregate of an aggregate
+answer: fewest
+composition: an aggregate of an aggregate: edition 2 returns the per-identity counts and leaves the mean and the maximum to the caller
+
+--- intent
+What is the average number of touchpoints per identity, and the largest number any one identity has? Return them as `mean` and `largest`.
+
+--- edition3
+query touchpoints_per_identity() {
+  match { from { match { $t touchpointByIdentity $x } return { $x, count($t) as n } } }
+  return { avg($n) as mean, max($n) as largest }
+}
+
+--- edition3
+query touchpoints_per_identity() {
+  match { from { match { $x: ExternalID  $t touchpointByIdentity $x } return { $x, count($t) as n } } }
+  return { avg($n) as mean, max($n) as largest }
+}

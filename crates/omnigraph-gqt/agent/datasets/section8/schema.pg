@@ -1,0 +1,15 @@
+// The schema of the GQ 3 RFC, section 8, in edition-2 spelling: `body` is a
+// full-text index and `embedding` an L2 vector, as today's `.pg` declares
+// them. Both editions' tasks run against this one schema.
+interface Named { name: String }
+
+node Person implements Named { handle: String @key  name: String  age: I32?  city: String? }
+node Company implements Named { slug: String @key  name: String }
+node Doc { id: String @key  title: String  body: String @index  year: I32  tags: [String]  embedding: Vector(3)? }
+node Collection { slug: String @key  min_docs: I32 }
+
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+edge In: Doc -> Collection        // traversed as "in": the bare name is reserved

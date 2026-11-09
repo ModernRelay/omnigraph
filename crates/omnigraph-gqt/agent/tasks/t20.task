@@ -1,0 +1,13 @@
+--- task
+id: t20
+dataset: section8
+kind: outer join
+
+--- intent
+List every person's name together with their employer's name, keeping people who have no employer.
+
+--- edition3
+query people_and_employers() {
+  match { $p: Person  optional { $p worksAt $c } }
+  return { $p.name, $c.name }
+}

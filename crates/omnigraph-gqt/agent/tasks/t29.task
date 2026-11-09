@@ -1,0 +1,37 @@
+--- task
+id: t29
+dataset: section8
+kind: hybrid, fused
+
+--- intent
+Fuse, by reciprocal rank fusion with constant 60, the 10 documents nearest to the vector `$v` and every document whose body matches the text `$q` ranked by BM25; return the 10 best fused titles.
+
+--- params
+{"q": "graph", "v": [1.0, 0.0, 0.0]}
+
+--- edition2
+query hybrid($q: String, $v: Vector(3)) {
+  match { $d: Doc }
+  return { $d.title }
+  order { rrf(nearest($d.embedding, $v), bm25($d.body, $q), 60) }
+  limit 10
+}
+
+--- edition3
+query hybrid($q: String, $v: Vector(3)) {
+  match {
+    let $docs = { match { $d: Doc } return { $d } }
+    from rrf(nearest($docs, $d.embedding, $v, k: 10), bm25($docs, $d.body, $q), k: 60)
+  }
+  return { $d.title }
+  order { $score desc }
+  limit 10
+}
+
+--- expect ordered
+columns: ["d.title"]
+["The graph primer"]
+["The graph of cities"]
+["Vector search notes"]
+["Rust in production"]
+["The search engine"]

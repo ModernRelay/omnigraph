@@ -1,0 +1,44 @@
+{"type":"Person","data":{"handle":"alice","name":"Alice","age":34,"city":"Berlin"}}
+{"type":"Person","data":{"handle":"bob","name":"Bob","age":70,"city":"Paris"}}
+{"type":"Person","data":{"handle":"carol","name":"Carol","age":28}}
+{"type":"Person","data":{"handle":"dave","name":"Dave","city":"Berlin"}}
+{"type":"Person","data":{"handle":"erin","name":"Erin","age":45,"city":"London"}}
+{"type":"Person","data":{"handle":"frank","name":"Frank","age":66,"city":"Paris"}}
+{"type":"Person","data":{"handle":"gina","name":"Gina","age":51,"city":"Rome"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Company","data":{"slug":"globex","name":"Globex"}}
+{"type":"Company","data":{"slug":"initech","name":"Initech"}}
+{"type":"Doc","data":{"id":"d1","title":"The graph primer","body":"graphs and traversal basics for databases","year":2025,"tags":["rust","graph"],"embedding":[1.0,0.0,0.0]}}
+{"type":"Doc","data":{"id":"d2","title":"Vector search notes","body":"nearest neighbour search with vectors","year":2024,"tags":["search"],"embedding":[0.9,0.1,0.0]}}
+{"type":"Doc","data":{"id":"d3","title":"The graph of cities","body":"cities connected by roads form a graph","year":2026,"tags":["graph"],"embedding":[0.0,1.0,0.0]}}
+{"type":"Doc","data":{"id":"d4","title":"Rust in production","body":"rust services and databases in production","year":2025,"tags":["rust"],"embedding":[0.6,0.4,0.0]}}
+{"type":"Doc","data":{"id":"d5","title":"Untitled draft","body":"notes","year":2023,"tags":[]}}
+{"type":"Doc","data":{"id":"d6","title":"The search engine","body":"ranking documents by relevance with bm25 search","year":2025,"tags":["search","rust"],"embedding":[0.1,0.0,1.0]}}
+{"type":"Collection","data":{"slug":"intro","min_docs":2}}
+{"type":"Collection","data":{"slug":"advanced","min_docs":3}}
+{"edge":"WorksAt","from":"alice","to":"acme"}
+{"edge":"WorksAt","from":"bob","to":"acme"}
+{"edge":"WorksAt","from":"dave","to":"acme"}
+{"edge":"WorksAt","from":"erin","to":"globex"}
+{"edge":"Knows","from":"alice","to":"bob"}
+{"edge":"Knows","from":"bob","to":"carol"}
+{"edge":"Knows","from":"carol","to":"alice"}
+{"edge":"Knows","from":"alice","to":"dave"}
+{"edge":"Knows","from":"erin","to":"alice"}
+{"edge":"Knows","from":"frank","to":"gina"}
+{"edge":"Authored","from":"alice","to":"d1"}
+{"edge":"Authored","from":"alice","to":"d4"}
+{"edge":"Authored","from":"bob","to":"d2"}
+{"edge":"Authored","from":"carol","to":"d3"}
+{"edge":"Authored","from":"erin","to":"d5"}
+{"edge":"Authored","from":"erin","to":"d6"}
+{"edge":"Cites","from":"d2","to":"d1"}
+{"edge":"Cites","from":"d3","to":"d1"}
+{"edge":"Cites","from":"d4","to":"d2"}
+{"edge":"Cites","from":"d6","to":"d2"}
+{"edge":"Cites","from":"d6","to":"d4"}
+{"edge":"In","from":"d1","to":"intro"}
+{"edge":"In","from":"d2","to":"intro"}
+{"edge":"In","from":"d3","to":"intro"}
+{"edge":"In","from":"d4","to":"advanced"}
+{"edge":"In","from":"d6","to":"advanced"}

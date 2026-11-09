@@ -1,0 +1,26 @@
+--- task
+id: t10
+dataset: section8
+kind: one hop, edge bound
+
+--- intent
+For the person with handle `$h`, show their employer's name and the employment link's source and destination ids.
+
+--- params
+{"h": "alice"}
+
+--- edition2
+query employer($h: String) {
+  match { $p: Person { handle: $h }  $p $k:worksAt $c }
+  return { $c.name, $k.@src, $k.@dst }
+}
+
+--- edition3
+query employer($h: String) {
+  match { $p: Person { handle: $h }  $p $k:worksAt $c }
+  return { $c.name, $k.@src, $k.@dst }
+}
+
+--- expect unordered
+columns: ["c.name","k.@src","k.@dst"]
+["Acme","alice","acme"]

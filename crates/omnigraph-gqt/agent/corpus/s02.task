@@ -1,0 +1,27 @@
+--- task
+id: s02
+dataset: social
+kind: group by a property
+answer: fewest
+
+--- intent
+How many people live in each city? Return the city and the number of people as `people`, sorted by city, leaving out people whose city is unknown.
+
+--- edition2
+query people_per_city() {
+  match { $p: Person  $p.city is not null }
+  return { $p.city, count($p) as people }
+  order { $p.city }
+}
+
+--- edition3
+query people_per_city() {
+  match { $p: Person  $p.city is not null }
+  return { $p.city, count($p) as people }
+  order { $p.city }
+}
+
+--- expect ordered
+columns: ["p.city","people"]
+["Berlin",2]
+["Madrid",1]

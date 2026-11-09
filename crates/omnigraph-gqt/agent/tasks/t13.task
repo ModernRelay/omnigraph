@@ -1,0 +1,28 @@
+--- task
+id: t13
+dataset: section8
+kind: edge whose name is a reserved word
+
+--- intent
+List the titles of the documents in the collection with slug `$slug`.
+
+--- params
+{"slug": "intro"}
+
+--- edition2
+query in_collection($slug: String) {
+  match { $x: Collection { slug: $slug }  $d "in" $x }
+  return { $d.title }
+}
+
+--- edition3
+query in_collection($slug: String) {
+  match { $x: Collection { slug: $slug }  $d "in" $x }
+  return { $d.title }
+}
+
+--- expect unordered
+columns: ["d.title"]
+["The graph primer"]
+["Vector search notes"]
+["The graph of cities"]

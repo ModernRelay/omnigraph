@@ -1,0 +1,23 @@
+--- task
+id: t30
+dataset: section8
+kind: hybrid, weighted
+
+--- intent
+Score each document whose body matches the text `$q` as 0.7 times 1/(1 + its vector distance to `$v`) plus 0.3 times its BM25 score; return the 10 best titles with the score as `s`.
+
+--- params
+{"q": "graph", "v": [1.0, 0.0, 0.0]}
+
+--- edition3
+query weighted($q: String, $v: Vector(3)) {
+  match {
+    let $docs = { match { $d: Doc } return { $d } }
+    from { match { from distance($docs, $d.embedding, $v) } return { $d, $distance as vec } }
+    from { match { from bm25($docs, $d.body, $q) } return { $d as d2, $score as lex } }
+    $d = $d2
+  }
+  return { $d.title, 0.7 * (1.0 / (1.0 + $vec)) + 0.3 * $lex as s }
+  order { s desc }
+  limit 10
+}

@@ -1,0 +1,29 @@
+--- task
+id: a01
+dataset: attribution
+kind: sum per group, ordered by the aggregate
+answer: fewest
+
+--- intent
+What is the total touchpoint weight on each source? Return the source slug and the summed weight as `total`, heaviest first.
+
+--- edition2
+query weight_per_source() {
+  match { $t: Touchpoint  $t touchpointOnSource $s }
+  return { $s.slug, sum($t.weight) as total }
+  order { total desc }
+}
+
+--- edition3
+query weight_per_source() {
+  match { $t: Touchpoint  $t touchpointOnSource $s }
+  return { $s.slug, sum($t.weight) as total }
+  order { total desc }
+}
+
+--- expect ordered
+columns: ["s.slug","total"]
+["excluded",18.0]
+["s1",13.0]
+["s2",2.0]
+["s3",1.0]

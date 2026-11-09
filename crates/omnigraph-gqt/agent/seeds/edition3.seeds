@@ -1,0 +1,388 @@
+--- seed
+id: e3-01
+task: t03
+class: infix `contains` and `starts_with` (edition 2's spelling)
+code: -
+
+--- text
+gq 3;
+query titled() {
+  match { $d: Doc  $d.title contains "graph"  $d.title starts_with "The" }
+  return { $d.title }
+}
+
+--- seed
+id: e3-02
+task: t05
+class: `contains` over a list property (edition 2's spelling)
+code: -
+
+--- text
+gq 3;
+query tagged() {
+  match { $d: Doc  $d.tags contains "rust" }
+  return { $d.title }
+}
+
+--- seed
+id: e3-03
+task: t28
+class: a positional option (edition 2's `fuzzy` budget)
+code: T71
+
+--- text
+gq 3;
+query mentions($s: String, $q: String) {
+  match { $d: Doc  search($d.body, $s)  fuzzy($d.body, $q, 2) }
+  return { $d.title }
+}
+
+--- seed
+id: e3-04
+task: t24
+class: a ranking in `order` (edition 2's spelling)
+code: T65
+
+--- text
+gq 3;
+query similar($q: Vector(3)) {
+  match { $d: Doc  $d.year >= 2025 }
+  return { $d.title }
+  order { nearest($d.embedding, $q) }
+  limit 20
+}
+
+--- seed
+id: e3-05
+task: t27
+class: a ranking in `return` and `order` (edition 2's spelling)
+code: T65
+
+--- text
+gq 3;
+query about($q: String) {
+  match { $d: Doc }
+  return { $d.title, bm25($d.body, $q) as s }
+  order { bm25($d.body, $q) desc }
+  limit 10
+}
+
+--- seed
+id: e3-06
+task: t33
+class: `delete T where` (edition 2's spelling)
+code: -
+
+--- text
+gq 3;
+query retire($h: String) {
+  delete WorksAt where @src = $h
+}
+
+--- seed
+id: e3-07
+task: t35
+class: `update T set … where` (edition 2's spelling)
+code: -
+
+--- text
+gq 3;
+query birthday($h: String) {
+  update Person set { age: age + 1 } where handle = $h
+}
+
+--- seed
+id: e3-08
+task: m3
+class: `having` (SQL)
+code: -
+
+--- text
+gq 3;
+query big_employers($min: I64) {
+  match { $c: Company  $p worksAt $c }
+  return { $c.name, count($p) as n }
+  having { n >= $min }
+  order { n desc }
+}
+
+--- seed
+id: e3-09
+task: t20
+class: `optional` without braces (Cypher)
+code: -
+
+--- text
+gq 3;
+query people_and_employers() {
+  match { $p: Person  optional $p worksAt $c }
+  return { $p.name, $c.name }
+}
+
+--- seed
+id: e3-10
+task: t09
+class: `CASE … END` (SQL)
+code: -
+
+--- text
+gq 3;
+query with_city() {
+  match { $p: Person }
+  return { $p.name, coalesce($p.city, "unknown") as city, CASE WHEN $p.age >= 65 THEN "senior" ELSE "active" END as band }
+}
+
+--- seed
+id: e3-11
+task: t08
+class: a minus spaced on one side only
+code: -
+
+--- text
+gq 3;
+query doubled($min: I32) {
+  match { $p: Person  $p.age * 2 >= $min }
+  return { $p.name, $p.age * 2 as twice, 2026 -$p.age as born_about }
+}
+
+--- seed
+id: e3-12
+task: t02
+class: a comparison inside binding braces
+code: -
+
+--- text
+gq 3;
+query adults($min: I32) {
+  match { $p: Person { age >= $min } }
+  return { $p.name }
+  order { $p.age desc }
+}
+
+--- seed
+id: e3-13
+task: t01
+class: a declaration without its parameter list
+code: Q002
+
+--- text
+gq 3;
+query person {
+  match { $p: Person { handle: $h } }
+  return { $p.name, $p.city }
+}
+
+--- seed
+id: e3-14
+task: t32
+class: the `mutation` keyword (GraphQL)
+code: -
+
+--- text
+gq 3;
+mutation hire($h: String, $slug: String) {
+  insert Person { handle: $h, name: $h }
+  insert WorksAt { from: $h, to: $slug }
+}
+
+--- seed
+id: e3-15
+task: t35
+class: a write body wrapped in `match { }`
+code: -
+
+--- text
+gq 3;
+query birthday($h: String) {
+  match { $p: Person { handle: $h } }
+  update $p set { age: $p.age + 1 }
+}
+
+--- seed
+id: e3-16
+task: t13
+class: a reserved edge name written bare
+code: T7
+
+--- text
+gq 3;
+query in_collection($slug: String) {
+  match { $x: Collection { slug: $slug }  $d in $x }
+  return { $d.title }
+}
+
+--- seed
+id: e3-17
+task: t18
+class: `where` (SQL, Cypher)
+code: -
+
+--- text
+gq 3;
+query well_connected($min: I64) {
+  match { $p: Person  where count { $p knows $q } >= $min }
+  return { $p.name }
+}
+
+--- seed
+id: e3-18
+task: t11
+class: an arrow traversal (Cypher)
+code: -
+
+--- text
+gq 3;
+query around($h: String) {
+  match { $p: Person { handle: $h }  $p -knows- $f }
+  return { $f.name }
+}
+
+--- seed
+id: e3-19
+task: t22
+class: `let … in` (a row-binding `let`)
+code: -
+
+--- text
+gq 3;
+query latest_per_author() {
+  match {
+    $p: Person
+    let $d in { match { $p authored $d } return { $d } order { $d.year desc } limit 3 }
+  }
+  return { $p.name, $d.title, $d.year }
+}
+
+--- seed
+id: e3-20
+task: t16
+class: `count(*)` (SQL)
+code: -
+
+--- text
+gq 3;
+query distinct_cities() {
+  match { $p: Person }
+  return { count(*) as cities }
+}
+
+--- seed
+id: e3-21
+task: t06
+class: a `null` literal in a read
+code: -
+
+--- text
+gq 3;
+query homeless() {
+  match { $p: Person  $p.city = null }
+  return { $p.name }
+}
+
+--- seed
+id: e3-22
+task: t02
+class: an uppercase keyword
+code: -
+
+--- text
+gq 3;
+query adults($min: I32) {
+  match { $p: Person  $p.age >= $min }
+  return { $p.name }
+  order { $p.age DESC }
+}
+
+--- seed
+id: e3-23
+task: t17
+class: an aggregate of an aggregate in one `return`
+code: T8
+
+--- text
+gq 3;
+query average_headcount() {
+  match { $c: Company  $p worksAt $c }
+  return { avg(count($p)) as mean, max(count($p)) as largest }
+}
+
+--- seed
+id: e3-24
+task: t30
+class: two rankings drawn into one scope
+code: T68
+
+--- text
+gq 3;
+query weighted($q: String, $v: Vector(3)) {
+  match {
+    from distance({ match { $d: Doc } return { $d } }, $d.embedding, $v)
+    from bm25({ match { $d: Doc } return { $d } }, $d.body, $q)
+  }
+  return { $d.title, 0.7 * (1.0 / (1.0 + $distance)) + 0.3 * $score as s }
+  order { s desc }
+  limit 10
+}
+
+--- seed
+id: e3-25
+task: t24
+class: `nearest` without `k`
+code: T17
+
+--- text
+gq 3;
+query similar($q: Vector(3)) {
+  match { from nearest({ match { $d: Doc  $d.year >= 2025 } return { $d } }, $d.embedding, $q) }
+  return { $d.title }
+  order { $distance }
+  limit 20
+}
+
+--- seed
+id: e3-26
+task: t21
+class: `union` between two reads (SQL)
+code: -
+
+--- text
+gq 3;
+query people_and_companies() {
+  match { $p: Person } return { $p.name as name, "person" as kind }
+  union
+  match { $c: Company } return { $c.name as name, "company" as kind }
+}
+
+--- seed
+id: e3-27
+task: t04
+class: single-quoted strings and `==`
+code: -
+
+--- text
+gq 3;
+query in_cities() {
+  match { $p: Person  $p.city == 'Berlin' or $p.city == 'Paris' }
+  return { $p.name }
+}
+
+--- seed
+id: e3-28
+task: m4
+class: a space before a call's parenthesis
+code: -
+
+--- text
+gq 3;
+query colleagues($of: String) {
+  match { $p: Person { handle: $of }  $p worksAt $c  $q worksAt $c  $q != $p }
+  return { $q }
+}
+
+query colleagues_of_colleagues($of: String) {
+  match {
+    from { match { from colleagues ($of) } return { $q as c } }
+    from { match { from colleagues ($c.handle) } return { $q as r } }
+  }
+  return distinct { $r.name }
+}

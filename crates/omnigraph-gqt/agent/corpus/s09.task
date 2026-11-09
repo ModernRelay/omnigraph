@@ -1,0 +1,49 @@
+--- task
+id: s09
+dataset: social
+kind: two hops through a shared neighbour
+answer: fewest
+
+--- intent
+Who else liked a comment that `$who` liked? Return their distinct slugs, leaving out `$who`.
+
+--- params
+{"who": "ann"}
+
+--- edition2
+query co_likers($who: String) {
+  match {
+    $me: Person { slug: $who }
+    $me likesComment $c
+    $p likesComment $c
+    $p.slug != $who
+  }
+  return distinct { $p.slug }
+}
+
+--- edition3
+query co_likers($who: String) {
+  match {
+    $me: Person { slug: $who }
+    $me likesComment $c
+    $p likesComment $c
+    $p != $me
+  }
+  return distinct { $p.slug }
+}
+
+--- edition3
+query co_likers($who: String) {
+  match {
+    $me: Person { slug: $who }
+    $me likesComment $c
+    $p likesComment $c
+    $p.slug != $who
+  }
+  return distinct { $p.slug }
+}
+
+--- expect unordered
+columns: ["p.slug"]
+["bob"]
+["cyd"]

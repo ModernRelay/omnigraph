@@ -1,0 +1,29 @@
+--- task
+id: t12
+dataset: section8
+kind: unbounded reachability
+answer: fewest
+
+--- intent
+List the distinct names of everyone reachable from the person with handle `$from` by following `knows` edges any number of times.
+
+--- params
+{"from": "alice"}
+
+--- edition3
+query reachable($from: String) {
+  match {
+    from union(
+      { match { $p: Person { handle: $from }  $p knows $q } return { $q } },
+      { match { from reachable($from)  $q knows $r } return { $r as q } })
+  }
+  return distinct { $q }
+}
+
+query reachable_names($from: String) {
+  match { from reachable($from) }
+  return distinct { $q.name }
+}
+
+--- note
+The recursive read returns the node column `$q`, since a relation drawn from must have variable-shaped columns (`T74`) and the recursion draws from itself; a second declaration projects the names.

@@ -1,0 +1,32 @@
+--- task
+id: t19
+dataset: section8
+kind: existence and absence
+
+--- intent
+List the names of people who have authored at least one document and none of whose documents is cited by any document.
+
+--- edition2
+query uncited_authors() {
+  match {
+    $p: Person
+    exists { $p authored $d }
+    not { $p authored $d2  $other cites $d2 }
+  }
+  return { $p.name }
+}
+
+--- edition3
+query uncited_authors() {
+  match {
+    $p: Person
+    exists { $p authored $d }
+    not { $p authored $d2  $other cites $d2 }
+  }
+  return { $p.name }
+}
+
+--- expect unordered
+columns: ["p.name"]
+["Carol"]
+["Erin"]

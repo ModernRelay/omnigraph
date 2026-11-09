@@ -1,0 +1,24 @@
+--- task
+id: s07
+dataset: social
+kind: distinct count under an existence test
+answer: fewest
+
+--- intent
+How many distinct names do the people who liked at least one comment have? Return the number as `names`.
+
+--- edition2
+query liker_names() {
+  match { $p: Person  exists { $p likesComment $c } }
+  return { count(distinct $p.name) as names }
+}
+
+--- edition3
+query liker_names() {
+  match { $p: Person  exists { $p likesComment $c } }
+  return { count(distinct $p.name) as names }
+}
+
+--- expect unordered
+columns: ["names"]
+[2]

@@ -1,0 +1,54 @@
+--- task
+id: m3
+dataset: section8
+kind: filter on an aggregate
+answer: fewest
+composition: filtering grouped output
+
+--- intent
+List the companies with at least `$min` employees: the company name and its employee count as `n`, largest first.
+
+--- params
+{"min": 2}
+
+--- edition2
+query big_employers($min: I64) {
+  match { $c: Company  count { $q worksAt $c } >= $min  $p worksAt $c }
+  return { $c.name, count($p) as n }
+  order { n desc }
+}
+
+--- edition3
+query big_employers($min: I64) {
+  match {
+    from { match { $c: Company  $p worksAt $c } return { $c, count($p) as n } }
+    $n >= $min
+  }
+  return { $c.name, $n }
+  order { $n desc }
+}
+
+--- edition3
+query big_employers($min: I64) {
+  match { $c: Company  count { $q worksAt $c } >= $min  $p worksAt $c }
+  return { $c.name, count($p) as n }
+  order { n desc }
+}
+
+--- edition3
+query big_employers($min: I64) {
+  match {
+    $c: Company
+    let $n = count { $p worksAt $c }
+    $n >= $min
+  }
+  return { $c.name, $n }
+  order { $n desc }
+}
+
+--- expect ordered
+columns: ["c.name","n"]
+["Acme",3]
+
+--- note
+The asset marks 'filter on an aggregate' Not supported in edition 2; with a literal or parameter threshold, a count block in `match` beside the grouped traversal expresses it.

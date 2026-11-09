@@ -1,0 +1,41 @@
+--- task
+id: r07
+dataset: reading
+kind: insert edges fed by a traversal
+answer: fewest
+composition: a write fed by a read: edition 2 inserts one edge per call, so the client reads the cited documents and calls the insert once for each
+
+--- intent
+Make `$who` know every document that the document `$doc` cites.
+
+--- params
+{"who": "p3", "doc": "d1"}
+
+--- edition2
+query cited($doc: String) {
+  match { $d: Doc { slug: $doc }  $d cites $o }
+  return { $o.slug }
+}
+
+--- edition2 each target=1:o.slug
+query learn($who: String, $target: String) {
+  insert Knows { from: $who, to: $target }
+}
+
+--- edition3
+query learn_cited($who: String, $doc: String) {
+  $d: Doc { slug: $doc }
+  $d cites $o
+  insert Knows { from: $who, to: $o }
+}
+
+--- check
+query check($who: String) {
+  match { $p: Person { name: $who }  $p knows $d }
+  return { $d.slug }
+}
+
+--- expect unordered
+columns: ["d.slug"]
+["d3"]
+["d4"]

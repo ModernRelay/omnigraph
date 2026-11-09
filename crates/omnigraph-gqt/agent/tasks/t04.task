@@ -1,0 +1,26 @@
+--- task
+id: t04
+dataset: section8
+kind: membership in a list literal
+
+--- intent
+List the names of people who live in Berlin or Paris.
+
+--- edition2
+query in_cities() {
+  match { $p: Person  $p.city in ["Berlin", "Paris"] }
+  return { $p.name }
+}
+
+--- edition3
+query in_cities() {
+  match { $p: Person  $p.city in ["Berlin", "Paris"] }
+  return { $p.name }
+}
+
+--- expect unordered
+columns: ["p.name"]
+["Alice"]
+["Bob"]
+["Dave"]
+["Frank"]

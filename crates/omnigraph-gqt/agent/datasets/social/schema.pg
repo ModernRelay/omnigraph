@@ -1,0 +1,14 @@
+node Person {
+    slug: String @key
+    name: String
+    city: String?
+    age: I64
+}
+
+node Comment {
+    slug: String @key
+    length: I64
+}
+
+edge CommentHasCreator: Comment -> Person
+edge LikesComment: Person -> Comment
