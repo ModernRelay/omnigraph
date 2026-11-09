@@ -572,8 +572,10 @@ async fn multi_table_staging_is_flat_in_history() {
 
 /// A keyed `Person` insert routes through the exact-id fenced adapter exactly
 /// once, does no bare `stage_append`, and builds no vector-index artifact. The
-/// adapter intentionally records in the existing merge-insert probe bucket;
-/// `forbidden_apis` separately closes generic/bare graph call sites.
+/// standard graph's `Person` table has an id BTREE, so the upsert's exact-id
+/// probe finds the key absent and stages the join-free fenced insert rather
+/// than the merge join (#1248); `forbidden_apis` separately closes generic/bare
+/// graph call sites.
 #[tokio::test]
 async fn keyed_insert_routes_through_fenced_adapter_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -587,8 +589,12 @@ async fn keyed_insert_routes_through_fenced_adapter_only() {
     .await;
     res.unwrap();
     assert_eq!(
-        staged.stage_merge_insert, 1,
-        "keyed Person insert stages one exact-id fenced merge"
+        staged.stage_fenced_insert, 1,
+        "keyed Person insert stages one exact-id fenced insert"
+    );
+    assert_eq!(
+        staged.stage_merge_insert, 0,
+        "an all-new keyed insert on an indexed table pays no merge join"
     );
     assert_eq!(
         staged.stage_append, 0,
