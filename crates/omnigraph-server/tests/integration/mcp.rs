@@ -1017,6 +1017,59 @@ async fn static_token_server_serves_mcp_without_oauth_discovery() {
     assert_eq!(schema["result"]["isError"], false, "{schema}");
 }
 
+/// A tool call runs on a server worker's stack, which is 2 MiB whatever
+/// `RUST_MIN_STACK` says (the test jobs set 16 MiB, which hid the overflow):
+/// `health`, which any token may call, used to abort the whole process with a
+/// stack overflow. Every request here runs in a task on a runtime whose
+/// workers have that stack, as the server's do, so an overflow aborts this
+/// test binary.
+#[test]
+fn mcp_tool_calls_fit_a_server_worker_stack() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(2 << 20)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (_temp, app) = static_token_app(omnigraph_server::McpSettings::default()).await;
+        let calls = [
+            ("health", json!({})),
+            ("schema", json!({"graph":"default"})),
+            ("snapshot", json!({"graph":"default"})),
+            (
+                "query",
+                json!({"graph":"default","query":"query adults() { match { $p: Person $p.age >= 30 } return { $p.name } }"}),
+            ),
+            (
+                "mutate",
+                json!({"graph":"default","query":"query add() { insert Person { name: \"Stack\", age: 1 } }"}),
+            ),
+        ];
+        for (tool, arguments) in calls {
+            let app = app.clone();
+            let result = tokio::spawn(async move { call(&app, "secret", tool, arguments).await })
+                .await
+                .unwrap();
+            assert_eq!(result["result"]["isError"], false, "{tool}: {result}");
+        }
+        for uri in [
+            "omnigraph://graphs/default/schema",
+            "omnigraph://graphs/default/branches",
+        ] {
+            let app = app.clone();
+            let (status, body) = tokio::spawn(async move {
+                json_response(&app, rpc(Some("secret"), "resources/read", json!({"uri":uri})))
+                    .await
+            })
+            .await
+            .unwrap();
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert!(body["result"]["contents"][0]["text"].is_string(), "{uri}: {body}");
+        }
+    });
+}
+
 async fn http_get(app: &Router, uri: &str, token: &str) -> Value {
     let (status, body) = json_response(app, get_request(uri, token)).await;
     assert_eq!(status, StatusCode::OK, "{uri}: {body}");
