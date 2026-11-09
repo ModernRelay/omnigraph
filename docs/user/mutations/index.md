@@ -257,11 +257,8 @@ Every version of a key written in one mutation counts, so an insert and an
 update of the same row charge its Blob twice.
 Keyed loads also bound their parser estimate independently. A strict JSONL
 load retains its projected input check, `strict_input_arrow_bytes`.
-A vector cell counts at its full width, the dimension times 4 bytes, whether
-it holds a value or is null: one `Vector(3072)` cell uses 12 KiB, so about
-2,600 such rows fit the 32 MiB default.
-A CSV load has no whole-statement input check.
-It applies `write_max_bytes` to each staged-write input instead.
+A vector counts its full width (dimension × 4 bytes), present or null: 12 KiB for `Vector(3072)`.
+A CSV load has no whole-statement input check; it applies `write_max_bytes` to each staged-write input instead.
 An overwrite stages the reader's 8,192-row batches, and a batch over the
 allowance refuses as `staged_write_input_bytes`.
 An overwrite writes a fragment per parse partition, up to 1 Mi rows each, as
