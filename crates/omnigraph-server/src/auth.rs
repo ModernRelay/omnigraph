@@ -126,8 +126,9 @@ pub(crate) fn parse_json_secret_payload(payload: &str) -> Result<Vec<(String, St
         }
         pairs.push((actor, token));
     }
-    pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
-    Ok(pairs)
+    // The same checks as the environment and file sources: reserved actor
+    // names and duplicate token values are refused.
+    crate::settings::validate_bearer_tokens(pairs)
 }
 
 #[cfg(feature = "aws")]
@@ -281,6 +282,16 @@ mod tests {
     fn parse_json_secret_payload_rejects_non_object() {
         let err = parse_json_secret_payload("[1, 2, 3]").unwrap_err();
         assert!(err.to_string().contains("not a JSON object"));
+    }
+
+    /// The secret source applies the same checks as the environment and file
+    /// sources: no actor in the signed-identity namespace, no shared token.
+    #[test]
+    fn parse_json_secret_payload_refuses_reserved_actors_and_duplicate_tokens() {
+        let err = parse_json_secret_payload(r#"{"principal:alice": "tok-a"}"#).unwrap_err();
+        assert!(err.to_string().contains("reserved prefix"), "{err}");
+        let err = parse_json_secret_payload(r#"{"alice": "same", "bob": "same"}"#).unwrap_err();
+        assert!(err.to_string().contains("duplicate bearer token"), "{err}");
     }
 
     #[tokio::test]

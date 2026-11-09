@@ -94,6 +94,10 @@ Choose one static token source:
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` | Path to that JSON object |
 | `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` | Secrets Manager mapping; requires an AWS-enabled build: the container images, the release archives from v0.14.0 and every edge build, or a source build with `cargo build -p omnigraph-server --features aws` |
 
+Every source refuses a blank actor, a duplicate token value and an actor name
+starting with `principal:`, which is reserved for signed and OIDC identities
+(`principal:<id>`), so a static token cannot match their policy rules.
+
 Send `Authorization: Bearer secret-a` (the scheme is case-insensitive). The token selects the
 actor for authorization and commit attribution; clients cannot claim another actor. See
 [Authorization and actors](policy.md). Every 401 carries a `WWW-Authenticate: Bearer` challenge, with `error="invalid_token"` when
