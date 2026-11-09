@@ -1,6 +1,6 @@
 use super::*;
 use crate::dataset_index::is_full_text_index;
-use crate::error::missing_graph_type_at_snapshot;
+use crate::error::{ManifestConflictDetails, ManifestError, missing_graph_type_at_snapshot};
 use crate::seams::{decide_seam, fail};
 use crate::table_store::{RefreshedIndex, TableStore};
 use lance::index::DatasetIndexExt;
@@ -1646,7 +1646,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         )
         .await;
         db.install_coordinator(next, &installed);
-        outcome?
+        outcome.map_err(|error| caller_precondition_at_publish(txn, branch, error))?
     } else {
         // An operation on a non-bound branch owns its coordinator locally;
         // it must never temporarily change this handle's query/write binding.
@@ -1691,7 +1691,8 @@ pub(super) async fn commit_updates_on_branch_with_expected(
             expectation,
             publication,
         )
-        .await?;
+        .await
+        .map_err(|error| caller_precondition_at_publish(txn, branch, error))?;
         *db.merge_authority_cache.lock().await = Some((cache_key.to_string(), coordinator));
         published
     };
@@ -1699,6 +1700,34 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         evict_superseded_handles(db, &txn.base, updates).await;
     }
     Ok(published)
+}
+
+/// The publisher's refusal on the branch head is the caller's `--if-commit`
+/// miss when the write carries one: terminal `PreconditionFailed` naming the
+/// head the publisher read, as the under-gate revalidation answers it.
+fn caller_precondition_at_publish(
+    txn: &crate::db::WriteTxn,
+    branch: Option<&str>,
+    error: OmniError,
+) -> OmniError {
+    let Some(expected) = txn.caller_expected_graph_head.as_deref() else {
+        return error;
+    };
+    let branch = branch.unwrap_or("main");
+    match error {
+        OmniError::Manifest(ManifestError {
+            details:
+                Some(ManifestConflictDetails::ReadSetChanged {
+                    ref member,
+                    ref actual,
+                    ..
+                }),
+            ..
+        }) if *member == format!("graph_head:{branch}") => {
+            OmniError::precondition_failed(branch, expected, actual.clone())
+        }
+        other => other,
+    }
 }
 
 /// Drop the held handle of every pin this publication replaced on its
