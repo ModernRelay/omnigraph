@@ -169,7 +169,9 @@ the same cursor (`crates/omnigraph/src/ordered_cursor.rs`):
   operation-wide `write_max_bytes` allowance (default 32 MiB), independent of
   the row-and-descriptor allowance used for each write chunk;
 - selected new IDs stage as strict inserts, existing IDs as known-present
-  updates, and removals as deletes;
+  updates, and removals as deletes selected by the `_rowid` the target-side
+  read returned (the target's own row, or the base row while the target pins
+  the base), which Lance takes without an index or a data-column scan;
 - the transaction plan is pre-minted and bounded before recovery arm;
 - selected validation deltas share one operation-wide memory budget.
 
@@ -187,8 +189,8 @@ versions, and `C` the bounded publish chunks.
 |---|---|---|
 | Pointer adoption | Metadata-only when no validation delta is needed; otherwise the delta may require base/source ordered scans | Manifest-pointer change; no table fork or row copy |
 | Proven insertion replay | Walk `K <= 1,024` transaction records and scan only the certified source interval | `C <= 1,024` join-free fenced inserts; no target ID preflight or MergeInsert join |
-| Adopt with delta | Lineage candidate discovery and reads scoped to the changed fragments when proven; otherwise at least two full ordered scans, base and source | New rows use preflighted fenced inserts; changed rows use update-only `KnownPresentUpdate`; deletes are chunked |
-| General three-way | Lineage candidate discovery and filtered reads when proven; otherwise at least three full ordered scans | New rows use preflighted fenced inserts; existing rows use `KnownPresentUpdate`; deletes are chunked |
+| Adopt with delta | Lineage candidate discovery and reads scoped to the changed fragments when proven; otherwise at least two full ordered scans, base and source | New rows use preflighted fenced inserts; changed rows use update-only `KnownPresentUpdate`; deletes are chunked and taken by `_rowid` |
+| General three-way | Lineage candidate discovery and filtered reads when proven; otherwise at least three full ordered scans | New rows use preflighted fenced inserts; existing rows use `KnownPresentUpdate`; deletes are chunked and taken by `_rowid` |
 
 Strict insertion probes the pinned target for its ids, then stages a
 join-free, insert-only `Update` carrying the exact-`id` key filter. That
