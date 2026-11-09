@@ -1524,10 +1524,9 @@ async fn repeat_warm_read_reuses_table_handles() {
     .await;
 }
 
-/// A write advances the table's version, so the next read misses the
-/// version-keyed cache and re-opens — never serving a stale handle (invariant 6
-/// for the cached path). Passes with or without the cache; a correctness guard
-/// that the cache cannot serve pre-write data.
+/// A write advances the table's version; the next read serves the new pin's
+/// rows from the handle the write committed, never a stale one (invariant 6
+/// for the cached path).
 #[tokio::test]
 async fn write_invalidates_table_cache_for_changed_table() {
     let dir = tempfile::tempdir().unwrap();
@@ -1565,8 +1564,9 @@ async fn write_invalidates_table_cache_for_changed_table() {
     .await;
     out.unwrap();
     assert_eq!(
-        io.data_reads, 4,
-        "a row read after a write re-opens the landed detached pin and scans it: the version-keyed cache misses"
+        io.data_reads, 0,
+        "a row read after a write opens nothing: the write left the landed detached pin's \
+         handle in the version-keyed cache, and the old pin's entry no longer matches"
     );
 
     let after = count_rows(&db, "node:Person").await;

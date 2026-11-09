@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::prelude::Expr;
@@ -121,14 +121,89 @@ pub fn is_full_text_index(index: &IndexMetadata) -> bool {
         .is_some_and(|details| IndexDetails(details.clone()).supports_fts())
 }
 
-/// Metadata-only check (no IO) of whether `scan_edges_by_endpoint` — a
-/// `key_col IN (...)` filter — on `ds` will be served by the persisted BTREE
-/// on `column`, or silently fall back to a full filtered scan. Mirrors
-/// Lance's own decision: scalar indices are disabled for the whole scan if
-/// ANY fragment lacks `physical_rows` (lance `dataset/scanner.rs`
-/// `create_filter_plan`), and are obviously unused if no BTREE on the
-/// column exists. The scan is correct (returns all rows) either way — this
-/// only surfaces the perf cliff so the indexed traversal can warn on it.
+/// The current fragments that the segments of one index cover together.
+///
+/// Lance stores an index as one or more segments under one name and serves a
+/// scan from the union of their fragment bitmaps: `scalar_index_info` unions
+/// each `(column, name)` entry and `unindexed_fragments` does the same. This is
+/// the one place Omnigraph computes that union, for the planner's index facts,
+/// the run-time key-column check and maintenance's lag reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentCoverage {
+    /// Current fragments that a segment reporting its bitmap covers.
+    pub covered: BTreeSet<u64>,
+    /// Whether every segment reports its bitmap. When one does not, `covered`
+    /// is a lower bound and Omnigraph treats the coverage as unknown. Each
+    /// caller decides what unknown means for its decision.
+    ///
+    /// For scalar search this is more conservative than Lance 13.
+    /// `unindexed_fragments` errors on such a segment, but
+    /// `scalar_index_info` first filters out every segment whose bitmap is
+    /// absent, empty, or holds no current fragment, except a full-text
+    /// segment, and serves the union of the others. So a BTREE with one
+    /// complete segment and one segment without a bitmap is used by Lance
+    /// but is unknown (and run-time `Degraded`) here. Only a full-text
+    /// segment without a bitmap makes Lance's own entry unknown. The
+    /// difference is cost only.
+    pub known: bool,
+}
+
+impl SegmentCoverage {
+    pub fn of<'a>(
+        segments: impl IntoIterator<Item = &'a IndexMetadata>,
+        current: &BTreeSet<u64>,
+    ) -> Self {
+        let mut coverage = Self {
+            covered: BTreeSet::new(),
+            known: true,
+        };
+        for segment in segments {
+            match segment.fragment_bitmap.as_ref() {
+                Some(bitmap) => coverage.covered.extend(
+                    bitmap
+                        .iter()
+                        .map(u64::from)
+                        .filter(|fragment| current.contains(fragment)),
+                ),
+                None => coverage.known = false,
+            }
+        }
+        coverage
+    }
+
+    /// Known coverage of every fragment in `current`.
+    pub fn covers_every(&self, current: &BTreeSet<u64>) -> bool {
+        self.known && self.covered.len() == current.len()
+    }
+}
+
+/// The ids of the dataset's current fragments.
+pub fn current_fragments(ds: &Dataset) -> BTreeSet<u64> {
+    ds.fragments().iter().map(|fragment| fragment.id).collect()
+}
+
+/// Whether `index` is a BTREE, by the plugin its details name. Details Lance
+/// cannot resolve to a plugin are not a BTREE, whatever their type URL says.
+pub fn is_btree_index(index: &IndexMetadata) -> bool {
+    index.index_details.as_ref().is_some_and(|details| {
+        IndexDetails(details.clone())
+            .get_plugin()
+            .is_ok_and(|plugin| plugin.name() == "BTree")
+    })
+}
+
+/// Metadata-only check (no IO) of whether a `key_col IN (...)` filter on `ds`
+/// will be served by persisted BTREE coverage of the whole table, or read
+/// some fragments by a full filtered scan. The scan returns the correct rows
+/// either way; this decides cost and surfaces the fallback.
+///
+/// It is the planner's rule (`IndexFact::fully_covers_btree` over every
+/// index keyed on the column, built in the engine's `plan_source::indexes`),
+/// so a run that has to probe coverage decides as a plan would: every index
+/// keyed on `column` is a BTREE whose segments together cover every current
+/// fragment, coverage is known, the table has a fragment, and every fragment
+/// records `physical_rows` (Lance disables scalar indices for the whole scan
+/// otherwise, `dataset/scanner.rs` `create_filter_plan`).
 pub async fn key_column_index_coverage(ds: &Dataset, column: &str) -> Result<IndexCoverage> {
     let Some(field_id) = ds.schema().field(column).map(|field| field.id) else {
         return Ok(IndexCoverage::Degraded {
@@ -136,77 +211,89 @@ pub async fn key_column_index_coverage(ds: &Dataset, column: &str) -> Result<Ind
         });
     };
     let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-    let btree = indices
-        .iter()
-        .filter(|index| !is_system_index(index))
-        .filter(|index| index.fields.len() == 1 && index.fields[0] == field_id)
-        .find(|index| {
-            index
-                .index_details
-                .as_ref()
-                .map(|details| details.type_url.ends_with("BTreeIndexDetails"))
-                .unwrap_or(false)
-        });
-    let Some(btree) = btree else {
-        return Ok(IndexCoverage::Degraded {
-            reason: format!("no BTREE index on '{}'", column),
-        });
-    };
-    // Same check Lance runs: a fragment missing physical_rows disables
-    // scalar indices for the entire scan (all-or-nothing).
-    if ds.fragments().iter().any(|f| f.physical_rows.is_none()) {
-        return Ok(IndexCoverage::Degraded {
-            reason: "a fragment is missing physical_rows".to_string(),
-        });
-    }
-    // An index only covers the fragments it was built over; fragments
-    // appended afterward (edge-index creation is skipped once a BTREE exists)
-    // are scanned unindexed. If any CURRENT fragment is absent from the
-    // index's `fragment_bitmap`, the scan is partly a full scan — so the
-    // chooser must not price it as fully indexed. A `None` bitmap means Lance
-    // can't report coverage; don't over-degrade in that case.
-    if let Some(bitmap) = btree.fragment_bitmap.as_ref() {
-        let uncovered = ds
-            .fragments()
+    Ok(key_column_coverage(
+        &indices,
+        field_id,
+        column,
+        &current_fragments(ds),
+        ds.fragments()
             .iter()
-            .filter(|f| !bitmap.contains(f.id as u32))
-            .count();
-        if uncovered > 0 {
-            return Ok(IndexCoverage::Degraded {
-                reason: format!(
-                    "{} fragment(s) not covered by the index on '{}'",
-                    uncovered, column
-                ),
-            });
+            .all(|fragment| fragment.physical_rows.is_some()),
+    ))
+}
+
+/// [`key_column_index_coverage`] over already-loaded metadata.
+pub fn key_column_coverage(
+    indices: &[IndexMetadata],
+    field_id: i32,
+    column: &str,
+    current: &BTreeSet<u64>,
+    physical_rows_known: bool,
+) -> IndexCoverage {
+    let degraded = |reason: String| IndexCoverage::Degraded { reason };
+    let mut by_name = BTreeMap::<&str, Vec<&IndexMetadata>>::new();
+    for index in indices
+        .iter()
+        .filter(|index| !is_system_index(index) && index.keyed_field() == Some(field_id))
+    {
+        by_name.entry(index.name.as_str()).or_default().push(index);
+    }
+    if !by_name
+        .values()
+        .any(|segments| segments.iter().all(|segment| is_btree_index(segment)))
+    {
+        return degraded(format!("no BTREE index on '{}'", column));
+    }
+    if !physical_rows_known {
+        return degraded("a fragment is missing physical_rows".to_string());
+    }
+    if current.is_empty() {
+        return degraded(format!("no fragment to index on '{}'", column));
+    }
+    for (name, segments) in by_name {
+        if !segments.iter().all(|segment| is_btree_index(segment)) {
+            return degraded(format!("index '{}' on '{}' is not a BTREE", name, column));
+        }
+        let coverage = SegmentCoverage::of(segments, current);
+        if !coverage.known {
+            return degraded(format!(
+                "index '{}' on '{}' does not report its fragment coverage",
+                name, column
+            ));
+        }
+        if !coverage.covers_every(current) {
+            return degraded(format!(
+                "{} fragment(s) not covered by the index '{}' on '{}'",
+                current.len() - coverage.covered.len(),
+                name,
+                column
+            ));
         }
     }
-    Ok(IndexCoverage::Indexed)
+    IndexCoverage::Indexed
 }
 
 /// True if any non-system index on `ds` leaves at least one current
-/// fragment uncovered, i.e. rows that the index does not yet account for
-/// (appended after the index was built, or rewritten by compaction). Such
-/// fragments are scanned unindexed until index maintenance covers them
-/// (full-text requires explicit rebuilding). Returns false when every index covers every fragment, or
-/// when the table has no (non-system) indices to optimize. A `None`
-/// `fragment_bitmap` means Lance cannot report coverage for that index, so
-/// we do not treat it as uncovered (mirrors `key_column_index_coverage`).
+/// fragment uncovered by all of its segments together, i.e. rows that the
+/// index does not yet account for (appended after the index was built, or
+/// rewritten by compaction). Such fragments are scanned unindexed until index
+/// maintenance covers them (full-text requires explicit rebuilding). Returns
+/// false when every index covers every fragment, or when the table has no
+/// (non-system) indices to optimize. Unknown coverage (a segment without a
+/// fragment bitmap) is not evidence of uncovered rows, as for the fold's lag.
 ///
 /// This reports physical coverage, not whether ordinary optimize can fix it.
 pub async fn has_unindexed_fragments(ds: &Dataset) -> Result<bool> {
     let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-    let frag_ids: Vec<u32> = ds.fragments().iter().map(|f| f.id as u32).collect();
-    for index in indices.iter() {
-        if is_system_index(index) {
-            continue;
-        }
-        if let Some(bitmap) = index.fragment_bitmap.as_ref() {
-            if frag_ids.iter().any(|id| !bitmap.contains(*id)) {
-                return Ok(true);
-            }
-        }
+    let current = current_fragments(ds);
+    let mut by_name = BTreeMap::<&str, Vec<&IndexMetadata>>::new();
+    for index in indices.iter().filter(|index| !is_system_index(index)) {
+        by_name.entry(index.name.as_str()).or_default().push(index);
     }
-    Ok(false)
+    Ok(by_name.into_values().any(|segments| {
+        let coverage = SegmentCoverage::of(segments, &current);
+        coverage.known && !coverage.covers_every(&current)
+    }))
 }
 
 pub async fn user_indices_for_column(ds: &Dataset, column: &str) -> Result<Vec<IndexMetadata>> {

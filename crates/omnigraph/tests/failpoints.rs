@@ -1934,9 +1934,21 @@ async fn named_branch_write_refuses_delete_recreate_before_effects() {
 async fn conditional_update_and_delete_races_return_precondition_failed_before_effects() {
     let _scenario = FailScenario::setup();
 
-    for query_name in ["set_age", "remove_person"] {
+    for (query_name, winner_opens_second_handle) in [
+        ("set_age", false),
+        ("remove_person", false),
+        ("set_age", true),
+        ("remove_person", true),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+        let winner = if winner_opens_second_handle {
+            std::sync::Arc::new(helpers::session(
+                Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap(),
+            ))
+        } else {
+            std::sync::Arc::clone(&db)
+        };
         let expected = branch_head_commit_id(dir.path(), "main").await.unwrap();
         let mutation_params = if query_name == "set_age" {
             helpers::mixed_params(&[("$name", "Alice")], &[("$age", 99)])
@@ -1963,22 +1975,23 @@ async fn conditional_update_and_delete_races_return_precondition_failed_before_e
         });
 
         rendezvous.wait_until_reached().await;
-        db.mutate(
-            "main",
-            OCC_DISJOINT_MUTATIONS,
-            "insert_company",
-            &params(&[("$name", "ConcurrentCo")]),
-        )
-        .await
-        .expect("the disjoint winner commits while the conditional mutation is parked");
+        winner
+            .mutate(
+                "main",
+                OCC_DISJOINT_MUTATIONS,
+                "insert_company",
+                &params(&[("$name", "ConcurrentCo")]),
+            )
+            .await
+            .expect("the disjoint winner commits while the conditional mutation is parked");
         let winner_head = branch_head_commit_id(dir.path(), "main").await.unwrap();
-        let winner_person_pin = helpers::snapshot_main(&db)
+        let winner_person_pin = helpers::snapshot_main(&winner)
             .await
             .unwrap()
             .dataset("node:Person")
             .unwrap()
             .published_dataset_version;
-        let person_uri = node_table_uri(&db, "Person").await;
+        let person_uri = node_table_uri(&winner, "Person").await;
         let winner_person_head = lance::Dataset::open(&person_uri)
             .await
             .unwrap()
@@ -2002,7 +2015,9 @@ async fn conditional_update_and_delete_races_return_precondition_failed_before_e
                 assert_eq!(actual.as_deref(), Some(winner_head.as_str()));
             }
             other => {
-                panic!("conditional {query_name} race must be PreconditionFailed, got: {other}")
+                panic!(
+                    "conditional {query_name} race (winner on a second handle: {winner_opens_second_handle}) must be PreconditionFailed, got: {other}"
+                )
             }
         }
 

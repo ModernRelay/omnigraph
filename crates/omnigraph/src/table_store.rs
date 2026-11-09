@@ -36,8 +36,8 @@ use lance::dataset::write::merge_insert::{
     MergeStats, SourceDedupeBehavior, UncommittedMergeInsert,
 };
 use lance::dataset::{
-    DeleteBuilder, InsertBuilder, MergeInsertBuilder, ReadBlobsStream, WhenMatched, WhenNotMatched,
-    WriteMode, WriteParams,
+    DeleteBuilder, InsertBuilder, MergeInsertBuilder, MergeInsertWriteMode, ReadBlobsStream,
+    WhenMatched, WhenNotMatched, WriteMode, WriteParams,
 };
 use lance::datatypes::Schema as LanceSchema;
 use lance::index::DatasetIndexExt;
@@ -1057,6 +1057,10 @@ pub struct StagedWrite {
     /// adds without removing anything); populated from
     /// `Operation::Update.removed_fragment_ids` for keyed writes.
     removed_fragment_ids: Vec<u64>,
+    /// Rows `stage_delete` removes, as Lance's delete scan counted them while
+    /// staging. `None` for every other effect, including `stage_delete_rows`,
+    /// whose rows the caller supplies and Lance does not count.
+    deleted_rows: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1183,6 +1187,7 @@ impl StagedWrite {
             commit_metadata: StagedCommitMetadata::default(),
             new_fragments,
             removed_fragment_ids,
+            deleted_rows: None,
         }
     }
 
@@ -1197,7 +1202,19 @@ impl StagedWrite {
             commit_metadata,
             new_fragments,
             removed_fragment_ids,
+            deleted_rows: None,
         }
+    }
+
+    fn with_deleted_rows(mut self, deleted_rows: u64) -> Self {
+        self.deleted_rows = Some(deleted_rows);
+        self
+    }
+
+    /// Rows a `stage_delete` removes, as Lance's delete scan counted them;
+    /// `None` for any other effect, including `stage_delete_rows`.
+    pub(crate) fn deleted_rows(&self) -> Option<u64> {
+        self.deleted_rows
     }
 
     pub fn new_fragments(&self) -> &[Fragment] {
@@ -3087,27 +3104,18 @@ impl TableStore {
         for index in indices.iter().filter(|index| Self::can_fold_index(index)) {
             by_name.entry(index.name.clone()).or_default().push(index);
         }
+        let current = crate::dataset_index::current_fragments(ds);
         let mut lag = Vec::new();
         for (name, segments) in by_name {
+            let coverage =
+                crate::dataset_index::SegmentCoverage::of(segments.iter().copied(), &current);
             // As on the public coverage surface, unknown coverage is not
             // evidence of work. Such legacy inventory needs explicit handling.
-            if segments
-                .iter()
-                .any(|segment| segment.fragment_bitmap.is_none())
-            {
+            if !coverage.known {
                 continue;
             }
-            let mut covered = std::collections::HashSet::<u32>::new();
-            for segment in &segments {
-                if let Some(bitmap) = segment.fragment_bitmap.as_ref() {
-                    covered.extend(bitmap.iter());
-                }
-            }
             let vector = Self::index_is_vector(segments[0]);
-            let complete = ds
-                .fragments()
-                .iter()
-                .all(|fragment| covered.contains(&(fragment.id as u32)));
+            let complete = coverage.covers_every(&current);
             // A scalar index whose segments together cover every fragment
             // is current. A vector index split into segments (Lance's own
             // fold left deltas, or a partial rebuild) is collapsed into one.
@@ -3382,12 +3390,15 @@ impl TableStore {
             }
         };
 
-        Ok(Some(StagedWrite::with_commit_metadata(
-            uncommitted.transaction,
-            StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
-            new_fragments,
-            removed_fragment_ids,
-        )))
+        Ok(Some(
+            StagedWrite::with_commit_metadata(
+                uncommitted.transaction,
+                StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
+                new_fragments,
+                removed_fragment_ids,
+            )
+            .with_deleted_rows(uncommitted.num_deleted_rows),
+        ))
     }
 
     /// Stage the delete of exactly the rows at `row_addrs`, captured by the
@@ -4058,7 +4069,8 @@ impl TableStore {
         // `stage_absence_proven_strict_insert`.
         let when_not_matched = match semantics {
             KeyedWriteSemantics::Upsert => WhenNotMatched::InsertAll,
-            KeyedWriteSemantics::KnownPresentUpdate => WhenNotMatched::DoNothing,
+            KeyedWriteSemantics::KnownPresentUpdate
+            | KeyedWriteSemantics::KnownPresentColumnPatch => WhenNotMatched::DoNothing,
             KeyedWriteSemantics::StrictInsert => {
                 return Err(OmniError::manifest_internal(format!(
                     "{context}: strict insert must stage through the absence-proven insert writer"
@@ -4070,12 +4082,23 @@ impl TableStore {
                 .map_err(OmniError::lance_internal)?;
         builder.when_matched(WhenMatched::UpdateAll);
         builder.when_not_matched(when_not_matched);
-        if semantics != KeyedWriteSemantics::KnownPresentUpdate {
+        let update_only = matches!(
+            semantics,
+            KeyedWriteSemantics::KnownPresentUpdate | KeyedWriteSemantics::KnownPresentColumnPatch
+        );
+        if !update_only {
             // Lance's scalar-index v1 route omits the inserted-row key filter.
             // Every insertion-capable path therefore forces v2 and validates
             // the exact-id filter below. Update-only staging may use v1 because
             // DoNothing closes the insertion action and affected_rows owns OCC.
             builder.use_index(false);
+        }
+        if semantics == KeyedWriteSemantics::KnownPresentColumnPatch {
+            // Patch `id` and the source's columns into the fragments holding
+            // the matched rows; the columns the source omits are neither read
+            // nor written. Lance refuses the mode, rather than falling back,
+            // when the source covers every column or carries a Blob.
+            builder.write_mode(MergeInsertWriteMode::RewriteColumns);
         }
         builder.conflict_retries(0);
         builder.source_dedupe_behavior(SourceDedupeBehavior::Fail);
@@ -4086,6 +4109,14 @@ impl TableStore {
             .await
             .map_err(OmniError::lance_stream)?;
 
+        if semantics == KeyedWriteSemantics::KnownPresentColumnPatch {
+            let mut uncommitted = uncommitted;
+            validate_known_present_column_patch(&uncommitted, merged_rows, context)?;
+            keep_key_index_coverage(&mut uncommitted.transaction, id_field_id, context)?;
+            let stats = uncommitted.stats.clone();
+            crate::instrumentation::record_stage_known_present_update(merged_rows);
+            return Ok((staged_column_patch_result(uncommitted, context)?, stats));
+        }
         if semantics == KeyedWriteSemantics::KnownPresentUpdate {
             validate_known_present_update(&uncommitted, id_field_id, merged_rows, context)?;
         } else {
@@ -5878,7 +5909,7 @@ impl TableStore {
                 .await?
         };
         let mut account = PendingScanAccount::new(budget)?;
-        account.add_batches(&pending)?;
+        let pending = account.retain_all(pending)?;
 
         let scan_rows = account.next_scan_rows();
         let scan_bytes = account.next_scan_bytes();
@@ -5912,8 +5943,7 @@ impl TableStore {
             if batch.num_rows() == 0 {
                 continue;
             }
-            account.add_batch(&batch)?;
-            committed.push(batch);
+            committed.push(account.retain(batch)?);
         }
 
         committed.extend(pending);
@@ -6049,7 +6079,7 @@ impl TableStore {
                 .collect::<Result<Vec<_>>>()?,
         };
         let mut account = PendingScanAccount::new(budget)?;
-        account.add_batches(&pending)?;
+        let pending = account.retain_all(pending)?;
         let carried_without_blobs: Option<SchemaRef> =
             (!carried.fields.iter().any(|field| field.is_blob()))
                 .then(|| Arc::new((&carried).into()));
@@ -6092,20 +6122,22 @@ impl TableStore {
                 continue;
             }
             account.ensure_additional_rows(batch.num_rows())?;
+            if let Some(schema) = &carried_without_blobs {
+                let carried_rows = predicate_rows_as(schema, &batch)?;
+                committed.push(account.retain(carried_rows)?);
+                continue;
+            }
+
             // This predicate scan contains every logical non-blob column and
             // `_rowid`, but no blob descriptors/payloads. Charge the logical
             // columns now so an already-overwide match fails before
-            // `take_rows` performs the second full-row read.
+            // `take_rows` performs the second full-row read. A scanner batch
+            // can share buffers with rows it does not contain, so measure a
+            // copy of the matched rows, as `PendingScanAccount::retain` does.
+            let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
             let non_blob_bytes = non_blob_column_bytes(committed_ds, &batch)?;
             account.remaining_bytes_after(non_blob_bytes)?;
             let payload_budget = account.write_budget.bytes() - account.payload_bytes;
-
-            if let Some(schema) = &carried_without_blobs {
-                let carried_rows = predicate_rows_as(schema, &batch)?;
-                account.add_batch(&carried_rows)?;
-                committed.push(carried_rows);
-                continue;
-            }
 
             let row_ids = batch
                 .column_by_name("_rowid")
@@ -6161,12 +6193,434 @@ impl TableStore {
                 Err(error) => return Err(error),
                 Ok(materialized) => materialized,
             };
-            account.add_batch(&materialized)?;
-            committed.push(materialized);
+            committed.push(account.retain(materialized)?);
         }
 
         committed.extend(pending);
         Ok(committed)
+    }
+
+    /// Select the rows an `update` matches and decide how its write lands
+    /// (issue #1264): as a column patch, Lance's `RewriteColumns`, which writes
+    /// `id` and the assigned columns into a data file beside each touched
+    /// fragment and never reads or writes the `request.omitted` columns; or as
+    /// whole rows, the keyed upsert every other write uses.
+    ///
+    /// One filtered scan reads the carried columns (every column but the
+    /// omitted ones) with `_rowid` and `_rowaddr`; on a table whose omitted
+    /// columns are all vectors it reads those too, so a row rewrite reads
+    /// what it always did (a patch then drops them unwritten). That fixes
+    /// [`UpdateWriteCost::patch_bytes`] and a lower bound of
+    /// [`UpdateWriteCost::rows_bytes`] (the carried columns and the vectors at
+    /// full width); a patch that beats the bound is chosen without reading any
+    /// omitted column. Otherwise the matched rows' omitted columns are taken by
+    /// `_rowid` (vectors and Blob descriptors, never a payload), which a row
+    /// rewrite needs anyway: their managed Blob lengths complete the estimate,
+    /// and a stored external reference selects the patch whatever the
+    /// estimate, because only the patch keeps it without reading or refusing
+    /// it. (On a vector-only table the bound is the whole estimate.)
+    ///
+    /// A patch returns the carried columns, schema order, for validation; the
+    /// patch source is cut from them at staging. Rows rebuild the taken Blobs,
+    /// as [`Self::scan_with_pending_materialized_blobs`] does, and return the
+    /// dataset's full logical schema. The caller holds no pending row of the
+    /// table, so this scan has no merge-shadow side.
+    pub async fn scan_update_matches(
+        &self,
+        ds: &Dataset,
+        request: &UpdateMatchRequest,
+        filter: Expr,
+        budget: PendingScanBudget,
+    ) -> Result<UpdateMatches> {
+        let schema = ds.schema();
+        if request.omitted.is_empty() {
+            return Err(OmniError::manifest_internal(
+                "scan_update_matches: a column patch must omit at least one column",
+            ));
+        }
+        let mut vector_row_bytes = 0_u64;
+        let mut omitted_blobs = Vec::new();
+        for name in &request.omitted {
+            let field = schema.field(name).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "scan_update_matches: omitted column '{name}' is not in the table"
+                ))
+            })?;
+            let width = if field.is_blob() {
+                field.is_blob_v2().then_some(0)
+            } else {
+                fixed_width_row_bytes(&field.data_type())
+            };
+            let Some(width) = width else {
+                // A legacy Blob or a vector of non-primitive items: no patch
+                // is estimated, so the update rewrites whole rows as before.
+                let batches = self
+                    .scan_with_pending_materialized_blobs(
+                        ds,
+                        &[],
+                        None,
+                        Some(filter),
+                        Some(&request.id_column),
+                        &[],
+                        budget,
+                    )
+                    .await?;
+                return Ok(UpdateMatches {
+                    mode: UpdateWriteMode::Rows,
+                    cost: UpdateWriteCost::default(),
+                    batches,
+                });
+            };
+            if field.is_blob() {
+                omitted_blobs.push(name.as_str());
+            }
+            vector_row_bytes = vector_row_bytes
+                .checked_add(width)
+                .ok_or_else(|| OmniError::manifest_internal("vector row bytes overflow"))?;
+        }
+        let mut assigned_field_ids: Vec<(HashSet<i32>, u64)> = Vec::new();
+        for (name, row_bytes) in &request.assigned {
+            let field = schema.field(name).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "scan_update_matches: assigned column '{name}' is not in the table"
+                ))
+            })?;
+            if field.is_blob() || request.omitted.contains(name) || *name == request.id_column {
+                return Err(OmniError::manifest_internal(format!(
+                    "scan_update_matches: '{name}' cannot be a column patch's assigned column"
+                )));
+            }
+            let mut ids = HashSet::new();
+            let mut pending = vec![field];
+            while let Some(field) = pending.pop() {
+                ids.insert(field.id);
+                pending.extend(field.children.iter());
+            }
+            assigned_field_ids.push((ids, *row_bytes));
+        }
+        let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+        let indexed_assigned_row_bytes = assigned_field_ids
+            .iter()
+            .filter(|(ids, _)| {
+                indices
+                    .iter()
+                    .filter(|index| !is_system_index(index))
+                    .any(|index| index.fields.iter().any(|id| ids.contains(id)))
+            })
+            .map(|(_, row_bytes)| *row_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let assigned_row_bytes = request
+            .assigned
+            .iter()
+            .map(|(_, row_bytes)| *row_bytes)
+            .fold(0_u64, u64::saturating_add);
+
+        let carried_names = schema
+            .fields
+            .iter()
+            .filter(|field| !request.omitted.contains(&field.name))
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        if !carried_names.contains(&request.id_column.as_str()) {
+            return Err(OmniError::manifest_internal(
+                "scan_update_matches: the id column must be carried",
+            ));
+        }
+        let carried: SchemaRef = Arc::new(
+            (&schema
+                .project(&carried_names)
+                .map_err(OmniError::lance_internal)?)
+                .into(),
+        );
+        let omitted_names = request
+            .omitted
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let omitted_schema = schema
+            .project(&omitted_names)
+            .map_err(OmniError::lance_internal)?;
+
+        // With no omitted Blob, the omitted columns are vectors and a row
+        // rewrite needs nothing else: the scan projects them, so a rewrite
+        // reads exactly what it always did and a patch drops them unwritten.
+        // A separate take of them would open another reader, which on Lance
+        // 13 reads the column's metadata again.
+        let scan_vectors = omitted_blobs.is_empty();
+        let projection = if scan_vectors {
+            schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect()
+        } else {
+            carried_names.clone()
+        };
+        let full: SchemaRef = Arc::new(schema.into());
+        let mut account = PendingScanAccount::new(budget)?;
+        let scan_rows = account.next_scan_rows();
+        let scan_bytes = account.next_scan_bytes();
+        let mut matched =
+            Self::scan_stream_with(ds, Some(&projection), None, None, true, |scanner| {
+                scanner.filter_expr(filter);
+                scanner.with_row_address();
+                scanner.batch_size(scan_rows);
+                scanner.batch_size_bytes(scan_bytes);
+                Ok(())
+            })
+            .await?;
+
+        let mut cost = UpdateWriteCost {
+            indexed_assigned_row_bytes,
+            rows_disallowed: !request.rows_allowed,
+            ..UpdateWriteCost::default()
+        };
+        let mut fragments = HashSet::new();
+        let mut scanned: Vec<(RecordBatch, Vec<u64>)> = Vec::new();
+        let mut scanned_whole: Vec<RecordBatch> = Vec::new();
+        let mut carried_bytes = 0_u64;
+        while let Some(batch) = matched.try_next().await.map_err(OmniError::storage)? {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            account.ensure_additional_rows(batch.num_rows())?;
+            // A filtered scan returns the matched rows as a slice of a batch
+            // decoded from their fragment, which pins that batch's buffers.
+            // Copied into their own buffers before they are charged or kept,
+            // the rows hold, and are charged, only their own bytes, whatever
+            // else their fragment stores or the scan's batch size was.
+            let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
+            // Admission charges the carried columns alone, what a patch
+            // retains, whichever mode the update then takes.
+            let rows = predicate_rows_as(&carried, &batch)?;
+            carried_bytes = carried_bytes
+                .checked_add(rows.get_array_memory_size() as u64)
+                .ok_or_else(|| OmniError::manifest_internal("pending scan byte count overflow"))?;
+            account.remaining_bytes_after(carried_bytes)?;
+            let addresses = batch
+                .column_by_name("_rowaddr")
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("expected _rowaddr in an update's match scan")
+                })?;
+            fragments.extend(addresses.values().iter().map(|address| address >> 32));
+            let ids = rows
+                .column_by_name(&request.id_column)
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(
+                        "expected a Utf8 id column in an update's match scan",
+                    )
+                })?;
+            // The offsets bound this batch's values: a slice shares its
+            // parent's whole values buffer.
+            let offsets = ids.value_offsets();
+            let id_values = offsets[offsets.len() - 1] - offsets[0];
+            cost.id_bytes = cost
+                .id_bytes
+                .saturating_add(u64::try_from(id_values).unwrap_or(0))
+                .saturating_add(4 * ids.len() as u64);
+            cost.carried_bytes = cost.carried_bytes.saturating_add(value_bytes(&rows));
+            cost.matched_rows = cost.matched_rows.saturating_add(rows.num_rows() as u64);
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::manifest_internal("expected _rowid in an update's match scan")
+                })?
+                .values()
+                .to_vec();
+            if scan_vectors {
+                scanned_whole.push(predicate_rows_as(&full, &batch)?);
+            }
+            scanned.push((rows, row_ids));
+        }
+        cost.vector_bytes = vector_row_bytes.saturating_mul(cost.matched_rows);
+        cost.assigned_bytes = assigned_row_bytes.saturating_mul(cost.matched_rows);
+        cost.touched_rows = ds
+            .manifest
+            .fragments
+            .iter()
+            .filter(|fragment| fragments.contains(&fragment.id))
+            .try_fold(0_u64, |rows, fragment| {
+                fragment
+                    .physical_rows
+                    .map(|physical| rows.saturating_add(physical as u64))
+            })
+            .unwrap_or(u64::MAX);
+
+        // The Blob lengths only add to a row rewrite's bytes: a patch that
+        // beats the bound without them beats it with them.
+        let patch = |scanned: Vec<(RecordBatch, Vec<u64>)>,
+                     account: &mut PendingScanAccount,
+                     cost: UpdateWriteCost|
+         -> Result<UpdateMatches> {
+            let mut batches = Vec::with_capacity(scanned.len());
+            for (rows, _) in scanned {
+                batches.push(account.retain(rows)?);
+            }
+            Ok(UpdateMatches {
+                mode: UpdateWriteMode::ColumnPatch,
+                cost,
+                batches,
+            })
+        };
+        if cost.matched_rows == 0 || cost.mode() == UpdateWriteMode::ColumnPatch {
+            return patch(scanned, &mut account, cost);
+        }
+        if scan_vectors {
+            // A row rewrite that does not fit the write budget takes the
+            // patch, which always fits when the carried columns do, so the
+            // budget constrains the choice and never decides admission.
+            let mut trial = account.clone();
+            let mut batches = Vec::with_capacity(scanned_whole.len());
+            for whole in scanned_whole {
+                match trial.retain(whole) {
+                    Ok(whole) => batches.push(whole),
+                    Err(OmniError::ResourceLimitExceeded { .. }) => {
+                        cost.rows_over_budget = true;
+                        return patch(scanned, &mut account, cost);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(UpdateMatches {
+                mode: UpdateWriteMode::Rows,
+                cost,
+                batches,
+            });
+        }
+
+        // Take the matched rows' omitted columns: vectors and Blob
+        // descriptors, no payload.
+        let mut taken = Vec::with_capacity(scanned.len());
+        for (_, row_ids) in &scanned {
+            let omitted = ds
+                .take_rows(row_ids, omitted_schema.clone())
+                .await
+                .map_err(OmniError::storage)?;
+            for name in &omitted_blobs {
+                let descriptions = omitted
+                    .column_by_name(name)
+                    .and_then(|column| column.as_any().downcast_ref::<StructArray>())
+                    .ok_or_else(|| {
+                        OmniError::blob_integrity(format!(
+                            "expected Blob descriptions for '{name}' in an update's matched rows"
+                        ))
+                    })?;
+                let decoder = BlobDescriptorDecoder::try_new(descriptions)?;
+                for row in 0..omitted.num_rows() {
+                    match decoder.classify(row)? {
+                        BlobDescriptor::Null => {}
+                        BlobDescriptor::Managed { length } => {
+                            cost.managed_blob_bytes =
+                                cost.managed_blob_bytes.saturating_add(length);
+                        }
+                        BlobDescriptor::External { .. } => cost.external_blob = true,
+                    }
+                }
+            }
+            taken.push(omitted);
+        }
+        if cost.mode() == UpdateWriteMode::ColumnPatch {
+            return patch(scanned, &mut account, cost);
+        }
+
+        // Rows: rebuild the taken Blobs and join them to the carried columns.
+        // A row rewrite that does not fit the write budget takes the patch,
+        // which fits whenever the carried columns do (they were charged
+        // above), so the budget constrains the choice and never decides the
+        // outcome. Payload lengths are known from the descriptors, so an
+        // overrun is found before any payload is read; the rows are charged
+        // to a trial account, kept only when every batch fits.
+        let payload_fits = account
+            .payload_bytes
+            .checked_add(cost.managed_blob_bytes)
+            .is_some_and(|payload| payload <= account.write_budget.bytes());
+        if !payload_fits {
+            cost.rows_over_budget = true;
+            return patch(scanned, &mut account, cost);
+        }
+        let mut trial = account.clone();
+        let mut batches = Vec::with_capacity(scanned.len());
+        for ((rows, row_ids), omitted) in scanned.iter().zip(taken) {
+            let whole = match self
+                .rows_with_omitted(
+                    ds,
+                    &full,
+                    &omitted_schema,
+                    !omitted_blobs.is_empty(),
+                    rows,
+                    omitted,
+                    row_ids,
+                    &trial,
+                )
+                .await
+                .and_then(|whole| trial.retain(whole))
+            {
+                Ok(whole) => whole,
+                Err(OmniError::ResourceLimitExceeded { .. }) => {
+                    cost.rows_over_budget = true;
+                    return patch(scanned, &mut account, cost);
+                }
+                Err(error) => return Err(error),
+            };
+            batches.push(whole);
+        }
+        Ok(UpdateMatches {
+            mode: UpdateWriteMode::Rows,
+            cost,
+            batches,
+        })
+    }
+
+    /// One batch of an update's matched rows, whole: the carried `rows` joined
+    /// to their `omitted` columns, whose Blobs are rebuilt as logical values
+    /// within what remains of `account`'s payload budget.
+    #[allow(clippy::too_many_arguments)]
+    async fn rows_with_omitted(
+        &self,
+        ds: &Dataset,
+        full: &SchemaRef,
+        omitted_schema: &LanceSchema,
+        has_blobs: bool,
+        rows: &RecordBatch,
+        omitted: RecordBatch,
+        row_ids: &[u64],
+        account: &PendingScanAccount,
+    ) -> Result<RecordBatch> {
+        account.remaining_bytes_after(rows.get_array_memory_size() as u64)?;
+        let omitted = if has_blobs {
+            let payload_budget = account.write_budget.bytes() - account.payload_bytes;
+            self.materialize_blob_batch_with_row_ids(
+                ds,
+                omitted_schema,
+                omitted,
+                row_ids,
+                Some(payload_budget),
+                None,
+                None,
+            )
+            .await?
+        } else {
+            omitted
+        };
+        let columns = full
+            .fields()
+            .iter()
+            .map(|field| {
+                rows.column_by_name(field.name())
+                    .or_else(|| omitted.column_by_name(field.name()))
+                    .cloned()
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "an update's matched rows lack column '{}'",
+                            field.name()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        RecordBatch::try_new(full.clone(), columns).map_err(OmniError::arrow_internal)
     }
 
     /// `count_rows` variant that respects staged writes. Used for
@@ -6498,14 +6952,157 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
     Ok(())
 }
 
+/// What [`TableStore::scan_update_matches`] needs from the update.
+#[derive(Debug, Clone)]
+pub struct UpdateMatchRequest {
+    /// The graph's system id column, the patch's join key.
+    pub id_column: String,
+    /// The assigned columns, none a Blob, each with the bytes one row's
+    /// value occupies in the patch source.
+    pub assigned: Vec<(String, u64)>,
+    /// Unassigned Blob and fixed-width vector columns: a column patch neither
+    /// reads nor writes them.
+    pub omitted: Vec<String>,
+    /// Whether the update may rewrite whole rows. A mutation that writes
+    /// another table shares one write budget with it, and a row rewrite
+    /// charges carried payload a patch does not, so there the update patches
+    /// and its charge does not depend on the mode. The caller sets it only for
+    /// a mutation of one statement (`ir.ops.len() == 1`), so every update in
+    /// a mutation of several statements patches whatever [`UpdateWriteCost`]
+    /// estimates: the estimate chooses the mode for single-statement
+    /// mutations alone, and tuning it changes nothing for the others.
+    pub rows_allowed: bool,
+}
+
+/// How an update's matched rows reach Lance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateWriteMode {
+    /// `id` and the assigned columns, patched into the touched fragments
+    /// (`MergeInsertWriteMode::RewriteColumns`).
+    ColumnPatch,
+    /// Whole rows, moved to a new fragment (`RewriteRows`).
+    Rows,
+}
+
+/// The facts an update's write mode is chosen from, in bytes. A column patch
+/// writes a column file covering every row of each touched fragment, so its
+/// size is the touched rows times the source row (`id` plus the assigned
+/// values) and barely falls as fewer rows match; a row rewrite reads and
+/// writes each matched row whole, its carried columns, vectors and managed
+/// Blob payloads. Both read about what they write, and both write one object
+/// per touched fragment (a patch file or a deletion vector), so the object
+/// count does not separate them.
+///
+/// The choice is a physical plan decision and never decides the outcome:
+/// admission charges the carried columns, which both modes hold, and a row
+/// rewrite that would exceed the write budget takes the patch
+/// (`rows_over_budget`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UpdateWriteCost {
+    pub matched_rows: u64,
+    /// Physical rows of the fragments holding a matched row.
+    pub touched_rows: u64,
+    /// The matched rows' ids, values plus offsets.
+    pub id_bytes: u64,
+    /// The matched rows' assigned values in the patch source.
+    pub assigned_bytes: u64,
+    /// The matched rows' carried (non-omitted) columns as stored.
+    pub carried_bytes: u64,
+    /// The matched rows' omitted vectors, at full width.
+    pub vector_bytes: u64,
+    /// The matched rows' managed Blob payloads in omitted columns.
+    pub managed_blob_bytes: u64,
+    /// Bytes one row's values occupy in the assigned columns an index covers.
+    /// A patch withdraws every touched fragment from such an index until the
+    /// next reconciliation, so reads of the column scan those fragments: one
+    /// read of the column over them is added to the patch's cost.
+    pub indexed_assigned_row_bytes: u64,
+    /// An omitted Blob column of a matched row holds an external reference.
+    pub external_blob: bool,
+    /// The mutation writes another table, so the update patches.
+    pub rows_disallowed: bool,
+    /// The row rewrite would exceed the write budget, so the update patches.
+    pub rows_over_budget: bool,
+}
+
+impl UpdateWriteCost {
+    /// The bytes a column patch costs: the source row times the touched rows,
+    /// plus a read of each indexed assigned column over the touched rows.
+    pub fn patch_bytes(&self) -> u128 {
+        if self.matched_rows == 0 {
+            return 0;
+        }
+        let source = u128::from(self.id_bytes) + u128::from(self.assigned_bytes);
+        source * u128::from(self.touched_rows) / u128::from(self.matched_rows)
+            + u128::from(self.indexed_assigned_row_bytes) * u128::from(self.touched_rows)
+    }
+
+    /// The bytes a row rewrite writes: every matched row whole.
+    pub fn rows_bytes(&self) -> u128 {
+        u128::from(self.carried_bytes)
+            + u128::from(self.vector_bytes)
+            + u128::from(self.managed_blob_bytes)
+    }
+
+    /// A stored external reference takes the patch, which keeps it unread;
+    /// so does a mutation that writes another table, or a row rewrite over
+    /// the write budget. Otherwise the smaller cost wins.
+    pub fn mode(&self) -> UpdateWriteMode {
+        if self.external_blob
+            || self.rows_disallowed
+            || self.rows_over_budget
+            || self.patch_bytes() < self.rows_bytes()
+        {
+            UpdateWriteMode::ColumnPatch
+        } else {
+            UpdateWriteMode::Rows
+        }
+    }
+}
+
+/// An update's matched rows in the shape its write mode stages: the carried
+/// columns for a patch, the full logical rows otherwise.
+#[derive(Debug)]
+pub struct UpdateMatches {
+    pub mode: UpdateWriteMode,
+    pub cost: UpdateWriteCost,
+    pub batches: Vec<RecordBatch>,
+}
+
+/// Bytes per row of a fixed-width vector column (`FixedSizeList` of a
+/// primitive), `None` for any other type.
+fn fixed_width_row_bytes(data_type: &arrow_schema::DataType) -> Option<u64> {
+    match data_type {
+        arrow_schema::DataType::FixedSizeList(item, length) => {
+            let width = item.data_type().primitive_width()?;
+            u64::try_from(*length)
+                .ok()?
+                .checked_mul(u64::try_from(width).ok()?)
+        }
+        _ => None,
+    }
+}
+
+/// Bytes the values of `batch` occupy, slices counted at their length.
+fn value_bytes(batch: &RecordBatch) -> u64 {
+    batch
+        .columns()
+        .iter()
+        .map(|column| column.to_data().get_slice_memory_size().unwrap_or(0) as u64)
+        .fold(0_u64, u64::saturating_add)
+}
+
 /// Incremental resource accounting for a pending-aware update scan.
 ///
 /// The retained `Vec<RecordBatch>` never grows past this account: pending
 /// results are charged first, and each committed scanner emission is charged
-/// only after pending-key shadowing. `initial_rows` represents this table's
+/// only after pending-key shadowing. Every kept batch goes through
+/// [`Self::retain`], so neither the charge nor the memory held depends on the
+/// rows stored beside a match. `initial_rows` represents this table's
 /// retained batches, while `initial_bytes` represents every table retained by
 /// `MutationStaging`, so a chained cross-table update receives only the
 /// remaining graph-operation byte budget.
+#[derive(Clone)]
 struct PendingScanAccount {
     table_key: String,
     rows: u64,
@@ -6534,17 +7131,33 @@ impl PendingScanAccount {
         &self.table_key
     }
 
-    fn add_batches(&mut self, batches: &[RecordBatch]) -> Result<()> {
-        for batch in batches {
-            self.add_batch(batch)?;
-        }
-        Ok(())
+    /// [`Self::retain`] each batch in order.
+    fn retain_all(&mut self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+        batches
+            .into_iter()
+            .map(|batch| self.retain(batch))
+            .collect()
     }
 
-    fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+    /// The one way a pending-aware scan keeps a batch, and the only method
+    /// that charges one: copy its rows into buffers of their own, then charge
+    /// the copy, and return the copy to keep.
+    ///
+    /// A Lance scanner batch can share buffers with rows it does not contain,
+    /// so charging (or keeping) it as emitted could count rows stored beside
+    /// a match. Copying first makes both the charge and the memory held
+    /// depend only on the kept rows, never on storage layout (issue #1303).
+    /// There is deliberately no separate batch charge method. Only `new` and
+    /// `retain` call `add_usage`, by convention rather than by the compiler,
+    /// so a new retention point should keep its batches through `retain`, and
+    /// must not charge an uncopied batch through `add_usage`. The copy is
+    /// made before the charge: its size is bounded by the input batch, not by
+    /// the budget, so an over-budget copy is made and then refused.
+    fn retain(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+        let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
         let rows = u64::try_from(batch.num_rows())
             .map_err(|_| OmniError::manifest_internal("pending scan row count exceeds u64"))?;
-        let usage = write_batch_bytes(batch)?;
+        let usage = write_batch_bytes(&batch)?;
         let payload_bytes = self
             .payload_bytes
             .checked_add(usage.payload)
@@ -6553,7 +7166,7 @@ impl PendingScanAccount {
             .check(MATERIALIZED_BLOB_PAYLOAD_BYTES, payload_bytes)?;
         self.add_usage(rows, usage.rows)?;
         self.payload_bytes = payload_bytes;
-        Ok(())
+        Ok(batch)
     }
 
     fn add_usage(&mut self, rows: u64, bytes: u64) -> Result<()> {
@@ -7366,6 +7979,131 @@ fn validate_known_present_update(
     Ok(())
 }
 
+/// The shape a known-present column patch must stage: every source id
+/// matched once and updated in place, nothing inserted or deleted, and one
+/// `Update { RewriteColumns }` that only attaches data files to existing
+/// fragments (no new or removed fragment, no inserted-row filter) and lists
+/// the offsets it patched, which `build_manifest` restamps.
+fn validate_known_present_column_patch(
+    uncommitted: &UncommittedMergeInsert,
+    expected_rows: u64,
+    context: &'static str,
+) -> Result<()> {
+    let stats = &uncommitted.stats;
+    if stats.num_inserted_rows != 0
+        || stats.num_updated_rows != expected_rows
+        || stats.num_deleted_rows != 0
+        || stats.num_skipped_duplicates != 0
+    {
+        return Err(OmniError::manifest_read_set_changed(
+            format!("{context}:known_present_ids"),
+            Some(format!(
+                "updated={expected_rows}, inserted=0, deleted=0, skipped=0"
+            )),
+            Some(format!(
+                "updated={}, inserted={}, deleted={}, skipped={}",
+                stats.num_updated_rows,
+                stats.num_inserted_rows,
+                stats.num_deleted_rows,
+                stats.num_skipped_duplicates
+            )),
+        ));
+    }
+    match &uncommitted.transaction.operation {
+        Operation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+            update_mode,
+            inserted_rows_filter,
+            updated_fragment_offsets,
+            ..
+        } if removed_fragment_ids.is_empty()
+            && new_fragments.is_empty()
+            && !updated_fragments.is_empty()
+            && update_mode == &Some(UpdateMode::RewriteColumns)
+            && inserted_rows_filter.is_none()
+            && updated_fragment_offsets.is_some() =>
+        {
+            Ok(())
+        }
+        _ => Err(OmniError::manifest_internal(format!(
+            "{context}: known-present column patch did not stage an in-place RewriteColumns Update"
+        ))),
+    }
+}
+
+/// Keep the `id` index's coverage of the fragments a column patch touched.
+///
+/// Lance writes every source column into the patch, the join key included,
+/// and lists it in `fields_modified`, which withdraws each touched fragment
+/// from every index over the key (lance 13.0.0 `select_write_sink`: the patch
+/// "would reproduce the key column byte for byte"). The values are byte for
+/// byte the ones the index holds, since the join matched them exactly, and a
+/// patch moves no row, so each row keeps its stable row id: the index entries
+/// stay exact. Removing the key from `fields_modified` keeps the coverage;
+/// the patch's other columns stay listed, so an index over them is withdrawn
+/// as Lance decides. `lance_surface_guards.rs` pins both halves.
+fn keep_key_index_coverage(
+    transaction: &mut Transaction,
+    id_field_id: i32,
+    context: &'static str,
+) -> Result<()> {
+    let Operation::Update {
+        fields_modified, ..
+    } = &mut transaction.operation
+    else {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: a column patch is not an Update"
+        )));
+    };
+    let key = u32::try_from(id_field_id).map_err(|_| {
+        OmniError::manifest_internal(format!("{context}: negative id field id {id_field_id}"))
+    })?;
+    if !fields_modified.contains(&key) {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: the column patch does not list the id field {key} it wrote"
+        )));
+    }
+    fields_modified.retain(|field| *field != key);
+    if fields_modified.is_empty() {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: the column patch modified no column besides the id"
+        )));
+    }
+    Ok(())
+}
+
+/// The staged packet of a column patch: the patched fragments replace their
+/// committed selves in a read-your-writes view (`committed - removed + new`),
+/// so they are both the removed and the new fragments. It removes no row, so
+/// it carries the same no-by-source-delete marker as every keyed update.
+fn staged_column_patch_result(
+    mut uncommitted: UncommittedMergeInsert,
+    context: &'static str,
+) -> Result<StagedWrite> {
+    let Operation::Update {
+        updated_fragments, ..
+    } = &uncommitted.transaction.operation
+    else {
+        return Err(OmniError::manifest_internal(format!(
+            "{context}: a column patch is not an Update"
+        )));
+    };
+    let new_fragments = updated_fragments.clone();
+    let removed_fragment_ids = updated_fragments
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect();
+    stamp_no_by_source_delete(&mut uncommitted.transaction);
+    Ok(StagedWrite::with_commit_metadata(
+        uncommitted.transaction,
+        StagedCommitMetadata::affected_rows(None),
+        new_fragments,
+        removed_fragment_ids,
+    ))
+}
+
 fn merge_stats_prove_pure_insert(stats: &MergeStats, expected_rows: u64) -> bool {
     stats.num_inserted_rows == expected_rows
         && stats.num_updated_rows == 0
@@ -7763,7 +8501,7 @@ fn next_proven_insert_batch(
         {
             batch.clone()
         } else {
-            copy_proven_insert_batch_range(batch, offset, rows)?
+            copy_batch_range(batch, offset, rows)?
         };
         let usage = write_batch_bytes(&candidate)?;
         let bytes = usage.rows.max(usage.payload);
@@ -7875,18 +8613,16 @@ fn finish_proven_insert_batch(
     Ok(batch)
 }
 
-fn copy_proven_insert_batch_range(
-    batch: &RecordBatch,
-    offset: usize,
-    rows: usize,
-) -> Result<RecordBatch> {
+/// `rows` rows of `batch` from `offset`, copied into buffers of their own: an
+/// Arrow slice keeps every buffer of its parent alive, a copy only its rows.
+fn copy_batch_range(batch: &RecordBatch, offset: usize, rows: usize) -> Result<RecordBatch> {
     let end = offset
         .checked_add(rows)
-        .ok_or_else(|| OmniError::manifest_internal("proven insert delta range overflow"))?;
+        .ok_or_else(|| OmniError::manifest_internal("batch copy range overflow"))?;
     let offset = u64::try_from(offset)
-        .map_err(|_| OmniError::manifest_internal("proven insert delta offset exceeds u64"))?;
+        .map_err(|_| OmniError::manifest_internal("batch copy offset exceeds u64"))?;
     let end = u64::try_from(end)
-        .map_err(|_| OmniError::manifest_internal("proven insert delta end exceeds u64"))?;
+        .map_err(|_| OmniError::manifest_internal("batch copy end exceeds u64"))?;
     let indices = UInt64Array::from_iter_values(offset..end);
     arrow_select::take::take_record_batch(batch, &indices).map_err(OmniError::arrow_internal)
 }
@@ -7955,6 +8691,91 @@ fn staged_keyed_merge_result(
 mod tests {
     use super::*;
     use arrow_array::{StringArray, UInt8Array, UInt32Array};
+
+    /// Issue #1264: the write mode an update takes from its byte estimate.
+    #[test]
+    fn update_write_mode_follows_bytes_external_references_and_indexes() {
+        // One row of a 512-row fragment, a 32-byte vector: a patch writes the
+        // whole fragment's key and value, a rewrite the one row.
+        let point = UpdateWriteCost {
+            matched_rows: 1,
+            touched_rows: 512,
+            id_bytes: 30,
+            assigned_bytes: 4,
+            carried_bytes: 60,
+            vector_bytes: 32,
+            ..UpdateWriteCost::default()
+        };
+        assert_eq!(point.patch_bytes(), 512 * 34);
+        assert_eq!(point.rows_bytes(), 92);
+        assert_eq!(point.mode(), UpdateWriteMode::Rows);
+        // The same row holding a 1 MiB Blob.
+        let blob = UpdateWriteCost {
+            managed_blob_bytes: 1 << 20,
+            ..point
+        };
+        assert_eq!(blob.mode(), UpdateWriteMode::ColumnPatch);
+        // Every row of the fragment, even with no Blob.
+        let all = UpdateWriteCost {
+            matched_rows: 512,
+            id_bytes: 512 * 30,
+            assigned_bytes: 512 * 4,
+            carried_bytes: 512 * 60,
+            vector_bytes: 512 * 32,
+            ..point
+        };
+        assert_eq!(all.mode(), UpdateWriteMode::ColumnPatch);
+        // An index on the assigned column adds a read of it over the touched
+        // rows to the patch: still cheaper than rewriting a 1 MiB Blob, not
+        // than rewriting a narrow row that the patch already loses to.
+        let indexed = UpdateWriteCost {
+            indexed_assigned_row_bytes: 4,
+            ..blob
+        };
+        assert_eq!(indexed.patch_bytes(), 512 * 34 + 512 * 4);
+        assert_eq!(indexed.mode(), UpdateWriteMode::ColumnPatch);
+        let indexed_all = UpdateWriteCost {
+            matched_rows: 512,
+            id_bytes: 512 * 30,
+            assigned_bytes: 512 * 4,
+            carried_bytes: 512 * 40,
+            indexed_assigned_row_bytes: 30,
+            ..point
+        };
+        assert_eq!(indexed_all.mode(), UpdateWriteMode::Rows);
+        // A stored external reference, a mutation writing another table, and
+        // a row rewrite over the write budget take the patch whatever the
+        // estimate.
+        for cost in [point, indexed_all] {
+            for forced in [
+                UpdateWriteCost {
+                    external_blob: true,
+                    ..cost
+                },
+                UpdateWriteCost {
+                    rows_disallowed: true,
+                    ..cost
+                },
+                UpdateWriteCost {
+                    rows_over_budget: true,
+                    ..cost
+                },
+            ] {
+                assert_eq!(forced.mode(), UpdateWriteMode::ColumnPatch);
+            }
+        }
+        // Equal bytes keep the row rewrite; no match writes nothing.
+        let tie = UpdateWriteCost {
+            matched_rows: 1,
+            touched_rows: 2,
+            id_bytes: 5,
+            assigned_bytes: 5,
+            carried_bytes: 20,
+            ..UpdateWriteCost::default()
+        };
+        assert_eq!(tie.mode(), UpdateWriteMode::Rows);
+        assert_eq!(UpdateWriteCost::default().patch_bytes(), 0);
+    }
     use arrow_schema::{DataType, Field, Schema};
     use lance::blob::BlobArrayBuilder;
 

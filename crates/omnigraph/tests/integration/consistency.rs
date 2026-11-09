@@ -304,6 +304,93 @@ async fn write_max_bytes_load_boundaries_are_independent_and_atomic() {
     }
 }
 
+/// A vector's admission estimates match its Arrow layout (issue #484): a
+/// FixedSizeList has no offsets and one validity bit per child slot. Rows
+/// whose Arrow batch fits `write_max_bytes` load, whether their vectors are
+/// present or null, through every keyed load door; rows that do not fit still
+/// refuse with the typed limit and publish nothing. Before the fix, the parse
+/// estimate charged an offset per element (about twice a Float32 vector's
+/// bytes) and the strict projection a byte per validity bit, so both loads
+/// below were refused at about half and four fifths of the allowance.
+#[tokio::test]
+async fn wide_vector_loads_fit_write_max_bytes_by_their_arrow_size_issue_484() {
+    use omnigraph::settings::{SettingId, SettingValue, Source};
+    const LIMIT: u64 = 1024 * 1024;
+    const DIMENSION: usize = 256;
+    const FITTING_ROWS: usize = 850;
+    const OVER_ROWS: usize = 1100;
+    let rows = |count: usize, present: bool| {
+        let vector = vec![0.5_f32; DIMENSION];
+        let mut input = String::new();
+        for row in 0..count {
+            let data = if present {
+                serde_json::json!({"slug": format!("c{row:04}"), "embedding": vector})
+            } else {
+                serde_json::json!({"slug": format!("c{row:04}")})
+            };
+            writeln!(
+                input,
+                "{}",
+                serde_json::json!({"type": "Chunk", "data": data})
+            )
+            .unwrap();
+        }
+        input
+    };
+    for present in [true, false] {
+        for strict in [false, true] {
+            for mode in [LoadMode::Append, LoadMode::Merge] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut db = helpers::session(
+                    Omnigraph::init(
+                        dir.path().to_str().unwrap(),
+                        "node Chunk { slug: String @key embedding: Vector(256)? }",
+                    )
+                    .await
+                    .unwrap(),
+                );
+                db.set(
+                    SettingId::WriteMaxBytes,
+                    &SettingValue::Integer(LIMIT as i64),
+                    Source::File,
+                )
+                .unwrap();
+                let load = |input: String| {
+                    let db = &db;
+                    async move {
+                        if strict {
+                            db.load_graph_batch("main", &input, mode).await
+                        } else {
+                            db.load_jsonl(&input, mode).await
+                        }
+                    }
+                };
+                load(rows(FITTING_ROWS, present))
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "present={present}, strict={strict}, mode={mode:?}: rows whose Arrow \
+                         batch fits write_max_bytes must load: {error:?}"
+                        )
+                    });
+                assert_eq!(count_rows(&db, "node:Chunk").await, FITTING_ROWS);
+
+                let before = snapshot_main(&db).await.unwrap().graph_manifest_version();
+                let error = load(rows(OVER_ROWS, present)).await.unwrap_err();
+                assert!(
+                    matches!(error, OmniError::ResourceLimitExceeded { limit: LIMIT, .. }),
+                    "present={present}, strict={strict}, mode={mode:?}: {error:?}"
+                );
+                assert_eq!(
+                    snapshot_main(&db).await.unwrap().graph_manifest_version(),
+                    before
+                );
+                assert_eq!(count_rows(&db, "node:Chunk").await, FITTING_ROWS);
+            }
+        }
+    }
+}
+
 /// The sibling 32 MiB cap is measured from the staged Arrow batch, not JSON
 /// syntax. A single wide keyed row must be rejected with a typed limit before
 /// either Lance HEAD or graph visibility can move.

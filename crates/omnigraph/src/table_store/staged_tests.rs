@@ -3081,11 +3081,26 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
             .execute(transaction)
             .await
             .unwrap();
+        let segments = coverage_ds.load_indices().await.unwrap();
+        let mut bitmaps: Vec<_> = segments
+            .iter()
+            .filter(|index| index.fields == [field_id])
+            .map(|index| index.fragment_bitmap.as_ref().unwrap().len())
+            .collect();
+        bitmaps.sort_unstable();
+        assert_eq!(
+            bitmaps,
+            [0, coverage_ds.fragments().len() as u64],
+            "fixture must split {column} into an empty and a complete segment"
+        );
+        // Issue #1298: coverage is the union of an index's segments (RFC
+        // 0046), so an empty segment beside a complete one leaves no row
+        // uncovered.
         assert!(
-            crate::dataset_index::has_unindexed_fragments(&coverage_ds)
+            !crate::dataset_index::has_unindexed_fragments(&coverage_ds)
                 .await
                 .unwrap(),
-            "fixture must expose per-segment partial coverage for {column}"
+            "the segments of {column} cover every fragment together"
         );
         assert_eq!(
             TableStore::has_foldable_unindexed_fragments(&coverage_ds)
@@ -3232,6 +3247,7 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
         .await
         .unwrap()
         .expect("alice matches → Some(StagedWrite)");
+    assert_eq!(staged.deleted_rows(), Some(1));
     assert_eq!(
         ds.version().version,
         pre_version,
@@ -3264,6 +3280,18 @@ async fn stage_delete_does_not_advance_head_and_reads_through_staged() {
         .await
         .unwrap();
     assert!(none.is_none(), "a 0-row delete must stage nothing");
+
+    // A filter that matches only part of what it names reports the rows Lance
+    // actually removed, which a branch merge compares with its chunk (#1295).
+    let partial = store
+        .stage_delete(
+            &committed,
+            ident("id").in_list(vec![lit("bob"), lit("nobody")], false),
+        )
+        .await
+        .unwrap()
+        .expect("bob matches");
+    assert_eq!(partial.deleted_rows(), Some(1));
 }
 
 #[tokio::test]
@@ -3646,5 +3674,79 @@ async fn schema_evolution_plans_metadata_only_steps_and_refuses_rewrites() {
     assert_eq!(
         adopted.field("age").unwrap().id,
         unmarked.schema().field("age").unwrap().id
+    );
+}
+
+/// Issue #1298: Lance keeps an index as segments under one name and serves a
+/// scan from their union (`scalar_index_info`, `unindexed_fragments`). A BTREE
+/// whose delta segment covers the appended fragment covers the table, as the
+/// planner's index facts say. The run-time key-column check read only the
+/// first segment it found and the lag report judged each segment alone, so
+/// both reported uncovered rows. `run_time_key_coverage_agrees_with_the_plan_facts`
+/// (`engine/plan_source/indexes.rs`) pins the shared rule on synthetic
+/// metadata; this test builds the segments with Lance itself.
+#[tokio::test]
+async fn segments_of_one_btree_cover_together_issue_1298() {
+    use arrow_array::RecordBatchIterator;
+    use lance::dataset::{WriteMode, WriteParams};
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::ScalarIndexParams;
+
+    async fn write(uri: &str, ids: &[&str], mode: WriteMode) -> Dataset {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(ids.to_vec()))],
+        )
+        .unwrap();
+        let params = WriteParams {
+            mode,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        Dataset::write(reader, uri, Some(params)).await.unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("segments.lance");
+    let uri = uri.to_str().unwrap();
+    let mut ds = write(uri, &["a", "b"], WriteMode::Create).await;
+    ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("id_idx".to_string())
+        .await
+        .unwrap();
+    write(uri, &["c"], WriteMode::Append).await;
+    let mut ds = Dataset::open(uri).await.unwrap();
+    ds.optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    let indices = ds.load_indices().await.unwrap();
+    let segments: Vec<_> = indices
+        .iter()
+        .filter(|index| index.name == "id_idx")
+        .collect();
+    assert_eq!(segments.len(), 2, "append leaves a delta segment");
+    assert!(
+        segments.iter().all(|segment| segment
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| bitmap.len() == 1)),
+        "each segment covers one of the two fragments"
+    );
+
+    assert_eq!(
+        crate::dataset_index::key_column_index_coverage(&ds, "id")
+            .await
+            .unwrap(),
+        crate::dataset_index::IndexCoverage::Indexed
+    );
+    assert!(
+        !crate::dataset_index::has_unindexed_fragments(&ds)
+            .await
+            .unwrap()
     );
 }

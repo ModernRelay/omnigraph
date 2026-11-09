@@ -34,7 +34,9 @@ edits.
 > batch is refused up front (HTTP 413, typed `resource_limit`) with no durable
 > effect — split it into chunks, each an atomic graph commit. Two further
 > 32 MiB limits apply to the whole keyed load, summed over every touched type:
-> the staged Arrow memory and the parsed-payload estimate. Separately, the ids
+> the staged Arrow memory and the parsed-payload estimate. A vector cell counts
+> its full width (dimension × 4 bytes) whether present or null, so about 2,600
+> `Vector(3072)` rows fit one load. Separately, the ids
 > an `overwrite` or a delete removes share one 32 MiB limit per operation (each
 > id counts its UTF-8 length plus 24 bytes); an `overwrite` that removes more
 > ids than that is refused and cannot be split. The strict NDJSON

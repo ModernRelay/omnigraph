@@ -6,7 +6,7 @@ upgrade procedure. Start with a release's highlights and upgrade actions
 where available. The complete changelog preserves individual change notes,
 including development decisions superseded before the final release.
 
-- [v0.15.0](v0.15.0.md): released 2026-11-06
+- [v0.15.0](v0.15.0.md): released 2026-11-09
 - [v0.14.0](v0.14.0.md): released 2026-10-22 · [Highlights and upgrade actions](v0.14.0-overview.md)
 - [v0.13.0](v0.13.0.md): released 2026-10-07 · [Highlights and upgrade actions](v0.13.0-overview.md)
 - [v0.12.0](v0.12.0.md): released 2026-10-05

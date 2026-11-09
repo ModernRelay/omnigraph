@@ -2704,6 +2704,156 @@ fn instrument_filtered_update_cost_over_per_commit_fragments() {
     }
 }
 
+/// Issue #1264: one scalar `update` on a node type with a Blob and a vector,
+/// measured on a reopened handle. Alone in its mutation it patches the
+/// assigned column (`UpdatePatchBlob16K`, `UpdatePatchBlob128K`,
+/// `UpdatePatchBlob1M`): it reads and writes no Blob or vector, so its calls
+/// do not follow the Blob size within one Blob placement, and the 128 KiB and
+/// 1 MiB rows, both in Lance 13's packed-sidecar range (64 KiB to 4 MiB), are
+/// equal. A 16 KiB Blob is stored inline in the data file (64 KiB or less),
+/// which changes how the patch's scan reads the other columns of that file.
+/// Beside a second statement on the type it rewrites the whole row
+/// (`UpdateRowsBlob1M`), reading the carried Blob. `UpdateRowsOverBudget`
+/// pins the fallback: the estimate prefers rewriting a row that holds a wide
+/// vector, which fits the write budget as matched, but its 8 KiB title
+/// assignment takes it past the budget at staging, so the update reads the
+/// Blob, then stages the patch.
+fn update_patch_cost_rows(replay: &str) -> String {
+    const SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    score: I32?\n    content: Blob?\n    emb: Vector(8)?\n}\n";
+    const WIDE_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    title: String?\n    content: Blob?\n    emb: Vector(2048)?\n}\n";
+    const UPDATES: &str = r#"
+query patch() {
+    update Doc set { score: 1 } where slug = "d1"
+}
+query rewrite() {
+    update Doc set { score: 2 } where slug = "d1"
+    update Doc set { score: 2 } where slug = "nobody"
+}
+query widen($title: String) {
+    update Doc set { title: $title } where slug = "d1"
+}
+"#;
+
+    fn base64(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let word = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            for index in 0..4 {
+                if index <= chunk.len() {
+                    out.push(TABLE[((word >> (18 - 6 * index)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    struct UpdateCost {
+        schema: &'static str,
+        dimensions: u32,
+        blob_bytes: usize,
+        query: &'static str,
+        write_max_bytes: Option<u64>,
+        label: &'static str,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for UpdateCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_update_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    self.schema,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let rows = (0..4u8)
+                .map(|row| {
+                    let emb = (0..self.dimensions)
+                        .map(|i| format!("{}.0", u32::from(row) * self.dimensions + i))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(
+                        r#"{{"type":"Doc","data":{{"slug":"d{row}","age":{row},"content":"base64:{}","emb":[{emb}]}}}}"#,
+                        base64(&vec![row + 1; self.blob_bytes])
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            db.load_jsonl(&rows, LoadMode::Overwrite).await.unwrap();
+            drop(db);
+            let mut settings = SessionSettings::default();
+            if let Some(bytes) = self.write_max_bytes {
+                settings = settings
+                    .with("write_max_bytes", &bytes.to_string())
+                    .unwrap();
+            }
+            let db = Session::from_defaults(
+                Arc::new(
+                    Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                        .await
+                        .unwrap(),
+                ),
+                settings,
+            );
+            let title = "w".repeat(8 * 1024);
+            let params = if self.query == "widen" {
+                mixed_params(&[("$title", &title)], &[])
+            } else {
+                omnigraph_compiler::ir::ParamMap::new()
+            };
+            omnigraph_dst::cost::set_label(self.label);
+            let result = db.mutate("main", UPDATES, self.query, &params).await;
+            omnigraph_dst::cost::set_label("_update_verify");
+            assert_eq!(result.unwrap().affected_nodes, 1);
+        }
+    }
+
+    let mut rows = String::new();
+    for (schema, dimensions, blob_bytes, query, write_max_bytes, label) in [
+        (SCHEMA, 8, 16 * 1024, "patch", None, "UpdatePatchBlob16K"),
+        (SCHEMA, 8, 128 * 1024, "patch", None, "UpdatePatchBlob128K"),
+        (SCHEMA, 8, 1024 * 1024, "patch", None, "UpdatePatchBlob1M"),
+        (SCHEMA, 8, 1024 * 1024, "rewrite", None, "UpdateRowsBlob1M"),
+        (
+            WIDE_SCHEMA,
+            2048,
+            1024,
+            "widen",
+            Some(12 * 1024),
+            "UpdateRowsOverBudget",
+        ),
+    ] {
+        rows.push_str(&labeled_cost_rows(
+            format!("shared-memory://dst-update-cost-{replay}-{label}"),
+            &UpdateCost {
+                schema,
+                dimensions,
+                blob_bytes,
+                query,
+                write_max_bytes,
+                label,
+            },
+            label,
+        ));
+    }
+    rows
+}
+
 /// A keyed lookup and a one-hop traversal on main, in the order a served
 /// graph meets them: a freshly opened handle's first read, then warm repeats,
 /// then a read after another handle published a commit (the stale path). The
@@ -3845,6 +3995,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&overwrite_removal_cost_rows("a"));
     table.push_str(&endpoint_probe_cost_rows("a"));
     table.push_str(&warm_read_cost_rows("a"));
+    table.push_str(&update_patch_cost_rows("a"));
     table.push_str(&nearest_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
@@ -3858,6 +4009,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&overwrite_removal_cost_rows("b"));
     table2.push_str(&endpoint_probe_cost_rows("b"));
     table2.push_str(&warm_read_cost_rows("b"));
+    table2.push_str(&update_patch_cost_rows("b"));
     table2.push_str(&nearest_cost_rows("b"));
     assert_eq!(
         table, table2,

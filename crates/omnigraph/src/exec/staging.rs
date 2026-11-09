@@ -51,6 +51,12 @@ pub(crate) enum PendingMode {
     StrictInsert,
     Upsert,
     Overwrite,
+    /// An `update` that patches columns of present rows (issue #1264): its
+    /// batch carries every column except the unassigned Blob and vector
+    /// columns, for validation, and stages only `id` plus the table's
+    /// [`PendingTable::patch_columns`]. It is the only write to its table in
+    /// the mutation, so it never mixes with another mode.
+    ColumnPatch,
 }
 
 /// Per-table accumulator. Each insert/update op pushes a `RecordBatch` into
@@ -61,6 +67,9 @@ pub(crate) struct PendingTable {
     pub(crate) schema: SchemaRef,
     pub(crate) mode: PendingMode,
     pub(crate) batches: Vec<RecordBatch>,
+    /// [`PendingMode::ColumnPatch`]: `id` and the assigned columns, schema
+    /// order, the columns Lance writes.
+    pub(crate) patch_columns: Vec<String>,
 }
 
 impl PendingTable {
@@ -69,6 +78,7 @@ impl PendingTable {
             schema,
             mode,
             batches: Vec::new(),
+            patch_columns: Vec::new(),
         }
     }
 
@@ -273,6 +283,11 @@ impl MutationStaging {
                     )));
                 }
             }
+            if existing.mode == PendingMode::ColumnPatch || mode == PendingMode::ColumnPatch {
+                return Err(OmniError::manifest_internal(format!(
+                    "table '{table_key}' cannot stage a column patch beside another write"
+                )));
+            }
             if !schemas_compatible(&existing.schema, &batch.schema()) {
                 return Err(OmniError::manifest(format!(
                     "table '{}' accumulated mutation batches with mismatched schemas: \
@@ -297,7 +312,10 @@ impl MutationStaging {
             .ok_or_else(|| {
                 OmniError::manifest_internal("pending Blob payload byte count overflow")
             })?;
-        let pending_bytes = if matches!(mode, PendingMode::StrictInsert | PendingMode::Upsert) {
+        let pending_bytes = if matches!(
+            mode,
+            PendingMode::StrictInsert | PendingMode::Upsert | PendingMode::ColumnPatch
+        ) {
             let existing_rows = self
                 .pending
                 .get(table_key)
@@ -344,6 +362,31 @@ impl MutationStaging {
         entry.batches.push(batch);
         self.pending_bytes = pending_bytes;
         self.pending_payload_bytes = pending_payload_bytes;
+        Ok(())
+    }
+
+    /// Stage an `update`'s column patch: `batch` holds every carried column
+    /// of the matched rows (validation reads them), `patch_columns` the `id`
+    /// and assigned columns Lance writes. The table must have nothing pending.
+    pub(crate) fn append_column_patch(
+        &mut self,
+        table_key: &str,
+        batch: RecordBatch,
+        patch_columns: Vec<String>,
+    ) -> Result<()> {
+        let schema = batch.schema();
+        if let Some(missing) = patch_columns
+            .iter()
+            .find(|name| schema.column_with_name(name).is_none())
+        {
+            return Err(OmniError::manifest_internal(format!(
+                "column patch of '{table_key}' names '{missing}', which its batch lacks"
+            )));
+        }
+        self.append_batch(table_key, schema, PendingMode::ColumnPatch, batch)?;
+        if let Some(entry) = self.pending.get_mut(table_key) {
+            entry.patch_columns = patch_columns;
+        }
         Ok(())
     }
 
@@ -865,7 +908,10 @@ fn prepare_pending_table(
         )));
     }
 
-    if matches!(table.mode, PendingMode::StrictInsert | PendingMode::Upsert) {
+    if matches!(
+        table.mode,
+        PendingMode::StrictInsert | PendingMode::Upsert | PendingMode::ColumnPatch
+    ) {
         let (rows, bytes) =
             table
                 .batches
@@ -910,6 +956,26 @@ fn prepare_pending_table(
         PendingMode::Overwrite => PreparedPendingTable::Overwrite {
             batches: table.batches,
         },
+        PendingMode::ColumnPatch => {
+            let carried = dedupe_merge_batches_by_id(&table.schema, table.batches, system_columns)?;
+            let indices = table
+                .patch_columns
+                .iter()
+                .map(|name| {
+                    carried.schema().index_of(name).map_err(|_| {
+                        OmniError::manifest_internal(format!(
+                            "column patch of '{table_key}' lacks its column '{name}'"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            PreparedPendingTable::Keyed {
+                semantics: KeyedWriteSemantics::KnownPresentColumnPatch,
+                batch: carried
+                    .project(&indices)
+                    .map_err(OmniError::arrow_internal)?,
+            }
+        }
     })
 }
 
@@ -1118,6 +1184,7 @@ impl StagedMutation {
         db: &crate::db::Omnigraph,
         branch: Option<&str>,
         txn: &crate::db::WriteTxn,
+        early: Option<crate::db::EarlyRevalidation>,
     ) -> Result<CommittedMutation> {
         let StagedMutation {
             staged,
@@ -1154,7 +1221,7 @@ impl StagedMutation {
         // the complete attempt before effects. Mutation inserts and load
         // append/merge may then reprepare at their outer bounded retry loop;
         // strict read-modify-write operations return the typed conflict.
-        let snapshot = db.revalidate_write_txn(txn).await?;
+        let snapshot = db.revalidate_write_txn_with(txn, early).await?;
         let pins = txn
             .unattached_base
             .as_ref()
@@ -1239,6 +1306,17 @@ impl StagedMutation {
                 .with_table_fork_owner(table_fork_owner)
                 .with_staged(state.version, identity.uuid.clone())
                 .with_last_linear_version(path.entry.version_metadata.last_linear_version());
+            db.read_caches()
+                .handles
+                .insert(
+                    &path.entry.dataset_path,
+                    path.table_branch.as_deref(),
+                    target,
+                    Some(state.version),
+                    version_metadata.e_tag(),
+                    detached.dataset().clone(),
+                )
+                .await;
             let update = DatasetUpdate {
                 identity: path.identity,
                 type_key: table_key.clone(),
