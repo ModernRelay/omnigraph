@@ -1670,7 +1670,7 @@ pub(crate) async fn run_mutate(
     expected_head: Option<&str>,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let file = classify(query)?;
-    refuse_process_settings(&file.settings)?;
+    refuse_process_settings(&file.settings, session.baseline())?;
     refuse_empty_file(&file)?;
     let queries = match file.body {
         FileBody::Queries(queries) => queries,
@@ -1882,7 +1882,7 @@ pub(crate) async fn run_query(
     snapshot: Option<String>,
 ) -> std::result::Result<ReadDispatch, ApiError> {
     let file = classify(query)?;
-    refuse_process_settings(&file.settings)?;
+    refuse_process_settings(&file.settings, session.baseline())?;
     refuse_empty_file(&file)?;
     let queries = match file.body {
         FileBody::Queries(queries) => queries,
