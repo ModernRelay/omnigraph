@@ -142,18 +142,27 @@ A `## Highlights` section holds three to five `### ` highlights for a minor or
 major release, and up to five for a patch release, each at most 150 words.
 The heading names the change and what it gives users in a few words, with a
 measured number when there is one (`CSV import: 630 million rows in under
-five minutes`, not `CSV loads go through the planner`). The body is in
-database terms: it opens with the mechanism (projection pushdown,
-copy-on-write branches, compare-and-swap publication), names the benchmark
-behind any number and the machine and storage it ran on, and lists its pull
-requests:
+five minutes`, not `CSV loads go through the planner`). The body opens with
+what changes for the reader: what was slow, refused, wrong or impossible
+before, who noticed, and what they can do now. Then it names the mechanism in
+database terms (projection pushdown, copy-on-write branches, compare-and-swap
+publication), names the benchmark behind any number and the machine and
+storage it ran on, says when a number was not measured on a cloud store, and
+lists its pull requests:
 
 ```markdown
 ### Counting no longer loads every embedding
 
-Projection pushdown: a `Vector` or `Blob` column is read only when the query
-names it, so a `count` over embedding-heavy types reads no vectors. #760, #795
+A `count` over a type with embeddings used to read every vector, so it slowed
+down as the vectors grew. It now reads none. Projection pushdown: a `Vector`
+or `Blob` column is read only when the query names it. #760, #795
 ```
+
+A note follows the same order in fewer words: say what the reader notices
+(`a read no longer waits for a write to commit`), not only what the code does
+(`branch state installs by pointer swap`). When the notes of a release are
+still hard to act on after it is tagged, add its
+[overview](#release-overviews) rather than editing the snapshot.
 
 The release-prep pull request may leave `## Highlights` empty for someone else
 to write: the preview shows them as still to be written and CI passes, but the
@@ -289,10 +298,15 @@ without its heading, status line and provenance comment. The length caps and
 the release file apply only to a format-2 cycle. Generated snapshots require
 exact verification, and existing published documents and URLs stay unchanged.
 
+### Release overviews
+
 A release may also have a curated `docs/releases/vX.Y.Z-overview.md`, linked
 from the generated release index. Reconcile superseded fragments against the
 code at the release tag and explain the final shipped behavior and upgrade
-actions. Link the complete immutable `vX.Y.Z.md` snapshot from the overview;
+actions. Write it for a reader deciding whether and how to upgrade: for each
+upgrade action, who is affected, what changes for them and why, and what to do;
+for each other change, what was slow, refused or wrong before and what works
+now. Link the complete immutable `vX.Y.Z.md` snapshot from the overview;
 do not edit the published snapshot or source notes to resolve contradictions.
 The overview is a maintained guide to that release, not a replacement for its
 recorded history. After adding it, regenerate the index with
