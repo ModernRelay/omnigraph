@@ -3597,7 +3597,7 @@ impl TableStore {
         ds: Dataset,
         type_key: &str,
         batch: RecordBatch,
-        semantics: KeyedWriteSemantics,
+        mut semantics: KeyedWriteSemantics,
         system_columns: SystemColumns,
         write_budget: WriteBudget,
     ) -> Result<StagedWrite> {
@@ -3643,6 +3643,37 @@ impl TableStore {
                     write_budget,
                 )
                 .await;
+        }
+        // Lance's insert-capable merge route joins the source against every
+        // id of the table. An upsert whose rows are all new or all present
+        // needs neither that join nor its inserted-key filter: the exact-id
+        // probe a strict insert runs decides which, through the id BTREE,
+        // and the write stages through the absence-proven insert writer or
+        // as a known-present update, which reaches its rows through the
+        // index. A mixed batch keeps the join, and so does a table without
+        // the BTREE, where the probe itself would read every id.
+        if semantics == KeyedWriteSemantics::Upsert
+            && has_btree_index_on(&ds, system_columns.id).await?
+        {
+            let present = Self::existing_id_count(&ds, &source_ids, system_columns).await?;
+            if present == 0 {
+                return self
+                    .stage_absence_proven_strict_insert(
+                        ds,
+                        type_key,
+                        batch,
+                        source_ids,
+                        id_field_id,
+                        &expected_schema_preorder_ids,
+                        "stage_keyed_write",
+                        system_columns,
+                        write_budget,
+                    )
+                    .await;
+            }
+            if present == source_ids.len() {
+                semantics = KeyedWriteSemantics::KnownPresentUpdate;
+            }
         }
 
         // MergeInsertBuilder does not expose WriteParams and therefore cannot
@@ -4052,6 +4083,44 @@ impl TableStore {
             }
         }
         Ok(None)
+    }
+
+    /// How many members of `source_ids` the pinned table holds, through the
+    /// same exact-id predicate as [`Self::first_existing_id`].
+    async fn existing_id_count(
+        ds: &Dataset,
+        source_ids: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<usize> {
+        use datafusion::prelude::{col, lit};
+
+        if source_ids.is_empty() {
+            return Ok(0);
+        }
+        let filter = col(system_columns.id)
+            .in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
+        let mut target_ids = Self::scan_stream_with(
+            ds,
+            Some(&[system_columns.id]),
+            None,
+            None,
+            false,
+            |scanner| {
+                scanner.filter_expr(filter);
+                Ok(())
+            },
+        )
+        .await?;
+        let mut present = HashSet::new();
+        while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
+            let ids = string_id_column(&batch, system_columns, "stage_keyed_write upsert probe")?;
+            for row in 0..ids.len() {
+                if ids.is_valid(row) {
+                    present.insert(ids.value(row).to_string());
+                }
+            }
+        }
+        Ok(present.len())
     }
 
     async fn stage_keyed_write_from_stream(
