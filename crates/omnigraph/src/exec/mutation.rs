@@ -1949,6 +1949,13 @@ impl Omnigraph {
         // Update is a STRICT op, so collapse #1 never skips its open — the
         // handle is always `Some` (and it's needed for the committed scan below).
         let ds = handle.expect("strict Update op always opens its dataset");
+        // As for a delete: a `<key> = v` conjunct also selects the derived
+        // `id = v`, so with an id BTREE the match scan narrows through the
+        // index instead of reading the key column of every fragment.
+        let pred_expr = match key_id_conjunct(self, &ds, type_name, predicate, params, txn).await? {
+            Some(id_conjunct) => pred_expr.and(id_conjunct),
+            None => pred_expr,
+        };
 
         if let Some(plan) = sole_write
             .then(|| {
@@ -2197,7 +2204,7 @@ impl Omnigraph {
         // the index instead of reading the key column of every fragment.
         // The recorded predicate stays the written one.
         let scan_predicate =
-            match delete_key_id_conjunct(self, &ds, type_name, predicate, params, txn).await? {
+            match key_id_conjunct(self, &ds, type_name, predicate, params, txn).await? {
                 Some(id_conjunct) => pred_expr.clone().and(id_conjunct),
                 None => pred_expr.clone(),
             };
@@ -2390,14 +2397,14 @@ impl Omnigraph {
     }
 }
 
-/// The derived-id conjunct of a node delete whose predicate has a top-level
-/// `<key> = <String literal or parameter>` conjunct on the type's single
-/// String `@key`: every write derives a keyed node's id from its key
+/// The derived-id conjunct of a node update or delete whose predicate has a
+/// top-level `<key> = <String literal or parameter>` conjunct on the type's
+/// single String `@key`: every write derives a keyed node's id from its key
 /// (`loader::canonical_key_id`), so `key = v` implies `id = derive(v)` and
 /// adding the conjunct selects the same rows. The read planner narrows the
 /// same shape (`scan_access::narrow_key`). Only when the pinned table has an
 /// id BTREE: without one the extra column would only add bytes.
-async fn delete_key_id_conjunct(
+async fn key_id_conjunct(
     db: &Omnigraph,
     ds: &SnapshotHandle,
     type_name: &str,
