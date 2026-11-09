@@ -1,0 +1,8 @@
+// task: the number of distinct cities
+// kind: aggregation
+// expect: accept
+// rfc: §6 freeze list: agg(distinct x)
+query q() {
+  match { $p: Person }
+  return { count(distinct $p.city) as cities }
+}

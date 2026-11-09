@@ -1,0 +1,10 @@
+// task: the RFC's §3 close_company
+// kind: writes
+// expect: accept
+// rfc: §3
+query close_company($slug: String) {
+  $c: Company { slug: $slug }
+  $p $k:worksAt $c
+  delete $k
+  update $p set { city: null }
+}

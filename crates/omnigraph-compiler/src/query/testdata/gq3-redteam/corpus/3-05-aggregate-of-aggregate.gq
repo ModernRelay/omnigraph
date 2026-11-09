@@ -1,0 +1,8 @@
+// task: the mean and largest headcount
+// kind: aggregation
+// expect: accept
+// rfc: asset §3
+query q() {
+  match { from { match { $p worksAt $c } return { $c, count($p) as n } } }
+  return { avg($n) as mean, max($n) as largest }
+}

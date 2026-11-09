@@ -1,0 +1,5 @@
+// task: a branch diff
+// kind: statements
+// expect: accept
+// rfc: asset §8
+branch diff feature into main

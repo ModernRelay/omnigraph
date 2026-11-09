@@ -1,0 +1,8 @@
+// task: people who know someone well connected
+// kind: aggregation
+// expect: accept
+// rfc: §3 Kept
+query q() {
+  match { $p: Person  count { $p knows $q  count { $q knows $r } > 2 } >= 1 }
+  return { $p.name }
+}

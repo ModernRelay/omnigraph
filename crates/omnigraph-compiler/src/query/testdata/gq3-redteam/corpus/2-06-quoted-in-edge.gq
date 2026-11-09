@@ -1,0 +1,8 @@
+// task: documents in a collection, the edge quoted
+// kind: traversal
+// expect: accept
+// rfc: §8 schema comment
+query q($s: String) {
+  match { $x: Collection { slug: $s }  $d "in" $x }
+  return { $d.title }
+}

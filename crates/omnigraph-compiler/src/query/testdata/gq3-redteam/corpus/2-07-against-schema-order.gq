@@ -1,0 +1,8 @@
+// task: employees of a company, written against schema order
+// kind: traversal
+// expect: accept
+// rfc: §6 queries fmt
+query q($s: String) {
+  match { $c: Company { slug: $s }  $c worksAt $p }
+  return { $p.name }
+}

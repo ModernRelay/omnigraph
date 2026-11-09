@@ -1,0 +1,8 @@
+// task: OPTIONAL MATCH as two words
+// kind: adversarial
+// expect: refuse-with-fix:optional { $p worksAt $c }
+// habit: Cypher
+query q() {
+  match { $p: Person  optional match { $p worksAt $c } }
+  return { $p.name, $c.name }
+}

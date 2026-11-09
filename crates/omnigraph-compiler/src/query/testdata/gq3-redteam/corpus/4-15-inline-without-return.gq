@@ -1,0 +1,8 @@
+// task: an inline read with order but no return
+// kind: shapes-of-a-result
+// expect: refuse
+// rfc: §7 read_body
+query q() {
+  match { $p: Person  from { match { $p knows $q } order { $q.age } } }
+  return { $p.name }
+}

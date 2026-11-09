@@ -1,0 +1,9 @@
+// task: unwind a list
+// kind: adversarial
+// expect: refuse-with-fix:$x in $list
+// habit: Cypher
+// rfc: §3 refused respellings
+query q($list: [String]) {
+  match { unwind $list as $x  $p: Person { city: $x } }
+  return { $p.name }
+}

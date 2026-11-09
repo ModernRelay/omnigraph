@@ -1,0 +1,8 @@
+// task: nullable and defaulted parameters of several types
+// kind: catalogue-and-declarations
+// expect: accept
+// rfc: §6 freeze list: parameters
+query q($a: I32 = 18, $c: String? = "Berlin", $f: F64 = 0.5, $b: Bool = true) {
+  match { $p: Person  $p.age > $a  $p.city = $c }
+  return { $p.name }
+}

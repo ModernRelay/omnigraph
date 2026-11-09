@@ -1,0 +1,9 @@
+// task: `from` as a key inside binding braces
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §7 contextual keywords
+// shape: $p: Person { from: 1 }
+query q() {
+  match { $p: Person { from: 1 } }
+  return { $p.name }
+}

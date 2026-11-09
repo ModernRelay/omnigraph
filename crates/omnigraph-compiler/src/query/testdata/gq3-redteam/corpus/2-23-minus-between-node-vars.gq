@@ -1,0 +1,10 @@
+// task: `$a - $b` with two node variables (a subtraction, ill-typed)
+// kind: traversal
+// expect: accept
+// rfc: §7: `$n - $m > 0` is arithmetic
+// shape: $a: Person | $b: Person | $a - $b > 0
+// later: type error: arithmetic over node references
+query q() {
+  match { $a: Person  $b: Person  $a - $b > 0 }
+  return { $a.name }
+}

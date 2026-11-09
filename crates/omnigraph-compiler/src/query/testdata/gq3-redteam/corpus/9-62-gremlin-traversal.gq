@@ -1,0 +1,5 @@
+// task: a Gremlin traversal
+// kind: adversarial
+// expect: refuse
+// habit: Gremlin
+g.V().hasLabel('Person').out('knows').values('name')

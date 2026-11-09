@@ -1,0 +1,8 @@
+// task: SPARQL variables
+// kind: adversarial
+// expect: refuse-with-fix:$p knows $q
+// habit: SPARQL
+query q() {
+  match { ?p knows ?q }
+  return { ?q }
+}

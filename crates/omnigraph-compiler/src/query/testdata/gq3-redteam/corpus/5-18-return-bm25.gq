@@ -1,0 +1,9 @@
+// task: edition 2's score as a return item
+// kind: ranking-and-search
+// expect: accept
+// rfc: §3 refused respellings
+// later: T65 with the from fix
+query q($q: String) {
+  match { $d: Doc }
+  return { $d.title, bm25($d.body, $q) as s }
+}

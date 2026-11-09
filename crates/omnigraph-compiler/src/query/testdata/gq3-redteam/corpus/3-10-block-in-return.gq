@@ -1,0 +1,8 @@
+// task: the degree as a return item without a let
+// kind: aggregation
+// expect: accept
+// rfc: §7 block_value as an operand
+query q() {
+  match { $p: Person }
+  return { $p.name, count { $p knows $q } as degree }
+}

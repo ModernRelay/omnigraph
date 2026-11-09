@@ -1,0 +1,7 @@
+// task: edition 2's update by predicate
+// kind: writes
+// expect: refuse-with-fix:$x: Person  $x.handle = $h  update $x set { age: 3 }
+// rfc: §6 rewriter row
+query w($h: String) {
+  update Person set { age: 3 } where handle = $h
+}

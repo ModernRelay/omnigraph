@@ -1,0 +1,10 @@
+// task: an explicit edition-2 file
+// kind: statements
+// expect: accept
+// raw: yes
+// rfc: §6: gq 2; for one release
+gq 2;
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}

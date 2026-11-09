@@ -1,0 +1,13 @@
+// task: the reachable read with its step arm first and the base clauses swapped
+// kind: traversal
+// expect: accept
+// rfc: §3 Recursion; §2 Union is a bag (arm order changes the names: from the first)
+// note: equivalent rows; the column names now come from the step arm, which aliases to q
+query reachable($from: String) {
+  match {
+    from union(
+      { match { from reachable($from)  $q knows $r } return { $r as q } },
+      { match { $p knows $q  $p: Person { handle: $from } } return { $q } })
+  }
+  return distinct { $q }
+}

@@ -1,0 +1,8 @@
+// task: an edge meta-field filter in a read
+// kind: adversarial
+// expect: accept
+// habit: GQ edition 2
+query q($h: String) {
+  match { $p $k:worksAt $c  $k.@src = $h }
+  return { $c.name }
+}

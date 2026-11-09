@@ -1,0 +1,8 @@
+// task: a display name joined from two properties
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3: concat as a registry row
+query q() {
+  match { $p: Person }
+  return { concat($p.name, " (", $p.handle, ")") as label }
+}

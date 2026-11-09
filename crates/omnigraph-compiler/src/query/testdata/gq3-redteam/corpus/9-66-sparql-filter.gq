@@ -1,0 +1,9 @@
+// task: filter() as a call
+// kind: adversarial
+// expect: accept
+// habit: SPARQL
+// later: unknown function filter; the fix is the bare filter clause
+query q() {
+  match { $p: Person  filter($p.age > 3) }
+  return { $p.name }
+}

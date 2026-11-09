@@ -1,0 +1,8 @@
+// task: a read comparing to null
+// kind: writes
+// expect: refuse-with-fix:$p.city is null
+// rfc: §6 freeze list: no null literal in a read
+query q() {
+  match { $p: Person  $p.city = null }
+  return { $p.name }
+}

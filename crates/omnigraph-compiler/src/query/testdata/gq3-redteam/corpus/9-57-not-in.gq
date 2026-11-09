@@ -1,0 +1,8 @@
+// task: NOT IN
+// kind: adversarial
+// expect: refuse-with-fix:not $p.city in ["Berlin"]
+// habit: SQL
+query q() {
+  match { $p: Person  $p.city not in ["Berlin"] }
+  return { $p.name }
+}

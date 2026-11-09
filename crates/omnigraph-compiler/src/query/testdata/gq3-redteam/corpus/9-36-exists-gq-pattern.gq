@@ -1,0 +1,8 @@
+// task: exists with a GQ pattern, which Cypher also spells with braces
+// kind: adversarial
+// expect: accept
+// habit: Cypher
+query q() {
+  match { $p: Person  exists { $p knows $q } }
+  return { $p.name }
+}

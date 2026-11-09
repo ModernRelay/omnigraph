@@ -1,0 +1,9 @@
+// task: an edge as a Datalog atom
+// kind: adversarial
+// expect: accept
+// habit: Datalog
+// later: unknown function knows; the fix is the triple `$p knows $q`
+query q() {
+  match { $p: Person  knows($p, $q) }
+  return { $p.name }
+}

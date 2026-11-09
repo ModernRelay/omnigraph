@@ -1,0 +1,10 @@
+// task: GROUP BY after return
+// kind: adversarial
+// expect: refuse-with-fix:<empty>
+// habit: SQL
+// note: the keys are implicit
+query q() {
+  match { $p worksAt $c }
+  return { $c.name, count($p) as n }
+  group by $c.name
+}

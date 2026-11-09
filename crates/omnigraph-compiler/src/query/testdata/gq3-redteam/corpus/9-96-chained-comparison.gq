@@ -1,0 +1,8 @@
+// task: a chained comparison
+// kind: adversarial
+// expect: refuse-with-fix:18 <= $p.age and $p.age < 65
+// habit: Datalog
+query q() {
+  match { $p: Person  18 <= $p.age < 65 }
+  return { $p.name }
+}

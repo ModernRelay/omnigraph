@@ -1,0 +1,8 @@
+// task: `$update` as a parameter and `$_update` as a let name
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §7: variables carry `$`
+query q($update: I32) {
+  match { $p: Person  let $_update = $update + 1  $p.age > $_update }
+  return { $p.name }
+}

@@ -1,0 +1,7 @@
+// task: a write declared with mutation
+// kind: writes
+// expect: refuse-with-fix:query hire($h: String) {\n  insert Person { handle: $h, name: $h }\n}
+// rfc: §3 refused respellings
+mutation hire($h: String) {
+  insert Person { handle: $h, name: $h }
+}

@@ -1,0 +1,8 @@
+// task: a read declared with mutation
+// kind: adversarial
+// expect: refuse-with-fix:query q() {\n  match { $p: Person }\n  return { $p.name }\n}
+// habit: GraphQL
+mutation q() {
+  match { $p: Person }
+  return { $p.name }
+}

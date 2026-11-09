@@ -1,0 +1,13 @@
+// task: shortest hop count by recursion with a round budget, the RFC's text
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §3 Recursion
+// later: T70 until stage Rec
+query distance($from: String) @budget(rounds = 50) {
+  match {
+    from union(
+      { match { $p: Person { handle: $from }  $p knows $q } return { $q, 1 as d } },
+      { match { from distance($from)  $q knows $r } return { $r as q, $d + 1 as d } })
+  }
+  return { $q, min($d) as d }
+}

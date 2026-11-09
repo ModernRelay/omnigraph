@@ -1,0 +1,8 @@
+// task: an inline read with return distinct
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §7 read_body
+query q() {
+  match { from { match { $p knows $q } return distinct { $q } } }
+  return { $q.name }
+}

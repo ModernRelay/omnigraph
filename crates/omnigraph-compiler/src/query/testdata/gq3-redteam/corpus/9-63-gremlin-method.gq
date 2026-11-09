@@ -1,0 +1,8 @@
+// task: a method-call step
+// kind: adversarial
+// expect: refuse-with-fix:$p knows $q
+// habit: Gremlin
+query q() {
+  match { $p: Person  $p.out(knows) }
+  return { $p.name }
+}

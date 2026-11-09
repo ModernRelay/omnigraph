@@ -1,0 +1,8 @@
+// task: people with a city and an age
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 Kept
+query q() {
+  match { $p: Person  $p.city is not null and not ($p.age is null) }
+  return { $p.name }
+}

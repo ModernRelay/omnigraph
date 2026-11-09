@@ -91,6 +91,14 @@ fn describe_checked_query_operation(
     let mut writes = BTreeSet::new();
 
     let result = match checked {
+        // The descriptor reads the lowered plan's result types, and the
+        // planner does not lower the core IR yet.
+        CheckedQuery::Edition3(core) => {
+            return Err(CompilerError::Plan(format!(
+                "`{}` is an edition-3 declaration; it type-checks, and its operation descriptor waits for the planner to lower edition 3",
+                core.name()
+            )));
+        }
         CheckedQuery::Read(query) => {
             collect_checked_reads(&query.scope, &mut reads);
             let ir = crate::lower_query(catalog, query)?;

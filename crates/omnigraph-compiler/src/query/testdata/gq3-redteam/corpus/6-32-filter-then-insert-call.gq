@@ -1,0 +1,9 @@
+// task: a write whose last clause is a call named like a statement word
+// kind: writes
+// expect: accept
+// rfc: §7 stmt_keyword is word-bounded
+// shape: $p: Person | inserted($p.handle)
+query w() {
+  $p: Person  inserted($p.handle)
+  delete $p
+}

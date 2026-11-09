@@ -1,0 +1,9 @@
+// task: arithmetic on both sides of a comparison
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 arithmetic
+// shape: $p: Person | $p.age * 2 + 1 >= $min - 3
+query q($min: I32) {
+  match { $p: Person  $p.age * 2 + 1 >= $min - 3 }
+  return { $p.name }
+}

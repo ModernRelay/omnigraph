@@ -47,7 +47,7 @@ impl StoredQuery {
     /// `true` if the selected declaration contains insert/update/delete
     /// statements — drives read-vs-mutate routing at invocation time.
     pub fn is_mutation(&self) -> bool {
-        !self.decl.mutations.is_empty()
+        self.decl.is_mutation()
     }
 
     /// The MCP tool name this query is catalogued under: the explicit

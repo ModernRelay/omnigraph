@@ -1,0 +1,8 @@
+// task: a person by key, the asset's text
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 Kept
+query q($h: String) {
+  match { $p: Person { handle: $h } }
+  return { $p.name, $p.city }
+}

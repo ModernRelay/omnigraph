@@ -1,0 +1,8 @@
+// task: people in any of a list of cities
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 Kept
+query q($cities: [String]) {
+  match { $p: Person  $p.city in $cities }
+  return { $p.name }
+}

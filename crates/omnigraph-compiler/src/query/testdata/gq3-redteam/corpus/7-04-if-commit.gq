@@ -1,0 +1,8 @@
+// task: an @if_commit precondition
+// kind: catalogue-and-declarations
+// expect: refuse
+// rfc: §5: @if_commit refused, naming the writes RFC
+query retract($h: String) @if_commit("abc") {
+  $p: Person { handle: $h }
+  delete $p
+}

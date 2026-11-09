@@ -1,0 +1,8 @@
+// task: an insert per row of a read
+// kind: writes
+// expect: accept
+// rfc: §2 Insert sink
+query w() {
+  $p: Person  $p.city = "Berlin"
+  insert Doc { id: $p.handle, title: $p.name, body: "", year: 2026, tags: [] }
+}

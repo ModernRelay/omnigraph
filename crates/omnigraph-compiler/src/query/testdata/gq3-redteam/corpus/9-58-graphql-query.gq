@@ -1,0 +1,5 @@
+// task: a GraphQL selection set
+// kind: adversarial
+// expect: refuse
+// habit: GraphQL
+query { person(handle: "x") { name } }

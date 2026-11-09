@@ -1,0 +1,9 @@
+// task: the direction before the key
+// kind: adversarial
+// expect: refuse-with-fix:$p.age desc
+// habit: SQL
+query q() {
+  match { $p: Person }
+  return { $p.name }
+  order { desc $p.age }
+}

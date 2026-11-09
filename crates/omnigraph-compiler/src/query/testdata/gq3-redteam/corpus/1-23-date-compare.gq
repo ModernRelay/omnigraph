@@ -1,0 +1,8 @@
+// task: documents after a date literal
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 Kept
+query q() {
+  match { $d: Doc  $d.year >= 2025  $p: Person  $p.age > 3  date("2025-01-01") < datetime("2026-01-01T00:00:00Z") }
+  return { $d.title }
+}

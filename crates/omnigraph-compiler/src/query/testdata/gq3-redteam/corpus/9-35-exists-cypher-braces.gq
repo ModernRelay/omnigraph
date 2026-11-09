@@ -1,0 +1,8 @@
+// task: EXISTS with a Cypher pattern inside
+// kind: adversarial
+// expect: refuse-with-fix:exists { $p knows $q }
+// habit: Cypher
+query q() {
+  match { $p: Person  exists { MATCH (p)-[:KNOWS]->(q) } }
+  return { $p.name }
+}

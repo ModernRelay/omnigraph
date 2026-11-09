@@ -1,0 +1,11 @@
+// task: a setting written before the edition line
+// kind: statements
+// expect: refuse-with-fix:gq 3;\nset ann_nprobes = 20;
+// raw: yes
+// rfc: §6: the edition line precedes the settings lines
+set ann_nprobes = 20;
+gq 3;
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}

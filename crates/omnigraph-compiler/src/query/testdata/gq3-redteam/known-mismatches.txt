@@ -1,0 +1,7 @@
+# The red-team corpus cases whose outcome differs from their header, pinned
+# by parser3_redteam::redteam_corpus_matches_its_pinned_mismatches. This list
+# only shrinks: a case leaves it when the front end meets its header.
+2-14-edge-named-not                           # `$a not $b` is two legal filters, `$a` and `not $b`; the type checker refuses the first (T41) but sees no edge to quote
+7-12-schema-in-query-grammar                  # schema declarations in the one grammar are a later change (the one-file loader)
+9-79-chained-path                             # the fix adds a traversal clause to `match` and rewrites the item; no edit of the item alone makes it legal
+9-83-missing-return                           # the missing items are the author's choice; the suggestion (`return { $p }`, needs review) is a guess

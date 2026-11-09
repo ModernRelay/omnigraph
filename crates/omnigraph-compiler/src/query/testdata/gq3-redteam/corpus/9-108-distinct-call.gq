@@ -1,0 +1,9 @@
+// task: distinct(x) as a function call in return
+// kind: adversarial
+// expect: accept
+// habit: SQL
+// later: unknown function distinct; the fix is return distinct
+query q() {
+  match { $p: Person }
+  return { distinct($p.city) }
+}

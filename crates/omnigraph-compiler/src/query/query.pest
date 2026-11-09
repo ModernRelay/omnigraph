@@ -272,3 +272,298 @@ string_char = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
 float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 integer = @{ ASCII_DIGIT+ }
 bool_lit = @{ ("true" | "false") ~ !(ASCII_ALPHANUMERIC | "_") }
+
+// ===========================================================================
+// GQ edition 3 (docs/rfcs/2026-11-07-gq-3.md, section 7).
+//
+// Selected by the edition line `gq 3;`; a file without it parses with
+// `query_file` above, unchanged. The rule names are section 7's, suffixed
+// `3` where an edition-2 rule of another body has the name. Rules whose name
+// ends in `_rec` are recognizers: they exist only so the builder can refuse
+// the text at the construct, with a byte-range suggestion (section 5). Every
+// recognizer accepts only text that section 7's rules refuse, so the set of
+// accepted texts is section 7's. The rule names are pinned by
+// `parser3_tests::the_edition3_rule_set_is_pinned` (section 11, rule 1).
+// ===========================================================================
+
+gq3_file = { SOI ~ edition_line ~ setting_stmt* ~ (show_stmt ~ statement_trailer3? | branch_stmt ~ ";"? ~ statement_trailer3? | commit_stmt ~ ";"? ~ statement_trailer3? | load_stmt ~ ";"? ~ statement_trailer3? | explain_stmt3 ~ statement_trailer3? | declaration3* ~ missing_param_list3?) ~ EOI }
+edition_line = { kw_gq ~ integer ~ ";" }
+explain_stmt3 = { kw_explain ~ (query_decl3 | load_stmt) }
+statement_trailer3 = { (setting_stmt | show_stmt | branch_stmt | commit_stmt | load_stmt | explain_stmt3 | declaration3)+ }
+missing_param_list3 = { (kw_query | kw_mutation | kw_view) ~ ident ~ !"(" ~ ANY* }
+
+// `mutation` and `view` are recognised at declaration start only to print
+// `query` as the fix.
+declaration3 = { query_decl3 | mutation_decl | view_decl }
+mutation_decl = { kw_mutation ~ ident ~ param_list3 ~ annotation3* ~ (as_commit_clause | as_unattached_clause)? ~ "{" ~ (read_body3 ~ &"}" | mutation_body3 ~ &"}" | swapped_read_rec) ~ "}" }
+view_decl     = { kw_view ~ ident ~ param_list3 ~ annotation3* ~ "{" ~ (read_body3 ~ &"}" | mutation_body3 ~ &"}" | swapped_read_rec) ~ "}" }
+
+query_decl3 = { kw_query ~ ident ~ param_list3 ~ annotation3* ~ (as_commit_clause | as_unattached_clause)? ~ "{" ~ (read_body3 ~ &"}" | mutation_body3 ~ &"}" | swapped_read_rec) ~ "}" }
+param_list3 = { "(" ~ (param_item3 ~ ("," ~ param_item3)*)? ~ ")" }
+param_item3 = _{ param3 | param_untyped_rec }
+// Section 7 writes `type_ref_or_kind` and `literal`, which it does not
+// define; the parameter kinds are a later change, so the type is today's
+// `type_ref` and the default an edition-3 literal.
+param3 = { variable ~ ":" ~ type_ref ~ ("=" ~ param_default)? }
+param_default = { neg_sign? ~ literal3 }
+neg_sign = { "-" }
+param_untyped_rec = { variable ~ &("," | ")") }
+annotation3 = { annotation_name ~ ("(" ~ (annotation_arg3 ~ ("," ~ annotation_arg3)*)? ~ ")")? }
+annotation_name = @{ "@" ~ ident }
+annotation_arg3 = { annotation_kwarg | annotation_colon_rec | annotation_value }
+annotation_kwarg = { ident ~ "=" ~ annotation_value }
+annotation_colon_rec = { ident ~ ":" ~ annotation_value }
+annotation_value = { literal3 | variable | meta_field | ident }
+
+// Read body: section 7's `match ~ return ~ order? ~ limit?`, written as a
+// sequence the builder checks, so a missing `return`, an `order` after
+// `limit`, `order by`, `offset`, `group by`, `having` and `retrieve` are
+// refused at the construct with a fix. The accepted texts are section 7's.
+read_body3 = { (match_clause3 | match_nobrace_rec) ~ retrieve_rec? ~ (return_clause3 | return_nobrace_rec)? ~ read_tail3* }
+read_tail3 = _{ order_clause3 | order_by_rec | limit_clause3 | limit_neg_rec | offset_rec | group_by_rec | having_rec }
+limit_neg_rec = { kw_limit ~ "-" ~ integer3 }
+// `return { … }` written before `match { … }`.
+swapped_read_rec = { return_clause3 ~ match_clause3 ~ read_tail3* }
+match_clause3 = { kw_match ~ "{" ~ read_clause3+ ~ "}" }
+// Inside braces there is no statement, so `$a delete $b` can only be a
+// triple over an edge named `delete`, refused with the quoted fix.
+read_clause3 = _{ stmt_edge_rec | clause3 }
+stmt_edge_rec = { variable ~ stmt_word ~ variable }
+stmt_word = @{ ("insert" | "update" | "delete") ~ !(ASCII_ALPHANUMERIC | "_") }
+match_nobrace_rec = { kw_match ~ !"{" ~ (!(kw_return | stmt_keyword) ~ clause3)+ }
+retrieve_rec = { fw_retrieve ~ "{" ~ brace_body ~ "}" }
+return_clause3 = { kw_return ~ kw_distinct? ~ "{" ~ projection3+ ~ "}" }
+return_nobrace_rec = { kw_return ~ kw_distinct? ~ !"{" ~ projection3+ }
+projection3 = { (sql_alias_rec | distinct_item_rec | star_item_rec | expr3 ~ alias3?) ~ ","? }
+alias3 = { kw_as ~ (reserved_alias | expr_ident | alias_string_rec) }
+alias_string_rec = { string_lit }
+sql_alias_rec = { !bool_lit ~ expr_ident ~ (!"==" ~ "=" | ":") ~ expr3 }
+distinct_item_rec = { kw_distinct ~ !"(" ~ expr3 }
+star_item_rec = { "*" }
+order_clause3 = { kw_order ~ "{" ~ ordering3 ~ ("," ~ ordering3)* ~ "}" }
+// A bare name in `order` is a return alias, and only a whole key may be one;
+// the builder refuses a bare name anywhere else.
+ordering3 = { dir_first_rec | expr3 ~ order_dir3? }
+dir_first_rec = { order_dir3 ~ !(expr_ident ~ ("," | "}" | order_dir3)) ~ expr3 }
+order_dir3 = @{ ("asc" | "desc") ~ !(ASCII_ALPHANUMERIC | "_") }
+order_by_rec = { kw_order ~ fw_by ~ ordering3 ~ ("," ~ ordering3)* }
+limit_clause3 = { kw_limit ~ (integer3 | variable) }
+offset_rec = { fw_offset ~ (integer3 | variable) }
+group_by_rec = { fw_group ~ fw_by ~ expr3 ~ ("," ~ expr3)* }
+having_rec = { fw_having ~ ("{" ~ brace_body ~ "}" | expr3) }
+
+// Clauses.
+clause3 = { arrow_traversal | cypher_pattern | list_to_rows | prefix_rec | with_rec | call_block_rec | match_prefix_rec | let_clause | from_clause | from_paren_rec | negation3 | optional_block | optional_rec | blockless_rec | binding_brace_filter | binding_paren_rec | binding3 | binding_lower_rec | traversal3 | filter3 | stray_braces_rec }
+let_clause     = { kw_let ~ variable ~ "=" ~ (inline_read | expr3) }
+// `from` is the clause when the next token is `{`, `$` or an identifier
+// touching `(`; a name with whitespace before its `(` is recognised to print
+// the touching form.
+from_clause    = { kw_from ~ &("{" | "$" | call_head | spaced_call_head) ~ relation_expr }
+relation_expr  = { inline_read | call | spaced_call_rec | variable }
+from_paren_rec = { kw_from ~ "(" ~ relation_expr ~ ")" }
+inline_read    = { "{" ~ (read_body3 ~ &"}" | matchless_read_rec) ~ "}" }
+matchless_read_rec = { (!kw_return ~ clause3)+ ~ return_clause3 ~ read_tail3* }
+optional_block = { kw_optional ~ "{" ~ read_clause3+ ~ "}" }
+negation3      = { kw_not ~ "{" ~ read_clause3+ ~ "}" }
+subquery_block3 = { "{" ~ read_clause3+ ~ "}" }
+binding3 = { variable ~ ":" ~ type_name ~ ("{" ~ prop_match_list3 ~ "}")? }       // a node or an edge type
+prop_match_list3 = { prop_match3 ~ ("," ~ prop_match3)* ~ ","? }
+prop_match3 = { ident ~ ":" ~ expr3 }
+traversal3 = { !(variable ~ edge_wildcard ~ variable ~ continuation) ~ variable ~ edge_binding? ~ (undirected_edge3 | edge_sel3) ~ traversal_bounds? ~ variable }
+continuation = { "." | concat_bars | sum_op3 | product_op | comp_op | infix_string_op | kw_in | kw_is | kw_and | kw_or }
+undirected_edge3 = { "<" ~ (edge_alternatives3 | edge_sel3) ~ ">" }
+edge_sel3 = { edge_alternation3 | edge_wildcard | catalogue_edge | edge_ident3 | string_lit }
+// `let`, `from`, `true`, `false`, `insert`, `update` and `delete` are never
+// bare edge names (nor are the reserved words, which `edge_ident` excludes):
+// in a write body `$ok  delete $p` would otherwise parse silently as a triple
+// over an edge named `delete`. They are written quoted, as `"in"` is.
+edge_ident3 = @{ !(("let" | "from" | "true" | "false" | "insert" | "update" | "delete") ~ !(ASCII_ALPHANUMERIC | "_")) ~ edge_ident }
+edge_alternation3 = { "(" ~ edge_alternatives3 ~ ")" }
+edge_alternatives3 = { edge_name3 ~ ("|" ~ edge_name3)+ }
+edge_name3 = _{ catalogue_edge | edge_ident3 | string_lit }
+catalogue_edge = @{ "@" ~ ident }
+filter3 = { expr3 }
+// Braces where a clause starts: property matches written after a filter.
+stray_braces_rec = { "{" ~ brace_body ~ "}" }
+
+// Recognizers in clause position.
+// `-e->`, `<-e-`, `-e-`, and Cypher's bracketed `-[:E]->`.
+arrow_traversal = { variable ~ arrow_open ~ ("[" ~ cypher_rel_body ~ "]" | edge_binding? ~ edge_sel3 ~ traversal_bounds?) ~ arrow_close ~ variable }
+arrow_open  = { "<-" | "-" }
+arrow_close = { "->" | "-" }
+// Cypher's `(a:Person)-[:KNOWS]->(b)`.
+cypher_pattern = { cypher_node ~ (cypher_rel ~ cypher_node)+ | cypher_typed_node }
+cypher_typed_node = { "(" ~ ident? ~ ":" ~ cypher_name ~ ("{" ~ cypher_prop ~ ("," ~ cypher_prop)* ~ "}")? ~ ")" }
+cypher_node = { "(" ~ ident? ~ (":" ~ cypher_name)? ~ ("{" ~ cypher_prop ~ ("," ~ cypher_prop)* ~ "}")? ~ ")" }
+cypher_prop = { ident ~ ":" ~ expr3 }
+cypher_rel = { arrow_open ~ ("[" ~ cypher_rel_body ~ "]")? ~ arrow_close }
+cypher_rel_body = { ident? ~ (":" ~ cypher_name)? ~ cypher_hops? }
+cypher_hops = { "*" ~ integer? ~ (".." ~ integer?)? }
+cypher_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+// `for $x in …`, `unwind … as $x`, `let $x in rel`, `let ($a, $b) in rel`.
+list_to_rows = { (kw_for ~ variable ~ kw_in ~ (inline_read | expr3)) | (kw_unwind ~ expr3 ~ kw_as ~ variable) | (kw_let ~ ("(" ~ variable ~ ("," ~ variable)* ~ ")" | variable) ~ kw_in ~ (inline_read | expr3)) }
+// Words from other languages at clause start (section 5's table).
+prefix_rec = { fw_where ~ clause3 }
+with_rec = { fw_with ~ with_item ~ ("," ~ with_item)* }
+with_item = { expr3 ~ (kw_as ~ expr_ident)? }
+call_block_rec = { fw_call ~ &"{" ~ (inline_read | "{" ~ clause3+ ~ "}") }
+match_prefix_rec = { fw_match ~ !"{" ~ clause3 }
+optional_rec = { fw_optional ~ fw_match? ~ ("{" ~ clause3+ ~ "}" | !"{" ~ clause3) }
+blockless_rec = { (kw_not | kw_exists) ~ !("{" | "(") ~ (arrow_traversal | cypher_pattern | traversal3 | binding3) }
+detach_rec = { fw_detach ~ &stmt_keyword }
+// `$d: Doc { year >= 2025 }`: braces holding a comparison.
+binding_brace_filter = { variable ~ ":" ~ type_name ~ "{" ~ !(prop_match_list3 ~ "}") ~ (brace_items_rec | brace_body) ~ "}" }
+brace_items_rec = { brace_item ~ ("," ~ brace_item)* ~ ","? ~ &"}" }
+brace_item = { brace_colon_compare | brace_compare | prop_match3 }
+brace_colon_compare = { ident ~ ":" ~ comp_op ~ sum3 }
+brace_compare = { ident ~ comp_op ~ sum3 }
+brace_body = @{ (("{" ~ brace_body ~ "}") | (!("{" | "}") ~ ANY))* }
+// `$p: Person(handle: $h)` and the withdrawn view binding `$x: View($h)`.
+binding_paren_rec = { variable ~ ":" ~ binding_paren_head ~ (prop_match_list3 | call_args)? ~ ")" }
+binding_paren_head = ${ type_name ~ "(" }
+binding_lower_rec = { variable ~ ":" ~ ident }
+
+// Write body: groups, each a read's clauses (bare) then its statements.
+mutation_body3 = { write_group+ ~ trailing_clauses_rec? }
+write_group    = { (!stmt_keyword ~ write_clause3)* ~ mutation_stmt3+ }
+write_clause3  = _{ match_block_rec | detach_rec | clause3 }
+// Section 7's `stmt_keyword` is the three statement words; `create`, `merge`
+// and `set` are recognised here too, so Cypher's and SQL's write words at a
+// write body's clause start are refused as statements with `insert` or
+// `update` as the fix. No clause can begin with those words, so the accepted
+// texts are section 7's.
+stmt_keyword   = @{ ("insert" | "update" | "delete" | "create" | "merge" | "set") ~ !(ASCII_ALPHANUMERIC | "_") }
+mutation_stmt3 = { where_stmt | create_rec | set_rec | delete_multi_rec | delete_type_rec | insert_paren_rec | update_noset_rec | stmt_var_rec | insert_stmt3 | update_stmt3 | delete_stmt3 }
+// `insert $b`, `update $b` with no `set`: after a lone variable, the shape of
+// a triple over an edge named `insert` or `update`.
+stmt_var_rec = { (kw_insert | kw_update) ~ variable ~ !(kw_set | "{") }
+insert_stmt3   = { kw_insert ~ type_name ~ "{" ~ assignment3+ ~ "}" }
+update_stmt3   = { kw_update ~ variable ~ kw_set ~ "{" ~ assignment3+ ~ "}" }
+delete_stmt3   = { kw_delete ~ variable }
+assignment3    = { (ident ~ ":" ~ (null_value | expr3) | eq_assign_rec | qualified_assign_rec | meta_assign_rec) ~ ","? }
+null_value     = { kw_null ~ &("," | "}" | ident ~ ":") }
+// The predicate admits bare names (section 7: "where_expr admits bare
+// names"), which the fix qualifies; `operand3` carries them as a recognizer.
+where_stmt     = { (kw_update ~ (variable | type_name) ~ kw_set ~ "{" ~ assignment3+ ~ "}" | kw_delete ~ (variable | type_name)) ~ kw_where ~ expr3 }
+match_block_rec = { kw_match ~ "{" ~ clause3+ ~ "}" }
+trailing_clauses_rec = { (!"}" ~ write_clause3)+ }
+eq_assign_rec = { ident ~ !"==" ~ "=" ~ (null_value | expr3) }
+qualified_assign_rec = { prop_access3 ~ (":" | "=") ~ (null_value | expr3) }
+meta_assign_rec = { meta_field ~ ":" ~ expr3 }
+create_rec = { fw_create ~ (cypher_node | type_name ~ "{" ~ assignment3+ ~ "}") }
+set_rec = { kw_set ~ set_item ~ ("," ~ set_item)* }
+set_item = { prop_access3 ~ "=" ~ (null_value | expr3) }
+delete_multi_rec = { kw_delete ~ variable ~ ("," ~ variable)+ }
+delete_type_rec = { kw_delete ~ type_name }
+insert_paren_rec = { kw_insert ~ type_name ~ "(" ~ "{" ~ assignment3+ ~ "}" ~ ")" }
+update_noset_rec = { kw_update ~ variable ~ "{" ~ assignment3+ ~ "}" }
+
+// Expressions: edition 2's logic ladder with the arithmetic ladder between
+// comparison and operand.
+expr3       = { or_expr3 }
+or_expr3    = { and_expr3 ~ (kw_or ~ and_expr3)* }
+and_expr3   = { not_expr3 ~ (kw_and ~ not_expr3)* }
+not_expr3   = { (kw_not ~ not_expr3) | comparison3 }
+comparison3 = { sum3 ~ (null_compare_rec | regex_rec | comp_op ~ sum3 ~ chained_rec? | not_in_rec | kw_in ~ (in_paren_rec | sum3) | between_rec | like_rec | starts_with_words_rec | infix_string_op ~ sum3 | null_test)? }
+null_compare_rec = { ("!=" | "=") ~ kw_null }
+regex_rec = { "=~" ~ sum3 }
+chained_rec = { (comp_op ~ sum3)+ }
+not_in_rec = { kw_not ~ kw_in ~ sum3 }
+in_paren_rec = { "(" ~ expr3 ~ ("," ~ expr3)+ ~ ")" }
+between_rec = { fw_between ~ sum3 ~ kw_and ~ sum3 }
+like_rec = { fw_like ~ sum3 }
+starts_with_words_rec = { (fw_starts | fw_ends) ~ fw_with ~ sum3 }
+// Infix `contains` / `starts_with`, word-bounded and not touching `(`.
+infix_string_op = @{ ("contains" | "starts_with") ~ !(ASCII_ALPHANUMERIC | "_" | "(") }
+// A binary minus has whitespace on both sides or neither; the builder
+// refuses `$n -1` and `$n- 1` with `$n - 1` as the fix.
+sum3        = { product3 ~ (sum_op3 ~ product3)* }
+sum_op3     = { "+" | "-" | concat_bars }
+concat_bars = { "||" }
+product3    = { unary3 ~ (product_op ~ unary3)* }
+product_op  = { "*" | "/" | "%" }
+unary3      = { unary_minus ~ unary3 | operand3 }
+unary_minus = { "-" }
+// Section 7's `operand3` has no bare name. Here a bare name is the last
+// alternative, the recognizer `bare_name_rec`, so the parse reaches the word
+// and the builder refuses it there with the foreign-word table's fix; it is
+// admitted only as a whole `order` key and inside the `where_stmt` predicate,
+// so the accepted texts are section 7's.
+operand3    = { "(" ~ expr3 ~ ")" | block_value | agg_distinct | count_star_rec | case_rec | literal3 | type_prop_rec | call | keyword_call_rec | spaced_call_rec | prop_method_rec | prop_chain_rec | prop_star_rec | prop_access3 | meta_field | variable | reserved_property | bare_name_rec }
+block_value = { (agg_name ~ ("(" ~ expr3 ~ ")")? | kw_exists) ~ subquery_block3 }
+agg_name    = @{ ("count" | "sum" | "avg" | "min" | "max") ~ !(ASCII_ALPHANUMERIC | "_") }
+agg_distinct = { agg_name ~ "(" ~ kw_distinct ~ expr3 ~ ")" }
+count_star_rec = { agg_name ~ "(" ~ "*" ~ ")" }
+// The call's name touches its `(`, and is never a clause keyword (section 5:
+// a registry row is never named `let`, `from`, `optional` or `exists`).
+call        = { call_head ~ call_args? ~ ")" }
+call_head   = ${ call_name ~ "(" }
+call_name   = @{ !(reserved | kw_let | kw_from | kw_optional | kw_exists) ~ ident }
+call_args   = { positional ~ ("," ~ positional)* ~ ("," ~ call_option)* ~ !("," ~ positional) | call_option ~ ("," ~ call_option)* ~ !("," ~ positional) | mixed_args_rec }
+// An option written before a positional argument.
+mixed_args_rec = { (call_option | positional) ~ ("," ~ (call_option | positional))+ }
+positional  = { !(ident ~ ":") ~ (inline_read | expr3) }
+call_option = { ident ~ ":" ~ expr3 }
+keyword_call_rec = { keyword_call_head ~ call_args? ~ ")" }
+keyword_call_head = ${ (kw_let | kw_from | kw_optional | kw_exists) ~ "(" }
+spaced_call_rec = { spaced_call_head ~ call_args? ~ ")" }
+spaced_call_head = ${ call_name ~ (" " | "\t" | "\r" | "\n")+ ~ "(" }
+case_rec = { fw_case ~ (fw_when ~ expr3 ~ fw_then ~ expr3)+ ~ (fw_else ~ expr3)? ~ fw_end }
+type_prop_rec = { type_name ~ "." ~ ident }
+prop_method_rec = { prop_method_head ~ call_args? ~ ")" }
+prop_method_head = ${ variable ~ "." ~ ident ~ "(" }
+prop_chain_rec = { variable ~ "." ~ ident ~ ("." ~ (ident | "*"))+ }
+prop_star_rec = { variable ~ "." ~ "*" }
+prop_access3 = { variable ~ "." ~ (meta_field | ident) }
+bare_name_rec = { expr_ident }
+
+literal3   = { list_lit3 | datetime_lit3 | date_lit3 | string_lit | exp_float_rec | float_lit3 | integer3 | bool_lit }
+// `date("…")` is the literal, and like a call its name touches its `(`.
+date_lit3     = { date_head3 ~ string_lit ~ ")" }
+date_head3    = @{ "date(" }
+datetime_lit3 = { datetime_head3 ~ string_lit ~ ")" }
+datetime_head3 = @{ "datetime(" }
+list_lit3  = { "[" ~ (literal3 ~ ("," ~ literal3)*)? ~ "]" }
+float_lit3 = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ ~ (("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+)? ~ !(ASCII_ALPHANUMERIC | "_") }
+integer3   = @{ ASCII_DIGIT+ ~ !(ASCII_ALPHANUMERIC | "_" | ".") }
+// `1e3`: an exponent needs a fraction.
+exp_float_rec = @{ ASCII_DIGIT+ ~ ("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+ ~ !(ASCII_ALPHANUMERIC | "_") }
+
+kw_gq       = @{ "gq" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_query    = @{ "query" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_mutation = @{ "mutation" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_view     = @{ "view" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_match    = @{ "match" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_return   = @{ "return" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_order    = @{ "order" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_let      = @{ "let" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_optional = @{ "optional" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_exists   = @{ "exists" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_insert   = @{ "insert" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_update   = @{ "update" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_where    = @{ "where" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_for      = @{ "for" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_unwind   = @{ "unwind" ~ !(ASCII_ALPHANUMERIC | "_") }
+// Foreign words: case-insensitive, word-bounded; `where(…)` and the like stay
+// calls.
+fw_where    = @{ (^"where" | ^"filter") ~ !(ASCII_ALPHANUMERIC | "_" | "(") }
+fw_with     = @{ ^"with" ~ !(ASCII_ALPHANUMERIC | "_" | "(") }
+fw_call     = @{ ^"call" ~ !(ASCII_ALPHANUMERIC | "_" | "(") }
+fw_match    = @{ ^"match" ~ !(ASCII_ALPHANUMERIC | "_" | "(") }
+fw_optional = @{ ^"optional" ~ !(ASCII_ALPHANUMERIC | "_" | "(") }
+fw_detach   = @{ ^"detach" ~ !(ASCII_ALPHANUMERIC | "_" | "(") }
+fw_create   = @{ (^"create" | ^"merge") ~ !(ASCII_ALPHANUMERIC | "_" | "(") }
+fw_by       = @{ ^"by" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_offset   = @{ (^"offset" | ^"skip") ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_group    = @{ ^"group" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_having   = @{ ^"having" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_retrieve = @{ ^"retrieve" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_between  = @{ ^"between" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_like     = @{ ^"like" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_starts   = @{ ^"starts" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_ends     = @{ ^"ends" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_case     = @{ ^"case" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_when     = @{ ^"when" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_then     = @{ ^"then" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_else     = @{ ^"else" ~ !(ASCII_ALPHANUMERIC | "_") }
+fw_end      = @{ ^"end" ~ !(ASCII_ALPHANUMERIC | "_") }

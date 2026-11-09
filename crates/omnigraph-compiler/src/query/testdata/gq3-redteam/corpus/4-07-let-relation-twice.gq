@@ -1,0 +1,8 @@
+// task: a named population drawn from twice
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §3 let $r = rel
+query q() {
+  match { let $people = { match { $p: Person } return { $p } }  from $people  from { match { from $people } return { $p as other } } }
+  return { $p.name, $other.name }
+}

@@ -1,0 +1,8 @@
+// task: property access on a type
+// kind: adversarial
+// expect: refuse-with-fix:$p.name
+// habit: SQL
+query q() {
+  match { $p: Person }
+  return { Person.name }
+}

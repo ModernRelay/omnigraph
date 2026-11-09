@@ -68,6 +68,7 @@ impl Session {
         params: &ParamMap,
     ) -> Result<(QueryResult, Option<String>)> {
         let settings = self.effective(query_source)?;
+        self.refuse_edition3(query_source, query_name)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
 
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
@@ -107,6 +108,7 @@ impl Session {
         params: &ParamMap,
     ) -> Result<QueryResult> {
         let settings = self.effective(query_source)?;
+        self.refuse_edition3(query_source, query_name)?;
         let (snapshot, catalog) = self.capture_historical_read_view(version).await?;
 
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
@@ -146,6 +148,7 @@ impl Session {
         params: &ParamMap,
     ) -> Result<serde_json::Value> {
         let settings = self.effective(query_source)?;
+        self.refuse_edition3(query_source, query_name)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
         admit_wildcard_target(
@@ -228,6 +231,7 @@ impl Session {
         params: &ParamMap,
     ) -> Result<engine::Executed> {
         let settings = self.effective(query_source)?;
+        self.refuse_edition3(query_source, query_name)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
         let CompiledRead::Query(query) =
             self.compile_named_query(&catalog, query_source, query_name)?
@@ -411,6 +415,9 @@ impl Omnigraph {
         }
         let statement = omnigraph_compiler::find_read_statement(query_source, query_name)
             .map_err(super::query_lookup_error)?;
+        if statement.decl().edition3.is_some() {
+            return Err(super::edition3_refusal(catalog, statement.decl()));
+        }
         let checked = CheckedRead::check(catalog, statement.decl())?;
         let ir = Arc::new(lower_query(catalog, checked.query())?);
         let query = CompiledQuery { ir, checked };

@@ -1,0 +1,9 @@
+// task: edition 2's list contains
+// kind: adversarial
+// expect: refuse-with-fix:"rust" in $d.tags
+// habit: GQ edition 2
+// rfc: §6 rewriter row: list contains → in
+query q() {
+  match { $d: Doc  $d.tags contains "rust" }
+  return { $d.title }
+}

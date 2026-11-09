@@ -1,0 +1,8 @@
+// task: an optional inside an optional
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §3
+query q() {
+  match { $p: Person  optional { $p worksAt $c  optional { $q worksAt $c } } }
+  return { $p.name, $c.name, $q.name }
+}

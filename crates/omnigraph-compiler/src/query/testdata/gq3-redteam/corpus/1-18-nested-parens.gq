@@ -1,0 +1,9 @@
+// task: a filter wrapped in redundant parentheses
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §7 operand
+// shape: $p: Person | $p.age > 3
+query q() {
+  match { $p: Person  ((($p.age))) > 3 }
+  return { $p.name }
+}

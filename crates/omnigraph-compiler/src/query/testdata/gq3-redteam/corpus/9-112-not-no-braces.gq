@@ -1,0 +1,8 @@
+// task: negation of a triple without a block
+// kind: adversarial
+// expect: refuse-with-fix:not { $p knows $q }
+// habit: Datalog
+query q() {
+  match { $p: Person  $q: Person  not $p knows $q }
+  return { $p.name }
+}

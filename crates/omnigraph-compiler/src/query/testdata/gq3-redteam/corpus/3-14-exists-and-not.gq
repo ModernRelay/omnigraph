@@ -1,0 +1,8 @@
+// task: authors without citations, the asset's text
+// kind: aggregation
+// expect: accept
+// rfc: asset §3
+query q() {
+  match { $p: Person  exists { $p authored $d }  not { $p authored $d2  $other cites $d2 } }
+  return { $p.name }
+}

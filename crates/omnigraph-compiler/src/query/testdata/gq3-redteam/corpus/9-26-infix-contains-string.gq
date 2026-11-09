@@ -1,0 +1,9 @@
+// task: edition 2's string contains
+// kind: adversarial
+// expect: refuse-with-fix:contains($d.title, "graph")
+// habit: GQ edition 2
+// rfc: §6 rewriter row
+query q() {
+  match { $d: Doc  $d.title contains "graph" }
+  return { $d.title }
+}

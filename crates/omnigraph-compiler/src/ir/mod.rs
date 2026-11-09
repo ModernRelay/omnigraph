@@ -1,4 +1,5 @@
 pub mod coerce;
+pub mod core3;
 mod erase;
 pub mod fold;
 pub mod load;

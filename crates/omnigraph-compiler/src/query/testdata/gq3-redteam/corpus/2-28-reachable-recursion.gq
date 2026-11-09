@@ -1,0 +1,13 @@
+// task: unbounded reachability as a recursive declared read, the RFC's text
+// kind: traversal
+// expect: accept
+// rfc: §3 Recursion
+// later: T70 until stage Rec
+query reachable($from: String) {
+  match {
+    from union(
+      { match { $p: Person { handle: $from }  $p knows $q } return { $q } },
+      { match { from reachable($from)  $q knows $r } return { $r as q } })
+  }
+  return distinct { $q }
+}

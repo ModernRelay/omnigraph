@@ -1,0 +1,9 @@
+// task: for over a relation
+// kind: adversarial
+// expect: refuse-with-fix:from { match { $p: Person } return { $p } }
+// habit: GQL
+// rfc: §3 refused respellings: for $x in rel
+query q() {
+  match { for $x in { match { $p: Person } return { $p } } }
+  return { $x.name }
+}

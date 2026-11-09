@@ -1,0 +1,7 @@
+// task: edition 2's delete by predicate
+// kind: writes
+// expect: refuse-with-fix:$x: Person  $x.handle = $h  delete $x
+// rfc: §6 rewriter row
+query w($h: String) {
+  delete Person where handle = $h
+}

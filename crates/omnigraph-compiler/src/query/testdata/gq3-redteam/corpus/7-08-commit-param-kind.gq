@@ -1,0 +1,8 @@
+// task: a Commit parameter kind
+// kind: catalogue-and-declarations
+// expect: refuse
+// rfc: §6 freeze list: the Branch and Commit kinds are later
+query retract($h: String, $c: Commit) {
+  $p: Person { handle: $h }
+  delete $p
+}

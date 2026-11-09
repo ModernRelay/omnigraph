@@ -1,0 +1,8 @@
+// task: && for conjunction
+// kind: adversarial
+// expect: refuse-with-fix:and
+// habit: Gremlin
+query q() {
+  match { $p: Person  $p.age >= 18 && $p.age < 65 }
+  return { $p.name }
+}

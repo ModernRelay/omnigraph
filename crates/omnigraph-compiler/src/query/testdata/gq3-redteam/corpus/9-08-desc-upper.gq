@@ -1,0 +1,9 @@
+// task: DESC in uppercase
+// kind: adversarial
+// expect: refuse-with-fix:desc
+// habit: SQL
+query q() {
+  match { $p: Person }
+  return { $p.name }
+  order { $p.age DESC }
+}

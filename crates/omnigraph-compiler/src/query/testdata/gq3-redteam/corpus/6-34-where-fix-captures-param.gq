@@ -1,0 +1,8 @@
+// task: edition 2's delete whose parameter is named $x, the name the fix binds
+// kind: writes
+// expect: refuse-with-fix:$p: Person  $p.handle = $x  delete $p
+// rfc: §6 rewriter row: `$x: T  φ′  delete $x`
+// note: the fixed binding name collides with the parameter
+query w($x: String) {
+  delete Person where handle = $x
+}

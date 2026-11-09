@@ -1,0 +1,9 @@
+// task: an alias named count used as an order key
+// kind: aggregation
+// expect: accept
+// rfc: §7 block_value; agg names are not reserved
+query q() {
+  match { $p: Person }
+  return { $p.age as count }
+  order { count desc }
+}

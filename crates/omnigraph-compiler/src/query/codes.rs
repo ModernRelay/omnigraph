@@ -22,6 +22,25 @@ codes! {
     Q003 = "a settings statement is refused";
     Q004 = "a branch, commit, show or explain statement is misplaced or malformed";
     Q005 = "a declaration body is refused";
+    // Edition 3 (`gq 3;`, docs/rfcs/2026-11-07-gq-3.md section 5): each
+    // refusal names the construct and carries a byte-range suggestion
+    // wherever one edit set makes the text legal.
+    Q006 = "the edition line names an edition this compiler does not read";
+    Q007 = "a traversal is written with an arrow; the fix is the triple";
+    Q008 = "an update or delete statement carries a where; the fix binds and filters";
+    Q009 = "`mutation` is not a declaration keyword; the fix is `query`";
+    Q010 = "a binding's braces hold a comparison; the fix is a filter clause";
+    Q011 = "a read body carries `as commit` or `as unattached branch`";
+    Q012 = "a respelling edition 3 refuses; the fix prints the legal form";
+    Q013 = "a clause follows a statement in a write body";
+    Q014 = "a spelling from another language; the fix prints the GQ form";
+    Q015 = "a form a later stage adds; the message names the stage";
+    Q016 = "a binary minus with whitespace on one side only; the fix spaces both";
+    Q017 = "a contextual keyword or literal as a bare edge name; the fix quotes it";
+    Q018 = "a bare name where a value is read; a bare name is a return alias in order only";
+    Q019 = "a call whose name does not touch its parenthesis, or a call named by a clause keyword";
+    Q020 = "a read body's clauses are missing, misplaced or unbraced";
+    Q021 = "an annotation's named argument is written `name: value`; the fix is `name = value`";
 
     // Typechecker.
     T1 = "unknown node type";
@@ -75,12 +94,29 @@ codes! {
     T57 = "distinct applies only to count";
     T58 = "a Boolean return item compares aggregates with constants only";
     T59 = "an rrf() ranks two bindings one traversal connects";
+    // Edition 3 (docs/rfcs/2026-11-07-gq-3.md section 5). T60 to T64, T66
+    // and T67 are unallocated.
+    T65 = "a ranking is written as a call in order or return; it is a relation function";
+    T68 = "a name drawn into scope, or bound inside an inline read, is already in scope";
+    T69 = "a relation where a scalar is read, or a scalar where a relation is read";
+    T70 = "a call cycle is not monotone, has no base arm, passes a computed argument, or exceeds the plan budget";
+    T71 = "an option is unknown, out of range or written positionally";
+    T72 = "an arithmetic operand is not numeric or the operation is unsupported";
+    T73 = "the arms of a union disagree on a column";
+    T74 = "a name is refused as a relation";
+    T75 = "an rrf arm is invalid";
+    T76 = "a write mixes delete with insert or update";
+    T77 = "a statement's variable is not a bound node or edge reference";
+    T78 = "an endpoint assignment is neither a key of the endpoint type nor a bound reference of it";
+    T79 = "a ranked column is not a node column of its population";
+    T80 = "an annotation is not one edition 3 reads";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
     // the binding it ranks, and `rrf()` arms one traversal connects are T59.
     P002 = "an edge alternation or wildcard traversal needs a finite traversal work limit";
     P003 = "the traversal work limit is out of range or recorded twice";
     P004 = "an edge alternation or wildcard traversal cannot run in CSR traversal mode";
+    P006 = "an edition-3 core node the planner does not lower yet";
 }
 
 #[cfg(test)]

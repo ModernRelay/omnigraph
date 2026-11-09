@@ -19,6 +19,15 @@ A query runs against one resolved `ReadTarget`:
 6. Bind the accepted plan's values and execute it against the same snapshot.
 7. Serialize result batches at the calling boundary.
 
+Every caller parses through one front door, `parse_query`, which reads the
+edition line first. Edition 2 (no line, or `gq 2;` blanked so positions keep)
+takes the steps above. Under `gq 3;` each declaration carries its edition-3
+tree (`QueryDecl::edition3`); `typecheck_query_decl` types it into the core IR
+(`ir::core3`), and the planner's `plan_edition3` refuses it with `P006`. Each
+engine door makes that check before it captures a snapshot
+(`Omnigraph::refuse_edition3`, against the handle's accepted catalog), so an
+edition-3 declaration reads no storage and nothing in it executes.
+
 Type checking constructs a complete `CheckedReadQuery` or
 `CheckedMutationQuery`. Its private fields retain typed expressions, scopes,
 parameter declarations and operation metadata. Each input expression and

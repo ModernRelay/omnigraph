@@ -1,0 +1,9 @@
+// task: skip then limit
+// kind: adversarial
+// expect: refuse
+// habit: Cypher
+query q() {
+  match { $p: Person }
+  return { $p.name }
+  skip 5 limit 10
+}

@@ -1,0 +1,9 @@
+// task: an option written before a positional argument
+// kind: ranking-and-search
+// expect: refuse
+// rfc: §6 freeze list: name(positional…, option: value…)
+// amended: the ranked column is a property access and `l2` is `distance` (RFC §3, 2026-11-08)
+query q($q: Vector(3)) {
+  match { from nearest({ match { $d: Doc } return { $d } }, k: 20, $d.embedding, $q) }
+  return { $d.title }
+}

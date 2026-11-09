@@ -1,0 +1,10 @@
+// task: close_company with its statements swapped and the binding after the triple
+// kind: writes
+// expect: accept
+// rfc: §3: statements see one snapshot, so their order cannot matter
+query close_company($slug: String) {
+  $p $k:worksAt $c
+  $c: Company { slug: $slug }
+  update $p set { city: null }
+  delete $k
+}

@@ -1,0 +1,9 @@
+// task: a traversal over an edge named `optional`
+// kind: traversal
+// expect: accept
+// rfc: §7
+// shape: $a: Person | $a optional $b
+query q() {
+  match { $a: Person  $a optional $b }
+  return { $b.name }
+}

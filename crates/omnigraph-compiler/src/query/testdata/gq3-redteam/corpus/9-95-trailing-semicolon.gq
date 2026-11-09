@@ -1,0 +1,8 @@
+// task: a semicolon after a declaration
+// kind: adversarial
+// expect: refuse-with-fix:<empty>
+// habit: SQL
+query q() {
+  match { $p: Person }
+  return { $p.name }
+};

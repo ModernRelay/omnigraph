@@ -1,0 +1,8 @@
+// task: collections with at least their minimum of documents (T40 lifted)
+// kind: aggregation
+// expect: accept
+// rfc: §3 refused respellings: legal
+query q() {
+  match { $x: Collection  count { $d "in" $x } >= $x.min_docs }
+  return { $x.slug }
+}

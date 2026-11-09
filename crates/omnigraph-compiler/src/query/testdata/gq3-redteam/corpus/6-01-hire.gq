@@ -1,0 +1,8 @@
+// task: insert a node and a keyed edge
+// kind: writes
+// expect: accept
+// rfc: asset §6
+query hire($h: String, $slug: String) {
+  insert Person { handle: $h, name: $h }
+  insert WorksAt { from: $h, to: $slug }
+}

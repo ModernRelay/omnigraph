@@ -1,0 +1,10 @@
+// task: the withdrawn retrieve { } clause
+// kind: adversarial
+// expect: refuse
+// habit: GQ edition 2
+// rfc: §3 refused respellings
+query q($v: Vector(3)) {
+  match { $d: Doc }
+  retrieve { nearest($d.embedding, $v, k: 10) }
+  return { $d.title }
+}

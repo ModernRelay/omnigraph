@@ -1,0 +1,8 @@
+// task: two property matches in braces with a trailing comma
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 Kept
+query q($h: String) {
+  match { $p: Person { handle: $h, city: "Berlin", } }
+  return { $p.name }
+}

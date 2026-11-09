@@ -1,0 +1,8 @@
+// task: the engine's operator catalogue
+// kind: catalogue-and-declarations
+// expect: accept
+// rfc: asset §7
+query q() {
+  match { $o: @Operator }
+  return { $o.name, $o.inputs }
+}

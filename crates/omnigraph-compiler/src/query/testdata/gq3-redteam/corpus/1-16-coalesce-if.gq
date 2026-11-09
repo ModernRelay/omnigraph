@@ -1,0 +1,8 @@
+// task: a default city and an age band, the asset's text
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 arithmetic: the conditional rows
+query q() {
+  match { $p: Person }
+  return { coalesce($p.city, "unknown") as city, if($p.age >= 65, "senior", "active") as band }
+}

@@ -1,0 +1,10 @@
+// task: limit then offset (paging is stage P)
+// kind: adversarial
+// expect: refuse
+// habit: SQL
+// rfc: §11 P
+query q() {
+  match { $p: Person }
+  return { $p.name }
+  limit 10 offset 5
+}

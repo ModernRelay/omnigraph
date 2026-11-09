@@ -1,0 +1,8 @@
+// task: CALL { } as a subquery
+// kind: adversarial
+// expect: refuse-with-fix:from { match { $p knows $q } return { $q } }
+// habit: Cypher
+query q() {
+  match { $p: Person  call { match { $p knows $q } return { $q } } }
+  return { $q.name }
+}

@@ -1,0 +1,9 @@
+// task: positional destructuring
+// kind: adversarial
+// expect: refuse-with-fix:from { match { $p worksAt $c } return { $p, $c } }
+// habit: GQ edition 2
+// rfc: §3 refused respellings
+query q() {
+  match { let ($a, $b) in { match { $p worksAt $c } return { $p, $c } } }
+  return { $a.name }
+}

@@ -1,0 +1,9 @@
+// task: a write whose first clause is the bare word match
+// kind: writes
+// expect: refuse
+// rfc: §7: the two bodies are distinct productions
+query w() {
+  match
+  $p: Person
+  delete $p
+}

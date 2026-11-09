@@ -1,0 +1,11 @@
+// task: a write whose clauses use from, optional and a block
+// kind: writes
+// expect: accept
+// rfc: §10 Writes: a write whose clauses use from, let, optional and a block
+query w() {
+  from { match { $p worksAt $c } return { $c, count($p) as n } }
+  optional { $c worksAt $z }
+  not { $c: Company { slug: "keep" } }
+  $n < 2
+  delete $c
+}

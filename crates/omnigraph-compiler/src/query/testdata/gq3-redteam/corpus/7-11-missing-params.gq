@@ -1,0 +1,8 @@
+// task: a declaration without its parameter list
+// kind: catalogue-and-declarations
+// expect: refuse-with-fix:query q()
+// rfc: §6 (today's Q002)
+query q {
+  match { $p: Person }
+  return { $p.name }
+}

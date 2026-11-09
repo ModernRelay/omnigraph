@@ -1,0 +1,10 @@
+// task: HAVING after return
+// kind: adversarial
+// expect: refuse
+// habit: SQL
+// rfc: §3 refused respellings
+query q() {
+  match { $p worksAt $c }
+  return { $c.name, count($p) as n }
+  having n > 3
+}

@@ -9,7 +9,8 @@ Commits, and History](../branching/index.md)), a `show` statement (see
 [session settings](#session-settings)), or an `explain` statement, which
 answers the plan a read query would run under instead of its rows (see
 [Explain](explain.md)). Any of them may open with
-[session settings](#session-settings) lines.
+[session settings](#session-settings) lines. This guide is GQ edition 2; see
+[Editions](editions.md) for the `gq 3;` preview line.
 
 ```gq
 query engineers($title: String) @description("People with a title") {

@@ -1,0 +1,8 @@
+// task: LIKE with wildcards
+// kind: adversarial
+// expect: refuse-with-fix:contains($d.title, "graph")
+// habit: SQL
+query q() {
+  match { $d: Doc  $d.title LIKE '%graph%' }
+  return { $d.title }
+}

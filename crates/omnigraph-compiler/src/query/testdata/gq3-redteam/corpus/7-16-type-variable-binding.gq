@@ -1,0 +1,8 @@
+// task: a type-variable binding `$x: $t` (stage Poly)
+// kind: catalogue-and-declarations
+// expect: refuse
+// rfc: §11 Poly
+query q() {
+  match { $x: $t }
+  return { $x.@id }
+}

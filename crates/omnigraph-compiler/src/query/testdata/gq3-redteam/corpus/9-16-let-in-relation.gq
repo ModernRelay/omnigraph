@@ -1,0 +1,9 @@
+// task: PR 1244's let … in
+// kind: adversarial
+// expect: refuse-with-fix:from { match { $p: Person } return { $p } }
+// habit: GQ edition 2
+// rfc: §3 refused respellings
+query q() {
+  match { let $x in { match { $p: Person } return { $p } } }
+  return { $x.name }
+}

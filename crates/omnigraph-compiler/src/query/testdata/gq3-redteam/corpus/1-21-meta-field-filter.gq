@@ -1,0 +1,8 @@
+// task: a node by its id meta-field
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §6 freeze list, meta-fields
+query q($id: String) {
+  match { $p: Person  $p.@id = $id }
+  return { $p.name }
+}

@@ -1,0 +1,8 @@
+// task: the newest three documents per author
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: asset §4
+query q() {
+  match { $p: Person  from { match { $p authored $d } return { $d } order { $d.year desc } limit 3 } }
+  return { $p.name, $d.title, $d.year }
+}

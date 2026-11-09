@@ -26,6 +26,7 @@
 pub mod aggregate;
 pub mod bound;
 pub mod cost;
+pub mod edition3;
 pub mod error;
 pub mod explain;
 pub mod gate;
@@ -60,6 +61,7 @@ pub use cost::{
     coverage_validate_access, direction_probe_factor, estimate_rows, executed_hops,
     hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
 };
+pub use edition3::plan_edition3;
 pub use error::PlanError;
 pub use explain::Explain;
 pub use gate::{Decision, Unrouted, accept_query, accept_query_explained, plan_query, route};

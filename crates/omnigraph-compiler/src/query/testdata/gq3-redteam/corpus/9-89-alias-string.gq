@@ -1,0 +1,8 @@
+// task: an alias written as a string
+// kind: adversarial
+// expect: refuse-with-fix:as name
+// habit: SQL
+query q() {
+  match { $p: Person }
+  return { $p.name as "Name" }
+}

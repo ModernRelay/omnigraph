@@ -1,0 +1,9 @@
+// task: a lowercase case expression
+// kind: adversarial
+// expect: refuse-with-fix:if($p.age > 65, "senior", "active")
+// habit: Cypher
+// rfc: §3 refused respellings
+query q() {
+  match { $p: Person }
+  return { $p.name, case when $p.age > 65 then "senior" else "active" end as band }
+}

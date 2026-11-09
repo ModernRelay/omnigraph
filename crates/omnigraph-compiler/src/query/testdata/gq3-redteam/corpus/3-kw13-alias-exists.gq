@@ -1,0 +1,9 @@
+// task: `exists` as a return alias, then ordered by
+// kind: aggregation
+// expect: accept
+// rfc: §7 contextual keywords; §6 reserved words
+query q() {
+  match { $p: Person }
+  return { $p.age as exists }
+  order { exists desc }
+}

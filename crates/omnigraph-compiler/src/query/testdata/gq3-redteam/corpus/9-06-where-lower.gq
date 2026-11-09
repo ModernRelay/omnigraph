@@ -1,0 +1,9 @@
+// task: a lowercase where inside match
+// kind: adversarial
+// expect: refuse-with-fix:$p.age > 30
+// habit: SQL
+// note: `where` is a legal bare name in a filter
+query q() {
+  match { $p: Person  where $p.age > 30 }
+  return { $p.name }
+}

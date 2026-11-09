@@ -1,0 +1,9 @@
+// task: DISTINCT inside the return braces
+// kind: adversarial
+// expect: refuse-with-fix:return distinct { $p.city }
+// habit: SQL
+// note: `distinct` is a legal bare name
+query q() {
+  match { $p: Person }
+  return { distinct $p.city }
+}

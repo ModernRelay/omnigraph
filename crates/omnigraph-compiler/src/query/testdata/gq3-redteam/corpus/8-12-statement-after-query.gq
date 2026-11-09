@@ -1,0 +1,9 @@
+// task: a branch statement after a read
+// kind: statements
+// expect: refuse
+// rfc: §3 Kept: statements
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}
+branch list

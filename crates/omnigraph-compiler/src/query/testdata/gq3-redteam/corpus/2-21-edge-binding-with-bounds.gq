@@ -1,0 +1,9 @@
+// task: an edge binding on a multi-hop traversal
+// kind: traversal
+// expect: accept
+// rfc: §2 Expand: $k binds only at m = n = 1
+// later: a type error: the edge binds only on a single hop
+query q() {
+  match { $a: Person  $a $k:knows{1,2} $b }
+  return { $b.name }
+}

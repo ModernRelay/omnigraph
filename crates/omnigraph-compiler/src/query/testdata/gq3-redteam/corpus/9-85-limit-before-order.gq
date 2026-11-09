@@ -1,0 +1,10 @@
+// task: limit written before order
+// kind: adversarial
+// expect: refuse
+// habit: SQL
+query q() {
+  match { $p: Person }
+  return { $p.name }
+  limit 10
+  order { $p.age }
+}

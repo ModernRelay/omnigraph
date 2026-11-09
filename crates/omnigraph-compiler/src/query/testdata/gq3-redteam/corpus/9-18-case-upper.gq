@@ -1,0 +1,9 @@
+// task: a CASE expression
+// kind: adversarial
+// expect: refuse-with-fix:if($p.age > 65, "senior", "active")
+// habit: SQL
+// rfc: §3 refused respellings
+query q() {
+  match { $p: Person }
+  return { $p.name, CASE WHEN $p.age > 65 THEN "senior" ELSE "active" END as band }
+}

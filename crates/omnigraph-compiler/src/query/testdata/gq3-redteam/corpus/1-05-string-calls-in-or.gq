@@ -1,0 +1,8 @@
+// task: a title containing a word or starting with a parameter
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §6 rewriter, infix rows
+query q($p: String) {
+  match { $d: Doc  contains($d.title, "graph") or starts_with($d.title, $p) }
+  return { $d.title }
+}

@@ -1,0 +1,7 @@
+// task: an edge insert with @src and @dst as the endpoint names
+// kind: writes
+// expect: refuse-with-fix:from: $h, to: $slug
+// rfc: unresolved question 7
+query hire($h: String, $slug: String) {
+  insert WorksAt { @src: $h, @dst: $slug }
+}

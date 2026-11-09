@@ -1,0 +1,8 @@
+// task: a parameter without a type
+// kind: adversarial
+// expect: refuse-with-fix:$h: String
+// habit: Cypher
+query q($h) {
+  match { $p: Person { handle: $h } }
+  return { $p.name }
+}

@@ -1,0 +1,9 @@
+// task: exists() as a property test
+// kind: adversarial
+// expect: refuse-with-fix:$p.city is not null
+// habit: Cypher
+// amended: a registry row is never named `exists` (RFC §5, 2026-11-08)
+query q() {
+  match { $p: Person  exists($p.city) }
+  return { $p.name }
+}

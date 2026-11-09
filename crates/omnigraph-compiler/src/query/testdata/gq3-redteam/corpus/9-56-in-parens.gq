@@ -1,0 +1,8 @@
+// task: IN with a parenthesised list
+// kind: adversarial
+// expect: refuse-with-fix:[30, 40]
+// habit: SQL
+query q() {
+  match { $p: Person  $p.age in (30, 40) }
+  return { $p.name }
+}

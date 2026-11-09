@@ -1,0 +1,8 @@
+// task: a namespaced type
+// kind: catalogue-and-declarations
+// expect: refuse
+// rfc: §6 freeze list: a :: segment is a parse error
+query q() {
+  match { $o: crm::Person }
+  return { $o.name }
+}

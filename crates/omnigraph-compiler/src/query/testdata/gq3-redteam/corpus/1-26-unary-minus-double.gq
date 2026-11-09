@@ -1,0 +1,9 @@
+// task: a double negation
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 arithmetic
+// note: a filter beginning with `-` again
+query q() {
+  match { $p: Person  - -$p.age < 0 }
+  return { $p.name }
+}

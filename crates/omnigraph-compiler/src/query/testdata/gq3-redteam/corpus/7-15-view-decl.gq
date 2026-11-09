@@ -1,0 +1,8 @@
+// task: a view declaration
+// kind: catalogue-and-declarations
+// expect: refuse-with-fix:query
+// rfc: §3 refused respellings: view → a named query
+view big() {
+  match { $c: Company }
+  return { $c.name }
+}

@@ -1,0 +1,9 @@
+// task: an assert sink (stage W1)
+// kind: catalogue-and-declarations
+// expect: refuse
+// rfc: §11 W1
+query w($h: String) {
+  $p: Person { handle: $h }
+  assert { match { $p knows $q } return { $q } }
+  delete $p
+}

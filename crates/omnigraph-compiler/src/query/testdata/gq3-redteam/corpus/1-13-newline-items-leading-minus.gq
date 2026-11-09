@@ -1,0 +1,13 @@
+// task: two return items on separate lines, the second a negation; the grammar reads one subtraction
+// kind: lookups-and-filters
+// expect: refuse-with-fix:$p.age, -$p.age
+// rfc: §3 arithmetic
+// note: an agent meant two items; edition 2 accepts newline-separated items, so the silent reading is the RFC's own rule
+// amended: `X  -Y` is refused (RFC §3, 2026-11-08); the intended text is two items
+query q() {
+  match { $p: Person }
+  return {
+    $p.age
+    -$p.age as neg
+  }
+}

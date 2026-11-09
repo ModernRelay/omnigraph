@@ -1,0 +1,8 @@
+// task: a count over a from inside a block
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §7 clause in a block
+query q() {
+  match { $p: Person  count { from { match { $p knows $q } return { $q } } } > 2 }
+  return { $p.name }
+}

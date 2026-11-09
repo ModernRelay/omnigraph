@@ -1,0 +1,8 @@
+// task: `$a - knows - $b`, spaced dashes around an edge name
+// kind: traversal
+// expect: refuse-with-fix:$a <knows> $b
+// rfc: §7 arrow_traversal
+query q() {
+  match { $a: Person  $a - knows - $b }
+  return { $b.name }
+}

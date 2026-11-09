@@ -1,0 +1,8 @@
+// task: a delete whose clauses sit in a `match { }` block, as the prose says
+// kind: writes
+// expect: refuse-with-fix:$p: Person { handle: $h }
+// rfc: §3 Writes fed by reads: 'zero or more match clauses'
+query w($h: String) {
+  match { $p: Person { handle: $h } }
+  delete $p
+}

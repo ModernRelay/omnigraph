@@ -1,0 +1,8 @@
+// task: an exponent float written without a fraction, `2e3`
+// kind: lookups-and-filters
+// expect: refuse-with-fix:2.0e3
+// rfc: §7 float_lit
+query q() {
+  match { $d: Doc  $d.year * 1.0 > 2e3 }
+  return { $d.title }
+}

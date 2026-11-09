@@ -1,0 +1,10 @@
+// task: annotations on a declaration
+// kind: catalogue-and-declarations
+// expect: accept
+// rfc: asset §7
+query people_over($cutoff: I32)
+  @description("People over a given age")
+  @instruction("Pass the age as an integer") {
+  match { $p: Person  $p.age > $cutoff }
+  return { $p.name }
+}

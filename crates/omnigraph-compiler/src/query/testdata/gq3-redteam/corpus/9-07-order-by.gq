@@ -1,0 +1,9 @@
+// task: ORDER BY after return
+// kind: adversarial
+// expect: refuse-with-fix:order { $p.age desc }
+// habit: SQL
+query q() {
+  match { $p: Person }
+  return { $p.name }
+  order by $p.age desc
+}

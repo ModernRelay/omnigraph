@@ -1,0 +1,9 @@
+// task: a from over nearest with a space before the parenthesis
+// kind: shapes-of-a-result
+// expect: refuse-with-fix:nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 5)
+// rfc: §7 from lookahead
+// amended: the ranked column is a property access and `l2` is `distance` (RFC §3, 2026-11-08); a space before a call's `(` is refused with the touching form (RFC §3, 2026-11-08)
+query q($q: Vector(3)) {
+  match { from nearest ({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 5) }
+  return { $d.title }
+}

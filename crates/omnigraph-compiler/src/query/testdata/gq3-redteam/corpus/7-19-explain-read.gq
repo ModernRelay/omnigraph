@@ -1,0 +1,8 @@
+// task: explain on a read declaration
+// kind: catalogue-and-declarations
+// expect: accept
+// rfc: §3 Kept: explain
+explain query q() {
+  match { $p: Person }
+  return { $p.name }
+}

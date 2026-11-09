@@ -1,0 +1,8 @@
+// task: == for equality
+// kind: adversarial
+// expect: refuse-with-fix:$p.city = "Berlin"
+// habit: Gremlin
+query q() {
+  match { $p: Person  $p.city == "Berlin" }
+  return { $p.name }
+}

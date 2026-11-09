@@ -1,0 +1,8 @@
+// task: a traversal over an edge named `not`, written bare
+// kind: traversal
+// expect: refuse-with-fix:$a "not" $b
+// rfc: §6 reserved words
+query q() {
+  match { $a: Person  $a not $b }
+  return { $b.name }
+}

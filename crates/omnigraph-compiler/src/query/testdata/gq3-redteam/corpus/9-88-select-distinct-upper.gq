@@ -1,0 +1,8 @@
+// task: RETURN DISTINCT in uppercase
+// kind: adversarial
+// expect: refuse-with-fix:return distinct { $p.city }
+// habit: SQL
+query q() {
+  match { $p: Person }
+  RETURN DISTINCT { $p.city }
+}

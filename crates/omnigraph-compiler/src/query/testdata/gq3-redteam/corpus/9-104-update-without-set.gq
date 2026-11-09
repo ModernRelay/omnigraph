@@ -1,0 +1,8 @@
+// task: update without set
+// kind: adversarial
+// expect: refuse-with-fix:update $p set { age: 3 }
+// habit: SQL
+query w($h: String) {
+  $p: Person { handle: $h }
+  update $p { age: 3 }
+}

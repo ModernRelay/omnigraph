@@ -1,0 +1,5 @@
+// task: a branch from main
+// kind: statements
+// expect: accept
+// rfc: asset §8
+branch create feature from main

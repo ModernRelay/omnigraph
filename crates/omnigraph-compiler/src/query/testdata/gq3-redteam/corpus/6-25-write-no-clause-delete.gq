@@ -1,0 +1,8 @@
+// task: a delete of an unbound variable
+// kind: writes
+// expect: accept
+// rfc: §5: delete takes a bound variable
+// later: type error: unbound
+query w() {
+  delete $p
+}

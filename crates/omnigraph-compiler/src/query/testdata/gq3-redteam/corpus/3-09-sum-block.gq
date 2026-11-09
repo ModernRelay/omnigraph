@@ -1,0 +1,8 @@
+// task: authors whose documents' years sum past a threshold
+// kind: aggregation
+// expect: accept
+// rfc: §3 Kept
+query q() {
+  match { $p: Person  sum($d.year) { $p authored $d } > 4000 }
+  return { $p.name }
+}

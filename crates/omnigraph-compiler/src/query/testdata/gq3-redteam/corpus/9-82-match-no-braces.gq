@@ -1,0 +1,8 @@
+// task: match without braces
+// kind: adversarial
+// expect: refuse-with-fix:match { $p: Person }
+// habit: Cypher
+query q() {
+  match $p: Person
+  return { $p.name }
+}

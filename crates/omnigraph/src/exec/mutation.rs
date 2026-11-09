@@ -1089,6 +1089,9 @@ impl Session {
     ) -> Result<crate::MutationReceipt> {
         let decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(query_lookup_error)?;
+        if decl.edition3.is_some() {
+            return Err(super::edition3_refusal(&self.catalog(), &decl));
+        }
         let (route, branch) = self
             .resolve_write_route(&decl.write_mode, branch, params, actor_id)
             .await?;
@@ -1584,10 +1587,13 @@ impl Omnigraph {
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(query_lookup_error)?;
 
+        if query_decl.edition3.is_some() {
+            return Err(super::edition3_refusal(catalog, &query_decl));
+        }
         let checked = typecheck_query_decl(catalog, &query_decl)?;
         let mutation_ctx = match checked {
             CheckedQuery::Mutation(ctx) => ctx,
-            CheckedQuery::Read(_) => {
+            CheckedQuery::Read(_) | CheckedQuery::Edition3(_) => {
                 return Err(OmniError::manifest(
                     "mutation execution called on a read query; use query instead".to_string(),
                 ));

@@ -1,0 +1,9 @@
+// task: `union` as a key inside binding braces
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §7 contextual keywords
+// shape: $p: Person { union: 1 }
+query q() {
+  match { $p: Person { union: 1 } }
+  return { $p.name }
+}

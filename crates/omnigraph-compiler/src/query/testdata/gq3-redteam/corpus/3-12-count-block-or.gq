@@ -1,0 +1,9 @@
+// task: a count block compared, then or-ed with another filter
+// kind: aggregation
+// expect: accept
+// rfc: §7
+// shape: $p: Person | count { $p knows $q } > 1 or $p.age > 3
+query q() {
+  match { $p: Person  count { $p knows $q } > 1 or $p.age > 3 }
+  return { $p.name }
+}

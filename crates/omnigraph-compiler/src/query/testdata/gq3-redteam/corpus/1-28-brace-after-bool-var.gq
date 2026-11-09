@@ -1,0 +1,8 @@
+// task: property braces after a let Boolean
+// kind: lookups-and-filters
+// expect: refuse
+// rfc: §7
+query q($h: String) {
+  match { $p: Person  let $ok = $p.age > 3  $ok { handle: $h } }
+  return { $p.name }
+}

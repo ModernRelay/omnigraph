@@ -1,0 +1,8 @@
+// task: COUNT(DISTINCT x) uppercase
+// kind: adversarial
+// expect: refuse-with-fix:count(distinct $p.city)
+// habit: Cypher
+query q() {
+  match { $p: Person }
+  return { COUNT(DISTINCT $p.city) as n }
+}

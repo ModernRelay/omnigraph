@@ -1,0 +1,9 @@
+// task: a traversal over an edge named `union`
+// kind: traversal
+// expect: accept
+// rfc: §7
+// shape: $a: Person | $a union $b
+query q() {
+  match { $a: Person  $a union $b }
+  return { $b.name }
+}

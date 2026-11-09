@@ -1,0 +1,9 @@
+// task: a SQL line comment
+// kind: adversarial
+// expect: refuse-with-fix://
+// habit: SQL
+query q() {
+  match { $p: Person  -- adults only
+  $p.age > 18 }
+  return { $p.name }
+}

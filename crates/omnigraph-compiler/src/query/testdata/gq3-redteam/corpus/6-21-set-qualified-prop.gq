@@ -1,0 +1,8 @@
+// task: an update assignment naming `$p.age`
+// kind: writes
+// expect: refuse-with-fix:age: 3
+// rfc: §3 Writes
+query w($h: String) {
+  $p: Person { handle: $h }
+  update $p set { $p.age: 3 }
+}

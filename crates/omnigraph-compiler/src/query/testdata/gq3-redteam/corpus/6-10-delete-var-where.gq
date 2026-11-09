@@ -1,0 +1,8 @@
+// task: a bound delete with a where
+// kind: writes
+// expect: refuse-with-fix:$p.age > 90  delete $p
+// rfc: §5: a where on a statement
+query w() {
+  $p: Person
+  delete $p where $p.age > 90
+}

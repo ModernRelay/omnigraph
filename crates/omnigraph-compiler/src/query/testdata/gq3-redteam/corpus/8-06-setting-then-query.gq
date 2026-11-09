@@ -1,0 +1,9 @@
+// task: a setting then a read
+// kind: statements
+// expect: accept
+// rfc: §6: the edition line before its settings lines
+set ann_nprobes = 20;
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}

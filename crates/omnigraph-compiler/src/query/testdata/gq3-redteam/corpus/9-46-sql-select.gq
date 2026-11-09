@@ -1,0 +1,5 @@
+// task: a SQL SELECT
+// kind: adversarial
+// expect: refuse
+// habit: SQL
+SELECT p.name FROM Person p WHERE p.age > 30

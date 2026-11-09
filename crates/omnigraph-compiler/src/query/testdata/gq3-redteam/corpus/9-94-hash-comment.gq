@@ -1,0 +1,9 @@
+// task: a hash comment
+// kind: adversarial
+// expect: refuse-with-fix://
+// habit: Gremlin
+query q() {
+  match { $p: Person  # adults only
+  $p.age > 18 }
+  return { $p.name }
+}

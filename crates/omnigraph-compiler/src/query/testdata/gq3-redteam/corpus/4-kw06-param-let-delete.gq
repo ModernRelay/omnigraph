@@ -1,0 +1,8 @@
+// task: `$delete` as a parameter and `$_delete` as a let name
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §7: variables carry `$`
+query q($delete: I32) {
+  match { $p: Person  let $_delete = $delete + 1  $p.age > $_delete }
+  return { $p.name }
+}

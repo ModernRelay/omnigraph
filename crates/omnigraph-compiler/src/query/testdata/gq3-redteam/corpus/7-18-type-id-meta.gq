@@ -1,0 +1,9 @@
+// task: the @type_id meta-field
+// kind: catalogue-and-declarations
+// expect: accept
+// rfc: §6 freeze list: an unknown meta-field is a type error
+// later: type error
+query q() {
+  match { $p: Person }
+  return { $p.@type_id }
+}

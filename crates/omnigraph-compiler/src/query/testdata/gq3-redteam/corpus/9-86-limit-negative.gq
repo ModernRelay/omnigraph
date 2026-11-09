@@ -1,0 +1,9 @@
+// task: a negative limit
+// kind: adversarial
+// expect: refuse
+// habit: SQL
+query q() {
+  match { $p: Person }
+  return { $p.name }
+  limit -1
+}

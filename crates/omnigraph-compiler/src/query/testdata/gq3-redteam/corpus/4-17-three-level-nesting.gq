@@ -1,0 +1,8 @@
+// task: a from inside a from inside a from
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §3 relation expressions
+query q() {
+  match { from { match { from { match { from { match { $p: Person } return { $p } } } return { $p } } } return { $p } } }
+  return { $p.name }
+}

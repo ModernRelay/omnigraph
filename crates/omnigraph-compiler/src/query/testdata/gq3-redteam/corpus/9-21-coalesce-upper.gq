@@ -1,0 +1,9 @@
+// task: COALESCE in uppercase
+// kind: adversarial
+// expect: refuse-with-fix:coalesce($p.city, "none")
+// habit: SQL
+// rfc: §3 refused respellings: coalesce as a keyword
+query q() {
+  match { $p: Person }
+  return { COALESCE($p.city, "none") as c }
+}

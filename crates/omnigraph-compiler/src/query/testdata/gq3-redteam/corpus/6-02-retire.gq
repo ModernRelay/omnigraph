@@ -1,0 +1,10 @@
+// task: the RFC's §8 retire
+// kind: writes
+// expect: accept
+// rfc: §8
+query retire($h: String) as commit {
+  $p: Person { handle: $h }
+  $p $k:worksAt $c
+  delete $k
+  update $p set { city: null }
+}

@@ -1,0 +1,9 @@
+// task: DETACH DELETE in lowercase
+// kind: adversarial
+// expect: refuse-with-fix:delete $p
+// habit: Cypher
+// note: `detach` is a legal bare-name filter
+query w($h: String) {
+  $p: Person { handle: $h }
+  detach delete $p
+}

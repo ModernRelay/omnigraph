@@ -1,0 +1,9 @@
+// task: an update assignment written with `=`
+// kind: writes
+// expect: refuse-with-fix:age: 3
+// habit: SQL
+// rfc: §3 Writes
+query w($h: String) {
+  $p: Person { handle: $h }
+  update $p set { age = 3 }
+}

@@ -1,0 +1,8 @@
+// task: friends in either direction
+// kind: traversal
+// expect: accept
+// rfc: §3 Kept
+query q($h: String) {
+  match { $p: Person { handle: $h }  $p <knows> $f }
+  return { $f.name }
+}

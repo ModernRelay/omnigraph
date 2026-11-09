@@ -1,0 +1,8 @@
+// task: a Cypher bracketed edge between GQ variables
+// kind: adversarial
+// expect: refuse-with-fix:$a knows $b
+// habit: Cypher
+query q() {
+  match { $a: Person  $a -[:knows]-> $b }
+  return { $b.name }
+}

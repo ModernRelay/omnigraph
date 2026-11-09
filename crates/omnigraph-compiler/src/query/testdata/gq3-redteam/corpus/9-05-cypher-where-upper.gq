@@ -1,0 +1,8 @@
+// task: an uppercase WHERE inside match
+// kind: adversarial
+// expect: refuse-with-fix:$p.age > 30
+// habit: Cypher
+query q() {
+  match { $p: Person WHERE $p.age > 30 }
+  return { $p.name }
+}

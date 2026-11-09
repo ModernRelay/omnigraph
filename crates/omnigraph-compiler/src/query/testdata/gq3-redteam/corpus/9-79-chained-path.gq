@@ -1,0 +1,8 @@
+// task: a chained property path through an edge
+// kind: adversarial
+// expect: refuse-with-fix:$p knows $f
+// habit: GraphQL
+query q() {
+  match { $p: Person }
+  return { $p.knows.name }
+}

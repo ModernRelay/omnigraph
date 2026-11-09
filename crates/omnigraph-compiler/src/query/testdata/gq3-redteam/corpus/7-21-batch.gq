@@ -1,0 +1,8 @@
+// task: a batch of two reads
+// kind: catalogue-and-declarations
+// expect: refuse
+// rfc: §6: batch removed
+batch {
+  query a() { match { $p: Person } return { $p.name } }
+  query b() { match { $c: Company } return { $c.name } }
+}

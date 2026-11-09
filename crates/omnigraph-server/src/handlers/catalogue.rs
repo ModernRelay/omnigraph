@@ -89,7 +89,7 @@ pub(crate) async fn catalogue_query(
     };
     let decl = select_named_query_decl(queries, request.name.as_deref())
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if !decl.mutations.is_empty() {
+    if decl.is_mutation() {
         return Err(ApiError::bad_request(format!(
             "query '{}' contains mutations; `{CATALOGUE_SCOPE}` is read-only",
             decl.name

@@ -1,0 +1,13 @@
+// task: a union of three reads in one call
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §3: union folded from the left
+query q() {
+  match {
+    from union(
+      { match { $p: Person } return { $p.name as name } },
+      { match { $c: Company } return { $c.name as name } },
+      { match { $d: Doc } return { $d.title as name } })
+  }
+  return { $name }
+}

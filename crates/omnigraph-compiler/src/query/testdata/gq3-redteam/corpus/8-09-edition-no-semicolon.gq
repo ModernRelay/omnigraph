@@ -1,0 +1,10 @@
+// task: the edition line without its semicolon
+// kind: statements
+// expect: refuse-with-fix:gq 3;
+// raw: yes
+// rfc: §6
+gq 3
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}

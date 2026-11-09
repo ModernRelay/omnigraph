@@ -1,0 +1,8 @@
+// task: a type test `$n is Person` (stage Poly)
+// kind: catalogue-and-declarations
+// expect: refuse
+// rfc: §11 Poly
+query q() {
+  match { $n: Named  $n is Person }
+  return { $n.name }
+}

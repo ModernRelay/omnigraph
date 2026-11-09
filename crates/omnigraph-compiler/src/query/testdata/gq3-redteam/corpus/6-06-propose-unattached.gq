@@ -1,0 +1,7 @@
+// task: an insert as an unattached branch
+// kind: writes
+// expect: accept
+// rfc: asset §6
+query propose($h: String) as unattached branch {
+  insert Person { handle: $h, name: $h }
+}

@@ -1,0 +1,9 @@
+// task: an arrow with no spaces
+// kind: adversarial
+// expect: refuse-with-fix:$a knows $b
+// habit: Cypher
+// rfc: §3 refused respellings
+query q() {
+  match { $a: Person  $a-knows->$b }
+  return { $b.name }
+}

@@ -1,0 +1,8 @@
+// task: a let value and a let relation in one match
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §3
+query q() {
+  match { $p: Person  let $a = $p.age + 1  let $r = { match { $q: Person } return { $q } }  from $r }
+  return { $a, $q.name }
+}

@@ -1,0 +1,9 @@
+// task: edition 2's infix starts_with
+// kind: adversarial
+// expect: refuse-with-fix:starts_with($p.name, "A")
+// habit: GQ edition 2
+// rfc: §3 refused respellings
+query q() {
+  match { $p: Person  $p.name starts_with "A" }
+  return { $p.name }
+}

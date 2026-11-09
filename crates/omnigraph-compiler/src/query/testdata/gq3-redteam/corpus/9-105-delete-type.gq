@@ -1,0 +1,7 @@
+// task: delete a whole type without where
+// kind: adversarial
+// expect: refuse-with-fix:$x: Person  delete $x
+// habit: GQ edition 2
+query w() {
+  delete Person
+}

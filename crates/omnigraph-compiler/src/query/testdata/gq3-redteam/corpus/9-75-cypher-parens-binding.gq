@@ -1,0 +1,8 @@
+// task: a binding with parentheses
+// kind: adversarial
+// expect: refuse-with-fix:$p: Person { handle: $h }
+// habit: Cypher
+query q($h: String) {
+  match { $p: Person(handle: $h) }
+  return { $p.name }
+}

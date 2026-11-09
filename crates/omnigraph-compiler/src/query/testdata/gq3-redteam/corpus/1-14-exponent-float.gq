@@ -1,0 +1,8 @@
+// task: a float with an exponent
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §7 float_lit
+query q() {
+  match { $d: Doc  $d.year * 1.0 > 2.0e3 }
+  return { $d.title }
+}

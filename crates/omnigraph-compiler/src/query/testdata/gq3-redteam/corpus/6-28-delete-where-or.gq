@@ -1,0 +1,7 @@
+// task: edition 2's delete with a disjunction
+// kind: writes
+// expect: refuse-with-fix:$x: Person  $x.age > 90 or $x.city is null  delete $x
+// rfc: §6 rewriter row
+query w() {
+  delete Person where age > 90 or city is null
+}

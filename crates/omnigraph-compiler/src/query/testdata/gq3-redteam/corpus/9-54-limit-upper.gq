@@ -1,0 +1,9 @@
+// task: LIMIT in uppercase
+// kind: adversarial
+// expect: refuse-with-fix:limit 10
+// habit: SQL
+query q() {
+  match { $p: Person }
+  return { $p.name }
+  LIMIT 10
+}

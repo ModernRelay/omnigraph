@@ -1,0 +1,8 @@
+// task: an arrow with an edge binding and bounds
+// kind: traversal
+// expect: refuse-with-fix:$a $k:knows{1,2} $b
+// rfc: §3 refused respellings
+query q() {
+  match { $a: Person  $a -$k:knows{1,2}-> $b }
+  return { $b.name }
+}

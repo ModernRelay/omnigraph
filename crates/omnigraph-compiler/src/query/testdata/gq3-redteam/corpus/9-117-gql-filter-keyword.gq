@@ -1,0 +1,8 @@
+// task: GQL's FILTER statement
+// kind: adversarial
+// expect: refuse-with-fix:$p.age > 30
+// habit: GQL
+query q() {
+  match { $p: Person  FILTER $p.age > 30 }
+  return { $p.name }
+}

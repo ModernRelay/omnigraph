@@ -1,0 +1,8 @@
+// task: an undirected traversal written with dashes
+// kind: traversal
+// expect: refuse-with-fix:$a <knows> $b
+// rfc: §7 parser test pins `$a -knows- $b`
+query q() {
+  match { $a: Person  $a -knows- $b }
+  return { $b.name }
+}

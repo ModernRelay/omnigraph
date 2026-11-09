@@ -1,0 +1,5 @@
+// task: load a CSV
+// kind: statements
+// expect: accept
+// rfc: asset §8
+load csv "people.csv" into node:Person mode append header

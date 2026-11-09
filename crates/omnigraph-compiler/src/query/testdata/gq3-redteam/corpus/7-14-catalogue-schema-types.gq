@@ -1,0 +1,8 @@
+// task: the asset's later-stage schema_types
+// kind: catalogue-and-declarations
+// expect: accept
+// rfc: asset §7
+query schema_types() {
+  match { $t: @Type  $p: @Property  $t @property $p }
+  return { $t.name, $p.name }
+}

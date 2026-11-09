@@ -1,0 +1,9 @@
+// task: `as` as a key inside binding braces
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §7 contextual keywords
+// shape: $p: Person { as: 1 }
+query q() {
+  match { $p: Person { as: 1 } }
+  return { $p.name }
+}

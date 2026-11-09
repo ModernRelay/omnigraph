@@ -1,0 +1,8 @@
+// task: `age: > 30` inside braces
+// kind: adversarial
+// expect: refuse-with-fix:$p: Person  $p.age > 30
+// habit: GraphQL
+query q() {
+  match { $p: Person { age: > 30 } }
+  return { $p.name }
+}

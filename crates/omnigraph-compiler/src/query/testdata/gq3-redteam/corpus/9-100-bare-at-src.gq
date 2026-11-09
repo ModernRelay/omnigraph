@@ -1,0 +1,9 @@
+// task: a bare @src in a read filter (edition 2's where habit)
+// kind: adversarial
+// expect: accept
+// habit: GQ edition 2
+// later: type error: a bare meta-field in a read; fix `$k.@src = $h`
+query q($h: String) {
+  match { $p $k:worksAt $c  @src = $h }
+  return { $c.name }
+}

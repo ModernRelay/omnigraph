@@ -1,0 +1,8 @@
+// task: a numbered parameter
+// kind: adversarial
+// expect: refuse
+// habit: Cypher
+query q() {
+  match { $p: Person { handle: $1 } }
+  return { $p.name }
+}

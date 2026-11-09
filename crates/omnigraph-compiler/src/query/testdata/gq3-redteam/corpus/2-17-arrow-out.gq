@@ -1,0 +1,8 @@
+// task: a directed traversal written with an arrow
+// kind: traversal
+// expect: refuse-with-fix:$a knows $b
+// rfc: §3 refused respellings: the arrow traversals
+query q() {
+  match { $a: Person  $a -knows-> $b }
+  return { $b.name }
+}

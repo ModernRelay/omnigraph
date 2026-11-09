@@ -1,0 +1,9 @@
+// task: string concatenation with ||
+// kind: adversarial
+// expect: refuse-with-fix:concat($p.name, " ", $p.handle)
+// habit: SQL
+// rfc: §3 refused respellings
+query q() {
+  match { $p: Person }
+  return { $p.name || " " || $p.handle as label }
+}

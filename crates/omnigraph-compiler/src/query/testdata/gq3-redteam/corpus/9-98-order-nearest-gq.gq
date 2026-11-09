@@ -1,0 +1,10 @@
+// task: order { nearest(…) } with k
+// kind: adversarial
+// expect: accept
+// habit: GQ edition 2
+// later: T65
+query q($q: Vector(3)) {
+  match { $d: Doc }
+  return { $d.title }
+  order { nearest($d.embedding, $q, k: 10) }
+}

@@ -1,0 +1,8 @@
+// task: ! for negation
+// kind: adversarial
+// expect: refuse-with-fix:not ($p.age > 3)
+// habit: Gremlin
+query q() {
+  match { $p: Person  !($p.age > 3) }
+  return { $p.name }
+}

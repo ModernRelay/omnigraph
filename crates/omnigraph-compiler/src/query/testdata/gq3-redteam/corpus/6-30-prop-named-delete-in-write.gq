@@ -1,0 +1,9 @@
+// task: a write filtering on a property named delete
+// kind: writes
+// expect: accept
+// rfc: §7 stmt_keyword: a property named insert is legal after a dot
+// shape: $p: Person | $p.delete = true
+query w() {
+  $p: Person  $p.delete = true
+  delete $p
+}

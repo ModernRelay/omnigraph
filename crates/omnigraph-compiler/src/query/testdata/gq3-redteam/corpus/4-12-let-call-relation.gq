@@ -1,0 +1,9 @@
+// task: a let naming a ranking call's relation
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §7: a call on the right of let is typed by its registry kind
+// amended: the ranked column is a property access and `l2` is `distance` (RFC §3, 2026-11-08)
+query q($q: Vector(3)) {
+  match { let $near = nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 5)  from $near }
+  return { $d.title, $distance }
+}

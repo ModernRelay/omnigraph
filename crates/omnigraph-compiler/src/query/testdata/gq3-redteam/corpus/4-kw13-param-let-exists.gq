@@ -1,0 +1,8 @@
+// task: `$exists` as a parameter and `$_exists` as a let name
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §7: variables carry `$`
+query q($exists: I32) {
+  match { $p: Person  let $_exists = $exists + 1  $p.age > $_exists }
+  return { $p.name }
+}

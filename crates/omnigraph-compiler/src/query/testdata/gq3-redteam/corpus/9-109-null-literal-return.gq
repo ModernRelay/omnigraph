@@ -1,0 +1,9 @@
+// task: a null literal in a return
+// kind: adversarial
+// expect: refuse
+// habit: SQL
+// rfc: §6 freeze list: no null literal in a read
+query q() {
+  match { $p: Person }
+  return { null as nothing }
+}

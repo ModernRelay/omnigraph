@@ -1,0 +1,10 @@
+// task: the edition line in uppercase
+// kind: statements
+// expect: refuse-with-fix:gq 3;
+// raw: yes
+// rfc: §6
+GQ 3;
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}

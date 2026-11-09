@@ -1,0 +1,13 @@
+// task: two read declarations in one request
+// kind: catalogue-and-declarations
+// expect: accept
+// rfc: §6 freeze list: a request may carry several declarations
+query a() {
+  match { $p: Person }
+  return { $p.name }
+}
+
+query b() {
+  match { $c: Company }
+  return { $c.name }
+}

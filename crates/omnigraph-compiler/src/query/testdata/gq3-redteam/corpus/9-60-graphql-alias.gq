@@ -1,0 +1,8 @@
+// task: a GraphQL alias in return
+// kind: adversarial
+// expect: refuse-with-fix:$p.name as n
+// habit: GraphQL
+query q() {
+  match { $p: Person }
+  return { n: $p.name }
+}

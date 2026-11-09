@@ -1968,7 +1968,7 @@ pub(crate) async fn run_query(
     let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
     let query_decl = select_named_query_decl(queries, name)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if !query_decl.mutations.is_empty() {
+    if query_decl.is_mutation() {
         return Err(ApiError::bad_request(format!(
             "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
             query_decl.name

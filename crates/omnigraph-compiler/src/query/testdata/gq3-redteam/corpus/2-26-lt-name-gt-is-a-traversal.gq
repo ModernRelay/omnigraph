@@ -1,0 +1,10 @@
+// task: `$x < y > $z`, a chained comparison an agent might write, reads as an undirected traversal over edge y
+// kind: traversal
+// expect: accept
+// rfc: §7 undirected_edge
+// shape: $a: Person | let $x = 1 | let $z = 9 | $x <y> $z
+// note: silent: the comparison chain becomes a traversal; edge y does not exist, so the type checker refuses it as an unknown edge, not as a chain
+query q() {
+  match { $a: Person  let $x = 1  let $z = 9  $x < y > $z }
+  return { $a.name }
+}

@@ -1,0 +1,8 @@
+// task: a lowercase type name
+// kind: adversarial
+// expect: refuse-with-fix:$p: Person
+// habit: Cypher
+query q() {
+  match { $p: person }
+  return { $p.name }
+}

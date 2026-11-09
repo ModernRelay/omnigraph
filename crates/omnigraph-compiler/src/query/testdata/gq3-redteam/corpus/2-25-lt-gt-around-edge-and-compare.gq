@@ -1,0 +1,9 @@
+// task: an undirected traversal and an age comparison in neighbouring clauses
+// kind: traversal
+// expect: accept
+// rfc: §7
+// shape: $a: Person | $a <knows> $b | $a.age < $b.age | $b.age > 3
+query q() {
+  match { $a: Person  $a <knows> $b  $a.age < $b.age  $b.age > 3 }
+  return { $b.name }
+}

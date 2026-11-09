@@ -1,0 +1,8 @@
+// task: two patterns that share no variable
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §2 derived forms
+query q() {
+  match { $p: Person  $c: Company }
+  return { $p.name, $c.name }
+}

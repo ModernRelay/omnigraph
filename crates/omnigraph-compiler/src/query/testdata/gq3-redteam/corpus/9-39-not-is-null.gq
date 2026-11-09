@@ -1,0 +1,8 @@
+// task: not … is null
+// kind: adversarial
+// expect: accept
+// habit: SQL
+query q() {
+  match { $p: Person  not $p.city is null }
+  return { $p.name }
+}

@@ -1,0 +1,11 @@
+// task: edition 2's fused order
+// kind: ranking-and-search
+// expect: accept
+// rfc: §6 rewriter
+// later: T65
+query q($q: String, $v: Vector(3)) {
+  match { $d: Doc }
+  return { $d.title }
+  order { rrf(nearest($d.embedding, $v), bm25($d.body, $q), 60) }
+  limit 10
+}

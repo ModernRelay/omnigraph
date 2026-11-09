@@ -1,0 +1,8 @@
+// task: SET a property
+// kind: adversarial
+// expect: refuse-with-fix:update $p set { age: 3 }
+// habit: Cypher
+query w($h: String) {
+  $p: Person { handle: $h }
+  set $p.age = 3
+}

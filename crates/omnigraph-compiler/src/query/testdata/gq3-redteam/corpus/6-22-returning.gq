@@ -1,0 +1,9 @@
+// task: a write with returning, a writes-RFC form
+// kind: writes
+// expect: refuse
+// rfc: §6 freeze list: returning is later
+query w($h: String) {
+  $p: Person { handle: $h }
+  delete $p
+  returning { @id }
+}

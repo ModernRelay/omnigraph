@@ -1,0 +1,8 @@
+// task: EXISTS over a triple without a block
+// kind: adversarial
+// expect: refuse-with-fix:exists { $p knows $q }
+// habit: SQL
+query q() {
+  match { $p: Person  exists $p knows $q }
+  return { $p.name }
+}

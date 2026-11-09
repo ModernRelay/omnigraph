@@ -1,0 +1,8 @@
+// task: a brace block written after a filter
+// kind: lookups-and-filters
+// expect: refuse
+// rfc: §7: a clause cannot start with `{`
+query q($h: String) {
+  match { $p: Person  $p.age > 3 { handle: $h } }
+  return { $p.name }
+}

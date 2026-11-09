@@ -1,0 +1,8 @@
+// task: the withdrawn view binding `$x: Name($arg)`
+// kind: catalogue-and-declarations
+// expect: refuse
+// rfc: §6: the view binding removed
+query q($h: String) {
+  match { $x: Colleagues($h) }
+  return { $x.name }
+}

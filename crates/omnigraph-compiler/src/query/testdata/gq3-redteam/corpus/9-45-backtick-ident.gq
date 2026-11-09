@@ -1,0 +1,8 @@
+// task: a backtick-quoted property
+// kind: adversarial
+// expect: refuse
+// habit: Cypher
+query q() {
+  match { $p: Person }
+  return { $p.`full name` }
+}

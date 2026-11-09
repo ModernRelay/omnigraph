@@ -1,0 +1,8 @@
+// task: documents tagged rust
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §6 rewriter, list contains
+query q() {
+  match { $d: Doc  "rust" in $d.tags }
+  return { $d.title }
+}

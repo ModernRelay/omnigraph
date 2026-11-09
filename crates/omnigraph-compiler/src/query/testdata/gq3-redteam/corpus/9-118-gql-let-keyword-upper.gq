@@ -1,0 +1,8 @@
+// task: GQL's uppercase LET
+// kind: adversarial
+// expect: refuse-with-fix:let $n = $p.age + 1
+// habit: GQL
+query q() {
+  match { $p: Person  LET $n = $p.age + 1 }
+  return { $n }
+}

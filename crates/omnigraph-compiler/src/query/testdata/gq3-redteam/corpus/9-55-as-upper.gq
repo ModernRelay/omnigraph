@@ -1,0 +1,8 @@
+// task: AS in uppercase
+// kind: adversarial
+// expect: refuse-with-fix:as n
+// habit: SQL
+query q() {
+  match { $p: Person }
+  return { $p.name AS n }
+}

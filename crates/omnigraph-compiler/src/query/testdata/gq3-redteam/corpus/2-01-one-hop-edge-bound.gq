@@ -1,0 +1,8 @@
+// task: an employer with the edge bound and its endpoints
+// kind: traversal
+// expect: accept
+// rfc: §3 Kept
+query q($h: String) {
+  match { $p: Person { handle: $h }  $p $k:worksAt $c }
+  return { $c.name, $k.@src, $k.@dst }
+}

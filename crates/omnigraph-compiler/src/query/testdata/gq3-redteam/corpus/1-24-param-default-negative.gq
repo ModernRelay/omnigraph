@@ -1,0 +1,8 @@
+// task: a parameter with a negative default
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §6 freeze list, parameters
+query q($floor: I32 = -1) {
+  match { $p: Person  $p.age > $floor }
+  return { $p.name }
+}

@@ -1,0 +1,9 @@
+// task: a let value feeding an update
+// kind: writes
+// expect: accept
+// rfc: §3 Writes fed by reads
+query w($h: String) {
+  $p: Person { handle: $h }
+  let $n = count { $p knows $q }
+  update $p set { age: $n }
+}

@@ -1,0 +1,9 @@
+// task: a person reached by knows or by worksAt-colleague (alternation)
+// kind: traversal
+// expect: accept
+// rfc: §3 Kept
+// later: T5 (members end on different types)
+query q() {
+  match { $p: Person  $p (knows | authored) $x }
+  return { $p.name }
+}

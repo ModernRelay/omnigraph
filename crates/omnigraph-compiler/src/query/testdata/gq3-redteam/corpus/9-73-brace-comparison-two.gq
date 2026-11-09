@@ -1,0 +1,9 @@
+// task: an equality and a comparison inside binding braces
+// kind: adversarial
+// expect: refuse-with-fix:$p: Person { city: "Berlin" }  $p.age > 30
+// habit: Cypher
+// rfc: §3 refused respellings
+query q() {
+  match { $p: Person { city: "Berlin", age > 30 } }
+  return { $p.name }
+}

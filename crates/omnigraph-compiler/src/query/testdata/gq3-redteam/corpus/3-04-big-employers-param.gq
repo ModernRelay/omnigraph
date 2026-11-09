@@ -1,0 +1,11 @@
+// task: employers above a parameter threshold, filter written before the from
+// kind: aggregation
+// expect: accept
+// rfc: §8 rewritten: the binding added inside the inline read
+query big_employers($min: I64) {
+  match {
+    from { match { $c: Company  $p worksAt $c } return { $c, count($p) as headcount } }
+    $headcount >= $min
+  }
+  return { $c.name, $headcount }
+}

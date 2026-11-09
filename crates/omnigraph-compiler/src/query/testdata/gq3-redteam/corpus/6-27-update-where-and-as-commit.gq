@@ -1,0 +1,7 @@
+// task: an edition-2 update with null under as commit
+// kind: writes
+// expect: refuse-with-fix:$x: Person  $x.age > 90  update $x set { city: null }
+// rfc: §6 rewriter row
+query w() as commit {
+  update Person set { city: null } where age > 90
+}

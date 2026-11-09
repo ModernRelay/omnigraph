@@ -1,0 +1,17 @@
+// task: colleagues_of_colleagues with the inner match and a renaming wrapper
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: asset §4 rewritten
+// later: T68 ($q imported into a scope that has $q)
+query colleagues($of: String) {
+  match { $p: Person { handle: $of }  $p worksAt $c  $q worksAt $c  $q != $p }
+  return { $q }
+}
+
+query colleagues_of_colleagues($of: String) {
+  match {
+    from colleagues($of)
+    from { match { from colleagues($q.handle) } return { $q as r } }
+  }
+  return distinct { $r.name }
+}

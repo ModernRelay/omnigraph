@@ -1,0 +1,9 @@
+// task: the negated age as a return item
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 arithmetic
+// returns: -$p.age as neg
+query q() {
+  match { $p: Person }
+  return { -$p.age as neg }
+}

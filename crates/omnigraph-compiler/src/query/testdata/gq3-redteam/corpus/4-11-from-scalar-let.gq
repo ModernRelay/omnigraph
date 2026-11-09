@@ -1,0 +1,9 @@
+// task: a from over a scalar let (a type error)
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §5: T69 the other way
+// later: T69
+query q() {
+  match { $p: Person  let $n = 1  from $n }
+  return { $p.name }
+}

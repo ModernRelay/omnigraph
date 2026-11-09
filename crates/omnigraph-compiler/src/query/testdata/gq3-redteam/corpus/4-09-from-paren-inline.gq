@@ -1,0 +1,8 @@
+// task: a from whose relation is a parenthesised inline read
+// kind: shapes-of-a-result
+// expect: refuse-with-fix:from { match { $p: Person } return { $p } }
+// rfc: §7 relation_expr
+query q() {
+  match { from ({ match { $p: Person } return { $p } }) }
+  return { $p.name }
+}

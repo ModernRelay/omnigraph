@@ -1,0 +1,10 @@
+// task: an edition this compiler does not read
+// kind: statements
+// expect: refuse-with-fix:gq 3;
+// raw: yes
+// rfc: §6 the edition line
+gq 4;
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}

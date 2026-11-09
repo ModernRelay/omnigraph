@@ -1,0 +1,8 @@
+// task: a binding written after its statement
+// kind: writes
+// expect: refuse-with-fix:$p: Person { handle: $h }  delete $p
+// rfc: §5: a statement before a clause … prints the order
+query w($h: String) {
+  delete $p
+  $p: Person { handle: $h }
+}

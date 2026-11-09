@@ -1,0 +1,9 @@
+// task: `let` as a key inside binding braces
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §7 contextual keywords
+// shape: $p: Person { let: 1 }
+query q() {
+  match { $p: Person { let: 1 } }
+  return { $p.name }
+}

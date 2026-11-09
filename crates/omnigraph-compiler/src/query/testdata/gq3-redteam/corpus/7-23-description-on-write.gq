@@ -1,0 +1,8 @@
+// task: an annotation and as commit on a write
+// kind: catalogue-and-declarations
+// expect: accept
+// rfc: §7 query_decl
+query w($h: String) @description("remove a person") as commit {
+  $p: Person { handle: $h }
+  delete $p
+}

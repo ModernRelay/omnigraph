@@ -1,0 +1,8 @@
+// task: a correlated from whose inner read uses an outer property
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §3 Scope and correlation
+query q() {
+  match { $p: Person  from { match { $q: Person  $q.age > $p.age } return { $q as older } } }
+  return { $p.name, $older.name }
+}

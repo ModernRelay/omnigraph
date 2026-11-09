@@ -1,0 +1,9 @@
+// task: a parameter written without its `$`
+// kind: lookups-and-filters
+// expect: refuse-with-fix:$h
+// rfc: §7: a bare identifier is not an operand
+// amended: added: the bare-name refusal (Q018) names the parameter
+query q($h: String) {
+  match { $p: Person { handle: h } }
+  return { $p.name }
+}

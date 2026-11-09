@@ -1,0 +1,13 @@
+// task: degree as a reusable value, the asset's text
+// kind: aggregation
+// expect: accept
+// rfc: asset §3
+query degrees($min: I64) {
+  match {
+    $p: Person
+    let $degree = count { $p knows $q }
+    $degree >= $min
+  }
+  return { $p.name, $degree }
+  order { $degree desc }
+}

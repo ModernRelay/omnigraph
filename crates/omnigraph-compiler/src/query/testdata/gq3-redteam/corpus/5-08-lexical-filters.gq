@@ -1,0 +1,8 @@
+// task: search and fuzzy as filters, the asset's text
+// kind: ranking-and-search
+// expect: accept
+// rfc: asset §5
+query q($q: String) {
+  match { $d: Doc  search($d.body, $q)  fuzzy($d.title, $q, max_edits: 2) }
+  return { $d.title }
+}

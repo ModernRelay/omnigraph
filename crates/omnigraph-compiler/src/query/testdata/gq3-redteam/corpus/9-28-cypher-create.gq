@@ -1,0 +1,7 @@
+// task: CREATE
+// kind: adversarial
+// expect: refuse-with-fix:insert Person { handle: "x", name: "x" }
+// habit: Cypher
+query w() {
+  CREATE (p:Person {handle: "x", name: "x"})
+}

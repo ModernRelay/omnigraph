@@ -1,0 +1,12 @@
+// task: employers with at least 100 people, the RFC's §8 text
+// kind: aggregation
+// expect: accept
+// rfc: §8
+query big_employers() {
+  match {
+    from { match { $p worksAt $c } return { $c, count($p) as headcount } }
+    $headcount >= 100
+  }
+  return { $c.name, $headcount }
+  order { $headcount desc }
+}

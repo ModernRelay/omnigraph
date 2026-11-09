@@ -1,0 +1,8 @@
+// task: friends of friends up to three hops
+// kind: traversal
+// expect: accept
+// rfc: §3 Kept
+query q($h: String) {
+  match { $p: Person { handle: $h }  $p knows{1,3} $q }
+  return { $q.name }
+}

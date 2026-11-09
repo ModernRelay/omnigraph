@@ -234,7 +234,7 @@ fn parse_error_message(diagnostic: QueryDiagnostic) -> String {
 }
 
 fn query_kind(query: &QueryDecl) -> QueryLintQueryKind {
-    if query.mutations.is_empty() {
+    if !query.is_mutation() {
         QueryLintQueryKind::Read
     } else {
         QueryLintQueryKind::Mutation
@@ -242,7 +242,7 @@ fn query_kind(query: &QueryDecl) -> QueryLintQueryKind {
 }
 
 fn per_query_warnings(query: &QueryDecl) -> Vec<String> {
-    if query.mutations.is_empty() || !query.params.is_empty() {
+    if !query.is_mutation() || !query.params.is_empty() {
         return Vec::new();
     }
     vec![HARDCODED_MUTATION_WARNING.to_string()]

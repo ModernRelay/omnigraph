@@ -696,14 +696,22 @@ impl MutationTarget {
 }
 
 /// A query after type checking, read or mutation. The two lowerers each
-/// take their own kind, so a checked query cannot reach the wrong one.
+/// take their own kind, so a checked query cannot reach the wrong one. An
+/// edition-3 declaration is typed into the core IR, which the planner reads
+/// ([`crate::ir::core3`]); no edition-2 lowerer accepts it.
 #[derive(Debug, Clone)]
 pub enum CheckedQuery {
     Read(CheckedReadQuery),
     Mutation(CheckedMutationQuery),
+    Edition3(std::sync::Arc<crate::ir::core3::CoreDecl>),
 }
 
 pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedQuery> {
+    if let Some(edition3) = &query.edition3 {
+        return super::typeck3::typecheck_edition3(catalog, edition3)
+            .map(|core| CheckedQuery::Edition3(std::sync::Arc::new(core)))
+            .map_err(CompilerError::query);
+    }
     if !query.mutations.is_empty() {
         let (params, param_types) = checked_params(&query.params)?;
         typecheck_unattached_base(&query.write_mode, &param_types)?;
@@ -723,6 +731,12 @@ pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<Chec
 }
 
 pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedReadQuery> {
+    if query.edition3.is_some() {
+        return Err(CompilerError::Plan(
+            "an edition-3 declaration is typed into the core IR; check it with typecheck_query_decl"
+                .to_string(),
+        ));
+    }
     if !query.mutations.is_empty() {
         return Err(CompilerError::Plan(
             "mutation query cannot be typechecked with read-query API".to_string(),
@@ -2209,7 +2223,7 @@ fn typecheck_traversal(
     Ok(resolved)
 }
 
-fn resolve_traversal(
+pub(crate) fn resolve_traversal(
     catalog: &Catalog,
     traversal: &Traversal,
     bindings: &HashMap<String, BoundVariable>,
@@ -3999,7 +4013,7 @@ fn membership_over_a_node(
 
 /// The type of a literal payload, computed once per occurrence (list
 /// elements included) and retained on the typed node.
-fn literal_type(lit: &Literal) -> Result<PropType> {
+pub(crate) fn literal_type(lit: &Literal) -> Result<PropType> {
     visits::literal(lit);
     match lit {
         // Null is compatible with any nullable type; default to String for inference.
@@ -4062,7 +4076,7 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
 /// A literal against the property it is assigned to or matched with;
 /// `lit_type` is the type the resolver computed for `lit`, so the payload
 /// is inspected here (null, vector width, enum values) but never typed again.
-fn check_literal_type(
+pub(crate) fn check_literal_type(
     lit: &Literal,
     lit_type: &PropType,
     expected: &PropType,
@@ -4148,14 +4162,14 @@ fn check_literal_type(
 
 /// `types_compatible`, plus a String parameter assigned to a Blob property
 /// (the blob's URI).
-fn assignment_compatible(actual: &PropType, expected: &PropType) -> bool {
+pub(crate) fn assignment_compatible(actual: &PropType, expected: &PropType) -> bool {
     types_compatible(actual, expected)
         || (matches!(expected.scalar, ScalarType::Blob)
             && matches!(actual.scalar, ScalarType::String)
             && !actual.list)
 }
 
-fn types_compatible(a: &PropType, b: &PropType) -> bool {
+pub(crate) fn types_compatible(a: &PropType, b: &PropType) -> bool {
     if a.list != b.list {
         return false;
     }

@@ -1,0 +1,9 @@
+// task: headcount per company ordered by the alias
+// kind: aggregation
+// expect: accept
+// rfc: §3 Kept
+query headcount() {
+  match { $p worksAt $c }
+  return { $c.name, count($p) as n }
+  order { n desc }
+}

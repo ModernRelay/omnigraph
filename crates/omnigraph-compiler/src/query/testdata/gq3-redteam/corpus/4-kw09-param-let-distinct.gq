@@ -1,0 +1,8 @@
+// task: `$distinct` as a parameter and `$_distinct` as a let name
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §7: variables carry `$`
+query q($distinct: I32) {
+  match { $p: Person  let $_distinct = $distinct + 1  $p.age > $_distinct }
+  return { $p.name }
+}

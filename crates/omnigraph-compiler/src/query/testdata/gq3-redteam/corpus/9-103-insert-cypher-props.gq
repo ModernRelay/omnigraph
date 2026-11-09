@@ -1,0 +1,7 @@
+// task: insert with parentheses
+// kind: adversarial
+// expect: refuse-with-fix:insert Person { handle: "x", name: "x" }
+// habit: Cypher
+query w() {
+  insert Person ({ handle: "x", name: "x" })
+}

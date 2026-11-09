@@ -1,0 +1,8 @@
+// task: `$optional` as a parameter and `$_optional` as a let name
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §7: variables carry `$`
+query q($optional: I32) {
+  match { $p: Person  let $_optional = $optional + 1  $p.age > $_optional }
+  return { $p.name }
+}

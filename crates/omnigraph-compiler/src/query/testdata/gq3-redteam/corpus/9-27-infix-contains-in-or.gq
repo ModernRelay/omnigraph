@@ -1,0 +1,9 @@
+// task: infix contains inside an or
+// kind: adversarial
+// expect: refuse-with-fix:contains($d.title, "graph")
+// habit: GQ edition 2
+// rfc: §6 rewriter row
+query q() {
+  match { $d: Doc  $d.year > 2020 or $d.title contains "graph" }
+  return { $d.title }
+}

@@ -1,0 +1,9 @@
+// task: a let value minus one, written with no spaces
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §7 ladder
+// shape: $p: Person | let $n = $p.age | $n - 1 > 0
+query q() {
+  match { $p: Person  let $n = $p.age  $n-1 > 0 }
+  return { $p.name }
+}

@@ -1,0 +1,9 @@
+// task: isnotnull() as a function
+// kind: adversarial
+// expect: accept
+// habit: SQL
+// later: unknown function
+query q() {
+  match { $p: Person  is_not_null($p.city) }
+  return { $p.name }
+}

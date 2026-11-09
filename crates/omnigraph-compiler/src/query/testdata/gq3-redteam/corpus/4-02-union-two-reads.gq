@@ -1,0 +1,12 @@
+// task: names of people and companies, the asset's text
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §3 relation expressions: union
+query people_and_companies() {
+  match {
+    from union(
+      { match { $p: Person } return { $p.name as name, "person" as kind } },
+      { match { $c: Company } return { $c.name as name, "company" as kind } })
+  }
+  return { $name, $kind }
+}

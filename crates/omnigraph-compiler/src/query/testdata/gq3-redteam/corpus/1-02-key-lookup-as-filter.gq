@@ -1,0 +1,9 @@
+// task: a person by key written as a filter clause, which fmt moves into the braces
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §6 queries fmt
+// shape: $p: Person | $p.handle = $h
+query q($h: String) {
+  match { $p: Person  $p.handle = $h }
+  return { $p.name, $p.city }
+}

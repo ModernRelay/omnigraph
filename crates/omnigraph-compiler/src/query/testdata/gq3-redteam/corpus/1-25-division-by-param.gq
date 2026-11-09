@@ -1,0 +1,8 @@
+// task: a ratio of two properties against a threshold
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 arithmetic
+query q($t: F64) {
+  match { $d: Doc  $p: Person  $d.year / $p.age > $t }
+  return { $d.title }
+}

@@ -1,0 +1,8 @@
+// task: MERGE (upsert)
+// kind: adversarial
+// expect: refuse-with-fix:insert Person { handle: $h, name: $h }
+// habit: Cypher
+// note: keyed insert is upsert
+query w($h: String) {
+  merge Person { handle: $h, name: $h }
+}

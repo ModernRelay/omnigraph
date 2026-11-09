@@ -259,7 +259,7 @@ impl FileBody {
     /// answers itself before it selects declarations.
     pub fn into_read_declarations(self) -> Result<Vec<QueryDecl>, String> {
         match self {
-            FileBody::Explain(decl) if !decl.mutations.is_empty() => Err(format!(
+            FileBody::Explain(decl) if decl.is_mutation() => Err(format!(
                 "`explain` applies to a read query; '{}' contains mutations",
                 decl.name
             )),
@@ -471,6 +471,60 @@ pub struct QueryDecl {
     /// The clause before the body. Only `Publish` on a read declaration (the
     /// parser refuses the other two there).
     pub write_mode: MutationWriteMode,
+    /// An edition-3 declaration (`gq 3;`): its parse tree, which the
+    /// edition-3 type checker reads. Its edition-2 body fields stay empty;
+    /// `None` for every edition-2 declaration.
+    pub edition3: Option<Edition3Decl>,
+}
+
+impl QueryDecl {
+    /// Whether the declaration writes: an edition-2 declaration with
+    /// mutation statements, or an edition-3 declaration whose body is a
+    /// write body (its kind is the body's shape).
+    pub fn is_mutation(&self) -> bool {
+        match &self.edition3 {
+            Some(decl) => decl.is_write(),
+            None => !self.mutations.is_empty(),
+        }
+    }
+}
+
+/// One edition-3 declaration and the file that declares it: a call resolves
+/// against the declarations of its own source unit, so the type checker
+/// needs the whole file.
+#[derive(Debug, Clone)]
+pub struct Edition3Decl {
+    file: std::sync::Arc<super::ast3::File3>,
+    index: usize,
+}
+
+impl Edition3Decl {
+    /// The declaration at `index` of `file`'s declarations, or its `explain`
+    /// target when `file` is an `explain` statement.
+    pub(crate) fn new(file: std::sync::Arc<super::ast3::File3>, index: usize) -> Self {
+        Self { file, index }
+    }
+
+    /// The file the declaration belongs to.
+    pub fn file(&self) -> &super::ast3::File3 {
+        &self.file
+    }
+
+    /// The declaration's parse tree.
+    pub fn decl(&self) -> &super::ast3::Decl3 {
+        match &self.file.body {
+            super::ast3::Body3::Decls(decls) => &decls[self.index],
+            super::ast3::Body3::Explain(decl) => decl,
+            super::ast3::Body3::Statement(_) => {
+                unreachable!("an edition-3 statement carries no declaration")
+            }
+        }
+    }
+
+    /// Whether the body is a write body.
+    pub fn is_write(&self) -> bool {
+        matches!(self.decl().body, super::ast3::DeclBody3::Write(_))
+    }
 }
 
 /// Where a mutation's result goes: the branch head (`Publish`), an

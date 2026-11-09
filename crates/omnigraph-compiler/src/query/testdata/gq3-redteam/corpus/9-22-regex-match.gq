@@ -1,0 +1,8 @@
+// task: a regular-expression match
+// kind: adversarial
+// expect: refuse
+// habit: Cypher
+query q() {
+  match { $p: Person  $p.name =~ "A.*" }
+  return { $p.name }
+}

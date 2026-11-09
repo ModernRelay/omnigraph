@@ -1,0 +1,8 @@
+// task: a computed update
+// kind: writes
+// expect: accept
+// rfc: asset §6
+query birthday($h: String) {
+  $p: Person { handle: $h }
+  update $p set { age: $p.age + 1 }
+}

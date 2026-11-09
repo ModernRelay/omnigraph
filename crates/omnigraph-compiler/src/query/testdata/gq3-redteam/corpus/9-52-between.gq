@@ -1,0 +1,8 @@
+// task: BETWEEN
+// kind: adversarial
+// expect: refuse-with-fix:$p.age >= 18 and $p.age <= 65
+// habit: SQL
+query q() {
+  match { $p: Person  $p.age BETWEEN 18 AND 65 }
+  return { $p.name }
+}

@@ -1,0 +1,9 @@
+// task: `let` as a property after a dot
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §7 contextual keywords; §6 reserved words
+// shape: $p: Person | $p.let = 1
+query q() {
+  match { $p: Person  $p.let = 1 }
+  return { $p.let }
+}

@@ -1,0 +1,11 @@
+// task: the edition line written twice
+// kind: statements
+// expect: refuse
+// raw: yes
+// rfc: §6
+gq 3;
+gq 3;
+query q() {
+  match { $p: Person }
+  return { $p.name }
+}

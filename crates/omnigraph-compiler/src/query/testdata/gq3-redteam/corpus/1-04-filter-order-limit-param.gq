@@ -1,0 +1,10 @@
+// task: adults ordered by age, the limit a parameter with a default
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 Kept, limit $k
+query adults($min: I32, $k: I64 = 25) {
+  match { $p: Person  $p.age >= $min }
+  return { $p.name }
+  order { $p.age desc }
+  limit $k
+}

@@ -1,0 +1,8 @@
+// task: anything one to two hops away
+// kind: traversal
+// expect: accept
+// rfc: §3 Kept
+query q($h: String) {
+  match { $p: Person { handle: $h }  $p *{1,2} $x  $x: Doc }
+  return { $x.title }
+}

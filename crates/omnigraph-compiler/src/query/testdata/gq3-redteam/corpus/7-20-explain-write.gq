@@ -1,0 +1,8 @@
+// task: explain on a write
+// kind: catalogue-and-declarations
+// expect: accept
+// rfc: §10 Writes: explain on a write
+explain query w($h: String) {
+  $p: Person { handle: $h }
+  delete $p
+}

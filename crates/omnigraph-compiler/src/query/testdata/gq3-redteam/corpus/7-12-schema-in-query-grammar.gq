@@ -1,0 +1,6 @@
+// task: a schema declaration in the one grammar
+// kind: catalogue-and-declarations
+// expect: accept
+// rfc: §7: one grammar for schema and queries; §6 freeze list
+// note: schema declarations not built
+node Person { handle: String @key  name: String }

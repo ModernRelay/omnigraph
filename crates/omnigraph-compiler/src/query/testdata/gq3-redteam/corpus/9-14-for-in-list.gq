@@ -1,0 +1,9 @@
+// task: for over a list
+// kind: adversarial
+// expect: refuse-with-fix:$x in $list
+// habit: GQL
+// rfc: §3 refused respellings
+query q($list: [String]) {
+  match { for $x in $list  $p: Person { city: $x } }
+  return { $p.name }
+}

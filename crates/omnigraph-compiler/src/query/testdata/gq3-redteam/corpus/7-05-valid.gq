@@ -1,0 +1,8 @@
+// task: an @valid interval
+// kind: catalogue-and-declarations
+// expect: refuse
+// rfc: §5
+query q() @valid("2026-01-01", "2027-01-01") {
+  match { $p: Person }
+  return { $p.name }
+}

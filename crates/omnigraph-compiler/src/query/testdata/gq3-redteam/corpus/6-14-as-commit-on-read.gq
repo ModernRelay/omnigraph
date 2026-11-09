@@ -1,0 +1,8 @@
+// task: as commit on a read body
+// kind: writes
+// expect: refuse-with-fix:<empty>
+// rfc: §5: a type error naming the missing sink
+query q() as commit {
+  match { $p: Person }
+  return { $p.name }
+}

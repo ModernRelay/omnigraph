@@ -1,0 +1,9 @@
+// task: schema types and their properties through a catalogue edge
+// kind: traversal
+// expect: accept
+// rfc: §6 freeze list, catalogue names
+// later: unknown `@` name until stage S
+query q() {
+  match { $t: @Type  $p: @Property  $t @property $p }
+  return { $t.name, $p.name }
+}

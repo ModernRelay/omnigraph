@@ -1,0 +1,9 @@
+// task: an edge inserted between two bound nodes
+// kind: writes
+// expect: accept
+// rfc: §3: an endpoint assignment is a key literal or a bound reference
+query w($h: String, $s: String) {
+  $p: Person { handle: $h }
+  $c: Company { slug: $s }
+  insert WorksAt { from: $p, to: $c }
+}

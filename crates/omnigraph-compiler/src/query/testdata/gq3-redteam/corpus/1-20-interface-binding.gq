@@ -1,0 +1,8 @@
+// task: every implementor of Named
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 Kept
+query q() {
+  match { $n: Named }
+  return { $n.name }
+}

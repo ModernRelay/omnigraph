@@ -1,0 +1,17 @@
+// task: the asset's colleagues_of_colleagues, inner read without match
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: asset §4
+// amended: the asset's text of 2026-11-08 (the inner reads open with match)
+query colleagues($of: String) {
+  match { $p: Person { handle: $of }  $p worksAt $c  $q worksAt $c  $q != $p }
+  return { $q }
+}
+
+query colleagues_of_colleagues($of: String) {
+  match {
+    from { match { from colleagues($of) } return { $q as c } }
+    from { match { from colleagues($c.handle) } return { $q as r } }
+  }
+  return distinct { $r.name }
+}

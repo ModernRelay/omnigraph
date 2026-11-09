@@ -1,0 +1,8 @@
+// task: people with an even age
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §3 arithmetic
+query q() {
+  match { $p: Person  $p.age % 2 = 0 }
+  return { $p.name }
+}

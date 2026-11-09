@@ -1,0 +1,9 @@
+// task: the average of distinct ages
+// kind: aggregation
+// expect: accept
+// rfc: §6 freeze list; unresolved question 5
+// later: T57 distinct applies only to count
+query q() {
+  match { $p: Person }
+  return { avg(distinct $p.age) as a }
+}

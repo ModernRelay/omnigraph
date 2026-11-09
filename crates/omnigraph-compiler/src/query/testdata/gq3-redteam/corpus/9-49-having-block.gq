@@ -1,0 +1,10 @@
+// task: the withdrawn having { } clause
+// kind: adversarial
+// expect: refuse
+// habit: GQ edition 2
+// rfc: §3 refused respellings
+query q() {
+  match { $p worksAt $c }
+  return { $c.name, count($p) as n }
+  having { n > 3 }
+}

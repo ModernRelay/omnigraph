@@ -1,0 +1,7 @@
+// task: an update by predicate whose assignment reads another property bare
+// kind: writes
+// expect: refuse-with-fix:$x: Person  $x.age > 3  update $x set { name: $x.handle }
+// rfc: §6 rewriter row; §3: assignments read `$x.prop`
+query w() {
+  update Person set { name: handle } where age > 3
+}

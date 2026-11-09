@@ -1,0 +1,14 @@
+// task: a declared read called with a named argument
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §2 Call: scalar arguments
+// note: the grammar reads `of: $h` as an option; the RFC never says whether a declared read takes options
+query colleagues($of: String) {
+  match { $p: Person { handle: $of }  $p worksAt $c  $q worksAt $c }
+  return { $q }
+}
+
+query q($h: String) {
+  match { from colleagues(of: $h) }
+  return { $q.name }
+}

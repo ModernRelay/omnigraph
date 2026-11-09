@@ -1,0 +1,9 @@
+// task: @budget with rows and on_exceed (retained until stage N)
+// kind: catalogue-and-declarations
+// expect: refuse
+// rfc: §6 freeze list
+// amended: `@budget(rows = …)` is refused naming stage N (RFC §5, 2026-11-08)
+query bounded() @budget(rows = 1000, on_exceed = refuse) {
+  match { $p: Person }
+  return { $p.handle }
+}

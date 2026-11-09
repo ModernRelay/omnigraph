@@ -1,0 +1,7 @@
+// task: a read with no return
+// kind: adversarial
+// expect: refuse-with-fix:return { $p.name }
+// habit: Datalog
+query q() {
+  match { $p: Person }
+}

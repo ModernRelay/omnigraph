@@ -1,0 +1,8 @@
+// task: `$insert` as a parameter and `$_insert` as a let name
+// kind: shapes-of-a-result
+// expect: accept
+// rfc: §7: variables carry `$`
+query q($insert: I32) {
+  match { $p: Person  let $_insert = $insert + 1  $p.age > $_insert }
+  return { $p.name }
+}

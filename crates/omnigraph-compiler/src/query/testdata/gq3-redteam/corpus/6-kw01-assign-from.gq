@@ -1,0 +1,8 @@
+// task: `from` as an update assignment name
+// kind: writes
+// expect: accept
+// rfc: §7: the three statement words stay unreserved
+query w() {
+  $p: Person
+  update $p set { from: 1 }
+}

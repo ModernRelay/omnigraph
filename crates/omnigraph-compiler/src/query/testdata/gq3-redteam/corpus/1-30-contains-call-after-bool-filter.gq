@@ -1,0 +1,9 @@
+// task: the contains call written after a Boolean let filter
+// kind: lookups-and-filters
+// expect: accept
+// rfc: §6 rewriter row
+// shape: $p: Person | let $ok = $p.age > 3 | $ok | contains($p.name, "a")
+query q() {
+  match { $p: Person  let $ok = $p.age > 3  $ok  contains($p.name, "a") }
+  return { $p.name }
+}

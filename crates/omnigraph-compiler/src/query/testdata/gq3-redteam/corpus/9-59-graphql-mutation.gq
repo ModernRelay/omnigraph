@@ -1,0 +1,8 @@
+// task: a GraphQL mutation
+// kind: adversarial
+// expect: refuse-with-fix:query addPerson($h: String) {\n  insert Person { handle: $h, name: $h }\n}
+// habit: GraphQL
+// rfc: §3 refused respellings
+mutation addPerson($h: String) {
+  insert Person { handle: $h, name: $h }
+}

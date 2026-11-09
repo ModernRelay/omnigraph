@@ -114,6 +114,12 @@ impl CatalogueScope {
     fn compile(&self, source: &str, name: &str) -> Result<(CompiledQuery, bool)> {
         let statement = omnigraph_compiler::find_read_statement(source, name)
             .map_err(crate::exec::query_lookup_error)?;
+        if statement.decl().edition3.is_some() {
+            return Err(crate::exec::edition3_refusal(
+                &self.catalog,
+                statement.decl(),
+            ));
+        }
         let checked = CheckedRead::check(&self.catalog, statement.decl())?;
         let ir = Arc::new(lower_query(&self.catalog, checked.query())?);
         Ok((CompiledQuery { ir, checked }, statement.is_explain()))

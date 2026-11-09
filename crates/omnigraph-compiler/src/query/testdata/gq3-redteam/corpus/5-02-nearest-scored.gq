@@ -1,0 +1,10 @@
+// task: the distance returned under an alias
+// kind: ranking-and-search
+// expect: accept
+// rfc: asset §5
+// amended: the ranked column is a property access and `l2` is `distance` (RFC §3, 2026-11-08)
+query q($q: Vector(3)) {
+  match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) }
+  return { $d.title, $distance as s }
+  order { $distance }
+}

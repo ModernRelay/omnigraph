@@ -1,0 +1,183 @@
+# Each refusal of the red-team corpus: its code, and the tree its suggestion
+# reparses to (printed), pinned by parser3_redteam::redteam_suggestions_reparse_to_their_pinned_trees.
+# Regenerate with GQ3_REDTEAM_BLESS=1.
+1-11-minus-literal-glued	Q016	gq 3; query q() { match { $p: Person let $n = $p.age $n - 1 > 0 } return { $p.name } }
+1-13-newline-items-leading-minus	Q016	gq 3; query q() { match { $p: Person } return { $p.age, -$p.age as neg } }
+1-15-exponent-without-fraction	Q005	gq 3; query q() { match { $d: Doc $d.year * 1.0 > 2000.0 } return { $d.title } }
+1-22-leading-minus-filter	Q016	gq 3; query q() { match { $p: Person let $x = $p.age (-1 < $x) } return { $p.name } }
+1-27-brace-after-filter	Q010	(no suggestion)
+1-28-brace-after-bool-var	Q010	(no suggestion)
+1-29-let-absorbs-leading-minus	Q016	gq 3; query q() { match { $p: Person let $x = $p.age (-1 < $x) } return { $p.name } }
+1-31-bare-property-in-filter	Q018	gq 3; query q() { match { $p: Person $p.name = "x" } return { $p.name } }
+1-32-bare-parameter-name	Q018	gq 3; query q($h: String) { match { $p: Person { handle: $h } } return { $p.name } }
+2-08-bare-in-edge	T7	gq 3; query q($s: String) { match { $x: Collection { slug: $s } $d "in" $x } return { $d.title } }
+2-09-edge-named-from	Q017	gq 3; query q() { match { $a: Person $a "from" $b } return { $b.name } }
+2-10-edge-named-let	Q017	gq 3; query q() { match { $a: Person $a "let" $b } return { $b.name } }
+2-14-edge-named-not	T41	(no suggestion)
+2-16-edge-named-insert-in-write	Q017	gq 3; query w() { $a: Person $a "insert" $b delete $b }
+2-17-arrow-out	Q007	gq 3; query q() { match { $a: Person $a knows $b } return { $b.name } }
+2-18-arrow-in	Q007	gq 3; query q() { match { $a: Person $b knows $a } return { $b.name } }
+2-19-arrow-undirected	Q007	gq 3; query q() { match { $a: Person $a <knows> $b } return { $b.name } }
+2-20-arrow-with-binding-and-bounds	Q007	gq 3; query q() { match { $a: Person $a $k:knows{1,2} $b } return { $b.name } }
+2-24-minus-bare-name-minus	Q007	gq 3; query q() { match { $a: Person $a <knows> $b } return { $b.name } }
+2-30-arrow-both-ends	Q007	gq 3; query q() { match { $a: Person $a <knows> $b } return { $b.name } }
+3-kw07-alias-in	Q005	gq 3; query q() { match { $p: Person } return { $p.age as in_ } order { in_ desc } }
+3-kw14-alias-not	Q005	gq 3; query q() { match { $p: Person } return { $p.age as not_ } order { not_ desc } }
+4-09-from-paren-inline	Q019	gq 3; query q() { match { from { match { $p: Person } return { $p } } } return { $p.name } }
+4-10-from-paren-call	Q019	gq 3; query q() { match { from union({ match { $p: Person } return { $p } }, { match { $p: Person } return { $p } }) } return { $p.name } }
+4-15-inline-without-return	Q020	gq 3; query q() { match { $p: Person from { match { $p knows $q } return { $p } order { $q.age } } } return { $p.name } }
+4-20-from-call-space-before-paren	Q019	gq 3; query colleagues($of: String) { match { $p: Person { handle: $of } $p worksAt $c $q worksAt $c } return { $q } } query q($h: String) { match { from colleagues($h) } return { $q.name } }
+4-21-from-nearest-space-before-paren	Q019	gq 3; query q($q: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 5) } return { $d.title } }
+5-27-option-before-positional	Q005	gq 3; query q($q: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) } return { $d.title } }
+6-07-write-in-match-wrapper	Q005	gq 3; query w($h: String) { $p: Person { handle: $h } delete $p }
+6-08-delete-where-type	Q008	gq 3; query w($h: String) { $x: Person $x.handle = $h delete $x }
+6-09-update-where-type	Q008	gq 3; query w($h: String) { $x: Person $x.handle = $h update $x set { age: 3 } }
+6-10-delete-var-where	Q008	gq 3; query w() { $p: Person $p.age > 90 delete $p }
+6-11-delete-edge-type-where	Q008	gq 3; query w($h: String) { $x: WorksAt $x.@src = $h delete $x }
+6-12-clause-after-statement	Q013	gq 3; query w($h: String) { $p: Person { handle: $h } delete $p }
+6-13-mutation-keyword	Q009	gq 3; query hire($h: String) { insert Person { handle: $h, name: $h } }
+6-14-as-commit-on-read	Q011	gq 3; query q() { match { $p: Person } return { $p.name } }
+6-19-endpoint-meta-fields	Q005	gq 3; query hire($h: String, $slug: String) { insert WorksAt { from: $h, to: $slug } }
+6-20-set-with-equals	Q005	gq 3; query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }
+6-21-set-qualified-prop	Q005	gq 3; query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }
+6-22-returning	Q015	gq 3; query w($h: String) { $p: Person { handle: $h } delete $p }
+6-23-delete-two-vars	Q014	gq 3; query w() { $p knows $q delete $p delete $q }
+6-27-update-where-and-as-commit	Q008	gq 3; query w() as commit { $x: Person $x.age > 90 update $x set { city: null } }
+6-28-delete-where-or	Q008	gq 3; query w() { $x: Person $x.age > 90 or $x.city is null delete $x }
+6-29-null-in-read-filter	Q014	gq 3; query q() { match { $p: Person $p.city is null } return { $p.name } }
+6-31-edge-named-update-in-write	Q017	gq 3; query w() { $p: Person $p "update" $q delete $q }
+6-33-bare-match-in-write	Q014	gq 3; query w() { $p: Person delete $p }
+6-34-where-fix-captures-param	Q008	gq 3; query w($x: String) { $p: Person $p.handle = $x delete $p }
+6-35-where-fix-bare-in-assignment	Q008	gq 3; query w() { $x: Person $x.age > 3 update $x set { name: $x.handle } }
+7-03-unknown-annotation	T80	gq 3; query q() { match { $p: Person } return { $p.name } }
+7-04-if-commit	T80	gq 3; query retract($h: String) { $p: Person { handle: $h } delete $p }
+7-05-valid	T80	gq 3; query q() { match { $p: Person } return { $p.name } }
+7-06-budget-rows	T80	gq 3; query bounded() { match { $p: Person } return { $p.handle } }
+7-07-namespace-type	Q015	gq 3; query q() { match { $o: Person } return { $o.name } }
+7-08-commit-param-kind	Q015	gq 3; query retract($h: String, $c: String) { $p: Person { handle: $h } delete $p }
+7-11-missing-params	Q002	gq 3; query q() { match { $p: Person } return { $p.name } }
+7-12-schema-in-query-grammar	Q001	(no suggestion)
+7-13-annotation-colon-args	Q021	gq 3; query q() @budget(plan = 1000) { match { $p: Person } return { $p.name } }
+7-15-view-decl	Q009	gq 3; query big() { match { $c: Company } return { $c.name } }
+7-16-type-variable-binding	Q015	(no suggestion)
+7-17-is-type-test	Q015	(no suggestion)
+7-21-batch	Q015	gq 3; query a() { match { $p: Person } return { $p.name } } query b() { match { $c: Company } return { $c.name } }
+7-22-assert-sink	Q015	gq 3; query w($h: String) { $p: Person { handle: $h } delete $p }
+7-24-view-binding	Q014	gq 3; query q($h: String) { match { from colleagues($h) } return { $x.name } }
+8-07-edition-4	Q006	gq 3; query q() { match { $p: Person } return { $p.name } }
+8-08-edition-twice	Q015	gq 3; query q() { match { $p: Person } return { $p.name } }
+8-09-edition-no-semicolon	Q006	gq 3; query q() { match { $p: Person } return { $p.name } }
+8-10-edition-uppercase	Q006	gq 3; query q() { match { $p: Person } return { $p.name } }
+8-11-setting-before-edition	Q006	gq 3; Set { id: AnnNprobes, value: Integer(20) } query q() { match { $p: Person } return { $p.name } }
+8-12-statement-after-query	Q001	(no suggestion)
+9-01-cypher-match-whole	Q014	refused Q001
+9-02-cypher-pattern-in-match	Q014	gq 3; query q() { match { $a: Person $a knows $b } return { $b.name } }
+9-03-cypher-bracket-edge	Q007	gq 3; query q() { match { $a: Person $a knows $b } return { $b.name } }
+9-04-cypher-arrow-glued	Q007	gq 3; query q() { match { $a: Person $a knows $b } return { $b.name } }
+9-05-cypher-where-upper	Q014	gq 3; query q() { match { $p: Person $p.age > 30 } return { $p.name } }
+9-06-where-lower	Q014	gq 3; query q() { match { $p: Person $p.age > 30 } return { $p.name } }
+9-07-order-by	Q014	gq 3; query q() { match { $p: Person } return { $p.name } order { $p.age desc } }
+9-08-desc-upper	Q014	gq 3; query q() { match { $p: Person } return { $p.name } order { $p.age desc } }
+9-09-limit-offset	Q015	gq 3; query q() { match { $p: Person } return { $p.name } limit 10 }
+9-10-cypher-skip-limit	Q015	gq 3; query q() { match { $p: Person } return { $p.name } limit 10 }
+9-101-arrow-reversed-cypher	Q007	gq 3; query q() { match { $a: Person $b knows $a } return { $b.name } }
+9-102-mutation-read	Q009	gq 3; query q() { match { $p: Person } return { $p.name } }
+9-103-insert-cypher-props	Q014	gq 3; query w() { insert Person { handle: "x", name: "x" } }
+9-104-update-without-set	Q005	gq 3; query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }
+9-105-delete-type	Q008	gq 3; query w() { $x: Person delete $x }
+9-106-sql-as-table-alias	Q014	refused Q014
+9-107-cypher-count-distinct-upper	Q014	gq 3; query q() { match { $p: Person } return { count(distinct $p.city) as n } }
+9-109-null-literal-return	Q005	(no suggestion)
+9-11-count-star	Q014	gq 3; query q() { match { $p: Person } return { count($p) as n } }
+9-110-order-desc-first	Q014	gq 3; query q() { match { $p: Person } return { $p.name } order { $p.age desc } }
+9-111-optional-no-braces	Q014	gq 3; query q() { match { $p: Person optional { $p worksAt $c } } return { $p.name, $c.name } }
+9-112-not-no-braces	Q014	gq 3; query q() { match { $p: Person $q: Person not { $p knows $q } } return { $p.name } }
+9-113-exists-no-braces	Q014	gq 3; query q() { match { $p: Person exists { $p knows $q } } return { $p.name } }
+9-114-cypher-where-not-pattern	Q014	gq 3; query q() { match { $p: Person $q: Person not { $p knows $q } } return { $p.name } }
+9-115-sql-select-alias-eq	Q014	gq 3; query q() { match { $p: Person } return { $p.name as n } }
+9-116-cypher-return-star	Q014	gq 3; query q() { match { $p: Person } return { $p } }
+9-117-gql-filter-keyword	Q014	gq 3; query q() { match { $p: Person $p.age > 30 } return { $p.name } }
+9-118-gql-let-keyword-upper	Q014	gq 3; query q() { match { $p: Person let $n = $p.age + 1 } return { $n } }
+9-119-kusto-pipe	Q001	(no suggestion)
+9-12-cypher-with	Q014	gq 3; query q() { match { from { match { $p worksAt $c } return { $c, count($p) as n } } $n > 3 } return { $c.name } }
+9-120-sparql-optional-braces-upper	Q014	gq 3; query q() { match { $p: Person optional { $p worksAt $c } } return { $p.name } }
+9-13-unwind	Q012	gq 3; query q($list: [String]) { match { $x in $list $p: Person { city: $x } } return { $p.name } }
+9-14-for-in-list	Q012	gq 3; query q($list: [String]) { match { $x in $list $p: Person { city: $x } } return { $p.name } }
+9-15-for-in-relation	Q012	gq 3; query q() { match { from { match { $p: Person } return { $p } } } return { $x.name } }
+9-16-let-in-relation	Q012	gq 3; query q() { match { from { match { $p: Person } return { $p } } } return { $x.name } }
+9-17-let-tuple-in	Q012	gq 3; query q() { match { from { match { $p worksAt $c } return { $p, $c } } } return { $a.name } }
+9-18-case-upper	Q012	gq 3; query q() { match { $p: Person } return { $p.name, if($p.age > 65, "senior", "active") as band } }
+9-19-case-lower	Q012	gq 3; query q() { match { $p: Person } return { $p.name, if($p.age > 65, "senior", "active") as band } }
+9-20-concat-bars	Q012	gq 3; query q() { match { $p: Person } return { concat($p.name, " ", $p.handle) as label } }
+9-21-coalesce-upper	Q014	gq 3; query q() { match { $p: Person } return { coalesce($p.city, "none") as c } }
+9-22-regex-match	Q014	(no suggestion)
+9-23-starts-with-words	Q014	gq 3; query q() { match { $p: Person starts_with($p.name, "A") } return { $p.name } }
+9-24-infix-starts-with	T7	gq 3; query q() { match { $p: Person starts_with($p.name, "A") } return { $p.name } }
+9-25-infix-contains-list	T7	gq 3; query q() { match { $d: Doc "rust" in $d.tags } return { $d.title } }
+9-26-infix-contains-string	T7	gq 3; query q() { match { $d: Doc contains($d.title, "graph") } return { $d.title } }
+9-27-infix-contains-in-or	T7	gq 3; query q() { match { $d: Doc $d.year > 2020 or contains($d.title, "graph") } return { $d.title } }
+9-28-cypher-create	Q014	gq 3; query w() { insert Person { handle: "x", name: "x" } }
+9-29-cypher-merge	Q014	gq 3; query w($h: String) { insert Person { handle: $h, name: $h } }
+9-30-cypher-set	Q014	gq 3; query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }
+9-31-delete-upper	Q014	gq 3; query w($h: String) { $p: Person { handle: $h } delete $p }
+9-32-detach-delete	Q014	gq 3; query w($h: String) { $p: Person { handle: $h } delete $p }
+9-33-optional-match	Q014	gq 3; query q() { match { $p: Person optional { $p worksAt $c } } return { $p.name, $c.name } }
+9-34-call-subquery	Q014	gq 3; query q() { match { $p: Person from { match { $p knows $q } return { $q } } } return { $q.name } }
+9-35-exists-cypher-braces	Q014	gq 3; query q() { match { $p: Person exists { $p knows $q } } return { $p.name } }
+9-37-exists-function	Q019	gq 3; query q() { match { $p: Person $p.city is not null } return { $p.name } }
+9-38-is-not-null-upper	Q014	gq 3; query q() { match { $p: Person $p.city is not null } return { $p.name } }
+9-40-neq-null	Q014	gq 3; query q() { match { $p: Person $p.city is not null } return { $p.name } }
+9-42-sql-neq	Q014	gq 3; query q() { match { $p: Person $p.city != "Berlin" } return { $p.name } }
+9-43-double-equals	Q014	gq 3; query q() { match { $p: Person $p.city = "Berlin" } return { $p.name } }
+9-44-single-quotes	Q014	gq 3; query q() { match { $p: Person $p.city = "Berlin" } return { $p.name } }
+9-45-backtick-ident	Q014	(no suggestion)
+9-46-sql-select	Q014	refused Q001
+9-47-group-by	Q014	gq 3; query q() { match { $p worksAt $c } return { $c.name, count($p) as n } }
+9-48-having-sql	Q014	(no suggestion)
+9-49-having-block	Q014	(no suggestion)
+9-50-retrieve	Q020	(no suggestion)
+9-51-like	Q014	gq 3; query q() { match { $d: Doc contains($d.title, "graph") } return { $d.title } }
+9-52-between	Q014	gq 3; query q() { match { $p: Person $p.age >= 18 and $p.age <= 65 } return { $p.name } }
+9-53-order-by-inside	Q014	gq 3; query q() { match { $p: Person } return { $p.name } order { $p.age desc } }
+9-54-limit-upper	Q014	gq 3; query q() { match { $p: Person } return { $p.name } limit 10 }
+9-55-as-upper	Q014	gq 3; query q() { match { $p: Person } return { $p.name as n } }
+9-56-in-parens	Q014	gq 3; query q() { match { $p: Person $p.age in [30, 40] } return { $p.name } }
+9-57-not-in	Q014	gq 3; query q() { match { $p: Person not $p.city in ["Berlin"] } return { $p.name } }
+9-58-graphql-query	Q001	(no suggestion)
+9-59-graphql-mutation	Q009	gq 3; query addPerson($h: String) { insert Person { handle: $h, name: $h } }
+9-60-graphql-alias	Q014	gq 3; query q() { match { $p: Person } return { $p.name as n } }
+9-61-graphql-fragment	Q001	(no suggestion)
+9-62-gremlin-traversal	Q014	refused Q001
+9-63-gremlin-method	Q014	gq 3; query q() { match { $p: Person $p knows $x } return { $p.name } }
+9-64-sparql-vars	Q014	gq 3; query q() { match { $p knows $q } return { $q } }
+9-65-sparql-select	Q014	refused Q001
+9-68-datalog-rule	Q001	(no suggestion)
+9-69-datalog-negation	Q014	gq 3; query q() { match { $p: Person $q: Person not { $p knows $q } } return { $p.name } }
+9-70-and-and	Q014	gq 3; query q() { match { $p: Person $p.age >= 18 and $p.age < 65 } return { $p.name } }
+9-71-bang-not	Q014	gq 3; query q() { match { $p: Person not $p.age > 3 } return { $p.name } }
+9-72-brace-comparison	Q010	gq 3; query q() { match { $p: Person $p.age > 30 } return { $p.name } }
+9-73-brace-comparison-two	Q010	gq 3; query q() { match { $p: Person { city: "Berlin" } $p.age > 30 } return { $p.name } }
+9-74-brace-colon-comparison	Q010	gq 3; query q() { match { $p: Person $p.age > 30 } return { $p.name } }
+9-75-cypher-parens-binding	Q014	gq 3; query q($h: String) { match { $p: Person { handle: $h } } return { $p.name } }
+9-76-lowercase-type	Q014	gq 3; query q() { match { $p: Person } return { $p.name } }
+9-77-uppercase-variable	Q014	gq 3; query q() { match { $p: Person } return { $p.name } }
+9-78-type-dot-property	Q014	gq 3; query q() { match { $p: Person } return { $p.name } }
+9-79-chained-path	Q014	(no suggestion)
+9-80-star-projection	Q014	gq 3; query q() { match { $p: Person } return { $p } }
+9-81-return-no-braces	Q020	gq 3; query q() { match { $p: Person } return { $p.name } }
+9-82-match-no-braces	Q020	gq 3; query q() { match { $p: Person } return { $p.name } }
+9-83-missing-return	Q020	gq 3; query q() { match { $p: Person } return { $p } }
+9-84-return-before-match	Q020	gq 3; query q() { match { $p: Person } return { $p.name } }
+9-85-limit-before-order	Q020	gq 3; query q() { match { $p: Person } return { $p.name } order { $p.age } limit 10 }
+9-86-limit-negative	Q020	(no suggestion)
+9-87-return-distinct-inside	Q014	gq 3; query q() { match { $p: Person } return distinct { $p.city } }
+9-88-select-distinct-upper	Q014	gq 3; query q() { match { $p: Person } return distinct { $p.city } }
+9-89-alias-string	Q014	gq 3; query q() { match { $p: Person } return { $p.name as name } }
+9-90-alias-reserved	Q005	gq 3; query q() { match { $p: Person } return { $p.name as in_ } }
+9-91-param-untyped	Q005	gq 3; query q($h: String) { match { $p: Person { handle: $h } } return { $p.name } }
+9-92-numbered-param	Q014	(no suggestion)
+9-93-sql-comment	Q014	gq 3; query q() { match { $p: Person $p.age > 18 } return { $p.name } }
+9-94-hash-comment	Q014	gq 3; query q() { match { $p: Person $p.age > 18 } return { $p.name } }
+9-95-trailing-semicolon	Q014	gq 3; query q() { match { $p: Person } return { $p.name } }
+9-96-chained-comparison	Q012	gq 3; query q() { match { $p: Person 18 <= $p.age and $p.age < 65 } return { $p.name } }
+9-97-batch	Q015	refused Q001

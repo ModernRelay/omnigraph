@@ -1,0 +1,8 @@
+// task: return written before match
+// kind: adversarial
+// expect: refuse
+// habit: SQL
+query q() {
+  return { $p.name }
+  match { $p: Person }
+}

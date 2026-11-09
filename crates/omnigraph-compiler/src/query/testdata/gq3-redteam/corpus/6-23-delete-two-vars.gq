@@ -1,0 +1,8 @@
+// task: one delete naming two variables
+// kind: writes
+// expect: refuse-with-fix:delete $p  delete $q
+// rfc: §3 Writes
+query w() {
+  $p knows $q
+  delete $p, $q
+}

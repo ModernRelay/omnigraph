@@ -1,0 +1,8 @@
+// task: a SQL table alias in a binding
+// kind: adversarial
+// expect: refuse
+// habit: SQL
+query q() {
+  match { $p: Person AS p }
+  return { $p.name }
+}

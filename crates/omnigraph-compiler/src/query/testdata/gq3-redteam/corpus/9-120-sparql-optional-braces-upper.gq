@@ -1,0 +1,8 @@
+// task: OPTIONAL in uppercase with braces
+// kind: adversarial
+// expect: refuse-with-fix:optional { $p worksAt $c }
+// habit: SPARQL
+query q() {
+  match { $p: Person  OPTIONAL { $p worksAt $c } }
+  return { $p.name }
+}

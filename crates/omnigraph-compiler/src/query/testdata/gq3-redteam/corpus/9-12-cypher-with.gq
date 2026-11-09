@@ -1,0 +1,8 @@
+// task: a WITH clause carrying an aggregate
+// kind: adversarial
+// expect: refuse-with-fix:from { match { $p worksAt $c } return { $c, count($p) as n } }
+// habit: Cypher
+query q() {
+  match { $p worksAt $c  with $c, count($p) as n  $n > 3 }
+  return { $c.name }
+}

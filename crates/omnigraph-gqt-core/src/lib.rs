@@ -1548,6 +1548,10 @@ fn refuse_process_settings(
 
 struct PendingStep {
     is_mutation: bool,
+    /// The compiler refused the step's source at parse: legal only under an
+    /// `expect error:`, where the step runs to that refusal through the
+    /// engine's door like any other query.
+    refused_at_parse: Option<String>,
     ordinal: usize,
     source: String,
     name: String,
@@ -1856,6 +1860,26 @@ fn same_as_v1_misplaced(
     )
 }
 
+/// The declaration of a step whose source the compiler refused at parse: no
+/// parameters and no body, so the step binds nothing and the door it runs
+/// through answers with the parse refusal.
+fn unparsed_decl() -> QueryDecl {
+    QueryDecl {
+        name: String::new(),
+        description: None,
+        instruction: None,
+        params: Vec::new(),
+        match_clause: Vec::new(),
+        return_clause: Vec::new(),
+        distinct: false,
+        order_clause: Vec::new(),
+        limit: None,
+        mutations: Vec::new(),
+        write_mode: MutationWriteMode::Publish,
+        edition3: None,
+    }
+}
+
 /// The step a declaration section becomes under `mode`, or why the mode is
 /// refused for it.
 fn complete_decl_step(
@@ -1864,6 +1888,11 @@ fn complete_decl_step(
     section: &Section<'_>,
     loop_var: Option<&str>,
 ) -> Result<Step, String> {
+    if let Some(refusal) = &step.refused_at_parse
+        && !matches!(mode, ExpectHeader::Error(_))
+    {
+        return Err(refusal.clone());
+    }
     match (mode, step.is_mutation) {
         (ExpectHeader::Outcome(_), _) => {
             Err("`expect outcome:` is accepted on a `branch merge` step only".into())
@@ -2203,12 +2232,33 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     .map(|(_, l)| *l)
                     .collect::<Vec<_>>()
                     .join("\n");
-                let file = parse_query(&source).map_err(|e| {
-                    format!(
-                        "`--- {kind}` section starting at line {} does not parse: {e}",
-                        section.header_line + 1
-                    )
-                })?;
+                let file = match parse_query(&source) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        // A refusal at parse is a step only under an
+                        // `expect error:`, which `complete_decl_step` checks.
+                        ordinal += 1;
+                        pending = Some(Pending::Decl(PendingStep {
+                            is_mutation: kind == "mutate",
+                            refused_at_parse: Some(format!(
+                                "`--- {kind}` section starting at line {} does not parse: {e}",
+                                section.header_line + 1
+                            )),
+                            ordinal,
+                            source: source.clone(),
+                            name: String::new(),
+                            branch_spelled: branch.is_some(),
+                            branch: branch.unwrap_or_else(|| MAIN_BRANCH.to_string()),
+                            snapshot,
+                            decl: Box::new(unparsed_decl()),
+                            ordered_refusal: None,
+                            expects_expand: false,
+                            params_raw: None,
+                            base_binding: None,
+                        }));
+                        continue;
+                    }
+                };
                 refuse_process_settings(&file.settings, &section.body)?;
                 let empty = file.empty_kind();
                 if let Some(name) = &snapshot {
@@ -2394,7 +2444,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         decls.len()
                     ));
                 };
-                let is_mutation = !decl.mutations.is_empty();
+                let is_mutation = decl.is_mutation();
                 if kind == "query" && is_mutation {
                     return Err(
                         "a mutation declaration under `--- query` is refused; use `--- mutate`"
@@ -2434,6 +2484,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 ordinal += 1;
                 pending = Some(Pending::Decl(PendingStep {
                     is_mutation,
+                    refused_at_parse: None,
                     ordinal,
                     source: source.clone(),
                     name: decl.name.clone(),
@@ -2504,7 +2555,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     }
                     inspect_decl(decl, &mut needs_indices)?;
-                    let kind = if decl.mutations.is_empty() {
+                    let kind = if !decl.is_mutation() {
                         SessionKind::Query
                     } else {
                         SessionKind::Mutation
@@ -3702,9 +3753,26 @@ fn check_rows_json(
     })
 }
 
+/// The text an `expect error:` needle is held against: the error rendered,
+/// with a parse diagnostic's code spelled after `parse error:` as type and
+/// plan diagnostics spell theirs, so a case can name a parse code.
+fn error_text<E: std::fmt::Display + 'static>(error: &E) -> String {
+    let any: &dyn std::any::Any = error;
+    let diagnostic = match any.downcast_ref::<omnigraph::error::OmniError>() {
+        Some(omnigraph::error::OmniError::Compiler(compiler)) => compiler.diagnostic(),
+        _ => None,
+    };
+    match diagnostic {
+        Some(d) if d.kind == omnigraph_compiler::QueryDiagnosticKind::Parse => {
+            format!("parse error: {}: {}", d.code, d.message)
+        }
+        _ => error.to_string(),
+    }
+}
+
 /// Holds an `error: <needle>` expect against the step's outcome: the step
 /// must fail, and the rendered error must contain the needle.
-fn check_error_expect<T, E: std::fmt::Display>(
+fn check_error_expect<T, E: std::fmt::Display + 'static>(
     host: &impl ExecutionHost,
     needle: &str,
     outcome: Result<T, E>,
@@ -3715,7 +3783,7 @@ fn check_error_expect<T, E: std::fmt::Display>(
             "expected an error containing \"{needle}\", but {succeeded}"
         )),
         Err(e) => {
-            let msg = e.to_string();
+            let msg = error_text(&e);
             host.observe(|| format!("error: {msg}"));
             if msg.contains(needle) {
                 Ok(())
@@ -3861,7 +3929,7 @@ async fn run_branch_read_step(
 /// Holds a read expect against a result the runner built itself (`branch
 /// list`, `show`): the result's own schema is the inferred one, so the
 /// shape check has no compiler to disagree with.
-fn check_synthetic_expect<E: std::fmt::Display>(
+fn check_synthetic_expect<E: std::fmt::Display + 'static>(
     host: &impl ExecutionHost,
     session: &Session,
     label: &str,
@@ -3973,7 +4041,7 @@ fn run_settings_step(
     Ok(())
 }
 
-fn check_write_expect<T, E: std::fmt::Display>(
+fn check_write_expect<T, E: std::fmt::Display + 'static>(
     host: &impl ExecutionHost,
     name: &str,
     expect: &WriteExpect,

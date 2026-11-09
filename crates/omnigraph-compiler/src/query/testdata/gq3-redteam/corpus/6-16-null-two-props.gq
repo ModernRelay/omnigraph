@@ -1,0 +1,8 @@
+// task: two properties cleared
+// kind: writes
+// expect: accept
+// rfc: §6 freeze list: null
+query w($h: String) {
+  $p: Person { handle: $h }
+  update $p set { city: null, age: null }
+}
