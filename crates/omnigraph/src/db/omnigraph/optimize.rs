@@ -1180,7 +1180,7 @@ async fn run_table_pipeline(
         }
     };
 
-    let mut unplanned = tasks.into_iter().enumerate();
+    let mut unplanned = tasks.into_iter().enumerate().peekable();
     let mut planning = FuturesOrdered::new();
     let mut ready: VecDeque<PlannedTable> = VecDeque::new();
     let mut staging = FuturesUnordered::new();
@@ -1259,9 +1259,14 @@ async fn run_table_pipeline(
                 None => {}
             }
         }
-        // Filling planning above leaves it non-empty while any table is
-        // unplanned, so an empty pipeline has visited every table or stopped.
+        // The fill above runs before the turns drain `ready`, so turns that
+        // stage nothing (a no-op plan, a deferral, a planning failure) can
+        // empty the pipeline while tables are still unplanned: go round
+        // again to plan them. Only a stop or a visited catalog ends the loop.
         if planning.is_empty() && ready.is_empty() && staging.is_empty() {
+            if stop.is_none() && unplanned.peek().is_some() {
+                continue;
+            }
             break;
         }
         // The deadline stops only a table whose turn has not come.

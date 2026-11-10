@@ -4960,6 +4960,81 @@ async fn optimize_cancelled_mid_run_publishes_nothing_and_the_next_run_does() {
     );
 }
 
+/// While one table's rewrite is in flight, the planner runs `planning` tables
+/// ahead into the ready queue. When those are no-ops, their turns stage
+/// nothing and drain the queue; the pipeline must then plan the rest of the
+/// catalog instead of ending. Before the fix it ended there and reported the
+/// unplanned tail `deferred(gate_hold_limit)` with no `resume_at`, though no
+/// gate hold was set (stress/REPORT.md, the pipeline's early exit).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrite() {
+    let _scenario = FailScenario::setup();
+    let mut schema = String::new();
+    for n in 0..12 {
+        schema += &format!("node T{n:02} {{\n    k: String @key\n}}\n");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::session(Omnigraph::init(&uri, &schema).await.unwrap());
+    for n in 0..12 {
+        let row = format!(r#"{{"type": "T{n:02}", "data": {{"k": "a"}}}}"#);
+        db.load_jsonl(&row, LoadMode::Merge).await.unwrap();
+    }
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    for planning in [1usize, 2, 8] {
+        // Three small fragments on the first table only: its rewrite is the
+        // run's one productive turn, parked until the planner ran ahead.
+        for i in 0..3 {
+            let row = format!(r#"{{"type": "T00", "data": {{"k": "p{planning}x{i}"}}}}"#);
+            db.load_jsonl(&row, LoadMode::Merge).await.unwrap();
+        }
+        let rendezvous =
+            helpers::failpoint::Rendezvous::park_first(&catalog::OPTIMIZE_BEFORE_COMPACT);
+        let run = {
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+                db.optimize_as(
+                    None,
+                    omnigraph::db::OptimizeRequest::default().with_concurrency(
+                        omnigraph::db::OptimizeConcurrency::new(planning, 1),
+                    ),
+                )
+                .await
+            })
+        };
+        rendezvous.wait_until_reached().await;
+        // Let the planner fill its ready queue with the no-op tables.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        rendezvous.release();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("optimize task hung")
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.tables.len(), 12, "{report:?}");
+        let deferred = report
+            .tables
+            .iter()
+            .filter(|stat| matches!(stat.outcome, omnigraph::db::TableOptimizeOutcome::Deferred(_)))
+            .map(|stat| stat.type_key.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            deferred.is_empty(),
+            "planning {planning}: no bound was set, yet {deferred:?} were deferred"
+        );
+        assert_eq!(report.resume_at, None, "planning {planning}");
+        assert_eq!(
+            report.tables[0].outcome,
+            omnigraph::db::TableOptimizeOutcome::Optimized,
+            "planning {planning}: {report:?}"
+        );
+    }
+}
+
 /// Optimize captures a complete authority token before entering any writer
 /// gate, then revalidates it after schema -> main -> table (`optimize.rs`, the
 /// comment above `open_write_txn`). That revalidation is the only thing that
