@@ -692,7 +692,7 @@ impl OperationRecord {
                 operation.published_commit = Some(published_commit);
                 operation.resolution = None;
                 operation.reason = None;
-                self.keep_kind_state(&operation);
+                self.keep_settled_kind_state(&operation);
                 self.push_terminal(operation);
             }
             Resolution::NotCommitted => {
@@ -791,6 +791,19 @@ impl OperationRecord {
             None => {
                 self.kind_state.optimize.remove(&operation.graph);
             }
+        }
+    }
+
+    /// A late settlement from history knows only what its record holds: a
+    /// position it carries moves the graph's position, and its absence says
+    /// nothing (the `publishing` write stores no `resume_at`, and a newer run
+    /// may have moved the position since), so it never clears one.
+    fn keep_settled_kind_state(&mut self, operation: &Operation) {
+        let resume_at = operation
+            .optimize_outcome()
+            .and_then(|outcome| outcome.resume_at.clone());
+        if resume_at.is_some() {
+            self.keep_kind_state(operation);
         }
     }
 
@@ -1251,6 +1264,40 @@ mod tests {
             Ok(Admitted::Existing(Box::new(repeat)))
         );
         assert_eq!(record.eviction_mark_ms, None);
+    }
+
+    #[test]
+    fn a_late_settlement_without_a_position_keeps_a_newer_runs_position() {
+        // stress N8: run 1's publication is in doubt; run 2 finishes and stores
+        // its position; run 1 then settles `Committed` from history. Its record
+        // holds no `resume_at`, so it must not erase run 2's position.
+        let mut record = OperationRecord::new(LEDGER);
+        record.admit_now(operation(1, "g")).unwrap();
+        record
+            .defer_publication(&id(1), "head unchanged".to_string())
+            .unwrap();
+        record.kind_state.optimize.insert(
+            "g".to_string(),
+            OptimizeState {
+                resume_at: "node:Newer".to_string(),
+            },
+        );
+        assert!(record.settle(
+            &id(1),
+            Resolution::Committed {
+                published_commit: "hb1.child".to_string()
+            }
+        ));
+        assert_eq!(record.terminal[0].state, OperationState::Succeeded);
+        assert_eq!(
+            record
+                .kind_state
+                .optimize
+                .get("g")
+                .map(|state| state.resume_at.as_str()),
+            Some("node:Newer")
+        );
+        record.validate().unwrap();
     }
 
     #[test]
