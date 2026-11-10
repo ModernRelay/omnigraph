@@ -802,6 +802,25 @@ pub(crate) async fn start_optimize(
             // The acceptance put is the operation's first step, under the
             // record gate the handler took; the run is live before the gate
             // is released, so no lookup can see an accepted record no run holds.
+            // A deployment closes the graph's admission before it cancels the
+            // live runs under this gate, so a graph no longer ready here is
+            // being drained: accept nothing rather than start a run its
+            // cancellation has already passed.
+            let still_admitted = matches!(
+                run_state.routing.registry.get(&run_handle.key),
+                crate::registry::RegistryLookup::Ready(_)
+            );
+            if !still_admitted {
+                drop(lock);
+                let _ = accepted.send(Err(ApiError::new(
+                    ErrorCode::ServiceUnavailable,
+                    format!(
+                        "graph {} is closing for a deployment; nothing was accepted",
+                        operation.graph
+                    ),
+                )));
+                return OwnedResult::from(Ok(()));
+            }
             let written = owner
                 .write_operations(&lock, &admitted, version.as_deref())
                 .await;
