@@ -210,9 +210,10 @@ With the example graph policy above, `act-alice` gets:
   `read` here also decides the reads that name no branch: listing branches, the
   schema, `show` and `commit show`. A commit list authorizes `read` on its
   branch, `main` when the query names none.
-- With `branch`, `actions` lists the actions allowed on it: `read`, `export`
-  and `change`, and `branch_delete`, `commit_publish`, `commit_drop` and
-  `schema_apply` with that branch as their target. Schema apply and the
+- With `branch`, `actions` lists the actions allowed on it: `read`, `export`,
+  `change` and `maintain` (served optimize asks it on `main`), and
+  `branch_delete`, `commit_publish`, `commit_drop` and `schema_apply` with that
+  branch as their target. Schema apply and the
   system-column upgrade target `main` only, and a storage upgrade authorizes
   each live branch, so `schema_apply` on another branch does not make schema
   apply possible there.
