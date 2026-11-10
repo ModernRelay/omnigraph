@@ -4,6 +4,7 @@
 use crate::error::{CompilerError, Result};
 
 use super::ast::QueryFile;
+use super::depth::check_query_nesting;
 use super::diagnostic::{Applicability, Position, QueryDiagnostic, Suggestion, TextEdit};
 use super::syntax::edition::skip_trivia;
 use super::syntax::{edition_window, parse};
@@ -33,8 +34,9 @@ pub fn has_settings_prefix(input: &str) -> bool {
 /// `gq 2;` (blanked so positions keep), is edition 2, unchanged; `gq 3;`
 /// selects the edition-3 front end, whose declarations carry their syntax
 /// tree ([`super::ast::QueryDecl::syntax`]); any other edition, and a malformed line,
-/// is `Q006` with `gq 3;` as the fix.
+/// is `Q022` with `gq 3;` as the fix.
 pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, QueryDiagnostic> {
+    check_query_nesting(input)?;
     use super::syntax::edition::{EditionLine, edition_line, edition_near_miss};
     match edition_line(input) {
         // A malformed edition line (`gq 3` without `;`, `GQ 3;`, a settings
@@ -61,7 +63,7 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Que
             start,
             end,
         } => Err(QueryDiagnostic::parse(
-            super::codes::Q006,
+            super::codes::Q022,
             format!("`gq {edition};` names no edition this compiler reads; it reads 2 and 3"),
             Some(Position::at(input, start)),
         )

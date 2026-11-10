@@ -133,7 +133,7 @@ fn the_edition_line_selects_the_grammar() {
     assert!(parse_query_diagnostic(&format!("gq 2;\n{e2}")).is_ok());
     // Any other edition is refused at parse.
     let e = parse_query_diagnostic(&format!("gq 4;\n{e2}")).unwrap_err();
-    assert_eq!(e.code.as_str(), "Q006");
+    assert_eq!(e.code.as_str(), "Q022");
     // The line stands before the settings lines.
     assert!(
         parse_source("gq 3;\nset ann_nprobes = 4;\nquery q() { match { $p: P } return { $p } }")
@@ -1378,7 +1378,7 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         r#"an edition other than 3"#,
-        "Q006",
+        "Q022",
         r#"gq 4;
 query q() {
   match { $p: Person }
@@ -1388,7 +1388,7 @@ query q() {
     ),
     (
         r#"an edition line without its semicolon"#,
-        "Q006",
+        "Q022",
         r#"gq 3
 query q() {
   match { $p: Person }
@@ -1398,7 +1398,7 @@ query q() {
     ),
     (
         r#"an uppercase edition line"#,
-        "Q006",
+        "Q022",
         r#"GQ 3;
 query q() {
   match { $p: Person }
@@ -1408,7 +1408,7 @@ query q() {
     ),
     (
         r#"a settings line before the edition line"#,
-        "Q006",
+        "Q022",
         r#"set ann_nprobes = 20;
 gq 3;
 query q() {

@@ -22,10 +22,10 @@ codes! {
     Q003 = "a settings statement is refused";
     Q004 = "a branch, commit, show or explain statement is misplaced or malformed";
     Q005 = "a declaration body is refused";
+    Q006 = "the source nests deeper than the compiler accepts";
     // Edition 3 (`gq 3;`, docs/rfcs/2026-11-07-gq-3.md section 5): each
     // refusal names the construct and carries a byte-range suggestion
     // wherever one edit set makes the text legal.
-    Q006 = "the edition line names an edition this compiler does not read";
     Q007 = "a traversal is written with an arrow; the fix is the triple";
     Q008 = "an update or delete statement carries a where; the fix binds and filters";
     Q009 = "`mutation` is not a declaration keyword; the fix is `query`";
@@ -41,6 +41,7 @@ codes! {
     Q019 = "a call whose name does not touch its parenthesis, or a call named by a clause keyword";
     Q020 = "a read body's clauses are missing, misplaced or unbraced";
     Q021 = "an annotation's named argument is written `name: value`; the fix is `name = value`";
+    Q022 = "the edition line names an edition this compiler does not read";
 
     // Typechecker.
     T1 = "unknown node type";

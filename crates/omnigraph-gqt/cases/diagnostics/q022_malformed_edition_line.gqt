@@ -1,5 +1,5 @@
 # issue: none
-# notes: The GQ edition-3 preview (`gq 3;`) refuses an edition line spelled in uppercase with `Q006`; nothing in the preview executes.
+# notes: The GQ edition-3 preview (`gq 3;`) refuses an edition line spelled in uppercase with `Q022`; nothing in the preview executes.
 
 --- runner
 timeout_ms: 10000
@@ -46,4 +46,4 @@ edge In: Doc -> Collection
 GQ 3;
 query q() { match { $p: Person } return { $p.name } }
 
---- expect error: parse error: Q006:
+--- expect error: parse error: Q022:

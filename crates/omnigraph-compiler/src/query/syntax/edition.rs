@@ -3,7 +3,7 @@
 //! edition 2; a malformed line is refused with `gq 3;` as the fix.
 
 use super::parse::{MACHINE, Refusal, edit, refusal};
-use crate::query::codes::Q006;
+use crate::query::codes::Q022;
 
 /// `input` after the grammar's `WHITESPACE` and `COMMENT`: an unterminated
 /// block comment consumes the rest, as it does in the parser.
@@ -139,5 +139,5 @@ pub fn edition_near_miss(input: &str) -> Option<Refusal> {
             (cursor, end),
         ),
     };
-    Some(refusal(input, Q006, message, span, edits, MACHINE))
+    Some(refusal(input, Q022, message, span, edits, MACHINE))
 }

@@ -2,6 +2,7 @@ pub mod ast;
 pub mod check;
 pub mod checked;
 pub mod codes;
+pub mod depth;
 pub mod descriptor;
 pub mod diagnostic;
 pub mod lint;

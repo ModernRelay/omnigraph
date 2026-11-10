@@ -127,7 +127,7 @@ and GQT rows, shape, affected counts, errors and loop semantics are shared by
 both paths. Unordered row comparison preserves duplicate counts.
 
 An `expect error: <needle>` holds when the step fails and its error contains
-the needle; a compiler diagnostic renders with its code, `parse error: Q006: …`
+the needle; a compiler diagnostic renders with its code, `parse error: Q022: …`
 as `type error: T7: …` and `plan error: P006: …` do, so a case can name the
 code it expects. A `--- query` or `--- mutate` section the compiler refuses at
 parse is a step only under `expect error:` (any other expectation refuses the
