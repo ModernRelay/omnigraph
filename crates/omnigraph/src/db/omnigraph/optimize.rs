@@ -1463,14 +1463,18 @@ async fn prepare_graph_index_artifact(
             target: "omnigraph::optimize",
             "graph index artifact skipped: not every declared edge table is materialized yet"
         );
-        return Ok(Err(ArtifactRefresh::Skipped(ArtifactSkip::IncompleteEdgeTables)));
+        return Ok(Err(ArtifactRefresh::Skipped(
+            ArtifactSkip::IncompleteEdgeTables,
+        )));
     }
     let mut count = None;
     if let Some(limit) = limit {
         let Some((shortest, widest)) =
             crate::graph_index::persist::fixed_bytes(&snapshot, &edge_types)?
         else {
-            return Ok(Err(ArtifactRefresh::Skipped(ArtifactSkip::IncompleteEdgeTables)));
+            return Ok(Err(ArtifactRefresh::Skipped(
+                ArtifactSkip::IncompleteEdgeTables,
+            )));
         };
         // A lower bound: every edge is two `u32` targets, and the live row
         // count is the number of rows the scan returns.
@@ -1502,8 +1506,7 @@ async fn prepare_graph_index_artifact(
         db.catalog().system_columns,
         count.as_mut(),
     );
-    let Some(index) = build.await?
-    else {
+    let Some(index) = build.await? else {
         let counted = count.as_ref().map_or(0, |count| count.counted());
         return Ok(Err(ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit {
             counted,
@@ -1513,7 +1516,9 @@ async fn prepare_graph_index_artifact(
     let Some((uri, body)) =
         crate::graph_index::persist::artifact_body(&snapshot, &edge_types, &index)?
     else {
-        return Ok(Err(ArtifactRefresh::Skipped(ArtifactSkip::IncompleteEdgeTables)));
+        return Ok(Err(ArtifactRefresh::Skipped(
+            ArtifactSkip::IncompleteEdgeTables,
+        )));
     };
     drop(index);
     Ok(Ok((uri, body)))

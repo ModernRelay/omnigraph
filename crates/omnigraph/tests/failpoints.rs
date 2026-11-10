@@ -5049,9 +5049,8 @@ async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrit
                 let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
                 db.optimize_as(
                     None,
-                    omnigraph::db::OptimizeRequest::default().with_concurrency(
-                        omnigraph::db::OptimizeConcurrency::new(planning, 1),
-                    ),
+                    omnigraph::db::OptimizeRequest::default()
+                        .with_concurrency(omnigraph::db::OptimizeConcurrency::new(planning, 1)),
                 )
                 .await
             })
@@ -5069,7 +5068,12 @@ async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrit
         let deferred = report
             .tables
             .iter()
-            .filter(|stat| matches!(stat.outcome, omnigraph::db::TableOptimizeOutcome::Deferred(_)))
+            .filter(|stat| {
+                matches!(
+                    stat.outcome,
+                    omnigraph::db::TableOptimizeOutcome::Deferred(_)
+                )
+            })
             .map(|stat| stat.type_key.clone())
             .collect::<Vec<_>>();
         assert!(
