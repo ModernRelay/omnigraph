@@ -1457,8 +1457,8 @@ mod tests {
 
     /// The owner's read of a key settles an unsettled conditional request
     /// whose precondition the observed generation no longer meets, and only
-    /// that (stress/REPORT.md: a lost record put that landed late kept the
-    /// operation record refused for the life of the process).
+    /// that: a lost record put that landed late used to keep the operation
+    /// record refused for the life of the process.
     #[test]
     fn a_read_that_observes_another_generation_settles_the_key() {
         let path = Path::from("__cluster/operations.json");

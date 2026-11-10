@@ -1268,7 +1268,7 @@ mod tests {
 
     #[test]
     fn a_late_settlement_without_a_position_keeps_a_newer_runs_position() {
-        // stress N8: run 1's publication is in doubt; run 2 finishes and stores
+        // Run 1's publication is in doubt; run 2 finishes and stores
         // its position; run 1 then settles `Committed` from history. Its record
         // holds no `resume_at`, so it must not erase run 2's position.
         let mut record = OperationRecord::new(LEDGER);

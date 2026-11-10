@@ -1268,7 +1268,7 @@ fn terminal_from_report(
 /// publication, an orphan, an ending this process still owes) may need a
 /// record change and takes the record gate. Taking the gate for a settled
 /// answer queued the run's own before-publish write, which holds the writer
-/// gates, behind every lookup (stress S8).
+/// gates, behind every lookup.
 fn answers_without_the_gate(found: &Operation, live: &[String], owes_an_ending: bool) -> bool {
     !owes_an_ending
         && (found.state.is_terminal() || live.iter().any(|id| id == &found.operation_id))
