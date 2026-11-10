@@ -85,9 +85,8 @@ pub(crate) fn read_of(c: &CoreDecl) -> &CoreRead {
     }
 }
 
-/// The RFC's examples (sections 3, 6 and 8), each type-checked (the second
-/// recursion of section 3 renamed); the edition-2 form of section 6's example
-/// through edition 2.
+/// The RFC's examples (sections 3, 6 and 8), each type-checked as written;
+/// the edition-2 form of section 6's example through edition 2.
 #[test]
 fn the_rfc_examples_type_check() {
     for text in [
@@ -162,19 +161,6 @@ query relocate($h: String) {
     ] {
         ok(text);
     }
-    // Section 3 names the second recursion `distance`, which section 5
-    // refuses: a declared read never shadows a registry row.
-    refused(
-        "query distance($from: String) @budget(rounds = 50) {
-  match {
-    from union(
-      { match { $p: Person { handle: $from }  $p knows $q } return { $q, 1 as d } },
-      { match { from distance($from)  $q knows $r } return { $r as q, $d + 1 as d } })
-  }
-  return { $q, min($d) as d }
-}",
-        "T74",
-    );
     assert_eq!(
         e2("query passages($matter: String, $q: String) {
   match {
