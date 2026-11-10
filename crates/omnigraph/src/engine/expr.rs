@@ -145,6 +145,99 @@ pub(super) fn evaluate_filter(
     boolean_mask(evaluate_expr(batch, filter, params)?, filter)
 }
 
+/// When at most this share of a batch's rows still needs a filter's value, the
+/// filter runs over those rows alone; above it, over the whole batch, where
+/// gathering the rows would cost more than it saves. DataFusion's `BinaryExpr`
+/// uses the same share for its pre-selection.
+const PRE_SELECTION_SHARE: f64 = 0.2;
+
+/// The rows whose Kleene `and` (`decides` false) or `or` (`decides` true) the
+/// left operand `left` has not decided: every row that is null or is not
+/// `decides`. Never null itself.
+pub(super) fn undecided(left: &BooleanArray, decides: bool) -> BooleanArray {
+    let values = if decides {
+        !left.values()
+    } else {
+        left.values().clone()
+    };
+    let undecided = match left.nulls() {
+        Some(nulls) => &values | &!nulls.inner(),
+        None => values,
+    };
+    BooleanArray::new(undecided, None)
+}
+
+/// The rows a filter mask keeps: true and not null. Never null itself.
+pub(super) fn kept_rows(mask: &BooleanArray) -> BooleanArray {
+    let kept = match mask.nulls() {
+        Some(nulls) => mask.values() & nulls.inner(),
+        None => mask.values().clone(),
+    };
+    BooleanArray::new(kept, None)
+}
+
+/// `filter` evaluated on the `selected` rows of `batch`: equal to
+/// [`evaluate_filter`] on every selected row and null or that value on every
+/// other row, so a caller combines it only with a mask that decides the
+/// unselected rows. No row is evaluated when none is selected; a small
+/// selection evaluates its rows alone, over just the columns `filter` reads,
+/// so an expensive operand skips the rows a cheaper one already removed.
+pub(super) fn evaluate_filter_where(
+    batch: &RecordBatch,
+    filter: &IRExpr,
+    params: &ParamMap,
+    selected: &BooleanArray,
+) -> Result<BooleanArray> {
+    let rows = batch.num_rows();
+    let kept = selected.true_count();
+    if kept == 0 {
+        return Ok(BooleanArray::new_null(rows));
+    }
+    if kept == rows || kept as f64 > rows as f64 * PRE_SELECTION_SHARE {
+        return evaluate_filter(batch, filter, params);
+    }
+    let reads = columns_read(batch, filter).unwrap_or_else(|| batch.clone());
+    let reads = arrow_select::filter::filter_record_batch(&reads, selected)
+        .map_err(OmniError::arrow_internal)?;
+    let values = evaluate_filter(&reads, filter, params)?;
+    let scattered = datafusion::physical_expr_common::utils::scatter(selected, &values)
+        .map_err(|err| OmniError::manifest_internal(err.to_string()))?;
+    boolean_mask(scattered, filter)
+}
+
+/// The columns of `batch` that `filter` reads, by the names
+/// [`evaluate_expr`] looks up; `None` when it reads a whole binding or a name
+/// the batch lacks, so the caller keeps every column and evaluation reports
+/// whatever it would report over the full batch.
+fn columns_read(batch: &RecordBatch, filter: &IRExpr) -> Option<RecordBatch> {
+    let schema = batch.schema();
+    let mut indices = Vec::new();
+    let mut complete = true;
+    filter.visit_leaves(|leaf| {
+        let name = match leaf {
+            IRExpr::PropAccess {
+                variable, property, ..
+            } => format!("{variable}.{property}"),
+            IRExpr::AliasRef(name, _) => name.clone(),
+            IRExpr::Param(_, _) | IRExpr::Literal(_, _) => return,
+            _ => {
+                complete = false;
+                return;
+            }
+        };
+        match schema.index_of(&name) {
+            Ok(index) => indices.push(index),
+            Err(_) => complete = false,
+        }
+    });
+    if !complete {
+        return None;
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    batch.project(&indices).ok()
+}
+
 fn evaluate_boolean(
     batch: &RecordBatch,
     filter: &IRExpr,
@@ -164,7 +257,7 @@ fn evaluate_boolean(
             ty: _,
         } => {
             let left = evaluate_filter(batch, left, params)?;
-            let right = evaluate_filter(batch, right, params)?;
+            let right = evaluate_filter_where(batch, right, params, &undecided(&left, false))?;
             boolean::and_kleene(&left, &right).map_err(OmniError::arrow_internal)
         }
         IRExpr::Binary {
@@ -174,7 +267,7 @@ fn evaluate_boolean(
             ty: _,
         } => {
             let left = evaluate_filter(batch, left, params)?;
-            let right = evaluate_filter(batch, right, params)?;
+            let right = evaluate_filter_where(batch, right, params, &undecided(&left, true))?;
             boolean::or_kleene(&left, &right).map_err(OmniError::arrow_internal)
         }
         IRExpr::Not(inner, _) => {
@@ -549,6 +642,48 @@ mod pre_selection_tests {
         )
     }
 
+    /// `a.x`, `a.y`, `a.z`: I64 values in 0..100, null where 7, 11 or 13
+    /// divides the drawn value.
+    fn batch(rows: usize, seed: u64) -> RecordBatch {
+        let mut state = seed;
+        let mut column = |nulls: u64| -> ArrayRef {
+            Arc::new(Int64Array::from_iter((0..rows).map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let value = (state >> 33) % 100;
+                (!value.is_multiple_of(nulls)).then_some(value as i64)
+            })))
+        };
+        let (x, y, z) = (column(7), column(11), column(13));
+        let fields: Vec<_> = ["a.x", "a.y", "a.z"]
+            .into_iter()
+            .map(|name| Field::new(name, DataType::Int64, true))
+            .collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![x, y, z]).unwrap()
+    }
+
+    /// `left op right` with both operands evaluated over every row, the
+    /// evaluator's behaviour before pre-selection.
+    fn full(batch: &RecordBatch, expr: &IRExpr) -> BooleanArray {
+        match expr {
+            IRExpr::Binary {
+                left,
+                op: op @ (BinaryOp::And | BinaryOp::Or),
+                right,
+                ..
+            } => {
+                let (left, right) = (full(batch, left), full(batch, right));
+                if *op == BinaryOp::And {
+                    boolean::and_kleene(&left, &right).unwrap()
+                } else {
+                    boolean::or_kleene(&left, &right).unwrap()
+                }
+            }
+            _ => evaluate_filter(batch, expr, &ParamMap::new()).unwrap(),
+        }
+    }
+
     /// The right operand of `and` runs only on the rows the left one kept:
     /// a row the left one removed cannot fail the right one. The F32 column
     /// holds an infinity (which no write stores) only on a removed row, so
@@ -587,5 +722,65 @@ mod pre_selection_tests {
         let kept: Vec<usize> = (0..rows as usize).filter(|&row| mask.value(row)).collect();
         assert_eq!(kept, vec![30, 40, 50, 60, 70, 80, 90]);
         assert_eq!(mask.null_count(), 0);
+    }
+
+    /// Pre-selection changes no value: every `and`/`or` shape, every left
+    /// selectivity (none, a few, the threshold, most, all) and nulls on both
+    /// sides give exactly the Kleene result of evaluating both operands in
+    /// full.
+    #[test]
+    fn pre_selection_keeps_kleene_values() {
+        let x = || prop("x", ScalarType::I64);
+        let y = || prop("y", ScalarType::I64);
+        let z = || prop("z", ScalarType::I64);
+        for seed in [1, 2, 3] {
+            let batch = batch(1_000, seed);
+            for cut in [0, 3, 20, 21, 60, 100] {
+                let left = || compare(x(), CompOp::Lt, cut);
+                let right = || compare(y(), CompOp::Ge, 50);
+                let shapes = [
+                    IRExpr::binary(left(), BinaryOp::And, right()),
+                    IRExpr::binary(left(), BinaryOp::Or, right()),
+                    IRExpr::binary(
+                        IRExpr::logical_not(left()),
+                        BinaryOp::Or,
+                        IRExpr::binary(right(), BinaryOp::And, compare(z(), CompOp::Ne, 4)),
+                    ),
+                    IRExpr::binary(
+                        IRExpr::binary(left(), BinaryOp::And, IRExpr::null_test(y(), true)),
+                        BinaryOp::And,
+                        IRExpr::binary(right(), BinaryOp::Or, compare(z(), CompOp::Lt, cut)),
+                    ),
+                ];
+                for shape in shapes {
+                    let got = evaluate_filter(&batch, &shape, &ParamMap::new()).unwrap();
+                    assert_eq!(got, full(&batch, &shape), "{shape} at cut {cut}");
+                }
+            }
+        }
+    }
+
+    /// A selection of no row evaluates nothing, so it reports no error even
+    /// for a column the batch lacks; a selection of a few rows over a filter
+    /// that reads no column keeps the selected row count.
+    #[test]
+    fn evaluate_filter_where_handles_empty_and_columnless_selections() {
+        let batch = batch(50, 4);
+        let missing = compare(prop("absent", ScalarType::I64), CompOp::Eq, 1);
+        let none = BooleanArray::from(vec![false; 50]);
+        let values = evaluate_filter_where(&batch, &missing, &ParamMap::new(), &none).unwrap();
+        assert_eq!((values.len(), values.null_count()), (50, 50));
+
+        let constant = IRExpr::comparison(
+            IRExpr::Literal(Literal::Integer(1), ty(ScalarType::I64, false)),
+            CompOp::Eq,
+            IRExpr::Literal(Literal::Integer(1), ty(ScalarType::I64, false)),
+        );
+        let few = BooleanArray::from_iter((0..50).map(|row| Some(row % 10 == 0)));
+        let values = evaluate_filter_where(&batch, &constant, &ParamMap::new(), &few).unwrap();
+        for row in 0..50 {
+            assert_eq!(values.is_valid(row), row % 10 == 0, "row {row}");
+        }
+        assert_eq!(values.true_count(), 5);
     }
 }

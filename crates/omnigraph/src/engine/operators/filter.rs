@@ -16,13 +16,15 @@ use omnigraph_compiler::ir::{IRExpr, ParamMap};
 use super::external;
 use super::memory::WorkMemory;
 use super::shape::{Mapped, Streaming};
-use crate::engine::expr::evaluate_filter;
+use crate::engine::expr::{evaluate_filter, evaluate_filter_where, kept_rows};
 
 /// The refusal name the pool reports when a filtered batch does not fit.
 const OUTPUT: &str = "filter output";
 
 /// Every one of `filters` evaluated over `batch`, conjoined into one mask
-/// (a null drops the row); `None` when there is no filter.
+/// (a null drops the row, as a false does); `None` when there is no filter.
+/// Each filter after the first is evaluated only on the rows the earlier
+/// ones kept.
 pub(super) fn conjoined_mask(
     batch: &RecordBatch,
     filters: &[IRExpr],
@@ -30,10 +32,13 @@ pub(super) fn conjoined_mask(
 ) -> DfResult<Option<BooleanArray>> {
     let mut mask: Option<BooleanArray> = None;
     for filter in filters {
-        let next = evaluate_filter(batch, filter, params).map_err(external)?;
         mask = Some(match mask {
-            None => next,
-            Some(mask) => datafusion::arrow::compute::and(&mask, &next)?,
+            None => evaluate_filter(batch, filter, params).map_err(external)?,
+            Some(mask) => {
+                let next = evaluate_filter_where(batch, filter, params, &kept_rows(&mask))
+                    .map_err(external)?;
+                datafusion::arrow::compute::and_kleene(&mask, &next)?
+            }
         });
     }
     Ok(mask)
