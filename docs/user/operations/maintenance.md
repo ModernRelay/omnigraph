@@ -337,12 +337,6 @@ Exit 0 means every table was visited and that nothing a retained graph
 commit pins, and no file such a commit references, was removed. It does not mean every table was collected: read the result rows
 for tables with an `error`.
 
-Cleanup reclaims table versions, not the graph's own catalog. Every graph
-commit adds a version of the branch's `__manifest`, and no command removes
-the versions of a live branch, so its storage grows with the number of
-commits. Plan storage for it on write-heavy graphs. A deleted branch's catalog
-can be collected by `cleanup` once nothing else depends on it.
-
 ## Suggested cadence
 
 - Run `optimize` after large loads or on a regular cadence for write-heavy
