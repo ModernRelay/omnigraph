@@ -67,9 +67,13 @@ fn classify(error: &color_eyre::Report) -> Refusal {
         // error leaves the submission in doubt.
         status
             if status >= 500
-                && !remote.output.disposition.as_ref().is_some_and(|disposition| {
-                    disposition.effects == omnigraph_api_types::DispositionEffects::None
-                }) =>
+                && !remote
+                    .output
+                    .disposition
+                    .as_ref()
+                    .is_some_and(|disposition| {
+                        disposition.effects == omnigraph_api_types::DispositionEffects::None
+                    }) =>
         {
             Refusal::Unanswered
         }
@@ -120,19 +124,59 @@ fn is_terminal(state: &str) -> bool {
     )
 }
 
+/// `future`'s output, unless `deadline` passes first. `--timeout` bounds
+/// every wait, the submission and each lookup included, not just the gaps
+/// between lookups: a server that stalls must not hold the CLI past it.
+async fn within<T>(deadline: Option<Instant>, future: impl Future<Output = T>) -> Option<T> {
+    match deadline {
+        None => Some(future.await),
+        Some(deadline) => tokio::time::timeout_at(deadline, future).await.ok(),
+    }
+}
+
+/// The caller's deadline passed: print what the last answer held and how to
+/// observe the operation, which may still run on the server.
+fn stop_waiting(
+    operation_id: &str,
+    last: Option<&Result<Value>>,
+    json: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<Completion> {
+    match last {
+        Some(Ok(record)) => write_record(operation_id, record, json, stdout)?,
+        Some(Err(error)) => writeln!(stderr, "error: {error}")?,
+        None => {}
+    }
+    writeln!(
+        stderr,
+        "stopped waiting; the operation may run or continue on the server: observe it with `omnigraph optimize --operation {operation_id}`"
+    )?;
+    Ok(Completion::exit(IN_DOUBT))
+}
+
 pub(crate) async fn run(
     client: &GraphClient,
     request: ServedOptimize,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
+    let deadline = request.timeout.map(|timeout| Instant::now() + timeout);
     let (operation_id, mut answer) = match &request.operation {
-        Some(id) => (id.clone(), client.operation(id).await),
+        Some(id) => match within(deadline, client.operation(id)).await {
+            Some(answer) => (id.clone(), answer),
+            None => return stop_waiting(id, None, request.json, stdout, stderr),
+        },
         None => {
             let id = omnigraph_cluster::new_operation_id();
             writeln!(stderr, "operation id: {id}")?;
             stderr.flush()?;
-            match client.start_optimize(request_body(&request, &id)).await {
+            let Some(submitted) =
+                within(deadline, client.start_optimize(request_body(&request, &id))).await
+            else {
+                return stop_waiting(&id, None, request.json, stdout, stderr);
+            };
+            match submitted {
                 Ok(record) => (id, Ok(record)),
                 Err(error) => match classify(&error) {
                     Refusal::DifferentRequest => {
@@ -152,15 +196,16 @@ pub(crate) async fn run(
                             stderr,
                             "no definite answer for {id} ({error}); looking it up, never resubmitting"
                         )?;
-                        let answer = client.operation(&id).await;
-                        (id, answer)
+                        match within(deadline, client.operation(&id)).await {
+                            Some(answer) => (id, answer),
+                            None => return stop_waiting(&id, None, request.json, stdout, stderr),
+                        }
                     }
                 },
             }
         }
     };
 
-    let deadline = request.timeout.map(|timeout| Instant::now() + timeout);
     let mut unanswered = 0_u32;
     loop {
         match &answer {
@@ -214,18 +259,18 @@ pub(crate) async fn run(
             }
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            match &answer {
-                Ok(record) => write_record(&operation_id, record, request.json, stdout)?,
-                Err(error) => writeln!(stderr, "error: {error}")?,
-            }
-            writeln!(
-                stderr,
-                "stopped waiting; the operation continues on the server: observe it with `omnigraph optimize --operation {operation_id}`"
-            )?;
-            return Ok(Completion::exit(IN_DOUBT));
+            return stop_waiting(&operation_id, Some(&answer), request.json, stdout, stderr);
         }
-        tokio::time::sleep(POLL).await;
-        answer = client.operation(&operation_id).await;
+        let pause = deadline.map_or(POLL, |deadline| {
+            POLL.min(deadline.saturating_duration_since(Instant::now()))
+        });
+        tokio::time::sleep(pause).await;
+        match within(deadline, client.operation(&operation_id)).await {
+            Some(next) => answer = next,
+            None => {
+                return stop_waiting(&operation_id, Some(&answer), request.json, stdout, stderr);
+            }
+        }
     }
 }
 

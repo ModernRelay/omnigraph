@@ -1281,6 +1281,37 @@ fn maintenance_refuses_server_targets_before_network() {
     server.assert_complete();
 }
 
+/// `--timeout` bounds every wait, the submission included: a server that
+/// answers the submission only after the deadline does not hold the CLI,
+/// which names the operation and exits as in doubt.
+#[test]
+fn optimize_timeout_bounds_a_stalled_submission() {
+    let server = crate::support::managed_http::IntentApiFixture::graph_with_response_delay(
+        vec![crate::support::managed_http::IntentReply::json(
+            202,
+            serde_json::json!({"lookup": "found", "operation": {"state": "accepted"}}),
+        )],
+        std::time::Duration::from_secs(8),
+    );
+    let started = std::time::Instant::now();
+    let output = cli()
+        .args(["optimize", "--timeout", "1", "--target"])
+        .fixture_target(&server.origin)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(6),
+        "the deadline bounds the submission: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        stderr.contains("operation id:") && stderr.contains("stopped waiting"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn optimize_with_as_flag_errors() {
     let output = output_failure(cli().args(["optimize", "--as", "act-op"]));
