@@ -106,8 +106,11 @@ omnigraph query get_person --target production --graph knowledge
 A server with no credential source (static tokens or signed-token trust) and no
 policy refuses to start unless explicitly
 given `--unauthenticated` (or `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only on a
-trusted development network. Tokens without a policy allow only `read`; other
-actions remain denied.
+trusted development network. A graph without a policy denies every action to
+every token, reads included, because tokens are not scoped to graphs; apply a
+policy to each graph. `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` in the server's
+environment lets every static token `read` every graph without a policy, as
+before.
 
 Managed signed data credentials are a separate token source, enabled with
 `--data-token-trust <file>`. The trust file binds keys to the exact deployment;
@@ -225,9 +228,11 @@ can update existing bundles and their bindings; the server drains affected
 requests before activating the new permissions. Current applied permissions
 authorize the deployment, so a newly granted administrator cannot authorize
 that grant.
-`--graph <id>` must match exactly one applied
-bundle; with both a graph bundle and a `cluster` bundle applied (as in the
-example above), the command refuses with "matches 2 policy bundles".
+Each action is answered by the bundle the server asks for it: a graph action
+by the bundle bound to `--graph <id>`, `graph_list` and `config_manage` by the
+bundle bound to `cluster`. `validate` checks both, each as its own kind, and
+`test` runs each case against its action's bundle. There is no fallback
+between the two: an action whose scope has no applied bundle is refused.
 
 ## Direct access is a separate trust boundary
 

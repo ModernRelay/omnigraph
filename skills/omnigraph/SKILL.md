@@ -5,7 +5,7 @@ license: MIT (see LICENSE at repo root)
 compatibility: Covers the current Omnigraph CLI and server, using HTTP contract 0.14. Upgrade the CLI, server and HTTP integrations together; the storage formats `omnigraph version` reports are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
 metadata:
   author: ModernRelay
-  version: "0.15.0"
+  version: "0.15.1"
   repository: https://github.com/ModernRelay/omnigraph
 ---
 
@@ -442,7 +442,6 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv`, `kv`, or `toon` |
 | `..` or a symlink in a `cluster.yaml` relative path | `config_path_escape` / `config_path_symlink` | Keep referenced files inside the config directory with plain relative paths |
 | A 0.13 operator file | configuration refusal | Rewrite it as `version: 1` (see [migrations](references/migrations.md#operator-configuration-rewrite)); keep the old operator home until unresolved work is reconciled |
-| Policy commands with both a graph and a `cluster` bundle applied | `matches 2 policy bundles` | Current limitation of `policy validate/test/explain --graph`; inspect each bundle file directly |
 
 ## Deep Dives
 
