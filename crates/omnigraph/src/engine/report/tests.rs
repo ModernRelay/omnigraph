@@ -1163,3 +1163,112 @@ async fn an_overfetch_rerun_appends_an_attempt_to_every_row() {
     assert_eq!(row(&run, returns).attempts.len(), 2);
     assert_eq!(row(&run, returns).status, RowStatus::Executed);
 }
+
+/// A bound-edge `Expand` orders its pairs in a DataFusion sort it runs
+/// itself, outside the tree, so that sort's spills reach the report only
+/// through the Expand's own row: a pass that spilled adds one `spill` entry
+/// for the node, and its row and attempts stay what they are without one.
+/// The sort writes zstd files, so the bytes spilled are fewer than the
+/// payload bytes of the rows spilled even though every payload is noise that
+/// compresses only to about four fifths.
+#[tokio::test]
+async fn a_spilling_bound_edge_sort_reports_its_spill_on_the_expand_row_issue_1339() {
+    const MIB: u64 = 1024 * 1024;
+    const EDGES: usize = 4096;
+    const PAYLOAD: usize = 1024;
+    let mut seed = vec![
+        r#"{"type":"Person","data":{"name":"a"}}"#.to_string(),
+        r#"{"type":"Person","data":{"name":"b"}}"#.to_string(),
+    ];
+    seed.extend((0..EDGES).map(|edge| {
+        let payload = (0..PAYLOAD)
+            .map(|position| {
+                let mut z =
+                    ((edge as u64) << 32 | position as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                char::from(b'!' + ((z ^ (z >> 31)) % 90) as u8)
+            })
+            .collect::<String>();
+        serde_json::json!({
+            "edge": "Knows",
+            "id": format!("k{edge:05}"),
+            "from": "a",
+            "to": "b",
+            "data": {"payload": payload},
+        })
+        .to_string()
+    }));
+    let seed: Vec<&str> = seed.iter().map(String::as_str).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let db = graph(
+        &dir,
+        r#"
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person {
+    payload: String
+}
+"#,
+        &seed,
+    )
+    .await;
+    let source = r#"
+query pairs() {
+    match {
+        $p: Person { name: "a" }
+        $p $e:knows $q
+    }
+    return { max($e.payload) as last }
+}
+"#;
+    let (rows, run) = crate::instrumentation::with_query_memory_limit(
+        4 * MIB,
+        run(&db, source, "pairs", &ParamMap::new()),
+    )
+    .await;
+    assert_eq!(rows, 1);
+    let expand = node_id(&run.plan, |node| {
+        matches!(node, PhysicalNode::Expand { .. })
+    });
+    assert_eq!(row(&run, expand).attempts[0].actual_rows, EDGES as u64);
+    assert_eq!(operator(&run, expand), "ExpandExec");
+    let spills = run.report.spills(expand);
+    let [(0, spilled)] = spills.as_slice() else {
+        panic!("one spill entry for the first pass: {:#?}", run.report);
+    };
+    assert!(spilled.spill_count > 0, "{spilled:?}");
+    assert!(spilled.spilled_rows > 0, "{spilled:?}");
+    assert!(
+        spilled.spilled_bytes > 0 && spilled.spilled_bytes < spilled.spilled_rows * PAYLOAD as u64,
+        "zstd-compressed spill files are smaller than the payloads they hold: {spilled:?}"
+    );
+    let report = serde_json::to_value(&run.report).unwrap();
+    assert_eq!(
+        report["spill"],
+        serde_json::json!([{
+            "id": expand,
+            "rung": 0,
+            "spill_count": spilled.spill_count,
+            "spilled_bytes": spilled.spilled_bytes,
+            "spilled_rows": spilled.spilled_rows,
+        }])
+    );
+    let expand_row = &report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == expand)
+        .unwrap();
+    assert_eq!(
+        expand_row.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["id", "operator", "status", "attempts"],
+        "a spill adds no field to the node's row"
+    );
+    for row in run.report.rows() {
+        if row.id != expand {
+            assert!(run.report.spills(row.id).is_empty(), "{row:?}");
+        }
+    }
+}

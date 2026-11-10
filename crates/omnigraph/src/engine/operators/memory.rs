@@ -370,6 +370,19 @@ pub(in crate::engine) struct WorkMemory {
     share: OnceLock<Option<LoadShare>>,
 }
 
+/// Adds the spills of a plan an operator ran itself to that operator's
+/// metrics when dropped; see [`WorkMemory::spills_of`].
+pub(in crate::engine) struct RecordSpills {
+    memory: Arc<WorkMemory>,
+    plan: Arc<dyn ExecutionPlan>,
+}
+
+impl Drop for RecordSpills {
+    fn drop(&mut self) {
+        self.memory.record_spills(&self.plan);
+    }
+}
+
 impl Drop for WorkMemory {
     fn drop(&mut self) {
         let held = self.scratch.size();
@@ -573,6 +586,58 @@ impl WorkMemory {
             .entry(name)
             .or_insert_with(|| MetricBuilder::new(&self.metrics).counter(name, 0))
             .add(value);
+    }
+
+    /// A guard that adds the spills of `plan`, a DataFusion plan this
+    /// memory's operator runs itself, to the operator's own `spill_count`,
+    /// `spilled_bytes` and `spilled_rows` when dropped: such a plan is not a
+    /// child in the tree, so its metrics reach the report only through its
+    /// operator. Dropping covers every way the run of `plan` ends: finished,
+    /// failed, or cancelled when a consumer such as a `Limit` drops the
+    /// operator's stream.
+    pub(in crate::engine) fn spills_of(
+        self: &Arc<Self>,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> RecordSpills {
+        RecordSpills {
+            memory: Arc::clone(self),
+            plan,
+        }
+    }
+
+    fn record_spills(&self, plan: &Arc<dyn ExecutionPlan>) {
+        fn visit(plan: &Arc<dyn ExecutionPlan>, totals: &mut [usize; 3]) {
+            if let Some(metrics) = plan.metrics() {
+                totals[0] += metrics.spill_count().unwrap_or(0);
+                totals[1] += metrics.spilled_bytes().unwrap_or(0);
+                totals[2] += metrics.spilled_rows().unwrap_or(0);
+            }
+            for child in plan.children() {
+                visit(child, totals);
+            }
+        }
+        let mut totals = [0; 3];
+        visit(plan, &mut totals);
+        if totals[0] == 0 {
+            return;
+        }
+        let mut counts = locked(&self.metric_counts);
+        for (name, value) in ["spill_count", "spilled_bytes", "spilled_rows"]
+            .into_iter()
+            .zip(totals)
+        {
+            counts
+                .entry(name)
+                .or_insert_with(|| {
+                    let builder = MetricBuilder::new(&self.metrics);
+                    match name {
+                        "spill_count" => builder.spill_count(0),
+                        "spilled_bytes" => builder.spilled_bytes(0),
+                        _ => builder.spilled_rows(0),
+                    }
+                })
+                .add(value);
+        }
     }
 
     pub(in crate::engine) fn error(&self, error: DataFusionError) -> OmniError {

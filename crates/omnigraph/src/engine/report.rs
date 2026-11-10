@@ -60,6 +60,44 @@ pub(crate) struct ReportRow {
     pub(crate) operator: String,
     pub(crate) status: RowStatus,
     pub(crate) attempts: Vec<Attempt>,
+    /// What the pass's operator spilled, moved to the report's own `spill`
+    /// list when the row is recorded; never part of the row itself.
+    #[serde(skip)]
+    pub(super) spilled: Option<Spilled>,
+}
+
+/// What one operator wrote to scratch files in one pass: DataFusion's
+/// `spill_count`, `spilled_bytes` (the bytes of the files as written, after
+/// compression) and `spilled_rows`, summed over the operator and the plans it
+/// runs itself, such as the pair sort of a bound-edge `Expand`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct Spilled {
+    pub(crate) spill_count: u64,
+    pub(crate) spilled_bytes: u64,
+    pub(crate) spilled_rows: u64,
+}
+
+impl Spilled {
+    /// The spills counted in `metrics`; `None` when the operator spilled
+    /// nothing.
+    pub(super) fn read(metrics: &datafusion::physical_plan::metrics::MetricsSet) -> Option<Self> {
+        let count = |value: Option<usize>| value.unwrap_or(0) as u64;
+        let spilled = Self {
+            spill_count: count(metrics.spill_count()),
+            spilled_bytes: count(metrics.spilled_bytes()),
+            spilled_rows: count(metrics.spilled_rows()),
+        };
+        (spilled.spill_count > 0).then_some(spilled)
+    }
+}
+
+/// The spills of one node's operator in the overfetch pass `rung`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SpillRow {
+    id: NodeId,
+    rung: usize,
+    #[serde(flatten)]
+    spilled: Spilled,
 }
 
 impl ReportRow {
@@ -70,6 +108,7 @@ impl ReportRow {
         ran: Ran,
         actual_rows: u64,
         drained: Option<bool>,
+        spilled: Option<Spilled>,
     ) -> Self {
         Self {
             id,
@@ -85,6 +124,7 @@ impl ReportRow {
                 actual_rows,
                 drained,
             }],
+            spilled,
         }
     }
 }
@@ -162,12 +202,27 @@ pub struct ExecutionReport {
     /// Optional native measurements. Timings vary between equivalent replays.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ann_metrics: Vec<AnnMetrics>,
+    /// One entry per operator pass that spilled, in the order recorded.
+    /// Spilling depends on the memory the run had, not on the plan, so it is
+    /// kept apart from `rows`, which replays compare.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    spill: Vec<SpillRow>,
 }
 
 impl ExecutionReport {
     #[cfg(test)]
     pub(crate) fn rows(&self) -> &[ReportRow] {
         &self.rows
+    }
+
+    /// The `spill` entries of node `id`, as `(rung, spilled)`.
+    #[cfg(test)]
+    pub(crate) fn spills(&self, id: NodeId) -> Vec<(usize, Spilled)> {
+        self.spill
+            .iter()
+            .filter(|spill| spill.id == id)
+            .map(|spill| (spill.rung, spill.spilled))
+            .collect()
     }
 
     #[cfg(test)]
@@ -208,7 +263,16 @@ impl ExecutionReport {
     /// Fold one pass in: a node met before gains the pass's attempt, and is
     /// `executed` once any pass polled its operator.
     pub(super) fn record(&mut self, pass: Vec<ReportRow>) {
-        for row in pass {
+        for mut row in pass {
+            if let Some(spilled) = row.spilled.take() {
+                for attempt in &row.attempts {
+                    self.spill.push(SpillRow {
+                        id: row.id,
+                        rung: attempt.rung,
+                        spilled,
+                    });
+                }
+            }
             match self.rows.iter_mut().find(|met| met.id == row.id) {
                 None => self.rows.push(row),
                 Some(met) => {
@@ -263,8 +327,9 @@ impl Executed {
     /// The report as actuals rows in the explain row schema: `tree`
     /// `profile`, no `depth`, `node` the plan node's kind, `detail` the row's
     /// own fields (`id`, `operator`, `status`, `attempts`), then one row per
-    /// search decision (`node` `gate` or `probes`) and measured nearest attempt
-    /// (`node` `ann_metrics`). The third public surface beside rows and explain.
+    /// search decision (`node` `gate` or `probes`), measured nearest attempt
+    /// (`node` `ann_metrics`) and operator pass that spilled (`node` `spill`).
+    /// The third public surface beside rows and explain.
     pub fn profile(&self) -> Result<omnigraph_compiler::result::QueryResult> {
         let mut rows = ExplainRows::default();
         for row in &self.report.rows {
@@ -302,6 +367,15 @@ impl Executed {
                 ))
             })?;
             rows.push(PROFILE_TREE, None, "ann_metrics", detail.to_string());
+        }
+        for spill in &self.report.spill {
+            let detail = serde_json::to_value(spill).map_err(|error| {
+                OmniError::manifest_internal(format!(
+                    "spills of node {} cannot serialize: {error}",
+                    spill.id
+                ))
+            })?;
+            rows.push(PROFILE_TREE, None, "spill", detail.to_string());
         }
         rows.into_result()
     }

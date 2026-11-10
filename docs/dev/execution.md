@@ -548,7 +548,9 @@ there is no separate pool or dummy reservation. This policy does not guarantee
 space for arbitrary wide graph allocations, which can still be refused.
 
 DataFusion operators that support spilling, including sorts, may use the
-query's scratch directory under its 100 GiB quota. The custom graph breakers
+query's scratch directory under its 100 GiB quota. Spill files are
+zstd-compressed Arrow IPC (`SPILL_COMPRESSION` in `engine/context.rs`), and
+the quota counts them at their compressed size. The custom graph breakers
 do not spill: a refused reservation returns `OmniError::ResourceLimitExceeded`
 with `query_memory_bytes`. Exhausted DataFusion memory and scratch quotas are
 classified as `query_memory_bytes` and `query_scratch_bytes`, respectively.
@@ -829,6 +831,16 @@ plan's, and writes one report row per node from the node's operator's own
 | `status` | `executed` | A stream of the operator was polled. |
 | `status` | `skipped` | The operator is in the tree and no stream of it was polled: the build scan of a hash join behind an empty probe, the right subtree of a cross join behind an empty left, everything under a `Limit` of zero rows or a `Sort` with a fetch of zero, an `AntiJoin` inner tree the bulk check answered without. |
 | `attempts` | `rung`, `ran`, `actual_rows`, `drained` | One entry per pass: `rung` 0 is the first pass and each rerun of the overfetch ladder appends one whose `rung` names the declared rung it took (`RankedAccess.overfetch[rung - 1]`); `ran` is `true` / `false` (polled or not), or on the operator of a declared switch the side that ran (`hash_join`, `id_lookup`, `csr`, `indexed_scan`); `actual_rows` is the operator's `output_rows` metric; `drained` is `true` or `false` for an omnigraph operator (its stream reached its end or not) and `null` for a DataFusion operator (`AggregateExec`), whose end no counter observes; `actual_rows` is complete only when `drained` is `true`, a lower bound otherwise. |
+
+An operator pass that spilled also adds one entry to the report's `spill`
+list, kept apart from the rows so that replays, which compare the rows, do
+not depend on the memory a run had: the node's `id`, the pass's `rung`, and
+the operator's `spill_count`, `spilled_bytes` (bytes written, after
+compression) and `spilled_rows`. A DataFusion plan an operator runs itself,
+outside the tree, reaches it through that operator: the bound-edge `Expand`
+adds its pair sort's spills to its own metrics when the sort's run ends
+(`WorkMemory::spills_of`), whether it finished, failed or was dropped by a
+consumer.
 
 Polled is read off the operator's metrics: omnigraph's operators count a
 `polls` metric on every poll of the streams they hand out (`operators::polled`),
