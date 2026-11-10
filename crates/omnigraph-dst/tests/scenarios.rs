@@ -6994,7 +6994,7 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                                 .expect("optimize handle"),
                         );
                         barrier.wait();
-                        for round in 0..80u32 {
+                        'rounds: for round in 0..80u32 {
                             // Real work first: an optimize over an unchanged
                             // store is a near-no-op that never walks refs.
                             // Two mutations per round keep compaction honest
@@ -7007,33 +7007,41 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                                 let _ =
                                     mutate_main(&db, MUTATION_QUERIES, "set_age", &params).await;
                             }
-                            match Box::pin(
+                            // A table whose own planning or rewrite fails is a
+                            // failed outcome in a successful report, so the
+                            // finding can arrive either way.
+                            let failures: Vec<String> = match Box::pin(
                                 db.optimize_as(None, omnigraph::db::OptimizeRequest::default()),
                             )
                             .await
                             {
-                                Ok(_) => {}
-                                Err(err) => {
-                                    let rendered = format!("{err:?}");
-                                    let raw_refs_not_found = rendered.contains("Not found")
-                                        && rendered.contains("_refs/branches/");
-                                    if raw_refs_not_found {
-                                        println!(
-                                            "OPTIMIZE-RACE REPRODUCED (round {round}): \
-                                             {rendered}"
-                                        );
-                                        caught.store(true, std::sync::atomic::Ordering::SeqCst);
-                                        break;
-                                    }
-                                    // Anything typed (Conflict et al.) is a legal
-                                    // maintenance rejection under churn — keep going.
-                                    assert!(
-                                        rendered.contains("kind: Conflict"),
-                                        "optimize failed with an UNEXPECTED shape \
-                                         (neither the finding nor a typed Conflict): \
+                                Ok(report) => report
+                                    .tables
+                                    .iter()
+                                    .filter_map(|table| table.failure.as_ref())
+                                    .map(|err| format!("{err:?}"))
+                                    .collect(),
+                                Err(err) => vec![format!("{err:?}")],
+                            };
+                            for rendered in failures {
+                                let raw_refs_not_found = rendered.contains("Not found")
+                                    && rendered.contains("_refs/branches/");
+                                if raw_refs_not_found {
+                                    println!(
+                                        "OPTIMIZE-RACE REPRODUCED (round {round}): \
                                          {rendered}"
                                     );
+                                    caught.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    break 'rounds;
                                 }
+                                // Anything typed (Conflict et al.) is a legal
+                                // maintenance rejection under churn — keep going.
+                                assert!(
+                                    rendered.contains("kind: Conflict"),
+                                    "optimize failed with an UNEXPECTED shape \
+                                     (neither the finding nor a typed Conflict): \
+                                     {rendered}"
+                                );
                             }
                             tokio::task::yield_now().await;
                         }

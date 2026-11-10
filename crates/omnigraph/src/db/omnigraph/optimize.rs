@@ -1115,19 +1115,17 @@ pub async fn optimize_all_datasets(
     drop(main_branch_guard);
     drop(schema_permit);
 
-    let cancellation = match (cancelled, cancel_requested()) {
-        (true, _) => RunCancellation::Cancelled,
-        (false, true) => RunCancellation::ArrivedLate,
-        (false, false) => RunCancellation::NotRequested,
-    };
-    let artifact = if cancellation != RunCancellation::NotRequested {
+    let artifact = if cancelled || cancel_requested() {
         ArtifactRefresh::Skipped(ArtifactSkip::Cancelled)
     } else {
+        // The scan reads only, so a cancellation that arrives during it
+        // abandons it; the write is issued only when none is pending.
         match persist_graph_index_artifact(
             db,
             &catalog,
             edge_tables_committed,
             request.limits.artifact_bytes,
+            cancellation,
         )
         .await
         {
@@ -1143,6 +1141,11 @@ pub async fn optimize_all_datasets(
         }
     };
 
+    let cancellation = match (cancelled, cancel_requested()) {
+        (true, _) => RunCancellation::Cancelled,
+        (false, true) => RunCancellation::ArrivedLate,
+        (false, false) => RunCancellation::NotRequested,
+    };
     Ok(OptimizeReport {
         input_commit,
         input_manifest_version,
@@ -1220,7 +1223,7 @@ async fn run_table_pipeline(
         }
     };
 
-    let mut unplanned = tasks.into_iter().enumerate();
+    let mut unplanned = tasks.into_iter().enumerate().peekable();
     let mut planning = FuturesOrdered::new();
     let mut ready: VecDeque<PlannedTable> = VecDeque::new();
     let mut staging = FuturesUnordered::new();
@@ -1299,9 +1302,14 @@ async fn run_table_pipeline(
                 None => {}
             }
         }
-        // Filling planning above leaves it non-empty while any table is
-        // unplanned, so an empty pipeline has visited every table or stopped.
+        // The fill above runs before the turns drain `ready`, so turns that
+        // stage nothing (a no-op plan, a deferral, a planning failure) can
+        // empty the pipeline while tables are still unplanned: go round
+        // again to plan them. Only a stop or a visited catalog ends the loop.
         if planning.is_empty() && ready.is_empty() && staging.is_empty() {
+            if stop.is_none() && unplanned.peek().is_some() {
+                continue;
+            }
             break;
         }
         // The deadline stops only a table whose turn has not come.
@@ -1406,87 +1414,30 @@ async fn persist_graph_index_artifact(
     catalog: &omnigraph_compiler::catalog::Catalog,
     edge_tables_committed: bool,
     limit: Option<u64>,
+    cancellation: Option<&OptimizeCancellation>,
 ) -> Result<ArtifactRefresh> {
-    if catalog.edge_types.is_empty() {
-        return Ok(ArtifactRefresh::Skipped(ArtifactSkip::NoEdgeTypes));
-    }
-    let uri = crate::graph_index::persist::artifact_uri(db.root_uri());
-    if !edge_tables_committed && db.storage_adapter().exists(&uri).await? {
-        tracing::debug!(
-            target: "omnigraph::optimize",
-            "graph index artifact refresh skipped: no edge table advanced and an artifact exists"
-        );
-        return Ok(ArtifactRefresh::Unchanged);
-    }
-    let edge_types: std::collections::HashMap<String, (String, String)> = catalog
-        .edge_types
-        .iter()
-        .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
-        .collect();
-    let snapshot = db.snapshot_for_branch(None).await?;
-    // `save` refuses a partially-materialized store (no complete identity to
-    // stamp); check that BEFORE paying the full-catalog edge scan.
-    if edge_types
-        .keys()
-        .any(|edge| snapshot.dataset(&format!("edge:{edge}")).is_none())
-    {
-        tracing::debug!(
-            target: "omnigraph::optimize",
-            "graph index artifact skipped: not every declared edge table is materialized yet"
-        );
-        return Ok(ArtifactRefresh::Skipped(ArtifactSkip::IncompleteEdgeTables));
-    }
-    let mut count = None;
-    if let Some(limit) = limit {
-        let Some((shortest, widest)) =
-            crate::graph_index::persist::fixed_bytes(&snapshot, &edge_types)?
-        else {
-            return Ok(ArtifactRefresh::Skipped(ArtifactSkip::IncompleteEdgeTables));
-        };
-        // A lower bound: every edge is two `u32` targets, and the live row
-        // count is the number of rows the scan returns.
-        let mut lower = shortest;
-        for edge in edge_types.keys() {
-            let rows = snapshot
-                .open_lance_dataset(&format!("edge:{edge}"))
-                .await?
-                .count_rows(None)
-                .await
-                .map_err(OmniError::storage)?;
-            lower = lower.saturating_add((rows as u64).saturating_mul(8));
-        }
-        if lower > limit {
-            return Ok(ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit {
-                counted: lower,
-                limit,
-            }));
-        }
-        count = Some(crate::graph_index::persist::ArtifactCount::new(
-            widest,
-            limit,
-            &edge_types,
-        ));
-    }
-    let Some(index) = crate::graph_index::GraphIndex::build_counted(
-        &snapshot,
-        &edge_types,
-        db.catalog().system_columns,
-        count.as_mut(),
-    )
-    .await?
-    else {
-        let counted = count.as_ref().map_or(0, |count| count.counted());
-        return Ok(ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit {
-            counted,
-            limit: limit.unwrap_or(0),
-        }));
+    // Everything before the write reads only, so a cancellation (a shutdown,
+    // a deployment) abandons it wherever it stands.
+    let prepare = prepare_graph_index_artifact(db, catalog, edge_tables_committed, limit);
+    let prepared = match cancellation {
+        Some(cancellation) => tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                return Ok(ArtifactRefresh::Skipped(ArtifactSkip::Cancelled));
+            }
+            prepared = prepare => prepared?,
+        },
+        None => prepare.await?,
     };
-    let Some((uri, body)) =
-        crate::graph_index::persist::artifact_body(&snapshot, &edge_types, &index)?
-    else {
-        return Ok(ArtifactRefresh::Skipped(ArtifactSkip::IncompleteEdgeTables));
+    let (uri, body) = match prepared {
+        Ok(write) => write,
+        Err(outcome) => return Ok(outcome),
     };
-    drop(index);
+    // No write is issued once a cancellation is pending: the artifact is
+    // derived, and the next run rebuilds it.
+    if cancellation.is_some_and(OptimizeCancellation::is_cancelled) {
+        return Ok(ArtifactRefresh::Skipped(ArtifactSkip::Cancelled));
+    }
     // The artifact key is mutable, so a write dropped mid-request would leave
     // its outcome unknown: once issued, the write runs to its end even when
     // this run is dropped.
@@ -1508,6 +1459,109 @@ async fn persist_graph_index_artifact(
         "graph index artifact persisted"
     );
     Ok(ArtifactRefresh::Refreshed)
+}
+
+decide_seam! {
+    /// The artifact refresh is about to read the edge tables, after the run
+    /// released its writer gates: a cancellation from here on abandons it.
+    pub static OPTIMIZE_ARTIFACT_SCAN = ("optimize.artifact_scan", Unreachable, [Fail]);
+}
+
+/// The artifact's object, or the outcome that ends the refresh without a
+/// write. Reads only.
+async fn prepare_graph_index_artifact(
+    db: &Omnigraph,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    edge_tables_committed: bool,
+    limit: Option<u64>,
+) -> Result<std::result::Result<(String, Vec<u8>), ArtifactRefresh>> {
+    if catalog.edge_types.is_empty() {
+        return Ok(Err(ArtifactRefresh::Skipped(ArtifactSkip::NoEdgeTypes)));
+    }
+    let uri = crate::graph_index::persist::artifact_uri(db.root_uri());
+    if !edge_tables_committed && db.storage_adapter().exists(&uri).await? {
+        tracing::debug!(
+            target: "omnigraph::optimize",
+            "graph index artifact refresh skipped: no edge table advanced and an artifact exists"
+        );
+        return Ok(Err(ArtifactRefresh::Unchanged));
+    }
+    let edge_types: std::collections::HashMap<String, (String, String)> = catalog
+        .edge_types
+        .iter()
+        .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
+        .collect();
+    fail(&OPTIMIZE_ARTIFACT_SCAN)?;
+    let snapshot = db.snapshot_for_branch(None).await?;
+    // `save` refuses a partially-materialized store (no complete identity to
+    // stamp); check that BEFORE paying the full-catalog edge scan.
+    if edge_types
+        .keys()
+        .any(|edge| snapshot.dataset(&format!("edge:{edge}")).is_none())
+    {
+        tracing::debug!(
+            target: "omnigraph::optimize",
+            "graph index artifact skipped: not every declared edge table is materialized yet"
+        );
+        return Ok(Err(ArtifactRefresh::Skipped(
+            ArtifactSkip::IncompleteEdgeTables,
+        )));
+    }
+    let mut count = None;
+    if let Some(limit) = limit {
+        let Some((shortest, widest)) =
+            crate::graph_index::persist::fixed_bytes(&snapshot, &edge_types)?
+        else {
+            return Ok(Err(ArtifactRefresh::Skipped(
+                ArtifactSkip::IncompleteEdgeTables,
+            )));
+        };
+        // A lower bound: every edge is two `u32` targets, and the live row
+        // count is the number of rows the scan returns.
+        let mut lower = shortest;
+        for edge in edge_types.keys() {
+            let rows = snapshot
+                .open_lance_dataset(&format!("edge:{edge}"))
+                .await?
+                .count_rows(None)
+                .await
+                .map_err(OmniError::storage)?;
+            lower = lower.saturating_add((rows as u64).saturating_mul(8));
+        }
+        if lower > limit {
+            return Ok(Err(ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit {
+                counted: lower,
+                limit,
+            })));
+        }
+        count = Some(crate::graph_index::persist::ArtifactCount::new(
+            widest,
+            limit,
+            &edge_types,
+        ));
+    }
+    let build = crate::graph_index::GraphIndex::build_counted(
+        &snapshot,
+        &edge_types,
+        db.catalog().system_columns,
+        count.as_mut(),
+    );
+    let Some(index) = build.await? else {
+        let counted = count.as_ref().map_or(0, |count| count.counted());
+        return Ok(Err(ArtifactRefresh::Skipped(ArtifactSkip::SizeLimit {
+            counted,
+            limit: limit.unwrap_or(0),
+        })));
+    };
+    let Some((uri, body)) =
+        crate::graph_index::persist::artifact_body(&snapshot, &edge_types, &index)?
+    else {
+        return Ok(Err(ArtifactRefresh::Skipped(
+            ArtifactSkip::IncompleteEdgeTables,
+        )));
+    };
+    drop(index);
+    Ok(Ok((uri, body)))
 }
 
 /// Pure planning: classify drift/no-work/productive state without advancing
