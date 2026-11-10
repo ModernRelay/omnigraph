@@ -1286,6 +1286,7 @@ fn maintenance_refuses_server_targets_before_network() {
 /// which names the operation and exits as in doubt.
 #[test]
 fn optimize_timeout_bounds_a_stalled_submission() {
+    use std::io::BufRead;
     let server = crate::support::managed_http::IntentApiFixture::graph_with_response_delay(
         vec![crate::support::managed_http::IntentReply::json(
             202,
@@ -1293,23 +1294,34 @@ fn optimize_timeout_bounds_a_stalled_submission() {
         )],
         std::time::Duration::from_secs(8),
     );
-    let started = std::time::Instant::now();
-    let output = cli()
+    let mut child = crate::support::cli_process()
         .args(["optimize", "--timeout", "1", "--target"])
         .fixture_target(&server.origin)
-        .output()
+        .args(["--graph", "knowledge"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    // Timed from the submission, so the process's own start-up (slow on a
+    // freshly linked binary) does not count against the deadline.
+    let mut submitted = None;
+    let mut stderr = String::new();
+    for line in std::io::BufReader::new(child.stderr.take().unwrap()).lines() {
+        let line = line.unwrap();
+        if line.starts_with("operation id:") {
+            submitted = Some(std::time::Instant::now());
+        }
+        stderr.push_str(&line);
+        stderr.push('\n');
+    }
+    let status = child.wait().unwrap();
+    let waited = submitted.expect("the CLI names the operation").elapsed();
+    assert_eq!(status.code(), Some(2), "{stderr}");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(6),
-        "the deadline bounds the submission: {:?}",
-        started.elapsed()
+        waited < std::time::Duration::from_secs(5),
+        "the deadline bounds the submission: {waited:?}"
     );
-    assert!(
-        stderr.contains("operation id:") && stderr.contains("stopped waiting"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("stopped waiting"), "{stderr}");
 }
 
 #[test]

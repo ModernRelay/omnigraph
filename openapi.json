@@ -13914,7 +13914,8 @@
           "branch_merge",
           "commit_publish",
           "commit_drop",
-          "invoke_query"
+          "invoke_query",
+          "maintain"
         ]
       },
       "AccessOutput": {
