@@ -33,7 +33,7 @@ query shadowed_property() {
     delete Flag where false = false
 }
 
---- expect error: Q008
+--- expect error: is not a statement
 
 --- query
 query flags_untouched() {
