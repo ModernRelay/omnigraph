@@ -755,9 +755,33 @@ pub(crate) async fn start_optimize(
             )));
         }
         Err(AdmissionRefusal::Unresolved) => {
-            return Err(ApiError::conflict(
-                "four publications are unresolved; a write on their settlement branches settles them",
-            ));
+            // Each record with where its walk stands (RFC 2.4), so an operator
+            // sees which graph and branch a settling write must reach.
+            let records = admitted
+                .unresolved
+                .iter()
+                .map(|op| {
+                    let walk = match &op.resolution {
+                        Some(progress) => format!(
+                            "walking: {} commits covered, next page at {}",
+                            progress.visited,
+                            progress.cursor.as_deref().unwrap_or("the branch tip")
+                        ),
+                        None => op
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "not walked yet".to_string()),
+                    };
+                    format!(
+                        "{} (graph {}, branch {}; {walk})",
+                        op.operation_id, op.graph, op.settlement_branch
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ApiError::conflict(format!(
+                "four publications are unresolved; a write on their settlement branches settles them: {records}"
+            )));
         }
         Err(AdmissionRefusal::Expired { eviction_mark_ms }) => {
             return Err(ApiError::conflict(format!(
