@@ -1,27 +1,189 @@
 pub(crate) mod persist;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use arrow_array::StringArray;
+use arrow_array::builder::StringBuilder;
+use arrow_array::{Array, ArrayRef, StringArray, UInt32Array};
 use futures::TryStreamExt;
+use hashbrown::HashTable;
 use omnigraph_compiler::SystemColumns;
 
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
 
-/// Dense u32 mapping for a single node type: String ID ↔ dense index.
+/// The seeds of the id hash (over an id's UTF-8 bytes): fixed, so a
+/// dictionary hashes the same way in every process; the table itself is
+/// never persisted.
+const ID_HASH_SEEDS: (u64, u64, u64, u64) = (
+    0x6f6d_6e69_6772_6170,
+    0x6874_7970_6569_6478,
+    0x6964_5f74_6f5f_6465,
+    0x6e73_655f_7461_626c,
+);
+
+fn id_hash_state() -> ahash::RandomState {
+    let (a, b, c, d) = ID_HASH_SEEDS;
+    ahash::RandomState::with_seeds(a, b, c, d)
+}
+
+/// The dense u32 mapping of one node type in a built or loaded graph index:
+/// the ids in dense order as one Arrow `Utf8` array (index `i` holds the id
+/// of dense `i`, in first-seen order), and a table of dense ids that hashes
+/// and compares through that array. No id is held twice and none is a
+/// separate allocation; destination columns are gathered from `ids` with
+/// Arrow's `take`. Immutable: built by [`TypeIndexBuilder`].
 #[derive(Debug, Clone)]
 pub struct TypeIndex {
-    id_to_dense: HashMap<String, u32>,
-    dense_to_id: Vec<String>,
+    ids: StringArray,
+    dense_of: HashTable<u32>,
+    state: ahash::RandomState,
 }
 
 impl TypeIndex {
-    pub(crate) fn new() -> Self {
-        Self {
-            id_to_dense: HashMap::new(),
-            dense_to_id: Vec::new(),
+    pub fn to_dense(&self, id: &str) -> Option<u32> {
+        let hash = self.state.hash_one(id.as_bytes());
+        self.dense_of
+            .find(hash, |&dense| self.ids.value(dense as usize) == id)
+            .copied()
+    }
+
+    pub fn to_id(&self, dense: u32) -> Option<&str> {
+        let dense = dense as usize;
+        (dense < self.ids.len()).then(|| self.ids.value(dense))
+    }
+
+    // The size of the dense id space, consumed as a CSR row width; emptiness is
+    // not a meaningful question for it.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// The dense-ordered id dictionary (index `i` holds the id of dense `i`).
+    pub(crate) fn ids(&self) -> &StringArray {
+        &self.ids
+    }
+
+    /// The index of `ids` in dense order; a duplicate is refused.
+    #[cfg(test)]
+    pub(crate) fn from_ids(ids: Vec<String>) -> Result<Self> {
+        let mut builder = TypeIndexBuilder::new();
+        for id in &ids {
+            builder.push_unique(id)?;
         }
+        Ok(builder.finish())
+    }
+}
+
+/// Builds a [`TypeIndex`]: appends each new id to one growing `Utf8` buffer
+/// and its dense id to the table, in first-seen order.
+#[derive(Debug)]
+pub(crate) struct TypeIndexBuilder {
+    ids: StringBuilder,
+    len: usize,
+    dense_of: HashTable<u32>,
+    state: ahash::RandomState,
+}
+
+impl TypeIndexBuilder {
+    pub(crate) fn new() -> Self {
+        Self::with_capacity(0, 0)
+    }
+
+    /// Room for `ids` ids of `bytes` bytes in total.
+    pub(crate) fn with_capacity(ids: usize, bytes: usize) -> Self {
+        Self {
+            ids: StringBuilder::with_capacity(ids, bytes),
+            len: 0,
+            dense_of: HashTable::with_capacity(ids),
+            state: id_hash_state(),
+        }
+    }
+
+    fn find(&self, hash: u64, id: &str) -> Option<u32> {
+        let offsets = self.ids.offsets_slice();
+        let values = self.ids.values_slice();
+        self.dense_of
+            .find(hash, |&dense| {
+                let dense = dense as usize;
+                &values[offsets[dense] as usize..offsets[dense + 1] as usize] == id.as_bytes()
+            })
+            .copied()
+    }
+
+    fn push(&mut self, hash: u64, id: &str) -> Result<u32> {
+        // A `Utf8` array addresses its bytes with i32 offsets, and dense ids
+        // are u32: refuse past either rather than let the builder panic.
+        let bytes = self.ids.values_slice().len().saturating_add(id.len());
+        let dense = u32::try_from(self.len)
+            .ok()
+            .filter(|_| i32::try_from(bytes).is_ok())
+            .ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "graph index dictionary outgrew one Utf8 array ({} ids, {bytes} bytes)",
+                    self.len
+                ))
+            })?;
+        self.ids.append_value(id);
+        self.len += 1;
+        let (state, offsets, values) = (
+            &self.state,
+            self.ids.offsets_slice(),
+            self.ids.values_slice(),
+        );
+        self.dense_of.insert_unique(hash, dense, |&entry| {
+            let entry = entry as usize;
+            state.hash_one(&values[offsets[entry] as usize..offsets[entry + 1] as usize])
+        });
+        Ok(dense)
+    }
+
+    /// The dense id of `id`, appended when it is new.
+    pub(crate) fn get_or_insert(&mut self, id: &str) -> Result<u32> {
+        let hash = self.state.hash_one(id.as_bytes());
+        match self.find(hash, id) {
+            Some(dense) => Ok(dense),
+            None => self.push(hash, id),
+        }
+    }
+
+    /// Append `id` as the next dense id (persisted-artifact load). A
+    /// duplicate would silently alias two dense slots, so it is refused.
+    pub(crate) fn push_unique(&mut self, id: &str) -> Result<u32> {
+        let hash = self.state.hash_one(id.as_bytes());
+        if self.find(hash, id).is_some() {
+            return Err(OmniError::manifest(format!(
+                "graph index dictionary holds duplicate id '{id}'"
+            )));
+        }
+        self.push(hash, id)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn finish(mut self) -> TypeIndex {
+        TypeIndex {
+            ids: self.ids.finish(),
+            dense_of: self.dense_of,
+            state: self.state,
+        }
+    }
+}
+
+/// A traversal's own growing String ID ↔ dense index mapping, for a walk
+/// that starts on the indexed path and interns ids as its scans find them.
+#[derive(Debug, Clone, Default)]
+pub struct IdInterner {
+    id_to_dense: HashMap<String, u32, ahash::RandomState>,
+    dense_to_id: Vec<String>,
+}
+
+impl IdInterner {
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
     /// Get or insert a string ID, returning its dense index.
@@ -43,8 +205,6 @@ impl TypeIndex {
         self.dense_to_id.get(dense as usize).map(|s| s.as_str())
     }
 
-    // The size of the dense id space, consumed as a CSR row width; emptiness is
-    // not a meaningful question for it.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.dense_to_id.len()
@@ -54,22 +214,48 @@ impl TypeIndex {
     pub(crate) fn ids(&self) -> &[String] {
         &self.dense_to_id
     }
+}
 
-    /// Rebuild from a dense-ordered dictionary (persisted-artifact load).
-    /// Duplicate ids would silently alias two dense slots, so they are refused.
-    pub(crate) fn from_ids(ids: Vec<String>) -> Result<Self> {
-        let mut id_to_dense = HashMap::with_capacity(ids.len());
-        for (dense, id) in ids.iter().enumerate() {
-            if id_to_dense.insert(id.clone(), dense as u32).is_some() {
-                return Err(OmniError::manifest(format!(
-                    "graph index dictionary holds duplicate id '{id}'"
-                )));
-            }
+/// The dictionary a walk's dense destination ids resolve through: a graph
+/// index's [`TypeIndex`] or the walk's own [`IdInterner`].
+#[derive(Clone, Copy)]
+pub(crate) enum DenseIds<'a> {
+    Index(&'a StringArray),
+    Interned(&'a [String]),
+}
+
+impl DenseIds<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Index(ids) => ids.len(),
+            Self::Interned(ids) => ids.len(),
         }
-        Ok(Self {
-            id_to_dense,
-            dense_to_id: ids,
-        })
+    }
+
+    /// The UTF-8 length of the id of `dense`, `None` outside the dictionary.
+    pub(crate) fn byte_len(&self, dense: u32) -> Option<usize> {
+        let dense = dense as usize;
+        match self {
+            Self::Index(ids) => (dense < ids.len()).then(|| {
+                let offsets = ids.value_offsets();
+                (offsets[dense + 1] - offsets[dense]) as usize
+            }),
+            Self::Interned(ids) => ids.get(dense).map(String::len),
+        }
+    }
+
+    /// The `Utf8` column of the ids of `dense`, every one inside the
+    /// dictionary (the caller checked); a graph index's ids are gathered
+    /// with Arrow's `take`.
+    pub(crate) fn column(&self, dense: &UInt32Array) -> Result<ArrayRef> {
+        match self {
+            Self::Index(ids) => arrow_select::take::take(*ids, dense, None).map_err(|error| {
+                OmniError::manifest_internal(format!("gathering destination ids failed: {error}"))
+            }),
+            Self::Interned(ids) => Ok(Arc::new(StringArray::from_iter_values(
+                dense.values().iter().map(|&d| ids[d as usize].as_str()),
+            ))),
+        }
     }
 }
 
@@ -192,7 +378,7 @@ impl GraphIndex {
         // `(table_key, version, table_branch, e_tag)` so a lazy-fork branch reuses
         // main's built index. If you read node tables, schema, or other state here,
         // add it to that key or the cache will serve a stale index.
-        let mut type_indices: HashMap<String, TypeIndex> = HashMap::new();
+        let mut builders: HashMap<String, TypeIndexBuilder> = HashMap::new();
         let mut csr = HashMap::new();
         let mut csc = HashMap::new();
 
@@ -220,12 +406,12 @@ impl GraphIndex {
                 .await
                 .map_err(OmniError::storage)?;
 
-            type_indices
+            builders
                 .entry(from_type.clone())
-                .or_insert_with(TypeIndex::new);
-            type_indices
+                .or_insert_with(TypeIndexBuilder::new);
+            builders
                 .entry(to_type.clone())
-                .or_insert_with(TypeIndex::new);
+                .or_insert_with(TypeIndexBuilder::new);
 
             let mut edges: Vec<(u32, u32)> = Vec::new();
             for batch in &batches {
@@ -233,14 +419,14 @@ impl GraphIndex {
                 let dsts = string_column(batch, system_columns.dst)?;
 
                 for i in 0..batch.num_rows() {
-                    let src_dense = type_indices
+                    let src_dense = builders
                         .get_mut(from_type)
                         .unwrap()
-                        .get_or_insert(srcs.value(i));
-                    let dst_dense = type_indices
+                        .get_or_insert(srcs.value(i))?;
+                    let dst_dense = builders
                         .get_mut(to_type)
                         .unwrap()
-                        .get_or_insert(dsts.value(i));
+                        .get_or_insert(dsts.value(i))?;
                     edges.push((src_dense, dst_dense));
                 }
             }
@@ -248,6 +434,10 @@ impl GraphIndex {
         }
 
         // Phase 2: Build CSR/CSC using final TypeIndex sizes
+        let type_indices: HashMap<String, TypeIndex> = builders
+            .into_iter()
+            .map(|(name, builder)| (name, builder.finish()))
+            .collect();
         let mut __dst_e2: Vec<_> = edge_types.iter().collect();
         __dst_e2.sort_by(|a, b| a.0.cmp(b.0));
         for (edge_name, (from_type, to_type)) in __dst_e2 {
@@ -382,10 +572,12 @@ mod tests {
 
     #[test]
     fn type_index_round_trip() {
-        let mut idx = TypeIndex::new();
-        let a = idx.get_or_insert("Alice");
-        let b = idx.get_or_insert("Bob");
-        let c = idx.get_or_insert("Charlie");
+        let mut builder = TypeIndexBuilder::new();
+        let a = builder.get_or_insert("Alice").unwrap();
+        let b = builder.get_or_insert("Bob").unwrap();
+        let c = builder.get_or_insert("Charlie").unwrap();
+        assert_eq!((a, b, c), (0, 1, 2), "dense ids follow first-seen order");
+        let idx = builder.finish();
 
         assert_eq!(idx.to_dense("Alice"), Some(a));
         assert_eq!(idx.to_dense("Bob"), Some(b));
@@ -395,22 +587,88 @@ mod tests {
         assert_eq!(idx.to_id(b), Some("Bob"));
         assert_eq!(idx.to_id(c), Some("Charlie"));
         assert_eq!(idx.len(), 3);
+        assert_eq!(
+            idx.ids(),
+            &StringArray::from(vec!["Alice", "Bob", "Charlie"])
+        );
     }
 
     #[test]
     fn type_index_idempotent_insert() {
-        let mut idx = TypeIndex::new();
-        let a1 = idx.get_or_insert("Alice");
-        let a2 = idx.get_or_insert("Alice");
+        let mut builder = TypeIndexBuilder::new();
+        let a1 = builder.get_or_insert("Alice").unwrap();
+        let a2 = builder.get_or_insert("Alice").unwrap();
         assert_eq!(a1, a2);
-        assert_eq!(idx.len(), 1);
+        assert_eq!(builder.finish().len(), 1);
     }
 
     #[test]
     fn type_index_unknown_returns_none() {
-        let idx = TypeIndex::new();
+        let idx = TypeIndexBuilder::new().finish();
         assert_eq!(idx.to_dense("unknown"), None);
         assert_eq!(idx.to_id(999), None);
+    }
+
+    #[test]
+    fn type_index_finds_every_id_across_table_growth() {
+        let mut builder = TypeIndexBuilder::new();
+        for i in 0..10_000u32 {
+            assert_eq!(builder.get_or_insert(&format!("node-{i}")).unwrap(), i);
+        }
+        for i in (0..10_000u32).rev() {
+            assert_eq!(builder.get_or_insert(&format!("node-{i}")).unwrap(), i);
+        }
+        let idx = builder.finish();
+        for i in 0..10_000u32 {
+            assert_eq!(idx.to_dense(&format!("node-{i}")), Some(i));
+            assert_eq!(idx.to_id(i), Some(format!("node-{i}").as_str()));
+        }
+        assert_eq!(idx.to_dense("node-10000"), None);
+        assert_eq!(idx.to_dense(""), None);
+    }
+
+    #[test]
+    fn type_index_push_unique_refuses_a_duplicate() {
+        let mut builder = TypeIndexBuilder::new();
+        builder.push_unique("Alice").unwrap();
+        builder.push_unique("").unwrap();
+        let err = builder.push_unique("Alice").unwrap_err();
+        assert!(err.to_string().contains("duplicate id 'Alice'"), "{err}");
+    }
+
+    #[test]
+    fn dense_ids_columns_match_for_both_dictionaries() {
+        let mut builder = TypeIndexBuilder::new();
+        let mut interner = IdInterner::new();
+        for id in ["a", "", "ccc", "dd"] {
+            builder.get_or_insert(id).unwrap();
+            interner.get_or_insert(id);
+        }
+        let index = builder.finish();
+        let dense = UInt32Array::from(vec![3u32, 0, 0, 1, 2]);
+        let expected: ArrayRef = Arc::new(StringArray::from(vec!["dd", "a", "a", "", "ccc"]));
+        for ids in [
+            DenseIds::Index(index.ids()),
+            DenseIds::Interned(interner.ids()),
+        ] {
+            assert_eq!(ids.len(), 4);
+            assert_eq!(ids.byte_len(2), Some(3));
+            assert_eq!(ids.byte_len(1), Some(0));
+            assert_eq!(ids.byte_len(4), None);
+            assert_eq!(&ids.column(&dense).unwrap(), &expected);
+        }
+    }
+
+    #[test]
+    fn id_interner_round_trip() {
+        let mut idx = IdInterner::new();
+        let a = idx.get_or_insert("Alice");
+        let b = idx.get_or_insert("Bob");
+        assert_eq!(idx.get_or_insert("Alice"), a);
+        assert_eq!(idx.to_dense("Bob"), Some(b));
+        assert_eq!(idx.to_id(a), Some("Alice"));
+        assert_eq!(idx.to_dense("unknown"), None);
+        assert_eq!(idx.len(), 2);
     }
 
     #[test]

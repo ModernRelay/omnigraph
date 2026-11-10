@@ -10,6 +10,7 @@ use omnigraph_planner::{ExpandCostInputs, ExpandMode, choose_expand_mode, should
 use datafusion::physical_plan::metrics::Gauge;
 
 use crate::error::missing_graph_type_at_snapshot;
+use crate::graph_index::DenseIds;
 
 use super::operators::memory::WorkMemory;
 use super::operators::{
@@ -492,26 +493,24 @@ fn source_node_key(source: usize, node: u32) -> u64 {
 
 /// The destination column of one chunk: `dense` resolved through `ids`, the
 /// dictionary of the walk's destination space, charged to `memory` first.
-fn destination_column(dense: &[u32], ids: &[String], memory: &WorkMemory) -> Result<ArrayRef> {
+fn destination_column(dense: &[u32], ids: DenseIds<'_>, memory: &WorkMemory) -> Result<ArrayRef> {
     // One pass checks every id against the dictionary and sums the bytes;
     // the column is then built straight from the dictionary.
     let mut bytes = 0usize;
     for &d in dense {
-        let id = ids.get(d as usize).ok_or_else(|| {
+        let len = ids.byte_len(d).ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "dense destination id {d} is outside its dictionary of {} ids",
                 ids.len()
             ))
         })?;
-        bytes = bytes.saturating_add(id.len());
+        bytes = bytes.saturating_add(len);
     }
     memory.string(bytes).map_err(|error| memory.error(error))?;
     memory
         .grow((dense.len() + 1).saturating_mul(std::mem::size_of::<i32>()))
         .map_err(|error| memory.error(error))?;
-    Ok(Arc::new(StringArray::from_iter_values(
-        dense.iter().map(|&d| ids[d as usize].as_str()),
-    )))
+    ids.column(&UInt32Array::from(dense.to_vec()))
 }
 
 /// The pending chunk as pairs ready to emit: its destinations resolved
@@ -521,7 +520,7 @@ fn take_pending_pairs(
     emitted_src: &mut Vec<u32>,
     emitted_dst: &mut Vec<u32>,
     emission_memory: &mut WorkMemory,
-    ids: &[String],
+    ids: DenseIds<'_>,
     memory: &WorkMemory,
     chunk_rows: usize,
 ) -> Result<ExpandedPairs> {
@@ -1265,7 +1264,7 @@ where
         Some((datasets, pushdown)) => ActiveExpandSource::Indexed(Box::new(IndexedExpandSource {
             datasets,
             pushdown,
-            interner: crate::graph_index::TypeIndex::new(),
+            interner: crate::graph_index::IdInterner::new(),
             neighbor_map: HashMap::new(),
         })),
         None => {
@@ -1394,7 +1393,7 @@ where
                         &mut emitted_src,
                         &mut emitted_dst,
                         &mut emission_memory,
-                        src.interner.ids(),
+                        DenseIds::Interned(src.interner.ids()),
                         memory,
                         chunk_rows,
                     )?;
@@ -1509,9 +1508,11 @@ where
                         adj_rev.map(|a| a.neighbors(node)).unwrap_or(&[]),
                     ),
                 };
-                let ids: &[String] = match &active {
-                    ActiveExpandSource::Indexed(src) => src.interner.ids(),
-                    ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => dst_idx.ids(),
+                let ids = match &active {
+                    ActiveExpandSource::Indexed(src) => DenseIds::Interned(src.interner.ids()),
+                    ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => {
+                        DenseIds::Index(dst_idx.ids())
+                    }
                 };
                 // Admit what this node's neighbours can add before the walk.
                 let before = memory.charged();
@@ -1572,9 +1573,9 @@ where
     let destination = if emitted_src.is_empty() {
         None
     } else {
-        let ids: &[String] = match &active {
-            ActiveExpandSource::Indexed(src) => src.interner.ids(),
-            ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => dst_idx.ids(),
+        let ids = match &active {
+            ActiveExpandSource::Indexed(src) => DenseIds::Interned(src.interner.ids()),
+            ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => DenseIds::Index(dst_idx.ids()),
         };
         Some(destination_column(&emitted_dst, ids, &emission_memory)?)
     };
@@ -1693,7 +1694,7 @@ pub(super) struct IndexedExpandSource {
     /// The known coverage verdict for the pushed key list, when the start
     /// decision judged it; `None` lets each scan probe.
     pub(super) pushdown: Option<bool>,
-    pub(super) interner: crate::graph_index::TypeIndex,
+    pub(super) interner: crate::graph_index::IdInterner,
     /// This hop's dense key -> dense neighbors (scan order; duplicates
     /// preserved, like CSR multi-edges). Rebuilt per hop.
     pub(super) neighbor_map: HashMap<u32, Vec<u32>>,
@@ -1716,7 +1717,7 @@ pub(super) async fn scan_neighbor_map(
     probes: &[EndpointColumns],
     keys: &[String],
     pushdown: Option<bool>,
-    interner: &mut crate::graph_index::TypeIndex,
+    interner: &mut crate::graph_index::IdInterner,
     neighbor_map: &mut HashMap<u32, Vec<u32>>,
     hop_memory: &WorkMemory,
     memory: &WorkMemory,
@@ -1753,7 +1754,7 @@ fn utf8_column<'b>(batch: &'b RecordBatch, name: &str) -> Result<&'b StringArray
 }
 
 pub(super) fn intern(
-    index: &mut crate::graph_index::TypeIndex,
+    index: &mut crate::graph_index::IdInterner,
     value: &str,
     memory: &WorkMemory,
 ) -> Result<u32> {

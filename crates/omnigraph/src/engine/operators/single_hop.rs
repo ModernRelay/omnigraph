@@ -21,7 +21,7 @@ use crate::engine::graph::{
     endpoint_probes, intern, resolve_csr, scan_neighbor_map,
 };
 use crate::error::OmniError;
-use crate::graph_index::{CsrIndex, TypeIndex};
+use crate::graph_index::{CsrIndex, DenseIds, IdInterner};
 
 /// The per-batch body of a named one hop: the first non-empty input batch
 /// decides the start mode, then every batch is walked in bounded slices,
@@ -247,12 +247,12 @@ impl SingleHop {
                 &neighbours,
                 &mut cursor,
                 &row_bytes,
-                ids.as_slice(),
+                ids.as_dense_ids(),
                 memory.batch_bytes(),
             );
             started
                 .walk
-                .flush(&batch, ids.as_slice(), memory, sender, schema)
+                .flush(&batch, ids.as_dense_ids(), memory, sender, schema)
                 .await?;
             match stop {
                 Stop::Full => {}
@@ -331,7 +331,7 @@ impl<'g> Source<'g> {
                 walk.size_stamps(csr.dst_idx.len(), walk_memory)?;
                 Ok((
                     src_dense,
-                    DestinationIds::Borrowed(csr.dst_idx.ids()),
+                    DestinationIds::Borrowed(DenseIds::Index(csr.dst_idx.ids())),
                     Neighbours::Csr {
                         adj: csr.adj,
                         adj_rev: csr.adj_rev,
@@ -339,7 +339,7 @@ impl<'g> Source<'g> {
                 ))
             }
             Self::Indexed { edge_ds, pushdown } => {
-                let mut interner = TypeIndex::new();
+                let mut interner = IdInterner::new();
                 let src_dense = (0..src_ids.len())
                     .map(|row| intern(&mut interner, src_ids.value(row), hop_memory).map(Some))
                     .collect::<crate::error::Result<Vec<_>>>()
@@ -372,15 +372,15 @@ impl<'g> Source<'g> {
 }
 
 enum DestinationIds<'g> {
-    Borrowed(&'g [String]),
-    Owned(TypeIndex),
+    Borrowed(DenseIds<'g>),
+    Owned(IdInterner),
 }
 
 impl DestinationIds<'_> {
-    fn as_slice(&self) -> &[String] {
+    fn as_dense_ids(&self) -> DenseIds<'_> {
         match self {
-            Self::Borrowed(ids) => ids,
-            Self::Owned(index) => index.ids(),
+            Self::Borrowed(ids) => *ids,
+            Self::Owned(interner) => DenseIds::Interned(interner.ids()),
         }
     }
 }
@@ -442,7 +442,7 @@ impl Walk {
         neighbours: &Neighbours<'_>,
         cursor: &mut Cursor,
         row_bytes: &[usize],
-        ids: &[String],
+        ids: DenseIds<'_>,
         byte_limit: usize,
     ) -> Stop {
         let mut bytes = 0usize;
@@ -463,7 +463,10 @@ impl Walk {
                     continue;
                 }
                 let row_size = row_bytes[cursor.row]
-                    .saturating_add(ids[neighbour as usize].len())
+                    .saturating_add(
+                        ids.byte_len(neighbour)
+                            .expect("a neighbour lies inside its destination dictionary"),
+                    )
                     .saturating_add(16);
                 if !self.ordinals.is_empty() && bytes.saturating_add(row_size) > byte_limit {
                     return Stop::Full;
@@ -486,7 +489,7 @@ impl Walk {
     async fn flush(
         &mut self,
         batch: &RecordBatch,
-        ids: &[String],
+        ids: DenseIds<'_>,
         memory: &Arc<WorkMemory>,
         sender: &BatchSender,
         schema: &SchemaRef,
@@ -508,15 +511,14 @@ impl Walk {
         let bytes = dst
             .values()
             .iter()
-            .map(|&dense| ids[dense as usize].len())
+            .map(|&dense| {
+                ids.byte_len(dense)
+                    .expect("a destination lies inside its dictionary")
+            })
             .sum::<usize>();
         work.string(bytes)?;
         work.grow((rows + 1).saturating_mul(std::mem::size_of::<i32>()))?;
-        let destination = Arc::new(StringArray::from_iter_values(
-            dst.values()
-                .iter()
-                .map(|&dense| ids[dense as usize].as_str()),
-        ));
+        let destination = ids.column(&dst).map_err(external)?;
         let output = align_sources(batch, &ordinals, destination, &[], schema, &work)?;
         sender.send_bounded(output, work).await
     }

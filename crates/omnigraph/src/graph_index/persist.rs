@@ -57,6 +57,7 @@
 
 use std::collections::HashMap;
 
+use arrow_array::Array as _;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
@@ -65,7 +66,7 @@ use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
 
-use super::{CsrIndex, GraphIndex, TypeIndex};
+use super::{CsrIndex, GraphIndex, TypeIndex, TypeIndexBuilder};
 
 const MAGIC: &[u8; 8] = b"OGCSRIDX";
 
@@ -276,7 +277,8 @@ fn serialize(index: &GraphIndex, tables: Vec<TableStamp>) -> Result<Vec<u8>> {
         push_prelude(&mut payload, SECTION_DICT, name, None);
         let ids = types[*name].ids();
         let before = payload.len();
-        for id in ids {
+        for dense in 0..ids.len() {
+            let id = ids.value(dense);
             payload.extend_from_slice(&(id.len() as u32).to_le_bytes());
             payload.extend_from_slice(id.as_bytes());
         }
@@ -468,12 +470,14 @@ fn decode_body(header: &Header, payload: &[u8]) -> Result<GraphIndex> {
         }
         let section = take(payload, &mut cursor, dict.len)?;
         // Every id costs at least its 4-byte length prefix, so the section
-        // bounds the possible id count regardless of what `count` claims.
+        // bounds the possible id count regardless of what `count` claims,
+        // and the id bytes regardless of how they split.
         let capacity_ceiling = section.len() / 4;
-        let mut ids = Vec::with_capacity(
+        let mut ids = TypeIndexBuilder::with_capacity(
             usize::try_from(dict.count)
                 .unwrap_or(0)
                 .min(capacity_ceiling),
+            section.len(),
         );
         let mut d = 0usize;
         while d < section.len() {
@@ -494,7 +498,7 @@ fn decode_body(header: &Header, payload: &[u8]) -> Result<GraphIndex> {
             let id = std::str::from_utf8(&section[d..id_end]).map_err(|_| {
                 OmniError::manifest("graph index artifact dictionary id is not UTF-8".to_string())
             })?;
-            ids.push(id.to_string());
+            ids.push_unique(id)?;
             d = id_end;
         }
         if ids.len() as u64 != dict.count {
@@ -503,7 +507,7 @@ fn decode_body(header: &Header, payload: &[u8]) -> Result<GraphIndex> {
                 dict.type_name
             )));
         }
-        type_indices.insert(dict.type_name.clone(), TypeIndex::from_ids(ids)?);
+        type_indices.insert(dict.type_name.clone(), ids.finish());
     }
 
     let dict_len = |type_name: &str| -> Result<usize> {
