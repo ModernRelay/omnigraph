@@ -61,13 +61,18 @@ const HYDRATION_SCAN_BATCH_ROWS: usize = 1024;
 pub(crate) const HYDRATION_SCAN_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 
 pub(crate) fn row_id_at(batch: &RecordBatch, row: usize, id_col: &str) -> Result<String> {
+    row_id_ref(batch, row, id_col).map(str::to_string)
+}
+
+/// The id of `row` borrowed from `batch`, for a comparison that keeps no copy.
+pub(crate) fn row_id_ref<'a>(batch: &'a RecordBatch, row: usize, id_col: &str) -> Result<&'a str> {
     let ids = batch
         .column_by_name(id_col)
         .ok_or_else(|| OmniError::manifest(format!("batch missing '{id_col}' column")))?
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| OmniError::manifest(format!("'{id_col}' column is not Utf8")))?;
-    Ok(ids.value(row).to_string())
+    Ok(ids.value(row))
 }
 
 /// The key filter of an ordered walk: a SQL predicate or a structured one.
@@ -321,7 +326,9 @@ impl OrderedRowCursor {
 
     /// The rest of the current hydrated chunk, or the next one, as a single
     /// batch in key order. For a caller that consumes rows in bulk; it copies
-    /// at most one chunk (the hard retained ceiling).
+    /// at most one chunk (the hard retained ceiling), once: the rows are
+    /// interleaved straight from the hydrated batches, so the chunk and its
+    /// ordered copy are the only two resident.
     pub(crate) async fn next_ordered_batch(&mut self) -> Result<Option<RecordBatch>> {
         if !self.fill().await? {
             return Ok(None);
@@ -332,21 +339,8 @@ impl OrderedRowCursor {
             .expect("fill leaves a chunk with rows remaining");
         let order = &chunk.order[self.hydrated_pos..];
         self.hydrated_pos = 0;
-        let mut offsets = Vec::with_capacity(chunk.batches.len());
-        let mut total = 0u64;
-        for batch in &chunk.batches {
-            offsets.push(total);
-            total += batch.num_rows() as u64;
-        }
-        let indices = UInt64Array::from_iter_values(
-            order
-                .iter()
-                .map(|(batch, row)| offsets[*batch] + *row as u64),
-        );
-        let schema = chunk.batches[0].schema();
-        let all = arrow_select::concat::concat_batches(&schema, &chunk.batches)
-            .map_err(OmniError::arrow_internal)?;
-        let ordered = arrow_select::take::take_record_batch(&all, &indices)
+        let batches: Vec<&RecordBatch> = chunk.batches.iter().collect();
+        let ordered = arrow_select::interleave::interleave_record_batch(&batches, order)
             .map_err(OmniError::arrow_internal)?;
         Ok(Some(ordered))
     }
@@ -582,8 +576,8 @@ impl OrderedRowCursor {
             let &(batch_index, row) = by_address
                 .get(address)
                 .ok_or_else(|| self.hydration_internal("is missing a requested row"))?;
-            if row_id_at(&batches[batch_index], row, self.id_col)?
-                != row_id_at(keys, start + offset, self.id_col)?
+            if row_id_ref(&batches[batch_index], row, self.id_col)?
+                != row_id_ref(keys, start + offset, self.id_col)?
             {
                 return Err(self.hydration_internal("returned a row out of key order"));
             }

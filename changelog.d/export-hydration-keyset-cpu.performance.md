@@ -1,0 +1,1 @@
+- Export copies each ordered chunk once instead of twice, and correlated blocks, bound edge traversals and column hydration spend less CPU. Results are unchanged.

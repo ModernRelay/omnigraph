@@ -127,7 +127,7 @@ impl DisplayAs for HashJoinExec {
 
 /// The seed of the join's hash function: fixed, so a build hashes the same
 /// way on every run.
-const HASH_SEED: u64 = 0x6f6d_6e69_6a6f_696e;
+pub(super) const HASH_SEED: u64 = 0x6f6d_6e69_6a6f_696e;
 
 /// The drained build side: its rows and, per distinct non-null id, the first
 /// row holding it, as `(hash, row)` entries in a table that borrows nothing
