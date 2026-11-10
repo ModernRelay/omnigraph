@@ -156,8 +156,10 @@ fn check_expr(expr: &IRExpr, introduced: &HashSet<String>) -> Result<()> {
             IRExpr::Aggregate { arg, .. }
             | IRExpr::Not(arg, _)
             | IRExpr::IsNull { expr: arg, .. }
+            | IRExpr::Neg { expr: arg, .. }
             | IRExpr::Cast { expr: arg, .. } => pending.push(arg),
             IRExpr::Binary { left, right, .. } => pending.extend([left.as_ref(), right.as_ref()]),
+            IRExpr::Call { args, .. } => pending.extend(args),
             IRExpr::Param(_, _) | IRExpr::Literal(_, _) | IRExpr::AliasRef(_, _) => {}
         }
     }

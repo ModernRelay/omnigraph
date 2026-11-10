@@ -884,11 +884,17 @@ pub(super) fn validate_plan_values(
                 }
                 | IRExpr::Not(arg, _)
                 | IRExpr::Cast { expr: arg, ty: _ }
+                | IRExpr::Neg { expr: arg, ty: _ }
                 | IRExpr::IsNull {
                     expr: arg,
                     negated: _,
                     ty: _,
                 } => pending.push(arg),
+                IRExpr::Call {
+                    func: _,
+                    args,
+                    ty: _,
+                } => pending.extend(args),
                 IRExpr::Binary {
                     left,
                     op: _,

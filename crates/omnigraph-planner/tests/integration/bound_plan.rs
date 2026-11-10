@@ -725,6 +725,30 @@ fn expression_mirror_preserves_every_typed_interior_and_nested_cast() {
             },
         });
     }
+    let age = || IRExpr::Param("age".into(), value_type(ScalarType::I64, true));
+    let sum = IRExpr::binary(
+        age(),
+        omnigraph_compiler::query::ast::BinaryOp::Arith(
+            omnigraph_compiler::query::syntax::ArithOp::Rem,
+        ),
+        age(),
+    );
+    expressions.push(IRExpr::Neg {
+        ty: sum.ty().clone(),
+        expr: Box::new(sum),
+    });
+    for func in [
+        omnigraph_compiler::ir::expr::ScalarFunc::Coalesce,
+        omnigraph_compiler::ir::expr::ScalarFunc::MatchTerms {
+            mode: omnigraph_compiler::ir::expr::TermsMode::All,
+        },
+    ] {
+        expressions.push(IRExpr::Call {
+            func,
+            args: vec![age(), text()],
+            ty: value_type(ScalarType::I64, true),
+        });
+    }
     for expression in expressions {
         let mirror = ExprMirror::from(&expression);
         let encoded = serde_json::to_vec(&mirror).unwrap();

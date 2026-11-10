@@ -36,6 +36,7 @@ use crate::instrumentation::{
 use crate::runtime_cache::CompiledQuery;
 
 mod adapters;
+mod arith;
 mod bind;
 pub(crate) mod catalogue;
 mod constant;

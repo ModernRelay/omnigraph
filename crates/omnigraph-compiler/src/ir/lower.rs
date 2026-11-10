@@ -882,6 +882,7 @@ fn rename_inner_bindings<'a>(
                 negated: _,
                 ty: _,
             }
+            | IRExpr::Neg { expr: arg, ty: _ }
             | IRExpr::Cast { expr: arg, ty: _ } => expressions.push(arg),
             IRExpr::Binary {
                 left,
@@ -889,6 +890,11 @@ fn rename_inner_bindings<'a>(
                 right,
                 ty: _,
             } => expressions.extend([left.as_mut(), right.as_mut()]),
+            IRExpr::Call {
+                func: _,
+                args,
+                ty: _,
+            } => expressions.extend(args.iter_mut()),
             IRExpr::Literal(_, _) | IRExpr::Param(_, _) | IRExpr::AliasRef(_, _) => {}
         }
     }

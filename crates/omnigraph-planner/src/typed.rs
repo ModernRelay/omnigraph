@@ -55,12 +55,15 @@ pub(crate) fn expr(root: &IRExpr) -> Value {
                             BinaryOp::And => "and",
                             BinaryOp::Or => "or",
                             BinaryOp::Compare(_) => "compare",
+                            BinaryOp::Arith(_) => "arith",
                         },
                         vec![left, right],
                     ),
                     IRExpr::Not(inner, _) => ("not", vec![inner]),
                     IRExpr::IsNull { expr, .. } => ("is_null", vec![expr]),
                     IRExpr::Cast { expr, .. } => ("cast", vec![expr]),
+                    IRExpr::Neg { expr, .. } => ("neg", vec![expr]),
+                    IRExpr::Call { func, args, .. } => (func.name(), args.iter().collect()),
                 };
 
                 pending.push(Step::Finish(expr, op, children.len()));

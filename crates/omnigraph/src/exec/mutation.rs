@@ -482,9 +482,10 @@ fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a st
         IRExpr::Binary { left, right, .. } => {
             first_unbound_param(left, params).or_else(|| first_unbound_param(right, params))
         }
-        IRExpr::Not(inner, _) | IRExpr::Cast { expr: inner, .. } => {
-            first_unbound_param(inner, params)
-        }
+        IRExpr::Not(inner, _)
+        | IRExpr::Cast { expr: inner, .. }
+        | IRExpr::Neg { expr: inner, .. } => first_unbound_param(inner, params),
+        IRExpr::Call { args, .. } => args.iter().find_map(|arg| first_unbound_param(arg, params)),
         IRExpr::IsNull { expr, .. } => first_unbound_param(expr, params),
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }

@@ -699,6 +699,8 @@ pub enum BinaryOp {
     Compare(CompOp),
     And,
     Or,
+    /// `+ - * / %` over one numeric type; the result has the operands' type.
+    Arith(super::syntax::ArithOp),
 }
 
 impl std::fmt::Display for BinaryOp {
@@ -707,6 +709,7 @@ impl std::fmt::Display for BinaryOp {
             Self::Compare(op) => write!(f, "{op}"),
             Self::And => f.write_str("and"),
             Self::Or => f.write_str("or"),
+            Self::Arith(op) => f.write_str(op.symbol()),
         }
     }
 }
@@ -864,6 +867,9 @@ pub(crate) enum Precedence {
     And,
     Not,
     Comparison,
+    Sum,
+    Product,
+    Negation,
     Atom,
 }
 

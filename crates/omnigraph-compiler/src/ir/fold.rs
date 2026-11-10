@@ -15,6 +15,7 @@ use crate::types::{ExprType, PropType, ScalarType};
 /// `left <op> right`, folded when both operands are literals.
 pub(super) fn binary(left: IRExpr, op: BinaryOp, right: IRExpr) -> IRExpr {
     if let (IRExpr::Literal(l, _), IRExpr::Literal(r, _)) = (&left, &right)
+        && !matches!(op, BinaryOp::Arith(_))
         && let Some(value) = evaluate(op, l, r)
     {
         return IRExpr::Literal(
@@ -62,6 +63,8 @@ pub fn evaluate(op: BinaryOp, left: &Literal, right: &Literal) -> Option<Literal
         BinaryOp::And => kleene(left, right, false),
         BinaryOp::Or => kleene(left, right, true),
         BinaryOp::Compare(op) => compare(op, left, right),
+        // Arithmetic can refuse a row; its failure keeps its place (A3).
+        BinaryOp::Arith(_) => None,
     }
 }
 

@@ -248,7 +248,7 @@ pub enum BlockFunc {
     Exists,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArithOp {
     Add,
     Sub,

@@ -265,6 +265,8 @@ pub(super) fn boolean(expr: IRExpr) -> IRExpr {
 pub fn binary(left: IRExpr, op: BinaryOp, right: IRExpr) -> Result<IRExpr> {
     let (left, op, right) = match op {
         BinaryOp::And | BinaryOp::Or => (boolean(left), op, boolean(right)),
+        // The checker widens arithmetic operands with explicit casts.
+        BinaryOp::Arith(_) => (left, op, right),
         BinaryOp::Compare(op) => {
             let op = resolved_operator(op, left.ty(), literal(&left), right.ty());
             let (lt, rt) =

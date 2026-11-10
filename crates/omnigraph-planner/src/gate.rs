@@ -267,7 +267,13 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
         }
         IRExpr::Not(inner, _)
         | IRExpr::IsNull { expr: inner, .. }
+        | IRExpr::Neg { expr: inner, .. }
         | IRExpr::Cast { expr: inner, .. } => params_of_expr(inner, out),
+        IRExpr::Call { args, .. } => {
+            for arg in args {
+                params_of_expr(arg, out);
+            }
+        }
         IRExpr::PropAccess { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Literal(_, _)

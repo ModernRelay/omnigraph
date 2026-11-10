@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use omnigraph_compiler::ir::expr::ScalarFunc;
 use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR, is_fresh_variable};
 use omnigraph_compiler::query::ast::{AggFunc, LoadStmtMode};
 use omnigraph_compiler::query::codes::{P002, P004};
@@ -359,8 +360,26 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
                 calls(left, types, out);
                 calls(right, types, out);
             }
+            IRExpr::Call {
+                func: ScalarFunc::MatchTerms { .. },
+                args,
+                ..
+            } => {
+                if let Some(IRExpr::PropAccess {
+                    variable, property, ..
+                }) = args.first()
+                    && let Some(type_name) = types.get(variable)
+                {
+                    let target = (type_name.clone(), property.clone());
+                    if !out.contains(&target) {
+                        out.push(target);
+                    }
+                }
+            }
+            IRExpr::Call { args, .. } => args.iter().for_each(|arg| calls(arg, types, out)),
             IRExpr::Not(inner, _)
             | IRExpr::Cast { expr: inner, .. }
+            | IRExpr::Neg { expr: inner, .. }
             | IRExpr::IsNull { expr: inner, .. } => calls(inner, types, out),
             IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
@@ -1214,7 +1233,9 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
         }
         IRExpr::Not(inner, _)
         | IRExpr::IsNull { expr: inner, .. }
+        | IRExpr::Neg { expr: inner, .. }
         | IRExpr::Cast { expr: inner, .. } => reads_of_expr(inner, out),
+        IRExpr::Call { args, .. } => args.iter().for_each(|arg| reads_of_expr(arg, out)),
         IRExpr::PropAccess {
             variable,
             property,

@@ -7,7 +7,7 @@ use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use datafusion::scalar::ScalarValue;
 use omnigraph_compiler::ir::{IRExpr, IROp, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::ast::{BinaryOp, Literal};
 use omnigraph_compiler::types::{ExprType, ScalarType};
 
 use crate::error::{OmniError, Result};
@@ -61,7 +61,9 @@ pub(crate) fn evaluate_constant(expr: &IRExpr, params: &ParamMap) -> Result<Lite
             | IRExpr::Binary { .. }
             | IRExpr::Not(_, _)
             | IRExpr::Cast { .. }
-            | IRExpr::IsNull { .. } => {
+            | IRExpr::IsNull { .. }
+            | IRExpr::Neg { .. }
+            | IRExpr::Call { .. } => {
                 return Err(OmniError::manifest_internal(
                     "Blob constant is not a URI leaf",
                 ));
@@ -193,6 +195,18 @@ fn fold_expr(expr: &IRExpr, params: &ParamMap) -> Result<IRExpr> {
             expr: Box::new(fold_expr(expr, params)?),
             ty: ty.clone(),
         },
+        IRExpr::Neg { expr, ty } => IRExpr::Neg {
+            expr: Box::new(fold_expr(expr, params)?),
+            ty: ty.clone(),
+        },
+        IRExpr::Call { func, args, ty } => IRExpr::Call {
+            func: *func,
+            args: args
+                .iter()
+                .map(|arg| fold_expr(arg, params))
+                .collect::<Result<_>>()?,
+            ty: ty.clone(),
+        },
         IRExpr::PropAccess { .. }
         | IRExpr::Nearest { .. }
         | IRExpr::Search { .. }
@@ -208,9 +222,19 @@ fn fold_expr(expr: &IRExpr, params: &ParamMap) -> Result<IRExpr> {
     })
 }
 
+/// Whether `expr` reads no row. Arithmetic is never folded early: an
+/// overflow or a zero divisor refuses the row it was written for, and a
+/// filter above may exclude every row (A3); registry calls are evaluated
+/// per batch like any other operator.
 pub(super) fn is_constant(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::Literal(_, _) | IRExpr::Param(_, _) => true,
+        IRExpr::Binary {
+            op: BinaryOp::Arith(_),
+            ..
+        }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. } => false,
         IRExpr::Binary { left, right, .. } => is_constant(left) && is_constant(right),
         IRExpr::Not(inner, _) => is_constant(inner),
         IRExpr::IsNull { expr, .. } | IRExpr::Cast { expr, .. } => is_constant(expr),
@@ -232,7 +256,7 @@ mod tests {
     use super::*;
     use arrow_array::{Array, Decimal128Array, Float64Array, ListArray};
     use arrow_schema::{DataType, Field};
-    use omnigraph_compiler::query::ast::{BinaryOp, CompOp};
+    use omnigraph_compiler::query::ast::CompOp;
     use omnigraph_compiler::types::PropType;
 
     fn scalar(kind: ScalarType, nullable: bool) -> ExprType {

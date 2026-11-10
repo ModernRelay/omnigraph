@@ -656,6 +656,8 @@ fn search_filter_is_ranking(
             | IRExpr::Binary { .. }
             | IRExpr::Not(_, _)
             | IRExpr::Cast { .. }
+            | IRExpr::Neg { .. }
+            | IRExpr::Call { .. }
             | IRExpr::IsNull { .. },
         )
         | None => false,
@@ -980,6 +982,8 @@ pub(super) fn build_fts_query(
         | IRExpr::Binary { .. }
         | IRExpr::Not(_, _)
         | IRExpr::Cast { .. }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. }
         | IRExpr::IsNull { .. } => return Ok(None),
     };
     query
@@ -1006,6 +1010,8 @@ pub(super) fn extract_property(expr: &IRExpr) -> Option<String> {
         | IRExpr::Binary { .. }
         | IRExpr::Not(_, _)
         | IRExpr::Cast { .. }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. }
         | IRExpr::IsNull { .. } => None,
     }
 }
@@ -1312,6 +1318,14 @@ fn typed_expr_to_df_expr(expr: &IRExpr, params: &ParamMap) -> Option<datafusion:
         | IRExpr::Variable(_, _)
         | IRExpr::Aggregate { .. }
         | IRExpr::AliasRef(_, _) => None,
+        // Arithmetic and registry calls stay in memory: a pushed term would
+        // trade the typed refusal of an overflow for the scanner's semantics.
+        IRExpr::Binary {
+            op: BinaryOp::Arith(_),
+            ..
+        }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. } => None,
     }
 }
 

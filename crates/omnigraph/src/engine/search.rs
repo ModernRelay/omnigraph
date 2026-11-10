@@ -771,6 +771,8 @@ pub(super) fn search_call(filter: &IRExpr) -> Option<&IRExpr> {
         | IRExpr::Binary { .. }
         | IRExpr::Not(_, _)
         | IRExpr::Cast { .. }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. }
         | IRExpr::IsNull { .. } => None,
     }
 }

@@ -1111,6 +1111,8 @@ impl Lower for Walk<'_, '_> {
                     | IRExpr::Binary { .. }
                     | IRExpr::Not(_, _)
                     | IRExpr::Cast { .. }
+                    | IRExpr::Neg { .. }
+                    | IRExpr::Call { .. }
                     | IRExpr::IsNull { .. },
                     Some(_),
                 ) => {
@@ -1134,6 +1136,8 @@ impl Lower for Walk<'_, '_> {
                     | IRExpr::Binary { .. }
                     | IRExpr::Not(_, _)
                     | IRExpr::Cast { .. }
+                    | IRExpr::Neg { .. }
+                    | IRExpr::Call { .. }
                     | IRExpr::IsNull { .. },
                     None,
                 ) => {
@@ -1213,6 +1217,8 @@ impl Lower for Walk<'_, '_> {
                 | IRExpr::Binary { .. }
                 | IRExpr::Not(_, _)
                 | IRExpr::Cast { .. }
+                | IRExpr::Neg { .. }
+                | IRExpr::Call { .. }
                 | IRExpr::IsNull { .. } => {
                     return Err(OmniError::manifest_internal(
                         "the planned sort key is not a property or an alias".to_string(),
@@ -1408,6 +1414,8 @@ fn aggregate_argument(
         | IRExpr::Binary { .. }
         | IRExpr::Not(_, _)
         | IRExpr::Cast { .. }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. }
         | IRExpr::IsNull { .. } => Projected::Expression(arg.clone(), ty.clone()),
     }
 }
@@ -1458,6 +1466,8 @@ fn hidden_columns(
             | IRExpr::Binary { .. }
             | IRExpr::Not(_, _)
             | IRExpr::Cast { .. }
+            | IRExpr::Neg { .. }
+            | IRExpr::Call { .. }
             | IRExpr::IsNull { .. } => {
                 return Err(OmniError::manifest_internal(
                     "the planned sort key is not a property or an alias".to_string(),

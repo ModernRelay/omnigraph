@@ -1,7 +1,7 @@
 //! The catalog of query compile diagnostic codes (RFC 0047). A code is
 //! stable once published: its meaning is frozen, its message text may
 //! improve. `Q…` codes are the parser's, `T…` codes the typechecker's, `P…`
-//! codes the planner's; the
+//! codes the planner's, `E…` codes a row refused while the query ran; the
 //! numbering has gaps where earlier stages were withdrawn, and a withdrawn
 //! number is never reused.
 
@@ -118,6 +118,12 @@ codes! {
     P003 = "the traversal work limit is out of range or recorded twice";
     P004 = "an edge alternation or wildcard traversal cannot run in CSR traversal mode";
     P006 = "an edition-3 core node the planner does not lower yet";
+
+    // Execution (docs/rfcs/2026-11-07-gq-3.md section 10): an arithmetic
+    // term refused a row; the failure keeps its place in the plan.
+    E1 = "integer arithmetic overflowed its type";
+    E2 = "a divisor is zero";
+    E3 = "a float result is not finite";
 }
 
 #[cfg(test)]
@@ -132,7 +138,7 @@ mod tests {
             assert!(seen.insert(code.as_str()), "duplicate code {code}");
             let (prefix, number) = code.as_str().split_at(1);
             assert!(
-                matches!(prefix, "Q" | "T" | "P"),
+                matches!(prefix, "Q" | "T" | "P" | "E"),
                 "{code}: unknown namespace"
             );
             assert!(
