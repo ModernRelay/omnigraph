@@ -1,1 +1,1 @@
-- A graph index keeps each node id once, in one Arrow array, and looks ids up through it with a faster hash. Traversals over the built index find their start ids and build destination columns with less work, and building or loading the index allocates far less: a loaded dictionary of 100,000 ids holds about 50 bytes per id instead of about 140. Results are unchanged.
+- The graph index keeps each node id once, in one Arrow array: traversals look ids up faster, and building or loading the index uses less time and memory. Results are unchanged.
