@@ -77,10 +77,13 @@ async fn server_opens_object_store_graph_directly_and_serves_snapshot_and_read(u
     .await
     .unwrap();
 
+    // The graph carries no policy; the token reads it through the operator
+    // opt-in.
     let app = build_app(
         AppState::open_with_bearer_token(uri.clone(), Some("object-store-token".to_string()))
             .await
-            .unwrap(),
+            .unwrap()
+            .with_reads_without_policy(true),
     );
 
     let (snapshot_status, snapshot_body) = json_response(
