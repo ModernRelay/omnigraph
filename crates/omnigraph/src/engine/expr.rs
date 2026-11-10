@@ -522,3 +522,70 @@ pub(super) fn identity_column(
     })?;
     Ok((variable.to_string(), col.clone()))
 }
+
+#[cfg(test)]
+mod pre_selection_tests {
+    use super::*;
+    use arrow_array::{Float32Array, Int64Array};
+    use omnigraph_compiler::types::{ExprType, PropType};
+
+    fn ty(scalar: ScalarType, nullable: bool) -> ExprType {
+        ExprType::from_prop(&PropType::scalar(scalar, nullable))
+    }
+
+    fn prop(property: &str, scalar: ScalarType) -> IRExpr {
+        IRExpr::PropAccess {
+            variable: "a".to_string(),
+            property: property.to_string(),
+            ty: ty(scalar, true),
+        }
+    }
+
+    fn compare(left: IRExpr, op: CompOp, right: i64) -> IRExpr {
+        IRExpr::comparison(
+            left,
+            op,
+            IRExpr::Literal(Literal::Integer(right.into()), ty(ScalarType::I64, false)),
+        )
+    }
+
+    /// The right operand of `and` runs only on the rows the left one kept:
+    /// a row the left one removed cannot fail the right one. The F32 column
+    /// holds an infinity (which no write stores) only on a removed row, so
+    /// the cast to F64 that the comparison records fails there and only
+    /// there. On main both operands ran over every row and the filter failed.
+    #[test]
+    fn and_skips_the_rows_its_left_operand_removed_issue_1336() {
+        let rows = 100;
+        let keep = Int64Array::from_iter_values((0..rows).map(|row| row % 10));
+        let measure = Float32Array::from_iter_values(
+            (0..rows).map(|row| if row == 1 { f32::INFINITY } else { row as f32 }),
+        );
+        let schema = Schema::new(vec![
+            Field::new("a.keep", DataType::Int64, true),
+            Field::new("a.measure", DataType::Float32, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(keep) as ArrayRef, Arc::new(measure) as ArrayRef],
+        )
+        .unwrap();
+        let widened = IRExpr::Cast {
+            expr: Box::new(prop("measure", ScalarType::F32)),
+            ty: ty(ScalarType::F64, true),
+        };
+        let threshold = IRExpr::Literal(Literal::Float(25.0), ty(ScalarType::F64, false));
+        let expensive = IRExpr::comparison(widened, CompOp::Gt, threshold);
+        assert!(
+            evaluate_filter(&batch, &expensive, &ParamMap::new()).is_err(),
+            "the infinite row fails the cast when it is evaluated"
+        );
+        let cheap = compare(prop("keep", ScalarType::I64), CompOp::Eq, 0);
+        let filter = IRExpr::binary(cheap, BinaryOp::And, expensive);
+
+        let mask = evaluate_filter(&batch, &filter, &ParamMap::new()).unwrap();
+        let kept: Vec<usize> = (0..rows as usize).filter(|&row| mask.value(row)).collect();
+        assert_eq!(kept, vec![30, 40, 50, 60, 70, 80, 90]);
+        assert_eq!(mask.null_count(), 0);
+    }
+}
