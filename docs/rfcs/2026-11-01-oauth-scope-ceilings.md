@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - Ragnor Comerford
 created: 2026-11-01
-updated: 2026-11-03
+updated: 2026-11-09
 discussion: https://github.com/ModernRelay/omnigraph/pull/1224
 supersedes: []
 superseded_by: []
@@ -143,7 +143,7 @@ implementation renames or namespaces it so the two never share a word.
 |---|---|
 | `graph.read` | `read`, `invoke_query`, `export` |
 | `graph.write` | `change`, `branch_create`, `branch_delete`, `branch_merge`, `commit_publish`, `commit_drop` |
-| `graph.write.unprotected` | the `graph.write` actions, only where the branch acted on is not a protected branch |
+| `graph.write.unprotected` | the `graph.write` actions, only where the request names the branch acted on and that branch is not a protected branch |
 | `graph.schema` | `schema_apply` |
 | `graph.admin` | `admin` |
 | `cluster.list` | `graph_list` |
@@ -197,7 +197,23 @@ client ceiling needs no such distinction.
 
 A policy action added later belongs to no scope until the vocabulary version
 that names it, so a ceilinged token can never perform it. This is the
-fail-closed direction.
+fail-closed direction. Two such actions are already in flight, and their
+place is decided here so that the vocabulary grows by decision rather than
+by whichever change fixes the failing vocabulary test:
+
+- `maintain` (#1175, #1282; required by the accepted remote-optimize RFC on
+  every optimize route) gets its own name, `graph.maintain`, in the
+  vocabulary version that ships the action. It stays apart from
+  `graph.admin`, because that RFC keeps `admin` from implying `maintain`.
+  The action is judged by the `branch` slot, so a person's own grant can
+  already be `branch_scope: unprotected`; the scope adds no branch limit of
+  its own.
+- `reclaim` (the same change) is excluded, recorded in the vocabulary test's
+  exclusion list with this RFC as the reason: it permanently deletes table
+  versions, and no client should hold it through a delegated token.
+
+Until an action is named, a request for it under any ceiling is refused as
+described under "Refusal shape", with no `scope` to offer.
 
 A scope names a kind of action, not a graph. `graph.read` lets the client
 read on every graph of the cluster where applied policy lets the person read;
@@ -275,9 +291,12 @@ policy decision:
    `forbidden` or hidden as 404 exactly where it is today.
 2. If policy allows and the actor's token has a ceiling, the requested policy
    action must be in it. A write action covered only by
-   `graph.write.unprotected` is in the ceiling only when the branch in the
-   slot the request is judged by is not protected in the applied bundle. A
-   miss is the third outcome, answered 403 `insufficient_scope`.
+   `graph.write.unprotected` is in the ceiling only when the slot the request
+   is judged by is present and names a branch that is not protected in the
+   applied bundle: the condition policy already evaluates for
+   `branch_scope: unprotected` and `target_branch_scope: unprotected`. An
+   empty slot fails it. A miss is the third outcome, answered 403
+   `insufficient_scope`.
 
 The second step sees the same `PolicyRequest` the first did, branch and target
 branch included, and asks the same `PolicyEngine` whether the judged branch
@@ -305,11 +324,13 @@ the grant cannot learn whether the query or commit exists. A ceiling miss is
 reached only after policy confirmed that the actor holds the grant, so on
 every one of those routes it is answered 403 `insufficient_scope`: the
 client learns only that its own user may act there, which that user reads
-from `/access` anyway. Two read paths fold a per-branch decision into their
-result: the readable diff answers "not found" for a side the caller cannot
-read, and the detailed branch list omits such a branch. A ceiling miss is
-not a per-branch fact, so both refuse the whole request with 403 before
-that mapping.
+from `/access` anyway. The readable diff folds a per-branch decision into
+its result: it answers "not found" for a side the caller cannot read. A
+ceiling miss is not a per-branch fact, so it refuses the whole request with
+403 before that mapping. The detailed branch list needs no such rule: it
+checks a scope-free `read` first, which a ceiling without `graph.read`
+already refuses with 403, and the per-branch filter that follows hides only
+the details of a branch, never its name.
 
 Policy goes first so `insufficient_scope` is only ever returned for an action
 the person could perform with a wider scope. A client that receives it may ask
@@ -348,10 +369,14 @@ the deployment caller, and `check_cluster` and `check_graph` apply it after
 their policy check, in the same order as the HTTP layer: `config_manage`
 under `cluster.config`, `read` under `graph.read`, `schema_apply` under
 `graph.schema`. A miss is a refusal diagnostic with code `insufficient_scope`
-that the server answers as a 403 with the body below; the server's
-deployment `refusal` mapper, which sends four diagnostic codes to 403 and
-every other to 409 with a flat `[code] message` string, gains this code on
-its 403 arm and builds `disposition` and `scope` from the diagnostic. Every
+and one new optional field, `scope`, holding the prefixed scope that would
+have covered the action, or nothing when no vocabulary entry does. The
+server's deployment `refusal` mapper, which sends four diagnostic codes to
+403 and every other to 409 with a flat `[code] message` string, gains this
+code on its 403 arm and builds the response as the `insufficient_scope`
+error below, not as `forbidden`: the server derives `disposition` from the
+error code, and `forbidden` would answer `refresh` where this error answers
+`fix`. Every
 one of these checks runs before the deployment is accepted. The ledger
 records the actor, as today, and never the ceiling. A settlement resumed
 after acceptance (a severed caller, a restarted server) still re-checks
@@ -383,9 +408,13 @@ HTTP conventions RFC requires:
 `scope` is the typed detail: the one prefixed scope that would have covered
 the refused action. A write to a protected branch under
 `graph.write.unprotected` names `graph.write`, the scope that would have
-covered it. `ErrorOutput` gains the optional field, and so does
-`ChangeErrorOutput`, which the change routes serialize instead. The response
-also carries
+covered it. When no vocabulary entry covers the action, because the action
+is newer than the vocabulary or deliberately excluded, `scope` is omitted
+from the body and from the challenge, and `disposition.action` stays `fix`:
+the client learns that no re-consent can lift the refusal, and a step-up
+client does not loop on a scope that does not exist. `ErrorOutput` gains the
+optional field, and so does `ChangeErrorOutput`, which the change routes
+serialize instead. The response also carries
 
 ```
 WWW-Authenticate: Bearer error="insufficient_scope", scope="omnigraph:graph.write", resource_metadata="<url>"
@@ -450,13 +479,15 @@ absent field is a token without a ceiling.
 
 Under `graph.write.unprotected` the report takes the two shapes policy
 already produces, because the route builds it from the same per-action
-slots. `change` follows `branch`, as a `branch_scope: unprotected` rule
-would. The target-scoped actions follow the `branch` query parameter placed
-in the target slot, as a `target_branch_scope: unprotected` rule would;
-`branch_create` and `branch_merge` appear only when `target_branch` is set,
-and only that target is tested. The write actions leave `graph_wide`, and
-`actions` lists them for an unprotected branch and omits them for a
-protected one. No new field is needed.
+slots. The `graph_wide` probe names no branch, so it fails the ceiling's
+present-and-unprotected condition and the write actions leave `graph_wide`,
+even where policy allows them on every branch. `change` follows `branch`, as
+a `branch_scope: unprotected` rule would. The target-scoped actions follow
+the `branch` query parameter placed in the target slot, as a
+`target_branch_scope: unprotected` rule would; `branch_create` and
+`branch_merge` appear only when `target_branch` is set, and only that target
+is tested. `actions` lists the write actions for a named unprotected branch
+and omits them for a protected one. No new field is needed.
 
 ### What a deployment must know about its authorization server
 
@@ -503,12 +534,16 @@ second step described above, and `AppliedPolicies::check_cluster` and
 are the only two places; no handler, MCP tool, resource or route checks a
 scope on its own. This preserves RFC 0003's invariant that the MCP layer adds
 no authorization path. The branch test for `graph.write.unprotected` is one
-predicate on `PolicyEngine`: given a `PolicyRequest`, whether the branch in
-the slot the action is judged by (`target_branch` for the actions
-`uses_target_branch_scope` names, `branch` otherwise) is in
-`protected_branches`. The server keeps no list of actions or slots of its own,
-so the ceiling and policy cannot disagree about which branch an action
-touches.
+predicate on `PolicyEngine`, the condition its Cedar `unprotected` rules
+already evaluate: given a `PolicyRequest`, the slot the action is judged by
+(`target_branch` for the actions `uses_target_branch_scope` names, `branch`
+otherwise) is present, and the branch it names is not in
+`protected_branches`. An empty slot is never unprotected. The server calls
+it only for the six `graph.write` actions; `schema_apply` shares the target
+slot but is `graph.schema`'s, and this scope never covers it. The server
+keeps no list of actions or slots of its own, so the ceiling and policy
+cannot disagree about which branch an action touches or what an empty slot
+means.
 
 ### Vocabulary as code
 
@@ -520,7 +555,7 @@ union of all slices equals every `PolicyAction` variant, so adding a policy
 action without placing it in the vocabulary fails to compile the test suite
 rather than silently leaving the action outside every ceiling. A deliberate
 omission is recorded by adding the action to the test's exclusion list, with
-the RFC that decided it.
+the RFC that decided it; `reclaim` is the first entry, decided above.
 
 ### Bounds
 
@@ -529,7 +564,7 @@ the RFC that decided it.
 | `scope_prefix` | 1–64 bytes, scope-token alphabet |
 | `scope` claim entries | ≤ 256, each 1–128 bytes, distinct |
 | Admitted token lifetime | unchanged: `exp - iat` ≤ 300 s, zero validation leeway, `iat` at most 30 s in the future |
-| Vocabulary size | 7 names; the whole prefixed list fits in 512 bytes of metadata |
+| Vocabulary size | 7 names today, 8 with `graph.maintain`; the whole prefixed list fits in 512 bytes of metadata |
 
 The entry bounds are this server's contract. They coincide with the Intent
 API's `validate_scopes`, so the two components refuse the same inputs.
@@ -551,7 +586,8 @@ API's `validate_scopes`, so the two components refuse the same inputs.
 - The vocabulary is owned by the server, is versioned with it, and is not
   configurable. A deployment chooses a prefix, never a mapping.
 - A branch is protected for the ceiling exactly when applied policy's
-  `protected_branches` names it. The ceiling never defines, defaults or
+  `protected_branches` names it, and a request that names no branch in the
+  judged slot is never unprotected. The ceiling never defines, defaults or
   implies a protected branch of its own.
 
 ## Compatibility and reversibility
@@ -616,8 +652,8 @@ touched.
 - **Treating `main` as protected for the scope even when
   `protected_branches` omits it.** Rejected: it would give a deployment two
   definitions of a protected branch, one for people and one for clients. A
-  bundle that protects nothing is a policy author's choice, and preview says
-  so.
+  bundle that protects nothing is a policy author's choice, and the boot log
+  says so.
 - **Delegated credentials** (`act`, `delegate:<actor>/<id>`). A different
   feature with its own identity questions; see #978.
 
@@ -632,7 +668,12 @@ touched.
 - Evaluation matrix: every policy action against every scope, with policy
   allowing and denying, asserting `forbidden` when policy denies and
   `insufficient_scope` only when policy allows.
-- The vocabulary test covers every `PolicyAction`.
+- The vocabulary test covers every `PolicyAction`, with `reclaim` in its
+  exclusion list once that action lands, and `graph.maintain` covering
+  `maintain`.
+- No-scope refusal: an action outside every vocabulary entry refuses with
+  `insufficient_scope`, no `scope` in the body or the challenge, and
+  `disposition.action: fix`.
 - `graph.write.unprotected`: each write action on a protected and an
   unprotected branch, judged by the `branch` slot for `change` and the
   `target_branch` slot for `branch_create`, `branch_delete`, `branch_merge`,
@@ -642,15 +683,17 @@ touched.
   refuses; a bundle with no `protected_branches` permits every branch and the
   boot log names the graph; a token holding both write scopes behaves as
   `graph.write`; `/access` follows `branch` for `change` and the target slot
-  for the other five, and names `branch_create` and `branch_merge` only when
-  `target_branch` is set.
+  for the other five, names `branch_create` and `branch_merge` only when
+  `target_branch` is set, and keeps the write actions out of `graph_wide`
+  under a policy that allows them on every branch, because the graph-wide
+  probe names no branch.
 - Hidden-404 routes: on stored-query invoke (handler and ingress
   classifier), change from a base commit, branch create from a snapshot,
   commit changes, commit publish and commit drop, a policy denial keeps its
   404 and a ceiling miss answers 403 `insufficient_scope` before the engine's
-  own not-found mapping; the readable diff and the detailed branch list
-  refuse under a ceiling without `graph.read` rather than hiding a side or
-  omitting a branch.
+  own not-found mapping; the readable diff refuses under a ceiling without
+  `graph.read` rather than hiding a side; the detailed branch list refuses
+  at its scope-free `read` check and never drops a branch name.
 - Default-deny mode (tokens, no bundle): an OIDC token is denied every
   action, with or without `graph.read`, by the signed-data rule that
   precedes the ceiling; a static token's `read` is unchanged.
@@ -666,8 +709,9 @@ touched.
 - Deployment routes: plan and apply refuse without `cluster.config`; with
   `cluster.config` alone, a deployment that changes a graph's schema refuses
   in preview and in apply with `insufficient_scope` naming `graph.schema`,
-  and one that reads a graph refuses naming `graph.read`, as a 403 whose
-  body carries `disposition` and `scope`; the ledger of an accepted
+  and one that reads a graph refuses naming `graph.read`, as a 403 with
+  code `insufficient_scope` whose body carries `disposition.action: fix`
+  and `scope`; the ledger of an accepted
   deployment holds no scope, and a settlement resumed after acceptance still
   passes its policy checks and completes without a token.
 - Attribution: a scoped write records the same `actor_id` as an unscoped one.
@@ -769,3 +813,11 @@ touched.
   with no bundle is denied by the signed-data rule before any ceiling; the
   deployment `refusal` mapper and the tokenless resume are described as they
   are; the misattributed conventions sentence is removed.
+- 2026-11-09: third revision after the reviews on 289071f5 and ce5c89ed.
+  The unprotected predicate is the Cedar condition policy already evaluates,
+  present and not protected, so the graph-wide probe of `/access` fails it
+  and the write actions leave `graph_wide`; a refusal for an action no scope
+  covers omits `scope`; the cluster diagnostic gains a `scope` field and the
+  deployment 403 is built as `insufficient_scope`; the detailed branch list
+  is described as it is; `maintain` is given `graph.maintain` and `reclaim`
+  is excluded ahead of #1282.
