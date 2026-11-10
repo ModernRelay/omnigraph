@@ -12,14 +12,20 @@
 //! relations, `Fix` or `Call`; this tree is the compiler's half, and the
 //! planner does not lower it yet (`P006`), so nothing in edition 3 executes.
 //!
+//! Every scalar a term holds (a filter's predicate, a projected or grouped
+//! item, an order key, an aggregate's argument, a score's query, a sink's
+//! assignment) is the bound expression [`IRExpr`], the one the pipeline IR
+//! uses: a reference column reads as a `Variable`, a value column as an
+//! `AliasRef`, a property or meta field as a `PropAccess`.
+//!
 //! Every node derives `PartialEq`: the desugaring-uniqueness test compares
 //! whole terms. Names are deterministic (fresh names come from a counter per
 //! declaration), so two spellings of one term compare equal.
 
-use crate::query::ast::{AggFunc, CompOp, Literal, MutationWriteMode};
-use crate::query::syntax::ArithOp;
+use super::expr::IRExpr;
+use crate::query::ast::{AggFunc, MutationWriteMode};
 use crate::query::typecheck::MutationTarget;
-use crate::types::{Direction, PropType, ScalarType};
+use crate::types::{Direction, ExprType, PropType, ScalarType};
 
 /// A value type with its nullability: a scalar or list (as the schema spells
 /// it), a node reference or an edge reference.
@@ -80,6 +86,20 @@ impl Ty {
         }
     }
 
+    /// The expression type of a value of this type: a reference's
+    /// nullability is the column's, so the reference type carries none.
+    pub fn expr_type(&self) -> ExprType {
+        match self {
+            Self::Value(p) => ExprType::from_prop(p),
+            Self::Node { type_name, .. } => ExprType::Node {
+                type_name: type_name.clone(),
+            },
+            Self::Edge { type_name, .. } => ExprType::Edge {
+                type_name: type_name.clone(),
+            },
+        }
+    }
+
     pub fn display(&self) -> String {
         match self {
             Self::Value(p) => p.display_name(),
@@ -125,144 +145,12 @@ impl RelTy {
     }
 }
 
-/// A typed scalar expression: the operand language of Filter, Project, Group
-/// and Order.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SExpr {
-    pub kind: SKind,
-    pub ty: Ty,
-    /// Arithmetic and registry rows declared `can_fail`; the planner keeps the
-    /// term behind its guards (A3).
-    pub can_fail: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum SKind {
-    Lit(Literal),
-    /// `null`, admitted only as an assignment value.
-    Null,
-    /// A declared parameter of the innermost declaration (a `Call` frame binds
-    /// it; it is never textually substituted).
-    Param(String),
-    /// A column of the current row.
-    Col(String),
-    /// A property of a reference column.
-    Prop {
-        col: String,
-        prop: String,
-    },
-    /// A meta-field (`@id`, `@src`, `@dst`, `@type`) of a reference column.
-    Meta {
-        col: String,
-        field: String,
-    },
-    Arith {
-        op: ArithOp,
-        left: Box<SExpr>,
-        right: Box<SExpr>,
-    },
-    Neg(Box<SExpr>),
-    Cmp {
-        op: CompOp,
-        left: Box<SExpr>,
-        right: Box<SExpr>,
-    },
-    In {
-        needle: Box<SExpr>,
-        list: Box<SExpr>,
-    },
-    IsNull {
-        expr: Box<SExpr>,
-        negated: bool,
-    },
-    Not(Box<SExpr>),
-    And(Box<SExpr>, Box<SExpr>),
-    Or(Box<SExpr>, Box<SExpr>),
-    /// A registry scalar row, its options in registry order with defaults
-    /// filled (so a spelled default and an omitted one are one term).
-    Call {
-        func: String,
-        args: Vec<SExpr>,
-        options: Vec<(String, SExpr)>,
-    },
-    /// An explicit numeric conversion (comparison casts stay explicit, as
-    /// today; arithmetic widening is one too).
-    Cast(Box<SExpr>),
-}
-
-impl SExpr {
-    pub fn new(kind: SKind, ty: Ty) -> Self {
-        let can_fail = match &kind {
-            SKind::Arith { .. } | SKind::Neg(_) => true,
-            SKind::Cmp { left, right, .. }
-            | SKind::And(left, right)
-            | SKind::Or(left, right)
-            | SKind::In {
-                needle: left,
-                list: right,
-            } => left.can_fail || right.can_fail,
-            SKind::Not(e) | SKind::Cast(e) | SKind::IsNull { expr: e, .. } => e.can_fail,
-            SKind::Call { args, options, .. } => {
-                args.iter().any(|a| a.can_fail) || options.iter().any(|(_, a)| a.can_fail)
-            }
-            SKind::Lit(_)
-            | SKind::Null
-            | SKind::Param(_)
-            | SKind::Col(_)
-            | SKind::Prop { .. }
-            | SKind::Meta { .. } => false,
-        };
-        Self { kind, ty, can_fail }
-    }
-
-    /// The columns the expression reads.
-    pub fn columns(&self, out: &mut Vec<String>) {
-        match &self.kind {
-            SKind::Col(c) | SKind::Prop { col: c, .. } | SKind::Meta { col: c, .. } => {
-                if !out.contains(c) {
-                    out.push(c.clone());
-                }
-            }
-            SKind::Arith { left, right, .. }
-            | SKind::Cmp { left, right, .. }
-            | SKind::And(left, right)
-            | SKind::Or(left, right)
-            | SKind::In {
-                needle: left,
-                list: right,
-            } => {
-                left.columns(out);
-                right.columns(out);
-            }
-            SKind::Neg(e) | SKind::Not(e) | SKind::Cast(e) | SKind::IsNull { expr: e, .. } => {
-                e.columns(out)
-            }
-            SKind::Call { args, options, .. } => {
-                for a in args {
-                    a.columns(out);
-                }
-                for (_, a) in options {
-                    a.columns(out);
-                }
-            }
-            SKind::Lit(_) | SKind::Null | SKind::Param(_) => {}
-        }
-    }
-
-    pub fn is_reference_read(&self) -> bool {
-        matches!(
-            self.kind,
-            SKind::Col(_) | SKind::Prop { .. } | SKind::Meta { .. }
-        )
-    }
-}
-
 /// One aggregate of a `Group`; `arg: None` counts rows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Agg {
     pub func: AggFunc,
     pub distinct: bool,
-    pub arg: Option<SExpr>,
+    pub arg: Option<IRExpr>,
     pub ty: Ty,
 }
 
@@ -285,14 +173,14 @@ pub enum ScoreKind {
 /// max_edits)` with defaults filled; a bare String is `terms(q, mode: any)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LexicalQuery {
-    pub text: SExpr,
+    pub text: IRExpr,
     pub mode_all: bool,
-    pub max_edits: SExpr,
+    pub max_edits: IRExpr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScoreQuery {
-    Vector(SExpr),
+    Vector(IRExpr),
     Lexical(LexicalQuery),
 }
 
@@ -323,19 +211,19 @@ pub enum Term {
     },
     Filter {
         input: Box<Term>,
-        pred: SExpr,
+        pred: IRExpr,
     },
     /// `keep`: the input's columns are kept and `items` appended (the
     /// derived-forms table's `Extend` without an aggregate); otherwise the
     /// output is `items` alone.
     Project {
         input: Box<Term>,
-        items: Vec<(String, SExpr)>,
+        items: Vec<(String, IRExpr)>,
         keep: bool,
     },
     Group {
         input: Box<Term>,
-        keys: Vec<(String, SExpr)>,
+        keys: Vec<(String, IRExpr)>,
         aggs: Vec<(String, Agg)>,
     },
     /// The outer columns, then the inner term's new columns.
@@ -350,7 +238,7 @@ pub enum Term {
     Order {
         input: Box<Term>,
         /// (key, descending)
-        keys: Vec<(SExpr, bool)>,
+        keys: Vec<(IRExpr, bool)>,
     },
     Cut {
         input: Box<Term>,
@@ -369,7 +257,7 @@ pub enum Term {
         input: Box<Term>,
         column: String,
         property: String,
-        query: SExpr,
+        query: IRExpr,
         k: Count,
         /// `None`: the engine's policy *[as today]*.
         recall: Option<f64>,
@@ -399,7 +287,7 @@ pub enum Term {
     /// parameters (evaluated in the caller's scope); `body` is closed.
     Call {
         name: String,
-        bindings: Vec<(String, SExpr)>,
+        bindings: Vec<(String, IRExpr)>,
         body: Box<Term>,
     },
 }
@@ -560,7 +448,7 @@ pub struct CoreRead {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AssignValue {
     Null,
-    Expr(SExpr),
+    Expr(IRExpr),
 }
 
 #[derive(Debug, Clone, PartialEq)]

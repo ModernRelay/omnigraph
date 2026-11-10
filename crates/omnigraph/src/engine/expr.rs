@@ -81,6 +81,9 @@ impl ProjectionContext {
             ExprType::ExactInteger { .. } => Err(OmniError::manifest_internal(
                 "internal exact integer cannot be a public result field",
             )),
+            ExprType::Edge { .. } => Err(OmniError::manifest_internal(
+                "an edge reference cannot be a public result field",
+            )),
             ExprType::Node { type_name } => {
                 let node = self.catalog.query_node_type(type_name).ok_or_else(|| {
                     OmniError::manifest_internal(format!("node type {type_name} is absent"))

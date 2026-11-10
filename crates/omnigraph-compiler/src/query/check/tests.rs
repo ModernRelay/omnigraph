@@ -703,7 +703,7 @@ fn arithmetic_widens_and_propagates_null() {
     );
     // The term carries `can_fail`, so the planner keeps it behind its guards.
     let c = ok("query q() { match { $p: Person  $p.age * 2 >= 10 } return { $p } }");
-    fn find_filter(t: &Term) -> Option<&SExpr> {
+    fn find_filter(t: &Term) -> Option<&crate::ir::expr::IRExpr> {
         match t {
             Term::Filter { pred, .. } => Some(pred),
             Term::Project { input, .. } | Term::Order { input, .. } | Term::Cut { input, .. } => {
@@ -712,7 +712,7 @@ fn arithmetic_widens_and_propagates_null() {
             _ => None,
         }
     }
-    assert!(find_filter(&read_of(&c).term).unwrap().can_fail);
+    assert!(find_filter(&read_of(&c).term).unwrap().can_fail());
 }
 
 #[test]
@@ -852,9 +852,9 @@ fn a_call_binds_its_arguments_and_never_substitutes() {
         panic!()
     };
     let text = format!("{:?}", r.term);
-    assert!(text.contains("Call { name: \"friends_of\", bindings: [(\"h\", SExpr { kind: Prop { col: \"p\", prop: \"handle\" }"), "{text}");
+    assert!(text.contains("Call { name: \"friends_of\", bindings: [(\"h\", PropAccess { variable: \"p\", property: \"handle\""), "{text}");
     assert!(
-        text.contains("Param(\"h\")"),
+        text.contains("Param(\"h\", "),
         "the body reads its parameter, not the argument: {text}"
     );
     // A declared read may not shadow a registry name or a clause keyword.

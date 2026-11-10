@@ -37,7 +37,7 @@ fn domain(ty: &ExprType) -> Option<Domain> {
     match ty {
         ExprType::Value { scalar, .. } => Some(Domain::Scalar(*scalar)),
         ExprType::ExactInteger { .. } => Some(Domain::Exact),
-        ExprType::Node { .. } => None,
+        ExprType::Node { .. } | ExprType::Edge { .. } => None,
     }
 }
 

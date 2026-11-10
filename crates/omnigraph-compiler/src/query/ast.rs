@@ -1059,6 +1059,7 @@ impl AggFunc {
                     nullable: _,
                 }
                 | ExprType::Node { type_name: _ }
+                | ExprType::Edge { type_name: _ }
                 | ExprType::ExactInteger { .. },
             ) => None,
         }

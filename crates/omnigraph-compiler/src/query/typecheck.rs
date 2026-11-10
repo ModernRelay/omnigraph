@@ -1910,9 +1910,9 @@ fn typecheck_subquery_predicate(
                 list: *list,
                 enum_values: None,
             },
-            ExprType::Node { type_name } => {
+            ExprType::Node { type_name } | ExprType::Edge { type_name } => {
                 return Err(CompilerError::Plan(format!(
-                    "{func} over a block has node result type `{type_name}`"
+                    "{func} over a block has reference result type `{type_name}`"
                 )));
             }
             ExprType::ExactInteger { .. } => {
@@ -3965,6 +3965,11 @@ pub(crate) fn projection_field(catalog: &Catalog, name: &str, ty: &ExprType) -> 
             return Err(CompilerError::Plan(
                 "internal exact integer cannot be a result column".into(),
             ));
+        }
+        ExprType::Edge { type_name } => {
+            return Err(CompilerError::Plan(format!(
+                "edge reference `{type_name}` cannot be a result column"
+            )));
         }
         ExprType::Node { type_name } => {
             let node_type = catalog.query_node_type(type_name).ok_or_else(|| {

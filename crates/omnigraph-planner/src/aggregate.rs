@@ -72,6 +72,7 @@ pub fn plan_aggregate(func: AggFunc, signature: &AggSignature) -> Result<Aggrega
                 ..
             }
             | ExprType::Node { .. }
+            | ExprType::Edge { .. }
             | ExprType::ExactInteger { .. } => {
                 return Err(PlanError::Internal("sum requires numeric input".into()));
             }

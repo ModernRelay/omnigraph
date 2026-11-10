@@ -14,8 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{Catalog, build_catalog};
 use crate::ir::core::*;
+use crate::ir::expr::IRExpr;
 use crate::query::ast::{AggFunc, CompOp, Literal};
-use crate::query::check::check_source;
+use crate::query::check::{SExpr, SKind, check_source};
 use crate::schema::parser::parse_schema;
 use crate::types::{Direction, PropType, ScalarType};
 
@@ -123,7 +124,7 @@ fn env(cols: &[(&str, Ty)]) -> Term {
             .collect(),
     )
 }
-fn filter(input: Term, pred: SExpr) -> Term {
+fn filter(input: Term, pred: IRExpr) -> Term {
     Term::Filter {
         input: input.boxed(),
         pred,
@@ -135,10 +136,10 @@ fn corr(outer: Term, inner: Term) -> Term {
         inner: inner.boxed(),
     }
 }
-fn col(n: &str, ty: Ty) -> SExpr {
-    SExpr::new(SKind::Col(n.into()), ty)
+fn col(n: &str, ty: Ty) -> IRExpr {
+    SExpr::new(SKind::Col(n.into()), ty).to_ir()
 }
-fn prop(c: &str, p: &str, ty: Ty) -> SExpr {
+fn prop(c: &str, p: &str, ty: Ty) -> IRExpr {
     SExpr::new(
         SKind::Prop {
             col: c.into(),
@@ -146,23 +147,16 @@ fn prop(c: &str, p: &str, ty: Ty) -> SExpr {
         },
         ty,
     )
+    .to_ir()
 }
-fn int(n: i128, s: ScalarType) -> SExpr {
-    SExpr::new(SKind::Lit(Literal::Integer(n)), val(s, false))
+fn int(n: i128, s: ScalarType) -> IRExpr {
+    SExpr::new(SKind::Lit(Literal::Integer(n)), val(s, false)).to_ir()
 }
-fn cmp(op: CompOp, l: SExpr, r: SExpr) -> SExpr {
-    let nullable = l.ty.nullable() || r.ty.nullable();
-    SExpr::new(
-        SKind::Cmp {
-            op,
-            left: Box::new(l),
-            right: Box::new(r),
-        },
-        boolean(nullable),
-    )
+fn cmp(op: CompOp, l: IRExpr, r: IRExpr) -> IRExpr {
+    IRExpr::comparison(l, op, r)
 }
-fn not(e: SExpr) -> SExpr {
-    SExpr::new(SKind::Not(Box::new(e)), boolean(false))
+fn not(e: IRExpr) -> IRExpr {
+    IRExpr::Not(Box::new(e), boolean(false).expr_type())
 }
 fn count_rows() -> Agg {
     Agg {
@@ -182,7 +176,7 @@ fn block(r: Term, inner: Term, c: &str) -> Term {
         },
     )
 }
-fn exists(c: &str) -> SExpr {
+fn exists(c: &str) -> IRExpr {
     cmp(
         CompOp::Gt,
         col(c, val(ScalarType::I64, false)),
@@ -300,7 +294,8 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
                                         type_name: "Company".into(),
                                         nullable: true,
                                     },
-                                ),
+                                )
+                                .to_ir(),
                             ),
                         ],
                         keep: false,
@@ -396,10 +391,13 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
                 column: "d".into(),
                 property: "embedding".into(),
                 kind: ScoreKind::Distance,
-                query: ScoreQuery::Vector(SExpr::new(
-                    SKind::Param("v".into()),
-                    Ty::Value(PropType::scalar(ScalarType::Vector(3), false)),
-                )),
+                query: ScoreQuery::Vector(
+                    SExpr::new(
+                        SKind::Param("v".into()),
+                        Ty::Value(PropType::scalar(ScalarType::Vector(3), false)),
+                    )
+                    .to_ir(),
+                ),
                 out: "distance".into(),
             },
         ),
@@ -412,7 +410,8 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
                 property: "body".into(),
                 kind: ScoreKind::Bm25,
                 query: ScoreQuery::Lexical(LexicalQuery {
-                    text: SExpr::new(SKind::Param("s".into()), val(ScalarType::String, false)),
+                    text: SExpr::new(SKind::Param("s".into()), val(ScalarType::String, false))
+                        .to_ir(),
                     mode_all: false,
                     max_edits: int(0, ScalarType::I64),
                 }),
@@ -429,7 +428,8 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
                 query: SExpr::new(
                     SKind::Param("v".into()),
                     Ty::Value(PropType::scalar(ScalarType::Vector(3), false)),
-                ),
+                )
+                .to_ir(),
                 k: Count::Literal(5),
                 recall: None,
                 out: "distance".into(),
@@ -499,7 +499,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             cmp(
                 Eq,
                 prop("p", "handle", name_ty()),
-                SExpr::new(SKind::Param("h".into()), name_ty())
+                SExpr::new(SKind::Param("h".into()), name_ty()).to_ir()
             )
         )
     );

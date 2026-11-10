@@ -369,6 +369,69 @@ impl IRExpr {
         false
     }
 
+    /// The columns of the current row the expression reads, in first-read
+    /// order: a reference or value column, or the column a property reads.
+    pub fn columns(&self, out: &mut Vec<String>) {
+        let mut add = |name: &String| {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        };
+        let mut pending = vec![self];
+        while let Some(expr) = pending.pop() {
+            match expr {
+                Self::Variable(name, _) | Self::AliasRef(name, _) => add(name),
+                Self::PropAccess { variable, .. } => add(variable),
+                Self::Nearest {
+                    variable, query, ..
+                } => {
+                    add(variable);
+                    pending.push(query);
+                }
+                Self::Param(_, _) | Self::Literal(_, _) => {}
+                Self::Search { field, query, .. }
+                | Self::MatchText { field, query, .. }
+                | Self::Bm25 { field, query, .. } => {
+                    pending.extend([query.as_ref(), field.as_ref()])
+                }
+                Self::Fuzzy {
+                    field,
+                    query,
+                    max_edits,
+                    ..
+                } => {
+                    pending.extend(max_edits.as_deref());
+                    pending.extend([query.as_ref(), field.as_ref()]);
+                }
+                Self::Rrf {
+                    primary,
+                    secondary,
+                    k,
+                    ..
+                } => {
+                    pending.extend(k.as_deref());
+                    pending.extend([secondary.as_ref(), primary.as_ref()]);
+                }
+                Self::Aggregate { arg, .. }
+                | Self::Not(arg, _)
+                | Self::IsNull { expr: arg, .. }
+                | Self::Neg { expr: arg, .. }
+                | Self::Cast { expr: arg, .. } => pending.push(arg),
+                Self::Binary { left, right, .. } => pending.extend([right.as_ref(), left.as_ref()]),
+                Self::Call { args, .. } => pending.extend(args.iter().rev()),
+            }
+        }
+    }
+
+    /// Whether the expression is a bare read of the current row: a column or
+    /// the property of one.
+    pub fn is_column_read(&self) -> bool {
+        matches!(
+            self,
+            Self::Variable(_, _) | Self::AliasRef(_, _) | Self::PropAccess { .. }
+        )
+    }
+
     /// The compiler-owned type of a leaf, retained through planner rewrites.
     pub fn leaf_type(&self) -> Option<&ExprType> {
         match self {

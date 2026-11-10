@@ -20,6 +20,7 @@ use crate::catalog::Catalog;
 use crate::error::CompilerError;
 use crate::ir::core::WriteGroup;
 use crate::ir::core::*;
+use crate::ir::expr::IRExpr;
 use crate::query::ast::{AggFunc, CompOp, EdgeSelector, Literal, Traversal};
 use crate::query::codes::*;
 use crate::query::diagnostic::{Applicability, QueryCode, QueryDiagnostic, Suggestion, TextEdit};
@@ -896,20 +897,20 @@ impl Ctx<'_> {
             }
             term = Term::Group {
                 input: term.boxed(),
-                keys,
+                keys: keys.into_iter().map(|(n, k)| (n, k.to_ir())).collect(),
                 aggs,
             };
             if !post.is_empty() {
                 term = Term::Project {
                     input: term.boxed(),
-                    items: post,
+                    items: post.into_iter().map(|(n, e)| (n, e.to_ir())).collect(),
                     keep: true,
                 };
             }
             if !order.is_empty() {
                 term = Term::Order {
                     input: term.boxed(),
-                    keys: order,
+                    keys: order.into_iter().map(|(k, d)| (k.to_ir(), d)).collect(),
                 };
             }
         } else {
@@ -939,13 +940,13 @@ impl Ctx<'_> {
             }
             term = Term::Project {
                 input: term.boxed(),
-                items: ext,
+                items: ext.into_iter().map(|(n, e)| (n, e.to_ir())).collect(),
                 keep: true,
             };
             if !order.is_empty() {
                 term = Term::Order {
                     input: term.boxed(),
-                    keys: order,
+                    keys: order.into_iter().map(|(k, d)| (k.to_ir(), d)).collect(),
                 };
             }
         }
@@ -981,7 +982,7 @@ impl Ctx<'_> {
                 .map(|(n, c)| {
                     (
                         c.name.clone(),
-                        SExpr::new(SKind::Col(n.clone()), c.ty.clone()),
+                        SExpr::new(SKind::Col(n.clone()), c.ty.clone()).to_ir(),
                     )
                 })
                 .collect(),
@@ -1107,7 +1108,7 @@ impl Ctx<'_> {
         Ok(Some(Agg {
             func,
             distinct,
-            arg: Some(a),
+            arg: Some(a.to_ir()),
             ty,
         }))
     }
@@ -2215,7 +2216,7 @@ impl Ctx<'_> {
                 input: pop.term.boxed(),
                 column: column.clone(),
                 property,
-                query: q,
+                query: q.to_ir(),
                 k,
                 recall,
                 out: out.to_string(),
@@ -2227,7 +2228,7 @@ impl Ctx<'_> {
                 property,
                 kind,
                 query: match query {
-                    ScoreQueryId::Vector(q) => ScoreQuery::Vector(q),
+                    ScoreQueryId::Vector(q) => ScoreQuery::Vector(q.to_ir()),
                     ScoreQueryId::Lexical(l) => ScoreQuery::Lexical(l),
                 },
                 out: out.to_string(),
@@ -2280,18 +2281,18 @@ impl Ctx<'_> {
         if let Expr::Call(c) = e
             && c.name == "terms"
         {
-            return self.terms(sc, c);
+            return Ok(self.terms(sc, c)?.lexical());
         }
         let text = self.expr(sc, e, At::Value)?;
         lexical_text(&text)?;
         Ok(LexicalQuery {
-            text,
+            text: text.to_ir(),
             mode_all: false,
-            max_edits: int_lit(0),
+            max_edits: int_lit(0).to_ir(),
         })
     }
 
-    fn terms(&mut self, sc: &mut Scope, c: &Call) -> R<LexicalQuery> {
+    fn terms(&mut self, sc: &mut Scope, c: &Call) -> R<Terms> {
         let [Arg::Expr(t)] = c.args.as_slice() else {
             return Err(err(T19, "`terms` takes one text argument"));
         };
@@ -2326,7 +2327,7 @@ impl Ctx<'_> {
                 }
             }
         }
-        Ok(LexicalQuery {
+        Ok(Terms {
             text,
             mode_all,
             max_edits,
@@ -2614,7 +2615,7 @@ impl Ctx<'_> {
                 bindings: params
                     .iter()
                     .map(|(p, _)| p.clone())
-                    .zip(bindings)
+                    .zip(bindings.iter().map(SExpr::to_ir))
                     .collect(),
                 body: term.boxed(),
             },
@@ -2898,10 +2899,9 @@ impl Ctx<'_> {
             check_literal_type(l, &lt, pt, prop)?;
             let mut want = pt.clone();
             want.nullable = false;
-            return Ok(AssignValue::Expr(SExpr::new(
-                SKind::Lit(l.clone()),
-                Ty::Value(want),
-            )));
+            return Ok(AssignValue::Expr(
+                SExpr::new(SKind::Lit(l.clone()), Ty::Value(want)).to_ir(),
+            ));
         }
         let v = self.expr(sc, value, At::Value)?;
         if !sc.block_buf.is_empty() {
@@ -2929,7 +2929,7 @@ impl Ctx<'_> {
                 ),
             ));
         }
-        Ok(AssignValue::Expr(v))
+        Ok(AssignValue::Expr(v.to_ir()))
     }
 
     fn endpoint(
@@ -2950,15 +2950,16 @@ impl Ctx<'_> {
             && let Some(ty) = sc.col(v)
         {
             return match ty {
-                Ty::Node { type_name, .. } if type_name == endpoint => {
-                    Ok(AssignValue::Expr(SExpr::new(
+                Ty::Node { type_name, .. } if type_name == endpoint => Ok(AssignValue::Expr(
+                    SExpr::new(
                         SKind::Col(v.clone()),
                         Ty::Node {
                             type_name,
                             nullable: false,
                         },
-                    )))
-                }
+                    )
+                    .to_ir(),
+                )),
                 other => Err(err(
                     T78,
                     format!(
@@ -2975,7 +2976,7 @@ impl Ctx<'_> {
             Ty::Value(t)
                 if !t.list && (types_compatible(t, &key_ty) || t.scalar == ScalarType::String) =>
             {
-                Ok(AssignValue::Expr(v))
+                Ok(AssignValue::Expr(v.to_ir()))
             }
             other => Err(err(
                 T78,
@@ -3188,7 +3189,7 @@ impl Ctx<'_> {
                                 Agg {
                                     func: f,
                                     distinct: false,
-                                    arg: Some(arg),
+                                    arg: Some(arg.to_ir()),
                                     ty,
                                 }
                             }
@@ -3688,7 +3689,8 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
                             .boxed(),
                         },
                         Ty::scalar(ScalarType::Bool, false),
-                    ),
+                    )
+                    .to_ir(),
                 },
             }
         }
@@ -3710,7 +3712,7 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
             }
             Term::Filter {
                 input: t.boxed(),
-                pred,
+                pred: pred.to_ir(),
             }
         }
         Step::Let {
@@ -3732,7 +3734,7 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
             }
             Term::Project {
                 input: t.boxed(),
-                items: vec![(name, value)],
+                items: vec![(name, value.to_ir())],
                 keep: true,
             }
         }
@@ -3759,7 +3761,7 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
                     .boxed(),
                 }
                 .boxed(),
-                pred: not_exists(&col),
+                pred: not_exists(&col).to_ir(),
             };
             let mut items = Vec::new();
             for c in output_columns(&r) {
@@ -3781,7 +3783,7 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
                 left: matched.boxed(),
                 right: Term::Project {
                     input: unmatched.boxed(),
-                    items,
+                    items: items.into_iter().map(|(n, e)| (n, e.to_ir())).collect(),
                     keep: false,
                 }
                 .boxed(),
@@ -3913,9 +3915,7 @@ fn monotone(name: &str, body: &Term, rounds: Option<u64>) -> R<Vec<String>> {
     // and a round budget declared.
     if let Term::Group { keys, aggs, .. } = own {
         for (n, k) in keys {
-            if reads_any(k, &computed)
-                || !k.is_reference_read() && !matches!(k.kind, SKind::Param(_))
-            {
+            if reads_any(k, &computed) || !k.is_column_read() && !matches!(k, IRExpr::Param(..)) {
                 return Err(t70(
                     name,
                     &format!(
@@ -3973,7 +3973,7 @@ fn depends(t: &Term, name: &str) -> bool {
     }
 }
 
-fn reads_any(e: &SExpr, cols: &HashSet<String>) -> bool {
+fn reads_any(e: &IRExpr, cols: &HashSet<String>) -> bool {
     let mut v = Vec::new();
     e.columns(&mut v);
     v.iter().any(|c| cols.contains(c))
@@ -4043,8 +4043,8 @@ impl Walk<'_> {
                     .collect();
                 for (n, e) in items {
                     let n = n.trim_start_matches('^').to_string();
-                    let computed = !(e.is_reference_read() || matches!(e.kind, SKind::Param(_)))
-                        || reads_any(e, &c);
+                    let computed =
+                        !(e.is_column_read() || matches!(e, IRExpr::Param(..))) || reads_any(e, &c);
                     if computed {
                         c.insert(n.clone());
                         c.insert(format!("^{n}"));
@@ -4153,15 +4153,15 @@ impl Walk<'_> {
 }
 
 /// `col > 0` or `col >= 1`: the `exists` reading of a block count.
-fn is_exists_of(pred: &SExpr, col: &str) -> bool {
-    let SKind::Cmp { op, left, right } = &pred.kind else {
+fn is_exists_of(pred: &IRExpr, col: &str) -> bool {
+    let Some((left, op, right)) = pred.comparison_parts() else {
         return false;
     };
-    matches!(&left.kind, SKind::Col(c) if c == col)
+    matches!(left, IRExpr::AliasRef(c, _) if c == col)
         && matches!(
-            (op, &right.kind),
-            (CompOp::Gt, SKind::Lit(Literal::Integer(0)))
-                | (CompOp::Ge, SKind::Lit(Literal::Integer(1)))
+            (op, right),
+            (CompOp::Gt, IRExpr::Literal(Literal::Integer(0), _))
+                | (CompOp::Ge, IRExpr::Literal(Literal::Integer(1), _))
         )
 }
 
@@ -4868,6 +4868,9 @@ fn expr_vars(e: &Expr, out: &mut Vec<String>) {
         }
     }
 }
+
+mod scalar;
+pub use scalar::{SExpr, SKind, Terms};
 
 #[cfg(test)]
 mod tests;
