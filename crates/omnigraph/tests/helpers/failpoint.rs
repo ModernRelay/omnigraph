@@ -16,7 +16,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use omnigraph::seams::{Decide, DecideSeam, Global, Hold, Installed};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use omnigraph::seams::{Behavior, Decide, DecideSeam, Decision, Global, Hold, Installed};
 
 /// A parked-on-first-arrival rendezvous bound to a seam. The underlying
 /// behavior is RAII-cleaned when this guard drops, which also releases a
@@ -65,5 +67,85 @@ impl Rendezvous {
     /// Release the parked thread so it resumes past the seam.
     pub fn release(&self) {
         self.hold.release();
+    }
+}
+
+/// Parks chosen crossings of one seam (counted from 1), each until its own
+/// release; every other crossing passes. One install covers them all, so a
+/// test parks a writer's first and second attempts without re-arming the
+/// seam in between. Dropping it releases every parked caller.
+pub struct ParkedCrossings {
+    name: &'static str,
+    holds: Arc<Vec<(u64, Arc<Hold>)>>,
+    _installed: Installed<dyn Decide, Global<dyn Decide>>,
+}
+
+struct ParkAt {
+    crossings: AtomicU64,
+    holds: Arc<Vec<(u64, Arc<Hold>)>>,
+}
+
+impl Behavior for ParkAt {
+    fn uninstalling(&self) {
+        for (_, hold) in self.holds.iter() {
+            hold.release();
+        }
+    }
+}
+
+impl Decide for ParkAt {
+    fn decide(&self, name: &'static str) -> Decision {
+        let crossing = self.crossings.fetch_add(1, Ordering::SeqCst) + 1;
+        match self.holds.iter().find(|(at, _)| *at == crossing) {
+            Some((_, hold)) => hold.decide(name),
+            None => Decision::Pass,
+        }
+    }
+}
+
+impl ParkedCrossings {
+    pub fn new(seam: &'static DecideSeam, crossings: &[u64]) -> Self {
+        assert!(
+            crossings.iter().all(|at| *at >= 1),
+            "crossings count from 1"
+        );
+        let holds = Arc::new(
+            crossings
+                .iter()
+                .map(|at| (*at, Arc::new(Hold::default())))
+                .collect::<Vec<_>>(),
+        );
+        let installed = seam.install(Arc::new(ParkAt {
+            crossings: AtomicU64::new(0),
+            holds: Arc::clone(&holds),
+        }));
+        Self {
+            name: seam.name(),
+            holds,
+            _installed: installed,
+        }
+    }
+
+    fn hold(&self, crossing: u64) -> &Hold {
+        self.holds
+            .iter()
+            .find(|(at, _)| *at == crossing)
+            .map(|(_, hold)| hold.as_ref())
+            .unwrap_or_else(|| panic!("crossing {crossing} of '{}' is not parked", self.name))
+    }
+
+    /// As [`Rendezvous::wait_until_reached`], for one parked crossing.
+    pub async fn wait_until_reached(&self, crossing: u64) {
+        for _ in 0..2400 {
+            if self.hold(crossing).reached() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("seam '{}' was never crossed a {crossing}th time", self.name);
+    }
+
+    pub fn release(&self, crossing: u64) {
+        self.hold(crossing).release();
     }
 }

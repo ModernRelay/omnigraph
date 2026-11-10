@@ -250,6 +250,10 @@ pub struct OperationTimings {
     /// How long the run held the branch's writer gates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_hold_ms: Option<u64>,
+    /// How long the run waited, before it took the gates, for writers that
+    /// an earlier publication sent back to prepare again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_yield_ms: Option<u64>,
     /// The start of execution to the end of the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compute_ms: Option<u64>,

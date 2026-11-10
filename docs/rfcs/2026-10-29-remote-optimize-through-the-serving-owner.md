@@ -137,8 +137,10 @@ durable before any effect and before the response. From then on:
 - **Restart.** An unfinished record is resolved from main's history, and the
   run is never executed again.
 - **Writes.** While a run holds the writer gates, writes to main wait. The
-  request bounds that wait (§1.2). This slice does not promise low write
-  latency during a run.
+  request bounds that wait (§1.2), and a run waits for writers it sent back
+  to prepare again before the next run takes the gates, so runs back to back
+  do not compound it. This slice does not promise low write latency during a
+  run.
 
 ### Sources of truth
 
@@ -245,6 +247,24 @@ writer gate before the artifact scan starts.
 the publication, plus the configuration clear.** Plans that are still running
 at the deadline are dropped: they read only. The report records the gate-hold
 time and each table's duration, so the bound can be checked against a run.
+
+**A writer that prepares again adds its own preparation, and no further
+runs.** A mutation or load prepares outside the gates, and a publication that
+moves main under it sends it back to prepare again (`ReadSetChanged`). While it
+does, it holds no place in the gate queue. Stress runs on RustFS and Azurite
+showed the effect: with optimize submitted back to back, each run took the
+gates while such a writer prepared, published, and sent it back again. One
+write waited 14 s through 9 runs whose longest hold was 3.9 s. So each such
+writer holds a mark until its write returns (`WriteQueueManager::mark_repreparing`),
+and a run, before its export exclusion, authority capture and gates, waits for
+the marks on main to clear (`yield_to_repreparing_writers`). The wait is
+bounded by `max_writer_yield` (default 10 s, not settable over HTTP), so
+conflicting writers cannot hold maintenance off for good, and it ends on the
+run's cancellation. The report and the record carry it as `writer_yield`
+(`timings.writer_yield_ms`). The rest of the cost, a second preparation for
+every write a publication overlaps, comes from comparing the whole branch
+authority rather than the rows a write read; #1331
+tracks removing it.
 
 Keeping today's gates is the cost this slice accepts. The bound keeps the
 stall finite. A new way to share the gates with writers is a second design.

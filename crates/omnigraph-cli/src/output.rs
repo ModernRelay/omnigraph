@@ -44,6 +44,7 @@ pub(crate) fn write_optimize(
             "graph_commit_id": report.graph_commit_id,
             "resume_at": report.resume_at,
             "gate_hold_ms": report.gate_hold.as_millis() as u64,
+            "writer_yield_ms": report.writer_yield.as_millis() as u64,
             "configuration_clear": {
                 "outcome": report.configuration_clear.as_str(),
                 "error": clear_error,
@@ -2092,6 +2093,7 @@ mod tests {
         report.graph_commit_id = Some("hb1.child".into());
         report.resume_at = Some("node:Zebra".into());
         report.gate_hold = std::time::Duration::from_millis(40);
+        report.writer_yield = std::time::Duration::from_millis(7);
         report.configuration_clear = ConfigurationClear::Unknown("timed out".into());
         report.artifact = ArtifactRefresh::Skipped(ArtifactSkip::NoEdgeTypes);
         assert_maintenance_report(
@@ -2116,6 +2118,7 @@ mod tests {
                 "graph_commit_id":"hb1.child",
                 "resume_at":"node:Zebra",
                 "gate_hold_ms":40,
+                "writer_yield_ms":7,
                 "configuration_clear":{"outcome":"unknown","error":"timed out"},
                 "artifact":{"outcome":"skipped","reason":"no_edge_types","error":null},
                 "datasets":[
@@ -2134,6 +2137,7 @@ mod tests {
         empty.graph_commit_id = None;
         empty.resume_at = None;
         empty.gate_hold = std::time::Duration::ZERO;
+        empty.writer_yield = std::time::Duration::ZERO;
         empty.configuration_clear = ConfigurationClear::NothingToClear;
         empty.artifact = ArtifactRefresh::Unchanged;
         assert_maintenance_report(
@@ -2144,6 +2148,7 @@ mod tests {
                 "graph_commit_id":null,
                 "resume_at":null,
                 "gate_hold_ms":0,
+                "writer_yield_ms":0,
                 "configuration_clear":{"outcome":"nothing_to_clear","error":null},
                 "artifact":{"outcome":"unchanged","reason":null,"error":null},
                 "datasets":[],

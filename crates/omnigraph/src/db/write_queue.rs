@@ -46,11 +46,13 @@
 //! ## Gates
 //!
 //! Every place where one operation waits for another in this process is one
-//! of six gates, and this module is where they live: `table` (a
+//! of seven gates, and this module is where they live: `table` (a
 //! [`QueueSlot`] per `(table_key, branch)`), `branch` (a slot per branch),
 //! `schema_shared` and `schema_exclusive` (the two sides of
 //! [`SchemaGateSlot`]), `export` (the export cut against destructive
-//! controls) and `coordinator_cas` (the handle's coordinator pointer swap,
+//! controls), `writer_yield` (optimize waiting for writers that are
+//! preparing again, [`WriteQueueManager::yield_to_repreparing_writers`]) and
+//! `coordinator_cas` (the handle's coordinator pointer swap,
 //! `Omnigraph::install_coordinator`). A gate acquisition crosses three
 //! decision seams, `gate.<name>.acquire` on entering the wait,
 //! `gate.<name>.hold` once the primitive is owned and `gate.<name>.release`
@@ -58,7 +60,9 @@
 //! observation site: the decision is read and passed, so an installed
 //! observer (GQT measure, the trace, a DST probe) sees every wait without the
 //! engine changing behavior. The `export` gate never waits: its two `try_*`
-//! acquisitions refuse instead, so it crosses `hold` and `release` only. A
+//! acquisitions refuse instead, so it crosses `hold` and `release` only. The
+//! `writer_yield` gate owns nothing: the waiting run crosses `acquire` and
+//! `hold` (its wait is over), and `release` is a writer's mark ending. A
 //! lost coordinator CAS round is a wait of the CAS kind: every round crosses
 //! `acquire`, the winning swap `hold`, and a refused install `refused`, the
 //! one `acquire` that ends with no hold. Not gates, and so outside this
@@ -70,9 +74,10 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use tokio::sync::{
-    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    Mutex as AsyncMutex, Notify, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
     RwLock as AsyncRwLock,
 };
 
@@ -166,6 +171,86 @@ decide_seam! {
 decide_seam! {
     /// An export cut or destructive control permit drops.
     pub static GATE_EXPORT_RELEASE = ("gate.export.release", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// An optimize run starts waiting for the writers on its branch that are
+    /// preparing again after a publication moved the branch under them.
+    pub static GATE_WRITER_YIELD_ACQUIRE = ("gate.writer_yield.acquire", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// The run stops waiting: no such writer is left, the wait reached its
+    /// limit, or the run was cancelled.
+    pub static GATE_WRITER_YIELD_HOLD = ("gate.writer_yield.hold", Unreachable, [Fail]);
+}
+decide_seam! {
+    /// A writer that was preparing again returns from its write, whatever
+    /// the outcome.
+    pub static GATE_WRITER_YIELD_RELEASE = ("gate.writer_yield.release", Unreachable, [Fail]);
+}
+
+/// The writers on each branch that are preparing again because a publication
+/// moved the branch under an attempt they had prepared (`ReadSetChanged`).
+///
+/// Such a writer has left the gate queue: it prepares outside the gates and
+/// queues again. An optimize run that queued meanwhile would take the gates
+/// first, publish, and send the writer back once more; on a store where
+/// preparing takes longer than the gap between two runs, a client that runs
+/// optimize back to back would keep one write waiting through many runs. So
+/// a run waits for these writers before it takes the branch's gates
+/// ([`WriteQueueManager::yield_to_repreparing_writers`]), and each writer's
+/// wait stays within one run's hold, one table, the publication and its own
+/// second preparation.
+#[derive(Default)]
+struct RepreparingWriters {
+    counts: Mutex<HashMap<Option<String>, usize>>,
+    changed: Notify,
+}
+
+impl RepreparingWriters {
+    fn count(&self, branch: &Option<String>) -> usize {
+        self.counts
+            .lock()
+            .expect("repreparing writer counts poisoned")
+            .get(branch)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// One writer preparing again on a branch. The writer holds it until its
+/// write returns, whether it committed, failed or gave up.
+#[must_use = "dropping the mark ends the writer's claim on optimize's wait"]
+pub(crate) struct RepreparingWriter {
+    writers: Arc<RepreparingWriters>,
+    branch: Option<String>,
+}
+
+impl Drop for RepreparingWriter {
+    fn drop(&mut self) {
+        observed(&GATE_WRITER_YIELD_RELEASE);
+        // The same release protocol as `QueueGuard`: under a turn, so a
+        // waiting run reads the count in a deterministic order.
+        let _turn = crate::dst_gate::turn();
+        let mut counts = self
+            .writers
+            .counts
+            .lock()
+            .expect("repreparing writer counts poisoned");
+        if let Some(count) = counts.get_mut(&self.branch) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.branch);
+            }
+        }
+        drop(counts);
+        self.writers.changed.notify_waiters();
+    }
+}
+
+/// A writer's branch as these marks key it: main is `None`, however the
+/// caller spells it.
+fn repreparing_key(branch: Option<&str>) -> Option<String> {
+    branch.filter(|name| *name != "main").map(str::to_string)
 }
 
 static TABLE_GATE: GateSeams = GateSeams {
@@ -536,6 +621,8 @@ pub(crate) struct WriteQueueManager {
     /// destructive controls share the read side, so they remain mutually
     /// concurrent but cannot remove a path/version beneath a live cut.
     export_gate: Arc<AsyncRwLock<()>>,
+    /// Writers preparing again on each branch, which optimize waits for.
+    repreparing: Arc<RepreparingWriters>,
     /// The graph-global shared/exclusive schema gate; see
     /// [`SchemaGateSlot`].
     schema_gate: Arc<SchemaGateSlot>,
@@ -613,6 +700,75 @@ impl WriteQueueManager {
     /// non-reentrancy contract as [`Self::acquire_schema_shared`].
     pub(crate) async fn acquire_schema_exclusive(&self) -> SchemaExclusivePermit {
         scheduled_schema_exclusive(Arc::clone(&self.schema_gate)).await
+    }
+
+    /// Mark a writer on `branch` as preparing again after `ReadSetChanged`.
+    /// The writer holds the mark until its write returns.
+    pub(crate) fn mark_repreparing(&self, branch: Option<&str>) -> RepreparingWriter {
+        let branch = repreparing_key(branch);
+        *self
+            .repreparing
+            .counts
+            .lock()
+            .expect("repreparing writer counts poisoned")
+            .entry(branch.clone())
+            .or_insert(0) += 1;
+        RepreparingWriter {
+            writers: Arc::clone(&self.repreparing),
+            branch,
+        }
+    }
+
+    /// Before an optimize run takes `branch`'s gates, wait until no writer on
+    /// it is preparing again ([`RepreparingWriters`]), for at most `limit` or
+    /// until `cancelled` completes. Returns how long the run waited.
+    ///
+    /// The limit keeps a steady stream of conflicting writers from holding
+    /// maintenance off for good. The caller holds no gate while it waits, so
+    /// the wait cannot block the writers it waits for.
+    pub(crate) async fn yield_to_repreparing_writers(
+        &self,
+        branch: Option<&str>,
+        limit: Duration,
+        cancelled: impl std::future::Future<Output = ()>,
+    ) -> Duration {
+        let branch = repreparing_key(branch);
+        let writers = &self.repreparing;
+        observed(&GATE_WRITER_YIELD_ACQUIRE);
+        let started = tokio::time::Instant::now();
+        let deadline = started + limit;
+        let mut cancelled = std::pin::pin!(cancelled);
+        loop {
+            let notified = writers.changed.notified();
+            let mut notified = std::pin::pin!(notified);
+            // Registered before the count is read, so a mark that ends in
+            // between still wakes the wait.
+            notified.as_mut().enable();
+            let installed = {
+                // Read under a turn, as the marks end under one.
+                let turn = crate::dst_gate::turn();
+                if writers.count(&branch) == 0 {
+                    break;
+                }
+                turn.is_some()
+            };
+            tokio::select! {
+                biased;
+                () = &mut cancelled => break,
+                () = tokio::time::sleep_until(deadline) => break,
+                // Installed, the contender stays in the turn loop, as every
+                // gate's does (`scheduled_lock_wait`).
+                () = async {
+                    if installed {
+                        tokio::task::yield_now().await;
+                    } else {
+                        notified.as_mut().await;
+                    }
+                } => {}
+            }
+        }
+        observed(&GATE_WRITER_YIELD_HOLD);
+        started.elapsed()
     }
 
     /// Reserve the sole immutable export cut without waiting.
@@ -1144,5 +1300,131 @@ mod tests {
         let first = WriteQueueManager::for_root(&real_identity);
         let second = WriteQueueManager::for_root(&alias_identity);
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// Optimize's wait for writers preparing again ends when the last mark on
+    /// its branch ends. A mark on another branch does not hold it, and main
+    /// is one key whether a writer names it or not.
+    #[tokio::test]
+    async fn writer_yield_waits_for_the_writers_preparing_again_on_its_branch() {
+        let qm = Arc::new(WriteQueueManager::new());
+        let unbounded = Duration::from_secs(30);
+        let waited = qm
+            .yield_to_repreparing_writers(None, unbounded, std::future::pending())
+            .await;
+        assert!(
+            waited < Duration::from_secs(1),
+            "no writer, no wait: {waited:?}"
+        );
+
+        let feature = qm.mark_repreparing(Some("feature"));
+        let waited = qm
+            .yield_to_repreparing_writers(None, unbounded, std::future::pending())
+            .await;
+        assert!(
+            waited < Duration::from_secs(1),
+            "a writer on another branch does not hold main's run: {waited:?}"
+        );
+        drop(feature);
+
+        let named = qm.mark_repreparing(Some("main"));
+        let unnamed = qm.mark_repreparing(None);
+        let waiter = {
+            let qm = Arc::clone(&qm);
+            tokio::spawn(async move {
+                qm.yield_to_repreparing_writers(None, unbounded, std::future::pending())
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(named);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the run waits while one writer is still preparing again"
+        );
+        drop(unnamed);
+        let waited = timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the run stops waiting once the last writer's mark ends")
+            .unwrap();
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+    }
+
+    /// The wait ends at its limit, so conflicting writers cannot hold
+    /// maintenance off for good, and on the run's cancellation.
+    #[tokio::test]
+    async fn writer_yield_ends_at_its_limit_and_on_cancellation() {
+        let qm = Arc::new(WriteQueueManager::new());
+        let _mark = qm.mark_repreparing(None);
+        let started = Instant::now();
+        let waited = qm
+            .yield_to_repreparing_writers(None, Duration::from_millis(100), std::future::pending())
+            .await;
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let waited = qm
+            .yield_to_repreparing_writers(None, Duration::ZERO, std::future::pending())
+            .await;
+        assert!(
+            waited < Duration::from_secs(1),
+            "a zero limit does not wait: {waited:?}"
+        );
+
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let waiter = {
+            let qm = Arc::clone(&qm);
+            tokio::spawn(async move {
+                qm.yield_to_repreparing_writers(None, Duration::from_secs(30), async {
+                    let _ = cancelled.await;
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+        cancel.send(()).unwrap();
+        timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("a cancelled run stops waiting")
+            .unwrap();
+    }
+
+    /// The writer-yield gate crosses `acquire` as the run starts waiting,
+    /// `release` as the writer's mark ends, and `hold` as the run goes on.
+    #[cfg(feature = "failpoints")]
+    #[tokio::test]
+    async fn writer_yield_crosses_acquire_release_hold() {
+        let _scenario = crate::seams::FailScenario::setup();
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let note = |name: &'static str| {
+            let events = Arc::clone(&events);
+            move || events.lock().unwrap().push(name)
+        };
+        let _observers = [
+            GATE_WRITER_YIELD_ACQUIRE.observe(note("acquire")),
+            GATE_WRITER_YIELD_HOLD.observe(note("hold")),
+            GATE_WRITER_YIELD_RELEASE.observe(note("release")),
+        ];
+        let qm = Arc::new(WriteQueueManager::new());
+        let mark = qm.mark_repreparing(None);
+        let waiter = {
+            let qm = Arc::clone(&qm);
+            tokio::spawn(async move {
+                qm.yield_to_repreparing_writers(
+                    None,
+                    Duration::from_secs(30),
+                    std::future::pending(),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(mark);
+        timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*events.lock().unwrap(), ["acquire", "release", "hold"]);
     }
 }

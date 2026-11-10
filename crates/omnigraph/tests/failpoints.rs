@@ -4960,6 +4960,125 @@ async fn optimize_cancelled_mid_run_publishes_nothing_and_the_next_run_does() {
     );
 }
 
+/// A run waits, before it takes the gates, for a writer that an earlier
+/// publication sent back to prepare again. Without the wait, runs submitted
+/// back to back take the gates while that writer prepares, publish, and send
+/// it back again, so on object storage one write waited through many runs
+/// (a writer's wait was bounded per run, not per write).
+///
+/// The writer's first attempt is parked before its gates while a run
+/// publishes over it; its second attempt is parked while the next run
+/// starts. That run must not take the gates until the write commits, and it
+/// then builds on the write's commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_waits_for_a_writer_preparing_again_after_a_publication() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    let optimize_db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let writer_db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+
+    let yields = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _yield_observer = {
+        let yields = Arc::clone(&yields);
+        catalog::GATE_WRITER_YIELD_ACQUIRE.observe(move || {
+            yields.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    // The writer crosses this seam once per attempt.
+    let attempts = helpers::failpoint::ParkedCrossings::new(
+        &catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        &[1, 2],
+    );
+    let writer = {
+        let writer_db = Arc::clone(&writer_db);
+        tokio::spawn(async move {
+            mutate_main(
+                &writer_db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "preparing-again")], &[("$age", 52)]),
+            )
+            .await
+        })
+    };
+    attempts.wait_until_reached(1).await;
+
+    // The first run publishes over the parked attempt. That writer is not
+    // preparing again yet, so the run does not wait for it.
+    let first_run = optimize_db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        first_run.graph_commit_id.is_some(),
+        "the seed leaves compaction work, so the run must publish over the writer"
+    );
+    assert!(first_run.writer_yield < std::time::Duration::from_secs(1));
+
+    // The run moved main under the attempt: it prepares again.
+    attempts.release(1);
+    attempts.wait_until_reached(2).await;
+
+    let second_run = {
+        let optimize_db = Arc::clone(&optimize_db);
+        tokio::spawn(async move {
+            optimize_db
+                .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                .await
+        })
+    };
+    for _ in 0..400 {
+        if yields.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        yields.load(Ordering::SeqCst),
+        2,
+        "the second run reached its wait"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !second_run.is_finished(),
+        "the second run must wait while the writer prepares again"
+    );
+
+    attempts.release(2);
+    writer
+        .await
+        .unwrap()
+        .expect("the writer commits on its second attempt");
+    let head_after_write = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let second_run = tokio::time::timeout(std::time::Duration::from_secs(20), second_run)
+        .await
+        .expect("the second run stops waiting once the write returns")
+        .unwrap()
+        .unwrap();
+    drop(attempts);
+    assert!(
+        second_run.writer_yield >= std::time::Duration::from_millis(200),
+        "the report records the wait: {:?}",
+        second_run.writer_yield
+    );
+    assert_eq!(
+        second_run.input_commit.as_deref(),
+        Some(head_after_write.as_str()),
+        "the second run builds on the write, not the other way round"
+    );
+    assert_eq!(
+        collect_column_strings(&read_table(&optimize_db, "node:Person").await, "name")
+            .iter()
+            .filter(|name| *name == "preparing-again")
+            .count(),
+        1
+    );
+}
+
 /// Optimize captures a complete authority token before entering any writer
 /// gate, then revalidates it after schema -> main -> table (`optimize.rs`, the
 /// comment above `open_write_txn`). That revalidation is the only thing that
