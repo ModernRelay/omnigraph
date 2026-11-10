@@ -357,6 +357,7 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
         mode,
         bind,
         allow_unauthenticated,
+        allow_reads_without_policy,
         require_all_graphs,
         witness,
         shutdown_grace,
@@ -370,6 +371,7 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
         },
         bind: "127.0.0.1:0".into(),
         allow_unauthenticated: true,
+        allow_reads_without_policy: false,
         require_all_graphs: false,
         witness: BootWitness::default(),
         shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
@@ -377,7 +379,7 @@ fn legacy_public_struct_literals_and_destructuring_compile() {
     };
     assert!(matches!(mode, ServerConfigMode::Multi { .. }));
     assert_eq!(bind, "127.0.0.1:0");
-    assert!(allow_unauthenticated && !require_all_graphs);
+    assert!(allow_unauthenticated && !allow_reads_without_policy && !require_all_graphs);
     assert!(witness.booted_serving_digest.is_none() && witness.state_cas.is_none());
     assert_eq!(witness.state_revision, 0);
     assert_eq!(shutdown_grace, DEFAULT_SHUTDOWN_GRACE);
@@ -1550,6 +1552,9 @@ mod owned_shutdown {
                 .env_remove("OMNIGRAPH_SERVER_BEARER_TOKEN")
                 .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE")
                 .env_remove("OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET")
+                // The owned graphs carry no policy; a journey that boots from
+                // the environment reads them through the operator opt-in.
+                .env("OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY", "1")
                 .env("OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX", "1")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -1661,6 +1666,9 @@ mod owned_shutdown {
             },
             bind: "127.0.0.1:0".into(),
             allow_unauthenticated: true,
+            // The owned graphs carry no policy; these journeys read them with
+            // a static token through the operator opt-in.
+            allow_reads_without_policy: true,
             require_all_graphs: true,
             witness: Default::default(),
             shutdown_grace: grace,
@@ -2767,9 +2775,11 @@ async fn live_deployment_fixture(mode: &str) {
             assert_eq!(receipt["active"], true, "{receipt}");
             assert_eq!(state.routing().registry.len(), original_inventory);
             assert!(!temp.path().join("graphs/og_catalog.omni").exists());
+            // Without its bound policy the catalogue denies every token, as
+            // any graph without a policy does.
             for (token, allowed) in [
-                ("reader-token", change != "update"),
-                ("operator-token", matches!(change, "update" | "remove")),
+                ("reader-token", !matches!(change, "update" | "remove")),
+                ("operator-token", change == "update"),
             ] {
                 let (code, body) =
                     json_response(&app, get_request("/graphs/og_catalog/schema", token)).await;

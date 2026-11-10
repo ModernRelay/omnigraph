@@ -353,6 +353,26 @@ fn bounded_result<T: Serialize>(value: &T) -> Result<ToolResult, ApiError> {
     omnigraph_mcp::bounded_result(value).map_err(|error| protocol_error(error, false))
 }
 
+/// One tool call's work, in its own allocation.
+type ToolFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<ToolResult, ApiError>> + Send + 'a>>;
+
+/// Build one tool call's future on the heap, in a frame of its own. A single
+/// future over every tool would be as large as the largest handler's, and the
+/// frame that polls it reserves room for each arm's handler future: enough,
+/// with the server's wrappers around it, to overflow a 2 MiB worker stack on
+/// any tool call. Each arm's future instead starts here and the dispatch
+/// holds only its pointer, so a tool call needs about the stack its HTTP
+/// route needs.
+#[inline(never)]
+fn boxed<'a, F, Fut>(start: F) -> ToolFuture<'a>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<ToolResult, ApiError>> + Send + 'a,
+{
+    Box::pin(start())
+}
+
 impl ServerHost {
     async fn execute(
         &self,
@@ -378,452 +398,523 @@ impl ServerHost {
             .map_err(|_| ApiError::bad_request("invalid MCP tool arguments"))?;
         let state = || State(self.state.clone());
         match call {
-            ToolCall::Health => bounded_result(&handlers::server_health().await.0),
-            ToolCall::Graphs => bounded_result(&self.discover(actor).await?),
+            ToolCall::Health => {
+                boxed(|| async { bounded_result(&handlers::server_health().await.0) }).await
+            }
+            ToolCall::Graphs => {
+                boxed(move || async move { bounded_result(&self.discover(actor).await?) }).await
+            }
             ToolCall::Schema(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output =
-                    handlers::server_schema_get(Extension(handle), Some(Extension(actor))).await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let output =
+                        handlers::server_schema_get(Extension(handle), Some(Extension(actor)))
+                            .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::Queries(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output =
-                    handlers::server_list_queries(Extension(handle), Some(Extension(actor)))
-                        .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let output =
+                        handlers::server_list_queries(Extension(handle), Some(Extension(actor)))
+                            .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::Query(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let Some(query) = args.query else {
-                    // A stored read, as `omnigraph query NAME` runs it.
-                    let name = args.name.ok_or_else(|| {
-                        ApiError::bad_request(
-                            "query needs `query` (GQ source) or `name` (a stored read)",
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let Some(query) = args.query else {
+                        // A stored read, as `omnigraph query NAME` runs it.
+                        let name = args.name.ok_or_else(|| {
+                            ApiError::bad_request(
+                                "query needs `query` (GQ source) or `name` (a stored read)",
+                            )
+                        })?;
+                        let body = serde_json::to_vec(&InvokeStoredQueryRequest {
+                            params: args.params.map(Value::Object),
+                            branch: args.branch,
+                            snapshot: args.snapshot,
+                            expect_mutation: Some(false),
+                        })
+                        .map_err(|_| ApiError::bad_request("invalid query parameters"))?;
+                        let output = handlers::server_invoke_query(
+                            state(),
+                            Extension(handle),
+                            Extension(input),
+                            Some(Extension(actor)),
+                            ApiPath(QueryNamePath { query_name: name }),
+                            HeaderMap::new(),
+                            Bytes::from(body),
                         )
-                    })?;
-                    let body = serde_json::to_vec(&InvokeStoredQueryRequest {
-                        params: args.params.map(Value::Object),
-                        branch: args.branch,
-                        snapshot: args.snapshot,
-                        expect_mutation: Some(false),
-                    })
-                    .map_err(|_| ApiError::bad_request("invalid query parameters"))?;
-                    let output = handlers::server_invoke_query(
+                        .await?;
+                        return bounded_result(&output.0);
+                    };
+                    let request = request_body(json!({
+                        "query": query,
+                        "name": args.name,
+                        "params": args.params,
+                        "branch": args.branch,
+                        "snapshot": args.snapshot,
+                    }))?;
+                    let output = handlers::server_query(
                         state(),
                         Extension(handle),
-                        Extension(input),
                         Some(Extension(actor)),
-                        ApiPath(QueryNamePath { query_name: name }),
-                        HeaderMap::new(),
-                        Bytes::from(body),
+                        ApiJson(request),
                     )
                     .await?;
-                    return bounded_result(&output.0);
-                };
-                let request = request_body(json!({
-                    "query": query,
-                    "name": args.name,
-                    "params": args.params,
-                    "branch": args.branch,
-                    "snapshot": args.snapshot,
-                }))?;
-                let output = handlers::server_query(
-                    state(),
-                    Extension(handle),
-                    Some(Extension(actor)),
-                    ApiJson(request),
-                )
-                .await?;
-                bounded_result(&output.0)
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::Snapshot(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output = handlers::server_snapshot(
-                    Extension(handle),
-                    Some(Extension(actor)),
-                    ApiQuery(crate::api::SnapshotQuery {
-                        branch: args.branch,
-                    }),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let output = handlers::server_snapshot(
+                        Extension(handle),
+                        Some(Extension(actor)),
+                        ApiQuery(crate::api::SnapshotQuery {
+                            branch: args.branch,
+                        }),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::Access(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output = handlers::access_body(
-                    &handle,
-                    Some(&actor),
-                    crate::api::AccessQuery {
-                        branch: args.branch,
-                        target_branch: args.target_branch,
-                    },
-                )?;
-                bounded_result(&output)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let output = handlers::access_body(
+                        &handle,
+                        Some(&actor),
+                        crate::api::AccessQuery {
+                            branch: args.branch,
+                            target_branch: args.target_branch,
+                        },
+                    )?;
+                    bounded_result(&output)
+                })
+                .await
             }
             ToolCall::BranchesList(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output = handlers::server_branch_list(
-                    Extension(handle),
-                    Some(Extension(actor)),
-                    ApiQuery(crate::api::BranchListQuery {
-                        detailed: args.detailed,
-                    }),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let output = handlers::server_branch_list(
+                        Extension(handle),
+                        Some(Extension(actor)),
+                        ApiQuery(crate::api::BranchListQuery {
+                            detailed: args.detailed,
+                        }),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::CommitsList(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let listing = match args.listing {
-                    Some(listing) => request_body(Value::String(listing))?,
-                    None => crate::api::CommitListing::History,
-                };
-                let output = handlers::server_commit_list(
-                    Extension(handle),
-                    Some(Extension(actor)),
-                    ApiQuery(crate::api::CommitListQuery {
-                        branch: args.branch,
-                        listing,
-                        limit: args.limit,
-                        page_token: args.page_token,
-                    }),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let listing = match args.listing {
+                        Some(listing) => request_body(Value::String(listing))?,
+                        None => crate::api::CommitListing::History,
+                    };
+                    let output = handlers::server_commit_list(
+                        Extension(handle),
+                        Some(Extension(actor)),
+                        ApiQuery(crate::api::CommitListQuery {
+                            branch: args.branch,
+                            listing,
+                            limit: args.limit,
+                            page_token: args.page_token,
+                        }),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::CommitsGet(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output = handlers::server_commit_show(
-                    Extension(handle),
-                    Some(Extension(actor)),
-                    ApiPath(handlers::CommitPath {
-                        commit_id: args.commit_id,
-                    }),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let output = handlers::server_commit_show(
+                        Extension(handle),
+                        Some(Extension(actor)),
+                        ApiPath(handlers::CommitPath {
+                            commit_id: args.commit_id,
+                        }),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::CommitsChanges(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let query = change_query(&[], &args.filters);
-                let output = handlers::server_commit_changes(
-                    state(),
-                    Extension(handle),
-                    Some(Extension(actor)),
-                    ApiPath(handlers::CommitPath {
-                        commit_id: args.commit_id,
-                    }),
-                    RawQuery(query),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let query = change_query(&[], &args.filters);
+                    let output = handlers::server_commit_changes(
+                        state(),
+                        Extension(handle),
+                        Some(Extension(actor)),
+                        ApiPath(handlers::CommitPath {
+                            commit_id: args.commit_id,
+                        }),
+                        RawQuery(query),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::ChangesPoll(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let query = change_query(
-                    &[
-                        ("branch", args.branch.as_deref()),
-                        ("cursor", args.cursor.as_deref()),
-                        ("start", args.start.as_deref()),
-                    ],
-                    &args.filters,
-                );
-                let output = handlers::server_changes_feed(
-                    state(),
-                    Extension(handle),
-                    Some(Extension(actor)),
-                    RawQuery(query),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let query = change_query(
+                        &[
+                            ("branch", args.branch.as_deref()),
+                            ("cursor", args.cursor.as_deref()),
+                            ("start", args.start.as_deref()),
+                        ],
+                        &args.filters,
+                    );
+                    let output = handlers::server_changes_feed(
+                        state(),
+                        Extension(handle),
+                        Some(Extension(actor)),
+                        RawQuery(query),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::Diff(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let query = change_query(
-                    &[
-                        ("from", Some(args.from.as_str())),
-                        ("to", Some(args.to.as_str())),
-                    ],
-                    &args.filters,
-                );
-                let output = handlers::server_diff(
-                    state(),
-                    Extension(handle),
-                    Some(Extension(actor)),
-                    RawQuery(query),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let query = change_query(
+                        &[
+                            ("from", Some(args.from.as_str())),
+                            ("to", Some(args.to.as_str())),
+                        ],
+                        &args.filters,
+                    );
+                    let output = handlers::server_diff(
+                        state(),
+                        Extension(handle),
+                        Some(Extension(actor)),
+                        RawQuery(query),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::BranchesDiff(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let query = change_query(
-                    &[
-                        ("source", Some(args.source.as_str())),
-                        ("target", args.target.as_deref()),
-                    ],
-                    &args.filters,
-                );
-                let output = handlers::server_branch_diff(
-                    state(),
-                    Extension(handle),
-                    Some(Extension(actor)),
-                    RawQuery(query),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let query = change_query(
+                        &[
+                            ("source", Some(args.source.as_str())),
+                            ("target", args.target.as_deref()),
+                        ],
+                        &args.filters,
+                    );
+                    let output = handlers::server_branch_diff(
+                        state(),
+                        Extension(handle),
+                        Some(Extension(actor)),
+                        RawQuery(query),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::BranchesMergeBase(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let query = change_query(
-                    &[
-                        ("source", Some(args.source.as_str())),
-                        ("target", args.target.as_deref()),
-                    ],
-                    &ChangeFilters::default(),
-                );
-                let output = handlers::server_merge_base(
-                    Extension(handle),
-                    Some(Extension(actor)),
-                    RawQuery(query),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let query = change_query(
+                        &[
+                            ("source", Some(args.source.as_str())),
+                            ("target", args.target.as_deref()),
+                        ],
+                        &ChangeFilters::default(),
+                    );
+                    let output = handlers::server_merge_base(
+                        Extension(handle),
+                        Some(Extension(actor)),
+                        RawQuery(query),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::BlobsStat(args) => {
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let query: crate::api::BlobReadQuery = request_body(json!({
-                    "entity": args.entity,
-                    "type": args.r#type,
-                    "id": args.id,
-                    "property": args.property,
-                    "branch": args.branch,
-                    "snapshot": args.snapshot,
-                }))?;
-                let response = handlers::server_blob_head(
-                    Extension(handle),
-                    Some(Extension(actor)),
-                    HeaderMap::new(),
-                    ApiQuery(query.clone()),
-                )
-                .await?;
-                bounded_result(&blob_stat_output(&query, &response)?)
+                boxed(move || async move {
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let query: crate::api::BlobReadQuery = request_body(json!({
+                        "entity": args.entity,
+                        "type": args.r#type,
+                        "id": args.id,
+                        "property": args.property,
+                        "branch": args.branch,
+                        "snapshot": args.snapshot,
+                    }))?;
+                    let response = handlers::server_blob_head(
+                        Extension(handle),
+                        Some(Extension(actor)),
+                        HeaderMap::new(),
+                        ApiQuery(query.clone()),
+                    )
+                    .await?;
+                    bounded_result(&blob_stat_output(&query, &response)?)
+                })
+                .await
             }
             ToolCall::Mutate(args) => {
-                let ingress = write_ingress()?;
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let precondition = args
-                    .if_graph_commit
-                    .as_deref()
-                    .map(graph_commit_precondition)
-                    .transpose()?;
-                let Some(query) = args.query else {
-                    // A stored mutation, as `omnigraph mutate NAME` runs it:
-                    // the precondition selects the conditional route that
-                    // requires it; the plain route refuses one.
-                    let name = args.name.ok_or_else(|| {
-                        ApiError::bad_request(
-                            "mutate needs `query` (GQ source) or `name` (a stored mutation)",
-                        )
-                    })?;
-                    let body = serde_json::to_vec(&InvokeStoredQueryRequest {
-                        params: args.params.map(Value::Object),
-                        branch: args.branch,
-                        snapshot: None,
-                        expect_mutation: Some(true),
-                    })
-                    .map_err(|_| ApiError::bad_request("invalid mutation parameters"))?;
-                    let path = ApiPath(QueryNamePath { query_name: name });
+                boxed(move || async move {
+                    let ingress = write_ingress()?;
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let precondition = args
+                        .if_graph_commit
+                        .as_deref()
+                        .map(graph_commit_precondition)
+                        .transpose()?;
+                    let Some(query) = args.query else {
+                        // A stored mutation, as `omnigraph mutate NAME` runs it:
+                        // the precondition selects the conditional route that
+                        // requires it; the plain route refuses one.
+                        let name = args.name.ok_or_else(|| {
+                            ApiError::bad_request(
+                                "mutate needs `query` (GQ source) or `name` (a stored mutation)",
+                            )
+                        })?;
+                        let body = serde_json::to_vec(&InvokeStoredQueryRequest {
+                            params: args.params.map(Value::Object),
+                            branch: args.branch,
+                            snapshot: None,
+                            expect_mutation: Some(true),
+                        })
+                        .map_err(|_| ApiError::bad_request("invalid mutation parameters"))?;
+                        let path = ApiPath(QueryNamePath { query_name: name });
+                        let output = match precondition {
+                            Some(headers) => {
+                                handlers::server_invoke_query_if_graph_commit(
+                                    state(),
+                                    Extension(handle),
+                                    Extension(ingress),
+                                    Some(Extension(actor)),
+                                    path,
+                                    headers,
+                                    Bytes::from(body),
+                                )
+                                .await?
+                            }
+                            None => {
+                                handlers::server_invoke_query(
+                                    state(),
+                                    Extension(handle),
+                                    Extension(ingress),
+                                    Some(Extension(actor)),
+                                    path,
+                                    HeaderMap::new(),
+                                    Bytes::from(body),
+                                )
+                                .await?
+                            }
+                        };
+                        return bounded_result(&output.0);
+                    };
+                    let request = ApiJson(request_body(json!({
+                        "query": query,
+                        "name": args.name,
+                        "params": args.params,
+                        "branch": args.branch,
+                    }))?);
                     let output = match precondition {
                         Some(headers) => {
-                            handlers::server_invoke_query_if_graph_commit(
+                            handlers::server_mutate_if_graph_commit(
                                 state(),
                                 Extension(handle),
                                 Extension(ingress),
                                 Some(Extension(actor)),
-                                path,
                                 headers,
-                                Bytes::from(body),
+                                request,
                             )
                             .await?
                         }
                         None => {
-                            handlers::server_invoke_query(
+                            handlers::server_mutate(
                                 state(),
                                 Extension(handle),
                                 Extension(ingress),
                                 Some(Extension(actor)),
-                                path,
                                 HeaderMap::new(),
-                                Bytes::from(body),
+                                request,
                             )
                             .await?
                         }
                     };
-                    return bounded_result(&output.0);
-                };
-                let request = ApiJson(request_body(json!({
-                    "query": query,
-                    "name": args.name,
-                    "params": args.params,
-                    "branch": args.branch,
-                }))?);
-                let output = match precondition {
-                    Some(headers) => {
-                        handlers::server_mutate_if_graph_commit(
-                            state(),
-                            Extension(handle),
-                            Extension(ingress),
-                            Some(Extension(actor)),
-                            headers,
-                            request,
-                        )
-                        .await?
-                    }
-                    None => {
-                        handlers::server_mutate(
-                            state(),
-                            Extension(handle),
-                            Extension(ingress),
-                            Some(Extension(actor)),
-                            HeaderMap::new(),
-                            request,
-                        )
-                        .await?
-                    }
-                };
-                bounded_result(&output.0)
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::Load(args) => {
-                let ingress = write_ingress()?;
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let request = request_body(json!({
-                    "branch": args.branch,
-                    "from": args.from,
-                    "mode": args.mode,
-                    "data": args.data,
-                }))?;
-                let output = handlers::server_load(
-                    state(),
-                    Extension(handle),
-                    Extension(ingress),
-                    Some(Extension(actor)),
-                    ApiJson(request),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let ingress = write_ingress()?;
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let request = request_body(json!({
+                        "branch": args.branch,
+                        "from": args.from,
+                        "mode": args.mode,
+                        "data": args.data,
+                    }))?;
+                    let output = handlers::server_load(
+                        state(),
+                        Extension(handle),
+                        Extension(ingress),
+                        Some(Extension(actor)),
+                        ApiJson(request),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::BlobsClear(args) => {
-                let ingress = write_ingress()?;
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let query = request_body(json!({
-                    "entity": args.entity,
-                    "type": args.r#type,
-                    "id": args.id,
-                    "property": args.property,
-                    "branch": args.branch,
-                }))?;
-                // The route's `If-Match` field, parsed by the route's own rule.
-                let mut headers = HeaderMap::new();
-                if let Some(tags) = args.if_match {
-                    headers.insert(
-                        header::IF_MATCH,
-                        HeaderValue::from_str(&tags).map_err(|_| {
-                            ApiError::bad_request("if_match is not a valid If-Match value")
-                        })?,
-                    );
-                }
-                let output = handlers::blob_clear_body(
-                    &self.state,
-                    &handle,
-                    ingress,
-                    Some(&actor),
-                    &headers,
-                    query,
-                )
-                .await?;
-                bounded_result(&output)
+                boxed(move || async move {
+                    let ingress = write_ingress()?;
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let query = request_body(json!({
+                        "entity": args.entity,
+                        "type": args.r#type,
+                        "id": args.id,
+                        "property": args.property,
+                        "branch": args.branch,
+                    }))?;
+                    // The route's `If-Match` field, parsed by the route's own rule.
+                    let mut headers = HeaderMap::new();
+                    if let Some(tags) = args.if_match {
+                        headers.insert(
+                            header::IF_MATCH,
+                            HeaderValue::from_str(&tags).map_err(|_| {
+                                ApiError::bad_request("if_match is not a valid If-Match value")
+                            })?,
+                        );
+                    }
+                    let output = handlers::blob_clear_body(
+                        &self.state,
+                        &handle,
+                        ingress,
+                        Some(&actor),
+                        &headers,
+                        query,
+                    )
+                    .await?;
+                    bounded_result(&output)
+                })
+                .await
             }
             ToolCall::BranchesCreate(args) => {
-                let ingress = write_ingress()?;
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output = handlers::server_branch_create(
-                    state(),
-                    Extension(handle),
-                    Extension(ingress),
-                    Some(Extension(actor)),
-                    ApiJson(crate::api::BranchCreateRequest {
-                        from: args.from,
-                        from_commit: args.from_commit,
-                        name: args.name,
-                    }),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let ingress = write_ingress()?;
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let output = handlers::server_branch_create(
+                        state(),
+                        Extension(handle),
+                        Extension(ingress),
+                        Some(Extension(actor)),
+                        ApiJson(crate::api::BranchCreateRequest {
+                            from: args.from,
+                            from_commit: args.from_commit,
+                            name: args.name,
+                        }),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::BranchesDelete(args) => {
-                let ingress = write_ingress()?;
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output = handlers::server_branch_delete(
-                    state(),
-                    Extension(handle),
-                    Extension(ingress),
-                    Some(Extension(actor)),
-                    ApiPath(handlers::BranchPath {
-                        branch_name: args.name,
-                    }),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let ingress = write_ingress()?;
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let output = handlers::server_branch_delete(
+                        state(),
+                        Extension(handle),
+                        Extension(ingress),
+                        Some(Extension(actor)),
+                        ApiPath(handlers::BranchPath {
+                            branch_name: args.name,
+                        }),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::BranchesMerge(args) => {
-                let ingress = write_ingress()?;
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let request = request_body(json!({
-                    "source": args.source,
-                    "target": args.target,
-                }))?;
-                let output = handlers::server_branch_merge(
-                    state(),
-                    Extension(handle),
-                    Extension(ingress),
-                    Some(Extension(actor)),
-                    ApiJson(request),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let ingress = write_ingress()?;
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let request = request_body(json!({
+                        "source": args.source,
+                        "target": args.target,
+                    }))?;
+                    let output = handlers::server_branch_merge(
+                        state(),
+                        Extension(handle),
+                        Extension(ingress),
+                        Some(Extension(actor)),
+                        ApiJson(request),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::CommitsPublish(args) => {
-                let ingress = write_ingress()?;
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                let output = handlers::server_commit_publish(
-                    state(),
-                    Extension(handle),
-                    Extension(ingress),
-                    Some(Extension(actor)),
-                    ApiPath(handlers::CommitPath {
-                        commit_id: args.commit_id,
-                    }),
-                )
-                .await?;
-                bounded_result(&output.0)
+                boxed(move || async move {
+                    let ingress = write_ingress()?;
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    let output = handlers::server_commit_publish(
+                        state(),
+                        Extension(handle),
+                        Extension(ingress),
+                        Some(Extension(actor)),
+                        ApiPath(handlers::CommitPath {
+                            commit_id: args.commit_id,
+                        }),
+                    )
+                    .await?;
+                    bounded_result(&output.0)
+                })
+                .await
             }
             ToolCall::CommitsDrop(args) => {
-                let ingress = write_ingress()?;
-                let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
-                handlers::server_commit_drop(
-                    state(),
-                    Extension(handle),
-                    Extension(ingress),
-                    Some(Extension(actor)),
-                    ApiPath(handlers::CommitPath {
-                        commit_id: args.commit_id,
-                    }),
-                )
-                .await?;
-                // The route answers 204; structured content must be an object.
-                bounded_result(&json!({}))
+                boxed(move || async move {
+                    let ingress = write_ingress()?;
+                    let (handle, actor) = self.graph(&args.graph, actor, &graph)?;
+                    handlers::server_commit_drop(
+                        state(),
+                        Extension(handle),
+                        Extension(ingress),
+                        Some(Extension(actor)),
+                        ApiPath(handlers::CommitPath {
+                            commit_id: args.commit_id,
+                        }),
+                    )
+                    .await?;
+                    // The route answers 204; structured content must be an object.
+                    bounded_result(&json!({}))
+                })
+                .await
             }
         }
     }

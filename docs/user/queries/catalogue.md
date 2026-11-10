@@ -57,8 +57,9 @@ query jobs_naming_no_operator() {
 A served read of `og_catalog` is authorized like a graph read: the policy
 bound to `graph.og_catalog` in `cluster.yaml` decides, with the resource
 `og_catalog` and no branch; without a bound policy the ordinary no-policy
-rules apply (static tokens may read, signed data credentials need a
-permit). See [Authorization and actors](../operations/policy.md).
+rules apply: every credential is refused, unless the server sets
+`OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`, which lets static tokens read.
+See [Authorization and actors](../operations/policy.md).
 
 ## What is refused
 

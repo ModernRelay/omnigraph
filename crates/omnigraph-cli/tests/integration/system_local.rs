@@ -2502,9 +2502,14 @@ fn cluster_server_boot_ignores_local_config_in_cwd() {
 #[test]
 fn local_cli_keyed_credentials_authenticate_url_matched_server_issue_1022() {
     let cluster = converged_loaded_cluster("local", None);
+    // The graph has no policy: the token reads it through the operator
+    // opt-in, so each refusal below is the credential's, not the policy's.
     let server = spawn_server_with_cluster_env(
         cluster.path(),
-        &[("OMNIGRAPH_SERVER_BEARER_TOKEN", "secret-tok")],
+        &[
+            ("OMNIGRAPH_SERVER_BEARER_TOKEN", "secret-tok"),
+            ("OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY", "1"),
+        ],
     );
     let home = tempfile::tempdir().unwrap();
     let token = home.path().join("token");

@@ -46,7 +46,18 @@ fn operators_request() -> QueryRequest {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn catalogue_scope_serves_reads_and_refuses_everything_else() {
-    let (_temp, app) = app_for_graph_with_auth_tokens_only(SCHEMA, &[("act-a", "token-a")]).await;
+    // Without a bound policy the catalogue refuses every token, as a graph
+    // without one does; the operator opt-in lets static tokens read it.
+    let (_temp, closed) =
+        app_for_graph_with_auth_tokens_only(SCHEMA, &[("act-a", "token-a")]).await;
+    let (status, body) = json_response(
+        &closed,
+        catalogue_query(Some("token-a"), &operators_request()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (_temp, app) =
+        app_for_graph_with_auth_tokens_only_reading(SCHEMA, &[("act-a", "token-a")], true).await;
 
     let (status, body) =
         json_response(&app, catalogue_query(Some("token-a"), &operators_request())).await;
