@@ -1853,6 +1853,13 @@ impl ObjectStorageAdapter {
         Ok(Some((bytes, etag)))
     }
 
+    /// A read observed `location` at `observed` (absent when `None`).
+    fn settle_superseded(&self, location: &ObjectPath, observed: Option<&str>) {
+        if let Some(scope) = &self.scope {
+            scope.settle_superseded(location, observed);
+        }
+    }
+
     /// A read-back showed that `precondition` no longer holds at `location`.
     fn settle_failed_precondition(
         &self,
@@ -2379,7 +2386,12 @@ impl StorageAdapter for ObjectStorageAdapter {
         // exposes the exact generation's size/token before body collection.
         let result = match self.store.get(&location).await {
             Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(object_store::Error::NotFound { .. }) => {
+                if self.supports_conditional_update {
+                    self.settle_superseded(&location, None);
+                }
+                return Ok(None);
+            }
             Err(err) => return Err(storage_backend_error("bounded_read", uri, err)),
         };
         let limit_error = |actual| StorageError::ResourceLimit {
@@ -2400,6 +2412,11 @@ impl StorageAdapter for ObjectStorageAdapter {
         } else {
             None
         };
+        // The owner's read of a key settles an earlier conditional request
+        // whose precondition this generation no longer meets (scoped.rs).
+        if let Some(token) = &remote_token {
+            self.settle_superseded(&location, Some(token));
+        }
         let mut stream = result.into_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream

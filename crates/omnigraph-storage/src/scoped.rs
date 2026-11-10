@@ -206,6 +206,27 @@ impl StorageIoScope {
         }
     }
 
+    /// A read of `path` observed the object at `observed` (its ETag), or
+    /// absent (`None`). A conditional request left unsettled there whose
+    /// precondition no longer holds can never apply: an if-match names
+    /// another version (or an object that is gone), a create-if-absent meets
+    /// an object. Settle it, as the module documentation says an owner's read
+    /// does. An unconditional request stays unsettled.
+    pub(crate) fn settle_superseded(&self, path: &Path, observed: Option<&str>) {
+        let mut state = self.inner.state.lock().unwrap();
+        let superseded = match (state.unsettled.get(path), observed) {
+            (Some(Some(Precondition::Matches(expected))), Some(etag)) => {
+                expected.rsplit_once('/').map(|(tag, _)| tag) != Some(etag)
+            }
+            (Some(Some(Precondition::Matches(_))), None) => true,
+            (Some(Some(Precondition::Absent)), Some(_)) => true,
+            _ => false,
+        };
+        if superseded {
+            state.unsettled.remove(path);
+        }
+    }
+
     pub fn pending(&self) -> usize {
         self.inner.state.lock().unwrap().pending
     }
@@ -1420,6 +1441,40 @@ mod tests {
 
     /// A store's refusal before applying leaves nothing to settle, and a
     /// refused re-issue keeps the uncertainty its first copy left.
+
+    /// The owner's read of a key settles an unsettled conditional request
+    /// whose precondition the observed generation no longer meets, and only
+    /// that (stress/REPORT.md: a lost record put that landed late kept the
+    /// operation record refused for the life of the process).
+    #[test]
+    fn a_read_that_observes_another_generation_settles_the_key() {
+        let path = Path::from("__cluster/operations.json");
+        let scope = StorageIoScope::new();
+        let unsettle = |precondition| {
+            scope.inner.state.lock().unwrap().unsettle(&path, precondition);
+        };
+
+        unsettle(Some(Precondition::Matches("\"e1\"/".into())));
+        scope.settle_superseded(&path, Some("\"e1\""));
+        assert_eq!(scope.unsettled_keys(), 1, "the precondition still holds");
+        scope.settle_superseded(&path, Some("\"e2\""));
+        assert_eq!(scope.unsettled_keys(), 0, "another generation settles it");
+
+        unsettle(Some(Precondition::Matches("\"e1\"/".into())));
+        scope.settle_superseded(&path, None);
+        assert_eq!(scope.unsettled_keys(), 0, "an if-match cannot apply to a gone object");
+
+        unsettle(Some(Precondition::Absent));
+        scope.settle_superseded(&path, None);
+        assert_eq!(scope.unsettled_keys(), 1, "a create can still land on an absent key");
+        scope.settle_superseded(&path, Some("\"e1\""));
+        assert_eq!(scope.unsettled_keys(), 0, "a create cannot apply over an object");
+
+        unsettle(None);
+        scope.settle_superseded(&path, Some("\"e9\""));
+        assert_eq!(scope.unsettled_keys(), 1, "an unconditional request stays unsettled");
+    }
+
     #[tokio::test]
     async fn a_refused_request_leaves_its_key_settled_issue_1067() {
         let scope = StorageIoScope::new();
