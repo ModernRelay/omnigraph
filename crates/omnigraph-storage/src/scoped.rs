@@ -1452,9 +1452,6 @@ mod tests {
         assert!(!scope.is_uncertain(), "its success settled the key");
     }
 
-    /// A store's refusal before applying leaves nothing to settle, and a
-    /// refused re-issue keeps the uncertainty its first copy left.
-
     /// The owner's read of a key settles an unsettled conditional request
     /// whose precondition the observed generation no longer meets, and only
     /// that: a lost record put that landed late used to keep the operation
@@ -1509,6 +1506,8 @@ mod tests {
         );
     }
 
+    /// A store's refusal before applying leaves nothing to settle, and a
+    /// refused re-issue keeps the uncertainty its first copy left.
     #[tokio::test]
     async fn a_refused_request_leaves_its_key_settled_issue_1067() {
         let scope = StorageIoScope::new();
