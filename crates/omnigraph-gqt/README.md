@@ -836,8 +836,10 @@ analyzer (a `fuzzy` match, a `bm25` order between documents the analyzer
 would tie, a projected score's last digits) carries no `expect same as
 reference`. It compares a `DateTime` as written, so a step that equates
 spellings with different offsets carries none either. The interpreter follows
-the RFC, not the engine: when the RFC's semantics change, it changes in the
-same pull request.
+the RFC's operator table, and today's behaviour where a row says *[as today]*;
+it stores a `bm25` score at `F32`, the type the engine gives `$score`, where
+the table says `F64`. When the RFC's semantics change, it changes in the same
+pull request.
 
 ## Run and reproduce
 
