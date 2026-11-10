@@ -62,7 +62,17 @@ fn classify(error: &color_eyre::Report) -> Refusal {
             Refusal::DifferentRequest
         }
         429 => Refusal::AnotherActive,
-        status if status >= 500 => Refusal::Unanswered,
+        // A server error that says it took no effect (routes off, admission
+        // closed) refused the request before acceptance; any other server
+        // error leaves the submission in doubt.
+        status
+            if status >= 500
+                && !remote.output.disposition.as_ref().is_some_and(|disposition| {
+                    disposition.effects == omnigraph_api_types::DispositionEffects::None
+                }) =>
+        {
+            Refusal::Unanswered
+        }
         _ => Refusal::BeforeAcceptance,
     }
 }
@@ -284,6 +294,36 @@ mod tests {
             retry_after: None,
             missing_credential: None,
         })
+    }
+
+    #[test]
+    fn a_server_error_that_took_no_effect_is_a_refusal_before_acceptance() {
+        let refused: omnigraph_api_types::ErrorOutput = serde_json::from_value(json!({
+            "error": "the recorded-operation routes are not enabled on this server",
+            "code": "service_unavailable",
+            "disposition": {"effects": "none", "action": "retry"},
+        }))
+        .unwrap();
+        let refused = color_eyre::Report::new(RemoteErrorCli {
+            output: refused,
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: None,
+            missing_credential: None,
+        });
+        assert_eq!(classify(&refused), Refusal::BeforeAcceptance);
+        let unknown: omnigraph_api_types::ErrorOutput = serde_json::from_value(json!({
+            "error": "the operation record write has no definite answer",
+            "code": "outcome_unknown",
+            "disposition": {"effects": "unknown", "action": "reconcile"},
+        }))
+        .unwrap();
+        let unknown = color_eyre::Report::new(RemoteErrorCli {
+            output: unknown,
+            status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            retry_after: None,
+            missing_credential: None,
+        });
+        assert_eq!(classify(&unknown), Refusal::Unanswered);
     }
 
     #[test]
