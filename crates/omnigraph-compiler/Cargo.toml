@@ -25,5 +25,9 @@ ahash = { workspace = true }
 sha2 = { workspace = true }
 ulid = { workspace = true }
 
+[dev-dependencies]
+# The parse, print and parse property (src/query/syntax/tests/round_trip.rs).
+proptest = "1"
+
 [lints]
 workspace = true

@@ -31,7 +31,8 @@ const SEARCH_DATA: &str = include_str!("../fixtures/search.jsonl");
 const SEARCH_QUERIES: &str = include_str!("../fixtures/search.gq");
 const SEARCH_MUTATIONS: &str = r#"
 query set_doc_title($slug: String, $title: String) {
-    update Doc set { title: $title } where slug = $slug
+    $x: Doc  $x.slug = $slug
+    update $x set { title: $title }
 }
 "#;
 
@@ -120,11 +121,13 @@ query insert_doc($title: String, $content: Blob, $note: String) {
 }
 
 query update_doc_note($title: String, $note: String) {
-    update Document set { note: $note } where title = $title
+    $x: Document  $x.title = $title
+    update $x set { note: $note }
 }
 
 query delete_doc($title: String) {
-    delete Document where title = $title
+    $x: Document  $x.title = $title
+    delete $x
 }
 "#;
 
@@ -1027,11 +1030,13 @@ async fn branch_merge_with_blob_columns_keeps_a_lazy_reader_honest_across_branch
 async fn branch_merge_compares_rows_written_before_a_blob_property_was_added() {
     const WRITES: &str = r#"
 query set_note($title: String, $note: String) {
-    update Document set { note: $note } where title = $title
+    $x: Document  $x.title = $title
+    update $x set { note: $note }
 }
 
 query set_thumb($title: String, $thumb: Blob) {
-    update Document set { thumb: $thumb } where title = $title
+    $x: Document  $x.title = $title
+    update $x set { thumb: $thumb }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -3240,7 +3245,7 @@ async fn branch_merge_detects_nested_list_value_change() {
     // returned only if feature's change survived the merge.
     let queries = r#"
 query docs_with_tag($tag: String) {
-    match { $d: Doc  $d.tags contains $tag }
+    match { $d: Doc  $tag in $d.tags }
     return { $d.slug }
 }
 "#;
@@ -4314,7 +4319,8 @@ query add_knows($from: String, $to: String) {
 }
 
 query delete_person($name: String) {
-    delete Person where name = $name
+    $x: Person  $x.name = $name
+    delete $x
 }
 "#;
 

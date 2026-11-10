@@ -54,7 +54,8 @@ j.name: String
 
 --- mutate
 query rename_scan() {
-    update @Operator set { name: "Read" } where name = "Scan"
+    $x: @Operator  $x.name = "Scan"
+    update $x set { name: "Read" }
 }
 
 --- expect error: catalogue type `@Operator` is read-only
@@ -76,4 +77,4 @@ query search_operators($q: String) {
 --- params
 {"q":"scan"}
 
---- expect error: match_text cannot target catalogue binding `$o: @Operator`
+--- expect error: T27: `match_text` needs a full-text index on `@Operator.name`

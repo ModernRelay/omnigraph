@@ -55,7 +55,7 @@ m.number: String
 --- expect plan
 scan Matter as $m: filter reads [m.number]
 
---- expect same as v1
+--- expect same as reference
 
 --- query
 set engine = v2;
@@ -101,7 +101,7 @@ p.pid: String
 --- expect plan
 scan Matter as $m: filter reads [m.number]
 
---- expect same as v1
+--- expect same as reference
 
 --- query
 set engine = v2;
@@ -134,14 +134,14 @@ query bare_word_is_the_membership_test() {
     return { $p.pid }
 }
 
---- expect error: T7: `$p in $m` tests membership and `$p` is a node; to follow the edge `In` write `$p "in" $m`
+--- expect error: T7: `$m` is bound by nothing but the edge named `in`, so `$p in $m` is a traversal over it, whose bare name is reserved
 
 --- query
 set engine = v2;
 query contains_spelling($ms: [String]) {
     match {
         $m: Matter
-        ($ms contains $m.number)
+        ($m.number in $ms)
     }
     return { $m.number }
 }
@@ -345,7 +345,8 @@ query scalar_on_the_right() {
 
 --- mutate
 query recode($ms: [String]) {
-    update Matter set { code: 9 } where number in $ms
+    $x: Matter  $x.number in $ms
+    update $x set { code: 9 }
 }
 
 --- params
@@ -372,7 +373,8 @@ m.mid: String
 
 --- mutate
 query recode_no_member($ms: [String]) {
-    update Matter set { code: 7 } where number in $ms
+    $x: Matter  $x.number in $ms
+    update $x set { code: 7 }
 }
 
 --- params
@@ -382,7 +384,8 @@ query recode_no_member($ms: [String]) {
 
 --- mutate
 query recode_outside_the_empty_set($cs: [I64]) {
-    update Matter set { code: 7 } where not (code in $cs)
+    $x: Matter  not ($x.code in $cs)
+    update $x set { code: 7 }
 }
 
 --- params

@@ -24,14 +24,16 @@ node Deal {
 
 --- mutate
 query delete_open_large_deals() {
-    delete Deal where dealStage = "open" and amountUsd > 10
+    $x: Deal  $x.dealStage = "open" and $x.amountUsd > 10
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query close_large_deals($floor: I32) {
-    update Deal set { dealStage: "closed" } where amountUsd > $floor
+    $x: Deal  $x.amountUsd > $floor
+    update $x set { dealStage: "closed" }
 }
 
 --- params

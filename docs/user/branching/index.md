@@ -215,12 +215,11 @@ id (`--snapshot <id>`), and the commit lists with `published: false`.
 query propose_bob() as commit {
     insert Person { name: "bob", age: 41 }
 }
-
-branch merge feature into main as commit
-
-commit publish "<commit-id>"
-commit drop "<commit-id>"
 ```
+
+A merge is written `branch merge feature into main as commit`. Each control
+statement stands alone in its source: `commit publish "<commit-id>"` and
+`commit drop "<commit-id>"`.
 
 `commit publish` installs the commit on the branch it recorded as its target.
 The published commit keeps the actor and timestamp of the write that created

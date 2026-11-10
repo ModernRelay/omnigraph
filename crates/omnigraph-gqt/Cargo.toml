@@ -17,11 +17,11 @@ omnigraph-gqt-core = { path = "../omnigraph-gqt-core", version = "0.15.1" }
 async-trait = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
-# `test-util` is `Session::with_read_executor`, the seam `expect same as v1`
-# installs the reference engine through; GQT is its one regular enabler.
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.15.1", features = ["test-util"] }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.15.1" }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1" }
-omnigraph-reference-engine = { path = "../omnigraph-reference-engine" }
+# The core reference interpreter `--- expect same as reference` compares
+# against; GQT is its one caller.
+omnigraph-reference = { path = "../omnigraph-reference" }
 serde_json = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }

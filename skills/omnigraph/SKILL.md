@@ -93,11 +93,11 @@ query get_signal($slug: String) {
   `schema show --json` reports the graph's physical `system_columns`; do not
   substitute physical `__id` names into GQ.
 - **List/sort** by appending `order { $s.stagingTimestamp desc } limit 50` after `return`. Without `order`, `limit n` may return any `n` valid rows (the subset can change between releases); order for stable pages.
-- **`nearest` and `rrf` require a trailing `limit N`** — omitting it is a compile error. `bm25` does not require a limit, but use one to keep ranked output bounded. Ranking operators lead `order { }`, and still restrict rows (`bm25` keeps only text matches; `nearest` skips null vectors). Scope with `match`/filters first, then rank (`order { nearest($d.embedding, $q) } limit 10`). Project a score by repeating the leading key: `return { $d.slug, nearest($d.embedding, $q) as distance }`. A ranked read's JSON result carries a `ranking` object (`by`, `order`, `exhaustive`, `score_columns`); `exhaustive: false` means the `ann_nprobes` cap left vector partitions unsearched, so a nearer row may exist.
+- **A ranking is a relation drawn with `from`**, never a call in `order` or `return` (`T65`, whose fix is printed): `match { from nearest({ match { $d: Doc  $d.year > 2020 } return { $d } }, $d.embedding, $q, k: 10) } return { $d.slug, $distance } order { $distance } limit 10`. The inline read is the population (scope it with traversals and filters there; its `return` lists the bindings the query reads on), `k` is the window (required, `T17`), and the score arrives as the column `$distance` (`nearest`) or `$score` (`bm25`, `rrf`), ordered `order { $distance }` or `order { $score desc }` as the leading key. `nearest` also needs `limit N`; give it `k`'s value. Rankings restrict rows (`bm25` keeps only text matches; `nearest` skips null vectors). A ranked read's JSON result carries a `ranking` object (`by`, `order`, `exhaustive`, `score_columns`); `exhaustive: false` means the `ann_nprobes` cap left vector partitions unsearched, so a nearer row may exist.
 
 ### Mutation (`.gq`)
 
-There is **no top-level `mutation { }`** — every block is a named `query`; the verb (`insert`/`update`/`delete`) makes it a write. Dispatch with `omnigraph mutate` (not `query`). (A source may instead hold exactly one statement: `branch create|delete|merge` and `commit publish|drop` run through `mutate`; `branch list|diff|merge-base`, `branch merge … dry run` and `explain` through `query`; `load csv` through `mutate`; see [`references/queries.md`](references/queries.md#branch-statements).)
+There is **no `mutation` keyword** (`Q009`) — every block is a named `query`; a body that ends in statements is a write. A write body is groups: clauses written bare (not in `match { }`) that bind and filter, `$x: Signal { slug: $slug }` or `$x: Signal  $x.slug = $slug`, then statements over the bound variable, `update $x set { … }` or `delete $x`; `insert T { … }` with no clauses runs once. Properties in filters are always `$x.prop`, endpoints `$x.@src`/`$x.@dst`. `update T set { … } where …` and `delete T where …` are refused (`Q008`) with the binding form printed as the fix. Dispatch with `omnigraph mutate` (not `query`). (A source may instead hold exactly one statement: `branch create|delete|merge` and `commit publish|drop` run through `mutate`; `branch list|diff|merge-base`, `branch merge … dry run` and `explain` through `query`; `load csv` through `mutate`; see [`references/queries.md`](references/queries.md#branch-statements).)
 
 ```gq
 query add_signal($slug: String, $name: String, $brief: String, $createdAt: DateTime) {
@@ -105,8 +105,8 @@ query add_signal($slug: String, $name: String, $brief: String, $createdAt: DateT
                     stagingTimestamp: $createdAt, createdAt: $createdAt, updatedAt: $createdAt }
 }
 query link($from: String, $to: String) { insert FormsPattern { from: $from, to: $to } }
-query retitle($slug: String, $t: String) { update Signal set { name: $t } where slug = $slug }
-query remove($slug: String)              { delete Signal where slug = $slug }
+query retitle($slug: String, $t: String) { $x: Signal  $x.slug = $slug  update $x set { name: $t } }
+query remove($slug: String)              { $x: Signal  $x.slug = $slug  delete $x }
 ```
 
 - **Every non-nullable property must be supplied.** Lint normally reports T12
@@ -114,7 +114,8 @@ query remove($slug: String)              { delete Signal where slug = $slug }
   is a known exception: source-only insert can lint successfully even though
   execution still requires the vector. Supply it explicitly; writes never
   embed automatically.
-- A single mutation is insert/update-only **or** delete-only — never both (D₂ rule, refused at execution before any effect; `lint` does not catch it); split them.
+- A single mutation is insert/update-only **or** delete-only — never both (`T76`, which `lint` reports); split them.
+- A write group's clauses are one binding of the written type plus filters over it; a traversal, block or search predicate there, or an assignment that reads the row (`{ age: $x.age }`), type-checks but `mutate` refuses it (`P006`).
 - Edge inserts give logical `from`/`to` endpoint IDs; a propertyless edge needs only those, and there is no nested `data` block in GQ. An unkeyed edge insert is strict (inserting twice creates two edges). An edge type may declare `@key(@src, @dst[, prop…])` in its body when created; inserts then upsert by the derived id, and identical inserts on two branches converge on merge. Edges cannot be `update`d (T16).
 
 ### Bulk load (JSONL)
@@ -168,21 +169,22 @@ omnigraph lint   --schema schema.pg --query queries/foo.gq    # after EVERY .gq/
 The non-obvious facts that bite, then the full grammar:
 
 - **Scalar param types**: `String Bool I32 I64 U32 U64 F32 F64 DateTime Date Blob`. Modifiers: `T?` (optional), `[T]` (list), `Vector(N)`. There is **no `Int`** — use `I64`. An integer parameter takes its type's whole range (`U64` up to `18446744073709551615`); send a 64-bit value above 2^53 in `--params` as a decimal string so no client rounds it through a double.
-- **A read query needs `match` *and* `return`** (`order`/`limit` optional); a mutation has neither — only `insert`/`update`/`delete`.
+- **A read query needs `match` *and* `return`** (`order`/`limit` optional); a mutation has neither — bare clauses, then `insert`/`update`/`delete` statements.
+- **A bare name is not a value** (`Q018`): a property is `$x.name`, a parameter `$name`, a string `"name"`. A query may not be named like a function or clause keyword (`search`, `nearest`, `count`, …: `T74`).
 - **`limit` takes an integer literal, not a param** — `limit 50`, never `limit $n`.
 - **Variable-hop traversal**: `$p knows{1,3} $f` — bounds are **required to be finite** (`{1,}` is rejected: "unbounded traversal is disabled"), and an edge whose endpoint types differ allows only one hop (`T5`). Hops are shortest-path distances; each `$_` is a distinct anonymous node; variables beginning `__` are reserved.
 - **Undirected traversal**: `$p <knows> $f` matches the edge in either direction, deduplicated (a pair connected both ways appears once). Same-endpoint-type edges only (e.g. `Related: Issue -> Issue`) — asymmetric edges are rejected (T22). Composes with bounds (`$p <knows>{1,3} $f`) and correlated blocks (`not { }`, `exists { }`, `count { } > 2`).
 - **Edge bindings**: an optional `$var:` prefix on the edge word — `$src $w:knows $dst`, undirected `$a $w:<related> $b` — binds the matched edge row, so edge properties work in filters (`$w.confidence = "asserted"`), projections (`return { $w.role }`), aggregates, and ordering. A bound traversal returns one row per edge (parallel edges stay distinct); binding a `{min,max}` multi-hop, rebinding a taken name, or projecting bare `$w` is rejected (T23).
 - **Literals & calls**: `now()`, `date("2026-04-29")`, `datetime("…T00:00:00Z")`, list `[…]`.
-`starts_with`, `contains`, `in`, `>=`, `<=`, `!=`, `>`, `<`, `=`, `is null`, `is not null`
+`starts_with($x.f, "A")`, `contains($x.f, "g")`, `in`, `>=`, `<=`, `!=`, `>`, `<`, `=`, `is null`, `is not null`
 
-Those are the complete **filter operators** (`$m.number in $numbers` tests membership in a list parameter or literal); conditions compose with `and`, `or`, `not`, parentheses and `is null` / `is not null`, and a filter keeps only rows whose expression is true (a comparison with a null operand is null). String predicates are exact and
+Those are the complete **filter operators** (`$m.number in $numbers` tests membership in a list parameter or literal, `"rust" in $m.tags` in a list property; infix `contains`/`starts_with` is `T7`); conditions compose with `and`, `or`, `not`, parentheses and `is null` / `is not null`, and a filter keeps only rows whose expression is true (a comparison with a null operand is null). String predicates are exact and
 case-sensitive. **Aggregates** are `count/sum/avg/min/max` (`count($f) as n`, `count(distinct $f.city) as cities`); `min`/`max` also accept String, Bool, Date, and DateTime. Alias aggregates and order by the alias. `return distinct { … }` keeps one row per distinct projected tuple.
 - **Result column names must be distinct** (`T25`): alias projections that would collide.
 - **Stored-query metadata**: `@description("…")` / `@instruction("…")` may follow the param list.
 - **Casing**: type names uppercase-initial (`Signal`); idents/edges lowercase-initial (`formsPattern`); variables `$`-prefixed. `//` and `/* */` comments only.
 
-The compiler grammar in `crates/omnigraph-compiler/src/query/query.pest` is the
+The compiler grammar in `crates/omnigraph-compiler/src/query/syntax/grammar.pest` is the
 single source of truth.
 
 ## CLI Reference (condensed)
@@ -411,7 +413,8 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | `_`-prefixed property on a new graph | `property name '_x' is reserved for system columns (names starting with '_')` | Rename it; `from`/`to` are also reserved on edges (`is reserved on edge types`) |
 | Expecting `@embed` to populate vectors during load | missing/stale vectors | `@embed` is metadata; run the offline `omnigraph embed ... --reembed-all` file pipeline, then load its output |
 | `schema apply` with feature branches open | `schema apply requires a graph with only main` | Delete them (`merge --delete-branch` or `branch delete`); a merge alone leaves the branch live |
-| `nearest(...)` / `rrf(...)` without `limit` | compile error | Add `limit N`; a BM25-only query may omit it, though bounded output is recommended |
+| `order { nearest(...) }`, `bm25(...)`/`rrf(...)` in `order` or `return` | `T65` | Draw the ranking with `from nearest({ match { … } return { $d } }, $d.embedding, $q, k: N)` and order by `$distance` (or `$score desc`); the diagnostic prints the fix |
+| `nearest` without `limit` | `nearest() ordering requires a limit clause` at run time | Add `limit N` equal to its `k`; a BM25-only query may omit it, though bounded output is recommended |
 | Adding non-nullable property without backfill | unsupported migration | Make optional → backfill; keep it optional (tightening `T?` → `T` is refused, OG-MF-106) |
 | `omnigraph init --json` | `unexpected argument '--json' found` | `init` doesn't support `--json`; drop the flag |
 | `omnigraph init` on an already-initialized URI | `graph already initialized or initialization metadata exists at '<uri>'` | Never overwrite it. `--force` only replaces orphan schema artifacts after proving there is no graph manifest |
@@ -419,10 +422,11 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Committing `.env.omni` | credential leak | Add `.env*` to `.gitignore` |
 | Non-parameterized query values | typecheck surprise, injection risk | Declare `$param: Type` and pass via `--params` |
 | Missing required field in `insert` | ``T12: insert for `X` must provide non-nullable property `Y` `` | Accept the param in the mutation signature |
-| Mixing `delete` with `insert`/`update` in one query | lint passes; `mutate` fails "mixes inserts/updates and deletes" | Split into two mutations (D₂ rule) |
-| `$p.id`, `{ id: $v }`, `where id =` for identity | ``T6``/``T2``/``T11``: ``type `Person` has no property `id`; the system identity is `$p.@id` `` (a failing stored-query registry quarantines its graph) | Use `$p.@id`, `$e.@src`/`@dst`, `where @id =`; `id` means a declared user property |
+| Mixing `delete` with `insert`/`update` in one query | `T76` | Split into two mutations |
+| `update T set { … } where …`, `delete T where …` | `Q008` | `$x: T  $x.prop = $v  update $x set { … }` / `delete $x`; the diagnostic prints it |
+| `$p.id`, `{ id: $v }` for identity | ``T6``/``T2``/``T11``: ``type `Person` has no property `id`; the system identity is `$p.@id` `` (a failing stored-query registry quarantines its graph) | Use `$p.@id`, `$e.@src`/`@dst`, `$x.@id = $v`; `id` means a declared user property |
 | Long-lived feature branches | merge conflicts, schema apply blocked | Merge promptly; delete when done |
-| `mutation { ... }` wrapper in `.gq` | `parse error: expected query_file` at line 1 | Use `query <name>(...) { insert T { ... } }`; there is no top-level `mutation` keyword |
+| `mutation` keyword or wrapper in `.gq` | `Q009` (`mutation` is not a declaration keyword), or a parse error at its `{` | Use `query <name>(...) { insert T { ... } }`; a body opening with `match {` before statements is refused too |
 | `--config` on a data/schema command | `unexpected argument '--config' found` | Use it only for source-taking cluster commands; select destinations with `--target` |
 | `--as` names another actor than the served write's token | `actor_mismatch` (exit 4) | Use the token of that actor, or drop `--as`; the bearer token selects the actor |
 | Reading a large schema via stdout-capped tool | Truncated, garbled, or duplicated output | `omnigraph schema show --target <name> --graph <id> > /tmp/schema.pg`, then read the file in chunks |

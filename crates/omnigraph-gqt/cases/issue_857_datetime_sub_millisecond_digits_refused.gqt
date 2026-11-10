@@ -44,11 +44,11 @@ query at_now() { match { $e: Event $e.at = now() } return { $e.name } }
 --- expect error: param '__nanograph_now': reserved for now() and cannot be bound
 
 --- mutate
-query move_now() { update Event set { at: datetime("2025-01-01T00:00:00Z") } where at = now() }
+query move_now() { $x: Event  $x.at = now()  update $x set { at: datetime("2025-01-01T00:00:00Z") } }
 --- params
 {"__nanograph_now": "2024-01-01T00:00:00.123456Z"}
 --- expect error: param '__nanograph_now': reserved for now() and cannot be bound
 
 --- mutate
-query set_now() { update Event set { at: now() } where name = "a" }
+query set_now() { $x: Event  $x.name = "a"  update $x set { at: now() } }
 --- expect affected: nodes=1 edges=0

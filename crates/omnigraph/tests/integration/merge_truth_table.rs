@@ -88,7 +88,8 @@ query insert_person($name: String, $age: I32) {
 }
 
 query delete_person($name: String) {
-    delete Person where name = $name
+    $x: Person  $x.name = $name
+    delete $x
 }
 
 query insert_knows($from: String, $to: String) {
@@ -96,11 +97,13 @@ query insert_knows($from: String, $to: String) {
 }
 
 query delete_knows_from($from: String) {
-    delete Knows where from = $from
+    $x: Knows  $x.@src = $from
+    delete $x
 }
 
 query set_person_age($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
+    $x: Person  $x.name = $name
+    update $x set { age: $age }
 }
 
 query get_person($name: String) {

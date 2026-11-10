@@ -43,10 +43,14 @@ scope: next_step
 
 --- mutate branch: main
 query w() {
-    update Person set { note: "u" } where name = "alice"
-    update Marker set { note: "u" } where name = "initial"
-    update Company set { note: "u" } where name = "acme"
-    update Tag set { note: "u" } where name = "t0"
+    $x: Person  $x.name = "alice"
+    update $x set { note: "u" }
+    $x: Marker  $x.name = "initial"
+    update $x set { note: "u" }
+    $x: Company  $x.name = "acme"
+    update $x set { note: "u" }
+    $x: Tag  $x.name = "t0"
+    update $x set { note: "u" }
 }
 --- expect error: injected failpoint triggered: mutation.post_table_commit
 
@@ -122,10 +126,14 @@ t.note: String?
 
 --- mutate branch: main
 query w() {
-    update Person set { note: "u" } where name = "alice"
-    update Marker set { note: "u" } where name = "initial"
-    update Company set { note: "u" } where name = "acme"
-    update Tag set { note: "u" } where name = "t0"
+    $x: Person  $x.name = "alice"
+    update $x set { note: "u" }
+    $x: Marker  $x.name = "initial"
+    update $x set { note: "u" }
+    $x: Company  $x.name = "acme"
+    update $x set { note: "u" }
+    $x: Tag  $x.name = "t0"
+    update $x set { note: "u" }
 }
 --- expect affected: nodes=4 edges=0
 

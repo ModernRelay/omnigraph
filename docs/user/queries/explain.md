@@ -80,14 +80,14 @@ run may take instead: `id_lookup` when the build refuses memory before the
 traversal is consumed, `null` when the plan declares none. A run takes no
 switch the plan does not declare; which side ran is in the
 [`profile`](#profile) rows, never in explain. A physical `Scan` row of a
-binding a leading `nearest()` or `bm25()` ranks carries `ranked`: an object
+binding a `nearest` or `bm25` ranking ranks carries `ranked`: an object
 with `kind` (`nearest` or `bm25`), `property`, `query` (the argument as the
 query wrote it, a parameter name such as `$q` or a literal, never its bound
 value), `fetch` (the candidates the index is asked for: the query's limit
 for `nearest`, `null` for `bm25`, which is uncapped), `nprobes` on a
 `nearest` scan (the `ann_nprobes` setting when the plan was built, the IVF
 partitions probed per index delta; `null` is no cap) and `scope` (`order`
-for the query's own order, `primary` or `secondary` for an arm of `rrf()`).
+for the query's own ranking, `primary` or `secondary` for an arm of `rrf`).
 A `nearest` scan's `policy` declares what the run may do when an attempt
 leaves it short: `probe_factor` (each rescan multiplies the probe cap),
 `flat_rescan_on_unreached`, `uncapped_on_missing_counters` and
@@ -115,7 +115,7 @@ row keys follow the arm's score and fused node ID; selected edges use
 appends the fused score as `<binding>._rrf`. A
 physical `CrossJoin` row carries `filters`, the conjuncts over both bindings
 it keeps pairs by, when it has any. A physical `ContainsJoin` row is the
-planner's join for one `$r.x contains $l.y` conjunct: it carries `haystack`
+planner's join for one `contains($r.x, $l.y)` conjunct: it carries `haystack`
 (`$r.x`, the text searched) and `needle` (`$l.y`, the text searched for) as
 GQ spells them, and `residual`, the other conjuncts of the same filter as
 text; its second input is the table `Scan` of `$r`, whose `runtime_filter`
@@ -140,7 +140,7 @@ describes), `logical_hash` (the structural hash of the logical plan),
 `explain_version`, `operation`, and the statistics used by planning; then
 `validation`, what plan acceptance checked: `{"scope": "exact_subset"}` when
 the query is a member of the exact fragment (one binding, Boolean, integer and
-String filters, an optional leading `bm25()`, property sort keys, a limit and a
+String filters, an optional `bm25` ranking, property sort keys, a limit and a
 projection of properties and the score) and every rewrite from its canonical
 form was checked, `{"scope": "invariants_only"}` when the plan was checked
 against the query's requirements alone. A plan that fails acceptance is never
@@ -204,7 +204,7 @@ block, `not`, `exists`, `count` and the column aggregates, and prints its
 predicate, then `key_set` under that strategy). It is the tree of the query's first pass; a
 search that widens its scan after a short answer lowers it again. An
 `explain` runs nothing, so when the lowering would need the embedding client
-(a `nearest()` whose query is a string), the tree is left out and one `plan`
+(a `nearest` whose query is a string), the tree is left out and one `plan`
 row `datafusion` reads `unavailable: …` with the reason.
 
 ## Profile

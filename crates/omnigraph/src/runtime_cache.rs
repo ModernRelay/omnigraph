@@ -3,11 +3,10 @@ use std::hash::Hash;
 use std::sync::{Arc, Weak};
 
 use lance::session::Session;
-use omnigraph_compiler::CheckedRead;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::QueryIR;
 use omnigraph_core::handle_cache::LruMap;
+use omnigraph_planner::ReadShape;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -347,13 +346,34 @@ pub(crate) struct CompiledQueryKey {
     name: String,
 }
 
-/// A compiled read declaration: its IR, and the checked declaration the IR
-/// was lowered from, which plan acceptance derives the query's requirements
-/// from.
+/// A compiled read declaration: the shape of its checked core term that the
+/// planner plans and acceptance derives the query's requirements from.
 #[derive(Clone)]
 pub(crate) struct CompiledQuery {
-    pub(crate) ir: Arc<QueryIR>,
-    pub(crate) checked: CheckedRead,
+    pub(crate) ir: Arc<ReadShape>,
+}
+
+impl CompiledQuery {
+    /// Check `decl` against `catalog` and shape its core term for the
+    /// planner; a write or a core node the planner does not lower is
+    /// refused.
+    pub(crate) fn compile(
+        catalog: &Catalog,
+        decl: &omnigraph_compiler::query::file::QueryDecl,
+    ) -> crate::error::Result<Self> {
+        use omnigraph_compiler::ir::core::CoreDecl;
+        let core = match omnigraph_compiler::query::check::check_query_decl(catalog, decl)? {
+            CoreDecl::Read(read) => read,
+            CoreDecl::Write(_) => {
+                return Err(crate::error::OmniError::manifest(format!(
+                    "`{}` is a write; run it through the mutation door",
+                    decl.name
+                )));
+            }
+        };
+        let ir = Arc::new(ReadShape::of(&core, catalog).map_err(crate::exec::plan_refusal)?);
+        Ok(Self { ir })
+    }
 }
 
 /// A compiled read statement: a declaration the door runs for rows, or an
@@ -371,7 +391,7 @@ impl CompiledRead {
         }
     }
 
-    pub(crate) fn ir(&self) -> &Arc<QueryIR> {
+    pub(crate) fn ir(&self) -> &Arc<ReadShape> {
         &self.query().ir
     }
 }
@@ -648,11 +668,11 @@ query since($n: I64) { match { $c: Chunk  $c.n >= $n } return { $c.slug } }
             std::collections::HashMap::from([
                 (
                     "slug".to_string(),
-                    omnigraph_compiler::query::ast::Literal::String(format!("c{n}")),
+                    omnigraph_compiler::query::value::Literal::String(format!("c{n}")),
                 ),
                 (
                     "n".to_string(),
-                    omnigraph_compiler::query::ast::Literal::Integer(i128::from(n)),
+                    omnigraph_compiler::query::value::Literal::Integer(i128::from(n)),
                 ),
             ])
         };
@@ -732,11 +752,11 @@ query since($n: I64) { match { $c: Chunk  $c.n >= $n } return { $c.slug } }
             std::collections::HashMap::from([
                 (
                     "slug".to_string(),
-                    omnigraph_compiler::query::ast::Literal::String(format!("c{n}")),
+                    omnigraph_compiler::query::value::Literal::String(format!("c{n}")),
                 ),
                 (
                     "n".to_string(),
-                    omnigraph_compiler::query::ast::Literal::Integer(i128::from(n)),
+                    omnigraph_compiler::query::value::Literal::Integer(i128::from(n)),
                 ),
             ])
         };
@@ -863,12 +883,7 @@ edge Likes: Person -> Person {}
         let (_, built) = db.capture_current_read_view().await.unwrap();
         let compile = |catalog: &Catalog, source: &str, name: &str| {
             let decl = omnigraph_compiler::find_named_query(source, name).unwrap();
-            let checked = CheckedRead::check(catalog, &decl).unwrap();
-            let ir = omnigraph_compiler::lower_query(catalog, checked.query()).unwrap();
-            CompiledRead::Query(CompiledQuery {
-                ir: Arc::new(ir),
-                checked,
-            })
+            CompiledRead::Query(CompiledQuery::compile(catalog, &decl).unwrap())
         };
         let cache = CompiledQueryCache::default();
         let source = "query q() { match { $p: Person } return { $p.name } }";

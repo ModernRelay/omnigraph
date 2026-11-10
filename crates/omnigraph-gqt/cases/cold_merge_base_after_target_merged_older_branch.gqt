@@ -44,7 +44,8 @@ branch create b1
 --- loop $i 1 5
 --- mutate
 query bump_alice($n: I32) {
-    update Person set { age: $n } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: $n }
 }
 --- params
 {"n": ${i}}
@@ -65,7 +66,8 @@ branch merge b0
 
 --- mutate branch: b1
 query delete_w2() {
-    delete Person where name = "w2"
+    $x: Person  $x.name = "w2"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0

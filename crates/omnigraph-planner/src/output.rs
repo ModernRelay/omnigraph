@@ -25,7 +25,7 @@ pub(crate) fn node_object_types(
         .iter()
         .filter_map(|projection| match &projection.ty {
             ExprType::Node { type_name } => Some(type_name.as_str()),
-            ExprType::Value { .. } | ExprType::ExactInteger { .. } => None,
+            ExprType::Value { .. } | ExprType::Edge { .. } | ExprType::ExactInteger { .. } => None,
         })
         .collect();
     names
@@ -77,6 +77,9 @@ pub(crate) fn return_schema(
             }
             ExprType::ExactInteger { .. } => {
                 return Err(PlanError::Internal("exact_integer is not a public result type".into()));
+            }
+            ExprType::Edge { .. } => {
+                return Err(PlanError::Internal("an edge reference is not a public result type".into()));
             }
             ExprType::Node { type_name } => {
                 let fields = objects.get(type_name.as_str()).ok_or_else(|| {

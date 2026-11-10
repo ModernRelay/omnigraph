@@ -65,7 +65,7 @@ fn coverage_requires_every_endpoint_and_every_candidate_to_be_complete() {
                 (vec![src, duplicate, dst], direction == Direction::In),
             ] {
                 let mut hop = expand("a", "b", vec![]);
-                let IROp::Expand { edges, .. } = &mut hop else {
+                let PatternStep::Expand { edges, .. } = &mut hop else {
                     unreachable!()
                 };
                 *edges = EdgeSelection::Named(EdgeMember {
@@ -527,7 +527,7 @@ fn a_key_equality_on_the_source_scan_bounds_the_frontier_to_one_row() {
     let filtered = |property: &str| {
         ir(
             vec![
-                IROp::NodeScan {
+                PatternStep::NodeScan {
                     variable: "a".to_string(),
                     type_name: "T".to_string(),
                     filters: vec![IRExpr::comparison(
@@ -634,7 +634,7 @@ fn no_statistics_records_csr_with_no_estimate() {
 #[test]
 fn two_hops_choose_a_cold_csr_below_both_caps() {
     let mut step = expand("a", "b", vec![]);
-    if let IROp::Expand { max_hops, .. } = &mut step {
+    if let PatternStep::Expand { max_hops, .. } = &mut step {
         *max_hops = Some(2);
     }
     let op = ir(vec![scan("a"), step], vec![prop("b", "slug")], vec![]);
@@ -692,7 +692,7 @@ fn a_contains_join_streams_the_searched_side_only_when_it_has_no_fewer_rows() {
             vec![
                 scan_of("m", "Matter"),
                 scan_of("w", "Word"),
-                IROp::Filter(filter),
+                PatternStep::Filter(filter),
             ],
             vec![prop("m", "slug"), prop("w", "slug")],
             vec![],
@@ -745,7 +745,7 @@ fn a_contains_join_marks_its_right_scan_and_keeps_the_other_conjunct() {
         vec![
             scan_of("m", "Matter"),
             scan_of("p", "Passage"),
-            IROp::Filter(IRExpr::and_all([contains.clone(), other.clone()]).expect("two")),
+            PatternStep::Filter(IRExpr::and_all([contains.clone(), other.clone()]).expect("two")),
         ],
         vec![prop("m", "slug"), prop("p", "slug")],
         vec![],
@@ -966,7 +966,7 @@ fn a_limit_hydrates_every_large_scan_but_not_a_key_lookup() {
     );
 
     let lookup = ir(
-        vec![IROp::NodeScan {
+        vec![PatternStep::NodeScan {
             variable: "c".to_string(),
             type_name: "T".to_string(),
             filters: vec![IRExpr::comparison(
@@ -1006,10 +1006,10 @@ fn a_limit_hydrates_every_large_scan_but_not_a_key_lookup() {
 /// not keep the others from hydrating.
 #[test]
 fn hydration_keeps_every_column_something_besides_the_output_reads() {
-    let op = Operation::Query(Box::new(QueryIR {
+    let op = Operation::Query(Box::new(ReadShape {
         name: "q".to_string(),
         params: vec![],
-        pipeline: vec![IROp::NodeScan {
+        pipeline: vec![PatternStep::NodeScan {
             variable: "c".to_string(),
             type_name: "T".to_string(),
             filters: vec![IRExpr::comparison(
@@ -1096,11 +1096,11 @@ fn equals(variable: &str, property: &str, value: &str) -> IRExpr {
 fn negated_two_hops(
     outer_filters: Vec<IRExpr>,
     k_filters: Vec<IRExpr>,
-    inner_filters: Vec<IROp>,
+    inner_filters: Vec<PatternStep>,
 ) -> Operation {
     let mut inner = vec![expand("a", "m", vec![]), expand("m", "k", k_filters)];
     inner.extend(inner_filters);
-    let outer = IROp::NodeScan {
+    let outer = PatternStep::NodeScan {
         variable: "a".to_string(),
         type_name: "T".to_string(),
         filters: outer_filters,
@@ -1108,7 +1108,7 @@ fn negated_two_hops(
     ir(
         vec![
             outer,
-            IROp::AntiJoin {
+            PatternStep::AntiJoin {
                 outer_var: "a".to_string(),
                 inner,
                 predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
@@ -1267,7 +1267,7 @@ fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
 fn unbounded_or_outer_reading_blocks_stay_correlated() {
     use omnigraph_planner::AntiJoinStrategy;
 
-    let reads_outer = IROp::Filter(IRExpr::comparison(
+    let reads_outer = PatternStep::Filter(IRExpr::comparison(
         prop("m", "state"),
         CompOp::Eq,
         prop("a", "state"),
@@ -1343,7 +1343,7 @@ fn key_set_starts_from_the_most_bounded_binding_and_the_first_on_a_tie() {
         ir(
             vec![
                 scan("a"),
-                IROp::AntiJoin {
+                PatternStep::AntiJoin {
                     outer_var: "a".to_string(),
                     inner: vec![expand("a", "m", m_filters), expand("m", "k", k_filters)],
                     predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),

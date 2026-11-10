@@ -6,7 +6,7 @@
 
 use color_eyre::eyre::{Result, bail};
 use omnigraph_api_types::{branch_statement_refusals, query_file_refusals};
-use omnigraph_compiler::query::ast::{
+use omnigraph_compiler::query::file::{
     BranchRead, BranchStmt, BranchWrite, CommitWrite, EXPLAIN_STATEMENT_NAME, EmptyFile, FileBody,
     LoadStmt, MutationWriteMode, QueryFile, SettingStmt, show_statement_name,
 };

@@ -78,9 +78,9 @@ node Doc { slug: String @key status: String embedding: Vector(4) @index }
 
 --- query
 query filtered_nearest($q: Vector(4)) {
-    match { $d: Doc { status: "hit" } }
+    match { from nearest({ match { $d: Doc { status: "hit" } } return { $d } }, $d.embedding, $q, k: 3) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 --- params

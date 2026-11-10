@@ -228,7 +228,7 @@ query comparison_in_match() {
     return { $f.title }
 }
 
---- expect error: T7: filter comparisons require scalar operands, got aggregate and I64
+--- expect error: T8: `count($p)` is an aggregate; in a filter it is a block over the clauses it counts
 
 --- query
 query property_beside_aggregate() {
@@ -239,7 +239,7 @@ query property_beside_aggregate() {
     return { $f.title, count($p) >= $f.min_members as big }
 }
 
---- expect error: compares aggregates with constants only
+--- expect error: T9: `big` reads `$f` beside an aggregate, and no return item groups by it; return the column as an item, or aggregate it
 
 --- query
 query missing_alias() {
@@ -250,7 +250,7 @@ query missing_alias() {
     return { count($p) > 0 }
 }
 
---- expect error: T43: a comparison in return needs an alias; write `… as <name>`
+--- expect error: T43: an expression over aggregates in return needs an alias
 
 --- query
 query comparison_order_key_not_returned() {
@@ -357,11 +357,7 @@ query aggregate_metadata_name_still_orders() {
     return { count($p.@id), count($p) > 0 as present }
     order { $p.@id }
 }
---- expect unordered
-{"p.@id":3,"present":true}
---- expect shape
-p.@id: I64
-present: Bool?
+--- expect error: T42
 
 --- query
 query constant_edge_type_still_orders_groups() {
@@ -369,9 +365,4 @@ query constant_edge_type_still_orders_groups() {
     return { $f.title as title, count($p) > 0 as present }
     order { $e.@type }
 }
---- expect unordered
-{"title":"graph club","present":true}
-{"title":"chess","present":true}
---- expect shape
-title: String
-present: Bool?
+--- expect error: T42

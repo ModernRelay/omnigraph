@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
-use crate::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
+use crate::query::file::{LoadStmt, LoadStmtMode, LoadTarget};
 
 use super::write::DeltaClass;
 

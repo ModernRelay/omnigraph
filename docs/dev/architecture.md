@@ -86,7 +86,7 @@ alias is reused. See [invariants.md](invariants.md) and
 
 | Layer | Owns |
 |---|---|
-| `omnigraph-compiler` | `.pg` and `.gq` parsing, catalog, type checking, lint, migration planning, and typed IR lowering. It has no Lance dependency. |
+| `omnigraph-compiler` | `.pg` and `.gq` parsing, catalog, type checking into the typed core IR, lint, and migration planning. It has no Lance dependency. |
 | `omnigraph-planner` | Logical and physical plans, optimizer passes, cost estimates and explain documents; metadata enters through `PlanSource`, with no Lance dependency. |
 | `omnigraph` (`omnigraph-engine`) | The public facade (`Omnigraph`, `Snapshot`), the graph coordinator, query and mutation execution, the table store, graph topology, validation, and recovery. |
 | `omnigraph-catalog` | `__manifest` publication (multi-dataset publication), graph branch registrations and lineage, retention, and `commit_graph`. |
@@ -102,7 +102,6 @@ alias is reused. See [invariants.md](invariants.md) and
 | `omnigraph-server` | HTTP authentication, read authorization, admission control, routing, OpenAPI, multi-graph serving and live deployment activation. |
 | `omnigraph-azure-admission` | Azure deployment wrapper that admits one mutation-capable server process through the root-derived Blob lease. It is not a storage backend. |
 | `omnigraph-gqt-core` | GQT format, embedded and served execution, and expectation checks shared by the GQT runner and benchmark harness. It has no build script or test-only engine dependency. |
-| `omnigraph-reference-engine` | Engine v1, frozen (`publish = false`, hash-pinned by its `tests/frozen.rs`): the reference executor a GQT step's `--- expect same as v1` compares engine v2 against. Its input is the pinned `omnigraph_compiler::ir::untyped` read IR, produced by one-way erasure only at the test reference door. It depends only on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and third-party crates; `omnigraph-gqt` is the only crate that may depend on it (`forbidden_apis.rs` guards both), and no production door reaches it. |
 
 The server mounts `omnigraph-mcp` at `/mcp` on its existing listener. Its adapter
 dispatches to the same handlers as HTTP and retains authentication, OAuth

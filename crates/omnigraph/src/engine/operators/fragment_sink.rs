@@ -341,7 +341,7 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::sink::DataSinkExec;
     use datafusion::physical_plan::ExecutionPlan;
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     use omnigraph_compiler::settings::SessionSettings;
 
     use super::super::fixtures;

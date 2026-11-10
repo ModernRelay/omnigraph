@@ -98,7 +98,8 @@ r.slug: String
 
 --- mutate
 query delete_bare_or_and() {
-    delete Row where a or b and c
+    $x: Row  $x.a or $x.b and $x.c
+    delete $x
 }
 
 --- expect affected: nodes=3 edges=0

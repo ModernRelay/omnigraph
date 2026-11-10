@@ -1,21 +1,20 @@
-//! What a checked read declaration requires of every plan for it (RFC 0047,
-//! "Requirements come from the checked query"). The declaration fixes what
-//! the query asks for: its bindings and their types, how many traversals,
-//! correlated blocks, return items and order keys it writes, its limit, and
-//! which rank call a projected score names. The compiler's typed lowering of
-//! that declaration (`AcceptInput::ir`, its filter constants folded under the
-//! bound values) states each expression in the form a plan carries it: every
-//! conjunct, traversal, block predicate and order key is copied from IR.
-//! A split return reads aggregate leaves by alias after grouping; acceptance
-//! checks their operands against this IR, with explicit casts and types intact.
-//! The declaration is consulted only where the lowering erases meaning: a
-//! projected rank call becomes its score column.
+//! What a checked read requires of every plan for it (RFC 0047,
+//! "Requirements come from the checked query"). The checked read is the
+//! core term; its shape (`AcceptInput::ir`, a [`crate::read_shape::ReadShape`]
+//! with its filter constants folded under the bound values) states each
+//! expression in the form a plan carries it: every binding and its type,
+//! conjunct, traversal, block predicate, return item, order key and the
+//! limit. A split return reads aggregate leaves by alias after grouping;
+//! acceptance checks their operands against the shape, with explicit casts
+//! and types intact. A return item that reads the leading ranking's score
+//! column projects that ranking.
 
 use std::collections::{BTreeMap, HashSet};
 
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, SubqueryPredicate};
-use omnigraph_compiler::query::ast::{Clause, Expr, Literal, Projection};
-use omnigraph_compiler::query::typecheck::BoundVariable;
+use crate::read_shape::PatternStep;
+use omnigraph_compiler::ir::is_fresh_variable;
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
+use omnigraph_compiler::query::value::{DISTANCE_COLUMN, Literal, RRF_COLUMN, SCORE_COLUMN};
 use omnigraph_compiler::traversal::EdgeSelection;
 use omnigraph_compiler::types::ExprType;
 
@@ -79,6 +78,13 @@ impl Retrieval {
     }
 }
 
+/// What a variable of the top-level scope binds.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoundVariable {
+    Node { type_name: String },
+    Edge { type_names: Vec<String> },
+}
+
 /// The search a leading `order` key names.
 #[derive(Debug, Clone)]
 pub(crate) enum Search {
@@ -129,11 +135,11 @@ pub struct Requirements {
     /// is left out.
     pub(crate) eligibility: Vec<IRExpr>,
     pub(crate) returns: Vec<IRProjection>,
-    /// The written return items that project a rank call, by position, with
-    /// the call as written.
-    pub(crate) projected_ranks: Vec<(usize, Expr)>,
-    /// The leading `order` key as written, when it is a search.
-    pub(crate) written_search: Option<Expr>,
+    /// The return items that read the leading ranking's score column, by
+    /// position, with that ranking.
+    pub(crate) projected_ranks: Vec<(usize, IRExpr)>,
+    /// The leading `order` key, when it is a search.
+    pub(crate) written_search: Option<IRExpr>,
     /// The `order` keys after a leading search key that order something (a
     /// literal key does not), each bound to a `return` item as the planner
     /// binds it.
@@ -151,39 +157,32 @@ impl Requirements {
         input: &AcceptInput<'_>,
         budget: &mut Budget,
     ) -> Result<Self, ValidationError> {
-        let decl = input.checked.decl();
-        let types = input.checked.query();
         let ir = input.ir;
         let mut eligibility = Vec::new();
         let mut traversals = Vec::new();
         let mut blocks = Vec::new();
+        let mut bindings: BTreeMap<String, BoundVariable> = BTreeMap::new();
+        let mut selected_edges = HashSet::new();
         for op in &ir.pipeline {
             budget.visit(1)?;
             match op {
-                IROp::NodeScan {
+                PatternStep::NodeScan {
                     variable,
                     type_name,
                     filters,
                 } => {
-                    match types.bindings().get(variable) {
-                        Some(BoundVariable::Node {
-                            type_name: declared,
-                        }) if declared == type_name => {}
-                        _ => {
-                            return Err(ValidationError::violated(
-                                "binding identity",
-                                format!(
-                                    "the lowering scans `${variable}: {type_name}`, which the query does not bind"
-                                ),
-                            ));
-                        }
-                    }
+                    bindings.insert(
+                        variable.clone(),
+                        BoundVariable::Node {
+                            type_name: type_name.clone(),
+                        },
+                    );
                     push_conjuncts(&mut eligibility, filters);
                 }
-                IROp::Filter(filter) => {
+                PatternStep::Filter(filter) => {
                     push_conjuncts(&mut eligibility, std::slice::from_ref(filter))
                 }
-                IROp::Expand {
+                PatternStep::Expand {
                     src_var,
                     dst_var,
                     edges,
@@ -194,6 +193,26 @@ impl Requirements {
                     dst_filters,
                     edge_binding,
                 } => {
+                    if !is_fresh_variable(dst_var) {
+                        bindings.insert(
+                            dst_var.clone(),
+                            BoundVariable::Node {
+                                type_name: dst_type.clone(),
+                            },
+                        );
+                    }
+                    if let Some(edge) = edge_binding {
+                        let mut type_names: Vec<String> = edges
+                            .members()
+                            .iter()
+                            .map(|m| m.edge_type.clone())
+                            .collect();
+                        type_names.dedup();
+                        bindings.insert(edge.clone(), BoundVariable::Edge { type_names });
+                        if edges.named().is_none() {
+                            selected_edges.insert(edge.clone());
+                        }
+                    }
                     traversals.push(Traversal {
                         src: src_var.clone(),
                         dst: dst_var.clone(),
@@ -206,7 +225,7 @@ impl Requirements {
                     });
                     push_conjuncts(&mut eligibility, dst_filters);
                 }
-                IROp::AntiJoin {
+                PatternStep::AntiJoin {
                     outer_var,
                     predicate,
                     ..
@@ -214,52 +233,6 @@ impl Requirements {
                     outer_var: outer_var.clone(),
                     predicate: predicate.clone(),
                 }),
-            }
-        }
-        // The lowering states each expression; the declaration fixes how many
-        // of each the query asks for.
-        let written_blocks = decl
-            .match_clause
-            .iter()
-            .filter(|clause| matches!(clause, Clause::Subquery(_)))
-            .count();
-        let counts = [
-            ("traversals", types.traversals().count(), traversals.len()),
-            ("correlated blocks", written_blocks, blocks.len()),
-            (
-                "return items",
-                decl.return_clause.len(),
-                ir.return_exprs.len(),
-            ),
-            ("order keys", decl.order_clause.len(), ir.order_by.len()),
-        ];
-        for (what, written, lowered) in counts {
-            if written != lowered {
-                return Err(ValidationError::violated(
-                    "lowering",
-                    format!("the query writes {written} {what}; its lowering holds {lowered}"),
-                ));
-            }
-        }
-        if ir.limit != decl.limit {
-            return Err(ValidationError::violated(
-                "lowering",
-                format!(
-                    "the query's `limit` is {:?}; its lowering's is {:?}",
-                    decl.limit, ir.limit
-                ),
-            ));
-        }
-        let mut selected_edges = HashSet::new();
-        for traversal in types.traversals() {
-            budget.visit(1)?;
-            if let Some(edge) = traversal
-                .edge_binding
-                .as_deref()
-                .filter(|edge| *edge != "_")
-                && traversal.edges.named().is_none()
-            {
-                selected_edges.insert(edge.to_string());
             }
         }
         let mut keys = ir.order_by.as_slice();
@@ -299,24 +272,27 @@ impl Requirements {
             .collect();
         let written_search = search
             .as_ref()
-            .and(decl.order_clause.first())
+            .and(ir.order_by.first())
             .map(|key| key.expr.clone());
-        Ok(Self {
-            bindings: types
-                .bindings()
+        let projected_ranks = match &written_search {
+            Some(lead) => ir
+                .return_exprs
                 .iter()
-                .map(|(name, bound)| (name.clone(), bound.clone()))
+                .enumerate()
+                .filter(|(_, projection)| reads_score(&projection.expr))
+                .map(|(index, _)| (index, lead.clone()))
                 .collect(),
+            None => Vec::new(),
+        };
+        Ok(Self {
+            bindings,
             selected_edges,
             traversals,
             blocks,
             search,
             eligibility,
             returns: ir.return_exprs.clone(),
-            projected_ranks: projected_rank_calls(&decl.return_clause)
-                .into_iter()
-                .map(|(index, call)| (index, call.clone()))
-                .collect(),
+            projected_ranks,
             written_search,
             order,
             ordered: !ir.order_by.is_empty(),
@@ -350,7 +326,7 @@ pub(crate) fn narrowed_identity<'w>(
             property,
             ty,
         },
-        omnigraph_compiler::query::ast::CompOp::Eq,
+        omnigraph_compiler::query::value::CompOp::Eq,
         IRExpr::Literal(Literal::String(id), literal_ty),
     )) = derived.comparison_parts()
     else {
@@ -371,7 +347,7 @@ pub(crate) fn narrowed_identity<'w>(
         return false;
     };
     written.into_iter().any(|conjunct| {
-        let Some((left, omnigraph_compiler::query::ast::CompOp::Eq, right)) =
+        let Some((left, omnigraph_compiler::query::value::CompOp::Eq, right)) =
             conjunct.comparison_parts()
         else {
             return false;
@@ -412,29 +388,24 @@ pub(crate) fn constant_true(conjunct: &IRExpr) -> bool {
     matches!(conjunct, IRExpr::Literal(Literal::Bool(true), _))
 }
 
-/// Every written return item that projects a rank call, at its root or in
-/// the Boolean structure around it, with the call.
-pub(crate) fn projected_rank_calls(returns: &[Projection]) -> Vec<(usize, &Expr)> {
-    fn calls<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
-        match expr {
-            Expr::Binary { left, right, .. } => {
-                calls(left, out);
-                calls(right, out);
+/// Whether a return item reads a retrieval's score column, at its root or
+/// in the Boolean structure around it.
+pub(crate) fn reads_score(expr: &IRExpr) -> bool {
+    let mut found = false;
+    let mut pending = vec![expr];
+    while let Some(e) = pending.pop() {
+        match e {
+            IRExpr::PropAccess { property, .. }
+                if [DISTANCE_COLUMN, SCORE_COLUMN, RRF_COLUMN].contains(&property.as_str()) =>
+            {
+                found = true
             }
-            Expr::In { needle, list } => {
-                calls(needle, out);
-                calls(list, out);
-            }
-            Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => calls(inner, out),
-            call if call.score_column().is_some() => out.push(call),
+            IRExpr::Binary { left, right, .. } => pending.extend([left.as_ref(), right.as_ref()]),
+            IRExpr::Not(inner, _)
+            | IRExpr::IsNull { expr: inner, .. }
+            | IRExpr::Cast { expr: inner, .. } => pending.push(inner),
             _ => {}
         }
     }
-    let mut out = Vec::new();
-    for (index, projection) in returns.iter().enumerate() {
-        let mut found = Vec::new();
-        calls(&projection.expr, &mut found);
-        out.extend(found.into_iter().map(|call| (index, call)));
-    }
-    out
+    found
 }

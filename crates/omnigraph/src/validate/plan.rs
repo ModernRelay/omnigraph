@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use omnigraph_compiler::catalog::{Catalog, NodeType};
 use omnigraph_compiler::ir::{DeltaClass, WriteKind, lower_write_table};
-use omnigraph_compiler::query::ast::LoadTarget;
+use omnigraph_compiler::query::file::LoadTarget;
 use omnigraph_planner::{
     CommittedSide, Decision, Explain, IndexFact, MemorySource, NodeTypeSpec, Operation,
     PhysicalNode, RouteOverride, Side, SideId, route,

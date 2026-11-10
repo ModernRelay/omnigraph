@@ -4,15 +4,16 @@ use std::sync::Arc;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use omnigraph::Session;
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::Omnigraph;
 use omnigraph::error::OmniError;
 use omnigraph::storage::StorageAdapter;
+use omnigraph_compiler::ir::core::CoreRead;
 use omnigraph_compiler::{ParamMap, QueryResult};
 use serde_json::Value;
 
 use crate::concurrent::ConcurrentStep;
 use crate::runner_config::SeamDirective;
-use crate::{Case, Item, QueryStep, Step, StepFail};
+use crate::{Case, Item, Step, StepFail};
 
 /// Runner-owned observation and execution facilities around ordinary GQT steps.
 pub trait ExecutionHost: Sync {
@@ -32,10 +33,11 @@ pub trait ExecutionHost: Sync {
             };
             steps
                 .iter()
-                .any(|step| matches!(step, Step::Query(query) if query.same_as_v1))
+                .any(|step| matches!(step, Step::Query(query) if query.same_as_reference))
         }) {
             return Err(
-                "unsupported_environment: this executor cannot compare the reference engine".into(),
+                "unsupported_environment: this executor cannot compare the reference interpreter"
+                    .into(),
             );
         }
         Ok(())
@@ -83,13 +85,15 @@ pub trait ExecutionHost: Sync {
         .boxed()
     }
 
-    fn reference_query<'a>(
+    /// The rows the core reference interpreter returns for `read` over
+    /// `branch` of the case session, for `--- expect same as reference`.
+    fn reference_rows<'a>(
         &'a self,
         _session: &'a Session,
-        _step: &'a QueryStep,
-        _target: ReadTarget,
+        _read: &'a CoreRead,
+        _branch: &'a str,
         _params: &'a ParamMap,
-    ) -> BoxFuture<'a, Result<QueryResult, String>> {
+    ) -> BoxFuture<'a, Result<Vec<Value>, String>> {
         futures::future::ready(Err(
             "unsupported_environment: reference comparison requires the GQT runner".into(),
         ))

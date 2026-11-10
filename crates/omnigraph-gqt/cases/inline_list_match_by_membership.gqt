@@ -65,4 +65,4 @@ query list_parameter_refused($tags: [String]) {
     return { $p.slug }
 }
 
---- expect error: T7: list equality is not supported for property `tags`; use a scalar parameter for membership matching
+--- expect error: T7: list equality is not supported: cannot compare [String] with [String]

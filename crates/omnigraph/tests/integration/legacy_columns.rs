@@ -366,7 +366,7 @@ async fn legacy_vintage_graph_mutates_diffs_evolves_and_reopens() {
 
     mutate_main(
         &db,
-        "query raise($name: String, $age: I32) {\n    update Person set { age: $age } where @id = $name\n}",
+        "query raise($name: String, $age: I32) {\n    $x: Person  $x.@id = $name\n    update $x set { age: $age }\n}",
         "raise",
         &{
             let mut params = ParamMap::new();
@@ -379,7 +379,7 @@ async fn legacy_vintage_graph_mutates_diffs_evolves_and_reopens() {
     .unwrap();
     mutate_main(
         &db,
-        "query fire($name: String) {\n    delete Person where @id = $name\n}",
+        "query fire($name: String) {\n    $x: Person  $x.@id = $name\n    delete $x\n}",
         "fire",
         &{
             let mut params = ParamMap::new();

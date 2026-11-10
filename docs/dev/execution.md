@@ -9,9 +9,13 @@
 A query runs against one resolved `ReadTarget`:
 
 1. Resolve the branch or graph snapshot once.
-2. Parse and type-check `.gq` source against that snapshot's accepted catalog.
-3. Lower the checked query to typed IR, keeping the declaration and its
-   checked query beside it (`CheckedRead`).
+2. Parse and type-check `.gq` source against that snapshot's accepted catalog
+   into the typed core IR (`ir::core`).
+3. Shape the core read for the planner (`omnigraph_planner::read_shape`): the
+   pattern of scans, expansions, filters and correlated blocks, its return
+   items, order, limit and the ranking a `from nearest/bm25/rrf` draws. A core
+   node the planner does not lower (`Union`, `Fix`, `Call`, a computed order
+   key no return item computes) is refused with `P006`.
 4. Gather the planning inputs once: bound parameters (`now()` among them),
    constants folded to their values, statistics, settings and the index
    facts the full-text coverage of every ranked property is derived from.
@@ -19,19 +23,23 @@ A query runs against one resolved `ReadTarget`:
 6. Bind the accepted plan's values and execute it against the same snapshot.
 7. Serialize result batches at the calling boundary.
 
-Type checking constructs a complete `CheckedReadQuery` or
-`CheckedMutationQuery`. Its private fields retain typed expressions, scopes,
-parameter declarations and operation metadata. Each input expression and
-literal payload is resolved once per successful checking invocation, including
-null members of literal lists. Equal expressions at different source locations
-are separate occurrences.
+Every caller parses through one front door, `parse_query`: the nesting bound,
+then the one grammar (`query/syntax/grammar.pest`). The type checker
+(`query/check/`) types each declaration into one core term, places every
+filter after the last binder of a variable it names, and binds every
+expression (`check/bind.rs`): system columns to their physical names,
+comparisons and membership through `ir::coerce`, which stores the explicit
+casts of invariant 9, literal-only nodes folded. The planner, the engine,
+result-schema inference (`check::result::result_schema`) and every header
+consumer (server, CLI, cluster, MCP, lint, the operation descriptor) read that
+core term; nothing re-derives types from the text.
 
-Lowering and result-schema inference consume the checked value and read its
-retained types. Callers use the same accepted catalog for checking, lowering
-and schema inference. Lowering still inserts comparison casts, folds constants
-and substitutes search scores; validation of the resulting IR remains fallible.
-The compiler's occurrence tests check resolution counts independently and
-assert that lowering and schema inference perform no further resolution.
+A write body checks to `CoreWrite`: groups of clauses and their sinks. The
+engine's `exec/write_plan.rs` lowers each group to today's staged writes: a
+group's clauses must be a scan of the statement's target filtered by
+predicates over that variable alone, an `update` or `delete` takes them as its
+selection, an `insert` with no clauses runs once and one after a matching
+statement once per matched row. Any other group is `P006`.
 
 The executor never refreshes a mutable branch head midway through a query.
 Historical reads build from the requested immutable table versions; current
@@ -53,11 +61,11 @@ Stable code owners:
 
 | Concern | Owner |
 |---|---|
-| Parser, type checker, lowering | `crates/omnigraph-compiler/src/query/`, `src/ir/` |
+| Parser, type checker, core IR | `crates/omnigraph-compiler/src/query/`, `src/ir/` |
+| Read shape (the core read as the planner reads it) | `crates/omnigraph-planner/src/read_shape.rs` |
 | Read doors | `crates/omnigraph/src/exec/query_doors.rs` |
 | Plan acceptance | `crates/omnigraph-planner/src/validate/` |
 | Plan lowering, operators and context (engine v2) | `crates/omnigraph/src/engine/` |
-| Frozen engine v1, the GQT test reference | `crates/omnigraph-reference-engine/` |
 | Lance scan boundary | `crates/omnigraph/src/table_store.rs` |
 | Topology build/cache | `crates/omnigraph/src/graph_index/`, `runtime_cache.rs` |
 | Mutation orchestration | `crates/omnigraph/src/exec/mutation.rs` |
@@ -94,9 +102,9 @@ are flat Arrow batches, not a factorized representation: an `Expand` copies
 an input row's columns into every output row that row produces. What bounds
 multi-hop fan-out is:
 
-- deferred bindings: the compiler's IR lowering gives at most one binding of
-  each connected pattern a `NodeScan`: the binding the leading search order
-  ranks, else the first declared (`scan_root`). `Expand` introduces the rest,
+- deferred bindings: the read shape gives at most one binding of each
+  connected pattern a `NodeScan`: the binding the ranking ranks, else the
+  first bound (`read_shape.rs`, `place`). `Expand` introduces the rest,
   in either direction, so connected bindings never become a cross join closed
   by a filter;
 - bounded streaming: every `Expand` emits chunks of at most
@@ -262,22 +270,6 @@ value, `v2`, and refuses `v1` as an unknown value. The doors
 query shape the planner refuses (`UnsupportedQuery`) is a `BadRequest` user
 error on execute, the error `explain_query` gives for it.
 
-Engine v1, the executor v2 replaced, is the crate
-`omnigraph-reference-engine` (`publish = false`). Its source and the compiler's
-`ir::untyped` read IR are frozen and pinned by the crate's `tests/frozen.rs`;
-it depends on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and
-third-party crates only, so it is
-independent of the production engine and planner in either direction; the
-compiler, core and catalog crates are shared. `omnigraph-gqt` is its one dependent: it
-installs `ReferenceEngine` on a session copy through
-`Session::with_read_executor` (the `ReadExecutor` trait in
-`omnigraph_catalog::read_executor`, both under the `test-util` feature) to run
-a step's `--- expect same as v1` comparison. Only this reference door converts
-the compiled query with `QueryIR::erase` into `ir::untyped`; erasure is one-way,
-and engine v2 keeps the compiler's normal IR. It answers `not { ... }` blocks
-only among the correlated blocks, and refuses count predicates and a string
-`nearest` argument. A defect is fixed on v2, never in the reference.
-
 Filter placement is a planner decision, the `predicate_pushdown` pass
 on a query plan (`place_query_filters`, per scope: the top-level tree and
 each correlated block's inner tree on its own): a search filter moves to the scan of
@@ -303,8 +295,8 @@ Column projection is the second pushdown dimension, the
 `projection_pushdown` pass described below.
 
 Before a query runs, `plan_query`
-(`engine/plan_source.rs`) hands the compiled `QueryIR` to the planner as
-`Operation::Query`: `resolve_query` folds the `IROp` pipeline into a logical
+(`engine/plan_source.rs`) hands the compiled read shape (`ReadShape`) to the
+planner as `Operation::Query`: `resolve_query` folds its pattern steps into a logical
 tree (one `TableScan` per `match` binding, `Join { kind: Cross }` for a
 second binding with no edge, `Expand`, `Filter`, `AntiJoin` with its inner
 tree over an `OuterReference` leaf standing for the enclosing rows, a leading
@@ -674,9 +666,9 @@ is how a `nearest()` over a string query reads `unavailable`. A bound plan
 serializes through planner-owned mirror types (`mirror.rs`) and reads back
 equal (`omnigraph-planner/tests/integration/bound_plan.rs`); the `SearchMode` of a
 ranked scan is built from the plan node, the value table and the pass, never
-from the `QueryIR`.
+from the read shape.
 
-Nothing reads the `QueryIR` after `plan_query` returns, and the types say so:
+Nothing reads the read shape after `plan_query` returns, and the types say so:
 `execute(bound: BoundPlan, context: &EngineContext)` (`engine/mod.rs`) is the
 run, and `EngineContext` holds the snapshot, the catalog and the graph-index
 handle, each data and not a decision: no session setting and no environment
@@ -852,8 +844,8 @@ no RFC accompanies it.
 ## Plan acceptance
 
 Every read reaches execution through one door: `accept_query` plans the query
-and the planner's validator checks the plan against what the checked
-declaration requires; only that check constructs an `AcceptedPlan`, whose
+and the planner's validator checks the plan against what the read shape of
+the checked declaration requires; only that check constructs an `AcceptedPlan`, whose
 fields are private, and `bind` and `execute` take nothing else. The ordinary
 run, `Session::explain_query`, the `explain` statement and the inspected run
 share the path, so explain validates exactly what a run validates and reports
@@ -867,17 +859,17 @@ row keys (`optimizer::validate_rank_fuse_row_tiebreaks`). Execution keeps
 only the checks that need the snapshot or the bound values
 (`validate_traversal_admission`, `typed_value::validate_plan_values`).
 
-The requirements come from the compiler's typed lowering of the checked
-declaration (`AcceptInput.ir`), checked first against the declaration's
-counts of traversals, blocks, return items, order keys and limit. Every
-`QueryIR` expression carries its type and every conversion is an explicit
+The requirements come from the read shape of the checked core term
+(`AcceptInput.ir`): its bindings, traversals, blocks, return items, order
+keys and limit. Every
+read-shape expression carries its type and every conversion is an explicit
 `Cast`, so acceptance compares expressions with their types. For a split
 aggregate return, `validate/returns.rs` checks a `Projection` directly above
 `Aggregate` or `MetadataCount`: group keys, return-item names, order and
 types, and each aggregate operand reached through an `AliasRef` must match
-the typed lowering. Ambiguous or unused intermediate columns are refused.
-The declaration supplies only which return items and order key are the
-written score calls. The checks: binding identity and traversal
+the read shape. Ambiguous or unused intermediate columns are refused.
+The read shape supplies which return items and order keys read the score
+column. The checks: binding identity and traversal
 identity (endpoints, edge selection, direction, endpoint types, hop bounds),
 search identity and its declared approximation, eligibility in both
 directions (every lowered conjunct is tested, checked per `rrf` arm since

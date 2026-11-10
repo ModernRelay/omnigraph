@@ -52,7 +52,8 @@ pass key_to_id
 
 --- mutate branch: child
 query bump_alpha() {
-    update Person set { age: 44 } where slug = "alpha"
+    $x: Person  $x.slug = "alpha"
+    update $x set { age: 44 }
 }
 --- expect affected: nodes=1 edges=0
 

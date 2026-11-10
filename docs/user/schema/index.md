@@ -68,8 +68,8 @@ and `src`/`dst` on edges. On current graphs all three names are ordinary
 property names. Query meta-fields use `@id`, `@src`, and `@dst`; projected
 node objects use `@id`, and JSONL exports use a top-level `id`. The schema
 endpoint (`GET /schema`) reports the physical spellings in `system_columns`.
-`_distance` and `_score` are also reserved for new declarations: search-ordered
-queries rank results by those columns. A graph whose schema already declared
+`_distance` and `_score` are also reserved for new declarations: a ranking's
+search output carries those columns. A graph whose schema already declared
 either name before this reservation keeps opening; only new schemas are
 refused.
 

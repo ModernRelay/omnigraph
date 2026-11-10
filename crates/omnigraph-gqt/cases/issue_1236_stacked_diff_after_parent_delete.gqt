@@ -33,7 +33,8 @@ branch create a
 
 --- mutate branch: a
 query promote() {
-    update Person set { title: "Lead" } where name = "p5"
+    $x: Person  $x.name = "p5"
+    update $x set { title: "Lead" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -47,7 +48,8 @@ branch create b from a
 
 --- mutate branch: b
 query promote() {
-    update Person set { title: "Principal" } where name = "p7"
+    $x: Person  $x.name = "p7"
+    update $x set { title: "Principal" }
 }
 
 --- expect affected: nodes=1 edges=0

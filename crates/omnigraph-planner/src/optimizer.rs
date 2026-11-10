@@ -5,10 +5,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::read_shape::{PatternStep, ReadShape};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR, is_fresh_variable};
-use omnigraph_compiler::query::ast::{AggFunc, LoadStmtMode};
+use omnigraph_compiler::ir::expr::ScalarFunc;
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, is_fresh_variable};
 use omnigraph_compiler::query::codes::{P002, P004};
+use omnigraph_compiler::query::file::LoadStmtMode;
+use omnigraph_compiler::query::value::AggFunc;
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 use omnigraph_compiler::types::Direction;
@@ -301,7 +304,7 @@ pub fn write_count_schema() -> SchemaRef {
     )]))
 }
 
-/// Stage 1, pass 1 for a GQ query: the flat `IROp` pipeline folded into a
+/// Stage 1, pass 1 for a GQ query: the flat `PatternStep` pipeline folded into a
 /// tree, then a leading search function, the `return`, the remaining
 /// `order` keys and the `limit` above it.
 /// The node properties the query's full-text calls read the index of, as
@@ -311,23 +314,23 @@ pub fn write_count_schema() -> SchemaRef {
 /// one's coverage (`require_full_text_indexes`) and acceptance requires the
 /// plan to record it. Block-local bindings stay within their lexical scope;
 /// nested blocks inherit their parent's bindings, never a sibling's locals.
-pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
-    fn bindings(ops: &[IROp], out: &mut HashMap<String, String>) {
+pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
+    fn bindings(ops: &[PatternStep], out: &mut HashMap<String, String>) {
         for op in ops {
             match op {
-                IROp::NodeScan {
+                PatternStep::NodeScan {
                     variable,
                     type_name,
                     filters: _,
                 } => {
                     out.insert(variable.clone(), type_name.clone());
                 }
-                IROp::Expand {
+                PatternStep::Expand {
                     dst_var, dst_type, ..
                 } => {
                     out.insert(dst_var.clone(), dst_type.clone());
                 }
-                IROp::AntiJoin { .. } | IROp::Filter(_) => {}
+                PatternStep::AntiJoin { .. } | PatternStep::Filter(_) => {}
             }
         }
     }
@@ -359,8 +362,26 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
                 calls(left, types, out);
                 calls(right, types, out);
             }
+            IRExpr::Call {
+                func: ScalarFunc::MatchTerms { .. },
+                args,
+                ..
+            } => {
+                if let Some(IRExpr::PropAccess {
+                    variable, property, ..
+                }) = args.first()
+                    && let Some(type_name) = types.get(variable)
+                {
+                    let target = (type_name.clone(), property.clone());
+                    if !out.contains(&target) {
+                        out.push(target);
+                    }
+                }
+            }
+            IRExpr::Call { args, .. } => args.iter().for_each(|arg| calls(arg, types, out)),
             IRExpr::Not(inner, _)
             | IRExpr::Cast { expr: inner, .. }
+            | IRExpr::Neg { expr: inner, .. }
             | IRExpr::IsNull { expr: inner, .. } => calls(inner, types, out),
             IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
@@ -372,19 +393,19 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
         }
     }
     fn filter_calls(
-        ops: &[IROp],
+        ops: &[PatternStep],
         types: &HashMap<String, String>,
         out: &mut Vec<(String, String)>,
     ) {
         for op in ops {
             match op {
-                IROp::NodeScan { filters, .. }
-                | IROp::Expand {
+                PatternStep::NodeScan { filters, .. }
+                | PatternStep::Expand {
                     dst_filters: filters,
                     ..
                 } => filters.iter().for_each(|filter| calls(filter, types, out)),
-                IROp::Filter(filter) => calls(filter, types, out),
-                IROp::AntiJoin { inner, .. } => {
+                PatternStep::Filter(filter) => calls(filter, types, out),
+                PatternStep::AntiJoin { inner, .. } => {
                     let mut inner_types = types.clone();
                     bindings(inner, &mut inner_types);
                     filter_calls(inner, &inner_types, out);
@@ -410,7 +431,7 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
 /// Lance would fall back to a bare, case-sensitive tokenizer, so the call is
 /// refused rather than answered differently. The type checker (`T27`)
 /// already required the declaration.
-fn require_full_text_indexes(ir: &QueryIR, source: &dyn PlanSource) -> Result<(), PlanError> {
+fn require_full_text_indexes(ir: &ReadShape, source: &dyn PlanSource) -> Result<(), PlanError> {
     for (type_name, property) in full_text_targets(ir) {
         let type_key = format!("node:{type_name}");
         if source.full_text_coverage(&type_key, &property) == FullTextCoverage::Absent {
@@ -424,7 +445,7 @@ fn require_full_text_indexes(ir: &QueryIR, source: &dyn PlanSource) -> Result<()
 
 fn resolve_query(
     plan: &mut LogicalPlan,
-    ir: &QueryIR,
+    ir: &ReadShape,
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
     require_full_text_indexes(ir, source)?;
@@ -450,7 +471,7 @@ fn resolve_query(
             ));
         }
     }
-    let QueryIR {
+    let ReadShape {
         name: _,
         params: _,
         pipeline,
@@ -575,7 +596,7 @@ fn resolve_query(
 /// starts from the `OuterReference`, so its first op may filter or expand.
 fn resolve_pipeline(
     plan: &mut LogicalPlan,
-    ops: &[IROp],
+    ops: &[PatternStep],
     source: &dyn PlanSource,
     next_binding: &mut u16,
     seed: Option<LogicalId>,
@@ -583,7 +604,7 @@ fn resolve_pipeline(
     let mut current: Option<LogicalId> = seed;
     for op in ops {
         let node = match op {
-            IROp::NodeScan {
+            PatternStep::NodeScan {
                 variable,
                 type_name,
                 filters,
@@ -635,12 +656,12 @@ fn resolve_pipeline(
                     }
                 }
             }
-            IROp::Filter(filter) => {
+            PatternStep::Filter(filter) => {
                 let input = bound(current, "filter")?;
                 let schema = schema_of(plan, input)?;
                 filter_over(plan, input, std::slice::from_ref(filter), schema)
             }
-            IROp::Expand {
+            PatternStep::Expand {
                 src_var,
                 dst_var,
                 edges,
@@ -695,7 +716,7 @@ fn resolve_pipeline(
                 );
                 filter_over(plan, destination, dst_filters, schema)
             }
-            IROp::AntiJoin {
+            PatternStep::AntiJoin {
                 outer_var,
                 inner,
                 predicate,
@@ -902,7 +923,7 @@ pub(crate) fn rank_score(binding: &str, kind: RankKind) -> IRExpr {
 fn fused_score(binding: &str) -> IRExpr {
     IRExpr::PropAccess {
         variable: binding.to_string(),
-        property: omnigraph_compiler::query::ast::RRF_COLUMN.to_string(),
+        property: omnigraph_compiler::query::value::RRF_COLUMN.to_string(),
         ty: omnigraph_compiler::types::ExprType::from_prop(
             &omnigraph_compiler::types::PropType::scalar(
                 omnigraph_compiler::types::ScalarType::F64,
@@ -1214,7 +1235,9 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
         }
         IRExpr::Not(inner, _)
         | IRExpr::IsNull { expr: inner, .. }
+        | IRExpr::Neg { expr: inner, .. }
         | IRExpr::Cast { expr: inner, .. } => reads_of_expr(inner, out),
+        IRExpr::Call { args, .. } => args.iter().for_each(|arg| reads_of_expr(arg, out)),
         IRExpr::PropAccess {
             variable,
             property,

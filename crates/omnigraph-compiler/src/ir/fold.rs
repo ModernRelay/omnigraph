@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use crate::query::ast::{BinaryOp, CompOp, Literal};
+use crate::query::value::{BinaryOp, CompOp, Literal};
 
 use super::IRExpr;
 use crate::types::{ExprType, PropType, ScalarType};
@@ -15,6 +15,7 @@ use crate::types::{ExprType, PropType, ScalarType};
 /// `left <op> right`, folded when both operands are literals.
 pub(super) fn binary(left: IRExpr, op: BinaryOp, right: IRExpr) -> IRExpr {
     if let (IRExpr::Literal(l, _), IRExpr::Literal(r, _)) = (&left, &right)
+        && !matches!(op, BinaryOp::Arith(_))
         && let Some(value) = evaluate(op, l, r)
     {
         return IRExpr::Literal(
@@ -29,7 +30,7 @@ pub(super) fn binary(left: IRExpr, op: BinaryOp, right: IRExpr) -> IRExpr {
 }
 
 /// `not <inner>`, folded over a Boolean or null literal.
-pub(super) fn not(inner: IRExpr) -> IRExpr {
+pub(crate) fn not(inner: IRExpr) -> IRExpr {
     match inner {
         IRExpr::Literal(Literal::Bool(value), ty) => IRExpr::Literal(
             Literal::Bool(!value),
@@ -44,7 +45,7 @@ pub(super) fn not(inner: IRExpr) -> IRExpr {
 }
 
 /// `<expr> is null` / `is not null`, folded over any literal.
-pub(super) fn is_null(expr: IRExpr, negated: bool) -> IRExpr {
+pub(crate) fn is_null(expr: IRExpr, negated: bool) -> IRExpr {
     match expr {
         IRExpr::Literal(literal, _) => IRExpr::Literal(
             Literal::Bool(matches!(literal, Literal::Null) != negated),
@@ -62,6 +63,8 @@ pub fn evaluate(op: BinaryOp, left: &Literal, right: &Literal) -> Option<Literal
         BinaryOp::And => kleene(left, right, false),
         BinaryOp::Or => kleene(left, right, true),
         BinaryOp::Compare(op) => compare(op, left, right),
+        // Arithmetic can refuse a row; its failure keeps its place (A3).
+        BinaryOp::Arith(_) => None,
     }
 }
 

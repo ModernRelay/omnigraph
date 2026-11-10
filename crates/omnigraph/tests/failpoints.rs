@@ -67,7 +67,8 @@ const BLOB_WRITE_SEED: &str = r#"{"type":"Document","data":{"title":"readme","co
 
 const BLOB_WRITE_MUTATIONS: &str = r#"
 query set_note($title: String, $note: String) {
-    update Document set { note: $note } where title = $title
+    $x: Document  $x.title = $title
+    update $x set { note: $note }
 }
 "#;
 
@@ -127,7 +128,8 @@ query insert_user($name: String, $email: String) {
 
 const OCC_DISJOINT_MUTATIONS: &str = r#"
 query set_age($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
+    $x: Person  $x.name = $name
+    update $x set { age: $age }
 }
 
 query insert_company($name: String) {
@@ -5334,7 +5336,8 @@ async fn setup_branch_merge_multichunk_delete(dir: &tempfile::TempDir) -> (Strin
     const CHUNK_ROWS: usize = 8192;
     const DELETE_QUERY: &str = r#"
 query remove_scored() {
-    delete Person where score = 1
+    $x: Person  $x.score = 1
+    delete $x
 }
 "#;
 
@@ -6602,7 +6605,8 @@ node Document {
             "feature",
             r#"
 query remove_victim() {
-    delete Document where title = "victim"
+    $x: Document  $x.title = "victim"
+    delete $x
 }
 "#,
             "remove_victim",

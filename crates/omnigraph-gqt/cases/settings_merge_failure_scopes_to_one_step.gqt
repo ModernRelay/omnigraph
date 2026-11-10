@@ -33,14 +33,16 @@ branch create source;
 
 --- mutate branch: source
 query bump_on_source() {
-    update Person set { age: 31 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query bump_on_main() {
-    update Person set { age: 32 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 32 }
 }
 
 --- expect affected: nodes=1 edges=0

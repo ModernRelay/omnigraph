@@ -24,7 +24,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
 
 use omnigraph_compiler::ir::{DeltaClass, LoadCheck, WriteKind, lower_load};
-use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
+use omnigraph_compiler::query::file::{LoadStmt, LoadStmtMode, LoadTarget};
 use omnigraph_planner::{
     BoundPlan, CommittedSide, Decision, MemorySource, Operation, RouteOverride, Side, SideId,
     TableRef, ValueTable, route,

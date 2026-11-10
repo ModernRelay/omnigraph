@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
-use crate::query::ast::LoadTarget;
+use crate::query::file::LoadTarget;
 
 use super::load::{LoadCheck, checks_for};
 

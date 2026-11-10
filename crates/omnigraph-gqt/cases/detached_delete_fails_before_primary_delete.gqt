@@ -28,7 +28,7 @@ action: fail
 scope: next_step
 
 --- mutate
-query delete_bob() { delete Person where name = "bob" }
+query delete_bob() { $x: Person  $x.name = "bob"  delete $x }
 --- expect error: injected failpoint triggered: mutation.delete_node_pre_primary_delete
 
 --- query branch: main
@@ -50,7 +50,7 @@ p.name: String
 q.name: String
 
 --- mutate
-query delete_bob() { delete Person where name = "bob" }
+query delete_bob() { $x: Person  $x.name = "bob"  delete $x }
 --- expect affected: nodes=1 edges=2
 
 --- restart

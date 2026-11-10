@@ -960,7 +960,8 @@ async fn mutation_update_key_property_rejected() {
 
     let queries = r#"
 query rename_person($old_name: String, $new_name: String) {
-    update Person set { name: $new_name } where name = $old_name
+    $x: Person  $x.name = $old_name
+    update $x set { name: $new_name }
 }
 "#;
 
@@ -1014,16 +1015,19 @@ query insert_doc($title: String, $content: Blob) {
 }
 
 query update_doc_content($title: String, $content: Blob) {
-    update Document set { content: $content } where title = $title
+    $x: Document  $x.title = $title
+    update $x set { content: $content }
 }
 
 query clear_doc_content($title: String, $content: Blob?) {
-    update Document set { content: $content } where title = $title
+    $x: Document  $x.title = $title
+    update $x set { content: $content }
 }
 
 query insert_then_clear_doc_content($title: String, $content: Blob, $cleared: Blob?) {
     insert Document { title: $title, content: $content }
-    update Document set { content: $cleared } where title = $title
+    $x: Document  $x.title = $title
+    update $x set { content: $cleared }
 }
 "#;
 
@@ -1034,7 +1038,7 @@ fn null_blob_params(title: &str, names: &[&str]) -> ParamMap {
     for name in names {
         map.insert(
             name.to_string(),
-            omnigraph_compiler::query::ast::Literal::Null,
+            omnigraph_compiler::query::value::Literal::Null,
         );
     }
     map
@@ -1809,11 +1813,11 @@ query insert_person($name: String, $age: I32) {
         let mut p = omnigraph_compiler::ir::ParamMap::new();
         p.insert(
             "name".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("Old".to_string()),
+            omnigraph_compiler::query::value::Literal::String("Old".to_string()),
         );
         p.insert(
             "age".to_string(),
-            omnigraph_compiler::query::ast::Literal::Integer(300),
+            omnigraph_compiler::query::value::Literal::Integer(300),
         );
         p
     })
@@ -1834,7 +1838,8 @@ node Person {
 "#;
     let queries = r#"
 query set_age($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
+    $x: Person  $x.name = $name
+    update $x set { age: $age }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -1851,11 +1856,11 @@ query set_age($name: String, $age: I32) {
         let mut p = omnigraph_compiler::ir::ParamMap::new();
         p.insert(
             "name".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("Alice".to_string()),
+            omnigraph_compiler::query::value::Literal::String("Alice".to_string()),
         );
         p.insert(
             "age".to_string(),
-            omnigraph_compiler::query::ast::Literal::Integer(300),
+            omnigraph_compiler::query::value::Literal::Integer(300),
         );
         p
     })
@@ -1886,7 +1891,7 @@ query insert_order($code: String) {
         let mut p = omnigraph_compiler::ir::ParamMap::new();
         p.insert(
             "code".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
+            omnigraph_compiler::query::value::Literal::String("invalid".to_string()),
         );
         p
     })
@@ -1907,7 +1912,8 @@ node Order {
 "#;
     let queries = r#"
 query set_label($code: String, $label: String) {
-    update Order set { label: $label } where code = $code
+    $x: Order  $x.code = $code
+    update $x set { label: $label }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -1924,11 +1930,11 @@ query set_label($code: String, $label: String) {
         let mut p = omnigraph_compiler::ir::ParamMap::new();
         p.insert(
             "code".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("ABC-123".to_string()),
+            omnigraph_compiler::query::value::Literal::String("ABC-123".to_string()),
         );
         p.insert(
             "label".to_string(),
-            omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
+            omnigraph_compiler::query::value::Literal::String("invalid".to_string()),
         );
         p
     })
@@ -2004,7 +2010,8 @@ query insert_article($slug: String, $attachment: Blob, $summary: String, $rating
     insert Article { slug: $slug, attachment: $attachment, summary: $summary, rating: $rating }
 }
 query update_summary($slug: String, $summary: String) {
-    update Article set { summary: $summary } where slug = $slug
+    $x: Article  $x.slug = $slug
+    update $x set { summary: $summary }
 }
 query get_article($slug: String) {
     match { $a: Article { slug: $slug } }
@@ -2131,7 +2138,7 @@ async fn blob_update_null_round_trip() {
     let mut insert_then_clear = null_blob_params("ok-computer", &["cleared"]);
     insert_then_clear.insert(
         "content".to_string(),
-        omnigraph_compiler::query::ast::Literal::String("base64:AQID".to_string()),
+        omnigraph_compiler::query::value::Literal::String("base64:AQID".to_string()),
     );
     let result = mutate_main(
         &db,
@@ -2838,7 +2845,8 @@ async fn update_edge_type_returns_error_not_panic() {
     // execute_update must not panic with HashMap key-not-found.
     let mutations = r#"
 query update_edge($from: String) {
-    update Knows set { since: "2025-01-01" } where from = $from
+    $x: Knows  $x.@src = $from
+    update $x set { since: "2025-01-01" }
 }
 "#;
     let result = mutate_main(
@@ -3041,7 +3049,7 @@ node Doc {
 query docs_with_tag($tag: String) {
     match {
         $d: Doc
-        $d.tags contains $tag
+        $tag in $d.tags
     }
     return { $d.slug }
 }

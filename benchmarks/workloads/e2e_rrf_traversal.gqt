@@ -9,14 +9,14 @@ environments:
 
 --- query
 query recall_two_terms($q1: String, $q2: String) {
-    match {
+    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
         $c: Chunk
         $a: Artifact
         $c chunkOfArtifact $a
         search($c.text, $q1)
     }
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 1
 }
 
@@ -37,14 +37,14 @@ rank fuse row tiebreak [$a.@id]
 
 --- query
 query recall_two_terms($q1: String, $q2: String) {
-    match {
+    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
         $c: Chunk
         $a: Artifact
         $c chunkOfArtifact $a
         search($c.text, $q1)
     }
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 1
 }
 

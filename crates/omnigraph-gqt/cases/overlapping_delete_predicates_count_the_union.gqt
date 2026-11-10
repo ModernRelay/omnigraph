@@ -31,9 +31,12 @@ edge Knows: Person -> Person
 
 --- mutate
 query delete_three_overlapping($threshold: I32) {
-    delete Person where team = "red"
-    delete Person where age > $threshold
-    delete Person where name = "Alice"
+    $x: Person  $x.team = "red"
+    delete $x
+    $x: Person  $x.age > $threshold
+    delete $x
+    $x: Person  $x.name = "Alice"
+    delete $x
 }
 
 --- params

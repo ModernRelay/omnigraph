@@ -42,7 +42,8 @@ export budget and must not share a binary with the other export tests.
 | `omnigraph-dst` | `crates/omnigraph-dst/tests/` (`scenarios.rs`, `integration/lane_b.rs`, `integration/torn_init.rs`) plus in-source proofs | Crate-local fixtures. Deterministic simulation; needs `--cfg tokio_unstable` (the workspace `.cargo/config.toml` sets it for every build; the default workspace gate excludes the crate by name). Run from `crates/omnigraph-dst`: its `[env]`-only `.cargo/config.toml` supplies the pool trio that `require_pool_env` asserts at process start. `#[ignore]`d tests are fleet/hunt instruments driven by the DST workflows |
 | `omnigraph-bench` | In-source configuration tests and `crates/omnigraph-bench/tests/` | Checked-in cases and suites under `benchmarks/` |
 | `omnigraph-gqt-core` | In-source format, expectation and ordinary execution tests | Shared parser and executor used by the GQT runner and benchmark harness |
-| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus runner self-tests and the corpus layout check | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; author-marked slow cases under `crates/omnigraph-gqt/cases_slow/`, run by the `GQT slow nightly` workflow and never by `cargo test`; format in RFC 0045 |
+| `omnigraph-reference` | In-source `src/tests.rs`, one test per core operator of the RFC's operator table, `Fix` and `Call` included; `tests/dependencies.rs`, which holds the crate to the compiler alone | Module-local fixtures; GQT's `--- expect same as reference` ([GQT README](../../crates/omnigraph-gqt/README.md#reference-comparison)) is its corpus-wide use |
+| `omnigraph-gqt` | `tests/gq_logic_tests.rs`, one libtest test per `.gqt` case (`datatest-stable`, `harness = false`), plus runner self-tests, the corpus layout check and `tests/integration/query_corpus.rs`, which parses every documented query text (the guides' and the skill's ```` ```gq ```` blocks, the `.gq` files) and type-checks each `.gq` file that has a `.pg` beside it | The `.gqt` corpus under `crates/omnigraph-gqt/cases/`; author-marked slow cases under `crates/omnigraph-gqt/cases_slow/`, run by the `GQT slow nightly` workflow and never by `cargo test`; format in RFC 0045 |
 
 Do not copy server or CLI process setup into a new suite. Their support modules own hermetic configuration, binary startup, temporary roots, and common assertions.
 
@@ -59,7 +60,6 @@ The engine integration suite is grouped by behavior, not implementation module:
 | Initialization and representative journeys | `integration/lifecycle.rs`, `integration/end_to_end.rs`, `integration/composite_flow.rs`, `integration/consistency.rs` |
 | Query results and operators | `integration/aggregation.rs`, `integration/literal_filters.rs`, `integration/ordering.rs`, `integration/traversal_indexed.rs`, `integration/traversal_adaptive.rs`, `integration/proptest_equivalence.rs`; the `.gqt` corpus lives in `omnigraph-gqt` (`crates/omnigraph-gqt/cases/`) |
 | V2 execution and memory | `integration/engine_v2.rs`, `integration/engine_v2_memory.rs`; `integration/repro_issue_703.rs` and `integration/repro_issue_723.rs` own ignored scale symptoms |
-| Frozen engine v1, the reference | `crates/omnigraph-reference-engine/tests/frozen.rs` pins every source file's bytes; `forbidden_apis.rs` owns that `omnigraph-gqt` is the crate's only dependent and that its source names neither the engine nor the planner; the crate has no other tests, and a `.gqt` step's `--- expect same as v1` compares v2's rows with its answer |
 | V2 plan nodes' operators and the execution report | In-source `engine/report/tests.rs` owns which operator each node builds and what its row says (`ran`, `actual_rows`, `drained`); `crates/omnigraph-planner/tests/integration/lower_walk.rs` owns the walk's order and refusals; the `ran` lines of `--- expect plan` read the report of the case's own run |
 | V2 plan sufficiency: the bound plan alone reproduces a run | `crates/omnigraph/tests/integration/engine_v2_plan_replay.rs` (see [Plan replay](#plan-replay)): one query per node kind with a switch or a ladder, replayed twice through `Session::replay_bound_plan` from its serialized replay envelope, equal rows, the same trace and the same search decisions required; `crates/omnigraph-planner/tests/integration/bound_plan.rs` owns the serialized form; in-source `engine/search.rs` tests own the declared ladder's stepping; `engine/plan_source.rs` tests own that the assumed memory limit sizes the plan, the lowering and the pool |
 | V2 plan acceptance: every read plan checked against its checked query | In-source `crates/omnigraph-planner/src/validate/tests.rs` owns one broken plan per check (binding, traversal and search identity, predicate retention and origin, block strategy, row cut, order and tie-break including fused and grouped searches, projection and score origin, hydration, declared policies, full-text prerequisites), the key-narrowing conjunct admitted only with its re-derived id, exact-fragment membership over admitted and excluded forms, the derivation's rules and rejections (hydrated members included), entry parity under an exhausted limit, and the `instrument:` derivation cost curve; `engine/plan_source/key_tests.rs` owns the narrowed key on a real snapshot and its refusal when edited; `integration/engine_v2_plan_replay.rs` owns that a saved plan failing well-formedness or a requirement is a bad request at the replay door; `validate/replay.rs` and `validate/budget.rs` tests own decoding limits, version refusals and budget charges; `integration/engine_v2.rs::every_read_door_shares_one_acceptance` owns that the run, both explain doors and the inspected run accept one plan and refuse alike; GQT cases claim the scope with `validation scope <scope>` in `--- expect plan` |
@@ -551,19 +551,6 @@ cases live at its root; v2-specific cases live in `v2/`, and plan assertions
 in `v2/planner/`. Every case runs on engine v2, the one engine; a
 `set engine = v2;` line some cases carry changes nothing, and directory
 placement selects nothing.
-
-A query step may end with `--- expect same as v1`, directly after its
-`--- expect shape` or `--- expect plan`. The runner then runs the step's query
-again on a copy of the case session that carries the frozen reference engine
-(`omnigraph_reference_engine::ReferenceEngine`, installed through
-`Session::with_read_executor` under the engine's `test-util` feature) and
-compares its rows with v2's, ordered or unordered as the step's rows expect
-says. A v1 error, a v1 gate refusal included, or a row difference fails the
-step. The section is refused on a mutate step, an error expect, `show` and
-`branch list`, and the DST runner skips it. The reference answers `not { ... }`
-blocks only among the correlated blocks, and refuses count predicates and a
-string `nearest` argument, so a case using those carries no
-`expect same as v1`.
 
 Every case is its own libtest test named `case::<relative/path>.gqt`, registered
 at run time (`datatest-stable`), so the ordinary name filter selects cases, a

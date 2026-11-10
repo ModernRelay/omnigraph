@@ -21,7 +21,7 @@ branch create saved
 --- expect ok
 
 --- mutate
-query delete_main() { delete Doc where slug = "a" }
+query delete_main() { $x: Doc  $x.slug = "a"  delete $x }
 
 --- expect affected: nodes=1 edges=0
 
@@ -52,7 +52,7 @@ n: I64
 pass aggregate_pushdown
 
 --- mutate branch: saved
-query delete_saved() { delete Doc where slug = "b" }
+query delete_saved() { $x: Doc  $x.slug = "b"  delete $x }
 
 --- expect affected: nodes=1 edges=0
 
@@ -70,7 +70,7 @@ n: I64
 pass aggregate_pushdown
 
 --- mutate
-query delete_remaining() { delete Doc where slug != "a" }
+query delete_remaining() { $x: Doc  $x.slug != "a"  delete $x }
 
 --- expect affected: nodes=2 edges=0
 

@@ -1569,7 +1569,7 @@ mod tests {
     use arrow_array::StringArray;
     use arrow_schema::{DataType, Field, Schema};
     use omnigraph_compiler::ir::lower_load;
-    use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
+    use omnigraph_compiler::query::file::{LoadStmt, LoadStmtMode, LoadTarget};
     use omnigraph_compiler::settings::SessionSettings;
     use omnigraph_planner::ConsultedImage;
 

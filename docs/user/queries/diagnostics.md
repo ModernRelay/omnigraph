@@ -112,9 +112,24 @@ do not mean there is no possible fix.
 | `Q001` | The source does not match the grammar at the reported position; `expected` names the grammar rules the parser could accept there. |
 | `Q002` | A query declaration is missing its parameter list. |
 | `Q003` | A settings statement is refused: unknown setting, value outside its row, or a process setting in a request. |
-| `Q004` | A branch, show or explain statement is misplaced or malformed. |
+| `Q004` | A branch, commit, show or explain statement is misplaced or malformed. |
 | `Q005` | A declaration body is refused; `expected` names the construct. |
 | `Q006` | The source nests too deeply, checked before the grammar runs: more than 64 levels of brackets and adjacent `not`s, or an expression deeper than 256 levels when each `and`/`or` of a chain also counts one. Write a long `or` chain over one property as `$p.name in [...]`. |
+| `Q007` | A traversal is written with an arrow; the fix is the triple. |
+| `Q008` | An `update` or `delete` statement carries a `where`; the fix binds and filters, as in `$x: Person  $x.email = $e  delete $x`. |
+| `Q009` | `mutation` is not a declaration keyword; the fix is `query`. |
+| `Q010` | A binding's braces hold a comparison; the fix is a filter clause. |
+| `Q011` | A read body carries `as commit` or `as unattached branch`. |
+| `Q012` | A respelling the language refuses; the fix prints the legal form. |
+| `Q013` | A clause follows a statement in a write body. |
+| `Q014` | A spelling from another language (`==`, `&&`, `where`, `count(*)`, …); the fix prints the GQ form. |
+| `Q015` | A form the language does not have yet; the message names it. |
+| `Q016` | A binary minus with whitespace on one side only; the fix spaces both. |
+| `Q017` | A contextual keyword or literal as a bare edge name; the fix quotes it. |
+| `Q018` | A bare name where a value is read; a bare name is a return alias in `order` only. |
+| `Q019` | A call whose name does not touch its `(`, or a call named by a clause keyword. |
+| `Q020` | A read body's clauses are missing, misplaced or unbraced. |
+| `Q021` | An annotation's named argument is written `name: value`; the fix is `name = value`. |
 
 Type codes are listed where the construct they guard is described, in
 [Query language](index.md).
@@ -130,9 +145,9 @@ an internal error.
 | `P002` | An edge alternation or wildcard traversal has no finite traversal work limit. The fix sets `traversal_work_limit` before the query. |
 | `P003` | The traversal work limit is outside `1..=9223372036854775807`, or a plan records it twice. |
 | `P004` | An edge alternation or wildcard traversal was asked to run in CSR traversal mode; it runs in `auto` or `indexed` mode. |
+| `P006` | A type-checked shape the planner does not run, such as a block compared with a column, or a write group whose clauses are more than one filtered binding of its target; `expected` names it. |
 
-`P001` and `P005` are withdrawn. A search order ranks the binding it names
-whatever the `match` block declares first, so a ranking on a binding a
-traversal reaches is no longer refused, and an `rrf()` whose arms rank two
-bindings one traversal connects is the type error `T59`
-([Search](../search/index.md#ranking-a-traversal-reached-binding)).
+`P001` and `P005` are withdrawn. A ranking ranks the binding it names
+whatever its population declares first
+([Search](../search/index.md#ranking-a-traversal-reached-binding)), and an
+`rrf` whose arms rank two bindings is the type error `T75`.

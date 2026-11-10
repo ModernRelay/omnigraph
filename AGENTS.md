@@ -44,7 +44,8 @@ Tools that support `@` imports include these automatically:
   skill in the CLI and MCP), `omnigraph-mcp` (MCP protocol and catalog), server,
   Azure admission wrapper, benchmark harness,
   `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
-  test per case), and `omnigraph-dst` (deterministic simulation testing; needs
+  test per case), `omnigraph-reference` (the core IR's reference
+  interpreter, which GQT compares query rows against), and `omnigraph-dst` (deterministic simulation testing; needs
   `--cfg tokio_unstable`, set by the workspace `.cargo/config.toml` for every
   build — the workspace test gate excludes the crate by name)
 - License: MIT
@@ -59,7 +60,7 @@ HTTP server.
 CLI / HTTP server
         |
         v
-compiler: parse, typecheck, IR, lowering
+compiler: parse, type check to the core IR
         |
         v
 engine: snapshots, execution, graph publication, recovery
@@ -211,13 +212,10 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   `.github/workflows/tests-slow-nightly.yml`, the nightly job that runs them
   with `--run-ignored only` and refuses a run in which an enrolled name did
   not pass.
-- Engine v1 is frozen: every file under
-  `crates/omnigraph-reference-engine/src/` is pinned by
-  `crates/omnigraph-reference-engine/tests/frozen.rs`. v1 is reachable only
-  through GQT's `--- expect same as v1`, which compares a query step's v2
-  rows with v1's. A defect seen on v1 is fixed on v2
-  (`crates/omnigraph/src/engine/`); a v1 edit needs the pin updated in the
-  same PR and a reviewer's eyes.
+- `crates/omnigraph-reference` evaluates the core IR as the RFC's operator
+  table states it; GQT's `--- expect same as reference` compares a query
+  step's rows with it. It is not frozen: a change to core semantics updates it
+  in the same pull request, and a disagreement is a bug in one of the two.
 - A change to what an operation reads or writes in storage adds or updates
   its row in the DST storage-cost golden,
   `crates/omnigraph-dst/cost_table.txt`, and the pull request explains every

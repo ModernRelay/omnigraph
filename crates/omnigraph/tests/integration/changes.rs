@@ -1030,7 +1030,8 @@ async fn cross_branch_diff_detects_empty_string_to_null_update() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    body: String?\n}";
     const SET_BODY: &str = r#"
 query set_body($slug: String, $body: String) {
-    update Doc set { body: $body } where slug = $slug
+    $x: Doc  $x.slug = $slug
+    update $x set { body: $body }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -1087,7 +1088,8 @@ async fn cross_branch_diff_detects_row_prefix_named_property_update() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    row_notes: String?\n}";
     const SET_NOTES: &str = r#"
 query set_notes($slug: String, $notes: String) {
-    update Doc set { row_notes: $notes } where slug = $slug
+    $x: Doc  $x.slug = $slug
+    update $x set { row_notes: $notes }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -1356,7 +1358,7 @@ async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
     let db = helpers::session(db);
     db.mutate(
         "main",
-        "query drop_document($title: String) {\n    delete Document where title = $title\n}\n",
+        "query drop_document($title: String) {\n    $x: Document  $x.title = $title\n    delete $x\n}\n",
         "drop_document",
         &helpers::params(&[("$title", "ranged")]),
     )
@@ -2667,11 +2669,13 @@ node Ghost {
     .unwrap();
     let writes = r#"
 query set_note($name: String, $note: String) {
-    update Person set { note: $note } where name = $name
+    $x: Person  $x.name = $name
+    update $x set { note: $note }
 }
 
 query set_attachment($name: String, $attachment: Blob) {
-    update Person set { attachment: $attachment } where name = $name
+    $x: Person  $x.name = $name
+    update $x set { attachment: $attachment }
 }
 "#;
     let set_note = db

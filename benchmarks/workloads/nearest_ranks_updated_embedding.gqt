@@ -9,9 +9,9 @@ environments:
 
 --- query
 query nearest_after_update($q: Vector(4)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 6) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 6
 }
 
@@ -30,9 +30,9 @@ d.slug: String
 
 --- query
 query nearest_after_update($q: Vector(4)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 6) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 6
 }
 

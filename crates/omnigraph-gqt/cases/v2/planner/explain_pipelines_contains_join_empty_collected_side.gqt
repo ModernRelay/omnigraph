@@ -26,7 +26,7 @@ query cites() {
     match {
         $p: Paper
         $m: Matter
-        $p.text contains $m.number
+        contains($p.text, $m.number)
     }
     return { $p.slug, $m.number }
 }

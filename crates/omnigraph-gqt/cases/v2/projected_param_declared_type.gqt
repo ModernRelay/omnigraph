@@ -3,7 +3,7 @@
 # notes: I32, U32, F32 (rounded to 32 bits), U64, Vector(2) (Float32 elements), [U32], min/max over one, a null
 # notes: I64? and an omitted DateTime?, never the bound value's type (Int64, Float64, List<Float64>, a Utf8 null).
 # notes: A value beyond the F32 range is refused, projected or not; the largest F32 is kept. The case pins column
-# notes: types, which `expect same as v1` does not compare, and the reference engine keeps the bound value's type.
+# notes: types.
 
 --- runner
 timeout_ms: 10000

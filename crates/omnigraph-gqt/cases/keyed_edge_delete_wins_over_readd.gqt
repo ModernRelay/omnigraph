@@ -43,7 +43,8 @@ query readd() {
 
 --- mutate branch: b1
 query delete() {
-    delete Knows where from = "alice"
+    $x: Knows  $x.@src = "alice"
+    delete $x
 }
 
 --- expect affected: nodes=0 edges=1

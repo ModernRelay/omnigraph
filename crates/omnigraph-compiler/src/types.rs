@@ -317,6 +317,11 @@ pub enum ExprType {
     Node {
         type_name: String,
     },
+    /// An edge reference column of the core IR; `type_name` may hold the
+    /// alternatives of an edge selector, joined by `|`.
+    Edge {
+        type_name: String,
+    },
     /// Internal exact comparison carrier, never a declared parameter or result.
     ExactInteger {
         list: bool,
@@ -336,14 +341,14 @@ impl ExprType {
     pub fn nullable(&self) -> bool {
         match self {
             Self::Value { nullable, .. } | Self::ExactInteger { nullable, .. } => *nullable,
-            Self::Node { .. } => false,
+            Self::Node { .. } | Self::Edge { .. } => false,
         }
     }
 
     pub fn is_list(&self) -> bool {
         match self {
             Self::Value { list, .. } | Self::ExactInteger { list, .. } => *list,
-            Self::Node { .. } => false,
+            Self::Node { .. } | Self::Edge { .. } => false,
         }
     }
 
@@ -365,7 +370,8 @@ impl ExprType {
             (Self::ExactInteger { list: left, .. }, Self::ExactInteger { list: right, .. }) => {
                 left == right
             }
-            (Self::Node { type_name: left }, Self::Node { type_name: right }) => left == right,
+            (Self::Node { type_name: left }, Self::Node { type_name: right })
+            | (Self::Edge { type_name: left }, Self::Edge { type_name: right }) => left == right,
             _ => false,
         }
     }
@@ -389,6 +395,7 @@ impl ExprType {
             }
             .display_name(),
             Self::Node { type_name } => type_name.clone(),
+            Self::Edge { type_name } => format!("edge {type_name}"),
             Self::ExactInteger { list, nullable } => format!(
                 "{}{}",
                 if *list {
@@ -417,7 +424,7 @@ impl ExprType {
                 }
                 .to_arrow(),
             ),
-            Self::Node { type_name: _ } => None,
+            Self::Node { type_name: _ } | Self::Edge { type_name: _ } => None,
             Self::ExactInteger { list, .. } => Some(if *list {
                 DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
                     "item",

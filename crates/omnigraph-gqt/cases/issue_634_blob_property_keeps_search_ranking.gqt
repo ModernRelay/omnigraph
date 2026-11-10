@@ -23,12 +23,12 @@ node Chunk {
 
 --- query
 query ranked($q: String) {
-    match {
+    match { from bm25({ match {
         $c: Chunk
         search($c.text, $q)
-    }
+    } return { $c } }, $c.text, $q) }
     return { $c.slug }
-    order { bm25($c.text, $q) }
+    order { $score desc }
 }
 
 --- params
@@ -43,9 +43,9 @@ c.slug: String
 
 --- query
 query closest($v: Vector(2)) {
-    match { $c: Chunk }
+    match { from nearest({ match { $c: Chunk } return { $c } }, $c.embedding, $v, k: 2) }
     return { $c.slug }
-    order { nearest($c.embedding, $v) }
+    order { $distance }
     limit 2
 }
 

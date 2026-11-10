@@ -14,12 +14,13 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, ParamMap};
-use omnigraph_compiler::query::ast::{AggFunc, BinaryOp, CompOp, Literal};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, ParamMap};
+use omnigraph_compiler::query::value::{AggFunc, BinaryOp, CompOp, Literal};
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::types::ScalarType;
+use omnigraph_planner::PatternStep;
 use omnigraph_planner::{
     AcceptedBoundPlan, BoundPlan, DatasetPin, Evidence, ExpandMode, ExpandPolicy, NodeId,
     OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, RankKind, RankScope,
@@ -36,6 +37,7 @@ use crate::instrumentation::{
 use crate::runtime_cache::CompiledQuery;
 
 mod adapters;
+mod arith;
 mod bind;
 pub(crate) mod catalogue;
 mod constant;

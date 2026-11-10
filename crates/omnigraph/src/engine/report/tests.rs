@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, StringArray};
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::settings::SessionSettings;
 use omnigraph_planner::{AccessPath, NodeId, PhysicalNode, PhysicalPlan, RankKind, RankScope};
 
@@ -376,7 +376,7 @@ const CITED: &str = r#"query cited() {
     match {
         $m: Matter
         $p: Passage
-        $p.text contains $m.number
+        contains($p.text, $m.number)
     }
     return { $m.mid, $p.pid }
 }"#;
@@ -385,7 +385,7 @@ const CITED_PASSAGE_FIRST: &str = r#"query cited() {
     match {
         $p: Passage
         $m: Matter
-        $p.text contains $m.number
+        contains($p.text, $m.number)
     }
     return { $m.mid, $p.pid }
 }"#;
@@ -619,7 +619,7 @@ const CITED_BY_M1: &str = r#"query cited() {
     match {
         $m: Matter
         $p: Passage
-        $p.text contains $m.number
+        contains($p.text, $m.number)
         $m.mid = "m1" or $p.pid = "p9"
     }
     return { $m.mid, $p.pid }
@@ -985,30 +985,30 @@ fn doc_seed() -> Vec<String> {
 
 const DOC_QUERIES: &str = r#"
 query by_text($t: String) {
-    match { $d: Doc }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $t) }
     return { $d.slug }
-    order { bm25($d.text, $t) }
+    order { $score desc }
     limit 3
 }
 query fused($t: String, $q: Vector(4)) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) $d: Doc }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    order { $score desc }
     limit 3
 }
 query fused_then_slug($t: String, $q: Vector(4)) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) $d: Doc }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)), $d.slug }
+    order { $score desc, $d.slug }
     limit 3
 }
 query nearest_with_edge($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: Doc
         $d knows $t
-    }
+    } return { $d, $t } }, $d.embedding, $q, k: 3) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 "#;

@@ -30,7 +30,8 @@ query root_bob() as unattached branch {
 
 --- mutate
 query noop_child() as unattached branch on "${r}" {
-    update Person set { age: 99 } where name = "nobody"
+    $x: Person  $x.name = "nobody"
+    update $x set { age: 99 }
 }
 
 --- expect affected: nodes=0 edges=0

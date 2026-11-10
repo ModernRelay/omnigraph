@@ -13,7 +13,7 @@ use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 
 use crate::helpers::*;
 

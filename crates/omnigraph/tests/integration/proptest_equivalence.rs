@@ -24,7 +24,7 @@ use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 
 use crate::helpers::*;
 

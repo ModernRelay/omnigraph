@@ -12,7 +12,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use datafusion::common::ScalarValue;
 use omnigraph_compiler::ir::{BlockAggregateExpr, IRExpr, ParamMap, SubqueryPredicate};
-use omnigraph_compiler::query::ast::{AggFunc, CompOp};
+use omnigraph_compiler::query::value::{AggFunc, CompOp};
 use omnigraph_compiler::types::{AggSignature, ExprType};
 use omnigraph_planner::{Accumulator, AggregateSpec, plan_block_aggregate};
 
@@ -531,7 +531,7 @@ impl Column {
 mod tests {
     use super::*;
     use arrow_array::{Float32Array, Int64Array, UInt64Array};
-    use omnigraph_compiler::query::ast::Literal;
+    use omnigraph_compiler::query::value::Literal;
     use omnigraph_compiler::types::{PropType, ScalarType};
 
     fn scalar(kind: ScalarType, nullable: bool) -> ExprType {

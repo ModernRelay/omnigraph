@@ -1,6 +1,6 @@
 # issue: none
 # notes: A search-only order over a pipeline with a second, unranked binding sorts by the score and tie-breaks on every scope binding's id, which the planner reads for the scan; a search order on a traversal destination roots its component there and ranks the reached documents only (d000, the global nearest, is not reached).
-# notes: An `rrf()` whose arms rank two bindings one traversal connects is refused at type checking (T59) in both declaration orders: each arm would root the component at its own binding, so the refusal offers no reorder.
+# notes: An `rrf` whose arms rank two bindings one traversal connects is refused at type checking (T75) in both declaration orders: the fused target would be a pair.
 # red_on: 2026-09-23, task 0226 tree before the one-pass tie-break: step 1 failed with `the planned tie-break column 'z.__id' is not in the sort input` (the tie-break was derived at lowering, after projection pushdown); step 2 failed with `column 'd._distance' not found for ordering` instead of a planning refusal.
 
 --- runner
@@ -35,32 +35,32 @@ edge Knows: Person -> Doc
 
 --- query
 query connected_rrf_d_first($q: Vector(4)) {
-    match { $d: Doc $t: Doc $p: Person $p knows $d $p knows $t }
+    match { from rrf(nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1), nearest({ match { $t: Doc } return { $t } }, $t.embedding, $q, k: 1))  $d: Doc $t: Doc $p: Person $p knows $d $p knows $t }
     return { $d.slug, $t.slug }
-    order { rrf(nearest($d.embedding, $q), nearest($t.embedding, $q)) }
+    order { $score desc }
     limit 1
 }
 --- params
 {"q": [0.0, 0.0, 0.0, 0.0]}
---- expect error: type error: T59: `rrf()` ranks `$d` and `$t`, which one traversal connects
+--- expect error: T75: `rrf` arm 2 ranks `$t` (node Doc), arm 1 ranks `$d` (node Doc); the fused target would be a pair
 
 --- query
 query connected_rrf_t_first($q: Vector(4)) {
-    match { $t: Doc $d: Doc $p: Person $p knows $d $p knows $t }
+    match { from rrf(nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1), nearest({ match { $t: Doc } return { $t } }, $t.embedding, $q, k: 1))  $t: Doc $d: Doc $p: Person $p knows $d $p knows $t }
     return { $d.slug, $t.slug }
-    order { rrf(nearest($d.embedding, $q), nearest($t.embedding, $q)) }
+    order { $score desc }
     limit 1
 }
 --- params
 {"q": [0.0, 0.0, 0.0, 0.0]}
---- expect error: type error: T59: `rrf()` ranks `$d` and `$t`, which one traversal connects
+--- expect error: T75: `rrf` arm 2 ranks `$t` (node Doc), arm 1 ranks `$d` (node Doc); the fused target would be a pair
 
 --- query
 set engine = v2;
 query search_only_order_with_an_unranked_binding($q: Vector(4)) {
-    match { $c: Doc $z: Zone }
+    match { from nearest({ match { $c: Doc $z: Zone } return { $c, $z } }, $c.embedding, $q, k: 3) }
     return { $c.slug, $z.name }
-    order { nearest($c.embedding, $q) }
+    order { $distance }
     limit 3
 }
 --- params
@@ -78,9 +78,9 @@ sort tiebreak [$c, $z]
 --- query
 set engine = v2;
 query nearest_on_a_traversal_destination($q: Vector(4)) {
-    match { $p: Person $p knows $d }
+    match { from nearest({ match { $p: Person $p knows $d } return { $p, $d } }, $d.embedding, $q, k: 1) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 1
 }
 --- params
@@ -91,4 +91,5 @@ query nearest_on_a_traversal_destination($q: Vector(4)) {
 d.slug: String
 --- expect plan
 scan Doc as $d: ranked nearest fetch 1
---- expect same as v1
+
+--- expect same as reference

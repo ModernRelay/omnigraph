@@ -25,7 +25,7 @@ set engine = v2;
 query count_non_x_docs() {
     match {
         $d: Doc
-        not { $d.slug starts_with "x" }
+        not { starts_with($d.slug, "x") }
     }
     return { count($d) as n }
 }

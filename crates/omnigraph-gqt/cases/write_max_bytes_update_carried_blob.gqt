@@ -407,8 +407,10 @@ node Apart {
 --- mutate
 set write_max_bytes = 2047;
 query retitle_one_byte_short() {
-    update Doc set { title: "new" } where slug = "big"
-    update Doc set { title: "none" } where slug = "nobody"
+    $x: Doc  $x.slug = "big"
+    update $x set { title: "new" }
+    $x: Doc  $x.slug = "nobody"
+    update $x set { title: "none" }
 }
 
 --- expect error: materialized blob payload bytes
@@ -429,8 +431,10 @@ d.title: String
 --- mutate
 set write_max_bytes = 2048;
 query retitle_exact() {
-    update Doc set { title: "new" } where slug = "big"
-    update Doc set { title: "none" } where slug = "nobody"
+    $x: Doc  $x.slug = "big"
+    update $x set { title: "new" }
+    $x: Doc  $x.slug = "nobody"
+    update $x set { title: "none" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -451,7 +455,8 @@ d.title: String
 --- mutate
 set write_max_bytes = 2047;
 query retitle_alone() {
-    update Doc set { title: "patched" } where slug = "big"
+    $x: Doc  $x.slug = "big"
+    update $x set { title: "patched" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -472,8 +477,10 @@ d.title: String
 --- mutate
 set write_max_bytes = 2047;
 query carry_after_patch_still_counts_the_payload() {
-    update Doc set { title: "new" } where slug = "big"
-    update Doc set { title: "none" } where slug = "nobody"
+    $x: Doc  $x.slug = "big"
+    update $x set { title: "new" }
+    $x: Doc  $x.slug = "nobody"
+    update $x set { title: "none" }
 }
 
 --- expect error: materialized blob payload bytes
@@ -481,7 +488,8 @@ query carry_after_patch_still_counts_the_payload() {
 --- mutate
 set write_max_bytes = 2047;
 query clear_and_retitle($c: Blob?) {
-    update Doc set { content: $c, title: "cleared" } where slug = "big"
+    $x: Doc  $x.slug = "big"
+    update $x set { content: $c, title: "cleared" }
 }
 
 --- params
@@ -505,7 +513,8 @@ d.title: String
 --- mutate
 set write_max_bytes = 2047;
 query retitle_indexed_alone() {
-    update Indexed set { title: "patched" } where slug = "big"
+    $x: Indexed  $x.slug = "big"
+    update $x set { title: "patched" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -513,7 +522,8 @@ query retitle_indexed_alone() {
 --- mutate
 set write_max_bytes = 8191;
 query retitle_packed_alone() {
-    update Packed set { title: "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt" } where slug = "big"
+    $x: Packed  $x.slug = "big"
+    update $x set { title: "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -559,7 +569,8 @@ tables:
 --- mutate
 set write_max_bytes = 4096;
 query retitle_shared_fragment() {
-    update Shared set { title: "patched" } where slug = "big"
+    $x: Shared  $x.slug = "big"
+    update $x set { title: "patched" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -567,7 +578,8 @@ query retitle_shared_fragment() {
 --- mutate
 set write_max_bytes = 4096;
 query retitle_apart_fragment() {
-    update Apart set { title: "patched" } where slug = "big"
+    $x: Apart  $x.slug = "big"
+    update $x set { title: "patched" }
 }
 
 --- expect affected: nodes=1 edges=0

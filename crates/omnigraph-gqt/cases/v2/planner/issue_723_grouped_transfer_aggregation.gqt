@@ -55,6 +55,8 @@ scan Account as $dst: columns [__id, accountId]
 pass projection_pushdown
 not pass aggregate_pushdown
 
+--- expect same as reference
+
 --- query
 set engine = v2;
 query top_two_senders() {
@@ -70,6 +72,8 @@ query top_two_senders() {
 src.accountId: String
 transfers: I64
 sent: F64?
+
+--- expect same as reference
 --- query
 set engine = v2;
 query filtered_transfers() {
@@ -85,6 +89,8 @@ sent: F64?
 --- expect plan
 not pass aggregate_pushdown
 
+--- expect same as reference
+
 --- query
 set engine = v2;
 query empty_frontier() {
@@ -96,6 +102,8 @@ query empty_frontier() {
 src.accountId: String
 transfers: I64
 sent: F64?
+
+--- expect same as reference
 
 --- query
 set engine = v2;
@@ -109,6 +117,8 @@ src.accountId: String
 transfers: I64
 sent: F64?
 
+--- expect same as reference
+
 --- query
 set engine = v2;
 query no_qualifying_edges() {
@@ -120,6 +130,8 @@ query no_qualifying_edges() {
 src.accountId: String
 transfers: I64
 sent: F64?
+
+--- expect same as reference
 
 --- mutate
 query add_direction_boundaries() {
@@ -145,6 +157,8 @@ src.accountId: String
 transfers: I64
 sent: F64?
 
+--- expect same as reference
+
 --- query
 set engine = v2;
 query either_direction_once_per_edge() {
@@ -160,6 +174,8 @@ query either_direction_once_per_edge() {
 edges: I64
 transfers: I64
 sent: F64?
+
+--- expect same as reference
 
 --- query
 set engine = v2;
@@ -178,6 +194,8 @@ src.accountId: String
 transfers: I64
 sent: F64?
 
+--- expect same as reference
+
 --- query
 set engine = v2;
 query filtered_destination() {
@@ -195,6 +213,8 @@ src.accountId: String
 transfers: I64
 sent: F64?
 
+--- expect same as reference
+
 --- query
 set engine = v2;
 query largest_individual_transfers() {
@@ -210,3 +230,5 @@ query largest_individual_transfers() {
 src.accountId: String
 dst.accountId: String
 t.amount: I64?
+
+--- expect same as reference

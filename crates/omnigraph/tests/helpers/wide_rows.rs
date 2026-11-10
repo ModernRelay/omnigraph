@@ -25,7 +25,7 @@ node Doc {
 }
 "#;
 
-pub const WIDE_ROW_SET_PAYLOAD: &str = "query set_payload($key: String, $payload: String) {\n    update Doc set { payload: $payload } where key = $key\n}";
+pub const WIDE_ROW_SET_PAYLOAD: &str = "query set_payload($key: String, $payload: String) {\n    $x: Doc  $x.key = $key\n    update $x set { payload: $payload }\n}";
 
 /// Comfortably past the 150 MiB / 4 = 37.5 MiB SortExec input cap.
 pub const WIDE_PAYLOAD_BYTES: usize = 40 * 1024 * 1024;

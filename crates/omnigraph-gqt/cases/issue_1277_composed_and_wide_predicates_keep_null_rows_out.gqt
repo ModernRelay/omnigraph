@@ -68,23 +68,28 @@ w.slug: String
 
 --- mutate
 query update_five_properties_tested_twice() {
-    update Wide set { tag: "hit" } where not ((p1 in ["a"]) and (p1 in ["b"])) or not ((p2 in ["a"]) and (p2 in ["b"])) or not ((p3 in ["a"]) and (p3 in ["b"])) or not ((p4 in ["a"]) and (p4 in ["b"])) or not ((p5 in ["a"]) and (p5 in ["b"]))
+    $x: Wide  not (($x.p1 in ["a"]) and ($x.p1 in ["b"])) or not (($x.p2 in ["a"]) and ($x.p2 in ["b"])) or not (($x.p3 in ["a"]) and ($x.p3 in ["b"])) or not (($x.p4 in ["a"]) and ($x.p4 in ["b"])) or not (($x.p5 in ["a"]) and ($x.p5 in ["b"]))
+    update $x set { tag: "hit" }
 }
 
 --- expect error: may compare at most 4 properties more than once each
 
 --- mutate
 query update_four_properties_tested_twice() {
-    update Wide set { tag: "hit" } where not ((p1 in ["a"]) and (p1 in ["b"])) or not ((p2 in ["a"]) and (p2 in ["b"])) or not ((p3 in ["a"]) and (p3 in ["b"])) or not ((p4 in ["a"]) and (p4 in ["b"]))
+    $x: Wide  not (($x.p1 in ["a"]) and ($x.p1 in ["b"])) or not (($x.p2 in ["a"]) and ($x.p2 in ["b"])) or not (($x.p3 in ["a"]) and ($x.p3 in ["b"])) or not (($x.p4 in ["a"]) and ($x.p4 in ["b"]))
+    update $x set { tag: "hit" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query delete_after_disjoint_negated_statements() {
-    delete Item where not (s in ["y"])
-    delete Item where not (s in ["x"])
-    delete Item where t = "k"
+    $x: Item  not ($x.s in ["y"])
+    delete $x
+    $x: Item  not ($x.s in ["x"])
+    delete $x
+    $x: Item  $x.t = "k"
+    delete $x
 }
 
 --- expect affected: nodes=4 edges=0

@@ -30,7 +30,7 @@ action: fail
 scope: next_step
 
 --- mutate branch: work
-query update_alice() { update Person set { age: 31 } where name = "alice" }
+query update_alice() { $x: Person  $x.name = "alice"  update $x set { age: 31 } }
 
 --- expect error: injected failpoint triggered: mutation.post_finalize_pre_publisher
 
@@ -59,7 +59,7 @@ p.name: String
 p.age: I64
 
 --- mutate branch: work
-query update_again() { update Person set { age: 32 } where name = "alice" }
+query update_again() { $x: Person  $x.name = "alice"  update $x set { age: 32 } }
 
 --- expect affected: nodes=1 edges=0
 

@@ -45,7 +45,7 @@ query membership_of_a_node() {
     return { $r.rid }
 }
 
---- expect error: T7: `$r in $i` tests membership and `$r` is a node; `in` takes a value on the left and a list on the right
+--- expect error: T6: variable `$i` is not bound
 
 --- query
 set engine = v2;
@@ -289,8 +289,10 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 --- mutate
 query change_covered_rows() {
-    update Item set { code: 10, day: date("2024-10-10"), word: "outside" } where slug = "a"
-    update Item set { code: 7, day: date("2024-07-07"), word: "theta" } where slug = "b"
+    $x: Item  $x.slug = "a"
+    update $x set { code: 10, day: date("2024-10-10"), word: "outside" }
+    $x: Item  $x.slug = "b"
+    update $x set { code: 7, day: date("2024-07-07"), word: "theta" }
 }
 
 --- expect affected: nodes=2 edges=0
@@ -378,7 +380,8 @@ expand $r Holds $i: mode indexed_scan ran indexed_scan
 
 --- mutate
 query delete_covered_member() {
-    delete Item where slug = "c"
+    $x: Item  $x.slug = "c"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=1

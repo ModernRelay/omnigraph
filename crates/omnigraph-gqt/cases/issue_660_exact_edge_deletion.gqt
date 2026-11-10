@@ -32,7 +32,8 @@ edge Knows: Person -> Person {}
 
 --- mutate
 query group_the_middle_ranks() {
-    update Person set { group: "middle" } where rank > 1 and rank < 4
+    $x: Person  $x.rank > 1 and $x.rank < 4
+    update $x set { group: "middle" }
 }
 
 --- expect affected: nodes=2 edges=0
@@ -60,7 +61,8 @@ branch create exact
 
 --- mutate branch: exact
 query delete_the_pair() {
-    delete Knows where @src = "a" and @dst = "b"
+    $x: Knows  $x.@src = "a" and $x.@dst = "b"
+    delete $x
 }
 
 --- expect affected: nodes=0 edges=2
@@ -115,7 +117,8 @@ id: String
 
 --- mutate branch: main
 query delete_by_parameters($src: String, $dst: String) {
-    delete Knows where @src = $src and @dst = $dst
+    $x: Knows  $x.@src = $src and $x.@dst = $dst
+    delete $x
 }
 
 --- params

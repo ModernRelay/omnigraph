@@ -57,7 +57,7 @@ query bare_aggregate_in_match_stays_rejected() {
     }
     return { $n.slug }
 }
---- expect error: T7: filter comparisons require scalar operands, got aggregate and I64
+--- expect error: T8: `count($m)` is an aggregate; in a filter it is a block over the clauses it counts
 
 --- query
 query more_than_two() {
@@ -184,7 +184,7 @@ query outer_property_as_the_bound_is_refused() {
     }
     return { $n.slug }
 }
---- expect error: T40: count over a block compares with a literal, now() or a parameter
+--- expect error: P006: `outer_property_as_the_bound_is_refused`: the planner does not lower a block value compared with a column
 
 --- query
 query not_equal_to_a_parameter($bound: I64) {

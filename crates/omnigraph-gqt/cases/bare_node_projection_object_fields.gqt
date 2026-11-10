@@ -44,6 +44,8 @@ p.embedding: Vector(2)?
 --- expect plan
 result columns [p: Person, p.embedding: Vector(2)?]
 
+--- expect same as reference
+
 --- query
 query zero_rows() {
     match { $p: Person { name: "nobody" } }
@@ -57,6 +59,8 @@ p: Person
 
 --- expect plan
 result columns [p: Person]
+
+--- expect same as reference
 
 --- query
 query count_alone() {
@@ -72,6 +76,8 @@ n: I64
 
 --- expect plan
 result columns [n: I64?]
+
+--- expect same as reference
 
 --- query
 query friends_per_person() {
@@ -93,6 +99,8 @@ friends: I64
 --- expect plan
 result columns [p: Person, friends: I64?]
 
+--- expect same as reference
+
 --- query
 query alias_ordered() {
     match { $p: Person }
@@ -111,13 +119,15 @@ person: Person
 --- expect plan
 result columns [person: Person]
 
+--- expect same as reference
+
 --- query
 query min_of_node() {
     match { $p: Person }
     return { min($p) as first }
 }
 
---- expect error: T8: min cannot take node binding `$p` bare
+--- expect error: T8: min cannot take a reference bare; access one of its properties
 
 --- query
 query min_of_node_alias() {
@@ -125,7 +135,7 @@ query min_of_node_alias() {
     return { $p as person, min(person) as first }
 }
 
---- expect error: T8: min cannot take node projection `person` bare
+--- expect error: Q018: `person` is a bare name, which is not a value in a read: a property is `$x.person`, a parameter `$person`, a string `"person"`; a bare name is a return alias in `order` only
 
 --- query
 query count_of_count() {

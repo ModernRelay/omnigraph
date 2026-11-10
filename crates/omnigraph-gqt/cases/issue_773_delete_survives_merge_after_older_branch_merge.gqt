@@ -72,7 +72,8 @@ branch merge b0
 
 --- mutate branch: b1
 query delete_w2() {
-    delete Person where name = "w2"
+    $x: Person  $x.name = "w2"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0

@@ -26,7 +26,7 @@ use omnigraph_cluster::{
     read_serving_snapshot_from_storage, status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use ulid::Ulid;
 
 const SCHEMA_V1: &str = "node Person {\n  name: String @key\n}\n";

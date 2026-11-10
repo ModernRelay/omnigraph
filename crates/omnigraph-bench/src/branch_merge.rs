@@ -27,7 +27,7 @@ use omnigraph_compiler::SystemColumns;
 #[cfg(test)]
 use omnigraph_compiler::ir::ParamMap;
 #[cfg(test)]
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 #[cfg(test)]
 use omnigraph_compiler::schema::parser::parse_schema;
 #[cfg(test)]
@@ -1279,7 +1279,7 @@ fn mutation_queries(diverged_tables: usize) -> String {
         let ty = edge_type_name(table);
         writeln!(
             source,
-            "query del_{table}($c: String) {{\n    delete {ty} where cohort = $c\n}}\n"
+            "query del_{table}($c: String) {{\n    $x: {ty}  $x.cohort = $c\n    delete $x\n}}\n"
         )
         .expect("writing to String cannot fail");
     }

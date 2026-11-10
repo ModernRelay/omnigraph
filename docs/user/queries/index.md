@@ -39,16 +39,17 @@ query <name>($required: String, $optional: I32?) { ... }
 Parameter types use the schema scalar types. Every non-nullable declared
 parameter must be supplied; omission fails before query execution. A trailing
 `?` accepts `null` or an omitted value. `@description("...")` and
-`@instruction("...")` attach metadata for clients that expose stored queries
-as tools. An integer parameter carries the whole range of its declared type,
-so a `U64` parameter takes every value from `0` to `18446744073709551615`.
+`@instruction("...")` attach metadata for tool clients. An integer parameter
+carries its type's whole range: a `U64` takes `0` to `18446744073709551615`.
 
 ## Match patterns
 
 A match binds nodes and follows typed relationships. For edge alternatives,
 wildcard, bounded hops, direction and edge identity, see
 [Traversal and match patterns](traversal.md). Omitted bounds always mean
-exactly `{1,1}`; multiple hops require an explicit finite range.
+exactly `{1,1}`; multiple hops require an explicit finite range. `from` draws
+the rows of a ranking into the match, and `let` names a relation for it; see
+[Search](../search/index.md).
 
 ### Boolean expressions and nulls
 
@@ -59,9 +60,9 @@ error. `not {` stays the pattern negation. Operands of `and`, `or` and `not`
 must be `Bool` (`T41`), as in
 `($d.stage = "open" or $d.stage = "paused") and not $d.amount < $cut`.
 
-A comparison (`contains` and `starts_with` included) with a null operand is
-null, and `not null` is null. A filter or mutation `where` keeps only rows
-whose expression is true, so `not ($p.age > 30)` skips rows whose `age` is
+A comparison or string test (`contains(...)`, `starts_with(...)`) with a null
+operand is null, and `not null` is null. A filter keeps only rows whose
+expression is true, so `not ($p.age > 30)` skips rows whose `age` is
 null.
 
 Numeric comparisons choose their types before execution. A literal may use a
@@ -69,7 +70,7 @@ property's type when its value is exactly representable in that type; otherwise
 both operands use a common numeric type. Parameters use their declared type,
 regardless of the supplied value. An `F32` property storing `0.1` therefore
 differs from the `F64` literal `0.1`, while `0.5` compares exactly. These rules
-also apply to list membership and mutation predicates, whether a filter runs
+also apply to list membership and the filters of a write, whether a filter runs
 in a scan or in memory. Mixed signed and `U64` values compare without losing
 integer precision.
 
@@ -89,16 +90,15 @@ refuses a `Blob`.
 `and`, `or`, `not`, `is`, `null` and `in` are reserved words: none is a bare operand
 or a return alias. `$p.and` after a dot and `and: 1` in an assignment or
 binding match stay legal; `nothing` and `android` are ordinary identifiers.
+A bare name is never a value in a read (`Q018`): a property is `$x.name`, a
+parameter `$name` and a string `"name"`; the one bare name is a return alias in
+`order`.
 A traversal names its edge bare or as a string, the one spelling for an edge
 a reserved word names: `$i "in" $b` follows the edge `In`; `$i in $b` tests membership.
 
-A mutation `where` takes the same expressions over the target type's
-properties, `@id`, `@src`, `@dst`, literals, parameters and `now()`, never a
-binding variable, aggregate or search call:
-`delete Knows where @src = "a" and @dst = "b"`. Assignment values and binding
-matches take constants evaluated once per invocation, such as
-`adult: true or $flag`; a property or system field there is `T45`. See
-[Mutations](../mutations/index.md).
+Binding matches take constants evaluated once per invocation, such as
+`{ adult: true or $flag }`; a property or system field there is `T45`. A
+[write](../mutations/index.md) selects its rows with the same clauses.
 
 ### Correlated blocks
 
@@ -107,21 +107,18 @@ matches take constants evaluated once per invocation, such as
 outer row. Each block must read a variable bound outside it. The row is kept
 when the aggregate comparison is true: `not` means `count = 0`, and `exists`
 means `count > 0`. The right side is a literal, `now()` or typed parameter;
-numeric bounds follow the [comparison rules](#boolean-expressions-and-nulls)
+a column, such as `$p.quota`, type-checks but is refused by the planner
+(`P006`). Numeric bounds follow the [comparison rules](#boolean-expressions-and-nulls)
 for the aggregate's result type. Its argument is a scalar expression in the
 block's scope: numeric for `sum` and `avg`; numeric, `String`, `Bool`, `Date`
 or `DateTime` for `min` and `max`, as in `return`. With no matches, `sum`,
 `min`, `max` and `avg` satisfy no comparison; `count` is `0`.
 
 Integer block `sum` accumulates exactly in 128 bits, refuses overflow of that
-range, and rounds the total once to `F64` before comparison. For example,
-`9007199254740993` and `-9007199254740992` sum to `1`, while a single value
-`9007199254740993` rounds to `9007199254740992` and does not satisfy
-`sum(...) { ... } > 9007199254740992`.
-
-As in `return`, `avg` converts each non-null input to `F64` before summing
-and dividing by the count. For those same two values, the average is `0`,
-because the first value rounds before accumulation. `min` and `max` retain
+range, and rounds the total once to `F64` before comparison: `9007199254740993`
+and `-9007199254740992` sum to `1`, while `9007199254740993` alone rounds to
+`9007199254740992`. As in `return`, `avg` converts each non-null input to `F64`
+before summing, so those two values average `0`. `min` and `max` retain
 the column's declared type, including the full `U64` range; comparing a `U64`
 extremum with an `I64` parameter preserves both integer ranges. Row count and
 column `count` use `I64` and refuse a count beyond its range; column `count`
@@ -136,7 +133,7 @@ scanned. A single-hop, filter-free `count { ... }` over a directed, unbound
 edge is answered from the graph index's degree. A bare aggregate in `match`,
 `count($d) > 2` without a block, is refused: it names no row to group by.
 
-```
+```gq
 query prolific($least: I64) {
     match {
         $a: Author
@@ -153,21 +150,22 @@ query prolific($least: I64) {
 
 ### Strings and lists
 
-- `$x.tags contains "rust"` tests membership when `tags` is a list.
+- `"rust" in $x.tags` tests membership when `tags` is a list.
 - `$x.number in $numbers` tests membership in a list parameter or literal
-  (`$x.number in ["A-1", "A-2"]`): `$numbers contains $x.number` with the
-  list, of the value's type (`T7`), on the right. On a matched binding's
-  property it filters that binding's scan. An empty list has no member: `in`
-  keeps no row, `not (... in [])` keeps the rows whose value is not null.
-- `$x.title contains "graph"` tests exact, case-sensitive substring containment
-  when `title` is a String.
-- `$x.title starts_with "Omni"` tests an exact, case-sensitive prefix.
+  (`$x.number in ["A-1", "A-2"]`); the right side is a list of the value's
+  type (`T7`). On a matched binding's property it filters that binding's scan.
+  An empty list has no member: `in` keeps no row, `not (... in [])` keeps the
+  rows whose value is not null.
+- `contains($x.title, "graph")` tests exact, case-sensitive substring
+  containment when `title` is a String.
+- `starts_with($x.title, "Omni")` tests an exact, case-sensitive prefix.
+- The infix forms `$x.title contains "graph"` and `$x.title starts_with "Omni"`,
+  and `contains` over a list, are `T7`, with the call or `in` as the fix.
 
-`NULL` never matches these predicates. `%` and `_` are ordinary characters,
-not wildcards. The predicates remain correct without an index; do not assume a
-free-text String index accelerates exact prefix or substring filters. Use
-[full-text search](../search/index.md) for tokenization, fuzzy matching, and
-relevance ranking.
+`NULL` never matches these predicates, and `%` and `_` are not wildcards. They
+are correct without an index, and a free-text String index does not accelerate
+them; use [full-text search](../search/index.md) for tokens, fuzzy matching and
+relevance.
 
 ### System fields
 
@@ -176,12 +174,11 @@ A node's identity and an edge's endpoints are system fields, read through
 identity of any binding, `$e.@src` and `$e.@dst` the endpoints of a bound
 edge. They work in filters, projections, and orderings (`$p.@id = $who`,
 `return { $p.@id }`, `order { $p.@id asc }`) and answer on every graph,
-whatever the stored column is called. In a mutation predicate, which carries
-no binding, the bare form serves: `delete Person where @id = $who`,
-`delete Knows where @src = $who`. A bare `id` (`$p.id`, `where id = ...`)
-always names a user property called `id`; where none is declared it is the
-unknown-property error, which names the meta-field. Edge inserts keep
-addressing endpoints as `from` and `to`. `$e.@type` returns the bound edge's
+whatever the stored column is called; a write reads them through its binding
+too (`$x.@src = $who`), and a bare `@id` is `T6`. A bare `id` (`$p.id`,
+`{ id: ... }`) always names a user property called `id`; where none is declared
+it is the unknown-property error, which names the meta-field. Edge inserts
+address endpoints as `from` and `to`. `$e.@type` returns the bound edge's
 canonical schema type name as a non-null `String`, including on ordinary named
 traversals; it is synthesized query metadata and cannot be written. `@src` and
 `@dst` preserve stored orientation, including when the query traverses in
@@ -190,15 +187,17 @@ type: `$o: @Operator` binds the rows of the [engine catalogue](catalogue.md).
 
 ## Return, order, and limit
 
-```gq
+```gq fragment
 return { $person.name, count($company) as companies }
 order { companies desc, $person.name asc }
 limit 20
 ```
 
-Return expressions include variables, properties, literals, `now()`, and the
-aggregates `count`, `sum`, `avg`, `min`, and `max`. Each gives one column named by
-its alias or expression (`$p.name` gives `p.name`); duplicates are refused (`T25`).
+Return expressions include variables, properties, literals, `now()`, the
+aggregates `count`, `sum`, `avg`, `min`, and `max`, and the score column a
+[ranking](../search/index.md) adds (`$distance` or `$score`). Each gives one
+column named by its alias or expression (`$p.name` gives `p.name`, `$score`
+gives `score`); duplicates are refused (`T25`).
 
 Integer `sum` accumulates exactly in 128 bits and rounds once to `F64`; `avg`
 uses a floating-point accumulator. `min` and `max` accept numeric, `String`,
@@ -214,41 +213,46 @@ Other aggregates require a property (`T8`) and refuse `distinct` (`T57`).
 
 A comparison or Boolean expression requires an alias (`T43`), such as
 `$p.age > 30 as adult`; its result is `Bool`, or `Bool?` with a nullable operand,
-and `is null` is always `Bool`. In an aggregated return its operands are
-aggregates, literals, `now()` and parameters, evaluated per group after
-aggregation: `count($p) > 0 as any` is `Bool?` because `count` is `I64?`. A group
-value beside an aggregate is refused (`T58`), any other Boolean item too (`T9`).
+and `is null` is always `Bool`. In an aggregated return an item over
+aggregates, literals, `now()` and parameters is evaluated per group after
+aggregation: `count($p) > 0 as any` is `Bool?` because `count` is `I64?`. An
+item that reads no aggregate, a property or a Boolean such as
+`$p.age > 30 as adult`, is a group key; one that combines an aggregate with a
+column no return item groups by is refused (`T9`).
 
 `return distinct { $p.name }` keeps one row per complete projected tuple.
 Repeated traversal matches and equal values on different entities collapse;
 nulls compare equal. Every projection is a key, including comparisons, and
 bare nodes deduplicate by identity. Deduplication follows `match` and precedes
 ordering and limiting, so the limit counts distinct rows. Aggregates with
-`distinct` are refused (`T56`). Except for a leading search function, DISTINCT
-order keys must be projected values or aliases, including property keys
-(`T42`). Remaining projected columns break ties ascending; no identity tiebreak is added.
+`distinct` are refused (`T56`). DISTINCT order keys must be projected values
+or aliases, including property keys (`T42`). Remaining projected columns break
+ties ascending; no identity tiebreak is added.
 
 For ordinary returns, explicit order is total: entity ids break ties only when
 they can change the visible order, and no id is read when every projection is a
-key. Ascending puts nulls first, descending last. `nearest(...)` requires a limit.
-On ungrouped, non-DISTINCT rows, property and system-field order keys need not be projected;
-other keys, except the leading search function, must be return aliases or
-expressions written in return (`T42`), like `count($d)` after `return { count($d) as deals }`.
+key. Ascending puts nulls first, descending last. On ungrouped, non-DISTINCT
+rows an order key need not be projected: `order { $p.age desc }` sorts by a
+property the return leaves out. Over grouped rows, an aggregated or DISTINCT
+return, an order key must be a return item or its alias (`T42`), like
+`count($d)` after `return { count($d) as deals }`.
 
-For ordinary returns, `nearest(...)` orders by ascending distance and `bm25`
-and `rrf` by descending score, including through traversals, ranking the binding named whichever binding `match` declares first ([details](../search/index.md#ranking-a-traversal-reached-binding); `rrf` arms on two connected bindings: `T59`).
-The search function must lead; subsequent keys precede the identity tiebreak. Projected
-scores must repeat that leading function (`T33`); the [Search guide](../search/index.md)
-defines their names and types. Rank expressions under aggregates (`T32`) and
-search predicates in return (`T35`) are refused.
+A read that draws from a [ranking](../search/index.md) orders by its score
+column, written as the leading key: `order { $distance }` for `nearest`, by
+ascending distance, and `order { $score desc }` for `bm25` and `rrf`, by
+descending score, including through traversals, ranking the binding the
+ranking names whichever binding its population declares first
+([details](../search/index.md#ranking-a-traversal-reached-binding)).
+Subsequent keys precede the identity tiebreak. `nearest` requires a limit. A
+ranking written as a call in `order` or `return` is refused (`T65`), and so is
+a search predicate in return (`T38`).
 
-For aggregate or DISTINCT returns, the leading search function selects the
-input population; it does not order the output. Subsequent keys order output
-rows, followed by every group or DISTINCT key ascending. Without subsequent
-keys, output is unordered. Aggregates cannot project scores (`T9`). DISTINCT
-uses the selected nearest population without retry overfetch, so duplicates
-can leave fewer rows than the limit. BM25 reads every matching entity before
-the final limit.
+For aggregate or DISTINCT returns, the ranking selects the input population;
+it does not order the output, and its score is not an order key (`T42`). The
+written keys order output rows, followed by every group or DISTINCT key
+ascending. Without keys, output is unordered. DISTINCT uses the selected
+nearest population without retry overfetch, so duplicates can leave fewer rows
+than the limit. BM25 reads every matching entity before the final limit.
 
 ## Blobs
 
@@ -268,11 +272,9 @@ omnigraph query engineers --query queries.gq --branch review \
 ```
 
 When the snapshot has an effective graph head, `omnigraph query --json`
-includes its `graph_commit_id`, pinned with the returned rows. Use that
-same-snapshot id with a later mutation's `--if-commit` option when implementing
-read-modify-write. On a newly created, unmodified branch, it is the head
-inherited from the source branch and is valid for the branch's first
-conditional mutation. See [Branches, Commits, and History](../branching/index.md).
+includes its `graph_commit_id`, pinned with the returned rows; pass it to a
+later mutation's `--if-commit` for read-modify-write. On a new, unmodified
+branch it is the head inherited from the source branch. See [Branches, Commits, and History](../branching/index.md).
 
 ## JSON result spelling
 
@@ -303,13 +305,12 @@ with a non-zero digit past the third fractional digit, such as
 `datetime(...)` literal; trailing zeros, as in `.123000`, are accepted.
 
 A `Date` or `DateTime` count outside the range the writer can format is refused
-on load. A read that meets one fails with status 500; the error names the
-column, the result row, and the count, and an `update` of that row repairs it.
+on load; a read that meets one fails with status 500 naming the column, row and
+count, and an `update` of that row repairs it.
 
 ## Session settings
 
-Use `set`, `reset`, and `show` to configure query execution. See
-[Session settings](settings.md) for syntax, scopes, defaults, and CLI/HTTP usage.
+`set`, `reset` and `show` configure query execution; see [Session settings](settings.md).
 
 ## Linting
 
@@ -332,7 +333,7 @@ For every query that compiles successfully, JSON output includes an
 `operation` descriptor:
 
 - `result` lists projected fields in return order. Each field has `name`,
-  `kind`, and `nullable`; list fields also have `item_kind`, and vectors
+  the result column (`p.name`, or the alias), `kind`, and `nullable`; list fields also have `item_kind`, and vectors
   have `vector_dim`.
 - `reads` conservatively lists every node or edge type the query may inspect.
 - `writes` lists every node or edge type the query may change and is empty

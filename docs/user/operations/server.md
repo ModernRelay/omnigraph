@@ -283,7 +283,7 @@ curl -sS http://localhost:8080/graphs/knowledge/mutate/if-graph-commit \
   -H 'authorization: Bearer secret-a' \
   -H 'content-type: application/json' \
   -H 'Omnigraph-If-Graph-Commit: <graph_commit_id>' \
-  -d '{"query":"query rename($name: String) { update Person set { name: $name } where email = \"ada@example.com\" }","name":"rename","params":{"name":"Ada"}}'
+  -d '{"query":"query rename($name: String) { $x: Person { email: \"ada@example.com\" }  update $x set { name: $name } }","name":"rename","params":{"name":"Ada"}}'
 ```
 
 Stored mutations use `POST /graphs/{graph_id}/queries/{query_name}/if-graph-commit` with

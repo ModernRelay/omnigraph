@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 
 use arrow_schema::SchemaRef;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, SubqueryPredicate};
-use omnigraph_compiler::query::ast::{BinaryOp, CompOp};
+use omnigraph_compiler::query::value::{BinaryOp, CompOp};
 use omnigraph_compiler::traversal::EdgeSelection;
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
@@ -640,7 +640,7 @@ macro_rules! physical_nodes {
         /// in the engine's lowering
         /// (`crates/omnigraph/src/engine/lower.rs`), whose exhaustive match is the
         /// proof. A read node carries the IR pieces its arm takes, so the lowering
-        /// never re-derives from `QueryIR`.
+        /// never re-derives from `ReadShape`.
         #[derive(Debug, Clone)]
         pub enum PhysicalNode {
             $(

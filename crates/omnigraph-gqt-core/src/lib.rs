@@ -15,15 +15,16 @@ use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::instrumentation::{QueryIoProbes, capture_query_io_probes, with_query_io_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::{MutationReceipt, Session};
-use omnigraph_compiler::query::ast::{
-    BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite,
-    EmptyFile, Expr, FileBody, Literal, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt,
-    UnattachedBase, show_statement_name,
+use omnigraph_compiler::ir::core::CoreDecl;
+use omnigraph_compiler::query::check::{check_query_decl, result_schema};
+use omnigraph_compiler::query::file::{
+    BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, CommitWrite, EmptyFile,
+    FileBody, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt, UnattachedBase,
+    show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::query::typecheck::{
-    executed_column_name, infer_query_result_schema, typecheck_query,
-};
+use omnigraph_compiler::query::syntax::{Arg, Clause, DeclBody, Expr, LetValue, ReadBody, RelExpr};
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::schema::ast::{Annotation, PropDecl, SchemaDecl};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::settings::{Engine, SessionSettings, SettingId, SettingRow, Traversal};
@@ -250,9 +251,10 @@ pub struct QueryStep {
     /// The `--- expect plan` section, checked against the engine's explain
     /// document before the rows.
     plan: Option<PlanExpect>,
-    /// `--- expect same as v1`: the rows must also equal the reference
-    /// engine's rows for the same query, compared as `expect` compares.
-    same_as_v1: bool,
+    /// `--- expect same as reference`: the rows must also equal the core
+    /// reference interpreter's rows for the same query, compared as the
+    /// step's `expect` compares.
+    same_as_reference: bool,
 }
 
 #[derive(Debug)]
@@ -1229,89 +1231,58 @@ fn validate_subst_tokens(
 /// Walks one expression for the index decision and the string-`nearest`
 /// refusal. Exhaustive over `Expr` so a newly added construct is a compile
 /// error, never a silent skip.
-fn walk_expr(
-    expr: &Expr,
-    params: &[Param],
-    needs_indices: &mut bool,
-    reject_edge_type: bool,
-) -> Result<(), String> {
+/// Whether an expression reads a search or ranking call (which needs the
+/// case's indexes built), refusing a `nearest` whose query is a String.
+fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<(), String> {
     match expr {
-        Expr::PropAccess { property, .. }
-            if reject_edge_type && property == omnigraph_compiler::traversal::EDGE_TYPE_META =>
-        {
-            return Err(
-                "expect same as v1: the reference engine does not support edge @type access".into(),
-            );
-        }
-        Expr::Now
-        | Expr::PropAccess { .. }
+        Expr::Literal(_)
         | Expr::Variable(_)
-        | Expr::Literal(_)
-        | Expr::AliasRef(_) => {}
-        Expr::Aggregate {
-            func,
-            distinct,
-            arg,
-        } => {
-            if reject_edge_type && *distinct {
-                return Err(format!(
-                    "expect same as v1: the reference engine does not support `{func}(distinct …)`"
-                ));
+        | Expr::Prop { .. }
+        | Expr::Meta(_)
+        | Expr::Ident(_) => {}
+        Expr::Call(call) => {
+            if matches!(
+                call.name.as_str(),
+                "search" | "fuzzy" | "match_text" | "match_terms" | "bm25" | "nearest" | "rrf"
+            ) {
+                *needs_indices = true;
             }
-            walk_expr(arg, params, needs_indices, reject_edge_type)?
-        }
-        Expr::Binary { left, op: _, right }
-        | Expr::In {
-            needle: left,
-            list: right,
-        } => {
-            walk_expr(left, params, needs_indices, reject_edge_type)?;
-            walk_expr(right, params, needs_indices, reject_edge_type)?;
-        }
-        Expr::Not(inner)
-        | Expr::IsNull {
-            expr: inner,
-            negated: _,
-        } => walk_expr(inner, params, needs_indices, reject_edge_type)?,
-        Expr::Search { field, query }
-        | Expr::MatchText { field, query }
-        | Expr::Bm25 { field, query } => {
-            *needs_indices = true;
-            walk_expr(field, params, needs_indices, reject_edge_type)?;
-            walk_expr(query, params, needs_indices, reject_edge_type)?;
-        }
-        Expr::Fuzzy {
-            field,
-            query,
-            max_edits,
-        } => {
-            *needs_indices = true;
-            walk_expr(field, params, needs_indices, reject_edge_type)?;
-            walk_expr(query, params, needs_indices, reject_edge_type)?;
-            if let Some(max_edits) = max_edits {
-                walk_expr(max_edits, params, needs_indices, reject_edge_type)?;
+            if call.name == "nearest"
+                && let Some(Arg::Expr(query)) = call.args.get(2)
+            {
+                refuse_string_nearest(query, params)?;
+            }
+            for arg in &call.args {
+                match arg {
+                    Arg::Expr(e) => walk_expr(e, params, needs_indices)?,
+                    Arg::Inline(body) => walk_read(body, params, needs_indices)?,
+                }
+            }
+            for (_, value) in &call.options {
+                walk_expr(value, params, needs_indices)?;
             }
         }
-        Expr::Nearest {
-            variable: _,
-            property: _,
-            query,
-        } => {
-            *needs_indices = true;
-            refuse_string_nearest(query, params)?;
-            walk_expr(query, params, needs_indices, reject_edge_type)?;
+        Expr::AggDistinct { arg, .. } | Expr::Neg(arg) | Expr::Not(arg) => {
+            walk_expr(arg, params, needs_indices)?
         }
-        Expr::Rrf {
-            primary,
-            secondary,
-            k,
-        } => {
-            *needs_indices = true;
-            walk_expr(primary, params, needs_indices, reject_edge_type)?;
-            walk_expr(secondary, params, needs_indices, reject_edge_type)?;
-            if let Some(k) = k {
-                walk_expr(k, params, needs_indices, reject_edge_type)?;
+        Expr::IsNull { expr, .. } => walk_expr(expr, params, needs_indices)?,
+        Expr::Block(block) => {
+            walk_clauses(&block.clauses, params, needs_indices)?;
+            if let Some(arg) = &block.arg {
+                walk_expr(arg, params, needs_indices)?;
             }
+        }
+        Expr::Arith { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::InfixString { left, right, .. } => {
+            walk_expr(left, params, needs_indices)?;
+            walk_expr(right, params, needs_indices)?;
+        }
+        Expr::In { needle, list, .. } => {
+            walk_expr(needle, params, needs_indices)?;
+            walk_expr(list, params, needs_indices)?;
         }
     }
     Ok(())
@@ -1338,28 +1309,43 @@ fn refuse_string_nearest(query: &Expr, params: &[Param]) -> Result<(), String> {
     )
 }
 
+fn walk_read(body: &ReadBody, params: &[Param], needs_indices: &mut bool) -> Result<(), String> {
+    walk_clauses(&body.clauses, params, needs_indices)?;
+    for projection in &body.projections {
+        walk_expr(&projection.expr, params, needs_indices)?;
+    }
+    for ordering in &body.order {
+        walk_expr(&ordering.expr, params, needs_indices)?;
+    }
+    Ok(())
+}
+
 fn walk_clauses(
     clauses: &[Clause],
     params: &[Param],
     needs_indices: &mut bool,
-    reject_edge_type: bool,
 ) -> Result<(), String> {
     for clause in clauses {
         match clause {
-            Clause::Binding(binding) => {
-                for property in &binding.prop_matches {
-                    walk_expr(&property.value, params, needs_indices, reject_edge_type)?;
+            Clause::Binding { prop_matches, .. } => {
+                for (_, value) in prop_matches {
+                    walk_expr(value, params, needs_indices)?;
                 }
             }
             Clause::Traversal(_) => {}
-            Clause::Filter(f) => walk_expr(f, params, needs_indices, reject_edge_type)?,
-            Clause::Subquery(subquery) => {
-                walk_clauses(&subquery.clauses, params, needs_indices, reject_edge_type)?;
-                if let Some(arg) = &subquery.arg {
-                    walk_expr(arg, params, needs_indices, reject_edge_type)?;
-                }
-                walk_expr(&subquery.right, params, needs_indices, reject_edge_type)?;
+            Clause::Filter(f) => walk_expr(f, params, needs_indices)?,
+            Clause::Not(inner) | Clause::Optional(inner) => {
+                walk_clauses(inner, params, needs_indices)?
             }
+            Clause::Let { value, .. } => match value {
+                LetValue::Relation(body) => walk_read(body, params, needs_indices)?,
+                LetValue::Expr(e) => walk_expr(e, params, needs_indices)?,
+            },
+            Clause::From(rel) => match rel {
+                RelExpr::Inline(body) => walk_read(body, params, needs_indices)?,
+                RelExpr::Call(call) => walk_expr(&Expr::Call(call.clone()), params, needs_indices)?,
+                RelExpr::Variable(_) => {}
+            },
         }
     }
     Ok(())
@@ -1367,89 +1353,92 @@ fn walk_clauses(
 
 fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
-        Expr::Aggregate { .. } => true,
-        Expr::Binary { left, right, .. }
-        | Expr::In {
-            needle: left,
-            list: right,
-        } => contains_aggregate(left) || contains_aggregate(right),
-        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => contains_aggregate(inner),
+        Expr::AggDistinct { .. } => true,
+        Expr::Call(call) if ["count", "sum", "avg", "min", "max"].contains(&call.name.as_str()) => {
+            true
+        }
+        Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Arith { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        Expr::In { needle, list, .. } => contains_aggregate(needle) || contains_aggregate(list),
+        Expr::Not(inner) | Expr::Neg(inner) | Expr::IsNull { expr: inner, .. } => {
+            contains_aggregate(inner)
+        }
         _ => false,
     }
+}
+
+/// The read body of a declaration, when it is a read.
+fn read_body(decl: &QueryDecl) -> Option<&ReadBody> {
+    match &decl.syntax.decl().body {
+        DeclBody::Read(body) => Some(body),
+        DeclBody::Write(_) => None,
+    }
+}
+
+/// Whether a read draws a ranking with `from` (`nearest`, `bm25`, `rrf`).
+fn ranks(body: &ReadBody) -> bool {
+    body.clauses.iter().any(|clause| match clause {
+        Clause::From(RelExpr::Call(call)) => {
+            matches!(call.name.as_str(), "nearest" | "bm25" | "rrf")
+        }
+        Clause::Let {
+            value: LetValue::Relation(_),
+            ..
+        } => false,
+        _ => false,
+    })
 }
 
 /// Why `expect ordered` is refused: search-led aggregates and DISTINCT
 /// need a key after the search function to order their output rows.
 /// Ordinary ordered queries retain their total-order contract.
 fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
-    if decl.order_clause.is_empty() {
+    let body = read_body(decl)?;
+    if body.order.is_empty() {
         return Some("`expect ordered` is refused for a query without an `order` clause".into());
     }
-    let search_led = matches!(
-        decl.order_clause.first().map(|o| &o.expr),
-        Some(Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. })
-    );
-    if decl.distinct && search_led && decl.order_clause.len() == 1 {
+    let search_led = ranks(body);
+    // The keys after the ranking's: every key but a read of the score
+    // column. Under an aggregate or `distinct` the score orders no output
+    // row, so only these keys order them.
+    let keys_after = body
+        .order
+        .iter()
+        .filter(|o| !matches!(&o.expr, Expr::Variable(v) if v == "score" || v == "distance"))
+        .count();
+    if body.distinct && search_led && keys_after == 0 {
         return Some(
             "`expect ordered` is refused for rank-only `return distinct`; \
              use `expect unordered` or add a projected order key"
                 .into(),
         );
     }
-    if decl
-        .return_clause
-        .iter()
-        .any(|p| contains_aggregate(&p.expr))
+    if body.projections.iter().any(|p| contains_aggregate(&p.expr))
+        && (!search_led || keys_after == 0)
     {
-        if !search_led || decl.order_clause.len() < 2 {
-            return Some(
-                "`expect ordered` is refused for a query with an aggregate in its `return` list \
-                 unless a search function leads its `order` and a key follows it; only then does \
-                 the sort append every group key, and group rows carry no `<var>.id` tie-break"
-                    .into(),
-            );
-        }
+        return Some(
+            "`expect ordered` is refused for a query with an aggregate in its `return` list \
+             unless it reads a ranking and an `order` key besides the score orders the groups; \
+             only then does the sort append every group key, and group rows carry no `<var>.id` \
+             tie-break"
+                .into(),
+        );
     }
     None
 }
 
 fn inspect_decl(decl: &QueryDecl, needs_indices: &mut bool) -> Result<(), String> {
-    inspect_decl_with_policy(decl, needs_indices, false)
-}
-
-fn inspect_decl_with_policy(
-    decl: &QueryDecl,
-    needs_indices: &mut bool,
-    reject_edge_type: bool,
-) -> Result<(), String> {
-    if reject_edge_type && decl.distinct {
-        return Err(
-            "expect same as v1: the reference engine does not support `return distinct`".into(),
-        );
+    match &decl.syntax.decl().body {
+        DeclBody::Read(body) => walk_read(body, &decl.params, needs_indices),
+        DeclBody::Write(write) => {
+            for group in &write.groups {
+                walk_clauses(&group.clauses, &decl.params, needs_indices)?;
+            }
+            Ok(())
+        }
     }
-    walk_clauses(
-        &decl.match_clause,
-        &decl.params,
-        needs_indices,
-        reject_edge_type,
-    )?;
-    for projection in &decl.return_clause {
-        walk_expr(
-            &projection.expr,
-            &decl.params,
-            needs_indices,
-            reject_edge_type,
-        )?;
-    }
-    for ordering in &decl.order_clause {
-        walk_expr(
-            &ordering.expr,
-            &decl.params,
-            needs_indices,
-            reject_edge_type,
-        )?;
-    }
-    Ok(())
 }
 
 fn props_use_embed(props: &[PropDecl]) -> bool {
@@ -1548,6 +1537,10 @@ fn refuse_process_settings(
 
 struct PendingStep {
     is_mutation: bool,
+    /// The compiler refused the step's source at parse: legal only under an
+    /// `expect error:`, where the step runs to that refusal through the
+    /// engine's door like any other query.
+    refused_at_parse: Option<String>,
     ordinal: usize,
     source: String,
     name: String,
@@ -1767,6 +1760,37 @@ fn complete_merge_expect(
     )?))
 }
 
+/// The expect word that adds the reference comparison to a query step's
+/// rows expect.
+const SAME_AS_REFERENCE: &str = "same as reference";
+
+/// Why a `--- expect same as reference` section has no step to attach to; a
+/// mutate step, pending or just completed, gets its own refusal.
+fn same_as_reference_misplaced(
+    line: usize,
+    pending: Option<&Pending>,
+    items: &[Item],
+    open_loop: Option<&(String, Vec<String>, Vec<Step>)>,
+) -> String {
+    let last = match open_loop {
+        Some((_, _, steps)) => steps.last(),
+        None => match items.last() {
+            Some(Item::Step(step)) => Some(step),
+            Some(Item::Loop { .. }) | None => None,
+        },
+    };
+    let on_mutate = matches!(pending, Some(Pending::Decl(step)) if step.is_mutation)
+        || (pending.is_none() && matches!(last, Some(Step::Mutate(_))));
+    if on_mutate {
+        return format!(
+            "invalid_case: line {line}: `--- expect same as reference` is refused on a mutate step; the reference interpreter only reads, and a mutation returns no rows to compare"
+        );
+    }
+    format!(
+        "line {line}: `--- expect same as reference` must directly follow a query step's `--- expect shape` or `--- expect plan`; it adds the reference comparison to the step's own rows expect"
+    )
+}
+
 /// The step a control write becomes under `mode`.
 fn complete_control_step(
     ordinal: usize,
@@ -1825,35 +1849,11 @@ fn complete_control_step(
     })
 }
 
-/// The expect word that adds the reference-engine comparison to a query
-/// step's rows expect.
-const SAME_AS_V1: &str = "same as v1";
-
-/// Why a `--- expect same as v1` section has no step to attach to; a mutate
-/// step, pending or just completed, gets its own refusal.
-fn same_as_v1_misplaced(
-    line: usize,
-    pending: Option<&Pending>,
-    items: &[Item],
-    open_loop: Option<&(String, Vec<String>, Vec<Step>)>,
-) -> String {
-    let last = match open_loop {
-        Some((_, _, steps)) => steps.last(),
-        None => match items.last() {
-            Some(Item::Step(step)) => Some(step),
-            Some(Item::Loop { .. }) | None => None,
-        },
-    };
-    let on_mutate = matches!(pending, Some(Pending::Decl(step)) if step.is_mutation)
-        || (pending.is_none() && matches!(last, Some(Step::Mutate(_))));
-    if on_mutate {
-        return format!(
-            "invalid_case: line {line}: `--- expect same as v1` is refused on a mutate step; the reference engine only reads, and a mutation returns no rows to compare"
-        );
-    }
-    format!(
-        "line {line}: `--- expect same as v1` must directly follow a query step's `--- expect shape` or `--- expect plan`; it adds the reference-engine comparison to the step's own rows expect"
-    )
+/// The declaration of a step whose source the compiler refused at parse: no
+/// parameters and no body, so the step binds nothing and the door it runs
+/// through answers with the parse refusal.
+fn unparsed_decl() -> QueryDecl {
+    QueryDecl::unnamed_read()
 }
 
 /// The step a declaration section becomes under `mode`, or why the mode is
@@ -1864,6 +1864,11 @@ fn complete_decl_step(
     section: &Section<'_>,
     loop_var: Option<&str>,
 ) -> Result<Step, String> {
+    if let Some(refusal) = &step.refused_at_parse
+        && !matches!(mode, ExpectHeader::Error(_))
+    {
+        return Err(refusal.clone());
+    }
     match (mode, step.is_mutation) {
         (ExpectHeader::Outcome(_), _) => {
             Err("`expect outcome:` is accepted on a `branch merge` step only".into())
@@ -1889,9 +1894,9 @@ fn complete_decl_step(
                 decl: step.decl,
                 params_raw: step.params_raw,
                 expects_expand: step.expects_expand,
+                same_as_reference: false,
                 expect: rows_expect(ordered, section, loop_var)?,
                 plan: None,
-                same_as_v1: false,
             }))
         }
         (ExpectHeader::Error(needle), is_mutation) => {
@@ -1922,9 +1927,9 @@ fn complete_decl_step(
                     decl: step.decl,
                     params_raw: step.params_raw,
                     expects_expand: step.expects_expand,
+                    same_as_reference: false,
                     expect: QueryExpect::Error { needle },
                     plan: None,
-                    same_as_v1: false,
                 })
             })
         }
@@ -2024,7 +2029,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut pending: Option<Pending> = None;
     let mut awaiting_shape: Option<Step> = None;
     let mut awaiting_plan: Option<Step> = None;
-    let mut awaiting_same_as_v1: Option<Step> = None;
+    let mut awaiting_same_as_reference: Option<Step> = None;
     let mut awaiting_load_plan = false;
     let mut ordinal = 0usize;
     let mut seams = BTreeMap::new();
@@ -2087,10 +2092,13 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         if expect_word != "plan" {
             awaiting_load_plan = false;
         }
-        if let Some(step) = awaiting_plan.take_if(|_| !matches!(expect_word, "plan" | SAME_AS_V1)) {
+        if let Some(step) =
+            awaiting_plan.take_if(|_| !matches!(expect_word, "plan" | SAME_AS_REFERENCE))
+        {
             push_step(&mut items, &mut open_loop, step);
         }
-        if let Some(step) = awaiting_same_as_v1.take_if(|_| expect_word != SAME_AS_V1) {
+        if let Some(step) = awaiting_same_as_reference.take_if(|_| expect_word != SAME_AS_REFERENCE)
+        {
             push_step(&mut items, &mut open_loop, step);
         }
         if awaiting_seam_step && !matches!(kind, "mutate" | "load" | "seam") {
@@ -2203,12 +2211,33 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     .map(|(_, l)| *l)
                     .collect::<Vec<_>>()
                     .join("\n");
-                let file = parse_query(&source).map_err(|e| {
-                    format!(
-                        "`--- {kind}` section starting at line {} does not parse: {e}",
-                        section.header_line + 1
-                    )
-                })?;
+                let file = match parse_query(&source) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        // A refusal at parse is a step only under an
+                        // `expect error:`, which `complete_decl_step` checks.
+                        ordinal += 1;
+                        pending = Some(Pending::Decl(PendingStep {
+                            is_mutation: kind == "mutate",
+                            refused_at_parse: Some(format!(
+                                "`--- {kind}` section starting at line {} does not parse: {e}",
+                                section.header_line + 1
+                            )),
+                            ordinal,
+                            source: source.clone(),
+                            name: String::new(),
+                            branch_spelled: branch.is_some(),
+                            branch: branch.unwrap_or_else(|| MAIN_BRANCH.to_string()),
+                            snapshot,
+                            decl: Box::new(unparsed_decl()),
+                            ordered_refusal: None,
+                            expects_expand: false,
+                            params_raw: None,
+                            base_binding: None,
+                        }));
+                        continue;
+                    }
+                };
                 refuse_process_settings(&file.settings, &section.body)?;
                 let empty = file.empty_kind();
                 if let Some(name) = &snapshot {
@@ -2394,7 +2423,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         decls.len()
                     ));
                 };
-                let is_mutation = !decl.mutations.is_empty();
+                let is_mutation = decl.is_mutation();
                 if kind == "query" && is_mutation {
                     return Err(
                         "a mutation declaration under `--- query` is refused; use `--- mutate`"
@@ -2434,6 +2463,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 ordinal += 1;
                 pending = Some(Pending::Decl(PendingStep {
                     is_mutation,
+                    refused_at_parse: None,
                     ordinal,
                     source: source.clone(),
                     name: decl.name.clone(),
@@ -2442,7 +2472,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     snapshot,
                     decl: Box::new(decl.clone()),
                     ordered_refusal: ordered_refusal(decl),
-                    expects_expand: expects_expand(&decl.match_clause),
+                    expects_expand: expects_expand(decl),
                     params_raw: None,
                     base_binding: base_binding.map(str::to_string),
                 }));
@@ -2504,7 +2534,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     }
                     inspect_decl(decl, &mut needs_indices)?;
-                    let kind = if decl.mutations.is_empty() {
+                    let kind = if !decl.is_mutation() {
                         SessionKind::Query
                     } else {
                         SessionKind::Mutation
@@ -2688,16 +2718,17 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     };
                     query.plan = Some(PlanExpect { lines });
-                    awaiting_same_as_v1 = Some(step);
+                    awaiting_same_as_reference = Some(step);
                     continue;
                 }
-                if rest.trim() == SAME_AS_V1 {
+                if rest.trim() == SAME_AS_REFERENCE {
                     let line = section.header_line + 1;
-                    refuse_nonempty_body(&section.body, "an `expect same as v1` section")?;
-                    let Some(mut step) =
-                        awaiting_plan.take().or_else(|| awaiting_same_as_v1.take())
+                    refuse_nonempty_body(&section.body, "an `expect same as reference` section")?;
+                    let Some(mut step) = awaiting_plan
+                        .take()
+                        .or_else(|| awaiting_same_as_reference.take())
                     else {
-                        return Err(same_as_v1_misplaced(
+                        return Err(same_as_reference_misplaced(
                             line,
                             pending.as_ref(),
                             &items,
@@ -2706,10 +2737,10 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     };
                     let Step::Query(query) = &mut step else {
                         return Err(format!(
-                            "line {line}: `--- expect same as v1` is supported only on a query declaration step"
+                            "line {line}: `--- expect same as reference` is supported only on a query declaration step"
                         ));
                     };
-                    query.same_as_v1 = true;
+                    query.same_as_reference = true;
                     push_step(&mut items, &mut open_loop, step);
                     continue;
                 }
@@ -2890,7 +2921,10 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         return Err("the final step is missing its `--- expect`".into());
     }
     settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
-    if let Some(step) = awaiting_plan.take().or_else(|| awaiting_same_as_v1.take()) {
+    if let Some(step) = awaiting_plan
+        .take()
+        .or_else(|| awaiting_same_as_reference.take())
+    {
         push_step(&mut items, &mut open_loop, step);
     }
     if open_loop.is_some() {
@@ -3245,17 +3279,19 @@ fn check_pin(
 /// Whether a match clause list runs at least one Expand: an unbound traversal
 /// outside a correlated block (a bound edge and a block take paths of their
 /// own that the other-path check covers).
-fn expects_expand(clauses: &[Clause]) -> bool {
-    clauses.iter().any(|c| match c {
-        Clause::Traversal(t) => t.edge_binding.is_none(),
-        Clause::Subquery(_) | Clause::Binding(_) | Clause::Filter(_) => false,
+fn expects_expand(decl: &QueryDecl) -> bool {
+    read_body(decl).is_some_and(|body| {
+        body.clauses.iter().any(|c| match c {
+            Clause::Traversal(t) => t.edge_binding.is_none(),
+            _ => false,
+        })
     })
 }
 
 /// Why the executed result disagrees with the schema the compiler inferred
-/// for `decl`, if it does: the column count, then per position the executed
+/// for the step, if it does: the column count, then per position the executed
 /// name, the Arrow type, and nulls in a column the compiler inferred non-null.
-fn schema_drift(decl: &QueryDecl, inferred: &Schema, result: &QueryResult) -> Option<String> {
+fn schema_drift(inferred: &Schema, result: &QueryResult) -> Option<String> {
     let executed = result.schema();
     if executed.fields().len() != inferred.fields().len() {
         return Some(format!(
@@ -3265,8 +3301,7 @@ fn schema_drift(decl: &QueryDecl, inferred: &Schema, result: &QueryResult) -> Op
         ));
     }
     for (i, (want, got)) in inferred.fields().iter().zip(executed.fields()).enumerate() {
-        let proj = &decl.return_clause[i];
-        let name = executed_column_name(&proj.expr, proj.alias.as_deref());
+        let name = want.name().clone();
         if got.name() != &name {
             return Some(format!(
                 "result schema mismatch at column {i}: expected name `{name}`, the executor returned `{}`",
@@ -3399,21 +3434,14 @@ fn check_inferred_results(
     bound: &BoundPlan,
 ) -> Result<(), String> {
     let declared = declared_result_schema(bound)?;
-    if declared.fields().len() != inferred.fields().len()
-        || declared.fields().len() != decl.return_clause.len()
-    {
+    let _ = decl;
+    if declared.fields().len() != inferred.fields().len() {
         return Err(
             "result schema mismatch: planned and inferred column counts differ".to_string(),
         );
     }
-    for (i, ((planned, inferred), item)) in declared
-        .fields()
-        .iter()
-        .zip(inferred.fields())
-        .zip(&decl.return_clause)
-        .enumerate()
-    {
-        let name = executed_column_name(&item.expr, item.alias.as_deref());
+    for (i, (planned, inferred)) in declared.fields().iter().zip(inferred.fields()).enumerate() {
+        let name = inferred.name().clone();
         if planned.name() != &name
             || planned.data_type() != inferred.data_type()
             || planned.is_nullable() != inferred.is_nullable()
@@ -3572,14 +3600,19 @@ async fn run_query_step(
                 }
             }
             let catalog = session.catalog();
-            let inferred = typecheck_query(&catalog, &step.decl)
-                .and_then(|checked| infer_query_result_schema(&catalog, &checked))
+            let inferred = check_query_decl(&catalog, &step.decl)
+                .and_then(|core| match core {
+                    CoreDecl::Read(read) => result_schema(&catalog, &read),
+                    CoreDecl::Write(_) => Err(omnigraph_compiler::error::CompilerError::Plan(
+                        "a write has no result schema".into(),
+                    )),
+                })
                 .map_err(|e| fail(format!("result schema inference failed: {e}")))?;
             if let Some(run) = &inspection {
                 check_inferred_results(&step.decl, &inferred, &run.plan).map_err(&fail)?;
                 check_planned_results(&run.plan, &result).map_err(&fail)?;
             }
-            let drift = schema_drift(&step.decl, &inferred, &result);
+            let drift = schema_drift(&inferred, &result);
             if let Some(mismatch) = shape_mismatch(&shape.lines, &result, &inferred, &catalog) {
                 let (message, bless_lines) = match (&drift, bless_shape_lines(&result, &catalog)) {
                     (Some(drift), _) => (
@@ -3601,8 +3634,8 @@ async fn run_query_step(
                 return Err(fail(drift));
             }
             check_rows(host, &label, &result, *ordered, body_raw, *span, binding)?;
-            if step.same_as_v1 && !host.active() {
-                check_same_as_v1(host, session, step, target, &params, &result, *ordered)
+            if step.same_as_reference && !host.active() {
+                check_same_as_reference(host, session, step, &target, &params, &result, *ordered)
                     .await
                     .map_err(&fail)?;
             }
@@ -3614,34 +3647,64 @@ async fn run_query_step(
     }
 }
 
-/// `--- expect same as v1`: the step's query again on a copy of the case
-/// session whose reads run on the reference engine; any v1 error, a gate
-/// refusal included, or a row difference fails the step.
-async fn check_same_as_v1(
+/// `--- expect same as reference`: the step's query evaluated by the core
+/// reference interpreter over the same branch; a refusal of either kind or a
+/// row difference fails the step.
+async fn check_same_as_reference(
     host: &impl ExecutionHost,
     session: &Session,
     step: &QueryStep,
-    target: ReadTarget,
+    target: &ReadTarget,
     params: &omnigraph_compiler::ParamMap,
-    v2: &QueryResult,
+    engine: &QueryResult,
     ordered: bool,
 ) -> Result<(), String> {
-    inspect_decl_with_policy(&step.decl, &mut false, true)?;
-    let v1 = host
-        .reference_query(session, step, target, params)
-        .await
-        .map_err(|e| format!("expect same as v1: v2 returned rows, v1 failed: {e}"))?;
-    let rows = |result: &QueryResult, engine: &str| match result.to_rust_json() {
-        Ok(Value::Array(rows)) => Ok(rows),
-        Ok(_) => Err(format!(
-            "expect same as v1: {engine} returned a non-array row set"
-        )),
-        Err(e) => Err(format!(
-            "expect same as v1: {engine} rows failed to render as JSON: {e}"
-        )),
+    let ReadTarget::Branch(branch) = target else {
+        return Err(
+            "expect same as reference: the reference reads a branch, not a snapshot".into(),
+        );
     };
-    compare_rows(&rows(&v1, "v1")?, &rows(v2, "v2")?, ordered).map_err(|(message, _)| {
-        format!("expect same as v1: the engines disagree (expected = v1, actual = v2): {message}")
+    let catalog = session.catalog();
+    let CoreDecl::Read(read) = check_query_decl(&catalog, &step.decl)
+        .map_err(|e| format!("expect same as reference: {e}"))?
+    else {
+        return Err("expect same as reference: the step is a write".into());
+    };
+    let reference = host
+        .reference_rows(session, &read, branch, params)
+        .await
+        .map_err(|e| {
+            format!(
+                "expect same as reference: the engine returned rows, the reference refused: {e}"
+            )
+        })?;
+    let actual = match engine.to_rust_json() {
+        Ok(Value::Array(rows)) => rows,
+        Ok(_) => {
+            return Err("expect same as reference: the engine returned a non-array row set".into());
+        }
+        Err(e) => {
+            return Err(format!(
+                "expect same as reference: rows failed to render as JSON: {e}"
+            ));
+        }
+    };
+    compare_with_reference(&reference, &actual, ordered)
+}
+
+/// The reference's rows against the engine's, ordered or as bags; a
+/// difference names both row sets.
+fn compare_with_reference(
+    reference: &[Value],
+    engine: &[Value],
+    ordered: bool,
+) -> Result<(), String> {
+    compare_rows(reference, engine, ordered).map_err(|(message, _)| {
+        format!(
+            "expect same as reference: the engine and the reference disagree (expected = reference, actual = engine): {message}\nreference: {}\nengine: {}",
+            Value::Array(reference.to_vec()),
+            Value::Array(engine.to_vec())
+        )
     })
 }
 
@@ -3702,9 +3765,26 @@ fn check_rows_json(
     })
 }
 
+/// The text an `expect error:` needle is held against: the error rendered,
+/// with a parse diagnostic's code spelled after `parse error:` as type and
+/// plan diagnostics spell theirs, so a case can name a parse code.
+fn error_text<E: std::fmt::Display + 'static>(error: &E) -> String {
+    let any: &dyn std::any::Any = error;
+    let diagnostic = match any.downcast_ref::<omnigraph::error::OmniError>() {
+        Some(omnigraph::error::OmniError::Compiler(compiler)) => compiler.diagnostic(),
+        _ => None,
+    };
+    match diagnostic {
+        Some(d) if d.kind == omnigraph_compiler::QueryDiagnosticKind::Parse => {
+            format!("parse error: {}: {}", d.code, d.message)
+        }
+        _ => error.to_string(),
+    }
+}
+
 /// Holds an `error: <needle>` expect against the step's outcome: the step
 /// must fail, and the rendered error must contain the needle.
-fn check_error_expect<T, E: std::fmt::Display>(
+fn check_error_expect<T, E: std::fmt::Display + 'static>(
     host: &impl ExecutionHost,
     needle: &str,
     outcome: Result<T, E>,
@@ -3715,7 +3795,7 @@ fn check_error_expect<T, E: std::fmt::Display>(
             "expected an error containing \"{needle}\", but {succeeded}"
         )),
         Err(e) => {
-            let msg = e.to_string();
+            let msg = error_text(&e);
             host.observe(|| format!("error: {msg}"));
             if msg.contains(needle) {
                 Ok(())
@@ -3861,7 +3941,7 @@ async fn run_branch_read_step(
 /// Holds a read expect against a result the runner built itself (`branch
 /// list`, `show`): the result's own schema is the inferred one, so the
 /// shape check has no compiler to disagree with.
-fn check_synthetic_expect<E: std::fmt::Display>(
+fn check_synthetic_expect<E: std::fmt::Display + 'static>(
     host: &impl ExecutionHost,
     session: &Session,
     label: &str,
@@ -3973,7 +4053,7 @@ fn run_settings_step(
     Ok(())
 }
 
-fn check_write_expect<T, E: std::fmt::Display>(
+fn check_write_expect<T, E: std::fmt::Display + 'static>(
     host: &impl ExecutionHost,
     name: &str,
     expect: &WriteExpect,

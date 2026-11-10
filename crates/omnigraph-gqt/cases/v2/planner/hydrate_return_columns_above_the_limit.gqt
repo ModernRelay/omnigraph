@@ -68,7 +68,7 @@ pass late_materialization
 hydrate $d: columns [body, title]
 scan Doc as $d: columns [__id, slug, rank, body, title]
 
---- expect same as v1
+--- expect same as reference
 
 --- query
 query cited_twice() {
@@ -96,7 +96,7 @@ pass late_materialization
 hydrate $b: columns [body, embedding]
 hash join $b
 
---- expect same as v1
+--- expect same as reference
 
 --- query
 query first_citation() {
@@ -119,7 +119,7 @@ pass late_materialization
 hydrate $b: columns [body]
 scan Doc as $b: access id_lookup
 
---- expect same as v1
+--- expect same as reference
 
 --- query
 query by_title() {
@@ -140,7 +140,7 @@ t: String
 --- expect plan
 not pass late_materialization
 
---- expect same as v1
+--- expect same as reference
 
 --- query
 query lowest_three() {
@@ -162,7 +162,7 @@ d.body: String?
 --- expect plan
 not pass late_materialization
 
---- expect same as v1
+--- expect same as reference
 
 --- query
 query one_body() {
@@ -180,7 +180,7 @@ d.body: String?
 --- expect plan
 not pass late_materialization
 
---- expect same as v1
+--- expect same as reference
 
 --- mutate
 branch create feature

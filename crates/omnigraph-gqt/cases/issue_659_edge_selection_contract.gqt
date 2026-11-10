@@ -54,7 +54,13 @@ query missing_wildcard_endpoint() { match { $p: Person $p * $q } return { $p.nam
 --- query
 query inferred_wildcard_endpoint() { match { $p: Person $p knows $q $p * $q } return { $p.name } }
 
---- expect error: requires explicitly declared source and destination node bindings
+--- expect unordered
+{"p.name": "a"}
+{"p.name": "a"}
+{"p.name": "a"}
+
+--- expect shape
+p.name: String
 
 --- query
 query incompatible_members() { match { $p: Person $p (knows | owns) $q } return { $p.name } }
@@ -128,4 +134,4 @@ query single_name_group_is_not_edge_alternation() {
     match { $a: Person $b: Person $a (knows) $b }
     return { $a.name }
 }
---- expect error: T41: a filter must be Boolean
+--- expect error: Q018: `knows` is a bare name, which is not a value in a read: a property is `$x.knows`, a parameter `$knows`, a string `"knows"`; a bare name is a return alias in `order` only

@@ -31,7 +31,8 @@ branch create src
 
 --- mutate
 query diverge_main() {
-    update Person set { age: 9 } where name = "bob"
+    $x: Person  $x.name = "bob"
+    update $x set { age: 9 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -39,7 +40,8 @@ query diverge_main() {
 --- loop $i 1 4
 --- mutate branch: src
 query bump_alice($n: I32) {
-    update Person set { age: $n } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: $n }
 }
 --- params
 {"n": ${i}}

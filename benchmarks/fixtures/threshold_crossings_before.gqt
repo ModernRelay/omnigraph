@@ -24,7 +24,7 @@ branch create "b" from main
 
 --- loop $i 1 3
 --- mutate branch: b
-query bump($n: I32) { update Person set { age: $n } where name = "alice" }
+query bump($n: I32) { $x: Person  $x.name = "alice"  update $x set { age: $n } }
 --- params
 {"n": ${i}}
 --- expect affected: nodes=1 edges=0

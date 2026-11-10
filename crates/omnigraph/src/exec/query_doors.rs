@@ -1,16 +1,15 @@
 //! Session and compiled-query read entry points. Every read plans and runs
-//! through `crate::engine::execute_query`; a test session may carry a
-//! `ReadExecutor` that runs its reads instead (feature `test-util`).
+//! through `crate::engine::execute_query`.
 
 use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
-use omnigraph_compiler::ir::{IROp, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::LoadStmt;
+use omnigraph_compiler::ir::ParamMap;
+use omnigraph_compiler::query::file::LoadStmt;
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
-use omnigraph_compiler::{CheckedRead, lower_query};
+use omnigraph_planner::{PatternStep, ReadShape};
 
 use crate::db::{Omnigraph, ReadTarget, Snapshot};
 use crate::engine;
@@ -241,10 +240,12 @@ impl Session {
             matches!(&resolved.requested, ReadTarget::Snapshot(_)),
             ir.has_wildcard_traversal(),
         )?;
-        let traverses = ir
-            .pipeline
-            .iter()
-            .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
+        let traverses = ir.pipeline.iter().any(|op| {
+            matches!(
+                op,
+                PatternStep::Expand { .. } | PatternStep::AntiJoin { .. }
+            )
+        });
         let graph_index = if traverses {
             engine::GraphIndexHandle::cached(
                 Arc::clone(&**self),
@@ -337,9 +338,8 @@ impl Session {
         engine::execute(accepted, &context).await
     }
 
-    /// One compiled query through the engine, or through the installed
-    /// `ReadExecutor`. The lazy graph-index handle means an index-served query
-    /// with no `AntiJoin` never builds the CSR.
+    /// One compiled query through the engine. The lazy graph-index handle
+    /// means an index-served query with no `AntiJoin` never builds the CSR.
     async fn execute_on_route(
         &self,
         settings: &SessionSettings,
@@ -349,23 +349,13 @@ impl Session {
         index_source: IndexSource<'_>,
         catalog: &Arc<Catalog>,
     ) -> Result<QueryResult> {
-        let ir: &QueryIR = &query.ir;
-        #[cfg(feature = "test-util")]
-        if let Some(executor) = self.read_executor() {
-            let erased = ir.erase();
-            let request = omnigraph_catalog::read_executor::ReadRequest {
-                ir: &erased,
-                params,
-                snapshot: snapshot.raw(),
-                catalog,
-                settings,
-            };
-            return executor.execute(request).await;
-        }
-        let needs_graph = ir
-            .pipeline
-            .iter()
-            .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
+        let ir: &ReadShape = &query.ir;
+        let needs_graph = ir.pipeline.iter().any(|op| {
+            matches!(
+                op,
+                PatternStep::Expand { .. } | PatternStep::AntiJoin { .. }
+            )
+        });
         let graph_index = match (&index_source, needs_graph) {
             (_, false) => engine::GraphIndexHandle::none(),
             (IndexSource::Cached(resolved), true) => engine::GraphIndexHandle::cached(
@@ -411,9 +401,7 @@ impl Omnigraph {
         }
         let statement = omnigraph_compiler::find_read_statement(query_source, query_name)
             .map_err(super::query_lookup_error)?;
-        let checked = CheckedRead::check(catalog, statement.decl())?;
-        let ir = Arc::new(lower_query(catalog, checked.query())?);
-        let query = CompiledQuery { ir, checked };
+        let query = CompiledQuery::compile(catalog, statement.decl())?;
         let compiled = if statement.is_explain() {
             CompiledRead::Explain(query)
         } else {

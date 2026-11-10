@@ -1181,33 +1181,33 @@ fn refuses_ok_expect_on_a_query_step() {
     assert!(refusal("x", &text).contains("a query step takes"));
 }
 
-const SAME: &str = "--- expect same as v1\n";
+const SAME: &str = "--- expect same as reference\n";
 
 #[test]
-fn same_as_v1_follows_a_query_steps_shape_or_plan() {
+fn same_as_reference_follows_a_query_steps_shape_or_plan() {
     let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{QUERY}{EXPECT}");
     let case = parse_case("x", &text).unwrap();
     let flags: Vec<bool> = case
         .items
         .iter()
         .map(|item| match item {
-            Item::Step(Step::Query(step)) => step.same_as_v1,
+            Item::Step(Step::Query(step)) => step.same_as_reference,
             other => panic!("expected query steps, got {other:?}"),
         })
         .collect();
     assert_eq!(flags, [true, false]);
     let after_plan = format!(
-        "{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect plan\npass projection_pushdown\n{SAME}"
+        "{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect plan\nscan Person as $p: no filter\n{SAME}"
     );
     let case = parse_case("x", &after_plan).unwrap();
     let Some(Item::Step(Step::Query(step))) = case.items.first() else {
         panic!("first item is the query step");
     };
-    assert!(step.same_as_v1 && step.plan.is_some());
+    assert!(step.same_as_reference && step.plan.is_some());
 }
 
 #[test]
-fn same_as_v1_is_refused_off_a_query_rows_expect() {
+fn same_as_reference_is_refused_off_a_query_rows_expect() {
     for text in [
         format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{SAME}"),
         format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{SAME}"),
@@ -1248,6 +1248,26 @@ fn same_as_v1_is_refused_off_a_query_rows_expect() {
         let refused = refusal("x", &text);
         assert!(refused.contains(needle), "{needle}: {refused}");
     }
+}
+
+#[test]
+fn same_as_reference_compares_as_the_rows_expect_compares() {
+    let a = serde_json::json!({"p.name": "alice"});
+    let b = serde_json::json!({"p.name": "bob"});
+    compare_with_reference(&[a.clone(), b.clone()], &[b.clone(), a.clone()], false).unwrap();
+    let moved =
+        compare_with_reference(&[a.clone(), b.clone()], &[b.clone(), a.clone()], true).unwrap_err();
+    assert!(
+        moved.contains(
+            "the engine and the reference disagree (expected = reference, actual = engine)"
+        ),
+        "{moved}"
+    );
+    let missing = compare_with_reference(&[a.clone(), b], &[a], false).unwrap_err();
+    assert!(
+        missing.contains("reference: [") && missing.contains("engine: [{\"p.name\":\"alice\"}]"),
+        "{missing}"
+    );
 }
 
 #[test]
@@ -1430,14 +1450,14 @@ fn refuses_embed_schema() {
 
 #[test]
 fn refuses_nearest_over_a_string_literal() {
-    let query = "--- query\nquery q() {\n    match { $p: Person }\n    return { $p.name }\n    order { nearest($p.name, \"alpha\") }\n}\n";
+    let query = "--- query\nquery q() {\n    match { from nearest({ match { $p: Person } return { $p } }, $p.name, \"alpha\", k: 3) }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
     assert!(refusal("x", &text).contains("string argument"));
 }
 
 #[test]
 fn refuses_nearest_over_a_string_param() {
-    let query = "--- query\nquery q($q: String) {\n    match { $p: Person }\n    return { $p.name }\n    order { nearest($p.name, $q) }\n}\n";
+    let query = "--- query\nquery q($q: String) {\n    match { from nearest({ match { $p: Person } return { $p } }, $p.name, $q, k: 3) }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
     let text = format!(
         "{HDR}{SCHEMA}{SEED}{query}--- params\n{{\"q\": \"alpha\"}}\n--- expect unordered\n"
     );
@@ -1521,14 +1541,6 @@ mod schema_drift {
 
     use super::*;
 
-    const AGG_QUERY: &str =
-        "query q() {\n    match { $p: Person }\n    return { count($p) as n, min($p.age) as m }\n}";
-    const NAME_QUERY: &str = "query q() {\n    match { $p: Person }\n    return { $p.name }\n}";
-
-    fn decl(source: &str) -> QueryDecl {
-        parse_query(source).unwrap().single_decl().clone()
-    }
-
     fn agg_inferred() -> Schema {
         Schema::new(vec![
             Field::new("n", DataType::Int64, true),
@@ -1554,7 +1566,7 @@ mod schema_drift {
                 Arc::new(Float64Array::from(vec![None::<f64>])),
             ],
         );
-        let msg = schema_drift(&decl(AGG_QUERY), &agg_inferred(), &executed).unwrap();
+        let msg = schema_drift(&agg_inferred(), &executed).unwrap();
         assert!(msg.contains("column 1 `m`"), "got: {msg}");
         assert!(msg.contains("inferred Int32"), "got: {msg}");
         assert!(msg.contains("returned Float64"), "got: {msg}");
@@ -1572,10 +1584,7 @@ mod schema_drift {
                 Arc::new(Int32Array::from(vec![Some(7)])),
             ],
         );
-        assert_eq!(
-            schema_drift(&decl(AGG_QUERY), &agg_inferred(), &executed),
-            None
-        );
+        assert_eq!(schema_drift(&agg_inferred(), &executed), None);
     }
 
     #[test]
@@ -1584,31 +1593,31 @@ mod schema_drift {
             vec![Field::new("n", DataType::Int64, true)],
             vec![Arc::new(Int64Array::from(vec![0]))],
         );
-        let msg = schema_drift(&decl(AGG_QUERY), &agg_inferred(), &executed).unwrap();
+        let msg = schema_drift(&agg_inferred(), &executed).unwrap();
         assert!(msg.contains("inferred 2 column(s)"), "got: {msg}");
         assert!(msg.contains("returned 1"), "got: {msg}");
     }
 
     #[test]
     fn reports_an_executed_name_off_the_compiler_rule() {
-        let inferred = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
+        let inferred = Schema::new(vec![Field::new("p.name", DataType::Utf8, false)]);
         let executed = result(
             vec![Field::new("name", DataType::Utf8, false)],
             vec![Arc::new(StringArray::from(vec!["alice"]))],
         );
-        let msg = schema_drift(&decl(NAME_QUERY), &inferred, &executed).unwrap();
+        let msg = schema_drift(&inferred, &executed).unwrap();
         assert!(msg.contains("expected name `p.name`"), "got: {msg}");
         assert!(msg.contains("returned `name`"), "got: {msg}");
     }
 
     #[test]
     fn reports_nulls_in_a_column_inferred_non_nullable() {
-        let inferred = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
+        let inferred = Schema::new(vec![Field::new("p.name", DataType::Utf8, false)]);
         let executed = result(
             vec![Field::new("p.name", DataType::Utf8, true)],
             vec![Arc::new(StringArray::from(vec![Some("alice"), None]))],
         );
-        let msg = schema_drift(&decl(NAME_QUERY), &inferred, &executed).unwrap();
+        let msg = schema_drift(&inferred, &executed).unwrap();
         assert!(msg.contains("column 0 `p.name`"), "got: {msg}");
         assert!(msg.contains("returned 1 null(s)"), "got: {msg}");
     }
@@ -1823,7 +1832,7 @@ mod result_contract {
 
     #[test]
     fn planner_typed_renderer_and_gqt_validator_agree_on_every_expression_kind() {
-        use omnigraph_compiler::query::ast::{AggFunc, CompOp};
+        use omnigraph_compiler::query::value::{AggFunc, CompOp};
         use omnigraph_compiler::types::AggSignature;
         let ty = |scalar, nullable| ExprType::from_prop(&PropType::scalar(scalar, nullable));
         let text = || {
@@ -1936,7 +1945,7 @@ mod result_contract {
     fn block_typed_trees_and_specs_survive_every_row_round_trip_guard() {
         use omnigraph_compiler::AggSignature;
         use omnigraph_compiler::ir::{BlockAggregateExpr, SubqueryPredicate};
-        use omnigraph_compiler::query::ast::{AggFunc, CompOp};
+        use omnigraph_compiler::query::value::{AggFunc, CompOp};
         let ty = |scalar, nullable| ExprType::from_prop(&PropType::scalar(scalar, nullable));
         let leaf = BlockAggregateExpr::Aggregate {
             func: AggFunc::Sum,
@@ -2581,7 +2590,7 @@ fn refuses_loop_headers_with_a_body() {
 
 #[test]
 fn refuses_nearest_over_a_string_property() {
-    let query = "--- query\nquery q() {\n    match { $p: Person }\n    return { $p.name }\n    order { nearest($p.name, $p.name) }\n}\n";
+    let query = "--- query\nquery q() {\n    match { from nearest({ match { $p: Person } return { $p } }, $p.name, $p.name, k: 3) }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
     assert!(refusal("x", &text).contains("vector parameter"));
 }
@@ -2620,17 +2629,17 @@ fn pin_violation_names_the_path_that_ran() {
 #[test]
 fn expects_expand_ignores_bound_edges_and_plain_bindings() {
     let unbound = parse_query(TRAVERSAL_QUERY.trim_start_matches("--- query\n")).unwrap();
-    assert!(expects_expand(&unbound.single_decl().match_clause));
+    assert!(expects_expand(unbound.single_decl()));
     let bound = "query f($n: String) {\n    match {\n        $a: Person\n        $a.name = $n\n        \
                  $a $k:knows $b\n    }\n    return { $b.name }\n}\n";
     let bound = parse_query(bound).unwrap();
-    assert!(!expects_expand(&bound.single_decl().match_clause));
+    assert!(!expects_expand(bound.single_decl()));
     let plain = parse_query(QUERY.trim_start_matches("--- query\n")).unwrap();
-    assert!(!expects_expand(&plain.single_decl().match_clause));
+    assert!(!expects_expand(plain.single_decl()));
     let negated = "query f() {\n    match {\n        $a: Person\n        not { $a knows $x }\n    }\n    \
                    return { $a.name }\n}\n";
     let negated = parse_query(negated).unwrap();
-    assert!(!expects_expand(&negated.single_decl().match_clause));
+    assert!(!expects_expand(negated.single_decl()));
 }
 
 /// A two-node, one-edge graph with a one-hop traversal, for the pin tests.
@@ -2788,15 +2797,19 @@ async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
 
 #[test]
 fn refuses_ordered_expect_with_an_aggregate_in_return() {
-    let query = "--- query\nquery q($t: String) {\n    match { $p: Person\n        search($p.name, $t) }\n    \
-                 return { count($p) as total }\n    order { bm25($p.name, $t) }\n}\n";
+    let query = "--- query\nquery q($t: String) {\n    match { from bm25({ match { $p: Person\n        search($p.name, $t) } return { $p } }, $p.name, $t) }\n    \
+                 return { count($p) as total }\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
+    assert!(refusal("x", &text).contains("order` clause"));
+    let unranked = "--- query\nquery q() {\n    match { $p: Person }\n    \
+                    return { $p.name, count($p) as total }\n    order { total desc }\n}\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{unranked}--- expect ordered\n");
     assert!(refusal("x", &text).contains("aggregate in its `return` list"));
     let text =
         format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n--- expect shape\ntotal: I64?\n");
     parse_case("x", &text).unwrap();
-    let query = "--- query\nquery q($t: String) {\n    match { $p: Person }\n    \
-                 return { $p.name, count($p) as total }\n    order { bm25($p.name, $t), total desc }\n    limit 3\n}\n";
+    let query = "--- query\nquery q($t: String) {\n    match { from bm25({ match { $p: Person } return { $p } }, $p.name, $t) }\n    \
+                 return { $p.name, count($p) as total }\n    order { total desc }\n    limit 3\n}\n";
     let text = format!(
         "{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n--- expect shape\np.name: String\ntotal: I64?\n"
     );
@@ -2805,15 +2818,24 @@ fn refuses_ordered_expect_with_an_aggregate_in_return() {
 
 #[test]
 fn refuses_ordered_expect_with_rank_only_distinct_issue_953() {
-    for ranking in [
-        "nearest($p.vec, $v)",
-        "bm25($p.name, $t)",
-        "rrf(nearest($p.vec, $v), bm25($p.name, $t))",
+    for (ranking, score) in [
+        (
+            "from nearest({ match { $p: Person } return { $p } }, $p.vec, $v, k: 3)",
+            "$distance",
+        ),
+        (
+            "from bm25({ match { $p: Person } return { $p } }, $p.name, $t)",
+            "$score desc",
+        ),
+        (
+            "let $all = { match { $p: Person } return { $p } }  from rrf(nearest($all, $p.vec, $v, k: 3), bm25($all, $p.name, $t), k: 60)",
+            "$score desc",
+        ),
     ] {
         let query = format!(
             "--- query\nquery q($v: Vector(4), $t: String) {{\n\
-             match {{ $p: Person }}\nreturn distinct {{ $p.name }}\n\
-             order {{ {ranking} }}\nlimit 3\n}}\n"
+             match {{ {ranking} }}\nreturn distinct {{ $p.name }}\n\
+             order {{ {score} }}\nlimit 3\n}}\n"
         );
         let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n{SHAPE}");
         assert!(refusal("x", &text).contains("rank-only `return distinct`"));
@@ -2821,8 +2843,11 @@ fn refuses_ordered_expect_with_rank_only_distinct_issue_953() {
         parse_case("x", &text).unwrap();
         for accepted in [
             query.replace("return distinct", "return"),
-            query.replace(ranking, &format!("{ranking}, $p.name")),
-            query.replace(ranking, "$p.name"),
+            query.replace(
+                &format!("order {{ {score} }}"),
+                &format!("order {{ {score}, $p.name }}"),
+            ),
+            query.replace(&format!("order {{ {score} }}"), "order { $p.name }"),
         ] {
             let text = format!("{HDR}{SCHEMA}{SEED}{accepted}--- expect ordered\n{SHAPE}");
             parse_case("x", &text).unwrap();
@@ -3119,12 +3144,7 @@ fn execute_case<'a>(
 #[test]
 fn core_manifest_has_no_runner_or_test_feature_dependency() {
     let manifest = include_str!("../Cargo.toml");
-    for forbidden in [
-        "omnigraph-dst",
-        "omnigraph-reference-engine",
-        "test-util",
-        "[build-dependencies]",
-    ] {
+    for forbidden in ["omnigraph-dst", "test-util", "[build-dependencies]"] {
         assert!(
             !manifest.contains(forbidden),
             "core dependency boundary: {forbidden}"

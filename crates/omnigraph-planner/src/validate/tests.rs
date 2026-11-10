@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use omnigraph_compiler::CheckedRead;
+use crate::read_shape::ReadShape;
 use omnigraph_compiler::catalog::{Catalog, build_catalog};
-use omnigraph_compiler::ir::{IRExpr, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::ir::{IRExpr, ParamMap};
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::schema::parser::parse_schema;
 
 use super::*;
@@ -53,8 +53,7 @@ impl KeyIds for Keys {
 
 struct Fixture {
     catalog: Catalog,
-    checked: CheckedRead,
-    ir: QueryIR,
+    ir: ReadShape,
     params: ParamMap,
     source: MemorySource,
 }
@@ -66,9 +65,7 @@ impl Fixture {
 
     fn with_schema(schema: &str, query: &str, params: &[(&str, Literal)]) -> Self {
         let catalog = build_catalog(&parse_schema(schema).unwrap()).unwrap();
-        let decl = omnigraph_compiler::find_named_query(query, "q").unwrap();
-        let checked = CheckedRead::check(&catalog, &decl).unwrap();
-        let ir = omnigraph_compiler::lower_query(&catalog, checked.query()).unwrap();
+        let ir = ReadShape::of_source(&catalog, query, "q").unwrap();
         let mut source = MemorySource::default().with_edge_version("Cites", 1);
         for (name, node_type) in &catalog.node_types {
             source = source.with_node_type(
@@ -92,7 +89,6 @@ impl Fixture {
         }
         Self {
             catalog,
-            checked,
             ir,
             params: params
                 .iter()
@@ -120,7 +116,6 @@ impl Fixture {
 
     fn input(&self) -> AcceptInput<'_> {
         AcceptInput {
-            checked: &self.checked,
             catalog: &self.catalog,
             ir: &self.ir,
             params: &self.params,
@@ -135,7 +130,6 @@ impl Fixture {
         derivation: Option<Derivation>,
     ) -> Result<AcceptedPlan, ValidationError> {
         let input = AcceptInput {
-            checked: &self.checked,
             catalog: &self.catalog,
             ir: &self.ir,
             params: &self.params,
@@ -169,9 +163,9 @@ const FILTERED: &str = r#"query q($min: I64) {
 }"#;
 
 const RANKED: &str = r#"query q($q: String) {
-    match { $d: Doc $d.year > 2000 }
-    return { $d.slug, bm25($d.title, $q) as score }
-    order { bm25($d.title, $q), $d.year }
+    match { from bm25({ match { $d: Doc $d.year > 2000 } return { $d } }, $d.title, $q) }
+    return { $d.slug, $score as score }
+    order { $score desc, $d.year }
     limit 3
 }"#;
 
@@ -194,7 +188,7 @@ fn the_planned_plans_are_accepted() {
     }
     let outside = Fixture::new(
         r#"query q() {
-    match { $d: Doc $d.title contains "graph" }
+    match { $d: Doc contains($d.title, "graph") }
     return { $d.slug }
 }"#,
         &[],
@@ -453,7 +447,7 @@ fn identity(catalog: &Catalog, id: &str) -> IRExpr {
             property: catalog.system_columns.id.to_string(),
             ty: ty.clone(),
         },
-        omnigraph_compiler::query::ast::CompOp::Eq,
+        omnigraph_compiler::query::value::CompOp::Eq,
         IRExpr::Literal(Literal::String(id.to_string()), ty),
     )
 }
@@ -578,11 +572,11 @@ fn drop_first_sort_key(plan: &mut PhysicalPlan) {
 fn fused_and_grouped_searches_sort_as_the_query_requires() {
     let q = [("q", Literal::String("graph".into()))];
     let fused = Fixture::new(
-        "query q($q: String) { match { $d: Doc } return { $d.slug } order { rrf(bm25($d.title, $q), bm25($d.title, $q)), $d.slug desc } limit 2 }",
+        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60) $d: Doc } return { $d.slug } order { $score desc, $d.slug desc } limit 2 }",
         &q,
     );
     let grouped = Fixture::new(
-        "query q($q: String) { match { $d: Doc } return { $d.open, count($d) as n } order { bm25($d.title, $q), n desc } }",
+        "query q($q: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $q) } return { $d.open, count($d) as n } order { n desc } }",
         &q,
     );
     for fixture in [fused, grouped] {
@@ -734,7 +728,7 @@ fn an_unwritten_row_cut_fails_the_row_cut() {
     };
 
     let unlimited = Fixture::new(
-        "query q() { match { $d: Doc $d.title contains \"graph\" } return { $d.slug } }",
+        "query q() { match { $d: Doc contains($d.title, \"graph\") } return { $d.slug } }",
         &[],
     );
     let mut plan = unlimited.plan();
@@ -925,7 +919,7 @@ fn changed_aggregate_comparison_returns_are_refused() {
 #[test]
 fn a_second_projection_cannot_introduce_grouping() {
     let fixture = Fixture::new(
-        "query q() { match { $d: Doc $d.title contains \"graph\" } return { $d.year } }",
+        "query q() { match { $d: Doc contains($d.title, \"graph\") } return { $d.year } }",
         &[],
     );
     let mut plan = fixture.plan();
@@ -985,7 +979,6 @@ fn a_score_read_from_another_column_fails_the_projection() {
 fn an_exhausted_budget_is_a_resource_outcome() {
     let fixture = ranked();
     let input = AcceptInput {
-        checked: &fixture.checked,
         catalog: &fixture.catalog,
         ir: &fixture.ir,
         params: &fixture.params,
@@ -1005,9 +998,9 @@ fn an_exhausted_budget_is_a_resource_outcome() {
 }
 
 const NEAREST: &str = r#"query q($v: Vector(2)) {
-    match { $d: Doc $d cites $e }
+    match { from nearest({ match { $d: Doc $d cites $e } return { $d, $e } }, $d.embedding, $v, k: 3) }
     return { $d.slug }
-    order { nearest($d.embedding, $v) }
+    order { $distance }
     limit 3
 }"#;
 
@@ -1116,7 +1109,7 @@ fn membership_admits_the_fragment_and_nothing_else() {
         "query q() { match { $d: Doc $d.rank is null or $d.rank > 2 } return { $d.slug, $d.rank } }",
         "query q() { match { $d: Doc $d.open } return { $d.title as t } order { $d.year desc, $d.title } limit 4 }",
         "query q($t: String) { match { $d: Doc $d.title = $t } return { $d.slug } limit 0 }",
-        "query q($q: String) { match { $d: Doc } return { bm25($d.title, $q) as s, $d.slug } order { bm25($d.title, $q), $d.slug desc } limit 2 }",
+        "query q($q: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $q) } return { $score as s, $d.slug } order { $score desc, $d.slug desc } limit 2 }",
     ];
     for query in members {
         let params = [
@@ -1136,7 +1129,7 @@ fn membership_admits_the_fragment_and_nothing_else() {
         );
     }
     let outside = [
-        "query q() { match { $d: Doc $d.title contains \"g\" } return { $d.slug } }",
+        "query q() { match { $d: Doc contains($d.title, \"g\") } return { $d.slug } }",
         "query q() { match { $d: Doc $d.score > 1.5 } return { $d.slug } }",
         "query q() { match { $d: Doc $d.born > date(\"2020-01-01\") } return { $d.slug } }",
         "query q() { match { $d: Doc { tags: \"a\" } } return { $d.slug } }",
@@ -1148,8 +1141,8 @@ fn membership_admits_the_fragment_and_nothing_else() {
         "query q() { match { $d: Doc } return { $d.@id } }",
         "query q() { match { $d: Doc } return { $d.slug } order { $d.score } }",
         "query q() { match { $d: Doc search($d.title, \"g\") } return { $d.slug } }",
-        "query q($v: Vector(2)) { match { $d: Doc } return { $d.slug } order { nearest($d.embedding, $v) } limit 2 }",
-        "query q($q: String) { match { $d: Doc } return { $d.slug } order { rrf(bm25($d.title, $q), bm25($d.title, $q)) } limit 2 }",
+        "query q($v: Vector(2)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2) } return { $d.slug } order { $distance } limit 2 }",
+        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60) $d: Doc } return { $d.slug } order { $score desc } limit 2 }",
     ];
     for query in outside {
         let params = [
@@ -1189,7 +1182,6 @@ fn both_acceptance_entries_agree_even_when_a_limit_runs_out() {
     ] {
         let fixture = ranked();
         let input = AcceptInput {
-            checked: &fixture.checked,
             catalog: &fixture.catalog,
             ir: &fixture.ir,
             params: &fixture.params,
@@ -1243,7 +1235,6 @@ fn derivation_cost_grows_with_the_query() {
         let derivation = traced.derivation().unwrap();
         let bytes = serde_json::to_vec(&derivation).unwrap().len();
         let input = AcceptInput {
-            checked: &fixture.checked,
             catalog: &fixture.catalog,
             ir: &fixture.ir,
             params: &fixture.params,
@@ -1343,35 +1334,28 @@ fn a_constant_return_needs_no_tiebreak() {
 }
 
 /// An `order` clause whose every key folds to a constant still orders its
-/// rows, by the identity tie-break alone (or groups, by nothing more), so the
-/// plan's sort is required rather than refused.
+/// rows, by the identity tie-break alone, so the plan's sort is required
+/// rather than refused. (Over groups such a key is no return item and is
+/// refused at type check, `T42`.)
 #[test]
 fn a_constant_order_still_sorts() {
-    for query in [
-        r#"query q() {
+    let query = r#"query q() {
     match { $p: Doc $d: Doc $p $e:cites $d }
     return { $d.slug as target }
     order { $e.@type }
-}"#,
-        r#"query q() {
-    match { $p: Doc $d: Doc $p $e:cites $d }
-    return { $p.slug as source, count($d) as n }
-    order { $e.@type }
-}"#,
-    ] {
-        let fixture = Fixture::new(query, &[]);
-        assert!(
-            fixture
-                .ir
-                .order_by
-                .iter()
-                .all(|key| matches!(key.expr, IRExpr::Literal(_, _))),
-            "the lowering folds the single edge type: {query}"
-        );
+}"#;
+    let fixture = Fixture::new(query, &[]);
+    assert!(
         fixture
-            .accept(fixture.plan())
-            .unwrap_or_else(|error| panic!("{query}: {error:?}"));
-    }
+            .ir
+            .order_by
+            .iter()
+            .all(|key| matches!(key.expr, IRExpr::Literal(_, _))),
+        "the binding folds the single edge type"
+    );
+    fixture
+        .accept(fixture.plan())
+        .unwrap_or_else(|error| panic!("{error:?}"));
 }
 
 /// `return distinct` groups rows like an aggregate: the planner binds its

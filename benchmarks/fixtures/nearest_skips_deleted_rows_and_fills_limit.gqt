@@ -27,7 +27,8 @@ node Doc {
 
 --- mutate
 query delete_doc($s: String) {
-    delete Doc where slug = $s
+    $x: Doc  $x.slug = $s
+    delete $x
 }
 
 --- params
@@ -37,7 +38,8 @@ query delete_doc($s: String) {
 
 --- mutate
 query delete_doc($s: String) {
-    delete Doc where slug = $s
+    $x: Doc  $x.slug = $s
+    delete $x
 }
 
 --- params
@@ -47,7 +49,8 @@ query delete_doc($s: String) {
 
 --- mutate
 query delete_doc($s: String) {
-    delete Doc where slug = $s
+    $x: Doc  $x.slug = $s
+    delete $x
 }
 
 --- params

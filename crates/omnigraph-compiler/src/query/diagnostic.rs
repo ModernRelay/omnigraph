@@ -58,6 +58,8 @@ pub enum QueryDiagnosticKind {
     Parse,
     Type,
     Plan,
+    /// A row the query refused while it ran (an `E…` code).
+    Execution,
 }
 
 /// A source position: 1-based line and column (in characters) plus the byte
@@ -191,6 +193,24 @@ impl QueryDiagnostic {
         }
     }
 
+    /// An execution diagnostic: a well-typed expression refused a row while
+    /// the query ran (an integer overflow, a zero divisor, a non-finite
+    /// float), so it carries the `execution` stage.
+    pub fn execution(code: QueryCode, message: impl Into<String>) -> Self {
+        Self {
+            kind: QueryDiagnosticKind::Execution,
+            code,
+            message: message.into(),
+            position: None,
+            stage: Some(Box::new(Stage {
+                name: "execution",
+                expression: None,
+            })),
+            fix: None,
+            suggestion: None,
+        }
+    }
+
     pub fn with_fix(mut self, fix: impl Into<String>) -> Self {
         self.fix = Some(fix.into());
         self
@@ -225,6 +245,9 @@ impl std::fmt::Display for QueryDiagnostic {
             }
             QueryDiagnosticKind::Plan => {
                 write!(f, "plan error: {}: {}", self.code, self.message)
+            }
+            QueryDiagnosticKind::Execution => {
+                write!(f, "execution error: {}: {}", self.code, self.message)
             }
         }
     }

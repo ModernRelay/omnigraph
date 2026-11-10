@@ -2,16 +2,16 @@
 
 use futures::FutureExt as _;
 use omnigraph::Session;
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::Omnigraph;
 use omnigraph::storage::StorageAdapter;
+use omnigraph_compiler::QueryResult;
 use omnigraph_compiler::settings::{DEFINITIONS, Engine};
-use omnigraph_compiler::{ParamMap, QueryResult};
 use omnigraph_gqt_core::concurrent::ConcurrentStep;
 pub use omnigraph_gqt_core::runner_config;
 use omnigraph_gqt_core::runner_config::{Execution, SeamDirective};
 use omnigraph_gqt_core::{
-    Case, ControlStep, ControlWrite, ExecutionHost, Item, QueryStep, Step, StepFail,
-    canonical_json, case_session, parse_case, run_session, seed_case,
+    Case, ControlStep, ControlWrite, ExecutionHost, Item, Step, StepFail, canonical_json,
+    case_session, parse_case, run_session, seed_case,
 };
 pub use omnigraph_gqt_core::{ServerTarget, admit_served};
 use serde_json::Value;
@@ -83,20 +83,29 @@ impl ExecutionHost for GqtHost {
     fn measure_step_end(&self, ordinal: u64) {
         dst_runner::measure_step_end(ordinal);
     }
-    fn reference_query<'a>(
+    fn reference_rows<'a>(
         &'a self,
         session: &'a Session,
-        step: &'a QueryStep,
-        target: ReadTarget,
-        params: &'a ParamMap,
-    ) -> futures::future::BoxFuture<'a, Result<QueryResult, String>> {
+        read: &'a omnigraph_compiler::ir::core::CoreRead,
+        branch: &'a str,
+        params: &'a omnigraph_compiler::ParamMap,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Value>, String>> {
         async move {
-            session
-                .clone()
-                .with_read_executor(Arc::new(omnigraph_reference_engine::ReferenceEngine))
-                .query(target, &step.source, &step.name, params)
+            // The reference reads the branch's rows through the engine's
+            // export, the narrowest public read of a whole branch.
+            let export = session
+                .db()
+                .export_jsonl(branch, &[])
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|e| format!("export failed: {e}"))?;
+            let catalog = session.catalog();
+            let graph = omnigraph_reference::Graph::from_export(&catalog, &export)
+                .map_err(|e| e.to_string())?;
+            let params = params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            omnigraph_reference::Interpreter::new(&catalog, &graph, &params)
+                .run(read)
+                .map(|(rows, _)| rows)
+                .map_err(|e| e.to_string())
         }
         .boxed()
     }

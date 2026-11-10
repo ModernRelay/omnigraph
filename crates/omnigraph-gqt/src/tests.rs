@@ -1,21 +1,16 @@
 use super::*;
 
 const HDR: &str = "# issue: none\n";
-const SCHEMA: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Person {\n    name: String @key\n}\n";
-const SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n";
-const QUERY: &str =
-    "--- query\nquery all() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
-const EXPECT: &str =
-    "--- expect unordered\n{\"p.name\": \"alice\"}\n--- expect shape\np.name: String\n";
-const SAME: &str = "--- expect same as v1\n";
 const TRAVERSAL_SCHEMA: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Person {\n    name: String @key\n}\n\n\
                                 edge Knows: Person -> Person {\n    since: I64\n}\n";
 const TRAVERSAL_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n\
                               {\"type\":\"Person\",\"data\":{\"name\":\"bob\"}}\n\
                               {\"edge\":\"Knows\",\"id\":\"k-1\",\"from\":\"alice\",\"to\":\"bob\",\"data\":{\"since\":2020}}\n";
 
+/// Every read position of an edge's `@type`, which the engine and the
+/// reference both answer, passes the comparison end to end.
 #[tokio::test]
-async fn reference_comparison_refuses_named_type_access_in_every_read_position() {
+async fn reference_comparison_answers_named_type_access_in_every_read_position() {
     for (clauses, returns, order, rows, shape) in [
         (
             "$a: Person $a $e:knows $b",
@@ -54,54 +49,13 @@ async fn reference_comparison_refuses_named_type_access_in_every_read_position()
         ),
     ] {
         let text = format!(
-            "{HDR}{TRAVERSAL_SCHEMA}{TRAVERSAL_SEED}--- query\nquery q() {{ match {{ {clauses} }} return {{ {returns} }} {order} }}\n--- expect unordered\n{rows}\n--- expect shape\n{shape}\n--- expect same as v1\n"
+            "{HDR}{TRAVERSAL_SCHEMA}{TRAVERSAL_SEED}--- query\nquery q() {{ match {{ {clauses} }} return {{ {returns} }} {order} }}\n--- expect unordered\n{rows}\n--- expect shape\n{shape}\n--- expect same as reference\n"
         );
-        let case = parse_case("reference_type_admission", &text).unwrap();
-        let error = execute_case(&case, Path::new("unused.gqt"), false)
+        let case = parse_case("reference_type_access", &text).unwrap();
+        execute_case(&case, Path::new("unused.gqt"), false)
             .await
-            .unwrap_err();
-        assert!(
-            error.contains("reference engine does not support edge @type access"),
-            "{error}"
-        );
+            .unwrap_or_else(|error| panic!("{clauses} / {returns}: {error}"));
     }
-}
-
-#[tokio::test]
-async fn same_as_v1_fails_on_a_v1_error_or_a_row_difference() {
-    let equal = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}");
-    let case = parse_case("x", &equal).unwrap();
-    execute_case(&case, Path::new("unused.gqt"), false)
-        .await
-        .unwrap();
-
-    let compound = "--- query\nquery either() {\n    match { $p: Person  $p.name = \"alice\" or $p.name = \"bob\" }\n    return { $p.name }\n}\n";
-    let refused = format!("{HDR}{SCHEMA}{SEED}{compound}{EXPECT}{SAME}");
-    let case = parse_case("x", &refused).unwrap();
-    let err = execute_case(&case, Path::new("unused.gqt"), false)
-        .await
-        .unwrap_err();
-    assert!(
-        err.contains("expect same as v1: v2 returned rows, v1 failed")
-            && err.contains("compound predicates")
-            && err.contains("drop `--- expect same as v1` from this step"),
-        "{err}"
-    );
-
-    let differing = "# issue: none\n--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n\
-         --- schema\nnode P {\n    k: String @key\n    age: I64\n    score: F64\n}\n\
-         --- seed\n{\"type\":\"P\",\"data\":{\"k\":\"k\",\"age\":7,\"score\":7.5}}\n\
-         --- query\nquery kept() {\n    match { $p: P  not { $p.age < $p.score } }\n    return { $p.k }\n}\n\
-         --- expect unordered\n--- expect shape\np.k: String\n--- expect same as v1\n";
-    let case = parse_case("x", differing).unwrap();
-    let err = execute_case(&case, Path::new("unused.gqt"), false)
-        .await
-        .unwrap_err();
-    assert!(
-        err.contains("the engines disagree (expected = v1, actual = v2)")
-            && err.contains("{\"p.k\":\"k\"}"),
-        "{err}"
-    );
 }
 
 #[tokio::test]

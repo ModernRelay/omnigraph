@@ -81,6 +81,9 @@ impl ProjectionContext {
             ExprType::ExactInteger { .. } => Err(OmniError::manifest_internal(
                 "internal exact integer cannot be a public result field",
             )),
+            ExprType::Edge { .. } => Err(OmniError::manifest_internal(
+                "an edge reference cannot be a public result field",
+            )),
             ExprType::Node { type_name } => {
                 let node = self.catalog.query_node_type(type_name).ok_or_else(|| {
                     OmniError::manifest_internal(format!("node type {type_name} is absent"))
@@ -103,17 +106,17 @@ impl ProjectionContext {
 }
 
 #[cfg(test)]
-pub(super) fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String, String>) {
+pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<String, String>) {
     for op in pipeline {
         match op {
-            IROp::NodeScan {
+            PatternStep::NodeScan {
                 variable,
                 type_name,
                 filters: _,
             } => {
                 out.insert(variable.clone(), type_name.clone());
             }
-            IROp::Expand {
+            PatternStep::Expand {
                 src_var: _,
                 dst_var,
                 edges: _,
@@ -126,8 +129,8 @@ pub(super) fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String,
             } => {
                 out.insert(dst_var.clone(), dst_type.clone());
             }
-            IROp::Filter(_) => {}
-            IROp::AntiJoin {
+            PatternStep::Filter(_) => {}
+            PatternStep::AntiJoin {
                 outer_var: _,
                 inner,
                 predicate: _,
@@ -206,7 +209,13 @@ fn evaluate_boolean(
         | IRExpr::Literal(_, _)
         | IRExpr::Aggregate { .. }
         | IRExpr::AliasRef(_, _)
-        | IRExpr::Cast { .. } => Err(OmniError::manifest_internal("expected a Boolean operator")),
+        | IRExpr::Cast { .. }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. }
+        | IRExpr::Binary {
+            op: BinaryOp::Arith(_),
+            ..
+        } => Err(OmniError::manifest_internal("expected a Boolean operator")),
     }
 }
 
@@ -275,6 +284,27 @@ pub(super) fn evaluate_expr(
     params: &ParamMap,
 ) -> Result<ArrayRef> {
     let values: ArrayRef = match expr {
+        IRExpr::Binary {
+            left,
+            op: BinaryOp::Arith(op),
+            right,
+            ty: _,
+        } => {
+            let left = evaluate_expr(batch, left, params)?;
+            let right = evaluate_expr(batch, right, params)?;
+            super::arith::binary(*op, &left, &right)?
+        }
+        IRExpr::Neg { expr: child, .. } => {
+            let values = evaluate_expr(batch, child, params)?;
+            super::arith::negate(&values)?
+        }
+        IRExpr::Call { func, args, ty } => {
+            let args = args
+                .iter()
+                .map(|arg| evaluate_expr(batch, arg, params))
+                .collect::<Result<Vec<_>>>()?;
+            super::arith::call(*func, &args, ty)?
+        }
         IRExpr::Binary { .. } | IRExpr::Not(_, _) | IRExpr::IsNull { .. } => {
             Arc::new(evaluate_boolean(batch, expr, params)?)
         }
@@ -485,9 +515,12 @@ pub(super) fn evaluate_projection(
                 .map_err(OmniError::arrow_internal)?;
             Ok((name.clone(), Arc::new(node) as ArrayRef))
         }
-        IRExpr::Binary { .. } | IRExpr::Not(_, _) | IRExpr::IsNull { .. } | IRExpr::Cast { .. } => {
-            Ok((expr.to_string(), evaluate_expr(wide_batch, expr, params)?))
-        }
+        IRExpr::Binary { .. }
+        | IRExpr::Not(_, _)
+        | IRExpr::IsNull { .. }
+        | IRExpr::Cast { .. }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. } => Ok((expr.to_string(), evaluate_expr(wide_batch, expr, params)?)),
         IRExpr::AliasRef(name, _) => Ok((name.clone(), alias_column(wide_batch, name)?)),
         IRExpr::Nearest { .. }
         | IRExpr::Search { .. }

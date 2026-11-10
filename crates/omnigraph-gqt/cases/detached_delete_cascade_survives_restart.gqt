@@ -32,7 +32,7 @@ branch create work
 --- expect ok
 
 --- mutate branch: work
-query delete_bob() { delete Person where name = "bob" }
+query delete_bob() { $x: Person  $x.name = "bob"  delete $x }
 
 --- expect affected: nodes=1 edges=3
 

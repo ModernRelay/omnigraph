@@ -799,7 +799,8 @@ async fn negation_delete_edge_grows_antijoin_result() {
         &db,
         r#"
 query fire($from: String) {
-    delete WorksAt where from = $from
+    $x: WorksAt  $x.@src = $from
+    delete $x
 }
 "#,
         "fire",

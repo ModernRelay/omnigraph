@@ -32,7 +32,8 @@ branch create x
 
 --- mutate branch: x
 query set_a_on_x() {
-    update Person set { age: 1 } where name = "a"
+    $x: Person  $x.name = "a"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -49,7 +50,8 @@ branch delete x
 
 --- mutate branch: s
 query set_b_on_s() {
-    update Person set { age: 1 } where name = "b"
+    $x: Person  $x.name = "b"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0

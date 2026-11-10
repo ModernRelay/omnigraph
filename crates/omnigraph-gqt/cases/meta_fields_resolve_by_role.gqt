@@ -156,11 +156,7 @@ query aggregate_identity_order() {
     order { $p.@id }
 }
 
---- expect unordered
-{"p.@id":2}
-
---- expect shape
-p.@id: I64
+--- expect error: T42
 
 --- query
 query user_id_beside_identity() {
@@ -224,7 +220,7 @@ e.@id: String
 f.@id: String
 
 --- mutate
-query birthday() { update Person set { age: 26 } where @id = "bob" }
+query birthday() { $x: Person  $x.@id = "bob"  update $x set { age: 26 } }
 
 --- expect affected: nodes=1 edges=0
 
@@ -239,12 +235,12 @@ query updated() { match { $p: Person
 p.age: I32?
 
 --- mutate
-query absent_edge_identity() { delete Knows where @id = "absent" }
+query absent_edge_identity() { $x: Knows  $x.@id = "absent"  delete $x }
 
 --- expect affected: nodes=0 edges=0
 
 --- mutate
-query absent_edge_endpoint() { delete Knows where @dst = "absent" }
+query absent_edge_endpoint() { $x: Knows  $x.@dst = "absent"  delete $x }
 
 --- expect affected: nodes=0 edges=0
 
@@ -261,7 +257,7 @@ query node_has_no_owner() { match { $p: Person } return { $p.@owner } }
 --- query
 query bare_node_id_filter() { match { $p: Person { id: "alice" } } return { $p.name } }
 
---- expect error: T2: type `Person` has no property `id`; filter the system identity with `$p.@id = ...` in the match block
+--- expect error: T2: type `Person` has no property `id`; the system identity is `$p.@id`
 
 --- query
 query bare_edge_id() { match { $p: Person
@@ -292,7 +288,7 @@ query insert_node_id_property() { insert Person { name: "x", id: "x" } }
 --- expect error: T11: type `Person` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 
 --- mutate
-query update_node_id_property() { update Person set { id: "x" } where @id = "alice" }
+query update_node_id_property() { $x: Person  $x.@id = "alice"  update $x set { id: "x" } }
 
 --- expect error: T11: type `Person` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 
@@ -302,32 +298,32 @@ query insert_edge_id_property() { insert Bare { from: "alice", to: "bob", id: "x
 --- expect error: T11: type `Bare` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 
 --- mutate
-query delete_by_bare_source() { delete Bare where src = "alice" }
+query delete_by_bare_source() { $x: Bare  $x.src = "alice"  delete $x }
 
---- expect error: T11: type `Bare` has no property `src`; the system endpoint is `@src`
-
---- mutate
-query delete_by_bare_destination() { delete Bare where dst = "bob" }
-
---- expect error: T11: type `Bare` has no property `dst`; the system endpoint is `@dst`
+--- expect error: T6: edge `Bare` has no property `src`; the system endpoint is `$x.@src`
 
 --- mutate
-query delete_node_by_source() { delete Person where @src = "alice" }
+query delete_by_bare_destination() { $x: Bare  $x.dst = "bob"  delete $x }
 
---- expect error: T11: type `Person` has no meta-field `@src`; the meta-fields of this type are `@id`
-
---- mutate
-query delete_edge_by_owner() { delete Knows where @owner = "alice" }
-
---- expect error: T11: type `Knows` has no meta-field `@owner`; the meta-fields of this type are `@id`, `@src`, `@dst`
+--- expect error: T6: edge `Bare` has no property `dst`; the system endpoint is `$x.@dst`
 
 --- mutate
-query wrong_identity_type($n: I32) { delete Person where @id = $n }
+query delete_node_by_source() { $x: Person  $x.@src = "alice"  delete $x }
+
+--- expect error: T6: binding `$x` has no meta-field `@src`; its meta-fields are `@id`
+
+--- mutate
+query delete_edge_by_owner() { $x: Knows  $x.@owner = "alice"  delete $x }
+
+--- expect error: T6: binding `$x` has no meta-field `@owner`; its meta-fields are `@id`, `@src`, `@dst` and `@type`
+
+--- mutate
+query wrong_identity_type($n: I32) { $x: Person  $x.@id = $n  delete $x }
 
 --- params
 {"n":1}
 
---- expect error: T7: cannot assign/compare I32 with String for property `@id`
+--- expect error: T7: cannot compare String with I32
 
 --- query
 query bare_id_is_not_the_identity() {
@@ -339,7 +335,8 @@ query bare_id_is_not_the_identity() {
 
 --- mutate
 query unlink($who: String) {
-    delete Knows where @src = $who
+    $x: Knows  $x.@src = $who
+    delete $x
 }
 
 --- params
@@ -349,7 +346,8 @@ query unlink($who: String) {
 
 --- mutate
 query forget($who: String) {
-    delete Person where @id = $who
+    $x: Person  $x.@id = $who
+    delete $x
 }
 
 --- params
@@ -359,13 +357,14 @@ query forget($who: String) {
 
 --- mutate
 query forget_by_bare_id($who: String) {
-    delete Person where id = $who
+    $x: Person  $x.id = $who
+    delete $x
 }
 
 --- params
 {"who": "alice"}
 
---- expect error: T11: type `Person` has no property `id`; the system identity is `@id`
+--- expect error: T6: type `Person` has no property `id`; the system identity is `$x.@id`
 
 --- query
 query remaining() {

@@ -36,14 +36,16 @@ query mark() {
 
 --- mutate
 query alice_ages() {
-    update Person set { age: 31 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query alice_reverts() {
-    update Person set { age: 30 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 30 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -57,14 +59,16 @@ query gina_arrives() {
 
 --- mutate
 query gina_leaves() {
-    delete Person where name = "gina"
+    $x: Person  $x.name = "gina"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query hank_leaves() {
-    delete Person where name = "hank"
+    $x: Person  $x.name = "hank"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
@@ -78,7 +82,8 @@ query hank_returns() {
 
 --- mutate
 query ivan_leaves() {
-    delete Person where name = "ivan"
+    $x: Person  $x.name = "ivan"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
@@ -101,7 +106,8 @@ query jill_arrives() {
 
 --- mutate
 query jill_ages() {
-    update Person set { age: 19 } where name = "jill"
+    $x: Person  $x.name = "jill"
+    update $x set { age: 19 }
 }
 
 --- expect affected: nodes=1 edges=0

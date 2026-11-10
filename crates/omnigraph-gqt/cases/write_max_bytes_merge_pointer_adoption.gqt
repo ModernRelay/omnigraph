@@ -33,7 +33,8 @@ branch create feature;
 
 --- mutate
 query lengthen() {
-    update Doc set { note: "long" } where slug = "w"
+    $x: Doc  $x.slug = "w"
+    update $x set { note: "long" }
 }
 
 --- expect affected: nodes=1 edges=0

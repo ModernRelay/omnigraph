@@ -147,9 +147,9 @@ n: I64
 
 --- query branch: tgt
 query vector_read_indexed_row($q: Vector(4)) {
-    match { $p: Person }
+    match { from nearest({ match { $p: Person } return { $p } }, $p.embedding, $q, k: 1) }
     return { $p.name }
-    order { nearest($p.embedding, $q) }
+    order { $distance }
     limit 1
 }
 
@@ -164,9 +164,9 @@ p.name: String
 
 --- query branch: tgt
 query vector_read_new_row($q: Vector(4)) {
-    match { $p: Person }
+    match { from nearest({ match { $p: Person } return { $p } }, $p.embedding, $q, k: 1) }
     return { $p.name }
-    order { nearest($p.embedding, $q) }
+    order { $distance }
     limit 1
 }
 

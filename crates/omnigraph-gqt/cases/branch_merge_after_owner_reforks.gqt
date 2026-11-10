@@ -25,7 +25,8 @@ branch create feature
 
 --- mutate branch: feature
 query feature_write() {
-    update Person set { age: 31 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -42,7 +43,8 @@ branch merge feature
 
 --- mutate
 query main_write() {
-    update Person set { age: 32 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 32 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -54,7 +56,8 @@ branch merge main into feature
 
 --- mutate branch: feature
 query feature_writes_after_pointer_switch() {
-    update Person set { age: 33 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 33 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -66,7 +69,8 @@ branch create replacement from feature
 
 --- mutate branch: replacement
 query replacement_write() {
-    update Person set { age: 34 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 34 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -104,14 +108,16 @@ p.age: I32
 
 --- mutate branch: feature
 query feature_writes_after_borrowing() {
-    update Person set { age: 35 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 35 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: replacement
 query replacement_writes_independently() {
-    update Person set { age: 36 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 36 }
 }
 
 --- expect affected: nodes=1 edges=0

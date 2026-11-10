@@ -1,5 +1,5 @@
 use omnigraph_compiler::ir::{BlockAggregateExpr, IRExpr};
-use omnigraph_compiler::query::ast::AggFunc;
+use omnigraph_compiler::query::value::AggFunc;
 use omnigraph_compiler::types::{AggSignature, ExprType, ScalarType};
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +72,7 @@ pub fn plan_aggregate(func: AggFunc, signature: &AggSignature) -> Result<Aggrega
                 ..
             }
             | ExprType::Node { .. }
+            | ExprType::Edge { .. }
             | ExprType::ExactInteger { .. } => {
                 return Err(PlanError::Internal("sum requires numeric input".into()));
             }

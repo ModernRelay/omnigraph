@@ -2,9 +2,10 @@
 use crate::fixture_bounds;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::task::noop_waker;
-use omnigraph_compiler::ir::{IRExpr, IROp, IRProjection, QueryIR};
-use omnigraph_compiler::query::ast::{CompOp, Literal};
+use omnigraph_compiler::ir::{IRExpr, IRProjection};
+use omnigraph_compiler::query::value::{CompOp, Literal};
 use omnigraph_compiler::{ExprType, SYSTEM_COLUMNS_V3, ScalarType};
+use omnigraph_planner::read_shape::{PatternStep, ReadShape};
 use omnigraph_planner::*;
 use std::future::Future;
 use std::sync::Arc;
@@ -129,8 +130,8 @@ fn prop(binding: &str) -> IRExpr {
         },
     }
 }
-fn query(two: bool) -> QueryIR {
-    let scan = |binding: &str| IROp::NodeScan {
+fn query(two: bool) -> ReadShape {
+    let scan = |binding: &str| PatternStep::NodeScan {
         variable: binding.into(),
         type_name: "Doc".into(),
         filters: vec![IRExpr::comparison(
@@ -139,7 +140,7 @@ fn query(two: bool) -> QueryIR {
             IRExpr::Literal(Literal::String("a".into()), prop(binding).ty().clone()),
         )],
     };
-    QueryIR {
+    ReadShape {
         name: "probe".into(),
         params: vec![],
         pipeline: if two {
@@ -158,7 +159,7 @@ fn query(two: bool) -> QueryIR {
         limit: None,
     }
 }
-fn prepared(query: &QueryIR, source: &ProbeSource) -> Decision {
+fn prepared(query: &ReadShape, source: &ProbeSource) -> Decision {
     let decision = route(
         &Operation::Query(Box::new(query.clone())),
         source,

@@ -539,7 +539,9 @@ impl PlanSource for MemorySource {
             _ => None,
         };
         Ok(match literal {
-            Some(omnigraph_compiler::query::ast::Literal::String(key)) => Some(format!("id:{key}")),
+            Some(omnigraph_compiler::query::value::Literal::String(key)) => {
+                Some(format!("id:{key}"))
+            }
             _ => None,
         })
     }

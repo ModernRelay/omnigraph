@@ -1,6 +1,7 @@
 # issue: 659
 # red_on: 7f1233bb
 # notes: RRF retains concrete edge multiplicity and orders equal IDs by type before applying a row limit.
+# notes: The second arm ranks `hay` so the two arms differ; it selects only `b`, which has no outgoing edge, so the rows are `a`'s.
 
 --- runner
 timeout_ms: 10000
@@ -24,12 +25,12 @@ edge Likes: Person -> Person
 
 --- query
 query fused_types() {
-    match {
+    match { let $all = { match { $p: Person } return { $p } }  from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60)
         $p: Person
         $p $e:(likes | knows) $q
     }
     return { $e.@type as edge_type, $e.@id as edge_id }
-    order { rrf(bm25($p.text, "needle"), bm25($p.text, "needle")) }
+    order { $score desc }
     limit 2
 }
 
@@ -45,14 +46,16 @@ edge_id: String
 expand $p $q: selection alternation [Knows out, Likes out]
 rank fuse row tiebreak [$e.@type, $e.@id, $q.@id]
 
+--- expect same as reference
+
 --- query
 query fused_type_page() {
-    match {
+    match { let $all = { match { $p: Person } return { $p } }  from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60)
         $p: Person
         $p $e:(likes | knows) $q
     }
     return { $e.@type as edge_type, $e.@id as edge_id }
-    order { rrf(bm25($p.text, "needle"), bm25($p.text, "needle")) }
+    order { $score desc }
     limit 1
 }
 
@@ -63,15 +66,17 @@ query fused_type_page() {
 edge_type: String
 edge_id: String
 
+--- expect same as reference
+
 --- query
 query fused_wildcard_type_page() {
-    match {
+    match { let $all = { match { $p: Person } return { $p } }  from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60)
         $p: Person
         $q: Person
         $p $e:* $q
     }
     return { $e.@type as edge_type, $e.@id as edge_id }
-    order { rrf(bm25($p.text, "needle"), bm25($p.text, "needle")) }
+    order { $score desc }
     limit 1
 }
 
@@ -85,3 +90,5 @@ edge_id: String
 --- expect plan
 expand $p $q: selection wildcard [Knows out, Likes out]
 rank fuse row tiebreak [$e.@type, $e.@id, $q.@id]
+
+--- expect same as reference

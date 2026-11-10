@@ -8,7 +8,7 @@ environments:
     storage: local-filesystem
 
 --- mutate branch: feature
-query new_lifetime_write() { update Item set { value: 1 } where key = "alice" }
+query new_lifetime_write() { $x: Item  $x.key = "alice"  update $x set { value: 1 } }
 --- expect affected: nodes=1 edges=0
 
 --- query branch: main

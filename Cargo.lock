@@ -5691,6 +5691,7 @@ dependencies = [
  "arrow-select",
  "pest",
  "pest_derive",
+ "proptest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5834,7 +5835,7 @@ dependencies = [
  "omnigraph-dst",
  "omnigraph-engine",
  "omnigraph-gqt-core",
- "omnigraph-reference-engine",
+ "omnigraph-reference",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5923,27 +5924,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "omnigraph-reference-engine"
+name = "omnigraph-reference"
 version = "0.15.1"
 dependencies = [
- "arrow-array",
- "arrow-cast",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
- "arrow-string",
- "chrono",
- "datafusion",
- "futures",
- "lance",
- "lance-datafusion",
- "lance-index",
- "omnigraph-catalog",
  "omnigraph-compiler",
- "omnigraph-core",
- "sha2 0.10.9",
- "tokio",
- "tracing",
+ "serde_json",
 ]
 
 [[package]]

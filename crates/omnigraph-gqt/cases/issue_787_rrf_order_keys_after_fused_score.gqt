@@ -2,7 +2,8 @@
 # red_on: 2026-10-09, upstream main: every step returned the primary arm's row order; RankFuseExec sorted by the fused sum alone and truncated entities, so keys after a leading rrf() never reached a Sort.
 # notes: Keys after a leading rrf() apply as secondary sorts, then the entity id breaks ties (RFC 0047 §One total order; docs/user/queries/index.md, search/index.md Hybrid ranking).
 # notes: aa and zz swap ranks between the alpha and beta arms, so they tie exactly on the fused score; step 1 orders the tie by `$d.slug desc` (zz), step 2 by the id alone (aa).
-# notes: Step 3: one fused entity fans out to two rows, which `$c.slug desc` must order (zz) before the limit.
+# notes: Step 3: one fused entity fans out to two rows, which `$c.slug desc` must order (zz) before the limit;
+# notes: its second arm ranks `alpha` so the two arms differ, selecting `aa` and `zz`, which cite nothing.
 
 --- runner
 timeout_ms: 10000
@@ -26,9 +27,9 @@ edge Cites: Doc -> Doc
 
 --- query
 query secondary_key_breaks_fused_tie() {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, "alpha"), bm25($all, $d.text, "beta"), k: 60) $d: Doc }
     return { $d.slug }
-    order { rrf(bm25($d.text, "alpha"), bm25($d.text, "beta")), $d.slug desc }
+    order { $score desc, $d.slug desc }
     limit 1
 }
 
@@ -40,9 +41,9 @@ d.slug: String
 
 --- query
 query id_breaks_fused_tie() {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, "beta"), bm25($all, $d.text, "alpha"), k: 60) $d: Doc }
     return { $d.slug }
-    order { rrf(bm25($d.text, "beta"), bm25($d.text, "alpha")) }
+    order { $score desc }
     limit 1
 }
 
@@ -54,12 +55,12 @@ d.slug: String
 
 --- query
 query secondary_key_orders_fanout_rows() {
-    match {
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "alpha"), k: 60)
         $d: Doc
         $d cites $c
     }
     return { $c.slug }
-    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle")), $c.slug desc }
+    order { $score desc, $c.slug desc }
     limit 1
 }
 

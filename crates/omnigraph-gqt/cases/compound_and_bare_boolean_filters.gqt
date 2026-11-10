@@ -1,6 +1,6 @@
 # issue: none
 # notes: A compound predicate, a bare Bool property or parameter and a comparison of comparisons each filter rows; one comparison with
-# notes: a leading `nearest` order gives the reference engine's rows; a type fault inside a compound is the plain type error, and a compound update `where` runs.
+# notes: a leading `nearest` order gives the pinned rows; a type fault inside a compound is the plain type error, and a compound update `where` runs.
 
 --- runner
 timeout_ms: 10000
@@ -38,9 +38,9 @@ p.slug: String
 
 --- query
 query leading_nearest_runs($q: Vector(2)) {
-    match { $p: Person  $p.enabled = true }
+    match { from nearest({ match { $p: Person  $p.enabled = true } return { $p } }, $p.embedding, $q, k: 1) }
     return { $p.slug }
-    order { nearest($p.embedding, $q) }
+    order { $distance }
     limit 1
 }
 
@@ -52,8 +52,8 @@ query leading_nearest_runs($q: Vector(2)) {
 
 --- expect shape
 p.slug: String
---- expect same as v1
 
+--- expect same as reference
 --- query
 set engine = v2;
 query bare_boolean_property() {
@@ -110,11 +110,12 @@ query type_fault_inside_compound() {
     return { $p.slug }
 }
 
---- expect error: T41: `and` needs Bool operands, got Bool and String
+--- expect error: T41: a filter needs a Bool, got String
 
 --- mutate
 query compound_where_runs($cut: I64) {
-    update Person set { enabled: false } where age < $cut or name = "carol"
+    $x: Person  $x.age < $cut or $x.name = "carol"
+    update $x set { enabled: false }
 }
 
 --- params

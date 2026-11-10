@@ -828,8 +828,8 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
     let before = manifest_dataset_version(&graph_path(temp.path())).await;
     for query in [
         "query add() { insert Person { name: \"Mallory\", age: 1 } }",
-        "query bump() { update Person set { age: 99 } where name = \"Alice\" }",
-        "query drop() { delete Person where name = \"Alice\" }",
+        "query bump() { $x: Person  $x.name = \"Alice\"  update $x set { age: 99 } }",
+        "query drop() { $x: Person  $x.name = \"Alice\"  delete $x }",
         "branch create feature from main",
     ] {
         let refused = call(

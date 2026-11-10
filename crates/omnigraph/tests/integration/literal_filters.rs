@@ -208,7 +208,7 @@ query born_eq_param($d: Date) { match { $m: Metric  $m.born = $d } return { $m.n
     );
 
     let m = r#"
-query touch_born($d: Date) { update Metric set { active: false } where born = $d }
+query touch_born($d: Date) { $x: Metric  $x.born = $d  update $x set { active: false } }
 "#;
     let err = db
         .mutate("main", m, "touch_born", &params)
@@ -270,7 +270,7 @@ query seen_opt_param($t: DateTime?) { match { $m: Metric  $m.seen = $t } return 
 query seen_in_opt_param($ts: [DateTime]?) { match { $m: Metric  $m.seen in $ts } return { $m.name } }
 "#;
     let m = r#"
-query touch_seen($t: DateTime) { update Metric set { active: false } where seen = $t }
+query touch_seen($t: DateTime) { $x: Metric  $x.seen = $t  update $x set { active: false } }
 "#;
 
     let mut params = ParamMap::new();
@@ -406,11 +406,11 @@ async fn string_predicate_filters_execute_on_scanned_variable() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
     let q = r#"
-query prefix() { match { $m: Metric  $m.label starts_with "alp" } return { $m.name } }
-query prefix_param($q: String) { match { $m: Metric  $m.label starts_with $q } return { $m.name } }
-query substr() { match { $m: Metric  $m.label contains "ta r" } return { $m.name } }
-query substr_all() { match { $m: Metric  $m.label contains "a" } return { $m.name } }
-query key_prefix() { match { $m: Metric  $m.name starts_with "m" } return { $m.name } }
+query prefix() { match { $m: Metric  starts_with($m.label, "alp") } return { $m.name } }
+query prefix_param($q: String) { match { $m: Metric  starts_with($m.label, $q) } return { $m.name } }
+query substr() { match { $m: Metric  contains($m.label, "ta r") } return { $m.name } }
+query substr_all() { match { $m: Metric  contains($m.label, "a") } return { $m.name } }
+query key_prefix() { match { $m: Metric  starts_with($m.name, "m") } return { $m.name } }
 "#;
     // Prefix: "alpha one", "alps" start with "alp"; NULL label (m4) is not a match.
     assert_eq!(
@@ -451,7 +451,7 @@ query cross() {
     match {
         $a: Metric
         $b: Metric
-        $b.label starts_with $a.label
+        starts_with($b.label, $a.label)
     }
     return { $a.name, $b.name }
 }
@@ -479,7 +479,7 @@ async fn string_contains_resolves_inside_negation() {
 query not_sal_tagged() {
     match {
         $m: Metric
-        not { $m tagged $t  $t.tname contains "sal" }
+        not { $m tagged $t  contains($t.tname, "sal") }
     }
     return { $m.name }
 }
@@ -507,14 +507,14 @@ async fn reversed_and_same_variable_string_predicates_execute() {
 query reversed() {
     match {
         $m: Metric
-        "the alps are tall" contains $m.label
+        contains("the alps are tall", $m.label)
     }
     return { $m.name }
 }
 query same_var() {
     match {
         $m: Metric
-        $m.label starts_with $m.name
+        starts_with($m.label, $m.name)
     }
     return { $m.name }
 }
@@ -546,8 +546,7 @@ async fn standalone_string_predicate_is_hoisted_into_scan() {
 
     let dir = tempfile::tempdir().unwrap();
     let db = metric_db(&dir).await;
-    let q =
-        r#"query prefix() { match { $m: Metric  $m.label starts_with "alp" } return { $m.name } }"#;
+    let q = r#"query prefix() { match { $m: Metric  starts_with($m.label, "alp") } return { $m.name } }"#;
 
     let probes = QueryIoProbes::default();
     let r = with_query_io_probes(
@@ -585,14 +584,14 @@ query prefix_and_search() {
     match {
         $m: Metric
         search($m.label, "alps")
-        $m.label starts_with "al"
+        starts_with($m.label, "al")
     }
     return { $m.name }
 }
 query not_alp_tagged() {
     match {
         $m: Metric
-        not { $m tagged $t  $t.tname starts_with "alp" }
+        not { $m tagged $t  starts_with($t.tname, "alp") }
     }
     return { $m.name }
 }
@@ -616,8 +615,8 @@ async fn string_predicate_filters_execute_on_expanded_variable() {
     // $t is introduced by the traversal, so these standalone filters take the
     // in-memory arm — results must match the pushdown arm's semantics.
     let q = r#"
-query tag_prefix() { match { $m: Metric  $m tagged $t  $t.tname starts_with "alp" } return { $m.name } }
-query tag_substr() { match { $m: Metric  $m tagged $t  $t.tname contains "sal" } return { $m.name } }
+query tag_prefix() { match { $m: Metric  $m tagged $t  starts_with($t.tname, "alp") } return { $m.name } }
+query tag_substr() { match { $m: Metric  $m tagged $t  contains($t.tname, "sal") } return { $m.name } }
 "#;
     // Only m1 is tagged "alpine".
     assert_eq!(
@@ -682,7 +681,7 @@ async fn unused_mutation_parameters_are_checked_before_a_noop() {
         ("F64", Literal::Float(f64::NAN), Literal::Float(1.25)),
     ] {
         let source = format!(
-            "query unused($value: {type_name}) {{ update Metric set {{ active: false }} where name = \"missing\" }}"
+            "query unused($value: {type_name}) {{ $x: Metric  $x.name = \"missing\"  update $x set {{ active: false }} }}"
         );
         let error = db
             .mutate(
@@ -723,7 +722,8 @@ async fn mutation_assignment_parameter_is_checked_before_an_empty_scan_after_hea
     let dir = tempfile::tempdir().unwrap();
     let db = metric_db(&dir).await;
     let source = r#"query assigned($value: I32) {
-        update Metric set { count: $value } where name = "missing"
+        $x: Metric  $x.name = "missing"
+        update $x set { count: $value }
     }"#;
     let params = ParamMap::from([("value".into(), Literal::Integer(i128::from(i32::MAX) + 1))]);
     let error = db
@@ -771,7 +771,8 @@ async fn omitted_nullable_mutation_parameters_are_null_from_a_rust_param_map() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
     let predicate = r#"query optional_predicate($name: String?) {
-        update Metric set { active: false } where name = $name
+        $x: Metric  $x.name = $name
+        update $x set { active: false }
     }"#;
     for params in [
         ParamMap::new(),
@@ -787,7 +788,8 @@ async fn omitted_nullable_mutation_parameters_are_null_from_a_rust_param_map() {
     }
 
     let assignment = r#"query optional_assignment($count: I32?) {
-        update Metric set { count: $count } where name = "m1"
+        $x: Metric  $x.name = "m1"
+        update $x set { count: $count }
     }"#;
     let receipt = db
         .mutate_with_receipt("main", assignment, "optional_assignment", &ParamMap::new())

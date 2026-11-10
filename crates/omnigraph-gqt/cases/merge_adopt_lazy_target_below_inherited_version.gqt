@@ -28,35 +28,40 @@ branch create feature
 
 --- mutate
 query a_2_on_main() {
-    update Person set { age: 2 } where name = "a"
+    $x: Person  $x.name = "a"
+    update $x set { age: 2 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query a_3_on_main() {
-    update Person set { age: 3 } where name = "a"
+    $x: Person  $x.name = "a"
+    update $x set { age: 3 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query a_4_on_main() {
-    update Person set { age: 4 } where name = "a"
+    $x: Person  $x.name = "a"
+    update $x set { age: 4 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query a_5_on_main() {
-    update Person set { age: 5 } where name = "a"
+    $x: Person  $x.name = "a"
+    update $x set { age: 5 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: feature
 query b_9_on_feature() {
-    update Person set { age: 9 } where name = "b"
+    $x: Person  $x.name = "b"
+    update $x set { age: 9 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -68,7 +73,8 @@ branch merge main into feature
 
 --- mutate branch: feature
 query a_50_on_feature() {
-    update Person set { age: 50 } where name = "a"
+    $x: Person  $x.name = "a"
+    update $x set { age: 50 }
 }
 
 --- expect affected: nodes=1 edges=0

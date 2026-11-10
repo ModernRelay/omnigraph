@@ -2041,11 +2041,13 @@ node Tag {
     .unwrap();
     let writes = r#"
 query set_summary($title: String, $summary: String) {
-    update Document set { summary: $summary } where title = $title
+    $x: Document  $x.title = $title
+    update $x set { summary: $summary }
 }
 
 query set_strength($name: String, $strength: I32) {
-    update Tag set { strength: $strength } where name = $name
+    $x: Tag  $x.name = $name
+    update $x set { strength: $strength }
 }
 "#;
     mutate_main(
@@ -4008,7 +4010,7 @@ async fn issue_721_deleted_null_row_is_purged_by_promotion() {
             .unwrap();
         mutate_main(
             &db,
-            "query rm($slug: String) { delete Decision where slug = $slug }",
+            "query rm($slug: String) { $x: Decision  $x.slug = $slug  delete $x }",
             "rm",
             &params(&[("slug", "gone")]),
         )

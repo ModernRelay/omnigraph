@@ -15,7 +15,7 @@ use omnigraph::Session;
 use omnigraph::db::{BranchCreated, MergeResult, SnapshotId};
 use omnigraph::settings::{ChangeLineage, SettingId, SettingValue};
 use omnigraph_compiler::Literal;
-use omnigraph_compiler::query::ast::{
+use omnigraph_compiler::query::file::{
     BranchStmt, EmptyFile, FileBody, MutationWriteMode, QueryDecl, QueryFile, UnattachedBase,
 };
 use tracing::Instrument;
@@ -1972,7 +1972,7 @@ pub(crate) async fn run_query(
     let target = resolve_authorized_read_target(&handle, actor, branch, snapshot).await?;
     let query_decl = select_named_query_decl(queries, name)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if !query_decl.mutations.is_empty() {
+    if query_decl.is_mutation() {
         return Err(ApiError::bad_request(format!(
             "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
             query_decl.name
@@ -3682,7 +3682,7 @@ pub(crate) async fn server_commit_publish(
         &session,
         actor_ref,
         ingress,
-        omnigraph_compiler::query::ast::CommitWrite::Publish {
+        omnigraph_compiler::query::file::CommitWrite::Publish {
             graph_commit_id: commit_id,
         },
     )
@@ -3732,7 +3732,7 @@ pub(crate) async fn server_commit_drop(
         &session,
         actor_ref,
         ingress,
-        omnigraph_compiler::query::ast::CommitWrite::Drop {
+        omnigraph_compiler::query::file::CommitWrite::Drop {
             graph_commit_id: commit_id,
         },
     )
@@ -3771,7 +3771,7 @@ pub(crate) fn select_named_query_decl(
 }
 
 pub(crate) fn query_params_from_json(
-    query_params: &[omnigraph_compiler::query::ast::Param],
+    query_params: &[omnigraph_compiler::query::file::Param],
     params_json: Option<&Value>,
 ) -> Result<ParamMap> {
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)

@@ -867,10 +867,7 @@ fn emit_gqt_engine_digest(root: &Path) {
     for entry in std::fs::read_dir(root.join("crates")).expect("read workspace crates") {
         let path = entry.expect("read crate entry").path();
         let name = path.file_name().unwrap().to_string_lossy();
-        if matches!(
-            name.as_ref(),
-            "omnigraph-gqt" | "omnigraph-dst" | "omnigraph-reference-engine"
-        ) {
+        if matches!(name.as_ref(), "omnigraph-gqt" | "omnigraph-dst") {
             continue;
         }
         for leaf in ["Cargo.toml", "build.rs", "src"] {
