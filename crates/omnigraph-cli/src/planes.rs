@@ -19,8 +19,9 @@ pub(crate) enum Requirement {
     /// One graph of an existing server, reached only over HTTP: a client of
     /// the server, never of its storage.
     ServedGraph,
-    /// An existing server as a whole, handed to another client: `--graph` may
-    /// name one of its graphs but is not required, and no request is sent.
+    /// An existing server or managed cluster as a whole, handed to another
+    /// client: `--graph` may name one of its graphs but is not required, and
+    /// no request is sent.
     ServedTarget,
     Registry,
     Root,
@@ -389,26 +390,23 @@ pub(crate) fn validate_target(
     use Requirement::*;
     use TargetBinding::*;
     let need = requirement(&cli.command);
-    if (need == ServedGraph && !matches!(target.binding, Server { .. } | Managed(_)))
-        || (need == ServedTarget && !matches!(target.binding, Server { .. }))
+    if matches!(need, ServedGraph | ServedTarget)
+        && !matches!(target.binding, Server { .. } | Managed(_))
     {
-        let label = command_label(&cli.command);
-        let why = match &target.binding {
-            Managed(_) => {
-                format!("{label} does not open a managed target; it opens a server target")
-            }
-            _ => format!(
-                "{label} connects to an existing server, and target '{}' is direct storage; \
+        return Err(crate::targets::refusal(
+            "target_kind_unsupported",
+            format!(
+                "{} connects to an existing server, and target '{}' is direct storage; \
                  select a {} target for a server that serves the graph",
+                command_label(&cli.command),
                 target.label(),
                 if need == ServedGraph {
                     "served"
                 } else {
-                    "server"
+                    "server or managed cluster"
                 }
             ),
-        };
-        return Err(crate::targets::refusal("target_kind_unsupported", why));
+        ));
     }
     let allowed = match (&need, &target.binding) {
         (Graph { .. } | Standalone | Alias, DirectGraph { .. }) => true,
@@ -441,6 +439,7 @@ pub(crate) fn validate_target(
                 direct_only: false, ..
             }
             | ServedGraph
+            | ServedTarget
             | RootOrServedGraph
             | Registry
             | Deployment

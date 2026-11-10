@@ -225,7 +225,8 @@ An incompatible change to either contract requires its discovery number to chang
 `protocols.access` identifies the `omnigraph access --json` shape: protocol 2
 uses `actor_id` in place of protocol 1's `actor`. `protocols.studio` identifies
 the [Studio link](cli/studio.md#the-link), `studio --json`, and the `home` and
-`binding` digests `target inspect --json` reports for checking a link.
+`binding` digests `target inspect --json` reports for checking a link. The
+link's managed cluster form is an addition within protocol 1.
 `internal_schema.writes` is the storage-format stamp this binary's commits
 write, and `internal_schema.serves` is the inclusive range, lowest first, that
 normal open accepts; `snapshot --json` reports a graph's own stamp as
