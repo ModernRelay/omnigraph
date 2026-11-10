@@ -30,6 +30,8 @@ query ordered_limit_zero_v2() {
 --- expect shape
 p.name: String
 
+--- expect same as reference
+
 --- query
 set engine = v2;
 query ordered_limit_zero_desc_v2() {

@@ -51,6 +51,8 @@ aggregate n: count(Person) count error -> I64?
 aggregate distinct_n: count(distinct Person) count error -> I64?
 aggregate teams: count(distinct String) count error -> I64?
 
+--- expect same as reference
+
 --- query
 query totals_by_team() {
     match { $p: Person }
@@ -71,6 +73,8 @@ n: I64
 aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
 aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
 aggregate n: count(Person) count error -> I64?
+
+--- expect same as reference
 
 --- query
 query totals_of_nobody() {
@@ -94,6 +98,8 @@ aggregate total: sum(I64?) exact_integer round_to_nearest -> F64?
 aggregate mean: avg(I64?) float64 round_to_nearest -> F64?
 aggregate n: count(Person) count error -> I64?
 
+--- expect same as reference
+
 --- query
 query birthdates_by_team() {
     match { $p: Person }
@@ -108,3 +114,5 @@ query birthdates_by_team() {
 p.team: String
 first: Date?
 last: Date?
+
+--- expect same as reference

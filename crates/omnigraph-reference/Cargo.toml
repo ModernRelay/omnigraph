@@ -1,0 +1,15 @@
+[package]
+name = "omnigraph-reference"
+version = "0.15.1"
+edition = "2024"
+description = "A reference interpreter of the GQ core IR: the GQT corpus's differential oracle. Never published."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+publish = false
+
+[dependencies]
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1" }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

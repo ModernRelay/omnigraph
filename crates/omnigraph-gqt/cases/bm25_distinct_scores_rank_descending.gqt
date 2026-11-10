@@ -39,6 +39,8 @@ query bm25_ranked($q: String) {
 --- expect shape
 n.slug: String
 
+--- expect same as reference
+
 --- query
 query distinct_literal_order($q: String) {
     match { from bm25({ match { $n: Note } return { $n } }, $n.body, $q) }
@@ -61,3 +63,5 @@ one: I64
 
 --- expect plan
 sort no tiebreak
+
+--- expect same as reference

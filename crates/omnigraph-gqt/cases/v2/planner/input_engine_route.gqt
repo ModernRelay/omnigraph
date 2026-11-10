@@ -43,3 +43,5 @@ p.name: String
 q.name: String
 --- expect plan
 expand $p Knows $q: mode indexed_scan ran indexed_scan
+
+--- expect same as reference

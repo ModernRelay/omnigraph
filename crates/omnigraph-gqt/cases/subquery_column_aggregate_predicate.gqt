@@ -57,6 +57,8 @@ query total_above_100() {
 --- expect shape
 n.slug: String
 
+--- expect same as reference
+
 --- query
 query largest_artifact_at_most_21() {
     match {
@@ -71,6 +73,8 @@ query largest_artifact_at_most_21() {
 {"n.slug":"small"}
 --- expect shape
 n.slug: String
+
+--- expect same as reference
 
 --- query
 query smallest_artifact_is_50() {
@@ -87,6 +91,8 @@ query smallest_artifact_is_50() {
 --- expect shape
 n.slug: String
 
+--- expect same as reference
+
 --- query
 query integer_inputs_have_a_fractional_average() {
     match {
@@ -101,6 +107,8 @@ query integer_inputs_have_a_fractional_average() {
 {"n.slug":"small"}
 --- expect shape
 n.slug: String
+
+--- expect same as reference
 
 --- query
 query no_match_has_no_aggregate() {
@@ -117,6 +125,8 @@ query no_match_has_no_aggregate() {
 {"n.slug":"large"}
 --- expect shape
 n.slug: String
+
+--- expect same as reference
 
 --- query
 query newest_artifact_after_a_date($since: Date) {
@@ -139,6 +149,8 @@ block aggregate max($m.created): max(Date) extremum error -> Date?
 type max($m.created): Date?
 no cast max($m.created)
 
+--- expect same as reference
+
 --- query
 query oldest_artifact_before_a_date_literal() {
     match {
@@ -155,6 +167,8 @@ query oldest_artifact_before_a_date_literal() {
 n.slug: String
 --- expect plan
 block aggregate min($m.created): min(Date) extremum error -> Date?
+
+--- expect same as reference
 
 --- query
 query scan_introduced_block_binding_loads_the_argument() {
@@ -174,6 +188,8 @@ query scan_introduced_block_binding_loads_the_argument() {
 --- expect shape
 n.slug: String
 
+--- expect same as reference
+
 --- query
 query count_over_a_column_counts_its_values() {
     match {
@@ -191,6 +207,8 @@ n.slug: String
 --- expect plan
 block aggregate count($m.label): count(String?) count error -> I64?
 type count($m.label): I64?
+
+--- expect same as reference
 
 --- query
 query null_bound_satisfies_nothing($s: String?) {
@@ -211,6 +229,8 @@ n.slug: String
 type max($m.label): String?
 type $s: String?
 
+--- expect same as reference
+
 --- query
 query unsigned_above_the_signed_range_is_kept() {
     match {
@@ -230,6 +250,8 @@ block aggregate max($m.big): max(U64?) extremum error -> U64?
 cast 0: I64 -> U64
 no cast max($m.big)
 
+--- expect same as reference
+
 --- query
 query largest_label() {
     match {
@@ -246,6 +268,8 @@ query largest_label() {
 n.slug: String
 --- expect plan
 block aggregate max($m.label): max(String?) extremum error -> String?
+
+--- expect same as reference
 
 --- query
 query sum_over_a_string_is_refused() {
@@ -289,6 +313,8 @@ n.slug: String
 --- expect plan
 block aggregate count($m.big): count(U64?) count error -> I64?
 
+--- expect same as reference
+
 --- query
 query float_average_skips_null_values($mean: F64) {
     match {
@@ -305,6 +331,8 @@ query float_average_skips_null_values($mean: F64) {
 {"n.slug":"small"}
 --- expect shape
 n.slug: String
+
+--- expect same as reference
 
 --- query
 query largest_boolean() {
@@ -323,6 +351,8 @@ n.slug: String
 --- expect plan
 block aggregate max($m.published): max(Bool) extremum error -> Bool?
 
+--- expect same as reference
+
 
 --- query
 query minimum_f32_retains_its_declared_domain() {
@@ -340,6 +370,8 @@ n.slug: String
 block aggregate min($m.weight): min(F32?) extremum error -> F32?
 cast 0.10000000149011612: F64 -> F32
 no cast min($m.weight)
+
+--- expect same as reference
 
 --- query
 query maximum_f32_widens_only_after_finalization($bound: F64) {
@@ -360,6 +392,8 @@ block aggregate max($m.weight): max(F32?) extremum error -> F32?
 cast max($m.weight): F32? -> F64?
 no cast $bound
 
+--- expect same as reference
+
 --- query
 query count_over_a_node_is_row_count($bound: U64) {
     match {
@@ -379,3 +413,5 @@ n.slug: String
 type count: I64
 cast count: I64 -> exact_integer
 cast $bound: U64 -> exact_integer
+
+--- expect same as reference

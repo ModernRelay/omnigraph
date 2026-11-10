@@ -19,6 +19,9 @@ futures = { workspace = true }
 object_store = { workspace = true }
 omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.15.1" }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1" }
+# The core reference interpreter `--- expect same as reference` compares
+# against; GQT is its one caller.
+omnigraph-reference = { path = "../omnigraph-reference" }
 serde_json = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }

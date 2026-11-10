@@ -1,5 +1,63 @@
 use super::*;
 
+const HDR: &str = "# issue: none\n";
+const TRAVERSAL_SCHEMA: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Person {\n    name: String @key\n}\n\n\
+                                edge Knows: Person -> Person {\n    since: I64\n}\n";
+const TRAVERSAL_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n\
+                              {\"type\":\"Person\",\"data\":{\"name\":\"bob\"}}\n\
+                              {\"edge\":\"Knows\",\"id\":\"k-1\",\"from\":\"alice\",\"to\":\"bob\",\"data\":{\"since\":2020}}\n";
+
+/// Every read position of an edge's `@type`, which the engine and the
+/// reference both answer, passes the comparison end to end.
+#[tokio::test]
+async fn reference_comparison_answers_named_type_access_in_every_read_position() {
+    for (clauses, returns, order, rows, shape) in [
+        (
+            "$a: Person $a $e:knows $b",
+            "$e.@type as kind",
+            "",
+            "{\"kind\":\"Knows\"}",
+            "kind: String",
+        ),
+        (
+            "$a: Person $a $e:knows $b $e.@type = \"Knows\"",
+            "$b.name as name",
+            "",
+            "{\"name\":\"bob\"}",
+            "name: String",
+        ),
+        (
+            "$a: Person $a $e:knows $b",
+            "count($e.@type) as n",
+            "",
+            "{\"n\":1}",
+            "n: I64",
+        ),
+        (
+            "$a: Person $a $e:knows $b",
+            "$b.name as name",
+            "order { $e.@type }",
+            "{\"name\":\"bob\"}",
+            "name: String",
+        ),
+        (
+            "$a: Person exists { $a $e:knows $b $e.@type = \"Knows\" }",
+            "$a.name as name",
+            "",
+            "{\"name\":\"alice\"}",
+            "name: String",
+        ),
+    ] {
+        let text = format!(
+            "{HDR}{TRAVERSAL_SCHEMA}{TRAVERSAL_SEED}--- query\nquery q() {{ match {{ {clauses} }} return {{ {returns} }} {order} }}\n--- expect unordered\n{rows}\n--- expect shape\n{shape}\n--- expect same as reference\n"
+        );
+        let case = parse_case("reference_type_access", &text).unwrap();
+        execute_case(&case, Path::new("unused.gqt"), false)
+            .await
+            .unwrap_or_else(|error| panic!("{clauses} / {returns}: {error}"));
+    }
+}
+
 #[tokio::test]
 async fn bounded_fails_a_case_over_its_budget() {
     let slow = run_bounded("slow", Duration::from_millis(50), async {

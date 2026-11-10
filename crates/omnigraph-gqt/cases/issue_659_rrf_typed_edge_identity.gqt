@@ -46,6 +46,8 @@ edge_id: String
 expand $p $q: selection alternation [Knows out, Likes out]
 rank fuse row tiebreak [$e.@type, $e.@id, $q.@id]
 
+--- expect same as reference
+
 --- query
 query fused_type_page() {
     match { let $all = { match { $p: Person } return { $p } }  from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60)
@@ -63,6 +65,8 @@ query fused_type_page() {
 --- expect shape
 edge_type: String
 edge_id: String
+
+--- expect same as reference
 
 --- query
 query fused_wildcard_type_page() {
@@ -86,3 +90,5 @@ edge_id: String
 --- expect plan
 expand $p $q: selection wildcard [Knows out, Likes out]
 rank fuse row tiebreak [$e.@type, $e.@id, $q.@id]
+
+--- expect same as reference

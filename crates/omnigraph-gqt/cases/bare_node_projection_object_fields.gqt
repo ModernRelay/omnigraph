@@ -44,6 +44,8 @@ p.embedding: Vector(2)?
 --- expect plan
 result columns [p: Person, p.embedding: Vector(2)?]
 
+--- expect same as reference
+
 --- query
 query zero_rows() {
     match { $p: Person { name: "nobody" } }
@@ -57,6 +59,8 @@ p: Person
 
 --- expect plan
 result columns [p: Person]
+
+--- expect same as reference
 
 --- query
 query count_alone() {
@@ -72,6 +76,8 @@ n: I64
 
 --- expect plan
 result columns [n: I64?]
+
+--- expect same as reference
 
 --- query
 query friends_per_person() {
@@ -93,6 +99,8 @@ friends: I64
 --- expect plan
 result columns [p: Person, friends: I64?]
 
+--- expect same as reference
+
 --- query
 query alias_ordered() {
     match { $p: Person }
@@ -110,6 +118,8 @@ person: Person
 
 --- expect plan
 result columns [person: Person]
+
+--- expect same as reference
 
 --- query
 query min_of_node() {

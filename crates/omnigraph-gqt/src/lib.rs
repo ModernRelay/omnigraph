@@ -83,6 +83,32 @@ impl ExecutionHost for GqtHost {
     fn measure_step_end(&self, ordinal: u64) {
         dst_runner::measure_step_end(ordinal);
     }
+    fn reference_rows<'a>(
+        &'a self,
+        session: &'a Session,
+        read: &'a omnigraph_compiler::ir::core::CoreRead,
+        branch: &'a str,
+        params: &'a omnigraph_compiler::ParamMap,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<Value>, String>> {
+        async move {
+            // The reference reads the branch's rows through the engine's
+            // export, the narrowest public read of a whole branch.
+            let export = session
+                .db()
+                .export_jsonl(branch, &[])
+                .await
+                .map_err(|e| format!("export failed: {e}"))?;
+            let catalog = session.catalog();
+            let graph = omnigraph_reference::Graph::from_export(&catalog, &export)
+                .map_err(|e| e.to_string())?;
+            let params = params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            omnigraph_reference::Interpreter::new(&catalog, &graph, &params)
+                .run(read)
+                .map(|(rows, _)| rows)
+                .map_err(|e| e.to_string())
+        }
+        .boxed()
+    }
     fn concurrent_step<'a>(
         &'a self,
         session: &'a Session,

@@ -44,6 +44,8 @@ label: String
 --- expect plan
 expand $p $d: selection alternation [OwnedBy in, Owns out]
 
+--- expect same as reference
+
 --- query
 query cross_type_wildcard() {
     match { $p: Person { name: "p" } $d: Doc $p $e:* $d }
@@ -58,6 +60,8 @@ query cross_type_wildcard() {
 destination: String
 edge_type: String
 
+--- expect same as reference
+
 --- query
 query distinct_cross_type_destination() {
     match { $p: Person { name: "p" } $p (owns | ownedBy) $d }
@@ -69,6 +73,8 @@ query distinct_cross_type_destination() {
 
 --- expect shape
 destination: String
+
+--- expect same as reference
 
 --- query
 query incompatible_common_property() {
@@ -100,6 +106,8 @@ destination: String
 edge_type: String
 edge_id: String
 
+--- expect same as reference
+
 --- query
 query correlated_common_string_argument() {
     match { $p: Person count(contains($e.label, "own")) { $p $e:(owns | ownedBy) $d } = 2 }
@@ -111,3 +119,5 @@ query correlated_common_string_argument() {
 
 --- expect shape
 name: String
+
+--- expect same as reference

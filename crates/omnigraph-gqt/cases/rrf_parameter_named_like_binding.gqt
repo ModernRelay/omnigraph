@@ -47,3 +47,5 @@ query fused_v2($q: Vector(4), $t: String) {
 
 --- expect shape
 d.slug: String
+
+--- expect same as reference

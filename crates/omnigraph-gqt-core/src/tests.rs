@@ -1181,6 +1181,95 @@ fn refuses_ok_expect_on_a_query_step() {
     assert!(refusal("x", &text).contains("a query step takes"));
 }
 
+const SAME: &str = "--- expect same as reference\n";
+
+#[test]
+fn same_as_reference_follows_a_query_steps_shape_or_plan() {
+    let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{QUERY}{EXPECT}");
+    let case = parse_case("x", &text).unwrap();
+    let flags: Vec<bool> = case
+        .items
+        .iter()
+        .map(|item| match item {
+            Item::Step(Step::Query(step)) => step.same_as_reference,
+            other => panic!("expected query steps, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(flags, [true, false]);
+    let after_plan = format!(
+        "{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- expect plan\nscan Person as $p: no filter\n{SAME}"
+    );
+    let case = parse_case("x", &after_plan).unwrap();
+    let Some(Item::Step(Step::Query(step))) = case.items.first() else {
+        panic!("first item is the query step");
+    };
+    assert!(step.same_as_reference && step.plan.is_some());
+}
+
+#[test]
+fn same_as_reference_is_refused_off_a_query_rows_expect() {
+    for text in [
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{SAME}"),
+        format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{SAME}"),
+    ] {
+        let refused = refusal("x", &text);
+        assert!(
+            refused.starts_with("invalid_case: ") && refused.contains("refused on a mutate step"),
+            "{refused}"
+        );
+    }
+    let rows = "--- expect unordered\n{\"p.name\": \"alice\"}\n";
+    for (text, needle) in [
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{SAME}{SHAPE}"),
+            "must directly follow",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{rows}{SAME}{SHAPE}"),
+            "needs an `--- expect shape`",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect error: boom\n{SAME}"),
+            "must directly follow",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{SAME}"),
+            "must directly follow",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}{SAME}{{\"p.name\": \"alice\"}}\n"),
+            "carries no body",
+        ),
+        (
+            format!("{HDR}{SCHEMA}{SEED}{CREATE}{LIST}{SAME}"),
+            "only on a query declaration step",
+        ),
+    ] {
+        let refused = refusal("x", &text);
+        assert!(refused.contains(needle), "{needle}: {refused}");
+    }
+}
+
+#[test]
+fn same_as_reference_compares_as_the_rows_expect_compares() {
+    let a = serde_json::json!({"p.name": "alice"});
+    let b = serde_json::json!({"p.name": "bob"});
+    compare_with_reference(&[a.clone(), b.clone()], &[b.clone(), a.clone()], false).unwrap();
+    let moved =
+        compare_with_reference(&[a.clone(), b.clone()], &[b.clone(), a.clone()], true).unwrap_err();
+    assert!(
+        moved.contains(
+            "the engine and the reference disagree (expected = reference, actual = engine)"
+        ),
+        "{moved}"
+    );
+    let missing = compare_with_reference(&[a.clone(), b], &[a], false).unwrap_err();
+    assert!(
+        missing.contains("reference: [") && missing.contains("engine: [{\"p.name\":\"alice\"}]"),
+        "{missing}"
+    );
+}
+
 #[test]
 fn refuses_query_step_without_expect() {
     let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}");

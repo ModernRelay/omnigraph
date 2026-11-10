@@ -93,7 +93,7 @@ the served and skipped cases and refuses an empty served set. A declared
 runner implements it. The declared `storage` is recorded, not checked: no
 route reports the server's backend. Refused before any request, by name: `--- restart`,
 `--- concurrent`, seam directives, settings steps and settings prefixes on a
-control or `show` step, `--- expect plan`, the
+control or `show` step, `--- expect plan`, `--- expect same as reference`, the
 `# traversal:` pin, and queries that need indices (`search`, `fuzzy`,
 `nearest`, `rrf`). The `--- expect shape` section is not judged under a
 server target: it holds the executor's Arrow schema against the compiler's,
@@ -802,6 +802,42 @@ load validate edge_ri edge:Knows to Person: access probe
 load write: overwrite fragments
 load executed: partitions 1 rows 2
 ```
+
+## Reference comparison
+
+A query step may end with `--- expect same as reference`, directly after its
+`--- expect shape` or `--- expect plan`; the section has no body. The runner
+checks the step's query to its core IR again, evaluates it with the core
+reference interpreter (`omnigraph_reference::Interpreter`, the crate
+`omnigraph-reference`) over the same branch's rows, read through the engine's
+export, and compares those rows with the engine's, ordered or unordered as the
+step's `--- expect` says. The step's own rows expect still applies; the
+comparison is added to it.
+
+```text
+--- expect unordered
+--- expect shape
+p.name: String
+--- expect same as reference
+```
+
+The interpreter evaluates each core operator of the RFC's operator table
+directly: nested loops, whole-table reads, no index, planner or cost model. A
+reference refusal or a row difference fails the step, and the failure prints
+both row sets. The section is refused on a mutate step, an error expect,
+`show` and `branch list`, and at run time on a `snapshot:` target, since the
+reference reads a branch. The DST runner skips the comparison, and an
+executor other than the GQT runner refuses the case.
+
+The interpreter does not model the engine's text analyzer: it splits text into
+lowercase alphanumeric tokens, with no stemming or stop words, and scores
+`bm25` in `F64` before rounding to `F32`. A step whose rows depend on the
+analyzer (a `fuzzy` match, a `bm25` order between documents the analyzer
+would tie, a projected score's last digits) carries no `expect same as
+reference`. It compares a `DateTime` as written, so a step that equates
+spellings with different offsets carries none either. The interpreter follows
+the RFC, not the engine: when the RFC's semantics change, it changes in the
+same pull request.
 
 ## Run and reproduce
 

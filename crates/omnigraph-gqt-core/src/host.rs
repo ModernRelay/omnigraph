@@ -7,12 +7,13 @@ use omnigraph::Session;
 use omnigraph::db::Omnigraph;
 use omnigraph::error::OmniError;
 use omnigraph::storage::StorageAdapter;
-use omnigraph_compiler::QueryResult;
+use omnigraph_compiler::ir::core::CoreRead;
+use omnigraph_compiler::{ParamMap, QueryResult};
 use serde_json::Value;
 
 use crate::concurrent::ConcurrentStep;
 use crate::runner_config::SeamDirective;
-use crate::{Case, Step, StepFail};
+use crate::{Case, Item, Step, StepFail};
 
 /// Runner-owned observation and execution facilities around ordinary GQT steps.
 pub trait ExecutionHost: Sync {
@@ -22,6 +23,20 @@ pub trait ExecutionHost: Sync {
         if case.needs_dst() {
             return Err(
                 "unsupported_environment: this executor cannot run seams or concurrent blocks"
+                    .into(),
+            );
+        }
+        if case.items.iter().any(|item| {
+            let steps = match item {
+                Item::Step(step) => std::slice::from_ref(step),
+                Item::Loop { steps, .. } => steps,
+            };
+            steps
+                .iter()
+                .any(|step| matches!(step, Step::Query(query) if query.same_as_reference))
+        }) {
+            return Err(
+                "unsupported_environment: this executor cannot compare the reference interpreter"
                     .into(),
             );
         }
@@ -67,6 +82,21 @@ pub trait ExecutionHost: Sync {
                 None => Omnigraph::open(uri).await,
             }
         }
+        .boxed()
+    }
+
+    /// The rows the core reference interpreter returns for `read` over
+    /// `branch` of the case session, for `--- expect same as reference`.
+    fn reference_rows<'a>(
+        &'a self,
+        _session: &'a Session,
+        _read: &'a CoreRead,
+        _branch: &'a str,
+        _params: &'a ParamMap,
+    ) -> BoxFuture<'a, Result<Vec<Value>, String>> {
+        futures::future::ready(Err(
+            "unsupported_environment: reference comparison requires the GQT runner".into(),
+        ))
         .boxed()
     }
 

@@ -29,3 +29,5 @@ query folded_inline_match() {
 
 --- expect shape
 p.slug: String
+
+--- expect same as reference

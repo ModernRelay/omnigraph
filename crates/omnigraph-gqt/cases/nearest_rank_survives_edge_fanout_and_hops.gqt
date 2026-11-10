@@ -57,6 +57,8 @@ query nearest_edges($q: Vector(4)) {
 d.slug: String
 w.label: String
 
+--- expect same as reference
+
 --- query
 query nearest_hops($q: Vector(4)) {
     match { from nearest({ match {
@@ -78,3 +80,5 @@ query nearest_hops($q: Vector(4)) {
 --- expect shape
 d.slug: String
 target.slug: String
+
+--- expect same as reference

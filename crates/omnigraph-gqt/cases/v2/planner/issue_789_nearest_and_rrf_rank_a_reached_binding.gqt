@@ -57,6 +57,8 @@ query nearest_on_an_undeclared_destination($q: Vector(2)) {
 d.slug: String
 --- expect plan
 scan Doc as $d: ranked nearest fetch 1
+
+--- expect same as reference
 --- query
 query nearest_on_a_destination_declared_second($q: Vector(2)) {
     match { from nearest({ match {
@@ -77,6 +79,8 @@ query nearest_on_a_destination_declared_second($q: Vector(2)) {
 d.slug: String
 --- expect plan
 scan Doc as $d: ranked nearest fetch 2
+
+--- expect same as reference
 --- query
 query rrf_over_one_destination($q: Vector(2)) {
     match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 2), bm25($all, $d.body, "needle"), k: 60)
@@ -93,6 +97,8 @@ query rrf_over_one_destination($q: Vector(2)) {
 {"d.slug":"d1"}
 --- expect shape
 d.slug: String
+
+--- expect same as reference
 --- query
 query nearest_from_a_source_with_no_edges($q: Vector(2)) {
     match { from nearest({ match {
@@ -109,3 +115,5 @@ query nearest_from_a_source_with_no_edges($q: Vector(2)) {
 
 --- expect shape
 d.slug: String
+
+--- expect same as reference

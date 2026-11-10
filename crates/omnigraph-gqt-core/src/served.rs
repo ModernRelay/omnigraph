@@ -89,6 +89,9 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
                 if query.plan.is_some() {
                     refused.push(format!("step {ordinal} (expect plan)"));
                 }
+                if query.same_as_reference {
+                    refused.push(format!("step {ordinal} (expect same as reference)"));
+                }
             }
             Step::Control(control) => {
                 if !control.prefix.is_empty() {

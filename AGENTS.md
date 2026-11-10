@@ -44,7 +44,8 @@ Tools that support `@` imports include these automatically:
   skill in the CLI and MCP), `omnigraph-mcp` (MCP protocol and catalog), server,
   Azure admission wrapper, benchmark harness,
   `omnigraph-gqt` (the `.gqt` logic-test corpus and its runner; one libtest
-  test per case), and `omnigraph-dst` (deterministic simulation testing; needs
+  test per case), `omnigraph-reference` (the core IR's reference
+  interpreter, which GQT compares query rows against), and `omnigraph-dst` (deterministic simulation testing; needs
   `--cfg tokio_unstable`, set by the workspace `.cargo/config.toml` for every
   build — the workspace test gate excludes the crate by name)
 - License: MIT
@@ -211,6 +212,10 @@ Set `OMNIGRAPH_UPDATE_OPENAPI=1` only when the drift is intentional.
   `.github/workflows/tests-slow-nightly.yml`, the nightly job that runs them
   with `--run-ignored only` and refuses a run in which an enrolled name did
   not pass.
+- `crates/omnigraph-reference` evaluates the core IR as the RFC's operator
+  table states it; GQT's `--- expect same as reference` compares a query
+  step's rows with it. It is not frozen: a change to core semantics updates it
+  in the same pull request, and a disagreement is a bug in one of the two.
 - A change to what an operation reads or writes in storage adds or updates
   its row in the DST storage-cost golden,
   `crates/omnigraph-dst/cost_table.txt`, and the pull request explains every

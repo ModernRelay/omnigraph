@@ -251,6 +251,10 @@ pub struct QueryStep {
     /// The `--- expect plan` section, checked against the engine's explain
     /// document before the rows.
     plan: Option<PlanExpect>,
+    /// `--- expect same as reference`: the rows must also equal the core
+    /// reference interpreter's rows for the same query, compared as the
+    /// step's `expect` compares.
+    same_as_reference: bool,
 }
 
 #[derive(Debug)]
@@ -1756,6 +1760,37 @@ fn complete_merge_expect(
     )?))
 }
 
+/// The expect word that adds the reference comparison to a query step's
+/// rows expect.
+const SAME_AS_REFERENCE: &str = "same as reference";
+
+/// Why a `--- expect same as reference` section has no step to attach to; a
+/// mutate step, pending or just completed, gets its own refusal.
+fn same_as_reference_misplaced(
+    line: usize,
+    pending: Option<&Pending>,
+    items: &[Item],
+    open_loop: Option<&(String, Vec<String>, Vec<Step>)>,
+) -> String {
+    let last = match open_loop {
+        Some((_, _, steps)) => steps.last(),
+        None => match items.last() {
+            Some(Item::Step(step)) => Some(step),
+            Some(Item::Loop { .. }) | None => None,
+        },
+    };
+    let on_mutate = matches!(pending, Some(Pending::Decl(step)) if step.is_mutation)
+        || (pending.is_none() && matches!(last, Some(Step::Mutate(_))));
+    if on_mutate {
+        return format!(
+            "invalid_case: line {line}: `--- expect same as reference` is refused on a mutate step; the reference interpreter only reads, and a mutation returns no rows to compare"
+        );
+    }
+    format!(
+        "line {line}: `--- expect same as reference` must directly follow a query step's `--- expect shape` or `--- expect plan`; it adds the reference comparison to the step's own rows expect"
+    )
+}
+
 /// The step a control write becomes under `mode`.
 fn complete_control_step(
     ordinal: usize,
@@ -1859,6 +1894,7 @@ fn complete_decl_step(
                 decl: step.decl,
                 params_raw: step.params_raw,
                 expects_expand: step.expects_expand,
+                same_as_reference: false,
                 expect: rows_expect(ordered, section, loop_var)?,
                 plan: None,
             }))
@@ -1891,6 +1927,7 @@ fn complete_decl_step(
                     decl: step.decl,
                     params_raw: step.params_raw,
                     expects_expand: step.expects_expand,
+                    same_as_reference: false,
                     expect: QueryExpect::Error { needle },
                     plan: None,
                 })
@@ -1992,6 +2029,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
     let mut pending: Option<Pending> = None;
     let mut awaiting_shape: Option<Step> = None;
     let mut awaiting_plan: Option<Step> = None;
+    let mut awaiting_same_as_reference: Option<Step> = None;
     let mut awaiting_load_plan = false;
     let mut ordinal = 0usize;
     let mut seams = BTreeMap::new();
@@ -2054,7 +2092,13 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         if expect_word != "plan" {
             awaiting_load_plan = false;
         }
-        if let Some(step) = awaiting_plan.take_if(|_| expect_word != "plan") {
+        if let Some(step) =
+            awaiting_plan.take_if(|_| !matches!(expect_word, "plan" | SAME_AS_REFERENCE))
+        {
+            push_step(&mut items, &mut open_loop, step);
+        }
+        if let Some(step) = awaiting_same_as_reference.take_if(|_| expect_word != SAME_AS_REFERENCE)
+        {
             push_step(&mut items, &mut open_loop, step);
         }
         if awaiting_seam_step && !matches!(kind, "mutate" | "load" | "seam") {
@@ -2674,6 +2718,29 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     };
                     query.plan = Some(PlanExpect { lines });
+                    awaiting_same_as_reference = Some(step);
+                    continue;
+                }
+                if rest.trim() == SAME_AS_REFERENCE {
+                    let line = section.header_line + 1;
+                    refuse_nonempty_body(&section.body, "an `expect same as reference` section")?;
+                    let Some(mut step) = awaiting_plan
+                        .take()
+                        .or_else(|| awaiting_same_as_reference.take())
+                    else {
+                        return Err(same_as_reference_misplaced(
+                            line,
+                            pending.as_ref(),
+                            &items,
+                            open_loop.as_ref(),
+                        ));
+                    };
+                    let Step::Query(query) = &mut step else {
+                        return Err(format!(
+                            "line {line}: `--- expect same as reference` is supported only on a query declaration step"
+                        ));
+                    };
+                    query.same_as_reference = true;
                     push_step(&mut items, &mut open_loop, step);
                     continue;
                 }
@@ -2854,7 +2921,10 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         return Err("the final step is missing its `--- expect`".into());
     }
     settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
-    if let Some(step) = awaiting_plan.take() {
+    if let Some(step) = awaiting_plan
+        .take()
+        .or_else(|| awaiting_same_as_reference.take())
+    {
         push_step(&mut items, &mut open_loop, step);
     }
     if open_loop.is_some() {
@@ -3563,12 +3633,79 @@ async fn run_query_step(
             if let Some(drift) = drift {
                 return Err(fail(drift));
             }
-            check_rows(host, &label, &result, *ordered, body_raw, *span, binding)
+            check_rows(host, &label, &result, *ordered, body_raw, *span, binding)?;
+            if step.same_as_reference && !host.active() {
+                check_same_as_reference(host, session, step, &target, &params, &result, *ordered)
+                    .await
+                    .map_err(&fail)?;
+            }
+            Ok(())
         }
         QueryExpect::Error { needle } => {
             check_error_expect(host, needle, outcome, "the query succeeded").map_err(fail)
         }
     }
+}
+
+/// `--- expect same as reference`: the step's query evaluated by the core
+/// reference interpreter over the same branch; a refusal of either kind or a
+/// row difference fails the step.
+async fn check_same_as_reference(
+    host: &impl ExecutionHost,
+    session: &Session,
+    step: &QueryStep,
+    target: &ReadTarget,
+    params: &omnigraph_compiler::ParamMap,
+    engine: &QueryResult,
+    ordered: bool,
+) -> Result<(), String> {
+    let ReadTarget::Branch(branch) = target else {
+        return Err(
+            "expect same as reference: the reference reads a branch, not a snapshot".into(),
+        );
+    };
+    let catalog = session.catalog();
+    let CoreDecl::Read(read) = check_query_decl(&catalog, &step.decl)
+        .map_err(|e| format!("expect same as reference: {e}"))?
+    else {
+        return Err("expect same as reference: the step is a write".into());
+    };
+    let reference = host
+        .reference_rows(session, &read, branch, params)
+        .await
+        .map_err(|e| {
+            format!(
+                "expect same as reference: the engine returned rows, the reference refused: {e}"
+            )
+        })?;
+    let actual = match engine.to_rust_json() {
+        Ok(Value::Array(rows)) => rows,
+        Ok(_) => {
+            return Err("expect same as reference: the engine returned a non-array row set".into());
+        }
+        Err(e) => {
+            return Err(format!(
+                "expect same as reference: rows failed to render as JSON: {e}"
+            ));
+        }
+    };
+    compare_with_reference(&reference, &actual, ordered)
+}
+
+/// The reference's rows against the engine's, ordered or as bags; a
+/// difference names both row sets.
+fn compare_with_reference(
+    reference: &[Value],
+    engine: &[Value],
+    ordered: bool,
+) -> Result<(), String> {
+    compare_rows(reference, engine, ordered).map_err(|(message, _)| {
+        format!(
+            "expect same as reference: the engine and the reference disagree (expected = reference, actual = engine): {message}\nreference: {}\nengine: {}",
+            Value::Array(reference.to_vec()),
+            Value::Array(engine.to_vec())
+        )
+    })
 }
 
 /// Compares the executed rows with the expect body; a mismatch carries the

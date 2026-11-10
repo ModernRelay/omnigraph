@@ -5835,6 +5835,7 @@ dependencies = [
  "omnigraph-dst",
  "omnigraph-engine",
  "omnigraph-gqt-core",
+ "omnigraph-reference",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5920,6 +5921,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "yaml_serde",
+]
+
+[[package]]
+name = "omnigraph-reference"
+version = "0.15.1"
+dependencies = [
+ "omnigraph-compiler",
+ "serde_json",
 ]
 
 [[package]]
