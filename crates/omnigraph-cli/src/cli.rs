@@ -227,16 +227,19 @@ pub(crate) enum Command {
     /// discovers or hosts a server. stdout carries only MCP messages and
     /// diagnostics go to stderr.
     Mcp(McpArgs),
-    /// Open OmniGraph Studio on an existing server target, print its link
-    /// and exit.
+    /// Open OmniGraph Studio on an existing server target or managed cluster
+    /// target, print its link and exit.
     ///
-    /// The `omnigraph-studio://open` link names the target, `--graph` when
-    /// given, and digests of the target's binding and of this operator home,
-    /// which Studio checks against its own resolution of the target. It
-    /// carries no secret and acquires no credential. Direct and managed
-    /// targets refuse. Without Studio, or anything on this platform that
-    /// handles its links, it prints the link and refuses with
-    /// `studio_unavailable`; it never opens a browser.
+    /// For a server target the `omnigraph-studio://open` link names the
+    /// target, `--graph` when given, and digests of the target's binding and
+    /// of this operator home, which Studio checks against its own resolution
+    /// of the target. For a managed cluster target it identifies the cluster:
+    /// the control plane, the organization, and the cluster's ID and
+    /// incarnation, which Studio opens with its own sign-in. It carries no
+    /// secret and acquires no credential. Direct targets refuse. Without
+    /// Studio, or anything on this platform that handles its links, it prints
+    /// the link and refuses with `studio_unavailable`; it never opens a
+    /// browser.
     Studio(StudioArgs),
     #[command(
         about = "Validate operator configuration, rename bindings, or recover interrupted edits"

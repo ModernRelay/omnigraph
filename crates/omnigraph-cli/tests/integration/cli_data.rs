@@ -6058,7 +6058,9 @@ impl FakeOpeners {
 /// desktops the link goes to the program Studio's registered desktop entry
 /// runs, never to `xdg-open`, so a browser on `PATH` cannot stand in for
 /// Studio. Without anything that opens Studio's links it prints the link and
-/// refuses with `studio_unavailable`. Direct and managed targets refuse
+/// refuses with `studio_unavailable`. A managed cluster target opens by its
+/// identity, read from the operator configuration: no control plane or data
+/// endpoint is contacted and no sign-in is read. Direct targets refuse
 /// before the platform is asked or any endpoint contacted.
 #[cfg(unix)]
 #[test]
@@ -6196,8 +6198,30 @@ fn studio_opens_a_server_target_whose_digests_target_inspect_reports() {
         }
     }
 
+    // A managed cluster target is identified, not named: the profile's
+    // control plane and organization, the cluster and its incarnation, and
+    // the target's default graph unless `--graph` names another. The link
+    // has no target or digest, since Studio reaches the cluster itself.
+    let api = endpoint.replace("://", ":%2F%2F");
+    for (graph, opens) in [(None, "knowledge"), (Some("notes"), "notes")] {
+        let mut args = vec!["--target", "managed", "--json"];
+        if let Some(graph) = graph {
+            args.extend(["--graph", graph]);
+        }
+        let report = parse_stdout_json(&output_success(&mut installed.studio(home, &args)));
+        let link = format!(
+            "omnigraph-studio://open?api={api}&organization=org&cluster=c&incarnation=i&graph={opens}"
+        );
+        assert_eq!(
+            report,
+            json!({"protocol": 1, "target": "managed", "api": endpoint, "organization": "org",
+                   "cluster": "c", "incarnation": "i", "link": link})
+        );
+        opened(&installed, &link);
+    }
+
     let inline = absent.join("inline.omni");
-    for target in ["scratch", "managed", inline.to_str().unwrap()] {
+    for target in ["scratch", inline.to_str().unwrap()] {
         let output = installed
             .studio(home, &["--target", target, "--json"])
             .output()

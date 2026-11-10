@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-16
-updated: 2026-10-31
+updated: 2026-11-10
 discussion: https://github.com/ModernRelay/omnigraph/pull/1017
 supersedes: []
 superseded_by: []
@@ -239,7 +239,7 @@ explicit cluster deployment workflow; this RFC creates no shortcut around it.
 | Server with a token owner | Opens Studio on that server | Relays to its `/mcp` with the owner's token | Returns the owner's token |
 | Server with anonymous access | Opens Studio on that server | Relays without a token | Refused (`credential_anonymous`) |
 | Server on a Unix socket | Refused (`studio_transport_unsupported`): Studio's client speaks TCP | Relays over the socket | Returns the owner's token if authenticated |
-| Managed cluster | Deferred to [A2](#a2-oauth-for-standard-clients-and-managed-access) | Deferred to [A3](#a3-mcp-relay-for-managed-targets) | Refused: managed credentials stay the CLI's |
+| Managed cluster | Opens Studio on that cluster by its identity; Studio reaches it as its own OAuth client ([A2](#a2-oauth-for-standard-clients-and-managed-access)) | Deferred to [A3](#a3-mcp-relay-for-managed-targets) | Refused: managed credentials stay the CLI's |
 | Managed account | Refused | Refused | Refused |
 
 Unsupported kinds refuse with `target_kind_unsupported`; the dedicated
@@ -490,10 +490,12 @@ Studio's spec 012 lists this as E15.
 ### Opening Studio
 
 `omnigraph studio --target NAME [--graph G]` validates the target, opens
-`omnigraph-studio://open?target=NAME&binding=<digest>&home=<digest>[&graph=G]`,
-prints the link and exits, as `codex app` opens the Codex app. It owns nothing
-at runtime, so its one contract with Studio is the link format, which Studio
-owns.
+`omnigraph-studio://open?target=NAME&binding=<digest>&home=<digest>[&graph=G]`
+for a server target, or
+`omnigraph-studio://open?api=<origin>&organization=<id>&cluster=<id>&incarnation=<id>[&graph=G]`
+for a managed cluster target, prints the link and exits, as `codex app` opens
+the Codex app. It owns nothing at runtime, so its one contract with Studio is
+the link format, which Studio owns.
 
 - On macOS it opens Studio by bundle identifier (`open -b`). On Linux and
   Windows it opens the link only when the platform names a handler for the
@@ -521,6 +523,19 @@ owns.
 - Studio accepts an existing server target and obtains its static credential
   through `omnigraph credential get` when authentication is configured. It
   never opens graph storage or starts a server, and a direct target refuses.
+- **A managed cluster target is identified, not named.** Its link carries the
+  control plane's origin, the organization, and the cluster's ID and
+  incarnation, as the operator configuration records them, and the target's
+  `default_graph` when `--graph` names none. It has no `target`, `binding` or
+  `home`: Studio does not resolve a managed target through the CLI. It opens
+  the cluster through a control plane it already knows, as its own OAuth
+  client ([A2](#a2-oauth-for-standard-clients-and-managed-access)), and only
+  when that control plane lists a cluster with this ID and incarnation in the
+  organization. The launcher sends no request and reads no credential for
+  either form, so it checks nothing against the control plane. A managed
+  account, which names no cluster, still refuses. Both forms are protocol 1:
+  the managed form is produced only where the launcher refused before, and a
+  Studio that predates it refuses a link without a `target`.
 - A link opens without executing a write, as Studio's own link rules require.
   Write affordances follow the server's access response and the person's
   explicit action; opening a link grants no authority or server mode.
@@ -1168,7 +1183,7 @@ repositories' changes are listed as dependencies, made and reviewed there.
 |---|---|
 | Choosing the CLI | Check the target, credential and Studio-link protocols needed for client commands. The server owns storage compatibility; Studio never selects a local engine or executable named by a link. |
 | Server connections | Use an existing configured server endpoint. Do not open storage, start a server, generate its policy or token, or keep a local-server registry. |
-| Links and saved state | Validate the target binding and operator-home digest; links do not execute writes. Keep saved state keyed by the validated target binding and graph. Register and dispatch the link scheme on supported platforms. |
+| Links and saved state | Validate a server link's target binding and operator-home digest, and check a managed cluster link against what the control plane answers for that cluster in its organization; links do not execute writes. Keep saved state keyed by the validated target binding and graph. A window on a managed cluster saves the cluster's identity with its graph and reopens it through the control plane; that is the window's state, not a server list, since the control plane still lists the clusters and issues every token. Register and dispatch the link scheme on supported platforms. |
 | Configuration | Replace duplicate operator-config and credential parsing with the CLI's target and credential contracts. Migrate existing keychain server entries through the owning CLI once. |
 | Static tokens | Obtain with `credential get --json`, keep in memory, send only within the returned endpoint scope, and refresh on 401 without replaying uncertain writes. |
 | Access and failures | Show actions allowed by the access response; interpret `code` and disposition, and never replay an unknown write. |
@@ -1307,9 +1322,9 @@ reachable through every deployment's proxy. Studio would implement the client.
 **Interim exception for Studio.** Until the managed control plane enables that
 resource profile and registers Studio, and Studio implements this client,
 Studio may reach a managed cluster with the CLI's data token for it. The
-launcher stays refused (the target table's "Deferred to A2" and Opening
-Studio): Studio uses the token only after a person selects a managed target
-inside Studio. It takes the token from `omnigraph credentials export --target
+launcher's managed link (Opening Studio) hands Studio no credential and is
+not part of this exception: Studio uses the token only after a person selects
+a managed target inside Studio. It takes the token from `omnigraph credentials export --target
 NAME`, the one credential command that accepts a managed target, which writes
 only to a Unix FIFO and never starts an interactive login. Export returns the
 CLI's cached data token while it validates and asks the issuer for a new one
@@ -1613,3 +1628,16 @@ proposal.
   exception table for served cluster roots and stays there for direct
   targets. The other commands in that row are unchanged. The table stands
   unchanged until acceptance.
+- 2026-11-10: The launcher opens a managed cluster target. The managed
+  control plane accepts Studio as a standard OAuth client and Studio signs in
+  to it as one, which is what A2 waited on, so `omnigraph studio` no longer
+  refuses the target: it emits a second link form that identifies the cluster
+  (control plane, organization, cluster ID, incarnation) instead of naming a
+  target for Studio to resolve through the CLI. The form is an addition within
+  `protocols.studio` 1. Superseded sentences: the target table's "Managed
+  cluster" `studio` cell, "Deferred to A2"; Opening Studio's opening sentence,
+  which named one link form; A2's "The launcher stays refused (the target
+  table's "Deferred to A2" and Opening Studio)"; and the 2026-10-25 entry's
+  "the launcher's refusal of a managed target (the target table and Opening
+  Studio) is unchanged". A managed account still refuses, and A3, the MCP
+  relay's managed row, is unchanged.

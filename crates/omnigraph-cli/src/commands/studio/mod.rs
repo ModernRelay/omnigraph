@@ -1,13 +1,23 @@
-//! `omnigraph studio`: open OmniGraph Studio on an existing server target.
+//! `omnigraph studio`: open OmniGraph Studio on an existing server target or
+//! managed cluster target.
 //!
 //! The command validates the target, builds one `omnigraph-studio://open`
 //! link, hands it to the platform and exits; it owns nothing at runtime and
-//! sends no request. The link names the target, the graph `--graph` chose,
-//! and the digests of the target's binding and of the operator home
-//! ([`crate::target_identity`]). Studio resolves the target itself through the
-//! CLI, whose `target inspect --json` reports the same digests, and refuses a
-//! link that disagrees with its own resolution. A link carries no secret,
-//! never names a path or an executable, and opening one runs no write.
+//! sends no request. The link has one of two forms:
+//!
+//! - **A server target** is named: the target, the graph `--graph` chose,
+//!   and the digests of the target's binding and of the operator home
+//!   ([`crate::target_identity`]). Studio resolves the target itself through
+//!   the CLI, whose `target inspect --json` reports the same digests, and
+//!   refuses a link that disagrees with its own resolution.
+//! - **A managed cluster target** is identified: the control plane's origin,
+//!   the organization, and the cluster's ID and incarnation, all from the
+//!   operator configuration. Studio reaches the cluster with its own sign-in
+//!   to that control plane, so the link names no target and carries no
+//!   digest.
+//!
+//! A link carries no secret, never names a path or an executable, and opening
+//! one runs no write.
 
 mod args;
 mod desktop;
@@ -39,12 +49,41 @@ pub(crate) struct StudioScope<'a> {
 
 /// One validated link and the facts it was built from: `studio --json`.
 #[derive(Debug, Serialize)]
-struct StudioLink {
-    protocol: u32,
-    target: String,
-    binding: String,
-    home: String,
-    link: String,
+#[serde(untagged)]
+enum StudioLink {
+    /// A server target, by name, with the digests Studio checks.
+    Server {
+        protocol: u32,
+        target: String,
+        binding: String,
+        home: String,
+        link: String,
+    },
+    /// A managed cluster, by identity. `target` is the name this invocation
+    /// resolved; the link does not carry it.
+    Cluster {
+        protocol: u32,
+        target: String,
+        api: String,
+        organization: String,
+        cluster: String,
+        incarnation: String,
+        link: String,
+    },
+}
+
+impl StudioLink {
+    fn link(&self) -> &str {
+        match self {
+            Self::Server { link, .. } | Self::Cluster { link, .. } => link,
+        }
+    }
+
+    fn target(&self) -> &str {
+        match self {
+            Self::Server { target, .. } | Self::Cluster { target, .. } => target,
+        }
+    }
 }
 
 pub(crate) fn run(
@@ -56,18 +95,46 @@ pub(crate) fn run(
     stderr: &mut dyn Write,
 ) -> Result<Completion> {
     let link = prepare(&scope)?;
-    let opening = open::open(&platform, &link.link, runner);
+    let opening = open::open(&platform, link.link(), runner);
     deliver(&link, args.json, opening, stdout, stderr)
 }
 
 fn prepare(scope: &StudioScope<'_>) -> Result<StudioLink> {
-    let TargetBinding::Server { endpoint, .. } = &scope.target.binding else {
+    match &scope.target.binding {
+        TargetBinding::Server { endpoint, .. } => server(scope, endpoint),
+        TargetBinding::Managed(binding) => cluster(scope, binding),
         // Applicability refused every other kind before resolution ended.
-        return Err(refusal(
-            "target_kind_unsupported",
-            "studio opens an existing server target",
-        ));
-    };
+        _ => Err(unsupported()),
+    }
+}
+
+fn unsupported() -> color_eyre::Report {
+    refusal(
+        "target_kind_unsupported",
+        "studio opens an existing server target or a managed cluster target",
+    )
+}
+
+/// The registered name the invocation resolved; an inline address has none.
+fn registered<'a>(scope: &StudioScope<'a>) -> Result<&'a String> {
+    match &scope.target.provenance {
+        TargetProvenance::Explicit { name } | TargetProvenance::Default { name } => Ok(name),
+        TargetProvenance::Inline { .. } => Err(refusal(
+            "target_invalid",
+            "a Studio link names a registered target; register this one with `omnigraph target add`",
+        )),
+    }
+}
+
+fn graph_segment(graph: Option<&str>) -> Result<()> {
+    if let Some(graph) = graph {
+        crate::helpers::require_graph_segment(graph)
+            .map_err(|error| refusal("target_incompatible", error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn server(scope: &StudioScope<'_>, endpoint: &str) -> Result<StudioLink> {
     if crate::graph_http::server_scheme(endpoint) == Some("unix") {
         return Err(refusal(
             "studio_transport_unsupported",
@@ -78,19 +145,8 @@ fn prepare(scope: &StudioScope<'_>) -> Result<StudioLink> {
             ),
         ));
     }
-    let name = match &scope.target.provenance {
-        TargetProvenance::Explicit { name } | TargetProvenance::Default { name } => name,
-        TargetProvenance::Inline { .. } => {
-            return Err(refusal(
-                "target_invalid",
-                "a Studio link names a registered target; register this one with `omnigraph target add`",
-            ));
-        }
-    };
-    if let Some(graph) = scope.graph {
-        crate::helpers::require_graph_segment(graph)
-            .map_err(|error| refusal("target_incompatible", error.to_string()))?;
-    }
+    let name = registered(scope)?;
+    graph_segment(scope.graph)?;
     let entry = scope
         .operator
         .get(&mut std::io::sink())?
@@ -103,19 +159,60 @@ fn prepare(scope: &StudioScope<'_>) -> Result<StudioLink> {
                 format!("unknown target '{name}'; register it with `omnigraph target add {name}`"),
             )
         })?;
-    let binding = crate::target_identity::binding_digest(entry)?.ok_or_else(|| {
-        refusal(
-            "target_kind_unsupported",
-            "studio opens an existing server target",
-        )
-    })?;
+    let binding = crate::target_identity::binding_digest(entry)?.ok_or_else(unsupported)?;
     let home = crate::target_identity::home_digest(scope.operator)?;
     let link = link(name, &binding, &home, scope.graph);
-    Ok(StudioLink {
+    Ok(StudioLink::Server {
         protocol: STUDIO_PROTOCOL,
         target: name.clone(),
         binding,
         home,
+        link,
+    })
+}
+
+/// A managed cluster target's link: its identity as the operator
+/// configuration records it. Nothing is resolved against the control plane
+/// here; Studio asks the control plane for this cluster itself, in this
+/// organization, and opens it when its incarnation is this one, or says why
+/// not. The link's graph
+/// is `--graph`, else the target's `default_graph`, else absent: unlike a
+/// server link, whose target Studio resolves through the CLI, this one gives
+/// Studio no target entry to read a default from.
+fn cluster(scope: &StudioScope<'_>, binding: &crate::managed::Binding) -> Result<StudioLink> {
+    let name = registered(scope)?;
+    let Some(cluster) = &binding.cluster else {
+        return Err(refusal(
+            "target_kind_unsupported",
+            "studio opens a managed cluster target, not a managed account; add the cluster \
+             with `omnigraph target add NAME --profile PROFILE --cluster CLUSTER_ID`",
+        ));
+    };
+    let organization = binding.organization_id.as_deref().ok_or_else(|| {
+        refusal(
+            "organization_required",
+            format!(
+                "target '{name}' names no organization, and a Studio link identifies a cluster \
+                 by its organization; complete the profile's organization_id"
+            ),
+        )
+    })?;
+    let graph = scope.graph.or(cluster.default_graph.as_deref());
+    graph_segment(graph)?;
+    let link = cluster_link(
+        &binding.api,
+        organization,
+        &cluster.cluster_id,
+        &cluster.cluster_incarnation,
+        graph,
+    );
+    Ok(StudioLink::Cluster {
+        protocol: STUDIO_PROTOCOL,
+        target: name.clone(),
+        api: binding.api.clone(),
+        organization: organization.to_owned(),
+        cluster: cluster.cluster_id.clone(),
+        incarnation: cluster.cluster_incarnation.clone(),
         link,
     })
 }
@@ -128,15 +225,40 @@ fn link(target: &str, binding: &str, home: &str, graph: Option<&str>) -> String 
         query_value(binding),
         query_value(home)
     );
+    push_graph(&mut link, graph);
+    link
+}
+
+/// `omnigraph-studio://open?api=ORIGIN&organization=ORG&cluster=ID&incarnation=ID[&graph=G]`.
+/// It has no `target`: a reader tells the two forms apart by that.
+fn cluster_link(
+    api: &str,
+    organization: &str,
+    cluster: &str,
+    incarnation: &str,
+    graph: Option<&str>,
+) -> String {
+    let mut link = format!(
+        "{SCHEME}://open?api={}&organization={}&cluster={}&incarnation={}",
+        query_value(api),
+        query_value(organization),
+        query_value(cluster),
+        query_value(incarnation)
+    );
+    push_graph(&mut link, graph);
+    link
+}
+
+fn push_graph(link: &mut String, graph: Option<&str>) {
     if let Some(graph) = graph {
         link.push_str("&graph=");
         link.push_str(&query_value(graph));
     }
-    link
 }
 
-/// Target names, graph ids and digests are already query-safe; anything else
-/// is percent-encoded, so no value can add a parameter.
+/// Target names, graph ids, digests and managed identifiers are already
+/// query-safe; anything else, such as the `/` of an origin, is
+/// percent-encoded, so no value can add a parameter.
 fn query_value(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -161,11 +283,11 @@ fn deliver(
             if json {
                 crate::output::write_json(link, stdout)?;
             } else {
-                writeln!(stdout, "{}", link.link)?;
+                writeln!(stdout, "{}", link.link())?;
                 writeln!(
                     stderr,
                     "opened OmniGraph Studio on target '{}'",
-                    link.target
+                    link.target()
                 )?;
             }
             return Ok(Completion::success());
@@ -181,13 +303,13 @@ fn deliver(
             &serde_json::json!({
                 "error": error,
                 "code": "studio_unavailable",
-                "link": link.link,
+                "link": link.link(),
                 "install": INSTALL_URL,
             }),
             stdout,
         )?;
     } else {
-        writeln!(stdout, "{}", link.link)?;
+        writeln!(stdout, "{}", link.link())?;
         writeln!(stderr, "{error}")?;
     }
     stdout.flush()?;
@@ -219,15 +341,51 @@ mod tests {
         assert_eq!(query_value("a&b=c/d e?#"), "a%26b%3Dc%2Fd%20e%3F%23");
     }
 
+    #[test]
+    fn a_cluster_link_identifies_the_cluster_and_names_no_target() {
+        assert_eq!(
+            cluster_link(
+                "https://platform.example.com",
+                "org_01",
+                "01CLUSTER",
+                "01INCARNATION",
+                None
+            ),
+            "omnigraph-studio://open?api=https:%2F%2Fplatform.example.com&organization=org_01\
+             &cluster=01CLUSTER&incarnation=01INCARNATION"
+        );
+        // A control plane under a path prefix keeps its route, encoded.
+        assert_eq!(
+            cluster_link(
+                "https://control.example.com/prefix",
+                "org_01",
+                "c",
+                "i",
+                Some("knowledge")
+            ),
+            "omnigraph-studio://open?api=https:%2F%2Fcontrol.example.com%2Fprefix\
+             &organization=org_01&cluster=c&incarnation=i&graph=knowledge"
+        );
+    }
+
     /// An operator home holding `targets`, and a target resolved from it.
     fn resolved(
         targets: &str,
         name: &str,
     ) -> (tempfile::TempDir, InvocationConfig, ResolvedTarget) {
+        resolved_from(&format!("targets:\n{targets}"), name)
+    }
+
+    /// An operator home holding the `version: 1` document's `sections`, and
+    /// a target resolved from it.
+    fn resolved_from(
+        sections: &str,
+        name: &str,
+    ) -> (tempfile::TempDir, InvocationConfig, ResolvedTarget) {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
             home.path().join("config.yaml"),
-            format!("version: 1\ntargets:\n{targets}"),
+            format!("version: 1\n{sections}"),
         )
         .unwrap();
         let input = InvocationConfig::at(Some(home.path().to_owned()), None);
@@ -243,6 +401,13 @@ mod tests {
     const STAGING: &str = "  staging:\n    kind: server\n    endpoint: https://graph.example.com\n    \
                            auth: {provider: token, source: {env: OG_STAGING_TOKEN}}\n    \
                            default_graph: knowledge\n";
+
+    /// A managed profile and a cluster target that uses it.
+    const MANAGED: &str = "profiles:\n  work:\n    api: https://control.example.com/prefix/\n    \
+                           organization_id: org_work\n    auth: {provider: omnigraph}\n\
+                           targets:\n  production:\n    kind: managed\n    profile: work\n    \
+                           cluster_id: 01CLUSTER\n    cluster_incarnation: 01INCARNATION\n    \
+                           endpoint: https://data.example.com\n    default_graph: knowledge\n";
 
     fn run_with(
         scope: StudioScope<'_>,
@@ -327,6 +492,101 @@ mod tests {
         assert!(stderr.contains("opened OmniGraph Studio"), "{stderr}");
     }
 
+    /// A managed cluster target opens by identity: the profile's control
+    /// plane and organization and the target's cluster, all read from the
+    /// operator configuration. The link names no target and carries no
+    /// digest, and the target's `default_graph` rides in it unless `--graph`
+    /// names another.
+    #[test]
+    fn studio_opens_a_managed_cluster_target_by_its_identity() {
+        let (_home, input, target) = resolved_from(MANAGED, "production");
+        for (graph, opened) in [(None, "knowledge"), (Some("notes"), "notes")] {
+            let expected = format!(
+                "omnigraph-studio://open?api=https:%2F%2Fcontrol.example.com%2Fprefix\
+                 &organization=org_work&cluster=01CLUSTER&incarnation=01INCARNATION&graph={opened}"
+            );
+            let mut runner = Recorded::answering(vec![("open", exited(true, ""))]);
+            let scope = StudioScope {
+                operator: &input,
+                target: &target,
+                graph,
+            };
+            let (result, stdout, _) = run_with(scope, true, Platform::MacOs, &mut runner);
+            assert_eq!(result.unwrap(), Completion::success());
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&stdout).unwrap(),
+                serde_json::json!({
+                    "protocol": 1,
+                    "target": "production",
+                    "api": "https://control.example.com/prefix",
+                    "organization": "org_work",
+                    "cluster": "01CLUSTER",
+                    "incarnation": "01INCARNATION",
+                    "link": expected,
+                })
+            );
+            assert_eq!(
+                runner.calls,
+                [vec![
+                    "open".to_owned(),
+                    "-b".into(),
+                    "com.modernrelay.omnigraph-studio".into(),
+                    expected.clone()
+                ]]
+            );
+        }
+
+        // A target without a `default_graph` leaves the graph to Studio:
+        // the link names none unless `--graph` does.
+        let TargetBinding::Managed(binding) = &target.binding else {
+            panic!("a managed target resolves to a managed binding");
+        };
+        let mut binding = binding.clone();
+        binding.cluster.as_mut().unwrap().default_graph = None;
+        let undefaulted = ResolvedTarget::new(
+            TargetBinding::Managed(binding),
+            TargetProvenance::Explicit {
+                name: "production".into(),
+            },
+        );
+        for (graph, suffix) in [(None, ""), (Some("notes"), "&graph=notes")] {
+            let mut runner = Recorded::answering(vec![("open", exited(true, ""))]);
+            let scope = StudioScope {
+                operator: &input,
+                target: &undefaulted,
+                graph,
+            };
+            let (result, stdout, _) = run_with(scope, true, Platform::MacOs, &mut runner);
+            assert_eq!(result.unwrap(), Completion::success());
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["link"],
+                format!(
+                    "omnigraph-studio://open?api=https:%2F%2Fcontrol.example.com%2Fprefix\
+                     &organization=org_work&cluster=01CLUSTER&incarnation=01INCARNATION{suffix}"
+                )
+            );
+        }
+
+        // Without `--json` the link is the only line on stdout.
+        let mut runner = Recorded::answering(vec![("open", exited(true, ""))]);
+        let scope = StudioScope {
+            operator: &input,
+            target: &target,
+            graph: None,
+        };
+        let (result, stdout, stderr) = run_with(scope, false, Platform::MacOs, &mut runner);
+        assert_eq!(result.unwrap(), Completion::success());
+        assert!(
+            stdout.starts_with("omnigraph-studio://open?api=") && stdout.lines().count() == 1,
+            "{stdout}"
+        );
+        assert!(!stdout.contains("target="), "{stdout}");
+        assert!(
+            stderr.contains("opened OmniGraph Studio on target 'production'"),
+            "{stderr}"
+        );
+    }
+
     #[test]
     fn without_a_handler_it_prints_the_link_and_refuses_studio_unavailable() {
         let (_home, input, target) = resolved(STAGING, "staging");
@@ -394,11 +654,32 @@ mod tests {
             },
             TargetProvenance::Explicit { name: "g".into() },
         );
+        let (_managed_home, _, cluster) = resolved_from(MANAGED, "production");
+        let TargetBinding::Managed(binding) = &cluster.binding else {
+            panic!("a managed target resolves to a managed binding");
+        };
+        let managed = |change: &dyn Fn(&mut crate::managed::Binding)| {
+            let mut binding = binding.clone();
+            change(&mut binding);
+            ResolvedTarget::new(
+                TargetBinding::Managed(binding),
+                TargetProvenance::Explicit {
+                    name: "production".into(),
+                },
+            )
+        };
+        // A managed account names no cluster, and a link needs the
+        // organization that owns the cluster.
+        let account = managed(&|binding| binding.cluster = None);
+        let unowned = managed(&|binding| binding.organization_id = None);
         for (target, graph, code) in [
             (&unix, None, "studio_transport_unsupported"),
             (&inline, None, "target_invalid"),
             (&direct, None, "target_kind_unsupported"),
             (&server, Some("../etc"), "target_incompatible"),
+            (&account, None, "target_kind_unsupported"),
+            (&unowned, None, "organization_required"),
+            (&cluster, Some("../etc"), "target_incompatible"),
         ] {
             let mut runner = Recorded::default();
             let scope = StudioScope {

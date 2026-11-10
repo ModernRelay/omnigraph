@@ -61,7 +61,7 @@ prints the exact flags of the installed binary.
 | `config` | `validate` `rename-profile` `rename-target` `recover-rename` `recover-operations` | Validate/edit operator bindings or preserve legacy operation evidence |
 | `access` | — | Say who you are at a target and which actions its policy grants, graph-wide and on a branch |
 | `mcp` | — | Relay an agent's stdio MCP to an existing server or managed target's `/mcp`, bound to one graph; read-only tools unless `--write` |
-| `studio` | — | Open Omnigraph Studio on an existing server target through an `omnigraph-studio://open` link, and print the link |
+| `studio` | — | Open Omnigraph Studio on an existing server target or managed cluster target through an `omnigraph-studio://open` link, and print the link |
 | `skill` | `export` `show` | Export or print this skill as built into the CLI |
 | `version` | — | Print the CLI version, the HTTP contract it speaks and the storage formats it writes and serves; `--json` prints them as one object |
 
@@ -473,17 +473,23 @@ bridge never starts a server. A lost answer is never resent: an
 
 ```bash
 omnigraph studio --target staging --graph knowledge --json
+omnigraph studio --target production
 ```
 
-`omnigraph studio` opens Omnigraph Studio on an existing server target with an
-`omnigraph-studio://open?target=NAME&binding=…&home=…[&graph=G]` link, prints
-the link and exits. It sends no request and reads no credential; Studio
+`omnigraph studio` opens Omnigraph Studio on an existing server target or
+managed cluster target, prints the link and exits. It sends no request and
+reads no credential. A server target's link is
+`omnigraph-studio://open?target=NAME&binding=…&home=…[&graph=G]`: Studio
 resolves the target itself and refuses a link whose `binding` or `home`
 digest differs from what `target inspect NAME --json` reports in its own
-operator home. Direct and managed targets refuse with
-`target_kind_unsupported`. Where nothing opens Studio's links it prints the
-link and refuses with `studio_unavailable`; it never opens a browser. See
-[Open Studio](../../../docs/user/cli/studio.md).
+operator home. A managed cluster target's link is
+`omnigraph-studio://open?api=ORIGIN&organization=ORG_ID&cluster=CLUSTER_ID&incarnation=INCARNATION[&graph=G]`:
+it identifies the cluster from the operator configuration, carries the
+target's `default_graph` unless `--graph` names another, and Studio opens it
+with its own sign-in to that control plane, not the CLI's login. Direct
+targets refuse with `target_kind_unsupported`. Where nothing opens Studio's
+links it prints the link and refuses with `studio_unavailable`; it never
+opens a browser. See [Open Studio](../../../docs/user/cli/studio.md).
 
 ## Addressing a Graph
 

@@ -225,7 +225,7 @@ destination line.
 | Authentication | `login --create-profile NAME`, `login --profile NAME`, or `logout --profile NAME` for platform sessions; `credentials set/status/remove/export` requires explicit profile or standalone target |
 | Access | `access [--branch B [--target-branch T]]`; the actor and the actions the graph's policy grants it, from a server or managed target's access route or, for a direct graph or root target, the installed policy; catalogue targets refuse |
 | Agent MCP | `mcp --target NAME [--graph G] [--write]` relays an agent's stdio MCP to an existing server or managed target's `/mcp` with that target's credential, bound to one graph, read-only tools unless `--write` (the server's policy still decides every call); a cancelled write gets no answer and may still have landed; direct targets refuse |
-| Studio | `studio --target NAME [--graph G] [--json]` opens Omnigraph Studio on an existing server target through an `omnigraph-studio://open` link and prints it, sending no request; direct and managed targets refuse; without Studio it refuses `studio_unavailable` |
+| Studio | `studio --target NAME [--graph G] [--json]` opens Omnigraph Studio on an existing server target, or on a managed cluster target by its identity, through an `omnigraph-studio://open` link and prints it, sending no request; direct targets refuse; without Studio it refuses `studio_unavailable` |
 
 `query` and `mutate` invoke stored queries by positional name, or accept
 `--query FILE` / `-e SOURCE`. Use `--params` or `--params-file`, never interpolate
