@@ -289,6 +289,7 @@ fn settings_from_snapshot_inner(
     }
 
     let env_unauth = env_flag("OMNIGRAPH_UNAUTHENTICATED");
+    let env_reads_without_policy = env_flag("OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY");
 
     Ok(ServerConfig {
         mode: ServerConfigMode::Multi {
@@ -299,6 +300,7 @@ fn settings_from_snapshot_inner(
         },
         bind: cli_bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
         allow_unauthenticated: cli_allow_unauthenticated || env_unauth,
+        allow_reads_without_policy: env_reads_without_policy,
         require_all_graphs,
         witness,
         // The binary resolves the flag, then the environment, then the default
@@ -550,7 +552,8 @@ pub(crate) fn env_flag(name: &str) -> bool {
 ///   operator opt-in.
 /// * **DefaultDeny** — tokens configured but no policy file. The
 ///   server requires a valid bearer token; once authenticated, every
-///   action except `Read` is denied with 403. Closes the "tokens but
+///   graph action is denied with 403 (a static token may `read` under the
+///   `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY` opt-in). Closes the "tokens but
 ///   forgot the policy file" trap.
 /// * **PolicyEnabled** — policy file configured and at least one
 ///   bearer token configured. Cedar evaluates every authenticated
@@ -1065,10 +1068,20 @@ mod tests {
             authorize(Some(&actor), None, req(PolicyAction::Change)).unwrap(),
             Authz::Denied(_)
         ));
-        // `read` is the one per-graph action permitted without a policy.
+        // `read` is denied too: tokens are not scoped to graphs.
         assert!(matches!(
             authorize(Some(&actor), None, req(PolicyAction::Read)).unwrap(),
+            Authz::Denied(_)
+        ));
+        // The operator opt-in restores `read`, and only `read`.
+        let reader = actor.clone().with_policy_less_reads(true);
+        assert!(matches!(
+            authorize(Some(&reader), None, req(PolicyAction::Read)).unwrap(),
             Authz::Allowed
+        ));
+        assert!(matches!(
+            authorize(Some(&reader), None, req(PolicyAction::Change)).unwrap(),
+            Authz::Denied(_)
         ));
         // Open mode (no actor, no policy) → allowed.
         assert!(matches!(
@@ -1344,6 +1357,7 @@ mod tests {
             },
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
+            allow_reads_without_policy: false,
             require_all_graphs: false,
             witness: crate::BootWitness::default(),
             shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,
@@ -1403,6 +1417,7 @@ mod tests {
             },
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
+            allow_reads_without_policy: false,
             require_all_graphs: false,
             witness: crate::BootWitness::default(),
             shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,

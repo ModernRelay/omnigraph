@@ -3269,6 +3269,29 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
             Some((1, 11)),
             "{path}"
         );
+
+        // A source nested past the bound is refused before the grammar
+        // recurses over it; parsed, it would exhaust the worker's stack and
+        // abort the server for every caller.
+        let deep = format!(
+            "query q() {{ match {{ $p: Person {}$p.age > 1{} }} return {{ $p.name }} }}",
+            "(".repeat(100_000),
+            ")".repeat(100_000)
+        );
+        let chain = format!(
+            "query q() {{ match {{ $p: Person {} }} return {{ $p.name }} }}",
+            vec!["$p.age > 1"; 50_000].join(" or ")
+        );
+        for source in [deep, chain] {
+            let body = json!({field: source, "branch": "main"});
+            let (status, out) = json_response(&app, send(path, token, body, expected_head)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
+            let error: ErrorOutput = serde_json::from_value(out).unwrap();
+            let diagnostic = error
+                .diagnostic
+                .expect("a refused query carries its diagnostic");
+            assert_eq!(diagnostic.code, "Q006", "{path}");
+        }
     }
 }
 

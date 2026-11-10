@@ -2615,3 +2615,39 @@ fn grammar_mismatch_reports_q001_at_the_deepest_failure() {
     let at = err.position.unwrap();
     assert_eq!((at.line, at.column), (1, 21));
 }
+
+/// Every shape that recurses once per repetition is refused with `Q006`
+/// before the grammar runs, on a thread with the default 2 MiB stack the
+/// server's workers use; parsed, these sources overflow it.
+#[test]
+fn deeply_nested_sources_are_refused_before_the_grammar_recurses() {
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(|| {
+            let filter = |expr: String| {
+                format!("query q() {{ match {{ $p: Person\n {expr} }} return {{ $p.name }} }}")
+            };
+            let n = 100_000;
+            for source in [
+                filter(format!("{}$p.age > 1{}", "(".repeat(n), ")".repeat(n))),
+                filter(format!("{}$p.age > 1", "not ".repeat(n))),
+                filter(format!(
+                    "{}$p.age > 1{}",
+                    "not { ".repeat(n),
+                    " }".repeat(n)
+                )),
+                filter(format!("$p.age in {}1{}", "[".repeat(n), "]".repeat(n))),
+                filter(vec!["$p.age > 1"; n].join(" or ")),
+                filter(vec!["$p.age > 1"; n].join(" and ")),
+            ] {
+                let diagnostic = parse_query_diagnostic(&source).unwrap_err();
+                assert_eq!(diagnostic.code, crate::query::codes::Q006);
+                assert!(diagnostic.fix.is_some());
+            }
+            let within = filter(format!("{}$p.age > 1{}", "(".repeat(48), ")".repeat(48)));
+            assert!(parse_query_diagnostic(&within).is_ok());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

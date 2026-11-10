@@ -146,7 +146,12 @@ commit has does, so the id discloses nothing (see
 
 ## Validate and test
 
-Policy commands read the applied bundle from a cluster:
+Policy commands read the applied bundles from a cluster and ask the bundle a
+server asks: graph actions go to the bundle bound to `--graph`, and
+`graph_list` and `config_manage` go to the bundle bound to `cluster`.
+`validate` checks each of the two that is applied, as its own kind; `test`
+runs each case against the bundle for its action. An action whose scope has
+no applied bundle is refused; the other scope's bundle never answers it.
 
 ```bash
 omnigraph policy validate --target ./company-brain --graph knowledge
@@ -206,9 +211,10 @@ The route evaluates the installed policy for the caller's resolved actor, each
 action shaped as the route that performs it shapes it, so it answers exactly as
 those routes decide. It needs no action of its own, reads no graph data, and
 judges branches by name without checking that they exist. It names actions,
-never the rules behind them, and reveals nothing about other actors. A static
-token on a graph without a policy gets `read` alone, and a signed data
-credential without one nothing, as those routes decide; a server without
+never the rules behind them, and reveals nothing about other actors. A
+credential on a graph without a policy gets nothing (a static token gets `read`
+when the server sets `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`), as those routes
+decide; a server without
 authentication allows every graph action and reports `actor_id: null`. The MCP
 `access` tool returns the same body, and `omnigraph access` prints it for a
 server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
@@ -250,7 +256,7 @@ For static token authentication:
 | Tokens | Policy | Startup and authorization |
 |---|---|---|
 | none | none | Requires explicit `--unauthenticated` and a loopback `--bind` (or `OMNIGRAPH_UNAUTHENTICATED_ALLOW_REMOTE=1`); otherwise startup fails |
-| configured | none | Only the `read` action is allowed; all other actions are denied |
+| configured | none | Every graph action is denied, `read` included, unless `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` lets static tokens `read` |
 | configured | configured | The policy decides each action |
 | none | configured | Startup fails because no request could establish an actor |
 
