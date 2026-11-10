@@ -893,11 +893,12 @@ mod tests {
             config.witness,
             Arc::new(AtomicBool::new(false)),
             DEFAULT_SHUTDOWN_GRACE,
-        );
+        )
+        // The deployed graph has no policy; the operator token reads it
+        // through the opt-in, since this test is about the handoff, not policy.
+        .with_reads_without_policy(true);
         super::deployment::initialize_boot_activation(&state);
-        // The deployed graph carries no policy; the token reads its snapshot
-        // through the operator opt-in.
-        let app = super::build_app(state.with_reads_without_policy(true));
+        let app = super::build_app(state);
         let (code, ready) = response(&app, "GET", "/readyz", Value::Null).await;
         assert_eq!(code, StatusCode::OK, "{ready}");
         assert_eq!(ready["ready_graph_count"], 0);
