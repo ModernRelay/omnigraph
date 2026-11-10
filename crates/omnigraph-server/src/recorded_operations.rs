@@ -813,11 +813,15 @@ pub(crate) async fn start_optimize(
     let (accepted, acceptance) = oneshot::channel::<Acceptance>();
     let run_state = state.clone();
     let run_handle = handle.clone();
+    // RFC §3.5: one span per run naming the operation, the graph, the nonce
+    // and the commit; the last two are recorded once the run knows them.
     let span = tracing::info_span!(
         "recorded_operation",
         operation_id = %input.operation_id,
         kind = kind.as_str(),
         graph = %operation.graph,
+        nonce = tracing::field::Empty,
+        commit = tracing::field::Empty,
     );
     let operation_id = input.operation_id.clone();
     let submitted = state.operations.submit(
@@ -970,6 +974,7 @@ async fn run(
 ) -> OwnedResult<()> {
     let started = Instant::now();
     let id = operation.operation_id.clone();
+    let span = tracing::Span::current();
 
     // `running` in doubt: no table work starts, and the next admission or
     // lookup records the run `interrupted`.
@@ -997,13 +1002,21 @@ async fn run(
 
     let publishing_landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let publishing_in_doubt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The nonce the `publishing` write stored; the terminal write keeps it
+    // (RFC §2.2: the record holds the intent nonce).
+    let publishing_nonce = Arc::new(std::sync::Mutex::new(None::<String>));
     let hook = {
         let state = state.clone();
         let owner = owner.clone();
         let id = id.clone();
         let landed = Arc::clone(&publishing_landed);
         let in_doubt = Arc::clone(&publishing_in_doubt);
+        let span = span.clone();
+        let stored_nonce = Arc::clone(&publishing_nonce);
         OptimizeBeforePublish::new(move |publication| {
+            span.record("nonce", publication.nonce.as_str());
+            let nonce = publication.nonce.clone();
+            let stored_nonce = Arc::clone(&stored_nonce);
             let state = state.clone();
             let owner = owner.clone();
             let id = id.clone();
@@ -1023,6 +1036,7 @@ async fn run(
                 .await
                 {
                     Ok(()) => {
+                        *stored_nonce.lock().unwrap_or_else(PoisonError::into_inner) = Some(nonce);
                         landed.store(true, std::sync::atomic::Ordering::SeqCst);
                         Ok(())
                     }
@@ -1060,6 +1074,13 @@ async fn run(
     watch.abort();
     let cancel_reason = state.recorded.cancel_reason(&id);
 
+    if let Some(nonce) = publishing_nonce
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+    {
+        operation.nonce = Some(nonce);
+    }
     operation.timings.queued_ms = Some(started.duration_since(accepted_at).as_millis() as u64);
     operation.timings.compute_ms = Some(started.elapsed().as_millis() as u64);
     let (ending, failure) = match result {
@@ -1091,6 +1112,28 @@ async fn run(
             (ending, Some(ApiError::from_omni(error)))
         }
     };
+    match &ending {
+        Ending::Terminal(terminal) => {
+            if let Some(nonce) = &terminal.nonce {
+                span.record("nonce", nonce.as_str());
+            }
+            if let Some(commit) = &terminal.published_commit {
+                span.record("commit", commit.as_str());
+            }
+            tracing::info!(
+                state = ?terminal.state,
+                gate_hold_ms = terminal.timings.gate_hold_ms,
+                compute_ms = terminal.timings.compute_ms,
+                "recorded operation ended"
+            );
+        }
+        Ending::Unresolved(reason) => {
+            tracing::warn!(%reason, "recorded operation's publication is unresolved");
+        }
+        Ending::Silent => {
+            tracing::warn!("recorded operation's publishing write is in doubt");
+        }
+    }
     {
         // The run leaves the live set in the same step as its final write, so
         // a lookup under the gate never meets an ended run still marked active.

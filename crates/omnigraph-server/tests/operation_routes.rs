@@ -331,6 +331,18 @@ async fn recorded_optimize_keeps_a_record_a_caller_reads_by_id() {
     assert_eq!(operation["state"], "succeeded", "{terminal}");
     assert_eq!(terminal["in_progress"], false, "{terminal}");
     assert!(operation["published_commit"].is_string(), "{terminal}");
+    // RFC §2.2: the terminal record keeps the intent nonce the `publishing`
+    // write stored, and the published commit answers it.
+    let nonce = operation["nonce"]
+        .as_str()
+        .expect("terminal record keeps the nonce");
+    assert!(
+        operation["published_commit"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!(".{nonce}")),
+        "{terminal}"
+    );
     assert!(
         operation["outcome"]["tables"]
             .as_array()
