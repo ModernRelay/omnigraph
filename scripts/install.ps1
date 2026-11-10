@@ -59,6 +59,16 @@ function Download-ReleaseFiles {
   }
 }
 
+# Whether $Tag names a stable release before v0.14.0, the first one published
+# with a build attestation. Edge tags and later releases do not.
+function Test-PredatesAttestations {
+  param([string]$Tag)
+  if ($Tag -match '^v?(\d+)\.(\d+)\.(\d+)') {
+    return ([int]$Matches[1] -eq 0 -and [int]$Matches[2] -lt 14)
+  }
+  return $false
+}
+
 function Verify-Attestation {
   param([string]$ArchivePath)
 
@@ -93,9 +103,11 @@ function Verify-Attestation {
     Write-Log "Verified build provenance of $assetName with gh attestation verify"
     return
   }
-  if ($mode -eq "auto" -and $Version -ne "") {
-    # An explicitly named release may predate attestations (before v0.14).
-    Write-Log "warning: no valid build attestation for $Version; it may predate attestations"
+  if ($mode -eq "auto" -and (Test-PredatesAttestations -Tag $Version)) {
+    # Releases before v0.14.0 were published without attestations. Any
+    # other release, a pinned edge build included, carries one, so a failed
+    # check there refuses the archive.
+    Write-Log "warning: $Version predates build attestations; its provenance was not verified"
     return
   }
   throw "build provenance verification failed for $assetName; refusing to install. Set VERIFY_ATTESTATION=off only if you trust this archive"

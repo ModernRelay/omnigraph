@@ -151,6 +151,23 @@ stable_release_tag() {
   esac
 }
 
+# Whether `$1` names a stable release before v0.14.0, the first one published
+# with a build attestation. Edge tags and later releases do not.
+version_predates_attestations() {
+  local version="${1#v}" major minor
+  case "$version" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  major="${version%%.*}"
+  minor="${version#*.}"
+  minor="${minor%%.*}"
+  case "$major$minor" in
+    *[!0-9]*) return 1 ;;
+  esac
+  [ "$major" -eq 0 ] && [ "$minor" -lt 14 ]
+}
+
 verify_attestation() {
   local archive="$1"
 
@@ -177,9 +194,11 @@ verify_attestation() {
     log "Verified build provenance of $(basename "$archive") with gh attestation verify"
     return
   fi
-  if [ "$VERIFY_ATTESTATION" = "auto" ] && [ -n "$VERSION" ]; then
-    # An explicitly named release may predate attestations (before v0.14).
-    log "warning: no valid build attestation for $VERSION; it may predate attestations. Set VERIFY_ATTESTATION=off to silence this, or require to refuse it"
+  if [ "$VERIFY_ATTESTATION" = "auto" ] && version_predates_attestations "$VERSION"; then
+    # Releases before v0.14.0 were published without attestations. Any
+    # other release, a pinned edge build included, carries one, so a failed
+    # check there refuses the archive.
+    log "warning: $VERSION predates build attestations; its provenance was not verified. Set VERIFY_ATTESTATION=off to silence this, or require to refuse it"
     return
   fi
   die "build provenance verification failed for $(basename "$archive"); refusing to install. Set VERIFY_ATTESTATION=off only if you trust this archive"
