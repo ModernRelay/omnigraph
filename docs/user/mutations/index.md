@@ -37,26 +37,26 @@ and `ab2` from `a` to `b`, `ac`, and `db`:
 query exact() { delete Knows where @src = "a" and @dst = "b" }
 ```
 
-removes `ab1` and `ab2` and nothing else: `affected: nodes=0 edges=2`. A
-binding variable in a `where` is refused at compile time (`T14`); an
-aggregate, search, or ranking call is `T44`, for example ``T44: `count` cannot
-appear in a mutation where; a where compares the row's own properties,
-parameters and now()``. A compound `where` runs under either `engine` setting.
+removes `ab1` and `ab2` and nothing else: `affected: nodes=0 edges=2`. A binding
+variable in a `where` is refused at compile time (`T14`); an aggregate, search,
+or ranking call is `T44`, for example ``T44: `count` cannot appear in a mutation
+where; a where compares the row's own properties, parameters and now()``. A
+compound `where` runs under either `engine` setting. A `where` that tests over
+four properties twice each with `=`, `!=` or `in` is refused.
 
-Assignment values are constants: literals, parameters, `now()`, and
-comparisons or Boolean operators over them, such as `adult: true or $flag`.
-A constant's value is fixed per invocation: parameters and `now()` are bound
-once before any retry, so a retried mutation computes the same value. It follows the read rules
-for null: with `$flag` null, `true or $flag` is `true` and `false and $flag`
-is `false`, and `$age > 30` with `$age` null is null. A null result assigned
-to a nullable property writes null; on a `Blob` property it clears the cell.
-`null` is a reserved word, so clear a Blob through a nullable parameter such
-as `$content: Blob?`. Assigned to a non-nullable property a
-null result is refused with a typed error that names the property, never
-written as a default. A
-property or system field in a value is refused, for example ``T45: `age`
-cannot appear in an assignment value; assignments and binding matches are
-constants per invocation``.
+Assignment values are constants: literals, parameters, `now()`, and comparisons
+or Boolean operators over them, such as `adult: true or $flag`. A constant's
+value is fixed per invocation: parameters and `now()` are bound once before any
+retry, so a retried mutation computes the same value. It follows the read rules
+for null: with `$flag` null, `true or $flag` is `true` and `false and $flag` is
+`false`, and `$age > 30` with `$age` null is null. A null result assigned to a
+nullable property writes null; on a `Blob` property it clears the cell. `null`
+is a reserved word, so clear a Blob through a nullable parameter such as
+`$content: Blob?`. Assigned to a non-nullable property a null result is refused
+with a typed error that names the property, never written as a default. A
+property or system field in a value is refused, for example ``T45: `age` cannot
+appear in an assignment value; assignments and binding matches are constants per
+invocation``.
 
 A mutation query may contain several inserts and updates, or several deletes,
 but it cannot mix inserts or updates with deletes. Split that workflow into two
@@ -257,8 +257,8 @@ Every version of a key written in one mutation counts, so an insert and an
 update of the same row charge its Blob twice.
 Keyed loads also bound their parser estimate independently. A strict JSONL
 load retains its projected input check, `strict_input_arrow_bytes`.
-A CSV load has no whole-statement input check.
-It applies `write_max_bytes` to each staged-write input instead.
+A vector counts its full width (dimension × 4 bytes), present or null: 12 KiB for `Vector(3072)`.
+A CSV load has no whole-statement input check; it applies `write_max_bytes` to each staged-write input instead.
 An overwrite stages the reader's 8,192-row batches, and a batch over the
 allowance refuses as `staged_write_input_bytes`.
 An overwrite writes a fragment per parse partition, up to 1 Mi rows each, as

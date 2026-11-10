@@ -20,6 +20,26 @@ brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
 
+### macOS signing and Keychain access
+
+New macOS release archives are signed with EQTR INC's Developer ID and
+notarized by Apple, on both stable and edge channels. The CLI keeps the
+signing identifier `com.modernrelay.omnigraph` across updates so Keychain
+can recognize the new executable as the same application.
+
+When moving from an older ad hoc signed build, macOS may ask you once to
+authorize the signed CLI to access an existing credential. Signing does not
+grant access to an item you have not authorized. Source and Nix builds use
+their own local signing identity and do not inherit release trust.
+
+The release remains a tarball of three executables. Apple's notarization
+ticket is checked online: a ticket cannot be stapled to a standalone CLI
+binary or a tarball. A release can be published before Apple finishes
+notarizing it; its binaries count as notarized once Apple accepts the
+submission. Until then, macOS may refuse to open a copy downloaded with a web
+browser. The install script downloads with `curl`, which does not mark files
+for that check. Older published archives are unchanged.
+
 ## Nix
 
 The repository's flake builds the three release programs from source with the

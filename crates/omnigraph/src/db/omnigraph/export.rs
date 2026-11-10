@@ -1,7 +1,7 @@
 use super::*;
-use crate::changes::model::is_reserved_storage_system_column;
 use crate::ordered_cursor::{KeyOrder, OrderedRowCursor, WalkSubject};
 use futures::TryStreamExt;
+use lance_core::is_system_column;
 use omnigraph_compiler::SYSTEM_COLUMNS_META;
 use std::future::Future;
 
@@ -901,7 +901,7 @@ pub(crate) async fn logical_row_image(
         .schema()
         .fields()
         .iter()
-        .filter(|field| !is_reserved_storage_system_column(field.name()))
+        .filter(|field| !is_system_column(field.name()))
         .map(|field| field.name().clone())
         .collect::<Vec<_>>();
     let lines = row_json_lines(&row_batch, &fields, blob_values.as_ref(), 0, id_col)?;

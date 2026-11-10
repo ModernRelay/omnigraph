@@ -57,6 +57,14 @@
               "--features" "omnigraph-server/aws"
             ];
             nativeBuildInputs = [ pkgs.protobuf ];
+            # .cargo/config.toml links Linux through scripts/cargo-linker.sh,
+            # which the dependency build's dummy source does not hold (naersk
+            # copies only the manifests, the lock file and the Cargo config).
+            # Cargo reads these over the file, and naersk passes them to both
+            # derivations; `cc` is what the script runs when mold is absent,
+            # as it is here.
+            CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "cc";
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER = "cc";
             # A set RUSTFLAGS replaces the workspace `[build] rustflags`, the
             # test suites' `--cfg tokio_unstable`, as in every release build.
             # naersk would put its path remapping in CARGO_BUILD_RUSTFLAGS,

@@ -43,12 +43,17 @@ fn parity() -> Parity {
     // cluster directory (one graph, id `parity`), seeded with the same
     // fixture data as the local twin.
     let cluster_dir = parity_configs(temp.path(), &local);
+    // The engine catalogue has no bound policy; the served arm reads it
+    // through the operator opt-in.
     let server = spawn_server_with_cluster_env(
         &cluster_dir,
-        &[(
-            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
-            r#"{"act-parity":"parity-tok"}"#,
-        )],
+        &[
+            (
+                "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+                r#"{"act-parity":"parity-tok"}"#,
+            ),
+            ("OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY", "1"),
+        ],
     );
     let local_operator_home = parity_operator_home(temp.path());
     Parity {

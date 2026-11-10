@@ -5,7 +5,7 @@ license: MIT (see LICENSE at repo root)
 compatibility: Covers the current Omnigraph CLI and server, using HTTP contract 0.14. Upgrade the CLI, server and HTTP integrations together; the storage formats `omnigraph version` reports are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
 metadata:
   author: ModernRelay
-  version: "0.15.0"
+  version: "0.15.1"
   repository: https://github.com/ModernRelay/omnigraph
 ---
 
@@ -431,7 +431,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Review branch left after a timed-out `load --from` | uncertain load result | Inspect its content and history; matching `main`'s head alone is not proof of abandonment or authorization to delete it |
 | `omnigraph schema apply` / `init` on a cluster-managed graph | refused — bypasses the cluster ledger | Evolve cluster graphs via `omnigraph cluster apply --target ROOT --config .`; `schema apply`/`init` are for a non-cluster store |
 | Assuming Blob-bearing data cannot compact | unnecessary skipped maintenance | Lance 13 Blob compaction is supported; `optimize` preserves null/empty/non-empty values |
-| `@unique`/`@index` on a Blob column | schema parse/validation rejection | Blob properties cannot be keys, unique, or indexed |
+| `@unique`/`@index` on a Blob column, `@unique` on a list or vector | schema parse/validation rejection | Blob properties cannot be keys, unique, or indexed; list and vector properties cannot be keys or unique |
 | Full-text search refused with `FullTextIndexRebuildRequired` | the index has no certified analyzer | Run `index rebuild --kind full-text --branch <b>` on every live branch that needs text search; `upgrade` does not rebuild indexes |
 | Opening a graph at a format below v14 | refused: `this omnigraph reads only v14 to v16` | A standalone v8, v9 or v13 graph is converted by `upgrade` (next row); any other format is rebuilt by export with the binary that wrote it, then `init` and `load --mode overwrite` |
 | Opening a v8, v9 or v13 graph | refused: normal open serves v14 to v16 only and names `omnigraph upgrade` | Stop every process using the graph, back up the whole root, then run `upgrade --target ./graph.omni --check --json` and `upgrade --target ./graph.omni --json` on a standalone graph; a cluster-managed graph below v14 is exported with the build that wrote it and rebuilt. The message's positional `<graph>` examples predate `--target`. See [converting a graph](references/migrations.md#convert-a-v8-v9-or-v13-graph) |
@@ -442,7 +442,6 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | `defaults.output: arrow` | configuration refusal | Use `table`, `json`, `jsonl`, `csv`, `kv`, or `toon` |
 | `..` or a symlink in a `cluster.yaml` relative path | `config_path_escape` / `config_path_symlink` | Keep referenced files inside the config directory with plain relative paths |
 | A 0.13 operator file | configuration refusal | Rewrite it as `version: 1` (see [migrations](references/migrations.md#operator-configuration-rewrite)); keep the old operator home until unresolved work is reconciled |
-| Policy commands with both a graph and a `cluster` bundle applied | `matches 2 policy bundles` | Current limitation of `policy validate/test/explain --graph`; inspect each bundle file directly |
 
 ## Deep Dives
 

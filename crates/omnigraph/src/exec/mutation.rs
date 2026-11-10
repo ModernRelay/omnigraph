@@ -2,7 +2,8 @@ use super::*;
 
 use crate::db::manifest::HistoryReleaseBytes;
 use crate::engine::{
-    evaluate_constant, fill_declared_params, id_in_list_expr, ir_expr_to_df_expr, validate_params,
+    MAX_NULL_SPLIT_COLUMNS, evaluate_constant, exceeds_null_split_columns, fill_declared_params,
+    id_in_list_expr, ir_expr_to_df_expr, validate_params,
 };
 use crate::instrumentation::record_mutation_table_open;
 use crate::loader::append_blob_value;
@@ -459,6 +460,13 @@ fn mutation_predicate_expr(predicate: &IRExpr, params: &ParamMap, schema: &Schem
         )));
     }
     ir_expr_to_df_expr(predicate, params, Some(schema)).ok_or_else(|| {
+        if exceeds_null_split_columns(predicate, params) {
+            return OmniError::manifest(format!(
+                "unsupported expression in mutation predicate: {predicate}: a mutation `where` \
+                 may compare at most {MAX_NULL_SPLIT_COLUMNS} properties more than once each \
+                 with `=`, `!=` or `in`"
+            ));
+        }
         OmniError::manifest(format!(
             "unsupported expression in mutation predicate: {predicate}"
         ))
@@ -490,6 +498,115 @@ fn first_unbound_param<'a>(expr: &'a IRExpr, params: &ParamMap) -> Option<&'a st
         | IRExpr::Aggregate { .. }
         | IRExpr::AliasRef(_, _) => None,
     }
+}
+
+/// How an `update` may stage a column patch (issue #1264): the columns it
+/// leaves unread, what it returns for validation and what Lance writes.
+struct ColumnPatchPlan {
+    request: crate::table_store::UpdateMatchRequest,
+    /// The node's schema without the omitted columns, catalog order.
+    carried: SchemaRef,
+    /// `id` and the assigned columns, catalog order.
+    patch_columns: Vec<String>,
+}
+
+/// The column patch an update of `node_type` assigning `resolved` may stage,
+/// or `None` when the update must write whole rows: it assigns nothing or a
+/// Blob (Lance patches no Blob column), leaves no Blob or vector column
+/// unassigned, or a key or uniqueness group names an omitted column, whose
+/// values validation must read.
+fn column_patch_plan(
+    node_type: &omnigraph_compiler::catalog::NodeType,
+    schema: &SchemaRef,
+    resolved: &HashMap<String, Literal>,
+    id_column: &str,
+    rows_allowed: bool,
+) -> Result<Option<ColumnPatchPlan>> {
+    if resolved.is_empty()
+        || resolved
+            .keys()
+            .any(|name| node_type.blob_properties.contains(name))
+    {
+        return Ok(None);
+    }
+    let omitted = schema
+        .fields()
+        .iter()
+        .filter(|field| {
+            !resolved.contains_key(field.name())
+                && (node_type.blob_properties.contains(field.name())
+                    || matches!(field.data_type(), DataType::FixedSizeList(_, _)))
+        })
+        .map(|field| field.name().clone())
+        .collect::<Vec<_>>();
+    if omitted.is_empty()
+        || node_type
+            .key
+            .iter()
+            .chain(node_type.unique_constraints.iter())
+            .flatten()
+            .any(|column| omitted.contains(column))
+    {
+        return Ok(None);
+    }
+    let mut assigned = Vec::with_capacity(resolved.len());
+    for field in schema.fields() {
+        if let Some(value) = resolved.get(field.name()) {
+            let one = literal_to_typed_array(value, field.data_type(), 1)?;
+            let row_bytes = one.to_data().get_slice_memory_size().unwrap_or(0) as u64;
+            assigned.push((field.name().clone(), row_bytes));
+        }
+    }
+    let carried_indices = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| !omitted.contains(field.name()))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let carried = Arc::new(
+        schema
+            .project(&carried_indices)
+            .map_err(OmniError::arrow_internal)?,
+    );
+    let patch_columns = schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() == id_column || resolved.contains_key(field.name()))
+        .map(|field| field.name().clone())
+        .collect();
+    Ok(Some(ColumnPatchPlan {
+        request: crate::table_store::UpdateMatchRequest {
+            id_column: id_column.to_string(),
+            assigned,
+            omitted,
+            rows_allowed,
+        },
+        carried,
+        patch_columns,
+    }))
+}
+
+/// `batches` with their columns in `schema`'s order, matched by name.
+fn rebind_by_name(schema: &SchemaRef, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    batch.column_by_name(field.name()).cloned().ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "update scan lacks column '{}'",
+                            field.name()
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            RecordBatch::try_new(schema.clone(), columns).map_err(OmniError::arrow_internal)
+        })
+        .collect()
 }
 
 /// Rebuild a matched batch, which lacks the Blobs it assigns, on `full_schema`
@@ -731,11 +848,19 @@ pub(super) async fn open_table_for_mutation(
 /// cascade, or — if it is the only match — leaves the node undeleted). Only
 /// rows a prior predicate matched as definitely TRUE should be excluded:
 /// `(prior) IS NOT TRUE` keeps both FALSE and UNKNOWN rows.
+///
+/// Each prior predicate gets its own `IS NOT TRUE` (`(p1 OR p2) IS NOT TRUE`
+/// is `p1 IS NOT TRUE AND p2 IS NOT TRUE`). An `OR` of the priors would put
+/// their tests side by side, where Lance's simplifier folds two disjoint
+/// `NOT IN` tests of one nullable column to `true` and so excludes the rows
+/// whose value is null (#1277); `IS NOT TRUE` has no rewrite there.
 fn dedup_delete_filter(base: &Expr, prior: &[Expr]) -> Expr {
-    match prior.iter().cloned().reduce(Expr::or) {
-        None => base.clone(),
-        Some(excluded) => base.clone().and(excluded.is_not_true()),
-    }
+    prior
+        .iter()
+        .cloned()
+        .fold(base.clone(), |filter, excluded| {
+            filter.and(excluded.is_not_true())
+        })
 }
 
 /// D₂ parse-time check: a single mutation query is either insert/update-only
@@ -1374,17 +1499,18 @@ impl Omnigraph {
         // effect is a fresh file or a detached version no manifest names: a
         // failure here is definite (`Unpublished`), whatever its cause, and a
         // server must not treat it as an outcome it cannot establish.
-        let staged = staging
-            .stage_all_with_concurrency(self, requested, stage_write_concurrency)
-            .await
-            .map_err(OmniError::unpublished)?;
+        let (staged, early) = futures::join!(
+            staging.stage_all_with_concurrency(self, requested, stage_write_concurrency),
+            self.early_revalidation(txn),
+        );
+        let staged = staged.map_err(OmniError::unpublished)?;
         fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
         let lineage_intent = self
             .new_lineage_intent_for_branch(requested, actor_id, history_release_bytes)
             .await
             .map_err(OmniError::unpublished)?;
         let committed = staged
-            .commit_all(self, requested, txn)
+            .commit_all(self, requested, txn, early)
             .await
             .map_err(OmniError::unpublished)?;
         Ok(CommittedStagedMutation {
@@ -1484,6 +1610,28 @@ impl Omnigraph {
         txn: &crate::db::WriteTxn,
     ) -> Result<MutationResult> {
         let mut total = MutationResult::default();
+        // The node tables exactly one statement of this mutation writes. Only
+        // there may an `update` stage a column patch: its pending batch omits
+        // the unassigned Blob and vector columns, so no other write to the
+        // table can join it in the one keyed write the table stages.
+        let mut writes_per_node_type: HashMap<&str, usize> = HashMap::new();
+        for op in &ir.ops {
+            if let MutationOpIR::Insert {
+                target: MutationTarget::Node { type_name },
+                ..
+            }
+            | MutationOpIR::Update {
+                target: MutationTarget::Node { type_name },
+                ..
+            }
+            | MutationOpIR::Delete {
+                target: MutationTarget::Node { type_name },
+                ..
+            } = op
+            {
+                *writes_per_node_type.entry(type_name.as_str()).or_default() += 1;
+            }
+        }
         for op in &ir.ops {
             let result = match op {
                 MutationOpIR::Insert {
@@ -1498,6 +1646,15 @@ impl Omnigraph {
                     assignments,
                     predicate,
                 } => {
+                    let sole_write = matches!(
+                        target,
+                        MutationTarget::Node { type_name }
+                            if writes_per_node_type.get(type_name.as_str()) == Some(&1)
+                    );
+                    // A mutation that writes no other table: only there is
+                    // the update's own write budget not shared, so only there
+                    // may a cheaper row rewrite carry payload a patch would not.
+                    let only_write = ir.ops.len() == 1;
                     self.execute_update(
                         target,
                         assignments,
@@ -1506,6 +1663,8 @@ impl Omnigraph {
                         branch,
                         staging,
                         txn,
+                        sole_write,
+                        only_write,
                     )
                     .await?
                 }
@@ -1711,6 +1870,8 @@ impl Omnigraph {
         branch: Option<&str>,
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
+        sole_write: bool,
+        only_write: bool,
     ) -> Result<MutationResult> {
         let catalog = &txn.catalog;
         let type_name = match target {
@@ -1789,6 +1950,115 @@ impl Omnigraph {
         // Update is a STRICT op, so collapse #1 never skips its open — the
         // handle is always `Some` (and it's needed for the committed scan below).
         let ds = handle.expect("strict Update op always opens its dataset");
+
+        if let Some(plan) = sole_write
+            .then(|| {
+                column_patch_plan(
+                    node_type,
+                    &schema,
+                    &resolved,
+                    catalog.system_columns.id,
+                    only_write,
+                )
+            })
+            .transpose()?
+            .flatten()
+        {
+            if !staging.pending_batches(&table_key).is_empty() {
+                return Err(OmniError::manifest_internal(format!(
+                    "the sole update of '{table_key}' found pending rows"
+                )));
+            }
+            let budget = PendingScanBudget::new(
+                &table_key,
+                staging.pending_resource_usage(&table_key)?,
+                staging.write_budget(),
+            );
+            // Boxed: the scan's state would otherwise widen every mutation
+            // future that holds an update.
+            let matches =
+                Box::pin(
+                    self.storage()
+                        .scan_update_matches(&ds, &plan.request, pred_expr, budget),
+                )
+                .await?;
+            let affected_count = matches.batches.iter().map(RecordBatch::num_rows).sum();
+            tracing::debug!(
+                table = %table_key,
+                mode = ?matches.mode,
+                cost = ?matches.cost,
+                patch_bytes = matches.cost.patch_bytes() as u64,
+                rows_bytes = matches.cost.rows_bytes() as u64,
+                "update write mode"
+            );
+            if affected_count == 0 {
+                return Ok(MutationResult {
+                    affected_nodes: 0,
+                    affected_edges: 0,
+                });
+            }
+            // The patch: the carried columns of `batches` (whole rows hold
+            // them too) with the assigned values.
+            let stage_patch =
+                |staging: &mut MutationStaging, batches: Vec<RecordBatch>| -> Result<()> {
+                    let matched = concat_match_batches_to_schema(
+                        &plan.carried,
+                        rebind_by_name(&plan.carried, batches)?,
+                    )?;
+                    let updated = apply_assignments(
+                        &plan.carried,
+                        &matched,
+                        &resolved,
+                        &blob_props,
+                        staging.write_budget(),
+                    )?;
+                    staging.append_column_patch(&table_key, updated, plan.patch_columns.clone())
+                };
+            match matches.mode {
+                crate::table_store::UpdateWriteMode::ColumnPatch => {
+                    stage_patch(staging, matches.batches)?;
+                }
+                crate::table_store::UpdateWriteMode::Rows => {
+                    let matched = concat_match_batches_to_schema(
+                        &schema,
+                        rebind_by_name(&schema, matches.batches)?,
+                    )?;
+                    let updated = apply_assignments(
+                        &schema,
+                        &matched,
+                        &resolved,
+                        &blob_props,
+                        staging.write_budget(),
+                    )?;
+                    let updated_schema = updated.schema();
+                    // A refused row rewrite takes the patch, so admission
+                    // never depends on the mode (`append_batch` refuses before
+                    // it stages anything). This is the one decision over the
+                    // final batch, assignments applied: the scan's descriptor
+                    // check and trial account only stop early, to skip payload
+                    // reads and to bound the rows held while they are built,
+                    // and both start from this staging's usage
+                    // (`pending_resource_usage`) and charge the same
+                    // `write_batch_bytes`. `UpdateRowsOverBudget` in the DST
+                    // storage-cost golden pins this path's cost.
+                    match staging.append_batch(
+                        &table_key,
+                        updated_schema,
+                        PendingMode::Upsert,
+                        updated,
+                    ) {
+                        Err(OmniError::ResourceLimitExceeded { .. }) => {
+                            stage_patch(staging, vec![matched])?;
+                        }
+                        result => result?,
+                    }
+                }
+            }
+            return Ok(MutationResult {
+                affected_nodes: affected_count,
+                affected_edges: 0,
+            });
+        }
 
         // Scan committed via Lance + apply the same predicate to pending
         // batches via DataFusion `MemTable` (read-your-writes for prior ops in
@@ -2478,5 +2748,26 @@ edge Shared: Endpoint -> Endpoint { label: String }
         assert!(staging.is_empty());
         assert!(staging.paths.is_empty());
         assert!(staging.deleted_ids.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod delete_filter_tests {
+    use super::dedup_delete_filter;
+    use crate::engine::lance_filter_support::selected_rows;
+    use datafusion::prelude::{col, lit, not};
+
+    /// A later statement selects `k = "a"`, the row whose `s` is null; the
+    /// earlier statements' disjoint `NOT IN` tests are null there, so they
+    /// did not match it and must not exclude it.
+    #[test]
+    fn earlier_disjoint_not_in_statements_do_not_exclude_a_null_row_issue_1277() {
+        let prior = [
+            not(col("s").in_list(vec![lit("y")], false)),
+            not(col("s").in_list(vec![lit("x")], false)),
+        ];
+        let filter = dedup_delete_filter(&col("k").eq(lit("a")), &prior);
+        assert_eq!(selected_rows(filter.clone(), false), vec![0]);
+        assert_eq!(selected_rows(filter, true), vec![0]);
     }
 }

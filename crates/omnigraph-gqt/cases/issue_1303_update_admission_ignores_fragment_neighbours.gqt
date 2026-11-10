@@ -1,0 +1,278 @@
+# issue: 1303
+# red_on: 2026-11-08, main ea4a16d5: step 4 `retitle_shared` fails with `resource limit exceeded for retained keyed batch bytes per operation: actual 6473, limit 2048`; steps 1-3 green. On main e7e8e03b (#1272), the full case fails at step 4 the same way, and with the limit kept on one shared-table step at a time, step 4 `retitle_shared`, step 8 `clear_shared_doc` and step 10 `retitle_shared_doc_in_two_statements` each fail alone (actual 6473); step 6 `retitle_shared_doc_carrying_its_blob` passes there because #1272's column patch copies its matched rows.
+# notes: Whether an update is admitted under write_max_bytes depends only on the request and the
+# notes: matched rows, never on the rows stored beside them. `Shared` holds 301 rows in one fragment;
+# notes: `Apart` holds the same rows in two (row000 alone, the 300 others appended later). The same
+# notes: update of row000 is admitted on both at the same limit. A Lance scanner batch can share
+# notes: buffers with rows it does not contain; charged as emitted, the shared layout cost 6,473 bytes.
+# notes: The `Doc` tables cover the two Blob scans: one carries the unassigned Blob (its pre-charge
+# notes: measured the slice too), and one assigns every Blob, so the matched rows are carried as scanned.
+# notes: A sole update that carries an unassigned Blob stages a column patch (#1272), so the `DocTwice`
+# notes: steps carry the Blob in two statements (the second matches nothing) to keep that pre-charge
+# notes: covered. A whole-row update moves its row to a new fragment, so each limited update on a
+# notes: shared table runs on its own fresh table, before any other update has moved row000.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Shared {
+    slug: String @key
+    title: String
+}
+
+node Apart {
+    slug: String @key
+    title: String
+}
+
+node SharedDoc {
+    slug: String @key
+    content: Blob?
+    title: String
+}
+
+node ApartDoc {
+    slug: String @key
+    content: Blob?
+    title: String
+}
+
+node SharedDocCleared {
+    slug: String @key
+    content: Blob?
+    title: String
+}
+
+node ApartDocCleared {
+    slug: String @key
+    content: Blob?
+    title: String
+}
+
+node SharedDocTwice {
+    slug: String @key
+    content: Blob?
+    title: String
+}
+
+node ApartDocTwice {
+    slug: String @key
+    content: Blob?
+    title: String
+}
+
+--- seed
+
+--- load generate: v1 seed: 0 mode: append
+tables:
+  - kind: node
+    name: Shared
+    rows: 301
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+  - kind: node
+    name: Apart
+    rows: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+  - kind: node
+    name: ApartDoc
+    rows: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+  - kind: node
+    name: SharedDoc
+    rows: 301
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+  - kind: node
+    name: SharedDocCleared
+    rows: 301
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+  - kind: node
+    name: ApartDocCleared
+    rows: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+  - kind: node
+    name: SharedDocTwice
+    rows: 301
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+  - kind: node
+    name: ApartDocTwice
+    rows: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+
+--- expect ok
+
+--- load generate: v1 seed: 0 mode: append
+tables:
+  - kind: node
+    name: Apart
+    rows: 300
+    start: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+  - kind: node
+    name: ApartDoc
+    rows: 300
+    start: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+  - kind: node
+    name: ApartDocCleared
+    rows: 300
+    start: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+  - kind: node
+    name: ApartDocTwice
+    rows: 300
+    start: 1
+    commits: 1
+    columns:
+      slug: {kind: key, prefix: row, width: 3}
+      title: {kind: repeat, text: old, count: 1}
+
+--- expect ok
+
+--- mutate
+set write_max_bytes = 2048;
+query retitle_apart() {
+    update Apart set { title: "new" } where slug = "row000"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 2048;
+query retitle_shared() {
+    update Shared set { title: "new" } where slug = "row000"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 2048;
+query retitle_apart_doc_carrying_its_blob() {
+    update ApartDoc set { title: "new" } where slug = "row000"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 2048;
+query retitle_shared_doc_carrying_its_blob() {
+    update SharedDoc set { title: "new" } where slug = "row000"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 2048;
+query clear_apart_doc($c: Blob?) {
+    update ApartDocCleared set { content: $c, title: "cleared" } where slug = "row000"
+}
+
+--- params
+{"c": null}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 2048;
+query clear_shared_doc($c: Blob?) {
+    update SharedDocCleared set { content: $c, title: "cleared" } where slug = "row000"
+}
+
+--- params
+{"c": null}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 2048;
+query retitle_apart_doc_in_two_statements() {
+    update ApartDocTwice set { title: "twice" } where slug = "row000"
+    update ApartDocTwice set { title: "twice" } where slug = "nobody"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+set write_max_bytes = 2048;
+query retitle_shared_doc_in_two_statements() {
+    update SharedDocTwice set { title: "twice" } where slug = "row000"
+    update SharedDocTwice set { title: "twice" } where slug = "nobody"
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query titles_after_updates() {
+    match {
+        $s: Shared { slug: "row000" }
+        $a: Apart { slug: "row000" }
+    }
+    return { $s.title, $a.title }
+}
+
+--- expect unordered
+{"s.title": "new", "a.title": "new"}
+
+--- expect shape
+s.title: String
+a.title: String
+
+--- query
+query doc_titles_after_updates() {
+    match {
+        $s: SharedDoc { slug: "row000" }
+        $a: ApartDoc { slug: "row000" }
+        $sc: SharedDocCleared { slug: "row000" }
+        $ac: ApartDocCleared { slug: "row000" }
+        $st: SharedDocTwice { slug: "row000" }
+        $at: ApartDocTwice { slug: "row000" }
+    }
+    return { $s.title, $a.title, $sc.title, $ac.title, $st.title, $at.title }
+}
+
+--- expect unordered
+{"s.title": "new", "a.title": "new", "sc.title": "cleared", "ac.title": "cleared", "st.title": "twice", "at.title": "twice"}
+
+--- expect shape
+s.title: String
+a.title: String
+sc.title: String
+ac.title: String
+st.title: String
+at.title: String

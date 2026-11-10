@@ -1,0 +1,1 @@
+- A write demotes the cached handle of each table version it replaced instead of dropping it, so a reader or branch still at that version reopens nothing while the cache's budget has room.

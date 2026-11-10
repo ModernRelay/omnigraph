@@ -59,13 +59,6 @@ where
         self.lru.clear();
     }
 
-    /// Remove one entry, returning its value.
-    pub fn remove(&mut self, key: &K) -> Option<V> {
-        let value = self.entries.remove(key)?;
-        self.lru.retain(|existing| existing != key);
-        Some(value)
-    }
-
     /// Remove the least recently used entry.
     pub fn pop_oldest(&mut self) -> Option<(K, V)> {
         while let Some(oldest) = self.lru.pop_front() {
@@ -98,19 +91,24 @@ where
         self.lru.retain(|existing| existing != &key);
         self.lru.push_back(key);
     }
+
+    /// Move a held entry to the eviction front; a later `get` promotes it
+    /// back. A key that is not held changes nothing.
+    pub fn demote(&mut self, key: &K) {
+        if !self.entries.contains_key(key) {
+            return;
+        }
+        self.lru.retain(|existing| existing != key);
+        self.lru.push_front(key.clone());
+    }
 }
 
 /// Most held `Dataset` handles.
 const TABLE_HANDLE_CACHE_CAP: usize = 64;
 
-/// Most bytes of decoded Lance manifest the held handles keep alive, weighed
-/// as Lance weighs a manifest in its own metadata cache (`DeepSizeOf`). A
-/// manifest lists every fragment of its version, so one handle's size is
-/// linear in the table's fragment count; the count cap alone let 64 versions
-/// of one hot table hold 64 copies of its fragment list (issue 859). The
-/// newest entry is always admitted, so a single larger manifest still stays
-/// warm. Evicting an entry costs at most one reopen; keys are version-exact,
-/// so it never changes a result.
+/// Most decoded manifest bytes the held handles keep alive, weighed as Lance
+/// weighs a manifest (`DeepSizeOf`): a manifest lists every fragment, so a
+/// count cap alone held 64 fragment lists of one hot table (issue 859).
 const TABLE_HANDLE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -154,8 +152,10 @@ impl TableHandleKey {
 ///
 /// Retention is bounded twice: by entry count and by the decoded manifest
 /// bytes the entries keep alive (`TABLE_HANDLE_CACHE_BYTES`). A writer that
-/// publishes a new pin evicts the pin it staged on (`evict`), so a steadily
-/// written table holds its current version, not its recent history.
+/// publishes a new pin demotes the pin it staged on (`demote`): it stays held
+/// while the budget has room, for a reader or a fork still at that version,
+/// and is the first out under pressure, so a steadily written table's history
+/// never displaces a live pin.
 #[derive(Default)]
 pub struct TableHandleCache {
     inner: Mutex<TableHandleCacheInner>,
@@ -274,13 +274,12 @@ impl TableHandleCache {
         inner.entries.get(&key).map(|held| held.dataset.clone())
     }
 
-    /// Drop the handle for exactly this pin, if held. A writer calls it for
-    /// the pin it staged on once its publication names a newer one: that
-    /// version left the branch's working set. A reader still at the old pin
-    /// keeps its own `Dataset` clone; one that opens it again pays one open.
-    pub async fn evict(&self, key: &TableHandleKey) {
+    /// Move exactly this pin, if held, to the eviction front: a writer calls
+    /// it for the pin it staged on once its publication names a newer one.
+    /// A reader or fork that opens the pin again promotes it back.
+    pub async fn demote(&self, key: &TableHandleKey) {
         let mut inner = self.inner.lock().await;
-        inner.entries.remove(key);
+        inner.entries.demote(key);
     }
 
     /// The held handles' count, fragment entries and weighed manifest bytes.
@@ -314,11 +313,37 @@ impl TableHandleCache {
         let inner = self.inner.lock().await;
         inner.entries.keys_by_recency()
     }
+
+    /// Hold `dataset` for the pin a writer just committed, under the key the
+    /// published registration will carry, so the next open of that pin on
+    /// this handle costs no request (RFC 0067: the writer holds the handle it
+    /// needs; the pin is immutable, so a lost publish leaves a harmless entry).
+    pub async fn insert(
+        &self,
+        dataset_path: &str,
+        table_branch: Option<&str>,
+        version: u64,
+        staged_version: Option<u64>,
+        e_tag: Option<&str>,
+        dataset: Dataset,
+    ) {
+        let key = TableHandleKey::new(dataset_path, table_branch, version, staged_version, e_tag);
+        let manifest_bytes = dataset.manifest().deep_size_of();
+        let mut inner = self.inner.lock().await;
+        inner.insert(
+            key,
+            HeldHandle {
+                dataset,
+                manifest_bytes,
+            },
+        );
+    }
 }
 
 impl TableHandleCacheInner {
-    /// Admit `key`, then evict least recently used entries until the held
-    /// manifests fit the byte budget. The newest entry always stays.
+    /// Admit `key`, then evict from the front (demoted pins, then the least
+    /// recently used) until the held manifests fit the byte budget. The
+    /// newest entry always stays.
     fn insert(&mut self, key: TableHandleKey, value: HeldHandle) {
         self.entries.insert(key, value);
         while self.entries.len() > 1
@@ -442,9 +467,10 @@ mod tests {
         assert_eq!(held.iter().map(|key| key.version).collect::<Vec<_>>(), [3]);
     }
 
-    /// `evict` drops exactly the named pin and leaves every other held.
+    /// `demote` moves exactly the named pin to the eviction front, keeps it
+    /// held, and ignores a pin that is not held.
     #[tokio::test]
-    async fn evict_drops_only_the_named_pin() {
+    async fn demote_moves_only_the_named_pin_to_the_eviction_front() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("t.lance");
         let uri = uri.to_str().unwrap();
@@ -455,16 +481,70 @@ mod tests {
             open(&cache, uri, version).await;
         }
         cache
-            .evict(&TableHandleKey::new("t", None, 2, None, None))
+            .demote(&TableHandleKey::new("t", None, 3, None, None))
             .await;
         cache
-            .evict(&TableHandleKey::new("t", Some("other"), 3, None, None))
+            .demote(&TableHandleKey::new("t", Some("other"), 2, None, None))
             .await;
         let held = cache.held_keys().await;
         assert_eq!(
             held.iter().map(|key| key.version).collect::<Vec<_>>(),
-            [1, 3]
+            [3, 1, 2]
         );
-        assert_eq!(cache.occupancy().await.handles, 2);
+        assert_eq!(cache.occupancy().await.handles, 3);
+    }
+
+    /// Under budget pressure a demoted pin goes before every live one, even
+    /// the most recently opened; a hit on a demoted pin promotes it back, so
+    /// the oldest live pin goes instead.
+    #[tokio::test]
+    async fn budget_pressure_drops_demoted_pins_before_live_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("t.lance");
+        let uri = uri.to_str().unwrap();
+        appended_table(uri, 4).await;
+
+        let mut all_four = 0;
+        for version in 1..=4 {
+            all_four += open(&TableHandleCache::default(), uri, version)
+                .await
+                .manifest()
+                .deep_size_of();
+        }
+        let budget = all_four - 1;
+
+        let cache = TableHandleCache::with_limits(TABLE_HANDLE_CACHE_CAP, budget);
+        for version in 1..=3 {
+            open(&cache, uri, version).await;
+        }
+        cache
+            .demote(&TableHandleKey::new("t", None, 3, None, None))
+            .await;
+        open(&cache, uri, 4).await;
+        let held = cache.held_keys().await;
+        assert_eq!(
+            held.iter().map(|key| key.version).collect::<Vec<_>>(),
+            [1, 2, 4],
+            "the demoted newest pin went first"
+        );
+
+        let cache = TableHandleCache::with_limits(TABLE_HANDLE_CACHE_CAP, budget);
+        for version in 1..=3 {
+            open(&cache, uri, version).await;
+        }
+        cache
+            .demote(&TableHandleKey::new("t", None, 2, None, None))
+            .await;
+        assert!(
+            cache.get("t", None, 2, None, None).await.is_some(),
+            "a hit on a demoted pin"
+        );
+        open(&cache, uri, 4).await;
+        let held = cache.held_keys().await;
+        assert_eq!(
+            held.iter().map(|key| key.version).collect::<Vec<_>>(),
+            [3, 2, 4],
+            "the promoted pin stayed; the oldest live pin went"
+        );
     }
 }
