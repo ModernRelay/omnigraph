@@ -3930,6 +3930,65 @@ fn managed_organization_lists_directory_and_invitation_pages_without_enrolling()
         None,
     );
     api.assert_complete();
+
+    // The person's organizations, with the selected profile's marked. The
+    // answer describes the person, so it names no organization of its own.
+    let response = serde_json::json!({"data":{"organizations":[
+        {"organization_id":"account-one","name":"Acme Research"},
+        {"organization_id":"account-two","name":null}
+    ]},"meta":{"provenance":"service_db"}});
+    for json in [true, false] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![IntentReply::json(200, response.clone())]);
+        let mut command = organization_cli(temp.path(), &api.origin);
+        command.arg("list");
+        if json {
+            command.arg("--json");
+        }
+        let output = output_success(&mut command);
+        if json {
+            assert_eq!(parse_stdout_json(&output), response);
+        } else {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for expected in [
+                "* account-one  Acme Research  · this profile\n",
+                "  account-two  (no name)\n",
+                "login --create-profile NAME --organization ORG_ID",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+        }
+        assert_control_request(
+            &api.workflow_requests()[0],
+            "GET",
+            "/v1/organizations",
+            Value::Null,
+            None,
+        );
+        assert!(!temp.path().join(".omnigraph").exists());
+        api.assert_complete();
+    }
+    // A listing that is not one refuses whole: a repeated or malformed
+    // organization, or a name with a control character.
+    for organizations in [
+        serde_json::json!([{"organization_id":"account-one","name":"A"},{"organization_id":"account-one","name":"B"}]),
+        serde_json::json!([{"organization_id":"account one","name":null}]),
+        serde_json::json!([{"organization_id":"account-one","name":"A\u{1b}[2J"}]),
+    ] {
+        let temp = tempdir().unwrap();
+        let api = lifecycle_fixture(vec![IntentReply::json(
+            200,
+            serde_json::json!({"data":{"organizations":organizations},"meta":{}}),
+        )]);
+        let output =
+            output_failure(organization_cli(temp.path(), &api.origin).args(["list", "--json"]));
+        assert_eq!(
+            parse_stdout_json(&output)["type"],
+            "api_response_invalid",
+            "{organizations}"
+        );
+        api.assert_complete();
+    }
 }
 
 #[test]

@@ -435,11 +435,19 @@ async fn run(
         ..
     } = &cli.command
     {
+        // A person at a terminal is asked which organization the profile
+        // is for when they belong to several; anything else is refused.
+        let choice = if stdin_is_terminal {
+            managed::OrganizationChoice::Ask(stdin)
+        } else {
+            managed::OrganizationChoice::Refuse
+        };
         commands::targets::onboard(
             &operator,
             name,
             api.as_deref().unwrap_or("https://platform.omnigraph.dev"),
             organization.as_deref(),
+            choice,
             stdout,
             stderr,
         )

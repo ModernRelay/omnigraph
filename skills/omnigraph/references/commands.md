@@ -16,7 +16,7 @@
 - Open Studio (studio)
 - Addressing a graph
 - Output formats and positions · health check
-- Organization administration (members and invitations)
+- Organization administration (your organizations, members and invitations)
 - Cluster control plane (direct and managed)
 
 Commands you'll reach for but don't need best-practice rules around. Quick syntax reference.
@@ -51,10 +51,10 @@ prints the exact flags of the installed binary.
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
 | `cluster` | `validate` `plan` `apply` `status` `observe` `force-unlock` `upgrade-ledger` `create` `list` `members list` `pull` `push` `delete` `undo-delete` `token` `operation` `history` `cancel` | Deploy and inspect a cluster; the target kind selects the backend |
-| `organization` | `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | Manage the selected organization's members and invitations; requires a profile; `org` is an alias |
+| `organization` | `list` `members list` `members set` `members offboard` `invitations list` `invitations send` `invitations resend` `invitations revoke` | List the organizations you belong to; manage the selected organization's members and invitations; requires a profile; `org` is an alias |
 | `policy` | `validate` `test` `explain` | Validate or evaluate a cluster's applied policy |
 | `embed` | — | Generate, clean or refresh seed embeddings |
-| `login` | — | Create a profile with `--create-profile`, or sign in to its `omnigraph` auth provider |
+| `login` | — | Create a profile with `--create-profile` (pass `--organization ID` when you belong to several), or sign in to its `omnigraph` auth provider |
 | `logout` | — | Clear the selected platform session and report revocation |
 | `target` | `list` `inspect` `add` `refresh` `remove` | Manage resource bindings |
 | `credentials` | `set` `status` `remove` `export` | Explicit owner/profile custody and pipe-only access export |
@@ -428,9 +428,19 @@ pipe, not terminal/file output, and never exports refresh credentials.
 refreshes a managed endpoint without changing its incarnation. `target remove
 NAME` keeps credentials/journals and requires remaining references to be valid.
 Onboarding requires `login --create-profile NAME`, with optional `--organization ID`
-and `--api URL` (default `https://platform.omnigraph.dev`). Bare login uses
+and `--api URL` (default `https://platform.omnigraph.dev`). A profile belongs to
+one organization. Without `--organization`, a person in one organization gets
+it; a person in several is asked at a terminal and otherwise refused with
+`organization_required` and the list, so in automation, or when unsure, pass
+`--organization ID`. The sign-in's browser session never picks among several.
+Bare login uses
 `defaults.profile`; `login --profile NAME` selects an existing profile. Missing
 profiles never cause implicit creation, and creation refuses existing names.
+A refused sign-in names its check: `provider_response_invalid` means the
+identity provider's tokens do not fit the API's published sign-in
+configuration, which signing in again does not fix; `credential_invalid` means
+a session saved on this machine fails a check, which `logout` then `login`
+replaces.
 Managed target add uses `--profile NAME` or `defaults.profile`.
 `config recover-operations --source DIR --profile NAME [--json]`
 preserves matching legacy folder evidence; it neither converts config nor submits
@@ -564,13 +574,19 @@ is healthy; authorized `graphs list --target NAME --json` on a registered target
 Use a profile for `organization` (`org`):
 
 ```bash
+omnigraph organization list --profile work
 omnigraph organization members list --profile work --json
 omnigraph organization invitations send person@example.com --role member --profile work --idempotency-key invite-person
 omnigraph organization members set person@example.com --profile work --role member --idempotency-key role-person
 omnigraph organization members offboard person@example.com --profile work --idempotency-key offboard-person --json
 ```
 
-The caller needs current provider `members_manage` permission. WorkOS owns
+`organization list` shows the organizations the signed-in person is an active
+member of, with names and IDs, and marks the profile's; it needs no service
+permission, and its `--json` is the API envelope (`data.organizations`).
+Use an ID from it with `login --create-profile NAME --organization ID` to work
+in another organization. The member and invitation commands need current
+provider `members_manage` permission. WorkOS owns
 organization membership and service roles; applied cluster configuration owns
 graph and deployment permissions. No local enrollment or member-patch command
 is required. Member operations accept an email or exact user ID. `members set`

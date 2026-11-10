@@ -36,11 +36,16 @@ fn edit(
     targets::replace_file(&path, &after)
 }
 
+/// Creates the profile `name` after a verified sign-in. Without
+/// `organization` the sign-in's own is used when it is the person's only
+/// one; with several, `choice` asks or refuses, so the profile is never
+/// bound to whichever organization the browser session carried.
 pub(crate) async fn onboard(
     input: &InvocationConfig,
     name: &str,
     api: &str,
     organization: Option<&str>,
+    choice: crate::managed::OrganizationChoice<'_>,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<()> {
@@ -63,7 +68,7 @@ pub(crate) async fn onboard(
     profile.api = route.clone();
     let auth = crate::operator_routing::registration_auth(input, name, &route)?;
     crate::operator_routing::AUTH.scope(Some(auth), async {
-            let receipt = crate::managed::register_login(route.clone(), organization, stderr).await?;
+            let receipt = crate::managed::register_login(route.clone(), organization, choice, stderr).await?;
         let organization = receipt["data"]["account_id"].as_str().ok_or_else(|| eyre!("verified login response has no organization"))?;
         profile.organization_id = organization.to_owned();
         if let Err(error) = edit(input, |config| {

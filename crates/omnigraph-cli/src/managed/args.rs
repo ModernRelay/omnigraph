@@ -10,6 +10,9 @@ pub(crate) struct OrganizationArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum OrganizationCommand {
+    /// List the organizations the signed-in person is an active member of,
+    /// marking the selected profile's.
+    List,
     /// List members, set service roles or offboard a member.
     Members {
         #[command(subcommand)]

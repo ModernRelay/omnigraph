@@ -1,7 +1,7 @@
 //! Managed human credentials never share the legacy named-server token file.
 use super::{Api, Failure, Method, Result, Value, canonical_origin, json, write_diagnostic};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::time::Instant;
@@ -633,8 +633,14 @@ async fn select_human_with(
     let saved = renewal::load_selected(store, origin, organization)?.ok_or_else(login_required)?;
     let provider = provider::Provider::new(&saved.config)?;
     let saved = renewal::credential_loaded(store, saved, &provider).await?;
-    let (verified, _, _) =
-        renewal::verify(origin, &saved.config, saved.access_token(), None).await?;
+    let (verified, _, _) = renewal::verify(
+        origin,
+        &saved.config,
+        saved.access_token(),
+        None,
+        renewal::Source::Saved,
+    )
+    .await?;
     if verified != saved.identity {
         return Err(Failure::refused(
             "session_identity_mismatch",
@@ -874,18 +880,21 @@ async fn login_with(
         config,
         provider,
         organization,
+        OrganizationChoice::Refuse,
         stderr,
         cached,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn login_validated(
     store: &dyn Store,
     origin: &str,
     config: provider::Config,
     provider: &provider::Provider,
     organization: Option<&str>,
+    choice: OrganizationChoice<'_>,
     stderr: &mut dyn Write,
     cached: Vec<renewal::Session>,
 ) -> Result<Value> {
@@ -900,7 +909,14 @@ async fn login_validated(
     {
         match renewal::credential_loaded(store, saved.clone(), provider).await {
             Ok(current) => {
-                let verified = renewal::verify(origin, &config, current.access_token(), None).await;
+                let verified = renewal::verify(
+                    origin,
+                    &config,
+                    current.access_token(),
+                    None,
+                    renewal::Source::Saved,
+                )
+                .await;
                 match verified {
                     Ok((identity, expiry, mut body)) => {
                         if identity != saved.identity {
@@ -982,7 +998,17 @@ async fn login_validated(
             })?;
         match reply {
             Ok(tokens) => {
-                return accept_device(store, origin, config, provider, tokens, organization).await;
+                return accept_device(
+                    store,
+                    origin,
+                    config,
+                    provider,
+                    tokens,
+                    organization,
+                    choice,
+                    stderr,
+                )
+                .await;
             }
             Err(error) if error.code() == Some("authorization_pending") => {}
             Err(error) if error.code() == Some("slow_down") => {
@@ -993,6 +1019,165 @@ async fn login_validated(
     }
 }
 
+/// How a login that named no organization settles on one when the person is
+/// an active member of several. A profile is bound to one organization for
+/// good, so it is never the one a browser session happened to carry.
+pub(crate) enum OrganizationChoice<'a> {
+    /// No one to ask: refuse, and list the organizations to choose from.
+    Refuse,
+    /// Ask on the terminal: the list goes to stderr and the answer is read
+    /// from here.
+    Ask(&'a mut dyn Read),
+}
+
+/// The answers a person gets to give before the sign-in is abandoned.
+const CHOICE_ATTEMPTS: usize = 3;
+
+fn several_organizations(listed: &[super::organization::Membership], why: &str) -> Failure {
+    let organizations: Vec<String> = listed
+        .iter()
+        .map(super::organization::Membership::label)
+        .collect();
+    Failure::refused(
+        "organization_required",
+        &format!(
+            "{why}; run login again with --organization ORG_ID, one of: {}",
+            organizations.join(", ")
+        ),
+    )
+}
+
+/// Asks which of `listed` the profile is for. An answer is a row's number or
+/// an organization ID; an end of input, or [`CHOICE_ATTEMPTS`] answers that
+/// name none, abandons the sign-in.
+fn ask_organization(
+    listed: &[super::organization::Membership],
+    signed: &str,
+    input: &mut dyn Read,
+    stderr: &mut dyn Write,
+) -> Result<String> {
+    let mut rows = String::from("You are an active member of several organizations:\n");
+    for (index, organization) in listed.iter().enumerate() {
+        rows.push_str(&format!(
+            "  {}. {}{}\n",
+            index + 1,
+            organization.label(),
+            if organization.organization_id == signed {
+                "  · the one this sign-in opened"
+            } else {
+                ""
+            }
+        ));
+    }
+    write_diagnostic(stderr, format_args!("{rows}"))?;
+    for _ in 0..CHOICE_ATTEMPTS {
+        write_diagnostic(
+            stderr,
+            format_args!(
+                "Organization for this profile [1-{} or an organization ID]: ",
+                listed.len()
+            ),
+        )?;
+        let line = crate::input::read_line(input).map_err(|_| {
+            several_organizations(listed, "the organization choice could not be read")
+        })?;
+        if line.is_empty() {
+            break;
+        }
+        let answer = line.trim();
+        let chosen = answer
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| listed.get(number.checked_sub(1)?))
+            .or_else(|| {
+                listed
+                    .iter()
+                    .find(|organization| organization.organization_id == answer)
+            });
+        if let Some(chosen) = chosen {
+            return Ok(chosen.organization_id.clone());
+        }
+    }
+    Err(several_organizations(listed, "no organization was chosen"))
+}
+
+/// The organization of a login that named none: the sign-in's own when it is
+/// the person's only one, else the one they choose. The person's wait is
+/// unbounded, so this runs before the claims lock and the network deadline
+/// of [`accept_device`]; it reads no saved state and keeps nothing.
+async fn settle_organization(
+    origin: &str,
+    config: &provider::Config,
+    tokens: &workos::AuthenticateResponse,
+    choice: OrganizationChoice<'_>,
+    stderr: &mut dyn Write,
+) -> Result<String> {
+    let initial = renewal::device_claims(config, tokens)?;
+    // The API authenticates a person's session by its organization, so a
+    // sign-in without one cannot ask it which organizations there are.
+    let signed = initial
+        .organization()
+        .ok_or_else(renewal::organization_required)?
+        .to_owned();
+    let access: &str = tokens.access_token.as_ref();
+    let listed = super::organization::list_memberships(
+        &Api::new(origin.into(), Some(access.to_owned()))?,
+        super::REQUEST_TIMEOUT,
+    )
+    .await
+    .map(|(_, listed)| listed)
+    .map_err(|error| {
+        let error = scrub(error, access);
+        if error.response_status == Some(reqwest::StatusCode::NOT_FOUND) {
+            // An API that cannot say whether there are others cannot make
+            // this sign-in's organization the right one by default.
+            return Failure::refused(
+                "organization_required",
+                "this API does not list your organizations; run login again with --organization ORG_ID",
+            );
+        }
+        error
+    })?;
+    if listed
+        .iter()
+        .all(|organization| organization.organization_id == signed)
+    {
+        return Ok(signed);
+    }
+    match choice {
+        OrganizationChoice::Refuse => Err(several_organizations(
+            &listed,
+            "you are an active member of several organizations and this login names none",
+        )),
+        OrganizationChoice::Ask(input) => ask_organization(&listed, &signed, input, stderr),
+    }
+}
+
+/// Revokes a device sign-in that will not be kept, once it is known to be a
+/// new session and none this machine already holds. Best effort: the tokens
+/// are dropped either way, and without its refresh token the session cannot
+/// be renewed.
+async fn discard_device_session(
+    store: &dyn Store,
+    origin: &str,
+    config: &provider::Config,
+    tokens: &workos::AuthenticateResponse,
+) {
+    let _claims_lock = if crate::operator_routing::journal_owner().is_some() {
+        match coordination::global_session_lock().await {
+            Ok(lock) => Some(lock),
+            Err(_) => return,
+        }
+    } else {
+        None
+    };
+    if renewal::check_device_session(store, origin, config, tokens).is_ok() {
+        let access: &str = tokens.access_token.as_ref();
+        renewal::revoke(origin, access.to_owned()).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn accept_device(
     store: &dyn Store,
     origin: &str,
@@ -1000,7 +1185,24 @@ async fn accept_device(
     provider: &provider::Provider,
     tokens: workos::AuthenticateResponse,
     organization: Option<&str>,
+    choice: OrganizationChoice<'_>,
+    stderr: &mut dyn Write,
 ) -> Result<Value> {
+    let settled = match organization {
+        Some(organization) => organization.to_owned(),
+        None => match settle_organization(origin, &config, &tokens, choice, stderr).await {
+            Ok(organization) => organization,
+            Err(error) => {
+                // A sign-in without an organization is no session the API
+                // knows, so there is nothing it could revoke.
+                if tokens.organization_id.is_some() {
+                    discard_device_session(store, origin, &config, &tokens).await;
+                }
+                return Err(error);
+            }
+        },
+    };
+    let organization = Some(settled.as_str());
     let _claims_lock = if crate::operator_routing::journal_owner().is_some() {
         Some(coordination::global_session_lock().await?)
     } else {
@@ -1064,10 +1266,11 @@ pub(super) async fn login_replacing(
     principal: Option<&str>,
     stderr: &mut dyn Write,
 ) -> Result<Value> {
+    // An existing profile names its organization, so there is nothing to ask.
     REPLACE_PRINCIPAL
         .scope(
             principal.map(str::to_owned),
-            login(origin, organization, stderr),
+            login(origin, organization, OrganizationChoice::Refuse, stderr),
         )
         .await
 }
@@ -1075,6 +1278,7 @@ pub(super) async fn login_replacing(
 pub(super) async fn login(
     origin: String,
     organization: Option<&str>,
+    choice: OrganizationChoice<'_>,
     stderr: &mut dyn Write,
 ) -> Result<Value> {
     let _lock = coordination::lock(&origin).await?;
@@ -1087,6 +1291,7 @@ pub(super) async fn login(
         config,
         &provider,
         organization,
+        choice,
         stderr,
         cached,
     )
