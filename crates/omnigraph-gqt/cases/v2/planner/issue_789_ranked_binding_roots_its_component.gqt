@@ -41,12 +41,12 @@ edge Cites: Doc -> Doc
 
 --- query
 query bm25_on_an_undeclared_destination() {
-    match {
+    match { from bm25({ match {
         $p: Person { name: "p1" }
         $p knows $d
-    }
+    } return { $p, $d } }, $d.body, "needle") }
     return { $d.slug }
-    order { bm25($d.body, "needle") }
+    order { $score desc }
     limit 3
 }
 --- expect ordered
@@ -57,13 +57,13 @@ d.slug: String
 scan Doc as $d: ranked bm25
 --- query
 query bm25_two_hops_from_the_source() {
-    match {
+    match { from bm25({ match {
         $p: Person { name: "p1" }
         $p knows $x
         $x cites $d
-    }
+    } return { $p, $x, $d } }, $d.body, "needle") }
     return { $x.slug, $d.slug }
-    order { bm25($d.body, "needle") }
+    order { $score desc }
     limit 3
 }
 --- expect unordered
@@ -76,12 +76,12 @@ d.slug: String
 scan Doc as $d: ranked bm25
 --- query
 query bm25_on_a_traversal_source() {
-    match {
+    match { from bm25({ match {
         $t: Doc { slug: "d3" }
         $d cites $t
-    }
+    } return { $t, $d } }, $d.body, "needle") }
     return { $d.slug }
-    order { bm25($d.body, "needle") }
+    order { $score desc }
     limit 3
 }
 --- expect ordered
@@ -92,12 +92,12 @@ d.slug: String
 scan Doc as $d: ranked bm25
 --- query
 query bm25_over_an_undirected_traversal() {
-    match {
+    match { from bm25({ match {
         $a: Doc { slug: "d3" }
         $a <cites> $d
-    }
+    } return { $a, $d } }, $d.body, "needle") }
     return { $d.slug }
-    order { bm25($d.body, "needle") }
+    order { $score desc }
     limit 3
 }
 --- expect ordered

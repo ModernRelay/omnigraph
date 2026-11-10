@@ -1,8 +1,7 @@
 //! The desugaring-uniqueness test and the closure table as a test
 //! (docs/rfcs/2026-11-07-gq-3.md, section 10).
 //!
-//! The first lowers every surface form of section 3 through the edition-3
-//! checker and compares its core term with the term the derived-forms table
+//! The first lowers every surface form of section 3 through the checker and compares its core term with the term the derived-forms table
 //! of section 2 names, built here directly; then it lowers every form and
 //! fails on two forms that share a term unless the formatter list of section
 //! 6 writes both one way, or A6's one exception (a literal and a reference to
@@ -15,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::catalog::{Catalog, build_catalog};
 use crate::ir::core::*;
 use crate::ir::expr::IRExpr;
-use crate::query::ast::{AggFunc, CompOp, Literal};
 use crate::query::check::{SExpr, SKind, check_source};
+use crate::query::value::{AggFunc, CompOp, Literal};
 use crate::schema::parser::parse_schema;
 use crate::types::{Direction, PropType, ScalarType};
 
@@ -29,8 +28,7 @@ fn catalog() -> Catalog {
 
 #[track_caller]
 fn lower(src: &str) -> CoreDecl {
-    let out =
-        check_source(&catalog(), &format!("gq 3;\n{src}")).unwrap_or_else(|e| panic!("{e}\n{src}"));
+    let out = check_source(&catalog(), src).unwrap_or_else(|e| panic!("{e}\n{src}"));
     out.into_iter()
         .last()
         .unwrap()
@@ -41,7 +39,7 @@ fn lower(src: &str) -> CoreDecl {
 
 #[track_caller]
 fn refusal(src: &str) -> crate::query::diagnostic::QueryDiagnostic {
-    match check_source(&catalog(), &format!("gq 3;\n{src}")) {
+    match check_source(&catalog(), src) {
         Err(e) => e,
         Ok(out) => out
             .into_iter()
@@ -107,8 +105,22 @@ fn expand(input: Term, src: &str, dst: &str, dst_type: &str, sel: &[(&str, Direc
         input: input.boxed(),
         src: src.into(),
         dst: dst.into(),
+        src_type: "Person".into(),
         dst_type: dst_type.into(),
-        selector: sel.iter().map(|(e, d)| (e.to_string(), *d)).collect(),
+        edges: {
+            let members: Vec<crate::traversal::EdgeMember> = sel
+                .iter()
+                .map(|(e, d)| crate::traversal::EdgeMember {
+                    edge_type: e.to_string(),
+                    direction: *d,
+                })
+                .collect();
+            if let [one] = members.as_slice() {
+                crate::traversal::EdgeSelection::Named(one.clone())
+            } else {
+                crate::traversal::EdgeSelection::Alternation(members)
+            }
+        },
         min_hops: 1,
         max_hops: Some(1),
         edge_var: None,
@@ -152,8 +164,17 @@ fn prop(c: &str, p: &str, ty: Ty) -> IRExpr {
 fn int(n: i128, s: ScalarType) -> IRExpr {
     SExpr::new(SKind::Lit(Literal::Integer(n)), val(s, false)).to_ir()
 }
+/// A comparison in the bound form the checker stores: each numeric literal at
+/// its own type, the casts [`coerce`](crate::ir::coerce)'s.
 fn cmp(op: CompOp, l: IRExpr, r: IRExpr) -> IRExpr {
-    IRExpr::comparison(l, op, r)
+    let own = |e: IRExpr| match e {
+        IRExpr::Literal(lit @ (Literal::Integer(_) | Literal::Float(_)), _) => {
+            let ty = crate::query::check::literal::literal_type(&lit).unwrap();
+            IRExpr::Literal(lit, crate::types::ExprType::from_prop(&ty))
+        }
+        other => other,
+    };
+    crate::ir::coerce::binary(own(l), crate::query::value::BinaryOp::Compare(op), own(r)).unwrap()
 }
 fn not(e: IRExpr) -> IRExpr {
     IRExpr::Not(Box::new(e), boolean(false).expr_type())
@@ -242,8 +263,8 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             "count { p } as a value: Correlate(R, Group(p, [], [agg])), the aggregate column",
             "query f() { match { $p: Person  let $n = count { $p knows $q } } return { $n } }",
             Term::Project {
-                input: block(scan("p", "Person"), knows_q_from_env(), "_b1").boxed(),
-                items: vec![("n".into(), col("_b1", val(ScalarType::I64, false)))],
+                input: block(scan("p", "Person"), knows_q_from_env(), "__temp_b1").boxed(),
+                items: vec![("n".into(), col("__temp_b1", val(ScalarType::I64, false)))],
                 keep: true,
             },
         ),
@@ -251,16 +272,16 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             "exists { p }: count { p } > 0",
             "query f() { match { $p: Person  exists { $p knows $q } } return { $p } }",
             filter(
-                block(scan("p", "Person"), knows_q_from_env(), "_b1"),
-                exists("_b1"),
+                block(scan("p", "Person"), knows_q_from_env(), "__temp_b1"),
+                exists("__temp_b1"),
             ),
         ),
         (
             "not { p }: Filter(¬ exists { p })",
             "query f() { match { $p: Person  not { $p knows $q } } return { $p } }",
             filter(
-                block(scan("p", "Person"), knows_q_from_env(), "_b1"),
-                not(exists("_b1")),
+                block(scan("p", "Person"), knows_q_from_env(), "__temp_b1"),
+                not(exists("__temp_b1")),
             ),
         ),
         (
@@ -477,7 +498,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
         "query f($s: String, $v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }  from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) } return { $d } }",
     );
     assert!(
-        matches!(match_term(&got), Term::Fuse { arms, k: 60, weights, .. } if arms.len() == 2 && weights == &vec![1.0, 1.0])
+        matches!(match_term(&got), Term::Fuse { arms, k: Count::Literal(60), weights, .. } if arms.len() == 2 && weights == &vec![1.0, 1.0])
     );
     let got = lower(
         "query g($h: String) { match { $p: Person { handle: $h } } return { $p } }\nquery f() { match { from g(\"a\") } return { $p } }",
@@ -503,7 +524,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             )
         )
     );
-    // Edition 2's `delete T where φ`, as the rewriter writes it:
+    // The old `delete T where φ`, as the rewriter writes it:
     // Delete(Filter(Scan(T), φ), $x).
     let got = lower("query w() { $x: Person  $x.age > 3  delete $x }");
     let CoreDecl::Write(w) = &got else { panic!() };

@@ -9,7 +9,8 @@ environments:
 
 --- mutate
 query update_tables() {
-    update T0 set { value: 1 } where key = "row"
+    $x: T0  $x.key = "row"
+    update $x set { value: 1 }
 }
 --- expect affected: nodes=1 edges=0
 

@@ -2504,7 +2504,7 @@ async fn insert(graph: &Arc<Omnigraph>, branch: &str, name: &str) {
             "seed",
             &HashMap::from([(
                 "name".to_string(),
-                omnigraph_compiler::query::ast::Literal::String(name.to_string()),
+                omnigraph_compiler::query::value::Literal::String(name.to_string()),
             )]),
         )
         .await

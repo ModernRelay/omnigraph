@@ -191,7 +191,8 @@ i.slug: String
 
 --- mutate
 query update_or_of_negated_memberships() {
-    update Item set { tag: "hit" } where not (s in ["x"]) or not (s in ["y"])
+    $x: Item  not ($x.s in ["x"]) or not ($x.s in ["y"])
+    update $x set { tag: "hit" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -213,7 +214,8 @@ i.slug: String
 
 --- mutate
 query delete_or_of_negated_memberships() {
-    delete Item where not (s in ["x"]) or not (s in ["y"])
+    $x: Item  not ($x.s in ["x"]) or not ($x.s in ["y"])
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=2

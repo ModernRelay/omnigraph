@@ -1,5 +1,5 @@
 use omnigraph_compiler::ir::IRExpr;
-use omnigraph_compiler::query::ast::{CompOp, Literal};
+use omnigraph_compiler::query::value::{CompOp, Literal};
 use omnigraph_compiler::{ExprType, ScalarType};
 
 use crate::error::PlanError;

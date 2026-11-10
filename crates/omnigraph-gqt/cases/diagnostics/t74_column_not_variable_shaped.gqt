@@ -1,5 +1,5 @@
 # issue: none
-# notes: The GQ edition-3 preview (`gq 3;`) refuses `from` over a column that is neither a variable nor aliased with `T74`; nothing in the preview executes.
+# notes: The compiler refuses `from` over a column that is neither a variable nor aliased with `T74`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,7 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-gq 3;
 query q() { match { from { match { $p: Person } return { $p.name } } } return { 1 as one } }
 
 --- expect error: type error: T74:

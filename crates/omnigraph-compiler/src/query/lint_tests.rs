@@ -111,7 +111,8 @@ return { $p.name }
 }
 
 query bad_update($slug: String) {
-update Person set { missing: "nope" } where slug = $slug
+$x: Person  $x.slug = $slug
+update $x set { missing: "nope" }
 }
 "#,
         "/tmp/queries.gq",
@@ -125,7 +126,7 @@ update Person set { missing: "nope" } where slug = $slug
     assert_eq!(
         operation.result,
         vec![QueryResultFieldDescriptor {
-            name: "name".to_string(),
+            name: "p.name".to_string(),
             kind: QueryValueKind::String,
             item_kind: None,
             vector_dim: None,
@@ -246,7 +247,8 @@ effectiveTo: DateTime?
         ),
         r#"
 query update_policy($slug: String, $name: String) {
-update Policy set { name: $name } where slug = $slug
+$x: Policy  $x.slug = $slug
+update $x set { name: $name }
 }
 "#,
         "/tmp/queries.gq",
@@ -300,7 +302,8 @@ embedding: Vector(3)? @embed(body)
         ),
         r#"
 query update_doc($slug: String, $body: String) {
-update Doc set { body: $body } where slug = $slug
+$x: Doc  $x.slug = $slug
+update $x set { body: $body }
 }
 "#,
         "/tmp/queries.gq",
@@ -334,7 +337,8 @@ name: String?
         &catalog,
         r#"
 query update_policy($slug: String, $name: String) {
-update Policy set { name: $name } where slug = $slug
+$x: Policy  $x.slug = $slug
+update $x set { name: $name }
 }
 "#,
         "/tmp/queries.gq",
@@ -364,11 +368,13 @@ a_field: String?
         ),
         r#"
 query update_b($slug: String) {
-update Policy set { a_field: "x" } where slug = $slug
+$x: Policy  $x.slug = $slug
+update $x set { a_field: "x" }
 }
 
 query update_a($slug: String) {
-update Policy set { a_field: "x" } where slug = $slug
+$x: Policy  $x.slug = $slug
+update $x set { a_field: "x" }
 }
 "#,
         "/tmp/queries.gq",
@@ -443,7 +449,8 @@ edge Partners: Company -> Company
         ),
         r#"
 query delete_person($slug: String) {
-delete Person where slug = $slug
+$x: Person  $x.slug = $slug
+delete $x
 }
 "#,
         "/tmp/queries.gq",
@@ -547,19 +554,19 @@ return {
     assert_eq!(
         shapes,
         vec![
-            ("slug", QueryValueKind::String, None, None, false),
-            ("count", QueryValueKind::Int, None, None, false),
-            ("total", QueryValueKind::BigInt, None, None, false),
-            ("score", QueryValueKind::Float, None, None, false),
+            ("d.slug", QueryValueKind::String, None, None, false),
+            ("d.count", QueryValueKind::Int, None, None, false),
+            ("d.total", QueryValueKind::BigInt, None, None, false),
+            ("d.score", QueryValueKind::Float, None, None, false),
             (
-                "tags",
+                "d.tags",
                 QueryValueKind::List,
                 Some(QueryValueKind::Date),
                 None,
                 true,
             ),
-            ("embedding", QueryValueKind::Vector, None, Some(3), false,),
-            ("createdAt", QueryValueKind::DateTime, None, None, true,),
+            ("d.embedding", QueryValueKind::Vector, None, Some(3), false,),
+            ("d.createdAt", QueryValueKind::DateTime, None, None, true,),
             ("d", QueryValueKind::Object, None, None, false),
         ]
     );
@@ -568,7 +575,7 @@ return {
     assert_eq!(
         serialized["results"][0]["operation"]["result"][4],
         serde_json::json!({
-            "name": "tags",
+            "name": "d.tags",
             "kind": "list",
             "item_kind": "date",
             "nullable": true
@@ -577,7 +584,7 @@ return {
     assert_eq!(
         serialized["results"][0]["operation"]["result"][5],
         serde_json::json!({
-            "name": "embedding",
+            "name": "d.embedding",
             "kind": "vector",
             "vector_dim": 3,
             "nullable": false

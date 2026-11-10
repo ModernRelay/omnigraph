@@ -113,7 +113,7 @@ query per_market_by_max() {
     order { max($d.amount) }
 }
 
---- expect error: T42: order key `max($d.amount)` does not appear in return; add it to return or order by its alias
+--- expect error: T42: an aggregate order key must repeat a return item; order by its alias
 
 --- query
 set engine = v2;
@@ -140,4 +140,4 @@ query boolean_key_unbound() {
     order { $p.age > 30 }
 }
 
---- expect error: T42: order key `$p.age > 30` does not appear in return; add it to return or order by its alias
+--- expect error: P006: `boolean_key_unbound`: the planner does not lower an order key computed from columns

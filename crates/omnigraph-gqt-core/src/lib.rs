@@ -15,15 +15,16 @@ use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::instrumentation::{QueryIoProbes, capture_query_io_probes, with_query_io_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::{MutationReceipt, Session};
-use omnigraph_compiler::query::ast::{
-    BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, Clause, CommitWrite,
-    EmptyFile, Expr, FileBody, Literal, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt,
-    UnattachedBase, show_statement_name,
+use omnigraph_compiler::ir::core::CoreDecl;
+use omnigraph_compiler::query::check::{check_query_decl, result_schema};
+use omnigraph_compiler::query::file::{
+    BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, CommitWrite, EmptyFile,
+    FileBody, LoadStmt, MutationWriteMode, Param, QueryDecl, SettingStmt, UnattachedBase,
+    show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::query::typecheck::{
-    executed_column_name, infer_query_result_schema, typecheck_query,
-};
+use omnigraph_compiler::query::syntax::{Arg, Clause, DeclBody, Expr, LetValue, ReadBody, RelExpr};
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::schema::ast::{Annotation, PropDecl, SchemaDecl};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::settings::{Engine, SessionSettings, SettingId, SettingRow, Traversal};
@@ -1226,66 +1227,58 @@ fn validate_subst_tokens(
 /// Walks one expression for the index decision and the string-`nearest`
 /// refusal. Exhaustive over `Expr` so a newly added construct is a compile
 /// error, never a silent skip.
+/// Whether an expression reads a search or ranking call (which needs the
+/// case's indexes built), refusing a `nearest` whose query is a String.
 fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<(), String> {
     match expr {
-        Expr::Now
-        | Expr::PropAccess { .. }
+        Expr::Literal(_)
         | Expr::Variable(_)
-        | Expr::Literal(_)
-        | Expr::AliasRef(_) => {}
-        Expr::Aggregate { arg, .. } => walk_expr(arg, params, needs_indices)?,
-        Expr::Binary { left, op: _, right }
-        | Expr::In {
-            needle: left,
-            list: right,
-        } => {
+        | Expr::Prop { .. }
+        | Expr::Meta(_)
+        | Expr::Ident(_) => {}
+        Expr::Call(call) => {
+            if matches!(
+                call.name.as_str(),
+                "search" | "fuzzy" | "match_text" | "match_terms" | "bm25" | "nearest" | "rrf"
+            ) {
+                *needs_indices = true;
+            }
+            if call.name == "nearest"
+                && let Some(Arg::Expr(query)) = call.args.get(2)
+            {
+                refuse_string_nearest(query, params)?;
+            }
+            for arg in &call.args {
+                match arg {
+                    Arg::Expr(e) => walk_expr(e, params, needs_indices)?,
+                    Arg::Inline(body) => walk_read(body, params, needs_indices)?,
+                }
+            }
+            for (_, value) in &call.options {
+                walk_expr(value, params, needs_indices)?;
+            }
+        }
+        Expr::AggDistinct { arg, .. } | Expr::Neg(arg) | Expr::Not(arg) => {
+            walk_expr(arg, params, needs_indices)?
+        }
+        Expr::IsNull { expr, .. } => walk_expr(expr, params, needs_indices)?,
+        Expr::Block(block) => {
+            walk_clauses(&block.clauses, params, needs_indices)?;
+            if let Some(arg) = &block.arg {
+                walk_expr(arg, params, needs_indices)?;
+            }
+        }
+        Expr::Arith { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::InfixString { left, right, .. } => {
             walk_expr(left, params, needs_indices)?;
             walk_expr(right, params, needs_indices)?;
         }
-        Expr::Not(inner)
-        | Expr::IsNull {
-            expr: inner,
-            negated: _,
-        } => walk_expr(inner, params, needs_indices)?,
-        Expr::Search { field, query }
-        | Expr::MatchText { field, query }
-        | Expr::Bm25 { field, query } => {
-            *needs_indices = true;
-            walk_expr(field, params, needs_indices)?;
-            walk_expr(query, params, needs_indices)?;
-        }
-        Expr::Fuzzy {
-            field,
-            query,
-            max_edits,
-        } => {
-            *needs_indices = true;
-            walk_expr(field, params, needs_indices)?;
-            walk_expr(query, params, needs_indices)?;
-            if let Some(max_edits) = max_edits {
-                walk_expr(max_edits, params, needs_indices)?;
-            }
-        }
-        Expr::Nearest {
-            variable: _,
-            property: _,
-            query,
-        } => {
-            *needs_indices = true;
-            refuse_string_nearest(query, params)?;
-            walk_expr(query, params, needs_indices)?;
-        }
-        Expr::Rrf {
-            primary,
-            secondary,
-            k,
-        } => {
-            *needs_indices = true;
-            walk_expr(primary, params, needs_indices)?;
-            walk_expr(secondary, params, needs_indices)?;
-            if let Some(k) = k {
-                walk_expr(k, params, needs_indices)?;
-            }
+        Expr::In { needle, list, .. } => {
+            walk_expr(needle, params, needs_indices)?;
+            walk_expr(list, params, needs_indices)?;
         }
     }
     Ok(())
@@ -1312,6 +1305,17 @@ fn refuse_string_nearest(query: &Expr, params: &[Param]) -> Result<(), String> {
     )
 }
 
+fn walk_read(body: &ReadBody, params: &[Param], needs_indices: &mut bool) -> Result<(), String> {
+    walk_clauses(&body.clauses, params, needs_indices)?;
+    for projection in &body.projections {
+        walk_expr(&projection.expr, params, needs_indices)?;
+    }
+    for ordering in &body.order {
+        walk_expr(&ordering.expr, params, needs_indices)?;
+    }
+    Ok(())
+}
+
 fn walk_clauses(
     clauses: &[Clause],
     params: &[Param],
@@ -1319,20 +1323,25 @@ fn walk_clauses(
 ) -> Result<(), String> {
     for clause in clauses {
         match clause {
-            Clause::Binding(binding) => {
-                for property in &binding.prop_matches {
-                    walk_expr(&property.value, params, needs_indices)?;
+            Clause::Binding { prop_matches, .. } => {
+                for (_, value) in prop_matches {
+                    walk_expr(value, params, needs_indices)?;
                 }
             }
             Clause::Traversal(_) => {}
             Clause::Filter(f) => walk_expr(f, params, needs_indices)?,
-            Clause::Subquery(subquery) => {
-                walk_clauses(&subquery.clauses, params, needs_indices)?;
-                if let Some(arg) = &subquery.arg {
-                    walk_expr(arg, params, needs_indices)?;
-                }
-                walk_expr(&subquery.right, params, needs_indices)?;
+            Clause::Not(inner) | Clause::Optional(inner) => {
+                walk_clauses(inner, params, needs_indices)?
             }
+            Clause::Let { value, .. } => match value {
+                LetValue::Relation(body) => walk_read(body, params, needs_indices)?,
+                LetValue::Expr(e) => walk_expr(e, params, needs_indices)?,
+            },
+            Clause::From(rel) => match rel {
+                RelExpr::Inline(body) => walk_read(body, params, needs_indices)?,
+                RelExpr::Call(call) => walk_expr(&Expr::Call(call.clone()), params, needs_indices)?,
+                RelExpr::Variable(_) => {}
+            },
         }
     }
     Ok(())
@@ -1340,61 +1349,92 @@ fn walk_clauses(
 
 fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
-        Expr::Aggregate { .. } => true,
-        Expr::Binary { left, right, .. }
-        | Expr::In {
-            needle: left,
-            list: right,
-        } => contains_aggregate(left) || contains_aggregate(right),
-        Expr::Not(inner) | Expr::IsNull { expr: inner, .. } => contains_aggregate(inner),
+        Expr::AggDistinct { .. } => true,
+        Expr::Call(call) if ["count", "sum", "avg", "min", "max"].contains(&call.name.as_str()) => {
+            true
+        }
+        Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Arith { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        Expr::In { needle, list, .. } => contains_aggregate(needle) || contains_aggregate(list),
+        Expr::Not(inner) | Expr::Neg(inner) | Expr::IsNull { expr: inner, .. } => {
+            contains_aggregate(inner)
+        }
         _ => false,
     }
+}
+
+/// The read body of a declaration, when it is a read.
+fn read_body(decl: &QueryDecl) -> Option<&ReadBody> {
+    match &decl.syntax.decl().body {
+        DeclBody::Read(body) => Some(body),
+        DeclBody::Write(_) => None,
+    }
+}
+
+/// Whether a read draws a ranking with `from` (`nearest`, `bm25`, `rrf`).
+fn ranks(body: &ReadBody) -> bool {
+    body.clauses.iter().any(|clause| match clause {
+        Clause::From(RelExpr::Call(call)) => {
+            matches!(call.name.as_str(), "nearest" | "bm25" | "rrf")
+        }
+        Clause::Let {
+            value: LetValue::Relation(_),
+            ..
+        } => false,
+        _ => false,
+    })
 }
 
 /// Why `expect ordered` is refused: search-led aggregates and DISTINCT
 /// need a key after the search function to order their output rows.
 /// Ordinary ordered queries retain their total-order contract.
 fn ordered_refusal(decl: &QueryDecl) -> Option<String> {
-    if decl.order_clause.is_empty() {
+    let body = read_body(decl)?;
+    if body.order.is_empty() {
         return Some("`expect ordered` is refused for a query without an `order` clause".into());
     }
-    let search_led = matches!(
-        decl.order_clause.first().map(|o| &o.expr),
-        Some(Expr::Nearest { .. } | Expr::Bm25 { .. } | Expr::Rrf { .. })
-    );
-    if decl.distinct && search_led && decl.order_clause.len() == 1 {
+    let search_led = ranks(body);
+    // The keys after the ranking's: every key but a read of the score
+    // column. Under an aggregate or `distinct` the score orders no output
+    // row, so only these keys order them.
+    let keys_after = body
+        .order
+        .iter()
+        .filter(|o| !matches!(&o.expr, Expr::Variable(v) if v == "score" || v == "distance"))
+        .count();
+    if body.distinct && search_led && keys_after == 0 {
         return Some(
             "`expect ordered` is refused for rank-only `return distinct`; \
              use `expect unordered` or add a projected order key"
                 .into(),
         );
     }
-    if decl
-        .return_clause
-        .iter()
-        .any(|p| contains_aggregate(&p.expr))
+    if body.projections.iter().any(|p| contains_aggregate(&p.expr))
+        && (!search_led || keys_after == 0)
     {
-        if !search_led || decl.order_clause.len() < 2 {
-            return Some(
-                "`expect ordered` is refused for a query with an aggregate in its `return` list \
-                 unless a search function leads its `order` and a key follows it; only then does \
-                 the sort append every group key, and group rows carry no `<var>.id` tie-break"
-                    .into(),
-            );
-        }
+        return Some(
+            "`expect ordered` is refused for a query with an aggregate in its `return` list \
+             unless it reads a ranking and an `order` key besides the score orders the groups; \
+             only then does the sort append every group key, and group rows carry no `<var>.id` \
+             tie-break"
+                .into(),
+        );
     }
     None
 }
 
 fn inspect_decl(decl: &QueryDecl, needs_indices: &mut bool) -> Result<(), String> {
-    walk_clauses(&decl.match_clause, &decl.params, needs_indices)?;
-    for projection in &decl.return_clause {
-        walk_expr(&projection.expr, &decl.params, needs_indices)?;
+    match &decl.syntax.decl().body {
+        DeclBody::Read(body) => walk_read(body, &decl.params, needs_indices),
+        DeclBody::Write(write) => {
+            for group in &write.groups {
+                walk_clauses(&group.clauses, &decl.params, needs_indices)?;
+            }
+            Ok(())
+        }
     }
-    for ordering in &decl.order_clause {
-        walk_expr(&ordering.expr, &decl.params, needs_indices)?;
-    }
-    Ok(())
 }
 
 fn props_use_embed(props: &[PropDecl]) -> bool {
@@ -1778,20 +1818,7 @@ fn complete_control_step(
 /// parameters and no body, so the step binds nothing and the door it runs
 /// through answers with the parse refusal.
 fn unparsed_decl() -> QueryDecl {
-    QueryDecl {
-        name: String::new(),
-        description: None,
-        instruction: None,
-        params: Vec::new(),
-        match_clause: Vec::new(),
-        return_clause: Vec::new(),
-        distinct: false,
-        order_clause: Vec::new(),
-        limit: None,
-        mutations: Vec::new(),
-        write_mode: MutationWriteMode::Publish,
-        syntax: None,
-    }
+    QueryDecl::unnamed_read()
 }
 
 /// The step a declaration section becomes under `mode`, or why the mode is
@@ -2401,7 +2428,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                     snapshot,
                     decl: Box::new(decl.clone()),
                     ordered_refusal: ordered_refusal(decl),
-                    expects_expand: expects_expand(&decl.match_clause),
+                    expects_expand: expects_expand(decl),
                     params_raw: None,
                     base_binding: base_binding.map(str::to_string),
                 }));
@@ -3182,17 +3209,19 @@ fn check_pin(
 /// Whether a match clause list runs at least one Expand: an unbound traversal
 /// outside a correlated block (a bound edge and a block take paths of their
 /// own that the other-path check covers).
-fn expects_expand(clauses: &[Clause]) -> bool {
-    clauses.iter().any(|c| match c {
-        Clause::Traversal(t) => t.edge_binding.is_none(),
-        Clause::Subquery(_) | Clause::Binding(_) | Clause::Filter(_) => false,
+fn expects_expand(decl: &QueryDecl) -> bool {
+    read_body(decl).is_some_and(|body| {
+        body.clauses.iter().any(|c| match c {
+            Clause::Traversal(t) => t.edge_binding.is_none(),
+            _ => false,
+        })
     })
 }
 
 /// Why the executed result disagrees with the schema the compiler inferred
-/// for `decl`, if it does: the column count, then per position the executed
+/// for the step, if it does: the column count, then per position the executed
 /// name, the Arrow type, and nulls in a column the compiler inferred non-null.
-fn schema_drift(decl: &QueryDecl, inferred: &Schema, result: &QueryResult) -> Option<String> {
+fn schema_drift(inferred: &Schema, result: &QueryResult) -> Option<String> {
     let executed = result.schema();
     if executed.fields().len() != inferred.fields().len() {
         return Some(format!(
@@ -3202,8 +3231,7 @@ fn schema_drift(decl: &QueryDecl, inferred: &Schema, result: &QueryResult) -> Op
         ));
     }
     for (i, (want, got)) in inferred.fields().iter().zip(executed.fields()).enumerate() {
-        let proj = &decl.return_clause[i];
-        let name = executed_column_name(&proj.expr, proj.alias.as_deref());
+        let name = want.name().clone();
         if got.name() != &name {
             return Some(format!(
                 "result schema mismatch at column {i}: expected name `{name}`, the executor returned `{}`",
@@ -3336,21 +3364,14 @@ fn check_inferred_results(
     bound: &BoundPlan,
 ) -> Result<(), String> {
     let declared = declared_result_schema(bound)?;
-    if declared.fields().len() != inferred.fields().len()
-        || declared.fields().len() != decl.return_clause.len()
-    {
+    let _ = decl;
+    if declared.fields().len() != inferred.fields().len() {
         return Err(
             "result schema mismatch: planned and inferred column counts differ".to_string(),
         );
     }
-    for (i, ((planned, inferred), item)) in declared
-        .fields()
-        .iter()
-        .zip(inferred.fields())
-        .zip(&decl.return_clause)
-        .enumerate()
-    {
-        let name = executed_column_name(&item.expr, item.alias.as_deref());
+    for (i, (planned, inferred)) in declared.fields().iter().zip(inferred.fields()).enumerate() {
+        let name = inferred.name().clone();
         if planned.name() != &name
             || planned.data_type() != inferred.data_type()
             || planned.is_nullable() != inferred.is_nullable()
@@ -3509,14 +3530,19 @@ async fn run_query_step(
                 }
             }
             let catalog = session.catalog();
-            let inferred = typecheck_query(&catalog, &step.decl)
-                .and_then(|checked| infer_query_result_schema(&catalog, &checked))
+            let inferred = check_query_decl(&catalog, &step.decl)
+                .and_then(|core| match core {
+                    CoreDecl::Read(read) => result_schema(&catalog, &read),
+                    CoreDecl::Write(_) => Err(omnigraph_compiler::error::CompilerError::Plan(
+                        "a write has no result schema".into(),
+                    )),
+                })
                 .map_err(|e| fail(format!("result schema inference failed: {e}")))?;
             if let Some(run) = &inspection {
                 check_inferred_results(&step.decl, &inferred, &run.plan).map_err(&fail)?;
                 check_planned_results(&run.plan, &result).map_err(&fail)?;
             }
-            let drift = schema_drift(&step.decl, &inferred, &result);
+            let drift = schema_drift(&inferred, &result);
             if let Some(mismatch) = shape_mismatch(&shape.lines, &result, &inferred, &catalog) {
                 let (message, bless_lines) = match (&drift, bless_shape_lines(&result, &catalog)) {
                     (Some(drift), _) => (

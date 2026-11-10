@@ -215,7 +215,7 @@ query distinct_under_sum() {
     return { sum(distinct $p.age) as total }
 }
 
---- expect error: `distinct` applies only to `count`
+--- expect error: T57: distinct applies only to count
 
 --- query
 query distinct_return_over_distinct_count() {
@@ -223,4 +223,4 @@ query distinct_return_over_distinct_count() {
     return distinct { count(distinct $p) as people }
 }
 
---- expect error: `distinct` on an aggregated return
+--- expect error: T56: `return distinct` does not apply to an aggregated return

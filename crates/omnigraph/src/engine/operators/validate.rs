@@ -990,7 +990,7 @@ mod tests {
     };
     use omnigraph_compiler::catalog::{Catalog, build_catalog};
     use omnigraph_compiler::ir::{DeltaClass, lower_load};
-    use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
+    use omnigraph_compiler::query::file::{LoadStmt, LoadStmtMode, LoadTarget};
     use omnigraph_compiler::schema::parser::parse_schema;
     use omnigraph_compiler::settings::SessionSettings;
     use omnigraph_planner::{

@@ -49,7 +49,7 @@ query cross_binding_filter_stays_below_traversal() {
     match {
         $m: Matter
         $p: Passage
-        $p.text contains $m.number
+        contains($p.text, $m.number)
         $p passageOfRevision $r
         $r: SourceRevision
         $r.matter_number != $m.number
@@ -85,7 +85,7 @@ query passage_reached_by_the_traversal() {
         $m: Matter
         $r: SourceRevision
         $p passageOfRevision $r
-        $p.text contains $m.number
+        contains($p.text, $m.number)
         $r.matter_number != $m.number
     }
     return { $r.matter_number, $m.number as cited, count($p) as n }

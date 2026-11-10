@@ -152,4 +152,4 @@ query block_must_read_an_outer_variable() {
     }
     return { $n.slug }
 }
---- expect error: T39: exists block must reference at least one outer-bound variable
+--- expect error: T39: an exists or aggregate block must reference an outer-bound variable

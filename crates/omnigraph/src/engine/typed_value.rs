@@ -621,7 +621,7 @@ pub(super) fn validate_plan_values(
                     owners.scores.insert(
                         (
                             arms[0].binding.as_str(),
-                            omnigraph_compiler::query::ast::RRF_COLUMN,
+                            omnigraph_compiler::query::value::RRF_COLUMN,
                         ),
                         DataType::Float64,
                     );
@@ -920,7 +920,7 @@ pub(super) fn validate_plan_values(
 mod tests {
     use super::*;
     use crate::error::ManifestErrorKind;
-    use omnigraph_compiler::query::ast::Param;
+    use omnigraph_compiler::query::file::Param;
     use omnigraph_compiler::types::PropType;
 
     fn scalar(scalar: ScalarType, nullable: bool) -> ExprType {

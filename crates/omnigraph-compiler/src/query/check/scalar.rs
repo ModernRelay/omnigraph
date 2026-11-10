@@ -5,8 +5,8 @@
 
 use crate::ir::core::Ty;
 use crate::ir::expr::{IRExpr, ScalarFunc, TermsMode};
-use crate::query::ast::{BinaryOp, CompOp, Literal, NOW_PARAM_NAME};
 use crate::query::syntax::ArithOp;
+use crate::query::value::{BinaryOp, CompOp, Literal, NOW_PARAM_NAME};
 use crate::types::ExprType;
 
 /// A typed scalar expression: the operand language of Filter, Project, Group
@@ -164,7 +164,11 @@ impl SExpr {
             },
             SKind::Meta { col, field } => IRExpr::PropAccess {
                 variable: col.clone(),
-                property: format!("@{field}"),
+                property: if field.starts_with('@') {
+                    field.clone()
+                } else {
+                    format!("@{field}")
+                },
                 ty,
             },
             SKind::Arith { op, left, right } => IRExpr::Binary {

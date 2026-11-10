@@ -163,12 +163,12 @@ edge Knows: Doc -> Doc {
 
 --- query
 query nearest_with_edge($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: Doc
         $d knows $t
-    }
+    } return { $d, $t } }, $d.embedding, $q, k: 2) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 2
 }
 
@@ -184,12 +184,12 @@ d.slug: String
 
 --- query
 query nearest_with_edge_wide($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: Doc
         $d knows $t
-    }
+    } return { $d, $t } }, $d.embedding, $q, k: 50) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 50
 }
 

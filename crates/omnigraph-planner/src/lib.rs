@@ -25,7 +25,6 @@
 
 pub mod aggregate;
 pub mod bound;
-pub mod core_plan;
 pub mod cost;
 pub mod error;
 pub mod explain;
@@ -40,6 +39,7 @@ pub mod output;
 pub mod passes;
 pub mod physical;
 pub mod ranking;
+pub mod read_shape;
 pub mod registry;
 pub mod route;
 pub mod scan_access;
@@ -52,7 +52,6 @@ pub use aggregate::{
     validate_aggregate_specs,
 };
 pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
-pub use core_plan::plan_core;
 pub use cost::{
     AccessPath, AntiJoinStrategy, CSR_BUILD_FACTOR, CoverageProvenance, EndpointProbe,
     ExpandCostInputs, ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO,
@@ -91,6 +90,7 @@ pub use physical::{
     validate_streams,
 };
 pub use ranking::{PlannedRanking, planned_ranking};
+pub use read_shape::{PatternStep, ReadShape};
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
 pub use source::{

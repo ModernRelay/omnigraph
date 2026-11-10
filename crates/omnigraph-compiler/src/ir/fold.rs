@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 
-use crate::query::ast::{BinaryOp, CompOp, Literal};
+use crate::query::value::{BinaryOp, CompOp, Literal};
 
 use super::IRExpr;
 use crate::types::{ExprType, PropType, ScalarType};
@@ -30,7 +30,7 @@ pub(super) fn binary(left: IRExpr, op: BinaryOp, right: IRExpr) -> IRExpr {
 }
 
 /// `not <inner>`, folded over a Boolean or null literal.
-pub(super) fn not(inner: IRExpr) -> IRExpr {
+pub(crate) fn not(inner: IRExpr) -> IRExpr {
     match inner {
         IRExpr::Literal(Literal::Bool(value), ty) => IRExpr::Literal(
             Literal::Bool(!value),
@@ -45,7 +45,7 @@ pub(super) fn not(inner: IRExpr) -> IRExpr {
 }
 
 /// `<expr> is null` / `is not null`, folded over any literal.
-pub(super) fn is_null(expr: IRExpr, negated: bool) -> IRExpr {
+pub(crate) fn is_null(expr: IRExpr, negated: bool) -> IRExpr {
     match expr {
         IRExpr::Literal(literal, _) => IRExpr::Literal(
             Literal::Bool(matches!(literal, Literal::Null) != negated),

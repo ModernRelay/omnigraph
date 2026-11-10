@@ -32,7 +32,7 @@ query adult_friends_named_a() {
     match {
         $p: Person { slug: "r" }
         $p knows $f
-        $f.age > 30 and $f.name starts_with "a"
+        $f.age > 30 and starts_with($f.name, "a")
     }
     return { $f.slug }
 }

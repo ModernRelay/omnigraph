@@ -85,7 +85,7 @@ fn listed_names(output: &std::process::Output) -> Vec<String> {
         .collect()
 }
 
-const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+const SET_AGE: &str = "query set_age($name: String, $age: I32) { $x: Person  $x.name = $name  update $x set { age: $age } }";
 
 #[test]
 fn branch_statements_embedded_print_the_verb_lines() {
@@ -1393,8 +1393,8 @@ fn cluster_apply_rejects_a_broken_query_naming_it_and_where() {
             "broken",
             "query broken() { match { $p: Person $p.age > } return { $p.name } }",
             &[
-                "broken: parse error: expected operand",
-                "  --> line 1, column 46",
+                "broken: parse error: expected an operator that continues the expression or a clause",
+                "  --> line 1, column 67",
             ],
         ),
     ];

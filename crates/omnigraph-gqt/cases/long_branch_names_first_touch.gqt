@@ -20,7 +20,8 @@ branch create "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 --- expect ok
 --- mutate branch: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 query write() {
-    update Person set { age: 31 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 31 }
 }
 --- expect affected: nodes=1 edges=0
 --- query branch: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -37,7 +38,8 @@ branch create "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 --- expect ok
 --- mutate branch: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 query write() {
-    update Person set { age: 31 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 31 }
 }
 --- expect affected: nodes=1 edges=0
 --- query branch: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -54,7 +56,8 @@ branch create "team/data/ccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 --- expect ok
 --- mutate branch: team/data/ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 query write() {
-    update Person set { age: 31 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 31 }
 }
 --- expect affected: nodes=1 edges=0
 --- query branch: team/data/ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
@@ -71,7 +74,8 @@ branch create "équipe/échanges"
 --- expect ok
 --- mutate branch: équipe/échanges
 query write() {
-    update Person set { age: 31 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 31 }
 }
 --- expect affected: nodes=1 edges=0
 --- query branch: équipe/échanges

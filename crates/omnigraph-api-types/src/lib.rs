@@ -11,7 +11,7 @@ use omnigraph::loader::{LoadExecuted, LoadMode, LoadOperatorExecuted, LoadReceip
 use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
-use omnigraph_compiler::query::ast::Param;
+use omnigraph_compiler::query::file::Param;
 use omnigraph_compiler::result::{QueryResult, Ranking, SearchFunction as ResultSearchFunction};
 use omnigraph_compiler::settings::{
     ChangeLineage, Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,

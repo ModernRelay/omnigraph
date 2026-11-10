@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::catalog::Catalog;
-use crate::query::ast::{Mutation, QueryDecl};
+use crate::ir::core::{CoreDecl, MutationTarget, Sink};
 use crate::query::descriptor::{QueryOperationDescriptor, describe_query_operation};
 use crate::query::diagnostic::QueryDiagnostic;
+use crate::query::file::QueryDecl;
 use crate::query::parser::parse_query_diagnostic;
 
 const PARSE_ERROR_CODE: &str = "Q000";
@@ -136,7 +137,7 @@ pub fn lint_query_file(
                 let warnings = per_query_warnings(query);
                 match describe_query_operation(catalog, query) {
                     Ok(operation) => {
-                        collect_update_coverage(query, &mut coverage);
+                        collect_update_coverage(catalog, query, &mut coverage);
                         results.push(QueryLintQueryResult {
                             name: query.name.clone(),
                             kind,
@@ -248,15 +249,25 @@ fn per_query_warnings(query: &QueryDecl) -> Vec<String> {
     vec![HARDCODED_MUTATION_WARNING.to_string()]
 }
 
-fn collect_update_coverage(query: &QueryDecl, coverage: &mut BTreeMap<String, UpdateCoverage>) {
-    for mutation in &query.mutations {
-        if let Mutation::Update(update) = mutation {
-            let entry = coverage.entry(update.type_name.clone()).or_default();
+fn collect_update_coverage(
+    catalog: &Catalog,
+    query: &QueryDecl,
+    coverage: &mut BTreeMap<String, UpdateCoverage>,
+) {
+    let Ok(CoreDecl::Write(write)) = crate::query::check::check_query_decl(catalog, query) else {
+        return;
+    };
+    for sink in write.groups.iter().flat_map(|group| &group.sinks) {
+        if let Sink::Update {
+            target: MutationTarget::Node { type_name },
+            assignments,
+            ..
+        } = sink
+        {
+            let entry = coverage.entry(type_name.clone()).or_default();
             entry.query_names.insert(query.name.clone());
-            for assignment in &update.assignments {
-                entry
-                    .assigned_properties
-                    .insert(assignment.property.clone());
+            for (property, _) in assignments {
+                entry.assigned_properties.insert(property.clone());
             }
         }
     }

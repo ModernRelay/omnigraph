@@ -25,7 +25,7 @@ node Person {
 set engine = v2;
 query substring_and_membership() {
     match { $p: Person }
-    return { $p.slug, $p.name contains "li" as hit, $p.tags contains "rust" as tagged }
+    return { $p.slug, contains($p.name, "li") as hit, "rust" in $p.tags as tagged }
 }
 
 --- expect unordered

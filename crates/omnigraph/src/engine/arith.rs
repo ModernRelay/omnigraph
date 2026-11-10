@@ -224,7 +224,7 @@ mod tests {
         use arrow_array::RecordBatch;
         use arrow_schema::{Field, Schema};
         use omnigraph_compiler::ir::IRExpr;
-        use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
+        use omnigraph_compiler::query::value::{BinaryOp, CompOp, Literal};
         let ty = ExprType::from_prop(&PropType::scalar(ScalarType::I64, true));
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(

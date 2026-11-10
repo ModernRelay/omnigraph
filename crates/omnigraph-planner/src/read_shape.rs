@@ -1,0 +1,1530 @@
+//! A core read as the planner lowers it (docs/rfcs/2026-11-07-gq-3.md,
+//! section 11, "One IR").
+//!
+//! The type checker hands the planner one typed core term per read
+//! ([`CoreRead`]). [`ReadShape::of`] decomposes it into what the logical
+//! plan is built from: the pattern's scans, expansions, filters and
+//! correlated blocks in the order they run, then the return items, the order
+//! keys and the limit. A `from` over a ranking (`nearest`, `bm25`, `rrf`)
+//! becomes the leading rank key the ranked scan executes, the pattern under
+//! it the scan's prefilter. The shape is derived per plan and never stored.
+//!
+//! The pattern's facts (bindings with their filters, triples, filter
+//! clauses, blocks) are recovered from the term, then placed: the first
+//! binding of each connected component scans and the others are introduced
+//! by the expansion that reaches them, their filters going with it; a triple
+//! whose ends are both bound expands to a fresh name and filters on
+//! identity; the filter clauses follow, then the blocks. A core node the
+//! planner has no plan node for, or a shape outside this table, is `P006`.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use omnigraph_compiler::catalog::Catalog;
+use omnigraph_compiler::ir::core::{
+    ANON_PREFIX, Agg, Col, CoreRead, Count, FRESH_PREFIX, LexicalQuery, RRF_DEFAULT_K, ScoreKind,
+    ScoreQuery, Term, Ty,
+};
+use omnigraph_compiler::ir::{
+    BlockAggregateExpr, IRExpr, IROrdering, IRParam, IRProjection, SubqueryPredicate,
+};
+use omnigraph_compiler::query::codes::P006;
+use omnigraph_compiler::query::file::Param;
+use omnigraph_compiler::query::value::{
+    AggFunc, BinaryOp, CompOp, DISTANCE_COLUMN, Literal, RRF_COLUMN, SCORE_COLUMN,
+};
+use omnigraph_compiler::traversal::EdgeSelection;
+use omnigraph_compiler::types::{AggSignature, ExprType, PropType, ScalarType};
+
+use crate::error::PlanError;
+
+/// A core read's top-level shape: the pattern's steps in run order, then
+/// what the read returns.
+#[derive(Debug, Clone)]
+pub struct ReadShape {
+    pub name: String,
+    /// The declared parameters, every one of them, in declared order.
+    pub params: Vec<IRParam>,
+    pub pipeline: Vec<PatternStep>,
+    pub return_exprs: Vec<IRProjection>,
+    /// `return distinct`: one row per distinct projected tuple.
+    pub distinct: bool,
+    pub order_by: Vec<IROrdering>,
+    pub limit: Option<u64>,
+}
+
+/// One step of a pattern.
+#[derive(Debug, Clone)]
+pub enum PatternStep {
+    NodeScan {
+        variable: String,
+        type_name: String,
+        /// The binding's filters over `variable`.
+        filters: Vec<IRExpr>,
+    },
+    Expand {
+        src_var: String,
+        dst_var: String,
+        edges: EdgeSelection,
+        src_type: String,
+        dst_type: String,
+        min_hops: u32,
+        max_hops: Option<u32>,
+        /// The filters of a binding the expansion introduces, applied as it
+        /// hydrates the destination.
+        dst_filters: Vec<IRExpr>,
+        /// The edge variable: one output row per matching edge, its
+        /// properties carried under this prefix.
+        edge_binding: Option<String>,
+    },
+    Filter(IRExpr),
+    /// A correlated block: `inner` runs over the outer rows and `predicate`
+    /// decides per outer row on the aggregate of its matches.
+    AntiJoin {
+        outer_var: String,
+        inner: Vec<PatternStep>,
+        predicate: SubqueryPredicate,
+    },
+}
+
+impl ReadShape {
+    pub fn has_edge_selections(&self) -> bool {
+        self.any_edge_selection(|edges| edges.named().is_none())
+    }
+
+    pub fn has_wildcard_traversal(&self) -> bool {
+        self.any_edge_selection(EdgeSelection::is_wildcard)
+    }
+
+    fn any_edge_selection(&self, predicate: impl Fn(&EdgeSelection) -> bool) -> bool {
+        let mut pending: Vec<_> = self.pipeline.iter().collect();
+        while let Some(step) = pending.pop() {
+            match step {
+                PatternStep::Expand { edges, .. } => {
+                    if predicate(edges) {
+                        return true;
+                    }
+                }
+                PatternStep::AntiJoin { inner, .. } => pending.extend(inner),
+                PatternStep::NodeScan { .. } | PatternStep::Filter(_) => {}
+            }
+        }
+        false
+    }
+
+    /// The shape of `read`, or `P006` naming what the planner does not lower.
+    pub fn of(read: &CoreRead, catalog: &Catalog) -> Result<Self, PlanError> {
+        Shaper::new(catalog, &read.name, &read.params).read(read)
+    }
+
+    /// The shape of the read declared as `name` in `source`, checked against
+    /// `catalog`; the refusal of any stage as text.
+    pub fn of_source(catalog: &Catalog, source: &str, name: &str) -> Result<Self, String> {
+        let decl = omnigraph_compiler::find_named_query(source, name).map_err(|e| e.to_string())?;
+        match omnigraph_compiler::query::check::check_query_decl(catalog, &decl)
+            .map_err(|e| e.to_string())?
+        {
+            omnigraph_compiler::ir::core::CoreDecl::Read(read) => {
+                Self::of(&read, catalog).map_err(|e| e.to_string())
+            }
+            omnigraph_compiler::ir::core::CoreDecl::Write(_) => {
+                Err(format!("`{name}` is a write, not a read"))
+            }
+        }
+    }
+}
+
+fn unsupported(name: &str, what: impl std::fmt::Display) -> PlanError {
+    PlanError::refused(
+        P006,
+        format!("`{name}`: the planner does not lower {what}"),
+        None,
+    )
+}
+
+/// The ranking a read's `from` draws: the leading rank key it becomes, and
+/// the score column the read names.
+struct Ranking {
+    key: IRExpr,
+    /// The column the read reads the score through (`distance`, `score`).
+    out: String,
+    /// The ranked node column.
+    column: String,
+    /// The score column the retrieval appends (`_distance`, `_score`,
+    /// `_rrf`) and its type.
+    score: (&'static str, ExprType),
+    descending: bool,
+    /// The `k` of each `nearest` window the ranking draws (its own, or its
+    /// `rrf` arms'); `None` for a window read from a parameter.
+    windows: Vec<Option<u64>>,
+}
+
+struct Shaper<'a> {
+    catalog: &'a Catalog,
+    name: &'a str,
+    params: &'a [(String, PropType)],
+}
+
+/// The pattern facts of one scope, in the order the term states them.
+#[derive(Default, Debug)]
+struct Facts {
+    bindings: Vec<BindingFact>,
+    traversals: Vec<TraversalFact>,
+    filters: Vec<IRExpr>,
+    blocks: Vec<BlockFact>,
+    /// The type of every node variable the scope binds.
+    types: HashMap<String, String>,
+}
+
+#[derive(Debug)]
+struct BindingFact {
+    variable: String,
+    type_name: String,
+    filters: Vec<IRExpr>,
+}
+
+#[derive(Debug, Clone)]
+struct TraversalFact {
+    src: String,
+    dst: String,
+    edges: EdgeSelection,
+    src_type: String,
+    dst_type: String,
+    min_hops: u32,
+    max_hops: Option<u32>,
+    edge_binding: Option<String>,
+}
+
+#[derive(Debug)]
+struct BlockFact {
+    inner: Facts,
+    /// The outer columns the block may correlate on.
+    outer: HashSet<String>,
+    left: BlockAggregateExpr,
+    op: CompOp,
+    right: IRExpr,
+}
+
+fn is_anon(name: &str) -> bool {
+    name.starts_with(ANON_PREFIX)
+}
+
+fn is_block_column(name: &str) -> bool {
+    name.starts_with(FRESH_PREFIX) && name[FRESH_PREFIX.len()..].starts_with('b')
+}
+
+fn is_semi(name: &str) -> bool {
+    name.starts_with(FRESH_PREFIX) && name[FRESH_PREFIX.len()..].starts_with('t')
+}
+
+/// The variable every leaf of `e` reads, when it reads exactly one.
+fn single_variable(e: &IRExpr) -> Option<String> {
+    let mut cols = Vec::new();
+    e.columns(&mut cols);
+    match cols.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
+impl<'a> Shaper<'a> {
+    fn new(catalog: &'a Catalog, name: &'a str, params: &'a [(String, PropType)]) -> Self {
+        Self {
+            catalog,
+            name,
+            params,
+        }
+    }
+
+    /// A parameter's declared type.
+    fn param_type(&self, name: &str) -> ExprType {
+        self.params
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, ty)| ExprType::from_prop(ty))
+            .unwrap_or_else(|| scalar(ScalarType::I64))
+    }
+
+    fn refuse(&self, what: impl std::fmt::Display) -> PlanError {
+        unsupported(self.name, what)
+    }
+
+    fn read(&self, read: &CoreRead) -> Result<ReadShape, PlanError> {
+        // The final projection names the result columns.
+        let Term::Project {
+            input,
+            items: finals,
+            keep: false,
+        } = &read.term
+        else {
+            return Err(self.refuse("a read without its final projection"));
+        };
+        let mut term: &Term = input;
+        let mut limit = None;
+        if let Term::Cut { input, k } = term {
+            limit = Some(match k {
+                Count::Literal(n) => *n,
+                Count::Param(_) => return Err(self.refuse("`limit` over a parameter")),
+            });
+            term = input;
+        }
+        let mut order_keys: &[(IRExpr, bool)] = &[];
+        if let Term::Order { input, keys } = term {
+            order_keys = keys;
+            term = input;
+        }
+        // The items, by their hidden names, and the body under them.
+        let mut items: HashMap<String, IRExpr> = HashMap::new();
+        let mut aggs: HashMap<String, Agg> = HashMap::new();
+        let mut distinct = false;
+        let body = match term {
+            Term::Project {
+                input,
+                items: extended,
+                keep: true,
+            } => match input.as_ref() {
+                Term::Group {
+                    input,
+                    keys,
+                    aggs: grouped,
+                } => {
+                    items.extend(extended.iter().cloned());
+                    items.extend(keys.iter().cloned());
+                    aggs.extend(grouped.iter().cloned());
+                    input.as_ref()
+                }
+                other => {
+                    items.extend(extended.iter().cloned());
+                    other
+                }
+            },
+            Term::Group {
+                input,
+                keys,
+                aggs: grouped,
+            } => {
+                distinct = grouped.is_empty();
+                items.extend(keys.iter().cloned());
+                aggs.extend(grouped.iter().cloned());
+                input.as_ref()
+            }
+            _ => return Err(self.refuse("a read whose returns are not a projection")),
+        };
+        let (body, ranking) = self.ranking(body)?;
+        // Return items.
+        let mut return_exprs = Vec::new();
+        for (column, expr) in finals {
+            let (IRExpr::AliasRef(hidden, ty) | IRExpr::Variable(hidden, ty)) = expr else {
+                return Err(self.refuse("a final projection that is not a column"));
+            };
+            let item = match (items.get(hidden), aggs.get(hidden)) {
+                (Some(e), _) => self.item(e, &aggs, ranking.as_ref())?,
+                (None, Some(agg)) => self.aggregate(agg, ranking.as_ref())?,
+                (None, None) => {
+                    return Err(PlanError::Internal(format!(
+                        "result column `{column}` names no item"
+                    )));
+                }
+            };
+            let alias = self.alias(column, &item);
+            return_exprs.push(IRProjection {
+                ty: if item.ty() == ty {
+                    ty.clone()
+                } else {
+                    item.ty().clone()
+                },
+                expr: item,
+                alias,
+                column: column.clone(),
+            });
+        }
+        // Order keys: the rank key leads (left out under an aggregate or
+        // `distinct`), the others read return items or the pattern.
+        let grouped = !aggs.is_empty() || distinct;
+        if let Some(ranking) = &ranking {
+            self.check_ranking(ranking, order_keys, limit, grouped)?;
+        }
+        let mut order_by = Vec::new();
+        let mut keys = order_keys.iter().peekable();
+        if let Some(ranking) = &ranking {
+            let leads =
+                matches!(keys.peek(), Some((IRExpr::AliasRef(name, _), _)) if *name == ranking.out);
+            let descending = match keys.peek() {
+                Some((_, descending)) if leads => *descending,
+                _ => ranking.descending,
+            };
+            if leads {
+                keys.next();
+            }
+            order_by.push(IROrdering {
+                expr: ranking.key.clone(),
+                descending,
+            });
+        }
+        for (key, descending) in keys {
+            let expr = match key {
+                IRExpr::AliasRef(hidden, _) | IRExpr::Variable(hidden, _)
+                    if items.contains_key(hidden) || aggs.contains_key(hidden) =>
+                {
+                    let projection = return_exprs
+                        .iter()
+                        .zip(finals)
+                        .find(|(_, (_, e))| {
+                            matches!(e, IRExpr::AliasRef(h, _) | IRExpr::Variable(h, _) if h == hidden)
+                        })
+                        .map(|(p, _)| p);
+                    match projection {
+                        Some(IRProjection {
+                            alias: Some(alias),
+                            ty,
+                            ..
+                        }) => IRExpr::AliasRef(alias.clone(), ty.clone()),
+                        Some(projection) => projection.expr.clone(),
+                        None => self.item(
+                            items.get(hidden).ok_or_else(|| {
+                                self.refuse("an order key over an unreturned aggregate")
+                            })?,
+                            &aggs,
+                            ranking.as_ref(),
+                        )?,
+                    }
+                }
+                other => self.item(other, &aggs, ranking.as_ref())?,
+            };
+            // The sort reads columns: a computed key reads the first return
+            // item that computes it; one no item computes is not lowered yet.
+            let computed = matches!(
+                expr,
+                IRExpr::Binary { .. }
+                    | IRExpr::Not(..)
+                    | IRExpr::Cast { .. }
+                    | IRExpr::Neg { .. }
+                    | IRExpr::Call { .. }
+                    | IRExpr::IsNull { .. }
+            );
+            let expr = if computed {
+                let Some(item) = return_exprs.iter().find(|p| p.expr == expr) else {
+                    return Err(self.refuse("an order key computed from columns"));
+                };
+                IRExpr::AliasRef(
+                    item.alias.clone().unwrap_or_else(|| item.column.clone()),
+                    item.ty.clone(),
+                )
+            } else {
+                expr
+            };
+            order_by.push(IROrdering {
+                expr,
+                descending: *descending,
+            });
+        }
+        let _ = grouped;
+        // The pattern.
+        let mut facts = Facts::default();
+        self.facts(body, &mut facts)?;
+        let ranked: Vec<String> = ranking
+            .as_ref()
+            .map(|r| vec![r.column.clone()])
+            .unwrap_or_default();
+        let mut pipeline = Vec::new();
+        let mut fresh = FreshNames::default();
+        self.place(
+            &facts,
+            &ranked,
+            &mut pipeline,
+            &mut HashSet::new(),
+            &HashSet::new(),
+            &mut fresh,
+        )?;
+        Ok(ReadShape {
+            name: read.name.clone(),
+            params: read
+                .params
+                .iter()
+                .map(|(name, ty)| IRParam {
+                    declaration: Param {
+                        name: name.clone(),
+                        type_name: ty.display_name().trim_end_matches('?').to_string(),
+                        nullable: ty.nullable,
+                    },
+                    ty: ExprType::from_prop(ty),
+                })
+                .collect(),
+            pipeline,
+            return_exprs,
+            distinct,
+            order_by,
+            limit,
+        })
+    }
+
+    /// The alias a return item carries: none when the column is the name the
+    /// item gets unaliased, the column otherwise; a meta field always names
+    /// its result key.
+    fn alias(&self, column: &str, item: &IRExpr) -> Option<String> {
+        let default = match item {
+            IRExpr::PropAccess {
+                variable, property, ..
+            } => {
+                let system = self.catalog.system_columns;
+                if [system.id, system.src, system.dst].contains(&property.as_str()) {
+                    return Some(column.to_string());
+                }
+                format!("{variable}.{property}")
+            }
+            IRExpr::Variable(name, _) | IRExpr::Param(name, _) => name.clone(),
+            IRExpr::Literal(_, _) => "literal".to_string(),
+            IRExpr::Aggregate { arg, .. } => match arg.as_ref() {
+                IRExpr::PropAccess {
+                    variable, property, ..
+                } => format!("{variable}.{property}"),
+                IRExpr::Variable(name, _) => name.clone(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        };
+        (default != column).then(|| column.to_string())
+    }
+
+    /// A return item or order key: a hidden aggregate column read as its
+    /// aggregate, a score column as the column the retrieval appends.
+    fn item(
+        &self,
+        e: &IRExpr,
+        aggs: &HashMap<String, Agg>,
+        ranking: Option<&Ranking>,
+    ) -> Result<IRExpr, PlanError> {
+        Ok(match e {
+            IRExpr::AliasRef(name, _) if aggs.contains_key(name) => {
+                self.aggregate(&aggs[name], ranking)?
+            }
+            IRExpr::AliasRef(name, _) if ranking.is_some_and(|r| r.out == *name) => {
+                let r = ranking.unwrap();
+                IRExpr::PropAccess {
+                    variable: r.column.clone(),
+                    property: r.score.0.to_string(),
+                    ty: r.score.1.clone(),
+                }
+            }
+            IRExpr::Binary {
+                left,
+                op,
+                right,
+                ty,
+            } => IRExpr::Binary {
+                left: Box::new(self.item(left, aggs, ranking)?),
+                op: *op,
+                right: Box::new(self.item(right, aggs, ranking)?),
+                ty: ty.clone(),
+            },
+            IRExpr::Not(inner, ty) => {
+                IRExpr::Not(Box::new(self.item(inner, aggs, ranking)?), ty.clone())
+            }
+            IRExpr::IsNull { expr, negated, ty } => IRExpr::IsNull {
+                expr: Box::new(self.item(expr, aggs, ranking)?),
+                negated: *negated,
+                ty: ty.clone(),
+            },
+            IRExpr::Cast { expr, ty } => IRExpr::Cast {
+                expr: Box::new(self.item(expr, aggs, ranking)?),
+                ty: ty.clone(),
+            },
+            other => other.clone(),
+        })
+    }
+
+    /// What today's ranked scans run: the score leads the `order` in its
+    /// ranking's direction (absent over groups, which it does not order),
+    /// and each `nearest` window is the read's `limit` (`100` under `rrf`
+    /// without one). Any other combination is a different relation, not
+    /// lowered yet.
+    fn check_ranking(
+        &self,
+        ranking: &Ranking,
+        order_keys: &[(IRExpr, bool)],
+        limit: Option<u64>,
+        grouped: bool,
+    ) -> Result<(), PlanError> {
+        let reads_score =
+            |e: &IRExpr| matches!(e, IRExpr::AliasRef(name, _) if *name == ranking.out);
+        match order_keys.first() {
+            Some((key, descending)) if reads_score(key) => {
+                if *descending != ranking.descending {
+                    return Err(self.refuse("a score ordered against its ranking's direction"));
+                }
+            }
+            _ if order_keys.iter().any(|(k, _)| reads_score(k)) => {
+                return Err(self.refuse("a score that is not the leading `order` key"));
+            }
+            Some(_) if !grouped => {
+                return Err(
+                    self.refuse("an `order` over a ranking that does not lead with its score")
+                );
+            }
+            None if !grouped && limit.is_some() => {
+                return Err(self.refuse("a `limit` over a ranking with no `order` by its score"));
+            }
+            _ => {}
+        }
+        let fused = matches!(ranking.key, IRExpr::Rrf { .. });
+        let expected = match (limit, fused) {
+            (Some(n), _) => Some(n),
+            (None, true) => Some(RRF_NEAREST_ARM_WINDOW),
+            (None, false) => None,
+        };
+        if ranking
+            .windows
+            .iter()
+            .any(|w| w.is_none() || *w != expected)
+        {
+            return Err(self.refuse("a `nearest` window `k` other than the read's `limit`"));
+        }
+        Ok(())
+    }
+
+    /// A `Group` aggregate as the aggregate expression a return item holds.
+    fn aggregate(&self, agg: &Agg, ranking: Option<&Ranking>) -> Result<IRExpr, PlanError> {
+        let Some(arg) = &agg.arg else {
+            return Err(self.refuse("a row count without an argument in `return`"));
+        };
+        let mut read = Vec::new();
+        arg.columns(&mut read);
+        if ranking.is_some_and(|r| read.contains(&r.out)) {
+            return Err(self.refuse("an aggregate over a ranking's score"));
+        }
+        let result = nullable_result(agg);
+        Ok(IRExpr::Aggregate {
+            func: agg.func,
+            distinct: agg.distinct,
+            arg: Box::new(arg.clone()),
+            signature: AggSignature {
+                arg: arg.ty().clone(),
+                result,
+            },
+        })
+    }
+
+    /// The ranking at the root of a body, when it draws one, and the
+    /// pattern under it.
+    fn ranking<'t>(&self, body: &'t Term) -> Result<(&'t Term, Option<Ranking>), PlanError> {
+        match body {
+            Term::ApproxTopK {
+                input,
+                column,
+                property,
+                query,
+                out,
+                k,
+                ..
+            } => Ok((
+                self.population(input)?,
+                Some(Ranking {
+                    key: IRExpr::Nearest {
+                        variable: column.clone(),
+                        property: property.clone(),
+                        query: Box::new(query.clone()),
+                        ty: scalar(ScalarType::F32),
+                    },
+                    out: out.clone(),
+                    column: column.clone(),
+                    score: (DISTANCE_COLUMN, scalar(ScalarType::F32)),
+                    descending: false,
+                    windows: vec![match k {
+                        Count::Literal(n) => Some(*n),
+                        Count::Param(_) => None,
+                    }],
+                }),
+            )),
+            Term::Score {
+                input,
+                column,
+                property,
+                kind: ScoreKind::Bm25,
+                query: ScoreQuery::Lexical(LexicalQuery { text, .. }),
+                out,
+            } => Ok((
+                self.population(input)?,
+                Some(Ranking {
+                    key: IRExpr::Bm25 {
+                        field: Box::new(IRExpr::PropAccess {
+                            variable: column.clone(),
+                            property: property.clone(),
+                            ty: scalar(ScalarType::String),
+                        }),
+                        query: Box::new(text.clone()),
+                        ty: scalar(ScalarType::F32),
+                    },
+                    out: out.clone(),
+                    column: column.clone(),
+                    score: (SCORE_COLUMN, scalar(ScalarType::F32)),
+                    descending: true,
+                    windows: Vec::new(),
+                }),
+            )),
+            Term::Score { .. } => Err(self.refuse("`distance`")),
+            other => match fuse_leaf(other) {
+                Some(fuse) => Ok((other, Some(self.fused(fuse)?))),
+                None => Ok((other, None)),
+            },
+        }
+    }
+
+    /// `rrf` over the type population: the `Fuse` at the leaf of the
+    /// pattern, which the rest of the pattern extends from its target.
+    fn fused(&self, fuse: &Term) -> Result<Ranking, PlanError> {
+        let Term::Fuse {
+            arms, target, k, ..
+        } = fuse
+        else {
+            unreachable!("fuse_leaf returns a Fuse")
+        };
+        let mut windows = Vec::new();
+        let mut arm = |t: &Term| -> Result<IRExpr, PlanError> {
+            match self.ranking(t)? {
+                (_, Some(r)) => {
+                    windows.extend(r.windows);
+                    Ok(r.key)
+                }
+                (_, None) => Err(self.refuse("an `rrf` arm that is not a ranking")),
+            }
+        };
+        let [primary, secondary] = arms.as_slice() else {
+            return Err(self.refuse("an `rrf` of other than two arms"));
+        };
+        let (primary, secondary) = (arm(primary)?, arm(secondary)?);
+        // The default constant is the unwritten one.
+        let k = match k {
+            Count::Literal(n) if *n == RRF_DEFAULT_K => None,
+            Count::Literal(n) => Some(Box::new(IRExpr::Literal(
+                Literal::Integer(i128::from(*n)),
+                scalar(ScalarType::I64),
+            ))),
+            Count::Param(p) => Some(Box::new(IRExpr::Param(p.clone(), self.param_type(p)))),
+        };
+        Ok(Ranking {
+            key: IRExpr::Rrf {
+                primary: Box::new(primary),
+                secondary: Box::new(secondary),
+                k,
+                ty: scalar(ScalarType::F64),
+            },
+            out: "score".to_string(),
+            column: target.clone(),
+            score: (RRF_COLUMN, scalar(ScalarType::F64)),
+            descending: true,
+            windows,
+        })
+    }
+
+    /// The pattern of a ranking's population: an inline read returning the
+    /// variables its pattern binds.
+    fn population<'t>(&self, input: &'t Term) -> Result<&'t Term, PlanError> {
+        let mut term = input;
+        while let Term::Project { input, .. } = term {
+            term = input;
+        }
+        Ok(term)
+    }
+
+    /// The facts of `term` into `facts`.
+    fn facts(&self, term: &Term, facts: &mut Facts) -> Result<(), PlanError> {
+        match term {
+            Term::Unit | Term::Env(_) => Ok(()),
+            Term::Scan {
+                var,
+                ty: Ty::Node { type_name, .. },
+            } => {
+                facts.types.insert(var.clone(), type_name.clone());
+                facts.bindings.push(BindingFact {
+                    variable: var.clone(),
+                    type_name: type_name.clone(),
+                    filters: Vec::new(),
+                });
+                Ok(())
+            }
+            Term::Scan { .. } => Err(self.refuse("a scan of an edge type in a read")),
+            Term::Expand {
+                input,
+                src,
+                dst,
+                src_type,
+                dst_type,
+                edges,
+                min_hops,
+                max_hops,
+                edge_var,
+            } => {
+                self.facts(input, facts)?;
+                self.traversal(
+                    facts,
+                    TraversalFact {
+                        src: src.clone(),
+                        dst: dst.clone(),
+                        edges: edges.clone(),
+                        src_type: src_type.clone(),
+                        dst_type: dst_type.clone(),
+                        min_hops: *min_hops,
+                        max_hops: *max_hops,
+                        edge_binding: edge_var.clone(),
+                    },
+                );
+                Ok(())
+            }
+            Term::Filter { input, pred } => self.filter(input, pred, facts),
+            Term::Correlate { outer, inner } => {
+                self.facts(outer, facts)?;
+                if let Term::Group { .. } = inner.as_ref() {
+                    return Err(self.refuse("a correlated block read without its filter"));
+                }
+                self.facts(inner, facts)
+            }
+            Term::Fuse { arms, target, .. } => {
+                let type_name = arms
+                    .first()
+                    .and_then(|arm| population_type(arm, target))
+                    .ok_or_else(|| {
+                        self.refuse("an `rrf` arm over a population that is not a type")
+                    })?;
+                facts.types.insert(target.clone(), type_name.clone());
+                facts.bindings.push(BindingFact {
+                    variable: target.clone(),
+                    type_name,
+                    filters: Vec::new(),
+                });
+                Ok(())
+            }
+            other => Err(self.refuse(format!("a `{}` node in a pattern", other.operator()))),
+        }
+    }
+
+    fn traversal(&self, facts: &mut Facts, mut t: TraversalFact) {
+        for end in [&mut t.src, &mut t.dst] {
+            if is_anon(end) {
+                *end = "_".to_string();
+            }
+        }
+        if t.dst != "_" {
+            facts.types.insert(t.dst.clone(), t.dst_type.clone());
+        }
+        if t.src != "_" {
+            facts.types.insert(t.src.clone(), t.src_type.clone());
+        }
+        facts.traversals.push(t);
+    }
+
+    fn filter(&self, input: &Term, pred: &IRExpr, facts: &mut Facts) -> Result<(), PlanError> {
+        // A triple whose ends were both bound: the expansion to a fresh name
+        // and the identity filter tying it to the end.
+        if let Term::Expand {
+            input: below,
+            src,
+            dst,
+            src_type,
+            dst_type,
+            edges,
+            min_hops,
+            max_hops,
+            edge_var,
+        } = input
+            && is_semi(dst)
+            && let Some((left, CompOp::Eq, IRExpr::PropAccess { variable: end, .. })) =
+                pred.comparison_parts()
+            && matches!(left, IRExpr::PropAccess { variable, .. } if variable == dst)
+        {
+            self.facts(below, facts)?;
+            self.traversal(
+                facts,
+                TraversalFact {
+                    src: src.clone(),
+                    dst: end.clone(),
+                    edges: edges.clone(),
+                    src_type: src_type.clone(),
+                    dst_type: dst_type.clone(),
+                    min_hops: *min_hops,
+                    max_hops: *max_hops,
+                    edge_binding: edge_var.clone(),
+                },
+            );
+            return Ok(());
+        }
+        // A predicate over block columns: the blocks under it.
+        let mut cols = Vec::new();
+        pred.columns(&mut cols);
+        if cols.iter().any(|c| is_block_column(c)) {
+            return self.blocks(input, pred, facts);
+        }
+        self.facts(input, facts)?;
+        // A filter over one binding's variable, written right after it, is
+        // that binding's filter.
+        let mut below = input;
+        while let Term::Filter { input, .. } = below {
+            below = input;
+        }
+        if let Term::Scan { var, .. } = below
+            && single_variable(pred).as_deref() == Some(var.as_str())
+            && let Some(binding) = facts.bindings.iter_mut().rev().find(|b| b.variable == *var)
+        {
+            binding.filters.push(pred.clone());
+            return Ok(());
+        }
+        facts.filters.push(pred.clone());
+        Ok(())
+    }
+
+    /// `pred` over the aggregates of the correlated blocks under it.
+    fn blocks(&self, input: &Term, pred: &IRExpr, facts: &mut Facts) -> Result<(), PlanError> {
+        let mut groups: Vec<(&Term, &str, &Agg, Vec<Col>)> = Vec::new();
+        let mut below = input;
+        while let Term::Correlate { outer, inner } = below {
+            let Term::Group { input, keys, aggs } = inner.as_ref() else {
+                break;
+            };
+            let [(column, agg)] = aggs.as_slice() else {
+                return Err(self.refuse("a block of more than one aggregate"));
+            };
+            if !keys.is_empty() {
+                return Err(self.refuse("a block with grouping keys"));
+            }
+            let mut leaf = input.as_ref();
+            loop {
+                match leaf {
+                    Term::Env(cols) => {
+                        groups.push((input, column, agg, cols.clone()));
+                        break;
+                    }
+                    other => match other.children().first() {
+                        Some(child) => leaf = child,
+                        None => {
+                            groups.push((input, column, agg, Vec::new()));
+                            break;
+                        }
+                    },
+                }
+            }
+            below = outer;
+        }
+        self.facts(below, facts)?;
+        // One block per comparison; `not (c > 0)` is the row-count zero test.
+        groups.reverse();
+        for (inner, column, agg, env) in groups {
+            let (op, right) = match block_comparison(pred, column) {
+                Some(found) => found,
+                None => return Err(self.refuse("a filter over block values")),
+            };
+            if !right.columns_empty() {
+                return Err(self.refuse("a block value compared with a column"));
+            }
+            let mut inner_facts = Facts::default();
+            self.facts(inner, &mut inner_facts)?;
+            let left = match &agg.arg {
+                // Counting a node binding counts its rows.
+                None => BlockAggregateExpr::count_rows(),
+                Some(IRExpr::Variable(_, ExprType::Node { .. } | ExprType::Edge { .. }))
+                    if agg.func == AggFunc::Count && !agg.distinct =>
+                {
+                    BlockAggregateExpr::count_rows()
+                }
+                Some(arg) => BlockAggregateExpr::Aggregate {
+                    func: agg.func,
+                    arg: Box::new(arg.clone()),
+                    signature: AggSignature {
+                        arg: arg.ty().clone(),
+                        result: nullable_result(agg),
+                    },
+                },
+            };
+            facts.blocks.push(BlockFact {
+                inner: inner_facts,
+                outer: env.iter().map(|c| c.name.clone()).collect(),
+                left,
+                op,
+                right,
+            });
+        }
+        Ok(())
+    }
+
+    /// The pattern's steps: the facts placed as the module documentation
+    /// describes.
+    fn place(
+        &self,
+        facts: &Facts,
+        ranked: &[String],
+        pipeline: &mut Vec<PatternStep>,
+        bound_vars: &mut HashSet<String>,
+        outer_physical_names: &HashSet<String>,
+        fresh: &mut FreshNames,
+    ) -> Result<(), PlanError> {
+        let bindings: Vec<&BindingFact> = facts.bindings.iter().collect();
+        let traversals: Vec<&TraversalFact> = facts.traversals.iter().collect();
+        let binding_set: HashSet<&str> = bindings.iter().map(|b| b.variable.as_str()).collect();
+        let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+        for t in &traversals {
+            let (src, dst) = (t.src.as_str(), t.dst.as_str());
+            if src != "_" && dst != "_" {
+                adj.entry(src).or_default().push(dst);
+                adj.entry(dst).or_default().push(src);
+            }
+        }
+        let mut deferred_set: HashSet<String> = HashSet::new();
+        let mut component_visited: HashSet<&str> = HashSet::new();
+        let searched: HashSet<String> = facts.filters.iter().filter_map(search_subject).collect();
+        let mut ranked_scans: Vec<(Option<&str>, &str, &str)> = Vec::new();
+        let ranked_nodes: Vec<(&str, &str)> = ranked
+            .iter()
+            .filter_map(|var| {
+                facts
+                    .types
+                    .get(var)
+                    .map(|type_name| (var.as_str(), type_name.as_str()))
+            })
+            .collect();
+        let starts = bindings
+            .iter()
+            .map(|binding| binding.variable.as_str())
+            .chain(ranked_nodes.iter().map(|(var, _)| *var))
+            .collect::<Vec<_>>();
+        for start in starts {
+            if component_visited.contains(start) {
+                continue;
+            }
+            let mut queue = VecDeque::new();
+            queue.push_back(start);
+            let mut component_bindings: Vec<&str> = Vec::new();
+            let mut component_vars: Vec<&str> = Vec::new();
+            while let Some(var) = queue.pop_front() {
+                if !component_visited.insert(var) {
+                    continue;
+                }
+                component_vars.push(var);
+                if binding_set.contains(var) {
+                    component_bindings.push(var);
+                }
+                if let Some(neighbours) = adj.get(var) {
+                    for &n in neighbours {
+                        if !component_visited.contains(n) {
+                            queue.push_back(n);
+                        }
+                    }
+                }
+            }
+            let reaches_outer = component_vars.iter().any(|var| bound_vars.contains(*var));
+            let inner_bindings: Vec<&str> = component_bindings
+                .iter()
+                .copied()
+                .filter(|var| !bound_vars.contains(*var))
+                .collect();
+            let ranked_here: Vec<(&str, &str)> = ranked_nodes
+                .iter()
+                .copied()
+                .filter(|(var, _)| component_vars.contains(var) && !bound_vars.contains(*var))
+                .collect();
+            let root = match ranked_here[..] {
+                [] => scan_root(&inner_bindings, reaches_outer, &searched),
+                [(var, type_name)] => {
+                    let declared = inner_bindings.iter().position(|binding| *binding == var);
+                    if declared.is_none() {
+                        ranked_scans.push((component_bindings.first().copied(), var, type_name));
+                    }
+                    declared
+                }
+                _ => {
+                    return Err(self.refuse("a ranking over two bindings one traversal connects"));
+                }
+            };
+            for (index, var) in inner_bindings.into_iter().enumerate() {
+                if Some(index) != root {
+                    deferred_set.insert(var.to_string());
+                }
+            }
+        }
+        let mut deferred_filters: HashMap<String, Vec<IRExpr>> = HashMap::new();
+        let mut rebind_filters: Vec<IRExpr> = Vec::new();
+        for binding in &bindings {
+            ranked_scans.retain(|&(anchor, variable, type_name)| {
+                if anchor != Some(binding.variable.as_str()) {
+                    return true;
+                }
+                pipeline.push(PatternStep::NodeScan {
+                    variable: variable.to_string(),
+                    type_name: type_name.to_string(),
+                    filters: Vec::new(),
+                });
+                bound_vars.insert(variable.to_string());
+                false
+            });
+            let binding_filters = binding.filters.clone();
+            if bound_vars.contains(&binding.variable) {
+                rebind_filters.extend(binding_filters);
+                continue;
+            }
+            if deferred_set.contains(&binding.variable) {
+                if !binding_filters.is_empty() {
+                    deferred_filters
+                        .entry(binding.variable.clone())
+                        .or_default()
+                        .extend(binding_filters);
+                }
+                continue;
+            }
+            pipeline.push(PatternStep::NodeScan {
+                variable: binding.variable.clone(),
+                type_name: binding.type_name.clone(),
+                filters: binding_filters,
+            });
+            bound_vars.insert(binding.variable.clone());
+        }
+        for (_, variable, type_name) in ranked_scans {
+            pipeline.push(PatternStep::NodeScan {
+                variable: variable.to_string(),
+                type_name: type_name.to_string(),
+                filters: Vec::new(),
+            });
+            bound_vars.insert(variable.to_string());
+        }
+        let mut remaining: Vec<&TraversalFact> = traversals.clone();
+        while !remaining.is_empty() {
+            let mut next_remaining = Vec::new();
+            for traversal in &remaining {
+                let src_bound = traversal.src != "_" && bound_vars.contains(&traversal.src);
+                let dst_bound = traversal.dst != "_" && bound_vars.contains(&traversal.dst);
+                if !src_bound && !dst_bound {
+                    next_remaining.push(*traversal);
+                    continue;
+                }
+                let edge_binding = traversal.edge_binding.clone();
+                if src_bound && dst_bound {
+                    let temp_var = fresh.temp(&traversal.dst);
+                    pipeline.push(PatternStep::Expand {
+                        src_var: traversal.src.clone(),
+                        dst_var: temp_var.clone(),
+                        edges: traversal.edges.clone(),
+                        src_type: traversal.src_type.clone(),
+                        dst_type: traversal.dst_type.clone(),
+                        min_hops: traversal.min_hops,
+                        max_hops: traversal.max_hops,
+                        dst_filters: vec![],
+                        edge_binding,
+                    });
+                    let id = self.catalog.system_columns.id.to_string();
+                    let string = scalar(ScalarType::String);
+                    pipeline.push(PatternStep::Filter(
+                        omnigraph_compiler::ir::coerce::binary(
+                            IRExpr::PropAccess {
+                                variable: temp_var,
+                                property: id.clone(),
+                                ty: string.clone(),
+                            },
+                            BinaryOp::Compare(CompOp::Eq),
+                            IRExpr::PropAccess {
+                                variable: traversal.dst.clone(),
+                                property: id,
+                                ty: string,
+                            },
+                        )
+                        .map_err(|e| PlanError::Internal(e.to_string()))?,
+                    ));
+                } else if !src_bound && dst_bound {
+                    let introduced_filters =
+                        deferred_filters.remove(&traversal.src).unwrap_or_default();
+                    let dst_var = if traversal.src == "_" {
+                        fresh.anon()
+                    } else {
+                        traversal.src.clone()
+                    };
+                    pipeline.push(PatternStep::Expand {
+                        src_var: traversal.dst.clone(),
+                        dst_var,
+                        edges: traversal.edges.reversed(),
+                        src_type: traversal.dst_type.clone(),
+                        dst_type: traversal.src_type.clone(),
+                        min_hops: traversal.min_hops,
+                        max_hops: traversal.max_hops,
+                        dst_filters: introduced_filters,
+                        edge_binding,
+                    });
+                    if traversal.src != "_" {
+                        bound_vars.insert(traversal.src.clone());
+                    }
+                } else {
+                    let introduced_filters =
+                        deferred_filters.remove(&traversal.dst).unwrap_or_default();
+                    let dst_var = if traversal.dst == "_" {
+                        fresh.anon()
+                    } else {
+                        traversal.dst.clone()
+                    };
+                    pipeline.push(PatternStep::Expand {
+                        src_var: traversal.src.clone(),
+                        dst_var,
+                        edges: traversal.edges.clone(),
+                        src_type: traversal.src_type.clone(),
+                        dst_type: traversal.dst_type.clone(),
+                        min_hops: traversal.min_hops,
+                        max_hops: traversal.max_hops,
+                        dst_filters: introduced_filters,
+                        edge_binding,
+                    });
+                    if traversal.dst != "_" {
+                        bound_vars.insert(traversal.dst.clone());
+                    }
+                }
+            }
+            if next_remaining.len() == remaining.len() {
+                // Neither end bound: the source starts its own pattern.
+                let t = next_remaining[0];
+                pipeline.push(PatternStep::NodeScan {
+                    variable: t.src.clone(),
+                    type_name: t.src_type.clone(),
+                    filters: Vec::new(),
+                });
+                bound_vars.insert(t.src.clone());
+            }
+            remaining = next_remaining;
+        }
+        pipeline.extend(rebind_filters.into_iter().map(PatternStep::Filter));
+        for filter in &facts.filters {
+            pipeline.push(PatternStep::Filter(filter.clone()));
+        }
+        if facts.blocks.is_empty() {
+            return Ok(());
+        }
+        let mut physical_names = outer_physical_names.clone();
+        for step in pipeline.iter() {
+            match step {
+                PatternStep::NodeScan { variable, .. } => {
+                    physical_names.insert(variable.clone());
+                }
+                PatternStep::Expand {
+                    dst_var,
+                    edge_binding,
+                    ..
+                } => {
+                    physical_names.insert(dst_var.clone());
+                    physical_names.extend(edge_binding.iter().cloned());
+                }
+                PatternStep::Filter(_) | PatternStep::AntiJoin { .. } => {}
+            }
+        }
+        for block in &facts.blocks {
+            let visible_outer: HashSet<String> = bound_vars
+                .iter()
+                .filter(|name| block.outer.contains(*name))
+                .cloned()
+                .collect();
+            let outer_var = find_outer_var(&block.inner, &visible_outer);
+            let mut inner_names: Vec<&String> = block
+                .inner
+                .types
+                .keys()
+                .chain(block.inner.bindings.iter().map(|b| &b.variable))
+                .chain(
+                    block
+                        .inner
+                        .traversals
+                        .iter()
+                        .filter_map(|t| t.edge_binding.as_ref()),
+                )
+                .filter(|name| !block.outer.contains(*name) && physical_names.contains(*name))
+                .collect();
+            inner_names.sort();
+            inner_names.dedup();
+            let renames: HashMap<String, String> = inner_names
+                .into_iter()
+                .map(|name| (name.clone(), fresh.temp(name)))
+                .collect();
+            let mut inner_pipeline = Vec::new();
+            let mut inner_bound = visible_outer;
+            self.place(
+                &block.inner,
+                &[],
+                &mut inner_pipeline,
+                &mut inner_bound,
+                &physical_names,
+                fresh,
+            )?;
+            let mut left = block.left.clone();
+            rename_inner_bindings(&mut inner_pipeline, left.arg_mut(), &renames);
+            let predicate =
+                omnigraph_compiler::ir::coerce::block(left, block.op, block.right.clone())
+                    .map_err(|e| PlanError::Internal(e.to_string()))?;
+            pipeline.push(PatternStep::AntiJoin {
+                outer_var: outer_var.unwrap_or_default(),
+                inner: inner_pipeline,
+                predicate,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn scalar(s: ScalarType) -> ExprType {
+    ExprType::from_prop(&PropType::scalar(s, false))
+}
+
+/// The comparison `pred` makes of a block column: `c op right`, or
+/// `not (c > 0)` as `c = 0`.
+fn block_comparison(pred: &IRExpr, column: &str) -> Option<(CompOp, IRExpr)> {
+    let mut conjuncts = pred.clone().into_conjuncts();
+    for conjunct in conjuncts.drain(..) {
+        if let IRExpr::Not(inner, _) = &conjunct
+            && let Some((
+                IRExpr::AliasRef(c, _),
+                CompOp::Gt,
+                IRExpr::Literal(Literal::Integer(0), ty),
+            )) = inner.comparison_parts()
+            && c == column
+        {
+            return Some((CompOp::Eq, IRExpr::Literal(Literal::Integer(0), ty.clone())));
+        }
+        if let Some((left, op, right)) = conjunct.comparison_parts() {
+            let left = match left {
+                IRExpr::Cast { expr, .. } => expr.as_ref(),
+                other => other,
+            };
+            if matches!(left, IRExpr::AliasRef(c, _) if c == column) {
+                let right = match right {
+                    IRExpr::Cast { expr, .. } => expr.as_ref().clone(),
+                    other => other.clone(),
+                };
+                return Some((op, right));
+            }
+        }
+    }
+    None
+}
+
+/// The variable a search predicate filter searches.
+fn search_subject(filter: &IRExpr) -> Option<String> {
+    let (call, CompOp::Eq, IRExpr::Literal(Literal::Bool(true), _)) = filter.comparison_parts()?
+    else {
+        return None;
+    };
+    match call {
+        IRExpr::Search { field, .. }
+        | IRExpr::Fuzzy { field, .. }
+        | IRExpr::MatchText { field, .. } => match field.as_ref() {
+            IRExpr::PropAccess { variable, .. } => Some(variable.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn scan_root(
+    inner_bindings: &[&str],
+    reaches_outer: bool,
+    searched: &HashSet<String>,
+) -> Option<usize> {
+    if reaches_outer {
+        inner_bindings
+            .iter()
+            .position(|var| searched.contains(*var))
+    } else {
+        inner_bindings.first().map(|_| 0)
+    }
+}
+
+/// The `Fuse` a pattern extends from: the leaf its first inputs reach.
+fn fuse_leaf(term: &Term) -> Option<&Term> {
+    match term {
+        Term::Fuse { .. } => Some(term),
+        Term::Expand { input, .. } | Term::Filter { input, .. } => fuse_leaf(input),
+        Term::Correlate { outer, .. } => fuse_leaf(outer),
+        _ => None,
+    }
+}
+
+/// The node type an `rrf` arm ranks: the scan under its population.
+fn population_type(arm: &Term, target: &str) -> Option<String> {
+    let mut term = arm;
+    loop {
+        term = match term {
+            Term::ApproxTopK { input, .. }
+            | Term::Score { input, .. }
+            | Term::Project { input, .. }
+            | Term::Filter { input, .. } => input,
+            Term::Scan {
+                var,
+                ty: Ty::Node { type_name, .. },
+            } if var == target => return Some(type_name.clone()),
+            _ => return None,
+        };
+    }
+}
+
+/// The window an `rrf`'s `nearest` arm draws when the read has no `limit`
+/// (today's arm window).
+const RRF_NEAREST_ARM_WINDOW: u64 = 100;
+
+/// An aggregate's result as its signature states it: nullable, since an
+/// aggregate over no rows has no value.
+fn nullable_result(agg: &Agg) -> ExprType {
+    match agg.ty.expr_type() {
+        ExprType::Value { scalar, list, .. } => ExprType::Value {
+            scalar,
+            list,
+            nullable: true,
+        },
+        other => other,
+    }
+}
+
+/// The outer variable a block correlates on: the first its traversals
+/// touch, else the first of its bindings that is outer-bound, else the first
+/// its filters read. The term places a filter as soon as its variables are
+/// bound, so the written order of filters and traversals is not recoverable;
+/// a block's traversals come first.
+fn find_outer_var(facts: &Facts, outer_bound: &HashSet<String>) -> Option<String> {
+    let traversal = facts.traversals.iter().find_map(|t| {
+        [&t.src, &t.dst]
+            .into_iter()
+            .find(|v| outer_bound.contains(*v))
+            .cloned()
+    });
+    let binding = || {
+        facts
+            .bindings
+            .iter()
+            .find(|b| outer_bound.contains(&b.variable))
+            .map(|b| b.variable.clone())
+    };
+    let filter = || {
+        facts
+            .bindings
+            .iter()
+            .flat_map(|b| b.filters.iter())
+            .chain(facts.filters.iter())
+            .find_map(|f| {
+                let mut cols = Vec::new();
+                f.columns(&mut cols);
+                cols.into_iter().find(|c| outer_bound.contains(c))
+            })
+    };
+    traversal.or_else(binding).or_else(filter)
+}
+
+#[derive(Default)]
+struct FreshNames {
+    anon: usize,
+    temp: usize,
+}
+
+impl FreshNames {
+    fn anon(&mut self) -> String {
+        self.anon += 1;
+        format!("{ANON_PREFIX}{}", self.anon)
+    }
+
+    fn temp(&mut self, dst: &str) -> String {
+        self.temp += 1;
+        format!("{FRESH_PREFIX}{}_{}", dst, self.temp)
+    }
+}
+
+fn rename_inner_bindings(
+    pipeline: &mut [PatternStep],
+    argument: Option<&mut IRExpr>,
+    renames: &HashMap<String, String>,
+) {
+    if renames.is_empty() {
+        return;
+    }
+    let rename = |variable: &mut String| {
+        if let Some(name) = renames.get(variable) {
+            *variable = name.clone();
+        }
+    };
+    let mut expressions: Vec<&mut IRExpr> = argument.into_iter().collect();
+    let mut pending: Vec<_> = pipeline.iter_mut().collect();
+    while let Some(step) = pending.pop() {
+        match step {
+            PatternStep::NodeScan {
+                variable, filters, ..
+            } => {
+                rename(variable);
+                expressions.extend(filters);
+            }
+            PatternStep::Expand {
+                src_var,
+                dst_var,
+                dst_filters,
+                edge_binding,
+                ..
+            } => {
+                rename(src_var);
+                rename(dst_var);
+                if let Some(binding) = edge_binding {
+                    rename(binding);
+                }
+                expressions.extend(dst_filters);
+            }
+            PatternStep::Filter(expr) => expressions.push(expr),
+            PatternStep::AntiJoin {
+                outer_var,
+                inner,
+                predicate,
+            } => {
+                rename(outer_var);
+                expressions.extend(predicate.left.arg_mut());
+                expressions.push(&mut predicate.right);
+                pending.extend(inner);
+            }
+        }
+    }
+    for expr in expressions {
+        rename_expr(expr, &rename);
+    }
+}
+
+fn rename_expr(expr: &mut IRExpr, rename: &impl Fn(&mut String)) {
+    match expr {
+        IRExpr::PropAccess { variable, .. } | IRExpr::Variable(variable, _) => rename(variable),
+        IRExpr::Nearest {
+            variable, query, ..
+        } => {
+            rename(variable);
+            rename_expr(query, rename);
+        }
+        IRExpr::Search { field, query, .. }
+        | IRExpr::MatchText { field, query, .. }
+        | IRExpr::Bm25 { field, query, .. } => {
+            rename_expr(field, rename);
+            rename_expr(query, rename);
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+            ..
+        } => {
+            rename_expr(field, rename);
+            rename_expr(query, rename);
+            if let Some(m) = max_edits {
+                rename_expr(m, rename);
+            }
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+            ..
+        } => {
+            rename_expr(primary, rename);
+            rename_expr(secondary, rename);
+            if let Some(k) = k {
+                rename_expr(k, rename);
+            }
+        }
+        IRExpr::Aggregate { arg, .. }
+        | IRExpr::Not(arg, _)
+        | IRExpr::IsNull { expr: arg, .. }
+        | IRExpr::Neg { expr: arg, .. }
+        | IRExpr::Cast { expr: arg, .. } => rename_expr(arg, rename),
+        IRExpr::Binary { left, right, .. } => {
+            rename_expr(left, rename);
+            rename_expr(right, rename);
+        }
+        IRExpr::Call { args, .. } => args.iter_mut().for_each(|a| rename_expr(a, rename)),
+        IRExpr::Literal(_, _) | IRExpr::Param(_, _) | IRExpr::AliasRef(_, _) => {}
+    }
+}

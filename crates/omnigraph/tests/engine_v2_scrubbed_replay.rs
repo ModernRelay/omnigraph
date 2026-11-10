@@ -13,7 +13,7 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::instrumentation::with_query_memory_limit;
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_planner::{EXPAND_INDEXED_MAX_FRONTIER_ENV, PhysicalNode};
 use serde_json::Value;
 use serial_test::serial;
@@ -252,9 +252,9 @@ node Doc {
 "#;
 
 const NEAREST: &str = r#"query by_vector($q: Vector(4)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 3) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }"#;
 

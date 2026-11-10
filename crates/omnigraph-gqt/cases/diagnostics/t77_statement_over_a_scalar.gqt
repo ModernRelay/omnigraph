@@ -1,5 +1,5 @@
 # issue: none
-# notes: The GQ edition-3 preview (`gq 3;`) refuses a statement over a variable that is not a reference with `T77`; nothing in the preview executes.
+# notes: The compiler refuses a statement over a variable that is not a reference with `T77`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,7 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- mutate
-gq 3;
 query w($h: String) { $p: Person { handle: $h }  let $n = $p.name  delete $n }
 
 --- expect error: type error: T77:

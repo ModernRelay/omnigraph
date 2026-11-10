@@ -6,11 +6,9 @@ use serde::Serialize;
 use crate::catalog::Catalog;
 use crate::error::{CompilerError, Result};
 
-use super::ast::QueryDecl;
-use super::typecheck::{
-    BoundVariable, CheckedMutationOp, CheckedQuery, CheckedScope, MutationTarget, projection_field,
-    typecheck_query_decl,
-};
+use super::check::{check_query_decl, result_schema};
+use super::file::QueryDecl;
+use crate::ir::core::{CoreDecl, MutationTarget, Sink, Term};
 
 /// A compiled query's conservative graph access set and result shape.
 ///
@@ -79,81 +77,63 @@ pub fn describe_query_operation(
     catalog: &Catalog,
     query: &QueryDecl,
 ) -> Result<QueryOperationDescriptor> {
-    let checked = typecheck_query_decl(catalog, query)?;
-    describe_checked_query_operation(catalog, &checked)
+    let core = check_query_decl(catalog, query)?;
+    describe_core_operation(catalog, &core)
 }
 
-fn describe_checked_query_operation(
-    catalog: &Catalog,
-    checked: &CheckedQuery,
-) -> Result<QueryOperationDescriptor> {
+fn describe_core_operation(catalog: &Catalog, core: &CoreDecl) -> Result<QueryOperationDescriptor> {
     let mut reads = BTreeSet::new();
     let mut writes = BTreeSet::new();
-
-    let result = match checked {
-        // The descriptor reads the lowered plan's result types, and the
-        // planner does not lower the core IR yet.
-        CheckedQuery::Core(core) => {
-            return Err(CompilerError::Plan(format!(
-                "`{}` is an edition-3 declaration; it type-checks, and its operation descriptor waits for the planner to lower edition 3",
-                core.name()
-            )));
-        }
-        CheckedQuery::Read(query) => {
-            collect_checked_reads(&query.scope, &mut reads);
-            let ir = crate::lower_query(catalog, query)?;
-            ir.return_exprs
+    let result = match core {
+        CoreDecl::Read(read) => {
+            collect_term_reads(&read.term, &mut reads);
+            result_schema(catalog, read)?
+                .fields()
                 .iter()
-                .zip(&query.returns)
-                .map(|(projection, item)| {
-                    let field = projection_field(catalog, &item.inferred_name, &projection.ty)?;
-                    result_field_descriptor(&field)
-                })
+                .map(|field| result_field_descriptor(field))
                 .collect::<Result<Vec<_>>>()?
         }
-        CheckedQuery::Mutation(query) => {
-            for op in &query.ops {
-                let fact = target_fact(op.target());
-                reads.insert(fact.clone());
-                writes.insert(fact);
-
-                match op {
-                    CheckedMutationOp::Insert {
-                        target: MutationTarget::Edge { type_name },
-                        ..
-                    } => {
-                        let edge = catalog.edge_types.get(type_name).ok_or_else(|| {
-                            CompilerError::Plan(format!(
-                                "typechecked edge type `{type_name}` is absent from the catalog"
-                            ))
-                        })?;
-                        reads.insert(node_fact(&edge.from_type));
-                        reads.insert(node_fact(&edge.to_type));
-                    }
-                    CheckedMutationOp::Delete {
-                        target: MutationTarget::Node { type_name },
-                        ..
-                    } => {
-                        for edge in catalog.edge_types.values().filter(|edge| {
-                            edge.from_type == *type_name || edge.to_type == *type_name
-                        }) {
-                            let edge_fact = QueryGraphFact {
-                                kind: QueryGraphFactKind::Edge,
-                                type_name: edge.name.clone(),
-                            };
-                            reads.insert(edge_fact.clone());
-                            writes.insert(edge_fact);
+        CoreDecl::Write(write) => {
+            for group in &write.groups {
+                collect_term_reads(&group.input, &mut reads);
+                for sink in &group.sinks {
+                    let target = match sink {
+                        Sink::Insert { target, .. }
+                        | Sink::Update { target, .. }
+                        | Sink::Delete { target, .. } => target,
+                    };
+                    let fact = target_fact(target);
+                    reads.insert(fact.clone());
+                    writes.insert(fact);
+                    match (sink, target) {
+                        (Sink::Insert { .. }, MutationTarget::Edge { type_name }) => {
+                            let edge = catalog.edge_types.get(type_name).ok_or_else(|| {
+                                CompilerError::Plan(format!(
+                                    "typechecked edge type `{type_name}` is absent from the catalog"
+                                ))
+                            })?;
+                            reads.insert(node_fact(&edge.from_type));
+                            reads.insert(node_fact(&edge.to_type));
                         }
+                        (Sink::Delete { .. }, MutationTarget::Node { type_name }) => {
+                            for edge in catalog.edge_types.values().filter(|edge| {
+                                edge.from_type == *type_name || edge.to_type == *type_name
+                            }) {
+                                let edge_fact = QueryGraphFact {
+                                    kind: QueryGraphFactKind::Edge,
+                                    type_name: edge.name.clone(),
+                                };
+                                reads.insert(edge_fact.clone());
+                                writes.insert(edge_fact);
+                            }
+                        }
+                        _ => {}
                     }
-                    CheckedMutationOp::Insert { .. }
-                    | CheckedMutationOp::Update { .. }
-                    | CheckedMutationOp::Delete { .. } => {}
                 }
             }
             Vec::new()
         }
     };
-
     Ok(QueryOperationDescriptor {
         result,
         reads: reads.into_iter().collect(),
@@ -161,25 +141,43 @@ fn describe_checked_query_operation(
     })
 }
 
-fn collect_checked_reads(scope: &CheckedScope, reads: &mut BTreeSet<QueryGraphFact>) {
-    let mut pending = vec![scope];
-    while let Some(scope) = pending.pop() {
-        for binding in scope.bindings.values() {
-            if let BoundVariable::Node { type_name } = binding {
+/// Every node type a term scans or expands to, and every edge type it
+/// traverses.
+fn collect_term_reads(term: &Term, reads: &mut BTreeSet<QueryGraphFact>) {
+    match term {
+        Term::Scan { ty, .. } => match ty {
+            crate::ir::core::Ty::Node { type_name, .. } => {
                 reads.insert(node_fact(type_name));
             }
-        }
-        for traversal in scope.traversals() {
-            reads.insert(node_fact(&traversal.src_type));
-            reads.insert(node_fact(&traversal.dst_type));
-            for member in traversal.edges.members() {
+            crate::ir::core::Ty::Edge { type_name, .. } => {
+                for name in type_name.split('|') {
+                    reads.insert(QueryGraphFact {
+                        kind: QueryGraphFactKind::Edge,
+                        type_name: name.to_string(),
+                    });
+                }
+            }
+            crate::ir::core::Ty::Value(_) => {}
+        },
+        Term::Expand {
+            src_type,
+            dst_type,
+            edges,
+            ..
+        } => {
+            reads.insert(node_fact(src_type));
+            reads.insert(node_fact(dst_type));
+            for member in edges.members() {
                 reads.insert(QueryGraphFact {
                     kind: QueryGraphFactKind::Edge,
                     type_name: member.edge_type.clone(),
                 });
             }
         }
-        pending.extend(scope.blocks().map(|block| &block.inner));
+        _ => {}
+    }
+    for child in term.children() {
+        collect_term_reads(child, reads);
     }
 }
 

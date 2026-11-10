@@ -10,7 +10,7 @@ use axum::extract::State;
 use axum::{Extension, Json};
 use omnigraph::catalogue::{CATALOGUE_SCOPE, CatalogueScope};
 use omnigraph::db::ReadTarget;
-use omnigraph_compiler::query::ast::FileBody;
+use omnigraph_compiler::query::file::FileBody;
 use omnigraph_policy::{PolicyAction, PolicyRequest};
 
 use super::dispatch::{classify, refuse_empty_file, refuse_process_settings};

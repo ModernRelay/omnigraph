@@ -24,7 +24,8 @@ branch create feature
 
 --- mutate branch: feature
 query feature_write() {
-    update Person set { age: 31 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -36,7 +37,8 @@ branch merge feature
 
 --- mutate
 query main_write() {
-    update Person set { age: 32 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 32 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -55,7 +57,8 @@ branch merge main into feature
 
 --- mutate branch: feature
 query feature_rewrites() {
-    update Person set { age: 33 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 33 }
 }
 
 --- expect affected: nodes=1 edges=0

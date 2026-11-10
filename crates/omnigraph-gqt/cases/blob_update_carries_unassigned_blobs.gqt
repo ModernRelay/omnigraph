@@ -29,7 +29,8 @@ node Doc {
 
 --- mutate
 query assign_first_carry_second($slug: String, $first: Blob?) {
-    update Doc set { first: $first } where slug = $slug
+    $x: Doc  $x.slug = $slug
+    update $x set { first: $first }
 }
 
 --- params
@@ -39,7 +40,8 @@ query assign_first_carry_second($slug: String, $first: Blob?) {
 
 --- mutate
 query clear_first_carry_second($slug: String, $first: Blob?) {
-    update Doc set { first: $first } where slug = $slug
+    $x: Doc  $x.slug = $slug
+    update $x set { first: $first }
 }
 
 --- params
@@ -49,7 +51,8 @@ query clear_first_carry_second($slug: String, $first: Blob?) {
 
 --- mutate
 query assign_scalar_carry_both($slug: String) {
-    update Doc set { title: "renamed" } where slug = $slug
+    $x: Doc  $x.slug = $slug
+    update $x set { title: "renamed" }
 }
 
 --- params
@@ -59,7 +62,8 @@ query assign_scalar_carry_both($slug: String) {
 
 --- mutate
 query assign_both($slug: String, $first: Blob?, $second: Blob?) {
-    update Doc set { first: $first, second: $second } where slug = $slug
+    $x: Doc  $x.slug = $slug
+    update $x set { first: $first, second: $second }
 }
 
 --- params
@@ -70,7 +74,8 @@ query assign_both($slug: String, $first: Blob?, $second: Blob?) {
 --- mutate
 query insert_then_assign_second($first: Blob?, $second: Blob?) {
     insert Doc { slug: "c", first: $first, title: "gamma", rank: 3 }
-    update Doc set { second: $second } where slug = "c"
+    $x: Doc  $x.slug = "c"
+    update $x set { second: $second }
 }
 
 --- params
@@ -80,7 +85,8 @@ query insert_then_assign_second($first: Blob?, $second: Blob?) {
 
 --- mutate
 query assign_scalar_over_null_and_stored_blobs() {
-    update Doc set { rank: 9 } where rank > 1
+    $x: Doc  $x.rank > 1
+    update $x set { rank: 9 }
 }
 
 --- expect affected: nodes=2 edges=0
@@ -103,7 +109,8 @@ d.rank: I64
 
 --- mutate
 query null_on_non_nullable_scalar_matching_no_row($slug: String, $rank: I64?) {
-    update Doc set { rank: $rank } where slug = $slug
+    $x: Doc  $x.slug = $slug
+    update $x set { rank: $rank }
 }
 
 --- params

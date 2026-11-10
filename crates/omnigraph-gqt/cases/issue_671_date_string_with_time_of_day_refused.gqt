@@ -32,7 +32,8 @@ query insert_event($name: String, $day: Date) {
 
 --- mutate
 query touch_on_datetime_literal() {
-    update Event set { name: "moved" } where day = date("2024-01-01T02:00:00+05:00")
+    $x: Event  $x.day = date("2024-01-01T02:00:00+05:00")
+    update $x set { name: "moved" }
 }
 
 --- expect error: invalid Date literal '2024-01-01T02:00:00+05:00'

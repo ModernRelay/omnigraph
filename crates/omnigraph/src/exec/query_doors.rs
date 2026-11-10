@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
-use omnigraph_compiler::ir::{IROp, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::LoadStmt;
+use omnigraph_compiler::ir::ParamMap;
+use omnigraph_compiler::query::file::LoadStmt;
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::settings::SessionSettings;
-use omnigraph_compiler::{CheckedRead, lower_query};
+use omnigraph_planner::{PatternStep, ReadShape};
 
 use crate::db::{Omnigraph, ReadTarget, Snapshot};
 use crate::engine;
@@ -67,7 +67,6 @@ impl Session {
         params: &ParamMap,
     ) -> Result<(QueryResult, Option<String>)> {
         let settings = self.effective(query_source)?;
-        self.refuse_unlowered(query_source, query_name)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
 
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
@@ -107,7 +106,6 @@ impl Session {
         params: &ParamMap,
     ) -> Result<QueryResult> {
         let settings = self.effective(query_source)?;
-        self.refuse_unlowered(query_source, query_name)?;
         let (snapshot, catalog) = self.capture_historical_read_view(version).await?;
 
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
@@ -147,7 +145,6 @@ impl Session {
         params: &ParamMap,
     ) -> Result<serde_json::Value> {
         let settings = self.effective(query_source)?;
-        self.refuse_unlowered(query_source, query_name)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
         let compiled = self.compile_named_query(&catalog, query_source, query_name)?;
         admit_wildcard_target(
@@ -230,7 +227,6 @@ impl Session {
         params: &ParamMap,
     ) -> Result<engine::Executed> {
         let settings = self.effective(query_source)?;
-        self.refuse_unlowered(query_source, query_name)?;
         let (resolved, catalog) = self.capture_read_view(target).await?;
         let CompiledRead::Query(query) =
             self.compile_named_query(&catalog, query_source, query_name)?
@@ -244,10 +240,12 @@ impl Session {
             matches!(&resolved.requested, ReadTarget::Snapshot(_)),
             ir.has_wildcard_traversal(),
         )?;
-        let traverses = ir
-            .pipeline
-            .iter()
-            .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
+        let traverses = ir.pipeline.iter().any(|op| {
+            matches!(
+                op,
+                PatternStep::Expand { .. } | PatternStep::AntiJoin { .. }
+            )
+        });
         let graph_index = if traverses {
             engine::GraphIndexHandle::cached(
                 Arc::clone(&**self),
@@ -351,11 +349,13 @@ impl Session {
         index_source: IndexSource<'_>,
         catalog: &Arc<Catalog>,
     ) -> Result<QueryResult> {
-        let ir: &QueryIR = &query.ir;
-        let needs_graph = ir
-            .pipeline
-            .iter()
-            .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
+        let ir: &ReadShape = &query.ir;
+        let needs_graph = ir.pipeline.iter().any(|op| {
+            matches!(
+                op,
+                PatternStep::Expand { .. } | PatternStep::AntiJoin { .. }
+            )
+        });
         let graph_index = match (&index_source, needs_graph) {
             (_, false) => engine::GraphIndexHandle::none(),
             (IndexSource::Cached(resolved), true) => engine::GraphIndexHandle::cached(
@@ -401,12 +401,7 @@ impl Omnigraph {
         }
         let statement = omnigraph_compiler::find_read_statement(query_source, query_name)
             .map_err(super::query_lookup_error)?;
-        if statement.decl().syntax.is_some() {
-            return Err(super::unlowered_refusal(catalog, statement.decl()));
-        }
-        let checked = CheckedRead::check(catalog, statement.decl())?;
-        let ir = Arc::new(lower_query(catalog, checked.query())?);
-        let query = CompiledQuery { ir, checked };
+        let query = CompiledQuery::compile(catalog, statement.decl())?;
         let compiled = if statement.is_explain() {
             CompiledRead::Explain(query)
         } else {

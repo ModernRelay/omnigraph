@@ -43,7 +43,7 @@ query searched($q: String) {
 }
 --- params
 {"q": "deep"}
---- expect error: T27: `search` over `$d.notes` needs a full-text index
+--- expect error: T27: `search` needs a full-text index on `Doc.notes`
 
 --- query
 query fuzzed($q: String) {
@@ -52,7 +52,7 @@ query fuzzed($q: String) {
 }
 --- params
 {"q": "deep"}
---- expect error: T27: `fuzzy` over `$d.notes` needs a full-text index
+--- expect error: T27: `fuzzy` needs a full-text index on `Doc.notes`
 
 --- query
 query matched($q: String) {
@@ -61,18 +61,18 @@ query matched($q: String) {
 }
 --- params
 {"q": "deep"}
---- expect error: T27: `match_text` over `$d.notes` needs a full-text index
+--- expect error: T27: `match_text` needs a full-text index on `Doc.notes`
 
 --- query
 query ranked($q: String) {
-    match { $d: Doc }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.notes, $q) }
     return { $d.slug }
-    order { bm25($d.notes, $q) }
+    order { $score desc }
     limit 2
 }
 --- params
 {"q": "deep"}
---- expect error: T27: `bm25` over `$d.notes` needs a full-text index
+--- expect error: T27: `bm25` needs a full-text index on `Doc.notes`
 
 --- query
 query lower($q: String) {

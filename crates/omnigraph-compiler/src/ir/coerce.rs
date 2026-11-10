@@ -2,7 +2,7 @@
 //! Cast nodes; execution never chooses a domain from bound parameter values.
 
 use crate::error::{CompilerError, Result};
-use crate::query::ast::{BinaryOp, CompOp, Literal};
+use crate::query::value::{BinaryOp, CompOp, Literal};
 use crate::types::{ExprType, ScalarType};
 
 use super::{BlockAggregateExpr, IRExpr, SubqueryPredicate, fold};
@@ -371,7 +371,7 @@ fn float_round_trips(value: f64, target: Domain) -> bool {
 }
 
 /// `in` fixes the list role before overloaded `contains` dispatch sees a null.
-pub(super) fn in_list(list: IRExpr, needle: IRExpr) -> Result<IRExpr> {
+pub(crate) fn in_list(list: IRExpr, needle: IRExpr) -> Result<IRExpr> {
     let list = match list {
         IRExpr::Literal(Literal::Null, _) => {
             let domain =

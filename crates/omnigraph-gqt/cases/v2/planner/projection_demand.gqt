@@ -72,9 +72,9 @@ scan T as $c: columns [__id, slug, state, rank, kind, kind_ref]
 --- query
 set engine = v2;
 query leading_nearest() {
-    match { $c: T }
+    match { from nearest({ match { $c: T } return { $c } }, $c.embedding, [1.0, 0.0], k: 1) }
     return { $c.slug }
-    order { nearest($c.embedding, [1.0, 0.0]) }
+    order { $distance }
     limit 1
 }
 --- expect ordered

@@ -39,7 +39,7 @@ query literal_needles_with_passage_written_first() {
     match {
         $p: Passage
         $m: Matter
-        $p.text contains $m.number
+        contains($p.text, $m.number)
         $m.mid != "m-empty"
     }
     return { $m.mid, $p.pid }
@@ -66,7 +66,7 @@ query empty_needle() {
     match {
         $m: Matter
         $p: Passage
-        $p.text contains $m.number
+        contains($p.text, $m.number)
         $m.mid = "m-empty"
     }
     return { $m.mid, $p.pid }
@@ -90,7 +90,7 @@ query null_needles_only() {
     match {
         $m: Matter
         $p: Passage
-        $p.text contains $m.number
+        contains($p.text, $m.number)
         $m.mid = "m-null"
     }
     return { $m.mid, $p.pid }
@@ -108,7 +108,7 @@ query contains_inside_an_or() {
     match {
         $m: Matter
         $p: Passage
-        $p.text contains $m.number or $p.pid = "p-digit"
+        contains($p.text, $m.number) or $p.pid = "p-digit"
         $m.mid != "m-empty"
         $m.mid != "m-null"
     }

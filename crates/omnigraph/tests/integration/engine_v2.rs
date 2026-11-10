@@ -474,7 +474,7 @@ async fn explain_resolves_omitted_nullable_parameters_before_planning() {
     let omitted = omnigraph_compiler::ir::ParamMap::new();
     let explicit = [(
         "min".to_string(),
-        omnigraph_compiler::query::ast::Literal::Null,
+        omnigraph_compiler::query::value::Literal::Null,
     )]
     .into_iter()
     .collect();
@@ -695,34 +695,38 @@ async fn explain_search_uses_vector_params_without_initializing_embeddings() {
 
     let dir = tempfile::tempdir().unwrap();
     let v2 = with_setting(&vector_doc_graph(&dir).await, "engine", "v2");
-    for (ordering, parameter_type, values, available) in [
+    for (ranking, ordering, parameter_type, values, available) in [
         (
-            "nearest($d.embedding, $q)",
+            "from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1)",
+            "$distance",
             "Vector(4)",
             vector_param("q", &[0.0; 4]),
             true,
         ),
         (
-            "rrf(nearest($d.embedding, $q), bm25($d.title, \"a\"))",
+            "let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60)",
+            "$score desc",
             "Vector(4)",
             vector_param("q", &[0.0; 4]),
             true,
         ),
         (
-            "nearest($d.embedding, $q)",
+            "from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1)",
+            "$distance",
             "String",
             params(&[("q", "a")]),
             false,
         ),
         (
-            "rrf(nearest($d.embedding, $q), bm25($d.title, \"a\"))",
+            "let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60)",
+            "$score desc",
             "String",
             params(&[("q", "a")]),
             false,
         ),
     ] {
         let source = format!(
-            "explain query ranked($q: {parameter_type}) {{ match {{ $d: Doc }} return {{ $d.slug }} order {{ {ordering} }} limit 1 }}",
+            "explain query ranked($q: {parameter_type}) {{ match {{ {ranking} }} return {{ $d.slug }} order {{ {ordering} }} limit 1 }}",
         );
         let probes = QueryIoProbes::default();
         let result =
@@ -786,7 +790,7 @@ async fn rrf_order_runs_a_cross_join_over_multiple_probe_batches() {
     );
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     let db = with_setting(&db, "engine", "v2");
-    let source = "query fused($t: String) {\n    match {\n        $d: Doc\n        $p: Probe\n        $d.n = $p.n\n    }\n    return { $d.slug }\n    order { rrf(bm25($d.text, $t), bm25($d.text, $t)) }\n    limit 1\n}";
+    let source = "query fused($t: String) {\n    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, \"needle needle\"), k: 60)\n        $d: Doc\n        $p: Probe\n        $d.n = $p.n\n    }\n    return { $d.slug }\n    order { $score desc }\n    limit 1\n}";
     let result = query_main(
         &db,
         &format!("explain {source}"),
@@ -870,15 +874,14 @@ edge Tags: Source -> Doc
 "#;
     let source = r#"
 query rows($q: Vector(4)) {
-    match { $s: Source $s links $d $s tags $t }
+    match { from nearest({ match { $s: Source $s links $d $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
     return { $s.slug, $d.slug, $t.slug }
-    order { nearest($s.embedding, $q) }
+    order { $distance }
     limit 10
 }
 query total($q: Vector(4)) {
-    match { $s: Source $s links $d $s tags $t }
+    match { from nearest({ match { $s: Source $s links $d $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
     return { count($d) as n }
-    order { nearest($s.embedding, $q) }
     limit 10
 }
 "#;
@@ -1151,9 +1154,9 @@ edge Likes: Person -> Doc
     limit 2
 }";
     const RANKED: &str = "query ranked($q: String) {
-    match { $d: Doc }
-    return { $d.slug, bm25($d.title, $q) as score }
-    order { bm25($d.title, $q) }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $q) }
+    return { $d.slug, $score as score }
+    order { $score desc }
     limit 2
 }";
     const LIKED: &str = "query liked() {
@@ -1162,9 +1165,9 @@ edge Likes: Person -> Doc
     order { $p.name }
 }";
     const RANKED_DESTINATION: &str = "query ranked_destination($q: String) {
-    match { $p: Person $p likes $d }
+    match { from bm25({ match { $p: Person $p likes $d } return { $p, $d } }, $d.title, $q) }
     return { $d.slug }
-    order { bm25($d.title, $q) }
+    order { $score desc }
 }";
     const WILDCARD: &str = "query wildcard() {
     match { $p: Person $d: Doc $p * $d }

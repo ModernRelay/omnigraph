@@ -1,5 +1,5 @@
 # issue: none
-# notes: The GQ edition-3 preview (`gq 3;`) refuses edition 2's `delete T where φ` with `Q008`; nothing in the preview executes.
+# notes: The compiler refuses the old `delete T where φ` with `Q008`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,7 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- mutate
-gq 3;
 query w($h: String) { delete Person where handle = $h }
 
 --- expect error: parse error: Q008:

@@ -33,7 +33,7 @@ w1: ok
 w2: ok
 
 --- concurrent
-u1 on feature: query age_alice() { update Person set { age: 99 } where name = "alice" }
+u1 on feature: query age_alice() { $x: Person  $x.name = "alice"  update $x set { age: 99 } }
 i1 on feature: query add_globex() { insert Company { name: "globex" } }
 order: u1 park put nodes/, i1, u1 put nodes/, u1
 --- expect
@@ -41,7 +41,7 @@ u1: error: graph_head:feature
 i1: ok
 
 --- concurrent
-d1 on feature: query delete_alice() { delete Person where name = "alice" }
+d1 on feature: query delete_alice() { $x: Person  $x.name = "alice"  delete $x }
 i2 on feature: query add_initech() { insert Company { name: "initech" } }
 order: d1 park put _deletions/, i2, d1 put _deletions/, d1
 --- expect

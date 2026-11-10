@@ -1,7 +1,7 @@
 {
   "branch-merge-d50-process-cold-xfs": {
-    "planned_sha256": "ccdd6fe31f024747a44d0911bc915e5c8285d9590d870bf4fe7eedff3c3652b4",
-    "recipe_sha256": "15da6902a942b5e48e9549b9a5c73d6eea42f4a49f146ff478b364a75b7c8fb9",
+    "planned_sha256": "fa5fb9f78ff73bf3235da65bf6ca5a8c0e10260436391d551338411b36314878",
+    "recipe_sha256": "7442e70f7f719cc017fab9fa046869b16785ff8a37473cabe435f927641ff65a",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -30,11 +30,11 @@
       "timer": "monotonic"
     },
     "repetitions": 5,
-    "bound_point_id": "58f5ae4950087b6f9578398df9ec741c0426ae4c7a938c93f0ed85b6e95b922c"
+    "bound_point_id": "bb25b08f06e21bd4eb044bd233a1869e660ddc488336e554ddd470b73b5f8ed4"
   },
   "branch-merge-d50-warm": {
-    "planned_sha256": "e8a4f0e4761ff264ee41e72613d3d431f8d65b02bc68c957096098fac752077e",
-    "recipe_sha256": "15da6902a942b5e48e9549b9a5c73d6eea42f4a49f146ff478b364a75b7c8fb9",
+    "planned_sha256": "09f3defe9af4b5d04fb4d32d361c43bbe08bef93b75bdc38b7bb80785ab8d6a4",
+    "recipe_sha256": "7442e70f7f719cc017fab9fa046869b16785ff8a37473cabe435f927641ff65a",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -63,7 +63,7 @@
       "timer": "monotonic"
     },
     "repetitions": 5,
-    "bound_point_id": "05561cc1bfc25ee6a98317ddb71c85ed5f1baecf2aefdb04be0e15e226a2bc83"
+    "bound_point_id": "38c74745966c8ea148ad34416393c535eefabfdc51f8a47efad6f4975ebc4daf"
   },
   "equal-current-narrow-one-batch": {
     "planned_sha256": "944da755d2f8bba63769c901d2fe8a6507cf8448b39c60c6a0037131d373c901",
@@ -165,8 +165,8 @@
     "bound_point_id": "75b32416fb1b9d01e413265fcf1d9332b8d27416406d23d92c4eb39ad2dd6cda"
   },
   "finbench-disjoint-merge": {
-    "planned_sha256": "fa68eb6e74a3297d5e2014c9e7d868e36fd79b41102044bbff219bf9b10b7ef4",
-    "recipe_sha256": "41476a6e797e77f131c6146c40c9ef8f89d54340a0c66c722a50be65493653cb",
+    "planned_sha256": "76a2ad445decaa95d0359529f6a260a35c13025e7fcf0d04acad26316ee17308",
+    "recipe_sha256": "d65af679339827053c7a324f1f0acabee680df743faf5dc040ab6a1c126f6385",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -175,7 +175,7 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "a8140565e4595e5b5824f5bbb3dcdebb6fa9ba4e87319452fdd132e0fd7c6ec3",
+    "workload_sha256": "f93fe3d1b13f039d7cf1e90e15cb9d3728a5884d839b27363a2755865e61f37c",
     "measured_step": {
       "ordinal": 1,
       "text": "--- mutate\nbranch merge \"bench-source\" into \"bench-target\"\n"
@@ -195,10 +195,10 @@
       "timer": "monotonic"
     },
     "repetitions": 5,
-    "bound_point_id": "cf41d8ea8f6c34dff16def2a502ed38d6efeb5d60f904aa3ad4b9ac285887e29"
+    "bound_point_id": "609af70f9299dd16ec4c57699da76e5a13096ef85e7434d434d3d336862f84a1"
   },
   "hot-table-idle-base": {
-    "planned_sha256": "fc09c57c5f42905335ec0e902e242465f9e1a2fb3d24cbde07d1afa36c116796",
+    "planned_sha256": "c6bd03bc1c6e46358f0d700ede421b29a3de9e61e45734571f9acf211d481747",
     "recipe_sha256": "b4e3ef173926410d1c747f0a859cdcceadbe1d717b41efc50970db3eacba318b",
     "needs_indices": false,
     "cache_condition": {
@@ -208,10 +208,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "41a30481a7c81300f0f1ba2637ccfe5f894b65f9b39e20e7c002ed79b85eb1fa",
+    "workload_sha256": "533ec9ca5c5b6459d6a7ff04c888ac4d677176acc21b78924c9c0b8f65f5c8cf",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate\nquery hot_write() { update Hot set { value: 1 } where key = \"hot\" }\n"
+      "text": "--- mutate\nquery hot_write() { $x: Hot  $x.key = \"hot\"  update $x set { value: 1 } }\n"
     },
     "environment": {
       "backend": {
@@ -228,11 +228,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "558a4433e0852cea05f1a27f5f97589894ef6d946d2bdf7d64615f6f94298945"
+    "bound_point_id": "d6def5114fae3e8c17b75c8e7d49e7bf091d23f9b626864d3c7936d11f556632"
   },
   "hot-table-idle-branches-4-aged": {
-    "planned_sha256": "b9b29f234de2c8c18641ae1c50c928558ebe256a380768cb7d9300c6f191a3c0",
-    "recipe_sha256": "84b87d96ecee06c11f418996e5ecb273d8f08f59955fdf4c16a3be74fba5fa22",
+    "planned_sha256": "2c7e29966451581c264855587f3916edffeaafb30cf0c20e5aef8b7a6318b6e5",
+    "recipe_sha256": "579f889a2d1b36be188ac694d2f235d8fc76fea0543eccc6f685b7b7b1ea6549",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -241,10 +241,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "23592c6c9ab32fd56cc0dca1216a09ef7f48d099cba75370b0e49b0a9db45610",
+    "workload_sha256": "919b027ea15e3c5de20d3671613626c1b1a743fde72c92cb6e228bf97fec271b",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate\nquery hot_write() { update Hot set { value: 1 } where key = \"hot\" }\n"
+      "text": "--- mutate\nquery hot_write() { $x: Hot  $x.key = \"hot\"  update $x set { value: 1 } }\n"
     },
     "environment": {
       "backend": {
@@ -261,10 +261,10 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "473abbfcf26c56ff14ea9f026ee2ec2391f1542060cfab56255fc42476dbc940"
+    "bound_point_id": "df98510d845d760416115f72c0b6c2a5e3b2cdc4fb2efbbb29637ac3a17f09f9"
   },
   "hot-table-idle-branches-4": {
-    "planned_sha256": "5873062f8101e26671ca396a606dda74fa458d53d3075a794f8473fcbd062394",
+    "planned_sha256": "688a8c683fffd409ad3a138cc1814f60d730711959d6beee5df50902ee62bc1e",
     "recipe_sha256": "5925ef4f593121c780c599aecde366707ed6f2e0b8826172d6c835f9155e3411",
     "needs_indices": false,
     "cache_condition": {
@@ -274,10 +274,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "23592c6c9ab32fd56cc0dca1216a09ef7f48d099cba75370b0e49b0a9db45610",
+    "workload_sha256": "919b027ea15e3c5de20d3671613626c1b1a743fde72c92cb6e228bf97fec271b",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate\nquery hot_write() { update Hot set { value: 1 } where key = \"hot\" }\n"
+      "text": "--- mutate\nquery hot_write() { $x: Hot  $x.key = \"hot\"  update $x set { value: 1 } }\n"
     },
     "environment": {
       "backend": {
@@ -294,10 +294,10 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "b954972b30a9a7c48c906e071bda8c98337bca79c120e037f0937b71412d9da1"
+    "bound_point_id": "3d271daf93632029fb6b5dabc8d6e014aa7afd80c12290aea6f6624a87369dff"
   },
   "hot-table-idle-tables-4": {
-    "planned_sha256": "d8e31bbe7783a5217c3bb491196e055f6a05fdde0b814343c7b3fc643f866830",
+    "planned_sha256": "d9d7f00c2e569fc348382dfadf25b0f2c34fb4d34b4efe1bd8ad18763e2c4e27",
     "recipe_sha256": "9788e0e6579a7b00ce11fce0ff8842a9f0ddefb9f84609de6bf38dfb59b9627a",
     "needs_indices": false,
     "cache_condition": {
@@ -307,10 +307,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "875d141e4e8650fb14a57d5f1bc60b8107f288eee9fba42bee36452863a1694e",
+    "workload_sha256": "fff94609d3a379d652c6fda3e6c56a22e0d87b81e74fe4f85ec4c7c6ddf7bcfa",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate\nquery hot_write() { update Hot set { value: 1 } where key = \"hot\" }\n"
+      "text": "--- mutate\nquery hot_write() { $x: Hot  $x.key = \"hot\"  update $x set { value: 1 } }\n"
     },
     "environment": {
       "backend": {
@@ -327,10 +327,10 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "17733b0cc4f5dc6e9d198af04e744e08fbf3a3de8164eebdd42dbcad6ce6eea5"
+    "bound_point_id": "897b1cc0c8108e0fa98a7ef275c78e97ddf3dae7677632db8ffadd0c1635cd37"
   },
   "identity-lifecycle": {
-    "planned_sha256": "ce1b027e275d6cdb332deb840db63de46f3e8e774deaad88fd01bf81838df4f8",
+    "planned_sha256": "c9a81e0bd0156491a1aa2be47aec621eeadf781c202aee573e5584083b4a9455",
     "recipe_sha256": "bbe06c0e7f7c9b34d68553ef0c0f7cfe4fe4428e36be9733127b2ca00ed5aa2b",
     "needs_indices": false,
     "cache_condition": {
@@ -340,10 +340,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "368843ea03dded64beeb77c225f11f12c44c42432364ae220e4f9b78e8cd4517",
+    "workload_sha256": "1e9281ade6c80c61e772cd38c31d5480026af593331c84d89d54228c60e068db",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate branch: feature\nquery new_lifetime_write() { update Item set { value: 1 } where key = \"alice\" }\n"
+      "text": "--- mutate branch: feature\nquery new_lifetime_write() { $x: Item  $x.key = \"alice\"  update $x set { value: 1 } }\n"
     },
     "environment": {
       "backend": {
@@ -360,11 +360,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "2197f0eb6a1cf8e5d148ddedce8302b46b489c6d593b23d5eff3358ce6b17d76"
+    "bound_point_id": "03ca66cdb8b5610747042d7bbaba26eec75ebce6dcb578f918e469649668aa5b"
   },
   "nearest-ranks-updated-embedding": {
-    "planned_sha256": "3924c636aecde87cea376f46e01ed44255fd06105efdb3b48e200f7367af8a6c",
-    "recipe_sha256": "a1046296a47d6a5318dcd6d55850dbf91afec416bd14599588c3d688f3ba09a7",
+    "planned_sha256": "7751f5ffd013597922267895a5839d69b9caa53e1b4a013c9980f08ca96297a6",
+    "recipe_sha256": "9ab964a255d5a2258234d659b0066026d676ebee76905f701323f3c3e8d5a653",
     "needs_indices": true,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -373,10 +373,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "9f6e3b64c4ce9380c85a4f5e3bc2384c535da1102f81b0abd6a765eef4fd5cd5",
+    "workload_sha256": "f4d866a7ecea1f18e613b9b164110415a2940305f45bb86336c72b24cf47b72b",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- query\nquery nearest_after_update($q: Vector(4)) {\n    match { $d: Doc }\n    return { $d.slug }\n    order { nearest($d.embedding, $q) }\n    limit 6\n}\n"
+      "text": "--- query\nquery nearest_after_update($q: Vector(4)) {\n    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 6) }\n    return { $d.slug }\n    order { $distance }\n    limit 6\n}\n"
     },
     "environment": {
       "backend": {
@@ -393,11 +393,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "59558ec916cb798ea37a1a48fb8bf8496e2e923f1ffd389503bbda6265ec1a6e"
+    "bound_point_id": "0dc239a121d54fe8f232a731e67d9762b71efea754b9c1f0837c640c3d302137"
   },
   "nearest-skips-deleted-rows-and-fills-limit": {
-    "planned_sha256": "fdb29ab01b91ddbb1494f971aa12cc9005f094315d6798f58ba2f1b8f858283e",
-    "recipe_sha256": "9b79ab2b36bb3e9aa93e174dc3236b78c2cca9904ac1513baf4006a28d46159b",
+    "planned_sha256": "e10891f74624f3633c8ae8e587ca4aafc2100d354ab3da489cf5b5c1dafcea0a",
+    "recipe_sha256": "06f09c2202c7318f6bc569567597e6ba7a2cb733591349a3ef597f7b7ac12e81",
     "needs_indices": true,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -406,10 +406,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "bcd3e6440e4f0e707cdc11de097216038fa589fc8a7af2f4176d9e17971f1f6c",
+    "workload_sha256": "d6d27db65699dd00d77c842da2c856af3a140d192622f76e8cd8f0780de40d39",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- query\nquery nearest_after_delete($q: Vector(4)) {\n    match { $d: Doc }\n    return { $d.slug }\n    order { nearest($d.embedding, $q) }\n    limit 3\n}\n"
+      "text": "--- query\nquery nearest_after_delete($q: Vector(4)) {\n    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 3) }\n    return { $d.slug }\n    order { $distance }\n    limit 3\n}\n"
     },
     "environment": {
       "backend": {
@@ -426,10 +426,10 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "b03372d8a3a224a3121981d34cfd0bd0ca0807f5062ec92745fe90841d8f4a47"
+    "bound_point_id": "ae6ab289e46ed3d6c27309d25d616cade593f6f3d4b8132bba4072682bb02e53"
   },
   "parallel-tables-1": {
-    "planned_sha256": "6a809ebafdbaeb2e63c357068070650e87f83ff96c6dcebdfe38c808126cb705",
+    "planned_sha256": "944b5590c252f5cb2e56678f85f92038c80cd0dc358374b7cb07b4ba76ac14a6",
     "recipe_sha256": "a93baf07c040c531b3b7b5b9e17662f6f495bc8ddc74b512e2dcce1e7d0c4fb4",
     "needs_indices": false,
     "cache_condition": {
@@ -439,10 +439,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "c5eb4a1edad883f1ae31662edca7e267effd01a5873e27b9962eb5df7bd61ac9",
+    "workload_sha256": "f71b3e6808219e2f73f2bc820c1bb5841140388b30211b379d7bfe675f82dcd6",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate\nquery update_tables() {\n    update T0 set { value: 1 } where key = \"row\"\n}\n"
+      "text": "--- mutate\nquery update_tables() {\n    $x: T0  $x.key = \"row\"\n    update $x set { value: 1 }\n}\n"
     },
     "environment": {
       "backend": {
@@ -459,10 +459,10 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "97ab7587e284aebea3bb3b85bf72dea4b820169a6099b4248451cb724915ac78"
+    "bound_point_id": "fc9cd3ddda9aa2ddddf1b11dca07300ac63d3fd5505d8e5795ca52d4d91104b3"
   },
   "parallel-tables-2": {
-    "planned_sha256": "0725c0eb1bf62980de62fb51afda22fa2b7bb996872b0b6a19f55a68a7eb5316",
+    "planned_sha256": "cd0a6eaeaa7dd32f27a9b318d318c5ec77d09d25f0055a0f8258c1e0ed5e2fbc",
     "recipe_sha256": "a93baf07c040c531b3b7b5b9e17662f6f495bc8ddc74b512e2dcce1e7d0c4fb4",
     "needs_indices": false,
     "cache_condition": {
@@ -472,10 +472,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "89792d9649cfd72864278101478028fca899f5a7256747a26221c136512c257f",
+    "workload_sha256": "b97388a5b5c1beedbcc5d406fc7af43c83353831502582ef94c593554249e717",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate\nquery update_tables() {\n    update T0 set { value: 1 } where key = \"row\"\n    update T1 set { value: 1 } where key = \"row\"\n}\n"
+      "text": "--- mutate\nquery update_tables() {\n    $x: T0  $x.key = \"row\"\n    update $x set { value: 1 }\n    $x: T1  $x.key = \"row\"\n    update $x set { value: 1 }\n}\n"
     },
     "environment": {
       "backend": {
@@ -492,10 +492,10 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "dc454b7effa6acac773946c5785aee0d8d1c03f01cc9325aafceca081e5602fe"
+    "bound_point_id": "23c17090271a67d227a7c6e81a5d3f10c26173746b6c7b758b56a6cde20fd391"
   },
   "parallel-tables-4": {
-    "planned_sha256": "e44c54a970697ec1fdae65b13ac5010c6c3e57f05bfbb77566507cfdfaf37918",
+    "planned_sha256": "2b099fe9a4989ac2077fe09fde091166e154b4922d603e4dc8d4be172d902f13",
     "recipe_sha256": "a93baf07c040c531b3b7b5b9e17662f6f495bc8ddc74b512e2dcce1e7d0c4fb4",
     "needs_indices": false,
     "cache_condition": {
@@ -505,10 +505,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "c70501f2c099eb3ad05317073669c1d8aab64c3d4dd86e56ed9a80d1cdeb9d8b",
+    "workload_sha256": "c661e58f944f4a1993a3cc5bab503b1d7c44ce57486b3d853bf00dfa0c173c19",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate\nquery update_tables() {\n    update T0 set { value: 1 } where key = \"row\"\n    update T1 set { value: 1 } where key = \"row\"\n    update T2 set { value: 1 } where key = \"row\"\n    update T3 set { value: 1 } where key = \"row\"\n}\n"
+      "text": "--- mutate\nquery update_tables() {\n    $x: T0  $x.key = \"row\"\n    update $x set { value: 1 }\n    $x: T1  $x.key = \"row\"\n    update $x set { value: 1 }\n    $x: T2  $x.key = \"row\"\n    update $x set { value: 1 }\n    $x: T3  $x.key = \"row\"\n    update $x set { value: 1 }\n}\n"
     },
     "environment": {
       "backend": {
@@ -525,7 +525,7 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "f40a90fef2bfeda934b708e07f0429309666f343885ee2b909f6f5439e99e1d7"
+    "bound_point_id": "0159fc0230f491cd5b59124ba09731adc4440acff86a3f83a744f74f0e23f318"
   },
   "repeated-deletion-recreation-branches": {
     "planned_sha256": "c7efbf5c5147fc5884955f8e80dee1f8a63cd115fb9f3fbdd491b4d8e544bbc9",
@@ -561,8 +561,8 @@
     "bound_point_id": "7bf85e25523ad239aa8aebd2da48a15b2786070b17f218f848b5119eb49ba538"
   },
   "repeated-deletion-recreation-rows": {
-    "planned_sha256": "8fca672576ac37395b90a6104cb5149e0e887b55d72314c0db34ca26fe785b79",
-    "recipe_sha256": "8371a66502f86d582f8e22a544185a55f167df8097bf48a3ee59a4ab4e2aac90",
+    "planned_sha256": "76af2728fe98c0f476d97580388c45d88a3fc8f29e135e1c1de6ef354ee85372",
+    "recipe_sha256": "fff314dc745e5338f2ab6a308cbe956315f89e6101393020a16733605affbdc5",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -591,11 +591,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "ba04e2377b6a646b1541b01bd5d13601820d460b450ee6a1cc3843c6ae7f0bf3"
+    "bound_point_id": "5539c3cf4e66d321836a302815b47f1634f34b06a02ec58a92ea2bafc19bfe44"
   },
   "threshold-crossings-after": {
-    "planned_sha256": "816a7ab57ff1c8c452c90fa91b21d3fa11a6a17737538c2f2fa8e94031a37c74",
-    "recipe_sha256": "d2dd8680bef590f8220c29e1023ccda47e95013af346d1163235dce093dd98e6",
+    "planned_sha256": "be49575d6d8de0b2aa8c470889023c0ca4d722795cae4c5bc1e123266656a735",
+    "recipe_sha256": "520ef13b3cc5f31b41214dc29eeeb0f5e771126326cdd82718acc2c030b8147f",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -624,11 +624,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "e2bb568ed7242120e06c6fa9449c209cf82d5af82d2e5bbce23231a93017dfcd"
+    "bound_point_id": "eac500ce91c820a0bc4b7b441c3cba0972dd4996618a22429a1f0c51f15e42a3"
   },
   "threshold-crossings-at": {
-    "planned_sha256": "76b6ab70aeb9138f55b2340925c55932992d24419f9855af3904987e2e3a9499",
-    "recipe_sha256": "08705667a0439cd0507831c3c55c74eff1f9c98d20140066d17c2bb2f8a3b734",
+    "planned_sha256": "803d50e3fe6f325909245ca5ea0a01c9e11469ed05c0742878d2eb83d130f417",
+    "recipe_sha256": "c6c2ab51a1bb830b0cbcdb2132da5dd519c8f9f5c324cfcb3e22555fef4d38c7",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -657,11 +657,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "eaf136a2d8a42fce0ae6ae61b2d56c07f9426e6f52518a32c7cdbe6260b916b4"
+    "bound_point_id": "954589aad58e82a8512fe10e317738a6a0be35092026b15067d70a114a713356"
   },
   "threshold-crossings-before": {
-    "planned_sha256": "11e22c2493a374f1f79e327cf14923b35b75378f5e2711408b617654cb0ba680",
-    "recipe_sha256": "d964d0f0e9e7fe8ddd9982e7a2144af6597cab8803290b7910559bf91f8c8920",
+    "planned_sha256": "d7e322f096879e68484b9501a59a044a6a1e6698be9cecf4ad11575f951e2b84",
+    "recipe_sha256": "9cd49dde5c260cdeba735b98cb24f212e03f6f048d82de7d9ba1477daa74e816",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -690,11 +690,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "d631107c5bd456586723cc9b20702e539a0038fb478c96a5b295b379e21d85f1"
+    "bound_point_id": "f442f36d8c59a78f3bf7fc54dc8a3b79682f825bc7c1bd98b6aa5192b02fd308"
   },
   "threshold-crossings-production-control": {
-    "planned_sha256": "1017c799cc1785d9ca3080c3d26b7d50c7ce805f4db8c98b4abd5dbbdf13c303",
-    "recipe_sha256": "71d701e25eca6fc0fcb1a223008a09c2c035c389f1a6541a05603823d651b4da",
+    "planned_sha256": "05d8bd07110cefd9a38606ddfca29750ae74cdbdb04e5922123d1da2b3328ba6",
+    "recipe_sha256": "2572f7218d4ca07e98d926318ea7264831ddc68edf3a4f0486913703acf9dd7a",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -723,7 +723,7 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "cf2dd956484e7c25f246a23cc750284d928104a746e3d5a9368c660b0b0ca224"
+    "bound_point_id": "ca81d64e859a66d70feb550cdd5d742e66386269a99acb38bb5423c71cb287a5"
   },
   "tiny-branch": {
     "planned_sha256": "7ee3201f7763dbff290a6503f1d5d92e848eedcf422375d22c6da7915b40c581",
@@ -924,8 +924,8 @@
     "bound_point_id": "5cea5d0175028cce37ae18fd1127230deec68588b88ffddfd43368bba5002760"
   },
   "very-long-history-1000-read": {
-    "planned_sha256": "8632c258ed5512d2fb27e8f4e0c5340d3cb9bd2d9fed146003c2ef0acdecb3d2",
-    "recipe_sha256": "702aee2a81b264606e2ca936b2a27816f5b1e6f45b62ae525c559d11b73b7cbc",
+    "planned_sha256": "310c75637ec4916ec74c45484e67aa5b890480b621ffd4830dc324874d18369c",
+    "recipe_sha256": "fb84ae35509ffa69e10caa11ead0dae8b8eae3c906ce012ac2e1b331122e531a",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -954,11 +954,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "566d461ac80b9a7f951bb2080941bd9d6b72aa7d4a5860d448c58043c385da12"
+    "bound_point_id": "0cbee8423395346358317aef5f4519119d3ba3d5e8d819f2bca2b66a7e77f7a6"
   },
   "very-long-history-1000-reopen": {
-    "planned_sha256": "d9ce9bab827d737d2edef00930df5c2263777221db69f7d4a3f1a953441c81c7",
-    "recipe_sha256": "702aee2a81b264606e2ca936b2a27816f5b1e6f45b62ae525c559d11b73b7cbc",
+    "planned_sha256": "5ad2cdb0d67c997a1d4f8949ce002cca9a06d654f201ee2186b106c408b4ca97",
+    "recipe_sha256": "fb84ae35509ffa69e10caa11ead0dae8b8eae3c906ce012ac2e1b331122e531a",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -987,11 +987,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "7bdbb6de0708ebee2933dc3b3208d974a9120b68f132fb298b66dec0d0d45f4c"
+    "bound_point_id": "45301a8090b36336a810a02046fae3a666905c5f84f695fc0ec63f125085b36d"
   },
   "very-long-history-1000-write": {
-    "planned_sha256": "bfa976efb74a7b8fcfa7f64204017a2f8164168e999a94de38956587d822de94",
-    "recipe_sha256": "702aee2a81b264606e2ca936b2a27816f5b1e6f45b62ae525c559d11b73b7cbc",
+    "planned_sha256": "19d01a1931015a18b1ab9c0ae954c16c2649765349c50c8944342c1fe897b1ec",
+    "recipe_sha256": "fb84ae35509ffa69e10caa11ead0dae8b8eae3c906ce012ac2e1b331122e531a",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -1000,10 +1000,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "0dce5117f90efb547b88a13fcf26ba7a1ae1c906394f8ca834488efc46ac9d40",
+    "workload_sha256": "8e565cb91e5f59a2803b5a9e66a68e300e600b49ad794f74befcfac7a0bebc34",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate\nquery next_write() { update HistoryRow set { value: 1 } where key = \"hot\" }\n"
+      "text": "--- mutate\nquery next_write() { $x: HistoryRow  $x.key = \"hot\"  update $x set { value: 1 } }\n"
     },
     "environment": {
       "backend": {
@@ -1020,11 +1020,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "e500048d07712d34f3b2f928c09c9f19a9af0c39fd24770a5c2fc178b5bea8ed"
+    "bound_point_id": "2ae93dda57cdde9423bbac7ee9f57b6408229e50b64a9b6cab366588a1ed86c8"
   },
   "very-long-history-10000-read": {
-    "planned_sha256": "fbd05e9a8d754620859a4f4091b13bafef89195b5f5b71192371561a1d6332ec",
-    "recipe_sha256": "20289499361183e537bf67c7c9ab50337ec3147d8303bebf93e9e93366242865",
+    "planned_sha256": "637a73b628b123ac3bef51984accbe1af2fb41297ba2570a4bd9f4c27b7348ff",
+    "recipe_sha256": "3ad400f708e52ce87e9b23f6ff0eaa5abb9b16912f7b1cff66ed563d0963f89a",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -1053,11 +1053,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "8caef27559bd7a4b68cf915f771d546dc685690921357645d94fe56edfd8ebba"
+    "bound_point_id": "26bacf0c4dabb8aec04775cf32d13ba8c4bac1e58aff20ab05c5728d0175fefd"
   },
   "very-long-history-10000-reopen": {
-    "planned_sha256": "48c6c5b1fe51d500750362cc2ff4702588341e9796607ed8bda9a40db50513a5",
-    "recipe_sha256": "20289499361183e537bf67c7c9ab50337ec3147d8303bebf93e9e93366242865",
+    "planned_sha256": "d1e07526d28616c5e6f4b60b30acfc8da89ff5193ad84dd2b4c4d643c64a6aa6",
+    "recipe_sha256": "3ad400f708e52ce87e9b23f6ff0eaa5abb9b16912f7b1cff66ed563d0963f89a",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -1086,11 +1086,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "ca7d63bf804e7a89fc6c99938c455d7bd8a1f84dcb0d5845cf29353fc107f5d0"
+    "bound_point_id": "0181a7a0815183976a9ee69940e1d6df7c028abe048af66f4f37740e3611c463"
   },
   "very-long-history-10000-write": {
-    "planned_sha256": "a5e2e906c9859ffec534ace301ecaa0461c862f28b9e081ac586cc55709bb357",
-    "recipe_sha256": "20289499361183e537bf67c7c9ab50337ec3147d8303bebf93e9e93366242865",
+    "planned_sha256": "f722ae4fcf845a827daa96a79d72e542db5317f31322fd7c15dceaea8ef7c452",
+    "recipe_sha256": "3ad400f708e52ce87e9b23f6ff0eaa5abb9b16912f7b1cff66ed563d0963f89a",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -1099,10 +1099,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "0dce5117f90efb547b88a13fcf26ba7a1ae1c906394f8ca834488efc46ac9d40",
+    "workload_sha256": "8e565cb91e5f59a2803b5a9e66a68e300e600b49ad794f74befcfac7a0bebc34",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate\nquery next_write() { update HistoryRow set { value: 1 } where key = \"hot\" }\n"
+      "text": "--- mutate\nquery next_write() { $x: HistoryRow  $x.key = \"hot\"  update $x set { value: 1 } }\n"
     },
     "environment": {
       "backend": {
@@ -1119,11 +1119,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "9632a510a3daa6ce8638ce94309bd5cd6de5f260bc2a59afc5346bff2ab55f93"
+    "bound_point_id": "134924edbd4d59bd7a948392996a43956641040dbacdc6fa9c673bdd1b98b1b4"
   },
   "very-long-history-100000-read": {
-    "planned_sha256": "596d6b25c1f395a7af86419457920c4d2f0068a9f0198f87e9321902acd695cb",
-    "recipe_sha256": "916364ba4b48d699405af7c35ade449c6116e3726718073545131e7720a53134",
+    "planned_sha256": "febd10d007d03f88e125ec36bccd8692701dfe6097639460b53a77da3bbf9e82",
+    "recipe_sha256": "c459ad38fbb40b004b0cf8fbfb2b77abc0c70bbb1b73c2edbbfdd6fc0ff09ece",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -1152,11 +1152,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "983bdd0e2e2aef4ae4aea9d6a25a2d733f6581ddad483cb884271583d379fce2"
+    "bound_point_id": "7d6f10e6c6b8bc94d83316882bf1fcbe917f69cf87f3bae94f967ea1231fc7fe"
   },
   "very-long-history-100000-reopen": {
-    "planned_sha256": "314c64f1d8245069077a984f2880e1c18629fba298c0a0ad6589978f80cc8d4e",
-    "recipe_sha256": "916364ba4b48d699405af7c35ade449c6116e3726718073545131e7720a53134",
+    "planned_sha256": "b8354728b7dc82d21069742d368ecf30b7e7c4a0e8baaff10ae303ebdbe17182",
+    "recipe_sha256": "c459ad38fbb40b004b0cf8fbfb2b77abc0c70bbb1b73c2edbbfdd6fc0ff09ece",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -1185,11 +1185,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "c7471c25a0e8bf90fc2b84aadbc63da31820bf51375f15a699cd3091b163c8d3"
+    "bound_point_id": "2353a1447714ebf10f7866a5019eecee7dbd71f54b79359d7e3da56ca222d72d"
   },
   "very-long-history-100000-write": {
-    "planned_sha256": "61d1a62b2520508c876b5cd4336d507727bffcbb65b30cd3f454c317ffe56ba9",
-    "recipe_sha256": "916364ba4b48d699405af7c35ade449c6116e3726718073545131e7720a53134",
+    "planned_sha256": "c7bf17cb9ca62537d48994517a0d0ecf0fdfeee6ce3d092b6da3f2a3071bf56a",
+    "recipe_sha256": "c459ad38fbb40b004b0cf8fbfb2b77abc0c70bbb1b73c2edbbfdd6fc0ff09ece",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -1198,10 +1198,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "0dce5117f90efb547b88a13fcf26ba7a1ae1c906394f8ca834488efc46ac9d40",
+    "workload_sha256": "8e565cb91e5f59a2803b5a9e66a68e300e600b49ad794f74befcfac7a0bebc34",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate\nquery next_write() { update HistoryRow set { value: 1 } where key = \"hot\" }\n"
+      "text": "--- mutate\nquery next_write() { $x: HistoryRow  $x.key = \"hot\"  update $x set { value: 1 } }\n"
     },
     "environment": {
       "backend": {
@@ -1218,11 +1218,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "d4e7ac49cf8901991016475921275b60877ad01bb781a22e616806b20e632576"
+    "bound_point_id": "1dd1bedf548e2aa58a62019bf3599ea43f4d17c9171c55eb34210428098f9fdc"
   },
   "very-long-history-32-read": {
-    "planned_sha256": "44b689c167d9927d4de356372cea0a22d0eb45b9e8c85f159cec4b349a8adf75",
-    "recipe_sha256": "ba69422e67a458a8461c55f67ccab8202288ba0e0ba8cdd127e4e3f1a76d5ff6",
+    "planned_sha256": "da9a0f7e20c2d4e1e6e4a397dfd5f7acf0e50ed1f812bc45493b5340535e0bec",
+    "recipe_sha256": "1391159de22007dcccdd814524ab3618f1173e3e41b2f72b799db234115966a9",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -1251,11 +1251,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "b83aa66b368c52be894df39a5a6c3a6d915d281bcb43fb79a0325261587cf52d"
+    "bound_point_id": "29060a04485d4e1f764892e9d3e43966ae1166c7d92f87a66f6055bcb85cb0b3"
   },
   "very-long-history-32-reopen": {
-    "planned_sha256": "a85f951e4ee851aec468544db60d27fc9de16cf14298aacd857539df5e846f41",
-    "recipe_sha256": "ba69422e67a458a8461c55f67ccab8202288ba0e0ba8cdd127e4e3f1a76d5ff6",
+    "planned_sha256": "e1869b0d743673d7ba9818453734d5c8dcdb4fa19c31ba62c8da16c89bfc2945",
+    "recipe_sha256": "1391159de22007dcccdd814524ab3618f1173e3e41b2f72b799db234115966a9",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -1284,11 +1284,11 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "003540c32207370748a2fc16f7d174c4692dbbaa3510ca83538b95270fecd992"
+    "bound_point_id": "00ee0f8f96fec1d561d3f6b7fa9697703cba7e4ab6d0594a7bb003e23136859b"
   },
   "very-long-history-32-write": {
-    "planned_sha256": "15fcb19c7aad26eed7ebed80b4c48b88e25ca1018840859dd3f347022a00c1d4",
-    "recipe_sha256": "ba69422e67a458a8461c55f67ccab8202288ba0e0ba8cdd127e4e3f1a76d5ff6",
+    "planned_sha256": "b120db60228f51b637b0a94a5fceec7c7ef9baa267e55cba15730a212dff4e46",
+    "recipe_sha256": "1391159de22007dcccdd814524ab3618f1173e3e41b2f72b799db234115966a9",
     "needs_indices": false,
     "cache_condition": {
       "process": "fresh-per-repetition",
@@ -1297,10 +1297,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "0dce5117f90efb547b88a13fcf26ba7a1ae1c906394f8ca834488efc46ac9d40",
+    "workload_sha256": "8e565cb91e5f59a2803b5a9e66a68e300e600b49ad794f74befcfac7a0bebc34",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- mutate\nquery next_write() { update HistoryRow set { value: 1 } where key = \"hot\" }\n"
+      "text": "--- mutate\nquery next_write() { $x: HistoryRow  $x.key = \"hot\"  update $x set { value: 1 } }\n"
     },
     "environment": {
       "backend": {
@@ -1317,6 +1317,6 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "b7763606305654dbeeb984b352cc8ddfe35ffe47e73e12f3b161ab493a37428f"
+    "bound_point_id": "76b05b5a1e1cf8bac16c564432eaba4374da766bc5b9e04a10a4a21c11edae8f"
   }
 }

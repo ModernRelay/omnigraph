@@ -117,7 +117,7 @@ query min_of_node() {
     return { min($p) as first }
 }
 
---- expect error: T8: min cannot take node binding `$p` bare
+--- expect error: T8: min cannot take a reference bare; access one of its properties
 
 --- query
 query min_of_node_alias() {
@@ -125,7 +125,7 @@ query min_of_node_alias() {
     return { $p as person, min(person) as first }
 }
 
---- expect error: T8: min cannot take node projection `person` bare
+--- expect error: Q018: `person` is a bare name, which is not a value in a read: a property is `$x.person`, a parameter `$person`, a string `"person"`; a bare name is a return alias in `order` only
 
 --- query
 query count_of_count() {

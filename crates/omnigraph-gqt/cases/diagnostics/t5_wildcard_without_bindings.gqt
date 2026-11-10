@@ -1,5 +1,5 @@
 # issue: none
-# notes: The GQ edition-3 preview (`gq 3;`) refuses a wildcard traversal with no declared endpoint types with `T5`; nothing in the preview executes.
+# notes: The compiler refuses a wildcard traversal with no declared endpoint types with `T5`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,7 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-gq 3;
 query q() { match { $a * $b } return { $a } }
 
 --- expect error: type error: T5:

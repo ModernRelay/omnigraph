@@ -34,7 +34,8 @@ branch create t
 
 --- mutate branch: x
 query set_a_on_x() {
-    update Person set { age: 1 } where name = "a"
+    $x: Person  $x.name = "a"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -51,14 +52,16 @@ branch merge x into t
 
 --- mutate
 query set_a_on_main() {
-    update Person set { age: 2 } where name = "a"
+    $x: Person  $x.name = "a"
+    update $x set { age: 2 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: t
 query set_b_on_t() {
-    update Person set { age: 1 } where name = "b"
+    $x: Person  $x.name = "b"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0

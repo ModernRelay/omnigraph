@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use omnigraph_compiler::ir::{IRExpr, SubqueryPredicate};
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::{ExprType, PropType, ScalarType};
 use omnigraph_planner::{
     AntiJoinStrategy, EmptyEligible, KeyJoinKind, NodeId, PhysicalNode, PhysicalNodeKind,

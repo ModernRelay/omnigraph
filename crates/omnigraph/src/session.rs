@@ -7,9 +7,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use omnigraph_compiler::error::CompilerError;
-use omnigraph_compiler::query::ast::{BranchDiffSides, BranchRead, SettingStmt};
 use omnigraph_compiler::query::codes::Q003;
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
+use omnigraph_compiler::query::file::{BranchDiffSides, BranchRead, SettingStmt};
 use omnigraph_compiler::query::parser::{has_settings_prefix, parse_query};
 use omnigraph_compiler::settings::{
     DEFINITIONS, SessionSettings, SessionSettingsError, SettingId, SettingRow, SettingValue,

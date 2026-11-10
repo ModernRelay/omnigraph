@@ -133,7 +133,7 @@ company: String
 
 --- query
 query named_child_string_argument() {
-    match { $p: Person count($f.name contains "x") { $p knows $f } > 0 }
+    match { $p: Person count(contains($f.name, "x")) { $p knows $f } > 0 }
     return { $p.name as person }
 }
 --- expect unordered
@@ -147,21 +147,35 @@ query named_unanchored() {
     match { $p: Person $x knows $y }
     return { $p.name }
 }
---- expect error: requires an executable source or destination node binding
+--- expect unordered
+{"p.name": "p"}
+{"p.name": "x"}
+
+--- expect shape
+p.name: String
 
 --- query
 query selected_unanchored() {
     match { $p: Person $x (knows | likes) $y }
     return { $p.name }
 }
---- expect error: requires an executable source or destination node binding
+--- expect unordered
+{"p.name": "p"}
+{"p.name": "x"}
+
+--- expect shape
+p.name: String
 
 --- query
 query nested_unanchored() {
     match { $p: Person not { $p.name = "p" $x knows $y } }
     return { $p.name }
 }
---- expect error: requires an executable source or destination node binding
+--- expect unordered
+{"p.name": "x"}
+
+--- expect shape
+p.name: String
 
 --- query
 query child_declaration_does_not_escape() {

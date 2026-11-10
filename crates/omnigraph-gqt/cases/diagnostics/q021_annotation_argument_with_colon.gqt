@@ -1,5 +1,5 @@
 # issue: none
-# notes: The GQ edition-3 preview (`gq 3;`) refuses an annotation argument written `name: value` with `Q021`; nothing in the preview executes.
+# notes: The compiler refuses an annotation argument written `name: value` with `Q021`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,7 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-gq 3;
 query q() @budget(plan: 10) { match { $p: Person } return { $p.name } }
 
 --- expect error: parse error: Q021:

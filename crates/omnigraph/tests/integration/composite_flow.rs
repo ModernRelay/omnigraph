@@ -518,7 +518,7 @@ async fn composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh() {
     // Step 7: mutation on main using the new schema's added property —
     // verifies the catalog reload completed and the engine accepts a
     // mutation referencing `nickname`.
-    const NICKNAME_QUERY: &str = "query set_nickname($name: String, $nickname: String) {\n    update Person set { nickname: $nickname } where name = $name\n}";
+    const NICKNAME_QUERY: &str = "query set_nickname($name: String, $nickname: String) {\n    $x: Person  $x.name = $name\n    update $x set { nickname: $nickname }\n}";
     db_b.mutate_as(
         "main",
         NICKNAME_QUERY,

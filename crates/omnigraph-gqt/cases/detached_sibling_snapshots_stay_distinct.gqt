@@ -29,11 +29,11 @@ branch create right
 --- expect ok
 
 --- mutate branch: left
-query left_changes() { update Person set { age: 1 } where name = "a" insert Knows { from: "b", to: "c" } }
+query left_changes() { $x: Person  $x.name = "a"  update $x set { age: 1 } insert Knows { from: "b", to: "c" } }
 --- expect affected: nodes=1 edges=1
 
 --- mutate branch: right
-query right_changes() { update Person set { age: 2 } where name = "a" insert Knows { from: "c", to: "a" } }
+query right_changes() { $x: Person  $x.name = "a"  update $x set { age: 2 } insert Knows { from: "c", to: "a" } }
 --- expect affected: nodes=1 edges=1
 
 --- query branch: left
@@ -108,7 +108,7 @@ x.age: I32
 y.name: String
 
 --- mutate branch: left
-query left_again() { update Person set { age: 3 } where name = "a" insert Knows { from: "c", to: "b" } }
+query left_again() { $x: Person  $x.name = "a"  update $x set { age: 3 } insert Knows { from: "c", to: "b" } }
 --- expect affected: nodes=1 edges=1
 
 --- restart

@@ -34,7 +34,7 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::LoadMode;
 use omnigraph::settings::SessionSettings;
 use omnigraph_compiler::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::result::QueryResult;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

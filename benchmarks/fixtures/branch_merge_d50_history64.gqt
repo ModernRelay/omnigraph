@@ -114,11 +114,11 @@ tables:
 
 --- loop $cycle 0 32
 --- mutate
-query age_set_one() { update BenchN000 set { val: 1 } where name = "n000_r0000000" }
+query age_set_one() { $x: BenchN000  $x.name = "n000_r0000000"  update $x set { val: 1 } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query age_restore_zero() { update BenchN000 set { val: 0 } where name = "n000_r0000000" }
+query age_restore_zero() { $x: BenchN000  $x.name = "n000_r0000000"  update $x set { val: 0 } }
 --- expect affected: nodes=1 edges=0
 
 --- endloop
@@ -149,7 +149,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_0($c: String) { delete BenchE000 where cohort = $c }
+query delete_src_0($c: String) { $x: BenchE000  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -172,7 +172,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_1($c: String) { delete BenchE001 where cohort = $c }
+query delete_src_1($c: String) { $x: BenchE001  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -195,7 +195,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_2($c: String) { delete BenchE002 where cohort = $c }
+query delete_src_2($c: String) { $x: BenchE002  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -218,7 +218,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_3($c: String) { delete BenchE003 where cohort = $c }
+query delete_src_3($c: String) { $x: BenchE003  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -309,7 +309,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_0($c: String) { delete BenchE000 where cohort = $c }
+query delete_tgt_0($c: String) { $x: BenchE000  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok
@@ -332,7 +332,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_1($c: String) { delete BenchE001 where cohort = $c }
+query delete_tgt_1($c: String) { $x: BenchE001  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok
@@ -355,7 +355,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_2($c: String) { delete BenchE002 where cohort = $c }
+query delete_tgt_2($c: String) { $x: BenchE002  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok
@@ -378,7 +378,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_3($c: String) { delete BenchE003 where cohort = $c }
+query delete_tgt_3($c: String) { $x: BenchE003  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok

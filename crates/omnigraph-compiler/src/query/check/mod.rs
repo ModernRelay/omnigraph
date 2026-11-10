@@ -1,7 +1,6 @@
-//! The edition-3 type checker (docs/rfcs/2026-11-07-gq-3.md, sections 2, 3
-//! and 5).
+//! The type checker (docs/rfcs/2026-11-07-gq-3.md, sections 2, 3 and 5).
 //!
-//! It reads the edition-3 parse tree ([`crate::query::syntax`]) of one source unit and
+//! It reads the parse tree ([`crate::query::syntax`]) of one source unit and
 //! types every declaration into the core IR ([`crate::ir::core`]), or
 //! refuses it with a typed code. The derived-forms table of section 2 is the
 //! lowering: each clause becomes a step, and the steps fold into one term in
@@ -9,27 +8,31 @@
 //! a variable it names, a block, `let` and `from` seeing only earlier text,
 //! so a block correlates on the names bound before it).
 //!
-//! Rules that are *[as today]* reuse the edition-2 checker's functions
-//! (traversal resolution, literal typing, type compatibility), so the two
-//! editions agree on the shapes they share; the tests compare the two on the
-//! repository's corpus.
+//! Traversal resolution (`traversal`), literal typing and type
+//! compatibility (`literal`) are the one implementation of those rules. A
+//! last pass (`bind`) puts every expression in its bound form: physical
+//! columns, and the casts [`crate::ir::coerce`] chooses.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::CompilerError;
+use crate::ir::core::MutationTarget;
 use crate::ir::core::WriteGroup;
 use crate::ir::core::*;
 use crate::ir::expr::IRExpr;
-use crate::query::ast::{AggFunc, CompOp, EdgeSelector, Literal, Traversal};
 use crate::query::codes::*;
-use crate::query::diagnostic::{Applicability, QueryCode, QueryDiagnostic, Suggestion, TextEdit};
-use crate::query::syntax::*;
-use crate::query::typecheck::{
-    BoundVariable, MutationTarget, assignment_compatible, check_literal_type, literal_type,
-    resolve_traversal, types_compatible,
+use crate::query::diagnostic::{
+    Applicability, Position, QueryCode, QueryDiagnostic, Suggestion, TextEdit,
 };
+use crate::query::file::{MutationWriteMode, UnattachedBase};
+use crate::query::syntax::*;
+use crate::query::syntax::{EdgeSelector, Traversal};
+use crate::query::value::{AggFunc, CompOp, Literal, NOW_PARAM_NAME};
+use crate::traversal::EdgeSelection;
 use crate::types::{Direction, PropType, ScalarType};
+use literal::{assignment_compatible, check_literal_type, literal_type, types_compatible};
+use traversal::{BoundVariable, resolve_traversal};
 
 /// The internal error: a refusal, or the signal that a recursive read's type
 /// is not yet known (the base pass of [`Ctx::read_decl`]).
@@ -71,7 +74,7 @@ pub struct CheckedDecl {
     pub core: CoreDecl,
 }
 
-/// Type-check every declaration of an edition-3 file against `catalog`. The
+/// Type-check every declaration of a file against `catalog`. The
 /// declarations of the file are the source unit a `Call` resolves against.
 pub fn check_file(
     catalog: &Catalog,
@@ -89,11 +92,11 @@ pub fn check_file(
         .collect()
 }
 
-/// Type-check the edition-3 declaration the front door handed on, with the
-/// other declarations of its file as the source unit its calls resolve in.
+/// Type-check the declaration the front door handed on, with the other
+/// declarations of its file as the source unit its calls resolve in.
 pub fn check_syntax_decl(
     catalog: &Catalog,
-    syntax: &crate::query::ast::SyntaxDecl,
+    syntax: &crate::query::file::SyntaxDecl,
 ) -> Result<CoreDecl, QueryDiagnostic> {
     let file = syntax.file();
     let decls: Vec<&Decl> = match &file.body {
@@ -105,10 +108,19 @@ pub fn check_syntax_decl(
     check_decl(catalog, &unit, syntax.decl()).map(|checked| checked.core)
 }
 
+/// [`check_syntax_decl`] over a declaration's header, its refusal as a
+/// compiler error.
+pub fn check_query_decl(
+    catalog: &Catalog,
+    decl: &crate::query::file::QueryDecl,
+) -> crate::error::Result<CoreDecl> {
+    check_syntax_decl(catalog, &decl.syntax).map_err(CompilerError::query)
+}
+
 /// Each declaration's name and its checked form or refusal.
 pub type CheckedDecls = Vec<(String, Result<CheckedDecl, QueryDiagnostic>)>;
 
-/// Parse an edition-3 source (it must open with `gq 3;`) and type-check it.
+/// Parse a source and type-check it.
 pub fn check_source(catalog: &Catalog, source: &str) -> Result<CheckedDecls, QueryDiagnostic> {
     let file = crate::query::syntax::parse::parse_source(source)?;
     Ok(check_file(catalog, &file))
@@ -128,6 +140,7 @@ pub fn check_decl(
         assume: HashMap::new(),
         rec_hits: HashSet::new(),
         in_write: false,
+        at: None,
     };
     let params = match param_types(&decl.params) {
         Ok(p) => p,
@@ -156,8 +169,19 @@ pub fn check_decl(
         DeclBody::Write(w) => ctx.write_decl(decl, w).map(CoreDecl::Write),
     };
     match out {
-        Ok(core) => Ok(CheckedDecl { core }),
-        Err(E::D(d)) => Err(d),
+        Ok(mut core) => {
+            bind::bind_decl(catalog, &mut core).map_err(|e| match e {
+                CompilerError::Query(d) => *d,
+                other => QueryDiagnostic::typecheck(T7, other.to_string()),
+            })?;
+            Ok(CheckedDecl { core })
+        }
+        Err(E::D(mut d)) => {
+            if d.position.is_none() {
+                d.position = ctx.at;
+            }
+            Err(d)
+        }
         Err(E::Pending(name)) => Err(QueryDiagnostic::typecheck(
             T70,
             format!(
@@ -167,7 +191,7 @@ pub fn check_decl(
     }
 }
 
-/// Edition 2's infix `contains` or `starts_with`, refused here because the
+/// An infix `contains` or `starts_with`, refused here because the
 /// left operand's type picks the fix: over a list the test is `in`, over a
 /// String the registry call.
 fn infix_string(op: InfixStringOp, at: &SourceSpan, list: bool) -> QueryDiagnostic {
@@ -179,10 +203,7 @@ fn infix_string(op: InfixStringOp, at: &SourceSpan, list: bool) -> QueryDiagnost
     };
     let mut diagnostic = QueryDiagnostic::typecheck(
         T7,
-        format!(
-            "`{}` is a function in edition 3, not an infix operator",
-            op.name()
-        ),
+        format!("`{}` is a function, not an infix operator", op.name()),
     )
     .with_fix(replacement.clone())
     .with_suggestion(Suggestion {
@@ -211,10 +232,247 @@ fn ranking_as_scalar(name: &str) -> QueryDiagnostic {
     QueryDiagnostic::typecheck(
         T65,
         format!(
-            "`{name}` is a relation function in edition 3; a ranking is drawn with `from`, and its score is a column"
+            "`{name}` is a relation function; a ranking is drawn with `from`, and its score is a column"
         ),
     )
     .with_fix(fix)
+}
+
+/// `T65` for a ranking written as a call in `order` or `return`, with the
+/// edit that draws it with `from` over the read's own pattern when the read
+/// gives every piece the edit needs: the spans the parser recorded, a
+/// `limit` to size a `nearest` window, every occurrence the same call, no
+/// aggregate, and for `rrf` the type of the ranked binding.
+fn ranking_in_order_or_return(body: &ReadBody) -> Option<QueryDiagnostic> {
+    let is_ranking = |e: &Expr| matches!(e, Expr::Call(c) if matches!(c.name.as_str(), "nearest" | "bm25" | "rrf" | "distance"));
+    let (call, written) = body
+        .order
+        .iter()
+        .map(|o| &o.expr)
+        .zip(
+            body.spans
+                .order
+                .iter()
+                .map(Some)
+                .chain(std::iter::repeat(None)),
+        )
+        .chain(
+            body.projections.iter().map(|p| &p.expr).zip(
+                body.spans
+                    .items
+                    .iter()
+                    .map(Some)
+                    .chain(std::iter::repeat(None)),
+            ),
+        )
+        .find(|(e, _)| is_ranking(e))?;
+    let Expr::Call(call) = call else {
+        unreachable!("is_ranking holds")
+    };
+    let mut diagnostic = ranking_as_scalar(&call.name);
+    diagnostic.position = written.map(|s| s.position);
+    if let Some((edits, fix)) = ranking_edits(body, call) {
+        diagnostic = diagnostic.with_fix(fix).with_suggestion(Suggestion {
+            applicability: Applicability::MachineApplicable,
+            edits,
+        });
+    }
+    Some(diagnostic)
+}
+
+/// The edits, and the fix they write: the `match` clause and the `order`.
+fn ranking_edits(body: &ReadBody, call: &Call) -> Option<(Vec<TextEdit>, String)> {
+    use crate::query::syntax::print;
+    let spans = &body.spans;
+    let inner = spans.match_inner.as_ref()?;
+    if body.projections.iter().any(|p| contains_agg(&p.expr)) || body.distinct {
+        return None;
+    }
+    // Every ranking in `order` and `return` is this call.
+    let ranking = |e: &Expr| matches!(e, Expr::Call(c) if matches!(c.name.as_str(), "nearest" | "bm25" | "rrf" | "distance"));
+    if body
+        .order
+        .iter()
+        .map(|o| &o.expr)
+        .chain(body.projections.iter().map(|p| &p.expr))
+        .any(|e| ranking(e) && *e != Expr::Call(call.clone()))
+    {
+        return None;
+    }
+    // The variables the pattern binds, in written order.
+    let mut vars: Vec<String> = Vec::new();
+    let mut push = |v: &String| {
+        if !v.starts_with('_') && !vars.contains(v) {
+            vars.push(v.clone());
+        }
+    };
+    for c in &body.clauses {
+        match c {
+            Clause::Binding { variable, .. } => push(variable),
+            Clause::Traversal(t) => {
+                push(&t.src);
+                if let Some(e) = &t.edge_binding {
+                    push(e);
+                }
+                push(&t.dst);
+            }
+            _ => {}
+        }
+    }
+    let args: Vec<String> = call
+        .args
+        .iter()
+        .map(|a| match a {
+            Arg::Expr(e) => Some(print::expr(e)),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let limit = spans.limit.as_ref().and_then(|_| match &body.limit {
+        Some(Limit::Literal(n)) => Some(n.to_string()),
+        Some(Limit::Param(p)) => Some(format!("${p}")),
+        None => None,
+    });
+    let returned = vars
+        .iter()
+        .map(|v| format!("${v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (prefix, suffix, score, ordered) = match call.name.as_str() {
+        "nearest" | "distance" | "bm25" => {
+            let [field, query] = args.as_slice() else {
+                return None;
+            };
+            let window = match call.name.as_str() {
+                "nearest" => format!(", k: {}", limit.clone()?),
+                _ => String::new(),
+            };
+            let (score, ordered) = match call.name.as_str() {
+                "bm25" => ("$score", "$score desc"),
+                _ => ("$distance", "$distance"),
+            };
+            (
+                format!(" from {}({{ match {{", call.name),
+                format!("}} return {{ {returned} }} }}, {field}, {query}{window}) "),
+                score,
+                ordered,
+            )
+        }
+        "rrf" => {
+            // The arms rank the type of the ranked binding; the pattern
+            // follows, correlated on it.
+            let mut arms = Vec::new();
+            let mut ranked: Option<String> = None;
+            for a in &call.args {
+                let Arg::Expr(Expr::Call(arm)) = a else {
+                    return None;
+                };
+                let [
+                    Arg::Expr(field @ Expr::Prop { variable, .. }),
+                    Arg::Expr(query),
+                ] = arm.args.as_slice()
+                else {
+                    return None;
+                };
+                if ranked.get_or_insert_with(|| variable.clone()) != variable {
+                    return None;
+                }
+                let window = match arm.name.as_str() {
+                    "nearest" => format!(", k: {}", limit.clone().unwrap_or_else(|| "100".into())),
+                    "bm25" => String::new(),
+                    _ => return None,
+                };
+                arms.push(format!(
+                    "{}($all, {}, {}{window})",
+                    arm.name,
+                    print::expr(field),
+                    print::expr(query)
+                ));
+            }
+            let ranked = ranked?;
+            let type_name = body.clauses.iter().find_map(|c| match c {
+                Clause::Binding {
+                    variable,
+                    type_name,
+                    ..
+                } if *variable == ranked => Some(type_name.clone()),
+                _ => None,
+            })?;
+            if vars.contains(&"all".to_string()) {
+                return None;
+            }
+            let k = call
+                .options
+                .iter()
+                .find(|(o, _)| o == "k")
+                .map(|(_, v)| print::expr(v))
+                .unwrap_or_else(|| "60".into());
+            (
+                format!(
+                    " let $all = {{ match {{ ${ranked}: {type_name} }} return {{ ${ranked} }} }}  from rrf({}, k: {k}) ",
+                    arms.join(", ")
+                ),
+                String::new(),
+                "$score",
+                "$score desc",
+            )
+        }
+        _ => return None,
+    };
+    let mut edits = vec![TextEdit {
+        start: inner.start,
+        end: inner.start,
+        replacement: prefix,
+    }];
+    if !suffix.is_empty() {
+        edits.push(TextEdit {
+            start: inner.end,
+            end: inner.end,
+            replacement: suffix,
+        });
+    }
+    let this = Expr::Call(call.clone());
+    for (o, span) in body.order.iter().zip(&spans.order) {
+        if o.expr == this {
+            edits.push(TextEdit {
+                start: span.start,
+                end: span.end,
+                replacement: ordered.to_string(),
+            });
+        }
+    }
+    if spans.order.len() != body.order.len() || spans.items.len() != body.projections.len() {
+        return None;
+    }
+    for (p, span) in body.projections.iter().zip(&spans.items) {
+        if p.expr == this {
+            let alias = match (p.alias.is_none(), score) {
+                (true, "$distance") => " as _distance",
+                (true, _) => " as _score",
+                _ => "",
+            };
+            edits.push(TextEdit {
+                start: span.start,
+                end: span.end,
+                replacement: format!("{score}{alias}"),
+            });
+        }
+    }
+    let pattern = body
+        .clauses
+        .iter()
+        .map(|c| print::clause(c, Default::default()))
+        .collect::<Vec<_>>()
+        .join("  ");
+    let fix = format!(
+        "match {{{} {pattern} {}}}  order {{ {ordered} }}",
+        edits[0].replacement,
+        edits
+            .get(1)
+            .filter(|e| e.start == inner.end && e.end == inner.end)
+            .map_or("", |e| e.replacement.as_str()),
+    );
+    edits.sort_by_key(|e| (e.start, e.end));
+    Some((edits, fix))
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +520,9 @@ struct Ctx<'a> {
     /// Checking a write body: a declared read is not callable there until
     /// stage W2.
     in_write: bool,
+    /// Where the clause, return item, order key or statement being checked
+    /// was written: the position of a refusal that names none of its own.
+    at: Option<Position>,
 }
 
 struct Frame {
@@ -276,9 +537,10 @@ struct Frame {
 struct Rel {
     term: Term,
     ty: RelTy,
-    /// Whether each column is variable-shaped (a bare variable or an alias)
-    /// and so may be drawn into scope by `from`.
-    shaped: Vec<bool>,
+    /// Per column, `None` when it is variable-shaped (a bare variable or an
+    /// alias) and so may be drawn into scope by `from`; otherwise the return
+    /// item as written, which the refusal names.
+    shaped: Vec<Option<String>>,
     ranked: Option<Ranked>,
     /// The outer columns the relation reads.
     free: Vec<String>,
@@ -307,8 +569,9 @@ enum Step {
     Expand {
         src: String,
         dst: String,
+        src_type: String,
         dst_type: String,
-        selector: Vec<(String, Direction)>,
+        edges: EdgeSelection,
         min_hops: u32,
         max_hops: Option<u32>,
         edge_var: Option<String>,
@@ -363,7 +626,7 @@ struct Scope {
     /// outer name is `T68`, since it would silently become a filter.
     inner: bool,
     /// True inside a block or `optional`: a binding that re-mentions an
-    /// outer variable correlates on it, as edition 2 reads it.
+    /// outer variable correlates on it.
     correlates: bool,
     /// While a filter written earlier is placed: the names bound before it,
     /// the only outer names a block inside it correlates on.
@@ -374,7 +637,8 @@ struct Scope {
 enum Pending {
     /// A filter clause and the names bound before it: a block inside it
     /// correlates on those alone.
-    Filter(Expr, Vec<String>),
+    /// And where it was written.
+    Filter(Expr, Vec<String>, Option<Position>),
     Braces {
         var: String,
         prop: String,
@@ -472,9 +736,73 @@ impl Scope {
     }
 }
 
+/// An identifier for a return item as written: its words joined by `_`
+/// (`count($p)` is `count_p`, `$p.name` is `p_name`).
+fn alias_for(written: &str) -> String {
+    written
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// `e` with every subexpression a group key computes read as that key's
+/// column.
+fn key_columns(e: IRExpr, keys: &[(String, IRExpr)]) -> IRExpr {
+    if let Some((name, key)) = keys.iter().find(|(_, k)| *k == e) {
+        return IRExpr::AliasRef(name.clone(), key.ty().clone());
+    }
+    let b = |x: Box<IRExpr>| Box::new(key_columns(*x, keys));
+    match e {
+        IRExpr::Binary {
+            left,
+            op,
+            right,
+            ty,
+        } => IRExpr::Binary {
+            left: b(left),
+            op,
+            right: b(right),
+            ty,
+        },
+        IRExpr::Not(inner, ty) => IRExpr::Not(b(inner), ty),
+        IRExpr::IsNull { expr, negated, ty } => IRExpr::IsNull {
+            expr: b(expr),
+            negated,
+            ty,
+        },
+        IRExpr::Cast { expr, ty } => IRExpr::Cast { expr: b(expr), ty },
+        IRExpr::Neg { expr, ty } => IRExpr::Neg { expr: b(expr), ty },
+        IRExpr::Call { func, args, ty } => IRExpr::Call {
+            func,
+            args: args.into_iter().map(|a| key_columns(a, keys)).collect(),
+            ty,
+        },
+        other => other,
+    }
+}
+
+/// The reason an assignment cannot name a system column.
+fn system_assignment_hint(property: &str) -> &'static str {
+    match property {
+        "id" => {
+            "; the engine assigns system identity; it cannot be set through a property assignment"
+        }
+        _ => "",
+    }
+}
+
 fn param_types(params: &[Param]) -> R<Vec<(String, PropType)>> {
     let mut out = Vec::new();
     for p in params {
+        if p.name == NOW_PARAM_NAME {
+            return Err(err(
+                T47,
+                format!(
+                    "parameter name `${NOW_PARAM_NAME}` is reserved for runtime timestamp injection"
+                ),
+            ));
+        }
         let Some(ty) = PropType::from_param_type_name(&p.type_name, p.nullable) else {
             return Err(err(
                 T48,
@@ -561,7 +889,7 @@ fn annotation(a: &Annotation, budget: &mut Budget) -> R<()> {
                 return Err(err(
                     T80,
                     format!(
-                        "`@{other}` is not an annotation edition 3 reads; the metadata annotations are @{}, and `@budget(plan = n, rounds = n)` is typed",
+                        "`@{other}` is not an annotation the language reads; the metadata annotations are @{}, and `@budget(plan = n, rounds = n)` is typed",
                         METADATA_ANNOTATIONS.join(", @")
                     ),
                 ));
@@ -616,9 +944,15 @@ fn annotation(a: &Annotation, budget: &mut Budget) -> R<()> {
 }
 
 impl Ctx<'_> {
+    /// A name no declaration can collide with in practice: an anonymous
+    /// triple end (`a`) under [`ANON_PREFIX`], every other made-up column
+    /// under [`FRESH_PREFIX`].
     fn fresh(&mut self, prefix: &str) -> String {
         self.fresh += 1;
-        format!("_{prefix}{}", self.fresh)
+        match prefix {
+            "a" => format!("{ANON_PREFIX}{}", self.fresh),
+            other => format!("{FRESH_PREFIX}{other}{}", self.fresh),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -701,6 +1035,31 @@ impl Ctx<'_> {
 
     fn write_decl(&mut self, decl: &Decl, body: &WriteBody) -> R<CoreWrite> {
         let params = param_types(&decl.params)?;
+        if let MutationWriteMode::Unattached {
+            base: Some(UnattachedBase::Param(name)),
+        } = &decl.write_mode
+        {
+            match params.iter().find(|(n, _)| n == name) {
+                Some((_, ty)) if ty.scalar == ScalarType::String && !ty.nullable && !ty.list => {}
+                Some((_, ty)) => {
+                    return Err(err(
+                        T55,
+                        format!(
+                            "`on $base` needs a declared `String` parameter; `${name}` is `{}`",
+                            ty.display_name()
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(err(
+                        T55,
+                        format!(
+                            "`on $base` needs a declared `String` parameter; `${name}` is not declared"
+                        ),
+                    ));
+                }
+            }
+        }
         annotations(decl)?;
         let pmap: HashMap<String, PropType> = params.iter().cloned().collect();
         let mut groups = Vec::new();
@@ -711,10 +1070,13 @@ impl Ctx<'_> {
         // are found only by running it, so no conflict is refused here.
         for (g, group) in body.groups.iter().enumerate() {
             let mut sc = Scope::new(pmap.clone(), Vec::new(), HashMap::new());
-            self.clauses(&mut sc, &group.clauses)?;
+            self.clauses(&mut sc, &group.clauses, &group.spans.clauses)?;
             let input = self.finish(&mut sc)?.unwrap_or(Term::Unit);
             let mut sinks = Vec::new();
             for (i, s) in group.statements.iter().enumerate() {
+                if let Some(span) = group.spans.statements.get(i) {
+                    self.at = Some(span.position);
+                }
                 let (sink, this) = self.statement(&mut sc, s)?;
                 let label = format!("statement {} of group {}", i + 1, g + 1);
                 match &class {
@@ -722,7 +1084,7 @@ impl Ctx<'_> {
                         return Err(err(
                             T76,
                             format!(
-                                "{label} is {} but {first} is {}; a write mixes no `delete` with an `insert` or `update` (the constructive-or-destructive split, as today)",
+                                "{label} is {} but {first} is {}; a write mixes no `delete` with an `insert` or `update`: split it into separate mutations",
                                 class_word(this),
                                 class_word(*c)
                             ),
@@ -750,14 +1112,20 @@ impl Ctx<'_> {
     /// A read body in `sc` (top level: no outer columns; inline: the
     /// enclosing scope's visible columns).
     fn read_body(&mut self, body: &ReadBody, mut sc: Scope) -> R<Rel> {
-        self.clauses(&mut sc, &body.clauses)?;
+        if let Some(refusal) = ranking_in_order_or_return(body) {
+            return Err(E::D(refusal));
+        }
+        self.clauses(&mut sc, &body.clauses, &body.spans.clauses)?;
         // Return items, typed beside every match column.
         let mut items = Vec::new();
         let mut aggs = Vec::new();
         let mut post: Vec<(String, SExpr)> = Vec::new();
         let mut shaped = Vec::new();
         let mut names: Vec<String> = Vec::new();
-        for p in &body.projections {
+        for (i, p) in body.projections.iter().enumerate() {
+            if let Some(span) = body.spans.items.get(i) {
+                self.at = Some(span.position);
+            }
             let name = item_name(&p.expr, p.alias.as_deref());
             if names.contains(&name) {
                 return Err(err(
@@ -766,7 +1134,10 @@ impl Ctx<'_> {
                 ));
             }
             names.push(name.clone());
-            shaped.push(p.alias.is_some() || matches!(p.expr, Expr::Variable(_)));
+            shaped.push(
+                (p.alias.is_none() && !matches!(p.expr, Expr::Variable(_)))
+                    .then(|| crate::query::syntax::print::expr(&p.expr)),
+            );
             if let Some(agg) = self.aggregate(&mut sc, &p.expr)? {
                 aggs.push((format!("^{name}"), agg));
                 items.push(None);
@@ -857,7 +1228,10 @@ impl Ctx<'_> {
             // Order keys over the groups: a key item's expression, or an
             // alias.
             let mut order = Vec::new();
-            for o in &body.order {
+            for (k, o) in body.order.iter().enumerate() {
+                if let Some(span) = body.spans.order.get(k) {
+                    self.at = Some(span.position);
+                }
                 let same_item = body.projections.iter().position(|p| p.expr == o.expr);
                 let k = match &o.expr {
                     Expr::Ident(alias) if names.contains(alias) => {
@@ -880,6 +1254,12 @@ impl Ctx<'_> {
                             }
                         }
                     }
+                    e if contains_agg(e) => {
+                        return Err(err(
+                            T42,
+                            "an aggregate order key must repeat a return item; order by its alias",
+                        ));
+                    }
                     e => {
                         let typed = self.order_key(&mut sc, e)?;
                         match keys.iter().find(|(_, k)| *k == typed) {
@@ -895,15 +1275,39 @@ impl Ctx<'_> {
                 };
                 order.push((k, o.descending.unwrap_or(false)));
             }
+            let keys: Vec<(String, IRExpr)> =
+                keys.into_iter().map(|(n, k)| (n, k.to_ir())).collect();
+            // An expression over aggregates runs after the `Group`, where
+            // only its keys and aggregates exist: a match column it reads is
+            // the key that returns it, and one no key returns is refused.
+            let mut post_items = Vec::new();
+            for (n, e) in post {
+                let e = key_columns(e.to_ir(), &keys);
+                let mut read = Vec::new();
+                e.columns(&mut read);
+                if let Some(c) = read
+                    .iter()
+                    .find(|c| !c.starts_with('^') && !keys.iter().any(|(k, _)| k == *c))
+                {
+                    return Err(err(
+                        T9,
+                        format!(
+                            "`{}` reads `${c}` beside an aggregate, and no return item groups by it; return the column as an item, or aggregate it",
+                            n.trim_start_matches('^')
+                        ),
+                    ));
+                }
+                post_items.push((n, e));
+            }
             term = Term::Group {
                 input: term.boxed(),
-                keys: keys.into_iter().map(|(n, k)| (n, k.to_ir())).collect(),
+                keys: keys.clone(),
                 aggs,
             };
-            if !post.is_empty() {
+            if !post_items.is_empty() {
                 term = Term::Project {
                     input: term.boxed(),
-                    items: post.into_iter().map(|(n, e)| (n, e.to_ir())).collect(),
+                    items: post_items,
                     keep: true,
                 };
             }
@@ -923,7 +1327,10 @@ impl Ctx<'_> {
             }
             ext_names = ext.iter().map(|(n, _)| n.clone()).collect();
             let mut order = Vec::new();
-            for o in &body.order {
+            for (k, o) in body.order.iter().enumerate() {
+                if let Some(span) = body.spans.order.get(k) {
+                    self.at = Some(span.position);
+                }
                 let k = match &o.expr {
                     Expr::Ident(alias) => match ext.iter().find(|(n, _)| n[1..] == **alias) {
                         Some((n, e)) => SExpr::new(SKind::Col(n.clone()), e.ty.clone()),
@@ -1103,6 +1510,9 @@ impl Ctx<'_> {
         if distinct && func != AggFunc::Count {
             return Err(err(T57, "distinct applies only to count"));
         }
+        if contains_agg(arg) {
+            return Err(err(T8, format!("{func} cannot take an aggregate")));
+        }
         let a = self.expr(sc, arg, At::Value)?;
         let ty = agg_type(func, &a.ty)?;
         Ok(Some(Agg {
@@ -1152,9 +1562,17 @@ impl Ctx<'_> {
     }
 
     /// Type every clause of a scope.
-    fn clauses(&mut self, sc: &mut Scope, clauses: &[Clause]) -> R<()> {
+    /// The clauses of one scope; `spans`, when the parser recorded them, say
+    /// where each was written.
+    fn clauses(&mut self, sc: &mut Scope, clauses: &[Clause], spans: &[SourceSpan]) -> R<()> {
+        if let Some(fix) = aggregate_filter_fix(clauses, self.in_write) {
+            return Err(fix);
+        }
         lookahead(clauses, sc);
-        for c in clauses {
+        for (i, c) in clauses.iter().enumerate() {
+            if let Some(span) = spans.get(i) {
+                self.at = Some(span.position);
+            }
             self.clause(sc, c)?;
             self.flush(sc, false)?;
         }
@@ -1176,7 +1594,10 @@ impl Ctx<'_> {
             }
             let at = sc.position(&vars);
             match p {
-                Pending::Filter(e, before) => {
+                Pending::Filter(e, before, written) => {
+                    if written.is_some() {
+                        self.at = written;
+                    }
                     // An error abandons the scope, so the restriction needs
                     // no reset on that path.
                     sc.block_visible = Some(before);
@@ -1204,6 +1625,24 @@ impl Ctx<'_> {
     }
 
     fn clause(&mut self, sc: &mut Scope, c: &Clause) -> R<()> {
+        let written: Vec<&str> = match c {
+            Clause::Let { name, .. } => vec![name],
+            Clause::Binding { variable, .. } => vec![variable],
+            Clause::Traversal(t) => [Some(&t.src), Some(&t.dst), t.edge_binding.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(String::as_str)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let Some(name) = written.into_iter().find(|n| n.starts_with("__")) {
+            return Err(err(
+                T49,
+                format!(
+                    "variable `${name}`: names beginning with `__` are reserved for the compiler"
+                ),
+            ));
+        }
         match c {
             Clause::Binding {
                 variable,
@@ -1220,10 +1659,10 @@ impl Ctx<'_> {
                 }
                 Ok(())
             }
-            Clause::Traversal(TraversalEq(t)) => self.traversal(sc, t),
+            Clause::Traversal(t) => self.traversal(sc, t),
             Clause::Filter(e) => {
                 let before = sc.visible().into_iter().map(|c| c.name).collect();
-                sc.pending.push(Pending::Filter(e.clone(), before));
+                sc.pending.push(Pending::Filter(e.clone(), before, self.at));
                 Ok(())
             }
             // A block sees only the text before it, so it correlates on the
@@ -1331,7 +1770,7 @@ impl Ctx<'_> {
             return Err(err(
                 T1,
                 format!(
-                    "`{type_name}` is an interface; a binding names a node type (an interface population is the polymorphism stage, Poly), as today"
+                    "`{type_name}` is an interface; a binding names a node type; an interface population is a later stage"
                 ),
             ));
         }
@@ -1356,6 +1795,21 @@ impl Ctx<'_> {
         let Some(ty) = sc.col(var) else {
             return Err(err(T6, format!("`${var}` is not bound")));
         };
+        // A braces field names a property of the bound type (T2).
+        if let Ty::Node { type_name, .. } = &ty
+            && self
+                .node_props(type_name)
+                .is_some_and(|props| !props.contains_key(prop))
+        {
+            let hint = match prop {
+                "id" => format!("; the system identity is `${var}.@id`"),
+                _ => String::new(),
+            };
+            return Err(err(
+                T2,
+                format!("type `{type_name}` has no property `{prop}`{hint}"),
+            ));
+        }
         let (prop_ty, owner) = self.property(&ty, prop, var)?;
         if prop_ty.scalar == ScalarType::Blob {
             return Err(err(
@@ -1387,6 +1841,14 @@ impl Ctx<'_> {
         let v = adapt(v, &Ty::Value(prop_ty.clone()));
         if let Expr::Literal(l) = value {
             let lt = literal_type(l)?;
+            if prop_ty.list && lt.list {
+                return Err(err(
+                    T3,
+                    format!(
+                        "list equality is not supported for property `{prop}`; use a scalar value to match list membership"
+                    ),
+                ));
+            }
             // A list property matches a scalar literal by membership.
             if prop_ty.list && !lt.list {
                 let mut elem = prop_ty.clone();
@@ -1471,13 +1933,8 @@ impl Ctx<'_> {
                         },
                     );
                 }
-                Ty::Edge { type_name, .. } => {
-                    bindings.insert(
-                        c.name.clone(),
-                        BoundVariable::Edge {
-                            type_names: vec![type_name.clone()],
-                        },
-                    );
+                Ty::Edge { .. } => {
+                    bindings.insert(c.name.clone(), BoundVariable::Edge);
                 }
                 Ty::Value(_) => {}
             }
@@ -1544,25 +2001,8 @@ impl Ctx<'_> {
             .iter()
             .map(|m| (m.edge_type.clone(), m.direction))
             .collect();
-        let reverse = |sel: &[(String, Direction)]| -> Vec<(String, Direction)> {
-            let mut out: Vec<_> = sel
-                .iter()
-                .map(|(e, d)| {
-                    (
-                        e.clone(),
-                        match d {
-                            Direction::Out => Direction::In,
-                            Direction::In => Direction::Out,
-                            Direction::Both => Direction::Both,
-                        },
-                    )
-                })
-                .collect();
-            out.sort_by(|a, b| a.0.cmp(&b.0));
-            out
-        };
-        let mut forward = members.clone();
-        forward.sort_by(|a, b| a.0.cmp(&b.0));
+        let forward = resolved.edges.clone();
+        let reverse = resolved.edges.reversed();
         let edge_col = resolved.edge_binding.clone().map(|k| Col {
             name: k,
             ty: Ty::Edge {
@@ -1589,7 +2029,7 @@ impl Ctx<'_> {
                 t.dst.clone(),
                 t.src.clone(),
                 resolved.src_type.clone(),
-                reverse(&members),
+                reverse.clone(),
                 true,
             )
         } else {
@@ -1603,7 +2043,7 @@ impl Ctx<'_> {
                     t.dst.clone(),
                     t.src.clone(),
                     resolved.src_type.clone(),
-                    reverse(&members),
+                    reverse,
                     false,
                 )
             } else {
@@ -1639,8 +2079,9 @@ impl Ctx<'_> {
         let expand = Step::Expand {
             src: from.clone(),
             dst: to.clone(),
+            src_type: from_type.clone(),
             dst_type: to_type.clone(),
-            selector: sel,
+            edges: sel,
             min_hops: resolved.min_hops,
             max_hops: resolved.max_hops,
             edge_var: resolved.edge_binding.clone(),
@@ -1682,7 +2123,7 @@ impl Ctx<'_> {
         let mut inner = Scope::new(sc.params.clone(), sc.visible(), sc.rels.clone());
         inner.inner = false;
         inner.correlates = true;
-        self.clauses(&mut inner, clauses)?;
+        self.clauses(&mut inner, clauses, &[])?;
         let new_cols: Vec<Col> = inner
             .cols
             .iter()
@@ -1755,17 +2196,17 @@ impl Ctx<'_> {
 
     /// `from rel`: the relation's columns enter scope by name.
     fn draw(&mut self, sc: &mut Scope, r: Rel) -> R<()> {
-        for (c, shaped) in r.ty.cols.iter().zip(&r.shaped) {
-            if !shaped {
+        for (c, written) in r.ty.cols.iter().zip(&r.shaped) {
+            if let Some(written) = written {
                 return Err(err_fix(
                     T74,
                     format!(
-                        "the column `{}` is not variable-shaped and cannot be drawn into scope",
+                        "the return item `{written}` produces the column `{}`, which is not variable-shaped and cannot be drawn into scope",
                         c.name
                     ),
                     format!(
-                        "alias it on the inner `return`: `… as {}`",
-                        c.name.replace(['.', '@'], "_")
+                        "alias it on the inner `return`: `{written} as {}`",
+                        alias_for(written)
                     ),
                 ));
             }
@@ -1814,7 +2255,7 @@ impl Ctx<'_> {
         let mut inner = Scope::new(sc.params.clone(), outer, sc.rels.clone());
         inner.inner = false;
         inner.correlates = true;
-        self.clauses(&mut inner, clauses)?;
+        self.clauses(&mut inner, clauses, &[])?;
         self.flush(&mut inner, true)?;
         let arg = match arg {
             Some(a) => Some(self.expr(&mut inner, a, At::Value)?),
@@ -2150,20 +2591,10 @@ impl Ctx<'_> {
                         ));
                     }
                 }
-                Ty::Value(t) if t.scalar == ScalarType::String && !t.list => {
-                    let embedded = self
-                        .catalog
-                        .query_node_type(&type_name)
-                        .is_some_and(|n| n.embed_sources.contains_key(&property));
-                    if !embedded {
-                        return Err(err(
-                            T15,
-                            format!(
-                                "a String query needs `@embed` on `{type_name}.{property}`; pass a Vector({dim})"
-                            ),
-                        ));
-                    }
-                }
+                // A String is embedded with the field's recipe, or, on a
+                // field without `@embed`, the default one, as today (the
+                // RFC leaves the default recipe's `.pg` spelling open).
+                Ty::Value(t) if t.scalar == ScalarType::String && !t.list => {}
                 other => {
                     return Err(err(
                         T15,
@@ -2176,17 +2607,18 @@ impl Ctx<'_> {
             }
             ScoreQueryId::Vector(q)
         };
-        let out_ty = match kind {
-            ScoreKind::Bm25 => Ty::scalar(ScalarType::F64, false),
-            ScoreKind::Distance => Ty::scalar(ScalarType::F32, false),
-        };
+        // Both scores are `F32`, the type today's scans produce; section 2
+        // types `bm25` `F64` with its `bm25_v1` scorer, which this engine
+        // does not yet run.
+        let out_ty = Ty::scalar(ScalarType::F32, false);
+        let _ = kind;
         let mut cols = pop.ty.cols.clone();
         cols.push(Col {
             name: out.to_string(),
             ty: out_ty,
         });
         let mut shaped = pop.shaped.clone();
-        shaped.push(true);
+        shaped.push(None);
         let identity = Some((
             pop.term.clone(),
             format!("{column}.{property}"),
@@ -2383,17 +2815,27 @@ impl Ctx<'_> {
                 }
             }
         }
-        let mut k = RRF_DEFAULT_K;
+        let mut k = Count::Literal(RRF_DEFAULT_K);
         let mut weights = vec![1.0; n];
         for (o, v) in &c.options {
             match (o.as_str(), v) {
                 ("k", Expr::Literal(Literal::Integer(x))) if *x >= 1 && *x <= RRF_MAX_K as i128 => {
-                    k = *x as u64
+                    k = Count::Literal(*x as u64)
+                }
+                // An integer parameter: the engine refuses a value outside
+                // the range as it runs.
+                ("k", Expr::Variable(p))
+                    if sc
+                        .params
+                        .get(p)
+                        .is_some_and(|t| !t.list && is_integer(t.scalar)) =>
+                {
+                    k = Count::Param(p.clone())
                 }
                 ("k", _) => {
                     return Err(err(
                         T71,
-                        "`rrf`'s `k:` is an integer literal in 1..=1000000",
+                        "`rrf`'s `k:` is an integer literal in 1..=1000000 or an integer parameter",
                     ));
                 }
                 ("weights", Expr::Literal(Literal::List(ws))) => {
@@ -2453,7 +2895,7 @@ impl Ctx<'_> {
                     },
                 ],
             },
-            shaped: vec![true, true],
+            shaped: vec![None, None],
             ranked: Some(Ranked {
                 column: target,
                 identity: None,
@@ -2584,7 +3026,7 @@ impl Ctx<'_> {
                     ty: ty.clone(),
                 },
                 ty,
-                shaped: vec![true; n],
+                shaped: vec![None; n],
                 ranked: None,
                 free: Vec::new(),
             });
@@ -2693,7 +3135,11 @@ impl Ctx<'_> {
                         let Some(pt) = node.properties.get(&a.property).cloned() else {
                             return Err(err(
                                 T11,
-                                format!("type `{type_name}` has no property `{}`", a.property),
+                                format!(
+                                    "type `{type_name}` has no property `{}`{}",
+                                    a.property,
+                                    system_assignment_hint(&a.property)
+                                ),
                             ));
                         };
                         out.push((
@@ -2751,7 +3197,10 @@ impl Ctx<'_> {
                                 let Some(pt) = edge.properties.get(p).cloned() else {
                                     return Err(err(
                                         T11,
-                                        format!("type `{type_name}` has no property `{p}`"),
+                                        format!(
+                                            "type `{type_name}` has no property `{p}`{}",
+                                            system_assignment_hint(p)
+                                        ),
                                     ));
                                 };
                                 self.assign(sc, &a.value, &pt, p)?
@@ -2795,11 +3244,16 @@ impl Ctx<'_> {
                 assignments,
             } => {
                 let target = self.statement_target(sc, variable, "update")?;
-                let MutationTarget::Node { type_name } = &target else {
-                    return Err(err(
-                        T16,
-                        format!("update of the edge `${variable}` is not supported (as today)"),
-                    ));
+                let type_name = match &target {
+                    MutationTarget::Node { type_name } => type_name,
+                    MutationTarget::Edge { type_name } => {
+                        return Err(err(
+                            T16,
+                            format!(
+                                "update mutation for edge type `{type_name}` is not supported (`${variable}`); delete the edge and insert it again"
+                            ),
+                        ));
+                    }
                 };
                 if assignments.is_empty() {
                     return Err(err(T10, "update requires at least one assignment"));
@@ -2811,7 +3265,11 @@ impl Ctx<'_> {
                     let Some(pt) = props.get(&a.property).cloned() else {
                         return Err(err(
                             T11,
-                            format!("type `{type_name}` has no property `{}`", a.property),
+                            format!(
+                                "type `{type_name}` has no property `{}`{}",
+                                a.property,
+                                system_assignment_hint(&a.property)
+                            ),
                         ));
                     };
                     out.push((
@@ -2915,7 +3373,9 @@ impl Ctx<'_> {
             Ty::Value(t) => {
                 assignment_compatible(t, pt)
                     && (!t.scalar.is_numeric() || numeric_fits(t.scalar, pt.scalar))
-                    && (pt.nullable || !t.nullable || matches!(v.kind, SKind::Param(_)))
+                    // A nullable value for a non-null property is checked as
+                    // the write runs (a constant can evaluate to non-null).
+                    && (pt.nullable || !t.nullable || v.to_ir().columns_empty())
             }
             _ => false,
         };
@@ -3015,9 +3475,13 @@ impl Ctx<'_> {
                     return Err(err(T6, format!("type `{type_name}` not found")));
                 };
                 let Some(p) = props.get(prop) else {
+                    let hint = match prop {
+                        "id" => format!("; the system identity is `${var}.@id`"),
+                        _ => String::new(),
+                    };
                     return Err(err(
                         T6,
-                        format!("type `{type_name}` has no property `{prop}`"),
+                        format!("type `{type_name}` has no property `{prop}`{hint}"),
                     ));
                 };
                 let mut p = p.clone();
@@ -3032,10 +3496,23 @@ impl Ctx<'_> {
                 let Some(mut p) =
                     crate::traversal::common_edge_property(self.catalog, &names, prop)
                 else {
-                    return Err(err(
-                        T6,
-                        format!("edge `{type_name}` has no property `{prop}`"),
-                    ));
+                    let what = if type_name.is_empty() {
+                        format!(
+                            "`${var}` selects no edge: an empty wildcard has no inferable property `{prop}`"
+                        )
+                    } else if names.len() > 1 {
+                        format!(
+                            "edge `{type_name}` has no common property `{prop}`: it must exist with compatible types on every selected edge"
+                        )
+                    } else {
+                        let hint = match prop {
+                            "id" => format!("; the system identity is `${var}.@id`"),
+                            "src" | "dst" => format!("; the system endpoint is `${var}.@{prop}`"),
+                            _ => String::new(),
+                        };
+                        format!("edge `{type_name}` has no property `{prop}`{hint}")
+                    };
+                    return Err(err(T6, what));
                 };
                 p.nullable |= *nullable;
                 Ok((p, type_name.clone()))
@@ -3115,9 +3592,18 @@ impl Ctx<'_> {
                         Ty::Value(_) => false,
                     };
                     if !admitted {
+                        let fields = match &ty {
+                            Ty::Node { .. } => "its meta-fields are `@id`",
+                            Ty::Edge { .. } => {
+                                "its meta-fields are `@id`, `@src`, `@dst` and `@type`"
+                            }
+                            Ty::Value(_) => "a value has no meta-fields",
+                        };
                         return Err(err(
                             T6,
-                            format!("`${variable}` has no meta-field `{property}`"),
+                            format!(
+                                "binding `${variable}` has no meta-field `{property}`; {fields}"
+                            ),
                         ));
                     }
                     SExpr::new(
@@ -3226,13 +3712,26 @@ impl Ctx<'_> {
                 // `in`, whose bare name is reserved; refused before the
                 // needle is typed, since a traversal would bind it.
                 if let (Expr::Variable(a), Expr::Variable(b)) = (needle.as_ref(), list.as_ref()) {
-                    if matches!(sc.col(b), Some(Ty::Node { .. })) {
+                    // A node on the right, or an unbound name beside a node
+                    // when the schema has an edge named `in`: only the
+                    // traversal binds it.
+                    let node = matches!(sc.col(b), Some(Ty::Node { .. }));
+                    let unbound_edge = sc.col(b).is_none()
+                        && matches!(sc.col(a), Some(Ty::Node { .. }))
+                        && self.catalog.lookup_edge_by_name("in").is_some();
+                    if node || unbound_edge {
                         let replacement = format!("${a} \"in\" ${b}");
                         let mut d = QueryDiagnostic::typecheck(
                             T7,
-                            format!(
-                                "`${b}` is a node, so `${a} in ${b}` is a traversal over the edge named `in`, whose bare name is reserved"
-                            ),
+                            if node {
+                                format!(
+                                    "`${b}` is a node, so `${a} in ${b}` is a traversal over the edge named `in`, whose bare name is reserved"
+                                )
+                            } else {
+                                format!(
+                                    "`${b}` is bound by nothing but the edge named `in`, so `${a} in ${b}` is a traversal over it, whose bare name is reserved"
+                                )
+                            },
                         )
                         .with_fix(replacement.clone())
                         .with_suggestion(Suggestion {
@@ -3257,11 +3756,16 @@ impl Ctx<'_> {
                 };
                 let n = adapt(n, &l.ty.clone());
                 match &l.ty {
-                    Ty::Node { .. } => return Err(err(T7, "`in` reads a list, not a node")),
+                    Ty::Node { .. } => {
+                        return Err(err(T7, "`in` needs a list on the right, not a node"));
+                    }
                     Ty::Value(t) if !t.list => {
                         return Err(err_fix(
                             T7,
-                            format!("`in` reads a list; the right side is {}", t.display_name()),
+                            format!(
+                                "`in` needs a list on the right; the right side is {}",
+                                t.display_name()
+                            ),
                             "contains(<string>, <substring>) for a substring test",
                         ));
                     }
@@ -3275,7 +3779,7 @@ impl Ctx<'_> {
                                 return Err(err(
                                     T7,
                                     format!(
-                                        "`in` over {} needs a {} needle, got {}",
+                                        "`in` tests membership in {}: the needle must be {}, got {}",
                                         t.display_name(),
                                         elem.display_name(),
                                         other.display()
@@ -3314,8 +3818,13 @@ impl Ctx<'_> {
             Expr::And(l, r) | Expr::Or(l, r) => {
                 let a = self.expr(sc, l, sub)?;
                 let b = self.expr(sc, r, sub)?;
-                require_bool(&a, "`and`/`or`")?;
-                require_bool(&b, "`and`/`or`")?;
+                let what = if matches!(e, Expr::And(..)) {
+                    "`and`"
+                } else {
+                    "`or`"
+                };
+                require_bool(&a, what)?;
+                require_bool(&b, what)?;
                 let ty = Ty::scalar(ScalarType::Bool, a.ty.nullable() || b.ty.nullable());
                 if matches!(e, Expr::And(..)) {
                     SExpr::new(SKind::And(a.boxed(), b.boxed()), ty)
@@ -3646,8 +4155,9 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
         Step::Expand {
             src,
             dst,
+            src_type,
             dst_type,
-            selector,
+            edges,
             min_hops,
             max_hops,
             edge_var,
@@ -3658,8 +4168,9 @@ fn apply(acc: Option<Term>, step: Step, _fresh: &mut u32) -> Term {
                 input: acc.unwrap_or(Term::Unit).boxed(),
                 src,
                 dst: target.clone(),
+                src_type,
                 dst_type: dst_type.clone(),
-                selector,
+                edges,
                 min_hops,
                 max_hops,
                 edge_var,
@@ -4288,7 +4799,13 @@ fn agg_func(name: &str) -> AggFunc {
 /// `count` are nullable over an empty input.
 fn agg_type(func: AggFunc, arg: &Ty) -> R<Ty> {
     match (func, arg) {
-        (AggFunc::Count, _) => Ok(Ty::scalar(ScalarType::I64, false)),
+        // An aggregate's value is nullable in its position, `count`'s too
+        // (the result contract the plan validates).
+        (AggFunc::Count, _) => Ok(Ty::scalar(ScalarType::I64, true)),
+        (_, Ty::Value(t)) if t.scalar == ScalarType::Blob => Err(err(
+            T24,
+            format!("a Blob is not a read value, so {func} cannot take it"),
+        )),
         (_, Ty::Node { .. } | Ty::Edge { .. }) => Err(err(
             T8,
             format!("{func} cannot take a reference bare; access one of its properties"),
@@ -4323,7 +4840,7 @@ fn require_bool(e: &SExpr, what: &str) -> R<()> {
 
 /// An integer literal takes the integer type of the operand it meets; a
 /// float literal stays `F64` (the RFC's rules leave literals unstated; this
-/// is edition 2's contextual literal typing).
+/// is contextual literal typing).
 fn adapt(e: SExpr, other: &Ty) -> SExpr {
     match (&e.kind, other) {
         (SKind::Lit(Literal::Integer(n)), Ty::Value(t))
@@ -4428,7 +4945,7 @@ fn arith(op: ArithOp, l: SExpr, r: SExpr) -> R<SExpr> {
         return Err(err(
             T72,
             format!(
-                "`{}` mixes U64 with a signed integer; the RFC states no common type",
+                "`{}` mixes U64 with a signed integer, which have no common type",
                 op.symbol()
             ),
         ));
@@ -4477,7 +4994,18 @@ fn compare(op: CompOp, l: SExpr, r: SExpr) -> R<SExpr> {
         }
         (Ty::Value(a), Ty::Value(b)) => {
             if matches!(op, CompOp::Contains | CompOp::StartsWith) {
-                return Err(err(T7, "infix string operators are calls in edition 3"));
+                return Err(err(T7, "infix string operators are calls"));
+            }
+            if a.list && b.list && types_compatible(a, b) {
+                return Err(err_fix(
+                    T7,
+                    format!(
+                        "list equality is not supported: cannot compare {} with {}",
+                        a.display_name(),
+                        b.display_name()
+                    ),
+                    "test membership of one value: `<value> in <list>`",
+                ));
             }
             if !types_compatible(a, b) || a.list || b.list {
                 return Err(err(
@@ -4616,6 +5144,120 @@ fn contains_agg(e: &Expr) -> bool {
     }
 }
 
+/// `T8` for an aggregate call in a filter clause, with the block form as the
+/// fix: the clauses that bind the aggregate's argument move into the block,
+/// and the call becomes the block's value (`$p knows $f  count($f) > 3` is
+/// `count($f) { $p knows $f } > 3`).
+fn aggregate_filter_fix(clauses: &[Clause], in_write: bool) -> Option<E> {
+    use crate::query::syntax::print;
+    let (at, call) = clauses.iter().enumerate().find_map(|(i, c)| match c {
+        Clause::Filter(e) => first_aggregate_call(e).map(|call| (i, call)),
+        _ => None,
+    })?;
+    let Some(Arg::Expr(arg)) = call.args.first() else {
+        return None;
+    };
+    let mut vars = Vec::new();
+    expr_vars(arg, &mut vars);
+    let binds = |c: &Clause| match c {
+        Clause::Binding { variable, .. } => vars.contains(variable),
+        Clause::Traversal(t) => {
+            vars.contains(&t.dst)
+                || vars.contains(&t.src)
+                || t.edge_binding.as_ref().is_some_and(|e| vars.contains(e))
+        }
+        _ => false,
+    };
+    let moved: Vec<Clause> = clauses.iter().filter(|c| binds(c)).cloned().collect();
+    let written = print::expr(&Expr::Call(call.clone()));
+    // A block correlates on a name the remaining clauses bind; with none
+    // left, the count is a grouped value of the whole read.
+    let mut kept_vars = Vec::new();
+    for c in clauses.iter().filter(|c| !binds(c)) {
+        match c {
+            Clause::Binding { variable, .. } => kept_vars.push(variable.clone()),
+            Clause::Traversal(t) => kept_vars.extend([t.src.clone(), t.dst.clone()]),
+            _ => {}
+        }
+    }
+    let correlated = moved.iter().any(|c| match c {
+        Clause::Traversal(t) => kept_vars.contains(&t.src) || kept_vars.contains(&t.dst),
+        _ => false,
+    });
+    if !correlated {
+        // A write has no `return`; the general refusal stands.
+        if in_write {
+            return None;
+        }
+        return Some(err_fix(
+            T8,
+            format!("`{written}` is an aggregate over the read's own rows; it belongs in `return`"),
+            format!("return {{ {written} as {} }}", alias_for(&written)),
+        ));
+    }
+    let func = agg_func(&call.name);
+    let block = Expr::Block(Box::new(Block {
+        func: BlockFunc::Agg(func),
+        arg: Some(Box::new(arg.clone())),
+        clauses: moved,
+    }));
+    let Clause::Filter(filter) = &clauses[at] else {
+        unreachable!("found above")
+    };
+    let rewritten = replace_call(filter, call, &block);
+    let kept: Vec<String> = clauses
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| *i != at && !binds(c))
+        .map(|(_, c)| print::clause(c, Default::default()))
+        .chain(std::iter::once(print::expr(&rewritten)))
+        .collect();
+    Some(err_fix(
+        T8,
+        format!(
+            "`{written}` is an aggregate; in a filter it is a block over the clauses it counts"
+        ),
+        format!("match {{ {} }}", kept.join("  ")),
+    ))
+}
+
+fn first_aggregate_call(e: &Expr) -> Option<&Call> {
+    match e {
+        Expr::Call(c) if AGGREGATES.contains(&c.name.as_str()) => Some(c),
+        Expr::Compare { left, right, .. }
+        | Expr::Arith { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right) => {
+            first_aggregate_call(left).or_else(|| first_aggregate_call(right))
+        }
+        Expr::Not(x) | Expr::Neg(x) => first_aggregate_call(x),
+        _ => None,
+    }
+}
+
+/// `e` with the call `call` replaced by `with`.
+fn replace_call(e: &Expr, call: &Call, with: &Expr) -> Expr {
+    let r = |x: &Expr| Box::new(replace_call(x, call, with));
+    match e {
+        Expr::Call(c) if c == call => with.clone(),
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op: *op,
+            left: r(left),
+            right: r(right),
+        },
+        Expr::Arith { op, left, right } => Expr::Arith {
+            op: *op,
+            left: r(left),
+            right: r(right),
+        },
+        Expr::And(a, b) => Expr::And(r(a), r(b)),
+        Expr::Or(a, b) => Expr::Or(r(a), r(b)),
+        Expr::Not(x) => Expr::Not(r(x)),
+        Expr::Neg(x) => Expr::Neg(r(x)),
+        other => other.clone(),
+    }
+}
+
 /// The conjuncts of a top-level `and` (the formatter splits them into
 /// clauses without changing the term, so the lowering splits them too).
 fn conjuncts(e: &Expr) -> Vec<&Expr> {
@@ -4629,7 +5271,8 @@ fn conjuncts(e: &Expr) -> Vec<&Expr> {
     }
 }
 
-/// The name a return item produces (edition 2's executed spelling).
+/// The name a return item produces: its alias, `var.prop` for a property,
+/// the variable for a reference.
 fn item_name(e: &Expr, alias: Option<&str>) -> String {
     if let Some(a) = alias {
         return a.to_string();
@@ -4643,7 +5286,7 @@ fn item_name(e: &Expr, alias: Option<&str>) -> String {
             _ => c.name.clone(),
         },
         Expr::AggDistinct { arg, .. } => item_name(arg, None),
-        Expr::Call(c) if c.name == "now" => crate::query::ast::NOW_PARAM_NAME.to_string(),
+        Expr::Call(c) if c.name == "now" => crate::query::value::NOW_PARAM_NAME.to_string(),
         Expr::Call(c) => c.name.clone(),
         _ => "expression".into(),
     }
@@ -4676,7 +5319,7 @@ fn lookahead(clauses: &[Clause], sc: &mut Scope) {
                 sc.declared_nodes.insert(variable.clone());
                 sc.future.insert(variable.clone());
             }
-            Clause::Traversal(TraversalEq(t)) => {
+            Clause::Traversal(t) => {
                 sc.future.insert(t.src.clone());
                 sc.future.insert(t.dst.clone());
                 if let Some(k) = &t.edge_binding {
@@ -4714,7 +5357,7 @@ fn lookahead(clauses: &[Clause], sc: &mut Scope) {
 fn pending_vars(p: &Pending, sc: &Scope) -> Vec<String> {
     let mut out = Vec::new();
     match p {
-        Pending::Filter(e, before) => filter_vars(e, before, &mut out),
+        Pending::Filter(e, before, _) => filter_vars(e, before, &mut out),
         Pending::Braces { var, value, .. } => {
             out.push(var.clone());
             expr_vars(value, &mut out);
@@ -4816,7 +5459,7 @@ fn clauses_vars(clauses: &[Clause], out: &mut Vec<String>) {
                     expr_vars(v, out);
                 }
             }
-            Clause::Traversal(TraversalEq(t)) => {
+            Clause::Traversal(t) => {
                 out.push(t.src.clone());
                 out.push(t.dst.clone());
             }
@@ -4869,7 +5512,12 @@ fn expr_vars(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
+mod bind;
+mod literal;
+mod result;
+pub use result::{projection_field, result_schema};
 mod scalar;
+mod traversal;
 pub use scalar::{SExpr, SKind, Terms};
 
 #[cfg(test)]

@@ -36,7 +36,8 @@ branch create s from b
 
 --- mutate branch: s
 query set_bob_on_s() {
-    update Person set { age: 7 } where name = "bob"
+    $x: Person  $x.name = "bob"
+    update $x set { age: 7 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -44,7 +45,8 @@ query set_bob_on_s() {
 --- loop $i 1 4
 --- mutate branch: b
 query bump_alice($n: I32) {
-    update Person set { age: $n } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: $n }
 }
 --- params
 {"n": ${i}}

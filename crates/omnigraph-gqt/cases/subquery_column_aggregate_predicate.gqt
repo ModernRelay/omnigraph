@@ -269,7 +269,7 @@ query date_aggregate_against_a_number_is_refused() {
     }
     return { $n.slug }
 }
---- expect error: T40: cannot compare max over a block (Date?) with I64
+--- expect error: T7: cannot compare Date? with I64
 
 --- query
 query count_null_values_and_empty_input_are_zero() {

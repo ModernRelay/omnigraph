@@ -2,6 +2,7 @@
 # red_on: 2026-10-10, upstream 58f1fcc6: step 1 returned p63..p59, the primary arm's insertion order; RankFuseExec cut entities and planned no Sort, so the tied joined rows reached the limit unordered.
 # notes: Every Probe joins the one matching Doc, so all 64 rows tie on the fused score; the Sort above the fusion orders the tie by the implicit ids ($d.@id, $p.@id) and `limit` cuts rows, so the five smallest Probe ids come back in id order (RFC 0047 §One total order).
 # notes: Reverse insertion order is the seed so an unordered pass-through is visibly wrong; explicit ID and returned-property trailing keys keep the RankFuse row tie-break.
+# notes: The second arm ranks `hay` so the two arms differ; it selects only `other`, which no Probe joins, so every joined row still ties.
 
 --- runner
 timeout_ms: 10000
@@ -91,13 +92,13 @@ node Probe {
 --- query
 set engine = v2;
 query fused_v2($t: String) {
-    match {
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60)
         $d: Doc
         $p: Probe
         $d.n = $p.n
     }
     return { $p.slug }
-    order { rrf(bm25($d.text, $t), bm25($d.text, $t)) }
+    order { $score desc }
     limit 5
 }
 
@@ -117,13 +118,13 @@ p.slug: String
 --- query
 set engine = v2;
 query fused_explicit_id($t: String) {
-    match {
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60)
         $d: Doc
         $p: Probe
         $d.n = $p.n
     }
     return { $p.slug }
-    order { rrf(bm25($d.text, $t), bm25($d.text, $t)), $p.@id }
+    order { $score desc, $p.@id }
     limit 1
 }
 
@@ -142,13 +143,13 @@ rank fuse row tiebreak [$p.@id]
 --- query
 set engine = v2;
 query fused_covered_return($t: String) {
-    match {
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60)
         $d: Doc
         $p: Probe
         $d.n = $p.n
     }
     return { $p.slug }
-    order { rrf(bm25($d.text, $t), bm25($d.text, $t)), $p.slug }
+    order { $score desc, $p.slug }
     limit 1
 }
 

@@ -928,7 +928,7 @@ query due_with_tag($deadline: DateTime, $tag: String) {
     match {
         $t: Task
         $t.due_at <= $deadline
-        $t.tags contains $tag
+        $tag in $t.tags
     }
     return { $t.slug, $t.due_at, $t.tags, $t.scores, $t.active_days }
 }
@@ -958,12 +958,13 @@ query update_task(
     $scores: [I32],
     $active_days: [Date]
 ) {
-    update Task set {
+    $x: Task  $x.slug = $slug
+    update $x set {
         due_at: $due_at,
         tags: $tags,
         scores: $scores,
         active_days: $active_days
-    } where slug = $slug
+    }
 }
 
 query get_task($slug: String) {
@@ -1104,9 +1105,9 @@ node Doc {
         &queries,
         r#"
 query vector_search($q: String) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 3) }
     return { $d.slug, $d.title }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 "#,

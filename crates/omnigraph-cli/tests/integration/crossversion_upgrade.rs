@@ -1458,8 +1458,11 @@ fn current_v10_refuses_and_rebuilds_genuine_v09_graph_end_to_end() {
         ),
     )
     .unwrap();
-    let queries = cluster.join("queries.gq");
-    let query_source = r#"
+    // The predecessor's cluster holds its queries in the predecessor syntax;
+    // the rebuilt cluster below holds the same queries in the current syntax,
+    // which reserves the name `terms`, so its `terms` is `title_search`.
+    let predecessor_queries = cluster.join("queries.gq");
+    let predecessor_query_source = r#"
 query docs() {
     match { $d: Doc }
     return { $d.slug, $d.title, $d.body, $d.embedding }
@@ -1489,7 +1492,37 @@ query vectors($q: Vector(4)) {
 query retitle($title: String) { update Doc set { title: $title } where slug = "ml-intro" }
 query revise($body: String) { update Doc set { body: $body } where slug = "dl-basics" }
 "#;
-    fs::write(&queries, query_source).unwrap();
+    let query_source = r#"
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.body, $d.embedding }
+    order { $d.slug }
+}
+query edges() {
+    match { $a: Doc $a $c:cites $b }
+    return { $a.slug, $b.slug, $c.note }
+}
+query title_search($term: String) {
+    match { $d: Doc search($d.title, $term) }
+    return { $d.slug }
+    order { $d.slug }
+}
+query ranked($term: String) {
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $term) }
+    return { $d.slug }
+    order { $score desc }
+    limit 10
+}
+query vectors($q: Vector(4)) {
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1) }
+    return { $d.slug }
+    order { $distance }
+    limit 1
+}
+query retitle($title: String) { $x: Doc  $x.slug = "ml-intro"  update $x set { title: $title } }
+query revise($body: String) { $x: Doc  $x.slug = "dl-basics"  update $x set { body: $body } }
+"#;
+    fs::write(&predecessor_queries, predecessor_query_source).unwrap();
     fs::write(
         cluster.join("cluster.yaml"),
         "version: 1\nstate: { backend: cluster, lock: true }\ngraphs:\n  knowledge:\n    schema: graph.pg\n    queries: [queries.gq]\n",
@@ -1508,7 +1541,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
     .unwrap();
     let graph = cluster.join("graphs/knowledge.omni");
     let uri = graph.to_str().unwrap();
-    let query_path = queries.to_str().unwrap();
+    let predecessor_query_path = predecessor_queries.to_str().unwrap();
     assert_ok(
         "lint",
         &run_old(
@@ -1518,7 +1551,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
                 "--schema",
                 schema.to_str().unwrap(),
                 "--query",
-                query_path,
+                predecessor_query_path,
             ],
         ),
     );
@@ -1553,7 +1586,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
                 "mutate",
                 "retitle",
                 "--query",
-                query_path,
+                predecessor_query_path,
                 "--store",
                 uri,
                 "--params",
@@ -1574,7 +1607,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
                 "mutate",
                 "retitle",
                 "--query",
-                query_path,
+                predecessor_query_path,
                 "--store",
                 uri,
                 "--branch",
@@ -1598,7 +1631,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
                     "query",
                     "terms",
                     "--query",
-                    query_path,
+                    predecessor_query_path,
                     "--store",
                     uri,
                     "--branch",
@@ -1652,6 +1685,14 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         "the v6 refusal must direct the operator to export/import rebuild, got: {storage_refusal}",
     );
 
+    let rebuilt_cluster = temp.path().join("rebuilt-cluster");
+    fs::create_dir(&rebuilt_cluster).unwrap();
+    for name in ["graph.pg", "cluster.yaml"] {
+        fs::copy(cluster.join(name), rebuilt_cluster.join(name)).unwrap();
+    }
+    let queries = rebuilt_cluster.join("queries.gq");
+    fs::write(&queries, query_source).unwrap();
+    let query_path = queries.to_str().unwrap();
     output_success(
         cli()
             .args(["lint", "--schema"])
@@ -1659,12 +1700,6 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
             .arg("--query")
             .arg(&queries),
     );
-
-    let rebuilt_cluster = temp.path().join("rebuilt-cluster");
-    fs::create_dir(&rebuilt_cluster).unwrap();
-    for name in ["graph.pg", "queries.gq", "cluster.yaml"] {
-        fs::copy(cluster.join(name), rebuilt_cluster.join(name)).unwrap();
-    }
     apply_cluster_fixture(&rebuilt_cluster);
     let rebuilt = rebuilt_cluster.join("graphs/knowledge.omni");
     let rebuilt_uri = rebuilt.to_str().unwrap();
@@ -1730,7 +1765,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         );
         for (name, params) in [
             ("vectors", vector_params),
-            ("terms", term_params),
+            ("title_search", term_params),
             ("ranked", term_params),
         ] {
             let rows = parse_stdout_json(&output_success(&mut query_command(
@@ -1750,7 +1785,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         for (name, params) in [
             ("docs", "{}"),
             ("edges", "{}"),
-            ("terms", term_params),
+            ("title_search", term_params),
             ("ranked", term_params),
             ("vectors", vector_params),
         ] {
@@ -1761,7 +1796,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
                 &remote, branch, name, params,
             )));
             assert_eq!(served["rows"], local["rows"], "{branch}/{name}");
-            if matches!(name, "terms" | "ranked" | "vectors") {
+            if matches!(name, "title_search" | "ranked" | "vectors") {
                 assert_eq!(served["rows"], json!([{ "d.slug":"ml-intro" }]));
             }
         }
@@ -1836,7 +1871,7 @@ query revise($body: String) { update Doc set { body: $body } where slug = "dl-ba
         parse_stdout_json(&output_success(&mut query_command(
             &remote,
             "main",
-            "terms",
+            "title_search",
             term_params
         )))["rows"],
         json!([{ "d.slug":"ml-intro" }])
@@ -1953,11 +1988,14 @@ const ROOT_SCHEMA_OBJECTS: [&str; 3] = ["_schema.pg", "_schema.ir.json", "__sche
 const JOURNEY_LIVE_BRANCHES: [&str; 3] = ["main", "review", "child"];
 
 /// Writes the schema, the rows and the queries every in-place journey starts
-/// from under `directory`, and returns their paths in that order.
-fn journey_fixture(directory: &Path) -> [PathBuf; 3] {
+/// from under `directory`, and returns their paths in that order: the queries
+/// once in the current syntax and once in the predecessor syntax, which is
+/// the only one a predecessor binary parses.
+fn journey_fixture(directory: &Path) -> [PathBuf; 4] {
     let schema = directory.join("journey.pg");
     let data = directory.join("journey.jsonl");
     let queries = directory.join("journey.gq");
+    let predecessor_queries = directory.join("journey-predecessor.gq");
     std::fs::write(
         &schema,
         format!(
@@ -1978,7 +2016,8 @@ fn journey_fixture(directory: &Path) -> [PathBuf; 3] {
     )
     .unwrap();
     std::fs::write(&queries, journey_query_source()).unwrap();
-    [schema, data, queries]
+    std::fs::write(&predecessor_queries, predecessor_journey_query_source()).unwrap();
+    [schema, data, queries, predecessor_queries]
 }
 
 fn assert_writes_format(old: &Path, uri: &str, format: u32) {
@@ -1991,7 +2030,33 @@ fn assert_writes_format(old: &Path, uri: &str, format: u32) {
     );
 }
 
+/// The journey's queries in the current syntax; [`predecessor_journey_query_source`]
+/// holds the same queries for the predecessor binaries.
 fn journey_query_source() -> &'static str {
+    r#"
+query docs() {
+    match { $d: Doc }
+    return { $d.slug, $d.title, $d.body, $d.embedding }
+    order { $d.slug }
+}
+query edges() {
+    match { $a: Doc $a $c:cites $b }
+    return { $a.slug, $b.slug, $c.note }
+}
+query retitle($title: String) { $x: Doc  $x.slug = "ml-intro"  update $x set { title: $title } }
+query remove() { $x: Doc  $x.slug = "rl-intro"  delete $x }
+query revise() { $x: Doc  $x.slug = "dl-basics"  update $x set { body: "written after storage upgrade" } }
+query vectors($q: Vector(4)) {
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1) }
+    return { $d.slug }
+    order { $distance }
+    limit 1
+}
+"#
+}
+
+/// [`journey_query_source`] in the predecessor syntax.
+fn predecessor_journey_query_source() -> &'static str {
     r#"
 query docs() {
     match { $d: Doc }
@@ -2016,6 +2081,7 @@ query vectors($q: Vector(4)) {
 
 /// The rows `name` returns through `binary` at `selector value`, with the
 /// predecessor's widened floats narrowed so both binaries print alike.
+/// `query_path` holds the queries in the syntax `binary` parses.
 fn journey_rows(
     binary: Option<&Path>,
     uri: &str,
@@ -2063,6 +2129,16 @@ fn journey_rows(
 /// `Doc`, kept apart from [`journey_query_source`] so the binaries that never
 /// see that property compile the shared file.
 const RATED_QUERY_SOURCE: &str = r#"
+query rated() {
+    match { $d: Doc }
+    return { $d.slug, $d.rating }
+    order { $d.slug }
+}
+query rate() { $x: Doc  $x.slug = "ml-intro"  update $x set { rating: 5 } }
+"#;
+
+/// [`RATED_QUERY_SOURCE`] in the predecessor syntax.
+const PREDECESSOR_RATED_QUERY_SOURCE: &str = r#"
 query rated() {
     match { $d: Doc }
     return { $d.slug, $d.rating }
@@ -2171,8 +2247,9 @@ fn genuine_lance11_storage_upgrade_round_trip() {
     let temp = tempdir().unwrap();
     let graph = temp.path().join("lance-transition.omni");
     let uri = graph.to_str().unwrap();
-    let [schema, data, queries] = journey_fixture(temp.path());
+    let [schema, data, queries, predecessor_queries] = journey_fixture(temp.path());
     let query_path = queries.to_str().unwrap();
+    let predecessor_query_path = predecessor_queries.to_str().unwrap();
     fs::write(
         &schema,
         format!(
@@ -2195,12 +2272,9 @@ fn genuine_lance11_storage_upgrade_round_trip() {
         ),
     )
     .unwrap();
-    fs::write(
-        &queries,
-        format!(
-            "{}\n{}",
-            journey_query_source(),
-            r#"
+    // Both syntaxes spell these two queries alike, but the current one
+    // reserves the name `terms`: its file names that query `title_search`.
+    let added_queries = r#"
 query terms($term: String) {
     match { $d: Doc search($d.title, $term) }
     return { $d.slug }
@@ -2211,8 +2285,19 @@ query nullable_vectors() {
     return { $v.name, $v.embedding }
     order { $v.name }
 }
-"#,
+"#;
+    fs::write(
+        &queries,
+        format!(
+            "{}\n{}",
+            journey_query_source(),
+            added_queries.replace("query terms(", "query title_search(")
         ),
+    )
+    .unwrap();
+    fs::write(
+        &predecessor_queries,
+        format!("{}\n{added_queries}", predecessor_journey_query_source()),
     )
     .unwrap();
     let run = |binary: &Path, args: &[&str]| {
@@ -2230,9 +2315,17 @@ query nullable_vectors() {
             binary,
             &[
                 "query",
-                name,
+                if binary != old && name == "terms" {
+                    "title_search"
+                } else {
+                    name
+                },
                 "--query",
-                query_path,
+                if binary == old {
+                    predecessor_query_path
+                } else {
+                    query_path
+                },
                 if binary == old { "--store" } else { "--target" },
                 uri,
                 selector,
@@ -2309,7 +2402,7 @@ query nullable_vectors() {
             "mutate",
             "retitle",
             "--query",
-            query_path,
+            predecessor_query_path,
             "--store",
             uri,
             "--params",
@@ -2325,7 +2418,7 @@ query nullable_vectors() {
             "mutate",
             "retitle",
             "--query",
-            query_path,
+            predecessor_query_path,
             "--store",
             uri,
             "--branch",
@@ -2664,8 +2757,9 @@ fn storage_upgrade_preserves_history(
     let temp = tempdir().unwrap();
     let graph = temp.path().join("standalone.omni");
     let uri = graph.to_str().unwrap();
-    let [schema, data, queries] = journey_fixture(temp.path());
+    let [schema, data, queries, predecessor_queries] = journey_fixture(temp.path());
     let query_path = queries.to_str().unwrap();
+    let predecessor_query_path = predecessor_queries.to_str().unwrap();
     let first = born_with.as_ref().map_or(old, |born| born.binary);
     let released_writer = source_format < 13 && born_with.is_none();
 
@@ -2696,8 +2790,16 @@ fn storage_upgrade_preserves_history(
             &run_old(
                 binary,
                 &[
-                    "mutate", name, "--query", query_path, "--store", uri, "--branch", branch,
-                    "--params", params,
+                    "mutate",
+                    name,
+                    "--query",
+                    predecessor_query_path,
+                    "--store",
+                    uri,
+                    "--branch",
+                    branch,
+                    "--params",
+                    params,
                 ],
             ),
         );
@@ -2746,6 +2848,9 @@ fn storage_upgrade_preserves_history(
         let rated = temp.path().join("journey-rated.gq");
         std::fs::write(&rated, RATED_QUERY_SOURCE).unwrap();
         let rated_path = rated.to_str().unwrap().to_owned();
+        let predecessor_rated = temp.path().join("journey-rated-predecessor.gq");
+        std::fs::write(&predecessor_rated, PREDECESSOR_RATED_QUERY_SOURCE).unwrap();
+        let predecessor_rated_path = predecessor_rated.to_str().unwrap();
         assert_ok(
             "predecessor mutate of the added property",
             &run_old(
@@ -2754,7 +2859,7 @@ fn storage_upgrade_preserves_history(
                     "mutate",
                     "rate",
                     "--query",
-                    &rated_path,
+                    predecessor_rated_path,
                     "--store",
                     uri,
                     "--branch",
@@ -2771,7 +2876,7 @@ fn storage_upgrade_preserves_history(
                 "query",
                 "rated",
                 "--query",
-                rated_path.as_str(),
+                predecessor_rated_path,
                 "--store",
                 uri,
                 "--snapshot",
@@ -2891,8 +2996,22 @@ fn storage_upgrade_preserves_history(
         let id = commit["graph_commit_id"].as_str().unwrap();
         historical_rows.entry(id.to_owned()).or_insert_with(|| {
             [
-                journey_rows(Some(old), uri, query_path, "--snapshot", id, "docs"),
-                journey_rows(Some(old), uri, query_path, "--snapshot", id, "edges"),
+                journey_rows(
+                    Some(old),
+                    uri,
+                    predecessor_query_path,
+                    "--snapshot",
+                    id,
+                    "docs",
+                ),
+                journey_rows(
+                    Some(old),
+                    uri,
+                    predecessor_query_path,
+                    "--snapshot",
+                    id,
+                    "edges",
+                ),
             ]
         });
     }
@@ -3350,8 +3469,9 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
     let temp = tempdir().unwrap();
     let graph = temp.path().join("cleaned.omni");
     let uri = graph.to_str().unwrap();
-    let [schema, data, queries] = journey_fixture(temp.path());
+    let [schema, data, queries, predecessor_queries] = journey_fixture(temp.path());
     let query_path = queries.to_str().unwrap();
+    let predecessor_query_path = predecessor_queries.to_str().unwrap();
 
     assert_ok(
         "v0.11.0 init",
@@ -3386,7 +3506,7 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
                 "mutate",
                 "retitle",
                 "--query",
-                query_path,
+                predecessor_query_path,
                 "--store",
                 uri,
                 "--branch",
@@ -3420,7 +3540,11 @@ fn genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup() {
             "query",
             "docs",
             "--query",
-            query_path,
+            if target_flag == "--store" {
+                predecessor_query_path
+            } else {
+                query_path
+            },
             target_flag,
             uri,
             "--snapshot",

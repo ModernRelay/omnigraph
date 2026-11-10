@@ -48,14 +48,16 @@ branch merge feature into main;
 
 --- mutate
 query remove_bob() {
-    delete Person where name = "bob"
+    $x: Person  $x.name = "bob"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query remove_carol() {
-    delete Person where name = "carol"
+    $x: Person  $x.name = "carol"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
@@ -69,7 +71,8 @@ query readd_carol() {
 
 --- mutate branch: feature
 query birthday() {
-    update Person set { age: 31 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0

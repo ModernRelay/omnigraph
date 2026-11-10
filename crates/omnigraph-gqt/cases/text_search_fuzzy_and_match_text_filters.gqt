@@ -82,7 +82,7 @@ d.title: String
 query fuzzy_search($q: String) {
     match {
         $d: Doc
-        fuzzy($d.title, $q, 2)
+        fuzzy($d.title, $q, max_edits: 2)
     }
     return { $d.slug, $d.title }
 }
@@ -180,7 +180,8 @@ f.slug: String
 
 --- mutate
 query retitle_fresh() {
-    update Fresh set { body: "Deep Learning Systems" } where slug = "fresh-1"
+    $x: Fresh  $x.slug = "fresh-1"
+    update $x set { body: "Deep Learning Systems" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -212,7 +213,8 @@ query add_second_fresh() {
 
 --- mutate
 query drop_first_fresh() {
-    delete Fresh where slug = "fresh-1"
+    $x: Fresh  $x.slug = "fresh-1"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0

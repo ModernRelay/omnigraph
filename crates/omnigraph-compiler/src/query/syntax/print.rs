@@ -1,4 +1,4 @@
-//! A printer for the edition-3 tree.
+//! A printer for the parse tree.
 //!
 //! It writes the text the grammar reads back to an equal tree, inserting a
 //! parenthesis only where precedence requires one. The separators between
@@ -9,9 +9,9 @@
 use std::fmt::Write as _;
 
 use super::*;
-use crate::query::ast::{
-    AggFunc, CompOp, EdgeSelector, Literal, MutationWriteMode, UnattachedBase,
-};
+use crate::query::file::{MutationWriteMode, UnattachedBase};
+use crate::query::syntax::EdgeSelector;
+use crate::query::value::{AggFunc, CompOp, Literal};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Style {
@@ -34,7 +34,7 @@ impl Default for Style {
 }
 
 pub fn print_file(file: &SourceFile, style: Style) -> String {
-    let mut out = String::from("gq 3;\n");
+    let mut out = String::from("");
     for setting in &file.settings {
         let _ = writeln!(out, "{setting:?}");
     }
@@ -253,7 +253,7 @@ pub fn clause(c: &Clause, style: Style) -> String {
                 format!("${variable}: {type_name} {{ {} }}", items.join(", "))
             }
         }
-        Clause::Traversal(TraversalEq(t)) => {
+        Clause::Traversal(t) => {
             let mut out = format!("${} ", t.src);
             if let Some(b) = &t.edge_binding {
                 let _ = write!(out, "${b}:");

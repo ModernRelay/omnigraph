@@ -1911,7 +1911,7 @@ fn bindings_nearest(server: &TestServer, expected: &str) {
     let response = graph_http_client().post(format!("{}/graphs/bindings/query", server.base_url))
         .bearer_auth("live-deployment-token")
         .timeout(std::time::Duration::from_secs(10))
-        .json(&serde_json::json!({"query":"query nearest_docs($q: String) { match { $d: SearchDoc } return { $d.name } order { nearest($d.embedding, $q) } limit 1 }", "name":"nearest_docs", "params":{"q":"same-query-text"}}))
+        .json(&serde_json::json!({"query":"query nearest_docs($q: String) { match { from nearest({ match { $d: SearchDoc } return { $d } }, $d.embedding, $q, k: 1) } return { $d.name } order { $distance } limit 1 }", "name":"nearest_docs", "params":{"q":"same-query-text"}}))
         .send().unwrap();
     let status = response.status();
     let body: serde_json::Value = response.json().unwrap();

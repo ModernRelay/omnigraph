@@ -7,7 +7,7 @@ use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::ir::{
     DeltaClass, IRExpr, IROrdering, IRProjection, SubqueryPredicate, ValidateCheck,
 };
-use omnigraph_compiler::query::ast::LoadStmtMode;
+use omnigraph_compiler::query::file::LoadStmtMode;
 use omnigraph_compiler::traversal::EdgeSelection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

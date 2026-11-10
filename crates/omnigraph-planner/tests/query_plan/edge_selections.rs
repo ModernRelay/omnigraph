@@ -2,7 +2,7 @@
 //! that result-only GQT assertions cannot observe.
 
 use super::*;
-use omnigraph_compiler::query::ast::AggFunc;
+use omnigraph_compiler::query::value::AggFunc;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 use omnigraph_planner::ColumnRef;
 use omnigraph_planner::logical::tiebreak_text;
@@ -39,7 +39,7 @@ fn issue_659_large_finite_bounds_stop_estimation_at_a_fixed_point() {
                     },
                 );
             let mut named = expand("a", "b", vec![]);
-            let IROp::Expand { max_hops, .. } = &mut named else {
+            let PatternStep::Expand { max_hops, .. } = &mut named else {
                 unreachable!()
             };
             *max_hops = Some(hops);
@@ -102,7 +102,7 @@ fn issue_659_rrf_declares_typed_downstream_order_without_changing_fusion_identit
                 source = source.with_traversal_work_limit(100);
             }
             let mut expansion = selected("a", "b", selection);
-            let IROp::Expand { edge_binding, .. } = &mut expansion else {
+            let PatternStep::Expand { edge_binding, .. } = &mut expansion else {
                 unreachable!()
             };
             *edge_binding = Some("e".into());
@@ -166,10 +166,10 @@ fn issue_659_rrf_declares_typed_downstream_order_without_changing_fusion_identit
 fn rank_fuse_row_keys_cover_both_arms_without_correlated_locals_issue_659() {
     let mut query = query(correlated(alternatives()));
     query.pipeline[1] = scan("b");
-    let IROp::AntiJoin { inner, .. } = &mut query.pipeline[2] else {
+    let PatternStep::AntiJoin { inner, .. } = &mut query.pipeline[2] else {
         panic!("the fixture ends with a correlated block");
     };
-    let IROp::Expand { edge_binding, .. } = &mut inner[0] else {
+    let PatternStep::Expand { edge_binding, .. } = &mut inner[0] else {
         panic!("the correlated block binds a selected edge");
     };
     *edge_binding = Some("inner_edge".into());
@@ -359,7 +359,7 @@ fn issue_659_selected_edge_sort_declares_type_even_when_id_is_ordered() {
             ),
         ] {
             let mut expansion = selected("a", "b", selection.clone());
-            let IROp::Expand { edge_binding, .. } = &mut expansion else {
+            let PatternStep::Expand { edge_binding, .. } = &mut expansion else {
                 unreachable!()
             };
             *edge_binding = Some("e".into());
@@ -565,16 +565,16 @@ fn member(name: &str, direction: Direction) -> EdgeMember {
     }
 }
 
-fn selected(src: &str, dst: &str, edges: EdgeSelection) -> IROp {
+fn selected(src: &str, dst: &str, edges: EdgeSelection) -> PatternStep {
     let mut op = expand(src, dst, vec![]);
-    let IROp::Expand { edges: value, .. } = &mut op else {
+    let PatternStep::Expand { edges: value, .. } = &mut op else {
         unreachable!()
     };
     *value = edges;
     op
 }
 
-fn query(op: Operation) -> QueryIR {
+fn query(op: Operation) -> ReadShape {
     let Operation::Query(query) = op else {
         unreachable!()
     };
@@ -593,7 +593,7 @@ fn correlated(edges: EdgeSelection) -> Operation {
         vec![
             scan("a"),
             expand("a", "b", vec![]),
-            IROp::AntiJoin {
+            PatternStep::AntiJoin {
                 outer_var: "b".to_string(),
                 inner: vec![selected("b", "x", edges)],
                 predicate: omnigraph_compiler::ir::SubqueryPredicate {

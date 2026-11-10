@@ -8,12 +8,13 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use omnigraph_compiler::SYSTEM_COLUMNS_V3;
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
-use omnigraph_compiler::query::ast::{AggFunc, CompOp, Literal};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
+use omnigraph_compiler::query::value::{AggFunc, CompOp, Literal};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EdgeMember, EdgeSelection};
 use omnigraph_compiler::types::{AggSignature, Direction, ExprType, PropType, ScalarType};
 use omnigraph_planner::optimizer::resolve;
+use omnigraph_planner::read_shape::{PatternStep, ReadShape};
 use omnigraph_planner::{
     AccessPath, AdjacencyProof, Bounds, ExpandMode, ExpandPolicy, ExpandStatistics, FragmentStat,
     LogicalNode, LogicalPlan, MemorySource, NodeTypeSpec, Operation, PhysicalNode, PhysicalPlan,
@@ -86,12 +87,12 @@ fn node_type(type_name: &str, row_count: Option<u64>) -> NodeTypeSpec {
     }
 }
 
-fn scan(variable: &str) -> IROp {
+fn scan(variable: &str) -> PatternStep {
     scan_of(variable, "T")
 }
 
-fn scan_of(variable: &str, type_name: &str) -> IROp {
-    IROp::NodeScan {
+fn scan_of(variable: &str, type_name: &str) -> PatternStep {
+    PatternStep::NodeScan {
         variable: variable.to_string(),
         type_name: type_name.to_string(),
         filters: vec![],
@@ -121,7 +122,7 @@ fn prop(variable: &str, property: &str) -> IRExpr {
     }
 }
 
-fn projection(expr: IRExpr, pipeline: &[IROp]) -> IRProjection {
+fn projection(expr: IRExpr, pipeline: &[PatternStep]) -> IRProjection {
     let ty = match &expr {
         IRExpr::Aggregate { signature, .. } => signature.result.clone(),
         IRExpr::Literal(Literal::String(_), _) => {
@@ -131,12 +132,12 @@ fn projection(expr: IRExpr, pipeline: &[IROp]) -> IRProjection {
             let name = pipeline
                 .iter()
                 .find_map(|op| match op {
-                    IROp::NodeScan {
+                    PatternStep::NodeScan {
                         variable: bound,
                         type_name,
                         ..
                     } if bound == variable => Some(type_name),
-                    IROp::Expand {
+                    PatternStep::Expand {
                         dst_var, dst_type, ..
                     } if dst_var == variable => Some(dst_type),
                     _ => None,
@@ -170,8 +171,8 @@ fn projection(expr: IRExpr, pipeline: &[IROp]) -> IRProjection {
     }
 }
 
-fn ir(pipeline: Vec<IROp>, returns: Vec<IRExpr>, order_by: Vec<IRExpr>) -> Operation {
-    Operation::Query(Box::new(QueryIR {
+fn ir(pipeline: Vec<PatternStep>, returns: Vec<IRExpr>, order_by: Vec<IRExpr>) -> Operation {
+    Operation::Query(Box::new(ReadShape {
         name: "q".to_string(),
         params: vec![],
         return_exprs: returns
@@ -225,8 +226,8 @@ fn object_columns() -> BTreeSet<String> {
     columns
 }
 
-fn expand(src: &str, dst: &str, dst_filters: Vec<IRExpr>) -> IROp {
-    IROp::Expand {
+fn expand(src: &str, dst: &str, dst_filters: Vec<IRExpr>) -> PatternStep {
+    PatternStep::Expand {
         src_var: src.to_string(),
         dst_var: dst.to_string(),
         edges: EdgeSelection::Named(EdgeMember {

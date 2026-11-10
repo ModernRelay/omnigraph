@@ -55,7 +55,8 @@ query hire_with_employer() {
 
 --- mutate
 query retitle() {
-    update Person set { title: "cto" } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { title: "cto" }
 }
 
 --- expect affected: nodes=1 edges=0

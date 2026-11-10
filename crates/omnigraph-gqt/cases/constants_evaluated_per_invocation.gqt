@@ -54,7 +54,8 @@ p.slug: String
 
 --- mutate
 query assign_with_forty($slug: String, $age: I64) {
-    update Person set { adult: $age > 30 } where slug = $slug
+    $x: Person  $x.slug = $slug
+    update $x set { adult: $age > 30 }
 }
 
 --- params
@@ -64,7 +65,8 @@ query assign_with_forty($slug: String, $age: I64) {
 
 --- mutate
 query assign_with_twenty($slug: String, $age: I64) {
-    update Person set { adult: $age > 30 } where slug = $slug
+    $x: Person  $x.slug = $slug
+    update $x set { adult: $age > 30 }
 }
 
 --- params
@@ -88,7 +90,8 @@ p.adult: Bool
 
 --- mutate
 query or_absorbs_null($slug: String, $flag: Bool?) {
-    update Person set { adult: true or $flag } where slug = $slug
+    $x: Person  $x.slug = $slug
+    update $x set { adult: true or $flag }
 }
 
 --- params
@@ -98,7 +101,8 @@ query or_absorbs_null($slug: String, $flag: Bool?) {
 
 --- mutate
 query and_absorbs_null($slug: String, $flag: Bool?) {
-    update Person set { adult: false and $flag } where slug = $slug
+    $x: Person  $x.slug = $slug
+    update $x set { adult: false and $flag }
 }
 
 --- params

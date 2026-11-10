@@ -16,9 +16,9 @@
 
 use std::collections::HashSet;
 
+use super::requirements::BoundVariable;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
-use omnigraph_compiler::query::ast::{Expr, RRF_COLUMN};
-use omnigraph_compiler::query::typecheck::BoundVariable;
+use omnigraph_compiler::query::value::RRF_COLUMN;
 use omnigraph_compiler::types::{ExprType, ScalarType};
 
 use super::budget::Budget;
@@ -829,11 +829,11 @@ impl Requirements {
         for (_, call) in &self.projected_ranks {
             let origin = self.written_search.as_ref().is_some_and(|lead| {
                 lead == call
-                    || matches!(lead, Expr::Rrf { primary, secondary, .. }
+                    || matches!(lead, IRExpr::Rrf { primary, secondary, .. }
                         if **primary == *call || **secondary == *call)
             });
             let planned = match call {
-                Expr::Rrf { .. } => plan
+                IRExpr::Rrf { .. } => plan
                     .live()
                     .any(|(_, node)| matches!(node, PhysicalNode::RankFuse { .. })),
                 call => projected_retrieval(call).is_some_and(|(kind, binding, property)| {
@@ -1379,13 +1379,15 @@ fn exactness(approximate: bool) -> &'static str {
 }
 
 /// The (kind, binding, property) a projected `nearest` or `bm25` call reads.
-fn projected_retrieval(expr: &Expr) -> Option<(RankKind, &str, &str)> {
+fn projected_retrieval(expr: &IRExpr) -> Option<(RankKind, &str, &str)> {
     match expr {
-        Expr::Nearest {
+        IRExpr::Nearest {
             variable, property, ..
         } => Some((RankKind::Nearest, variable, property)),
-        Expr::Bm25 { field, .. } => match field.as_ref() {
-            Expr::PropAccess { variable, property } => Some((RankKind::Bm25, variable, property)),
+        IRExpr::Bm25 { field, .. } => match field.as_ref() {
+            IRExpr::PropAccess {
+                variable, property, ..
+            } => Some((RankKind::Bm25, variable, property)),
             _ => None,
         },
         _ => None,

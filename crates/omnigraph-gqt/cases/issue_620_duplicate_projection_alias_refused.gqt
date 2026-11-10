@@ -26,7 +26,7 @@ query same_alias_twice() {
     return { $a.name as value, $a.num as value }
 }
 
---- expect error: result column `value` is produced by more than one projection
+--- expect error: T25: two return items produce the column `value`; alias one
 
 --- query
 query same_property_twice() {
@@ -36,7 +36,7 @@ query same_property_twice() {
     return { $a.num, $a.num }
 }
 
---- expect error: result column `a.num` is produced by more than one projection
+--- expect error: T25: two return items produce the column `a.num`; alias one
 
 --- query
 query two_literals() {
@@ -46,7 +46,7 @@ query two_literals() {
     return { 1, 2 }
 }
 
---- expect error: result column `literal` is produced by more than one projection
+--- expect error: T25: two return items produce the column `literal`; alias one
 
 --- query
 query alias_named_like_a_literal() {
@@ -56,7 +56,7 @@ query alias_named_like_a_literal() {
     return { $a.num as literal, 2 }
 }
 
---- expect error: result column `literal` is produced by more than one projection
+--- expect error: T25: two return items produce the column `literal`; alias one
 
 --- query
 query property_and_aggregate_over_it() {
@@ -66,7 +66,7 @@ query property_and_aggregate_over_it() {
     return { $a.name, count($a.name) }
 }
 
---- expect error: result column `a.name` is produced by more than one projection
+--- expect error: T25: two return items produce the column `a.name`; alias one
 
 --- query
 query variable_and_alias_named_like_it() {
@@ -77,7 +77,7 @@ query variable_and_alias_named_like_it() {
     return { $a, $b.name as a }
 }
 
---- expect error: result column `a` is produced by more than one projection
+--- expect error: T25: two return items produce the column `a`; alias one
 
 --- query
 query parameter_and_alias_named_like_it($x: I64) {
@@ -90,7 +90,7 @@ query parameter_and_alias_named_like_it($x: I64) {
 --- params
 {"x": 1}
 
---- expect error: result column `x` is produced by more than one projection
+--- expect error: T25: two return items produce the column `x`; alias one
 
 --- query
 query two_aggregates_one_alias() {
@@ -100,7 +100,7 @@ query two_aggregates_one_alias() {
     return { count($a) as n, sum($a.num) as n }
 }
 
---- expect error: result column `n` is produced by more than one projection
+--- expect error: T25: two return items produce the column `n`; alias one
 
 --- query
 query third_occurrence() {
@@ -110,7 +110,7 @@ query third_occurrence() {
     return { $a.name as v, $a.num as w, $a.name as v }
 }
 
---- expect error: result column `v` is produced by more than one projection
+--- expect error: T25: two return items produce the column `v`; alias one
 
 --- query
 query distinct_aliases() {

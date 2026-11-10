@@ -33,7 +33,8 @@ query insert_person($name: String, $age: I32) {
 }
 
 query set_age($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
+    $x: Person  $x.name = $name
+    update $x set { age: $age }
 }
 "#;
 

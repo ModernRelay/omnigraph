@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use omnigraph_compiler::SystemColumns;
-use omnigraph_compiler::ir::{IRExpr, IROp, IRProjection, QueryIR};
+use omnigraph_compiler::ir::{IRExpr, IRProjection};
 use omnigraph_planner::optimizer::resolve;
+use omnigraph_planner::read_shape::{PatternStep, ReadShape};
 use omnigraph_planner::registry::{Coverage, REGISTRY, Route, lookup};
 use omnigraph_planner::{
     AdjacencyProof, Census, Decision, JoinKind, LogicalKind, MemorySource, NodeTypeSpec, Operation,
@@ -333,10 +334,10 @@ fn doc_source() -> MemorySource {
 }
 
 fn documents_query() -> Operation {
-    Operation::Query(Box::new(QueryIR {
+    Operation::Query(Box::new(ReadShape {
         name: "documents".to_string(),
         params: Vec::new(),
-        pipeline: vec![IROp::NodeScan {
+        pipeline: vec![PatternStep::NodeScan {
             variable: "d".to_string(),
             type_name: "Doc".to_string(),
             filters: Vec::new(),

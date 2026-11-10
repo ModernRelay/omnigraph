@@ -40,12 +40,12 @@ node Doc {
 
 --- query
 query nearest_after_negation($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: Doc
-        not { $d.name starts_with "doc-00" }
-    }
+        not { starts_with($d.name, "doc-00") }
+    } return { $d } }, $d.embedding, $q, k: 4) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 4
 }
 

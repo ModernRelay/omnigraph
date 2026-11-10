@@ -52,7 +52,7 @@ p.name: String
 p.age: I32?
 
 --- concurrent
-w1: query age_alice() { update Person set { age: 9 } where name = "alice" }
+w1: query age_alice() { $x: Person  $x.name = "alice"  update $x set { age: 9 } }
 w2 on feature: query add_erin() { insert Person { name: "erin", age: 5 } }
 order: w1 head __manifest/_versions/, w1 head __manifest/_versions/, w1 park head __manifest/_versions/, w2 start, w2, w1 head __manifest/_versions/, w1
 --- expect

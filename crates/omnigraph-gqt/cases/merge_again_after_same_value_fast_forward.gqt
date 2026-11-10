@@ -21,7 +21,7 @@ branch create b0
 --- expect ok
 
 --- mutate branch: b0
-query insert_a_same_size() { insert Person { name: "a" } update Company set { size: 5 } where name = "c0" }
+query insert_a_same_size() { insert Person { name: "a" } $x: Company  $x.name = "c0"  update $x set { size: 5 } }
 --- expect affected: nodes=2 edges=0
 
 --- mutate

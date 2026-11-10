@@ -70,14 +70,16 @@ query thing_by_id_with_null($id: String) {
 
 --- mutate
 query delete_thing_by_id_without_params($id: String) {
-    delete Thing where id = $id
+    $x: Thing  $x.id = $id
+    delete $x
 }
 
 --- expect error: parameter 'id' not provided
 
 --- mutate
 query rename_thing_by_id_with_empty_params($id: String, $name: String) {
-    update Thing set { name: $name } where id = $id
+    $x: Thing  $x.id = $id
+    update $x set { name: $name }
 }
 
 --- params
@@ -94,7 +96,8 @@ query insert_thing_without_params($id: String) {
 
 --- mutate
 query unused_required_mutation_param($unused: I32) {
-    update Thing set { name: "changed" } where id = "missing"
+    $x: Thing  $x.id = "missing"
+    update $x set { name: "changed" }
 }
 
 --- expect error: parameter 'unused' not provided

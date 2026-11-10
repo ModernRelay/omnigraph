@@ -16,9 +16,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::query::ast::QueryDecl;
+use omnigraph_compiler::query::check::check_query_decl as typecheck_query_decl;
+use omnigraph_compiler::query::file::QueryDecl;
 use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::query::typecheck::typecheck_query_decl;
 use omnigraph_compiler::settings::STORED_QUERY_CARRIES_NO_SETTINGS;
 use omnigraph_compiler::types::{PropType, ScalarType};
 
@@ -598,8 +598,8 @@ embedding: Vector(4)
     fn vector_param_on_exposed_query_warns() {
         let reg = QueryRegistry::from_specs(vec![spec(
             "vec_search",
-            "query vec_search($q: Vector(4)) { match { $u: User } return { $u.name } \
-             order { nearest($u.embedding, $q) } limit 3 }",
+            "query vec_search($q: Vector(4)) { match { from nearest({ match { $u: User } return { $u } }, \
+             $u.embedding, $q, k: 3) } return { $u.name } order { $distance } limit 3 }",
             true, // mcp.expose
         )])
         .unwrap();
@@ -613,8 +613,8 @@ embedding: Vector(4)
     fn vector_param_on_unexposed_query_is_silent() {
         let reg = QueryRegistry::from_specs(vec![spec(
             "vec_search",
-            "query vec_search($q: Vector(4)) { match { $u: User } return { $u.name } \
-             order { nearest($u.embedding, $q) } limit 3 }",
+            "query vec_search($q: Vector(4)) { match { from nearest({ match { $u: User } return { $u } }, \
+             $u.embedding, $q, k: 3) } return { $u.name } order { $distance } limit 3 }",
             false, // not exposed — vector param is fine for service-to-service callers
         )])
         .unwrap();
@@ -629,8 +629,8 @@ embedding: Vector(4)
         // the structured type check against a false positive (and pins that
         // only `Vector(_)` triggers the warning).
         let reg = QueryRegistry::from_specs(vec![spec(
-            "search",
-            "query search($name: String) { match { $u: User { name: $name } } return { $u.name } }",
+            "find_user",
+            "query find_user($name: String) { match { $u: User { name: $name } } return { $u.name } }",
             true,
         )])
         .unwrap();

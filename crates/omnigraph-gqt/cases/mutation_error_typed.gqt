@@ -31,7 +31,8 @@ query insert_missing_key($age: I32) {
 
 --- mutate
 query delete_absent($name: String) {
-    delete Person where name = $name
+    $x: Person  $x.name = $name
+    delete $x
 }
 
 --- params

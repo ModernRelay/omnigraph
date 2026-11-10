@@ -1521,7 +1521,8 @@ node Policy {
         &query_path,
         r#"
 query update_policy($slug: String, $name: String) {
-    update Policy set { name: $name } where slug = $slug
+    $x: Policy  $x.slug = $slug
+    update $x set { name: $name }
 }
 
 query list_policies() {
@@ -1562,12 +1563,12 @@ query list_policies() {
         serde_json::json!({
             "result": [
                 {
-                    "name": "name",
+                    "name": "p.name",
                     "kind": "string",
                     "nullable": true
                 },
                 {
-                    "name": "effectiveTo",
+                    "name": "p.effectiveTo",
                     "kind": "datetime",
                     "nullable": true
                 }
@@ -1600,7 +1601,8 @@ node Person {
         &query_path,
         r#"
 query broken($slug: String) {
-    update Person set { missing: "nope" } where slug = $slug
+    $x: Person  $x.slug = $slug
+    update $x set { missing: "nope" }
 }
 "#,
     );
@@ -1835,7 +1837,8 @@ node Policy {
         &query_path,
         r#"
 query update_policy($slug: String, $name: String) {
-    update Policy set { name: $name } where slug = $slug
+    $x: Policy  $x.slug = $slug
+    update $x set { name: $name }
 }
 "#,
     );
@@ -1877,7 +1880,8 @@ node Policy {
         &query_path,
         r#"
 query bad_update($slug: String) {
-    update Policy set { priority_level: "high" } where slug = $slug
+    $x: Policy  $x.slug = $slug
+    update $x set { priority_level: "high" }
 }
 "#,
     );
@@ -2597,9 +2601,9 @@ fn ranked_read_reports_its_ranking_in_json_and_jsonl() {
         &queries,
         r#"
 query scored($q: String) {
-    match { $d: Doc }
-    return { $d.slug, bm25($d.title, $q) as relevance }
-    order { bm25($d.title, $q) }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $q) }
+    return { $d.slug, $score as relevance }
+    order { $score desc }
     limit 2
 }
 "#,
@@ -2696,7 +2700,7 @@ query insert_person($name: String, $age: I32) {
             .arg("--target")
             .arg(&graph)
             .arg("-e")
-            .arg("query no_match() { update Person set { age: 99 } where name = \"Nobody\" }")
+            .arg("query no_match() { $x: Person  $x.name = \"Nobody\"  update $x set { age: 99 } }")
             .arg("--json"),
     ));
     assert_eq!(no_op["affected_nodes"], 0);
@@ -2911,7 +2915,7 @@ fn load_statement_answers_the_executed_plan_beside_the_change() {
 fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
     const FIND_PERSON: &str =
         "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
-    const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { $x: Person  $x.name = $name  update $x set { age: $age } }";
 
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -2994,7 +2998,7 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
 /// stop even a conditional mutation before its data request is dispatched.
 #[test]
 fn remote_if_commit_fails_closed_against_an_older_server() {
-    const SET_AGE: &str = "query set_age($name: String, $age: I32) { update Person set { age: $age } where name = $name }";
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { $x: Person  $x.name = $name  update $x set { age: $age } }";
 
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
     for (status, headers) in [

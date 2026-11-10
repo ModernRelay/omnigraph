@@ -276,7 +276,7 @@ fn parity_ranked_query_ranking() {
     let queries = p._temp.path().join("ranked.gq");
     std::fs::write(
         &queries,
-        "query ranked($q: String) {\n    match { $p: Person }\n    return { $p.name, bm25($p.name, $q) as relevance }\n    order { bm25($p.name, $q) }\n    limit 2\n}\n",
+        "query ranked($q: String) {\n    match { from bm25({ match { $p: Person } return { $p } }, $p.name, $q) }\n    return { $p.name, $score as relevance }\n    order { $score desc }\n    limit 2\n}\n",
     )
     .unwrap();
     let (l, r) = p.run(&[
@@ -468,7 +468,7 @@ fn parity_mutate() {
     let (l, r) = p.run(&[
         "mutate",
         "-e",
-        "query no_match() { update Person set { age: 99 } where name = \"Nobody\" }",
+        "query no_match() { $x: Person  $x.name = \"Nobody\"  update $x set { age: 99 } }",
         "--json",
     ]);
     assert_parity("no-op mutate", &l, &r);

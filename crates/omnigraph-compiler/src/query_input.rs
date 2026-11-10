@@ -5,8 +5,9 @@ use serde_json::Value;
 
 use crate::error::CompilerError;
 use crate::ir::ParamMap;
-use crate::query::ast::{Literal, Param, QueryDecl};
+use crate::query::file::{Param, QueryDecl};
 use crate::query::parser::parse_query;
+use crate::query::value::Literal;
 use crate::types::{check_date_literal, check_datetime_literal};
 
 const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
@@ -784,7 +785,7 @@ mod tests {
     use super::{
         JsonParamMode, ToParam, find_named_query, find_read_statement, json_params_to_param_map,
     };
-    use crate::query::ast::Literal;
+    use crate::query::value::Literal;
 
     #[test]
     fn js_mode_rejects_unsafe_integer_numbers() {

@@ -5,7 +5,7 @@ fn expand_destination_filters_and_projection_belong_to_its_dependent_scan() {
     let op = ir(
         vec![
             scan("a"),
-            IROp::Expand {
+            PatternStep::Expand {
                 src_var: "a".to_string(),
                 dst_var: "b".to_string(),
                 edges: EdgeSelection::Named(EdgeMember {
@@ -184,7 +184,7 @@ fn physical_anti_join_predicate_reads_back_equal() {
     let op = ir(
         vec![
             scan("a"),
-            IROp::AntiJoin {
+            PatternStep::AntiJoin {
                 outer_var: "a".to_string(),
                 inner: vec![expand("a", "x", vec![])],
                 predicate: predicate.clone(),
@@ -233,7 +233,7 @@ fn physical_anti_join_predicate_reads_back_equal() {
 /// node prints no `schema` and the root scan its pinned version.
 #[test]
 fn the_physical_document_prints_gq_orderings_and_no_query_schema() {
-    let op = Operation::Query(Box::new(QueryIR {
+    let op = Operation::Query(Box::new(ReadShape {
         name: "q".to_string(),
         params: vec![],
         pipeline: vec![scan("c")],
@@ -373,7 +373,7 @@ fn a_search_order_plans_its_score_sort_and_a_fusion_two_arms() {
             vec![
                 scan("n"),
                 scan("c"),
-                IROp::Filter(
+                PatternStep::Filter(
                     IRExpr::and_all([contains.clone(), residual.clone()]).expect("two conjuncts"),
                 ),
             ],

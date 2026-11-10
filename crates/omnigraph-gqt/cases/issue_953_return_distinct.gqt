@@ -52,7 +52,7 @@ query members_plain() {
     match {
         $f: Forum
         $f hasMember $p
-        $f.title contains "graph"
+        contains($f.title, "graph")
     }
     return { $p.name }
 }
@@ -74,7 +74,7 @@ query members_distinct() {
     match {
         $f: Forum
         $f hasMember $p
-        $f.title contains "graph"
+        contains($f.title, "graph")
     }
     return distinct { $p.name }
 }
@@ -107,7 +107,7 @@ query first_two_names() {
     match {
         $f: Forum
         $f hasMember $p
-        $f.title contains "graph"
+        contains($f.title, "graph")
     }
     return distinct { $p.name }
     order { $p.name asc }
@@ -145,7 +145,7 @@ query members_as_nodes() {
     match {
         $f: Forum
         $f hasMember $p
-        $f.title contains "graph"
+        contains($f.title, "graph")
     }
     return distinct { $p }
     order { $p }
@@ -181,7 +181,7 @@ query distinct_with_aggregate() {
     return distinct { $p.name, count($p) as n }
 }
 
---- expect error: `distinct` on an aggregated return
+--- expect error: T56: `return distinct` does not apply to an aggregated return
 
 --- query
 set engine = v2;
@@ -191,7 +191,7 @@ query order_key_outside_projection() {
     order { $p.age }
 }
 
---- expect error: order key `$p.age` does not appear in return
+--- expect error: T42: an order key over grouped rows must be a return item or name its alias
 
 --- query
 set engine = v2;

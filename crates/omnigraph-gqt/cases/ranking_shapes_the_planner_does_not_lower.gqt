@@ -1,0 +1,84 @@
+# issue: none
+# notes: Today's ranked scans run a ranking whose score leads the `order` in its ranking's direction and whose
+# notes: `nearest` window `k` is the read's `limit`. A well-typed read that asks for anything else is refused with
+# notes: `P006` rather than run as a different relation: a window other than `limit`, a score ordered against its
+# notes: direction or after another key, an `order` or a `limit` that ignores the score, an aggregate over the score.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+    embedding: Vector(2) @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","text":"needle","embedding":[0.0,1.0]}}
+{"type":"Doc","data":{"slug":"b","text":"needle hay","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","text":"hay","embedding":[1.0,1.0]}}
+
+--- query
+query window_other_than_limit() {
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 2) }
+    return { $d.slug }
+    order { $distance }
+    limit 3
+}
+
+--- expect error: P006:
+
+--- query
+query distance_descending() {
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 2) }
+    return { $d.slug }
+    order { $distance desc }
+    limit 2
+}
+
+--- expect error: P006:
+
+--- query
+query score_after_another_key() {
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, "needle") }
+    return { $d.slug }
+    order { $d.slug, $score desc }
+}
+
+--- expect error: P006:
+
+--- query
+query limit_without_the_score() {
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, "needle") }
+    return { $d.slug }
+    limit 1
+}
+
+--- expect error: P006:
+
+--- query
+query aggregate_over_the_score() {
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, "needle") }
+    return { max($score) as best }
+}
+
+--- expect error: P006:
+
+--- query
+query the_lowered_shape() {
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 2) }
+    return { $d.slug }
+    order { $distance }
+    limit 2
+}
+
+--- expect ordered
+{"d.slug": "a"}
+{"d.slug": "c"}
+
+--- expect shape
+d.slug: String

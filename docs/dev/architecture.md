@@ -86,7 +86,7 @@ alias is reused. See [invariants.md](invariants.md) and
 
 | Layer | Owns |
 |---|---|
-| `omnigraph-compiler` | `.pg` and `.gq` parsing, catalog, type checking, lint, migration planning, and typed IR lowering. It has no Lance dependency. |
+| `omnigraph-compiler` | `.pg` and `.gq` parsing, catalog, type checking into the typed core IR, lint, and migration planning. It has no Lance dependency. |
 | `omnigraph-planner` | Logical and physical plans, optimizer passes, cost estimates and explain documents; metadata enters through `PlanSource`, with no Lance dependency. |
 | `omnigraph` (`omnigraph-engine`) | The public facade (`Omnigraph`, `Snapshot`), the graph coordinator, query and mutation execution, the table store, graph topology, validation, and recovery. |
 | `omnigraph-catalog` | `__manifest` publication (multi-dataset publication), graph branch registrations and lineage, retention, and `commit_graph`. |

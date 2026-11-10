@@ -6373,9 +6373,9 @@ node Doc {
 "#;
     const EMBED_QUERY: &str = r#"
 query vector_search_string($q: String) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 3) }
     return { $d.slug, $d.title }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 "#;
@@ -6452,13 +6452,13 @@ async fn query_envelope_reports_its_ranking() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    title: String @index\n}\n";
     const QUERIES: &str = r#"
 query fused($a: String, $b: String) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.title, $a), bm25($all, $d.title, $b), k: 60) $d: Doc }
     return {
         $d.slug,
-        rrf(bm25($d.title, $a), bm25($d.title, $b)) as fused,
-        rrf(bm25($d.title, $a), bm25($d.title, $b)) as again
+        $score as fused,
+        $score as again
     }
-    order { rrf(bm25($d.title, $a), bm25($d.title, $b)) }
+    order { $score desc }
     limit 2
 }
 query unranked() {
@@ -6786,8 +6786,10 @@ async fn removed_id_memory_refusals_keep_graph_and_admission_usable() {
         (
             "/mutate",
             json!({"query": "query clear() {\n\
-                delete First where name != \"\"\n\
-                delete Second where name != \"\"\n\
+                $x: First  $x.name != \"\"\n\
+                delete $x\n\
+                $y: Second  $y.name != \"\"\n\
+                delete $y\n\
             }"}),
         ),
         (

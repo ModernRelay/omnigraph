@@ -5,7 +5,7 @@
 //! frontier and warm CSR; only legacy plans probe index coverage again.
 
 use omnigraph_compiler::ir::{IRExpr, ValidateCheck};
-use omnigraph_compiler::query::ast::{CompOp, Literal};
+use omnigraph_compiler::query::value::{CompOp, Literal};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 

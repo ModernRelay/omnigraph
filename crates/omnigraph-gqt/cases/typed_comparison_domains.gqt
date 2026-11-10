@@ -199,7 +199,7 @@ cast $bound: I64 -> exact_integer
 set engine = v2;
 query signed_list_exact_literal() {
     match { $x: Number }
-    return { $x.key, $x.ns contains 9007199254740992.0 as member }
+    return { $x.key, 9007199254740992.0 in $x.ns as member }
 }
 --- expect unordered
 {"x.key":"a","member":false}
@@ -247,7 +247,7 @@ type [9007199254740992.0, 1.5]: [F64]
 set engine = v2;
 query unsigned_list_negative_needle($needle: I64) {
     match { $x: Number }
-    return { $x.key, $x.us contains $needle as member }
+    return { $x.key, $needle in $x.us as member }
 }
 --- params
 {"needle":-1}
@@ -264,7 +264,7 @@ cast $needle: I64 -> exact_integer
 --- query
 set engine = v2;
 query f32_list_nonrepresentable_needle() {
-    match { $x: Number $x.fs contains 0.1 }
+    match { $x: Number 0.1 in $x.fs }
     return { $x.key }
 }
 --- expect unordered

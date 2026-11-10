@@ -3,8 +3,8 @@
 //! correlated block predicate's aggregate side.
 
 use crate::error::{CompilerError, Result};
-use crate::query::ast::{AggFunc, BinaryOp, CompOp, Literal, NOW_PARAM_NAME, Precedence};
 use crate::query::syntax::ArithOp;
+use crate::query::value::{AggFunc, BinaryOp, CompOp, Literal, NOW_PARAM_NAME, Precedence};
 use crate::types::{AggSignature, ExprType, PropType};
 
 use super::coerce;
@@ -421,6 +421,13 @@ impl IRExpr {
                 Self::Call { args, .. } => pending.extend(args.iter().rev()),
             }
         }
+    }
+
+    /// Whether the expression reads no column of the row.
+    pub fn columns_empty(&self) -> bool {
+        let mut cols = Vec::new();
+        self.columns(&mut cols);
+        cols.is_empty()
     }
 
     /// Whether the expression is a bare read of the current row: a column or

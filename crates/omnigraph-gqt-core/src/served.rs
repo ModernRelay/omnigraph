@@ -11,7 +11,7 @@ use omnigraph_api_types::{
     BranchMergeOutcome, BranchOutcomeOutput, ChangeOutput, ChangeRequest, HTTP_API_CONTRACT,
     HTTP_API_CONTRACT_HEADER, IngestRequest, QueryRequest, ReadOutput, SchemaOutput,
 };
-use omnigraph_compiler::query::ast::{BranchCreateFrom, show_statement_name};
+use omnigraph_compiler::query::file::{BranchCreateFrom, show_statement_name};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

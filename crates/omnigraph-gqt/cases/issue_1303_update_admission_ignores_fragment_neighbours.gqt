@@ -168,7 +168,8 @@ tables:
 --- mutate
 set write_max_bytes = 2048;
 query retitle_apart() {
-    update Apart set { title: "new" } where slug = "row000"
+    $x: Apart  $x.slug = "row000"
+    update $x set { title: "new" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -176,7 +177,8 @@ query retitle_apart() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_shared() {
-    update Shared set { title: "new" } where slug = "row000"
+    $x: Shared  $x.slug = "row000"
+    update $x set { title: "new" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -184,7 +186,8 @@ query retitle_shared() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_apart_doc_carrying_its_blob() {
-    update ApartDoc set { title: "new" } where slug = "row000"
+    $x: ApartDoc  $x.slug = "row000"
+    update $x set { title: "new" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -192,7 +195,8 @@ query retitle_apart_doc_carrying_its_blob() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_shared_doc_carrying_its_blob() {
-    update SharedDoc set { title: "new" } where slug = "row000"
+    $x: SharedDoc  $x.slug = "row000"
+    update $x set { title: "new" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -200,7 +204,8 @@ query retitle_shared_doc_carrying_its_blob() {
 --- mutate
 set write_max_bytes = 2048;
 query clear_apart_doc($c: Blob?) {
-    update ApartDocCleared set { content: $c, title: "cleared" } where slug = "row000"
+    $x: ApartDocCleared  $x.slug = "row000"
+    update $x set { content: $c, title: "cleared" }
 }
 
 --- params
@@ -211,7 +216,8 @@ query clear_apart_doc($c: Blob?) {
 --- mutate
 set write_max_bytes = 2048;
 query clear_shared_doc($c: Blob?) {
-    update SharedDocCleared set { content: $c, title: "cleared" } where slug = "row000"
+    $x: SharedDocCleared  $x.slug = "row000"
+    update $x set { content: $c, title: "cleared" }
 }
 
 --- params
@@ -222,8 +228,10 @@ query clear_shared_doc($c: Blob?) {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_apart_doc_in_two_statements() {
-    update ApartDocTwice set { title: "twice" } where slug = "row000"
-    update ApartDocTwice set { title: "twice" } where slug = "nobody"
+    $x: ApartDocTwice  $x.slug = "row000"
+    update $x set { title: "twice" }
+    $x: ApartDocTwice  $x.slug = "nobody"
+    update $x set { title: "twice" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -231,8 +239,10 @@ query retitle_apart_doc_in_two_statements() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_shared_doc_in_two_statements() {
-    update SharedDocTwice set { title: "twice" } where slug = "row000"
-    update SharedDocTwice set { title: "twice" } where slug = "nobody"
+    $x: SharedDocTwice  $x.slug = "row000"
+    update $x set { title: "twice" }
+    $x: SharedDocTwice  $x.slug = "nobody"
+    update $x set { title: "twice" }
 }
 
 --- expect affected: nodes=1 edges=0

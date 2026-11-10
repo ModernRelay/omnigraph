@@ -1,7 +1,7 @@
-//! Parse, print, parse again over generated edition-3 declarations
+//! Parse, print, parse again over generated declarations
 //! (docs/rfcs/2026-11-07-gq-3.md, section 10).
 //!
-//! The generator builds random read declarations from the edition-3 grammar:
+//! The generator builds random read declarations from the grammar:
 //! bindings, triples in every traversal form, filters over the arithmetic
 //! ladder and calls, `let`, `from` over inline reads, calls and `$r`, the
 //! blocks as clauses and as values, `optional`, and `return`, `order` and
@@ -19,10 +19,12 @@
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
 
-use crate::query::ast::{AggFunc, CompOp, EdgeSelector, Literal, MutationWriteMode, Traversal};
+use crate::query::file::MutationWriteMode;
 use crate::query::syntax::parse::parse_source;
 use crate::query::syntax::print::{Style, print_decl};
 use crate::query::syntax::*;
+use crate::query::syntax::{EdgeSelector, Traversal};
+use crate::query::value::{AggFunc, CompOp, Literal};
 
 const VARS: &[&str] = &["a", "b", "p", "q", "from", "let", "count", "x1"];
 const PROPS: &[&str] = &[
@@ -229,7 +231,7 @@ fn traversal() -> impl Strategy<Value = Clause> {
     )
         .prop_map(
             |(src, edge_binding, selector, undirected, (min_hops, max_hops), dst)| {
-                Clause::Traversal(TraversalEq(Traversal {
+                Clause::Traversal(Traversal {
                     src,
                     selector,
                     dst,
@@ -237,7 +239,7 @@ fn traversal() -> impl Strategy<Value = Clause> {
                     max_hops,
                     undirected,
                     edge_binding,
-                }))
+                })
             },
         )
 }
@@ -275,7 +277,7 @@ fn clause(depth: u32) -> BoxedStrategy<Clause> {
             // sits between a lone-variable filter and a `$` clause as the
             // edge of a triple; it is never Boolean.
             .prop_filter("lone non-Boolean leaf", |e| !matches!(e,
-                Expr::Ident(_) | Expr::Meta(_) | Expr::Literal(crate::query::ast::Literal::String(_))))
+                Expr::Ident(_) | Expr::Meta(_) | Expr::Literal(crate::query::value::Literal::String(_))))
             // ... and `not` over one is the brace-less `not` over that
             // triple, refused (Q014); `not` of a number is never Boolean.
             .prop_filter("a lone product of two variables", |e| {
@@ -312,7 +314,7 @@ fn bare_edge_shape(cs: &[Clause]) -> bool {
             lone(&w[0])
                 && matches!(
                     w[1],
-                    Clause::Filter(Expr::Literal(crate::query::ast::Literal::Bool(_)))
+                    Clause::Filter(Expr::Literal(crate::query::value::Literal::Bool(_)))
                 )
                 && lone(&w[2])
         })
@@ -344,6 +346,7 @@ fn read_body(depth: u32) -> BoxedStrategy<ReadBody> {
         limit,
     )
         .prop_map(|(clauses, distinct, projections, order, limit)| ReadBody {
+            spans: Default::default(),
             clauses,
             distinct,
             projections,
@@ -418,6 +421,7 @@ fn write_body() -> BoxedStrategy<WriteBody> {
             proptest::collection::vec(statement(), 1..3),
         )
             .prop_map(|(clauses, statements)| WriteGroup {
+                spans: Default::default(),
                 clauses,
                 statements,
             })
@@ -454,7 +458,7 @@ pub(crate) enum Trip {
 /// One round trip: `Ok` when the reparse is the tree (or a counted known
 /// shadow), `Err` with the text otherwise.
 pub(crate) fn round_trip(d: &Decl, style: Style) -> Result<Trip, String> {
-    let text = format!("gq 3;\n{}", print_decl(d, style));
+    let text = print_decl(d, style);
     match parse_source(&text) {
         Ok(SourceFile {
             body: Body::Decls(decls),

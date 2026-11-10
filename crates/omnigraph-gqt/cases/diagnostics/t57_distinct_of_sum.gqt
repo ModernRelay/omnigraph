@@ -1,5 +1,5 @@
 # issue: none
-# notes: The GQ edition-3 preview (`gq 3;`) refuses `distinct` inside an aggregate other than count with `T57`; nothing in the preview executes.
+# notes: The compiler refuses `distinct` inside an aggregate other than count with `T57`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,7 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-gq 3;
 query q() { match { $p: Person } return { sum(distinct $p.age) as s } }
 
 --- expect error: type error: T57:

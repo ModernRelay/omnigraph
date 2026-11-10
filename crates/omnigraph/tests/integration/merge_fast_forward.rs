@@ -883,7 +883,7 @@ async fn node_string_value(
 #[tokio::test]
 async fn three_way_merge_detects_empty_string_to_null_change() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    body: String?\n}";
-    const SET_BODY: &str = "query set_body($slug: String, $body: String) {\n    update Doc set { body: $body } where slug = $slug\n}";
+    const SET_BODY: &str = "query set_body($slug: String, $body: String) {\n    $x: Doc  $x.slug = $slug\n    update $x set { body: $body }\n}";
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
@@ -934,7 +934,7 @@ async fn three_way_merge_detects_empty_string_to_null_change() {
 #[tokio::test]
 async fn three_way_merge_detects_row_prefix_named_property_change() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    row_notes: String?\n}";
-    const SET_NOTES: &str = "query set_notes($slug: String, $notes: String) {\n    update Doc set { row_notes: $notes } where slug = $slug\n}";
+    const SET_NOTES: &str = "query set_notes($slug: String, $notes: String) {\n    $x: Doc  $x.slug = $slug\n    update $x set { row_notes: $notes }\n}";
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let main = helpers::session(Omnigraph::init(uri, SCHEMA).await.unwrap());
@@ -1669,7 +1669,8 @@ async fn fast_forward_merge_switches_blob_table_pin() {
 async fn blob_changed_only_adopt_is_a_pointer_switch() {
     const SET_NOTE: &str = r#"
 query set_note($title: String, $note: String) {
-    update Document set { note: $note } where title = $title
+    $x: Document  $x.title = $title
+    update $x set { note: $note }
 }
 "#;
 

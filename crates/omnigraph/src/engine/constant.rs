@@ -6,9 +6,10 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use datafusion::scalar::ScalarValue;
-use omnigraph_compiler::ir::{IRExpr, IROp, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::{BinaryOp, Literal};
+use omnigraph_compiler::ir::{IRExpr, ParamMap};
+use omnigraph_compiler::query::value::{BinaryOp, Literal};
 use omnigraph_compiler::types::{ExprType, ScalarType};
+use omnigraph_planner::{PatternStep, ReadShape};
 
 use crate::error::{OmniError, Result};
 
@@ -135,17 +136,17 @@ fn literal_list(values: &ArrayRef) -> Result<Literal> {
 }
 
 /// Fold bound constant filters without changing their compiler-selected types.
-pub(crate) fn fold_query_constants(ir: &QueryIR, params: &ParamMap) -> Result<QueryIR> {
+pub(crate) fn fold_query_constants(ir: &ReadShape, params: &ParamMap) -> Result<ReadShape> {
     let mut folded = ir.clone();
     fold_pipeline(&mut folded.pipeline, params)?;
     Ok(folded)
 }
 
-fn fold_pipeline(pipeline: &mut [IROp], params: &ParamMap) -> Result<()> {
+fn fold_pipeline(pipeline: &mut [PatternStep], params: &ParamMap) -> Result<()> {
     for op in pipeline {
         match op {
-            IROp::NodeScan { filters, .. }
-            | IROp::Expand {
+            PatternStep::NodeScan { filters, .. }
+            | PatternStep::Expand {
                 dst_filters: filters,
                 ..
             } => {
@@ -153,8 +154,8 @@ fn fold_pipeline(pipeline: &mut [IROp], params: &ParamMap) -> Result<()> {
                     *filter = fold_expr(filter, params)?;
                 }
             }
-            IROp::Filter(filter) => *filter = fold_expr(filter, params)?,
-            IROp::AntiJoin { inner, .. } => fold_pipeline(inner, params)?,
+            PatternStep::Filter(filter) => *filter = fold_expr(filter, params)?,
+            PatternStep::AntiJoin { inner, .. } => fold_pipeline(inner, params)?,
         }
     }
     Ok(())
@@ -256,7 +257,7 @@ mod tests {
     use super::*;
     use arrow_array::{Array, Decimal128Array, Float64Array, ListArray};
     use arrow_schema::{DataType, Field};
-    use omnigraph_compiler::query::ast::CompOp;
+    use omnigraph_compiler::query::value::CompOp;
     use omnigraph_compiler::types::PropType;
 
     fn scalar(kind: ScalarType, nullable: bool) -> ExprType {

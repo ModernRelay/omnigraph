@@ -40,14 +40,16 @@ branch create feature
 
 --- mutate branch: feature
 query feature_bob() {
-    update Person set { age: 41 } where name = "bob"
+    $x: Person  $x.name = "bob"
+    update $x set { age: 41 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query main_bob() {
-    update Person set { age: 42 } where name = "bob"
+    $x: Person  $x.name = "bob"
+    update $x set { age: 42 }
 }
 
 --- expect affected: nodes=1 edges=0

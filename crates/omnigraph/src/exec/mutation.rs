@@ -22,7 +22,7 @@ use lance_select::mask::RowAddrTreeMap;
 fn resolve_assignments(
     type_name: &str,
     schema: &Schema,
-    assignments: &[IRAssignment],
+    assignments: &[Assignment],
     params: &ParamMap,
 ) -> Result<HashMap<String, Literal>> {
     let mut resolved = HashMap::with_capacity(assignments.len());
@@ -703,8 +703,8 @@ enum WriteRoute {
 impl WriteRoute {
     /// Whether lowering, which parses the declaration again, read the mode
     /// the route was resolved from.
-    fn agrees_with(&self, mode: &omnigraph_compiler::query::ast::MutationWriteMode) -> bool {
-        use omnigraph_compiler::query::ast::MutationWriteMode;
+    fn agrees_with(&self, mode: &omnigraph_compiler::query::file::MutationWriteMode) -> bool {
+        use omnigraph_compiler::query::file::MutationWriteMode;
         matches!(
             (self, mode),
             (Self::Publish, MutationWriteMode::Publish)
@@ -742,10 +742,10 @@ impl WriteRoute {
 /// The base id an `on` operand names: the literal as written, or the
 /// `String` value of the named parameter.
 fn unattached_base_id(
-    base: &omnigraph_compiler::query::ast::UnattachedBase,
+    base: &omnigraph_compiler::query::file::UnattachedBase,
     params: &ParamMap,
 ) -> Result<String> {
-    use omnigraph_compiler::query::ast::UnattachedBase;
+    use omnigraph_compiler::query::file::UnattachedBase;
     match base {
         UnattachedBase::Literal(id) => Ok(id.clone()),
         UnattachedBase::Param(name) => match params.get(name) {
@@ -878,17 +878,15 @@ fn dedup_delete_filter(base: &Expr, prior: &[Expr]) -> Expr {
 /// instead demand an in-query delete view, pending pruning, and per-table
 /// two-commit ordering in the hot mutation path — complexity this boundary
 /// deliberately avoids.
-fn enforce_no_mixed_destructive_constructive(
-    ir: &omnigraph_compiler::ir::MutationIR,
-) -> Result<()> {
+fn enforce_no_mixed_destructive_constructive(ir: &super::write_plan::WritePlan) -> Result<()> {
     let mut has_constructive = false;
     let mut has_delete = false;
     for op in &ir.ops {
         match op {
-            MutationOpIR::Insert { .. } | MutationOpIR::Update { .. } => {
+            WriteOp::Insert { .. } | WriteOp::Update { .. } => {
                 has_constructive = true;
             }
-            MutationOpIR::Delete { .. } => {
+            WriteOp::Delete { .. } => {
                 has_delete = true;
             }
         }
@@ -1090,9 +1088,6 @@ impl Session {
     ) -> Result<crate::MutationReceipt> {
         let decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(query_lookup_error)?;
-        if decl.syntax.is_some() {
-            return Err(super::unlowered_refusal(&self.catalog(), &decl));
-        }
         let (route, branch) = self
             .resolve_write_route(&decl.write_mode, branch, params, actor_id)
             .await?;
@@ -1117,12 +1112,12 @@ impl Session {
     /// write addresses its base's recorded target, a denial masked as not found.
     async fn resolve_write_route(
         &self,
-        mode: &omnigraph_compiler::query::ast::MutationWriteMode,
+        mode: &omnigraph_compiler::query::file::MutationWriteMode,
         branch: Option<&str>,
         params: &ParamMap,
         actor_id: Option<&str>,
     ) -> Result<(WriteRoute, String)> {
-        use omnigraph_compiler::query::ast::MutationWriteMode;
+        use omnigraph_compiler::query::file::MutationWriteMode;
         let base = match mode {
             MutationWriteMode::Publish => {
                 let branch = branch.unwrap_or("main");
@@ -1419,10 +1414,7 @@ impl Omnigraph {
         // pre-effect authority mismatch. Update/Delete keep strict caller-visible
         // `ReadSetChanged`; replaying their stale read-modify-write plan would be
         // a semantic rebase rather than a fresh execution contract.
-        *retryable = ir
-            .ops
-            .iter()
-            .all(|op| matches!(op, MutationOpIR::Insert { .. }));
+        *retryable = ir.ops.iter().all(|op| matches!(op, WriteOp::Insert { .. }));
 
         let exec_result = self
             .execute_named_mutation(
@@ -1585,24 +1577,20 @@ impl Omnigraph {
         catalog: &omnigraph_compiler::catalog::Catalog,
         query_source: &str,
         query_name: &str,
-    ) -> Result<omnigraph_compiler::ir::MutationIR> {
+    ) -> Result<super::write_plan::WritePlan> {
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(query_lookup_error)?;
 
-        if query_decl.syntax.is_some() {
-            return Err(super::unlowered_refusal(catalog, &query_decl));
-        }
-        let checked = typecheck_query_decl(catalog, &query_decl)?;
-        let mutation_ctx = match checked {
-            CheckedQuery::Mutation(ctx) => ctx,
-            CheckedQuery::Read(_) | CheckedQuery::Core(_) => {
+        let ir = match omnigraph_compiler::query::check::check_query_decl(catalog, &query_decl)? {
+            omnigraph_compiler::ir::core::CoreDecl::Write(write) => {
+                super::write_plan::WritePlan::of(&write)?
+            }
+            omnigraph_compiler::ir::core::CoreDecl::Read(_) => {
                 return Err(OmniError::manifest(
                     "mutation execution called on a read query; use query instead".to_string(),
                 ));
             }
         };
-
-        let ir = lower_mutation_query(catalog, &mutation_ctx)?;
         // D₂: reject mixed insert/update + delete before any I/O.
         enforce_no_mixed_destructive_constructive(&ir)?;
         Ok(ir)
@@ -1610,7 +1598,7 @@ impl Omnigraph {
 
     async fn execute_named_mutation(
         &self,
-        ir: &omnigraph_compiler::ir::MutationIR,
+        ir: &super::write_plan::WritePlan,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
@@ -1623,15 +1611,15 @@ impl Omnigraph {
         // table can join it in the one keyed write the table stages.
         let mut writes_per_node_type: HashMap<&str, usize> = HashMap::new();
         for op in &ir.ops {
-            if let MutationOpIR::Insert {
+            if let WriteOp::Insert {
                 target: MutationTarget::Node { type_name },
                 ..
             }
-            | MutationOpIR::Update {
+            | WriteOp::Update {
                 target: MutationTarget::Node { type_name },
                 ..
             }
-            | MutationOpIR::Delete {
+            | WriteOp::Delete {
                 target: MutationTarget::Node { type_name },
                 ..
             } = op
@@ -1639,16 +1627,28 @@ impl Omnigraph {
                 *writes_per_node_type.entry(type_name.as_str()).or_default() += 1;
             }
         }
+        // The rows the group's last `update` or `delete` matched: an insert
+        // in a group with clauses runs once per row.
+        let mut matched = 0u64;
         for op in &ir.ops {
             let result = match op {
-                MutationOpIR::Insert {
+                WriteOp::Insert {
                     target,
                     assignments,
+                    per_row,
                 } => {
-                    self.execute_insert(target, assignments, params, branch, staging, txn)
-                        .await?
+                    let times = if *per_row { matched } else { 1 };
+                    let mut result = MutationResult::default();
+                    for _ in 0..times {
+                        let one = self
+                            .execute_insert(target, assignments, params, branch, staging, txn)
+                            .await?;
+                        result.affected_nodes += one.affected_nodes;
+                        result.affected_edges += one.affected_edges;
+                    }
+                    result
                 }
-                MutationOpIR::Update {
+                WriteOp::Update {
                     target,
                     assignments,
                     predicate,
@@ -1675,11 +1675,14 @@ impl Omnigraph {
                     )
                     .await?
                 }
-                MutationOpIR::Delete { target, predicate } => {
+                WriteOp::Delete { target, predicate } => {
                     self.execute_delete(target, predicate, params, branch, staging, txn)
                         .await?
                 }
             };
+            if !matches!(op, WriteOp::Insert { .. }) {
+                matched = (result.affected_nodes + result.affected_edges) as u64;
+            }
             total.affected_nodes += result.affected_nodes;
             total.affected_edges += result.affected_edges;
         }
@@ -1689,7 +1692,7 @@ impl Omnigraph {
     async fn execute_insert(
         &self,
         target: &MutationTarget,
-        assignments: &[IRAssignment],
+        assignments: &[Assignment],
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
@@ -1871,7 +1874,7 @@ impl Omnigraph {
     async fn execute_update(
         &self,
         target: &MutationTarget,
-        assignments: &[IRAssignment],
+        assignments: &[Assignment],
         predicate: &IRExpr,
         params: &ParamMap,
         branch: Option<&str>,
@@ -2422,7 +2425,7 @@ async fn delete_key_id_conjunct(
     };
     let mut derived = None;
     for conjunct in predicate.clone().into_conjuncts() {
-        let Some((left, omnigraph_compiler::query::ast::CompOp::Eq, right)) =
+        let Some((left, omnigraph_compiler::query::value::CompOp::Eq, right)) =
             conjunct.comparison_parts()
         else {
             continue;
@@ -2613,10 +2616,11 @@ mod literal_narrowing_tests {
 #[cfg(test)]
 mod target_tests {
     use super::*;
+    use crate::exec::write_plan::{Assignment, WritePlan};
     use crate::loader::LoadMode;
+    use omnigraph_compiler::ir::IRExpr;
     use omnigraph_compiler::ir::coerce;
-    use omnigraph_compiler::ir::{IRAssignment, IRExpr, MutationIR};
-    use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
+    use omnigraph_compiler::query::value::{BinaryOp, CompOp, Literal};
     use omnigraph_compiler::settings::SessionSettings;
     use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 
@@ -2656,7 +2660,7 @@ edge Shared: Endpoint -> Endpoint { label: String }
         };
         let string_type = || ExprType::from_prop(&PropType::scalar(ScalarType::String, false));
         let string = |text: &str| IRExpr::Literal(Literal::String(text.into()), string_type());
-        let assignment = |property: &str, text: &str| IRAssignment {
+        let assignment = |property: &str, text: &str| Assignment {
             property: property.into(),
             value: string(text),
         };
@@ -2672,26 +2676,27 @@ edge Shared: Endpoint -> Endpoint { label: String }
             )
             .unwrap()
         };
-        let mutation = |op: MutationOpIR| MutationIR {
+        let mutation = |op: WriteOp| WritePlan {
             name: "q".into(),
             params: Vec::new(),
             ops: vec![op],
-            write_mode: omnigraph_compiler::query::ast::MutationWriteMode::Publish,
+            write_mode: omnigraph_compiler::query::file::MutationWriteMode::Publish,
         };
         for (ir, is_insert) in [
             (
-                mutation(MutationOpIR::Insert {
+                mutation(WriteOp::Insert {
                     target: target.clone(),
                     assignments: vec![
                         assignment("from", "a"),
                         assignment("to", "b"),
                         assignment("label", "new"),
                     ],
+                    per_row: false,
                 }),
                 true,
             ),
             (
-                mutation(MutationOpIR::Delete {
+                mutation(WriteOp::Delete {
                     target: target.clone(),
                     predicate: label_is("existing"),
                 }),
@@ -2699,7 +2704,7 @@ edge Shared: Endpoint -> Endpoint { label: String }
             ),
         ] {
             let retained = match &ir.ops[0] {
-                MutationOpIR::Insert { target, .. } | MutationOpIR::Delete { target, .. } => target,
+                WriteOp::Insert { target, .. } | WriteOp::Delete { target, .. } => target,
                 other => panic!("unexpected operation: {other:?}"),
             };
             assert_eq!(retained, &target);
@@ -2729,12 +2734,12 @@ edge Shared: Endpoint -> Endpoint { label: String }
             }
         }
 
-        let ir = mutation(MutationOpIR::Update {
+        let ir = mutation(WriteOp::Update {
             target: target.clone(),
             assignments: vec![assignment("label", "changed")],
             predicate: label_is("existing"),
         });
-        let MutationOpIR::Update {
+        let WriteOp::Update {
             target: retained, ..
         } = &ir.ops[0]
         else {

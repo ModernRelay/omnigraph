@@ -1,4 +1,4 @@
-//! The foreign-habit table of the edition-3 front end
+//! The foreign-habit table of the query front end
 //! (docs/rfcs/2026-11-07-gq-3.md, section 5).
 //!
 //! Some habits an agent brings from other languages are lexical: a grammar
@@ -17,7 +17,7 @@ use pest::Parser;
 
 use super::parse::{Refusal, apply_edits, refusal, refusal_note};
 use super::{QueryParser, Rule};
-use crate::query::codes::{Q014, Q015};
+use crate::query::codes::{Q012, Q014, Q015};
 use crate::query::diagnostic::{Applicability, QueryCode, TextEdit};
 
 /// Words an uppercase spelling of which is lowercased: GQ's own keywords and
@@ -430,16 +430,31 @@ fn later_word(input: &str, start: usize, end: usize, prev: u8, depth: i32) -> Op
                 }),
             ))
         }
-        "gq" if start > 0
-            && input[..start].contains(';')
-            && after.starts_with(|c: char| c.is_ascii_digit()) =>
+        // SQL's `union` between two reads: GQ draws the union of two
+        // relations with the `union` relation function.
+        "union"
+            if depth == 1
+                && input[..start].trim_end().ends_with('}')
+                && after.starts_with("match") =>
+        {
+            Some(Habit {
+                code: Q014,
+                note: "match { from union({ match { … } return { $x } }, { match { … } return { $x } }) } return { $x }".into(),
+                ..note(
+                    "`union` between two reads is SQL's; GQ draws the union of two reads with `from union({ … }, { … })`",
+                    None,
+                )
+            })
+        }
+        "gq" if after.starts_with(|c: char| c.is_ascii_digit()) =>
         {
             let semi = end + input[end..].find(';')? + 1;
             let semi = semi + (input[semi..].len() - input[semi..].trim_start().len());
             Some(Habit {
                 span: (start, semi),
+                code: Q012,
                 ..note(
-                    "the edition line appears once, first in the file",
+                    "a source has no edition line; delete it",
                     Some(TextEdit {
                         start,
                         end: semi,
@@ -562,22 +577,22 @@ impl Tracked {
 /// The innermost clause, item, key, statement or assignment of `text` that
 /// holds byte `pos`.
 fn construct_at(text: &str, pos: usize) -> Option<(usize, usize)> {
-    let pairs = QueryParser::parse(Rule::query_file3, text).ok()?;
+    let pairs = QueryParser::parse(Rule::query_file, text).ok()?;
     let mut best: Option<(usize, usize)> = None;
     for p in pairs.flatten() {
         if !matches!(
             p.as_rule(),
-            Rule::clause3
-                | Rule::projection3
-                | Rule::ordering3
-                | Rule::mutation_stmt3
-                | Rule::assignment3
-                | Rule::alias3
-                | Rule::param3
-                | Rule::annotation3
-                | Rule::limit_clause3
-                | Rule::return_clause3
-                | Rule::match_clause3
+            Rule::clause
+                | Rule::projection
+                | Rule::ordering
+                | Rule::mutation_stmt
+                | Rule::assignment
+                | Rule::alias
+                | Rule::param
+                | Rule::annotation
+                | Rule::limit_clause
+                | Rule::return_clause
+                | Rule::match_clause
         ) {
             continue;
         }

@@ -117,7 +117,7 @@ fn served_identity_axes_and_read_only_suffix_are_enforced() {
             "omnigraph-server has no door for step 4 (restart)",
         ),
         (
-            "\n--- mutate\nquery write() { delete Person where name = \"added\" }\n--- expect affected: nodes=0 edges=0\n".to_string(),
+            "\n--- mutate\nquery write() { $x: Person  $x.name = \"added\"  delete $x }\n--- expect affected: nodes=0 edges=0\n".to_string(),
             "step 4 (mutate) advances a branch head; reset:none admits a served write only as an unpublished commit",
         ),
         (
@@ -1372,7 +1372,7 @@ val: I64
 #[test]
 fn served_admission_rejects_loop_writes_and_wrong_environment() {
     let p = plan("e2e-query-count-served");
-    let suffix = "\n--- loop $i 0 2\n--- mutate\nquery write() { delete Person where name = \"added\" }\n--- expect affected: nodes=0 edges=0\n--- endloop\n";
+    let suffix = "\n--- loop $i 0 2\n--- mutate\nquery write() { $x: Person  $x.name = \"added\"  delete $x }\n--- expect affected: nodes=0 edges=0\n--- endloop\n";
     let text = format!("{}{suffix}", p.queries.text);
     let parsed = omnigraph_gqt_core::parse_case("served_loop_write", &text).unwrap();
     let error = admit_target_queries(

@@ -24,7 +24,7 @@ query refused_0() {
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `search` is a search predicate; it must stand alone as a filter clause
 
 --- query
 set engine = v2;
@@ -33,7 +33,7 @@ query refused_1() {
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `search` is a search predicate; it must stand alone as a filter clause
 
 --- query
 set engine = v2;
@@ -42,7 +42,7 @@ query refused_2() {
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `search` is a search predicate; it must stand alone as a filter clause
 
 --- query
 set engine = v2;
@@ -54,7 +54,7 @@ query refused_3($enabled: Bool) {
 --- params
 {"enabled":true}
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `search` is a search predicate; it must stand alone as a filter clause
 
 --- query
 set engine = v2;
@@ -63,7 +63,7 @@ query refused_4() {
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `search` is a search predicate; it must stand alone as a filter clause
 
 --- query
 set engine = v2;
@@ -72,7 +72,7 @@ query refused_5() {
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `match_text` is a search predicate; it must stand alone as a filter clause
 
 --- query
 set engine = v2;
@@ -81,7 +81,7 @@ query refused_6() {
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `fuzzy` is a search predicate; it must stand alone as a filter clause
 
 --- query
 set engine = v2;

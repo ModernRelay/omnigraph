@@ -106,17 +106,17 @@ impl ProjectionContext {
 }
 
 #[cfg(test)]
-pub(super) fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String, String>) {
+pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<String, String>) {
     for op in pipeline {
         match op {
-            IROp::NodeScan {
+            PatternStep::NodeScan {
                 variable,
                 type_name,
                 filters: _,
             } => {
                 out.insert(variable.clone(), type_name.clone());
             }
-            IROp::Expand {
+            PatternStep::Expand {
                 src_var: _,
                 dst_var,
                 edges: _,
@@ -129,8 +129,8 @@ pub(super) fn collect_node_bindings(pipeline: &[IROp], out: &mut HashMap<String,
             } => {
                 out.insert(dst_var.clone(), dst_type.clone());
             }
-            IROp::Filter(_) => {}
-            IROp::AntiJoin {
+            PatternStep::Filter(_) => {}
+            PatternStep::AntiJoin {
                 outer_var: _,
                 inner,
                 predicate: _,

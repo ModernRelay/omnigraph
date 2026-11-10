@@ -22,12 +22,12 @@ node Doc {
 --- query
 set engine = v2;
 query filtered_rank($t: String, $q: String) {
-    match {
+    match { from bm25({ match {
         $d: Doc
         search($d.title, $t)
-    }
+    } return { $d } }, $d.body, $q) }
     return { $d.slug }
-    order { bm25($d.body, $q) }
+    order { $score desc }
     limit 5
 }
 

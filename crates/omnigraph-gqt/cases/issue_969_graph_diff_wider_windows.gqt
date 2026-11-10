@@ -47,14 +47,16 @@ query mark() {
 
 --- mutate
 query alice_ages() {
-    update Person set { age: 31 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query alice_ages_again() {
-    update Person set { age: 32 } where name = "alice"
+    $x: Person  $x.name = "alice"
+    update $x set { age: 32 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -68,14 +70,16 @@ query erin_arrives() {
 
 --- mutate
 query dave_leaves() {
-    delete Person where name = "dave"
+    $x: Person  $x.name = "dave"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query carol_leaves() {
-    delete Person where name = "carol"
+    $x: Person  $x.name = "carol"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
@@ -127,7 +131,8 @@ branch create sibling_b
 
 --- mutate branch: sibling_a
 query erin_ages_on_a() {
-    update Person set { age: 26 } where name = "erin"
+    $x: Person  $x.name = "erin"
+    update $x set { age: 26 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -136,7 +141,8 @@ query erin_ages_on_a() {
 
 --- mutate branch: sibling_b
 query erin_ages_on_b() {
-    update Person set { age: 27 } where name = "erin"
+    $x: Person  $x.name = "erin"
+    update $x set { age: 27 }
 }
 
 --- expect affected: nodes=1 edges=0

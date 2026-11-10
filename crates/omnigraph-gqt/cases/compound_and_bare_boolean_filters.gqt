@@ -38,9 +38,9 @@ p.slug: String
 
 --- query
 query leading_nearest_runs($q: Vector(2)) {
-    match { $p: Person  $p.enabled = true }
+    match { from nearest({ match { $p: Person  $p.enabled = true } return { $p } }, $p.embedding, $q, k: 1) }
     return { $p.slug }
-    order { nearest($p.embedding, $q) }
+    order { $distance }
     limit 1
 }
 
@@ -108,11 +108,12 @@ query type_fault_inside_compound() {
     return { $p.slug }
 }
 
---- expect error: T41: `and` needs Bool operands, got Bool and String
+--- expect error: T41: a filter needs a Bool, got String
 
 --- mutate
 query compound_where_runs($cut: I64) {
-    update Person set { enabled: false } where age < $cut or name = "carol"
+    $x: Person  $x.age < $cut or $x.name = "carol"
+    update $x set { enabled: false }
 }
 
 --- params

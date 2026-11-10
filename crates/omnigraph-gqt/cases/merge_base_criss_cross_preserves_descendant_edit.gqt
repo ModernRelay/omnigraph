@@ -34,14 +34,16 @@ branch create right;
 
 --- mutate branch: left
 query left_first() {
-    update Person set { age: 1 } where age = 0
+    $x: Person  $x.age = 0
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=2 edges=0
 
 --- mutate branch: right
 query right_first() {
-    update Person set { age: 1 } where age = 0
+    $x: Person  $x.age = 0
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=2 edges=0
@@ -68,7 +70,8 @@ branch merge left_old into right;
 
 --- mutate branch: right
 query right_later() {
-    update Person set { age: 7 } where name = "a"
+    $x: Person  $x.name = "a"
+    update $x set { age: 7 }
 }
 
 --- expect affected: nodes=1 edges=0

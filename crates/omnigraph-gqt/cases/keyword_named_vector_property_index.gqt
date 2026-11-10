@@ -23,9 +23,9 @@ node Doc {
 
 --- query
 query nearest_by_keyword_property($q: Vector(2)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.trim, $q, k: 2) }
     return { $d.slug }
-    order { nearest($d.trim, $q) }
+    order { $distance }
     limit 2
 }
 

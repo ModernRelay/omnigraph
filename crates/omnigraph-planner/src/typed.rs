@@ -2,7 +2,7 @@
 //! types are declarations carried by the IR, including explicit conversions.
 
 use omnigraph_compiler::ir::{BlockAggregateExpr, IRExpr, IRProjection};
-use omnigraph_compiler::query::ast::BinaryOp;
+use omnigraph_compiler::query::value::BinaryOp;
 use serde_json::{Value, json};
 
 use crate::logical::Predicate;
@@ -160,7 +160,7 @@ pub(crate) fn block_aggregate(
 mod tests {
     use super::*;
     use crate::logical::GqFilter;
-    use omnigraph_compiler::query::ast::{CompOp, Literal};
+    use omnigraph_compiler::query::value::{CompOp, Literal};
     use omnigraph_compiler::{ExprType, PropType, ScalarType};
 
     fn ty(scalar: ScalarType, nullable: bool) -> ExprType {

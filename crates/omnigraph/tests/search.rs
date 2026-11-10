@@ -9,7 +9,7 @@ use serial_test::serial;
 use omnigraph::Session;
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::LoadMode;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::result::QueryResult;
 
 use helpers::*;
@@ -26,37 +26,37 @@ node Doc {
 "#;
 const MOCK_SEARCH_QUERIES: &str = r#"
 query vector_search_vector($q: Vector(4)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 3) }
     return { $d.slug, $d.title }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 
 query vector_search_string($q: String) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 3) }
     return { $d.slug, $d.title }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 
 query vector_search_literal() {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, "alpha", k: 3) }
     return { $d.slug, $d.title }
-    order { nearest($d.embedding, "alpha") }
+    order { $distance }
     limit 3
 }
 
 query hybrid_search_vector($vq: Vector(4), $tq: String) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $vq, k: 3), bm25($all, $d.title, $tq), k: 60) $d: Doc }
     return { $d.slug, $d.title }
-    order { rrf(nearest($d.embedding, $vq), bm25($d.title, $tq)) }
+    order { $score desc }
     limit 3
 }
 
 query hybrid_search_string($vq: String, $tq: String) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $vq, k: 3), bm25($all, $d.title, $tq), k: 60) $d: Doc }
     return { $d.slug, $d.title }
-    order { rrf(nearest($d.embedding, $vq), bm25($d.title, $tq)) }
+    order { $score desc }
     limit 3
 }
 "#;
@@ -107,32 +107,32 @@ const RANKED_EDGE_DATA: &str = r#"{"type":"RankedDoc","data":{"slug":"rank-1","e
 
 const RANKED_EDGE_QUERIES: &str = r#"
 query nearest_edges($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: RankedDoc
         $d $w:rankedLink $target
-    }
+    } return { $d, $w, $target } }, $d.embedding, $q, k: 4) }
     return { $d.slug, $w.label }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 4
 }
 
 query rrf_edges($q1: Vector(4), $q2: Vector(4)) {
-    match {
+    match { let $all = { match { $d: RankedDoc } return { $d } }  from rrf(nearest($all, $d.embedding, $q1, k: 4), nearest($all, $d.embedding, $q2, k: 4), k: 60)
         $d: RankedDoc
         $d $w:rankedLink $target
     }
     return { $d.slug, $w.label }
-    order { rrf(nearest($d.embedding, $q1), nearest($d.embedding, $q2)) }
+    order { $score desc }
     limit 4
 }
 
 query nearest_hops($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: RankedDoc
         $d rankedLink{1,2} $target
-    }
+    } return { $d, $target } }, $d.embedding, $q, k: 2) }
     return { $d.slug, $target.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 2
 }
 "#;
@@ -157,25 +157,24 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 
 const UNDERFILL_AGG_QUERY: &str = r#"
 query recall_count($q: String) {
-    match {
+    match { from bm25({ match {
         $c: Chunk
         search($c.text, $q)
-    }
+    } return { $c } }, $c.text, $q) }
     return { count($c) as total }
-    order { bm25($c.text, $q) }
     limit 2
 }
 "#;
 
 const UNDERFILL_RRF_QUERY: &str = r#"
 query recall_rrf($q: String) {
-    match {
+    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q), bm25($all, $c.text, "needle needle"), k: 60)
         $c: Chunk
         $c chunkOfArtifact $a
         search($c.text, $q)
     }
     return { $c.slug, $a.slug }
-    order { rrf(bm25($c.text, $q), bm25($c.text, $q)) }
+    order { $score desc }
     limit 2
 }
 "#;
@@ -449,64 +448,64 @@ const ISSUE_567_FAR_QUERY: [f32; 4] = [13_300.0, 0.0, 0.0, 0.0];
 #[cfg(feature = "failpoints")]
 const ISSUE_567_QUERIES: &str = r#"
 query filtered_nearest($q: Vector(4)) {
-    match { $d: Doc { keep: true } }
+    match { from nearest({ match { $d: Doc { keep: true } } return { $d } }, $d.embedding, $q, k: 10) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 10
 }
 
 query rrf_all($q: Vector(4)) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 17000), nearest($all, $d.embedding, [0.0, 0.0, 0.0, 0.0], k: 17000), k: 60) $d: Doc }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $q)) }
+    order { $score desc }
     limit 17000
 }
 
 query nearest_friends($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: Doc
         $d knows $t
-    }
+    } return { $d, $t } }, $d.embedding, $q, k: 10) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 10
 }
 
 query nearest_all($q: Vector(4)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 10) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 10
 }
 
 query rrf_keep($q: Vector(4)) {
-    match { $d: Doc { keep: true } }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 10), nearest($all, $d.embedding, [0.0, 0.0, 0.0, 0.0], k: 10), k: 60) $d: Doc { keep: true } }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $q)) }
+    order { $score desc }
     limit 10
 }
 
 query nearest_far_friends($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: Doc
         $d far $t
-    }
+    } return { $d, $t } }, $d.embedding, $q, k: 10) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 10
 }
 
 query nearest_far_flag($q: Vector(4)) {
-    match { $d: Doc { far: true } }
+    match { from nearest({ match { $d: Doc { far: true } } return { $d } }, $d.embedding, $q, k: 10) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 10
 }
 
 query nearest_all_17000($q: Vector(4)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 17000) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 17000
 }
 "#;
@@ -595,7 +594,8 @@ edge Far: Doc -> Doc {
 "#;
     let delete_query = r#"
 query delete_middle() {
-    delete Doc where drop = true
+    $x: Doc  $x.drop = true
+    delete $x
 }
 "#;
     let db = session(Omnigraph::init(uri, schema).await.unwrap());
@@ -1246,9 +1246,9 @@ node Doc {
 "#;
     let queries = r#"
 query nearest_all($q: Vector(4)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 5000) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 5000
 }
 "#;
@@ -1327,9 +1327,9 @@ node Doc {
 "#;
     let queries = r#"
 query nearest_all($q: Vector(4)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 10) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 10
 }
 "#;
@@ -1404,22 +1404,21 @@ edge Knows: Doc -> Doc {
 
 const ISSUE_567_LINE_QUERIES: &str = r#"
 query nearest_friends($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: Doc
         $d knows $t
-    }
+    } return { $d, $t } }, $d.embedding, $q, k: 10) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 10
 }
 
 query nearest_friends_count($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: Doc
         $d knows $t
-    }
+    } return { $d, $t } }, $d.embedding, $q, k: 10) }
     return { count($d) as total }
-    order { nearest($d.embedding, $q) }
     limit 10
 }
 "#;
@@ -1862,9 +1861,9 @@ node Doc {
     let query = format!(
         r#"
 query ranked($q: Vector(4)) {{
-    match {{ $d: Doc }}
+    match {{ from nearest({{ match {{ $d: Doc }} return {{ $d }} }}, $d.embedding, $q, k: {LIMIT}) }}
     return {{ $d.slug }}
-    order {{ nearest($d.embedding, $q) }}
+    order {{ $distance }}
     limit {LIMIT}
 }}
 "#
@@ -2271,7 +2270,7 @@ async fn rrf_arms_scan_uncapped_in_one_pass() {
         "both rrf arms must scan every matching document in one pass"
     );
 
-    // Both arms rank identically (same bm25 expression), so fusion preserves
+    // Both arms rank identically (the second repeats the term), so fusion preserves
     // the tf order: the best-scoring edge-bearing chunks are 08 then 09.
     assert_eq!(
         result_slugs(&result),
@@ -2288,22 +2287,22 @@ async fn rrf_arms_scan_uncapped_in_one_pass() {
 async fn capped_bm25_matches_uncapped_prefix_on_partially_covered_index() {
     const PREFIX_QUERIES: &str = r#"
 query capped($q: String) {
-    match {
+    match { from bm25({ match {
         $c: Chunk
         search($c.text, $q)
-    }
+    } return { $c } }, $c.text, $q) }
     return { $c.slug }
-    order { bm25($c.text, $q) }
+    order { $score desc }
     limit 2
 }
 
 query uncapped_all($q: String) {
-    match {
+    match { from bm25({ match {
         $c: Chunk
         search($c.text, $q)
-    }
+    } return { $c } }, $c.text, $q) }
     return { $c.slug }
-    order { bm25($c.text, $q) }
+    order { $score desc }
 }
 "#;
     let dir = tempfile::tempdir().unwrap();
@@ -2926,9 +2925,9 @@ async fn a_full_text_index_with_no_segment_refuses_the_call_issue_747() {
 #[cfg(feature = "failpoints")]
 const ISSUE_1297_QUERIES: &str = r#"
 query nearest_scored($q: Vector(2)) {
-    match { $d: Doc }
-    return { $d.slug, nearest($d.embedding, $q) as distance }
-    order { nearest($d.embedding, $q) }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 10) }
+    return { $d.slug, $distance as distance }
+    order { $distance }
     limit 10
 }
 "#;

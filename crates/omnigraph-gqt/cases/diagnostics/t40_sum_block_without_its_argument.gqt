@@ -1,5 +1,5 @@
 # issue: none
-# notes: The GQ edition-3 preview (`gq 3;`) refuses a `sum` block without its argument with `T40`; nothing in the preview executes.
+# notes: The compiler refuses a `sum` block without its argument with `T40`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,7 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-gq 3;
 query q() { match { $p: Person  sum { $p knows $q } > 0 } return { $p.name } }
 
 --- expect error: type error: T40:

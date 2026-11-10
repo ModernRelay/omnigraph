@@ -27,9 +27,9 @@ node Doc {
 
 --- query
 query nearest_then_alias($q: Vector(4)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 10) }
     return { $d.slug, $d.name as name }
-    order { nearest($d.embedding, $q), name desc }
+    order { $distance, name desc }
     limit 10
 }
 

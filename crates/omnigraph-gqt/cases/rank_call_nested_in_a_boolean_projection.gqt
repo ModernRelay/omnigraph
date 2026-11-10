@@ -23,9 +23,9 @@ node Doc {
 --- query
 set engine = v2;
 query bm25_threshold($q: String) {
-    match { $d: Doc }
-    return { $d.slug, bm25($d.text, $q) > 0.0 as hit }
-    order { bm25($d.text, $q) desc }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $q) }
+    return { $d.slug, $score > 0.0 as hit }
+    order { $score desc }
     limit 2
 }
 
@@ -43,9 +43,9 @@ hit: Bool
 --- query
 set engine = v2;
 query nearest_threshold($v: Vector(2)) {
-    match { $d: Doc }
-    return { $d.slug, nearest($d.embedding, $v) < 1.0 as close }
-    order { nearest($d.embedding, $v) }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2) }
+    return { $d.slug, $distance < 1.0 as close }
+    order { $distance }
     limit 2
 }
 
@@ -63,9 +63,9 @@ close: Bool
 --- query
 set engine = v2;
 query nearest_threshold_expression($v: Vector(2)) {
-    match { $d: Doc }
-    return { $d.slug, nearest($d.embedding, $v) < 1.0 as close }
-    order { nearest($d.embedding, $v), (nearest($d.embedding, $v) < 1.0) asc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2) }
+    return { $d.slug, $distance < 1.0 as close }
+    order { $distance, ($distance < 1.0) asc }
     limit 2
 }
 
@@ -83,9 +83,9 @@ close: Bool
 --- query
 set engine = v2;
 query nearest_threshold_alias($v: Vector(2)) {
-    match { $d: Doc }
-    return { $d.slug, nearest($d.embedding, $v) < 1.0 as close }
-    order { nearest($d.embedding, $v), close asc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2) }
+    return { $d.slug, $distance < 1.0 as close }
+    order { $distance, close asc }
     limit 2
 }
 
@@ -103,9 +103,9 @@ close: Bool
 --- query
 set engine = v2;
 query bm25_threshold_expression($q: String) {
-    match { $d: Doc }
-    return { $d.slug, bm25($d.text, $q) > 0.18 as hit }
-    order { bm25($d.text, $q) desc, (bm25($d.text, $q) > 0.18) asc }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $q) }
+    return { $d.slug, $score > 0.18 as hit }
+    order { $score desc, ($score > 0.18) asc }
     limit 2
 }
 
@@ -123,9 +123,9 @@ hit: Bool
 --- query
 set engine = v2;
 query bm25_threshold_alias($q: String) {
-    match { $d: Doc }
-    return { $d.slug, bm25($d.text, $q) > 0.18 as hit }
-    order { bm25($d.text, $q) desc, hit asc }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $q) }
+    return { $d.slug, $score > 0.18 as hit }
+    order { $score desc, hit asc }
     limit 2
 }
 
@@ -143,9 +143,9 @@ hit: Bool
 --- query
 set engine = v2;
 query rrf_threshold_expression($v: Vector(2), $q: String) {
-    match { $d: Doc }
-    return { $d.slug, rrf(nearest($d.embedding, $v), bm25($d.text, $q)) > 0.0325 as high }
-    order { rrf(nearest($d.embedding, $v), bm25($d.text, $q)), (rrf(nearest($d.embedding, $v), bm25($d.text, $q)) > 0.0325) asc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, $q), k: 60) $d: Doc }
+    return { $d.slug, $score > 0.0325 as high }
+    order { $score desc, ($score > 0.0325) asc }
     limit 2
 }
 
@@ -163,9 +163,9 @@ high: Bool
 --- query
 set engine = v2;
 query rrf_threshold_alias($v: Vector(2), $q: String) {
-    match { $d: Doc }
-    return { $d.slug, rrf(nearest($d.embedding, $v), bm25($d.text, $q)) > 0.0325 as high }
-    order { rrf(nearest($d.embedding, $v), bm25($d.text, $q)), high asc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, $q), k: 60) $d: Doc }
+    return { $d.slug, $score > 0.0325 as high }
+    order { $score desc, high asc }
     limit 2
 }
 
@@ -183,20 +183,20 @@ high: Bool
 --- query
 set engine = v2;
 query recursive_rank_keys($v: Vector(2)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2) }
     return {
         $d.slug,
-        not (nearest($d.embedding, $v) < 1.0) as far,
-        nearest($d.embedding, $v) is null as missing,
-        nearest($d.embedding, $v) in [0.0] as exact,
-        nearest($d.embedding, $v) < 1.0 and $d.n > 5 as eligible
+        not ($distance < 1.0) as far,
+        $distance is null as missing,
+        $distance in [0.0] as exact,
+        $distance < 1.0 and $d.n > 5 as eligible
     }
     order {
-        nearest($d.embedding, $v),
-        (not (nearest($d.embedding, $v) < 1.0)) desc,
-        (nearest($d.embedding, $v) is null) desc,
-        (nearest($d.embedding, $v) in [0.0]) asc,
-        (nearest($d.embedding, $v) < 1.0 and $d.n > 5) asc
+        $distance,
+        (not ($distance < 1.0)) desc,
+        ($distance is null) desc,
+        ($distance in [0.0]) asc,
+        ($distance < 1.0 and $d.n > 5) asc
     }
     limit 2
 }

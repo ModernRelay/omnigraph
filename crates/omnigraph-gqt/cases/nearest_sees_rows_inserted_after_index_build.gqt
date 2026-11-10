@@ -45,9 +45,9 @@ query insert_doc($s: String, $n: I64, $nm: String, $e: Vector(4)) {
 
 --- query
 query nearest_after_insert($q: Vector(4)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 4) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 4
 }
 
@@ -67,9 +67,9 @@ d.slug: String
 
 --- query
 query nearest_after_restart($q: Vector(4)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 4) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 4
 }
 

@@ -1,21 +1,21 @@
-//! The typed core IR of GQ edition 3 (docs/rfcs/2026-11-07-gq-3.md,
-//! section 2).
+//! The typed core IR (docs/rfcs/2026-11-07-gq-3.md, section 2).
 //!
-//! The edition-3 type checker ([`crate::query::check`]) lowers every
+//! The type checker ([`crate::query::check`]) lowers every
 //! declaration into one [`Term`] tree over the thirteen core operators, the
 //! term former `Call` and the two leaves the operators need (`Unit`, the one
 //! empty row, and `Env`, the one enclosing row of a correlated term). A write
 //! is a list of [`WriteGroup`]s, each a term and its sinks.
 //!
-//! Today's [`super::QueryIR`] has no node for `Correlate`, `Union`, `Group`
-//! over a derived relation, `Score`, `ApproxTopK` as a relation, `Fuse` over
-//! relations, `Fix` or `Call`; this tree is the compiler's half, and the
-//! planner does not lower it yet (`P006`), so nothing in edition 3 executes.
+//! The planner reads only this tree. It lowers the forms the engine runs
+//! (a pattern of scans, expansions, filters and correlated blocks, its
+//! projection, grouping, order and cut, the rankings over a population, and
+//! the write groups) to today's plans, and refuses every other node with
+//! `P006`.
 //!
 //! Every scalar a term holds (a filter's predicate, a projected or grouped
 //! item, an order key, an aggregate's argument, a score's query, a sink's
-//! assignment) is the bound expression [`IRExpr`], the one the pipeline IR
-//! uses: a reference column reads as a `Variable`, a value column as an
+//! assignment) is the bound expression [`IRExpr`], the one the planner and
+//! the engine evaluate: a reference column reads as a `Variable`, a value column as an
 //! `AliasRef`, a property or meta field as a `PropAccess`.
 //!
 //! Every node derives `PartialEq`: the desugaring-uniqueness test compares
@@ -23,9 +23,10 @@
 //! declaration), so two spellings of one term compare equal.
 
 use super::expr::IRExpr;
-use crate::query::ast::{AggFunc, MutationWriteMode};
-use crate::query::typecheck::MutationTarget;
-use crate::types::{Direction, ExprType, PropType, ScalarType};
+use crate::query::file::MutationWriteMode;
+use crate::query::value::AggFunc;
+use crate::traversal::EdgeSelection;
+use crate::types::{ExprType, PropType, ScalarType};
 
 /// A value type with its nullability: a scalar or list (as the schema spells
 /// it), a node reference or an edge reference.
@@ -201,10 +202,14 @@ pub enum Term {
         input: Box<Term>,
         src: String,
         dst: String,
+        /// The node type `src` holds.
+        src_type: String,
         /// The node type `dst` takes.
         dst_type: String,
-        /// The edge selector: (edge type, direction) pairs, sorted.
-        selector: Vec<(String, Direction)>,
+        /// The edges traversed from `src`: one type, an alternation or a
+        /// wildcard, members sorted by name, each with its direction from
+        /// `src`.
+        edges: EdgeSelection,
         min_hops: u32,
         max_hops: Option<u32>,
         edge_var: Option<String>,
@@ -266,7 +271,8 @@ pub enum Term {
     Fuse {
         arms: Vec<Term>,
         target: String,
-        k: u64,
+        /// The fusion constant, `RRF_DEFAULT_K` when unwritten.
+        k: Count,
         weights: Vec<f64>,
     },
     /// The least fixpoint of a declared read over itself; `body` reads the
@@ -544,3 +550,37 @@ pub const RRF_DEFAULT_K: u64 = 60;
 pub const RRF_MAX_K: u64 = 1_000_000;
 pub const RRF_MIN_ARMS: usize = 2;
 pub const RRF_MAX_ARMS: usize = 16;
+
+/// The exact graph namespace selected for a mutation target.
+///
+/// Node and edge declarations may share a name, so consumers must carry the
+/// resolved kind from type checking instead of re-deriving it from spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MutationTarget {
+    Node { type_name: String },
+    Edge { type_name: String },
+}
+
+impl MutationTarget {
+    pub fn type_name(&self) -> &str {
+        match self {
+            Self::Node { type_name } | Self::Edge { type_name } => type_name,
+        }
+    }
+
+    pub fn is_edge(&self) -> bool {
+        matches!(self, Self::Edge { .. })
+    }
+}
+
+/// Whether `variable` is a name the type checker made up: an anonymous `_`
+/// endpoint or a fresh column. The query declares no such binding, so its
+/// identity orders nothing a reader can see.
+pub fn is_fresh_variable(variable: &str) -> bool {
+    variable.starts_with(ANON_PREFIX) || variable.starts_with(FRESH_PREFIX)
+}
+
+/// The prefix of an anonymous triple end's binding.
+pub const ANON_PREFIX: &str = "__anon_";
+/// The prefix of every other name the type checker makes up.
+pub const FRESH_PREFIX: &str = "__temp_";

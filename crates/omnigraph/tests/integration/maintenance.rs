@@ -1013,7 +1013,7 @@ async fn optimize_compacts_blob_fragments_with_deleted_rows() {
     for slug in ["a2", "b1"] {
         mutate_main(
             &db,
-            "query drop($slug: String) {\n    delete Doc where slug = $slug\n}",
+            "query drop($slug: String) {\n    $x: Doc  $x.slug = $slug\n    delete $x\n}",
             "drop",
             &mixed_params(&[("$slug", slug)], &[]),
         )

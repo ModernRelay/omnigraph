@@ -2718,20 +2718,20 @@ async fn repeated_merges_reuse_shared_cold_registry_files() {
     }
 }
 
-/// GQ edition 3 (`gq 3;`) is checked and does not run: each door types the
-/// declaration against the handle's accepted catalog and the planner refuses
-/// it (`P006`), and a type error answers with its own code, both before a
-/// snapshot is captured. Neither the read door nor the write door issues a
-/// storage request on the way.
+/// A declaration the planner does not lower is checked and does not run:
+/// each door types it against the handle's accepted catalog and the planner
+/// refuses it (`P006`), and a type error answers with its own code, both
+/// after the warm freshness probe and before any table opens. Neither door
+/// issues another storage request on the way.
 #[tokio::test]
-async fn a_core_declaration_is_refused_before_any_storage_access() {
+async fn an_unlowered_declaration_is_refused_before_any_storage_access() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
         init_and_load(&dir).await;
         let db = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
-        let read = "gq 3;\nquery friends($name: String) { match { $p: Person { name: $name }  $p knows $f } return { $f.name } }";
-        let write = "gq 3;\nquery rename($name: String) { $p: Person { name: $name }  update $p set { age: 1 } }";
-        let ill_typed = "gq 3;\nquery q() { match { $p: Person  $p.name + 1 > 0 } return { $p.name } }";
+        let read = "query friends($name: String) { match { $p: Person { name: $name }  optional { $p knows $f } } return { $p.name } }";
+        let write = "query rename($name: String) { $p: Person { name: $name }  $p knows $f  update $f set { age: 1 } }";
+        let ill_typed = "query q() { match { $p: Person  $p.name + 1 > 0 } return { $p.name } }";
         let cases = [
             (
                 measure(db.query(
@@ -2750,17 +2750,19 @@ async fn a_core_declaration_is_refused_before_any_storage_access() {
             ),
         ];
         for ((outcome, io), code) in cases {
-            let error = outcome.expect_err("edition 3 does not run");
+            let error = outcome.expect_err("the declaration does not run");
             assert_eq!(error.diagnostic().map(|d| d.code.as_str()), Some(code), "{error}");
+            // The warm freshness probe, as for any refused declaration, and
+            // nothing else: no table opens.
             assert_eq!(
                 (io.total_reads(), io.version_probes, io.data_open_count, io.internal_open_count),
-                (0, 0, 0, 0),
+                (1, 1, 0, 0),
                 "{code}: {io:?}"
             );
         }
         let (outcome, io) =
             measure(db.mutate("main", write, "rename", &params(&[("$name", "Alice")]))).await;
-        let error = outcome.expect_err("edition 3 does not run");
+        let error = outcome.expect_err("the declaration does not run");
         assert_eq!(error.diagnostic().map(|d| d.code.as_str()), Some("P006"), "{error}");
         assert_eq!(
             (
@@ -2771,7 +2773,7 @@ async fn a_core_declaration_is_refused_before_any_storage_access() {
                 io.data_open_count,
                 io.internal_open_count
             ),
-            (0, 0, 0, 0, 0, 0),
+            (1, 0, 0, 1, 0, 0),
             "{io:?}"
         );
     })

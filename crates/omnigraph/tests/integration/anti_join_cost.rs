@@ -20,7 +20,7 @@ use std::time::Instant;
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_planner::{AntiJoinStrategy, PhysicalNode};
 
 use crate::helpers::*;

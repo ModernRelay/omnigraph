@@ -30,7 +30,7 @@ key: String
 value: I64
 
 --- mutate
-query delete_temporary() { delete Item where key = "temporary" }
+query delete_temporary() { $x: Item  $x.key = "temporary"  delete $x }
 --- expect affected: nodes=1 edges=0
 
 --- query branch: main

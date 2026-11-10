@@ -523,9 +523,9 @@ node Doc {
     db.ensure_indices().await.unwrap();
     let v2 = with_setting(&db, "engine", "v2");
     let source = r#"query fused($q: String) {
-        match { $d: Doc }
+        match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $q), bm25($all, $d.text, "needle needle"), k: 60) $d: Doc }
         return { $d.slug }
-        order { rrf(bm25($d.text, $q), bm25($d.text, $q)) }
+        order { $score desc }
         limit 5000
     }"#;
     let values = params(&[("q", "needle")]);
@@ -615,9 +615,9 @@ edge Knows: Doc -> Doc
         "force_postfilter",
     );
     let query = r#"query friends($q: Vector(4)) {
-        match { $d: Doc $d knows $t }
+        match { from nearest({ match { $d: Doc $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10) }
         return { $d.slug }
-        order { nearest($d.embedding, $q) }
+        order { $distance }
         limit 10
     }"#;
     let probes = QueryMemoryProbes::default();
@@ -728,9 +728,9 @@ edge Knows: Person -> Person
         let v2 = with_setting(&db, "engine", "v2");
         let queries = r#"
 query fused($q: String) {
-    match { $p: Person $p knows $friend }
+    match { let $all = { match { $p: Person } return { $p } }  from rrf(bm25($all, $p.text, $q), bm25($all, $p.text, "needle needle"), k: 60) $p: Person $p knows $friend }
     return { $p.name }
-    order { rrf(bm25($p.text, $q), bm25($p.text, $q)) }
+    order { $score desc }
     limit 2
 }
 query without_matching_friend() {
@@ -1161,7 +1161,7 @@ const CITED: &str = r#"query cited() {
     match {
         $m: Matter
         $p: Passage
-        $p.text contains $m.number
+        contains($p.text, $m.number)
     }
     return { $m.mid, $p.pid }
 }"#;
@@ -1171,7 +1171,7 @@ const CITED_WITHOUT_NEEDLES: &str = r#"query cited() {
     match {
         $m: Matter
         $p: Passage
-        $p.text contains $m.number or $p.text = $m.number
+        contains($p.text, $m.number) or $p.text = $m.number
     }
     return { $m.mid, $p.pid }
 }"#;
@@ -1971,7 +1971,7 @@ async fn a_contains_join_and_its_cross_join_agree_on_generated_texts_over_severa
             probes.clone(),
             query_main(
                 &v2,
-                &cited_by("$p.text contains $m.number", extra),
+                &cited_by("contains($p.text, $m.number)", extra),
                 "cited",
                 &params(&[]),
             ),
@@ -1997,7 +1997,7 @@ async fn a_contains_join_and_its_cross_join_agree_on_generated_texts_over_severa
             probes.clone(),
             query_main(
                 &v2,
-                &cited_by("($p.text contains $m.number) or false", extra),
+                &cited_by("contains($p.text, $m.number) or false", extra),
                 "cited",
                 &params(&[]),
             ),

@@ -32,8 +32,8 @@ traversal and any hop bound above one, on a named edge or a selection, require
 the same node type at both ends: a hop ends on the destination type and the
 next one must start on the source type, so `$p worksAt{1,2} $c` over
 `WorksAt: Person -> Company` is refused with `T5` rather than run as one hop.
-Every connected traversal pattern needs an executable endpoint binding; an
-unrelated node declaration does not anchor it. Mixed-orientation alternatives
+A traversal on a named edge needs no bound end: `$a knows $b` alone matches
+every `Knows` edge. Mixed-orientation alternatives
 need a declared endpoint type when their orientation would otherwise be ambiguous.
 
 Hop counts are shortest-path distances from the start node: `{2,2}` returns the

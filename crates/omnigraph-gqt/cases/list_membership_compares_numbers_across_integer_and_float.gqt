@@ -22,7 +22,8 @@ node Person {
 
 --- mutate
 query assign($xs: [I64]) {
-    update Person set { adult: $xs contains 1.0 } where slug = "a"
+    $x: Person  $x.slug = "a"
+    update $x set { adult: 1.0 in $xs }
 }
 
 --- params
@@ -34,7 +35,7 @@ query assign($xs: [I64]) {
 set engine = v2;
 query read($xs: [I64]) {
     match { $p: Person }
-    return { $p.adult, $xs contains 1.0 as projected, $xs contains 2.0 as absent, [1] contains 1.0 as folded }
+    return { $p.adult, 1.0 in $xs as projected, 2.0 in $xs as absent, 1.0 in [1] as folded }
 }
 
 --- params
@@ -51,7 +52,8 @@ folded: Bool
 
 --- mutate
 query assign_null_needle($xs: [I64], $needle: F64?) {
-    update Person set { maybe: $xs contains $needle } where slug = "a"
+    $x: Person  $x.slug = "a"
+    update $x set { maybe: $needle in $xs }
 }
 
 --- params

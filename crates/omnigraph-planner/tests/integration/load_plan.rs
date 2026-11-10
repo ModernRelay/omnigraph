@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use omnigraph_compiler::ir::{ValidateCheck, lower_load};
-use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
+use omnigraph_compiler::query::file::{LoadStmt, LoadStmtMode, LoadTarget};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{SYSTEM_COLUMNS_V3, build_catalog};
 use omnigraph_planner::optimizer::resolve;

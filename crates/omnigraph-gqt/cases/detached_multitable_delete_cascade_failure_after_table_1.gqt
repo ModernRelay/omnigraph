@@ -40,7 +40,8 @@ scope: next_step
 
 --- mutate branch: main
 query w() {
-    delete Person where name = "eve"
+    $x: Person  $x.name = "eve"
+    delete $x
 }
 --- expect error: injected failpoint triggered: mutation.post_table_commit
 
@@ -100,7 +101,8 @@ c.name: String
 
 --- mutate branch: main
 query w() {
-    delete Person where name = "eve"
+    $x: Person  $x.name = "eve"
+    delete $x
 }
 --- expect affected: nodes=1 edges=2
 

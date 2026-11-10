@@ -1,38 +1,40 @@
-//! The edition-3 parser tests of docs/rfcs/2026-11-07-gq-3.md, section 10
+//! The parser tests of docs/rfcs/2026-11-07-gq-3.md, section 10
 //! ("Compiler parser tests"), the rule-set pin, and one repair per refusal
 //! shape.
 
 use super::parse::parse_source;
 use super::*;
-use crate::query::ast::{CompOp, EdgeSelector, FileBody, MutationWriteMode};
 use crate::query::diagnostic::QueryDiagnostic;
+use crate::query::file::{FileBody, MutationWriteMode};
 use crate::query::parser::parse_query_diagnostic;
+use crate::query::syntax::EdgeSelector;
+use crate::query::value::CompOp;
 
-pub(crate) fn parse3(src: &str) -> Result<SourceFile, QueryDiagnostic> {
-    parse_source(&format!("gq 3;\n{src}"))
+pub(crate) fn parse_text(src: &str) -> Result<SourceFile, QueryDiagnostic> {
+    parse_source(src)
 }
 
 #[track_caller]
-pub(crate) fn ok3(src: &str) -> SourceFile {
-    parse3(src).unwrap_or_else(|e| panic!("edition 3 refused:\n{src}\n{e:?}"))
+pub(crate) fn parsed(src: &str) -> SourceFile {
+    parse_text(src).unwrap_or_else(|e| panic!("refused:\n{src}\n{e:?}"))
 }
 
 #[track_caller]
-fn err3(src: &str) -> QueryDiagnostic {
-    match parse3(src) {
-        Ok(f) => panic!("edition 3 accepted:\n{src}\n{f:#?}"),
+fn refusal_of(src: &str) -> QueryDiagnostic {
+    match parse_text(src) {
+        Ok(f) => panic!("accepted:\n{src}\n{f:#?}"),
         Err(e) => e,
     }
 }
 
 #[track_caller]
 fn code3(src: &str) -> &'static str {
-    err3(src).code.as_str()
+    refusal_of(src).code.as_str()
 }
 
 #[track_caller]
 fn decl(src: &str) -> Decl {
-    match ok3(src).body {
+    match parsed(src).body {
         Body::Decls(mut d) => d.remove(0),
         other => panic!("not a declaration: {other:?}"),
     }
@@ -79,7 +81,7 @@ fn filter_expr(text: &str) -> Expr {
 }
 
 fn int(n: i128) -> Expr {
-    Expr::Literal(crate::query::ast::Literal::Integer(n))
+    Expr::Literal(crate::query::value::Literal::Integer(n))
 }
 fn var(v: &str) -> Expr {
     Expr::Variable(v.to_string())
@@ -100,55 +102,28 @@ fn cmp(op: CompOp, l: Expr, r: Expr) -> Expr {
 }
 
 // ---------------------------------------------------------------------------
-// The edition line.
+// Infix string predicates.
 
+/// An infix `contains` is a tree node the type checker refuses, since the
+/// left operand's type picks the fix (the call over a String, `in` over a
+/// list).
 #[test]
-fn the_edition_line_selects_the_grammar() {
-    // No line: edition 2, exactly as before (infix `contains` is legal).
-    let e2 = "query q() { match { $d: Doc  $d.t contains \"x\" } return { $d.t } }";
-    assert!(parse_query_diagnostic(e2).is_ok());
-    // `gq 3;`: the edition-3 front end reads it; the infix form is a tree
-    // node the type checker refuses, since the left operand's type picks the
-    // fix.
-    let f = parse_query_diagnostic(&format!("gq 3;\n{e2}")).unwrap();
+fn an_infix_string_predicate_is_a_node_the_checker_refuses() {
+    let f = parse_query_diagnostic(
+        "query q() { match { $d: Doc  $d.t contains \"x\" } return { $d.t } }",
+    )
+    .unwrap();
     let FileBody::Queries(decls) = f.body else {
         panic!("a declaration file")
     };
-    let syntax = decls[0].syntax.as_ref().expect("an edition-3 declaration");
-    let DeclBody::Read(body) = &syntax.decl().body else {
+    let DeclBody::Read(body) = &decls[0].syntax.decl().body else {
         panic!("a read")
     };
     assert!(matches!(
         body.clauses[1],
         Clause::Filter(Expr::InfixString { .. })
     ));
-    // `gq 2;` is blanked so every position keeps its column.
-    let e = parse_query_diagnostic("gq 2;\nquery q() { match { $d: Doc  $d.t = } return { $d } }")
-        .unwrap_err();
-    let direct =
-        parse_query_diagnostic("     \nquery q() { match { $d: Doc  $d.t = } return { $d } }")
-            .unwrap_err();
-    assert_eq!(e.position, direct.position);
-    // `gq 2;` selects edition 2 for one release.
-    assert!(parse_query_diagnostic(&format!("gq 2;\n{e2}")).is_ok());
-    // Any other edition is refused at parse.
-    let e = parse_query_diagnostic(&format!("gq 4;\n{e2}")).unwrap_err();
-    assert_eq!(e.code.as_str(), "Q022");
-    // The line stands before the settings lines.
-    assert!(
-        parse_source("gq 3;\nset ann_nprobes = 4;\nquery q() { match { $p: P } return { $p } }")
-            .is_ok()
-    );
-    assert!(
-        parse_source("set ann_nprobes = 4;\ngq 3;\nquery q() { match { $p: P } return { $p } }")
-            .is_err()
-    );
-    // A comment may precede it.
-    assert!(
-        parse_query_diagnostic("// header\ngq 3;\nquery q() { match { $p: P } return { $p } }")
-            .is_ok()
-    );
-    // `gq` as an identifier elsewhere is unaffected.
+    // `gq` is an ordinary identifier.
     assert!(
         parse_query_diagnostic("query gq() { match { $p: P { gq: 3 } } return { $p.gq } }").is_ok()
     );
@@ -240,7 +215,7 @@ fn from_takes_an_inline_read_a_variable_and_a_call() {
     // 7, as adopted on 2026-11-08: a bare filter named `from` is never well
     // typed), and so is a bare name anywhere in a `match`.
     for text in ["from = 1", "from", "from (1) = 1"] {
-        let e = err3(&format!(
+        let e = refusal_of(&format!(
             "query q() {{ match {{ {text} }} return {{ 1 as one }} }}"
         ));
         assert!(["Q018", "Q019"].contains(&e.code.as_str()), "{text}: {e:?}");
@@ -259,7 +234,7 @@ fn let_and_from_are_property_edge_alias_and_assignment_names() {
         let c = match_clauses(&format!("$ok {word} $p: Person"));
         assert_eq!(c.len(), 3, "{word}: {c:#?}");
         // Between two lone variables, refused with the quoted edge.
-        let e = err3(&format!(
+        let e = refusal_of(&format!(
             "query q() {{ match {{ $a {word} $b }} return {{ 1 as one }} }}"
         ));
         assert_eq!(e.code.as_str(), "Q017", "{word}");
@@ -273,7 +248,7 @@ fn let_and_from_are_property_edge_alias_and_assignment_names() {
         // An edge name: quoted, since `$ok  from $r` (a Boolean filter, then
         // a `from` clause) and `$ok from $r` (a triple over `from`) are the
         // same text.
-        let Clause::Traversal(TraversalEq(t)) = one_clause(&format!("$a \"{word}\" $b")) else {
+        let Clause::Traversal(t) = one_clause(&format!("$a \"{word}\" $b")) else {
             panic!("{word} as an edge")
         };
         assert_eq!(t.selector, EdgeSelector::Named(word.into()));
@@ -284,7 +259,7 @@ fn let_and_from_are_property_edge_alias_and_assignment_names() {
         one_clause(&format!("$a (\"{word}\" | knows) $b"));
         // The bare form between two lone variables is refused, with the
         // quoted edge as the fix (section 7, as adopted on 2026-11-08).
-        let e = err3(&format!(
+        let e = refusal_of(&format!(
             "query q() {{ match {{ $ok {word} $r }} return {{ 1 as one }} }}"
         ));
         assert_eq!(e.code.as_str(), "Q017", "{word}");
@@ -303,7 +278,7 @@ fn let_and_from_are_property_edge_alias_and_assignment_names() {
         );
         // A registry row is never named a clause keyword (section 5), so
         // `from(1)` and `let(1)` are refused, not calls.
-        let e = err3(&format!(
+        let e = refusal_of(&format!(
             "query q() {{ match {{ $x.a = {word}(1) }} return {{ 1 as one }} }}"
         ));
         assert_eq!(e.code.as_str(), "Q019", "{word}");
@@ -329,15 +304,12 @@ fn minus_is_arithmetic_and_the_arrow_is_refused() {
     // suggestion applied is `$n - 1`.
     for asym in ["$n -1 > 0", "$n- 1 > 0"] {
         let src = format!("query q() {{ match {{ {asym} }} return {{ 1 as one }} }}");
-        let e = err3(&src);
+        let e = refusal_of(&src);
         assert_eq!(e.code.as_str(), "Q016", "{asym}");
-        let fixed = super::parse::apply_edits(
-            &format!("gq 3;\n{src}"),
-            &e.suggestion.as_ref().unwrap().edits,
-        );
+        let fixed = super::parse::apply_edits(&src, &e.suggestion.as_ref().unwrap().edits);
         assert_eq!(
             parse_source(&fixed).unwrap(),
-            parse3("query q() { match { $n - 1 > 0 } return { 1 as one } }").unwrap(),
+            parse_text("query q() { match { $n - 1 > 0 } return { 1 as one } }").unwrap(),
             "{asym}"
         );
     }
@@ -349,18 +321,18 @@ fn minus_is_arithmetic_and_the_arrow_is_refused() {
     // Without spaces too.
     assert_eq!(filter_expr("$n-$m > 0"), filter_expr("$n - $m > 0"));
     // `$a -knows- $b` is the arrow, refused with the triple as the fix.
-    let e = err3("query q() { match { $a -knows- $b } return { $a } }");
+    let e = refusal_of("query q() { match { $a -knows- $b } return { $a } }");
     assert_eq!(e.code.as_str(), "Q007");
     assert_eq!(e.fix.as_deref(), Some("$a <knows> $b"));
-    let e = err3("query q() { match { $a -knows-> $b } return { $a } }");
+    let e = refusal_of("query q() { match { $a -knows-> $b } return { $a } }");
     assert_eq!(e.fix.as_deref(), Some("$a knows $b"));
-    let e = err3("query q() { match { $a <-knows- $b } return { $a } }");
+    let e = refusal_of("query q() { match { $a <-knows- $b } return { $a } }");
     assert_eq!(e.fix.as_deref(), Some("$b knows $a"));
-    let e = err3("query q() { match { $a -$k:knows{1,2}-> $b } return { $a } }");
+    let e = refusal_of("query q() { match { $a -$k:knows{1,2}-> $b } return { $a } }");
     assert_eq!(e.fix.as_deref(), Some("$a $k:knows{1,2} $b"));
-    let e = err3("query q() { match { $a -\"in\"-> $b } return { $a } }");
+    let e = refusal_of("query q() { match { $a -\"in\"-> $b } return { $a } }");
     assert_eq!(e.fix.as_deref(), Some("$a \"in\" $b"));
-    let e = err3("query q() { match { $a -(knows | likes)-> $b } return { $a } }");
+    let e = refusal_of("query q() { match { $a -(knows | likes)-> $b } return { $a } }");
     assert_eq!(e.fix.as_deref(), Some("$a (knows | likes) $b"));
 }
 
@@ -425,7 +397,7 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
     // Clauses have no separator: after an expression clause, `X  -Y` would
     // continue it, so it is refused (Q016) instead of silently merging.
     assert_eq!(
-        err3("query q() { match { $a.x\n  -$b.y > 0 } return { 1 } }")
+        refusal_of("query q() { match { $a.x\n  -$b.y > 0 } return { 1 } }")
             .code
             .as_str(),
         "Q016"
@@ -447,7 +419,7 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
         Expr::And(l, _) if matches!(*l, Expr::Not(_))
     ));
     // Comparison stays non-associative.
-    assert!(parse3("query q() { match { $a < $b < $c } return { $a } }").is_err());
+    assert!(parse_text("query q() { match { $a < $b < $c } return { $a } }").is_err());
     // Arithmetic in `return`, `order`, `let`, a binding value and an
     // assignment.
     let r = read(
@@ -464,7 +436,7 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
 
 #[test]
 fn float_literals_take_an_exponent() {
-    use crate::query::ast::Literal;
+    use crate::query::value::Literal;
     for (text, value) in [
         ("1.5e3", 1.5e3),
         ("2.0E-2", 2.0e-2),
@@ -490,17 +462,17 @@ fn float_literals_take_an_exponent() {
         Expr::Compare { right, .. } if matches!(*right, Expr::Neg(_))
     ));
     // `1e3` without a fraction is not a float. The RFC's `float_lit` admits
-    // only `d.d[e…]`; with edition 2's unbounded `integer`, `1e3` would read
-    // as `1` followed by the bare name `e3`. The word boundary on
-    // `integer3` makes it a parse error instead.
-    assert!(parse3("query q() { match { $x: X } return { 1e3 } }").is_err());
-    assert!(parse3("query q() { match { $x: X } return { 1.5e } }").is_err());
+    // only `d.d[e…]`; with an unbounded integer rule, `1e3` would read as
+    // `1` followed by the bare name `e3`. The word boundary on `integer`
+    // makes it a parse error instead.
+    assert!(parse_text("query q() { match { $x: X } return { 1e3 } }").is_err());
+    assert!(parse_text("query q() { match { $x: X } return { 1.5e } }").is_err());
 }
 
 // ---------------------------------------------------------------------------
 // The reserved set.
 
-/// Every word the edition-3 grammar spells as a keyword, other than the six
+/// Every word the grammar spells as a keyword, other than the six
 /// reserved ones.
 const CONTEXTUAL: &[&str] = &[
     "query",
@@ -618,7 +590,7 @@ fn the_reserved_set_is_the_six_words() {
         // Refused as an alias and as a bare edge; a property after a dot is
         // fine.
         assert!(
-            parse3(&format!(
+            parse_text(&format!(
                 "query q() {{ match {{ $p: P }} return {{ $p.a as {word} }} }}"
             ))
             .is_err(),
@@ -629,7 +601,7 @@ fn the_reserved_set_is_the_six_words() {
         ));
         let quoted = one_clause(&format!("$a \"{word}\" $b"));
         assert!(matches!(quoted, Clause::Traversal(_)), "{word} quoted");
-        let bare = parse3(&format!(
+        let bare = parse_text(&format!(
             "query q() {{ match {{ $a {word} $b }} return {{ $a }} }}"
         ));
         match *word {
@@ -649,7 +621,7 @@ fn the_reserved_set_is_the_six_words() {
 
 #[test]
 fn an_edge_named_in_is_quoted_and_the_bare_form_is_a_membership_filter() {
-    let Clause::Traversal(TraversalEq(t)) = one_clause("$d \"in\" $x") else {
+    let Clause::Traversal(t) = one_clause("$d \"in\" $x") else {
         panic!()
     };
     assert_eq!(t.selector, EdgeSelector::Named("in".into()));
@@ -672,13 +644,13 @@ fn an_edge_named_in_is_quoted_and_the_bare_form_is_a_membership_filter() {
 
 #[test]
 fn delete_and_update_with_where_print_the_binding_and_filter() {
-    let e = err3("query retire($h: String) { delete WorksAt where @src = $h }");
+    let e = refusal_of("query retire($h: String) { delete WorksAt where @src = $h }");
     assert_eq!(e.code.as_str(), "Q008");
     assert_eq!(
         e.fix.as_deref(),
         Some("$x: WorksAt  $x.@src = $h  delete $x")
     );
-    let e = err3(
+    let e = refusal_of(
         "query retire($h: String) { update Person set { city: \"x\" } where handle = $h and age > 3 }",
     );
     assert_eq!(e.code.as_str(), "Q008");
@@ -689,16 +661,16 @@ fn delete_and_update_with_where_print_the_binding_and_filter() {
     // `where_stmt` is tried first and takes a variable too, so
     // `delete $x where φ` prints the filter clause instead of reading `where`
     // as a bare name after the statement.
-    let e = err3("query q() { $x: Person  delete $x where $x.age > 3 }");
+    let e = refusal_of("query q() { $x: Person  delete $x where $x.age > 3 }");
     assert_eq!(e.code.as_str(), "Q008");
     assert_eq!(e.fix.as_deref(), Some("$x.age > 3  delete $x"));
-    let e = err3("query q() { $x: Person  update $x set { a: 1 } where $x.age > 3 }");
+    let e = refusal_of("query q() { $x: Person  update $x set { a: 1 } where $x.age > 3 }");
     assert_eq!(e.fix.as_deref(), Some("$x.age > 3  update $x set { a: 1 }"));
 }
 
 #[test]
 fn the_mutation_keyword_is_refused_with_query_as_the_fix() {
-    let e = err3("mutation hire($h: String) { insert Person { handle: $h } }");
+    let e = refusal_of("mutation hire($h: String) { insert Person { handle: $h } }");
     assert_eq!(e.code.as_str(), "Q009");
     // The fix is the construct the diagnostic points at, the keyword, with
     // the suggestion applied.
@@ -716,7 +688,7 @@ fn the_mutation_keyword_is_refused_with_query_as_the_fix() {
 
 #[test]
 fn a_comparison_in_binding_braces_prints_the_filter_clause() {
-    let e = err3("query q() { match { $d: Doc { year >= 2025 } } return { $d } }");
+    let e = refusal_of("query q() { match { $d: Doc { year >= 2025 } } return { $d } }");
     assert_eq!(e.code.as_str(), "Q010");
     assert_eq!(e.fix.as_deref(), Some("$d: Doc  $d.year >= 2025"));
     // A legal match list is unaffected, with or without a trailing comma.
@@ -731,15 +703,15 @@ fn as_commit_is_a_write_body_clause() {
         "query propose($h: String) as unattached branch on $h { insert Person { handle: $h, name: $h } }",
     );
     assert!(matches!(d.write_mode, MutationWriteMode::Unattached { .. }));
-    let e = err3("query r() as commit { match { $p: P } return { $p } }");
+    let e = refusal_of("query r() as commit { match { $p: P } return { $p } }");
     assert_eq!(e.code.as_str(), "Q011");
-    let e = err3("query r() as unattached branch { match { $p: P } return { $p } }");
+    let e = refusal_of("query r() as unattached branch { match { $p: P } return { $p } }");
     assert_eq!(e.code.as_str(), "Q011");
 }
 
 #[test]
 fn a_clause_after_a_statement_prints_the_order() {
-    let e = err3("query w() { $p: Person  delete $p  $q: Person }");
+    let e = refusal_of("query w() { $p: Person  delete $p  $q: Person }");
     assert_eq!(e.code.as_str(), "Q013");
     // Several statements after the clauses are fine.
     let w = write(
@@ -750,12 +722,12 @@ fn a_clause_after_a_statement_prints_the_order() {
     // reserved word.
     assert!(
         matches!(&w.all_statements()[1], Stmt::Update { assignments, .. }
-        if assignments[0].value == Expr::Literal(crate::query::ast::Literal::Null))
+        if assignments[0].value == Expr::Literal(crate::query::value::Literal::Null))
     );
     write("query w() { insert P { a: null, b: 1 } }");
     write("query w() { insert P { a: null  b: 1 } }");
-    assert!(parse3("query w() { insert P { a: null + 1 } }").is_err());
-    assert!(parse3("query q() { match { $p: P  $p.a = null } return { $p } }").is_err());
+    assert!(parse_text("query w() { insert P { a: null + 1 } }").is_err());
+    assert!(parse_text("query q() { match { $p: P  $p.a = null } return { $p } }").is_err());
 }
 
 #[test]
@@ -771,7 +743,7 @@ fn other_respellings_print_their_fix() {
         ("let $x in $r", "from $r"),
         ("let ($a, $b) in $r", "from $r"),
     ] {
-        let e = err3(&format!(
+        let e = refusal_of(&format!(
             "query q() {{ match {{ $d: Doc  {src} }} return {{ $d }} }}"
         ));
         assert_eq!(e.code.as_str(), "Q012", "{src}");
@@ -784,8 +756,8 @@ fn other_respellings_print_their_fix() {
     }
     // Every annotation parses; the type checker decides which names it reads
     // (`T80`), so a later typed annotation is additive.
-    parse3("query q() @if_commit($c) { $p: P  delete $p }").unwrap();
-    parse3("query q() @valid(from = 1) { match { $p: P } return { $p } }").unwrap();
+    parse_text("query q() @if_commit($c) { $p: P  delete $p }").unwrap();
+    parse_text("query q() @valid(from = 1) { match { $p: P } return { $p } }").unwrap();
     // `retrieve`, `having` and `view` are refused at the word, each naming
     // the GQ form (section 3's refused respellings).
     for (src, code) in [
@@ -823,7 +795,7 @@ fn one_keyword_and_the_body_shape_is_the_kind() {
     assert_eq!((w.all_clauses().len(), w.all_statements().len()), (1, 1));
     // A write body's clauses are bare; a body opening with `match { }` is
     // refused with the wrapper removed (section 5).
-    let e = err3("query w() { match { $p: Person } delete $p }");
+    let e = refusal_of("query w() { match { $p: Person } delete $p }");
     assert_eq!(e.code.as_str(), "Q005");
     assert_eq!(e.fix.as_deref(), Some("$p: Person"));
     // A statement keyword stays a property name, after a dot and as a key.
@@ -837,15 +809,15 @@ fn one_keyword_and_the_body_shape_is_the_kind() {
     let DeclBody::Read(r) = d.body else { panic!() };
     assert_eq!(r.limit, Some(Limit::Param("k".into())));
     // Several declarations in one file.
-    let f = ok3("query a() { match { $p: P } return { $p } }\nquery b() { insert P { a: 1 } }");
+    let f = parsed("query a() { match { $p: P } return { $p } }\nquery b() { insert P { a: 1 } }");
     assert!(matches!(f.body, Body::Decls(ref d) if d.len() == 2));
-    // `explain` over an edition-3 declaration.
+    // `explain` over a declaration.
     assert!(matches!(
-        ok3("explain query a() { match { from $r } return { $p } }").body,
+        parsed("explain query a() { match { from $r } return { $p } }").body,
         Body::Explain(_)
     ));
     // The missing parameter list keeps its fix.
-    let e = err3("query a { match { $p: P } return { $p } }");
+    let e = refusal_of("query a { match { $p: P } return { $p } }");
     assert_eq!(
         (e.code.as_str(), e.fix.as_deref()),
         ("Q002", Some("query a()"))
@@ -859,7 +831,7 @@ fn calls_take_positionals_then_options_and_one_distinct_form() {
     };
     assert_eq!((c.args.len(), c.options.len()), (2, 1));
     // An option before a positional is refused.
-    assert!(parse3("query q() { match { f(k: 1, $x) } return { 1 } }").is_err());
+    assert!(parse_text("query q() { match { f(k: 1, $x) } return { 1 } }").is_err());
     // Options only.
     filter_expr("f(k: 1, mode: any)");
     // `distinct` under any aggregate name (the type checker keeps T57).
@@ -884,8 +856,8 @@ fn calls_take_positionals_then_options_and_one_distinct_form() {
 #[test]
 fn a_block_in_clause_position_is_a_filter() {
     // One tree for one text: `count { p } > 1 or $x` is the disjunction, as
-    // the same text is anywhere else an expression stands; edition 2's
-    // `subquery_predicate` would read `count { p } > (1 or $x)`.
+    // the same text is anywhere else an expression stands, never
+    // `count { p } > (1 or $x)`.
     assert!(matches!(
         one_clause("count { $a: P } > 1 or $x"),
         Clause::Filter(Expr::Or(..))
@@ -919,7 +891,7 @@ fn a_product_of_two_variables_is_not_the_wildcard_triple() {
 fn a_bare_from_or_let_filter_before_a_variable_is_the_clause() {
     // The contextual keyword wins over a bare-name filter at clause start;
     // a bare name is never a value in a read.
-    assert!(parse3("query q() { match { from  $a: Person } return { 1 } }").is_err());
+    assert!(parse_text("query q() { match { from  $a: Person } return { 1 } }").is_err());
     assert!(matches!(one_clause("let  $a = 1"), Clause::Let { .. }));
 }
 
@@ -951,7 +923,7 @@ fn a_date_call_is_the_date_literal() {
                 variable: "x".into(),
                 property: "d".into()
             },
-            Expr::Literal(crate::query::ast::Literal::Date("2025-01-01".into()))
+            Expr::Literal(crate::query::value::Literal::Date("2025-01-01".into()))
         )
     );
     // With another argument shape it is a call.
@@ -1000,7 +972,7 @@ fn reserved_words_between_two_variables() {
     assert_eq!(match_clauses("$a: Person  $a not $b").len(), 3);
     for word in ["is", "null"] {
         assert!(
-            parse3(&format!(
+            parse_text(&format!(
                 "query q() {{ match {{ $a: Person  $a {word} $b }} return {{ 1 }} }}"
             ))
             .is_err(),
@@ -1019,22 +991,26 @@ fn a_date_literal_touches_its_parenthesis() {
     );
     assert!(matches!(
         filter_expr("$d.at > date(\"2025-01-01\")"),
-        Expr::Compare { right, .. } if matches!(*right, Expr::Literal(crate::query::ast::Literal::Date(_)))
+        Expr::Compare { right, .. } if matches!(*right, Expr::Literal(crate::query::value::Literal::Date(_)))
     ));
 }
 
 // ---------------------------------------------------------------------------
 // The rule-set pin (section 11, rule 1).
 
-/// Every rule the edition-3 section of `grammar.pest` defines, sorted.
+/// Every rule `grammar.pest` defines, sorted.
 const SYNTAX_RULES: &[&str] = &[
+    "BLOCK_COMMENT",
+    "COMMENT",
+    "LINE_COMMENT",
+    "WHITESPACE",
     "agg_distinct",
     "agg_name",
-    "alias3",
+    "alias",
     "alias_string_rec",
-    "and_expr3",
-    "annotation3",
-    "annotation_arg3",
+    "and_expr",
+    "annotation",
+    "annotation_arg",
     "annotation_colon_rec",
     "annotation_kwarg",
     "annotation_name",
@@ -1042,21 +1018,33 @@ const SYNTAX_RULES: &[&str] = &[
     "arrow_close",
     "arrow_open",
     "arrow_traversal",
-    "assignment3",
+    "as_commit_clause",
+    "as_unattached_clause",
+    "assignment",
     "bare_name_rec",
+    "base_type",
     "between_rec",
-    "binding3",
+    "binding",
     "binding_brace_filter",
     "binding_lower_rec",
     "binding_paren_head",
     "binding_paren_rec",
     "block_value",
     "blockless_rec",
+    "bool_lit",
     "brace_body",
     "brace_colon_compare",
     "brace_compare",
     "brace_item",
     "brace_items_rec",
+    "branch_create",
+    "branch_delete",
+    "branch_diff",
+    "branch_list",
+    "branch_merge",
+    "branch_merge_base",
+    "branch_name",
+    "branch_stmt",
     "call",
     "call_args",
     "call_block_rec",
@@ -1066,11 +1054,16 @@ const SYNTAX_RULES: &[&str] = &[
     "case_rec",
     "catalogue_edge",
     "chained_rec",
-    "clause3",
-    "comparison3",
+    "clause",
+    "commit_drop",
+    "commit_publish",
+    "commit_stmt",
+    "comp_op",
+    "comparison",
     "concat_bars",
     "continuation",
     "count_star_rec",
+    "create_from_commit",
     "create_rec",
     "cypher_hops",
     "cypher_name",
@@ -1080,29 +1073,36 @@ const SYNTAX_RULES: &[&str] = &[
     "cypher_rel",
     "cypher_rel_body",
     "cypher_typed_node",
-    "date_head3",
-    "date_lit3",
-    "datetime_head3",
-    "datetime_lit3",
-    "declaration3",
+    "date_head",
+    "date_lit",
+    "datetime_head",
+    "datetime_lit",
+    "declaration",
     "delete_multi_rec",
-    "delete_stmt3",
+    "delete_stmt",
     "delete_type_rec",
     "detach_rec",
+    "diff_after_page",
+    "diff_limit",
+    "digits",
     "dir_first_rec",
     "distinct_item_rec",
-    "edge_alternation3",
-    "edge_alternatives3",
-    "edge_ident3",
-    "edge_name3",
-    "edge_sel3",
-    "edition_line",
+    "dry_run_clause",
+    "edge_alternation",
+    "edge_alternatives",
+    "edge_binding",
+    "edge_ident",
+    "edge_name",
+    "edge_sel",
+    "edge_wildcard",
+    "edge_word",
     "eq_assign_rec",
     "exp_float_rec",
-    "explain_stmt3",
-    "expr3",
-    "filter3",
-    "float_lit3",
+    "explain_stmt",
+    "expr",
+    "expr_ident",
+    "filter",
+    "float_lit",
     "from_clause",
     "from_paren_rec",
     "fw_between",
@@ -1128,137 +1128,202 @@ const SYNTAX_RULES: &[&str] = &[
     "fw_with",
     "group_by_rec",
     "having_rec",
+    "ident",
+    "ident_chars",
     "in_paren_rec",
     "infix_string_op",
     "inline_read",
     "insert_paren_rec",
-    "insert_stmt3",
-    "integer3",
+    "insert_stmt",
+    "integer",
     "keyword_call_head",
     "keyword_call_rec",
+    "kw_after",
+    "kw_all",
+    "kw_and",
+    "kw_as",
+    "kw_branch",
+    "kw_columns",
+    "kw_commit",
+    "kw_create",
+    "kw_csv",
+    "kw_delete",
+    "kw_delimiter",
+    "kw_diff",
+    "kw_distinct",
+    "kw_drop",
+    "kw_dry",
     "kw_exists",
+    "kw_explain",
     "kw_for",
-    "kw_gq",
+    "kw_from",
+    "kw_header",
+    "kw_in",
     "kw_insert",
+    "kw_into",
+    "kw_is",
     "kw_let",
+    "kw_limit",
+    "kw_list",
+    "kw_load",
     "kw_match",
+    "kw_merge",
+    "kw_merge_base",
+    "kw_mode",
     "kw_mutation",
+    "kw_not",
+    "kw_null",
+    "kw_on",
     "kw_optional",
+    "kw_or",
     "kw_order",
+    "kw_page",
+    "kw_publish",
     "kw_query",
+    "kw_reset",
     "kw_return",
+    "kw_run",
+    "kw_set",
+    "kw_show",
+    "kw_to",
+    "kw_unattached",
     "kw_unwind",
     "kw_update",
     "kw_view",
     "kw_where",
     "let_clause",
     "like_rec",
-    "limit_clause3",
+    "limit_clause",
     "limit_neg_rec",
-    "list_lit3",
+    "list_lit",
     "list_to_rows",
-    "literal3",
+    "list_type",
+    "literal",
+    "load_columns",
+    "load_delimiter",
+    "load_header",
+    "load_kind",
+    "load_mode",
+    "load_mode_name",
+    "load_option",
+    "load_stmt",
+    "load_target",
     "match_block_rec",
-    "match_clause3",
+    "match_clause",
     "match_nobrace_rec",
     "match_prefix_rec",
     "matchless_read_rec",
     "meta_assign_rec",
-    "missing_param_list3",
+    "meta_field",
+    "missing_param_list",
     "mixed_args_rec",
-    "mutation_body3",
+    "mutation_body",
     "mutation_decl",
-    "mutation_stmt3",
+    "mutation_stmt",
     "neg_sign",
-    "negation3",
-    "not_expr3",
+    "negation",
+    "not_expr",
     "not_in_rec",
     "null_compare_rec",
+    "null_test",
     "null_value",
     "offset_rec",
-    "operand3",
+    "operand",
     "optional_block",
     "optional_rec",
-    "or_expr3",
+    "or_expr",
     "order_by_rec",
-    "order_clause3",
-    "order_dir3",
-    "ordering3",
-    "param3",
+    "order_clause",
+    "order_dir",
+    "ordering",
+    "param",
     "param_default",
-    "param_item3",
-    "param_list3",
+    "param_item",
+    "param_list",
     "param_untyped_rec",
     "positional",
     "prefix_rec",
-    "product3",
+    "product",
     "product_op",
-    "projection3",
-    "prop_access3",
+    "projection",
+    "prop_access",
     "prop_chain_rec",
-    "prop_match3",
-    "prop_match_list3",
+    "prop_match",
+    "prop_match_list",
     "prop_method_head",
     "prop_method_rec",
     "prop_star_rec",
     "qualified_assign_rec",
-    "query_decl3",
-    "query_file3",
-    "read_body3",
-    "read_clause3",
-    "read_tail3",
+    "query_decl",
+    "query_file",
+    "read_body",
+    "read_clause",
+    "read_tail",
     "regex_rec",
     "relation_expr",
+    "reserved",
+    "reserved_alias",
+    "reserved_property",
+    "reset_stmt",
     "retrieve_rec",
-    "return_clause3",
+    "return_clause",
     "return_nobrace_rec",
     "set_item",
     "set_rec",
+    "set_stmt",
+    "setting_name",
+    "setting_stmt",
+    "setting_value",
+    "show_stmt",
     "spaced_call_head",
     "spaced_call_rec",
     "sql_alias_rec",
     "star_item_rec",
     "starts_with_words_rec",
-    "statement_trailer3",
+    "statement_trailer",
     "stmt_edge_rec",
     "stmt_keyword",
     "stmt_var_rec",
     "stmt_word",
     "stray_braces_rec",
-    "subquery_block3",
-    "sum3",
-    "sum_op3",
+    "string_char",
+    "string_lit",
+    "subquery_block",
+    "sum",
+    "sum_op",
     "swapped_read_rec",
     "trailing_clauses_rec",
-    "traversal3",
+    "traversal",
+    "traversal_bounds",
+    "type_name",
     "type_prop_rec",
-    "unary3",
+    "type_ref",
+    "unary",
     "unary_minus",
-    "undirected_edge3",
+    "undirected_edge",
     "update_noset_rec",
-    "update_stmt3",
+    "update_stmt",
+    "variable",
+    "vector_type",
     "view_decl",
     "where_stmt",
     "with_item",
     "with_rec",
-    "write_clause3",
+    "write_clause",
     "write_group",
 ];
 
 /// No new grammar rule without an amendment (section 11, rule 1): a rule
-/// added to or removed from the edition-3 grammar turns this red, and the
-/// fix is an amendment to the GQ 3 RFC that names the production, the token
-/// edition 3 refused where it starts, and the collision it designs around.
+/// added to or removed from the grammar turns this red, and the fix is an
+/// amendment to the GQ RFC that names the production, the token the grammar
+/// refused where it starts, and the collision it designs around.
 /// Recognizers (`_rec`, and the rules only they use) print a fix and accept
 /// nothing section 7 refuses, but they are pinned too, so a recognizer that
 /// starts accepting text is seen.
 #[test]
-fn the_syntax_rule_set_is_pinned() {
+fn the_rule_set_is_pinned() {
     let grammar = include_str!("grammar.pest");
-    let section = &grammar[grammar
-        .find("// GQ edition 3")
-        .expect("the edition-3 banner")..];
-    let mut rules: Vec<&str> = section
+    let mut rules: Vec<&str> = grammar
         .lines()
         .filter_map(|line| {
             let (name, _) = line.split_once('=')?;
@@ -1274,7 +1339,7 @@ fn the_syntax_rule_set_is_pinned() {
     rules.dedup();
     assert_eq!(
         rules, SYNTAX_RULES,
-        "the edition-3 rule set moved; a grammar change after the break is an amendment to the GQ 3 RFC (section 11, rule 1)"
+        "the grammar's rule set moved; a grammar change is an amendment to the GQ RFC (section 11, rule 1)"
     );
 }
 
@@ -1282,9 +1347,7 @@ fn the_syntax_rule_set_is_pinned() {
 // Repairs: one row per distinct refusal shape agents' texts reached, each the
 // refused text, its code, and the text its suggestion must reparse to.
 
-/// `(shape, code, refused text, intended text)`. A text that opens with its
-/// own edition or settings line is taken as written; every other one is
-/// edition 3.
+/// `(shape, code, refused text, intended text)`.
 const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
     (
         r#"a declaration without its parameter list"#,
@@ -1375,47 +1438,6 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
   return { $p.name }
 }"#,
         r#"query q($h: String) { match { $p: Person { handle: $h } } return { $p.name } }"#,
-    ),
-    (
-        r#"an edition other than 3"#,
-        "Q022",
-        r#"gq 4;
-query q() {
-  match { $p: Person }
-  return { $p.name }
-}"#,
-        r#"gq 3; query q() { match { $p: Person } return { $p.name } }"#,
-    ),
-    (
-        r#"an edition line without its semicolon"#,
-        "Q022",
-        r#"gq 3
-query q() {
-  match { $p: Person }
-  return { $p.name }
-}"#,
-        r#"gq 3; query q() { match { $p: Person } return { $p.name } }"#,
-    ),
-    (
-        r#"an uppercase edition line"#,
-        "Q022",
-        r#"GQ 3;
-query q() {
-  match { $p: Person }
-  return { $p.name }
-}"#,
-        r#"gq 3; query q() { match { $p: Person } return { $p.name } }"#,
-    ),
-    (
-        r#"a settings line before the edition line"#,
-        "Q022",
-        r#"set ann_nprobes = 20;
-gq 3;
-query q() {
-  match { $p: Person }
-  return { $p.name }
-}"#,
-        r#"gq 3; set ann_nprobes = 20; query q() { match { $p: Person } return { $p.name } }"#,
     ),
     (
         r#"an outgoing arrow"#,
@@ -2157,13 +2179,9 @@ query q($h: String) {
     ),
 ];
 
-/// `text` as a source: its own edition or settings line, or `gq 3;` before it.
+/// `text` as a source.
 pub(crate) fn as_source(text: &str) -> String {
-    if text.starts_with("gq") || text.starts_with("GQ") || text.starts_with("set ") {
-        text.to_string()
-    } else {
-        format!("gq 3;\n{text}")
-    }
+    text.to_string()
 }
 
 #[test]
@@ -2187,3 +2205,19 @@ fn every_refusal_shape_prints_a_repair_that_reparses_to_the_intended_text() {
 }
 
 mod round_trip;
+
+/// SQL's `union` between two reads is refused naming it, with the
+/// `union` relation function as the fix.
+#[test]
+fn a_sql_union_between_reads_prints_the_relation_function() {
+    let d = refusal_of(
+        "query q() { match { $p: Person } return { $p.name } union match { $c: Company } return { $c.name } }",
+    );
+    assert_eq!(d.code.as_str(), "Q014", "{d}");
+    assert!(d.message.contains("`union`"), "{d}");
+    assert!(
+        d.fix.as_deref().is_some_and(|f| f.contains("from union({")),
+        "{d:?}"
+    );
+    assert_eq!(d.position.map(|p| p.column), Some(53));
+}

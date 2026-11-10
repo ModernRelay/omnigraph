@@ -2721,14 +2721,18 @@ fn update_patch_cost_rows(replay: &str) -> String {
     const WIDE_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    title: String?\n    content: Blob?\n    emb: Vector(2048)?\n}\n";
     const UPDATES: &str = r#"
 query patch() {
-    update Doc set { score: 1 } where slug = "d1"
+    $x: Doc  $x.slug = "d1"
+    update $x set { score: 1 }
 }
 query rewrite() {
-    update Doc set { score: 2 } where slug = "d1"
-    update Doc set { score: 2 } where slug = "nobody"
+    $x: Doc  $x.slug = "d1"
+    update $x set { score: 2 }
+    $x: Doc  $x.slug = "nobody"
+    update $x set { score: 2 }
 }
 query widen($title: String) {
-    update Doc set { title: $title } where slug = "d1"
+    $x: Doc  $x.slug = "d1"
+    update $x set { title: $title }
 }
 "#;
 
@@ -3048,9 +3052,9 @@ node Doc {
 "#;
     const QUERIES: &str = r#"
 query nearest_docs($q: Vector(2)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 4) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 4
 }
 "#;
@@ -3060,7 +3064,7 @@ query nearest_docs($q: Vector(2)) {
 
     impl NearestCost {
         async fn nearest(db: &Session) -> serde_json::Value {
-            use omnigraph_compiler::query::ast::Literal;
+            use omnigraph_compiler::query::value::Literal;
             let mut params = omnigraph_compiler::ir::ParamMap::new();
             params.insert(
                 "q".to_string(),
@@ -3727,7 +3731,7 @@ fn overwrite_removal_cost_rows(replay: &str) -> String {
             _workload_seed: u64,
         ) {
             use omnigraph::loader::CsvLoadRequest;
-            use omnigraph_compiler::query::ast::LoadTarget;
+            use omnigraph_compiler::query::file::LoadTarget;
 
             omnigraph_dst::cost::set_label("_overwrite_removal_setup");
             let schema = "node Person { id: String @key } \
@@ -3862,7 +3866,7 @@ fn endpoint_probe_cost_rows(replay: &str) -> String {
             _workload_seed: u64,
         ) {
             use omnigraph::loader::CsvLoadRequest;
-            use omnigraph_compiler::query::ast::LoadTarget;
+            use omnigraph_compiler::query::file::LoadTarget;
 
             omnigraph_dst::cost::set_label("_endpoint_probe_setup");
             let schema = "node Account { id: I64 @key } \

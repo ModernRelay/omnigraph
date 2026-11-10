@@ -1,7 +1,7 @@
 # Embeddings
 
 OmniGraph can turn query text into a vector for
-`nearest($document.embedding, $text)`. Use the same provider and model that
+`nearest(rel, $document.embedding, $text, k: n)`. Use the same provider and model that
 produced the stored document vectors; vectors from different models are not
 comparable.
 
@@ -70,7 +70,7 @@ node Document {
 ```
 
 The vector is the embedding of the record's `body` value exactly as stored,
-and a text `nearest($d.embedding, $q)` embeds `$q` exactly as given. Neither
+and a text `nearest(rel, $d.embedding, $q, k: n)` embeds `$q` exactly as given. Neither
 side adds a type name, a field label or any other template, and neither trims
 whitespace, so a record whose `body` equals the query text embeds the same
 input. The one difference a provider can see is the retrieval role: Gemini

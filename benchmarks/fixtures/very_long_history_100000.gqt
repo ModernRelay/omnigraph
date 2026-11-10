@@ -15,55 +15,55 @@ node HistoryRow { key: String @key value: I64 payload: String }
 
 --- loop $cycle 0 10000
 --- mutate
-query set_one() { update HistoryRow set { value: 1 } where key = "hot" }
+query set_one() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query restore_zero() { update HistoryRow set { value: 0 } where key = "hot" }
---- expect affected: nodes=1 edges=0
-
---- endloop
-
---- loop $cycle 0 10000
---- mutate
-query set_one() { update HistoryRow set { value: 1 } where key = "hot" }
---- expect affected: nodes=1 edges=0
-
---- mutate
-query restore_zero() { update HistoryRow set { value: 0 } where key = "hot" }
+query restore_zero() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 0 } }
 --- expect affected: nodes=1 edges=0
 
 --- endloop
 
 --- loop $cycle 0 10000
 --- mutate
-query set_one() { update HistoryRow set { value: 1 } where key = "hot" }
+query set_one() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query restore_zero() { update HistoryRow set { value: 0 } where key = "hot" }
---- expect affected: nodes=1 edges=0
-
---- endloop
-
---- loop $cycle 0 10000
---- mutate
-query set_one() { update HistoryRow set { value: 1 } where key = "hot" }
---- expect affected: nodes=1 edges=0
-
---- mutate
-query restore_zero() { update HistoryRow set { value: 0 } where key = "hot" }
+query restore_zero() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 0 } }
 --- expect affected: nodes=1 edges=0
 
 --- endloop
 
 --- loop $cycle 0 10000
 --- mutate
-query set_one() { update HistoryRow set { value: 1 } where key = "hot" }
+query set_one() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query restore_zero() { update HistoryRow set { value: 0 } where key = "hot" }
+query restore_zero() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 0 } }
+--- expect affected: nodes=1 edges=0
+
+--- endloop
+
+--- loop $cycle 0 10000
+--- mutate
+query set_one() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query restore_zero() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 0 } }
+--- expect affected: nodes=1 edges=0
+
+--- endloop
+
+--- loop $cycle 0 10000
+--- mutate
+query set_one() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query restore_zero() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 0 } }
 --- expect affected: nodes=1 edges=0
 
 --- endloop

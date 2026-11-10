@@ -12,8 +12,8 @@ use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
 use omnigraph_compiler::ir::{
     BlockAggregateExpr, IRExpr, IROrdering, IRProjection, SubqueryPredicate,
 };
-use omnigraph_compiler::query::ast::{AggFunc, BinaryOp, CompOp, Literal};
 use omnigraph_compiler::query::syntax::ArithOp;
+use omnigraph_compiler::query::value::{AggFunc, BinaryOp, CompOp, Literal};
 use omnigraph_compiler::traversal::{EdgeMember, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::{

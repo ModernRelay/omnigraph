@@ -8,7 +8,7 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_planner::PhysicalNode;
 use serde_json::Value;
 
@@ -67,9 +67,9 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
     db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
     db.ensure_indices().await.unwrap();
     let query = r#"query selected_page() {
-        match { $p: Person $p $e:(knows | likes) $q }
+        match { let $all = { match { $p: Person } return { $p } }  from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "needle needle"), k: 60) $p: Person $p $e:(knows | likes) $q }
         return { $e.@type as edge_type, $e.@id as edge_id, $q.name as target }
-        order { rrf(bm25($p.text, "needle"), bm25($p.text, "needle")) }
+        order { $score desc }
         limit 1
     }"#;
     let first = db
@@ -536,24 +536,24 @@ edge Knows: Doc -> Doc
 
 const DOC_QUERIES: &str = r#"
 query nearest_with_edge($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: Doc
         $d knows $t
-    }
+    } return { $d, $t } }, $d.embedding, $q, k: 3) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 query fused($t: String, $q: Vector(4)) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) $d: Doc }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    order { $score desc }
     limit 3
 }
 query fused_vectors($q: Vector(4), $r: Vector(4)) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $r, k: 3), k: 60) $d: Doc }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $r)) }
+    order { $score desc }
     limit 3
 }
 "#;
@@ -585,7 +585,7 @@ query cited() {
     match {
         $m: Matter
         $p: Passage
-        $p.text contains $m.number
+        contains($p.text, $m.number)
         $m.mid != $p.pid
     }
     return { $m.mid, $p.pid }
@@ -987,7 +987,7 @@ async fn a_marker_with_no_contains_join_refuses_the_replay() {
 #[tokio::test]
 async fn saved_contains_conjunct_refuses_pairing_and_leaf_type_drift() {
     use omnigraph_compiler::ir::IRExpr;
-    use omnigraph_compiler::query::ast::CompOp;
+    use omnigraph_compiler::query::value::CompOp;
     use omnigraph_compiler::{ExprType, PropType, ScalarType};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1372,31 +1372,30 @@ async fn a_read_reports_its_ranking() {
 
     const RANKED: &str = r#"
 query two_texts($a: String, $b: String) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $a), bm25($all, $d.text, $b), k: 60) $d: Doc }
     return {
         $d.slug,
-        rrf(bm25($d.text, $a), bm25($d.text, $b)) as fused,
-        rrf(bm25($d.text, $a), bm25($d.text, $b)) as again
+        $score as fused,
+        $score as again
     }
-    order { rrf(bm25($d.text, $a), bm25($d.text, $b)) }
+    order { $score desc }
     limit 3
 }
 query closest($q: Vector(4)) {
-    match { $d: Doc }
-    return { $d.slug, nearest($d.embedding, $q) }
-    order { nearest($d.embedding, $q) }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 2) }
+    return { $d.slug, $distance as _distance }
+    order { $distance }
     limit 2
 }
 query distinct_scores($a: String) {
-    match { $d: Doc }
-    return distinct { $d.slug, bm25($d.text, $a) as relevance }
-    order { bm25($d.text, $a) }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $a) }
+    return distinct { $d.slug, $score as relevance }
     limit 3
 }
 query computed_score($a: String) {
-    match { $d: Doc }
-    return { $d.slug, bm25($d.text, $a) as relevance, bm25($d.text, $a) > 0.0 as hit }
-    order { bm25($d.text, $a) }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $a) }
+    return { $d.slug, $score as relevance, $score > 0.0 as hit }
+    order { $score desc }
     limit 3
 }
 query unranked() {
@@ -1438,7 +1437,7 @@ query unranked() {
             RANKED,
             "closest",
             &closest,
-            ranking(SearchFunction::Nearest, &["d._distance"]),
+            ranking(SearchFunction::Nearest, &["_distance"]),
         ),
         (
             DOC_QUERIES,
@@ -1775,9 +1774,9 @@ async fn a_plan_refusal_is_a_typed_bad_request_and_a_ranked_destination_replays_
     let db = docs(&dir).await;
     let source = r#"
 query nearest_destination($q: Vector(4)) {
-    match { $d: Doc $d knows $t }
+    match { from nearest({ match { $d: Doc $d knows $t } return { $d, $t } }, $t.embedding, $q, k: 1) }
     return { $t.slug }
-    order { nearest($t.embedding, $q) }
+    order { $distance }
     limit 1
 }
 "#;
@@ -1813,12 +1812,12 @@ query nearest_destination($q: Vector(4)) {
         .expect("the ranked-root plan replays");
     assert_eq!(rows_of(&replay.result), expected);
 
-    // An `rrf()` whose arms rank two bindings one traversal connects is
-    // refused at type checking whichever binding is declared first, with no
-    // fix to follow: each arm would root the traversal at its own binding.
+    // An `rrf` whose arms rank two bindings one traversal connects is
+    // refused at type checking whichever binding is declared first: the fused
+    // target would be a pair.
     for (name, first, second) in [("d_first", "$d", "$t"), ("t_first", "$t", "$d")] {
         let source = format!(
-            "query {name}() {{\n    match {{ {first}: Doc {second}: Doc $d knows $t }}\n    return {{ $d.slug, $t.slug }}\n    order {{ rrf(bm25($d.text, \"needle\"), bm25($t.text, \"needle\")) }}\n    limit 1\n}}\n"
+            "query {name}() {{\n    match {{ from rrf(bm25({{ match {{ $d: Doc }} return {{ $d }} }}, $d.text, \"needle\"), bm25({{ match {{ $t: Doc }} return {{ $t }} }}, $t.text, \"needle\"))  {first}: Doc {second}: Doc $d knows $t }}\n    return {{ $d.slug, $t.slug }}\n    order {{ $score desc }}\n    limit 1\n}}\n"
         );
         let refused = db
             .query(ReadTarget::branch("main"), &source, name, &ParamMap::new())
@@ -1827,18 +1826,10 @@ query nearest_destination($q: Vector(4)) {
         let diagnostic = refused.diagnostic().unwrap_or_else(|| {
             panic!("{name}: a type refusal carries its diagnostic: {refused:?}")
         });
-        assert_eq!(diagnostic.code.as_str(), "T59", "{name}: {refused}");
+        assert_eq!(diagnostic.code.as_str(), "T75", "{name}: {refused}");
         assert_eq!(
             diagnostic.fix, None,
             "{name}: no declaration order serves both arms"
-        );
-        assert_eq!(
-            diagnostic
-                .stage
-                .as_ref()
-                .and_then(|stage| stage.expression.as_deref()),
-            Some(r#"rrf(bm25($d.text, "needle"), bm25($t.text, "needle"))"#),
-            "{name}"
         );
     }
 
@@ -2229,9 +2220,9 @@ async fn an_envelope_of_another_version_asks_for_the_query_again() {
 #[tokio::test]
 async fn a_replay_rechecks_recorded_full_text_coverage() {
     const SOURCE: &str = r#"query recent($t: String) {
-    match { $d: Doc $d.year >= 2000 }
-    return { $d.slug, bm25($d.text, $t) as score }
-    order { bm25($d.text, $t) }
+    match { from bm25({ match { $d: Doc $d.year >= 2000 } return { $d } }, $d.text, $t) }
+    return { $d.slug, $score as score }
+    order { $score desc }
 }"#;
     let dir = tempfile::tempdir().unwrap();
     let db = session(

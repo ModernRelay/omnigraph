@@ -82,7 +82,7 @@ query recent_signals() {
 
 Schema edges are PascalCase; traversal uses lowerCamelCase:
 
-```gq
+```gq fragment
 match {
     $s: Signal { slug: $slug }
     $s formsPattern $p         // edge FormsPattern: Signal -> Pattern
@@ -220,11 +220,11 @@ bindings cannot be projected.
 
 Each projection needs a distinct result column name (`T25`): use aliases when
 expressions would collide. Aliases can be used in `order`, including after a
-leading `nearest`/`bm25`/`rrf` key (`order { nearest($d.embedding, $q), title }`),
-but cannot be projected again in `return` (`T36`). Order an aggregate by its alias or by repeating
-the returned expression (`order { count($f) desc }`); an order key that is not
-a property, a system field, the leading search key, a `return` item, or an
-alias is refused at type checking (`T42`).
+leading score key (`order { $distance, title }`), but cannot be projected again
+in `return` (`T36`). On ungrouped rows any expression may be an order key, returned
+or not. Over grouped rows (an aggregate or `return distinct`) an order key must
+be a `return` item or its alias, such as `order { count($f) desc }` after
+`count($f)` in `return` (`T42`).
 
 In JSON results, null fields are omitted from rows and node objects; null
 elements within lists remain `null`. Dates are `"2026-04-29"`; DateTime values
@@ -241,21 +241,21 @@ range fails the read instead of printing.
 
 ### Text search
 
-```gq
+```gq fragment
 match {
     $d: Doc
     search($d.title, $q)       // full-text; needs @index or @key on the String (T27)
 }
 ```
 
-```gq
+```gq fragment
 match {
     $d: Doc
-    fuzzy($d.title, $q, 2)     // fuzzy match, max 2 edits
+    fuzzy($d.title, $q, max_edits: 2)     // fuzzy match, max 2 edits
 }
 ```
 
-```gq
+```gq fragment
 match {
     $d: Doc
     match_text($d.body, $q)    // regular full-text match (not phrase search)
@@ -266,33 +266,44 @@ match {
 
 ```gq
 query vector_search($q: Vector(3072)) {
-    match { $d: Doc }
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 10) }
     return { $d.slug, $d.title }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 10
 }
 ```
 
-`nearest`, `bm25`, and `rrf` belong in `order`, but they also restrict rows: a
-`bm25` ordering returns only text matches, `nearest` skips rows whose vector is
-null, and `rrf` returns the union of its arms' candidates. `nearest` and `rrf`
-require `limit N`; BM25 alone does not, though a limit is recommended for
-bounded output.
+`nearest`, `bm25`, and `rrf` are relations drawn into `match` with `from`: the
+first argument is the population (an inline read whose `return` lists the
+bindings the query reads on), the second the ranked property, and `from` adds
+the score column, `$distance` for `nearest` and `$score` for `bm25` and `rrf`.
+Order by it as the leading key (`order { $distance }`, `order { $score desc }`);
+a ranking written as a call in `order` or `return` is `T65`, with the `from`
+form printed as the fix. Rankings restrict rows: `bm25` returns only text
+matches, `nearest` skips rows whose vector is null, and `rrf` returns the union
+of its arms' candidates. `nearest` requires its window `k` (`T17`) and a
+`limit N` of the same value; BM25 alone needs neither, though a limit is
+recommended for bounded output.
 
-`nearest(...)`, `bm25(...)` and `rrf(...)` can also be projected as scores
-when the expression exactly repeats the leading `order` key (`T33`); see
-[`search.md`](search.md#projecting-scores). Search predicates (`search`,
-`fuzzy`, `match_text`) cannot be projected (`T35`). A ranked read's JSON
-carries a `ranking` object; see
+Return the score as `$distance`/`$score` (column `distance`/`score`) or alias
+it; see [`search.md`](search.md#projecting-scores). Search predicates
+(`search`, `fuzzy`, `match_text`) stand alone as filters and are not return
+items (`T38`). A ranked read's JSON carries a `ranking` object; see
 [`search.md`](search.md#what-a-ranked-read-reports).
 
 ### Hybrid (reciprocal rank fusion)
 
+Name the population once with `let` and rank it in both arms; the two arms must
+differ and rank one binding (`T75`):
+
 ```gq
 query hybrid_search($vq: Vector(3072), $tq: String) {
-    match { $d: Doc }
+    match {
+        let $all = { match { $d: Doc } return { $d } }
+        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60)
+    }
     return { $d.slug, $d.title }
-    order { rrf(nearest($d.embedding, $vq), bm25($d.title, $tq)) }
+    order { $score desc }
     limit 10
 }
 ```
@@ -320,7 +331,8 @@ distinct non-null values; `distinct` under another aggregate is refused
 (`T57`). `return distinct { … }` keeps one row per distinct projected tuple
 before `order`/`limit` (with aggregates: `T56`). A comparison in `return`
 needs an alias (`T43`): `$p.age > 30 as adult`, or over aggregates
-`count($f) > 0 as any`.
+`count($f) > 0 as any`. Beside aggregates, an item that reads no aggregate
+(`$p.age > 30 as adult` included) is a group key.
 Return-clause integer `sum` accumulates exactly in 128 bits and rounds the total
 once to `F64`; `avg` uses a floating-point accumulator.
 
@@ -336,35 +348,49 @@ once to `F64`; `avg` uses a floating-point accumulator.
 
 ## Filter Operators
 
-`starts_with`, `contains`, `in`, `>=`, `<=`, `!=`, `>`, `<`, `=`, `is null`, `is not null`
+`starts_with(…)`, `contains(…)`, `in`, `>=`, `<=`, `!=`, `>`, `<`, `=`, `is null`, `is not null`
 
 Combine filters with `and`, `or`, `not` and parentheses (`or` binds loosest,
 then `and`, then `not`); comparisons do not chain. A comparison with a null
 operand is null and a filter keeps only true rows, so `not ($p.age > 30)`
 skips null ages; add `or $p.age is null` to keep them. GQ has no `null`
-literal: `$p.x = null` is a parse error. On a list property, `contains` tests
-membership (`$p.tags contains "rust"`).
+literal: `$p.x = null` is a parse error. On a list property, `in` tests
+membership (`"rust" in $p.tags`). A bare name is not a value (`Q018`): write
+`$p.name`, `$name` or `"name"`.
 
-Both String predicates are exact and case-sensitive: `contains` matches a
-substring and `starts_with` matches a prefix. They remain correct without an
+Both String predicates are functions, exact and case-sensitive:
+`contains($p.name, "Al")` matches a substring and `starts_with($p.name, "A")`
+a prefix. The infix forms (`$p.name contains "Al"`) and `contains` over a list
+are refused (`T7`) with the call or `in` printed as the fix. They remain correct without an
 index; a free-text String index does not accelerate these exact predicates.
 
 `$m.number in $numbers` keeps the rows whose value is a member of a list
 parameter or literal, one query instead of one per candidate; the right side
 must be a list of the value's type.
 
-```gq
+```gq fragment
 match {
     $p: Person
     $p.age > 30
-    $p.name contains "Al"
-    $p.name starts_with "A"
+    contains($p.name, "Al")
+    starts_with($p.name, "A")
 }
 ```
 
 ## Mutations
 
-> **No top-level `mutation { ... }` wrapper.** Agents trained on GraphQL reflexively write `mutation { insert T { ... } }` — that fails the parser at character 1 with `parse error: expected query_file`. Every executable block in a `.gq` file is a named `query`; the body's verb (`insert` / `update` / `delete`) determines whether it's a write. Dispatch via `omnigraph mutate` (not `query`).
+> **No `mutation` keyword.** Agents trained on GraphQL reflexively write `mutation { insert T { ... } }` or `mutation name(...)` — both are parse errors (`Q009` for the keyword). Every executable block in a `.gq` file is a named `query`; a body that ends in statements (`insert` / `update` / `delete`) is a write. Dispatch via `omnigraph mutate` (not `query`).
+
+A write body is one or more groups. A group's clauses, written bare (not inside
+`match { }`), bind the rows to write and filter them: `$x: Signal  $x.slug = $slug`
+or `$x: Signal { slug: $slug }`. Its statements follow and run once per row:
+`update $x set { … }`, `delete $x`. An `insert T { … }` with no clauses runs
+once. Filters always name properties through the binding (`$x.slug`,
+`$x.@src`). `update T set { … } where …` and `delete T where …` are refused
+(`Q008`), and the diagnostic prints the binding form. The planner runs one
+binding of the written type plus filters over it; a traversal, block or search
+predicate in a write's clauses, or an assignment that reads the row
+(`{ age: $x.age }`), is refused (`P006`).
 
 ### Insert
 
@@ -407,25 +433,28 @@ query link_signal_forms_pattern($signal: String, $pattern: String) {
 
 A propertyless edge needs only `from` and `to`, which are logical endpoint IDs.
 GQ has no nested `data {}` block. These assignments are distinct from the
-endpoint meta-fields used in filters: `delete FormsPattern where @src = $signal`.
+endpoint meta-fields used in filters: `$x: FormsPattern  $x.@src = $signal  delete $x`.
 
 ### Update
 
 ```gq
 query retitle_signal($slug: String, $new_title: String) {
-    update Signal set { name: $new_title } where slug = $slug
+    $x: Signal  $x.slug = $slug
+    update $x set { name: $new_title }
 }
 ```
 
 An `update` cannot assign a `@key` property (refused when it runs, not by
-`lint`): delete and re-insert instead. A null assigned to a non-nullable
-property is refused before any row is matched.
+`lint`): delete and re-insert instead. `null` as a value (`{ note: null }`)
+clears a nullable property; a null assigned to a non-nullable property is
+refused before any row is matched.
 
 ### Delete
 
 ```gq
 query remove_signal($slug: String) {
-    delete Signal where slug = $slug
+    $x: Signal  $x.slug = $slug
+    delete $x
 }
 ```
 
@@ -445,9 +474,9 @@ edge twice creates two edges. Use `load --mode merge` for bulk upsert. Edge
 `update` is unsupported; reinsert a keyed edge to change non-key properties,
 or delete and reinsert an unkeyed edge.
 
-> **Insert/update-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`update` in the same query is refused when the mutation executes, before any effect — `lint` does not catch it. The split is deliberate: one mutation query is constructive XOR destructive. Split a delete-then-insert into two separate mutations.
+> **Insert/update-only OR delete-only (the D₂ rule).** A single mutation query may contain inserts and updates, **or** deletes — never both. Mixing a `delete` with an `insert`/`update` in the same query is a type error (`T76`) that `lint` reports. The split is deliberate: one mutation query is constructive XOR destructive. Split a delete-then-insert into two separate mutations.
 
-A mutation `where` may compare at most four properties more than once each with `=`, `!=` or `in` (for example `s in ["a"] or s in ["b"]` compares `s` twice). One that compares more is refused before any effect; split the condition across statements or simplify it.
+A write's filter may compare at most four properties more than once each with `=`, `!=` or `in` (for example `$x.s in ["a"] or $x.s in ["b"]` compares `s` twice). One that compares more is refused before any effect; split the condition across groups or simplify it.
 
 ### Date and DateTime values
 

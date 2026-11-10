@@ -9,7 +9,7 @@ use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget, Snapshot};
 use omnigraph::error::Result;
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::result::MutationResult;
 use omnigraph_compiler::settings::Traversal;
 
@@ -73,11 +73,13 @@ query insert_person($name: String, $age: I32) {
 }
 
 query set_age($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
+    $x: Person  $x.name = $name
+    update $x set { age: $age }
 }
 
 query remove_person($name: String) {
-    delete Person where name = $name
+    $x: Person  $x.name = $name
+    delete $x
 }
 
 query all_persons() {
@@ -90,7 +92,8 @@ query insert_person_v($name: String, $age: I32, $ver: I64) {
 }
 
 query set_age_v($name: String, $age: I32, $ver: I64) {
-    update Person set { age: $age, ver: $ver } where name = $name
+    $x: Person  $x.name = $name
+    update $x set { age: $age, ver: $ver }
 }
 
 query get_person($name: String) {
@@ -103,7 +106,8 @@ query add_friend($from: String, $to: String) {
 }
 
 query remove_friendships_from($from: String) {
-    delete Knows where from = $from
+    $x: Knows  $x.@src = $from
+    delete $x
 }
 
 query all_knows() {
@@ -115,8 +119,10 @@ query all_knows() {
 }
 
 query transfer($a: String, $b: String, $age_a: I32, $age_b: I32, $ver_a: I64, $ver_b: I64) {
-    update Person set { age: $age_a, ver: $ver_a } where name = $a
-    update Person set { age: $age_b, ver: $ver_b } where name = $b
+    $x: Person  $x.name = $a
+    update $x set { age: $age_a, ver: $ver_a }
+    $x: Person  $x.name = $b
+    update $x set { age: $age_b, ver: $ver_b }
 }
 
 query all_knows_bound() {

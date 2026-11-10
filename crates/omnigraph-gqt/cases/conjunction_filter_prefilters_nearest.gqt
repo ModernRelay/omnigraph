@@ -32,13 +32,13 @@ node Doc {
 
 --- query
 query nearest_matching_both_filters($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: Doc
         $d.n >= 7
-        $d.name contains "-00"
-    }
+        contains($d.name, "-00")
+    } return { $d } }, $d.embedding, $q, k: 3) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 

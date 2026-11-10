@@ -1458,7 +1458,7 @@ mod coercion_tests {
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
     use omnigraph_compiler::ir::{IRExpr, ParamMap};
-    use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
+    use omnigraph_compiler::query::value::{BinaryOp, CompOp, Literal};
     use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 
     /// GQ's JSON parameters refuse a null list element; an embedded `ParamMap` carries one.

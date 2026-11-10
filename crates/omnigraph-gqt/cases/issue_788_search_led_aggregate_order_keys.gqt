@@ -2,6 +2,7 @@
 # red_on: 2026-10-09, upstream main: a search-led aggregate planned no Sort at all, so the groups came back in the Aggregate's own order whatever keys followed bm25() or rrf().
 # notes: The leading search function selects the population an aggregate reads and does not order the groups; the keys after it order the groups, then every group key ascending (RFC 0047 §One total order), so the order is total and `expect ordered` holds.
 # notes: x has 1 doc, y has 2; the n desc / n asc pair is red whatever order the Aggregate emits groups in.
+# notes: The fused steps' second arm repeats the term, since identical arms are a type error; both arms select every Doc.
 
 --- runner
 timeout_ms: 10000
@@ -24,9 +25,9 @@ node Doc {
 --- query
 set engine = v2;
 query largest_group($t: String) {
-    match { $d: Doc }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $t) }
     return { $d.kind, count($d) as n }
-    order { bm25($d.text, $t), n desc }
+    order { n desc }
     limit 1
 }
 
@@ -43,9 +44,9 @@ n: I64
 --- query
 set engine = v2;
 query smallest_group($t: String) {
-    match { $d: Doc }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $t) }
     return { $d.kind, count($d) as n }
-    order { bm25($d.text, $t), n asc }
+    order { n asc }
     limit 1
 }
 
@@ -62,9 +63,9 @@ n: I64
 --- query
 set engine = v2;
 query every_group_ordered($t: String) {
-    match { $d: Doc }
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $t) }
     return { $d.kind, count($d) as n }
-    order { bm25($d.text, $t), n desc }
+    order { n desc }
     limit 10
 }
 
@@ -82,9 +83,9 @@ n: I64
 --- query
 set engine = v2;
 query fused_largest_group($t: String) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60) $d: Doc }
     return { $d.kind, count($d) as n }
-    order { rrf(bm25($d.text, $t), bm25($d.text, $t)), n desc }
+    order { n desc }
     limit 1
 }
 
@@ -101,9 +102,9 @@ n: I64
 --- query
 set engine = v2;
 query fused_smallest_group($t: String) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60) $d: Doc }
     return { $d.kind, count($d) as n }
-    order { rrf(bm25($d.text, $t), bm25($d.text, $t)), n asc }
+    order { n asc }
     limit 1
 }
 

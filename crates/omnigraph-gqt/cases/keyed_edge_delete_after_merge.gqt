@@ -70,7 +70,7 @@ p.name: String
 q.name: String
 
 --- mutate branch: main
-query delete_alice_edges() { delete Knows where from = "Alice" }
+query delete_alice_edges() { $x: Knows  $x.@src = "Alice"  delete $x }
 
 --- expect affected: nodes=0 edges=2
 

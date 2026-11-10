@@ -46,7 +46,8 @@ query add_c_a() {
 
 --- mutate branch: feature
 query drop_b_c() {
-    delete Knows where from = "b"
+    $x: Knows  $x.@src = "b"
+    delete $x
 }
 
 --- expect affected: nodes=0 edges=1

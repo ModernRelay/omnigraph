@@ -1,4 +1,4 @@
-//! The edition-3 type checker's tests (docs/rfcs/2026-11-07-gq-3.md, section
+//! The type checker's tests (docs/rfcs/2026-11-07-gq-3.md, section
 //! 10, "Type-check tests"), the RFC's examples type-checked, and one repair
 //! per type-level refusal shape.
 
@@ -31,7 +31,7 @@ pub(crate) fn catalog() -> Catalog {
     build_catalog(&parse_schema(SCHEMA).expect("the schema parses")).unwrap()
 }
 
-/// Check `src` (without the edition line) against [`SCHEMA`]; one
+/// Check `src` against [`SCHEMA`]; one
 /// result per declaration.
 #[track_caller]
 pub(crate) fn check(
@@ -40,8 +40,7 @@ pub(crate) fn check(
     String,
     Result<CheckedDecl, crate::query::diagnostic::QueryDiagnostic>,
 )> {
-    check_source(&catalog(), &format!("gq 3;\n{src}"))
-        .unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
+    check_source(&catalog(), src).unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
 }
 
 /// The code of the first refused declaration, or `ok`.
@@ -85,8 +84,7 @@ pub(crate) fn read_of(c: &CoreDecl) -> &CoreRead {
     }
 }
 
-/// The RFC's examples (sections 3, 6 and 8), each type-checked as written;
-/// the edition-2 form of section 6's example through edition 2.
+/// The RFC's examples (sections 3, 6 and 8), each type-checked as written.
 #[test]
 fn the_rfc_examples_type_check() {
     for text in [
@@ -161,50 +159,15 @@ query relocate($h: String) {
     ] {
         ok(text);
     }
-    assert_eq!(
-        e2("query passages($matter: String, $q: String) {
-  match {
-    $r: SourceRevision { matter_number: $matter }
-    $r hasPassage $p
-    $p.text contains \"tariff\"
-  }
-  return { $r.path, $p.locator, bm25($p.text, $q) as score }
-  order { bm25($p.text, $q) desc }
-  limit 5
-}"),
-        "ok"
-    );
-}
-
-/// Edition 2's verdict on `src` against [`SCHEMA`]: `ok` or the code.
-pub(crate) fn e2(src: &str) -> String {
-    let file = match crate::query::syntax::edition_window::parse(src) {
-        Ok(f) => f,
-        Err(e) => return format!("parse {}", e.code.as_str()),
-    };
-    let cat = catalog();
-    let crate::query::ast::FileBody::Queries(qs) = file.body else {
-        return "statement".into();
-    };
-    for q in &qs {
-        if let Err(e) = crate::query::typecheck::typecheck_query_decl(&cat, q) {
-            return e
-                .diagnostic()
-                .map_or_else(|| e.to_string(), |d| d.code.as_str().to_string());
-        }
-    }
-    "ok".into()
 }
 
 /// A block sees only the text before it (section 2, derived forms): it
 /// correlates on the names bound before it, and a name the enclosing scope
-/// binds after it is the block's own, as edition 2 reads it
-/// (`issue_659_compiler_scopes.gqt`). So `$x` here is local to the block:
-/// "`$p` knows nobody", in both editions.
+/// binds after it is the block's own (`issue_659_compiler_scopes.gqt`). So
+/// `$x` here is local to the block: "`$p` knows nobody".
 #[test]
 fn a_block_correlates_only_on_names_bound_before_it() {
     let src = "query q() { match { $p: Person  not { $p knows $x }  $x: Person { handle: \"q\" } } return { $p } }";
-    assert_eq!(e2(src), "ok");
     let c = ok(src);
     let text = format!("{:?}", read_of(&c).term);
     assert!(
@@ -232,15 +195,14 @@ fn a_block_correlates_only_on_names_bound_before_it() {
     );
 }
 
-/// A block re-mentions an outer variable to correlate on it, as edition 2
-/// reads it (`not { $p: Person { name: "bob" } }` is "`$p` is not bob"), so
+/// A block re-mentions an outer variable to correlate on it
+/// (`not { $p: Person { name: "bob" } }` is "`$p` is not bob"), so
 /// a block is never `T68`; a binding inside an inline read that reuses an
 /// outer name is.
 #[test]
 fn a_block_re_mentions_an_outer_variable_to_correlate_on_it() {
     let src =
         "query q() { match { $p: Person  not { $p: Person { handle: \"bob\" } } } return { $p } }";
-    assert_eq!(e2(src), "ok");
     let rebinding = ok(src);
     // The same term as the filter written inside the block.
     let filter =
@@ -498,13 +460,13 @@ fn a_relation_function_over_zero_and_two_node_columns() {
         vec![
             ("p.name".to_string(), "String".to_string()),
             ("d.title".to_string(), "String".to_string()),
-            ("score".to_string(), "F64".to_string()),
+            ("score".to_string(), "F32".to_string()),
         ]
     );
     // A bare field name is refused at its word, and the suggestion names the
     // one binding in scope.
     let e = parse_source(
-        "gq 3;\nquery q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, embedding, $v, k: 3) } return { $d } }",
+        "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, embedding, $v, k: 3) } return { $d } }",
     )
     .unwrap_err();
     assert_eq!(e.code.as_str(), "Q018", "{e}");
@@ -581,7 +543,7 @@ fn t65_with_the_from_fix() {
         let e = check(src);
         let e = e[0].1.as_ref().unwrap_err();
         assert_eq!(e.code.as_str(), "T65", "{src}");
-        assert!(e.fix.as_deref().unwrap().starts_with(fix), "{e:?}");
+        assert!(e.fix.as_deref().unwrap().contains(fix), "{e:?}");
     }
 }
 
@@ -590,7 +552,6 @@ fn t40_lifted() {
     // A block value compares with any scalar in scope.
     let src = "query full_collections() { match { $x: Collection  count { $d \"in\" $x } >= $x.min_docs } return { $x.slug } }";
     ok(src);
-    assert_eq!(e2(src), "T40");
     // It is a value: bound, returned and ordered.
     let c = ok(
         "query degrees($min: I64) { match { $p: Person  let $degree = count { $p knows $q }  $degree >= $min } return { $p.name, $degree } order { $degree desc } }",
@@ -741,7 +702,7 @@ fn the_ranking_functions_type_their_result_columns() {
     let c = ok(
         "query q($s: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.body, terms($s, mode: all, max_edits: 1)) } return { $score } }",
     );
-    assert_eq!(cols(&c)[0], ("score".into(), "F64".into()));
+    assert_eq!(cols(&c)[0], ("score".into(), "F32".into()));
     // `rrf` yields the target and `score` only: the population's other
     // columns are gone after fusion.
     let fused = "let $docs = { match { $p authored $d } return { $p, $d } }
@@ -983,7 +944,7 @@ fn the_constructive_or_destructive_split_and_ordered_statements() {
         "query retire($h: String) { $p: Person { handle: $h }  $p $k:worksAt $c  delete $k  update $p set { city: null } }",
         "T76",
     );
-    assert!(m.contains("constructive-or-destructive"), "{m}");
+    assert!(m.contains("split it into separate mutations"), "{m}");
     // Split across groups too: the split is per write.
     refused(
         "query w($h: String) { $p: Person { handle: $h }  delete $p  insert Person { handle: $h, name: $h } }",
@@ -1008,15 +969,14 @@ fn as_commit_is_admitted_only_on_a_write_body() {
     );
     assert_eq!(
         write_of(&w).write_mode,
-        crate::query::ast::MutationWriteMode::AsCommit
+        crate::query::file::MutationWriteMode::AsCommit
     );
-    let e = parse_source("gq 3;\nquery q() as commit { match { $p: Person } return { $p } }")
-        .unwrap_err();
+    let e = parse_source("query q() as commit { match { $p: Person } return { $p } }").unwrap_err();
     assert_eq!(e.code.as_str(), "Q011");
 }
 
 /// The probes the RFC's reference interpreter of the core was checked
-/// against, as edition-3 text, with the verdict section 2 gives each.
+/// against, with the verdict section 2 gives each.
 #[test]
 fn the_reference_interpreter_probes() {
     let dist = |ret: &str, budget: &str, filter: &str| {
@@ -1136,7 +1096,7 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
 #[test]
 fn every_type_refusal_shape_prints_a_repair_that_reparses_to_the_intended_text() {
     for (shape, code, refused, intended) in TYPE_REPAIRS {
-        let source = format!("gq 3;\n{refused}");
+        let source = refused.to_string();
         let file = parse_source(&source).unwrap_or_else(|e| panic!("{shape}: {e}"));
         let diagnostic = super::check_file(&catalog(), &file)
             .into_iter()
@@ -1150,9 +1110,111 @@ fn every_type_refusal_shape_prints_a_repair_that_reparses_to_the_intended_text()
         let repaired = crate::query::syntax::parse::apply_edits(&source, &suggestion.edits);
         let got = parse_source(&repaired)
             .unwrap_or_else(|e| panic!("{shape}: the repair does not parse: {e}\n{repaired}"));
-        let want = parse_source(&format!("gq 3;\n{intended}")).expect("the intended text parses");
+        let want = parse_source(intended).expect("the intended text parses");
         assert_eq!(got, want, "{shape}: repaired to\n{repaired}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics an agent repairs from: each names the construct, carries a fix
+// that type-checks, and points at where the text was written.
+
+/// The one refusal of `src`.
+#[track_caller]
+fn refused_with(src: &str, code: &str) -> crate::query::diagnostic::QueryDiagnostic {
+    let mut out = check(src);
+    let (_, outcome) = out.remove(0);
+    let d = outcome.expect_err("refused");
+    assert_eq!(d.code.as_str(), code, "{d}");
+    d
+}
+
+/// `T74` names the return item that produced the column it refuses, and its
+/// fix aliases that item.
+#[test]
+fn t74_names_the_return_item_behind_an_unshaped_column() {
+    let d = refused_with(
+        "query q() { match { from { match { $p: Person  $p worksAt $c } return { $c, count($p) } } } return { $c } }",
+        "T74",
+    );
+    assert!(d.message.contains("`count($p)`"), "{d}");
+    assert_eq!(
+        d.fix.as_deref(),
+        Some("alias it on the inner `return`: `count($p) as count_p`")
+    );
+    let fixed = "query q() { match { from { match { $p: Person  $p worksAt $c } return { $c, count($p) as count_p } } } return { $c, $count_p } }";
+    ok(fixed);
+}
+
+/// `T8` for an aggregate in a filter prints the block form, which
+/// type-checks; over the read's own rows it prints the `return` item.
+#[test]
+fn t8_prints_the_block_an_aggregate_filter_means() {
+    let d = refused_with(
+        "query q() { match { $p: Person  $p knows $f  count($f) > 3 } return { $p.name } }",
+        "T8",
+    );
+    let fix = d.fix.expect("a fix");
+    assert_eq!(fix, "match { $p: Person  count($f) { $p knows $f } > 3 }");
+    ok(&format!("query q() {{ {fix} return {{ $p.name }} }}"));
+    let d = refused_with(
+        "query q() { match { $p: Person  count($p) > 3 } return { $p.name } }",
+        "T8",
+    );
+    assert_eq!(d.fix.as_deref(), Some("return { count($p) as count_p }"));
+}
+
+/// `T65`'s suggestion draws the ranking with `from` over the read's own
+/// pattern; applied, the text type-checks to the form the rewriter writes.
+#[test]
+fn t65_suggests_an_applicable_edit() {
+    use crate::query::syntax::parse::apply_edits;
+    for (written, intended) in [
+        (
+            "query q($v: Vector(3)) { match { $d: Doc } return { $d.title } order { nearest($d.embedding, $v) } limit 3 }",
+            "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 3) } return { $d.title } order { $distance } limit 3 }",
+        ),
+        (
+            "query q($s: String) { match { $p: Person  $p authored $d } return { $d.title, bm25($d.body, $s) } order { bm25($d.body, $s) } limit 3 }",
+            "query q($s: String) { match { from bm25({ match { $p: Person  $p authored $d } return { $p, $d } }, $d.body, $s) } return { $d.title, $score as _score } order { $score desc } limit 3 }",
+        ),
+        (
+            "query q($s: String, $v: Vector(3)) { match { $d: Doc } return { $d.title } order { rrf(nearest($d.embedding, $v), bm25($d.body, $s)) } limit 3 }",
+            "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) $d: Doc } return { $d.title } order { $score desc } limit 3 }",
+        ),
+    ] {
+        let d = refused_with(written, "T65");
+        let suggestion = d.suggestion.expect("an edit");
+        assert_eq!(
+            suggestion.applicability,
+            crate::query::diagnostic::Applicability::MachineApplicable
+        );
+        let repaired = apply_edits(written, &suggestion.edits);
+        assert_eq!(
+            parse_source(&repaired).unwrap(),
+            parse_source(intended).unwrap(),
+            "{repaired}"
+        );
+        ok(&repaired);
+        assert!(d.position.is_some(), "{written}");
+    }
+}
+
+/// A type error points at the clause, return item or order key it was
+/// found in.
+#[test]
+fn a_type_error_carries_the_position_of_its_clause() {
+    let d = refused_with(
+        "query q() {\n  match {\n    $p: Person\n    $p.age > \"x\"\n  }\n  return { $p.name }\n}",
+        "T7",
+    );
+    let at = d.position.expect("a position");
+    assert_eq!((at.line, at.column), (4, 5));
+    let d = refused_with(
+        "query q() { match { $p: Person } return { $p.name } order { $p.nope } }",
+        "T6",
+    );
+    assert_eq!(d.position.map(|p| p.column), Some(61));
 }
 
 mod desugaring;

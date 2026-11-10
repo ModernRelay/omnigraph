@@ -138,7 +138,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_0($c: String) { delete BenchE000 where cohort = $c }
+query delete_src_0($c: String) { $x: BenchE000  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -161,7 +161,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_1($c: String) { delete BenchE001 where cohort = $c }
+query delete_src_1($c: String) { $x: BenchE001  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -184,7 +184,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_2($c: String) { delete BenchE002 where cohort = $c }
+query delete_src_2($c: String) { $x: BenchE002  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -207,7 +207,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_3($c: String) { delete BenchE003 where cohort = $c }
+query delete_src_3($c: String) { $x: BenchE003  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -298,7 +298,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_0($c: String) { delete BenchE000 where cohort = $c }
+query delete_tgt_0($c: String) { $x: BenchE000  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok
@@ -321,7 +321,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_1($c: String) { delete BenchE001 where cohort = $c }
+query delete_tgt_1($c: String) { $x: BenchE001  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok
@@ -344,7 +344,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_2($c: String) { delete BenchE002 where cohort = $c }
+query delete_tgt_2($c: String) { $x: BenchE002  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok
@@ -367,7 +367,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_3($c: String) { delete BenchE003 where cohort = $c }
+query delete_tgt_3($c: String) { $x: BenchE003  $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok

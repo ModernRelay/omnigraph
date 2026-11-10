@@ -23,8 +23,8 @@ node Doc {
 --- query
 query by_contains() {
     match { $d: Doc }
-    return { "a" in $d.tags as a, $d.tags contains "a" as b }
-    order { $d.tags contains "a" }
+    return { "a" in $d.tags as a, "a" in $d.tags as b }
+    order { "a" in $d.tags }
 }
 
 --- expect ordered
@@ -38,7 +38,7 @@ b: Bool
 --- query
 query by_alias() {
     match { $d: Doc }
-    return { "a" in $d.tags as a, $d.tags contains "a" as b }
+    return { "a" in $d.tags as a, "a" in $d.tags as b }
     order { a desc }
 }
 

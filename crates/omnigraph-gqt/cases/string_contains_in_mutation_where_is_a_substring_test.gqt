@@ -25,7 +25,8 @@ node Person {
 
 --- mutate
 query mark_by_substring($needle: String) {
-    update Person set { hit: $needle contains "li" } where name contains "o"
+    $x: Person  contains($x.name, "o")
+    update $x set { hit: contains($needle, "li") }
 }
 
 --- params
@@ -50,7 +51,8 @@ p.hit: Bool?
 
 --- mutate
 query mark_by_membership($tags: [String]) {
-    update Person set { hit: $tags contains "go" } where tags contains "rust"
+    $x: Person  "rust" in $x.tags
+    update $x set { hit: "go" in $tags }
 }
 
 --- params
@@ -75,7 +77,8 @@ p.hit: Bool?
 
 --- mutate
 query delete_by_substring() {
-    delete Person where name contains "ar"
+    $x: Person  contains($x.name, "ar")
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0

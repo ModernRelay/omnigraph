@@ -59,7 +59,7 @@ HTTP server.
 CLI / HTTP server
         |
         v
-compiler: parse, typecheck, IR, lowering
+compiler: parse, type check to the core IR
         |
         v
 engine: snapshots, execution, graph publication, recovery

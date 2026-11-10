@@ -44,12 +44,11 @@ pub use ir::ParamMap;
 /// `(2, 1)` adds typed edge selections (`docs/rfcs/2026-09-30-typed-edge-alternation.md`);
 /// `(2, 2)` adds the `as commit` clause and the `commit publish` / `commit drop`
 /// statements (`docs/rfcs/2026-10-10-unpublished-graph-commits.md`);
-/// `(2, 3)` adds `branch create <name> from commit "<id>"`.
-pub const GQ_LANGUAGE_VERSION: (u16, u16) = (2, 3);
-pub use ir::lower::{lower_mutation_query, lower_query};
+/// `(2, 3)` adds `branch create <name> from commit "<id>"`;
+/// `(3, 0)` is GQ 3 (`docs/rfcs/2026-11-07-gq-3.md`), which replaces the
+/// language whole.
+pub const GQ_LANGUAGE_VERSION: (u16, u16) = (3, 0);
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
-pub use query::ast::Literal;
-pub use query::checked::CheckedRead;
 pub use query::descriptor::{
     QueryGraphFact, QueryGraphFactKind, QueryOperationDescriptor, QueryResultFieldDescriptor,
     QueryValueKind, describe_query_operation,
@@ -63,6 +62,7 @@ pub use query::lint::{
     QueryLintSchemaSource, QueryLintSchemaSourceKind, QueryLintSeverity, QueryLintStatus,
     lint_query_file,
 };
+pub use query::value::Literal;
 pub use query_input::{
     JsonParamMode, ReadStatement, RunInputError, RunInputResult, ToParam, find_named_query,
     find_read_statement, json_params_to_param_map,

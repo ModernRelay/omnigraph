@@ -27,24 +27,30 @@ node Span {
 
 --- mutate
 query delete_by_interval() {
-    delete Span where interval = 1
+    $x: Span  $x.interval = 1
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query delete_by_exists() {
-    delete Span where exists = 2
+    $x: Span  $x.exists = 2
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query chained_updates() {
-    update Span set { exists: 5 } where trim = 3
-    update Span set { trim: 7 } where exists = 5
-    update Span set { interval: 8 } where trim = 7
-    update Span set { exists: 6 } where interval = 8
+    $x: Span  $x.trim = 3
+    update $x set { exists: 5 }
+    $x: Span  $x.exists = 5
+    update $x set { trim: 7 }
+    $x: Span  $x.trim = 7
+    update $x set { interval: 8 }
+    $x: Span  $x.interval = 8
+    update $x set { exists: 6 }
 }
 
 --- expect affected: nodes=4 edges=0

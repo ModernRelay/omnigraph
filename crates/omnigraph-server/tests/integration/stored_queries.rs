@@ -443,7 +443,7 @@ async fn server_refuses_boot_on_type_broken_stored_query() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invoke_stored_read_returns_rows() {
-    const RANKED_PEOPLE_GQ: &str = "query ranked_people($q: String) { match { $p: Person } return { $p.name, bm25($p.name, $q) as relevance } order { bm25($p.name, $q) } limit 2 }";
+    const RANKED_PEOPLE_GQ: &str = "query ranked_people($q: String) { match { from bm25({ match { $p: Person } return { $p } }, $p.name, $q) } return { $p.name, $score as relevance } order { $score desc } limit 2 }";
     let (_temp, app) = app_with_stored_queries(
         &[
             ("find_person", FIND_PERSON_GQ, false),
@@ -1230,7 +1230,7 @@ fn cluster_invoke(graph_id: &str, name: &str, body: Value) -> axum::http::Reques
         .unwrap()
 }
 
-/// A stored `where and = 1` or `as and` no longer parses, the registry refusal the cluster
+/// A stored `… where and = 1` statement or `as and` no longer parses, the registry refusal the cluster
 /// boot quarantines on and the import refuses; rewritten to `conj`, the registry imports,
 /// applies, boots under strict `require_all_graphs` with no quarantine, and serves.
 #[tokio::test(flavor = "multi_thread")]
@@ -1247,15 +1247,13 @@ async fn registry_rewritten_away_from_reserved_words_reloads_without_quarantine(
     let details: Vec<String> = errors.iter().map(ToString::to_string).collect();
     assert!(
         details.iter().any(|detail| {
-            detail.contains("stored query 'clear_flag'")
-                && detail.contains("`and` is a reserved word; a property of that name is written `$p.and` in a read and cannot be named bare in a mutation `where`")
+            detail.contains("stored query 'clear_flag'") && detail.contains("is not a statement")
         }),
         "{details:?}"
     );
     assert!(
         details.iter().any(|detail| {
-            detail.contains("stored query 'by_and'")
-                && detail.contains("`and` is a reserved word and cannot be a return alias")
+            detail.contains("stored query 'by_and'") && detail.contains("cannot be a return alias")
         }),
         "{details:?}"
     );
@@ -1304,7 +1302,7 @@ graphs:
     assert!(
         parse_errors
             .iter()
-            .any(|message| message.contains("cannot be named bare in a mutation `where`"))
+            .any(|message| message.contains("is not a statement"))
             && parse_errors
                 .iter()
                 .any(|message| message.contains("cannot be a return alias")),
@@ -1320,7 +1318,7 @@ graphs:
     .unwrap();
     std::fs::write(
         rewritten.path().join("mutations.gq"),
-        "query add_person($slug: String, $n: I64) { insert Person { slug: $slug, conj: $n } }\nquery clear_flag() { update Person set { conj: 0 } where conj = 1 }\n",
+        "query add_person($slug: String, $n: I64) { insert Person { slug: $slug, conj: $n } }\nquery clear_flag() { $x: Person  $x.conj = 1  update $x set { conj: 0 } }\n",
     )
     .unwrap();
     std::fs::write(

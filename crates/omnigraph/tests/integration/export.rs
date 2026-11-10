@@ -9,7 +9,7 @@ use omnigraph::error::OmniError;
 use omnigraph::loader::LoadMode;
 use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 
 use crate::helpers::*;
 
@@ -108,7 +108,8 @@ query put_membership($tenant: String, $slot: U32, $label: String) {
 }
 
 query move_membership($tenant: String, $next_slot: U32) {
-    update Membership set { slot: $next_slot } where tenant = $tenant
+    $x: Membership  $x.tenant = $tenant
+    update $x set { slot: $next_slot }
 }
 "#;
 

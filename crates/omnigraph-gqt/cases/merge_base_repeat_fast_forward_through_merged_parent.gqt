@@ -28,7 +28,8 @@ branch create s
 
 --- mutate branch: s
 query s_sets_a() {
-    update Person set { age: 1 } where name = "a"
+    $x: Person  $x.name = "a"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -40,7 +41,8 @@ branch merge s
 
 --- mutate branch: s
 query s_sets_b() {
-    update Person set { age: 1 } where name = "b"
+    $x: Person  $x.name = "b"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0

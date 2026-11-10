@@ -1,36 +1,32 @@
-//! The edition-3 parse tree (docs/rfcs/2026-11-07-gq-3.md, sections 3, 6 and
-//! 7).
-//!
-//! A separate tree from [`super::ast`], so the edition-2 nodes, which the
-//! planner and the GQT runner match exhaustively, are untouched. The front door hands each declaration on as
-//! a [`super::ast::QueryDecl`] carrying this tree
-//! ([`super::ast::SyntaxDecl`]); the edition-3 type checker
-//! ([`super::check`]) reads it.
+//! The surface tree (docs/rfcs/2026-11-07-gq-3.md, sections 3, 6 and 7):
+//! what the parser builds and the type checker ([`super::check`]) reads.
+//! The front door hands each declaration on as a
+//! [`super::file::QueryDecl`] carrying this tree
+//! ([`super::file::SyntaxDecl`]).
 //!
 //! Every node derives `PartialEq`, so a parse, print and parse round trip
 //! compares whole trees ([`print`]). Parentheses leave no node.
 
 use pest_derive::Parser;
 
-use super::ast::{AggFunc, CompOp, FileBody, Literal, MutationWriteMode, SettingStmt, Traversal};
 use super::diagnostic::Position;
+use super::file::{FileBody, MutationWriteMode, SettingStmt};
+use super::value::{AggFunc, CompOp, Literal};
 
-pub mod edition;
-pub mod edition_window;
 pub mod foreign;
 pub mod parse;
 pub mod print;
+pub mod statement;
 
 #[cfg(test)]
 mod tests;
 
-/// The grammar of both editions: the edition-2 rules the edition window
-/// reads, then the edition-3 rules (`grammar.pest`).
+/// The GQ grammar (`grammar.pest`).
 #[derive(Parser)]
 #[grammar = "query/syntax/grammar.pest"]
 pub(crate) struct QueryParser;
 
-/// A source that opened with `gq 3;`.
+/// A parsed source: its settings lines and its body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceFile {
     pub settings: Vec<SettingStmt>,
@@ -40,15 +36,14 @@ pub struct SourceFile {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Body {
     Decls(Vec<Decl>),
-    /// `show`, `branch`, `commit` or `load`: the edition-2 statement nodes,
-    /// whose grammar edition 3 keeps.
+    /// `show`, `branch`, `commit` or `load`: one statement.
     Statement(Box<StatementBody>),
-    /// `explain` over one edition-3 declaration.
+    /// `explain` over one declaration.
     Explain(Box<Decl>),
 }
 
-/// Edition 2's statement bodies compare by their debug form: they do not
-/// derive `PartialEq` and edition 3 changes none of them.
+/// A statement body compared by its debug form: the statement nodes do not
+/// derive `PartialEq`.
 #[derive(Debug, Clone)]
 pub struct StatementBody(pub FileBody);
 
@@ -70,7 +65,7 @@ pub struct Decl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub name: String,
-    /// The type as edition 2 spells it in `ast::Param::type_name`.
+    /// The type as a parameter declaration spells it.
     pub type_name: String,
     pub nullable: bool,
     pub default: Option<ParamDefault>,
@@ -121,6 +116,31 @@ pub struct ReadBody {
     pub projections: Vec<Projection>,
     pub order: Vec<Ordering>,
     pub limit: Option<Limit>,
+    /// Where each part was written.
+    pub spans: Box<ReadSpans>,
+}
+
+/// Where a read body's parts were written, for a type-check refusal's
+/// position and suggestion. Like [`SourceSpan`], it takes no part in tree
+/// equality; a body built rather than parsed has none.
+#[derive(Debug, Clone, Default)]
+pub struct ReadSpans {
+    /// The text between the `match` braces.
+    pub match_inner: Option<SourceSpan>,
+    /// One per clause, in order.
+    pub clauses: Vec<SourceSpan>,
+    /// One per return item, the item without its alias.
+    pub items: Vec<SourceSpan>,
+    /// One per order key, its direction included.
+    pub order: Vec<SourceSpan>,
+    /// The `limit` value.
+    pub limit: Option<SourceSpan>,
+}
+
+impl PartialEq for ReadSpans {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -168,6 +188,21 @@ impl WriteBody {
 pub struct WriteGroup {
     pub clauses: Vec<Clause>,
     pub statements: Vec<Stmt>,
+    /// Where each clause, then each statement, was written; empty for a
+    /// group built rather than parsed. No part of tree equality.
+    pub spans: GroupSpans,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GroupSpans {
+    pub clauses: Vec<SourceSpan>,
+    pub statements: Vec<SourceSpan>,
+}
+
+impl PartialEq for GroupSpans {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -207,18 +242,31 @@ pub enum Clause {
         type_name: String,
         prop_matches: Vec<(String, Expr)>,
     },
-    Traversal(TraversalEq),
+    Traversal(Traversal),
     Filter(Expr),
 }
 
-/// Edition 2's traversal node compared by its debug form.
-#[derive(Debug, Clone)]
-pub struct TraversalEq(pub Traversal);
+#[derive(Debug, Clone, PartialEq)]
+pub struct Traversal {
+    pub src: String,
+    pub selector: EdgeSelector,
+    pub dst: String,
+    pub min_hops: u32,
+    pub max_hops: Option<u32>,
+    /// `$a <edge> $b` — match the edge in either direction (set semantics;
+    /// same-endpoint-type edges only, enforced at typecheck).
+    pub undirected: bool,
+    /// Optional name for the matched edge (`$p $w:knows $f`), making the
+    /// edge's own properties addressable as `$w.<prop>`.
+    pub edge_binding: Option<String>,
+}
 
-impl PartialEq for TraversalEq {
-    fn eq(&self, other: &Self) -> bool {
-        format!("{:?}", self.0) == format!("{:?}", other.0)
-    }
+/// The source spelling of the edge types a traversal selects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeSelector {
+    Named(String),
+    Alternation(Vec<String>),
+    Wildcard,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -316,7 +364,7 @@ pub enum Expr {
     Not(Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
-    /// Edition 2's infix `contains` and `starts_with`. The type checker
+    /// An infix `contains` or `starts_with`. The type checker
     /// refuses it, since the left operand's type picks the fix: the call
     /// over a String, `in` over a list.
     InfixString {

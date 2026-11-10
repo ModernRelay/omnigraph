@@ -1,5 +1,5 @@
 # issue: none
-# notes: The GQ edition-3 preview (`gq 3;`) refuses a well-typed edition-3 read, which the planner does not lower yet with `P006`; nothing in the preview executes.
+# notes: A well-typed read whose core term the planner does not lower yet (`optional`, a `Union`) is refused with `P006`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,7 +43,9 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-gq 3;
-query q($h: String) { match { $p: Person { handle: $h }  $p knows $q } return { $q.name } }
+query q($h: String) { match { $p: Person { handle: $h }  optional { $p knows $q } } return { $p.name } }
 
---- expect error: plan error: P006:
+--- params
+{"h": "ada"}
+
+--- expect error: P006:

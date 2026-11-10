@@ -1,5 +1,5 @@
 use omnigraph_compiler::ir::{BlockAggregateExpr, IRExpr};
-use omnigraph_compiler::query::ast::AggFunc;
+use omnigraph_compiler::query::value::AggFunc;
 use omnigraph_compiler::types::{AggSignature, ExprType, ScalarType};
 use serde::{Deserialize, Serialize};
 

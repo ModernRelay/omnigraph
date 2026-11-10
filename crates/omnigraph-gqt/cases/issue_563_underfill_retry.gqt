@@ -54,13 +54,13 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 
 --- query
 query recall($q: String) {
-    match {
+    match { from bm25({ match {
         $c: Chunk
         $c chunkOfArtifact $a
         search($c.text, $q)
-    }
+    } return { $c, $a } }, $c.text, $q) }
     return { $c.slug, $a.slug }
-    order { bm25($c.text, $q) }
+    order { $score desc }
     limit 2
 }
 

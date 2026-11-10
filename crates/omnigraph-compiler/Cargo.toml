@@ -26,7 +26,7 @@ sha2 = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
-# The edition-3 parse, print and parse property (src/query/syntax/tests/round_trip.rs).
+# The parse, print and parse property (src/query/syntax/tests/round_trip.rs).
 proptest = "1"
 
 [lints]

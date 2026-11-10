@@ -6,10 +6,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::{CompOp, Literal};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, ParamMap};
+use omnigraph_compiler::query::value::{CompOp, Literal};
 use omnigraph_compiler::result::SearchFunction;
 use omnigraph_compiler::{ExprType, PropType, SYSTEM_COLUMNS_V3, ScalarType};
+use omnigraph_planner::read_shape::{PatternStep, ReadShape};
 use omnigraph_planner::{
     BOUND_PLAN_VERSION, BoundPlan, MemorySource, NodeTypeSpec, PhysicalNode, PhysicalPlan,
     RankKind, RankScope, TableRef, ValueTable, plan_query, planned_ranking,
@@ -69,11 +70,11 @@ fn prop(variable: &str, property: &str) -> IRExpr {
     }
 }
 
-fn query(order_by: IRExpr) -> QueryIR {
-    QueryIR {
+fn query(order_by: IRExpr) -> ReadShape {
+    ReadShape {
         name: "q".to_string(),
         params: vec![],
-        pipeline: vec![IROp::NodeScan {
+        pipeline: vec![PatternStep::NodeScan {
             variable: "d".to_string(),
             type_name: "Doc".to_string(),
             filters: vec![],
@@ -124,7 +125,7 @@ fn saved_plan_version_refuses_both_legacy_and_future_readers() {
     counted.limit = None;
     counted.return_exprs = vec![IRProjection {
         expr: IRExpr::Aggregate {
-            func: omnigraph_compiler::query::ast::AggFunc::Count,
+            func: omnigraph_compiler::query::value::AggFunc::Count,
             distinct: true,
             arg: Box::new(prop("d", "slug")),
             signature: omnigraph_compiler::AggSignature {
@@ -409,8 +410,8 @@ fn a_fused_plan_reads_back_with_both_arms() {
     ));
 }
 
-fn doc_scan(variable: &str) -> IROp {
-    IROp::NodeScan {
+fn doc_scan(variable: &str) -> PatternStep {
+    PatternStep::NodeScan {
         variable: variable.to_string(),
         type_name: "Doc".to_string(),
         filters: vec![],
@@ -420,8 +421,8 @@ fn doc_scan(variable: &str) -> IROp {
 /// `$d` and `$e` over `Doc` under `filter`, returning `$d.slug`.
 fn two_docs(filter: Option<IRExpr>) -> PhysicalPlan {
     let mut pipeline = vec![doc_scan("d"), doc_scan("e")];
-    pipeline.extend(filter.map(IROp::Filter));
-    let query = QueryIR {
+    pipeline.extend(filter.map(PatternStep::Filter));
+    let query = ReadShape {
         name: "q".to_string(),
         params: vec![],
         pipeline,
@@ -728,7 +729,7 @@ fn expression_mirror_preserves_every_typed_interior_and_nested_cast() {
     let age = || IRExpr::Param("age".into(), value_type(ScalarType::I64, true));
     let sum = IRExpr::binary(
         age(),
-        omnigraph_compiler::query::ast::BinaryOp::Arith(
+        omnigraph_compiler::query::value::BinaryOp::Arith(
             omnigraph_compiler::query::syntax::ArithOp::Rem,
         ),
         age(),
@@ -872,7 +873,7 @@ fn block_bound(left: omnigraph_compiler::ir::BlockAggregateExpr, right: IRExpr) 
 
 fn signed_sum_block() -> BoundPlan {
     use omnigraph_compiler::ir::BlockAggregateExpr;
-    use omnigraph_compiler::query::ast::AggFunc;
+    use omnigraph_compiler::query::value::AggFunc;
     let arg = value_type(ScalarType::I64, true);
     block_bound(
         BlockAggregateExpr::Aggregate {
@@ -919,7 +920,7 @@ fn refuses_block_before_execution(bound: &BoundPlan) {
 #[test]
 fn saved_block_tree_preserves_spec_signature_and_both_cast_roots() {
     use omnigraph_compiler::ir::BlockAggregateExpr;
-    use omnigraph_compiler::query::ast::AggFunc;
+    use omnigraph_compiler::query::value::AggFunc;
     let exact = |nullable| ExprType::ExactInteger {
         list: false,
         nullable,

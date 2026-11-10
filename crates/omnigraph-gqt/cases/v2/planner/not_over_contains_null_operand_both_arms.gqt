@@ -23,7 +23,7 @@ node Person {
 --- query
 set engine = v2;
 query pushed_not_contains() {
-    match { $p: Person  not ($p.name contains "li") }
+    match { $p: Person  not (contains($p.name, "li")) }
     return { $p.slug }
 }
 
@@ -40,7 +40,7 @@ scan Person as $p: filter reads [p.name]
 --- query
 set engine = v2;
 query pushed_not_starts_with() {
-    match { $p: Person  not ($p.name starts_with "a") }
+    match { $p: Person  not (starts_with($p.name, "a")) }
     return { $p.slug }
 }
 
@@ -53,7 +53,7 @@ p.slug: String
 --- query
 set engine = v2;
 query pushed_not_list_contains() {
-    match { $p: Person  not ($p.tags contains "rust") }
+    match { $p: Person  not ("rust" in $p.tags) }
     return { $p.slug }
 }
 
@@ -66,7 +66,7 @@ p.slug: String
 --- query
 set engine = v2;
 query null_parameter_needle($needle: String?) {
-    match { $p: Person  not ($p.name contains $needle) }
+    match { $p: Person  not (contains($p.name, $needle)) }
     return { $p.slug }
 }
 
@@ -84,7 +84,7 @@ query residual_not_contains() {
     match {
         $p: Person
         $q: Person { slug: "a" }
-        not ($p.name contains $q.name)
+        not (contains($p.name, $q.name))
     }
     return { $p.slug }
 }
@@ -105,7 +105,7 @@ query residual_not_starts_with() {
     match {
         $p: Person
         $q: Person { slug: "b" }
-        not ($p.name starts_with $q.name)
+        not (starts_with($p.name, $q.name))
     }
     return { $p.slug }
 }
@@ -122,7 +122,7 @@ query residual_not_list_contains() {
     match {
         $p: Person
         $q: Person { slug: "a" }
-        not ($p.tags contains $q.name)
+        not ($q.name in $p.tags)
     }
     return { $p.slug }
 }

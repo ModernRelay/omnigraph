@@ -25,14 +25,16 @@ node Person {
 
 --- mutate
 query note_a_names_tagged_y() {
-    update Person set { note: "seen" } where name starts_with "a" and tags contains "y"
+    $x: Person  starts_with($x.name, "a") and "y" in $x.tags
+    update $x set { note: "seen" }
 }
 
 --- expect affected: nodes=2 edges=0
 
 --- mutate
 query delete_a_names_tagged_x() {
-    delete Person where name starts_with "a" and tags contains "x"
+    $x: Person  starts_with($x.name, "a") and "x" in $x.tags
+    delete $x
 }
 
 --- expect affected: nodes=2 edges=0

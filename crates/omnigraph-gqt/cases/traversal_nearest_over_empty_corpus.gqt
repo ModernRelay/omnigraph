@@ -22,12 +22,12 @@ edge Knows: Doc -> Doc {
 
 --- query
 query nearest_empty_graph($q: Vector(4)) {
-    match {
+    match { from nearest({ match {
         $d: Doc
         $d knows $t
-    }
+    } return { $d, $t } }, $d.embedding, $q, k: 10) }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 10
 }
 

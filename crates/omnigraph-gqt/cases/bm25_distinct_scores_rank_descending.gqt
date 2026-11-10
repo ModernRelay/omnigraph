@@ -22,9 +22,9 @@ node Note {
 
 --- query
 query bm25_ranked($q: String) {
-    match { $n: Note }
+    match { from bm25({ match { $n: Note } return { $n } }, $n.body, $q) }
     return { $n.slug }
-    order { bm25($n.body, $q) }
+    order { $score desc }
     limit 3
 }
 
@@ -41,9 +41,9 @@ n.slug: String
 
 --- query
 query distinct_literal_order($q: String) {
-    match { $n: Note }
+    match { from bm25({ match { $n: Note } return { $n } }, $n.body, $q) }
     return distinct { $n.slug, 1 as one }
-    order { bm25($n.body, $q), 1 }
+    order { 1 }
     limit 3
 }
 

@@ -1,5 +1,5 @@
 # issue: none
-# notes: The GQ edition-3 preview (`gq 3;`) refuses `from` drawing a column whose name is in scope with `T68`; nothing in the preview executes.
+# notes: The compiler refuses `from` drawing a column whose name is in scope with `T68`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,7 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-gq 3;
 query q() { match { $c: Company  from { match { $x: Company } return { $x as c } } } return { $c.name } }
 
 --- expect error: type error: T68:

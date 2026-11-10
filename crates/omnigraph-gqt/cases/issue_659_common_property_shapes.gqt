@@ -57,7 +57,7 @@ expand $a $b: selection alternation [Knows out, Likes out]
 
 --- query
 query selected_list_predicate() {
-    match { $a: Person $a $e:(knows | likes) $b $e.tags contains "x" }
+    match { $a: Person $a $e:(knows | likes) $b "x" in $e.tags }
     return { $e.@type as kind }
 }
 --- expect unordered
@@ -90,7 +90,7 @@ query incompatible_vector_dimensions() {
 query nullable_block_argument_counts_nonnull_values() {
     match {
         $a: Person { name: "a" }
-        count($e.state contains "open") { $a $e:(knows | likes) $b } = 2
+        count(contains($e.state, "open")) { $a $e:(knows | likes) $b } = 2
     }
     return { $a.name as name }
 }
@@ -103,7 +103,7 @@ name: String
 query nullable_block_argument_parameter_counts_nonnull_values($term: String) {
     match {
         $a: Person { name: "a" }
-        count($e.state contains $term) { $a $e:(knows | likes) $b } = 2
+        count(contains($e.state, $term)) { $a $e:(knows | likes) $b } = 2
     }
     return { $a.name as name }
 }
