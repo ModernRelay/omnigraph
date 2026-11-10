@@ -786,6 +786,45 @@ mod tests {
         (header, bytes[fixed + header_len..].to_vec())
     }
 
+    /// Issue 1337: a loaded dictionary holds each id once, in one buffer.
+    /// Decoding 100,000 uuid-shaped ids (a 4 MB section: 36 bytes and a
+    /// 4-byte length prefix each) holds at most the section's size plus 16
+    /// bytes per id at its peak; an owned `String` per id, cloned into a
+    /// `HashMap<String, u32>` key, holds about 140 bytes per id.
+    #[test]
+    fn loading_a_dictionary_holds_each_id_once_issue_1337() {
+        const IDS: usize = 100_000;
+        let ids: Vec<String> = (0..IDS)
+            .map(|n| format!("{n:08x}-0000-4000-8000-{:012x}", n * 7919))
+            .collect();
+        let mut types = HashMap::new();
+        types.insert("Person".to_string(), TypeIndex::from_ids(ids).unwrap());
+        let index = GraphIndex::from_parts(types, HashMap::new(), HashMap::new()).unwrap();
+        let bytes = serialize(&index, Vec::new()).unwrap();
+        let (header, payload) = split(&bytes);
+        let section = header.dicts[0].len as usize;
+        assert_eq!(section, IDS * 40);
+
+        let (decoded, peak) = crate::test_alloc::peak_bytes(|| decode_body(&header, &payload));
+        let decoded = decoded.unwrap();
+        let person = decoded.type_index("Person").unwrap();
+        assert_eq!(person.len(), IDS);
+        assert_eq!(
+            person.to_dense("00000007-0000-4000-8000-00000000d889"),
+            Some(7)
+        );
+        assert_eq!(
+            person.to_id(99_999),
+            Some("0001869f-0000-4000-8000-00002f335071")
+        );
+        let ceiling = section + 16 * IDS;
+        assert!(
+            peak <= ceiling,
+            "decoding {IDS} ids held {peak} bytes ({} per id); the ceiling is {ceiling}",
+            peak / IDS
+        );
+    }
+
     // A lying header `count` must not drive the allocation — the clamp bounds
     // it by the section size and the mismatch check rejects the artifact.
     #[test]
