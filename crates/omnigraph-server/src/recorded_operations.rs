@@ -1218,6 +1218,43 @@ fn terminal_from_report(
 /// Find the record under the gate and authorize the actor for its kind's
 /// grant; an unknown id is authorized for the start kind, so the refusal
 /// says nothing about which ids exist.
+/// Whether a lookup may answer `found` from an unlocked read of the record.
+/// A terminal operation is never rewritten, and an active one whose run is
+/// live in this process changes only through that run's own writes, so no
+/// access of the record can change the answer. Anything else (an unresolved
+/// publication, an orphan, an ending this process still owes) may need a
+/// record change and takes the record gate. Taking the gate for a settled
+/// answer queued the run's own before-publish write, which holds the writer
+/// gates, behind every lookup (stress S8).
+fn answers_without_the_gate(found: &Operation, live: &[String], owes_an_ending: bool) -> bool {
+    !owes_an_ending
+        && (found.state.is_terminal() || live.iter().any(|id| id == &found.operation_id))
+}
+
+/// The settled answer for `operation_id` from an unlocked read, if
+/// [`answers_without_the_gate`] allows it.
+async fn unlocked_answer(
+    state: &AppState,
+    owner: &ClusterAdmission,
+    graph: &str,
+    operation_id: &str,
+) -> Option<Operation> {
+    let owes_an_ending = state
+        .recorded
+        .pending
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains_key(operation_id);
+    if owes_an_ending {
+        return None;
+    }
+    let Ok(Some((record, _))) = owner.peek_operations().await else {
+        return None;
+    };
+    let found = record.find(graph, operation_id)?;
+    answers_without_the_gate(found, &state.recorded.live_ids(), false).then(|| found.clone())
+}
+
 async fn find_authorized(
     state: &AppState,
     handle: &GraphRequest,
@@ -1227,6 +1264,12 @@ async fn find_authorized(
 ) -> Result<Option<Operation>, ApiError> {
     let owner = admission(state)?;
     let graph = handle.key.graph_id.to_string();
+    if cancel_by.is_none()
+        && let Some(found) = unlocked_answer(state, &owner, &graph, operation_id).await
+    {
+        authorize(handle, actor, found.kind())?;
+        return Ok(Some(found));
+    }
     let walks = walk_unresolved(state, &owner).await;
     let lock = owner.lock_operations().await;
     let updated = update(state, &owner, &lock, &walks, |record| {
@@ -1358,6 +1401,47 @@ mod tests {
             .is_err(),
             "a table byte ceiling above the run budget is refused"
         );
+    }
+
+    #[test]
+    fn only_a_settled_lookup_answers_without_the_record_gate() {
+        let id = "01JBQZ00000000000000000001".to_string();
+        let mut op = Operation::accepted(
+            id.clone(),
+            "g",
+            "domain",
+            OperationRequest::Optimize(omnigraph_cluster::OptimizeOptions {
+                tables: None,
+                max_gate_hold_ms: None,
+            }),
+            "operator",
+            None,
+        );
+        let live = vec![id.clone()];
+        // Active: only while its run is live in this process.
+        assert!(answers_without_the_gate(&op, &live, false));
+        assert!(
+            !answers_without_the_gate(&op, &[], false),
+            "an orphan needs settling"
+        );
+        op.state = OperationState::Publishing;
+        assert!(answers_without_the_gate(&op, &live, false));
+        assert!(
+            !answers_without_the_gate(&op, &[], false),
+            "an unresolved publication needs its walk"
+        );
+        // Terminal: never rewritten, live or not, unless an ending is owed.
+        for state in [
+            OperationState::Succeeded,
+            OperationState::Failed,
+            OperationState::Cancelled,
+            OperationState::Interrupted,
+            OperationState::Unsettled,
+        ] {
+            op.state = state;
+            assert!(answers_without_the_gate(&op, &[], false));
+            assert!(!answers_without_the_gate(&op, &[], true));
+        }
     }
 
     #[test]
