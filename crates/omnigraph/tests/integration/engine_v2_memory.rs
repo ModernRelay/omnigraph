@@ -2183,3 +2183,52 @@ async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251
     assert_eq!(rows, expected);
     assert_released(&probes);
 }
+
+/// A correlated block on the per-row path folds each inner batch as the
+/// stream yields it (#1338), so it never holds the hub's whole fan-out: 16 MiB
+/// of inner payload runs under a 12 MiB pool. Holding the inner output first
+/// was refused even under 24 MiB. The conjunct that reads the outer row keeps
+/// the block off the key-set path, and `max` keeps it off the bulk row count.
+/// GQT cannot select the pool.
+#[tokio::test]
+#[serial]
+async fn correlated_block_folds_inner_batches_as_they_stream_issue_1338() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = graph_fixture(&dir, 16_384, 1024).await;
+    let query = r#"query hubs() {
+        match {
+            $a: Person { name: "hub" }
+            max($b.payload) { $a knows $b  $a.name = $a.name } > ""
+        }
+        return { $a.name }
+    }"#;
+    let limit = 12 * MIB;
+    let explain =
+        with_query_memory_limit(limit, v2.explain_query("main", query, "hubs", &params(&[])))
+            .await
+            .unwrap();
+    let mut pending = vec![&explain["physical_plan"]];
+    let mut strategy = None;
+    while let Some(node) = pending.pop() {
+        if node["node"] == "AntiJoin" {
+            strategy = node["strategy"].as_str();
+        }
+        pending.extend(node["inputs"].as_array().into_iter().flatten());
+    }
+    assert_eq!(strategy, Some("correlated"), "{explain}");
+    let probes = QueryMemoryProbes::default();
+    let result = with_query_memory_probes(
+        probes.clone(),
+        with_query_memory_limit(limit, query_main(&v2, query, "hubs", &params(&[]))),
+    )
+    .await
+    .unwrap();
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.iter().collect::<Vec<_>>(), [Some("hub")]);
+    assert_released(&probes);
+}

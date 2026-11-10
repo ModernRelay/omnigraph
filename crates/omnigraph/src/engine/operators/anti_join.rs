@@ -30,9 +30,9 @@ use omnigraph_planner::{AggregateSpec, AntiJoinStrategy};
 use super::memory::WorkMemory;
 use super::shape::{Breaker, work};
 use super::subquery_aggregate::{
-    RowCountPredicate, SubqueryAggregate, ValueAccumulator, absorb_inner_batches,
+    RowCountPredicate, SubqueryAggregate, ValueAccumulator, absorb_inner_batch,
 };
-use super::{drain, drain_one, external};
+use super::{drain_one, external};
 use crate::engine::graph::{GraphIndexHandle, bulk_anti_join_mask};
 use crate::error::{OmniError, Result};
 
@@ -360,28 +360,38 @@ impl ExecutionPlan for AntiJoinMaskExec {
                         }
                         let tagged_batch = tag_batch(&wide, tagged).map_err(external)?;
                         reservation.hold(&tagged_batch)?;
-                        slot.fill(tagged_batch);
-                        let filled = FilledSlot(&slot);
-                        let result =
-                            async { drain(inner.execute(0, inner_ctx)?, &reservation).await }.await;
-                        drop(filled);
-                        let inner_batches = result?;
                         reservation.entries::<u64>(num_rows)?;
                         if SubqueryAggregate::tracks_values(aggregate_spec) {
-                            reservation
-                                .entries::<super::subquery_aggregate::ValueAccumulator>(num_rows)?;
+                            reservation.entries::<ValueAccumulator>(num_rows)?;
                         }
                         let mut aggregate =
                             SubqueryAggregate::new(&predicate, aggregate_spec, &params, num_rows)
                                 .map_err(external)?;
-                        absorb_inner_batches(
-                            &mut aggregate,
-                            &inner_batches,
-                            &tag_column,
-                            predicate.left.arg(),
-                            &|batch, arg| crate::engine::expr::evaluate_expr(batch, arg, &params),
-                        )
-                        .map_err(external)?;
+                        // The leaf takes the tagged batch when its stream is first
+                        // polled, so the guard lives until the stream ends.
+                        slot.fill(tagged_batch);
+                        let filled = FilledSlot(&slot);
+                        let result: DfResult<()> = async {
+                            let mut inner = inner.execute(0, inner_ctx)?;
+                            while let Some(batch) = inner.next().await {
+                                let batch = batch?;
+                                reservation.metric("input_rows", batch.num_rows());
+                                absorb_inner_batch(
+                                    &mut aggregate,
+                                    &batch,
+                                    &tag_column,
+                                    predicate.left.arg(),
+                                    &|batch, arg| {
+                                        crate::engine::expr::evaluate_expr(batch, arg, &params)
+                                    },
+                                )
+                                .map_err(external)?;
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        drop(filled);
+                        result?;
                         let keep = aggregate.keep_mask().map_err(external)?;
                         reservation.filter(&wide, &keep)
                     })

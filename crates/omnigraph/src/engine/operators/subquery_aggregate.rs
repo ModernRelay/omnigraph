@@ -451,31 +451,29 @@ impl SubqueryAggregate {
     }
 }
 
-/// Fold tagged inner batches; the argument's expression executes in the inner scope.
-pub(crate) fn absorb_inner_batches(
+/// Fold one tagged inner batch; the argument's expression executes in the inner scope.
+pub(crate) fn absorb_inner_batch(
     aggregate: &mut SubqueryAggregate,
-    batches: &[RecordBatch],
+    batch: &RecordBatch,
     tag_column: &str,
     arg: Option<&IRExpr>,
     evaluate: &dyn Fn(&RecordBatch, &IRExpr) -> Result<ArrayRef>,
 ) -> Result<()> {
-    for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
-        let tags = batch
-            .column_by_name(tag_column)
-            .ok_or_else(|| {
-                OmniError::manifest_internal(
-                    "anti-join inner pipeline dropped the correlation column",
-                )
-            })?
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .ok_or_else(|| {
-                OmniError::manifest_internal(format!("'{tag_column}' column is not UInt32"))
-            })?;
-        let values = arg.map(|arg| evaluate(batch, arg)).transpose()?;
-        aggregate.absorb(tags, values.as_ref())?;
+    if batch.num_rows() == 0 {
+        return Ok(());
     }
-    Ok(())
+    let tags = batch
+        .column_by_name(tag_column)
+        .ok_or_else(|| {
+            OmniError::manifest_internal("anti-join inner pipeline dropped the correlation column")
+        })?
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("'{tag_column}' column is not UInt32"))
+        })?;
+    let values = arg.map(|arg| evaluate(batch, arg)).transpose()?;
+    aggregate.absorb(tags, values.as_ref())
 }
 
 /// Convert toward the stored accumulator, retaining original typed extrema.
