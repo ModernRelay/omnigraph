@@ -66,6 +66,7 @@ omnigraph_seams::catalog! {
     crate::db::omnigraph::optimize::CLEANUP_PRE_GATES,
     crate::db::omnigraph::optimize::CLEANUP_POST_UNATTACHED_RELEASE,
     crate::db::omnigraph::optimize::CLEANUP_TABLE_GC,
+    crate::db::omnigraph::optimize::OPTIMIZE_ARTIFACT_SCAN,
     crate::db::omnigraph::optimize::OPTIMIZE_BEFORE_COMPACT,
     crate::db::omnigraph::optimize::OPTIMIZE_CONFIGURATION_CLEAR,
     crate::db::omnigraph::optimize::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,

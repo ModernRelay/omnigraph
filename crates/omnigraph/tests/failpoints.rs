@@ -4960,6 +4960,56 @@ async fn optimize_cancelled_mid_run_publishes_nothing_and_the_next_run_does() {
     );
 }
 
+/// A cancellation that arrives while the adjacency-artifact refresh reads the
+/// edge tables, after the publication, abandons the refresh: no write is
+/// issued and the run reports the cancellation as arriving late (RFC 1.8,
+/// 3.4). Before the fix the refresh took no cancellation, ran to its end and
+/// wrote the artifact (stress/REPORT.md, the artifact refresh).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn optimize_cancelled_during_the_artifact_scan_writes_no_artifact() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+    let artifact = dir.path().join("__graph_index").join("csr-current.bin");
+    let _ = std::fs::remove_file(&artifact);
+
+    let cancellation = omnigraph::db::OptimizeCancellation::new();
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(&catalog::OPTIMIZE_ARTIFACT_SCAN);
+    let run = {
+        let uri = uri.clone();
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+            db.optimize_as(
+                None,
+                omnigraph::db::OptimizeRequest::default().with_cancellation(cancellation),
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    cancellation.cancel();
+    rendezvous.release();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .expect("optimize task hung")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.artifact,
+        omnigraph::db::ArtifactRefresh::Skipped(omnigraph::db::ArtifactSkip::Cancelled),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.cancellation,
+        omnigraph::db::RunCancellation::ArrivedLate,
+        "{report:?}"
+    );
+    assert!(!artifact.exists(), "a cancelled refresh writes no artifact");
+}
+
 /// While one table's rewrite is in flight, the planner runs `planning` tables
 /// ahead into the ready queue. When those are no-ops, their turns stage
 /// nothing and drain the queue; the pipeline must then plan the rest of the
