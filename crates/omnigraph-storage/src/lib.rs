@@ -1860,6 +1860,13 @@ impl ObjectStorageAdapter {
         }
     }
 
+    /// A local replacement of `location` returned an error and so finished.
+    fn settle_returned_local_write(&self, location: &ObjectPath) {
+        if let Some(scope) = &self.scope {
+            scope.settle_returned_local_write(location);
+        }
+    }
+
     /// A read-back showed that `precondition` no longer holds at `location`.
     fn settle_failed_precondition(
         &self,
@@ -2504,11 +2511,26 @@ impl StorageAdapter for ObjectStorageAdapter {
         if local_version_token(&current) != expected_version {
             return Ok(None);
         }
-        self.store
-            .put(&location, payload)
-            .await
-            .map_err(|err| storage_backend_error("write_if_match", uri, err))?;
-        Ok(Some(local_version_token(contents.as_bytes())))
+        let Err(err) = self.store.put(&location, payload).await else {
+            return Ok(Some(local_version_token(contents.as_bytes())));
+        };
+        if self.codec != UriCodec::Local {
+            return Err(storage_backend_error("write_if_match", uri, err));
+        }
+        // A local write has finished when it returns, so the file holds its
+        // outcome and nothing of it can land later: settle the key, then read
+        // which outcome it was. Left unsettled, the key would refuse every
+        // later write for the life of the process.
+        self.settle_returned_local_write(&location);
+        match self.read_back(uri, &location).await? {
+            Some((bytes, _)) if bytes == contents.as_bytes() => {
+                Ok(Some(local_version_token(contents.as_bytes())))
+            }
+            Some((bytes, _)) if local_version_token(&bytes) == expected_version => {
+                Err(storage_backend_error("write_if_match", uri, err))
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
@@ -4920,6 +4942,57 @@ mod tests {
     }
 
     const LOCK: &str = "__cluster/lock.json";
+
+    /// On a local root, `write_text_if_match` is a read, a compare and an
+    /// unconditional put. A put that fails has finished, so it settles its
+    /// key: the next write of the record goes through, instead of every
+    /// write of it being refused until the process restarts. Whether the
+    /// failed put applied is read back from the file.
+    #[tokio::test]
+    async fn a_failed_local_if_match_write_settles_its_key() {
+        const RECORD: &str = "/graph/__cluster/operations.json";
+        for (case, script, outcome) in [
+            ("not applied", PutScript::LoseRequest, None),
+            ("applied", PutScript::LoseAnswer, Some("v2")),
+        ] {
+            let store = ScriptedPutStore::new([]);
+            let scope = StorageIoScope::new();
+            let adapter = ObjectStorageAdapter {
+                store: store.clone(),
+                scope: None,
+                codec: UriCodec::Local,
+                supports_conditional_update: false,
+                omit_read_etag: false,
+                omit_write_etag: false,
+            }
+            .with_scope(scope.clone());
+            adapter.write_text(RECORD, "v1").await.unwrap();
+            let (_, v1) = adapter.read_text_versioned(RECORD).await.unwrap();
+            store.script.lock().unwrap().push_back(script);
+            let result = adapter.write_text_if_match(RECORD, "v2", &v1).await;
+            assert_eq!(scope.unsettled_keys(), 0, "{case}: the key is settled");
+            match outcome {
+                None => {
+                    assert!(result.is_err(), "{case}: {result:?}");
+                    let held = adapter.read_text(RECORD).await.unwrap();
+                    assert_eq!(held, "v1", "{case}");
+                    assert!(
+                        adapter
+                            .write_text_if_match(RECORD, "v2", &v1)
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "{case}: the next write goes through"
+                    );
+                }
+                Some(written) => {
+                    assert!(result.unwrap().is_some(), "{case}");
+                    assert_eq!(adapter.read_text(RECORD).await.unwrap(), written, "{case}");
+                }
+            }
+            assert!(!scope.is_uncertain(), "{case}: a clean release is possible");
+        }
+    }
 
     fn lost(times: usize) -> Vec<PutScript> {
         vec![PutScript::LoseRequest; times]

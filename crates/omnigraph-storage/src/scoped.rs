@@ -227,6 +227,19 @@ impl StorageIoScope {
         }
     }
 
+    /// An unconditional replacement of `path` on a local filesystem returned
+    /// an error. A local write cannot land after it returns (its rename has
+    /// happened or it has not), so the key is settled whatever the error;
+    /// its owner reads the file to learn which. The local emulation of a
+    /// conditional update is the only caller, under its caller's lock on the
+    /// key, so the request it settles is its own.
+    pub(crate) fn settle_returned_local_write(&self, path: &Path) {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.unsettled.get(path) == Some(&None) {
+            state.unsettled.remove(path);
+        }
+    }
+
     pub fn pending(&self) -> usize {
         self.inner.state.lock().unwrap().pending
     }
@@ -1451,7 +1464,12 @@ mod tests {
         let path = Path::from("__cluster/operations.json");
         let scope = StorageIoScope::new();
         let unsettle = |precondition| {
-            scope.inner.state.lock().unwrap().unsettle(&path, precondition);
+            scope
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .unsettle(&path, precondition);
         };
 
         unsettle(Some(Precondition::Matches("\"e1\"/".into())));
@@ -1462,17 +1480,33 @@ mod tests {
 
         unsettle(Some(Precondition::Matches("\"e1\"/".into())));
         scope.settle_superseded(&path, None);
-        assert_eq!(scope.unsettled_keys(), 0, "an if-match cannot apply to a gone object");
+        assert_eq!(
+            scope.unsettled_keys(),
+            0,
+            "an if-match cannot apply to a gone object"
+        );
 
         unsettle(Some(Precondition::Absent));
         scope.settle_superseded(&path, None);
-        assert_eq!(scope.unsettled_keys(), 1, "a create can still land on an absent key");
+        assert_eq!(
+            scope.unsettled_keys(),
+            1,
+            "a create can still land on an absent key"
+        );
         scope.settle_superseded(&path, Some("\"e1\""));
-        assert_eq!(scope.unsettled_keys(), 0, "a create cannot apply over an object");
+        assert_eq!(
+            scope.unsettled_keys(),
+            0,
+            "a create cannot apply over an object"
+        );
 
         unsettle(None);
         scope.settle_superseded(&path, Some("\"e9\""));
-        assert_eq!(scope.unsettled_keys(), 1, "an unconditional request stays unsettled");
+        assert_eq!(
+            scope.unsettled_keys(),
+            1,
+            "an unconditional request stays unsettled"
+        );
     }
 
     #[tokio::test]
