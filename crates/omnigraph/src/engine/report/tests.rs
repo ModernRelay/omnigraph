@@ -1223,8 +1223,11 @@ query pairs() {
     return { max($e.payload) as last }
 }
 "#;
+    // At 4 and 5 MiB this fixture runs at the edge of a `query_memory_bytes`
+    // refusal (5 MiB is refused with or without spill compression); 16 MiB
+    // still spills every pair and leaves the run far from the cap.
     let (rows, run) = crate::instrumentation::with_query_memory_limit(
-        4 * MIB,
+        16 * MIB,
         run(&db, source, "pairs", &ParamMap::new()),
     )
     .await;
