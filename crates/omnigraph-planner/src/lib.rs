@@ -25,8 +25,8 @@
 
 pub mod aggregate;
 pub mod bound;
+pub mod core_plan;
 pub mod cost;
-pub mod edition3;
 pub mod error;
 pub mod explain;
 pub mod gate;
@@ -52,6 +52,7 @@ pub use aggregate::{
     validate_aggregate_specs,
 };
 pub use bound::{BOUND_PLAN_VERSION, BoundPlan, ValueTable};
+pub use core_plan::plan_core;
 pub use cost::{
     AccessPath, AntiJoinStrategy, CSR_BUILD_FACTOR, CoverageProvenance, EndpointProbe,
     ExpandCostInputs, ExpandMode, ExpandPolicy, HASH_JOIN_POOL_DIVISOR, HASH_JOIN_RATIO,
@@ -61,7 +62,6 @@ pub use cost::{
     coverage_validate_access, direction_probe_factor, estimate_rows, executed_hops,
     hydrate_chunk_bytes, scan_row_estimate, should_switch_to_csr,
 };
-pub use edition3::plan_edition3;
 pub use error::PlanError;
 pub use explain::Explain;
 pub use gate::{Decision, Unrouted, accept_query, accept_query_explained, plan_query, route};

@@ -182,7 +182,7 @@ case-sensitive. **Aggregates** are `count/sum/avg/min/max` (`count($f) as n`, `c
 - **Stored-query metadata**: `@description("…")` / `@instruction("…")` may follow the param list.
 - **Casing**: type names uppercase-initial (`Signal`); idents/edges lowercase-initial (`formsPattern`); variables `$`-prefixed. `//` and `/* */` comments only.
 
-The compiler grammar in `crates/omnigraph-compiler/src/query/query.pest` is the
+The compiler grammar in `crates/omnigraph-compiler/src/query/syntax/grammar.pest` is the
 single source of truth.
 
 ## CLI Reference (condensed)

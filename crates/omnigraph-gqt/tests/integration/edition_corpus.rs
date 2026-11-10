@@ -11,11 +11,13 @@ use std::path::{Path, PathBuf};
 
 use omnigraph_compiler::catalog::{Catalog, build_catalog};
 use omnigraph_compiler::query::ast::{FileBody, QueryDecl, QueryFile};
+use omnigraph_compiler::query::check::check_file;
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
-use omnigraph_compiler::query::parser::{parse_edition2, parse_query_diagnostic};
-use omnigraph_compiler::query::parser3::{EditionLine, edition_line, parse_query3};
+use omnigraph_compiler::query::parser::parse_query_diagnostic;
+use omnigraph_compiler::query::syntax::edition::{EditionLine, edition_line};
+use omnigraph_compiler::query::syntax::edition_window;
+use omnigraph_compiler::query::syntax::parse::parse_source;
 use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query_decl};
-use omnigraph_compiler::query::typeck3::typecheck_file3;
 use omnigraph_compiler::schema::parser::parse_schema;
 
 /// One edition-2 query text: where it is, the schema beside it, and the text.
@@ -30,7 +32,7 @@ fn root() -> PathBuf {
 }
 
 /// Every file with extension `ext` under `dir`, sorted; edition-3 cases
-/// (`gq3/`) and build output are not edition-2 text.
+/// (`cases/diagnostics/`) and build output are not edition-2 text.
 fn files(dir: &Path, ext: &str) -> Vec<PathBuf> {
     fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -39,10 +41,11 @@ fn files(dir: &Path, ext: &str) -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if !path
-                    .file_name()
-                    .is_some_and(|n| n == "target" || n == ".git" || n == "gq3")
-                {
+                let skipped = path.ends_with("cases/diagnostics")
+                    || path
+                        .file_name()
+                        .is_some_and(|n| n == "target" || n == ".git");
+                if !skipped {
                     walk(&path, ext, out);
                 }
             } else if path.extension().is_some_and(|e| e == ext) {
@@ -157,13 +160,13 @@ fn declarations(file: QueryFile) -> Vec<QueryDecl> {
 /// A source without an edition line parses exactly as the edition-2 front
 /// end parses it: the dispatcher changes no outcome, accepted or refused.
 #[test]
-fn every_edition2_text_in_the_repository_parses_as_before() {
+fn every_query_text_in_the_repository_parses_as_before() {
     let corpus = corpus();
     assert!(corpus.len() > 2500, "corpus shrank: {}", corpus.len());
     let mut accepted = 0;
     for text in &corpus {
         let through_the_door = parse_query_diagnostic(&text.source);
-        let direct = parse_edition2(&text.source);
+        let direct = edition_window::parse(&text.source);
         assert_eq!(
             format!("{through_the_door:?}"),
             format!("{direct:?}"),
@@ -193,7 +196,7 @@ fn lowered_ir(cat: &Catalog, decl: &QueryDecl) -> String {
                 Err(e) => format!("lowering: {e}"),
             }
         }
-        Ok(CheckedQuery::Edition3(_)) => "edition 3".to_string(),
+        Ok(CheckedQuery::Core(_)) => "edition 3".to_string(),
         Err(e) => format!("{e}"),
     }
 }
@@ -214,12 +217,12 @@ fn lowered(
 /// the front door to the same IR, or refused with the same error, as through
 /// the edition-2 parser.
 #[test]
-fn every_edition2_text_type_checks_to_the_same_ir_as_before() {
+fn every_query_text_type_checks_to_the_same_ir_as_before() {
     let mut declarations = 0;
     let mut lowered_ok = 0;
     for text in corpus() {
         let Some(cat) = catalog(&text) else { continue };
-        let before = lowered(&cat, &text.source, parse_edition2);
+        let before = lowered(&cat, &text.source, edition_window::parse);
         let through_the_door = lowered(&cat, &text.source, parse_query_diagnostic);
         assert_eq!(through_the_door, before, "{}", text.origin);
         for ir in before.iter().flatten() {
@@ -239,15 +242,15 @@ fn every_edition2_text_type_checks_to_the_same_ir_as_before() {
 /// bare-name rule in the four GQT cases whose `expect error` code moves (the
 /// rewriter's fixed map carries them).
 #[test]
-fn the_edition2_corpus_read_as_edition_3() {
+fn the_corpus_read_under_the_edition_line() {
     let mut parses = 0;
     let mut bare_names = BTreeSet::new();
     let mut unexpected = Vec::new();
     for text in corpus() {
-        if parse_edition2(&text.source).is_err() {
+        if edition_window::parse(&text.source).is_err() {
             continue;
         }
-        match parse_query3(&format!("gq 3;\n{}", text.source)) {
+        match parse_source(&format!("gq 3;\n{}", text.source)) {
             Ok(_) => parses += 1,
             Err(e) => match e.code.as_str() {
                 "Q008" => {}
@@ -279,7 +282,7 @@ fn the_edition2_corpus_read_as_edition_3() {
 /// every verdict that changes acceptance is a rule the RFC states (its
 /// Compatibility section and the rewriter table), pinned with its count.
 #[test]
-fn the_edition2_corpus_type_checks_alike_in_both_editions() {
+fn the_corpus_type_checks_alike_under_the_edition_line() {
     let code = |r: Result<(), String>| r.err().unwrap_or_else(|| "ok".to_string());
     let mut agree = 0usize;
     let mut total = 0usize;
@@ -289,7 +292,7 @@ fn the_edition2_corpus_type_checks_alike_in_both_editions() {
             continue;
         }
         let Some(cat) = catalog(&text) else { continue };
-        let Ok(file) = parse_edition2(&text.source) else {
+        let Ok(file) = edition_window::parse(&text.source) else {
             continue;
         };
         let two: Vec<String> = declarations(file)
@@ -301,10 +304,10 @@ fn the_edition2_corpus_type_checks_alike_in_both_editions() {
                 }))
             })
             .collect();
-        let Ok(file) = parse_query3(&format!("gq 3;\n{}", text.source)) else {
+        let Ok(file) = parse_source(&format!("gq 3;\n{}", text.source)) else {
             continue;
         };
-        let three: Vec<String> = typecheck_file3(&cat, &file)
+        let three: Vec<String> = check_file(&cat, &file)
             .into_iter()
             .map(|(_, r)| code(r.map(|_| ()).map_err(|e| e.code.as_str().to_string())))
             .collect();

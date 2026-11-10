@@ -1,4 +1,5 @@
 use super::*;
+use crate::query::parser::{has_settings_prefix, parse_query, parse_query_diagnostic};
 
 #[test]
 fn test_parse_basic_query() {

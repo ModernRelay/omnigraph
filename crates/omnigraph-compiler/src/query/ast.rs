@@ -474,7 +474,7 @@ pub struct QueryDecl {
     /// An edition-3 declaration (`gq 3;`): its parse tree, which the
     /// edition-3 type checker reads. Its edition-2 body fields stay empty;
     /// `None` for every edition-2 declaration.
-    pub edition3: Option<Edition3Decl>,
+    pub syntax: Option<SyntaxDecl>,
 }
 
 impl QueryDecl {
@@ -482,7 +482,7 @@ impl QueryDecl {
     /// mutation statements, or an edition-3 declaration whose body is a
     /// write body (its kind is the body's shape).
     pub fn is_mutation(&self) -> bool {
-        match &self.edition3 {
+        match &self.syntax {
             Some(decl) => decl.is_write(),
             None => !self.mutations.is_empty(),
         }
@@ -493,29 +493,29 @@ impl QueryDecl {
 /// against the declarations of its own source unit, so the type checker
 /// needs the whole file.
 #[derive(Debug, Clone)]
-pub struct Edition3Decl {
-    file: std::sync::Arc<super::ast3::File3>,
+pub struct SyntaxDecl {
+    file: std::sync::Arc<super::syntax::SourceFile>,
     index: usize,
 }
 
-impl Edition3Decl {
+impl SyntaxDecl {
     /// The declaration at `index` of `file`'s declarations, or its `explain`
     /// target when `file` is an `explain` statement.
-    pub(crate) fn new(file: std::sync::Arc<super::ast3::File3>, index: usize) -> Self {
+    pub(crate) fn new(file: std::sync::Arc<super::syntax::SourceFile>, index: usize) -> Self {
         Self { file, index }
     }
 
     /// The file the declaration belongs to.
-    pub fn file(&self) -> &super::ast3::File3 {
+    pub fn file(&self) -> &super::syntax::SourceFile {
         &self.file
     }
 
     /// The declaration's parse tree.
-    pub fn decl(&self) -> &super::ast3::Decl3 {
+    pub fn decl(&self) -> &super::syntax::Decl {
         match &self.file.body {
-            super::ast3::Body3::Decls(decls) => &decls[self.index],
-            super::ast3::Body3::Explain(decl) => decl,
-            super::ast3::Body3::Statement(_) => {
+            super::syntax::Body::Decls(decls) => &decls[self.index],
+            super::syntax::Body::Explain(decl) => decl,
+            super::syntax::Body::Statement(_) => {
                 unreachable!("an edition-3 statement carries no declaration")
             }
         }
@@ -523,7 +523,7 @@ impl Edition3Decl {
 
     /// Whether the body is a write body.
     pub fn is_write(&self) -> bool {
-        matches!(self.decl().body, super::ast3::DeclBody3::Write(_))
+        matches!(self.decl().body, super::syntax::DeclBody::Write(_))
     }
 }
 

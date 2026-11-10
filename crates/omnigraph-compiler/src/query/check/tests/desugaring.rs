@@ -12,27 +12,24 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::ast::{AggFunc, CompOp, Literal};
-use super::typeck3::compile3;
 use crate::catalog::{Catalog, build_catalog};
-use crate::ir::core3::*;
+use crate::ir::core::*;
+use crate::query::ast::{AggFunc, CompOp, Literal};
+use crate::query::check::check_source;
 use crate::schema::parser::parse_schema;
 use crate::types::{Direction, PropType, ScalarType};
 
 /// The checker tests' schema plus a second Person → Person edge, so that an
 /// alternation has two members of one orientation.
 fn catalog() -> Catalog {
-    let schema = format!(
-        "{}\nedge Likes: Person -> Person\n",
-        super::typeck3_tests::SCHEMA
-    );
+    let schema = format!("{}\nedge Likes: Person -> Person\n", super::SCHEMA);
     build_catalog(&parse_schema(&schema).unwrap()).unwrap()
 }
 
 #[track_caller]
 fn lower(src: &str) -> CoreDecl {
     let out =
-        compile3(&catalog(), &format!("gq 3;\n{src}")).unwrap_or_else(|e| panic!("{e}\n{src}"));
+        check_source(&catalog(), &format!("gq 3;\n{src}")).unwrap_or_else(|e| panic!("{e}\n{src}"));
     out.into_iter()
         .last()
         .unwrap()
@@ -42,8 +39,8 @@ fn lower(src: &str) -> CoreDecl {
 }
 
 #[track_caller]
-fn refusal(src: &str) -> super::diagnostic::QueryDiagnostic {
-    match compile3(&catalog(), &format!("gq 3;\n{src}")) {
+fn refusal(src: &str) -> crate::query::diagnostic::QueryDiagnostic {
+    match check_source(&catalog(), &format!("gq 3;\n{src}")) {
         Err(e) => e,
         Ok(out) => out
             .into_iter()
@@ -486,7 +483,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
         "query g($h: String) { match { $p: Person { handle: $h } } return { $p } }\nquery f() { match { from g(\"a\") } return { $p } }",
     );
     assert!(matches!(match_term(&got), Term::Call { name, .. } if name == "g"));
-    let got = lower(super::typeck3_tests::REACHABLE);
+    let got = lower(super::REACHABLE);
     assert!(matches!(term(&got), Term::Fix { .. }));
     // A write body: one group per run of clauses and statements, the clauses'
     // term then one sink per statement.
@@ -853,10 +850,7 @@ fn the_closure_table() {
         "Call argument, a scalar",
         accept("query g($c: String) { match { $x: Company { slug: $c } } return { $x } }\nquery q() { match { $p: Person  from g($p.handle) } return { $x } }"),
     );
-    rows.insert(
-        "Fix body, monotone",
-        accept(super::typeck3_tests::REACHABLE),
-    );
+    rows.insert("Fix body, monotone", accept(super::REACHABLE));
     rows.insert(
         "Fix body, a negation over it",
         refuse(

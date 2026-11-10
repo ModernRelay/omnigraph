@@ -1,5 +1,5 @@
 pub mod coerce;
-pub mod core3;
+pub mod core;
 pub mod fold;
 pub mod load;
 pub(crate) mod lower;

@@ -93,7 +93,7 @@ fn describe_checked_query_operation(
     let result = match checked {
         // The descriptor reads the lowered plan's result types, and the
         // planner does not lower the core IR yet.
-        CheckedQuery::Edition3(core) => {
+        CheckedQuery::Core(core) => {
             return Err(CompilerError::Plan(format!(
                 "`{}` is an edition-3 declaration; it type-checks, and its operation descriptor waits for the planner to lower edition 3",
                 core.name()

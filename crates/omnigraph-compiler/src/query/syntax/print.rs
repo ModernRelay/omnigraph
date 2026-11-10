@@ -8,8 +8,10 @@
 
 use std::fmt::Write as _;
 
-use super::ast::{AggFunc, CompOp, EdgeSelector, Literal, MutationWriteMode, UnattachedBase};
-use super::ast3::*;
+use super::*;
+use crate::query::ast::{
+    AggFunc, CompOp, EdgeSelector, Literal, MutationWriteMode, UnattachedBase,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Style {
@@ -31,28 +33,28 @@ impl Default for Style {
     }
 }
 
-pub fn print_file(file: &File3, style: Style) -> String {
+pub fn print_file(file: &SourceFile, style: Style) -> String {
     let mut out = String::from("gq 3;\n");
     for setting in &file.settings {
         let _ = writeln!(out, "{setting:?}");
     }
     match &file.body {
-        Body3::Decls(decls) => {
+        Body::Decls(decls) => {
             for d in decls {
                 out.push_str(&print_decl(d, style));
                 out.push('\n');
             }
         }
-        Body3::Explain(d) => {
+        Body::Explain(d) => {
             out.push_str("explain ");
             out.push_str(&print_decl(d, style));
         }
-        Body3::Statement(_) => out.push_str("/* statement */"),
+        Body::Statement(_) => out.push_str("/* statement */"),
     }
     out
 }
 
-pub fn print_decl(d: &Decl3, style: Style) -> String {
+pub fn print_decl(d: &Decl, style: Style) -> String {
     let mut out = format!("query {}(", d.name);
     for (i, p) in d.params.iter().enumerate() {
         if i > 0 {
@@ -84,8 +86,8 @@ pub fn print_decl(d: &Decl3, style: Style) -> String {
                     out.push_str(", ");
                 }
                 match arg {
-                    AnnotationArg3::Positional(v) => out.push_str(&annotation_value(v)),
-                    AnnotationArg3::Named(k, v) => {
+                    AnnotationArg::Positional(v) => out.push_str(&annotation_value(v)),
+                    AnnotationArg::Named(k, v) => {
                         let _ = write!(out, "{k} = {}", annotation_value(v));
                     }
                 }
@@ -111,8 +113,8 @@ pub fn print_decl(d: &Decl3, style: Style) -> String {
     }
     out.push_str(" { ");
     match &d.body {
-        DeclBody3::Read(body) => out.push_str(&read_body(body, style)),
-        DeclBody3::Write(body) => {
+        DeclBody::Read(body) => out.push_str(&read_body(body, style)),
+        DeclBody::Write(body) => {
             for (g, group) in body.groups.iter().enumerate() {
                 if g > 0 {
                     out.push_str(style.clause_sep);
@@ -134,36 +136,36 @@ pub fn print_decl(d: &Decl3, style: Style) -> String {
     out
 }
 
-fn annotation_value(v: &AnnotationValue3) -> String {
+fn annotation_value(v: &AnnotationValue) -> String {
     match v {
-        AnnotationValue3::Literal(l) => literal(l),
-        AnnotationValue3::Variable(v) => format!("${v}"),
-        AnnotationValue3::MetaField(m) => format!("@{m}"),
-        AnnotationValue3::Ident(i) => i.clone(),
+        AnnotationValue::Literal(l) => literal(l),
+        AnnotationValue::Variable(v) => format!("${v}"),
+        AnnotationValue::MetaField(m) => format!("@{m}"),
+        AnnotationValue::Ident(i) => i.clone(),
     }
 }
 
-fn statement(s: &Stmt3, style: Style) -> String {
-    let assignments = |a: &[Assignment3]| {
+fn statement(s: &Stmt, style: Style) -> String {
+    let assignments = |a: &[Assignment]| {
         a.iter()
             .map(|a| format!("{}: {}", a.property, expr(&a.value)))
             .collect::<Vec<_>>()
             .join(style.assignment_sep)
     };
     match s {
-        Stmt3::Insert {
+        Stmt::Insert {
             type_name,
             assignments: a,
         } => format!("insert {type_name} {{ {} }}", assignments(a)),
-        Stmt3::Update {
+        Stmt::Update {
             variable,
             assignments: a,
         } => format!("update ${variable} set {{ {} }}", assignments(a)),
-        Stmt3::Delete { variable } => format!("delete ${variable}"),
+        Stmt::Delete { variable } => format!("delete ${variable}"),
     }
 }
 
-pub fn read_body(body: &ReadBody3, style: Style) -> String {
+pub fn read_body(body: &ReadBody, style: Style) -> String {
     let mut out = String::from("match { ");
     out.push_str(&clauses(&body.clauses, style));
     out.push_str(" } return ");
@@ -206,37 +208,37 @@ pub fn read_body(body: &ReadBody3, style: Style) -> String {
     }
     match &body.limit {
         None => {}
-        Some(Limit3::Literal(n)) => {
+        Some(Limit::Literal(n)) => {
             let _ = write!(out, " limit {n}");
         }
-        Some(Limit3::Param(p)) => {
+        Some(Limit::Param(p)) => {
             let _ = write!(out, " limit ${p}");
         }
     }
     out
 }
 
-fn clauses(cs: &[Clause3], style: Style) -> String {
+fn clauses(cs: &[Clause], style: Style) -> String {
     cs.iter()
         .map(|c| clause(c, style))
         .collect::<Vec<_>>()
         .join(style.clause_sep)
 }
 
-fn inline(body: &ReadBody3, style: Style) -> String {
+fn inline(body: &ReadBody, style: Style) -> String {
     format!("{{ {} }}", read_body(body, style))
 }
 
-pub fn clause(c: &Clause3, style: Style) -> String {
+pub fn clause(c: &Clause, style: Style) -> String {
     match c {
-        Clause3::Let { name, value } => match value {
-            LetValue3::Relation(body) => format!("let ${name} = {}", inline(body, style)),
-            LetValue3::Expr(e) => format!("let ${name} = {}", expr(e)),
+        Clause::Let { name, value } => match value {
+            LetValue::Relation(body) => format!("let ${name} = {}", inline(body, style)),
+            LetValue::Expr(e) => format!("let ${name} = {}", expr(e)),
         },
-        Clause3::From(rel) => format!("from {}", relation(rel, style)),
-        Clause3::Not(cs) => format!("not {{ {} }}", clauses(cs, style)),
-        Clause3::Optional(cs) => format!("optional {{ {} }}", clauses(cs, style)),
-        Clause3::Binding {
+        Clause::From(rel) => format!("from {}", relation(rel, style)),
+        Clause::Not(cs) => format!("not {{ {} }}", clauses(cs, style)),
+        Clause::Optional(cs) => format!("optional {{ {} }}", clauses(cs, style)),
+        Clause::Binding {
             variable,
             type_name,
             prop_matches,
@@ -251,7 +253,7 @@ pub fn clause(c: &Clause3, style: Style) -> String {
                 format!("${variable}: {type_name} {{ {} }}", items.join(", "))
             }
         }
-        Clause3::Traversal(TraversalEq(t)) => {
+        Clause::Traversal(TraversalEq(t)) => {
             let mut out = format!("${} ", t.src);
             if let Some(b) = &t.edge_binding {
                 let _ = write!(out, "${b}:");
@@ -285,7 +287,7 @@ pub fn clause(c: &Clause3, style: Style) -> String {
             let _ = write!(out, " ${}", t.dst);
             out
         }
-        Clause3::Filter(e) => leading_minus_guarded(expr(e)),
+        Clause::Filter(e) => leading_minus_guarded(expr(e)),
     }
 }
 
@@ -312,19 +314,19 @@ fn edge(name: &str) -> String {
     }
 }
 
-fn relation(rel: &RelExpr3, style: Style) -> String {
+fn relation(rel: &RelExpr, style: Style) -> String {
     match rel {
-        RelExpr3::Inline(body) => inline(body, style),
-        RelExpr3::Call(c) => call(c),
-        RelExpr3::Variable(v) => format!("${v}"),
+        RelExpr::Inline(body) => inline(body, style),
+        RelExpr::Call(c) => call(c),
+        RelExpr::Variable(v) => format!("${v}"),
     }
 }
 
-fn block(b: &Block3, style: Style) -> String {
+fn block(b: &Block, style: Style) -> String {
     let head = match (b.func, &b.arg) {
-        (BlockFunc3::Exists, _) => "exists".to_string(),
-        (BlockFunc3::Agg(f), None) => agg(f).to_string(),
-        (BlockFunc3::Agg(f), Some(a)) => format!("{}({})", agg(f), expr(a)),
+        (BlockFunc::Exists, _) => "exists".to_string(),
+        (BlockFunc::Agg(f), None) => agg(f).to_string(),
+        (BlockFunc::Agg(f), Some(a)) => format!("{}({})", agg(f), expr(a)),
     };
     format!("{head} {{ {} }}", clauses(&b.clauses, style))
 }
@@ -352,13 +354,13 @@ fn comp(op: CompOp) -> &'static str {
     }
 }
 
-fn call(c: &Call3) -> String {
+fn call(c: &Call) -> String {
     let mut parts: Vec<String> = c
         .args
         .iter()
         .map(|a| match a {
-            Arg3::Expr(e) => expr(e),
-            Arg3::Inline(body) => inline(body, Style::default()),
+            Arg::Expr(e) => expr(e),
+            Arg::Inline(body) => inline(body, Style::default()),
         })
         .collect();
     parts.extend(c.options.iter().map(|(k, v)| format!("{k}: {}", expr(v))));
@@ -378,27 +380,26 @@ enum Prec {
     Atom,
 }
 
-fn prec(e: &Expr3) -> Prec {
+fn prec(e: &Expr) -> Prec {
     match e {
-        Expr3::Or(..) => Prec::Or,
-        Expr3::And(..) => Prec::And,
-        Expr3::Not(_) => Prec::Not,
-        Expr3::Compare { .. }
-        | Expr3::In { .. }
-        | Expr3::IsNull { .. }
-        | Expr3::InfixString { .. } => Prec::Comparison,
-        Expr3::Arith {
+        Expr::Or(..) => Prec::Or,
+        Expr::And(..) => Prec::And,
+        Expr::Not(_) => Prec::Not,
+        Expr::Compare { .. } | Expr::In { .. } | Expr::IsNull { .. } | Expr::InfixString { .. } => {
+            Prec::Comparison
+        }
+        Expr::Arith {
             op: ArithOp::Add | ArithOp::Sub,
             ..
         } => Prec::Sum,
-        Expr3::Arith { .. } => Prec::Product,
-        Expr3::Neg(_) => Prec::Unary,
+        Expr::Arith { .. } => Prec::Product,
+        Expr::Neg(_) => Prec::Unary,
         _ => Prec::Atom,
     }
 }
 
 /// `e` printed where the grammar requires at least `min`.
-fn at(e: &Expr3, min: Prec) -> String {
+fn at(e: &Expr, min: Prec) -> String {
     if prec(e) < min {
         format!("({})", expr(e))
     } else {
@@ -406,18 +407,18 @@ fn at(e: &Expr3, min: Prec) -> String {
     }
 }
 
-pub fn expr(e: &Expr3) -> String {
+pub fn expr(e: &Expr) -> String {
     match e {
-        Expr3::Literal(l) => literal(l),
-        Expr3::Variable(v) => format!("${v}"),
-        Expr3::Prop { variable, property } => format!("${variable}.{property}"),
-        Expr3::Meta(m) => format!("@{m}"),
-        Expr3::Ident(i) => i.clone(),
-        Expr3::Call(c) => call(c),
-        Expr3::AggDistinct { func, arg } => format!("{}(distinct {})", agg(*func), expr(arg)),
-        Expr3::Block(b) => block(b, Style::default()),
-        Expr3::Neg(inner) => format!("-{}", at(inner, Prec::Unary)),
-        Expr3::Arith { op, left, right } => {
+        Expr::Literal(l) => literal(l),
+        Expr::Variable(v) => format!("${v}"),
+        Expr::Prop { variable, property } => format!("${variable}.{property}"),
+        Expr::Meta(m) => format!("@{m}"),
+        Expr::Ident(i) => i.clone(),
+        Expr::Call(c) => call(c),
+        Expr::AggDistinct { func, arg } => format!("{}(distinct {})", agg(*func), expr(arg)),
+        Expr::Block(b) => block(b, Style::default()),
+        Expr::Neg(inner) => format!("-{}", at(inner, Prec::Unary)),
+        Expr::Arith { op, left, right } => {
             let own = prec(e);
             let right_min = if own == Prec::Sum {
                 Prec::Product
@@ -426,16 +427,16 @@ pub fn expr(e: &Expr3) -> String {
             };
             format!("{} {} {}", at(left, own), op.symbol(), at(right, right_min))
         }
-        Expr3::Compare { op, left, right } => format!(
+        Expr::Compare { op, left, right } => format!(
             "{} {} {}",
             at(left, Prec::Sum),
             comp(*op),
             at(right, Prec::Sum)
         ),
-        Expr3::In { needle, list, .. } => {
+        Expr::In { needle, list, .. } => {
             format!("{} in {}", at(needle, Prec::Sum), at(list, Prec::Sum))
         }
-        Expr3::IsNull {
+        Expr::IsNull {
             expr: inner,
             negated,
         } => format!(
@@ -443,10 +444,10 @@ pub fn expr(e: &Expr3) -> String {
             at(inner, Prec::Sum),
             if *negated { "not " } else { "" }
         ),
-        Expr3::Not(inner) => format!("not {}", at(inner, Prec::Not)),
-        Expr3::And(l, r) => format!("{} and {}", at(l, Prec::And), at(r, Prec::Not)),
-        Expr3::Or(l, r) => format!("{} or {}", at(l, Prec::Or), at(r, Prec::And)),
-        Expr3::InfixString {
+        Expr::Not(inner) => format!("not {}", at(inner, Prec::Not)),
+        Expr::And(l, r) => format!("{} and {}", at(l, Prec::And), at(r, Prec::Not)),
+        Expr::Or(l, r) => format!("{} or {}", at(l, Prec::Or), at(r, Prec::And)),
+        Expr::InfixString {
             op, left, right, ..
         } => format!(
             "{} {} {}",

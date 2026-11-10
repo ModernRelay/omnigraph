@@ -114,8 +114,8 @@ impl CatalogueScope {
     fn compile(&self, source: &str, name: &str) -> Result<(CompiledQuery, bool)> {
         let statement = omnigraph_compiler::find_read_statement(source, name)
             .map_err(crate::exec::query_lookup_error)?;
-        if statement.decl().edition3.is_some() {
-            return Err(crate::exec::edition3_refusal(
+        if statement.decl().syntax.is_some() {
+            return Err(crate::exec::unlowered_refusal(
                 &self.catalog,
                 statement.decl(),
             ));

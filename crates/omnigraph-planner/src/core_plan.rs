@@ -1,14 +1,14 @@
 //! The planner's door for GQ edition 3 (`gq 3;`, docs/rfcs/2026-11-07-gq-3.md).
 //!
 //! The compiler types an edition-3 declaration into the core IR
-//! ([`omnigraph_compiler::ir::core3`]). This release lowers none of it:
-//! [`plan_edition3`] refuses every declaration with `P006` before any plan
+//! ([`omnigraph_compiler::ir::core`]). This release lowers none of it:
+//! [`plan_core`] refuses every declaration with `P006` before any plan
 //! source is consulted, so the refusal needs no snapshot and reads no storage.
 //! The refusal names the first core node, in pre-order, that today's plan
 //! has no node for, or the declaration itself when every node has one; the
 //! release that lowers the core IR replaces this function.
 
-use omnigraph_compiler::ir::core3::{CoreDecl, CoreNode};
+use omnigraph_compiler::ir::core::{CoreDecl, CoreNode};
 use omnigraph_compiler::query::codes::P006;
 
 use crate::error::PlanError;
@@ -41,7 +41,7 @@ pub fn has_plan_node(node: CoreNode) -> bool {
 
 /// Plan an edition-3 declaration. No core node is lowered in this release,
 /// so the answer is always the `P006` refusal.
-pub fn plan_edition3(decl: &CoreDecl) -> PlanError {
+pub fn plan_core(decl: &CoreDecl) -> PlanError {
     let name = decl.name();
     let message = match decl.nodes().into_iter().find(|n| !has_plan_node(*n)) {
         // A self-calling read: the fixpoint evaluator is stage Rec's.
@@ -78,11 +78,10 @@ mod tests {
         let FileBody::Queries(decls) = file.body else {
             panic!("a declaration file")
         };
-        let CheckedQuery::Edition3(core) = typecheck_query_decl(&catalog, &decls[0]).unwrap()
-        else {
+        let CheckedQuery::Core(core) = typecheck_query_decl(&catalog, &decls[0]).unwrap() else {
             panic!("an edition-3 declaration")
         };
-        let PlanError::Unsupported(diagnostic) = plan_edition3(&core) else {
+        let PlanError::Unsupported(diagnostic) = plan_core(&core) else {
             panic!("a refusal")
         };
         assert_eq!(diagnostic.code, P006);
@@ -90,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn every_edition3_declaration_is_refused_naming_its_first_unplanned_node() {
+    fn every_core_declaration_is_refused_naming_its_first_unplanned_node() {
         let message = refusal(
             "gq 3;\nquery q() { match { from union({ match { $p: Person } return { $p } }, { match { $p: Person } return { $p } }) } return { $p.name } }",
         );

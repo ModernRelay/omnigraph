@@ -1,8 +1,8 @@
 //! The edition-3 type checker (docs/rfcs/2026-11-07-gq-3.md, sections 2, 3
 //! and 5).
 //!
-//! It reads the edition-3 parse tree ([`super::ast3`]) of one source unit and
-//! types every declaration into the core IR ([`crate::ir::core3`]), or
+//! It reads the edition-3 parse tree ([`crate::query::syntax`]) of one source unit and
+//! types every declaration into the core IR ([`crate::ir::core`]), or
 //! refuses it with a typed code. The derived-forms table of section 2 is the
 //! lowering: each clause becomes a step, and the steps fold into one term in
 //! clause order (binders in written order, a filter after the last binder of
@@ -18,11 +18,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::CompilerError;
-use crate::ir::core3::*;
+use crate::ir::core::WriteGroup;
+use crate::ir::core::*;
 use crate::query::ast::{AggFunc, CompOp, EdgeSelector, Literal, Traversal};
-use crate::query::ast3::*;
 use crate::query::codes::*;
 use crate::query::diagnostic::{Applicability, QueryCode, QueryDiagnostic, Suggestion, TextEdit};
+use crate::query::syntax::*;
 use crate::query::typecheck::{
     BoundVariable, MutationTarget, assignment_compatible, check_literal_type, literal_type,
     resolve_traversal, types_compatible,
@@ -65,59 +66,59 @@ fn err_fix(code: QueryCode, message: impl Into<String>, fix: impl Into<String>) 
 
 /// The result of checking one declaration.
 #[derive(Debug, Clone)]
-pub struct Checked3 {
+pub struct CheckedDecl {
     pub core: CoreDecl,
 }
 
 /// Type-check every declaration of an edition-3 file against `catalog`. The
 /// declarations of the file are the source unit a `Call` resolves against.
-pub fn typecheck_file3(
+pub fn check_file(
     catalog: &Catalog,
-    file: &File3,
-) -> Vec<(String, Result<Checked3, QueryDiagnostic>)> {
-    let decls: Vec<&Decl3> = match &file.body {
-        Body3::Decls(d) => d.iter().collect(),
-        Body3::Explain(d) => vec![d.as_ref()],
-        Body3::Statement(_) => Vec::new(),
+    file: &SourceFile,
+) -> Vec<(String, Result<CheckedDecl, QueryDiagnostic>)> {
+    let decls: Vec<&Decl> = match &file.body {
+        Body::Decls(d) => d.iter().collect(),
+        Body::Explain(d) => vec![d.as_ref()],
+        Body::Statement(_) => Vec::new(),
     };
-    let unit: HashMap<String, &Decl3> = decls.iter().map(|d| (d.name.clone(), *d)).collect();
+    let unit: HashMap<String, &Decl> = decls.iter().map(|d| (d.name.clone(), *d)).collect();
     decls
         .iter()
-        .map(|d| (d.name.clone(), typecheck_decl3(catalog, &unit, d)))
+        .map(|d| (d.name.clone(), check_decl(catalog, &unit, d)))
         .collect()
 }
 
 /// Type-check the edition-3 declaration the front door handed on, with the
 /// other declarations of its file as the source unit its calls resolve in.
-pub fn typecheck_edition3(
+pub fn check_syntax_decl(
     catalog: &Catalog,
-    edition3: &crate::query::ast::Edition3Decl,
+    syntax: &crate::query::ast::SyntaxDecl,
 ) -> Result<CoreDecl, QueryDiagnostic> {
-    let file = edition3.file();
-    let decls: Vec<&Decl3> = match &file.body {
-        Body3::Decls(d) => d.iter().collect(),
-        Body3::Explain(d) => vec![d.as_ref()],
-        Body3::Statement(_) => Vec::new(),
+    let file = syntax.file();
+    let decls: Vec<&Decl> = match &file.body {
+        Body::Decls(d) => d.iter().collect(),
+        Body::Explain(d) => vec![d.as_ref()],
+        Body::Statement(_) => Vec::new(),
     };
-    let unit: HashMap<String, &Decl3> = decls.iter().map(|d| (d.name.clone(), *d)).collect();
-    typecheck_decl3(catalog, &unit, edition3.decl()).map(|checked| checked.core)
+    let unit: HashMap<String, &Decl> = decls.iter().map(|d| (d.name.clone(), *d)).collect();
+    check_decl(catalog, &unit, syntax.decl()).map(|checked| checked.core)
 }
 
 /// Each declaration's name and its checked form or refusal.
-pub type Checked3s = Vec<(String, Result<Checked3, QueryDiagnostic>)>;
+pub type CheckedDecls = Vec<(String, Result<CheckedDecl, QueryDiagnostic>)>;
 
 /// Parse an edition-3 source (it must open with `gq 3;`) and type-check it.
-pub fn compile3(catalog: &Catalog, source: &str) -> Result<Checked3s, QueryDiagnostic> {
-    let file = super::parser3::parse_query3(source)?;
-    Ok(typecheck_file3(catalog, &file))
+pub fn check_source(catalog: &Catalog, source: &str) -> Result<CheckedDecls, QueryDiagnostic> {
+    let file = crate::query::syntax::parse::parse_source(source)?;
+    Ok(check_file(catalog, &file))
 }
 
 /// Type-check one declaration of a source unit.
-pub fn typecheck_decl3(
+pub fn check_decl(
     catalog: &Catalog,
-    unit: &HashMap<String, &Decl3>,
-    decl: &Decl3,
-) -> Result<Checked3, QueryDiagnostic> {
+    unit: &HashMap<String, &Decl>,
+    decl: &Decl,
+) -> Result<CheckedDecl, QueryDiagnostic> {
     let mut ctx = Ctx {
         catalog,
         unit,
@@ -140,9 +141,9 @@ pub fn typecheck_decl3(
             .collect(),
         params,
     });
-    ctx.in_write = matches!(decl.body, DeclBody3::Write(_));
+    ctx.in_write = matches!(decl.body, DeclBody::Write(_));
     let out = match &decl.body {
-        DeclBody3::Read(_) => ctx.read_decl(decl).map(|r| {
+        DeclBody::Read(_) => ctx.read_decl(decl).map(|r| {
             CoreDecl::Read(Box::new(CoreRead {
                 name: decl.name.clone(),
                 params: r.params,
@@ -151,10 +152,10 @@ pub fn typecheck_decl3(
                 plan_budget: r.budget,
             }))
         }),
-        DeclBody3::Write(w) => ctx.write_decl(decl, w).map(CoreDecl::Write),
+        DeclBody::Write(w) => ctx.write_decl(decl, w).map(CoreDecl::Write),
     };
     match out {
-        Ok(core) => Ok(Checked3 { core }),
+        Ok(core) => Ok(CheckedDecl { core }),
         Err(E::D(d)) => Err(d),
         Err(E::Pending(name)) => Err(QueryDiagnostic::typecheck(
             T70,
@@ -249,7 +250,7 @@ fn is_registry_name(name: &str) -> bool {
 
 struct Ctx<'a> {
     catalog: &'a Catalog,
-    unit: &'a HashMap<String, &'a Decl3>,
+    unit: &'a HashMap<String, &'a Decl>,
     fresh: u32,
     /// The declared reads being inlined, outermost first.
     frames: Vec<Frame>,
@@ -372,11 +373,11 @@ struct Scope {
 enum Pending {
     /// A filter clause and the names bound before it: a block inside it
     /// correlates on those alone.
-    Filter(Expr3, Vec<String>),
+    Filter(Expr, Vec<String>),
     Braces {
         var: String,
         prop: String,
-        value: Expr3,
+        value: Expr,
     },
 }
 
@@ -470,7 +471,7 @@ impl Scope {
     }
 }
 
-fn param_types(params: &[Param3]) -> R<Vec<(String, PropType)>> {
+fn param_types(params: &[Param]) -> R<Vec<(String, PropType)>> {
     let mut out = Vec::new();
     for p in params {
         let Some(ty) = PropType::from_param_type_name(&p.type_name, p.nullable) else {
@@ -515,7 +516,7 @@ struct Budget {
 /// The annotations of a declaration (section 5): the metadata allow-list is
 /// retained unread, `@budget(plan = n, rounds = n)` is typed, and every other
 /// name is refused, naming the stage that types it where one does.
-fn annotations(decl: &Decl3) -> R<Budget> {
+fn annotations(decl: &Decl) -> R<Budget> {
     let mut budget = Budget {
         plan: DEFAULT_PLAN_BUDGET,
         rounds: None,
@@ -541,7 +542,7 @@ fn annotations(decl: &Decl3) -> R<Budget> {
     Ok(budget)
 }
 
-fn annotation(a: &Annotation3, budget: &mut Budget) -> R<()> {
+fn annotation(a: &Annotation, budget: &mut Budget) -> R<()> {
     {
         match a.name.as_str() {
             name if METADATA_ANNOTATIONS.contains(&name) => return Ok(()),
@@ -572,7 +573,7 @@ fn annotation(a: &Annotation3, budget: &mut Budget) -> R<()> {
             ));
         };
         for arg in args {
-            let AnnotationArg3::Named(key, value) = arg else {
+            let AnnotationArg::Named(key, value) = arg else {
                 return Err(err(
                     T80,
                     "`@budget` takes `plan = n` and `rounds = n`, each a positive integer",
@@ -595,7 +596,7 @@ fn annotation(a: &Annotation3, budget: &mut Budget) -> R<()> {
                     ));
                 }
             }
-            let AnnotationValue3::Literal(Literal::Integer(n)) = value else {
+            let AnnotationValue::Literal(Literal::Integer(n)) = value else {
                 return Err(err(
                     T80,
                     format!("`@budget({key} = …)` takes a positive integer"),
@@ -622,7 +623,7 @@ impl Ctx<'_> {
     // -----------------------------------------------------------------------
     // Declarations.
 
-    fn read_decl(&mut self, decl: &Decl3) -> R<ReadOut> {
+    fn read_decl(&mut self, decl: &Decl) -> R<ReadOut> {
         if is_registry_name(&decl.name) || CLAUSE_KEYWORDS.contains(&decl.name.as_str()) {
             return Err(err(
                 T74,
@@ -632,7 +633,7 @@ impl Ctx<'_> {
                 ),
             ));
         }
-        let DeclBody3::Read(body) = &decl.body else {
+        let DeclBody::Read(body) = &decl.body else {
             return Err(err(
                 T74,
                 format!(
@@ -697,7 +698,7 @@ impl Ctx<'_> {
         })
     }
 
-    fn write_decl(&mut self, decl: &Decl3, body: &WriteBody3) -> R<CoreWrite> {
+    fn write_decl(&mut self, decl: &Decl, body: &WriteBody) -> R<CoreWrite> {
         let params = param_types(&decl.params)?;
         annotations(decl)?;
         let pmap: HashMap<String, PropType> = params.iter().cloned().collect();
@@ -747,7 +748,7 @@ impl Ctx<'_> {
 
     /// A read body in `sc` (top level: no outer columns; inline: the
     /// enclosing scope's visible columns).
-    fn read_body(&mut self, body: &ReadBody3, mut sc: Scope) -> R<Rel> {
+    fn read_body(&mut self, body: &ReadBody, mut sc: Scope) -> R<Rel> {
         self.clauses(&mut sc, &body.clauses)?;
         // Return items, typed beside every match column.
         let mut items = Vec::new();
@@ -764,7 +765,7 @@ impl Ctx<'_> {
                 ));
             }
             names.push(name.clone());
-            shaped.push(p.alias.is_some() || matches!(p.expr, Expr3::Variable(_)));
+            shaped.push(p.alias.is_some() || matches!(p.expr, Expr::Variable(_)));
             if let Some(agg) = self.aggregate(&mut sc, &p.expr)? {
                 aggs.push((format!("^{name}"), agg));
                 items.push(None);
@@ -858,7 +859,7 @@ impl Ctx<'_> {
             for o in &body.order {
                 let same_item = body.projections.iter().position(|p| p.expr == o.expr);
                 let k = match &o.expr {
-                    Expr3::Ident(alias) if names.contains(alias) => {
+                    Expr::Ident(alias) if names.contains(alias) => {
                         let i = names.iter().position(|n| n == alias).unwrap();
                         SExpr::new(SKind::Col(format!("^{alias}")), out_cols[i].ty.clone())
                     }
@@ -923,7 +924,7 @@ impl Ctx<'_> {
             let mut order = Vec::new();
             for o in &body.order {
                 let k = match &o.expr {
-                    Expr3::Ident(alias) => match ext.iter().find(|(n, _)| n[1..] == **alias) {
+                    Expr::Ident(alias) => match ext.iter().find(|(n, _)| n[1..] == **alias) {
                         Some((n, e)) => SExpr::new(SKind::Col(n.clone()), e.ty.clone()),
                         None => {
                             return Err(err(
@@ -950,8 +951,8 @@ impl Ctx<'_> {
         }
         if let Some(limit) = &body.limit {
             let k = match limit {
-                Limit3::Literal(n) => Count::Literal(*n),
-                Limit3::Param(p) => {
+                Limit::Literal(n) => Count::Literal(*n),
+                Limit::Param(p) => {
                     let Some(t) = sc.params.get(p) else {
                         return Err(err(T6, format!("`limit ${p}` names no parameter")));
                     };
@@ -1010,7 +1011,7 @@ impl Ctx<'_> {
         })
     }
 
-    fn order_key(&mut self, sc: &mut Scope, e: &Expr3) -> R<SExpr> {
+    fn order_key(&mut self, sc: &mut Scope, e: &Expr) -> R<SExpr> {
         let k = self.expr(sc, e, At::Value)?;
         if !sc.block_buf.is_empty() {
             return Err(err(
@@ -1026,65 +1027,65 @@ impl Ctx<'_> {
     fn extract_aggs(
         &mut self,
         sc: &mut Scope,
-        e: &Expr3,
+        e: &Expr,
         hidden: &mut Vec<(String, Agg)>,
-    ) -> R<Expr3> {
+    ) -> R<Expr> {
         if let Some(a) = self.aggregate(sc, e)? {
             self.fresh += 1;
             let n = format!("^_ag{}", self.fresh);
             hidden.push((n.clone(), a));
-            return Ok(Expr3::Variable(n));
+            return Ok(Expr::Variable(n));
         }
-        let b = |x: &Expr3,
+        let b = |x: &Expr,
                  this: &mut Self,
                  sc: &mut Scope,
                  h: &mut Vec<(String, Agg)>|
-         -> R<Box<Expr3>> { Ok(Box::new(this.extract_aggs(sc, x, h)?)) };
+         -> R<Box<Expr>> { Ok(Box::new(this.extract_aggs(sc, x, h)?)) };
         Ok(match e {
-            Expr3::Compare { op, left, right } => Expr3::Compare {
+            Expr::Compare { op, left, right } => Expr::Compare {
                 op: *op,
                 left: b(left, self, sc, hidden)?,
                 right: b(right, self, sc, hidden)?,
             },
-            Expr3::Arith { op, left, right } => Expr3::Arith {
+            Expr::Arith { op, left, right } => Expr::Arith {
                 op: *op,
                 left: b(left, self, sc, hidden)?,
                 right: b(right, self, sc, hidden)?,
             },
-            Expr3::And(l, r) => Expr3::And(b(l, self, sc, hidden)?, b(r, self, sc, hidden)?),
-            Expr3::Or(l, r) => Expr3::Or(b(l, self, sc, hidden)?, b(r, self, sc, hidden)?),
-            Expr3::Not(x) => Expr3::Not(b(x, self, sc, hidden)?),
-            Expr3::Neg(x) => Expr3::Neg(b(x, self, sc, hidden)?),
-            Expr3::IsNull { expr, negated } => Expr3::IsNull {
+            Expr::And(l, r) => Expr::And(b(l, self, sc, hidden)?, b(r, self, sc, hidden)?),
+            Expr::Or(l, r) => Expr::Or(b(l, self, sc, hidden)?, b(r, self, sc, hidden)?),
+            Expr::Not(x) => Expr::Not(b(x, self, sc, hidden)?),
+            Expr::Neg(x) => Expr::Neg(b(x, self, sc, hidden)?),
+            Expr::IsNull { expr, negated } => Expr::IsNull {
                 expr: b(expr, self, sc, hidden)?,
                 negated: *negated,
             },
-            Expr3::In { needle, list, at } => Expr3::In {
+            Expr::In { needle, list, at } => Expr::In {
                 needle: b(needle, self, sc, hidden)?,
                 list: b(list, self, sc, hidden)?,
                 at: at.clone(),
             },
-            Expr3::Call(c) => {
+            Expr::Call(c) => {
                 let mut c = c.clone();
                 for a in &mut c.args {
-                    if let Arg3::Expr(x) = a {
+                    if let Arg::Expr(x) = a {
                         *x = self.extract_aggs(sc, x, hidden)?;
                     }
                 }
-                Expr3::Call(c)
+                Expr::Call(c)
             }
             other => other.clone(),
         })
     }
 
     /// An aggregate return item, or `None`.
-    fn aggregate(&mut self, sc: &mut Scope, e: &Expr3) -> R<Option<Agg>> {
+    fn aggregate(&mut self, sc: &mut Scope, e: &Expr) -> R<Option<Agg>> {
         let (func, distinct, arg) = match e {
-            Expr3::Call(c) if AGGREGATES.contains(&c.name.as_str()) => {
+            Expr::Call(c) if AGGREGATES.contains(&c.name.as_str()) => {
                 if !c.options.is_empty() || c.args.len() != 1 {
                     return Err(err(T8, format!("`{}` takes one argument", c.name)));
                 }
-                let Arg3::Expr(a) = &c.args[0] else {
+                let Arg::Expr(a) = &c.args[0] else {
                     return Err(err(
                         T69,
                         format!(
@@ -1095,7 +1096,7 @@ impl Ctx<'_> {
                 };
                 (agg_func(&c.name), false, a)
             }
-            Expr3::AggDistinct { func, arg } => (*func, true, arg.as_ref()),
+            Expr::AggDistinct { func, arg } => (*func, true, arg.as_ref()),
             _ => return Ok(None),
         };
         if distinct && func != AggFunc::Count {
@@ -1150,7 +1151,7 @@ impl Ctx<'_> {
     }
 
     /// Type every clause of a scope.
-    fn clauses(&mut self, sc: &mut Scope, clauses: &[Clause3]) -> R<()> {
+    fn clauses(&mut self, sc: &mut Scope, clauses: &[Clause]) -> R<()> {
         lookahead(clauses, sc);
         for c in clauses {
             self.clause(sc, c)?;
@@ -1201,9 +1202,9 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    fn clause(&mut self, sc: &mut Scope, c: &Clause3) -> R<()> {
+    fn clause(&mut self, sc: &mut Scope, c: &Clause) -> R<()> {
         match c {
-            Clause3::Binding {
+            Clause::Binding {
                 variable,
                 type_name,
                 prop_matches,
@@ -1218,8 +1219,8 @@ impl Ctx<'_> {
                 }
                 Ok(())
             }
-            Clause3::Traversal(TraversalEq(t)) => self.traversal(sc, t),
-            Clause3::Filter(e) => {
+            Clause::Traversal(TraversalEq(t)) => self.traversal(sc, t),
+            Clause::Filter(e) => {
                 let before = sc.visible().into_iter().map(|c| c.name).collect();
                 sc.pending.push(Pending::Filter(e.clone(), before));
                 Ok(())
@@ -1227,7 +1228,7 @@ impl Ctx<'_> {
             // A block sees only the text before it, so it correlates on the
             // names bound so far and is placed after the last of those it
             // reads.
-            Clause3::Not(clauses) => {
+            Clause::Not(clauses) => {
                 let (term, free) = self.block_scope(sc, clauses)?;
                 if free.is_empty() {
                     return Err(err(
@@ -1247,9 +1248,9 @@ impl Ctx<'_> {
                 );
                 Ok(())
             }
-            Clause3::Optional(clauses) => self.optional(sc, clauses),
-            Clause3::Let { name, value } => self.let_clause(sc, name, value),
-            Clause3::From(rel) => {
+            Clause::Optional(clauses) => self.optional(sc, clauses),
+            Clause::Let { name, value } => self.let_clause(sc, name, value),
+            Clause::From(rel) => {
                 self.flush(sc, false)?;
                 let r = self.rel_expr(sc, &RelArg::Rel(rel))?;
                 self.draw(sc, r)
@@ -1350,7 +1351,7 @@ impl Ctx<'_> {
         Err(err(T1, format!("unknown node type `{type_name}`")))
     }
 
-    fn braces(&mut self, sc: &mut Scope, var: &str, prop: &str, value: &Expr3) -> R<SExpr> {
+    fn braces(&mut self, sc: &mut Scope, var: &str, prop: &str, value: &Expr) -> R<SExpr> {
         let Some(ty) = sc.col(var) else {
             return Err(err(T6, format!("`${var}` is not bound")));
         };
@@ -1383,7 +1384,7 @@ impl Ctx<'_> {
         );
         let v = self.expr(sc, value, At::Value)?;
         let v = adapt(v, &Ty::Value(prop_ty.clone()));
-        if let Expr3::Literal(l) = value {
+        if let Expr::Literal(l) = value {
             let lt = literal_type(l)?;
             // A list property matches a scalar literal by membership.
             if prop_ty.list && !lt.list {
@@ -1674,7 +1675,7 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    fn optional(&mut self, sc: &mut Scope, clauses: &[Clause3]) -> R<()> {
+    fn optional(&mut self, sc: &mut Scope, clauses: &[Clause]) -> R<()> {
         self.flush(sc, false)?;
         let before: Vec<String> = sc.visible().iter().map(|c| c.name.clone()).collect();
         let mut inner = Scope::new(sc.params.clone(), sc.visible(), sc.rels.clone());
@@ -1711,7 +1712,7 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    fn let_clause(&mut self, sc: &mut Scope, name: &str, value: &LetValue3) -> R<()> {
+    fn let_clause(&mut self, sc: &mut Scope, name: &str, value: &LetValue) -> R<()> {
         self.flush(sc, false)?;
         if sc.in_scope(name) {
             return Err(err_fix(
@@ -1721,17 +1722,17 @@ impl Ctx<'_> {
             ));
         }
         let rel = match value {
-            LetValue3::Relation(body) => Some(self.rel_expr(sc, &RelArg::Inline(body))?),
-            LetValue3::Expr(e) if is_relation_expr(e, sc, self.unit) => {
+            LetValue::Relation(body) => Some(self.rel_expr(sc, &RelArg::Inline(body))?),
+            LetValue::Expr(e) if is_relation_expr(e, sc, self.unit) => {
                 Some(self.rel_expr(sc, &RelArg::Expr(e))?)
             }
-            LetValue3::Expr(_) => None,
+            LetValue::Expr(_) => None,
         };
         if let Some(r) = rel {
             sc.rels.insert(name.to_string(), r);
             return Ok(());
         }
-        let LetValue3::Expr(e) = value else {
+        let LetValue::Expr(e) = value else {
             unreachable!()
         };
         let v = self.expr(sc, e, At::Value)?;
@@ -1788,7 +1789,7 @@ impl Ctx<'_> {
 
     /// A block's inner scope: its term (starting from `Env` when it reads an
     /// outer column) and its free variables.
-    fn block_scope(&mut self, sc: &mut Scope, clauses: &[Clause3]) -> R<(Term, Vec<String>)> {
+    fn block_scope(&mut self, sc: &mut Scope, clauses: &[Clause]) -> R<(Term, Vec<String>)> {
         let (t, f, _) = self.block_scope_arg(sc, clauses, None)?;
         Ok((t, f))
     }
@@ -1798,8 +1799,8 @@ impl Ctx<'_> {
     fn block_scope_arg(
         &mut self,
         sc: &mut Scope,
-        clauses: &[Clause3],
-        arg: Option<&Expr3>,
+        clauses: &[Clause],
+        arg: Option<&Expr>,
     ) -> R<(Term, Vec<String>, Option<SExpr>)> {
         let outer = match &sc.block_visible {
             Some(before) => sc
@@ -1831,9 +1832,9 @@ impl Ctx<'_> {
 
     fn rel_expr(&mut self, sc: &mut Scope, arg: &RelArg<'_>) -> R<Rel> {
         match arg {
-            RelArg::Rel(RelExpr3::Inline(_)) | RelArg::Inline(_) => {
-                let body: &ReadBody3 = match arg {
-                    RelArg::Rel(RelExpr3::Inline(b)) => b,
+            RelArg::Rel(RelExpr::Inline(_)) | RelArg::Inline(_) => {
+                let body: &ReadBody = match arg {
+                    RelArg::Rel(RelExpr::Inline(b)) => b,
                     RelArg::Inline(b) => b,
                     _ => unreachable!(),
                 };
@@ -1845,10 +1846,10 @@ impl Ctx<'_> {
                 }
                 Ok(r)
             }
-            RelArg::Rel(RelExpr3::Variable(v)) => self.rel_var(sc, v),
-            RelArg::Rel(RelExpr3::Call(c)) => self.rel_call(sc, c),
-            RelArg::Expr(Expr3::Variable(v)) => self.rel_var(sc, v),
-            RelArg::Expr(Expr3::Call(c)) => self.rel_call(sc, c),
+            RelArg::Rel(RelExpr::Variable(v)) => self.rel_var(sc, v),
+            RelArg::Rel(RelExpr::Call(c)) => self.rel_call(sc, c),
+            RelArg::Expr(Expr::Variable(v)) => self.rel_var(sc, v),
+            RelArg::Expr(Expr::Call(c)) => self.rel_call(sc, c),
             RelArg::Expr(_) => Err(err_fix(
                 T69,
                 "a scalar is read where a relation is expected",
@@ -1874,7 +1875,7 @@ impl Ctx<'_> {
         Err(err(T6, format!("`${v}` names no relation in scope")))
     }
 
-    fn rel_call(&mut self, sc: &mut Scope, c: &Call3) -> R<Rel> {
+    fn rel_call(&mut self, sc: &mut Scope, c: &Call) -> R<Rel> {
         match c.name.as_str() {
             "union" => self.union(sc, c),
             "distance" | "bm25" | "nearest" => self.ranking(sc, c),
@@ -1894,14 +1895,14 @@ impl Ctx<'_> {
         }
     }
 
-    fn arg_rel(&mut self, sc: &mut Scope, a: &Arg3) -> R<Rel> {
+    fn arg_rel(&mut self, sc: &mut Scope, a: &Arg) -> R<Rel> {
         match a {
-            Arg3::Inline(body) => self.rel_expr(sc, &RelArg::Inline(body)),
-            Arg3::Expr(e) => self.rel_expr(sc, &RelArg::Expr(e)),
+            Arg::Inline(body) => self.rel_expr(sc, &RelArg::Inline(body)),
+            Arg::Expr(e) => self.rel_expr(sc, &RelArg::Expr(e)),
         }
     }
 
-    fn union(&mut self, sc: &mut Scope, c: &Call3) -> R<Rel> {
+    fn union(&mut self, sc: &mut Scope, c: &Call) -> R<Rel> {
         if let Some((o, _)) = c.options.first() {
             return Err(err(T71, format!("`union` takes no option; got `{o}`")));
         }
@@ -1976,7 +1977,7 @@ impl Ctx<'_> {
     }
 
     /// `distance`, `bm25` and `nearest`.
-    fn ranking(&mut self, sc: &mut Scope, c: &Call3) -> R<Rel> {
+    fn ranking(&mut self, sc: &mut Scope, c: &Call) -> R<Rel> {
         let name = c.name.as_str();
         let (positional, admitted): (usize, &[&str]) = match name {
             "nearest" => (3, &["k", "recall"]),
@@ -2014,8 +2015,8 @@ impl Ctx<'_> {
         }
         let pop = self.arg_rel(sc, &c.args[0])?;
         let (column, property) = match &c.args[1] {
-            Arg3::Expr(Expr3::Prop { variable, property }) => (variable.clone(), property.clone()),
-            Arg3::Expr(Expr3::Ident(field)) => {
+            Arg::Expr(Expr::Prop { variable, property }) => (variable.clone(), property.clone()),
+            Arg::Expr(Expr::Ident(field)) => {
                 let col = pop
                     .ty
                     .node_columns()
@@ -2080,8 +2081,8 @@ impl Ctx<'_> {
             }
         };
         let query_arg = match &c.args[2] {
-            Arg3::Expr(e) => e,
-            Arg3::Inline(_) => {
+            Arg::Expr(e) => e,
+            Arg::Inline(_) => {
                 return Err(err(
                     T69,
                     format!("`{name}`'s query is a scalar, not a relation"),
@@ -2201,8 +2202,8 @@ impl Ctx<'_> {
             let k = self.count_option(sc, k, "k", 1, None)?;
             let recall = match c.options.iter().find(|(o, _)| o == "recall") {
                 None => None,
-                Some((_, Expr3::Literal(Literal::Float(r)))) if *r > 0.0 && *r <= 1.0 => Some(*r),
-                Some((_, Expr3::Literal(Literal::Integer(1)))) => Some(1.0),
+                Some((_, Expr::Literal(Literal::Float(r)))) if *r > 0.0 && *r <= 1.0 => Some(*r),
+                Some((_, Expr::Literal(Literal::Integer(1)))) => Some(1.0),
                 Some(_) => {
                     return Err(err(T71, "`recall:` is a literal in (0, 1]"));
                 }
@@ -2244,16 +2245,16 @@ impl Ctx<'_> {
     fn count_option(
         &mut self,
         sc: &mut Scope,
-        e: &Expr3,
+        e: &Expr,
         what: &str,
         min: i128,
         max: Option<i128>,
     ) -> R<Count> {
         match e {
-            Expr3::Literal(Literal::Integer(n)) if *n >= min && max.is_none_or(|m| *n <= m) => {
+            Expr::Literal(Literal::Integer(n)) if *n >= min && max.is_none_or(|m| *n <= m) => {
                 Ok(Count::Literal(*n as u64))
             }
-            Expr3::Variable(p)
+            Expr::Variable(p)
                 if sc
                     .params
                     .get(p)
@@ -2275,8 +2276,8 @@ impl Ctx<'_> {
     }
 
     /// A String query (`terms(q, mode: any)`) or a `terms(…)` value.
-    fn lexical(&mut self, sc: &mut Scope, e: &Expr3) -> R<LexicalQuery> {
-        if let Expr3::Call(c) = e
+    fn lexical(&mut self, sc: &mut Scope, e: &Expr) -> R<LexicalQuery> {
+        if let Expr::Call(c) = e
             && c.name == "terms"
         {
             return self.terms(sc, c);
@@ -2290,11 +2291,11 @@ impl Ctx<'_> {
         })
     }
 
-    fn terms(&mut self, sc: &mut Scope, c: &Call3) -> R<LexicalQuery> {
-        let [Arg3::Expr(t)] = c.args.as_slice() else {
+    fn terms(&mut self, sc: &mut Scope, c: &Call) -> R<LexicalQuery> {
+        let [Arg::Expr(t)] = c.args.as_slice() else {
             return Err(err(T19, "`terms` takes one text argument"));
         };
-        if !matches!(t, Expr3::Literal(Literal::String(_)) | Expr3::Variable(_)) {
+        if !matches!(t, Expr::Literal(Literal::String(_)) | Expr::Variable(_)) {
             return Err(err(T19, "`terms`' text is a String literal or parameter"));
         }
         let text = self.expr(sc, t, At::Value)?;
@@ -2303,15 +2304,15 @@ impl Ctx<'_> {
         let mut max_edits = int_lit(0);
         for (o, v) in &c.options {
             match (o.as_str(), v) {
-                ("mode", Expr3::Ident(m)) if m == "all" => mode_all = true,
-                ("mode", Expr3::Ident(m)) if m == "any" => mode_all = false,
-                ("max_edits", Expr3::Literal(Literal::Integer(n))) if (0..=2).contains(n) => {
+                ("mode", Expr::Ident(m)) if m == "all" => mode_all = true,
+                ("mode", Expr::Ident(m)) if m == "any" => mode_all = false,
+                ("max_edits", Expr::Literal(Literal::Integer(n))) if (0..=2).contains(n) => {
                     max_edits = int_lit(*n)
                 }
-                ("max_edits", Expr3::Literal(Literal::Integer(n))) => {
+                ("max_edits", Expr::Literal(Literal::Integer(n))) => {
                     return Err(err(T71, format!("`max_edits: {n}` is outside 0..=2")));
                 }
-                ("max_edits", Expr3::Variable(p))
+                ("max_edits", Expr::Variable(p))
                     if sc.params.get(p).is_some_and(|t| is_integer(t.scalar)) =>
                 {
                     max_edits = self.expr(sc, v, At::Value)?
@@ -2332,7 +2333,7 @@ impl Ctx<'_> {
         })
     }
 
-    fn rrf(&mut self, sc: &mut Scope, c: &Call3) -> R<Rel> {
+    fn rrf(&mut self, sc: &mut Scope, c: &Call) -> R<Rel> {
         let n = c.args.len();
         if !(RRF_MIN_ARMS..=RRF_MAX_ARMS).contains(&n) {
             return Err(err(T75, format!("`rrf` takes 2 to 16 arms, got {n}")));
@@ -2385,9 +2386,7 @@ impl Ctx<'_> {
         let mut weights = vec![1.0; n];
         for (o, v) in &c.options {
             match (o.as_str(), v) {
-                ("k", Expr3::Literal(Literal::Integer(x)))
-                    if *x >= 1 && *x <= RRF_MAX_K as i128 =>
-                {
+                ("k", Expr::Literal(Literal::Integer(x))) if *x >= 1 && *x <= RRF_MAX_K as i128 => {
                     k = *x as u64
                 }
                 ("k", _) => {
@@ -2396,7 +2395,7 @@ impl Ctx<'_> {
                         "`rrf`'s `k:` is an integer literal in 1..=1000000",
                     ));
                 }
-                ("weights", Expr3::Literal(Literal::List(ws))) => {
+                ("weights", Expr::Literal(Literal::List(ws))) => {
                     if ws.len() != n {
                         return Err(err(
                             T75,
@@ -2464,7 +2463,7 @@ impl Ctx<'_> {
 
     /// `name(args)`: a declared read of the same source unit, inlined with
     /// its arguments bound.
-    fn call(&mut self, sc: &mut Scope, c: &Call3) -> R<Rel> {
+    fn call(&mut self, sc: &mut Scope, c: &Call) -> R<Rel> {
         let decl = *self.unit.get(&c.name).unwrap();
         if self.in_write {
             return Err(err(
@@ -2475,7 +2474,7 @@ impl Ctx<'_> {
                 ),
             ));
         }
-        if let DeclBody3::Write(_) = decl.body {
+        if let DeclBody::Write(_) = decl.body {
             return Err(err(
                 T74,
                 format!(
@@ -2507,7 +2506,7 @@ impl Ctx<'_> {
         let mut bindings = Vec::new();
         for (i, (pname, pty)) in params.iter().enumerate() {
             let v = match c.args.get(i) {
-                Some(Arg3::Inline(_)) => {
+                Some(Arg::Inline(_)) => {
                     return Err(err_fix(
                         T69,
                         format!(
@@ -2517,7 +2516,7 @@ impl Ctx<'_> {
                         "pass a scalar, and draw the relation with `from` inside the read",
                     ));
                 }
-                Some(Arg3::Expr(e)) => {
+                Some(Arg::Expr(e)) => {
                     if is_relation_expr(e, sc, self.unit) {
                         return Err(err(
                             T69,
@@ -2629,7 +2628,7 @@ impl Ctx<'_> {
     /// A recursive call passes the parameters through unchanged: each
     /// argument, followed back through the call frames, is the target's own
     /// parameter in the same position.
-    fn recursive_args(&self, c: &Call3, args: &[SExpr], target: usize) -> R<()> {
+    fn recursive_args(&self, c: &Call, args: &[SExpr], target: usize) -> R<()> {
         let target_params = &self.frames[target].params;
         for (i, a) in args.iter().enumerate() {
             let mut cur = a.clone();
@@ -2669,9 +2668,9 @@ impl Ctx<'_> {
     // -----------------------------------------------------------------------
     // Write statements.
 
-    fn statement(&mut self, sc: &mut Scope, s: &Stmt3) -> R<(Sink, WriteClass)> {
+    fn statement(&mut self, sc: &mut Scope, s: &Stmt) -> R<(Sink, WriteClass)> {
         match s {
-            Stmt3::Insert {
+            Stmt::Insert {
                 type_name,
                 assignments,
             } => {
@@ -2790,7 +2789,7 @@ impl Ctx<'_> {
                 }
                 Err(err(T10, format!("unknown node/edge type `{type_name}`")))
             }
-            Stmt3::Update {
+            Stmt::Update {
                 variable,
                 assignments,
             } => {
@@ -2828,7 +2827,7 @@ impl Ctx<'_> {
                     WriteClass::Constructive,
                 ))
             }
-            Stmt3::Delete { variable } => {
+            Stmt::Delete { variable } => {
                 let target = self.statement_target(sc, variable, "delete")?;
                 Ok((
                     Sink::Delete {
@@ -2881,11 +2880,11 @@ impl Ctx<'_> {
     fn assign(
         &mut self,
         sc: &mut Scope,
-        value: &Expr3,
+        value: &Expr,
         pt: &PropType,
         prop: &str,
     ) -> R<AssignValue> {
-        if matches!(value, Expr3::Literal(Literal::Null)) {
+        if matches!(value, Expr::Literal(Literal::Null)) {
             if !pt.nullable {
                 return Err(err(
                     T3,
@@ -2894,7 +2893,7 @@ impl Ctx<'_> {
             }
             return Ok(AssignValue::Null);
         }
-        if let Expr3::Literal(l) = value {
+        if let Expr::Literal(l) = value {
             let lt = literal_type(l)?;
             check_literal_type(l, &lt, pt, prop)?;
             let mut want = pt.clone();
@@ -2936,7 +2935,7 @@ impl Ctx<'_> {
     fn endpoint(
         &mut self,
         sc: &mut Scope,
-        value: &Expr3,
+        value: &Expr,
         endpoint: &str,
         end: &str,
         edge: &str,
@@ -2947,7 +2946,7 @@ impl Ctx<'_> {
             .get(endpoint)
             .and_then(|n| n.key_property().and_then(|k| n.properties.get(k)).cloned())
             .unwrap_or_else(|| PropType::scalar(ScalarType::String, false));
-        if let Expr3::Variable(v) = value
+        if let Expr::Variable(v) = value
             && let Some(ty) = sc.col(v)
         {
             return match ty {
@@ -3050,7 +3049,7 @@ impl Ctx<'_> {
         }
     }
 
-    fn expr(&mut self, sc: &mut Scope, e: &Expr3, at: At) -> R<SExpr> {
+    fn expr(&mut self, sc: &mut Scope, e: &Expr, at: At) -> R<SExpr> {
         let top = matches!(at, At::Filter { top: true });
         let sub = if matches!(at, At::Filter { .. }) {
             At::Filter { top: false }
@@ -3059,7 +3058,7 @@ impl Ctx<'_> {
         };
         let boolean = Ty::scalar(ScalarType::Bool, false);
         Ok(match e {
-            Expr3::InfixString {
+            Expr::InfixString {
                 op,
                 left,
                 right: _,
@@ -3074,14 +3073,14 @@ impl Ctx<'_> {
                         .is_some_and(|p| p.list),
                 )));
             }
-            Expr3::Literal(Literal::Null) => {
+            Expr::Literal(Literal::Null) => {
                 return Err(err(
                     T7,
                     "`null` is not a value in a read; test it with `is null`",
                 ));
             }
-            Expr3::Literal(l) => SExpr::new(SKind::Lit(l.clone()), Ty::Value(literal_type(l)?)),
-            Expr3::Variable(v) => {
+            Expr::Literal(l) => SExpr::new(SKind::Lit(l.clone()), Ty::Value(literal_type(l)?)),
+            Expr::Variable(v) => {
                 if let Some(ty) = sc.col(v) {
                     SExpr::new(SKind::Col(v.clone()), ty)
                 } else if let Some(t) = sc.params.get(v) {
@@ -3098,7 +3097,7 @@ impl Ctx<'_> {
                     return Err(err(T6, format!("variable `${v}` is not bound")));
                 }
             }
-            Expr3::Prop { variable, property } => {
+            Expr::Prop { variable, property } => {
                 let Some(ty) = sc.col(variable) else {
                     if sc.params.contains_key(variable) {
                         return Err(err(
@@ -3144,26 +3143,26 @@ impl Ctx<'_> {
                     )
                 }
             }
-            Expr3::Meta(m) => {
+            Expr::Meta(m) => {
                 return Err(err(
                     T6,
                     format!("a bare meta-field `@{m}` names no binding; write `$x.@{m}`"),
                 ));
             }
-            Expr3::Ident(i) => {
+            Expr::Ident(i) => {
                 return Err(err(
                     T6,
                     format!("a bare identifier `{i}` is not a value in a read"),
                 ));
             }
-            Expr3::Call(c) => return self.call_scalar(sc, c, at, top),
-            Expr3::AggDistinct { func, .. } => {
+            Expr::Call(c) => return self.call_scalar(sc, c, at, top),
+            Expr::AggDistinct { func, .. } => {
                 return Err(err(
                     T8,
                     format!("`{func}(distinct …)` is an aggregate; it belongs in `return`"),
                 ));
             }
-            Expr3::Block(b) => {
+            Expr::Block(b) => {
                 let (term, free, arg) = self.block_scope_arg(sc, &b.clauses, b.arg.as_deref())?;
                 if free.is_empty() {
                     return Err(err(
@@ -3173,8 +3172,8 @@ impl Ctx<'_> {
                 }
                 let col = self.fresh("b");
                 let (agg, value) = match b.func {
-                    BlockFunc3::Exists => (count_rows(), exists_col(&col)),
-                    BlockFunc3::Agg(func) => {
+                    BlockFunc::Exists => (count_rows(), exists_col(&col)),
+                    BlockFunc::Agg(func) => {
                         let agg = match (arg, func) {
                             (None, AggFunc::Count) => count_rows(),
                             (None, f) => {
@@ -3202,22 +3201,22 @@ impl Ctx<'_> {
                 // The block's column is visible to the expression that reads it.
                 value
             }
-            Expr3::Neg(inner) => {
+            Expr::Neg(inner) => {
                 let v = self.expr(sc, inner, sub)?;
                 let ty = numeric(&v, "unary `-`")?;
                 SExpr::new(SKind::Neg(v.boxed()), ty)
             }
-            Expr3::Arith { op, left, right } => {
+            Expr::Arith { op, left, right } => {
                 let l = self.expr(sc, left, sub)?;
                 let r = self.expr(sc, right, sub)?;
                 arith(*op, l, r)?
             }
-            Expr3::Compare { op, left, right } => {
+            Expr::Compare { op, left, right } => {
                 let l = self.expr(sc, left, sub)?;
                 let r = self.expr(sc, right, sub)?;
                 compare(*op, l, r)?
             }
-            Expr3::In {
+            Expr::In {
                 needle,
                 list,
                 at: written,
@@ -3225,7 +3224,7 @@ impl Ctx<'_> {
                 // `$d in $x` over a node is a traversal over the edge named
                 // `in`, whose bare name is reserved; refused before the
                 // needle is typed, since a traversal would bind it.
-                if let (Expr3::Variable(a), Expr3::Variable(b)) = (needle.as_ref(), list.as_ref()) {
+                if let (Expr::Variable(a), Expr::Variable(b)) = (needle.as_ref(), list.as_ref()) {
                     if matches!(sc.col(b), Some(Ty::Node { .. })) {
                         let replacement = format!("${a} \"in\" ${b}");
                         let mut d = QueryDiagnostic::typecheck(
@@ -3295,7 +3294,7 @@ impl Ctx<'_> {
                     Ty::Edge { .. } => return Err(err(T7, "`in` reads a list, not an edge")),
                 }
             }
-            Expr3::IsNull { expr, negated } => {
+            Expr::IsNull { expr, negated } => {
                 let v = self.expr(sc, expr, sub)?;
                 SExpr::new(
                     SKind::IsNull {
@@ -3305,19 +3304,19 @@ impl Ctx<'_> {
                     boolean,
                 )
             }
-            Expr3::Not(inner) => {
+            Expr::Not(inner) => {
                 let v = self.expr(sc, inner, sub)?;
                 require_bool(&v, "`not`")?;
                 let ty = v.ty.clone();
                 SExpr::new(SKind::Not(v.boxed()), ty)
             }
-            Expr3::And(l, r) | Expr3::Or(l, r) => {
+            Expr::And(l, r) | Expr::Or(l, r) => {
                 let a = self.expr(sc, l, sub)?;
                 let b = self.expr(sc, r, sub)?;
                 require_bool(&a, "`and`/`or`")?;
                 require_bool(&b, "`and`/`or`")?;
                 let ty = Ty::scalar(ScalarType::Bool, a.ty.nullable() || b.ty.nullable());
-                if matches!(e, Expr3::And(..)) {
+                if matches!(e, Expr::And(..)) {
                     SExpr::new(SKind::And(a.boxed(), b.boxed()), ty)
                 } else {
                     SExpr::new(SKind::Or(a.boxed(), b.boxed()), ty)
@@ -3326,7 +3325,7 @@ impl Ctx<'_> {
         })
     }
 
-    fn call_scalar(&mut self, sc: &mut Scope, c: &Call3, at: At, top: bool) -> R<SExpr> {
+    fn call_scalar(&mut self, sc: &mut Scope, c: &Call, at: At, top: bool) -> R<SExpr> {
         let name = c.name.as_str();
         if matches!(name, "nearest" | "bm25" | "rrf" | "distance") {
             return Err(E::D(ranking_as_scalar(name)));
@@ -3349,15 +3348,15 @@ impl Ctx<'_> {
         let mut args = Vec::new();
         for a in &c.args {
             match a {
-                Arg3::Expr(e) => {
-                    if matches!(e, Expr3::Call(t) if t.name == "terms")
+                Arg::Expr(e) => {
+                    if matches!(e, Expr::Call(t) if t.name == "terms")
                         && matches!(name, "match_terms")
                     {
                         continue;
                     }
                     args.push(self.expr(sc, e, At::Value)?)
                 }
-                Arg3::Inline(_) => {
+                Arg::Inline(_) => {
                     return Err(err(
                         T69,
                         format!("`{name}` reads scalars; an inline read is a relation"),
@@ -3368,7 +3367,7 @@ impl Ctx<'_> {
         let bool_ty = |nullable| Ty::scalar(ScalarType::Bool, nullable);
         let string =
             |t: &Ty| matches!(t, Ty::Value(p) if p.scalar == ScalarType::String && !p.list);
-        let no_options = |c: &Call3| -> R<()> {
+        let no_options = |c: &Call| -> R<()> {
             match c.options.first() {
                 Some((o, _)) => Err(err(T71, format!("`{}` has no option `{o}`", c.name))),
                 None => Ok(()),
@@ -3466,7 +3465,7 @@ impl Ctx<'_> {
                 let mut options = Vec::new();
                 for (o, v) in &c.options {
                     if name == "fuzzy" && o == "max_edits" {
-                        if let Expr3::Literal(Literal::Integer(n)) = v
+                        if let Expr::Literal(Literal::Integer(n)) = v
                             && !(0..=2).contains(n)
                         {
                             return Err(err(T71, format!("`max_edits: {n}` is outside 0..=2")));
@@ -3498,7 +3497,7 @@ impl Ctx<'_> {
                 }
                 no_options(c)?;
                 search_field(self, &args)?;
-                let Some(Arg3::Expr(Expr3::Call(t))) = c.args.get(1) else {
+                let Some(Arg::Expr(Expr::Call(t))) = c.args.get(1) else {
                     return Err(err(
                         T19,
                         "`match_terms(field, terms(…))` takes a `terms` value",
@@ -3625,9 +3624,9 @@ enum At {
 }
 
 enum RelArg<'a> {
-    Rel(&'a RelExpr3),
-    Inline(&'a ReadBody3),
-    Expr(&'a Expr3),
+    Rel(&'a RelExpr),
+    Inline(&'a ReadBody),
+    Expr(&'a Expr),
 }
 
 // ---------------------------------------------------------------------------
@@ -4212,7 +4211,7 @@ fn class_word(c: WriteClass) -> &'static str {
     }
 }
 
-fn dup_assignments(a: &[Assignment3]) -> R<()> {
+fn dup_assignments(a: &[Assignment]) -> R<()> {
     let mut seen = HashSet::new();
     for x in a {
         if !seen.insert(&x.property) {
@@ -4593,35 +4592,35 @@ fn lexical_text(text: &SExpr) -> R<()> {
     }
 }
 
-fn contains_agg(e: &Expr3) -> bool {
+fn contains_agg(e: &Expr) -> bool {
     match e {
-        Expr3::Call(c) if AGGREGATES.contains(&c.name.as_str()) => true,
-        Expr3::AggDistinct { .. } => true,
-        Expr3::Call(c) => c
+        Expr::Call(c) if AGGREGATES.contains(&c.name.as_str()) => true,
+        Expr::AggDistinct { .. } => true,
+        Expr::Call(c) => c
             .args
             .iter()
-            .any(|a| matches!(a, Arg3::Expr(x) if contains_agg(x))),
-        Expr3::Compare { left, right, .. }
-        | Expr3::Arith { left, right, .. }
-        | Expr3::InfixString { left, right, .. }
-        | Expr3::And(left, right)
-        | Expr3::Or(left, right)
-        | Expr3::In {
+            .any(|a| matches!(a, Arg::Expr(x) if contains_agg(x))),
+        Expr::Compare { left, right, .. }
+        | Expr::Arith { left, right, .. }
+        | Expr::InfixString { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::In {
             needle: left,
             list: right,
             ..
         } => contains_agg(left) || contains_agg(right),
-        Expr3::Not(x) | Expr3::Neg(x) => contains_agg(x),
-        Expr3::IsNull { expr, .. } => contains_agg(expr),
+        Expr::Not(x) | Expr::Neg(x) => contains_agg(x),
+        Expr::IsNull { expr, .. } => contains_agg(expr),
         _ => false,
     }
 }
 
 /// The conjuncts of a top-level `and` (the formatter splits them into
 /// clauses without changing the term, so the lowering splits them too).
-fn conjuncts(e: &Expr3) -> Vec<&Expr3> {
+fn conjuncts(e: &Expr) -> Vec<&Expr> {
     match e {
-        Expr3::And(l, r) => {
+        Expr::And(l, r) => {
             let mut v = conjuncts(l);
             v.extend(conjuncts(r));
             v
@@ -4631,39 +4630,39 @@ fn conjuncts(e: &Expr3) -> Vec<&Expr3> {
 }
 
 /// The name a return item produces (edition 2's executed spelling).
-fn item_name(e: &Expr3, alias: Option<&str>) -> String {
+fn item_name(e: &Expr, alias: Option<&str>) -> String {
     if let Some(a) = alias {
         return a.to_string();
     }
     match e {
-        Expr3::Prop { variable, property } => format!("{variable}.{property}"),
-        Expr3::Variable(v) => v.clone(),
-        Expr3::Literal(_) => "literal".into(),
-        Expr3::Call(c) if AGGREGATES.contains(&c.name.as_str()) => match c.args.first() {
-            Some(Arg3::Expr(a)) => item_name(a, None),
+        Expr::Prop { variable, property } => format!("{variable}.{property}"),
+        Expr::Variable(v) => v.clone(),
+        Expr::Literal(_) => "literal".into(),
+        Expr::Call(c) if AGGREGATES.contains(&c.name.as_str()) => match c.args.first() {
+            Some(Arg::Expr(a)) => item_name(a, None),
             _ => c.name.clone(),
         },
-        Expr3::AggDistinct { arg, .. } => item_name(arg, None),
-        Expr3::Call(c) if c.name == "now" => crate::query::ast::NOW_PARAM_NAME.to_string(),
-        Expr3::Call(c) => c.name.clone(),
+        Expr::AggDistinct { arg, .. } => item_name(arg, None),
+        Expr::Call(c) if c.name == "now" => crate::query::ast::NOW_PARAM_NAME.to_string(),
+        Expr::Call(c) => c.name.clone(),
         _ => "expression".into(),
     }
 }
 
-fn is_relation_expr(e: &Expr3, sc: &Scope, unit: &HashMap<String, &Decl3>) -> bool {
+fn is_relation_expr(e: &Expr, sc: &Scope, unit: &HashMap<String, &Decl>) -> bool {
     match e {
-        Expr3::Variable(v) => sc.rels.contains_key(v),
-        Expr3::Call(c) => RELATION_ROWS.contains(&c.name.as_str()) || unit.contains_key(&c.name),
+        Expr::Variable(v) => sc.rels.contains_key(v),
+        Expr::Call(c) => RELATION_ROWS.contains(&c.name.as_str()) || unit.contains_key(&c.name),
         _ => false,
     }
 }
 
 /// Lookahead over a scope's clauses: the type each binding declares, and
 /// every name the scope will bind.
-fn lookahead(clauses: &[Clause3], sc: &mut Scope) {
+fn lookahead(clauses: &[Clause], sc: &mut Scope) {
     for c in clauses {
         match c {
-            Clause3::Binding {
+            Clause::Binding {
                 variable,
                 type_name,
                 ..
@@ -4677,35 +4676,35 @@ fn lookahead(clauses: &[Clause3], sc: &mut Scope) {
                 sc.declared_nodes.insert(variable.clone());
                 sc.future.insert(variable.clone());
             }
-            Clause3::Traversal(TraversalEq(t)) => {
+            Clause::Traversal(TraversalEq(t)) => {
                 sc.future.insert(t.src.clone());
                 sc.future.insert(t.dst.clone());
                 if let Some(k) = &t.edge_binding {
                     sc.future.insert(k.clone());
                 }
             }
-            Clause3::Let { name, .. } => {
+            Clause::Let { name, .. } => {
                 sc.future.insert(name.clone());
             }
-            Clause3::From(RelExpr3::Inline(body)) => {
+            Clause::From(RelExpr::Inline(body)) => {
                 for p in &body.projections {
                     match (&p.alias, &p.expr) {
                         (Some(a), _) => {
                             sc.future.insert(a.clone());
                         }
-                        (None, Expr3::Variable(v)) => {
+                        (None, Expr::Variable(v)) => {
                             sc.future.insert(v.clone());
                         }
                         _ => {}
                     }
                 }
             }
-            Clause3::Optional(inner) => {
+            Clause::Optional(inner) => {
                 let mut tmp = Scope::new(HashMap::new(), Vec::new(), HashMap::new());
                 lookahead(inner, &mut tmp);
                 sc.future.extend(tmp.future);
             }
-            Clause3::From(_) | Clause3::Filter(_) | Clause3::Not(_) => {}
+            Clause::From(_) | Clause::Filter(_) | Clause::Not(_) => {}
         }
     }
 }
@@ -4733,7 +4732,7 @@ fn pending_vars(p: &Pending, sc: &Scope) -> Vec<String> {
 /// The variables a filter waits for: those it names outside its blocks, and
 /// those a block names that were bound before the filter was written (the
 /// rest are the block's own).
-fn filter_vars(e: &Expr3, before: &[String], out: &mut Vec<String>) {
+fn filter_vars(e: &Expr, before: &[String], out: &mut Vec<String>) {
     let mut all = Vec::new();
     expr_vars(e, &mut all);
     let mut in_blocks = Vec::new();
@@ -4747,9 +4746,9 @@ fn filter_vars(e: &Expr3, before: &[String], out: &mut Vec<String>) {
 }
 
 /// The variables named inside the blocks of `e`.
-fn block_vars(e: &Expr3, out: &mut Vec<String>) {
+fn block_vars(e: &Expr, out: &mut Vec<String>) {
     match e {
-        Expr3::Block(b) => {
+        Expr::Block(b) => {
             clauses_vars(&b.clauses, out);
             if let Some(a) = &b.arg {
                 expr_vars(a, out);
@@ -4760,26 +4759,26 @@ fn block_vars(e: &Expr3, out: &mut Vec<String>) {
 }
 
 /// The variables `e` names outside its blocks.
-fn expr_vars_outside_blocks(e: &Expr3, out: &mut Vec<String>) {
+fn expr_vars_outside_blocks(e: &Expr, out: &mut Vec<String>) {
     match e {
-        Expr3::Block(_) => {}
-        Expr3::Variable(v) | Expr3::Prop { variable: v, .. } => out.push(v.clone()),
+        Expr::Block(_) => {}
+        Expr::Variable(v) | Expr::Prop { variable: v, .. } => out.push(v.clone()),
         other => for_each_child(other, &mut |child| expr_vars_outside_blocks(child, out)),
     }
 }
 
 /// Every direct operand of an expression that is not a block.
-fn for_each_child(e: &Expr3, f: &mut dyn FnMut(&Expr3)) {
+fn for_each_child(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     match e {
-        Expr3::Literal(_)
-        | Expr3::Variable(_)
-        | Expr3::Prop { .. }
-        | Expr3::Meta(_)
-        | Expr3::Ident(_)
-        | Expr3::Block(_) => {}
-        Expr3::Call(c) => {
+        Expr::Literal(_)
+        | Expr::Variable(_)
+        | Expr::Prop { .. }
+        | Expr::Meta(_)
+        | Expr::Ident(_)
+        | Expr::Block(_) => {}
+        Expr::Call(c) => {
             for a in &c.args {
-                if let Arg3::Expr(e) = a {
+                if let Arg::Expr(e) = a {
                     f(e);
                 }
             }
@@ -4787,27 +4786,27 @@ fn for_each_child(e: &Expr3, f: &mut dyn FnMut(&Expr3)) {
                 f(e);
             }
         }
-        Expr3::AggDistinct { arg, .. } | Expr3::Neg(arg) | Expr3::Not(arg) => f(arg),
-        Expr3::IsNull { expr, .. } => f(expr),
-        Expr3::Arith { left, right, .. }
-        | Expr3::Compare { left, right, .. }
-        | Expr3::InfixString { left, right, .. }
-        | Expr3::And(left, right)
-        | Expr3::Or(left, right) => {
+        Expr::AggDistinct { arg, .. } | Expr::Neg(arg) | Expr::Not(arg) => f(arg),
+        Expr::IsNull { expr, .. } => f(expr),
+        Expr::Arith { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::InfixString { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right) => {
             f(left);
             f(right);
         }
-        Expr3::In { needle, list, .. } => {
+        Expr::In { needle, list, .. } => {
             f(needle);
             f(list);
         }
     }
 }
 
-fn clauses_vars(clauses: &[Clause3], out: &mut Vec<String>) {
+fn clauses_vars(clauses: &[Clause], out: &mut Vec<String>) {
     for c in clauses {
         match c {
-            Clause3::Binding {
+            Clause::Binding {
                 variable,
                 prop_matches,
                 ..
@@ -4817,29 +4816,29 @@ fn clauses_vars(clauses: &[Clause3], out: &mut Vec<String>) {
                     expr_vars(v, out);
                 }
             }
-            Clause3::Traversal(TraversalEq(t)) => {
+            Clause::Traversal(TraversalEq(t)) => {
                 out.push(t.src.clone());
                 out.push(t.dst.clone());
             }
-            Clause3::Filter(e) => expr_vars(e, out),
-            Clause3::Not(c) | Clause3::Optional(c) => clauses_vars(c, out),
-            Clause3::Let { value, .. } => {
-                if let LetValue3::Expr(e) = value {
+            Clause::Filter(e) => expr_vars(e, out),
+            Clause::Not(c) | Clause::Optional(c) => clauses_vars(c, out),
+            Clause::Let { value, .. } => {
+                if let LetValue::Expr(e) = value {
                     expr_vars(e, out)
                 }
             }
-            Clause3::From(_) => {}
+            Clause::From(_) => {}
         }
     }
 }
 
-fn expr_vars(e: &Expr3, out: &mut Vec<String>) {
+fn expr_vars(e: &Expr, out: &mut Vec<String>) {
     match e {
-        Expr3::Variable(v) | Expr3::Prop { variable: v, .. } => out.push(v.clone()),
-        Expr3::Literal(_) | Expr3::Meta(_) | Expr3::Ident(_) => {}
-        Expr3::Call(c) => {
+        Expr::Variable(v) | Expr::Prop { variable: v, .. } => out.push(v.clone()),
+        Expr::Literal(_) | Expr::Meta(_) | Expr::Ident(_) => {}
+        Expr::Call(c) => {
             for a in &c.args {
-                if let Arg3::Expr(e) = a {
+                if let Arg::Expr(e) = a {
                     expr_vars(e, out);
                 }
             }
@@ -4847,25 +4846,28 @@ fn expr_vars(e: &Expr3, out: &mut Vec<String>) {
                 expr_vars(e, out);
             }
         }
-        Expr3::AggDistinct { arg, .. } | Expr3::Neg(arg) | Expr3::Not(arg) => expr_vars(arg, out),
-        Expr3::IsNull { expr, .. } => expr_vars(expr, out),
-        Expr3::Block(b) => {
+        Expr::AggDistinct { arg, .. } | Expr::Neg(arg) | Expr::Not(arg) => expr_vars(arg, out),
+        Expr::IsNull { expr, .. } => expr_vars(expr, out),
+        Expr::Block(b) => {
             clauses_vars(&b.clauses, out);
             if let Some(a) = &b.arg {
                 expr_vars(a, out);
             }
         }
-        Expr3::Arith { left, right, .. }
-        | Expr3::Compare { left, right, .. }
-        | Expr3::InfixString { left, right, .. }
-        | Expr3::And(left, right)
-        | Expr3::Or(left, right) => {
+        Expr::Arith { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::InfixString { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right) => {
             expr_vars(left, out);
             expr_vars(right, out);
         }
-        Expr3::In { needle, list, .. } => {
+        Expr::In { needle, list, .. } => {
             expr_vars(needle, out);
             expr_vars(list, out);
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

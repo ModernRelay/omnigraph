@@ -15,10 +15,10 @@
 
 use pest::Parser;
 
-use super::codes::{Q014, Q015};
-use super::diagnostic::{Applicability, QueryCode, TextEdit};
-use super::parser::{QueryParser, Rule};
-use super::parser3::{Refusal3, apply_edits, refusal, refusal_note};
+use super::parse::{Refusal, apply_edits, refusal, refusal_note};
+use super::{QueryParser, Rule};
+use crate::query::codes::{Q014, Q015};
+use crate::query::diagnostic::{Applicability, QueryCode, TextEdit};
 
 /// Words an uppercase spelling of which is lowercased: GQ's own keywords and
 /// the foreign words the grammar's recognizers hold.
@@ -562,7 +562,7 @@ impl Tracked {
 /// The innermost clause, item, key, statement or assignment of `text` that
 /// holds byte `pos`.
 fn construct_at(text: &str, pos: usize) -> Option<(usize, usize)> {
-    let pairs = QueryParser::parse(Rule::gq3_file, text).ok()?;
+    let pairs = QueryParser::parse(Rule::query_file3, text).ok()?;
     let mut best: Option<(usize, usize)> = None;
     for p in pairs.flatten() {
         if !matches!(
@@ -593,9 +593,9 @@ fn construct_at(text: &str, pos: usize) -> Option<(usize, usize)> {
 /// lexical habits it holds folded in.
 pub(crate) fn with_habits(
     input: &str,
-    first: Refusal3,
-    reparse: fn(&str) -> Option<Refusal3>,
-) -> Refusal3 {
+    first: Refusal,
+    reparse: fn(&str) -> Option<Refusal>,
+) -> Refusal {
     let habits = scan(input);
     let Some(lead) = habits.first().cloned() else {
         return first;

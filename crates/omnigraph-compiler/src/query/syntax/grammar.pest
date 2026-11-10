@@ -283,10 +283,10 @@ bool_lit = @{ ("true" | "false") ~ !(ASCII_ALPHANUMERIC | "_") }
 // the text at the construct, with a byte-range suggestion (section 5). Every
 // recognizer accepts only text that section 7's rules refuse, so the set of
 // accepted texts is section 7's. The rule names are pinned by
-// `parser3_tests::the_edition3_rule_set_is_pinned` (section 11, rule 1).
+// `syntax::tests::the_syntax_rule_set_is_pinned` (section 11, rule 1).
 // ===========================================================================
 
-gq3_file = { SOI ~ edition_line ~ setting_stmt* ~ (show_stmt ~ statement_trailer3? | branch_stmt ~ ";"? ~ statement_trailer3? | commit_stmt ~ ";"? ~ statement_trailer3? | load_stmt ~ ";"? ~ statement_trailer3? | explain_stmt3 ~ statement_trailer3? | declaration3* ~ missing_param_list3?) ~ EOI }
+query_file3 = { SOI ~ edition_line ~ setting_stmt* ~ (show_stmt ~ statement_trailer3? | branch_stmt ~ ";"? ~ statement_trailer3? | commit_stmt ~ ";"? ~ statement_trailer3? | load_stmt ~ ";"? ~ statement_trailer3? | explain_stmt3 ~ statement_trailer3? | declaration3* ~ missing_param_list3?) ~ EOI }
 edition_line = { kw_gq ~ integer ~ ";" }
 explain_stmt3 = { kw_explain ~ (query_decl3 | load_stmt) }
 statement_trailer3 = { (setting_stmt | show_stmt | branch_stmt | commit_stmt | load_stmt | explain_stmt3 | declaration3)+ }

@@ -2,18 +2,18 @@
 //! ("Compiler parser tests"), the rule-set pin, and one repair per refusal
 //! shape.
 
-use super::ast::{CompOp, EdgeSelector, FileBody, MutationWriteMode};
-use super::ast3::*;
-use super::diagnostic::QueryDiagnostic;
-use super::parser::parse_query_diagnostic;
-use super::parser3::parse_query3;
+use super::parse::parse_source;
+use super::*;
+use crate::query::ast::{CompOp, EdgeSelector, FileBody, MutationWriteMode};
+use crate::query::diagnostic::QueryDiagnostic;
+use crate::query::parser::parse_query_diagnostic;
 
-pub(crate) fn parse3(src: &str) -> Result<File3, QueryDiagnostic> {
-    parse_query3(&format!("gq 3;\n{src}"))
+pub(crate) fn parse3(src: &str) -> Result<SourceFile, QueryDiagnostic> {
+    parse_source(&format!("gq 3;\n{src}"))
 }
 
 #[track_caller]
-pub(crate) fn ok3(src: &str) -> File3 {
+pub(crate) fn ok3(src: &str) -> SourceFile {
     parse3(src).unwrap_or_else(|e| panic!("edition 3 refused:\n{src}\n{e:?}"))
 }
 
@@ -31,32 +31,32 @@ fn code3(src: &str) -> &'static str {
 }
 
 #[track_caller]
-fn decl(src: &str) -> Decl3 {
+fn decl(src: &str) -> Decl {
     match ok3(src).body {
-        Body3::Decls(mut d) => d.remove(0),
+        Body::Decls(mut d) => d.remove(0),
         other => panic!("not a declaration: {other:?}"),
     }
 }
 
 #[track_caller]
-fn read(src: &str) -> ReadBody3 {
+fn read(src: &str) -> ReadBody {
     match decl(src).body {
-        DeclBody3::Read(r) => r,
+        DeclBody::Read(r) => r,
         other => panic!("not a read: {other:?}"),
     }
 }
 
 #[track_caller]
-fn write(src: &str) -> WriteBody3 {
+fn write(src: &str) -> WriteBody {
     match decl(src).body {
-        DeclBody3::Write(w) => w,
+        DeclBody::Write(w) => w,
         other => panic!("not a write: {other:?}"),
     }
 }
 
 /// The clauses of `query q() { match { <clauses> } return { 1 as one } }`.
 #[track_caller]
-fn match_clauses(clauses: &str) -> Vec<Clause3> {
+fn match_clauses(clauses: &str) -> Vec<Clause> {
     read(&format!(
         "query q() {{ match {{ {clauses} }} return {{ 1 as one }} }}"
     ))
@@ -64,35 +64,35 @@ fn match_clauses(clauses: &str) -> Vec<Clause3> {
 }
 
 #[track_caller]
-fn one_clause(text: &str) -> Clause3 {
+fn one_clause(text: &str) -> Clause {
     let mut c = match_clauses(text);
     assert_eq!(c.len(), 1, "{text} gave {c:#?}");
     c.remove(0)
 }
 
 #[track_caller]
-fn filter_expr(text: &str) -> Expr3 {
+fn filter_expr(text: &str) -> Expr {
     match one_clause(text) {
-        Clause3::Filter(e) => e,
+        Clause::Filter(e) => e,
         other => panic!("{text}: not a filter: {other:?}"),
     }
 }
 
-fn int(n: i128) -> Expr3 {
-    Expr3::Literal(super::ast::Literal::Integer(n))
+fn int(n: i128) -> Expr {
+    Expr::Literal(crate::query::ast::Literal::Integer(n))
 }
-fn var(v: &str) -> Expr3 {
-    Expr3::Variable(v.to_string())
+fn var(v: &str) -> Expr {
+    Expr::Variable(v.to_string())
 }
-fn arith(op: ArithOp, l: Expr3, r: Expr3) -> Expr3 {
-    Expr3::Arith {
+fn arith(op: ArithOp, l: Expr, r: Expr) -> Expr {
+    Expr::Arith {
         op,
         left: Box::new(l),
         right: Box::new(r),
     }
 }
-fn cmp(op: CompOp, l: Expr3, r: Expr3) -> Expr3 {
-    Expr3::Compare {
+fn cmp(op: CompOp, l: Expr, r: Expr) -> Expr {
+    Expr::Compare {
         op,
         left: Box::new(l),
         right: Box::new(r),
@@ -114,16 +114,13 @@ fn the_edition_line_selects_the_grammar() {
     let FileBody::Queries(decls) = f.body else {
         panic!("a declaration file")
     };
-    let edition3 = decls[0]
-        .edition3
-        .as_ref()
-        .expect("an edition-3 declaration");
-    let DeclBody3::Read(body) = &edition3.decl().body else {
+    let syntax = decls[0].syntax.as_ref().expect("an edition-3 declaration");
+    let DeclBody::Read(body) = &syntax.decl().body else {
         panic!("a read")
     };
     assert!(matches!(
         body.clauses[1],
-        Clause3::Filter(Expr3::InfixString { .. })
+        Clause::Filter(Expr::InfixString { .. })
     ));
     // `gq 2;` is blanked so every position keeps its column.
     let e = parse_query_diagnostic("gq 2;\nquery q() { match { $d: Doc  $d.t = } return { $d } }")
@@ -139,11 +136,11 @@ fn the_edition_line_selects_the_grammar() {
     assert_eq!(e.code.as_str(), "Q006");
     // The line stands before the settings lines.
     assert!(
-        parse_query3("gq 3;\nset ann_nprobes = 4;\nquery q() { match { $p: P } return { $p } }")
+        parse_source("gq 3;\nset ann_nprobes = 4;\nquery q() { match { $p: P } return { $p } }")
             .is_ok()
     );
     assert!(
-        parse_query3("set ann_nprobes = 4;\ngq 3;\nquery q() { match { $p: P } return { $p } }")
+        parse_source("set ann_nprobes = 4;\ngq 3;\nquery q() { match { $p: P } return { $p } }")
             .is_err()
     );
     // A comment may precede it.
@@ -166,7 +163,7 @@ const FROM: &str = "from { match { $p knows $q } return { $q } }";
 #[test]
 fn let_and_from_in_every_clause_position() {
     for text in [LET, FROM] {
-        let probe = |c: &Clause3| matches!(c, Clause3::Let { .. } | Clause3::From(_));
+        let probe = |c: &Clause| matches!(c, Clause::Let { .. } | Clause::From(_));
         // First, middle and last of a `match`.
         for clauses in [
             format!("{text}  $p: Person"),
@@ -182,10 +179,10 @@ fn let_and_from_in_every_clause_position() {
             let suffix = if block == "count" { " > 0" } else { "" };
             let c = one_clause(&format!("{block} {{ $p: Person  {text} }}{suffix}"));
             let inner = match c {
-                Clause3::Not(c) | Clause3::Optional(c) => c,
-                Clause3::Filter(Expr3::Block(b)) => b.clauses,
-                Clause3::Filter(Expr3::Compare { left, .. }) => match *left {
-                    Expr3::Block(b) => b.clauses,
+                Clause::Not(c) | Clause::Optional(c) => c,
+                Clause::Filter(Expr::Block(b)) => b.clauses,
+                Clause::Filter(Expr::Compare { left, .. }) => match *left {
+                    Expr::Block(b) => b.clauses,
                     other => panic!("{block}: {other:?}"),
                 },
                 other => panic!("{block}: {other:?}"),
@@ -194,12 +191,12 @@ fn let_and_from_in_every_clause_position() {
         }
         // As a block value's clause.
         let e = filter_expr(&format!("$x.n < count {{ $p: Person  {text} }}"));
-        assert!(matches!(e, Expr3::Compare { .. }));
+        assert!(matches!(e, Expr::Compare { .. }));
         // Inside an inline read, as `from`'s and `let`'s relation.
         let c = one_clause(&format!(
             "from {{ match {{ $p: Person  {text} }} return {{ $p }} }}"
         ));
-        let Clause3::From(RelExpr3::Inline(body)) = c else {
+        let Clause::From(RelExpr::Inline(body)) = c else {
             panic!()
         };
         assert!(body.clauses.iter().any(probe));
@@ -222,23 +219,23 @@ fn let_and_from_in_every_clause_position() {
 fn from_takes_an_inline_read_a_variable_and_a_call() {
     assert!(matches!(
         one_clause("from { match { $p: Person } return { $p } }"),
-        Clause3::From(RelExpr3::Inline(_))
+        Clause::From(RelExpr::Inline(_))
     ));
     assert!(matches!(
         one_clause("from $docs"),
-        Clause3::From(RelExpr3::Variable(v)) if v == "docs"
+        Clause::From(RelExpr::Variable(v)) if v == "docs"
     ));
-    let Clause3::From(RelExpr3::Call(c)) = one_clause("from colleagues($x.handle)") else {
+    let Clause::From(RelExpr::Call(c)) = one_clause("from colleagues($x.handle)") else {
         panic!()
     };
     assert_eq!(c.name, "colleagues");
-    let Clause3::From(RelExpr3::Call(c)) = one_clause(
+    let Clause::From(RelExpr::Call(c)) = one_clause(
         "from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20, recall: 0.9)",
     ) else {
         panic!()
     };
     assert_eq!((c.args.len(), c.options.len()), (3, 2));
-    assert!(matches!(c.args[0], Arg3::Inline(_)));
+    assert!(matches!(c.args[0], Arg::Inline(_)));
     // `from` followed by anything else is a parse error at the word (section
     // 7, as adopted on 2026-11-08: a bare filter named `from` is never well
     // typed), and so is a bare name anywhere in a `match`.
@@ -257,7 +254,7 @@ fn let_and_from_are_property_edge_alias_and_assignment_names() {
         // The Boolean literals are not bare edge names either.
         assert!(matches!(
             one_clause(&format!("$a \"{word}\" $b")),
-            Clause3::Traversal(_)
+            Clause::Traversal(_)
         ));
         let c = match_clauses(&format!("$ok {word} $p: Person"));
         assert_eq!(c.len(), 3, "{word}: {c:#?}");
@@ -276,7 +273,7 @@ fn let_and_from_are_property_edge_alias_and_assignment_names() {
         // An edge name: quoted, since `$ok  from $r` (a Boolean filter, then
         // a `from` clause) and `$ok from $r` (a triple over `from`) are the
         // same text.
-        let Clause3::Traversal(TraversalEq(t)) = one_clause(&format!("$a \"{word}\" $b")) else {
+        let Clause::Traversal(TraversalEq(t)) = one_clause(&format!("$a \"{word}\" $b")) else {
             panic!("{word} as an edge")
         };
         assert_eq!(t.selector, EdgeSelector::Named(word.into()));
@@ -302,7 +299,7 @@ fn let_and_from_are_property_edge_alias_and_assignment_names() {
             "query w() {{ insert Person {{ {word}: 1, handle: \"h\" }} }}"
         ));
         assert!(
-            matches!(&w.all_statements()[0], Stmt3::Insert { assignments, .. } if assignments[0].property == word)
+            matches!(&w.all_statements()[0], Stmt::Insert { assignments, .. } if assignments[0].property == word)
         );
         // A registry row is never named a clause keyword (section 5), so
         // `from(1)` and `let(1)` are refused, not calls.
@@ -334,12 +331,12 @@ fn minus_is_arithmetic_and_the_arrow_is_refused() {
         let src = format!("query q() {{ match {{ {asym} }} return {{ 1 as one }} }}");
         let e = err3(&src);
         assert_eq!(e.code.as_str(), "Q016", "{asym}");
-        let fixed = super::parser3::apply_edits(
+        let fixed = super::parse::apply_edits(
             &format!("gq 3;\n{src}"),
             &e.suggestion.as_ref().unwrap().edits,
         );
         assert_eq!(
-            parse_query3(&fixed).unwrap(),
+            parse_source(&fixed).unwrap(),
             parse3("query q() { match { $n - 1 > 0 } return { 1 as one } }").unwrap(),
             "{asym}"
         );
@@ -412,18 +409,18 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
         cmp(
             CompOp::Lt,
             int(0),
-            arith(ArithOp::Mul, Expr3::Neg(Box::new(var("a"))), var("b"))
+            arith(ArithOp::Mul, Expr::Neg(Box::new(var("a"))), var("b"))
         )
     );
     // The leading-minus rule is gone (2026-11-08): a filter may begin with
     // `-`, because a `-` after whitespace and before a word is never binary.
     assert_eq!(
         filter_expr("-$a > 0"),
-        cmp(CompOp::Gt, Expr3::Neg(Box::new(var("a"))), int(0))
+        cmp(CompOp::Gt, Expr::Neg(Box::new(var("a"))), int(0))
     );
     assert_eq!(
         filter_expr("(-$a) > 0"),
-        cmp(CompOp::Gt, Expr3::Neg(Box::new(var("a"))), int(0))
+        cmp(CompOp::Gt, Expr::Neg(Box::new(var("a"))), int(0))
     );
     // Clauses have no separator: after an expression clause, `X  -Y` would
     // continue it, so it is refused (Q016) instead of silently merging.
@@ -442,12 +439,12 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
                 var("a"),
                 arith(ArithOp::Add, var("b"), var("c"))
             ),
-            Expr3::Neg(Box::new(Expr3::Neg(Box::new(int(1)))))
+            Expr::Neg(Box::new(Expr::Neg(Box::new(int(1)))))
         )
     );
     assert!(matches!(
         filter_expr("not $a + 1 > 2 and $b"),
-        Expr3::And(l, _) if matches!(*l, Expr3::Not(_))
+        Expr::And(l, _) if matches!(*l, Expr::Not(_))
     ));
     // Comparison stays non-associative.
     assert!(parse3("query q() { match { $a < $b < $c } return { $a } }").is_err());
@@ -461,13 +458,13 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
         "query birthday($h: String) { $p: Person { handle: $h }  update $p set { age: $p.age + 1 } }",
     );
     assert!(
-        matches!(&w.all_statements()[0], Stmt3::Update { assignments, .. } if matches!(assignments[0].value, Expr3::Arith { .. }))
+        matches!(&w.all_statements()[0], Stmt::Update { assignments, .. } if matches!(assignments[0].value, Expr::Arith { .. }))
     );
 }
 
 #[test]
 fn float_literals_take_an_exponent() {
-    use super::ast::Literal;
+    use crate::query::ast::Literal;
     for (text, value) in [
         ("1.5e3", 1.5e3),
         ("2.0E-2", 2.0e-2),
@@ -478,11 +475,11 @@ fn float_literals_take_an_exponent() {
             filter_expr(&format!("$x.f > {text}")),
             cmp(
                 CompOp::Gt,
-                Expr3::Prop {
+                Expr::Prop {
                     variable: "x".into(),
                     property: "f".into()
                 },
-                Expr3::Literal(Literal::Float(value))
+                Expr::Literal(Literal::Float(value))
             ),
             "{text}"
         );
@@ -490,7 +487,7 @@ fn float_literals_take_an_exponent() {
     // A negative exponent float is unary minus over the literal.
     assert!(matches!(
         filter_expr("$x.f > -1.0e-3"),
-        Expr3::Compare { right, .. } if matches!(*right, Expr3::Neg(_))
+        Expr::Compare { right, .. } if matches!(*right, Expr::Neg(_))
     ));
     // `1e3` without a fraction is not a float. The RFC's `float_lit` admits
     // only `d.d[e…]`; with edition 2's unbounded `integer`, `1e3` would read
@@ -601,7 +598,7 @@ fn the_reserved_set_is_the_six_words() {
         );
         let r = read(&src);
         assert!(
-            matches!(&r.clauses[2], Clause3::Traversal(_)),
+            matches!(&r.clauses[2], Clause::Traversal(_)),
             "`{word}` as an edge: {:#?}",
             r.clauses
         );
@@ -631,7 +628,7 @@ fn the_reserved_set_is_the_six_words() {
             "query q() {{ match {{ $p: P  $p.{word} = 1 }} return {{ $p.{word} }} }}"
         ));
         let quoted = one_clause(&format!("$a \"{word}\" $b"));
-        assert!(matches!(quoted, Clause3::Traversal(_)), "{word} quoted");
+        assert!(matches!(quoted, Clause::Traversal(_)), "{word} quoted");
         let bare = parse3(&format!(
             "query q() {{ match {{ $a {word} $b }} return {{ $a }} }}"
         ));
@@ -642,7 +639,7 @@ fn the_reserved_set_is_the_six_words() {
                 bare.is_err()
                     || !matches!(
                         bare.as_ref().unwrap().body,
-                        Body3::Decls(ref d) if matches!(&d[0].body, DeclBody3::Read(r) if matches!(r.clauses[0], Clause3::Traversal(_)))
+                        Body::Decls(ref d) if matches!(&d[0].body, DeclBody::Read(r) if matches!(r.clauses[0], Clause::Traversal(_)))
                     ),
                 "{word} bare is a traversal"
             ),
@@ -652,7 +649,7 @@ fn the_reserved_set_is_the_six_words() {
 
 #[test]
 fn an_edge_named_in_is_quoted_and_the_bare_form_is_a_membership_filter() {
-    let Clause3::Traversal(TraversalEq(t)) = one_clause("$d \"in\" $x") else {
+    let Clause::Traversal(TraversalEq(t)) = one_clause("$d \"in\" $x") else {
         panic!()
     };
     assert_eq!(t.selector, EdgeSelector::Named("in".into()));
@@ -662,7 +659,7 @@ fn an_edge_named_in_is_quoted_and_the_bare_form_is_a_membership_filter() {
     // (`T7`).
     assert_eq!(
         filter_expr("$d in $x"),
-        Expr3::In {
+        Expr::In {
             needle: Box::new(var("d")),
             list: Box::new(var("x")),
             at: SourceSpan::default(),
@@ -752,8 +749,8 @@ fn a_clause_after_a_statement_prints_the_order() {
     // `null` is an assignment value; in operand position it stays a
     // reserved word.
     assert!(
-        matches!(&w.all_statements()[1], Stmt3::Update { assignments, .. }
-        if assignments[0].value == Expr3::Literal(super::ast::Literal::Null))
+        matches!(&w.all_statements()[1], Stmt::Update { assignments, .. }
+        if assignments[0].value == Expr::Literal(crate::query::ast::Literal::Null))
     );
     write("query w() { insert P { a: null, b: 1 } }");
     write("query w() { insert P { a: null  b: 1 } }");
@@ -783,7 +780,7 @@ fn other_respellings_print_their_fix() {
     // Infix `contains` and `starts_with` parse to a node the type checker
     // refuses (`T7`), since the left operand's type picks the fix.
     for src in ["$d.title starts_with \"O\"", "$d.tags contains \"rust\""] {
-        assert!(matches!(filter_expr(src), Expr3::InfixString { .. }));
+        assert!(matches!(filter_expr(src), Expr::InfixString { .. }));
     }
     // Every annotation parses; the type checker decides which names it reads
     // (`T80`), so a later typed annotation is additive.
@@ -813,11 +810,11 @@ fn other_respellings_print_their_fix() {
 fn one_keyword_and_the_body_shape_is_the_kind() {
     assert!(matches!(
         decl("query r() { match { $p: P } return { $p } }").body,
-        DeclBody3::Read(_)
+        DeclBody::Read(_)
     ));
     assert!(matches!(
         decl("query w() { insert P { a: 1 } }").body,
-        DeclBody3::Write(_)
+        DeclBody::Write(_)
     ));
     // A write whose clauses come from a ranked read.
     let w = write(
@@ -837,15 +834,15 @@ fn one_keyword_and_the_body_shape_is_the_kind() {
     );
     assert!(d.params[1].default.as_ref().unwrap().negative);
     assert_eq!(d.annotations.len(), 3);
-    let DeclBody3::Read(r) = d.body else { panic!() };
-    assert_eq!(r.limit, Some(Limit3::Param("k".into())));
+    let DeclBody::Read(r) = d.body else { panic!() };
+    assert_eq!(r.limit, Some(Limit::Param("k".into())));
     // Several declarations in one file.
     let f = ok3("query a() { match { $p: P } return { $p } }\nquery b() { insert P { a: 1 } }");
-    assert!(matches!(f.body, Body3::Decls(ref d) if d.len() == 2));
+    assert!(matches!(f.body, Body::Decls(ref d) if d.len() == 2));
     // `explain` over an edition-3 declaration.
     assert!(matches!(
         ok3("explain query a() { match { from $r } return { $p } }").body,
-        Body3::Explain(_)
+        Body::Explain(_)
     ));
     // The missing parameter list keeps its fix.
     let e = err3("query a { match { $p: P } return { $p } }");
@@ -857,7 +854,7 @@ fn one_keyword_and_the_body_shape_is_the_kind() {
 
 #[test]
 fn calls_take_positionals_then_options_and_one_distinct_form() {
-    let Expr3::Call(c) = filter_expr("fuzzy($x.title, $q, max_edits: 2)") else {
+    let Expr::Call(c) = filter_expr("fuzzy($x.title, $q, max_edits: 2)") else {
         panic!()
     };
     assert_eq!((c.args.len(), c.options.len()), (2, 1));
@@ -869,11 +866,11 @@ fn calls_take_positionals_then_options_and_one_distinct_form() {
     let r = read(
         "query q() { match { $p: P } return { count(distinct $p.city) as c, sum(distinct $p.age) as s } }",
     );
-    assert!(matches!(r.projections[1].expr, Expr3::AggDistinct { .. }));
+    assert!(matches!(r.projections[1].expr, Expr::AggDistinct { .. }));
     // `date("…")` is a literal everywhere, including inside a list.
     assert!(matches!(
         filter_expr("$x.d in [date(\"2025-01-01\"), date(\"2025-01-02\")]"),
-        Expr3::In { .. }
+        Expr::In { .. }
     ));
     // Nested relation functions.
     one_clause(
@@ -881,7 +878,7 @@ fn calls_take_positionals_then_options_and_one_distinct_form() {
     );
     // A block value as an operand, compared with another binding's value.
     let e = filter_expr("count { $d \"in\" $x } + 1 >= $x.min_docs");
-    assert!(matches!(e, Expr3::Compare { left, .. } if matches!(*left, Expr3::Arith { .. })));
+    assert!(matches!(e, Expr::Compare { left, .. } if matches!(*left, Expr::Arith { .. })));
 }
 
 #[test]
@@ -891,11 +888,11 @@ fn a_block_in_clause_position_is_a_filter() {
     // `subquery_predicate` would read `count { p } > (1 or $x)`.
     assert!(matches!(
         one_clause("count { $a: P } > 1 or $x"),
-        Clause3::Filter(Expr3::Or(..))
+        Clause::Filter(Expr::Or(..))
     ));
     assert!(matches!(
         one_clause("exists { $a: P }"),
-        Clause3::Filter(Expr3::Block(_))
+        Clause::Filter(Expr::Block(_))
     ));
 }
 
@@ -907,14 +904,14 @@ fn a_product_of_two_variables_is_not_the_wildcard_triple() {
         filter_expr("$n * $m > 10"),
         cmp(CompOp::Gt, arith(ArithOp::Mul, var("n"), var("m")), int(10))
     );
-    assert!(matches!(filter_expr("$n * $m or $ok"), Expr3::Or(..)));
+    assert!(matches!(filter_expr("$n * $m or $ok"), Expr::Or(..)));
     // The triple stays a triple, alone, bounded, bound or followed by a
     // clause.
-    assert!(matches!(one_clause("$a * $b"), Clause3::Traversal(_)));
-    assert!(matches!(one_clause("$a *{1,3} $b"), Clause3::Traversal(_)));
-    assert!(matches!(one_clause("$a $k:* $b"), Clause3::Traversal(_)));
+    assert!(matches!(one_clause("$a * $b"), Clause::Traversal(_)));
+    assert!(matches!(one_clause("$a *{1,3} $b"), Clause::Traversal(_)));
+    assert!(matches!(one_clause("$a $k:* $b"), Clause::Traversal(_)));
     let c = match_clauses("$a * $b  $b: Person  (-$x) > 0");
-    assert!(matches!(c[0], Clause3::Traversal(_)), "{c:#?}");
+    assert!(matches!(c[0], Clause::Traversal(_)), "{c:#?}");
     assert_eq!(c.len(), 3);
 }
 
@@ -923,7 +920,7 @@ fn a_bare_from_or_let_filter_before_a_variable_is_the_clause() {
     // The contextual keyword wins over a bare-name filter at clause start;
     // a bare name is never a value in a read.
     assert!(parse3("query q() { match { from  $a: Person } return { 1 } }").is_err());
-    assert!(matches!(one_clause("let  $a = 1"), Clause3::Let { .. }));
+    assert!(matches!(one_clause("let  $a = 1"), Clause::Let { .. }));
 }
 
 #[test]
@@ -936,13 +933,10 @@ fn a_call_to_contains_after_a_boolean_filter_is_a_call() {
     // type checker refuses.
     assert!(matches!(
         filter_expr("$p.name contains \"a\""),
-        Expr3::InfixString { .. }
+        Expr::InfixString { .. }
     ));
     // A triple endpoint is never followed by `.`.
-    assert!(matches!(
-        filter_expr("$a * $a.n = 0"),
-        Expr3::Compare { .. }
-    ));
+    assert!(matches!(filter_expr("$a * $a.n = 0"), Expr::Compare { .. }));
 }
 
 #[test]
@@ -953,17 +947,17 @@ fn a_date_call_is_the_date_literal() {
         filter_expr("$x.d = date(\"2025-01-01\")"),
         cmp(
             CompOp::Eq,
-            Expr3::Prop {
+            Expr::Prop {
                 variable: "x".into(),
                 property: "d".into()
             },
-            Expr3::Literal(super::ast::Literal::Date("2025-01-01".into()))
+            Expr::Literal(crate::query::ast::Literal::Date("2025-01-01".into()))
         )
     );
     // With another argument shape it is a call.
     assert!(matches!(
         filter_expr("$x.d = date($s)"),
-        Expr3::Compare { right, .. } if matches!(*right, Expr3::Call(_))
+        Expr::Compare { right, .. } if matches!(*right, Expr::Call(_))
     ));
 }
 
@@ -1001,7 +995,7 @@ fn reserved_words_between_two_variables() {
     // edge of that name can be refused only by the type checker.
     for word in ["and", "or", "in"] {
         let c = match_clauses(&format!("$a: Person  $a {word} $b"));
-        assert!(matches!(c[1], Clause3::Filter(_)), "{word}: {c:#?}");
+        assert!(matches!(c[1], Clause::Filter(_)), "{word}: {c:#?}");
     }
     assert_eq!(match_clauses("$a: Person  $a not $b").len(), 3);
     for word in ["is", "null"] {
@@ -1025,15 +1019,15 @@ fn a_date_literal_touches_its_parenthesis() {
     );
     assert!(matches!(
         filter_expr("$d.at > date(\"2025-01-01\")"),
-        Expr3::Compare { right, .. } if matches!(*right, Expr3::Literal(super::ast::Literal::Date(_)))
+        Expr::Compare { right, .. } if matches!(*right, Expr::Literal(crate::query::ast::Literal::Date(_)))
     ));
 }
 
 // ---------------------------------------------------------------------------
 // The rule-set pin (section 11, rule 1).
 
-/// Every rule the edition-3 section of `query.pest` defines, sorted.
-const EDITION3_RULES: &[&str] = &[
+/// Every rule the edition-3 section of `grammar.pest` defines, sorted.
+const SYNTAX_RULES: &[&str] = &[
     "agg_distinct",
     "agg_name",
     "alias3",
@@ -1132,7 +1126,6 @@ const EDITION3_RULES: &[&str] = &[
     "fw_when",
     "fw_where",
     "fw_with",
-    "gq3_file",
     "group_by_rec",
     "having_rec",
     "in_paren_rec",
@@ -1210,6 +1203,7 @@ const EDITION3_RULES: &[&str] = &[
     "prop_star_rec",
     "qualified_assign_rec",
     "query_decl3",
+    "query_file3",
     "read_body3",
     "read_clause3",
     "read_tail3",
@@ -1259,8 +1253,8 @@ const EDITION3_RULES: &[&str] = &[
 /// nothing section 7 refuses, but they are pinned too, so a recognizer that
 /// starts accepting text is seen.
 #[test]
-fn the_edition3_rule_set_is_pinned() {
-    let grammar = include_str!("query.pest");
+fn the_syntax_rule_set_is_pinned() {
+    let grammar = include_str!("grammar.pest");
     let section = &grammar[grammar
         .find("// GQ edition 3")
         .expect("the edition-3 banner")..];
@@ -1279,7 +1273,7 @@ fn the_edition3_rule_set_is_pinned() {
     rules.sort_unstable();
     rules.dedup();
     assert_eq!(
-        rules, EDITION3_RULES,
+        rules, SYNTAX_RULES,
         "the edition-3 rule set moved; a grammar change after the break is an amendment to the GQ 3 RFC (section 11, rule 1)"
     );
 }
@@ -2184,10 +2178,12 @@ fn every_refusal_shape_prints_a_repair_that_reparses_to_the_intended_text() {
             .suggestion
             .as_ref()
             .unwrap_or_else(|| panic!("{shape}: no suggestion: {diagnostic}"));
-        let repaired = super::parser3::apply_edits(&source, &suggestion.edits);
-        let got = parse_query3(&repaired)
+        let repaired = super::parse::apply_edits(&source, &suggestion.edits);
+        let got = parse_source(&repaired)
             .unwrap_or_else(|e| panic!("{shape}: the repair does not parse: {e}\n{repaired}"));
-        let want = parse_query3(&as_source(intended)).expect("the intended text parses");
+        let want = parse_source(&as_source(intended)).expect("the intended text parses");
         assert_eq!(got, want, "{shape}: repaired to\n{repaired}");
     }
 }
+
+mod round_trip;

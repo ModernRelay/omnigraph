@@ -2,10 +2,10 @@
 //! 10, "Type-check tests"), the RFC's examples type-checked, and one repair
 //! per type-level refusal shape.
 
-use super::parser3::parse_query3;
-use super::typeck3::{Checked3, compile3};
+use super::{CheckedDecl, check_source};
 use crate::catalog::{Catalog, build_catalog};
-use crate::ir::core3::*;
+use crate::ir::core::*;
+use crate::query::syntax::parse::parse_source;
 use crate::schema::parser::parse_schema;
 
 /// The schema of the RFC's section 8 in today's `.pg` spelling (a String's
@@ -36,8 +36,12 @@ pub(crate) fn catalog() -> Catalog {
 #[track_caller]
 pub(crate) fn check(
     src: &str,
-) -> Vec<(String, Result<Checked3, super::diagnostic::QueryDiagnostic>)> {
-    compile3(&catalog(), &format!("gq 3;\n{src}")).unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
+) -> Vec<(
+    String,
+    Result<CheckedDecl, crate::query::diagnostic::QueryDiagnostic>,
+)> {
+    check_source(&catalog(), &format!("gq 3;\n{src}"))
+        .unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
 }
 
 /// The code of the first refused declaration, or `ok`.
@@ -188,16 +192,16 @@ query relocate($h: String) {
 
 /// Edition 2's verdict on `src` against [`SCHEMA`]: `ok` or the code.
 pub(crate) fn e2(src: &str) -> String {
-    let file = match super::parser::parse_edition2(src) {
+    let file = match crate::query::syntax::edition_window::parse(src) {
         Ok(f) => f,
         Err(e) => return format!("parse {}", e.code.as_str()),
     };
     let cat = catalog();
-    let super::ast::FileBody::Queries(qs) = file.body else {
+    let crate::query::ast::FileBody::Queries(qs) = file.body else {
         return "statement".into();
     };
     for q in &qs {
-        if let Err(e) = super::typecheck::typecheck_query_decl(&cat, q) {
+        if let Err(e) = crate::query::typecheck::typecheck_query_decl(&cat, q) {
             return e
                 .diagnostic()
                 .map_or_else(|| e.to_string(), |d| d.code.as_str().to_string());
@@ -513,7 +517,7 @@ fn a_relation_function_over_zero_and_two_node_columns() {
     );
     // A bare field name is refused at its word, and the suggestion names the
     // one binding in scope.
-    let e = parse_query3(
+    let e = parse_source(
         "gq 3;\nquery q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, embedding, $v, k: 3) } return { $d } }",
     )
     .unwrap_err();
@@ -1018,9 +1022,9 @@ fn as_commit_is_admitted_only_on_a_write_body() {
     );
     assert_eq!(
         write_of(&w).write_mode,
-        super::ast::MutationWriteMode::AsCommit
+        crate::query::ast::MutationWriteMode::AsCommit
     );
-    let e = parse_query3("gq 3;\nquery q() as commit { match { $p: Person } return { $p } }")
+    let e = parse_source("gq 3;\nquery q() as commit { match { $p: Person } return { $p } }")
         .unwrap_err();
     assert_eq!(e.code.as_str(), "Q011");
 }
@@ -1147,8 +1151,8 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
 fn every_type_refusal_shape_prints_a_repair_that_reparses_to_the_intended_text() {
     for (shape, code, refused, intended) in TYPE_REPAIRS {
         let source = format!("gq 3;\n{refused}");
-        let file = parse_query3(&source).unwrap_or_else(|e| panic!("{shape}: {e}"));
-        let diagnostic = super::typeck3::typecheck_file3(&catalog(), &file)
+        let file = parse_source(&source).unwrap_or_else(|e| panic!("{shape}: {e}"));
+        let diagnostic = super::check_file(&catalog(), &file)
             .into_iter()
             .find_map(|(_, r)| r.err())
             .unwrap_or_else(|| panic!("{shape}: accepted"));
@@ -1157,10 +1161,12 @@ fn every_type_refusal_shape_prints_a_repair_that_reparses_to_the_intended_text()
             .suggestion
             .as_ref()
             .unwrap_or_else(|| panic!("{shape}: no suggestion: {diagnostic}"));
-        let repaired = super::parser3::apply_edits(&source, &suggestion.edits);
-        let got = parse_query3(&repaired)
+        let repaired = crate::query::syntax::parse::apply_edits(&source, &suggestion.edits);
+        let got = parse_source(&repaired)
             .unwrap_or_else(|e| panic!("{shape}: the repair does not parse: {e}\n{repaired}"));
-        let want = parse_query3(&format!("gq 3;\n{intended}")).expect("the intended text parses");
+        let want = parse_source(&format!("gq 3;\n{intended}")).expect("the intended text parses");
         assert_eq!(got, want, "{shape}: repaired to\n{repaired}");
     }
 }
+
+mod desugaring;

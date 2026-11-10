@@ -1,7 +1,7 @@
 //! The typed core IR of GQ edition 3 (docs/rfcs/2026-11-07-gq-3.md,
 //! section 2).
 //!
-//! The edition-3 type checker ([`crate::query::typeck3`]) lowers every
+//! The edition-3 type checker ([`crate::query::check`]) lowers every
 //! declaration into one [`Term`] tree over the thirteen core operators, the
 //! term former `Call` and the two leaves the operators need (`Unit`, the one
 //! empty row, and `Env`, the one enclosing row of a correlated term). A write
@@ -17,7 +17,7 @@
 //! declaration), so two spellings of one term compare equal.
 
 use crate::query::ast::{AggFunc, CompOp, Literal, MutationWriteMode};
-use crate::query::ast3::ArithOp;
+use crate::query::syntax::ArithOp;
 use crate::query::typecheck::MutationTarget;
 use crate::types::{Direction, PropType, ScalarType};
 

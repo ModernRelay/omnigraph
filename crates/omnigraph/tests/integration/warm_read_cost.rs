@@ -2724,7 +2724,7 @@ async fn repeated_merges_reuse_shared_cold_registry_files() {
 /// snapshot is captured. Neither the read door nor the write door issues a
 /// storage request on the way.
 #[tokio::test]
-async fn an_edition3_declaration_is_refused_before_any_storage_access() {
+async fn a_core_declaration_is_refused_before_any_storage_access() {
     cost_harness(async {
         let dir = tempfile::tempdir().unwrap();
         init_and_load(&dir).await;

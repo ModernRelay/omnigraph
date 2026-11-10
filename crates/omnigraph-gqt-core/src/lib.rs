@@ -1790,7 +1790,7 @@ fn unparsed_decl() -> QueryDecl {
         limit: None,
         mutations: Vec::new(),
         write_mode: MutationWriteMode::Publish,
-        edition3: None,
+        syntax: None,
     }
 }
 

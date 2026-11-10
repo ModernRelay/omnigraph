@@ -1,14 +1,14 @@
 //! The edition-3 front end (docs/rfcs/2026-11-07-gq-3.md, sections 5, 6 and
 //! 7).
 //!
-//! [`parse_query3`] parses a source that opens with `gq 3;` into the
-//! edition-3 tree ([`super::ast3`]). Every refusal is a [`Refusal3`]: a
+//! [`parse_source`] parses a source that opens with `gq 3;` into the
+//! edition-3 tree ([`super`]). Every refusal is a [`Refusal`]: a
 //! diagnostic whose `suggestion` holds byte-range edits of the original
 //! source and whose `fix` is derived from them (the construct the diagnostic
 //! points at, with the edits applied), plus the construct's span. The
 //! recognizers of the grammar (rules ending `_rec`, `arrow_traversal`,
 //! `where_stmt`, …) are refused here with their edits; a lexical pass over a
-//! refused source ([`super::habits3`]) adds the habits a grammar rule cannot
+//! refused source ([`super::foreign`]) adds the habits a grammar rule cannot
 //! hold (single quotes, `<>`, `==`, `&&`, `!`, uppercase keywords, `?x`,
 //! `--` and `#` comments) and composes their edits with the structural
 //! refusal of the source they produce.
@@ -23,34 +23,35 @@ use pest::iterators::Pair;
 
 use crate::error::CompilerError;
 
-use super::ast::{
-    AggFunc, CompOp, EdgeSelector, Edition3Decl, FileBody, Literal, MutationWriteMode, Param,
-    QueryDecl, QueryFile, Traversal,
+use super::edition_window::{
+    compiler_error_to_diagnostic, diagnostic_at, parse_branch_stmt, parse_commit_stmt,
+    parse_edge_name, parse_load_stmt, parse_setting_stmt, parse_setting_target, parse_string_lit,
+    parse_traversal_bounds, parse_unattached_base, position_of,
 };
-use super::ast3::*;
-use super::codes::{
+use super::foreign;
+use super::*;
+use super::{QueryParser, Rule};
+use crate::query::ast::{
+    AggFunc, CompOp, EdgeSelector, FileBody, Literal, MutationWriteMode, QueryDecl, QueryFile,
+    SyntaxDecl, Traversal,
+};
+use crate::query::codes::{
     Q001, Q002, Q004, Q005, Q006, Q007, Q008, Q009, Q010, Q011, Q012, Q013, Q014, Q015, Q016, Q017,
     Q018, Q019, Q020, Q021,
 };
-use super::diagnostic::{
+use crate::query::diagnostic::{
     Applicability, Position, QueryCode, QueryDiagnostic, Suggestion, TextEdit,
-};
-use super::habits3;
-use super::parser::{
-    QueryParser, Rule, compiler_error_to_diagnostic, diagnostic_at, parse_branch_stmt,
-    parse_commit_stmt, parse_edge_name, parse_load_stmt, parse_setting_stmt, parse_setting_target,
-    parse_string_lit, parse_traversal_bounds, parse_unattached_base, position_of, skip_trivia,
 };
 
 /// A refusal: the diagnostic an agent reads, and the span of the construct it
 /// points at (the span the derived `fix` text replaces).
 #[derive(Debug, Clone)]
-pub struct Refusal3 {
+pub struct Refusal {
     pub diagnostic: QueryDiagnostic,
     pub span: Option<(usize, usize)>,
 }
 
-impl From<QueryDiagnostic> for Refusal3 {
+impl From<QueryDiagnostic> for Refusal {
     fn from(diagnostic: QueryDiagnostic) -> Self {
         Self {
             diagnostic,
@@ -59,7 +60,7 @@ impl From<QueryDiagnostic> for Refusal3 {
     }
 }
 
-impl Refusal3 {
+impl Refusal {
     pub fn edits(&self) -> &[TextEdit] {
         self.diagnostic
             .suggestion
@@ -68,9 +69,9 @@ impl Refusal3 {
     }
 }
 
-type R<T> = std::result::Result<T, Refusal3>;
+type R<T> = std::result::Result<T, Refusal>;
 
-const MACHINE: Applicability = Applicability::MachineApplicable;
+pub(super) const MACHINE: Applicability = Applicability::MachineApplicable;
 const REVIEW: Applicability = Applicability::NeedsReview;
 
 /// A refusal with edits; `fix` is the construct `span` with the edits that
@@ -82,7 +83,7 @@ pub(crate) fn refusal(
     span: (usize, usize),
     mut edits: Vec<TextEdit>,
     applicability: Applicability,
-) -> Refusal3 {
+) -> Refusal {
     let mut d = QueryDiagnostic::parse(code, message, Some(Position::at(input, span.0)));
     // A pest span may end after implicit whitespace; the construct ends at
     // its last token, and covers every edit that touches it.
@@ -101,7 +102,7 @@ pub(crate) fn refusal(
                 edits,
             });
     }
-    Refusal3 {
+    Refusal {
         diagnostic: d,
         span: Some(span),
     }
@@ -114,8 +115,8 @@ pub(crate) fn refusal_note(
     message: impl Into<String>,
     span: (usize, usize),
     note: impl Into<String>,
-) -> Refusal3 {
-    Refusal3 {
+) -> Refusal {
+    Refusal {
         diagnostic: QueryDiagnostic::parse(code, message, Some(Position::at(input, span.0)))
             .with_fix(note),
         span: Some(span),
@@ -158,7 +159,7 @@ pub fn apply_edits(input: &str, edits: &[TextEdit]) -> String {
     out
 }
 
-fn edit(start: usize, end: usize, replacement: impl Into<String>) -> TextEdit {
+pub(super) fn edit(start: usize, end: usize, replacement: impl Into<String>) -> TextEdit {
     TextEdit {
         start,
         end,
@@ -251,149 +252,23 @@ fn fresh_name(type_name: &str) -> String {
     })
 }
 
-/// The edition a source's first line selects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditionLine {
-    /// No `gq N;` line.
-    Absent,
-    /// `gq N;` spanning `start..end` in the source.
-    Present {
-        edition: u64,
-        start: usize,
-        end: usize,
-    },
-}
-
-/// Read the edition line: `gq`, word-bounded, an integer and `;`, after
-/// leading whitespace and comments. Anything else is `Absent`.
-pub fn edition_line(input: &str) -> EditionLine {
-    let rest = skip_trivia(input);
-    let start = input.len() - rest.len();
-    let Some(after) = rest.strip_prefix("gq") else {
-        return EditionLine::Absent;
-    };
-    if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
-        return EditionLine::Absent;
-    }
-    let after = skip_trivia(after);
-    let digits = after.len() - after.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    if digits == 0 {
-        return EditionLine::Absent;
-    }
-    let Ok(edition) = after[..digits].parse::<u64>() else {
-        return EditionLine::Absent;
-    };
-    let after = skip_trivia(&after[digits..]);
-    let Some(tail) = after.strip_prefix(';') else {
-        return EditionLine::Absent;
-    };
-    EditionLine::Present {
-        edition,
-        start,
-        end: input.len() - tail.len(),
-    }
-}
-
-/// A malformed edition line (section 5): `gq 3` without `;`, `GQ 3;`, or a
-/// settings line before it. Refused with `gq 3;` as the fix. `None` when the
-/// source has no edition line at all, or a well-formed one.
-pub fn edition_near_miss(input: &str) -> Option<Refusal3> {
-    if !matches!(edition_line(input), EditionLine::Absent) {
-        return None;
-    }
-    // The candidate line, after any settings lines.
-    let mut cursor = input.len() - skip_trivia(input).len();
-    let first = cursor;
-    let mut settings_end = None;
-    loop {
-        let rest = &input[cursor..];
-        let word_end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(rest.len());
-        let word = &rest[..word_end];
-        if word == "set" || word == "reset" {
-            let semi = rest.find(';')?;
-            cursor += semi + 1;
-            settings_end = Some(cursor);
-            cursor = input.len() - skip_trivia(&input[cursor..]).len();
-            continue;
-        }
-        break;
-    }
-    let rest = &input[cursor..];
-    if !rest.get(..2).is_some_and(|w| w.eq_ignore_ascii_case("gq")) {
-        return None;
-    }
-    let after = &rest[2..];
-    if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
-    let ws = after.len() - after.trim_start().len();
-    let digits = after[ws..].len()
-        - after[ws..]
-            .trim_start_matches(|c: char| c.is_ascii_digit())
-            .len();
-    if digits == 0 {
-        return None;
-    }
-    let mut end = cursor + 2 + ws + digits;
-    let tail = &input[end..];
-    let tail_ws = tail.len() - tail.trim_start_matches([' ', '\t']).len();
-    let has_semi = tail[tail_ws..].starts_with(';');
-    if has_semi {
-        end += tail_ws + 1;
-    }
-    let line = &input[cursor..end];
-    let number = &line[2 + ws..2 + ws + digits];
-    let fixed = format!("gq {number};");
-    let (message, edits, span) = match settings_end {
-        Some(_) => (
-            "the edition line comes first, before every settings line".to_string(),
-            vec![edit(first, first, format!("{fixed}\n")), {
-                // Delete the misplaced line and the whitespace before it.
-                let before = input[..cursor].trim_end_matches([' ', '\t', '\r', '\n']);
-                edit(before.len(), end, "")
-            }],
-            (first, end),
-        ),
-        None => (
-            if has_semi {
-                format!(
-                    "`{line}` is not the edition line; it is lowercase `gq`, the edition and `;`"
-                )
-            } else {
-                format!(
-                    "`{line}` is missing its `;`; the edition line is `gq`, the edition and `;`"
-                )
-            },
-            vec![edit(cursor, end, fixed)],
-            (cursor, end),
-        ),
-    };
-    Some(refusal(input, Q006, message, span, edits, MACHINE))
-}
-
 /// The edition-3 file as the front door hands it on: the settings, an
 /// edition-2 statement body unchanged, and one [`QueryDecl`] per declaration
 /// carrying its edition-3 tree. The edition-2 body fields of such a
 /// declaration stay empty; its name, metadata, parameters and write mode are
 /// filled so every door can select and describe it.
-pub(crate) fn into_query_file(file: File3) -> QueryFile {
+pub(crate) fn into_query_file(file: SourceFile) -> QueryFile {
     let settings = file.settings.clone();
     let file = Arc::new(file);
     let header = |index: usize| {
-        let edition3 = Edition3Decl::new(Arc::clone(&file), index);
-        let decl = edition3.decl();
+        let syntax = SyntaxDecl::new(Arc::clone(&file), index);
+        let decl = syntax.decl();
         let metadata = |name: &str| {
             decl.annotations
                 .iter()
                 .find_map(|a| match a.args.as_deref() {
                     Some(
-                        [
-                            AnnotationArg3::Positional(AnnotationValue3::Literal(Literal::String(
-                                s,
-                            ))),
-                        ],
+                        [AnnotationArg::Positional(AnnotationValue::Literal(Literal::String(s)))],
                     ) if a.name == name => Some(s.clone()),
                     _ => None,
                 })
@@ -405,7 +280,7 @@ pub(crate) fn into_query_file(file: File3) -> QueryFile {
             params: decl
                 .params
                 .iter()
-                .map(|p| Param {
+                .map(|p| crate::query::ast::Param {
                     name: p.name.clone(),
                     type_name: p.type_name.clone(),
                     nullable: p.nullable,
@@ -418,41 +293,41 @@ pub(crate) fn into_query_file(file: File3) -> QueryFile {
             limit: None,
             mutations: Vec::new(),
             write_mode: decl.write_mode.clone(),
-            edition3: Some(edition3.clone()),
+            syntax: Some(syntax.clone()),
         }
     };
     let body = match &file.body {
-        Body3::Decls(decls) => FileBody::Queries((0..decls.len()).map(header).collect()),
-        Body3::Explain(_) => FileBody::Explain(header(0)),
-        Body3::Statement(statement) => statement.0.clone(),
+        Body::Decls(decls) => FileBody::Queries((0..decls.len()).map(header).collect()),
+        Body::Explain(_) => FileBody::Explain(header(0)),
+        Body::Statement(statement) => statement.0.clone(),
     };
     QueryFile { settings, body }
 }
 
-pub fn parse_query3(input: &str) -> std::result::Result<File3, QueryDiagnostic> {
-    parse_query3_detailed(input).map_err(|r| r.diagnostic)
+pub fn parse_source(input: &str) -> std::result::Result<SourceFile, QueryDiagnostic> {
+    parse_source_detailed(input).map_err(|r| r.diagnostic)
 }
 
-/// [`parse_query3`] keeping the construct span of a refusal.
-pub fn parse_query3_detailed(input: &str) -> R<File3> {
+/// [`parse_source`] keeping the construct span of a refusal.
+pub fn parse_source_detailed(input: &str) -> R<SourceFile> {
     match structural(input) {
         Ok(file) => Ok(file),
-        Err(first) => Err(habits3::with_habits(input, first, structural_refusal)),
+        Err(first) => Err(foreign::with_habits(input, first, structural_refusal)),
     }
 }
 
 /// The structural parse alone, for the habit pass to reparse a candidate.
-fn structural_refusal(input: &str) -> Option<Refusal3> {
+fn structural_refusal(input: &str) -> Option<Refusal> {
     structural(input).err()
 }
 
-fn structural(input: &str) -> R<File3> {
-    let pairs =
-        QueryParser::parse(Rule::gq3_file, input).map_err(|error| grammar_error(input, error))?;
-    let file = pairs.into_iter().next().expect("grammar: one gq3_file");
+fn structural(input: &str) -> R<SourceFile> {
+    let pairs = QueryParser::parse(Rule::query_file3, input)
+        .map_err(|error| grammar_error(input, error))?;
+    let file = pairs.into_iter().next().expect("grammar: one query_file3");
     let mut settings = Vec::new();
     let mut decls = Vec::new();
-    let mut statement: Option<Body3> = None;
+    let mut statement: Option<Body> = None;
     for inner in file.into_inner() {
         match inner.as_rule() {
             Rule::edition_line => {
@@ -475,22 +350,22 @@ fn structural(input: &str) -> R<File3> {
             }
             Rule::setting_stmt => settings.push(parse_setting_stmt(inner)?),
             Rule::branch_stmt => {
-                statement = Some(Body3::Statement(Box::new(StatementBody(FileBody::Branch(
+                statement = Some(Body::Statement(Box::new(StatementBody(FileBody::Branch(
                     parse_branch_stmt(inner)?,
                 )))))
             }
             Rule::commit_stmt => {
-                statement = Some(Body3::Statement(Box::new(StatementBody(FileBody::Commit(
+                statement = Some(Body::Statement(Box::new(StatementBody(FileBody::Commit(
                     parse_commit_stmt(inner)?,
                 )))))
             }
             Rule::load_stmt => {
-                statement = Some(Body3::Statement(Box::new(StatementBody(FileBody::Load(
+                statement = Some(Body::Statement(Box::new(StatementBody(FileBody::Load(
                     parse_load_stmt(inner)?,
                 )))))
             }
             Rule::show_stmt => {
-                statement = Some(Body3::Statement(Box::new(StatementBody(FileBody::Show(
+                statement = Some(Body::Statement(Box::new(StatementBody(FileBody::Show(
                     parse_setting_target(inner)?,
                 )))))
             }
@@ -500,10 +375,10 @@ fn structural(input: &str) -> R<File3> {
                     .find(|p| matches!(p.as_rule(), Rule::query_decl3 | Rule::load_stmt))
                     .expect("grammar: explain_stmt3 wraps one declaration or load");
                 statement = Some(match wrapped.as_rule() {
-                    Rule::load_stmt => Body3::Statement(Box::new(StatementBody(
+                    Rule::load_stmt => Body::Statement(Box::new(StatementBody(
                         FileBody::ExplainLoad(parse_load_stmt(wrapped)?),
                     ))),
-                    _ => Body3::Explain(Box::new(decl(wrapped)?)),
+                    _ => Body::Explain(Box::new(decl(wrapped)?)),
                 });
             }
             Rule::statement_trailer3 => {
@@ -539,9 +414,9 @@ fn structural(input: &str) -> R<File3> {
             _ => {}
         }
     }
-    Ok(File3 {
+    Ok(SourceFile {
         settings,
-        body: statement.unwrap_or(Body3::Decls(decls)),
+        body: statement.unwrap_or(Body::Decls(decls)),
     })
 }
 
@@ -626,7 +501,7 @@ fn construct_name(rule: Rule) -> Option<&'static str> {
 
 /// A source the grammar refuses with no recognizer: a parse error naming the
 /// constructs expected there and the token found.
-fn grammar_error(input: &str, err: pest::error::Error<Rule>) -> Refusal3 {
+fn grammar_error(input: &str, err: pest::error::Error<Rule>) -> Refusal {
     let byte = match err.location {
         InputLocation::Pos(pos) => pos,
         InputLocation::Span((start, _)) => start,
@@ -686,7 +561,7 @@ fn token_at(input: &str, byte: usize) -> Option<&str> {
 
 /// `mutation name(…) { … }` and `view name(…) { … }`: a parse error with
 /// `query` as the fix, as a machine-applicable edit of the keyword.
-fn declaration_keyword(input: &str, d: Pair<Rule>, word: &str) -> Refusal3 {
+fn declaration_keyword(input: &str, d: Pair<Rule>, word: &str) -> Refusal {
     let keyword = d
         .clone()
         .into_inner()
@@ -741,7 +616,7 @@ fn collect_ctx(pair: &Pair<Rule>) -> Ctx {
     ctx
 }
 
-fn decl(pair: Pair<Rule>) -> R<Decl3> {
+fn decl(pair: Pair<Rule>) -> R<Decl> {
     let input = input_of(&pair);
     let ctx = collect_ctx(&pair);
     with_ctx(|c| *c = ctx);
@@ -761,7 +636,7 @@ fn decl(pair: Pair<Rule>) -> R<Decl3> {
             }
             Rule::annotation3 => annotations.push(annotation(item)?),
             Rule::as_commit_clause | Rule::as_unattached_clause => write_clause = Some(item),
-            Rule::read_body3 => body = Some(DeclBody3::Read(read_body(item)?)),
+            Rule::read_body3 => body = Some(DeclBody::Read(read_body(item)?)),
             Rule::swapped_read_rec => {
                 let input = input_of(&item);
                 let ret = item.clone().into_inner().next().unwrap();
@@ -781,7 +656,7 @@ fn decl(pair: Pair<Rule>) -> R<Decl3> {
                     MACHINE,
                 ));
             }
-            Rule::mutation_body3 => body = Some(DeclBody3::Write(write_body(item)?)),
+            Rule::mutation_body3 => body = Some(DeclBody::Write(write_body(item)?)),
             other => unreachable!("grammar: query_decl3 holds no {other:?}"),
         }
     }
@@ -790,7 +665,7 @@ fn decl(pair: Pair<Rule>) -> R<Decl3> {
     let write_mode = match write_clause {
         None => MutationWriteMode::Publish,
         Some(clause) => {
-            if matches!(body, DeclBody3::Read(_)) {
+            if matches!(body, DeclBody::Read(_)) {
                 let spelled = match clause.as_rule() {
                     Rule::as_commit_clause => "as commit",
                     _ => "as unattached branch",
@@ -818,7 +693,7 @@ fn decl(pair: Pair<Rule>) -> R<Decl3> {
             }
         }
     };
-    Ok(Decl3 {
+    Ok(Decl {
         name,
         params,
         annotations,
@@ -827,7 +702,7 @@ fn decl(pair: Pair<Rule>) -> R<Decl3> {
     })
 }
 
-fn param(pair: Pair<Rule>) -> R<Param3> {
+fn param(pair: Pair<Rule>) -> R<Param> {
     let input = input_of(&pair);
     if pair.as_rule() == Rule::param_untyped_rec {
         let (s, e) = span_of(&pair);
@@ -872,7 +747,7 @@ fn param(pair: Pair<Rule>) -> R<Param3> {
             })
         }
     };
-    Ok(Param3 {
+    Ok(Param {
         name,
         type_name,
         nullable,
@@ -882,7 +757,7 @@ fn param(pair: Pair<Rule>) -> R<Param3> {
 
 /// An annotation is parsed whatever its name; the type checker decides
 /// which names are read (`T80`), so a later typed annotation is additive.
-fn annotation(pair: Pair<Rule>) -> R<Annotation3> {
+fn annotation(pair: Pair<Rule>) -> R<Annotation> {
     let input = input_of(&pair);
     let whole = span_of(&pair);
     let mut inner = pair.clone().into_inner();
@@ -895,7 +770,7 @@ fn annotation(pair: Pair<Rule>) -> R<Annotation3> {
             Rule::annotation_kwarg => {
                 let mut kv = a.into_inner();
                 let key = kv.next().unwrap().as_str().to_string();
-                AnnotationArg3::Named(key, annotation_value(kv.next().unwrap())?)
+                AnnotationArg::Named(key, annotation_value(kv.next().unwrap())?)
             }
             Rule::annotation_colon_rec => {
                 let mut kv = a.clone().into_inner();
@@ -912,11 +787,11 @@ fn annotation(pair: Pair<Rule>) -> R<Annotation3> {
                     MACHINE,
                 ));
             }
-            _ => AnnotationArg3::Positional(annotation_value(a)?),
+            _ => AnnotationArg::Positional(annotation_value(a)?),
         });
     }
     let (start, end) = with_trailing_ws(input, whole.0, whole.1);
-    Ok(Annotation3 {
+    Ok(Annotation {
         name,
         args: text.contains('(').then_some(args),
         at: SourceSpan {
@@ -928,19 +803,19 @@ fn annotation(pair: Pair<Rule>) -> R<Annotation3> {
     })
 }
 
-fn annotation_value(pair: Pair<Rule>) -> R<AnnotationValue3> {
+fn annotation_value(pair: Pair<Rule>) -> R<AnnotationValue> {
     let v = pair.into_inner().next().unwrap();
     Ok(match v.as_rule() {
-        Rule::literal3 => AnnotationValue3::Literal(literal(v)?),
-        Rule::variable => AnnotationValue3::Variable(v.as_str()[1..].to_string()),
-        Rule::meta_field => AnnotationValue3::MetaField(v.as_str()[1..].to_string()),
-        _ => AnnotationValue3::Ident(v.as_str().to_string()),
+        Rule::literal3 => AnnotationValue::Literal(literal(v)?),
+        Rule::variable => AnnotationValue::Variable(v.as_str()[1..].to_string()),
+        Rule::meta_field => AnnotationValue::MetaField(v.as_str()[1..].to_string()),
+        _ => AnnotationValue::Ident(v.as_str().to_string()),
     })
 }
 
-fn read_body(pair: Pair<Rule>) -> R<ReadBody3> {
+fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
     let input = input_of(&pair);
-    let mut body = ReadBody3 {
+    let mut body = ReadBody {
         clauses: Vec::new(),
         distinct: false,
         projections: Vec::new(),
@@ -1083,7 +958,7 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody3> {
 }
 
 /// `order` then `limit`, each at most once; the recognised tails refused.
-fn read_tail(input: &str, body: &mut ReadBody3, tail: Vec<Pair<Rule>>) -> R<()> {
+fn read_tail(input: &str, body: &mut ReadBody, tail: Vec<Pair<Rule>>) -> R<()> {
     let mut order_pair: Option<Pair<Rule>> = None;
     let mut limit_pair: Option<Pair<Rule>> = None;
     for section in tail {
@@ -1137,9 +1012,9 @@ fn read_tail(input: &str, body: &mut ReadBody3, tail: Vec<Pair<Rule>>) -> R<()> 
                     .find(|p| p.as_rule() != Rule::kw_limit)
                     .unwrap();
                 body.limit = Some(match value.as_rule() {
-                    Rule::variable => Limit3::Param(value.as_str()[1..].to_string()),
-                    _ => Limit3::Literal(value.as_str().parse::<u64>().map_err(|e| {
-                        Refusal3::from(diagnostic_at(Q005, format!("invalid limit: {e}"), &value))
+                    Rule::variable => Limit::Param(value.as_str()[1..].to_string()),
+                    _ => Limit::Literal(value.as_str().parse::<u64>().map_err(|e| {
+                        Refusal::from(diagnostic_at(Q005, format!("invalid limit: {e}"), &value))
                     })?),
                 });
                 limit_pair = Some(section);
@@ -1217,7 +1092,7 @@ fn read_tail(input: &str, body: &mut ReadBody3, tail: Vec<Pair<Rule>>) -> R<()> 
     Ok(())
 }
 
-fn ordering(pair: Pair<Rule>) -> R<Ordering3> {
+fn ordering(pair: Pair<Rule>) -> R<Ordering> {
     let input = input_of(&pair);
     let first = pair.clone().into_inner().next().unwrap();
     if first.as_rule() == Rule::dir_first_rec {
@@ -1242,14 +1117,14 @@ fn ordering(pair: Pair<Rule>) -> R<Ordering3> {
     let key = parts.next().unwrap();
     // A whole key that is a bare name is a return alias.
     let expr = match lone(&key, Rule::bare_name_rec) {
-        Some(name) => Expr3::Ident(name.as_str().to_string()),
+        Some(name) => Expr::Ident(name.as_str().to_string()),
         None => expr(key)?,
     };
     let descending = parts.next().map(|d| d.as_str() == "desc");
-    Ok(Ordering3 { expr, descending })
+    Ok(Ordering { expr, descending })
 }
 
-fn projection(pair: Pair<Rule>) -> R<Projection3> {
+fn projection(pair: Pair<Rule>) -> R<Projection> {
     let input = input_of(&pair);
     let mut inner = pair.clone().into_inner();
     let first = inner.next().unwrap();
@@ -1377,12 +1252,12 @@ fn projection(pair: Pair<Rule>) -> R<Projection3> {
             _ => alias = Some(name.as_str().to_string()),
         }
     }
-    Ok(Projection3 { expr: e, alias })
+    Ok(Projection { expr: e, alias })
 }
 
-fn write_body(pair: Pair<Rule>) -> R<WriteBody3> {
+fn write_body(pair: Pair<Rule>) -> R<WriteBody> {
     let input = input_of(&pair);
-    let mut groups: Vec<WriteGroup3> = Vec::new();
+    let mut groups: Vec<WriteGroup> = Vec::new();
     let mut last_stmts: Option<(usize, usize)> = None;
     for part in pair.into_inner() {
         match part.as_rule() {
@@ -1436,7 +1311,7 @@ fn write_body(pair: Pair<Rule>) -> R<WriteBody3> {
                     }
                 }
                 last_stmts = stmt_span;
-                groups.push(WriteGroup3 {
+                groups.push(WriteGroup {
                     clauses: clause_list(clause_pairs)?,
                     statements,
                 });
@@ -1461,7 +1336,7 @@ fn write_body(pair: Pair<Rule>) -> R<WriteBody3> {
             _ => {}
         }
     }
-    Ok(WriteBody3 { groups })
+    Ok(WriteBody { groups })
 }
 
 fn assigns<'i>(p: &Pair<'i, Rule>) -> Vec<Pair<'i, Rule>> {
@@ -1479,7 +1354,7 @@ fn assignments_text(pairs: &[Pair<Rule>]) -> String {
         .join(", ")
 }
 
-fn statement(pair: Pair<Rule>) -> R<Stmt3> {
+fn statement(pair: Pair<Rule>) -> R<Stmt> {
     let input = input_of(&pair);
     let s = pair.into_inner().next().unwrap();
     let span = span_of(&s);
@@ -1491,7 +1366,7 @@ fn statement(pair: Pair<Rule>) -> R<Stmt3> {
                 .filter(|p| p.as_rule() != Rule::kw_insert);
             let type_name = inner.next().unwrap().as_str().to_string();
             let assignments = assignment_list(input, &assigns(&s))?;
-            Ok(Stmt3::Insert {
+            Ok(Stmt::Insert {
                 type_name,
                 assignments,
             })
@@ -1503,7 +1378,7 @@ fn statement(pair: Pair<Rule>) -> R<Stmt3> {
                 .find(|p| p.as_rule() == Rule::variable)
                 .unwrap();
             let assignments = assignment_list(input, &assigns(&s))?;
-            Ok(Stmt3::Update {
+            Ok(Stmt::Update {
                 variable: var.as_str()[1..].to_string(),
                 assignments,
             })
@@ -1513,7 +1388,7 @@ fn statement(pair: Pair<Rule>) -> R<Stmt3> {
                 .into_inner()
                 .find(|p| p.as_rule() == Rule::variable)
                 .unwrap();
-            Ok(Stmt3::Delete {
+            Ok(Stmt::Delete {
                 variable: var.as_str()[1..].to_string(),
             })
         }
@@ -1672,7 +1547,7 @@ fn statement(pair: Pair<Rule>) -> R<Stmt3> {
 
 /// Assignments, with the recognised respellings refused together so one
 /// suggestion fixes every one of them.
-fn assignment_list(input: &str, pairs: &[Pair<Rule>]) -> R<Vec<Assignment3>> {
+fn assignment_list(input: &str, pairs: &[Pair<Rule>]) -> R<Vec<Assignment>> {
     let mut edits = Vec::new();
     let mut first: Option<(&'static str, (usize, usize))> = None;
     let mut note = None;
@@ -1752,7 +1627,7 @@ fn assignment_list(input: &str, pairs: &[Pair<Rule>]) -> R<Vec<Assignment3>> {
 /// with a name the declaration does not use and writes `φ` as a filter
 /// clause, each bare property of `φ` and of the assignments qualified
 /// (section 5, and the rewriter's row of section 6).
-fn where_statement(s: Pair<Rule>) -> Refusal3 {
+fn where_statement(s: Pair<Rule>) -> Refusal {
     let input = input_of(&s);
     let span = span_of(&s);
     let mut kind = "";
@@ -1865,15 +1740,15 @@ fn qualify_bare_names(pair: &Pair<Rule>, var: &str) -> String {
     out
 }
 
-fn assignment(pair: Pair<Rule>) -> R<Assignment3> {
+fn assignment(pair: Pair<Rule>) -> R<Assignment> {
     let mut inner = pair.into_inner();
     let property = inner.next().unwrap().as_str().to_string();
     let value = inner.next().unwrap();
     let value = match value.as_rule() {
-        Rule::null_value => Expr3::Literal(Literal::Null),
+        Rule::null_value => Expr::Literal(Literal::Null),
         _ => expr(value)?,
     };
-    Ok(Assignment3 { property, value })
+    Ok(Assignment { property, value })
 }
 
 /// Descend through single-child expression rules to a pair of `rule`.
@@ -1930,7 +1805,7 @@ fn lone_var_filter<'i>(p: &Pair<'i, Rule>) -> Option<Pair<'i, Rule>> {
 /// first: a contextual keyword or Boolean literal written as a bare edge name
 /// between two lone variables (`$a from $b`, `$a let $b`, `$a true $b`), and
 /// Cypher's `with`, whose fix takes the clauses before it.
-fn clause_list(pairs: Vec<Pair<Rule>>) -> R<Vec<Clause3>> {
+fn clause_list(pairs: Vec<Pair<Rule>>) -> R<Vec<Clause>> {
     for i in 0..pairs.len() {
         let input = input_of(&pairs[i]);
         if let Some(a) = lone_var_filter(&pairs[i]) {
@@ -1974,7 +1849,7 @@ fn clause_list(pairs: Vec<Pair<Rule>>) -> R<Vec<Clause3>> {
     pairs.into_iter().map(clause).collect()
 }
 
-fn bare_edge(input: &str, span: (usize, usize), a: &str, word: &str, b: &str) -> Refusal3 {
+fn bare_edge(input: &str, span: (usize, usize), a: &str, word: &str, b: &str) -> Refusal {
     refusal(
         input,
         Q017,
@@ -1989,7 +1864,7 @@ fn bare_edge(input: &str, span: (usize, usize), a: &str, word: &str, b: &str) ->
 
 /// Cypher's `… WITH x, agg AS n …`: the clauses before it become an inline
 /// read whose `return` is the `with` items, drawn with `from`.
-fn with_clause(input: &str, before: &[Pair<Rule>], with: &Pair<Rule>) -> Refusal3 {
+fn with_clause(input: &str, before: &[Pair<Rule>], with: &Pair<Rule>) -> Refusal {
     let items: Vec<&str> = with
         .clone()
         .into_inner()
@@ -2028,7 +1903,7 @@ fn with_clause(input: &str, before: &[Pair<Rule>], with: &Pair<Rule>) -> Refusal
 
 /// Merge an inner refusal's edits into an outer recognizer's edits, so one
 /// suggestion repairs both (the outer construct is the span).
-fn compose_inner(outer: Vec<TextEdit>, inner: Result<Clause3, Refusal3>) -> R<Vec<TextEdit>> {
+fn compose_inner(outer: Vec<TextEdit>, inner: Result<Clause, Refusal>) -> R<Vec<TextEdit>> {
     match inner {
         Ok(_) => Ok(outer),
         Err(r) if !r.edits().is_empty() => {
@@ -2051,7 +1926,7 @@ fn inner_clauses<'i>(p: &Pair<'i, Rule>) -> Vec<Pair<'i, Rule>> {
         .collect()
 }
 
-fn clause(pair: Pair<Rule>) -> R<Clause3> {
+fn clause(pair: Pair<Rule>) -> R<Clause> {
     let input = input_of(&pair);
     let c = kind(&pair).unwrap();
     let span = span_of(&c);
@@ -2061,20 +1936,20 @@ fn clause(pair: Pair<Rule>) -> R<Clause3> {
             let name = inner.next().unwrap().as_str()[1..].to_string();
             let value = inner.next().unwrap();
             let value = match value.as_rule() {
-                Rule::inline_read => LetValue3::Relation(Box::new(inline_read(value)?)),
+                Rule::inline_read => LetValue::Relation(Box::new(inline_read(value)?)),
                 _ => {
                     let start = value.as_span().start();
-                    LetValue3::Expr(at_top(Top::Clause, start, || expr(value))?)
+                    LetValue::Expr(at_top(Top::Clause, start, || expr(value))?)
                 }
             };
-            Ok(Clause3::Let { name, value })
+            Ok(Clause::Let { name, value })
         }
         Rule::from_clause => {
             let rel = c
                 .into_inner()
                 .find(|p| p.as_rule() == Rule::relation_expr)
                 .unwrap();
-            Ok(Clause3::From(relation(rel)?))
+            Ok(Clause::From(relation(rel)?))
         }
         Rule::from_paren_rec => {
             let rel = c
@@ -2095,8 +1970,8 @@ fn clause(pair: Pair<Rule>) -> R<Clause3> {
                 MACHINE,
             ))
         }
-        Rule::negation3 => Ok(Clause3::Not(clause_list(inner_clauses(&c))?)),
-        Rule::optional_block => Ok(Clause3::Optional(clause_list(inner_clauses(&c))?)),
+        Rule::negation3 => Ok(Clause::Not(clause_list(inner_clauses(&c))?)),
+        Rule::optional_block => Ok(Clause::Optional(clause_list(inner_clauses(&c))?)),
         Rule::binding3 => {
             let mut inner = c.into_inner();
             let variable = inner.next().unwrap().as_str()[1..].to_string();
@@ -2109,7 +1984,7 @@ fn clause(pair: Pair<Rule>) -> R<Clause3> {
                     prop_matches.push((key, expr(kv.next().unwrap())?));
                 }
             }
-            Ok(Clause3::Binding {
+            Ok(Clause::Binding {
                 variable,
                 type_name,
                 prop_matches,
@@ -2171,7 +2046,7 @@ fn clause(pair: Pair<Rule>) -> R<Clause3> {
                 REVIEW,
             ))
         }
-        Rule::traversal3 => Ok(Clause3::Traversal(TraversalEq(traversal(c)?))),
+        Rule::traversal3 => Ok(Clause::Traversal(TraversalEq(traversal(c)?))),
         Rule::stmt_edge_rec => {
             let mut parts = c.clone().into_inner();
             let a = parts.next().unwrap().as_str();
@@ -2260,11 +2135,11 @@ fn clause(pair: Pair<Rule>) -> R<Clause3> {
             let edits = vec![edit(s, s, "{ "), edit(e, e, " }")];
             let inner_clause = match inner.as_rule() {
                 Rule::traversal3 => {
-                    traversal(inner.clone()).map(|t| Clause3::Traversal(TraversalEq(t)))
+                    traversal(inner.clone()).map(|t| Clause::Traversal(TraversalEq(t)))
                 }
                 Rule::arrow_traversal => Err(arrow(inner.clone())),
                 Rule::cypher_pattern => Err(cypher_pattern(inner.clone())),
-                _ => Ok(Clause3::Filter(Expr3::Literal(Literal::Bool(true)))),
+                _ => Ok(Clause::Filter(Expr::Literal(Literal::Bool(true)))),
             };
             let edits = compose_inner(edits, inner_clause)?;
             Err(refusal(
@@ -2311,7 +2186,7 @@ fn clause(pair: Pair<Rule>) -> R<Clause3> {
         Rule::filter3 => {
             let e = c.into_inner().next().unwrap();
             let start = e.as_span().start();
-            Ok(Clause3::Filter(at_top(Top::Clause, start, || {
+            Ok(Clause::Filter(at_top(Top::Clause, start, || {
                 filter_expr(e)
             })?))
         }
@@ -2328,7 +2203,7 @@ fn clause(pair: Pair<Rule>) -> R<Clause3> {
 
 /// A filter clause; a lone bare name at clause start that is a clause
 /// keyword gets that keyword's message.
-fn filter_expr(e: Pair<Rule>) -> R<Expr3> {
+fn filter_expr(e: Pair<Rule>) -> R<Expr> {
     let input = input_of(&e);
     if let Some(word) = lone(&e, Rule::bare_name_rec) {
         let w = word.as_str();
@@ -2412,7 +2287,7 @@ fn cypher_hops(p: &Pair<Rule>) -> String {
 
 /// `$a -e-> $b`, `$a <-e- $b`, `$a -e- $b` and Cypher's `-[:E]->`: a parse
 /// error whose fix is the triple.
-fn arrow(c: Pair<Rule>) -> Refusal3 {
+fn arrow(c: Pair<Rule>) -> Refusal {
     let input = input_of(&c);
     let span = span_of(&c);
     let mut vars = Vec::new();
@@ -2468,7 +2343,7 @@ fn arrow(c: Pair<Rule>) -> Refusal3 {
 }
 
 /// Cypher's `(a:Person)-[:KNOWS]->(b)`: the bindings and triples it means.
-fn cypher_pattern(c: Pair<Rule>) -> Refusal3 {
+fn cypher_pattern(c: Pair<Rule>) -> Refusal {
     let input = input_of(&c);
     let span = span_of(&c);
     let mut out: Vec<String> = Vec::new();
@@ -2550,7 +2425,7 @@ fn cypher_pattern(c: Pair<Rule>) -> Refusal3 {
     )
 }
 
-fn list_to_rows(c: Pair<Rule>) -> Refusal3 {
+fn list_to_rows(c: Pair<Rule>) -> Refusal {
     let input = input_of(&c);
     let span = span_of(&c);
     let first = c.clone().into_inner().next().unwrap();
@@ -2610,7 +2485,7 @@ fn list_to_rows(c: Pair<Rule>) -> Refusal3 {
 
 /// `$d: Doc { year >= 2025 }`: the equalities stay in the braces, each
 /// comparison becomes a filter clause on the bound variable.
-fn brace_filter(c: Pair<Rule>) -> Refusal3 {
+fn brace_filter(c: Pair<Rule>) -> Refusal {
     let input = input_of(&c);
     let span = span_of(&c);
     let mut inner = c.clone().into_inner();
@@ -2716,11 +2591,11 @@ fn edge_name(pair: Pair<Rule>) -> R<String> {
     }
 }
 
-fn into_diagnostic(error: CompilerError) -> Refusal3 {
+fn into_diagnostic(error: CompilerError) -> Refusal {
     compiler_error_to_diagnostic(error, Position::at("", 0)).into()
 }
 
-fn inline_read(pair: Pair<Rule>) -> R<ReadBody3> {
+fn inline_read(pair: Pair<Rule>) -> R<ReadBody> {
     let input = input_of(&pair);
     let body = pair.into_inner().next().unwrap();
     if body.as_rule() == Rule::matchless_read_rec {
@@ -2743,19 +2618,19 @@ fn inline_read(pair: Pair<Rule>) -> R<ReadBody3> {
     read_body(body)
 }
 
-fn relation(pair: Pair<Rule>) -> R<RelExpr3> {
+fn relation(pair: Pair<Rule>) -> R<RelExpr> {
     let r = pair.into_inner().next().unwrap();
     match r.as_rule() {
-        Rule::inline_read => Ok(RelExpr3::Inline(Box::new(inline_read(r)?))),
-        Rule::call => Ok(RelExpr3::Call(call(r)?)),
+        Rule::inline_read => Ok(RelExpr::Inline(Box::new(inline_read(r)?))),
+        Rule::call => Ok(RelExpr::Call(call(r)?)),
         Rule::spaced_call_rec => Err(spaced_call(r)),
-        Rule::variable => Ok(RelExpr3::Variable(r.as_str()[1..].to_string())),
+        Rule::variable => Ok(RelExpr::Variable(r.as_str()[1..].to_string())),
         other => unreachable!("grammar: relation_expr holds no {other:?}"),
     }
 }
 
 /// `name (…)`: the name touches its parenthesis.
-fn spaced_call(r: Pair<Rule>) -> Refusal3 {
+fn spaced_call(r: Pair<Rule>) -> Refusal {
     let input = input_of(&r);
     let head = r.clone().into_inner().next().unwrap();
     let name = head.clone().into_inner().next().unwrap();
@@ -2775,7 +2650,7 @@ fn spaced_call(r: Pair<Rule>) -> Refusal3 {
     )
 }
 
-fn call(pair: Pair<Rule>) -> R<Call3> {
+fn call(pair: Pair<Rule>) -> R<Call> {
     let mut name = String::new();
     let mut args = Vec::new();
     let mut options = Vec::new();
@@ -2797,8 +2672,8 @@ fn call(pair: Pair<Rule>) -> R<Call3> {
                         Rule::positional => {
                             let v = a.into_inner().next().unwrap();
                             args.push(match v.as_rule() {
-                                Rule::inline_read => Arg3::Inline(Box::new(inline_read(v)?)),
-                                _ => Arg3::Expr(expr(v)?),
+                                Rule::inline_read => Arg::Inline(Box::new(inline_read(v)?)),
+                                _ => Arg::Expr(expr(v)?),
                             });
                         }
                         Rule::call_option => {
@@ -2809,7 +2684,7 @@ fn call(pair: Pair<Rule>) -> R<Call3> {
                             // option's enumerated value (`terms($q, mode: any)`,
                             // section 7's `option`).
                             let value = match lone(&value, Rule::bare_name_rec) {
-                                Some(word) => Expr3::Ident(word.as_str().to_string()),
+                                Some(word) => Expr::Ident(word.as_str().to_string()),
                                 None => expr(value)?,
                             };
                             options.push((key, value));
@@ -2821,7 +2696,7 @@ fn call(pair: Pair<Rule>) -> R<Call3> {
             _ => {}
         }
     }
-    Ok(Call3 {
+    Ok(Call {
         name,
         args,
         options,
@@ -2830,7 +2705,7 @@ fn call(pair: Pair<Rule>) -> R<Call3> {
 
 /// An option before a positional argument: the positionals first, in order,
 /// then the options.
-fn mixed_args(mixed: Pair<Rule>) -> Refusal3 {
+fn mixed_args(mixed: Pair<Rule>) -> Refusal {
     let input = input_of(&mixed);
     let span = span_of(&mixed);
     let (pos, opts): (Vec<Pair<Rule>>, Vec<Pair<Rule>>) = mixed
@@ -2873,7 +2748,7 @@ fn comp_op(op: &str) -> CompOp {
     }
 }
 
-fn expr(pair: Pair<Rule>) -> R<Expr3> {
+fn expr(pair: Pair<Rule>) -> R<Expr> {
     let input = input_of(&pair);
     match pair.as_rule() {
         Rule::expr3 => expr(pair.into_inner().next().unwrap()),
@@ -2886,9 +2761,9 @@ fn expr(pair: Pair<Rule>) -> R<Expr3> {
             operands.try_fold(first, |left, right| {
                 let right = Box::new(expr(right)?);
                 Ok(if is_or {
-                    Expr3::Or(Box::new(left), right)
+                    Expr::Or(Box::new(left), right)
                 } else {
-                    Expr3::And(Box::new(left), right)
+                    Expr::And(Box::new(left), right)
                 })
             })
         }
@@ -2896,7 +2771,7 @@ fn expr(pair: Pair<Rule>) -> R<Expr3> {
             let mut parts = pair.into_inner();
             let first = parts.next().unwrap();
             if first.as_rule() == Rule::kw_not {
-                Ok(Expr3::Not(Box::new(expr(parts.next().unwrap())?)))
+                Ok(Expr::Not(Box::new(expr(parts.next().unwrap())?)))
             } else {
                 expr(first)
             }
@@ -2907,7 +2782,7 @@ fn expr(pair: Pair<Rule>) -> R<Expr3> {
             let mut parts = pair.into_inner();
             let first = parts.next().unwrap();
             if first.as_rule() == Rule::unary_minus {
-                Ok(Expr3::Neg(Box::new(expr(parts.next().unwrap())?)))
+                Ok(Expr::Neg(Box::new(expr(parts.next().unwrap())?)))
             } else {
                 expr(first)
             }
@@ -2917,7 +2792,7 @@ fn expr(pair: Pair<Rule>) -> R<Expr3> {
     }
 }
 
-fn comparison(pair: Pair<Rule>) -> R<Expr3> {
+fn comparison(pair: Pair<Rule>) -> R<Expr> {
     let input = input_of(&pair);
     let span = span_of(&pair);
     let parts: Vec<Pair<Rule>> = pair.into_inner().collect();
@@ -2926,7 +2801,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr3> {
     let Some(op) = parts.get(1).cloned() else {
         return expr(left_pair);
     };
-    let whole = |text: String, message: &str, code: QueryCode, app: Applicability| -> R<Expr3> {
+    let whole = |text: String, message: &str, code: QueryCode, app: Applicability| -> R<Expr> {
         Err(refusal(
             input,
             code,
@@ -2959,7 +2834,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr3> {
                     MACHINE,
                 );
             }
-            Ok(Expr3::Compare {
+            Ok(Expr::Compare {
                 op: comp_op(op.as_str()),
                 left: Box::new(expr(left_pair)?),
                 right: Box::new(expr(right_pair)?),
@@ -2984,7 +2859,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr3> {
                 ));
             }
             let list_source = list.as_str().trim().to_string();
-            Ok(Expr3::In {
+            Ok(Expr::In {
                 needle: Box::new(expr(left_pair)?),
                 list: Box::new(expr(list)?),
                 at: SourceSpan {
@@ -3078,7 +2953,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr3> {
                 if func == "ends_with" { REVIEW } else { MACHINE },
             )
         }
-        Rule::infix_string_op => Ok(Expr3::InfixString {
+        Rule::infix_string_op => Ok(Expr::InfixString {
             op: if op.as_str() == "contains" {
                 InfixStringOp::Contains
             } else {
@@ -3096,14 +2971,14 @@ fn comparison(pair: Pair<Rule>) -> R<Expr3> {
                 ],
             },
         }),
-        _ => Ok(Expr3::IsNull {
+        _ => Ok(Expr::IsNull {
             expr: Box::new(expr(left_pair)?),
             negated: op.into_inner().any(|k| k.as_rule() == Rule::kw_not),
         }),
     }
 }
 
-fn arithmetic(input: &str, pair: Pair<Rule>) -> R<Expr3> {
+fn arithmetic(input: &str, pair: Pair<Rule>) -> R<Expr> {
     let span = span_of(&pair);
     let parts: Vec<Pair<Rule>> = pair.into_inner().collect();
     // `a || b || c`: one concat call over the flattened chain.
@@ -3188,7 +3063,7 @@ fn arithmetic(input: &str, pair: Pair<Rule>) -> R<Expr3> {
             "/" => ArithOp::Div,
             _ => ArithOp::Rem,
         };
-        left = Expr3::Arith {
+        left = Expr::Arith {
             op,
             left: Box::new(left),
             right: Box::new(right),
@@ -3199,7 +3074,7 @@ fn arithmetic(input: &str, pair: Pair<Rule>) -> R<Expr3> {
 
 /// A bare name in operand position: refused at the word, with a guess at
 /// what was meant when the declaration gives one.
-fn bare_name(word: Pair<Rule>) -> Refusal3 {
+fn bare_name(word: Pair<Rule>) -> Refusal {
     let input = input_of(&word);
     let span = span_of(&word);
     let w = word.as_str();
@@ -3274,7 +3149,7 @@ fn bare_name(word: Pair<Rule>) -> Refusal3 {
     refusal_note(input, Q018, message, span, format!("$x.{w}"))
 }
 
-fn operand(pair: Pair<Rule>) -> R<Expr3> {
+fn operand(pair: Pair<Rule>) -> R<Expr> {
     let input = input_of(&pair);
     let inner = pair.into_inner().next().unwrap();
     let span = span_of(&inner);
@@ -3286,14 +3161,14 @@ fn operand(pair: Pair<Rule>) -> R<Expr3> {
             let mut clauses = Vec::new();
             for part in inner.into_inner() {
                 match part.as_rule() {
-                    Rule::agg_name => func = Some(BlockFunc3::Agg(agg_func(part.as_str()))),
-                    Rule::kw_exists => func = Some(BlockFunc3::Exists),
+                    Rule::agg_name => func = Some(BlockFunc::Agg(agg_func(part.as_str()))),
+                    Rule::kw_exists => func = Some(BlockFunc::Exists),
                     Rule::expr3 => arg = Some(Box::new(expr(part)?)),
                     Rule::subquery_block3 => clauses = clause_list(inner_clauses(&part))?,
                     _ => {}
                 }
             }
-            Ok(Expr3::Block(Box::new(Block3 {
+            Ok(Expr::Block(Box::new(Block {
                 func: func.unwrap(),
                 arg,
                 clauses,
@@ -3303,7 +3178,7 @@ fn operand(pair: Pair<Rule>) -> R<Expr3> {
             let mut parts = inner.into_inner();
             let func = agg_func(parts.next().unwrap().as_str());
             let arg = parts.find(|p| p.as_rule() == Rule::expr3).unwrap();
-            Ok(Expr3::AggDistinct {
+            Ok(Expr::AggDistinct {
                 func,
                 arg: Box::new(expr(arg)?),
             })
@@ -3378,7 +3253,7 @@ fn operand(pair: Pair<Rule>) -> R<Expr3> {
                 )),
             }
         }
-        Rule::literal3 => Ok(Expr3::Literal(literal(inner)?)),
+        Rule::literal3 => Ok(Expr::Literal(literal(inner)?)),
         Rule::type_prop_rec => {
             let mut parts = inner.clone().into_inner();
             let ty = parts.next().unwrap().as_str();
@@ -3398,7 +3273,7 @@ fn operand(pair: Pair<Rule>) -> R<Expr3> {
                 None => refusal_note(input, Q014, message, span, format!("$x: {ty} … $x.{prop}")),
             })
         }
-        Rule::call => Ok(Expr3::Call(call(inner)?)),
+        Rule::call => Ok(Expr::Call(call(inner)?)),
         Rule::keyword_call_rec => {
             let head = inner.clone().into_inner().next().unwrap();
             let word = head.as_str().trim_end_matches('(');
@@ -3497,10 +3372,10 @@ fn operand(pair: Pair<Rule>) -> R<Expr3> {
             let mut parts = inner.into_inner();
             let variable = parts.next().unwrap().as_str()[1..].to_string();
             let property = parts.next().unwrap().as_str().to_string();
-            Ok(Expr3::Prop { variable, property })
+            Ok(Expr::Prop { variable, property })
         }
-        Rule::meta_field => Ok(Expr3::Meta(inner.as_str()[1..].to_string())),
-        Rule::variable => Ok(Expr3::Variable(inner.as_str()[1..].to_string())),
+        Rule::meta_field => Ok(Expr::Meta(inner.as_str()[1..].to_string())),
+        Rule::variable => Ok(Expr::Variable(inner.as_str()[1..].to_string())),
         Rule::reserved_property if inner.as_str() == "null" => Err(refusal_note(
             input,
             Q005,
@@ -3520,7 +3395,7 @@ fn operand(pair: Pair<Rule>) -> R<Expr3> {
         .into()),
         Rule::bare_name_rec => {
             if with_ctx(|c| c.allow_bare) {
-                Ok(Expr3::Ident(inner.as_str().to_string()))
+                Ok(Expr::Ident(inner.as_str().to_string()))
             } else {
                 Err(bare_name(inner))
             }
@@ -3533,7 +3408,7 @@ fn literal(pair: Pair<Rule>) -> R<Literal> {
     let input = input_of(&pair);
     let inner = pair.into_inner().next().unwrap();
     let parse_err = |e: CompilerError, at: &Pair<Rule>| {
-        Refusal3::from(compiler_error_to_diagnostic(e, position_of(at)))
+        Refusal::from(compiler_error_to_diagnostic(e, position_of(at)))
     };
     Ok(match inner.as_rule() {
         Rule::string_lit => {
@@ -3541,7 +3416,7 @@ fn literal(pair: Pair<Rule>) -> R<Literal> {
         }
         Rule::integer3 => {
             Literal::Integer(i128::from(inner.as_str().parse::<i64>().map_err(|e| {
-                Refusal3::from(diagnostic_at(Q005, format!("invalid integer: {e}"), &inner))
+                Refusal::from(diagnostic_at(Q005, format!("invalid integer: {e}"), &inner))
             })?))
         }
         Rule::exp_float_rec => {
@@ -3558,7 +3433,7 @@ fn literal(pair: Pair<Rule>) -> R<Literal> {
             ));
         }
         Rule::float_lit3 => Literal::Float(inner.as_str().parse::<f64>().map_err(|e| {
-            Refusal3::from(diagnostic_at(Q005, format!("invalid float: {e}"), &inner))
+            Refusal::from(diagnostic_at(Q005, format!("invalid float: {e}"), &inner))
         })?),
         Rule::bool_lit => Literal::Bool(inner.as_str() == "true"),
         Rule::date_lit3 | Rule::datetime_lit3 => {

@@ -698,18 +698,18 @@ impl MutationTarget {
 /// A query after type checking, read or mutation. The two lowerers each
 /// take their own kind, so a checked query cannot reach the wrong one. An
 /// edition-3 declaration is typed into the core IR, which the planner reads
-/// ([`crate::ir::core3`]); no edition-2 lowerer accepts it.
+/// ([`crate::ir::core`]); no edition-2 lowerer accepts it.
 #[derive(Debug, Clone)]
 pub enum CheckedQuery {
     Read(CheckedReadQuery),
     Mutation(CheckedMutationQuery),
-    Edition3(std::sync::Arc<crate::ir::core3::CoreDecl>),
+    Core(std::sync::Arc<crate::ir::core::CoreDecl>),
 }
 
 pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedQuery> {
-    if let Some(edition3) = &query.edition3 {
-        return super::typeck3::typecheck_edition3(catalog, edition3)
-            .map(|core| CheckedQuery::Edition3(std::sync::Arc::new(core)))
+    if let Some(syntax) = &query.syntax {
+        return super::check::check_syntax_decl(catalog, syntax)
+            .map(|core| CheckedQuery::Core(std::sync::Arc::new(core)))
             .map_err(CompilerError::query);
     }
     if !query.mutations.is_empty() {
@@ -731,7 +731,7 @@ pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<Chec
 }
 
 pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedReadQuery> {
-    if query.edition3.is_some() {
+    if query.syntax.is_some() {
         return Err(CompilerError::Plan(
             "an edition-3 declaration is typed into the core IR; check it with typecheck_query_decl"
                 .to_string(),

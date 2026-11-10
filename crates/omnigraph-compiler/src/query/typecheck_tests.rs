@@ -187,7 +187,7 @@ insert Shared { label: "node" }
                 type_name: "Shared".to_string(),
             }]
         ),
-        CheckedQuery::Read(_) | CheckedQuery::Edition3(_) => {
+        CheckedQuery::Read(_) | CheckedQuery::Core(_) => {
             panic!("expected mutation typecheck result")
         }
     }
@@ -2183,7 +2183,7 @@ return { $d.name }
         limit: None,
         mutations: Vec::new(),
         write_mode: MutationWriteMode::Publish,
-        edition3: None,
+        syntax: None,
     };
     let error = typecheck_query(&catalog, &direct_ast).unwrap_err();
     assert_eq!(
