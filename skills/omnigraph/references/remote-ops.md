@@ -100,7 +100,9 @@ route.
   `action` is `retry`, only when no earlier step of the command took effect.
 - Structured `read_set_conflict` means an input changed before publication.
   Refresh and reconsider the operation, including schema/table identity changes;
-  an unchanged retry need not succeed. Commit conflicts use generic `conflict`,
+  an unchanged retry need not succeed. A publication that changed no row
+  (`optimize`, an index build) causes one only for an update or delete of a
+  row in a fragment it rewrote. Commit conflicts use generic `conflict`,
   so HTTP `409` alone does not identify a retryable case.
 - `key_conflict`: an append or strict insert found an existing id. Decide
   whether that entity is the intended one; do not silently turn the operation

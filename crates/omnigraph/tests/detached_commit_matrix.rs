@@ -99,6 +99,12 @@ enum Writer {
     /// A Blob clear of Alice's seeded `photo`: the same single-row upsert
     /// carrying a null value.
     BlobClear,
+    /// An insert into Person that an optimize run on another handle
+    /// overtakes between its staging and its writer gates: the run compacts
+    /// Person and publishes, and the insert is carried over that
+    /// row-preserving publication (its staged transaction rebased onto the
+    /// compacted version) instead of preparing again.
+    CarriedInsert,
 }
 
 fn photo_schema() -> String {
@@ -173,6 +179,7 @@ impl Writer {
             // the first and the second to leave a half-staged tail.
             Writer::SystemColumnUpgrade => vec![PostDetached(1), PostDetached(2), PrePublish],
             Writer::BlobPut | Writer::BlobClear => vec![PostDetached(1), PrePublish],
+            Writer::CarriedInsert => vec![PostDetached(1), PrePublish],
         }
     }
 
@@ -191,6 +198,7 @@ impl Writer {
             Writer::SystemColumnUpgrade => "system_column_upgrade",
             Writer::BlobPut => "blob_put",
             Writer::BlobClear => "blob_clear",
+            Writer::CarriedInsert => "carried_insert",
         }
     }
 }
@@ -347,6 +355,51 @@ async fn observe_photo(db: &Omnigraph) -> Option<Vec<u8>> {
     }
 }
 
+/// Run optimize to completion on a fresh handle of `root`, on its own thread
+/// and runtime, while the caller's thread waits: the overtaking run of the
+/// CarriedInsert writer.
+fn optimize_on_another_handle(root: String) {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let db = helpers::session(Omnigraph::open(&root).await.unwrap());
+                    let stats = db.optimize().await.unwrap();
+                    assert!(
+                        stats
+                            .iter()
+                            .any(|stat| stat.type_key == "node:Person" && stat.committed),
+                        "the overtaking optimize must compact Person: {stats:?}"
+                    );
+                })
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Overtake the next write that reaches its writer gates with an optimize
+/// run on another handle of `root`, once.
+fn overtake_next_write_with_optimize(root: &str) -> impl Sized {
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let root = root.to_string();
+    catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE.observe(move || {
+        if !fired.swap(true, Ordering::SeqCst) {
+            optimize_on_another_handle(root.clone());
+        }
+    })
+}
+
+/// The CarriedInsert writer's op.
+async fn carried_insert(db: &Session, root: &str, name: &str) -> omnigraph::error::Result<()> {
+    let _overtaken = overtake_next_write_with_optimize(root);
+    insert(db, name).await
+}
+
 /// The Load writer's op: two fresh rows through the loader's staging.
 async fn load_two(db: &Session, name: &str) -> omnigraph::error::Result<()> {
     let payload = format!(
@@ -446,6 +499,7 @@ fn rfc0067_matrix_child_process() {
                     .map(|_| ()),
                 "blob_put" => put_photo(&db, &name).await,
                 "blob_clear" => clear_photo(&db).await,
+                "carried_insert" => carried_insert(&db, &uri, &name).await,
                 _ => insert(&db, &name).await,
             };
             if let Err(error) = outcome {
@@ -674,7 +728,7 @@ async fn run_cell(
     }
     // An optimize cell needs compaction work: three more single-row commits
     // leave Person with four small fragments.
-    if writer == Writer::Optimize {
+    if matches!(writer, Writer::Optimize | Writer::CarriedInsert) {
         for seed in 0..3 {
             insert(&db, &format!("m{index}_seed{seed}")).await.unwrap();
         }
@@ -733,6 +787,7 @@ async fn run_cell(
     match fault {
         Fault::Return => {
             let _fault = catalog::decide(seam).unwrap().fail_once_at(hit);
+            let probes = omnigraph::instrumentation::QueryIoProbes::default();
             let outcome: omnigraph::error::Result<()> = match writer {
                 Writer::Insert => insert(&db, &write_name).await,
                 Writer::MultiTable => insert_and_friend(&db, &write_name).await,
@@ -756,7 +811,28 @@ async fn run_cell(
                     .map(|_| ()),
                 Writer::BlobPut => put_photo(&db, &write_name).await,
                 Writer::BlobClear => clear_photo(&db).await,
+                Writer::CarriedInsert => {
+                    omnigraph::instrumentation::with_query_io_probes(
+                        probes.clone(),
+                        carried_insert(&db, &root, &write_name),
+                    )
+                    .await
+                }
             };
+            if writer == Writer::CarriedInsert {
+                assert_eq!(
+                    probes
+                        .writes_carried_over_row_preserving
+                        .load(Ordering::Relaxed),
+                    1,
+                    "{cell}: the insert must be carried over the optimize publication"
+                );
+                assert_eq!(
+                    probes.mutation_reprepares.load(Ordering::Relaxed),
+                    0,
+                    "{cell}: the carried insert must not prepare again"
+                );
+            }
             acknowledged = outcome.is_ok();
             if let Err(error) = outcome {
                 // A data writer that fails after a detached effect and before
@@ -767,6 +843,7 @@ async fn run_cell(
                 if matches!(
                     writer,
                     Writer::Insert
+                        | Writer::CarriedInsert
                         | Writer::MultiTable
                         | Writer::Load
                         | Writer::Merge
@@ -838,7 +915,7 @@ async fn run_cell(
     }
     let visible = acknowledged;
     match writer {
-        Writer::Insert | Writer::Merge if visible => {
+        Writer::Insert | Writer::CarriedInsert | Writer::Merge if visible => {
             model.names.insert(write_name.clone());
         }
         Writer::MultiTable if visible => {
@@ -1133,6 +1210,8 @@ matrix_points! {
     rfc_0067_failure_window_matrix_blob_put_pre_publish: BlobPut, Window::PrePublish, ALL_FAULTS;
     rfc_0067_failure_window_matrix_blob_clear_post_detached_1: BlobClear, Window::PostDetached(1), ALL_FAULTS;
     rfc_0067_failure_window_matrix_blob_clear_pre_publish: BlobClear, Window::PrePublish, ALL_FAULTS;
+    rfc_0067_failure_window_matrix_carried_insert_post_detached_1_issue_1331: CarriedInsert, Window::PostDetached(1), ALL_FAULTS;
+    rfc_0067_failure_window_matrix_carried_insert_pre_publish_issue_1331: CarriedInsert, Window::PrePublish, ALL_FAULTS;
 }
 
 /// Every window of every writer is one point of `POINTS`, each fault exactly
@@ -1153,6 +1232,7 @@ fn every_writer_window_is_a_matrix_point() {
         Writer::SystemColumnUpgrade,
         Writer::BlobPut,
         Writer::BlobClear,
+        Writer::CarriedInsert,
     ];
     let mut covered: Vec<(Writer, Window, Fault)> = POINTS
         .iter()

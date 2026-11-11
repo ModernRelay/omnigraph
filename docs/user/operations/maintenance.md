@@ -50,14 +50,14 @@ deleting it does. A table holding no dropped values and nothing else to
 compact is left alone.
 
 Each table's work is staged as detached Lance versions of the table's current
-pin and published in one graph commit, like any other write. A run
-that fails before that commit leaves the graph unchanged and no recovery
-state; after it the published pins are the tables' versions, with nothing
-left to finish. Optimize runs beside
-live writers: a write that lands on a table while its compaction is staged
-fails the run with a read-set conflict, and the next run re-plans from the
-new state. An update or delete prepared before an optimize published reports
-the same conflict and is retried by its caller. Lance compacts neighbouring
+pin and published in one graph commit, like any other write. A run that fails
+before that commit leaves the graph unchanged and no recovery state; after it
+the published pins are the tables' versions, with nothing left to finish.
+Optimize runs beside live writers: a write that lands on a table while its
+compaction is staged fails the run with a read-set conflict, and the next run
+re-plans from the new state. A write prepared before an optimize published
+goes ahead; only an update or delete of a row in a rewritten fragment reports
+that conflict, and its caller retries it. Lance compacts neighbouring
 fragments only when the same indexes cover them, so a table whose index
 coverage was uneven before a run may coalesce fully only on the next run,
 after the rebuilt coverage is in place.

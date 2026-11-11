@@ -278,9 +278,26 @@ rebuilt whole as a detached commit chained on the rewrite under its name
 partition count; the batch publishes once with an exact CAS on every planned
 pin, and a pin a concurrent writer moved fails the run with a read-set
 conflict so the next run re-plans. A failure before publication leaves
-unpublished staging the collector reclaims once it is dead. A strict mutation
-prepared before Optimize's publication reports the same read-set conflict as
-it would after any other writer.
+unpublished staging the collector reclaims once it is dead.
+
+A mutation, load or Blob write prepared before such a publication is carried
+over it ([RFC](../rfcs/2026-11-10-writes-carried-over-row-preserving-publications.md)).
+Under its gates, when the head moved, `revalidate_write_txn_carrying` checks
+that the schema contract, the table set and every registration's identity,
+location, native ref and row count are unchanged, and that every moved pin
+reaches the captured one through `Rewrite` and `CreateIndex` commits alone
+(`table_store::row_preserving_chain`, at most
+`ROW_PRESERVING_CHAIN_MAX_LINKS` per table). The write is then re-anchored on
+the current head before any effect. A table it only read keeps its moved pin;
+a staged table goes through Lance's `TransactionRebase` over those commits
+(`table_store::rebase_staged_write`), records the current pin as its read
+version, and commits detached there, so the compaction stays and the table's
+history stays one chain. An insert, an append and an overwrite carry; an
+update or delete of a fragment a rewrite replaced is a conflict Lance reports,
+which stays `ReadSetChanged`. Any other publication in between, a row change
+or a schema change, refuses as before. A caller's `--if-commit` head and an
+unattached base are not carried. `QueryIoProbes::writes_carried_over_row_preserving`
+counts carries.
 
 The index writer (`ensure_indices`, which `omnigraph index build` runs on any
 branch, and the explicit full-text rebuild) follows the same protocol: it
@@ -685,6 +702,7 @@ carried stored external reference the policy refuses fails as
 | Observation | Outcome |
 |---|---|
 | Parse, validation, policy, limit, or authority failure before effects | Typed error; no graph movement |
+| Authority movement before effects through publications that changed no row (optimize, index builds) | Carry the attempt over them: re-anchor on the current head, rebase each moved staged table with Lance's resolver; a conflict Lance reports is the row below |
 | Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
 | Strict read-set movement | `ReadSetChanged` |
 | Exact duplicate on strict insert | `KeyConflict` |

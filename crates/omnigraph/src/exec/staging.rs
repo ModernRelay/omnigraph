@@ -1148,6 +1148,11 @@ pub(crate) struct CommittedMutation {
     /// set across manifest publish (see `commit_all`) so no same-process
     /// writer interleaves after revalidation.
     pub(crate) gates: crate::db::write_queue::HeldWriteGates,
+    /// The attempt re-anchored on the current head when revalidation carried
+    /// it over publications that changed no row; the publisher must expect
+    /// that head, not the captured one. `None` when the captured authority
+    /// was current.
+    pub(crate) carried_txn: Option<crate::db::WriteTxn>,
 }
 
 decide_seam! {
@@ -1187,8 +1192,8 @@ impl StagedMutation {
         early: Option<crate::db::EarlyRevalidation>,
     ) -> Result<CommittedMutation> {
         let StagedMutation {
-            staged,
-            expected_versions,
+            mut staged,
+            mut expected_versions,
         } = self;
 
         // Per-(table_key, branch) queues for every touched table. Sorted by
@@ -1214,19 +1219,31 @@ impl StagedMutation {
         // Re-capture manifest pins under the queue (PR 2 / MR-686).
         //
         // expected_versions was captured when the mutation first opened
-        // each table for mutation (the query's read-time pin). For
-        // Any writer may advance the branch while we stage reclaimable files
-        // outside the gate. RFC-022 does not patch those prepared table pins or
-        // transparently rebase a validated transaction: every mismatch rejects
-        // the complete attempt before effects. Mutation inserts and load
-        // append/merge may then reprepare at their outer bounded retry loop;
-        // strict read-modify-write operations return the typed conflict.
-        let snapshot = db.revalidate_write_txn_with(txn, early).await?;
+        // each table for mutation (the query's read-time pin). Any writer may
+        // advance the branch while we stage reclaimable files outside the
+        // gate. A mismatch rejects the complete attempt before effects, unless
+        // every publication since the capture changed no row (optimize
+        // compaction, index builds): the captured authority is then still
+        // logically current, and the attempt is re-anchored on the current
+        // head. Each staged table whose pin such a publication moved is carried
+        // over that pin's chain by Lance's own conflict resolver, so its
+        // detached commit reads the table's current pin; a table the write
+        // only read keeps its moved pin. Otherwise mutation inserts and load
+        // append/merge reprepare at their outer bounded retry loop, and strict
+        // read-modify-write operations return the typed conflict.
+        let (snapshot, carried_txn, mut carried) =
+            match db.revalidate_write_txn_carrying(txn, early).await? {
+                crate::db::WriteRevalidation::Current(snapshot) => (snapshot, None, HashMap::new()),
+                crate::db::WriteRevalidation::RowPreserving { txn, tables } => {
+                    (txn.base.clone(), Some(txn), tables)
+                }
+            };
+        let txn = carried_txn.as_deref().unwrap_or(txn);
         let pins = txn
             .unattached_base
             .as_ref()
             .map_or(&snapshot, |_| &txn.base);
-        for entry in &staged {
+        for entry in &mut staged {
             let current = pins
                 .dataset(&entry.table_key)
                 .map(|e| e.published_dataset_version)
@@ -1236,18 +1253,55 @@ impl StagedMutation {
                         entry.table_key,
                     ))
                 })?;
-
-            // RFC-022-enrolled mutation/load attempts never patch a prepared
-            // table expectation to a newer manifest pin. The complete branch
-            // token was just revalidated; any remaining table mismatch is a
-            // stale/internally-inconsistent read set and must restart the
-            // whole validation attempt before effects.
-            if entry.expected_version != current {
-                return Err(OmniError::manifest_read_set_changed(
-                    format!("published_dataset_version:{}", entry.table_key),
-                    Some(entry.expected_version.to_string()),
-                    Some(current.to_string()),
-                ));
+            if entry.expected_version == current {
+                continue;
+            }
+            let refused = OmniError::manifest_read_set_changed(
+                format!("published_dataset_version:{}", entry.table_key),
+                Some(entry.expected_version.to_string()),
+                Some(current.to_string()),
+            );
+            // Without a row-preserving chain, a moved pin is a stale read set:
+            // restart the whole validation attempt before effects.
+            let Some(table) = carried.remove(&entry.table_key) else {
+                return Err(refused);
+            };
+            let Some(staged_write) = entry.staged_write.take() else {
+                return Err(refused);
+            };
+            match db
+                .storage()
+                .rebase_staged_write(&entry.dataset, staged_write, &table.current, &table.chain)
+                .await?
+            {
+                Ok(rebased) => {
+                    entry.staged_write = Some(rebased);
+                    entry.dataset = table.current;
+                    entry.expected_version = current;
+                    entry.path.entry = table.entry;
+                    if let Some(expected) = expected_versions.get_mut(&entry.path.identity) {
+                        expected.table_version = current;
+                    }
+                }
+                Err(reason) => {
+                    tracing::debug!(
+                        table = %entry.table_key,
+                        %reason,
+                        "Lance's conflict rules refuse to carry the staged write over the table's \
+                         row-preserving commits"
+                    );
+                    return Err(refused);
+                }
+            }
+        }
+        // A touched table without a staged effect (a delete that matched no
+        // row) stages nothing to carry; its rows are unchanged, so it expects
+        // its current pin.
+        if carried_txn.is_some() {
+            for expected in expected_versions.values_mut() {
+                if let Some(entry) = pins.dataset(&expected.table_key) {
+                    expected.table_version = entry.published_dataset_version;
+                }
             }
         }
         // An empty load/mutation has no independently durable table effect.
@@ -1258,6 +1312,7 @@ impl StagedMutation {
                 expected_versions,
                 detached: Vec::new(),
                 gates,
+                carried_txn: carried_txn.map(|txn| *txn),
             });
         }
 
@@ -1342,6 +1397,7 @@ impl StagedMutation {
             expected_versions,
             detached: detached_tables,
             gates,
+            carried_txn: carried_txn.map(|txn| *txn),
         })
     }
 }

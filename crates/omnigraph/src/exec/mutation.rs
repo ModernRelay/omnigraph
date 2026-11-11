@@ -1536,10 +1536,14 @@ impl Omnigraph {
                     expected_versions,
                     detached: _,
                     gates: _held_gates,
+                    carried_txn,
                 },
             lineage_intent,
             plans: _,
         } = committed;
+        // A write carried over row-preserving publications publishes on the
+        // head it was re-anchored on.
+        let txn = carried_txn.as_ref().unwrap_or(txn);
         // `_held_gates` holds the shared schema permit, branch effect gate,
         // and sorted table gates acquired by `commit_all`. They remain held
         // through manifest publication, covering the complete same-process

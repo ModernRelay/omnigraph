@@ -320,7 +320,10 @@ indexes are preserved and any uncovered tail is scanned; use the explicit
 rebuild command when full-text coverage or analyzer compatibility must change.
 `optimize` also persists the derived traversal adjacency used to speed up
 traversal startup; it does not collect unused forks (that is `cleanup`). It
-works on `main`; use `index build` for another branch.
+works on `main`; use `index build` for another branch. Writes running beside
+it are not sent back by its publication: an insert, append or overwrite
+commits over the compaction, and only an update or delete of a row in a
+fragment the run rewrote returns `read_set_conflict`.
 
 ### `index build` — a branch's missing and lagging indexes
 

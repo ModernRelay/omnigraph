@@ -1506,10 +1506,14 @@ async fn publish_staged_load(
         expected_versions,
         detached: _,
         gates: _held_gates,
+        carried_txn,
     } = staged
         .commit_all(db, branch, txn, None)
         .await
         .map_err(OmniError::unpublished)?;
+    // A load carried over row-preserving publications publishes on the head
+    // it was re-anchored on.
+    let txn = carried_txn.as_ref().unwrap_or(txn);
     fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER).map_err(OmniError::unpublished)?;
     // The publisher alone decides between a definite loss and an outcome it
     // could not read back.

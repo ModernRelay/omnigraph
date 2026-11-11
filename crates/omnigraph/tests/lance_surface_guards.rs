@@ -7575,6 +7575,116 @@ async fn rfc_0067_create_index_keeps_every_fragment_of_its_read_version() {
     assert_eq!(rfc0067_ids(&rebuilt).await, parent_ids, "rows unchanged");
 }
 
+/// The Lance rules a write carried over a row-preserving publication relies
+/// on (RFC 2026-11-10-writes-carried-over-row-preserving-publications,
+/// `table_store::rebase_staged_write`): `TransactionRebase` carries an append
+/// staged on a version over a compaction `Rewrite` of that version unchanged,
+/// and the append committed detached on the compacted version keeps the
+/// compaction, every row and unique row ids; a delete staged on the same
+/// version whose fragment the rewrite replaced is a retryable conflict. Red
+/// when Lance changes either rule: the carry then needs a design review.
+#[tokio::test]
+async fn transaction_rebase_carries_an_append_over_a_rewrite_and_refuses_an_overlapping_delete() {
+    use lance::dataset::DeleteBuilder;
+    use lance::io::commit::conflict_resolver::TransactionRebase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let v1 = rfc0067_create(uri).await;
+    let v2 = rfc0067_append(v1, &["b1"]).await;
+    let base = rfc0067_append(v2, &["c1"]).await;
+    assert_eq!(base.get_fragments().len(), 3, "three fragments to compact");
+
+    let append = rfc0067_staged_append(&base, &["d1"]).await;
+    let delete = DeleteBuilder::new(Arc::new(base.clone()), "id = 'a1'")
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+    let mut compacted = base.clone();
+    compact_files(&mut compacted, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(compacted.get_fragments().len(), 1, "the rewrite compacted");
+    let rewrite = compacted.read_transaction().await.unwrap().unwrap();
+    assert!(
+        matches!(rewrite.operation, Operation::Rewrite { .. }),
+        "compaction commits a Rewrite: {:?}",
+        rewrite.operation
+    );
+    assert_eq!(rewrite.read_version, base.version().version);
+    let rewrite_version = compacted.version().version;
+
+    let mut rebase = TransactionRebase::try_new(&base, append, None)
+        .await
+        .unwrap();
+    rebase.check_txn(&rewrite, rewrite_version).unwrap();
+    let mut carried = rebase.finish(&compacted).await.unwrap();
+    carried.read_version = rewrite_version;
+    let committed = CommitBuilder::new(Arc::new(compacted.clone()))
+        .with_detached(true)
+        .with_skip_auto_cleanup(true)
+        .execute(carried)
+        .await
+        .unwrap();
+    let committed = rfc0067_pinned(uri, committed.version().version).await;
+    assert_eq!(
+        committed
+            .read_transaction()
+            .await
+            .unwrap()
+            .unwrap()
+            .read_version,
+        rewrite_version,
+        "the carried append reads the compacted version"
+    );
+    assert_eq!(
+        committed.get_fragments().len(),
+        2,
+        "the compacted fragment and the append's own: the compaction stays"
+    );
+    assert_eq!(
+        rfc0067_ids(&committed).await,
+        vec!["a1", "a2", "b1", "c1", "d1"],
+        "every row, once"
+    );
+    let mut scanner = committed.scan();
+    scanner.with_row_id().project(&["id"]).unwrap();
+    let row_ids: Vec<u64> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("_rowid")
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(
+        row_ids.iter().collect::<HashSet<_>>().len(),
+        row_ids.len(),
+        "the appended row takes a fresh stable row id"
+    );
+
+    let mut rebase =
+        TransactionRebase::try_new(&base, delete.transaction, delete.affected_rows.as_ref())
+            .await
+            .unwrap();
+    let refused = rebase.check_txn(&rewrite, rewrite_version).unwrap_err();
+    assert!(
+        matches!(refused, lance::Error::RetryableCommitConflict { .. }),
+        "a delete of a rewritten fragment is a retryable conflict: {refused}"
+    );
+}
+
 /// RFC 0067 §Promotion: replaying the transaction recorded in a detached
 /// manifest linearly at its base lands an identical twin: same uuid, same
 /// fragment ids, same rows, and the linear row stamps the change feed and
