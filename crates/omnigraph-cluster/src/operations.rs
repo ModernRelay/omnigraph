@@ -1166,12 +1166,9 @@ mod tests {
         assert_eq!(record.terminal[0].state, OperationState::Succeeded);
         assert_eq!(record.terminal[0].resolution, None);
         assert_eq!(
-            record
-                .kind_state
-                .optimize
-                .get("g")
-                .map(|state| state.resume_at.as_str()),
-            Some("node:Zebra")
+            record.kind_state.optimize.get("g"),
+            None,
+            "a late settlement leaves the graph's position as it was, even when its record holds one"
         );
         assert!(
             !record.settle(&id(1), Resolution::NotCommitted),
