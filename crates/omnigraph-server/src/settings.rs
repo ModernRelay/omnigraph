@@ -586,10 +586,24 @@ pub(crate) fn normalize_bearer_token(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The actor prefix signed data and OIDC identities resolve to
+/// (`principal:<id>`). Policy sees only the actor string, so a static token
+/// may not claim it.
+pub(crate) const SIGNED_ACTOR_PREFIX: &str = "principal:";
+
 pub(crate) fn normalize_bearer_actor(value: String) -> Result<String> {
     let value = value.trim().to_string();
     if value.is_empty() {
         bail!("bearer token actor names must not be blank");
+    }
+    if value
+        .get(..SIGNED_ACTOR_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SIGNED_ACTOR_PREFIX))
+    {
+        bail!(
+            "bearer token actor '{value}' uses the reserved prefix '{SIGNED_ACTOR_PREFIX}', \
+             which names signed and OIDC identities; choose another actor name"
+        );
     }
     Ok(value)
 }
@@ -663,6 +677,7 @@ mod tests {
         GraphId, GraphKey, GraphStartupConfig, RegistryLookup, ServerConfig, ServerConfigMode,
         ServerRuntimeState, StartupFailure, classify_server_runtime_state, hash_bearer_token,
         normalize_bearer_token, parse_bearer_tokens_json, serve, server_bearer_tokens_from_env,
+        validate_bearer_tokens,
     };
     use serial_test::serial;
     use std::env;
@@ -1412,6 +1427,32 @@ mod tests {
             assert!(
                 msg.contains("every request would 401"),
                 "rejection message must name the failure mode; got: {msg}"
+            );
+        }
+    }
+
+    /// Signed and OIDC identities resolve to `principal:<id>`, and policy sees
+    /// only the actor string: a static actor in that namespace would match
+    /// their rules.
+    #[test]
+    fn static_actors_cannot_claim_the_signed_identity_prefix() {
+        for reserved in [
+            "principal:alice",
+            " principal:alice ",
+            "PRINCIPAL:alice",
+            "principal:",
+        ] {
+            let err = validate_bearer_tokens(vec![(reserved.to_string(), "tok".to_string())])
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("reserved prefix"),
+                "{reserved}: {err}"
+            );
+        }
+        for allowed in ["alice", "principal", "my-principal:alice", "principalalice"] {
+            assert!(
+                validate_bearer_tokens(vec![(allowed.to_string(), "tok".to_string())]).is_ok(),
+                "{allowed}"
             );
         }
     }
