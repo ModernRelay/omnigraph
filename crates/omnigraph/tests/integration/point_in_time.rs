@@ -1184,7 +1184,10 @@ async fn historical_read_of_reclaimed_version_is_typed() {
     .await
     .unwrap();
 
-    let stats = db.cleanup(helpers::collector::keep_one()).await.unwrap();
+    let stats = db
+        .cleanup_as(helpers::collector::keep_one(), None)
+        .await
+        .unwrap();
     let person = stats
         .iter()
         .find(|row| row.type_key == "node:Person")

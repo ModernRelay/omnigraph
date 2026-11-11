@@ -22,6 +22,8 @@ Graph-scoped actions:
 | `branch_claim` | Claim of a branch's [writer epoch](troubleshooting.md#writer-epoch) |
 | `commit_publish` | Publication of an unpublished commit onto its recorded target branch |
 | `commit_drop` | Drop of an unpublished commit |
+| `maintain` | Content-preserving maintenance: optimize, index builds, the full-text rebuild and the repair report |
+| `reclaim` | Cleanup, which permanently removes table versions and files no retained commit needs |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved graph administration |
 
@@ -42,6 +44,16 @@ The reserved graph `admin` action does not grant cluster management.
 
 A stored mutation requires both `invoke_query` and `change`. A stored read
 requires `invoke_query` and `read`.
+
+`maintain` and `reclaim` are separate from `change`, so an automation account
+can compact a graph without the right to write data, and can hold `maintain`
+without the right to delete history. `maintain` is judged on the branch the
+operation maintains (`main` for optimize and the repair report) and takes
+`branch_scope`; `reclaim` covers every branch's history and takes no branch
+scope. `change` admits no maintenance: index builds and the full-text rebuild
+need `maintain` on their branch. The engine checks these actions whenever a policy is installed on the
+graph handle; the direct maintenance commands load no policy (see
+[maintenance](maintenance.md)).
 
 ## Bind a policy
 
@@ -125,7 +137,7 @@ empty, has leading or trailing whitespace, or contains a control character
 fails policy validation, and a request naming such a branch is refused as a
 bad request before any rule is evaluated (see
 [branch names](../branching/index.md#branch-names)). Server actions and graph-wide
-`invoke_query` rules do not take branch scopes. `commit_publish` and
+`invoke_query` and `reclaim` rules do not take branch scopes. `commit_publish` and
 `commit_drop` take `target_branch_scope`: the scope is the branch the
 unpublished commit recorded as its target. `branch_claim` takes
 `target_branch_scope` too: the scope is the branch the claim names. Writing an unpublished commit
@@ -223,7 +235,8 @@ authentication allows every graph action and reports `actor_id: null`. The MCP
 server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
 
 It reports policy actions, not actor views, so a view can still refuse a
-`change` the policy allows.
+`change` the policy allows. It does not report `maintain` or `reclaim`, since
+no server route runs maintenance.
 
 ## Actor identity
 

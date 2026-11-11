@@ -60,6 +60,15 @@ pub(crate) struct UpgradeArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct OptimizeArgs {
+    /// Only these tables, in this order: `node:<Type>` or `edge:<Type>`,
+    /// comma-separated or repeated. Default: every table on main.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) tables: Vec<String>,
+    /// Stop starting tables once the run has held main's writer gates this
+    /// long, and report the rest deferred. The first table always runs.
+    /// Accepts Go-style durations: `30s`, `5m`.
+    #[arg(long)]
+    pub(crate) max_gate_hold: Option<String>,
     #[arg(long)]
     pub(crate) json: bool,
 }
