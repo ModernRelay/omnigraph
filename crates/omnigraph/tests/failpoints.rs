@@ -5056,7 +5056,10 @@ async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrit
             })
         };
         rendezvous.wait_until_reached().await;
-        // Let the planner fill its ready queue with the no-op tables.
+        // Let the planner fill its ready queue with the no-op tables. No seam
+        // marks a filled queue, so this waits a fixed time: on a host slower
+        // than that the test passes without reproducing the early exit (a
+        // false green, never a false red).
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         rendezvous.release();
         let report = tokio::time::timeout(std::time::Duration::from_secs(30), run)

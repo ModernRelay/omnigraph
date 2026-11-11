@@ -302,7 +302,8 @@ failure whose evidence stays uncertain fails the run. A cancellation
 (`OptimizeRequest::with_cancellation`) is checked before every table's plan
 and rewrite and before the publication: it drops the tables in progress,
 defers every table as `cancelled` and publishes nothing; one that arrives
-after the last check lets the run finish and skips only the artifact scan.
+after the last check lets the run finish, and the artifact refresh stops
+before its write, or, if the write had already started, completes.
 Per-table ceilings (`TableCeilings`) are measured from the table's compaction
 plan before its first write, fragments first, and only when set: rows from
 fragment metadata, bytes from recorded data-file sizes or a HEAD resolved by
