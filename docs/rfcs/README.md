@@ -258,3 +258,4 @@ then dated RFCs by date.
 | [2026-10-29](2026-10-29-remote-optimize-through-the-serving-owner.md) | Remote optimize through the serving owner | maintainer | accepted | in-progress |
 | [2026-11-09](2026-11-09-writer-epoch-fence.md) | Writer epoch fence on the branch manifest | maintainer | draft | not-started |
 | [2026-11-10](2026-11-10-writes-carried-over-row-preserving-publications.md) | Writes carried over row-preserving publications | maintainer | draft | in-progress |
+| [2026-11-10](2026-11-10-graph-shallow-clone.md) | Graph shallow clone | maintainer | draft | not-started |

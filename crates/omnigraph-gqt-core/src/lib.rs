@@ -82,6 +82,9 @@ pub struct Case {
     /// The `# overwrite_chunk_rows:` pin: the rows one `load csv` overwrite
     /// chunk holds before its writer takes it.
     overwrite_chunk_rows: Option<usize>,
+    /// The `# writer: held` pin: the case's process claims the writer epoch
+    /// of `main` after the fixture loads and before the first step.
+    writer_held: bool,
     pub items: Vec<Item>,
     pub needs_indices: bool,
     /// `--- csv <name>` sections: the CSV text a `load csv "<name>"` step
@@ -108,8 +111,23 @@ impl Case {
             (Some(_), Some(_)) => {
                 Err("invalid_case: --store cannot be combined with schema and seed".into())
             }
-            (Some(_), None) | (None, Some(_)) => Ok(()),
+            (None, Some(_)) => self.admit_lasting_store(),
+            (Some(_), None) => Ok(()),
         }
+    }
+
+    /// Refuse the `# writer: held` pin on a store the case does not own: the
+    /// claim stays in the store, and every process that holds nothing is
+    /// refused its writes there from then on.
+    pub fn admit_lasting_store(&self) -> Result<(), String> {
+        if self.writer_held {
+            return Err(
+                "invalid_case: `# writer: held` cannot run on --store or in a bench dataset \
+                 or workload: its claim stays in a store the case does not own"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     fn has_loops(&self) -> bool {
@@ -589,6 +607,7 @@ struct Header {
     traversal: Option<&'static str>,
     csv_slice_bytes: Option<usize>,
     overwrite_chunk_rows: Option<usize>,
+    writer_held: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -597,14 +616,15 @@ enum IssueRef {
     Num(u64),
 }
 
-/// The six header keys, in the spelling the canonical form requires.
-const HEADER_KEYS: [&str; 6] = [
+/// The seven header keys, in the spelling the canonical form requires.
+const HEADER_KEYS: [&str; 7] = [
     "issue",
     "red_on",
     "notes",
     "traversal",
     "csv_slice_bytes",
     "overwrite_chunk_rows",
+    "writer",
 ];
 
 /// Canonical spelling for one header key and its trimmed value.
@@ -645,6 +665,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
     let mut traversal: Option<&'static str> = None;
     let mut csv_slice_bytes: Option<usize> = None;
     let mut overwrite_chunk_rows: Option<usize> = None;
+    let mut writer_held = false;
     for (idx, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -662,6 +683,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
             "traversal" => traversal.is_some(),
             "csv_slice_bytes" => csv_slice_bytes.is_some(),
             "overwrite_chunk_rows" => overwrite_chunk_rows.is_some(),
+            "writer" => writer_held,
             _ => false,
         };
         if duplicate {
@@ -725,6 +747,15 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
                     })?;
                 overwrite_chunk_rows = Some(rows);
             }
+            "writer" => {
+                if value != "held" {
+                    return Err(format!(
+                        "line {}: `# writer:` takes `held`, got `{value}`",
+                        idx + 1
+                    ));
+                }
+                writer_held = true;
+            }
             other => unreachable!("split_header_line admits only HEADER_KEYS, got `{other}`"),
         }
     }
@@ -739,6 +770,7 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
         traversal,
         csv_slice_bytes,
         overwrite_chunk_rows,
+        writer_held,
     })
 }
 
@@ -2913,6 +2945,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
         traversal: header.traversal,
         csv_slice_bytes: header.csv_slice_bytes,
         overwrite_chunk_rows: header.overwrite_chunk_rows,
+        writer_held: header.writer_held,
         items,
         needs_indices,
         csv_sections,
@@ -4437,6 +4470,13 @@ async fn execute_steps_inner<H: ExecutionHost>(
     host: &H,
 ) -> Result<Session, String> {
     host.admit_case(case)?;
+    if case.writer_held {
+        session
+            .db()
+            .claim_branch_writer("main")
+            .await
+            .map_err(|e| format!("`# writer: held` refused: the claim of `main` failed: {e}"))?;
+    }
     let mut first_fail: Option<StepFail> = None;
     let mut generation = 0usize;
     let mut bindings = Bindings::new();

@@ -72,6 +72,22 @@ async fn data_table_opener_is_flat_in_history_on_s3() {
     assert_flat(&curve, |c| c.data_opener_reads, 8, "S3 data-table opener");
 }
 
+/// The writer epoch cost gate on an object store, where every read is a
+/// request. Skips without `OMNIGRAPH_S3_TEST_BUCKET`.
+#[tokio::test]
+async fn branch_claim_adds_no_request_to_a_write_on_s3() {
+    let (Some(unclaimed), Some(held)) = (
+        s3_graph("claim-cost-unclaimed").await,
+        s3_graph("claim-cost-held").await,
+    ) else {
+        eprintln!(
+            "SKIP branch_claim_adds_no_request_to_a_write_on_s3: OMNIGRAPH_S3_TEST_BUCKET unset"
+        );
+        return;
+    };
+    helpers::cost::assert_branch_claim_adds_no_request_to_a_write(&unclaimed, &held).await;
+}
+
 /// RFC-033's external-source cost gate runs against the real S3-compatible
 /// provider. A fixed batch of normalized aliases must cause one source metadata
 /// request and one payload read, not one cold setup/HEAD/GET per row.

@@ -175,6 +175,96 @@ precondition and the exact Lance transaction identity each pin records. A
 retryable pre-effect attempt discards all staged work, captures a new
 `WriteTxn`, and repeats boundedly; it never reuses batches against a new base.
 
+## Writer epoch
+
+A branch's writer epoch is the `writer_epoch` control-fact row of its own
+`__manifest` ([storage format v17](versioning.md)). A branch without the
+row, or with a row its fork source wrote, is at epoch 0. A process holds an
+epoch for a branch only after a claim it published landed there. The holder
+registry (`omnigraph-catalog/src/writer_epoch.rs`) is process-wide, keyed by
+root identity and branch name, and records the native ref of the claim; no
+reload raises an entry, a refusal clears it, the process's own delete of the
+branch drops it, and otherwise it ends with the process.
+
+Every publication that moves a branch's head asserts the epoch.
+`publish_attempts` runs the check on each attempt over the rows that attempt
+loaded, before `check_publish_precondition` and before the return of a
+publish that would write nothing. A mutation that stages nothing returns
+before it reaches the publisher, so the check does not refuse it; on a branch
+its process holds it probes the head before it answers (below). A process
+holding nothing proceeds on rows at epoch 0 and a process holding `E`
+proceeds on rows at `E`. Any other pair
+is refused as `WriterFenced { held, read, current }`, which is not retried
+and clears the refused entry. The check issues no request: it compares the
+loaded rows with the registry, and a process that holds no branch resolves
+no key. An entry whose native ref is not the loaded chain's is dropped, so
+what a process held on a deleted branch never counts on a branch created
+again under its name. `main` has no native ref: after a root is created
+again or restored while a process still holds its `main`, that entry is
+cleared by the first refusal it meets, and until then it counts whenever
+the root's epoch equals it.
+
+A process that holds its handle's bound branch does not probe that branch's
+head at the sites below: no other process's publication can land on it, and
+the writers the fence does not cover are listed under the
+[support boundary](invariants.md#current-support-boundaries). The holder
+entry records the `__manifest` version of the process's last publication on
+the branch, the claim included. A handle whose installed view is at or above
+that version reads and writes from the installed head with no request; a
+handle below it, one that did not run that publication, reloads first, also
+with no probe. The sites are a read that targets the branch
+(`ReadTarget::Branch`), `resolve_snapshot`, a write's open and its
+revalidation, which ask `GraphCoordinator::head_is_current`, and its probe
+beside staging, which asks `held_head`. A merge's authority capture and
+revalidation, a branch create's capture of its source and the change-feed
+poll still probe the bound branch. A publish attempt that returns an error,
+or whose future is dropped, withdraws the recorded version, and a claim
+withdraws it before its put: each may have landed, or met a head that moved,
+with no record of it. Every handle then probes as before until the process's
+next publication lands. A write that stages nothing reaches no publication,
+so when its open took the recorded version for the head it probes once
+before it answers; a head that is neither its view nor the version on record
+now is prepared again on a fresh view. A held branch that is not the handle's
+bound branch, and every branch the process holds nothing on, is probed as
+before.
+
+Two changes by another process reach the owner by no path but a probe, so
+its handle serves reads from its installed snapshot until a publish of its
+own loads the branch. After another process claims the branch, that publish
+is refused, which clears the holder; a write of the replaced owner that
+stages nothing probes and is prepared again on a fresh view. After another
+process deletes the branch, a ref delete that asserts no epoch, that publish
+finds the branch gone, or finds the branch created again under its name:
+there the entry's native ref is not the loaded chain's, so the entry is
+dropped and the publish proceeds at epoch 0. The process's own delete of a
+branch withdraws the recorded version before it retires the ref and drops the
+entry once the retire has landed, so its handles probe.
+
+`Omnigraph::claim_branch_writer_as` claims under `branch_claim` on the branch
+it names, the shared schema permit and the branch gate, through a
+coordinator it opens under those gates. The catalog's `claim_writer_epoch`
+writes the loaded rows with the row at `E + 1` and a fresh attempt id as the
+next `__manifest` version, under `PublishPrecondition::ExactBranchIdentity`:
+the branch's name and Lance-native identifier, with no head compare. A moved
+head does not refuse a claim and a branch recreated under its name does. The
+version records no graph commit and moves no head; it is the first
+publication of the control-fact kind, and a publication that changes `table`
+rows or the schema contract still requires lineage. The process that already
+holds the rows' epoch gets it back and writes nothing. A claim that loses its
+version to another publication loads again and asserts the epoch its first
+load read, so of two racing claims one holds `E + 1` and the other is refused
+with `read: E`. A put with no answer is settled from the version it
+attempted: the row carrying this claim's attempt id is the claim landed, and
+another publication there before any acknowledgement is the claim lost.
+When that version cannot be read, or holds another publication after an
+acknowledgement, the claim is in doubt, keyed by the attempt id, and holds
+nothing; the next claim settles it by landing above it.
+
+Detached candidate versions (an unpublished commit or an unattached snapshot
+before publication) carry the row and assert nothing. Writes outside the
+publisher are not fenced: Lance ref metadata and ref deletes, the collector's
+deletes, `optimize`'s configuration commit and the stamp-only upgrade route.
+
 ## Writer adapters
 
 All current graph-visible writers share the publication door but have different
@@ -217,7 +307,10 @@ since a manifest lists every fragment. `commit_all` enters the gates,
 revalidates the complete
 authority (for the handle's bound branch, the probe taken beside the staging
 puts serves when it answered current and no publish has installed on the
-handle since; for another branch, the captured manifest probe first: an
+handle since, and a process that holds the branch's
+[writer epoch](#writer-epoch) with its last publication on record probes
+nowhere; for another branch, the
+captured manifest probe first: an
 unchanged version and branch identifier keep the captured authority, a
 mismatch is a fresh coherent capture), and commits
 every participant as a detached version of its pinned
@@ -707,6 +800,7 @@ carried stored external reference the policy refuses fails as
 | Authority movement before effects through publications that changed no row (optimize, index builds) | Carry the attempt over them: re-anchor on the current head, rebase each moved staged table with Lance's resolver; a conflict Lance reports is the row below |
 | Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
 | Strict read-set movement | `ReadSetChanged` |
+| A publish or a claim on a branch whose writer epoch is not the one its process asserts | `WriterFenced { held, read, current }` before the manifest put; never retried; the process's holder for the branch is cleared, and a publish's detached staging stays unpublished for the collector |
 | Exact duplicate on strict insert | `KeyConflict` |
 | Mutation, load, Blob write or merge fails before publication, after detached effects | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob and merge writers mark the steps between, so a server does not treat that logical error as uncertain; native storage settlement is checked independently, and a typed refusal keeps its shape |
 | A manifest request no re-issue settles | The write is reported in doubt and nothing records it. The version is created only if absent, so the request lands before the branch's next publication or never: that publication either loads it as the head and builds on it, or takes the version first, after which the late request fails its precondition (a race between the two is the ordinary version-CAS retry). The attempt's detached effects stay unreachable unless it lands, and the collector keeps them while their recorded publication authority is current |

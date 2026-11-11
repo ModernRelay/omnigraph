@@ -74,12 +74,13 @@ impl<'a> TableColumns<'a> {
 
     /// Whether `row` holds no table column, which a commit row requires.
     pub(crate) fn is_null(&self, row: usize) -> bool {
-        let strings = [
-            self.locations,
-            self.metadata,
-            self.table_keys,
-            self.table_branches,
-        ];
+        self.metadata.is_null(row) && self.is_null_beside_metadata(row)
+    }
+
+    /// Whether `row` holds no table column but `metadata`, which a control
+    /// fact requires: its payload is that column's JSON.
+    pub(crate) fn is_null_beside_metadata(&self, row: usize) -> bool {
+        let strings = [self.locations, self.table_keys, self.table_branches];
         let numbers = [
             self.stable_table_ids,
             self.table_incarnation_ids,
@@ -439,11 +440,13 @@ impl TableColumnsBuilder {
         Ok(())
     }
 
-    pub(crate) fn push_contract(&mut self, head: &crate::SchemaContractHead) -> Result<()> {
+    /// A row whose one table column is `metadata`, the JSON of `payload`:
+    /// the schema contract's head, or a control fact.
+    pub(crate) fn push_payload(&mut self, payload: &impl serde::Serialize) -> Result<()> {
         self.push_null();
         if let Some(metadata) = self.metadata.last_mut() {
             *metadata = Some(
-                serde_json::to_string(head)
+                serde_json::to_string(payload)
                     .map_err(|error| OmniError::manifest_internal(error.to_string()))?,
             );
         }

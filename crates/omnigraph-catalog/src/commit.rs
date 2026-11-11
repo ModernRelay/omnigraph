@@ -48,7 +48,8 @@ use lance_table::format::Fragment;
 use crate::error::{OmniError, Result};
 use crate::manifest_request::ManifestRequestProbe;
 use crate::migrations::{
-    INTERNAL_MANIFEST_SCHEMA_VERSION, guard_row_layout, read_stamp, stamp_entry,
+    BLOCK_REGISTRY_STAMP, CONTROL_FACTS_STAMP, guard_stamp, stamp_after_publish, stamp_entry,
+    supports_control_facts,
 };
 use crate::publisher::map_lance_publish_error;
 use crate::record::{compact_to_storage, manifest_storage_schema};
@@ -77,9 +78,10 @@ const DETACHED_VERSION_RETRIES: u32 = 20;
 
 /// Write `rows` as the hot row set of `dataset`'s version + 1, and `cold` as
 /// a cold fragment of that version. The schema metadata carries over from
-/// `dataset`, a served stamp, and the new version is stamped with the format
-/// this binary writes: a branch below it takes the current stamp in the CAS
-/// that writes its first rows. Returns the hot batch beside the new version.
+/// `dataset`, a served stamp, and the new version keeps the stamp `dataset`
+/// was loaded at, a v14 or v15 branch taking 16 in the CAS that writes its
+/// first rows ([`stamp_after_publish`]); a control fact is refused below its
+/// stamp. Returns the hot batch beside the new version.
 pub(crate) async fn overwrite(
     dataset: Dataset,
     rows: &ManifestRows,
@@ -129,14 +131,21 @@ async fn overwrite_probed(
     placement: Placement,
     probe: ManifestRequestProbe,
 ) -> Result<(Dataset, RecordBatch)> {
-    guard_row_layout(&dataset)?;
+    let loaded = guard_stamp(&dataset)?;
+    let written = stamp_after_publish(loaded);
+    if rows.writer_epoch.is_some() && !supports_control_facts(written) {
+        return Err(OmniError::manifest_internal(format!(
+            "a `__manifest` version stamped v{written} cannot hold a control fact; control \
+             facts need v{CONTROL_FACTS_STAMP}"
+        )));
+    }
     let mut metadata = dataset.schema().metadata.clone();
-    let (stamp_key, stamp_value) = stamp_entry(INTERNAL_MANIFEST_SCHEMA_VERSION);
+    let (stamp_key, stamp_value) = stamp_entry(written);
     metadata.insert(stamp_key, stamp_value);
     let schema = manifest_storage_schema(metadata);
     let batch = compact_to_storage(&rows.to_batch()?, &schema)?;
     let dataset = Arc::new(dataset);
-    let mut fragments = match read_stamp(&dataset) == Some(INTERNAL_MANIFEST_SCHEMA_VERSION) {
+    let mut fragments = match loaded >= BLOCK_REGISTRY_STAMP {
         true => state::cold_fragments(&dataset),
         false => Vec::new(),
     };
