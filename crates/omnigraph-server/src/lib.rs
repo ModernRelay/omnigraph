@@ -1482,6 +1482,16 @@ impl ApiError {
         self
     }
 
+    /// Mark an error as a definite refusal that applied nothing: the store
+    /// refused the write, or the server refused it before sending one. Its
+    /// effects are none even after an owned write started, as an engine
+    /// step's proof that it published nothing makes them.
+    pub(crate) fn applied_nothing(mut self) -> Self {
+        self.completion_uncertain = false;
+        self.unpublished = true;
+        self
+    }
+
     /// Carry what the request being served has done onto the error itself.
     /// That record is task-local, so an error that crosses into another task
     /// on its way to a response, as an MCP tool call's does, takes it along.
@@ -2360,6 +2370,27 @@ mod api_error_tests {
         let error = output_of(marked).await;
         assert_eq!(error.code, Some(ErrorCode::Conflict));
         assert_eq!(error.disposition, partial(DispositionAction::Refresh));
+
+        // A refusal the store or the server made before anything applied
+        // (a refused operation record write, a graph closing for a
+        // deployment) applied nothing, after an owned write started too; a
+        // 503 is retried.
+        let error = output_of(
+            ApiError::new(ErrorCode::ServiceUnavailable, "nothing was accepted")
+                .after_owned_write()
+                .applied_nothing(),
+        )
+        .await;
+        assert_eq!(error.code, Some(ErrorCode::ServiceUnavailable));
+        assert_eq!(error.disposition, none(DispositionAction::Retry));
+        let error =
+            output_of(ApiError::new(ErrorCode::ServiceUnavailable, "refused").after_owned_write())
+                .await;
+        assert_eq!(
+            error.disposition,
+            unknown(DispositionAction::Reconcile),
+            "without the mark, an error after an owned write may follow its effect"
+        );
 
         // Refusals a write meets before it starts took no effect, unless an
         // earlier step of the operation published.

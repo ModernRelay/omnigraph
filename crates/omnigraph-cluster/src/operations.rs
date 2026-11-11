@@ -692,7 +692,9 @@ impl OperationRecord {
                 operation.published_commit = Some(published_commit);
                 operation.resolution = None;
                 operation.reason = None;
-                self.keep_settled_kind_state(&operation);
+                // A late settlement never touches the graph's position: its
+                // record holds none (the `publishing` write stores none), and
+                // a newer run may have moved the position since.
                 self.push_terminal(operation);
             }
             Resolution::NotCommitted => {
@@ -791,19 +793,6 @@ impl OperationRecord {
             None => {
                 self.kind_state.optimize.remove(&operation.graph);
             }
-        }
-    }
-
-    /// A late settlement from history knows only what its record holds: a
-    /// position it carries moves the graph's position, and its absence says
-    /// nothing (the `publishing` write stores no `resume_at`, and a newer run
-    /// may have moved the position since), so it never clears one.
-    fn keep_settled_kind_state(&mut self, operation: &Operation) {
-        let resume_at = operation
-            .optimize_outcome()
-            .and_then(|outcome| outcome.resume_at.clone());
-        if resume_at.is_some() {
-            self.keep_kind_state(operation);
         }
     }
 
@@ -958,11 +947,13 @@ pub enum OperationWrite {
     /// The precondition failed: another write changed the record.
     Conflict,
     /// Nothing applied: the store, or this process's storage scope, refused
-    /// the request before it could land. A scope refuses a key with an
-    /// earlier request of unknown outcome until a replacement scope, so this
-    /// can hold for the rest of the process's life.
+    /// the request before it could land. A scope refuses a key while an
+    /// earlier request to it may still land: a conditional one until a read
+    /// shows the key at another version, an unconditional one (or a create
+    /// whose object never appeared) for the rest of the process's life.
     Refused { error: String },
-    /// No definite answer. The key is unsettled until a re-read settles it.
+    /// No definite answer: a copy may still land, or the read-back that was
+    /// to settle it failed. The key is unsettled until a re-read settles it.
     InDoubt { error: String },
 }
 
@@ -1267,37 +1258,46 @@ mod tests {
     }
 
     #[test]
-    fn a_late_settlement_without_a_position_keeps_a_newer_runs_position() {
-        // Run 1's publication is in doubt; run 2 finishes and stores
-        // its position; run 1 then settles `Committed` from history. Its record
-        // holds no `resume_at`, so it must not erase run 2's position.
-        let mut record = OperationRecord::new(LEDGER);
-        record.admit_now(operation(1, "g")).unwrap();
-        record
-            .defer_publication(&id(1), "head unchanged".to_string())
-            .unwrap();
-        record.kind_state.optimize.insert(
-            "g".to_string(),
-            OptimizeState {
-                resume_at: "node:Newer".to_string(),
-            },
-        );
-        assert!(record.settle(
-            &id(1),
-            Resolution::Committed {
-                published_commit: "hb1.child".to_string()
-            }
-        ));
-        assert_eq!(record.terminal[0].state, OperationState::Succeeded);
-        assert_eq!(
+    fn a_late_settlement_never_moves_a_newer_runs_position() {
+        // Run 1's publication is in doubt; run 2 finishes and stores its
+        // position; run 1 then settles `Committed` from history. Whether its
+        // record holds a position or not, run 2's stays.
+        for held in [None, Some("node:Older")] {
+            let mut record = OperationRecord::new(LEDGER);
+            record.admit_now(operation(1, "g")).unwrap();
             record
-                .kind_state
-                .optimize
-                .get("g")
-                .map(|state| state.resume_at.as_str()),
-            Some("node:Newer")
-        );
-        record.validate().unwrap();
+                .defer_publication(&id(1), "head unchanged".to_string())
+                .unwrap();
+            if let Some(held) = held {
+                record.unresolved[0]
+                    .optimize_outcome_mut()
+                    .unwrap()
+                    .resume_at = Some(held.to_string());
+            }
+            record.kind_state.optimize.insert(
+                "g".to_string(),
+                OptimizeState {
+                    resume_at: "node:Newer".to_string(),
+                },
+            );
+            assert!(record.settle(
+                &id(1),
+                Resolution::Committed {
+                    published_commit: "hb1.child".to_string()
+                }
+            ));
+            assert_eq!(record.terminal[0].state, OperationState::Succeeded);
+            assert_eq!(
+                record
+                    .kind_state
+                    .optimize
+                    .get("g")
+                    .map(|state| state.resume_at.as_str()),
+                Some("node:Newer"),
+                "{held:?}"
+            );
+            record.validate().unwrap();
+        }
     }
 
     #[test]

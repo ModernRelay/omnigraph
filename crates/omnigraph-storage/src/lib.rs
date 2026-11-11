@@ -274,6 +274,12 @@ pub enum StorageError {
         #[source]
         source: std::io::Error,
     },
+    /// A conditional write whose outcome no answer settled: a copy may still
+    /// land, or a failed write's read-back could not say whether it applied.
+    /// Every other error of a conditional write is a refusal that applied
+    /// nothing.
+    #[error("{0}")]
+    Unresolved(StorageFailure),
     #[error("storage resource '{resource}' for '{uri}' exceeds limit {limit} (actual {actual})")]
     ResourceLimit {
         resource: String,
@@ -288,12 +294,38 @@ impl StorageError {
         Self::Internal(message.into())
     }
 
-    /// Whether a conditional write ended with no answer that settled it: a
-    /// copy may still land. Every other error of a conditional write is a
+    /// Whether a conditional write ended with no answer that settled it
+    /// ([`Self::Unresolved`]). Every other error of a conditional write is a
     /// refusal that applied nothing, the owning scope's refusal of a key with
     /// an unsettled request included.
     pub fn is_unresolved_conditional(&self) -> bool {
-        matches!(self, Self::Backend(failure) if failure.message.contains(UNRESOLVED_CONDITIONAL_MARKER))
+        matches!(self, Self::Unresolved(_))
+    }
+
+    /// The failure this error carries, when it carries one.
+    fn failure(&self) -> Option<&StorageFailure> {
+        match self {
+            Self::Backend(failure) | Self::Unresolved(failure) | Self::Io { failure, .. } => {
+                Some(failure)
+            }
+            Self::Internal(_) | Self::ResourceLimit { .. } => None,
+        }
+    }
+
+    /// A read-back that was to settle a write's outcome failed, so that
+    /// outcome stays unknown.
+    fn unread_outcome(self, action: &str, uri: &str) -> Self {
+        let kind = self
+            .failure()
+            .map_or(StorageFailureKind::Unknown, |failure| failure.kind);
+        Self::Unresolved(StorageFailure::new(
+            kind,
+            format!(
+                "storage {action} is unresolved for '{}': the read-back that was to settle it \
+                 failed, so whether it applied is unknown: {self}",
+                redacted_storage_uri(uri)
+            ),
+        ))
     }
 
     fn backend(kind: StorageFailureKind, message: impl Into<String>) -> Self {
@@ -1831,6 +1863,38 @@ impl ObjectStorageAdapter {
         }
     }
 
+    /// The one GET every versioned read and read-back takes: the object and
+    /// its ETag, or the store's error (`NotFound` when no object exists).
+    /// What it observes settles an earlier conditional request to the key
+    /// whose precondition no longer holds (scoped.rs), so every owner read
+    /// settles alike. An answer without an ETag shows nothing about the
+    /// version and settles nothing.
+    async fn get_observed(
+        &self,
+        location: &ObjectPath,
+    ) -> object_store::Result<(object_store::GetResult, Option<String>)> {
+        let result = self.store.get(location).await;
+        if !self.supports_conditional_update {
+            return result.map(|result| (result, None));
+        }
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                if matches!(err, object_store::Error::NotFound { .. }) {
+                    self.settle_superseded(location, None);
+                }
+                return Err(err);
+            }
+        };
+        let etag = result.meta.e_tag.clone();
+        #[cfg(test)]
+        let etag = if self.omit_read_etag { None } else { etag };
+        if let Some(token) = &etag {
+            self.settle_superseded(location, Some(token));
+        }
+        Ok((result, etag))
+    }
+
     /// Read a key back after a conditional write: its bytes and its ETag,
     /// or `None` when no object exists.
     async fn read_back(
@@ -1838,14 +1902,11 @@ impl ObjectStorageAdapter {
         uri: &str,
         location: &ObjectPath,
     ) -> Result<Option<(bytes::Bytes, Option<String>)>> {
-        let result = match self.store.get(location).await {
-            Ok(result) => result,
+        let (result, etag) = match self.get_observed(location).await {
+            Ok(observed) => observed,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(err) => return Err(storage_backend_error("read back", uri, err)),
         };
-        let etag = result.meta.e_tag.clone();
-        #[cfg(test)]
-        let etag = if self.omit_read_etag { None } else { etag };
         let bytes = result
             .bytes()
             .await
@@ -1864,17 +1925,6 @@ impl ObjectStorageAdapter {
     fn settle_returned_local_write(&self, location: &ObjectPath) {
         if let Some(scope) = &self.scope {
             scope.settle_returned_local_write(location);
-        }
-    }
-
-    /// A read-back showed that `precondition` no longer holds at `location`.
-    fn settle_failed_precondition(
-        &self,
-        location: &ObjectPath,
-        precondition: &scoped::Precondition,
-    ) {
-        if let Some(scope) = &self.scope {
-            scope.settle_failed_precondition(location, precondition);
         }
     }
 
@@ -2059,11 +2109,10 @@ impl StorageAdapter for ObjectStorageAdapter {
             Resolution::Unsettled { error, .. } => error,
         };
         // Equal bytes are this call's: `contents` identifies its writer.
-        match self.read_back(uri, &location).await? {
-            Some((bytes, _)) => {
-                self.settle_failed_precondition(&location, &scoped::Precondition::Absent);
-                Ok(bytes == contents.as_bytes())
-            }
+        let read = self.read_back(uri, &location).await;
+        match read.map_err(|error| error.unread_outcome("write_if_absent", uri))? {
+            // The read-back's observation settled the key (`get_observed`).
+            Some((bytes, _)) => Ok(bytes == contents.as_bytes()),
             None => Err(unresolved_conditional_error("write_if_absent", uri, lost)),
         }
     }
@@ -2358,14 +2407,10 @@ impl StorageAdapter for ObjectStorageAdapter {
 
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
         let location = self.object_path(uri)?;
-        let result = self
-            .store
-            .get(&location)
+        let (result, etag) = self
+            .get_observed(&location)
             .await
             .map_err(|err| storage_backend_error("read", uri, err))?;
-        let etag = result.meta.e_tag.clone();
-        #[cfg(test)]
-        let etag = if self.omit_read_etag { None } else { etag };
         let bytes = result
             .bytes()
             .await
@@ -2391,14 +2436,9 @@ impl StorageAdapter for ObjectStorageAdapter {
         let location = self.object_path(uri)?;
         // A normal GET handles empty objects (an HTTP byte range cannot), and
         // exposes the exact generation's size/token before body collection.
-        let result = match self.store.get(&location).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => {
-                if self.supports_conditional_update {
-                    self.settle_superseded(&location, None);
-                }
-                return Ok(None);
-            }
+        let (result, etag) = match self.get_observed(&location).await {
+            Ok(observed) => observed,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(err) => return Err(storage_backend_error("bounded_read", uri, err)),
         };
         let limit_error = |actual| StorageError::ResourceLimit {
@@ -2411,19 +2451,11 @@ impl StorageAdapter for ObjectStorageAdapter {
         if expected_bytes > max_bytes {
             return Err(limit_error(expected_bytes));
         }
-        let etag = result.meta.e_tag.clone();
-        #[cfg(test)]
-        let etag = if self.omit_read_etag { None } else { etag };
         let remote_token = if self.supports_conditional_update {
             Some(required_remote_etag("bounded_read", uri, etag)?)
         } else {
             None
         };
-        // The owner's read of a key settles an earlier conditional request
-        // whose precondition this generation no longer meets (scoped.rs).
-        if let Some(token) = &remote_token {
-            self.settle_superseded(&location, Some(token));
-        }
         let mut stream = result.into_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream
@@ -2464,7 +2496,6 @@ impl StorageAdapter for ObjectStorageAdapter {
                 e_tag: Some(expected_version.to_string()),
                 version: None,
             };
-            let precondition = scoped::Precondition::update(&version);
             let lost = match self
                 .send_conditional_put(
                     "write_if_match",
@@ -2486,15 +2517,18 @@ impl StorageAdapter for ObjectStorageAdapter {
                 }
                 Resolution::Unsettled { error, .. } => error,
             };
-            let Some((bytes, etag)) = self.read_back(uri, &location).await? else {
-                self.settle_failed_precondition(&location, &precondition);
+            let read = self.read_back(uri, &location).await;
+            let read = read.map_err(|error| error.unread_outcome("write_if_match", uri))?;
+            // What the read-back observed settled the key unless it still
+            // shows the expected version (`get_observed`).
+            let Some((bytes, etag)) = read else {
                 return Ok(None);
             };
-            let current = required_remote_etag("read back", uri, etag)?;
+            let current = required_remote_etag("read back", uri, etag)
+                .map_err(|error| error.unread_outcome("write_if_match", uri))?;
             if current == expected_version {
                 return Err(unresolved_conditional_error("write_if_match", uri, lost));
             }
-            self.settle_failed_precondition(&location, &precondition);
             return Ok((bytes == contents.as_bytes()).then_some(current));
         }
         // Local emulation: content-compare then atomic replace. NOT a
@@ -2522,7 +2556,8 @@ impl StorageAdapter for ObjectStorageAdapter {
         // which outcome it was. Left unsettled, the key would refuse every
         // later write for the life of the process.
         self.settle_returned_local_write(&location);
-        match self.read_back(uri, &location).await? {
+        let read = self.read_back(uri, &location).await;
+        match read.map_err(|error| error.unread_outcome("write_if_match", uri))? {
             Some((bytes, _)) if bytes == contents.as_bytes() => {
                 Ok(Some(local_version_token(contents.as_bytes())))
             }
@@ -2668,19 +2703,15 @@ fn log_conditional_reissue(op: &'static str, reissue: u32, error: &object_store:
 
 /// No answer settled a conditional write and the key does not show it, so
 /// a copy may still land.
-/// The one phrase an unresolved conditional write's message carries, which
-/// [`StorageError::is_unresolved_conditional`] reads back.
-const UNRESOLVED_CONDITIONAL_MARKER: &str = "is unresolved for";
-
 fn unresolved_conditional_error(action: &str, uri: &str, err: object_store::Error) -> StorageError {
     let kind = classify_object_store_error(&err);
-    StorageError::backend(
+    StorageError::Unresolved(StorageFailure::new(
         kind,
         format!(
-            "storage {action} {UNRESOLVED_CONDITIONAL_MARKER} '{uri}': no answer settled the \
-             request and the object does not show it, so a copy may still land: {err}"
+            "storage {action} is unresolved for '{uri}': no answer settled the request and the \
+             object does not show it, so a copy may still land: {err}"
         ),
-    )
+    ))
 }
 
 fn single_attempt_retry_config() -> object_store::RetryConfig {
@@ -4789,6 +4820,9 @@ mod tests {
         LoseAnswer,
         /// Lose the put before it reaches the object.
         LoseRequest,
+        /// Lose the put before it reaches the object, and fail every read
+        /// from then on, as a store that stops answering does.
+        LoseRequestAndReads,
         /// Refuse the put before it applies.
         Refuse,
         /// Answer as S3 answers a conditional put while another one to the
@@ -4807,6 +4841,8 @@ mod tests {
         inner: Arc<InMemory>,
         script: Mutex<std::collections::VecDeque<PutScript>>,
         puts: std::sync::atomic::AtomicUsize,
+        /// Reads still to fail, as a store that stops answering does.
+        failing_gets: std::sync::atomic::AtomicUsize,
     }
 
     impl ScriptedPutStore {
@@ -4815,6 +4851,7 @@ mod tests {
                 inner: Arc::new(InMemory::new()),
                 script: Mutex::new(script.into_iter().collect()),
                 puts: std::sync::atomic::AtomicUsize::new(0),
+                failing_gets: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -4853,6 +4890,11 @@ mod tests {
                     Err(lost_answer())
                 }
                 Some(PutScript::LoseRequest) => Err(lost_answer()),
+                Some(PutScript::LoseRequestAndReads) => {
+                    self.failing_gets
+                        .store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+                    Err(lost_answer())
+                }
                 Some(PutScript::Refuse) => Err(object_store::Error::PermissionDenied {
                     path: location.to_string(),
                     source: "access denied".into(),
@@ -4887,6 +4929,17 @@ mod tests {
             location: &ObjectPath,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
+            let failing = self
+                .failing_gets
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok();
+            if failing {
+                return Err(lost_answer());
+            }
             self.inner.get_opts(location, options).await
         }
 
@@ -4991,6 +5044,50 @@ mod tests {
                 }
             }
             assert!(!scope.is_uncertain(), "{case}: a clean release is possible");
+        }
+    }
+
+    /// A read-back that was to settle a write's outcome and failed leaves
+    /// that outcome unknown, so the write is unresolved, never a refusal that
+    /// applied nothing: a create or an if-match whose every answer was lost,
+    /// and a failed local put, each with its read-back failing.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_read_back_leaves_the_write_unresolved() {
+        let all_lost = 1 + CONDITIONAL_REQUEST_REISSUES as usize;
+        for case in ["create", "if-match", "local if-match"] {
+            let store = ScriptedPutStore::new([]);
+            let adapter = match case {
+                "local if-match" => ObjectStorageAdapter {
+                    store: store.clone(),
+                    scope: None,
+                    codec: UriCodec::Local,
+                    supports_conditional_update: false,
+                    omit_read_etag: false,
+                    omit_write_etag: false,
+                },
+                _ => scripted_adapter(&store, UriCodec::Memory, None),
+            };
+            const KEY: &str = "/graph/state.json";
+            let version = if case == "create" {
+                None
+            } else {
+                adapter.write_text(KEY, "v1").await.unwrap();
+                Some(adapter.read_text_versioned(KEY).await.unwrap().1)
+            };
+            let script = match case {
+                "local if-match" => vec![PutScript::LoseRequestAndReads],
+                _ => [lost(all_lost - 1), vec![PutScript::LoseRequestAndReads]].concat(),
+            };
+            store.script.lock().unwrap().extend(script);
+            let error = match &version {
+                None => adapter.write_text_if_absent(KEY, "v2").await.map(|_| ()),
+                Some(version) => adapter
+                    .write_text_if_match(KEY, "v2", version)
+                    .await
+                    .map(|_| ()),
+            }
+            .expect_err(case);
+            assert!(error.is_unresolved_conditional(), "{case}: {error}");
         }
     }
 

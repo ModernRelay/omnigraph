@@ -631,7 +631,8 @@ impl From<omnigraph_storage::StorageError> for OmniError {
     fn from(error: omnigraph_storage::StorageError) -> Self {
         match error {
             omnigraph_storage::StorageError::Internal(message) => Self::manifest_internal(message),
-            omnigraph_storage::StorageError::Backend(failure) => Self::Storage(failure),
+            omnigraph_storage::StorageError::Backend(failure)
+            | omnigraph_storage::StorageError::Unresolved(failure) => Self::Storage(failure),
             omnigraph_storage::StorageError::Io { failure, .. } => Self::Storage(failure),
             omnigraph_storage::StorageError::ResourceLimit {
                 resource,

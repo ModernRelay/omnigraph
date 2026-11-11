@@ -196,22 +196,20 @@ impl StorageIoScope {
         self.inner.state.lock().unwrap().unsettled.len()
     }
 
-    /// A read of `path` showed that `precondition` no longer holds, so no
-    /// copy of the request it left unsettled can still apply: settle the
-    /// key. A key left unsettled by another request stays.
-    pub(crate) fn settle_failed_precondition(&self, path: &Path, precondition: &Precondition) {
-        let mut state = self.inner.state.lock().unwrap();
-        if state.unsettled.get(path) == Some(&Some(precondition.clone())) {
-            state.unsettled.remove(path);
-        }
-    }
-
     /// A read of `path` observed the object at `observed` (its ETag), or
     /// absent (`None`). A conditional request left unsettled there whose
     /// precondition no longer holds can never apply: an if-match names
     /// another version (or an object that is gone), a create-if-absent meets
     /// an object. Settle it, as the module documentation says an owner's read
     /// does. An unconditional request stays unsettled.
+    ///
+    /// "Another ETag" stands for "another version" only while an object's
+    /// ETag never comes back to an earlier value. On S3 a single-part ETag is
+    /// a hash of the bytes, so content that changes A to B and back to A
+    /// returns A's ETag, and a late copy conditioned on A could then apply.
+    /// The keys this settles are records that change on every write (ids,
+    /// times), so their bytes never repeat; a key whose bytes can repeat must
+    /// not rely on this.
     pub(crate) fn settle_superseded(&self, path: &Path, observed: Option<&str>) {
         let mut state = self.inner.state.lock().unwrap();
         let superseded = match (state.unsettled.get(path), observed) {
@@ -1424,9 +1422,13 @@ mod tests {
             "the re-issue is sent and meets the first copy: {conflict}"
         );
         assert_eq!(scope.unsettled_keys(), 1, "a conflict settles nothing");
-        scope.settle_failed_precondition(&lock, &Precondition::Matches("etag/".into()));
-        assert_eq!(scope.unsettled_keys(), 1, "another precondition's read");
-        scope.settle_failed_precondition(&lock, &Precondition::Absent);
+        scope.settle_superseded(&lock, None);
+        assert_eq!(
+            scope.unsettled_keys(),
+            1,
+            "an absent object leaves a create unsettled"
+        );
+        scope.settle_superseded(&lock, Some("etag"));
         assert!(!scope.is_uncertain(), "the object exists: the key settles");
         store
             .delete(&lock)

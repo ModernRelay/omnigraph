@@ -417,6 +417,15 @@ fn admission(state: &AppState) -> Result<ClusterAdmission, ApiError> {
     })
 }
 
+/// What a refusal naming an earlier request of unknown outcome means for the
+/// next try. This process's storage scope refuses a key while such a request
+/// may still land: a conditional one until a read shows the record at another
+/// version, an unconditional one (or a create whose object never appeared)
+/// until the server restarts.
+const UNSETTLED_REFUSAL: &str = "; a refusal that names an earlier request of unknown outcome \
+     clears once a read sees the record change, or, for an unconditional write or a create \
+     whose record never appeared, when the server restarts";
+
 fn refusal(error: omnigraph_cluster::Diagnostic) -> ApiError {
     ApiError::conflict(format!("[{}] {}", error.code, error.message))
 }
@@ -527,15 +536,12 @@ fn record_refusal(error: omnigraph_cluster::Diagnostic) -> ApiError {
             ),
         ),
         // Nothing applied: the store or this process's storage scope refused
-        // the request before sending it. A scope keeps refusing a key whose
-        // earlier request is unsettled until the server is replaced.
+        // the request before sending it.
         "operation_record_refused" => ApiError::new(
             ErrorCode::ServiceUnavailable,
-            format!(
-                "{}; nothing was accepted, and a refusal that names an unsettled earlier request holds until the server restarts",
-                error.message
-            ),
-        ),
+            format!("{}; nothing was accepted{UNSETTLED_REFUSAL}", error.message),
+        )
+        .applied_nothing(),
         _ => refusal(error),
     }
 }
@@ -668,7 +674,7 @@ type Acceptance = Result<Operation, ApiError>;
         (status = 409, description = "The same id with a different request (`[operation_request_mismatch]`), an id at or before the eviction mark (`[operation_id_expired]`), an outstanding deployment, four unresolved publications, or a record from another ledger (`[operation_record_foreign]`)", body = crate::api::ErrorOutput),
         (status = 429, description = "Another operation is active in the maintenance scope, or that scope's admission gate is held across an acceptance; honor `Retry-After`", body = crate::api::ErrorOutput),
         (status = 500, description = "Internal failure (code `internal`), or a record write with no definite answer (code `outcome_unknown`); look the operation up by its id", body = crate::api::ErrorOutput),
-        (status = 503, description = "The routes are not enabled, admission is closed, or the operation record write was refused and nothing was accepted (a refusal naming an unsettled earlier request holds until the server restarts)", body = crate::api::ErrorOutput),
+        (status = 503, description = "The routes are not enabled, admission is closed, or the operation record write was refused and nothing was accepted (a refusal naming an earlier request of unknown outcome clears once a read sees the record change, or, for an unconditional write or a create whose record never appeared, when the server restarts)", body = crate::api::ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -846,7 +852,8 @@ pub(crate) async fn start_optimize(
                         "graph {} is closing for a deployment; nothing was accepted",
                         operation.graph
                     ),
-                )));
+                )
+                .applied_nothing()));
                 return OwnedResult::from(Ok(()));
             }
             let written = owner
@@ -860,9 +867,10 @@ pub(crate) async fn start_optimize(
                 Ok(OperationWrite::Refused { error }) => Err(ApiError::new(
                     ErrorCode::ServiceUnavailable,
                     format!(
-                        "the operation record write was refused and nothing was accepted: {error}"
+                        "the operation record write was refused and nothing was accepted: {error}{UNSETTLED_REFUSAL}"
                     ),
-                )),
+                )
+                .applied_nothing()),
                 Ok(OperationWrite::InDoubt { error }) => {
                     Err(outcome_unknown(&operation_id, &error))
                 }
@@ -1258,9 +1266,6 @@ fn terminal_from_report(
     operation
 }
 
-/// Find the record under the gate and authorize the actor for its kind's
-/// grant; an unknown id is authorized for the start kind, so the refusal
-/// says nothing about which ids exist.
 /// Whether a lookup may answer `found` from an unlocked read of the record.
 /// A terminal operation is never rewritten, and an active one whose run is
 /// live in this process changes only through that run's own writes, so no
@@ -1298,6 +1303,9 @@ async fn unlocked_answer(
     answers_without_the_gate(found, &state.recorded.live_ids(), false).then(|| found.clone())
 }
 
+/// Find the record under the gate and authorize the actor for its kind's
+/// grant; an unknown id is authorized for the start kind, so the refusal
+/// says nothing about which ids exist.
 async fn find_authorized(
     state: &AppState,
     handle: &GraphRequest,
