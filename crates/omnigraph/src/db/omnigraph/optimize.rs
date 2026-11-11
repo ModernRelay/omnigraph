@@ -433,10 +433,6 @@ pub struct OptimizeReport {
     pub resume_at: Option<String>,
     /// How long the run held main's writer gates, from acquisition to release.
     pub gate_hold: Duration,
-    /// How long the run waited, before it took the gates, for writers on main
-    /// that an earlier publication sent back to prepare again
-    /// ([`OptimizeLimits::max_writer_yield`]).
-    pub writer_yield: Duration,
     /// The configuration clear, under the gates after the publication.
     pub configuration_clear: ConfigurationClear,
     /// The adjacency artifact refresh, after the gates are released.
@@ -536,12 +532,7 @@ impl OptimizeConcurrency {
     }
 }
 
-/// How long a run waits, at most, for writers preparing again when the
-/// request names no limit ([`OptimizeLimits::max_writer_yield`]).
-pub const DEFAULT_MAX_WRITER_YIELD: Duration = Duration::from_secs(10);
-
-/// Bounds on one run. An absent limit does not bound it, except
-/// `max_writer_yield`, which defaults to [`DEFAULT_MAX_WRITER_YIELD`].
+/// Bounds on one run. An absent limit does not bound it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OptimizeLimits {
@@ -550,12 +541,6 @@ pub struct OptimizeLimits {
     /// wait of a writer that queued for the gates is at most this, plus that
     /// table, the publication and the configuration clear.
     pub max_gate_hold: Option<Duration>,
-    /// Before it takes the gates, the run waits for writers on main that an
-    /// earlier publication sent back to prepare again, at most this long
-    /// (absent: [`DEFAULT_MAX_WRITER_YIELD`]; zero: no wait). Without the
-    /// wait, runs submitted back to back could each take the gates while such
-    /// a writer prepares, and one write would wait through many runs.
-    pub max_writer_yield: Option<Duration>,
     /// Ceilings on one table's plan, checked before its first write.
     pub table: TableCeilings,
     /// Total source bytes across the tables the run starts. It is also the
@@ -571,11 +556,6 @@ pub struct OptimizeLimits {
 impl OptimizeLimits {
     pub fn with_max_gate_hold(mut self, hold: Duration) -> Self {
         self.max_gate_hold = Some(hold);
-        self
-    }
-
-    pub fn with_max_writer_yield(mut self, wait: Duration) -> Self {
-        self.max_writer_yield = Some(wait);
         self
     }
 
@@ -909,25 +889,6 @@ pub async fn optimize_all_datasets(
     let concurrency = request
         .concurrency
         .unwrap_or_else(OptimizeConcurrency::from_env);
-    // A writer an earlier publication sent back to prepare again has left
-    // the gate queue. Let it finish before this run publishes over it again;
-    // a cancellation during the wait is seen at the pipeline's first check.
-    let writer_yield = db
-        .write_queue()
-        .yield_to_writers_published_over(
-            None,
-            request
-                .limits
-                .max_writer_yield
-                .unwrap_or(DEFAULT_MAX_WRITER_YIELD),
-            async {
-                match request.cancellation.as_ref() {
-                    Some(cancellation) => cancellation.cancelled().await,
-                    None => std::future::pending().await,
-                }
-            },
-        )
-        .await;
     let _export_exclusion = db
         .reserve_export_destructive_control()
         .map_err(OmniError::before_effect)?;
@@ -963,8 +924,8 @@ pub async fn optimize_all_datasets(
         .map_err(OmniError::before_effect)?;
     let full_catalog = request.tables.is_none();
 
-    // A run cancelled before it holds main's gates (during its writer yield,
-    // or while it waits for the gates behind writers) stops there, holding
+    // A run cancelled before it holds main's gates (while it waits for the
+    // gates behind writers) stops there, holding
     // only the shared schema permit that writers also share: it must not
     // queue for main's gates, nor hold them, only to report every table
     // cancelled.
@@ -981,7 +942,6 @@ pub async fn optimize_all_datasets(
             .collect(),
         resume_at: None,
         gate_hold: Duration::ZERO,
-        writer_yield,
         configuration_clear: ConfigurationClear::NotRun,
         artifact: ArtifactRefresh::Skipped(ArtifactSkip::Cancelled),
         cancellation: RunCancellation::Cancelled,
@@ -1144,12 +1104,6 @@ pub async fn optimize_all_datasets(
                 .map(|hook| hook as super::table_ops::BeforePublishHook<'_>),
         )
         .await;
-        // Every write in flight on main now started before this publication,
-        // so the next run waits for them (`yield_to_writers_published_over`).
-        // A publication whose outcome is in doubt may have landed, so it
-        // counts too: when it did not, the next run waits for writes no
-        // publication sent back, which costs only its wait.
-        db.write_queue().optimize_published(None);
         graph_commit_id = Some(commit?.graph_commit_id);
         db.runtime_cache.invalidate_all().await;
         if edge_tables_committed {
@@ -1208,7 +1162,6 @@ pub async fn optimize_all_datasets(
         // A cancelled run moved nothing, so the next run starts where this one did.
         resume_at: visited.resume_at.filter(|_| full_catalog && !cancelled),
         gate_hold,
-        writer_yield,
         configuration_clear,
         artifact,
         cancellation,

@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-11-10
-updated: 2026-11-10
+updated: 2026-11-11
 discussion: https://github.com/ModernRelay/omnigraph/pull/1349
 supersedes: []
 superseded_by: []
@@ -32,7 +32,7 @@ Issue #1331 measured the cost on RustFS (S3) with back-to-back optimize runs and
 
 Under invariant 7, compaction and index builds are derived physical state that "may change cost but not correctness". The write path contradicts it: a physical rewrite invalidates every overlapping logical write. Lance itself does not: its transaction specification makes `Append` compatible with `Rewrite`, and `Update` and `Delete` conflict with `Rewrite` "only if overlapping fragments", as a retryable conflict. Delta Lake (`dataChange = false` on `OPTIMIZE`) and Iceberg (`rewrite_data_files`) follow the same rule. Omnigraph is stricter than its substrate because it never asks the substrate: every graph-table write is a detached commit, which runs no conflict pass, and the graph-level check compares the whole authority token.
 
-The served-optimize change (PR #1282) bounds the symptom with a writer yield: an optimize run waits up to `max_writer_yield` (10 s) for writes that started before the previous optimize publication. It keeps the documented bound, but every overlapping writer still prepares again once, and under steady writes with two or more writers most runs wait the full 10 s. This RFC removes the cause, after which the yield has nothing to wait for.
+The served-optimize change (PR #1282) bounds the symptom with a writer yield: an optimize run waits up to `max_writer_yield` (10 s) for writes that started before the previous optimize publication. It keeps the documented bound, but every overlapping writer still prepares again once, and under steady writes with two or more writers most runs wait the full 10 s. This RFC removes the cause, and with it the yield, which has nothing left to wait for.
 
 ## User and operational behavior
 
@@ -137,7 +137,7 @@ Record on each graph commit whether it was maintenance, and accept a moved head 
 
 ### E. Keep the writer yield
 
-PR #1282's yield bounds the wait but keeps one re-preparation per overlapping write and makes optimize wait up to 10 s under steady writes. It remains correct after this change; its tickets, epoch and `max_writer_yield` become removable once both land.
+PR #1282's yield bounds the wait but keeps one re-preparation per overlapping write and makes optimize wait up to 10 s under steady writes. It would stay correct beside the carry, but once an optimize publication no longer sends a write back it only delays the run, and its tickets and per-branch publication count are a second record of writer state. This change removes it: the per-write tickets (`InFlightWrite`), `yield_to_writers_published_over`, `OptimizeLimits::max_writer_yield`, the report's `writer_yield` and the record's `timings.writer_yield_ms`, and the `writer_yield` gate seams. `PreEffectReprepares` keeps only the bounded reprepare loop.
 
 ## Evidence and tests
 
@@ -149,7 +149,7 @@ PR #1282's yield bounds the wait but keeps one re-preparation per overlapping wr
 
 ## Rollout
 
-One change: the proof, the carry and its tests land together, behind no setting. The writer yield of PR #1282 can be removed afterwards.
+One change: the proof, the carry and its tests land together, behind no setting, and remove the writer yield of PR #1282. No release shipped the yield; an operation record that an unreleased build wrote with `timings.writer_yield_ms` no longer reads, since the record refuses unknown fields.
 
 ## Unresolved questions
 
@@ -158,3 +158,4 @@ One change: the proof, the carry and its tests land together, behind no setting.
 ## Decision log
 
 - 2026-11-10: drafted for issue #1331. Chose Lance's resolver before effects over "maintenance loses" (compaction starvation, a weaker pin CAS, forked table histories) and over a maintenance flag (format change, claims instead of proof).
+- 2026-11-11: after PR #1282 merged, removed its writer yield in this change (alternative E), and kept `PreEffectReprepares` as the one bounded reprepare loop. The carry stays in `StagedMutation::commit_all` under the gates, which the mutation, load and Blob write paths share; the reprepare owner runs outside the gates and holds no staged table to carry.

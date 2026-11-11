@@ -7,7 +7,7 @@ implementation: in-progress
 authors:
   - ragnorc
 created: 2026-10-29
-updated: 2026-11-06
+updated: 2026-11-11
 discussion: https://github.com/ModernRelay/omnigraph/pull/1214
 supersedes: []
 superseded_by: []
@@ -137,10 +137,9 @@ durable before any effect and before the response. From then on:
 - **Restart.** An unfinished record is resolved from main's history, and the
   run is never executed again.
 - **Writes.** While a run holds the writer gates, writes to main wait. The
-  request bounds that wait (§1.2), and a run waits for writers it sent back
-  to prepare again before the next run takes the gates, so runs back to back
-  do not compound it. This slice does not promise low write latency during a
-  run.
+  request bounds that wait (§1.2), and a run's publication does not send a
+  write that overlaps it back to prepare again, so runs back to back do not
+  compound it. This slice does not promise low write latency during a run.
 
 ### Sources of truth
 
@@ -248,34 +247,20 @@ the publication, plus the configuration clear.** Plans that are still running
 at the deadline are dropped: they read only. The report records the gate-hold
 time and each table's duration, so the bound can be checked against a run.
 
-**A writer that prepares again adds its own preparation, and no further runs.**
-A mutation or load prepares outside the gates, and a publication that moves
-main under it sends it back to prepare again (`ReadSetChanged`). While it does,
-it holds no place in the gate queue. Stress runs on RustFS and Azurite showed
-the effect: with optimize submitted back to back, each run took the gates while
-such a writer prepared, published, and sent it back again. One write waited 14
-s through 9 runs whose longest hold was 3.9 s. So every mutation, load and Blob
-write holds a ticket from its first preparation until it returns
-(`PreEffectReprepares`, the one owner of a write that prepares again), stamped
-with how many optimize runs had published on its branch when it started
-(`WriteQueueManager::writer_in_flight`), and a run, before its export
-exclusion, authority capture and gates, waits until no write that started
-before main's last optimize publication is in flight
-(`yield_to_writers_published_over`). That covers a writer the last run sent
-back whether it is preparing again or still queued at the gates behind another
-writer, and no writer that started after that publication: writers sending each
-other back do not hold the run. The wait is bounded by `max_writer_yield`
-(default 10 s, not settable over HTTP), so a slow writer cannot hold
-maintenance off for good, and it ends on the run's cancellation; a run
-cancelled there, or while it waits for the gates, returns without them. Under
-steady writes on object storage with two or more writers, the writes a
-publication sent back keep sending each other back, so most runs wait the whole
-limit. The report and the record carry it as `writer_yield`
-(`timings.writer_yield_ms`). The rest of the cost, a second preparation for
-every write a publication overlaps, comes from comparing the whole branch
-authority rather than the rows a write read; #1331 tracks removing it. Drop the
-tickets, the epoch and `max_writer_yield` with that change: once an optimize
-publication no longer sends a write back, the yield has nothing to wait for.
+**A write that overlaps a run does not prepare again.** A mutation, load or
+Blob write prepares outside the gates. Stress runs on RustFS and Azurite showed
+what happens when a run's publication sends such a write back to prepare again
+(`ReadSetChanged`): with optimize submitted back to back, each run took the
+gates while the write prepared again, published, and sent it back once more.
+One write waited 14 s through 9 runs whose longest hold was 3.9 s. An
+optimize publication changes no row, so a write prepared before it is carried
+over it under the gates, onto the current head, instead of being sent back
+([carried writes](2026-11-10-writes-carried-over-row-preserving-publications.md)).
+Only an update or delete of a row in a fragment the run rewrote still reports
+the conflict, which its caller retries. A run therefore waits for no writer before it
+takes the gates. The first implementation of this RFC waited for such writers
+(a writer yield, bounded at 10 s, with per-write tickets); the carry removed
+both, and the report and the record carry no yield.
 
 Keeping today's gates is the cost this slice accepts. The bound keeps the
 stall finite. A new way to share the gates with writers is a second design.

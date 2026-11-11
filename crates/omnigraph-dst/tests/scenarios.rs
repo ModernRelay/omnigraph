@@ -3387,11 +3387,15 @@ fn carried_write_cost_rows(replay: &str) -> String {
                                 .install(Arc::new(omnigraph::dst_ids::SeededUlids::new(24_911)));
                             let _clock = omnigraph::dst_clock::CLOCK
                                 .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
-                            let stats = db.optimize().await.unwrap();
+                            let stats = db
+                                .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                                .await
+                                .unwrap()
+                                .tables;
                             assert!(
                                 stats
                                     .iter()
-                                    .any(|stat| stat.type_key == "node:Person" && stat.committed),
+                                    .any(|stat| stat.type_key == "node:Person" && stat.committed()),
                                 "the overtaking optimize must compact Person: {stats:?}"
                             );
                         });
@@ -3468,7 +3472,9 @@ fn carried_write_cost_rows(replay: &str) -> String {
             for seed in 3..6 {
                 Self::insert(&db, &format!("seed{seed}")).await;
             }
-            db.optimize().await.unwrap();
+            db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                .await
+                .unwrap();
             let db = session(
                 Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
                     .await

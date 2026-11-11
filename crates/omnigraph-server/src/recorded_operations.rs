@@ -1225,7 +1225,6 @@ fn terminal_from_report(
     operation.input_manifest_version = Some(report.input_manifest_version);
     operation.published_commit = report.graph_commit_id.clone();
     operation.timings.gate_hold_ms = Some(report.gate_hold.as_millis() as u64);
-    operation.timings.writer_yield_ms = Some(report.writer_yield.as_millis() as u64);
     if let Some(outcome) = operation.optimize_outcome_mut() {
         outcome.set_tables(report.tables.iter().map(table_outcome).collect());
         outcome.resume_at = report.resume_at.clone();

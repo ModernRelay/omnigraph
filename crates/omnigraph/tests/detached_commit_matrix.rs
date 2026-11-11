@@ -371,11 +371,15 @@ fn optimize_beside(db: Session) {
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    let stats = db.optimize().await.unwrap();
+                    let stats = db
+                        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                        .await
+                        .unwrap()
+                        .tables;
                     assert!(
                         stats
                             .iter()
-                            .any(|stat| stat.type_key == "node:Person" && stat.committed),
+                            .any(|stat| stat.type_key == "node:Person" && stat.committed()),
                         "the overtaking optimize must compact Person: {stats:?}"
                     );
                 })
