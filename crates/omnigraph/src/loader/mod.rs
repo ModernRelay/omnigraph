@@ -735,8 +735,6 @@ async fn load_jsonl_data(
     write_budget: WriteBudget,
     query_memory_bytes: u64,
 ) -> Result<LoadReceipt> {
-    const MAX_PRE_EFFECT_REPREPARES: usize = 32;
-
     // Every public load entry point already owns a stable `&str` payload
     // (`load_file_as` reads its file once). Replay that slice directly on a
     // pre-effect retry; copying it into a second raw byte buffer would double
@@ -757,10 +755,8 @@ async fn load_jsonl_data(
             LoadAttemptInput::Csv(request, &csv_input, handle)
         }
     };
-    // Held until this load returns, so an optimize run waits for it when an
-    // earlier run published while it was in flight.
-    let _in_flight = db.write_queue().writer_in_flight(branch);
-    for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
+    let mut reprepares = crate::db::reprepare::PreEffectReprepares::begin(db, branch, "load");
+    loop {
         let replay = BufReader::new(Cursor::new(data.as_bytes()));
         match load_jsonl_reader_once(
             db,
@@ -771,29 +767,18 @@ async fn load_jsonl_data(
             input,
             stage_write_concurrency,
             history_release_bytes,
-            attempt == 0,
+            reprepares.is_first(),
             write_budget,
             &memory,
         )
         .await
         {
-            Err(err)
-                if retryable
-                    && err.is_read_set_changed()
-                    && attempt < MAX_PRE_EFFECT_REPREPARES =>
-            {
-                tracing::debug!(
-                    attempt = attempt + 1,
-                    branch = branch.unwrap_or("main"),
-                    "prepared load authority changed before effects; repreparing"
-                );
-                crate::instrumentation::record_mutation_reprepare();
-                db.refresh_coordinator_only().await?;
+            Err(err) if reprepares.may_prepare_again(&err, retryable) => {
+                reprepares.prepare_again().await?;
             }
             result => return result,
         }
     }
-    unreachable!("bounded load retry loop always returns")
 }
 
 /// Retain CSV append/merge input against the shared keyed-write ceiling.

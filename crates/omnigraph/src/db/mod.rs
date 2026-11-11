@@ -5,6 +5,7 @@ pub(crate) mod graph_coordinator;
 pub(crate) mod legacy_sidecars;
 pub mod manifest;
 pub(crate) mod omnigraph;
+pub(crate) mod reprepare;
 mod schema_state;
 pub(crate) mod snapshot;
 #[cfg(test)]
