@@ -1293,12 +1293,12 @@ impl Omnigraph {
         write_budget: WriteBudget,
         route: &WriteRoute,
     ) -> Result<crate::MutationReceipt> {
-        const MAX_PRE_EFFECT_REPREPARES: usize = 32;
-
         // Resolve request-scoped values such as now() once so a safe
         // pre-effect retry does not change the logical input.
         let resolved_params = enrich_mutation_params(params)?;
-        for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
+        let mut reprepares =
+            crate::db::reprepare::PreEffectReprepares::begin(self, Some(branch), "mutation");
+        loop {
             let mut retryable = false;
             match self
                 .mutate_one_attempt(
@@ -1310,30 +1310,19 @@ impl Omnigraph {
                     expected_head,
                     stage_write_concurrency,
                     history_release_bytes,
-                    attempt == 0,
+                    reprepares.is_first(),
                     &mut retryable,
                     write_budget,
                     route,
                 )
                 .await
             {
-                Err(err)
-                    if retryable
-                        && err.is_read_set_changed()
-                        && attempt < MAX_PRE_EFFECT_REPREPARES =>
-                {
-                    tracing::debug!(
-                        attempt = attempt + 1,
-                        branch,
-                        "prepared mutation authority changed before effects; repreparing"
-                    );
-                    crate::instrumentation::record_mutation_reprepare();
-                    self.refresh_coordinator_only().await?;
+                Err(err) if reprepares.may_prepare_again(&err, retryable) => {
+                    reprepares.prepare_again().await?;
                 }
                 result => return result,
             }
         }
-        unreachable!("bounded mutation retry loop always returns")
     }
 
     async fn mutate_one_attempt(

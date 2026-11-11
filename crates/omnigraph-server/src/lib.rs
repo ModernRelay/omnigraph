@@ -11,6 +11,8 @@ mod handlers;
 mod http_contract;
 mod http_operations;
 mod ingress;
+mod recorded_operations;
+pub use recorded_operations::OperationSettings;
 mod mcp;
 pub mod operations;
 mod redacted_cause;
@@ -123,6 +125,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         (name = "cluster", description = "Cluster deployment planning and execution"),
         (name = "commits", description = "Graph commit history and publication"),
         (name = "health", description = "Process health and readiness probes"),
+        (name = "operations", description = "Recorded operations: optimize through the serving owner, looked up and cancelled by id"),
         (name = "management", description = "Server graph inventory and OAuth resource metadata"),
         (name = "mutations", description = "Graph mutations and data loading"),
         (name = "queries", description = "Inline and stored queries, and graph exports"),
@@ -170,6 +173,9 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_merge_base,
         handlers::server_changes_feed,
         handlers::server_changes_baseline,
+        recorded_operations::start_optimize,
+        recorded_operations::get_operation,
+        recorded_operations::cancel_operation,
     ),
     components(schemas(api::EntityKind, api::CommitListing, api::ChangeBaselineRecord, api::ChangeErrorOutput)),
     modifiers(&SecurityAddon),
@@ -426,6 +432,9 @@ pub struct AppState {
     // drain is not qualified native settlement, so the server never unlocks.
     cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
     deployments: Arc<deployment::DeploymentRuntime>,
+    /// Recorded operations: the record gate, the admission gates and the
+    /// runs this process holds.
+    recorded: Arc<recorded_operations::RecordedOperations>,
     /// Runtime routing and availability for every configured graph.
     /// Middleware injects an admitted `serving::GraphRequest` or refuses a blocked
     /// graph before collecting its request body.
@@ -870,6 +879,7 @@ impl AppState {
         Self {
             cluster_admission: None,
             deployments: Arc::new(deployment::DeploymentRuntime::default()),
+            recorded: Arc::new(recorded_operations::RecordedOperations::default()),
             routing: GraphRouting {
                 registry,
                 config_path: None,
@@ -925,6 +935,7 @@ impl AppState {
         Ok(Self {
             cluster_admission: None,
             deployments: Arc::new(deployment::DeploymentRuntime::default()),
+            recorded: Arc::new(recorded_operations::RecordedOperations::default()),
             routing: GraphRouting {
                 registry,
                 config_path,
@@ -1052,6 +1063,14 @@ impl AppState {
     #[must_use]
     pub fn with_mcp_settings(mut self, mcp: McpSettings) -> Self {
         self.mcp = Arc::new(mcp);
+        self
+    }
+
+    /// Attach the recorded-operation settings; the routes are off without
+    /// them.
+    #[must_use]
+    pub fn with_operation_settings(mut self, settings: OperationSettings) -> Self {
+        self.recorded = Arc::new(recorded_operations::RecordedOperations::new(settings));
         self
     }
 
@@ -1469,6 +1488,16 @@ impl ApiError {
     /// leave effects unknown.
     pub(crate) fn after_owned_write(mut self) -> Self {
         self.owned_write = true;
+        self
+    }
+
+    /// Mark an error as a definite refusal that applied nothing: the store
+    /// refused the write, or the server refused it before sending one. Its
+    /// effects are none even after an owned write started, as an engine
+    /// step's proof that it published nothing makes them.
+    pub(crate) fn applied_nothing(mut self) -> Self {
+        self.completion_uncertain = false;
+        self.unpublished = true;
         self
     }
 
@@ -2410,6 +2439,27 @@ mod api_error_tests {
         let error = output_of(marked).await;
         assert_eq!(error.code, Some(ErrorCode::Conflict));
         assert_eq!(error.disposition, partial(DispositionAction::Refresh));
+
+        // A refusal the store or the server made before anything applied
+        // (a refused operation record write, a graph closing for a
+        // deployment) applied nothing, after an owned write started too; a
+        // 503 is retried.
+        let error = output_of(
+            ApiError::new(ErrorCode::ServiceUnavailable, "nothing was accepted")
+                .after_owned_write()
+                .applied_nothing(),
+        )
+        .await;
+        assert_eq!(error.code, Some(ErrorCode::ServiceUnavailable));
+        assert_eq!(error.disposition, none(DispositionAction::Retry));
+        let error =
+            output_of(ApiError::new(ErrorCode::ServiceUnavailable, "refused").after_owned_write())
+                .await;
+        assert_eq!(
+            error.disposition,
+            unknown(DispositionAction::Reconcile),
+            "without the mark, an error after an owned write may follow its effect"
+        );
 
         // Refusals a write meets before it starts took no effect, unless an
         // earlier step of the operation published.
@@ -4150,6 +4200,10 @@ async fn serve_config(
         )
         .with_process_defaults(process_defaults)
         .with_mcp_settings(mcp)
+        .with_operation_settings(
+            OperationSettings::from_env()
+                .map_err(|error| eyre!("operation setting refused at startup: {error}"))?,
+        )
         .with_reads_without_policy(config.allow_reads_without_policy);
     deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();
