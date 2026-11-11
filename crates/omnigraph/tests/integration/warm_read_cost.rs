@@ -324,7 +324,10 @@ async fn held_bound_branch_reads_and_writes_across_an_optimize_configuration_com
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let owner = init_and_load(&dir).await;
-        owner.optimize().await.unwrap();
+        owner
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap();
         lance::Dataset::open(&format!("{uri}/__manifest"))
             .await
             .unwrap()
@@ -336,7 +339,10 @@ async fn held_bound_branch_reads_and_writes_across_an_optimize_configuration_com
         let people = count_rows(&second, "node:Person").await;
 
         let claimed = main_manifest_version(uri).await;
-        owner.optimize().await.unwrap();
+        owner
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap();
         assert_eq!(
             main_manifest_version(uri).await,
             claimed + 1,
