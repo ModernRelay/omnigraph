@@ -19,6 +19,7 @@ Graph-scoped actions:
 | `branch_create` | Branch creation |
 | `branch_delete` | Branch deletion |
 | `branch_merge` | Branch merge |
+| `branch_claim` | Claim of a branch's [writer epoch](troubleshooting.md#writer-epoch) |
 | `commit_publish` | Publication of an unpublished commit onto its recorded target branch |
 | `commit_drop` | Drop of an unpublished commit |
 | `invoke_query` | Entry to a stored query |
@@ -126,7 +127,8 @@ bad request before any rule is evaluated (see
 [branch names](../branching/index.md#branch-names)). Server actions and graph-wide
 `invoke_query` rules do not take branch scopes. `commit_publish` and
 `commit_drop` take `target_branch_scope`: the scope is the branch the
-unpublished commit recorded as its target. Writing an unpublished commit
+unpublished commit recorded as its target. `branch_claim` takes
+`target_branch_scope` too: the scope is the branch the claim names. Writing an unpublished commit
 needs no new action: a mutation `as commit` is a `change` on its branch and a
 merge `as commit` is a `branch_merge`, so an actor with ordinary write rights
 can omit `as commit`; this is a voluntary review workflow, not an approval
@@ -146,7 +148,12 @@ commit has does, so the id discloses nothing (see
 
 ## Validate and test
 
-Policy commands read the applied bundle from a cluster:
+Policy commands read the applied bundles from a cluster and ask the bundle a
+server asks: graph actions go to the bundle bound to `--graph`, and
+`graph_list` and `config_manage` go to the bundle bound to `cluster`.
+`validate` checks each of the two that is applied, as its own kind; `test`
+runs each case against the bundle for its action. An action whose scope has
+no applied bundle is refused; the other scope's bundle never answers it.
 
 ```bash
 omnigraph policy validate --target ./company-brain --graph knowledge
@@ -198,7 +205,8 @@ With the example graph policy above, `act-alice` gets:
   `schema_apply` with that branch as their target. Schema apply and the
   system-column upgrade target `main` only, and a storage upgrade authorizes
   each live branch, so `schema_apply` on another branch does not make schema
-  apply possible there.
+  apply possible there. `branch_claim` is not listed: no command or route
+  performs it in this release.
 - With `target_branch` as well, `actions` also lists `branch_create` from
   `branch` into the target and `branch_merge` of `branch` into it.
 
@@ -206,9 +214,10 @@ The route evaluates the installed policy for the caller's resolved actor, each
 action shaped as the route that performs it shapes it, so it answers exactly as
 those routes decide. It needs no action of its own, reads no graph data, and
 judges branches by name without checking that they exist. It names actions,
-never the rules behind them, and reveals nothing about other actors. A static
-token on a graph without a policy gets `read` alone, and a signed data
-credential without one nothing, as those routes decide; a server without
+never the rules behind them, and reveals nothing about other actors. A
+credential on a graph without a policy gets nothing (a static token gets `read`
+when the server sets `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1`), as those routes
+decide; a server without
 authentication allows every graph action and reports `actor_id: null`. The MCP
 `access` tool returns the same body, and `omnigraph access` prints it for a
 server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).

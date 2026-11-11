@@ -228,8 +228,8 @@ An incompatible change to either contract requires its discovery number to chang
 uses `actor_id` in place of protocol 1's `actor`. `protocols.studio` identifies
 the [Studio link](cli/studio.md#the-link), `studio --json`, and the `home` and
 `binding` digests `target inspect --json` reports for checking a link.
-`internal_schema.writes` is the storage-format stamp this binary's commits
-write, and `internal_schema.serves` is the inclusive range, lowest first, that
+`internal_schema.writes` is the storage-format stamp of a graph this binary
+creates, the highest it writes, and `internal_schema.serves` is the inclusive range, lowest first, that
 normal open accepts; `snapshot --json` reports a graph's own stamp as
 `internal_schema_version`. `omnigraph --version` (`-v`) prints only the first
 line.

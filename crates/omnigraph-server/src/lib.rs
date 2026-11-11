@@ -229,6 +229,11 @@ pub struct ServerConfig {
     /// who set up auth and forgot the policy file would otherwise ship
     /// the illusion of protection.
     pub allow_unauthenticated: bool,
+    /// Operator opt-in, from `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` only,
+    /// that lets every static bearer token `read` a graph with no applied
+    /// policy. Off by default: tokens are not scoped to graphs, so the
+    /// permit reaches every policy-less graph on the server.
+    pub allow_reads_without_policy: bool,
     /// Operator opt-in for fail-fast cluster boot. By default, graph-local
     /// startup failures quarantine that graph and healthy graphs still serve.
     /// When true, any quarantined or failed graph aborts startup.
@@ -430,6 +435,9 @@ pub struct AppState {
     workload: Arc<workload::WorkloadController>,
     operations: operations::OperationRuntime,
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
+    /// Whether a static bearer token may `read` a graph with no applied
+    /// policy ([`ServerConfig::allow_reads_without_policy`]).
+    allow_reads_without_policy: bool,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
     /// MCP boot settings: the extra `Host` values `/mcp` admits.
@@ -523,6 +531,7 @@ enum ApiErrorDetails {
     MergeConflicts(Vec<api::MergeConflictOutput>),
     PublishedDatasetVersionConflict(api::PublishedDatasetVersionConflictOutput),
     ReadSetConflict(api::ReadSetConflictOutput),
+    WriterFenced(api::WriterFencedOutput),
     KeyConflict(api::KeyConflictOutput),
     ResourceLimit(api::ResourceLimitOutput),
     BlobRange(api::BlobRangeOutput),
@@ -561,6 +570,7 @@ impl ApiErrorDetails {
             Self::MergeConflicts(_)
             | Self::PublishedDatasetVersionConflict(_)
             | Self::ReadSetConflict(_)
+            | Self::WriterFenced(_)
             | Self::KeyConflict(_)
             | Self::ResourceLimit(_)
             | Self::ExternalBlobSource(_)
@@ -868,6 +878,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            allow_reads_without_policy: false,
             mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
@@ -922,6 +933,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            allow_reads_without_policy: false,
             mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
@@ -1043,6 +1055,15 @@ impl AppState {
         self
     }
 
+    /// Let every static bearer token `read` a graph with no applied policy,
+    /// the behaviour before reads were denied like every other action
+    /// ([`ServerConfig::allow_reads_without_policy`]).
+    #[must_use]
+    pub fn with_reads_without_policy(mut self, allow: bool) -> Self {
+        self.allow_reads_without_policy = allow;
+        self
+    }
+
     pub(crate) fn mcp_settings(&self) -> &McpSettings {
         &self.mcp
     }
@@ -1105,7 +1126,8 @@ impl AppState {
             }
         }
         if let Some(actor) = matched {
-            return Ok(AuthenticatedActor::cluster_static(actor));
+            return Ok(AuthenticatedActor::cluster_static(actor)
+                .with_policy_less_reads(self.allow_reads_without_policy));
         }
         let Some(now) = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1371,6 +1393,13 @@ impl ApiError {
         Self::conflict(message).with_details(ApiErrorDetails::ReadSetConflict(details))
     }
 
+    /// HTTP 409 `writer_fenced`: the branch's writer epoch refused a publish
+    /// or a claim before its put, with the `writer_fenced` detail.
+    fn writer_fenced(message: String, details: api::WriterFencedOutput) -> Self {
+        Self::new(ErrorCode::WriterFenced, message)
+            .with_details(ApiErrorDetails::WriterFenced(details))
+    }
+
     fn key_conflict(message: String, details: api::KeyConflictOutput) -> Self {
         Self::conflict(message).with_details(ApiErrorDetails::KeyConflict(details))
     }
@@ -1607,6 +1636,18 @@ impl ApiError {
                     Some(ManifestConflictDetails::UnattachedCannotPublish { .. }) => {
                         Self::unattached_cannot_publish(err.message)
                     }
+                    Some(ManifestConflictDetails::WriterFenced {
+                        held,
+                        read,
+                        current,
+                    }) => Self::writer_fenced(
+                        err.message,
+                        api::WriterFencedOutput {
+                            held,
+                            read,
+                            current,
+                        },
+                    ),
                     _ => Self::conflict(err.message),
                 },
                 ManifestErrorKind::Internal => Self::internal(err.message),
@@ -1997,6 +2038,7 @@ impl ApiError {
                     output.published_dataset_version_conflict = Some(value)
                 }
                 ApiErrorDetails::ReadSetConflict(value) => output.read_set_conflict = Some(value),
+                ApiErrorDetails::WriterFenced(value) => output.writer_fenced = Some(value),
                 ApiErrorDetails::KeyConflict(value) => output.key_conflict = Some(value),
                 ApiErrorDetails::ResourceLimit(value) => output.resource_limit = Some(value),
                 ApiErrorDetails::BlobRange(value) => output.blob_range = Some(value),
@@ -2202,6 +2244,53 @@ mod api_error_tests {
         assert_eq!(details.expected_published_dataset_version, 7);
         assert_eq!(details.actual_published_dataset_version, 9);
         assert!(!error.error.contains("edge:Knows"));
+    }
+
+    #[tokio::test]
+    async fn branch_claim_refusal_is_409_writer_fenced_with_its_epochs() {
+        async fn body_of(error: ApiError) -> serde_json::Value {
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let publish = body_of(
+            ApiError::from_omni(OmniError::manifest_writer_fenced(
+                "feature",
+                Some(1),
+                None,
+                2,
+            ))
+            .after_owned_write(),
+        )
+        .await;
+        assert_eq!(publish["code"], "writer_fenced", "{publish}");
+        assert_eq!(
+            publish["writer_fenced"],
+            serde_json::json!({"held": 1, "current": 2}),
+            "{publish}"
+        );
+        assert_eq!(
+            publish["disposition"],
+            serde_json::json!({"effects": "none", "action": "refresh"}),
+            "{publish}"
+        );
+
+        let claim = body_of(ApiError::from_omni(OmniError::manifest_writer_fenced(
+            "feature",
+            None,
+            Some(0),
+            1,
+        )))
+        .await;
+        assert_eq!(
+            claim["writer_fenced"],
+            serde_json::json!({"read": 0, "current": 1}),
+            "{claim}"
+        );
     }
 
     #[tokio::test]
@@ -3990,12 +4079,18 @@ async fn serve_config(
         ),
         ServerRuntimeState::DefaultDeny => warn!(
             "bearer tokens are configured but no policy file is set — running in \
-             default-deny mode (static credentials permit `read`; signed data \
-             credentials require an explicit policy permit). Declare required policy \
-             bundles when bootstrapping; this deployment class keeps existing policy \
-             bindings fixed."
+             default-deny mode: every graph action is refused until a policy permits \
+             it. Declare required policy bundles when bootstrapping; this deployment \
+             class keeps existing policy bindings fixed."
         ),
         ServerRuntimeState::PolicyEnabled => {}
+    }
+    if config.allow_reads_without_policy {
+        warn!(
+            "OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY is set: every static bearer token \
+             may read every graph that has no applied policy. Tokens are not scoped \
+             to graphs; apply a policy to each graph instead."
+        );
     }
 
     let bind = config.bind.clone();
@@ -4054,7 +4149,8 @@ async fn serve_config(
             shutdown_grace,
         )
         .with_process_defaults(process_defaults)
-        .with_mcp_settings(mcp);
+        .with_mcp_settings(mcp)
+        .with_reads_without_policy(config.allow_reads_without_policy);
     deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();
     if let Some(admission) = retained_admission.as_ref() {
