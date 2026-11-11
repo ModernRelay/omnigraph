@@ -236,8 +236,8 @@ authentication allows every graph action and reports `actor_id: null`. The MCP
 server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
 
 It reports policy actions, not actor views, so a view can still refuse a
-`change` the policy allows. It does not report `maintain` or `reclaim`, since
-no server route runs maintenance.
+`change` the policy allows. It does not report `reclaim`, since no server
+route runs cleanup.
 
 ## Actor identity
 
