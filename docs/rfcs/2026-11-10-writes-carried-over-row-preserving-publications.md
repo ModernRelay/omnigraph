@@ -8,7 +8,7 @@ authors:
   - ragnorc
 created: 2026-11-10
 updated: 2026-11-10
-discussion: https://github.com/ModernRelay/omnigraph/issues/1331
+discussion: https://github.com/ModernRelay/omnigraph/pull/1349
 supersedes: []
 superseded_by: []
 blocked_on: []
