@@ -3,10 +3,11 @@
 //! It reads the parse tree ([`crate::query::syntax`]) of one source unit and
 //! types every declaration into the core IR ([`crate::ir::core`]), or
 //! refuses it with a typed code. The derived-forms table of section 2 is the
-//! lowering: each clause becomes a step, and the steps fold into one term in
-//! clause order (binders in written order, a filter after the last binder of
-//! a variable it names, a block, `let` and `from` seeing only earlier text,
-//! so a block correlates on the names bound before it).
+//! lowering: each element of `match` becomes a step in written order, `let`
+//! and `from` seeing only the elements before them, and each top-level
+//! conjunct of `where` a filter after the last binder of a variable it names;
+//! a block in `where` correlates on every element's names, a block in a
+//! `let` on the elements before it. The steps fold into one term.
 //!
 //! Traversal resolution (`traversal`), literal typing and type
 //! compatibility (`literal`) are the one implementation of those rules. A
@@ -288,6 +289,11 @@ fn ranking_edits(body: &ReadBody, call: &Call) -> Option<(Vec<TextEdit>, String)
     if body.projections.iter().any(|p| contains_agg(&p.expr)) || body.distinct {
         return None;
     }
+    let predicate_end = match (&body.pattern.predicate, &body.pattern.spans.predicate) {
+        (None, _) => None,
+        (Some(_), Some(p)) => Some(p.end),
+        (Some(_), None) => return None,
+    };
     // Every ranking in `order` and `return` is this call.
     let ranking = |e: &Expr| matches!(e, Expr::Call(c) if matches!(c.name.as_str(), "nearest" | "bm25" | "rrf" | "distance"));
     if body
@@ -306,10 +312,10 @@ fn ranking_edits(body: &ReadBody, call: &Call) -> Option<(Vec<TextEdit>, String)
             vars.push(v.clone());
         }
     };
-    for c in &body.clauses {
+    for c in &body.pattern.elements {
         match c {
-            Clause::Binding { variable, .. } => push(variable),
-            Clause::Traversal(t) => {
+            Element::Binding { variable, .. } => push(variable),
+            Element::Traversal(t) => {
                 push(&t.src);
                 if let Some(e) = &t.edge_binding {
                     push(e);
@@ -350,9 +356,16 @@ fn ranking_edits(body: &ReadBody, call: &Call) -> Option<(Vec<TextEdit>, String)
                 "bm25" => ("$score", "$score desc"),
                 _ => ("$distance", "$distance"),
             };
+            // The population is the whole `match` and its `where`; with a
+            // `where` the window closes after it, and the outer `match`
+            // closes there too.
+            let tail = format!(" return {{ {returned} }} }}, {field}, {query}{window})");
             (
                 format!(" from {}({{ match {{", call.name),
-                format!("}} return {{ {returned} }} }}, {field}, {query}{window}) "),
+                match predicate_end {
+                    Some(_) => format!("{tail} }}"),
+                    None => format!("}}{tail} "),
+                },
                 score,
                 ordered,
             )
@@ -389,11 +402,10 @@ fn ranking_edits(body: &ReadBody, call: &Call) -> Option<(Vec<TextEdit>, String)
                 ));
             }
             let ranked = ranked?;
-            let type_name = body.clauses.iter().find_map(|c| match c {
-                Clause::Binding {
+            let type_name = body.pattern.elements.iter().find_map(|c| match c {
+                Element::Binding {
                     variable,
                     type_name,
-                    ..
                 } if *variable == ranked => Some(type_name.clone()),
                 _ => None,
             })?;
@@ -408,7 +420,7 @@ fn ranking_edits(body: &ReadBody, call: &Call) -> Option<(Vec<TextEdit>, String)
                 .unwrap_or_else(|| "60".into());
             (
                 format!(
-                    " let $all = {{ match {{ ${ranked}: {type_name} }} return {{ ${ranked} }} }}  from rrf({}, k: {k}) ",
+                    " let $all = {{ match {{ ${ranked}: {type_name} }} return {{ ${ranked} }} }}, from rrf({}, k: {k}), ",
                     arms.join(", ")
                 ),
                 String::new(),
@@ -424,10 +436,11 @@ fn ranking_edits(body: &ReadBody, call: &Call) -> Option<(Vec<TextEdit>, String)
         replacement: prefix,
     }];
     if !suffix.is_empty() {
+        let at = predicate_end.unwrap_or(inner.end);
         edits.push(TextEdit {
-            start: inner.end,
-            end: inner.end,
-            replacement: suffix,
+            start: at,
+            end: at,
+            replacement: suffix.clone(),
         });
     }
     let this = Expr::Call(call.clone());
@@ -457,20 +470,27 @@ fn ranking_edits(body: &ReadBody, call: &Call) -> Option<(Vec<TextEdit>, String)
             });
         }
     }
-    let pattern = body
-        .clauses
+    let elements = body
+        .pattern
+        .elements
         .iter()
-        .map(|c| print::clause(c, Default::default()))
+        .map(print::element)
         .collect::<Vec<_>>()
-        .join("  ");
-    let fix = format!(
-        "match {{{} {pattern} {}}}  order {{ {ordered} }}",
-        edits[0].replacement,
-        edits
-            .get(1)
-            .filter(|e| e.start == inner.end && e.end == inner.end)
-            .map_or("", |e| e.replacement.as_str()),
-    );
+        .join(", ");
+    let filter = body
+        .pattern
+        .predicate
+        .as_ref()
+        .map(|p| format!(" where {}", print::expr(p)))
+        .unwrap_or_default();
+    let prefix = &edits[0].replacement;
+    let fix = match (suffix.is_empty(), predicate_end) {
+        (true, _) => format!("match {{{prefix}{elements} }}{filter}  order {{ {ordered} }}"),
+        (false, None) => format!("match {{{prefix} {elements} {suffix}}}  order {{ {ordered} }}"),
+        (false, Some(_)) => {
+            format!("match {{{prefix} {elements} }}{filter}{suffix}  order {{ {ordered} }}")
+        }
+    };
     edits.sort_by_key(|e| (e.start, e.end));
     Some((edits, fix))
 }
@@ -520,7 +540,7 @@ struct Ctx<'a> {
     /// Checking a write body: a declared read is not callable there until
     /// stage W2.
     in_write: bool,
-    /// Where the clause, return item, order key or statement being checked
+    /// Where the element, `where`, return item, order key or statement being checked
     /// was written: the position of a refusal that names none of its own.
     at: Option<Position>,
 }
@@ -613,10 +633,10 @@ struct Scope {
     steps: Vec<(usize, Step)>,
     /// Binder count so far.
     binders: usize,
-    /// Lookahead: the type every binding clause of this scope declares.
+    /// Lookahead: the type every binding of this scope declares.
     declared: HashMap<String, BoundVariable>,
     declared_nodes: HashSet<String>,
-    /// Names this scope's clauses will bind (lookahead for block
+    /// Names this scope's elements will bind (lookahead for block
     /// correlation).
     future: HashSet<String>,
     /// Block aggregates produced while typing the current expression.
@@ -635,15 +655,10 @@ struct Scope {
 
 #[derive(Clone)]
 enum Pending {
-    /// A filter clause and the names bound before it: a block inside it
+    /// A conjunct of `where` and the names bound before it: a block inside it
     /// correlates on those alone.
     /// And where it was written.
     Filter(Expr, Vec<String>, Option<Position>),
-    Braces {
-        var: String,
-        prop: String,
-        value: Expr,
-    },
 }
 
 impl Scope {
@@ -963,7 +978,7 @@ impl Ctx<'_> {
             return Err(err(
                 T74,
                 format!(
-                    "a declared read may not be named `{}`, which is a registry row or a clause keyword",
+                    "a declared read may not be named `{}`, which is a registry row or an element keyword",
                     decl.name
                 ),
             ));
@@ -1070,7 +1085,7 @@ impl Ctx<'_> {
         // are found only by running it, so no conflict is refused here.
         for (g, group) in body.groups.iter().enumerate() {
             let mut sc = Scope::new(pmap.clone(), Vec::new(), HashMap::new());
-            self.clauses(&mut sc, &group.clauses, &group.spans.clauses)?;
+            self.pattern(&mut sc, &group.pattern)?;
             let input = self.finish(&mut sc)?.unwrap_or(Term::Unit);
             let mut sinks = Vec::new();
             for (i, s) in group.statements.iter().enumerate() {
@@ -1115,7 +1130,7 @@ impl Ctx<'_> {
         if let Some(refusal) = ranking_in_order_or_return(body) {
             return Err(E::D(refusal));
         }
-        self.clauses(&mut sc, &body.clauses, &body.spans.clauses)?;
+        self.pattern(&mut sc, &body.pattern)?;
         // Return items, typed beside every match column.
         let mut items = Vec::new();
         let mut aggs = Vec::new();
@@ -1561,19 +1576,35 @@ impl Ctx<'_> {
         Ok(acc)
     }
 
-    /// Type every clause of a scope.
-    /// The clauses of one scope; `spans`, when the parser recorded them, say
-    /// where each was written.
-    fn clauses(&mut self, sc: &mut Scope, clauses: &[Clause], spans: &[SourceSpan]) -> R<()> {
-        if let Some(fix) = aggregate_filter_fix(clauses, self.in_write) {
+    /// The elements of one scope in written order, then its `where`, one
+    /// pending filter per top-level conjunct, each placed after the last
+    /// binder it reads. A block in the `where` correlates on every element's
+    /// names (section 3).
+    fn pattern(&mut self, sc: &mut Scope, pattern: &Pattern) -> R<()> {
+        if let Some(fix) = aggregate_filter_fix(pattern, self.in_write) {
             return Err(fix);
         }
-        lookahead(clauses, sc);
-        for (i, c) in clauses.iter().enumerate() {
-            if let Some(span) = spans.get(i) {
+        if let Some(refusal) = membership_triple(pattern, sc) {
+            return Err(E::D(refusal));
+        }
+        lookahead(&pattern.elements, sc);
+        for (i, c) in pattern.elements.iter().enumerate() {
+            if let Some(span) = pattern.spans.elements.get(i) {
                 self.at = Some(span.position);
             }
-            self.clause(sc, c)?;
+            self.element(sc, c)?;
+            self.flush(sc, false)?;
+        }
+        if let Some(predicate) = &pattern.predicate {
+            let written = pattern.spans.predicate.as_ref().map(|s| s.position);
+            if written.is_some() {
+                self.at = written;
+            }
+            let before: Vec<String> = sc.visible().into_iter().map(|c| c.name).collect();
+            for conj in conjuncts(predicate) {
+                sc.pending
+                    .push(Pending::Filter(conj.clone(), before.clone(), written));
+            }
             self.flush(sc, false)?;
         }
         Ok(())
@@ -1609,26 +1640,16 @@ impl Ctx<'_> {
                     }
                     sc.block_visible = None;
                 }
-                Pending::Braces { var, prop, value } => {
-                    let pred = self.braces(sc, &var, &prop, &value)?;
-                    sc.push_filter(
-                        at,
-                        Step::Filter {
-                            blocks: Vec::new(),
-                            pred,
-                        },
-                    );
-                }
             }
         }
         Ok(())
     }
 
-    fn clause(&mut self, sc: &mut Scope, c: &Clause) -> R<()> {
+    fn element(&mut self, sc: &mut Scope, c: &Element) -> R<()> {
         let written: Vec<&str> = match c {
-            Clause::Let { name, .. } => vec![name],
-            Clause::Binding { variable, .. } => vec![variable],
-            Clause::Traversal(t) => [Some(&t.src), Some(&t.dst), t.edge_binding.as_ref()]
+            Element::Let { name, .. } => vec![name],
+            Element::Binding { variable, .. } => vec![variable],
+            Element::Traversal(t) => [Some(&t.src), Some(&t.dst), t.edge_binding.as_ref()]
                 .into_iter()
                 .flatten()
                 .map(String::as_str)
@@ -1644,53 +1665,14 @@ impl Ctx<'_> {
             ));
         }
         match c {
-            Clause::Binding {
+            Element::Binding {
                 variable,
                 type_name,
-                prop_matches,
-            } => {
-                self.binding(sc, variable, type_name)?;
-                for (prop, value) in prop_matches {
-                    sc.pending.push(Pending::Braces {
-                        var: variable.clone(),
-                        prop: prop.clone(),
-                        value: value.clone(),
-                    });
-                }
-                Ok(())
-            }
-            Clause::Traversal(t) => self.traversal(sc, t),
-            Clause::Filter(e) => {
-                let before = sc.visible().into_iter().map(|c| c.name).collect();
-                sc.pending.push(Pending::Filter(e.clone(), before, self.at));
-                Ok(())
-            }
-            // A block sees only the text before it, so it correlates on the
-            // names bound so far and is placed after the last of those it
-            // reads.
-            Clause::Not(clauses) => {
-                let (term, free) = self.block_scope(sc, clauses)?;
-                if free.is_empty() {
-                    return Err(err(
-                        T9,
-                        "a `not { }` block must reference an outer-bound variable",
-                    ));
-                }
-                let at = sc.position(&free);
-                let col = self.fresh("b");
-                let pred = not_exists(&col);
-                sc.push_filter(
-                    at,
-                    Step::Filter {
-                        blocks: vec![(term, col, count_rows())],
-                        pred,
-                    },
-                );
-                Ok(())
-            }
-            Clause::Optional(clauses) => self.optional(sc, clauses),
-            Clause::Let { name, value } => self.let_clause(sc, name, value),
-            Clause::From(rel) => {
+            } => self.binding(sc, variable, type_name),
+            Element::Traversal(t) => self.traversal(sc, t),
+            Element::Optional(pattern) => self.optional(sc, pattern),
+            Element::Let { name, value } => self.let_clause(sc, name, value),
+            Element::From(rel) => {
                 self.flush(sc, false)?;
                 let r = self.rel_expr(sc, &RelArg::Rel(rel))?;
                 self.draw(sc, r)
@@ -1789,116 +1771,6 @@ impl Ctx<'_> {
             });
         }
         Err(err(T1, format!("unknown node type `{type_name}`")))
-    }
-
-    fn braces(&mut self, sc: &mut Scope, var: &str, prop: &str, value: &Expr) -> R<SExpr> {
-        let Some(ty) = sc.col(var) else {
-            return Err(err(T6, format!("`${var}` is not bound")));
-        };
-        // A braces field names a property of the bound type (T2).
-        if let Ty::Node { type_name, .. } = &ty
-            && self
-                .node_props(type_name)
-                .is_some_and(|props| !props.contains_key(prop))
-        {
-            let hint = match prop {
-                "id" => format!("; the system identity is `${var}.@id`"),
-                _ => String::new(),
-            };
-            return Err(err(
-                T2,
-                format!("type `{type_name}` has no property `{prop}`{hint}"),
-            ));
-        }
-        let (prop_ty, owner) = self.property(&ty, prop, var)?;
-        if prop_ty.scalar == ScalarType::Blob {
-            return Err(err(
-                T3,
-                format!("blob property `{owner}.{prop}` cannot be used in match patterns"),
-            ));
-        }
-        let mut named = Vec::new();
-        expr_vars(value, &mut named);
-        if let Some(v) = named
-            .iter()
-            .find(|v| !sc.params.contains_key(*v) || sc.is_bound(v))
-        {
-            return Err(err(
-                T45,
-                format!(
-                    "the value of `{prop}` in `${var}`'s braces must be a constant; `${v}` is not a parameter"
-                ),
-            ));
-        }
-        let field = SExpr::new(
-            SKind::Prop {
-                col: var.to_string(),
-                prop: prop.to_string(),
-            },
-            Ty::Value(prop_ty.clone()),
-        );
-        let v = self.expr(sc, value, At::Value)?;
-        let v = adapt(v, &Ty::Value(prop_ty.clone()));
-        if let Expr::Literal(l) = value {
-            let lt = literal_type(l)?;
-            if prop_ty.list && lt.list {
-                return Err(err(
-                    T3,
-                    format!(
-                        "list equality is not supported for property `{prop}`; use a scalar value to match list membership"
-                    ),
-                ));
-            }
-            // A list property matches a scalar literal by membership.
-            if prop_ty.list && !lt.list {
-                let mut elem = prop_ty.clone();
-                elem.list = false;
-                check_literal_type(l, &lt, &elem, prop)?;
-                return Ok(SExpr::new(
-                    SKind::In {
-                        needle: v.boxed(),
-                        list: field.boxed(),
-                    },
-                    Ty::scalar(ScalarType::Bool, false),
-                ));
-            }
-            check_literal_type(l, &lt, &prop_ty, prop)?;
-        } else if let Ty::Value(vt) = &v.ty
-            && prop_ty.list
-            && !vt.list
-        {
-            let mut elem = prop_ty.clone();
-            elem.list = false;
-            if !types_compatible(vt, &elem) {
-                return Err(err(
-                    T3,
-                    format!(
-                        "property `{prop}` holds {} but got {}",
-                        elem.display_name(),
-                        vt.display_name()
-                    ),
-                ));
-            }
-            return Ok(SExpr::new(
-                SKind::In {
-                    needle: v.boxed(),
-                    list: field.boxed(),
-                },
-                Ty::scalar(ScalarType::Bool, false),
-            ));
-        } else if let Ty::Value(vt) = &v.ty
-            && !types_compatible(vt, &prop_ty)
-        {
-            return Err(err(
-                T3,
-                format!(
-                    "property `{prop}` has type {} but got {}",
-                    prop_ty.display_name(),
-                    vt.display_name()
-                ),
-            ));
-        }
-        compare(CompOp::Eq, field, v)
     }
 
     fn traversal(&mut self, sc: &mut Scope, t: &Traversal) -> R<()> {
@@ -2117,13 +1989,13 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    fn optional(&mut self, sc: &mut Scope, clauses: &[Clause]) -> R<()> {
+    fn optional(&mut self, sc: &mut Scope, pattern: &Pattern) -> R<()> {
         self.flush(sc, false)?;
         let before: Vec<String> = sc.visible().iter().map(|c| c.name.clone()).collect();
         let mut inner = Scope::new(sc.params.clone(), sc.visible(), sc.rels.clone());
         inner.inner = false;
         inner.correlates = true;
-        self.clauses(&mut inner, clauses, &[])?;
+        self.pattern(&mut inner, pattern)?;
         let new_cols: Vec<Col> = inner
             .cols
             .iter()
@@ -2231,17 +2103,12 @@ impl Ctx<'_> {
 
     /// A block's inner scope: its term (starting from `Env` when it reads an
     /// outer column) and its free variables.
-    fn block_scope(&mut self, sc: &mut Scope, clauses: &[Clause]) -> R<(Term, Vec<String>)> {
-        let (t, f, _) = self.block_scope_arg(sc, clauses, None)?;
-        Ok((t, f))
-    }
-
     /// A block's inner scope, with its aggregate argument typed against the
     /// block's own bindings.
     fn block_scope_arg(
         &mut self,
         sc: &mut Scope,
-        clauses: &[Clause],
+        pattern: &Pattern,
         arg: Option<&Expr>,
     ) -> R<(Term, Vec<String>, Option<SExpr>)> {
         let outer = match &sc.block_visible {
@@ -2255,7 +2122,7 @@ impl Ctx<'_> {
         let mut inner = Scope::new(sc.params.clone(), outer, sc.rels.clone());
         inner.inner = false;
         inner.correlates = true;
-        self.clauses(&mut inner, clauses, &[])?;
+        self.pattern(&mut inner, pattern)?;
         self.flush(&mut inner, true)?;
         let arg = match arg {
             Some(a) => Some(self.expr(&mut inner, a, At::Value)?),
@@ -3330,8 +3197,8 @@ impl Ctx<'_> {
             )),
             None => Err(err_fix(
                 T77,
-                format!("`{what} ${var}`: `${var}` is not bound by the group's clauses"),
-                format!("bind it before the statement: `${var}: <Type> {{ … }}`"),
+                format!("`{what} ${var}`: `${var}` is not bound by the group's `match`"),
+                format!("bind it in the group's `match`: `match {{ ${var}: <Type> }} where …`"),
             )),
         }
     }
@@ -3365,7 +3232,7 @@ impl Ctx<'_> {
         if !sc.block_buf.is_empty() {
             return Err(err(
                 T44,
-                "a block is not an assignment value; bind it with `let` in the clauses",
+                "a block is not an assignment value; bind it with `let` in the group's `match`",
             ));
         }
         let v = adapt(v, &Ty::Value(pt.clone()));
@@ -3650,7 +3517,7 @@ impl Ctx<'_> {
                 ));
             }
             Expr::Block(b) => {
-                let (term, free, arg) = self.block_scope_arg(sc, &b.clauses, b.arg.as_deref())?;
+                let (term, free, arg) = self.block_scope_arg(sc, &b.pattern, b.arg.as_deref())?;
                 if free.is_empty() {
                     return Err(err(
                         T39,
@@ -3708,40 +3575,30 @@ impl Ctx<'_> {
                 list,
                 at: written,
             } => {
-                // `$d in $x` over a node is a traversal over the edge named
-                // `in`, whose bare name is reserved; refused before the
-                // needle is typed, since a traversal would bind it.
+                // `$d in $x` over a node is a triple over the edge named
+                // `in`, which is written in `match`; refused before the
+                // needle is typed, since only a triple would bind it.
                 if let (Expr::Variable(a), Expr::Variable(b)) = (needle.as_ref(), list.as_ref()) {
                     // A node on the right, or an unbound name beside a node
-                    // when the schema has an edge named `in`: only the
-                    // traversal binds it.
+                    // when the schema has an edge named `in`.
                     let node = matches!(sc.col(b), Some(Ty::Node { .. }));
                     let unbound_edge = sc.col(b).is_none()
                         && matches!(sc.col(a), Some(Ty::Node { .. }))
                         && self.catalog.lookup_edge_by_name("in").is_some();
                     if node || unbound_edge {
-                        let replacement = format!("${a} \"in\" ${b}");
                         let mut d = QueryDiagnostic::typecheck(
                             T7,
                             if node {
                                 format!(
-                                    "`${b}` is a node, so `${a} in ${b}` is a traversal over the edge named `in`, whose bare name is reserved"
+                                    "`${b}` is a node, so `${a} in ${b}` is a triple over the edge named `in`, an element of `match {{ … }}`, not a predicate"
                                 )
                             } else {
                                 format!(
-                                    "`${b}` is bound by nothing but the edge named `in`, so `${a} in ${b}` is a traversal over it, whose bare name is reserved"
+                                    "`${b}` is bound by nothing but the edge named `in`, so `${a} in ${b}` is a triple over it, an element of `match {{ … }}`, not a predicate"
                                 )
                             },
                         )
-                        .with_fix(replacement.clone())
-                        .with_suggestion(Suggestion {
-                            applicability: Applicability::MachineApplicable,
-                            edits: vec![TextEdit {
-                                start: written.start,
-                                end: written.end,
-                                replacement,
-                            }],
-                        });
+                        .with_fix(format!("match {{ …, ${a} in ${b} }}"));
                         d.position = Some(written.position);
                         return Err(E::D(d));
                     }
@@ -3810,7 +3667,20 @@ impl Ctx<'_> {
                 )
             }
             Expr::Not(inner) => {
-                let v = self.expr(sc, inner, sub)?;
+                // `not exists { … }` that reads no outer name excludes every
+                // row or none.
+                let v = match inner.as_ref() {
+                    Expr::Block(b) if b.func == BlockFunc::Exists => {
+                        self.expr(sc, inner, sub).map_err(|e| match e {
+                            E::D(d) if d.code == T39 => err(
+                                T9,
+                                "a `not exists { }` block must reference an outer-bound variable",
+                            ),
+                            other => other,
+                        })?
+                    }
+                    _ => self.expr(sc, inner, sub)?,
+                };
                 require_bool(&v, "`not`")?;
                 let ty = v.ty.clone();
                 SExpr::new(SKind::Not(v.boxed()), ty)
@@ -3956,7 +3826,7 @@ impl Ctx<'_> {
                     return Err(err(
                         T38,
                         format!(
-                            "`{name}` is a search predicate; it must stand alone as a filter clause"
+                            "`{name}` is a search predicate; it must stand alone as a conjunct of `where`"
                         ),
                     ));
                 }
@@ -4002,7 +3872,7 @@ impl Ctx<'_> {
                 if !top {
                     return Err(err(
                         T38,
-                        "`match_terms` is a predicate; it must stand alone as a filter clause",
+                        "`match_terms` is a predicate; it must stand alone as a conjunct of `where`",
                     ));
                 }
                 no_options(c)?;
@@ -5144,44 +5014,47 @@ fn contains_agg(e: &Expr) -> bool {
     }
 }
 
-/// `T8` for an aggregate call in a filter clause, with the block form as the
-/// fix: the clauses that bind the aggregate's argument move into the block,
-/// and the call becomes the block's value (`$p knows $f  count($f) > 3` is
-/// `count($f) { $p knows $f } > 3`).
-fn aggregate_filter_fix(clauses: &[Clause], in_write: bool) -> Option<E> {
+/// `T8` for an aggregate call in a `where`, with the block form as the fix:
+/// the elements that bind the aggregate's argument move into the block, and
+/// the call becomes the block's value (`match { $p knows $f } where
+/// count($f) > 3` is `where count($f) { $p knows $f } > 3`).
+fn aggregate_filter_fix(pattern: &Pattern, in_write: bool) -> Option<E> {
     use crate::query::syntax::print;
-    let (at, call) = clauses.iter().enumerate().find_map(|(i, c)| match c {
-        Clause::Filter(e) => first_aggregate_call(e).map(|call| (i, call)),
-        _ => None,
-    })?;
+    let filter = pattern.predicate.as_ref()?;
+    let call = first_aggregate_call(filter)?;
     let Some(Arg::Expr(arg)) = call.args.first() else {
         return None;
     };
     let mut vars = Vec::new();
     expr_vars(arg, &mut vars);
-    let binds = |c: &Clause| match c {
-        Clause::Binding { variable, .. } => vars.contains(variable),
-        Clause::Traversal(t) => {
+    let binds = |c: &Element| match c {
+        Element::Binding { variable, .. } => vars.contains(variable),
+        Element::Traversal(t) => {
             vars.contains(&t.dst)
                 || vars.contains(&t.src)
                 || t.edge_binding.as_ref().is_some_and(|e| vars.contains(e))
         }
         _ => false,
     };
-    let moved: Vec<Clause> = clauses.iter().filter(|c| binds(c)).cloned().collect();
+    let moved: Vec<Element> = pattern
+        .elements
+        .iter()
+        .filter(|c| binds(c))
+        .cloned()
+        .collect();
     let written = print::expr(&Expr::Call(call.clone()));
-    // A block correlates on a name the remaining clauses bind; with none
+    // A block correlates on a name the remaining elements bind; with none
     // left, the count is a grouped value of the whole read.
     let mut kept_vars = Vec::new();
-    for c in clauses.iter().filter(|c| !binds(c)) {
+    for c in pattern.elements.iter().filter(|c| !binds(c)) {
         match c {
-            Clause::Binding { variable, .. } => kept_vars.push(variable.clone()),
-            Clause::Traversal(t) => kept_vars.extend([t.src.clone(), t.dst.clone()]),
+            Element::Binding { variable, .. } => kept_vars.push(variable.clone()),
+            Element::Traversal(t) => kept_vars.extend([t.src.clone(), t.dst.clone()]),
             _ => {}
         }
     }
     let correlated = moved.iter().any(|c| match c {
-        Clause::Traversal(t) => kept_vars.contains(&t.src) || kept_vars.contains(&t.dst),
+        Element::Traversal(t) => kept_vars.contains(&t.src) || kept_vars.contains(&t.dst),
         _ => false,
     });
     if !correlated {
@@ -5199,26 +5072,98 @@ fn aggregate_filter_fix(clauses: &[Clause], in_write: bool) -> Option<E> {
     let block = Expr::Block(Box::new(Block {
         func: BlockFunc::Agg(func),
         arg: Some(Box::new(arg.clone())),
-        clauses: moved,
+        pattern: Pattern {
+            elements: moved,
+            ..Pattern::default()
+        },
     }));
-    let Clause::Filter(filter) = &clauses[at] else {
-        unreachable!("found above")
-    };
     let rewritten = replace_call(filter, call, &block);
-    let kept: Vec<String> = clauses
+    let kept: Vec<String> = pattern
+        .elements
         .iter()
-        .enumerate()
-        .filter(|(i, c)| *i != at && !binds(c))
-        .map(|(_, c)| print::clause(c, Default::default()))
-        .chain(std::iter::once(print::expr(&rewritten)))
+        .filter(|c| !binds(c))
+        .map(print::element)
         .collect();
     Some(err_fix(
         T8,
         format!(
-            "`{written}` is an aggregate; in a filter it is a block over the clauses it counts"
+            "`{written}` is an aggregate; in a filter it is a block over the elements it counts"
         ),
-        format!("match {{ {} }}", kept.join("  ")),
+        format!(
+            "match {{ {} }} where {}",
+            kept.join(", "),
+            print::expr(&rewritten)
+        ),
     ))
+}
+
+/// `T7` for `$d in $list` in `match`: a triple over the edge named `in` whose
+/// right end is a list parameter, which is the membership test written in
+/// the wrong place; the fix moves it to the `where`.
+fn membership_triple(pattern: &Pattern, sc: &Scope) -> Option<QueryDiagnostic> {
+    let (i, t) = pattern
+        .elements
+        .iter()
+        .enumerate()
+        .find_map(|(i, c)| match c {
+            Element::Traversal(t)
+                if t.selector == EdgeSelector::Named("in".into())
+                    && t.edge_binding.is_none()
+                    && !t.undirected
+                    && !sc.is_bound(&t.dst)
+                    && sc.params.get(&t.dst).is_some_and(|p| p.list) =>
+            {
+                Some((i, t))
+            }
+            _ => None,
+        })?;
+    let test = format!("${} in ${}", t.src, t.dst);
+    let mut d = QueryDiagnostic::typecheck(
+        T7,
+        format!(
+            "`${}` is a list, so `{test}` is a membership test, which belongs in `where`; inside `match`, `in` is an edge name",
+            t.dst
+        ),
+    )
+    .with_fix(format!("where {test}"));
+    let spans = &pattern.spans.elements;
+    if let Some(span) = spans.get(i) {
+        d.position = Some(span.position);
+    }
+    // Remove the element with one separator, then add the test to the
+    // `where` (or open one after the braces).
+    let removal = match (
+        spans.get(i),
+        spans.get(i + 1),
+        i.checked_sub(1).and_then(|p| spans.get(p)),
+    ) {
+        (Some(this), Some(next), _) => Some((this.start, next.start)),
+        (Some(this), None, Some(prev)) => Some((prev.end, this.end)),
+        _ => None,
+    };
+    let insertion = match (&pattern.spans.predicate, pattern.spans.close) {
+        (Some(p), _) => Some((p.end, format!(" and {test}"))),
+        (None, Some(close)) => Some((close, format!(" where {test}"))),
+        _ => None,
+    };
+    if let (Some((start, end)), Some((at, text))) = (removal, insertion) {
+        d = d.with_suggestion(Suggestion {
+            applicability: Applicability::MachineApplicable,
+            edits: vec![
+                TextEdit {
+                    start,
+                    end,
+                    replacement: String::new(),
+                },
+                TextEdit {
+                    start: at,
+                    end: at,
+                    replacement: text,
+                },
+            ],
+        });
+    }
+    Some(d)
 }
 
 fn first_aggregate_call(e: &Expr) -> Option<&Call> {
@@ -5258,8 +5203,8 @@ fn replace_call(e: &Expr, call: &Call, with: &Expr) -> Expr {
     }
 }
 
-/// The conjuncts of a top-level `and` (the formatter splits them into
-/// clauses without changing the term, so the lowering splits them too).
+/// The conjuncts of a top-level `and`: each is placed after the last binder
+/// it reads, so a conjunct is pushed down as far as its own names allow.
 fn conjuncts(e: &Expr) -> Vec<&Expr> {
     match e {
         Expr::And(l, r) => {
@@ -5300,15 +5245,14 @@ fn is_relation_expr(e: &Expr, sc: &Scope, unit: &HashMap<String, &Decl>) -> bool
     }
 }
 
-/// Lookahead over a scope's clauses: the type each binding declares, and
+/// Lookahead over a scope's elements: the type each binding declares, and
 /// every name the scope will bind.
-fn lookahead(clauses: &[Clause], sc: &mut Scope) {
-    for c in clauses {
+fn lookahead(elements: &[Element], sc: &mut Scope) {
+    for c in elements {
         match c {
-            Clause::Binding {
+            Element::Binding {
                 variable,
                 type_name,
-                ..
             } => {
                 sc.declared.insert(
                     variable.clone(),
@@ -5319,17 +5263,17 @@ fn lookahead(clauses: &[Clause], sc: &mut Scope) {
                 sc.declared_nodes.insert(variable.clone());
                 sc.future.insert(variable.clone());
             }
-            Clause::Traversal(t) => {
+            Element::Traversal(t) => {
                 sc.future.insert(t.src.clone());
                 sc.future.insert(t.dst.clone());
                 if let Some(k) = &t.edge_binding {
                     sc.future.insert(k.clone());
                 }
             }
-            Clause::Let { name, .. } => {
+            Element::Let { name, .. } => {
                 sc.future.insert(name.clone());
             }
-            Clause::From(RelExpr::Inline(body)) => {
+            Element::From(RelExpr::Inline(body)) => {
                 for p in &body.projections {
                     match (&p.alias, &p.expr) {
                         (Some(a), _) => {
@@ -5342,12 +5286,12 @@ fn lookahead(clauses: &[Clause], sc: &mut Scope) {
                     }
                 }
             }
-            Clause::Optional(inner) => {
+            Element::Optional(inner) => {
                 let mut tmp = Scope::new(HashMap::new(), Vec::new(), HashMap::new());
-                lookahead(inner, &mut tmp);
+                lookahead(&inner.elements, &mut tmp);
                 sc.future.extend(tmp.future);
             }
-            Clause::From(_) | Clause::Filter(_) | Clause::Not(_) => {}
+            Element::From(_) => {}
         }
     }
 }
@@ -5358,10 +5302,6 @@ fn pending_vars(p: &Pending, sc: &Scope) -> Vec<String> {
     let mut out = Vec::new();
     match p {
         Pending::Filter(e, before, _) => filter_vars(e, before, &mut out),
-        Pending::Braces { var, value, .. } => {
-            out.push(var.clone());
-            expr_vars(value, &mut out);
-        }
     }
     out.retain(|v| {
         (sc.future.contains(v) || sc.is_bound(v))
@@ -5392,7 +5332,7 @@ fn filter_vars(e: &Expr, before: &[String], out: &mut Vec<String>) {
 fn block_vars(e: &Expr, out: &mut Vec<String>) {
     match e {
         Expr::Block(b) => {
-            clauses_vars(&b.clauses, out);
+            pattern_vars(&b.pattern, out);
             if let Some(a) = &b.arg {
                 expr_vars(a, out);
             }
@@ -5446,32 +5386,25 @@ fn for_each_child(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
-fn clauses_vars(clauses: &[Clause], out: &mut Vec<String>) {
-    for c in clauses {
+fn pattern_vars(pattern: &Pattern, out: &mut Vec<String>) {
+    for c in &pattern.elements {
         match c {
-            Clause::Binding {
-                variable,
-                prop_matches,
-                ..
-            } => {
-                out.push(variable.clone());
-                for (_, v) in prop_matches {
-                    expr_vars(v, out);
-                }
-            }
-            Clause::Traversal(t) => {
+            Element::Binding { variable, .. } => out.push(variable.clone()),
+            Element::Traversal(t) => {
                 out.push(t.src.clone());
                 out.push(t.dst.clone());
             }
-            Clause::Filter(e) => expr_vars(e, out),
-            Clause::Not(c) | Clause::Optional(c) => clauses_vars(c, out),
-            Clause::Let { value, .. } => {
+            Element::Optional(p) => pattern_vars(p, out),
+            Element::Let { value, .. } => {
                 if let LetValue::Expr(e) = value {
                     expr_vars(e, out)
                 }
             }
-            Clause::From(_) => {}
+            Element::From(_) => {}
         }
+    }
+    if let Some(p) = &pattern.predicate {
+        expr_vars(p, out);
     }
 }
 
@@ -5492,7 +5425,7 @@ fn expr_vars(e: &Expr, out: &mut Vec<String>) {
         Expr::AggDistinct { arg, .. } | Expr::Neg(arg) | Expr::Not(arg) => expr_vars(arg, out),
         Expr::IsNull { expr, .. } => expr_vars(expr, out),
         Expr::Block(b) => {
-            clauses_vars(&b.clauses, out);
+            pattern_vars(&b.pattern, out);
             if let Some(a) = &b.arg {
                 expr_vars(a, out);
             }

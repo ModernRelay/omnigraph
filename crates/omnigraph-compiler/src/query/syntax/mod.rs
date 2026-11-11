@@ -111,13 +111,46 @@ pub enum DeclBody {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadBody {
-    pub clauses: Vec<Clause>,
+    /// `match { … } where φ`.
+    pub pattern: Box<Pattern>,
     pub distinct: bool,
     pub projections: Vec<Projection>,
     pub order: Vec<Ordering>,
     pub limit: Option<Limit>,
     /// Where each part was written.
     pub spans: Box<ReadSpans>,
+}
+
+/// The elements of a `match { … }` and the `where` after its braces, or of
+/// a block's or an `optional`'s braces with the `where` inside them
+/// (section 3): the elements produce rows, the predicate removes them.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Pattern {
+    pub elements: Vec<Element>,
+    /// The one Boolean expression of `where`, evaluated after every element.
+    pub predicate: Option<Expr>,
+    /// Where each part was written.
+    pub spans: PatternSpans,
+}
+
+/// Where a pattern's parts were written, for a type-check refusal's position
+/// and suggestion. Like [`SourceSpan`], it takes no part in tree equality; a
+/// pattern built rather than parsed has none.
+#[derive(Debug, Clone, Default)]
+pub struct PatternSpans {
+    /// One per element, in order.
+    pub elements: Vec<SourceSpan>,
+    /// The `where` expression.
+    pub predicate: Option<SourceSpan>,
+    /// The byte just after the closing brace of `match { … }`, where a
+    /// `where` would open.
+    pub close: Option<usize>,
+}
+
+impl PartialEq for PatternSpans {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 /// Where a read body's parts were written, for a type-check refusal's
@@ -127,8 +160,6 @@ pub struct ReadBody {
 pub struct ReadSpans {
     /// The text between the `match` braces.
     pub match_inner: Option<SourceSpan>,
-    /// One per clause, in order.
-    pub clauses: Vec<SourceSpan>,
     /// One per return item, the item without its alias.
     pub items: Vec<SourceSpan>,
     /// One per order key, its direction included.
@@ -164,15 +195,19 @@ pub enum Limit {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteBody {
-    /// One or more groups: each a run of clauses, then the statements that
-    /// write over its rows (RFC section 2, the write groups).
+    /// One or more groups: each a selection, `match { … } where φ` or none,
+    /// then the statements that write over its rows (RFC section 2, the
+    /// write groups).
     pub groups: Vec<WriteGroup>,
 }
 
 impl WriteBody {
-    /// Every group's clauses, in order.
-    pub fn all_clauses(&self) -> Vec<&Clause> {
-        self.groups.iter().flat_map(|g| g.clauses.iter()).collect()
+    /// Every group's elements, in order.
+    pub fn all_elements(&self) -> Vec<&Element> {
+        self.groups
+            .iter()
+            .flat_map(|g| g.pattern.elements.iter())
+            .collect()
     }
 
     /// Every group's statements, in order.
@@ -186,16 +221,16 @@ impl WriteBody {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteGroup {
-    pub clauses: Vec<Clause>,
+    /// The group's `match { … } where φ`; empty for a group with no `match`.
+    pub pattern: Pattern,
     pub statements: Vec<Stmt>,
-    /// Where each clause, then each statement, was written; empty for a
-    /// group built rather than parsed. No part of tree equality.
+    /// Where each statement was written; empty for a group built rather than
+    /// parsed. No part of tree equality.
     pub spans: GroupSpans,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct GroupSpans {
-    pub clauses: Vec<SourceSpan>,
     pub statements: Vec<SourceSpan>,
 }
 
@@ -226,8 +261,9 @@ pub struct Assignment {
     pub value: Expr,
 }
 
+/// An element of `match { … }`: a form that produces rows.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Clause {
+pub enum Element {
     /// `let $name = value`: a named value or a named relation.
     Let {
         name: String,
@@ -235,15 +271,13 @@ pub enum Clause {
     },
     /// `from rel`: rows drawn from a relation.
     From(RelExpr),
-    Not(Vec<Clause>),
-    Optional(Vec<Clause>),
+    Optional(Pattern),
+    /// `$x: T`, a node or an edge type.
     Binding {
         variable: String,
         type_name: String,
-        prop_matches: Vec<(String, Expr)>,
     },
     Traversal(Traversal),
-    Filter(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -287,7 +321,8 @@ pub enum RelExpr {
 pub struct Block {
     pub func: BlockFunc,
     pub arg: Option<Box<Expr>>,
-    pub clauses: Vec<Clause>,
+    /// The block's elements and its own `where`, inside its braces.
+    pub pattern: Pattern,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,8 +388,8 @@ pub enum Expr {
     In {
         needle: Box<Expr>,
         list: Box<Expr>,
-        /// Where it was written: `$d in $x` over a node is a traversal over
-        /// the reserved edge name, refused with the quoted form.
+        /// Where it was written: `$d in $x` over a node in `where` is a
+        /// triple, refused with the `match` element as the fix.
         at: SourceSpan,
     },
     IsNull {

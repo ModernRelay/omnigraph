@@ -180,6 +180,12 @@ fn source_span(p: &Pair<Rule>) -> SourceSpan {
     }
 }
 
+/// The end of a pair's last token: a pest span can end after the implicit
+/// whitespace a trailing repetition skipped.
+fn tend(input: &str, p: &Pair<Rule>) -> usize {
+    input[..p.as_span().end()].trim_end().len()
+}
+
 fn input_of<'i>(p: &Pair<'i, Rule>) -> &'i str {
     p.as_span().get_input()
 }
@@ -201,22 +207,6 @@ struct Ctx {
     bindings: Vec<(String, String)>,
     vars: BTreeSet<String>,
     allow_bare: bool,
-    /// The expression being built is a whole `return` item or a whole
-    /// clause starting at this byte: where a `$n -1` may be meant as two.
-    top: Option<(Top, usize)>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Top {
-    Item,
-    Clause,
-}
-
-fn at_top<T>(top: Top, start: usize, f: impl FnOnce() -> T) -> T {
-    let saved = with_ctx(|c| c.top.replace((top, start)));
-    let out = f();
-    with_ctx(|c| c.top = saved);
-    out
 }
 
 thread_local! {
@@ -408,6 +398,10 @@ fn structural(input: &str) -> R<SourceFile> {
     })
 }
 
+/// The constructs an element of `match { … }` may be.
+const ELEMENT: &str =
+    "an element (a binding `$x: Type`, a triple `$a edge $b`, `let`, `from` or `optional { }`)";
+
 /// The construct a grammar rule stands for, as a parse error names it.
 fn construct_name(rule: Rule) -> Option<&'static str> {
     use Rule as X;
@@ -421,6 +415,7 @@ fn construct_name(rule: Rule) -> Option<&'static str> {
         }
         X::annotation | X::annotation_name => "an annotation `@name(…)`",
         X::read_body | X::match_clause | X::kw_match => "`match { … }`",
+        X::where_clause | X::kw_where => "`where <expression>`",
         X::return_clause | X::kw_return => "`return { … }`",
         X::projection => "a return item",
         X::kw_as | X::alias => "`as <alias>`",
@@ -428,16 +423,14 @@ fn construct_name(rule: Rule) -> Option<&'static str> {
         X::ordering => "an order key",
         X::order_dir => "`asc` or `desc`",
         X::limit_clause | X::kw_limit => "`limit <n>`",
-        X::clause
+        X::elements
+        | X::element
+        | X::block_body
         | X::let_clause
         | X::from_clause
         | X::binding
         | X::traversal
-        | X::filter
-        | X::negation
-        | X::optional_block => {
-            "a clause (a binding `$x: Type`, a traversal `$a edge $b`, a filter, `let`, `from`, `not { }` or `optional { }`)"
-        }
+        | X::optional_block => ELEMENT,
         X::relation_expr | X::inline_read => {
             "a relation (`{ match { … } return { … } }`, a call or `$r`)"
         }
@@ -448,10 +441,10 @@ fn construct_name(rule: Rule) -> Option<&'static str> {
         X::update_stmt | X::kw_update => "`update $x set { … }`",
         X::delete_stmt | X::kw_delete => "`delete $x`",
         X::kw_set => "`set { … }`",
-        X::assignment => "an assignment `property: value`",
+        X::assignments | X::assignment => "an assignment `property: value`",
         X::prop_match_list | X::prop_match => "a property match `property: value`",
         X::type_name => "a type name (`Person`)",
-        X::ident | X::expr_ident | X::edge_ident | X::edge_word => "a name",
+        X::ident | X::expr_ident | X::edge_ident => "a name",
         X::edge_sel | X::undirected_edge | X::edge_alternation => "an edge name",
         X::traversal_bounds => "hop bounds `{m,n}`",
         X::expr
@@ -506,9 +499,8 @@ fn grammar_error(input: &str, err: pest::error::Error<Rule>) -> Refusal {
     let found = token_at(input, byte);
     // After an expression the ladder offers every operator; name the two
     // constructs the reader can act on.
-    let clause = "a clause (a binding `$x: Type`, a traversal `$a edge $b`, a filter, `let`, `from`, `not { }` or `optional { }`)";
-    if names.contains(&clause) && names.len() > 2 {
-        names = vec!["an operator that continues the expression", clause];
+    if names.contains(&ELEMENT) && names.len() > 2 {
+        names = vec!["an operator that continues the expression", ELEMENT];
     }
     let expected = match names.len() {
         0 => String::new(),
@@ -580,7 +572,10 @@ fn collect_ctx(pair: &Pair<Rule>) -> Ctx {
                     ctx.params.push(v.as_str()[1..].to_string());
                 }
             }
-            Rule::binding | Rule::binding_brace_filter | Rule::binding_paren_rec => {
+            Rule::binding
+            | Rule::binding_brace_filter
+            | Rule::binding_braces_rec
+            | Rule::binding_paren_rec => {
                 let mut inner = p.clone().into_inner();
                 let v = inner.next().map(|v| v.as_str()[1..].to_string());
                 let t = inner.find_map(|t| match t.as_rule() {
@@ -803,7 +798,7 @@ fn annotation_value(pair: Pair<Rule>) -> R<AnnotationValue> {
 fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
     let input = input_of(&pair);
     let mut body = ReadBody {
-        clauses: Vec::new(),
+        pattern: Box::default(),
         distinct: false,
         projections: Vec::new(),
         order: Vec::new(),
@@ -813,10 +808,18 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
     let mut seen_return = false;
     let mut match_end = 0;
     let mut tail: Vec<Pair<Rule>> = Vec::new();
-    for section in pair.clone().into_inner() {
+    let sections: Vec<Pair<Rule>> = pair.clone().into_inner().collect();
+    let where_pair = sections
+        .iter()
+        .find(|p| p.as_rule() == Rule::where_clause)
+        .cloned();
+    for section in sections {
         match section.as_rule() {
             Rule::match_clause => {
-                match_end = section.as_span().end();
+                let end = where_pair
+                    .as_ref()
+                    .map_or(section.as_span().end(), |w| w.as_span().end());
+                match_end = input[..end].trim_end().len();
                 let (s, e) = span_of(&section);
                 let open = s + input[s..e].find('{').unwrap_or(0) + 1;
                 let close = s + input[s..e].rfind('}').unwrap_or(e - s);
@@ -826,27 +829,10 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
                     position: Position::at(input, open),
                     operands: Vec::new(),
                 });
-                let pairs: Vec<Pair<Rule>> = section
-                    .into_inner()
-                    .filter(|c| matches!(c.as_rule(), Rule::clause | Rule::stmt_edge_rec))
-                    .collect();
-                body.spans.clauses = pairs.iter().map(source_span).collect();
-                body.clauses = clause_list(pairs)?;
+                body.pattern = Box::new(match_pattern(&section, where_pair.as_ref())?);
             }
-            Rule::match_nobrace_rec => {
-                let kw = section.clone().into_inner().next().unwrap();
-                let (s, e) = span_of(&section);
-                let e = input[..e].trim_end().len();
-                let (_, ke) = span_of(&kw);
-                return Err(refusal(
-                    input,
-                    Q020,
-                    "`match` takes its clauses in braces",
-                    (s, e),
-                    vec![edit(ke, ke, " {"), edit(e, e, " }")],
-                    MACHINE,
-                ));
-            }
+            Rule::where_clause => {}
+            Rule::match_nobrace_rec => return Err(match_nobrace(&section)),
             Rule::retrieve_rec => {
                 return Err(refusal_note(
                     input,
@@ -858,6 +844,7 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
             }
             Rule::return_clause => {
                 seen_return = true;
+                missing_commas(&section, "return items")?;
                 let mut distinct_items = Vec::new();
                 let return_span = span_of(&section);
                 let mut keyword_end = 0;
@@ -868,6 +855,7 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
                             body.distinct = true;
                             keyword_end = p.as_span().end();
                         }
+                        Rule::missing_comma_rec => {}
                         Rule::projection => {
                             if let Some(item) = p
                                 .clone()
@@ -967,6 +955,7 @@ fn read_tail(input: &str, body: &mut ReadBody, tail: Vec<Pair<Rule>>) -> R<()> {
         let span = span_of(&section);
         match section.as_rule() {
             Rule::order_clause => {
+                missing_commas(&section, "order keys")?;
                 if let Some(l) = &limit_pair {
                     let (ls, le) = span_of(l);
                     return Err(refusal(
@@ -1087,7 +1076,7 @@ fn read_tail(input: &str, body: &mut ReadBody, tail: Vec<Pair<Rule>>) -> R<()> {
                     Q014,
                     "`having` is SQL's; a grouped result is filtered by drawing it with `from` and filtering its rows",
                     span,
-                    "match { from { match { … } return { $c, count($p) as n } }  $n > 3 } return { … }",
+                    "match { from { match { … } return { $c, count($p) as n } } } where $n > 3 return { … }",
                 ));
             }
             other => unreachable!("grammar: read_tail holds no {other:?}"),
@@ -1181,8 +1170,7 @@ fn projection(pair: Pair<Rule>) -> R<Projection> {
         }
         _ => {}
     }
-    let start = first.as_span().start();
-    let e = at_top(Top::Item, start, || expr(first))?;
+    let e = expr(first)?;
     let mut alias = None;
     for part in inner {
         if part.as_rule() != Rule::alias {
@@ -1262,41 +1250,62 @@ fn projection(pair: Pair<Rule>) -> R<Projection> {
 fn write_body(pair: Pair<Rule>) -> R<WriteBody> {
     let input = input_of(&pair);
     let mut groups: Vec<WriteGroup> = Vec::new();
-    let mut last_stmts: Option<(usize, usize)> = None;
+    let mut last_group: Option<Pair<Rule>> = None;
     for part in pair.into_inner() {
         match part.as_rule() {
             Rule::write_group => {
-                let mut clause_pairs: Vec<Pair<Rule>> = Vec::new();
+                let parts: Vec<Pair<Rule>> = part.clone().into_inner().collect();
+                let selection = parts
+                    .iter()
+                    .find(|p| matches!(p.as_rule(), Rule::match_clause | Rule::match_nobrace_rec))
+                    .cloned();
+                let where_pair = parts
+                    .iter()
+                    .find(|p| p.as_rule() == Rule::where_clause)
+                    .cloned();
+                if let Some(m) = selection
+                    .as_ref()
+                    .filter(|m| m.as_rule() == Rule::match_nobrace_rec)
+                {
+                    return Err(match_nobrace(m));
+                }
+                if let Some(bare) = parts
+                    .iter()
+                    .find(|p| p.as_rule() == Rule::bare_elements_rec)
+                {
+                    // Cypher's `detach` before a statement is its own refusal.
+                    let kids: Vec<Pair<Rule>> = bare.clone().into_inner().collect();
+                    if let Some(detach) = kids.iter().find(|k| k.as_rule() == Rule::detach_rec)
+                        && kids.iter().all(|k| k.as_rule() == Rule::detach_rec)
+                    {
+                        return Err(element(detach.clone(), &[]).unwrap_err());
+                    }
+                    return Err(bare_elements(
+                        input,
+                        selection.as_ref(),
+                        where_pair.as_ref(),
+                        bare,
+                        None,
+                    ));
+                }
+                let pattern = match &selection {
+                    Some(m) => match_pattern(m, where_pair.as_ref())?,
+                    None => Pattern::default(),
+                };
                 let mut statements = Vec::new();
                 let mut spans = GroupSpans::default();
-                let mut stmt_span: Option<(usize, usize)> = None;
-                for p in part.into_inner() {
-                    match p.as_rule() {
-                        Rule::mutation_stmt
-                            if p.clone().into_inner().next().unwrap().as_rule()
-                                == Rule::stmt_var_rec =>
-                        {
-                            let rec = p.clone().into_inner().next().unwrap();
-                            let mut parts = rec.clone().into_inner();
-                            let word = parts.next().unwrap().as_str();
-                            let b_pair = parts.next().unwrap();
-                            let b = b_pair.as_str();
-                            if let Some(a) = clause_pairs.last().and_then(lone_var_filter) {
-                                // The rec's span ends after the whitespace its
-                                // lookahead skipped; the triple ends at `b`.
-                                let span = (
-                                    clause_pairs.last().unwrap().as_span().start(),
-                                    b_pair.as_span().end(),
-                                );
-                                return Err(bare_edge(input, span, a.as_str(), word, b));
-                            }
+                for p in parts.iter().filter(|p| p.as_rule() == Rule::mutation_stmt) {
+                    let s = p.clone().into_inner().next().unwrap();
+                    match s.as_rule() {
+                        Rule::stmt_var_rec => {
+                            let word = s.clone().into_inner().next().unwrap().as_str();
                             return Err(refusal_note(
                                 input,
                                 Q005,
                                 format!(
                                     "`{word}` takes a type (`insert T {{ … }}`) or a bound variable and `set` (`update $x set {{ … }}`)"
                                 ),
-                                span_of(&rec),
+                                span_of(&s),
                                 if word == "insert" {
                                     "insert <Type> { <property>: <value> }"
                                 } else {
@@ -1304,41 +1313,83 @@ fn write_body(pair: Pair<Rule>) -> R<WriteBody> {
                                 },
                             ));
                         }
-                        Rule::mutation_stmt => {
-                            let s = span_of(&p);
-                            stmt_span = Some(match stmt_span {
-                                None => s,
-                                Some((a, _)) => (a, s.1),
-                            });
-                            spans.statements.push(source_span(&p));
-                            statements.push(statement(p)?);
+                        Rule::where_stmt => {
+                            return Err(where_statement(
+                                s,
+                                selection.as_ref(),
+                                where_pair.as_ref(),
+                            ));
                         }
-                        _ => clause_pairs.push(p),
+                        _ => {
+                            spans.statements.push(source_span(p));
+                            statements.push(statement(p.clone())?);
+                        }
                     }
                 }
-                last_stmts = stmt_span;
-                spans.clauses = clause_pairs.iter().map(source_span).collect();
                 groups.push(WriteGroup {
-                    clauses: clause_list(clause_pairs)?,
+                    pattern,
                     statements,
                     spans,
                 });
+                last_group = Some(part);
             }
-            Rule::trailing_clauses_rec => {
-                let (ts, te) = span_of(&part);
-                let (ss, se) = last_stmts.expect("grammar: a write group precedes its trailer");
-                let te = input[..te].trim_end().len();
+            Rule::trailing_match_rec => {
+                let group = last_group
+                    .clone()
+                    .expect("grammar: a write group precedes its trailer");
+                let gparts: Vec<Pair<Rule>> = group.clone().into_inner().collect();
+                let first_stmt = gparts
+                    .iter()
+                    .find(|p| p.as_rule() == Rule::mutation_stmt)
+                    .expect("grammar: a write group holds a statement");
+                let message = "a group's `match { … }` comes before its statements";
+                let (ts, te) = (part.as_span().start(), tend(input, &part));
+                if gparts.iter().any(|p| p.as_rule() == Rule::match_clause) {
+                    return Err(refusal_note(
+                        input,
+                        Q013,
+                        message,
+                        (ts, te),
+                        "match { … } where …  <statements>",
+                    ));
+                }
+                let before = input[..ts].trim_end().len();
+                let at = first_stmt.as_span().start();
                 return Err(refusal(
                     input,
                     Q013,
-                    "a clause follows a statement; a group's clauses come before its statements",
-                    (ss, te),
-                    vec![edit(
-                        ss,
-                        te,
-                        format!("{}\n  {}", input[ts..te].trim(), input[ss..se].trim()),
-                    )],
+                    message,
+                    (at, te),
+                    vec![
+                        edit(before, te, ""),
+                        edit(at, at, format!("{}  ", &input[ts..te])),
+                    ],
                     MACHINE,
+                ));
+            }
+            Rule::trailing_elements_rec => {
+                let group = last_group
+                    .clone()
+                    .expect("grammar: a write group precedes its trailer");
+                let gparts: Vec<Pair<Rule>> = group.clone().into_inner().collect();
+                let selection = gparts
+                    .iter()
+                    .find(|p| p.as_rule() == Rule::match_clause)
+                    .cloned();
+                let where_pair = gparts
+                    .iter()
+                    .find(|p| p.as_rule() == Rule::where_clause)
+                    .cloned();
+                let first_stmt = gparts
+                    .iter()
+                    .find(|p| p.as_rule() == Rule::mutation_stmt)
+                    .expect("grammar: a write group holds a statement");
+                return Err(bare_elements(
+                    input,
+                    selection.as_ref(),
+                    where_pair.as_ref(),
+                    &part,
+                    Some(first_stmt.as_span().start()),
                 ));
             }
             _ => {}
@@ -1347,11 +1398,108 @@ fn write_body(pair: Pair<Rule>) -> R<WriteBody> {
     Ok(WriteBody { groups })
 }
 
+/// `match` with its elements not in braces.
+fn match_nobrace(section: &Pair<Rule>) -> Refusal {
+    let input = input_of(section);
+    let kw = section.clone().into_inner().next().unwrap();
+    let (s, e) = span_of(section);
+    let e = input[..e].trim_end().len();
+    let (_, ke) = span_of(&kw);
+    refusal(
+        input,
+        Q020,
+        "`match` takes its elements in braces",
+        (s, e),
+        vec![edit(ke, ke, " {"), edit(e, e, " }")],
+        MACHINE,
+    )
+}
+
+/// A write group's elements written without `match { }` (before its
+/// statements), or after its last statement (`statements_at` is where the
+/// group's statements start): the fix writes the group's `match { … }` and
+/// `where` before its statements, the misplaced elements joined to it and
+/// their predicates moved to the `where`.
+fn bare_elements(
+    input: &str,
+    selection: Option<&Pair<Rule>>,
+    where_pair: Option<&Pair<Rule>>,
+    bare: &Pair<Rule>,
+    statements_at: Option<usize>,
+) -> Refusal {
+    let mut pieces = Pieces::default();
+    if let Some(m) = selection {
+        if let Some(list) = child(m, Rule::elements) {
+            pieces.collect(&list);
+        }
+        if let Some(w) = child(m, Rule::inner_where_rec) {
+            pieces.preds.push(where_expr_text(&w));
+        }
+    }
+    if let Some(w) = where_pair {
+        pieces.preds.push(where_expr_text(w));
+    }
+    pieces.collect_items(
+        bare.clone()
+            .into_inner()
+            .filter(|p| p.as_rule() == Rule::element),
+    );
+    let rebuilt = pieces.render_match();
+    let (bs, be) = span_of(bare);
+    let be = input[..be].trim_end().len();
+    let mut edits = Vec::new();
+    match statements_at {
+        // Elements after the last statement: removed there, and the group's
+        // selection rewritten (or opened) before its statements.
+        Some(stmts) => {
+            let (ts, _) = span_of(bare);
+            let ts = input[..ts].trim_end().len();
+            edits.push(edit(ts, be, ""));
+            match selection {
+                Some(m) => {
+                    let end = where_pair.map_or(m.as_span().end(), |w| w.as_span().end());
+                    let end = input[..end].trim_end().len();
+                    edits.push(edit(m.as_span().start(), end, rebuilt));
+                }
+                None => edits.push(edit(stmts, stmts, format!("{rebuilt}\n  "))),
+            }
+            refusal(
+                input,
+                Q013,
+                "an element follows a statement; a group's elements are in its `match { … }`, before its statements",
+                (stmts, be),
+                edits,
+                MACHINE,
+            )
+        }
+        None => {
+            let start = selection.map_or(bs, |m| m.as_span().start());
+            edits.push(edit(start, be, rebuilt));
+            refusal(
+                input,
+                Q013,
+                "a write's elements are written in `match { … }`, and its filters in the `where` after the braces",
+                (start, be),
+                edits,
+                MACHINE,
+            )
+        }
+    }
+}
+
+/// The assignments of a statement, in order.
 fn assigns<'i>(p: &Pair<'i, Rule>) -> Vec<Pair<'i, Rule>> {
     p.clone()
         .into_inner()
+        .filter(|a| a.as_rule() == Rule::assignments)
+        .flat_map(|a| a.into_inner())
         .filter(|a| a.as_rule() == Rule::assignment)
         .collect()
+}
+
+/// The `assignments` list of a statement, for its separators.
+fn assignments_list<'i>(p: &Pair<'i, Rule>) -> Option<Pair<'i, Rule>> {
+    child(p, Rule::assignments)
 }
 
 fn assignments_text(pairs: &[Pair<Rule>]) -> String {
@@ -1365,6 +1513,16 @@ fn assignments_text(pairs: &[Pair<Rule>]) -> String {
 fn statement(pair: Pair<Rule>) -> R<Stmt> {
     let input = input_of(&pair);
     let s = pair.into_inner().next().unwrap();
+    match s.as_rule() {
+        Rule::insert_stmt | Rule::update_stmt if assignments_list(&s).is_some() => {
+            missing_commas(&assignments_list(&s).unwrap(), "assignments")?;
+            statement_inner(input, s)
+        }
+        _ => statement_inner(input, s),
+    }
+}
+
+fn statement_inner(input: &str, s: Pair<Rule>) -> R<Stmt> {
     let span = span_of(&s);
     match s.as_rule() {
         Rule::insert_stmt => {
@@ -1400,7 +1558,7 @@ fn statement(pair: Pair<Rule>) -> R<Stmt> {
                 variable: var.as_str()[1..].to_string(),
             })
         }
-        Rule::where_stmt => Err(where_statement(s)),
+        Rule::where_stmt => Err(where_statement(s, None, None)),
         Rule::create_rec => {
             let word = s
                 .clone()
@@ -1631,85 +1789,110 @@ fn assignment_list(input: &str, pairs: &[Pair<Rule>]) -> R<Vec<Assignment>> {
     pairs.iter().map(|p| assignment(p.clone())).collect()
 }
 
-/// `delete T where φ` / `update T set { … } where φ`: the fix binds the type
-/// with a name the declaration does not use and writes `φ` as a filter
-/// clause, each bare property of `φ` and of the assignments qualified
-/// (section 5, and the rewriter's row of section 6).
-fn where_statement(s: Pair<Rule>) -> Refusal {
+/// `delete T where φ` / `update T set { … } where φ`: the fix is the group
+/// form, `match { $x: T } where φ′  delete $x`, binding the type with a name
+/// the declaration does not use, each bare property of `φ` and of the
+/// assignments qualified (section 5, and the rewriter's row of section 6).
+/// Over a bound variable, `delete $x where φ`, the predicate joins the
+/// group's `where`.
+fn where_statement(
+    s: Pair<Rule>,
+    selection: Option<&Pair<Rule>>,
+    where_pair: Option<&Pair<Rule>>,
+) -> Refusal {
     let input = input_of(&s);
     let span = span_of(&s);
+    let span = (span.0, input[..span.1].trim_end().len());
     let mut kind = "";
     let mut type_name = "";
     let mut bound = None;
     let mut set: Vec<Pair<Rule>> = Vec::new();
     let mut predicate = None;
-    for part in s.into_inner() {
+    for part in s.clone().into_inner() {
         match part.as_rule() {
             Rule::kw_update => kind = "update",
             Rule::kw_delete => kind = "delete",
             Rule::type_name => type_name = part.as_str(),
             Rule::variable => bound = Some(part.as_str()),
-            Rule::assignment => set.push(part),
+            Rule::assignments => set.extend(
+                part.into_inner()
+                    .filter(|a| a.as_rule() == Rule::assignment),
+            ),
             Rule::expr => predicate = Some(part),
             _ => {}
         }
     }
     let predicate = predicate.expect("grammar: where_stmt holds its predicate");
+    let qualified_set = |v: &str| {
+        set.iter()
+            .map(|a| qualify_bare_names(a, v))
+            .map(|t| t.trim().trim_end_matches(',').trim().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     if let Some(var) = bound {
         let name = &var[1..];
         let statement = match kind {
-            "update" => format!(
-                "update {var} set {{ {} }}",
-                set.iter()
-                    .map(|a| qualify_bare_names(a, name))
-                    .map(|t| t.trim().trim_end_matches(',').trim().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            "update" => format!("update {var} set {{ {} }}", qualified_set(name)),
             _ => format!("delete {var}"),
         };
-        return refusal(
-            input,
-            Q008,
-            format!(
-                "a statement takes no `where`; the clauses before it select the rows `{var}` names"
-            ),
-            span,
-            vec![edit(
-                span.0,
-                span.1,
-                format!(
-                    "{}  {statement}",
-                    qualify_bare_names(&predicate, name).trim()
-                ),
-            )],
-            MACHINE,
+        let filter = qualify_bare_names(&predicate, name).trim().to_string();
+        let message = format!(
+            "a statement takes no `where`; the group's `match` and `where` select the rows `{var}` names"
         );
+        let Some(m) = selection else {
+            return refusal_note(
+                input,
+                Q008,
+                message,
+                span,
+                format!("match {{ {var}: <Type> }} where {filter}  {statement}"),
+            );
+        };
+        let mut edits = vec![edit(span.0, span.1, statement)];
+        match where_pair {
+            Some(w) => {
+                let e = child(w, Rule::expr).expect("grammar: a where holds its expression");
+                let (es, ee) = (e.as_span().start(), tend(input, &e));
+                let conjunct = if top_level_or(&predicate) {
+                    format!("({filter})")
+                } else {
+                    filter.clone()
+                };
+                if top_level_or(&e) {
+                    edits.push(edit(es, es, "("));
+                    edits.push(edit(ee, ee, format!(") and {conjunct}")));
+                } else {
+                    edits.push(edit(ee, ee, format!(" and {conjunct}")));
+                }
+            }
+            None => {
+                let end = input[..m.as_span().end()].trim_end().len();
+                edits.push(edit(end, end, format!(" where {filter}")));
+            }
+        }
+        return refusal(input, Q008, message, span, edits, MACHINE);
     }
     let v = fresh_name(type_name);
     let filter = qualify_bare_names(&predicate, &v);
     let statement = match kind {
-        "update" => format!(
-            "update ${v} set {{ {} }}",
-            set.iter()
-                .map(|a| qualify_bare_names(a, &v))
-                .map(|t| t.trim().trim_end_matches(',').trim().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        "update" => format!("update ${v} set {{ {} }}", qualified_set(&v)),
         _ => format!("delete ${v}"),
     };
     refusal(
         input,
         Q008,
         format!(
-            "`{kind} {type_name} … where …` is not a statement: a statement names a bound variable and the clauses select its rows"
+            "`{kind} {type_name} … where …` is not a statement: a statement names a bound variable, and the group's `match` and `where` select its rows"
         ),
         span,
         vec![edit(
             span.0,
             span.1,
-            format!("${v}: {type_name}  {}  {statement}", filter.trim()),
+            format!(
+                "match {{ ${v}: {type_name} }} where {}  {statement}",
+                filter.trim()
+            ),
         )],
         MACHINE,
     )
@@ -1773,8 +1956,8 @@ fn lone<'i>(pair: &Pair<'i, Rule>, rule: Rule) -> Option<Pair<'i, Rule>> {
         }
         if !matches!(
             p.as_rule(),
-            Rule::clause
-                | Rule::filter
+            Rule::element
+                | Rule::filter_rec
                 | Rule::expr
                 | Rule::or_expr
                 | Rule::and_expr
@@ -1793,84 +1976,467 @@ fn lone<'i>(pair: &Pair<'i, Rule>, rule: Rule) -> Option<Pair<'i, Rule>> {
     }
 }
 
-/// The clause kind under a `clause` pair.
-fn kind<'i>(p: &Pair<'i, Rule>) -> Option<Pair<'i, Rule>> {
-    if p.as_rule() == Rule::clause {
-        p.clone().into_inner().next()
+/// The element kind under an `element` pair.
+fn kind<'i>(p: &Pair<'i, Rule>) -> Pair<'i, Rule> {
+    if p.as_rule() == Rule::element {
+        p.clone().into_inner().next().unwrap()
     } else {
-        Some(p.clone())
+        p.clone()
     }
 }
 
-fn lone_var_filter<'i>(p: &Pair<'i, Rule>) -> Option<Pair<'i, Rule>> {
-    let k = kind(p)?;
-    (k.as_rule() == Rule::filter)
-        .then(|| lone(&k, Rule::variable))
-        .flatten()
+fn child<'i>(p: &Pair<'i, Rule>, rule: Rule) -> Option<Pair<'i, Rule>> {
+    p.clone().into_inner().find(|c| c.as_rule() == rule)
 }
 
-/// A clause list, with the shapes that span two or three clauses checked
-/// first: a contextual keyword or Boolean literal written as a bare edge name
-/// between two lone variables (`$a from $b`, `$a let $b`, `$a true $b`), and
-/// Cypher's `with`, whose fix takes the clauses before it.
-fn clause_list(pairs: Vec<Pair<Rule>>) -> R<Vec<Clause>> {
-    for i in 0..pairs.len() {
-        let input = input_of(&pairs[i]);
-        if let Some(a) = lone_var_filter(&pairs[i]) {
-            // `$a from $b`: a lone-variable filter, then `from $b`.
-            if let Some(next) = pairs.get(i + 1).and_then(kind) {
-                if next.as_rule() == Rule::from_clause {
-                    let rel = next
-                        .clone()
-                        .into_inner()
-                        .find(|r| r.as_rule() == Rule::relation_expr);
-                    if let Some(b) = rel.as_ref().and_then(|r| lone(r, Rule::variable)) {
-                        let span = (pairs[i].as_span().start(), next.as_span().end());
-                        return Err(bare_edge(input, span, a.as_str(), "from", b.as_str()));
+/// Whether an expression's top level is an `or` of two or more operands.
+fn top_level_or(e: &Pair<Rule>) -> bool {
+    let or = if e.as_rule() == Rule::or_expr {
+        Some(e.clone())
+    } else {
+        lone(e, Rule::or_expr).or_else(|| child(e, Rule::or_expr))
+    };
+    or.is_some_and(|o| {
+        o.into_inner()
+            .filter(|c| c.as_rule() == Rule::and_expr)
+            .count()
+            > 1
+    })
+}
+
+/// An expression's text as one conjunct of a `where`: parenthesized when
+/// its top level is an `or`.
+fn pred_text(e: &Pair<Rule>) -> String {
+    let text = e.as_str().trim().to_string();
+    if top_level_or(e) {
+        format!("({text})")
+    } else {
+        text
+    }
+}
+
+/// The expression of a `where` (`where_clause` or `inner_where_rec`), as a
+/// conjunct.
+fn where_expr_text(w: &Pair<Rule>) -> String {
+    let e = child(w, Rule::expr).expect("grammar: a where holds its expression");
+    pred_text(&e)
+}
+
+/// The text between the outermost braces of `p`, trimmed.
+fn inner_text(p: &Pair<Rule>) -> String {
+    let t = p.as_str();
+    let open = t.find('{').map_or(0, |i| i + 1);
+    let close = t.rfind('}').unwrap_or(t.len());
+    t[open..close.max(open)].trim().to_string()
+}
+
+/// What a list of elements holds when it is rewritten: the elements as
+/// written, the predicates written among them (which belong in the `where`),
+/// and the first problem found, by position. A rebuilt `match { … } where …`
+/// is one suggestion that repairs every problem of the list at once.
+#[derive(Default)]
+struct Pieces {
+    elements: Vec<String>,
+    preds: Vec<String>,
+    problem: Option<(QueryCode, String, usize)>,
+}
+
+/// One problem of an element list.
+fn note_problem(
+    problem: &mut Option<(QueryCode, String, usize)>,
+    code: QueryCode,
+    message: &str,
+    at: usize,
+) {
+    if problem.as_ref().is_none_or(|(_, _, b)| at < *b) {
+        *problem = Some((code, message.to_string(), at));
+    }
+}
+
+impl Pieces {
+    /// The elements of an `elements` pair, a missing comma among them a
+    /// problem; returns the first element refused on its own (a foreign
+    /// form, say).
+    fn collect<'i>(&mut self, list: &Pair<'i, Rule>) -> Option<Pair<'i, Rule>> {
+        let input = input_of(list);
+        let mut own = None;
+        let mut gap: Option<usize> = None;
+        for c in list.clone().into_inner() {
+            match c.as_rule() {
+                Rule::missing_comma_rec => {
+                    gap = Some(input[..c.as_span().start()].trim_end().len());
+                }
+                Rule::element => {
+                    // A predicate written without a comma before it moves to
+                    // the `where`, so its own refusal names it.
+                    let predicate = matches!(
+                        kind(&c).as_rule(),
+                        Rule::filter_rec
+                            | Rule::negation_rec
+                            | Rule::blockless_rec
+                            | Rule::prefix_rec
+                    );
+                    if let Some(at) = gap.take().filter(|_| !predicate) {
+                        note_problem(
+                            &mut self.problem,
+                            Q016,
+                            "elements are separated by commas; a space or a newline is not a separator",
+                            at,
+                        );
+                    }
+                    if self.item(&c) && own.is_none() {
+                        own = Some(c);
                     }
                 }
-            }
-            // `$a let $b`, `$a true $b`, `$a false $b`.
-            if let (Some(mid), Some(b)) = (
-                pairs.get(i + 1).and_then(kind),
-                pairs.get(i + 2).and_then(lone_var_filter),
-            ) {
-                if mid.as_rule() == Rule::filter {
-                    let word = lone(&mid, Rule::bare_name_rec)
-                        .map(|w| w.as_str().to_string())
-                        .or_else(|| lone(&mid, Rule::bool_lit).map(|w| w.as_str().to_string()));
-                    if let Some(word) =
-                        word.filter(|w| ["let", "true", "false"].contains(&w.as_str()))
-                    {
-                        let span = (pairs[i].as_span().start(), pairs[i + 2].as_span().end());
-                        return Err(bare_edge(input, span, a.as_str(), &word, b.as_str()));
-                    }
-                }
+                _ => {}
             }
         }
-        if let Some(k) = kind(&pairs[i]) {
-            if k.as_rule() == Rule::with_rec {
-                return Err(with_clause(input, &pairs[..i], &k));
-            }
+        own
+    }
+
+    /// Elements given one by one (written bare in a write body).
+    fn collect_items<'i>(&mut self, items: impl Iterator<Item = Pair<'i, Rule>>) {
+        for e in items {
+            self.item(&e);
         }
     }
-    pairs.into_iter().map(clause).collect()
+
+    /// One element: kept, or moved to the predicates; true when it is
+    /// refused on its own.
+    fn item(&mut self, e: &Pair<Rule>) -> bool {
+        let k = kind(e);
+        let at = k.as_span().start();
+        match k.as_rule() {
+            Rule::filter_rec
+                if keyword_filter(&k).is_none()
+                    && expr(k.clone().into_inner().next().unwrap()).is_ok() =>
+            {
+                let x = k.clone().into_inner().next().unwrap();
+                self.preds.push(pred_text(&x));
+                note_problem(
+                    &mut self.problem,
+                    Q017,
+                    "a filter is not an element of `match { … }`: a predicate belongs in the `where` after the braces",
+                    at,
+                );
+            }
+            Rule::negation_rec => {
+                self.preds
+                    .push(format!("not exists {{ {} }}", inner_text(&k)));
+                note_problem(
+                    &mut self.problem,
+                    Q012,
+                    "`not { … }` is `not exists { … }`, a predicate in `where`",
+                    at,
+                );
+            }
+            Rule::binding_braces_rec => {
+                let mut inner = k.clone().into_inner();
+                let var = inner.next().unwrap().as_str();
+                let ty = inner.next().unwrap().as_str();
+                self.elements.push(format!("{var}: {ty}"));
+                for pm in child(&k, Rule::prop_match_list).unwrap().into_inner() {
+                    let mut kv = pm.into_inner();
+                    let key = kv.next().unwrap().as_str();
+                    let value = kv.next().unwrap();
+                    self.preds
+                        .push(format!("{var}.{key} = {}", value.as_str().trim()));
+                }
+                note_problem(
+                    &mut self.problem,
+                    Q010,
+                    "a binding takes no property map: `$x: T { p: v }` is the equality `$x.p = v` in `where`",
+                    at,
+                );
+            }
+            Rule::binding_brace_filter if child(&k, Rule::brace_items_rec).is_some() => {
+                let mut inner = k.clone().into_inner();
+                let var = inner.next().unwrap().as_str();
+                let ty = inner.next().unwrap().as_str();
+                self.elements.push(format!("{var}: {ty}"));
+                for item in child(&k, Rule::brace_items_rec).unwrap().into_inner() {
+                    let it = item.into_inner().next().unwrap();
+                    let mut parts = it.clone().into_inner();
+                    let key = parts.next().unwrap().as_str();
+                    match it.as_rule() {
+                        Rule::prop_match => {
+                            let value = parts.next().unwrap().as_str().trim();
+                            self.preds.push(format!("{var}.{key} = {value}"));
+                        }
+                        _ => {
+                            let op = parts.next().unwrap().as_str();
+                            let value = parts.next().unwrap().as_str().trim();
+                            self.preds.push(format!("{var}.{key} {op} {value}"));
+                        }
+                    }
+                }
+                note_problem(
+                    &mut self.problem,
+                    Q010,
+                    "a binding takes no braces: a comparison on its property belongs in `where`",
+                    at,
+                );
+            }
+            Rule::binding_paren_rec if child(&k, Rule::prop_match_list).is_some() => {
+                let mut inner = k.clone().into_inner();
+                let var = inner.next().unwrap().as_str();
+                let head = inner.next().unwrap();
+                let ty = head.as_str().trim_end_matches('(').trim();
+                self.elements.push(format!("{var}: {ty}"));
+                for pm in child(&k, Rule::prop_match_list).unwrap().into_inner() {
+                    let mut kv = pm.into_inner();
+                    let key = kv.next().unwrap().as_str();
+                    let value = kv.next().unwrap();
+                    self.preds
+                        .push(format!("{var}.{key} = {}", value.as_str().trim()));
+                }
+                note_problem(
+                    &mut self.problem,
+                    Q014,
+                    "a binding is `$x: Type`; its property tests are comparisons in `where`",
+                    at,
+                );
+            }
+            Rule::blockless_rec => {
+                let word = k.clone().into_inner().next().unwrap();
+                let pattern = k.clone().into_inner().nth(1).unwrap();
+                let w = if word.as_str() == "not" {
+                    "not exists"
+                } else {
+                    "exists"
+                };
+                self.preds
+                    .push(format!("{w} {{ {} }}", pattern.as_str().trim()));
+                note_problem(
+                    &mut self.problem,
+                    Q014,
+                    "a pattern test takes its pattern in braces, and is a predicate in `where`: `where not exists { … }`",
+                    at,
+                );
+            }
+            Rule::prefix_rec => {
+                let inner = k.clone().into_inner().nth(1).unwrap();
+                let ik = kind(&inner);
+                if ik.as_rule() == Rule::filter_rec {
+                    self.preds
+                        .push(pred_text(&ik.clone().into_inner().next().unwrap()));
+                } else {
+                    self.elements.push(inner.as_str().trim().to_string());
+                }
+                note_problem(
+                    &mut self.problem,
+                    Q014,
+                    "`filter` is not GQ: a filter is a conjunct of the `where` after the `match` braces",
+                    at,
+                );
+            }
+            Rule::let_clause
+            | Rule::from_clause
+            | Rule::optional_block
+            | Rule::binding
+            | Rule::traversal => self.elements.push(e.as_str().trim().to_string()),
+            _ => {
+                self.elements.push(e.as_str().trim().to_string());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `match { elements } [where predicates]`.
+    fn render_match(&self) -> String {
+        let mut out = format!("match {{ {} }}", self.elements.join(", "));
+        if !self.preds.is_empty() {
+            out.push_str(&format!(" where {}", self.preds.join(" and ")));
+        }
+        out
+    }
+
+    /// `elements [where predicates]`, a block's braces' content.
+    fn render_block(&self) -> String {
+        let mut out = self.elements.join(", ");
+        if !self.preds.is_empty() {
+            out.push_str(&format!(" where {}", self.preds.join(" and ")));
+        }
+        out
+    }
 }
 
-fn bare_edge(input: &str, span: (usize, usize), a: &str, word: &str, b: &str) -> Refusal {
-    refusal(
+/// The list's elements built, or the refusal of its first problem: an
+/// element refused on its own, or the list rewritten as `rebuild` writes
+/// `pieces` over `region`.
+fn build_elements(
+    list: &Pair<Rule>,
+    mut pieces: Pieces,
+    own: Option<Pair<Rule>>,
+    region: (usize, usize),
+    rebuild: impl Fn(&Pieces) -> String,
+) -> R<(Vec<Element>, Vec<SourceSpan>)> {
+    let input = input_of(list);
+    let problem = pieces.problem.take();
+    let pairs: Vec<Pair<Rule>> = list
+        .clone()
+        .into_inner()
+        .filter(|c| c.as_rule() == Rule::element)
+        .collect();
+    if let Some(own) = &own {
+        if problem
+            .as_ref()
+            .is_none_or(|(_, _, at)| own.as_span().start() < *at)
+        {
+            let i = pairs
+                .iter()
+                .position(|p| p.as_span().start() == own.as_span().start())
+                .unwrap_or(0);
+            element(own.clone(), &pairs[..i])?;
+        }
+    }
+    if let Some((code, message, at)) = problem {
+        let end = input[..region.1].trim_end().len();
+        let mut refused = refusal(
+            input,
+            code,
+            message,
+            (region.0, end),
+            vec![edit(region.0, end, rebuild(&pieces))],
+            MACHINE,
+        );
+        refused.diagnostic.position = Some(Position::at(input, at));
+        return Err(refused);
+    }
+    let spans = pairs.iter().map(source_span).collect();
+    let mut elements = Vec::new();
+    for (i, p) in pairs.iter().enumerate() {
+        elements.push(element(p.clone(), &pairs[..i])?);
+    }
+    Ok((elements, spans))
+}
+
+/// A `match { … }` (a read's or a write group's) and the `where` after it.
+fn match_pattern(m: &Pair<Rule>, w: Option<&Pair<Rule>>) -> R<Pattern> {
+    let input = input_of(m);
+    let list = child(m, Rule::elements).expect("grammar: match holds its elements");
+    let mut pieces = Pieces::default();
+    let own = pieces.collect(&list);
+    if let Some(inner) = child(m, Rule::inner_where_rec) {
+        pieces.preds.push(where_expr_text(&inner));
+        note_problem(
+            &mut pieces.problem,
+            Q017,
+            "`where` follows the `match` braces, not inside them: `match { … } where <expression>`",
+            inner.as_span().start(),
+        );
+    }
+    if let Some(w) = w {
+        pieces.preds.push(where_expr_text(w));
+    }
+    let region = (
+        m.as_span().start(),
+        w.map_or(m.as_span().end(), |w| w.as_span().end()),
+    );
+    let (elements, spans) = build_elements(&list, pieces, own, region, Pieces::render_match)?;
+    let close = input[..m.as_span().end()].trim_end().len();
+    let (predicate, predicate_span) = match w {
+        Some(w) => {
+            let e = child(w, Rule::expr).expect("grammar: a where holds its expression");
+            (Some(expr(e.clone())?), Some(source_span(&e)))
+        }
+        None => (None, None),
+    };
+    Ok(Pattern {
+        elements,
+        predicate,
+        spans: PatternSpans {
+            elements: spans,
+            predicate: predicate_span,
+            close: Some(close),
+        },
+    })
+}
+
+/// A block's or an `optional`'s braces: its elements and its own `where`.
+fn block_pattern(body: &Pair<Rule>) -> R<Pattern> {
+    let list = child(body, Rule::elements).expect("grammar: a block holds its elements");
+    let w = child(body, Rule::where_clause);
+    let mut pieces = Pieces::default();
+    let own = pieces.collect(&list);
+    if let Some(w) = &w {
+        pieces.preds.push(where_expr_text(w));
+    }
+    let region = span_of(body);
+    let (elements, spans) = build_elements(&list, pieces, own, region, Pieces::render_block)?;
+    let (predicate, predicate_span) = match &w {
+        Some(w) => {
+            let e = child(w, Rule::expr).expect("grammar: a where holds its expression");
+            (Some(expr(e.clone())?), Some(source_span(&e)))
+        }
+        None => (None, None),
+    };
+    Ok(Pattern {
+        elements,
+        predicate,
+        spans: PatternSpans {
+            elements: spans,
+            predicate: predicate_span,
+            close: None,
+        },
+    })
+}
+
+/// `Q016` for a list whose items are separated by whitespace alone: one
+/// suggestion inserting every missing comma.
+fn missing_commas(list: &Pair<Rule>, what: &str) -> R<()> {
+    let input = input_of(list);
+    let edits: Vec<TextEdit> = list
+        .clone()
+        .into_inner()
+        .filter(|c| c.as_rule() == Rule::missing_comma_rec)
+        .map(|c| {
+            let at = input[..c.as_span().start()].trim_end().len();
+            edit(at, at, ",")
+        })
+        .collect();
+    let Some(first) = edits.first().map(|e| e.start) else {
+        return Ok(());
+    };
+    let mut refused = refusal(
         input,
-        Q017,
-        format!(
-            "`{word}` is never a bare edge name: between two variables it would read as a clause or a literal; an edge named `{word}` is quoted"
-        ),
-        span,
-        vec![edit(span.0, span.1, format!("{a} \"{word}\" {b}"))],
-        REVIEW,
-    )
+        Q016,
+        format!("{what} are separated by commas; a space or a newline is not a separator"),
+        span_of(list),
+        edits,
+        MACHINE,
+    );
+    refused.diagnostic.position = Some(Position::at(input, first));
+    Err(refused)
 }
 
-/// Cypher's `… WITH x, agg AS n …`: the clauses before it become an inline
+/// A lone bare word at element start that is an element keyword written
+/// without what it takes: refused with that keyword's message.
+fn keyword_filter(k: &Pair<Rule>) -> Option<Refusal> {
+    let input = input_of(k);
+    let e = k.clone().into_inner().next()?;
+    let word = lone(&e, Rule::bare_name_rec)?;
+    let span = span_of(&word);
+    let (message, note) = match word.as_str() {
+        "from" => (
+            "`from` takes a relation: an inline read `{ match { … } return { … } }`, `$r`, or a call",
+            "from { match { … } return { … } }",
+        ),
+        "let" => (
+            "`let` names a value: `let $name = <value>`",
+            "let $name = <value>",
+        ),
+        "optional" | "exists" | "not" => (
+            "this word takes a block of elements in braces",
+            "optional { … }",
+        ),
+        _ => return None,
+    };
+    Some(refusal_note(input, Q018, message, span, note))
+}
+
+/// Cypher's `… WITH x, agg AS n …`: the elements before it become an inline
 /// read whose `return` is the `with` items, drawn with `from`.
 fn with_clause(input: &str, before: &[Pair<Rule>], with: &Pair<Rule>) -> Refusal {
     let items: Vec<&str> = with
@@ -1890,7 +2456,10 @@ fn with_clause(input: &str, before: &[Pair<Rule>], with: &Pair<Rule>) -> Refusal
         );
     };
     let start = first.as_span().start();
-    let clauses = input[start..with.as_span().start()].trim();
+    let elements = input[start..with.as_span().start()]
+        .trim()
+        .trim_end_matches(',')
+        .trim();
     let span = (start, with.as_span().end());
     refusal(
         input,
@@ -1901,7 +2470,7 @@ fn with_clause(input: &str, before: &[Pair<Rule>], with: &Pair<Rule>) -> Refusal
             span.0,
             span.1,
             format!(
-                "from {{ match {{ {clauses} }} return {{ {} }} }}",
+                "from {{ match {{ {elements} }} return {{ {} }} }}",
                 items.join(", ")
             ),
         )],
@@ -1911,7 +2480,7 @@ fn with_clause(input: &str, before: &[Pair<Rule>], with: &Pair<Rule>) -> Refusal
 
 /// Merge an inner refusal's edits into an outer recognizer's edits, so one
 /// suggestion repairs both (the outer construct is the span).
-fn compose_inner(outer: Vec<TextEdit>, inner: Result<Clause, Refusal>) -> R<Vec<TextEdit>> {
+fn compose_inner(outer: Vec<TextEdit>, inner: Result<Element, Refusal>) -> R<Vec<TextEdit>> {
     match inner {
         Ok(_) => Ok(outer),
         Err(r) if !r.edits().is_empty() => {
@@ -1927,16 +2496,12 @@ fn compose_inner(outer: Vec<TextEdit>, inner: Result<Clause, Refusal>) -> R<Vec<
     }
 }
 
-fn inner_clauses<'i>(p: &Pair<'i, Rule>) -> Vec<Pair<'i, Rule>> {
-    p.clone()
-        .into_inner()
-        .filter(|c| matches!(c.as_rule(), Rule::clause | Rule::stmt_edge_rec))
-        .collect()
-}
-
-fn clause(pair: Pair<Rule>) -> R<Clause> {
+/// One element; `before` are the elements written before it in its list.
+/// A recognizer is refused with its fix; a predicate never reaches here
+/// (its list is refused first).
+fn element(pair: Pair<Rule>, before: &[Pair<Rule>]) -> R<Element> {
     let input = input_of(&pair);
-    let c = kind(&pair).unwrap();
+    let c = kind(&pair);
     let span = span_of(&c);
     match c.as_rule() {
         Rule::let_clause => {
@@ -1945,19 +2510,16 @@ fn clause(pair: Pair<Rule>) -> R<Clause> {
             let value = inner.next().unwrap();
             let value = match value.as_rule() {
                 Rule::inline_read => LetValue::Relation(Box::new(inline_read(value)?)),
-                _ => {
-                    let start = value.as_span().start();
-                    LetValue::Expr(at_top(Top::Clause, start, || expr(value))?)
-                }
+                _ => LetValue::Expr(expr(value)?),
             };
-            Ok(Clause::Let { name, value })
+            Ok(Element::Let { name, value })
         }
         Rule::from_clause => {
             let rel = c
                 .into_inner()
                 .find(|p| p.as_rule() == Rule::relation_expr)
                 .unwrap();
-            Ok(Clause::From(relation(rel)?))
+            Ok(Element::From(relation(rel)?))
         }
         Rule::from_paren_rec => {
             let rel = c
@@ -1978,66 +2540,53 @@ fn clause(pair: Pair<Rule>) -> R<Clause> {
                 MACHINE,
             ))
         }
-        Rule::negation => Ok(Clause::Not(clause_list(inner_clauses(&c))?)),
-        Rule::optional_block => Ok(Clause::Optional(clause_list(inner_clauses(&c))?)),
+        Rule::optional_block => {
+            let body = child(&c, Rule::block_body).unwrap();
+            Ok(Element::Optional(block_pattern(&body)?))
+        }
         Rule::binding => {
             let mut inner = c.into_inner();
             let variable = inner.next().unwrap().as_str()[1..].to_string();
             let type_name = inner.next().unwrap().as_str().to_string();
-            let mut prop_matches = Vec::new();
-            if let Some(list) = inner.next() {
-                for pm in list.into_inner() {
-                    let mut kv = pm.into_inner();
-                    let key = kv.next().unwrap().as_str().to_string();
-                    prop_matches.push((key, expr(kv.next().unwrap())?));
-                }
-            }
-            Ok(Clause::Binding {
+            Ok(Element::Binding {
                 variable,
                 type_name,
-                prop_matches,
             })
         }
-        Rule::binding_brace_filter => Err(brace_filter(c)),
-        Rule::binding_paren_rec => {
+        Rule::binding_brace_filter => {
             let mut inner = c.clone().into_inner();
             let var = inner.next().unwrap().as_str();
-            let head = inner.next().unwrap();
+            let ty = inner.next().unwrap().as_str();
+            Err(refusal_note(
+                input,
+                Q010,
+                "a binding takes no braces; a test of its properties is a comparison in `where`",
+                span,
+                format!("match {{ {var}: {ty} }} where {var}.<property> = <value>"),
+            ))
+        }
+        Rule::binding_paren_rec => {
+            let mut inner = c.clone().into_inner();
+            let head = inner.nth(1).unwrap();
             let ty = head.as_str().trim_end_matches('(').trim();
-            let args = inner.next();
-            Err(match args.as_ref().map(|a| a.as_rule()) {
-                Some(Rule::call_args) => {
-                    let name = lower_first(ty);
-                    refusal(
-                        input,
-                        Q014,
-                        "the view binding `$x: View(args)` was withdrawn: a declared read is drawn with `from name(args)`",
-                        span,
-                        vec![edit(
-                            span.0,
-                            span.1,
-                            format!("from {name}({})", args.unwrap().as_str().trim()),
-                        )],
-                        REVIEW,
-                    )
-                }
-                _ => refusal(
-                    input,
-                    Q014,
-                    "a binding's property matches are in braces, `$x: Type { property: value }`",
-                    span,
-                    vec![edit(
-                        span.0,
-                        span.1,
-                        format!(
-                            "{var}: {ty} {{ {} }}",
-                            args.map(|a| a.as_str().trim().to_string())
-                                .unwrap_or_default()
-                        ),
-                    )],
-                    MACHINE,
-                ),
-            })
+            let args = inner.find(|a| a.as_rule() == Rule::call_args);
+            let name = lower_first(ty);
+            Err(refusal(
+                input,
+                Q014,
+                "the view binding `$x: View(args)` was withdrawn: a declared read is drawn with `from name(args)`",
+                span,
+                vec![edit(
+                    span.0,
+                    span.1,
+                    format!(
+                        "from {name}({})",
+                        args.map(|a| a.as_str().trim().to_string())
+                            .unwrap_or_default()
+                    ),
+                )],
+                REVIEW,
+            ))
         }
         Rule::binding_lower_rec => {
             let ident = c.clone().into_inner().nth(1).unwrap();
@@ -2054,31 +2603,25 @@ fn clause(pair: Pair<Rule>) -> R<Clause> {
                 REVIEW,
             ))
         }
-        Rule::traversal => Ok(Clause::Traversal(traversal(c)?)),
-        Rule::stmt_edge_rec => {
-            let mut parts = c.clone().into_inner();
-            let a = parts.next().unwrap().as_str();
-            let word = parts.next().unwrap().as_str();
-            let b = parts.next().unwrap().as_str();
-            Err(bare_edge(input, span, a, word, b))
-        }
+        Rule::traversal => Ok(Element::Traversal(traversal(c)?)),
         Rule::arrow_traversal => Err(arrow(c)),
         Rule::cypher_pattern => Err(cypher_pattern(c)),
         Rule::list_to_rows => Err(list_to_rows(c)),
-        Rule::prefix_rec | Rule::match_prefix_rec => {
+        Rule::match_prefix_rec => {
             let word = c.clone().into_inner().next().unwrap();
             let inner = c.clone().into_inner().nth(1).unwrap();
             let (ws, we) = with_trailing_ws(input, word.as_span().start(), word.as_span().end());
-            let edits = compose_inner(vec![edit(ws, we, "")], clause(inner))?;
-            let w = word.as_str().to_ascii_lowercase();
-            let message = if w == "match" {
-                "`match` wraps a read's clauses once; inside it, and in a write body, clauses are written bare".to_string()
-            } else {
-                format!("`{w}` is not GQ: a filter is a clause of its own, written bare")
-            };
-            Err(refusal(input, Q014, message, span, edits, MACHINE))
+            let edits = compose_inner(vec![edit(ws, we, "")], element(inner, &[]))?;
+            Err(refusal(
+                input,
+                Q014,
+                "`match` wraps a read's elements once, in braces",
+                span,
+                edits,
+                MACHINE,
+            ))
         }
-        Rule::with_rec => unreachable!("clause_list refuses `with` first"),
+        Rule::with_rec => Err(with_clause(input, before, &c)),
         Rule::call_block_rec => {
             let word = c.clone().into_inner().next().unwrap();
             let (s, e) = span_of(&word);
@@ -2107,74 +2650,37 @@ fn clause(pair: Pair<Rule>) -> R<Clause> {
                 let (s, e) = with_trailing_ws(input, m.as_span().start(), m.as_span().end());
                 edits.push(edit(s, e, ""));
             }
-            let clauses: Vec<&Pair<Rule>> = rest
+            let elements: Vec<Pair<Rule>> = rest
                 .iter()
-                .filter(|p| p.as_rule() == Rule::clause)
+                .flat_map(|p| match p.as_rule() {
+                    Rule::element => vec![p.clone()],
+                    Rule::elements => p
+                        .clone()
+                        .into_inner()
+                        .filter(|e| e.as_rule() == Rule::element)
+                        .collect(),
+                    _ => Vec::new(),
+                })
                 .collect();
-            let braced = input[word.as_span().end()..].trim_start().starts_with('{')
-                || rest.iter().any(|p| p.as_rule() == Rule::fw_match)
-                    && input[rest[0].as_span().end()..]
-                        .trim_start()
-                        .starts_with('{');
+            let braced = rest.iter().any(|p| p.as_rule() == Rule::elements);
             if !braced {
-                if let Some(cl) = clauses.first() {
+                if let Some(cl) = elements.first() {
                     let (s, e) = span_of(cl);
+                    let e = input[..e].trim_end().len();
                     edits.push(edit(s, s, "{ "));
                     edits.push(edit(e, e, " }"));
                 }
             }
             let mut all = edits;
-            for cl in clauses {
-                all = compose_inner(all, clause(cl.clone()))?;
+            for cl in elements {
+                all = compose_inner(all, element(cl, &[]))?;
             }
             Err(refusal(
                 input,
                 Q014,
-                "`optional` takes its clauses in braces: `optional { … }`",
+                "`optional` takes its elements in braces: `optional { … }`",
                 span,
                 all,
-                MACHINE,
-            ))
-        }
-        Rule::blockless_rec => {
-            let word = c.clone().into_inner().next().unwrap();
-            let inner = c.clone().into_inner().nth(1).unwrap();
-            let (s, e) = span_of(&inner);
-            let edits = vec![edit(s, s, "{ "), edit(e, e, " }")];
-            let inner_clause = match inner.as_rule() {
-                Rule::traversal => traversal(inner.clone()).map(Clause::Traversal),
-                Rule::arrow_traversal => Err(arrow(inner.clone())),
-                Rule::cypher_pattern => Err(cypher_pattern(inner.clone())),
-                _ => Ok(Clause::Filter(Expr::Literal(Literal::Bool(true)))),
-            };
-            let edits = compose_inner(edits, inner_clause)?;
-            Err(refusal(
-                input,
-                Q014,
-                format!(
-                    "`{}` over a pattern takes it in braces: `{} {{ … }}`",
-                    word.as_str(),
-                    word.as_str()
-                ),
-                span,
-                edits,
-                MACHINE,
-            ))
-        }
-        Rule::match_block_rec => {
-            let kw = c.clone().into_inner().next().unwrap();
-            let first = c.clone().into_inner().nth(1).unwrap();
-            let open_end = first.as_span().start();
-            let close = input[..span.1 - 1].trim_end().len();
-            Err(refusal(
-                input,
-                Q005,
-                "a write body's clauses are written bare, not inside `match { }`",
-                span,
-                vec![
-                    edit(kw.as_span().start(), open_end, ""),
-                    edit(close, span.1, ""),
-                ],
                 MACHINE,
             ))
         }
@@ -2189,62 +2695,35 @@ fn clause(pair: Pair<Rule>) -> R<Clause> {
                 MACHINE,
             ))
         }
-        Rule::filter => {
-            let e = c.into_inner().next().unwrap();
-            let start = e.as_span().start();
-            Ok(Clause::Filter(at_top(Top::Clause, start, || {
-                filter_expr(e)
-            })?))
+        Rule::filter_rec => {
+            if let Some(r) = keyword_filter(&c) {
+                return Err(r);
+            }
+            expr(c.clone().into_inner().next().unwrap())?;
+            Err(refusal_note(
+                input,
+                Q017,
+                "a filter is not an element of `match { … }`: a predicate belongs in the `where` after the braces",
+                span,
+                "match { … } where <predicate>",
+            ))
         }
         Rule::stray_braces_rec => Err(refusal_note(
             input,
             Q010,
-            "property matches belong in a binding's braces, `$x: Type { property: value }`; a clause does not start with `{`",
+            "an element does not start with `{`; a test of a binding's properties is a comparison in `where`",
             span,
-            "$x: Type { <property>: <value> }",
+            "match { $x: Type } where $x.<property> = <value>",
         )),
-        other => unreachable!("grammar: clause holds no {other:?}"),
+        // A predicate inside a recognizer's own elements.
+        _ => Err(refusal_note(
+            input,
+            Q017,
+            "a predicate is not an element of `match { … }`: it belongs in the `where` after the braces",
+            span,
+            "match { … } where <predicate>",
+        )),
     }
-}
-
-/// A filter clause; a lone bare name at clause start that is a clause
-/// keyword gets that keyword's message.
-fn filter_expr(e: Pair<Rule>) -> R<Expr> {
-    let input = input_of(&e);
-    if let Some(word) = lone(&e, Rule::bare_name_rec) {
-        let w = word.as_str();
-        let span = span_of(&word);
-        let note = match w {
-            "from" => Some((
-                "`from` takes a relation: an inline read `{ match { … } return { … } }`, `$r`, or a call whose name touches its `(`",
-                "from { match { … } return { … } }",
-            )),
-            "let" => Some((
-                "`let` names a value: `let $name = <value>`",
-                "let $name = <value>",
-            )),
-            "optional" | "exists" | "not" => Some((
-                "this word takes a block of clauses in braces",
-                "optional { … }",
-            )),
-            "match" => {
-                let (s, e2) = with_trailing_ws(input, span.0, span.1);
-                return Err(refusal(
-                    input,
-                    Q005,
-                    "a write body's clauses are written bare; `match` belongs to a read",
-                    span,
-                    vec![edit(s, e2, "")],
-                    MACHINE,
-                ));
-            }
-            _ => None,
-        };
-        if let Some((message, note)) = note {
-            return Err(refusal_note(input, Q018, message, span, note));
-        }
-    }
-    expr(e)
 }
 
 fn lower_first(s: &str) -> String {
@@ -2409,10 +2888,10 @@ fn cypher_pattern(c: Pair<Rule>) -> Refusal {
             _ => {}
         }
     }
-    let message = "a graph pattern in GQ is bindings and triples over `$` variables: `$a: Person  $a knows $b`";
+    let message = "a graph pattern in GQ is bindings and triples over `$` variables: `$a: Person, $a knows $b`";
     for (i, (open, close, edge, hops)) in rels.iter().enumerate() {
         if edge.is_empty() {
-            return refusal_note(input, Q014, message, span, "$a: Type  $a <edge> $b");
+            return refusal_note(input, Q014, message, span, "$a: Type, $a <edge> $b");
         }
         let (a, b) = (&nodes[i], &nodes[i + 1]);
         out.push(match (open.as_str(), close.as_str()) {
@@ -2426,7 +2905,7 @@ fn cypher_pattern(c: Pair<Rule>) -> Refusal {
         Q014,
         message,
         span,
-        vec![edit(span.0, span.1, out.join("  "))],
+        vec![edit(span.0, span.1, out.join(", "))],
         MACHINE,
     )
 }
@@ -2468,80 +2947,21 @@ fn list_to_rows(c: Pair<Rule>) -> Refusal {
             REVIEW,
         );
     }
-    // Over a list there is no row form: the RFC's fix tests membership, and
-    // the variable must then be bound by a clause of its own.
-    let var = parts.iter().find(|p| p.as_rule() == Rule::variable);
-    let list = parts.iter().find(|p| p.as_rule() == Rule::expr);
-    match (var, list) {
-        (Some(v), Some(l)) => refusal(
-            input,
-            Q012,
-            message,
-            span,
-            vec![edit(
-                span.0,
-                span.1,
-                format!("{} in {}", v.as_str(), l.as_str().trim()),
-            )],
-            REVIEW,
-        ),
-        _ => refusal_note(input, Q012, message, span, "from <relation>"),
-    }
-}
-
-/// `$d: Doc { year >= 2025 }`: the equalities stay in the braces, each
-/// comparison becomes a filter clause on the bound variable.
-fn brace_filter(c: Pair<Rule>) -> Refusal {
-    let input = input_of(&c);
-    let span = span_of(&c);
-    let mut inner = c.clone().into_inner();
-    let var = inner.next().unwrap().as_str();
-    let ty = inner.next().unwrap().as_str();
-    let body = inner.next().unwrap();
-    let message =
-        "the braces of a binding hold `property: value` matches; a comparison is a filter clause";
-    if body.as_rule() != Rule::brace_items_rec {
-        return refusal_note(
-            input,
-            Q010,
-            "the braces of a binding hold `property: value` matches, each value a literal, parameter or expression",
-            span,
-            format!("{var}: {ty} {{ <property>: <value> }}"),
-        );
-    }
-    let mut kept = Vec::new();
-    let mut filters = Vec::new();
-    for item in body.into_inner() {
-        let it = item.into_inner().next().unwrap();
-        match it.as_rule() {
-            Rule::prop_match => kept.push(it.as_str().trim().to_string()),
-            Rule::brace_compare | Rule::brace_colon_compare => {
-                let mut parts = it.into_inner();
-                let key = parts.next().unwrap().as_str();
-                let op = parts.next().unwrap().as_str();
-                let value = parts.next().unwrap().as_str().trim();
-                filters.push(format!("{var}.{key} {op} {value}"));
-            }
-            _ => {}
+    // Over a list there is no row form, and the parser cannot tell a
+    // relation from a list: both readings are printed.
+    match parts.iter().find(|p| p.as_rule() == Rule::expr) {
+        Some(l) => {
+            let l = l.as_str().trim();
+            refusal_note(
+                input,
+                Q012,
+                message,
+                span,
+                format!("`from {l}` for its rows, or `$x.<property> in {l}` in `where` for a list"),
+            )
         }
+        None => refusal_note(input, Q012, message, span, "from <relation>"),
     }
-    let binding = if kept.is_empty() {
-        format!("{var}: {ty}")
-    } else {
-        format!("{var}: {ty} {{ {} }}", kept.join(", "))
-    };
-    refusal(
-        input,
-        Q010,
-        message,
-        span,
-        vec![edit(
-            span.0,
-            span.1,
-            format!("{binding}  {}", filters.join("  ")),
-        )],
-        MACHINE,
-    )
 }
 
 fn traversal(pair: Pair<Rule>) -> R<Traversal> {
@@ -2579,6 +2999,22 @@ fn traversal(pair: Pair<Rule>) -> R<Traversal> {
 
 fn edge_selector(pair: Pair<Rule>) -> R<EdgeSelector> {
     match pair.as_rule() {
+        Rule::edge_group_rec => {
+            let input = input_of(&pair);
+            let name = pair.clone().into_inner().next().unwrap();
+            Err(refusal(
+                input,
+                Q012,
+                "a group of one edge name is that name; an alternation is `(a | b)`",
+                span_of(&pair),
+                vec![edit(
+                    pair.as_span().start(),
+                    tend(input, &pair),
+                    name.as_str(),
+                )],
+                MACHINE,
+            ))
+        }
         Rule::edge_sel | Rule::edge_alternation => edge_selector(pair.into_inner().next().unwrap()),
         Rule::edge_wildcard => Ok(EdgeSelector::Wildcard),
         Rule::edge_alternatives => Ok(EdgeSelector::Alternation(
@@ -2603,13 +3039,15 @@ fn inline_read(pair: Pair<Rule>) -> R<ReadBody> {
     let input = input_of(&pair);
     let body = pair.into_inner().next().unwrap();
     if body.as_rule() == Rule::matchless_read_rec {
-        let clauses: Vec<Pair<Rule>> = body
+        let elements: Vec<Pair<Rule>> = body
             .clone()
             .into_inner()
-            .filter(|p| p.as_rule() == Rule::clause)
+            .filter(|p| p.as_rule() == Rule::element)
             .collect();
-        let start = clauses.first().unwrap().as_span().start();
-        let end = clauses.last().unwrap().as_span().end();
+        let start = elements.first().unwrap().as_span().start();
+        let end = input[..elements.last().unwrap().as_span().end()]
+            .trim_end()
+            .len();
         return Err(refusal(
             input,
             Q020,
@@ -2627,31 +3065,9 @@ fn relation(pair: Pair<Rule>) -> R<RelExpr> {
     match r.as_rule() {
         Rule::inline_read => Ok(RelExpr::Inline(Box::new(inline_read(r)?))),
         Rule::call => Ok(RelExpr::Call(call(r)?)),
-        Rule::spaced_call_rec => Err(spaced_call(r)),
         Rule::variable => Ok(RelExpr::Variable(r.as_str()[1..].to_string())),
         other => unreachable!("grammar: relation_expr holds no {other:?}"),
     }
-}
-
-/// `name (…)`: the name touches its parenthesis.
-fn spaced_call(r: Pair<Rule>) -> Refusal {
-    let input = input_of(&r);
-    let head = r.clone().into_inner().next().unwrap();
-    let name = head.clone().into_inner().next().unwrap();
-    let ne = name.as_span().end();
-    let paren = head.as_span().end() - 1;
-    refusal(
-        input,
-        Q019,
-        format!(
-            "a call's name touches its parenthesis: `{}(`; with a space, `{}` reads as a bare name",
-            name.as_str(),
-            name.as_str()
-        ),
-        span_of(&r),
-        vec![edit(ne, paren, "")],
-        MACHINE,
-    )
 }
 
 fn call(pair: Pair<Rule>) -> R<Call> {
@@ -2660,18 +3076,21 @@ fn call(pair: Pair<Rule>) -> R<Call> {
     let mut options = Vec::new();
     for part in pair.into_inner() {
         match part.as_rule() {
-            Rule::call_head => {
-                name = part.into_inner().next().unwrap().as_str().to_string();
-            }
+            Rule::call_name => name = part.as_str().to_string(),
             Rule::call_args => {
-                if let Some(mixed) = part
+                missing_commas(&part, "a call's arguments")?;
+                let items: Vec<Pair<Rule>> = part
                     .clone()
                     .into_inner()
-                    .find(|a| a.as_rule() == Rule::mixed_args_rec)
+                    .filter(|a| matches!(a.as_rule(), Rule::positional | Rule::call_option))
+                    .collect();
+                let first_option = items.iter().position(|a| a.as_rule() == Rule::call_option);
+                if first_option
+                    .is_some_and(|o| items[o..].iter().any(|a| a.as_rule() == Rule::positional))
                 {
-                    return Err(mixed_args(mixed));
+                    return Err(mixed_args(&part, &items));
                 }
-                for a in part.into_inner() {
+                for a in items {
                     match a.as_rule() {
                         Rule::positional => {
                             let v = a.into_inner().next().unwrap();
@@ -2680,7 +3099,7 @@ fn call(pair: Pair<Rule>) -> R<Call> {
                                 _ => Arg::Expr(expr(v)?),
                             });
                         }
-                        Rule::call_option => {
+                        _ => {
                             let mut kv = a.into_inner();
                             let key = kv.next().unwrap().as_str().to_string();
                             let value = kv.next().unwrap();
@@ -2693,7 +3112,6 @@ fn call(pair: Pair<Rule>) -> R<Call> {
                             };
                             options.push((key, value));
                         }
-                        _ => {}
                     }
                 }
             }
@@ -2709,13 +3127,11 @@ fn call(pair: Pair<Rule>) -> R<Call> {
 
 /// An option before a positional argument: the positionals first, in order,
 /// then the options.
-fn mixed_args(mixed: Pair<Rule>) -> Refusal {
-    let input = input_of(&mixed);
-    let span = span_of(&mixed);
-    let (pos, opts): (Vec<Pair<Rule>>, Vec<Pair<Rule>>) = mixed
-        .clone()
-        .into_inner()
-        .partition(|p| p.as_rule() == Rule::positional);
+fn mixed_args(list: &Pair<Rule>, items: &[Pair<Rule>]) -> Refusal {
+    let input = input_of(list);
+    let span = span_of(list);
+    let (pos, opts): (Vec<&Pair<Rule>>, Vec<&Pair<Rule>>) =
+        items.iter().partition(|p| p.as_rule() == Rule::positional);
     let text: Vec<&str> = pos
         .iter()
         .chain(opts.iter())
@@ -2774,6 +3190,18 @@ fn expr(pair: Pair<Rule>) -> R<Expr> {
         Rule::not_expr => {
             let mut parts = pair.into_inner();
             let first = parts.next().unwrap();
+            if first.as_rule() == Rule::not_block_rec {
+                let kw = first.clone().into_inner().next().unwrap();
+                let end = kw.as_span().end();
+                return Err(refusal(
+                    input,
+                    Q012,
+                    "`not { … }` is written `not exists { … }`",
+                    span_of(&first),
+                    vec![edit(end, end, " exists")],
+                    MACHINE,
+                ));
+            }
             if first.as_rule() == Rule::kw_not {
                 Ok(Expr::Not(Box::new(expr(parts.next().unwrap())?)))
             } else {
@@ -2798,7 +3226,7 @@ fn expr(pair: Pair<Rule>) -> R<Expr> {
 
 fn comparison(pair: Pair<Rule>) -> R<Expr> {
     let input = input_of(&pair);
-    let span = span_of(&pair);
+    let span = (pair.as_span().start(), tend(input, &pair));
     let parts: Vec<Pair<Rule>> = pair.into_inner().collect();
     let left_pair = parts[0].clone();
     let left_source = left_pair.as_str().trim().to_string();
@@ -2983,7 +3411,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
 }
 
 fn arithmetic(input: &str, pair: Pair<Rule>) -> R<Expr> {
-    let span = span_of(&pair);
+    let span = (pair.as_span().start(), tend(input, &pair));
     let parts: Vec<Pair<Rule>> = pair.into_inner().collect();
     // `a || b || c`: one concat call over the flattened chain.
     if parts.iter().any(|p| p.as_str() == "||") {
@@ -3012,55 +3440,12 @@ fn arithmetic(input: &str, pair: Pair<Rule>) -> R<Expr> {
             )
         });
     }
-    let top = with_ctx(|c| c.top).filter(|(_, start)| *start == span.0);
     let mut it = parts.into_iter();
     let first = it.next().unwrap();
-    // A pest span can end after the implicit whitespace a trailing
-    // repetition skipped; the operand ends at its last token.
-    let trimmed_end = |p: &Pair<Rule>| input[..p.as_span().end()].trim_end().len();
-    let mut left_end = trimmed_end(&first);
     let mut left = expr(first)?;
     while let Some(op) = it.next() {
-        let right_pair = it.next().unwrap();
-        let right_end = trimmed_end(&right_pair);
-        let right = expr(right_pair)?;
-        let symbol = op.as_str();
-        if symbol == "-" {
-            let at = op.as_span().start();
-            let gap = &input[left_end..at];
-            let before = input[..at]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_whitespace);
-            let after = input[at + 1..]
-                .chars()
-                .next()
-                .is_some_and(char::is_whitespace);
-            if before != after {
-                // A gap that separates clauses (a line break or two spaces)
-                // before a `-` touching its operand reads as a new item or
-                // clause; one space as a subtraction (section 3's gap rule).
-                let separator = gap.contains('\n') || gap.len() >= 2;
-                let edits = match (before, separator, top) {
-                    (true, true, Some((Top::Item, _))) => vec![edit(left_end, left_end, ",")],
-                    (true, true, Some((Top::Clause, _))) => {
-                        vec![edit(at, at, "("), edit(right_end, right_end, ")")]
-                    }
-                    (true, _, _) => vec![edit(at + 1, at + 1, " ")],
-                    (false, _, _) => vec![edit(at, at, " ")],
-                };
-                return Err(refusal(
-                    input,
-                    Q016,
-                    "a binary `-` has whitespace on both sides or neither; `$n -1` would otherwise merge two items or two clauses, or read as a sign depending on the clause before it",
-                    span,
-                    edits,
-                    REVIEW,
-                ));
-            }
-        }
-        left_end = right_end;
-        let op = match symbol {
+        let right = expr(it.next().unwrap())?;
+        let op = match op.as_str() {
             "+" => ArithOp::Add,
             "-" => ArithOp::Sub,
             "*" => ArithOp::Mul,
@@ -3083,7 +3468,10 @@ fn bare_name(word: Pair<Rule>) -> Refusal {
     let span = span_of(&word);
     let w = word.as_str();
     let fixed: Option<(&str, &str)> = match w {
-        "where" | "filter" => Some(("drop it: a filter is a clause of its own", "")),
+        "where" | "filter" => Some((
+            "drop it: a filter is a conjunct of the `where` after the `match` braces",
+            "",
+        )),
         "distinct" => None,
         _ => None,
     };
@@ -3162,20 +3550,20 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
         Rule::block_value => {
             let mut func = None;
             let mut arg = None;
-            let mut clauses = Vec::new();
+            let mut pattern = Pattern::default();
             for part in inner.into_inner() {
                 match part.as_rule() {
                     Rule::agg_name => func = Some(BlockFunc::Agg(agg_func(part.as_str()))),
                     Rule::kw_exists => func = Some(BlockFunc::Exists),
                     Rule::expr => arg = Some(Box::new(expr(part)?)),
-                    Rule::subquery_block => clauses = clause_list(inner_clauses(&part))?,
+                    Rule::block_body => pattern = block_pattern(&part)?,
                     _ => {}
                 }
             }
             Ok(Expr::Block(Box::new(Block {
                 func: func.unwrap(),
                 arg,
-                clauses,
+                pattern,
             })))
         }
         Rule::agg_distinct => {
@@ -3280,7 +3668,7 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
         Rule::call => Ok(Expr::Call(call(inner)?)),
         Rule::keyword_call_rec => {
             let head = inner.clone().into_inner().next().unwrap();
-            let word = head.as_str().trim_end_matches('(');
+            let word = head.as_str();
             let args: Vec<Pair<Rule>> = inner
                 .clone()
                 .into_inner()
@@ -3304,12 +3692,11 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
             Err(refusal_note(
                 input,
                 Q019,
-                format!("`{word}` is a clause keyword, and a registry row is never named one"),
+                format!("`{word}` is an element keyword, and a registry row is never named one"),
                 span,
                 format!("{word} {{ … }}"),
             ))
         }
-        Rule::spaced_call_rec => Err(spaced_call(inner)),
         Rule::prop_method_rec => {
             let head = inner.clone().into_inner().next().unwrap();
             let mut hp = head.clone().into_inner();
@@ -3357,9 +3744,9 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
         Rule::prop_chain_rec => Err(refusal_note(
             input,
             Q014,
-            "a property path through an edge is a traversal clause, then a property of its target",
+            "a property path through an edge is a triple in `match`, then a property of its target",
             span,
-            "match { … $p <edge> $q } return { $q.<property> }",
+            "match { …, $p <edge> $q } return { $q.<property> }",
         )),
         Rule::prop_star_rec => {
             let var = inner.clone().into_inner().next().unwrap();

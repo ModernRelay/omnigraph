@@ -23,7 +23,9 @@ use omnigraph_compiler::query::file::{
     show_statement_name,
 };
 use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::query::syntax::{Arg, Clause, DeclBody, Expr, LetValue, ReadBody, RelExpr};
+use omnigraph_compiler::query::syntax::{
+    Arg, DeclBody, Element, Expr, LetValue, Pattern, ReadBody, RelExpr,
+};
 use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::schema::ast::{Annotation, PropDecl, SchemaDecl};
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -1263,7 +1265,7 @@ fn walk_expr(expr: &Expr, params: &[Param], needs_indices: &mut bool) -> Result<
         }
         Expr::IsNull { expr, .. } => walk_expr(expr, params, needs_indices)?,
         Expr::Block(block) => {
-            walk_clauses(&block.clauses, params, needs_indices)?;
+            walk_pattern(&block.pattern, params, needs_indices)?;
             if let Some(arg) = &block.arg {
                 walk_expr(arg, params, needs_indices)?;
             }
@@ -1306,7 +1308,7 @@ fn refuse_string_nearest(query: &Expr, params: &[Param]) -> Result<(), String> {
 }
 
 fn walk_read(body: &ReadBody, params: &[Param], needs_indices: &mut bool) -> Result<(), String> {
-    walk_clauses(&body.clauses, params, needs_indices)?;
+    walk_pattern(&body.pattern, params, needs_indices)?;
     for projection in &body.projections {
         walk_expr(&projection.expr, params, needs_indices)?;
     }
@@ -1316,33 +1318,28 @@ fn walk_read(body: &ReadBody, params: &[Param], needs_indices: &mut bool) -> Res
     Ok(())
 }
 
-fn walk_clauses(
-    clauses: &[Clause],
+fn walk_pattern(
+    pattern: &Pattern,
     params: &[Param],
     needs_indices: &mut bool,
 ) -> Result<(), String> {
-    for clause in clauses {
-        match clause {
-            Clause::Binding { prop_matches, .. } => {
-                for (_, value) in prop_matches {
-                    walk_expr(value, params, needs_indices)?;
-                }
-            }
-            Clause::Traversal(_) => {}
-            Clause::Filter(f) => walk_expr(f, params, needs_indices)?,
-            Clause::Not(inner) | Clause::Optional(inner) => {
-                walk_clauses(inner, params, needs_indices)?
-            }
-            Clause::Let { value, .. } => match value {
+    for element in &pattern.elements {
+        match element {
+            Element::Binding { .. } | Element::Traversal(_) => {}
+            Element::Optional(inner) => walk_pattern(inner, params, needs_indices)?,
+            Element::Let { value, .. } => match value {
                 LetValue::Relation(body) => walk_read(body, params, needs_indices)?,
                 LetValue::Expr(e) => walk_expr(e, params, needs_indices)?,
             },
-            Clause::From(rel) => match rel {
+            Element::From(rel) => match rel {
                 RelExpr::Inline(body) => walk_read(body, params, needs_indices)?,
                 RelExpr::Call(call) => walk_expr(&Expr::Call(call.clone()), params, needs_indices)?,
                 RelExpr::Variable(_) => {}
             },
         }
+    }
+    if let Some(predicate) = &pattern.predicate {
+        walk_expr(predicate, params, needs_indices)?;
     }
     Ok(())
 }
@@ -1375,14 +1372,10 @@ fn read_body(decl: &QueryDecl) -> Option<&ReadBody> {
 
 /// Whether a read draws a ranking with `from` (`nearest`, `bm25`, `rrf`).
 fn ranks(body: &ReadBody) -> bool {
-    body.clauses.iter().any(|clause| match clause {
-        Clause::From(RelExpr::Call(call)) => {
+    body.pattern.elements.iter().any(|element| match element {
+        Element::From(RelExpr::Call(call)) => {
             matches!(call.name.as_str(), "nearest" | "bm25" | "rrf")
         }
-        Clause::Let {
-            value: LetValue::Relation(_),
-            ..
-        } => false,
         _ => false,
     })
 }
@@ -1430,7 +1423,7 @@ fn inspect_decl(decl: &QueryDecl, needs_indices: &mut bool) -> Result<(), String
         DeclBody::Read(body) => walk_read(body, &decl.params, needs_indices),
         DeclBody::Write(write) => {
             for group in &write.groups {
-                walk_clauses(&group.clauses, &decl.params, needs_indices)?;
+                walk_pattern(&group.pattern, &decl.params, needs_indices)?;
             }
             Ok(())
         }
@@ -3206,13 +3199,13 @@ fn check_pin(
     )
 }
 
-/// Whether a match clause list runs at least one Expand: an unbound traversal
+/// Whether a read's `match` runs at least one Expand: an unbound traversal
 /// outside a correlated block (a bound edge and a block take paths of their
 /// own that the other-path check covers).
 fn expects_expand(decl: &QueryDecl) -> bool {
     read_body(decl).is_some_and(|body| {
-        body.clauses.iter().any(|c| match c {
-            Clause::Traversal(t) => t.edge_binding.is_none(),
+        body.pattern.elements.iter().any(|c| match c {
+            Element::Traversal(t) => t.edge_binding.is_none(),
             _ => false,
         })
     })

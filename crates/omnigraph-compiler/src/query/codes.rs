@@ -27,19 +27,19 @@ codes! {
     // construct and carries a byte-range suggestion wherever one edit set
     // makes the text legal.
     Q007 = "a traversal is written with an arrow; the fix is the triple";
-    Q008 = "an update or delete statement carries a where; the fix binds and filters";
+    Q008 = "an update or delete statement carries a where; the fix is the group's match and where";
     Q009 = "`mutation` is not a declaration keyword; the fix is `query`";
-    Q010 = "a binding's braces hold a comparison; the fix is a filter clause";
+    Q010 = "a binding carries a property map or braces; the fix is the binding and a where conjunct";
     Q011 = "a read body carries `as commit` or `as unattached branch`";
     Q012 = "a respelling the language refuses; the fix prints the legal form";
-    Q013 = "a clause follows a statement in a write body";
+    Q013 = "a write's elements are written without match, or after a statement; the fix is the group's match";
     Q014 = "a spelling from another language; the fix prints the GQ form";
     Q015 = "a form a later stage adds; the message names the stage";
-    Q016 = "a binary minus with whitespace on one side only; the fix spaces both";
-    Q017 = "a contextual keyword or literal as a bare edge name; the fix quotes it";
+    Q016 = "two items of a list are separated by whitespace alone; the fix is the comma";
+    Q017 = "a filter, a where or a comparison inside the match braces; the fix moves it to the where after them";
     Q018 = "a bare name where a value is read; a bare name is a return alias in order only";
-    Q019 = "a call whose name does not touch its parenthesis, or a call named by a clause keyword";
-    Q020 = "a read body's clauses are missing, misplaced or unbraced";
+    Q019 = "a call named by an element keyword, or `from` over a parenthesized relation";
+    Q020 = "a read body's parts are missing, misplaced or unbraced";
     Q021 = "an annotation's named argument is written `name: value`; the fix is `name = value`";
 
     // Typechecker.

@@ -106,12 +106,12 @@ name: String?
         ),
         r#"
 query list_people($slug: String) {
-match { $p: Person { slug: $slug } }
+match { $p: Person } where $p.slug = $slug
 return { $p.name }
 }
 
 query bad_update($slug: String) {
-$x: Person  $x.slug = $slug
+match { $x: Person } where $x.slug = $slug
 update $x set { missing: "nope" }
 }
 "#,
@@ -247,7 +247,7 @@ effectiveTo: DateTime?
         ),
         r#"
 query update_policy($slug: String, $name: String) {
-$x: Policy  $x.slug = $slug
+match { $x: Policy } where $x.slug = $slug
 update $x set { name: $name }
 }
 "#,
@@ -302,7 +302,7 @@ embedding: Vector(3)? @embed(body)
         ),
         r#"
 query update_doc($slug: String, $body: String) {
-$x: Doc  $x.slug = $slug
+match { $x: Doc } where $x.slug = $slug
 update $x set { body: $body }
 }
 "#,
@@ -337,7 +337,7 @@ name: String?
         &catalog,
         r#"
 query update_policy($slug: String, $name: String) {
-$x: Policy  $x.slug = $slug
+match { $x: Policy } where $x.slug = $slug
 update $x set { name: $name }
 }
 "#,
@@ -368,12 +368,12 @@ a_field: String?
         ),
         r#"
 query update_b($slug: String) {
-$x: Policy  $x.slug = $slug
+match { $x: Policy } where $x.slug = $slug
 update $x set { a_field: "x" }
 }
 
 query update_a($slug: String) {
-$x: Policy  $x.slug = $slug
+match { $x: Policy } where $x.slug = $slug
 update $x set { a_field: "x" }
 }
 "#,
@@ -400,10 +400,8 @@ edge WorksAt: Person -> Company
         ),
         r#"
 query unemployed() {
-match {
-    $p: Person
-    not { $p worksAt $_ }
-}
+match { $p: Person }
+where not exists { $p worksAt $_ }
 return { $p.name }
 }
 
@@ -449,7 +447,7 @@ edge Partners: Company -> Company
         ),
         r#"
 query delete_person($slug: String) {
-$x: Person  $x.slug = $slug
+match { $x: Person } where $x.slug = $slug
 delete $x
 }
 "#,
@@ -523,13 +521,13 @@ createdAt: DateTime?
 query describe_doc() {
 match { $d: Doc }
 return {
-    $d.slug
-    $d.count
-    $d.total
-    $d.score
-    $d.tags
-    $d.embedding
-    $d.createdAt
+    $d.slug,
+    $d.count,
+    $d.total,
+    $d.score,
+    $d.tags,
+    $d.embedding,
+    $d.createdAt,
     $d
 }
 }
@@ -601,7 +599,7 @@ fn selected_scopes_contribute_every_read_fact_issue_659() {
         let output = lint_query_file(
             &schema,
             &format!(
-                "query q() {{ match {{ $p: Person not {{ $p {selector} $c $c: Company }} }} return {{ $p.name }} }}"
+                "query q() {{ match {{ $p: Person }} where not exists {{ $p {selector} $c, $c: Company }} return {{ $p.name }} }}"
             ),
             "/tmp/queries.gq",
             QueryLintSchemaSource::file("/tmp/schema.pg"),

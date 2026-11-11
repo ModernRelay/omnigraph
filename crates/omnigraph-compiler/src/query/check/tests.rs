@@ -91,8 +91,8 @@ fn the_rfc_examples_type_check() {
         "query reachable($from: String) {
   match {
     from union(
-      { match { $p: Person { handle: $from }  $p knows $q } return { $q } },
-      { match { from reachable($from)  $q knows $r } return { $r as q } })
+      { match { $p: Person, $p knows $q } where $p.handle = $from return { $q } },
+      { match { from reachable($from), $q knows $r } return { $r as q } }),
   }
   return distinct { $q }
 }
@@ -100,28 +100,28 @@ fn the_rfc_examples_type_check() {
 query hops($from: String) @budget(rounds = 50) {
   match {
     from union(
-      { match { $p: Person { handle: $from }  $p knows $q } return { $q, 1 as d } },
-      { match { from hops($from)  $q knows $r } return { $r as q, $d + 1 as d } })
+      { match { $p: Person, $p knows $q } where $p.handle = $from return { $q, 1 as d } },
+      { match { from hops($from), $q knows $r } return { $r as q, $d + 1 as d } }),
   }
   return { $q, min($d) as d }
 }",
         "query close_company($slug: String) {
-  $c: Company { slug: $slug }
-  $p $k:worksAt $c
+  match { $c: Company, $p $k:worksAt $c }
+  where $c.slug = $slug
   delete $k
 }
 
 query relocate_staff($slug: String) {
-  $c: Company { slug: $slug }
-  $p worksAt $c
+  match { $c: Company, $p worksAt $c }
+  where $c.slug = $slug
   update $p set { city: null }
 }",
         "query passages($matter: String, $q: String, $k: I64 = 5) {
   match {
     from bm25(
-      { match { $r: SourceRevision { matter_number: $matter }  $r hasPassage $p  contains($p.text, \"tariff\") }
+      { match { $r: SourceRevision, $r hasPassage $p } where $r.matter_number = $matter and contains($p.text, \"tariff\")
         return { $r, $p } },
-      $p.text, $q)
+      $p.text, $q),
   }
   return { $r.path, $p.locator, $score }
   order { $score desc }
@@ -129,31 +129,31 @@ query relocate_staff($slug: String) {
 }",
         "query big_employers() {
   match {
-    from { match { $p worksAt $c } return { $c, count($p) as headcount } }
-    $headcount >= 100
+    from { match { $p worksAt $c } return { $c, count($p) as headcount } },
   }
+  where $headcount >= 100
   return { $c.name, $headcount }
   order { $headcount desc }
 }",
         "query cited_near($coll: String, $q: Vector(3)) {
   match {
     from nearest(
-      { match { $d \"in\" $x  $x: Collection { slug: $coll } } return { $d } },
+      { match { $d in $x, $x: Collection } where $x.slug = $coll return { $d } },
       $d.embedding, $q, k: 20
-    )
-    $d cites $other
+    ),
+    $d cites $other,
   }
   return { $d.title, $distance, count($other) as cites }
   order { $distance }
 }",
         "query retire($h: String) as commit {
-  $p: Person { handle: $h }
-  $p $k:worksAt $c
+  match { $p: Person, $p $k:worksAt $c }
+  where $p.handle = $h
   delete $k
 }
 
 query relocate($h: String) {
-  $p: Person { handle: $h }
+  match { $p: Person } where $p.handle = $h
   update $p set { city: null }
 }",
     ] {
@@ -161,32 +161,34 @@ query relocate($h: String) {
     }
 }
 
-/// A block sees only the text before it (section 2, derived forms): it
-/// correlates on the names bound before it, and a name the enclosing scope
-/// binds after it is the block's own (`issue_659_compiler_scopes.gqt`). So
-/// `$x` here is local to the block: "`$p` knows nobody".
+/// A block correlates on the variables in scope where it is written
+/// (section 3): in `where`, every element's, since the `where` is evaluated
+/// after all of them; in a `let`, the elements before it.
 #[test]
-fn a_block_correlates_only_on_names_bound_before_it() {
-    let src = "query q() { match { $p: Person  not { $p knows $x }  $x: Person { handle: \"q\" } } return { $p } }";
-    let c = ok(src);
+fn a_block_correlates_on_the_names_in_scope_where_it_is_written() {
+    let c = ok(
+        "query q() { match { $p: Person, $x: Person } where not exists { $p knows $x } and $x.handle = \"q\" return { $p } }",
+    );
     let text = format!("{:?}", read_of(&c).term);
-    assert!(
-        text.contains("Env([Col { name: \"p\"") && !text.contains("Env([Col { name: \"p\", ty: Node { type_name: \"Person\", nullable: false } }, Col { name: \"x\""),
-        "the block's Env carries `p` alone: {text}"
-    );
-    // Written after `$x`, the same block correlates on both.
-    let after = ok(
-        "query q() { match { $p: Person  $x: Person { handle: \"q\" }  not { $p knows $x } } return { $p } }",
-    );
-    let text = format!("{:?}", read_of(&after).term);
     assert!(
         text.contains("Col { name: \"x\", ty: Node"),
         "the block's Env carries `x`: {text}"
     );
-    // The same holds for a block value in a filter that waits for a later
-    // variable: the block still correlates on the names before the filter.
+    // Written before `$x` in a `let`, the block sees `$p` alone, and its
+    // `$x` is its own.
+    let c = ok(
+        "query q() { match { $p: Person, let $n = count { $p knows $x }, $x: Person } where $x.handle = \"q\" return { $p, $n } }",
+    );
+    let text = format!("{:?}", read_of(&c).term);
+    assert!(
+        text.contains("Env([Col { name: \"p\"")
+            && !text.contains("Env([Col { name: \"p\", ty: Node { type_name: \"Person\", nullable: false } }, Col { name: \"x\""),
+        "the block's Env carries `p` alone: {text}"
+    );
+    // A block value compared with a later element's property correlates on
+    // the names the block reads.
     let waiting = ok(
-        "query q() { match { $p: Person  count { $p knows $x } >= $c.min_docs  $c: Collection } return { $p } }",
+        "query q() { match { $p: Person, $c: Collection } where count { $p knows $x } >= $c.min_docs return { $p } }",
     );
     let text = format!("{:?}", read_of(&waiting).term);
     assert!(
@@ -201,25 +203,25 @@ fn a_block_correlates_only_on_names_bound_before_it() {
 /// outer name is.
 #[test]
 fn a_block_re_mentions_an_outer_variable_to_correlate_on_it() {
-    let src =
-        "query q() { match { $p: Person  not { $p: Person { handle: \"bob\" } } } return { $p } }";
+    let src = "query q() { match { $p: Person } where not exists { $p: Person where $p.handle = \"bob\" } return { $p } }";
     let rebinding = ok(src);
     // The same term as the filter written inside the block.
-    let filter =
-        ok("query q() { match { $p: Person  not { $p.handle = \"bob\" } } return { $p } }");
+    let filter = ok(
+        "query q() { match { $p: Person } where not exists { $p: Person where $p.handle = \"bob\" } return { $p } }",
+    );
     assert_eq!(read_of(&rebinding).term, read_of(&filter).term);
     // Another type is a rebinding, refused as today.
     refused(
-        "query q() { match { $p: Person  not { $p: Company } } return { $p } }",
+        "query q() { match { $p: Person } where not exists { $p: Company } return { $p } }",
         "T50",
     );
     // `optional` correlates the same way.
     ok(
-        "query q() { match { $p: Person  optional { $p: Person { city: \"x\" }  $p worksAt $c } } return { $p, $c } }",
+        "query q() { match { $p: Person, optional { $p: Person, $p worksAt $c where $p.city = \"x\" } } return { $p, $c } }",
     );
     // An inline read may not rebind an outer name.
     refused(
-        "query q() { match { $p: Person  from { match { $p: Person } return { $p as q } } } return { $p } }",
+        "query q() { match { $p: Person, from { match { $p: Person } return { $p as q } } } return { $p } }",
         "T68",
     );
 }
@@ -244,23 +246,23 @@ fn t68_on_a_collision_with_each_kind_of_name_in_scope() {
     for (kind, src) in [
         (
             "node binding",
-            "query q() { match { $c: Company  from { match { $x: Company } return { $x as c } } } return { $c } }",
+            "query q() { match { $c: Company, from { match { $x: Company } return { $x as c } } } return { $c } }",
         ),
         (
             "edge binding",
-            "query q() { match { $p $k:worksAt $c  from { match { $x: Company } return { $x as k } } } return { $p } }",
+            "query q() { match { $p $k:worksAt $c, from { match { $x: Company } return { $x as k } } } return { $p } }",
         ),
         (
             "let value",
-            "query q() { match { $p: Person  let $n = 1  from { match { $x: Company } return { $x as n } } } return { $p } }",
+            "query q() { match { $p: Person, let $n = 1, from { match { $x: Company } return { $x as n } } } return { $p } }",
         ),
         (
             "let relation",
-            "query q() { match { let $r = { match { $x: Company } return { $x } }  from { match { $y: Company } return { $y as r } } } return { $y } }",
+            "query q() { match { let $r = { match { $x: Company } return { $x } }, from { match { $y: Company } return { $y as r } } } return { $y } }",
         ),
         (
             "from column",
-            "query q() { match { from { match { $x: Company } return { $x } }  from { match { $y: Company } return { $y as x } } } return { $x } }",
+            "query q() { match { from { match { $x: Company } return { $x } }, from { match { $y: Company } return { $y as x } } } return { $x } }",
         ),
         (
             "parameter",
@@ -272,7 +274,7 @@ fn t68_on_a_collision_with_each_kind_of_name_in_scope() {
         ),
         (
             "let reusing a column",
-            "query q() { match { $p: Person  let $p = 1 } return { $p } }",
+            "query q() { match { $p: Person, let $p = 1 } return { $p } }",
         ),
     ] {
         let m = refused(src, "T68");
@@ -281,23 +283,23 @@ fn t68_on_a_collision_with_each_kind_of_name_in_scope() {
     // An inner binding that reuses an outer name: it would silently become a
     // filter on the outer row.
     let m = refused(
-        "query q() { match { $p: Person  from { match { $p: Person  $p knows $q } return { $q } } } return { $p, $q } }",
+        "query q() { match { $p: Person, from { match { $p: Person, $p knows $q } return { $q } } } return { $p, $q } }",
         "T68",
     );
     assert!(m.contains("silently become a filter"), "{m}");
     // A `from` inside an inner read drawing a name the enclosing scope holds.
     refused(
-        "query q($v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }  $d: Doc  from { match { from distance($docs, $d.embedding, $v) } return { $d as e } } } return { $e } }",
+        "query q($v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, $d: Doc, from { match { from distance($docs, $d.embedding, $v) } return { $d as e } } } return { $e } }",
         "T68",
     );
     // The fix the code prints, an alias on the inner return, is accepted.
     ok(
-        "query q() { match { $c: Company  from { match { $x: Company } return { $x as c2 } } } return { $c, $c2 } }",
+        "query q() { match { $c: Company, from { match { $x: Company } return { $x as c2 } } } return { $c, $c2 } }",
     );
     // A traversal inside an inner read that names an outer variable is a
     // correlation, not a binding.
     ok(
-        "query q() { match { $p: Person  from { match { $p authored $d } return { $d } order { $d.year desc } limit 3 } } return { $p.name, $d.title } }",
+        "query q() { match { $p: Person, from { match { $p authored $d } return { $d } order { $d.year desc } limit 3 } } return { $p.name, $d.title } }",
     );
 }
 
@@ -305,20 +307,20 @@ fn t68_on_a_collision_with_each_kind_of_name_in_scope() {
 fn t69_both_ways() {
     // A relation where a scalar is read.
     for src in [
-        "query q() { match { let $r = { match { $p: Person } return { $p } }  $r = 1 } return { 1 as one } }",
-        "query q() { match { let $r = { match { $p: Person } return { $p } }  $x: Person } return { $r } }",
-        "query c($h: String) { match { $p: Person { handle: $h } } return { $p } }\nquery q() { match { $x: Person  c($x.handle) } return { $x } }",
-        "query q() { match { $x: Person  union({ match { $a: Person } return { $a } }, { match { $b: Person } return { $b as a } }) } return { $x } }",
+        "query q() { match { let $r = { match { $p: Person } return { $p } } } where $r = 1 return { 1 as one } }",
+        "query q() { match { let $r = { match { $p: Person } return { $p } }, $x: Person } return { $r } }",
+        "query c($h: String) { match { $p: Person } where $p.handle = $h return { $p } }\nquery q() { match { $x: Person } where c($x.handle) return { $x } }",
+        "query q() { match { $x: Person } where union({ match { $a: Person } return { $a } }, { match { $b: Person } return { $b as a } }) return { $x } }",
     ] {
         let m = refused(src, "T69");
         assert!(m.contains("relation"), "{m}");
     }
     // A scalar where a relation is read.
     for src in [
-        "query q() { match { $p: Person  from $p } return { $p } }",
-        "query q() { match { let $v = 1  from $v } return { $v } }",
+        "query q() { match { $p: Person, from $p } return { $p } }",
+        "query q() { match { let $v = 1, from $v } return { $v } }",
         "query q($h: String) { match { from $h } return { 1 as one } }",
-        "query c($h: String) { match { $p: Person { handle: $h } } return { $p } }\nquery q() { match { from c({ match { $x: Person } return { $x.handle as h } }) } return { $p } }",
+        "query c($h: String) { match { $p: Person } where $p.handle = $h return { $p } }\nquery q() { match { from c({ match { $x: Person } return { $x.handle as h } }) } return { $p } }",
     ] {
         refused(src, "T69");
     }
@@ -328,8 +330,8 @@ fn t69_both_ways() {
 pub(crate) const REACHABLE: &str = "query reachable($from: String) {
   match {
     from union(
-      { match { $p: Person { handle: $from }  $p knows $q } return { $q } },
-      { match { from reachable($from)  $q knows $r } return { $r as q } })
+      { match { $p: Person, $p knows $q } where $p.handle = $from return { $q } },
+      { match { from reachable($from), $q knows $r } return { $r as q } }),
   }
   return distinct { $q }
 }";
@@ -342,67 +344,67 @@ fn t70_for_a_non_monotone_cycle_and_a_budget_overrun() {
     // `exists` over the recursive rows is admitted, and is the term of
     // `count { } > 0`.
     for form in [
-        "exists { from members($from)  $m knows $q }",
-        "count { from members($from)  $m knows $q } > 0",
+        "exists { from members($from), $m knows $q }",
+        "count { from members($from), $m knows $q } > 0",
     ] {
         ok(&format!(
             "query members($from: String) {{ match {{ from union(
-               {{ match {{ $p: Person {{ handle: $from }} }} return {{ $p as m }} }},
-               {{ match {{ $q: Person  {form} }} return {{ $q as m }} }}) }} return distinct {{ $m }} }}"
+               {{ match {{ $p: Person }} where $p.handle = $from return {{ $p as m }} }},
+               {{ match {{ $q: Person }} where {form} return {{ $q as m }} }}) }} return distinct {{ $m }} }}"
         ));
     }
     // A `not` over the recursive read.
     let m = refused(
         "query bad($from: String) { match { from union(
-           { match { $p: Person { handle: $from } } return { $p as m } },
-           { match { $q: Person  not { from bad($from)  $m knows $q } } return { $q as m } }) } return distinct { $m } }",
+           { match { $p: Person } where $p.handle = $from return { $p as m } },
+           { match { $q: Person } where not exists { from bad($from), $m knows $q } return { $q as m } }) } return distinct { $m } }",
         "T70",
     );
     assert!(m.contains("not") && m.contains("bad"), "{m}");
     // A `count` over it.
     let m = refused(
         "query bad($from: String) { match { from union(
-           { match { $p: Person { handle: $from } } return { $p as m } },
-           { match { $q: Person  count { from bad($from)  $m knows $q } > 2 } return { $q as m } }) } return distinct { $m } }",
+           { match { $p: Person } where $p.handle = $from return { $p as m } },
+           { match { $q: Person } where count { from bad($from), $m knows $q } > 2 return { $q as m } }) } return distinct { $m } }",
         "T70",
     );
     assert!(m.contains("count"), "{m}");
     // An invented value without `min`.
     let m = refused(
         "query dist($from: String) @budget(rounds = 50) { match { from union(
-           { match { $p: Person { handle: $from }  $p knows $q } return { $q, 1 as d } },
-           { match { from dist($from)  $q knows $r } return { $r as q, $d + 1 as d } }) } return distinct { $q, $d } }",
+           { match { $p: Person, $p knows $q } where $p.handle = $from return { $q, 1 as d } },
+           { match { from dist($from), $q knows $r } return { $r as q, $d + 1 as d } }) } return distinct { $q, $d } }",
         "T70",
     );
     assert!(m.contains("computed column") || m.contains("invent"), "{m}");
     // An invented value under `min` without a round budget.
     let m = refused(
         "query dist($from: String) { match { from union(
-           { match { $p: Person { handle: $from }  $p knows $q } return { $q, 1 as d } },
-           { match { from dist($from)  $q knows $r } return { $r as q, $d + 1 as d } }) } return { $q, min($d) as d } }",
+           { match { $p: Person, $p knows $q } where $p.handle = $from return { $q, 1 as d } },
+           { match { from dist($from), $q knows $r } return { $r as q, $d + 1 as d } }) } return { $q, min($d) as d } }",
         "T70",
     );
     assert!(m.contains("round budget"), "{m}");
     // ... and with one, the RFC's `distance` example compiles.
     let d = ok("query dist($from: String) @budget(rounds = 50) { match { from union(
-           { match { $p: Person { handle: $from }  $p knows $q } return { $q, 1 as d } },
-           { match { from dist($from)  $q knows $r } return { $r as q, $d + 1 as d } }) } return { $q, min($d) as d } }");
+           { match { $p: Person, $p knows $q } where $p.handle = $from return { $q, 1 as d } },
+           { match { from dist($from), $q knows $r } return { $r as q, $d + 1 as d } }) } return { $q, min($d) as d } }");
     assert!(
         matches!(read_of(&d).term, Term::Fix { rounds: Some(50), ref lattice, .. } if lattice == &vec!["d".to_string()])
     );
     // A filter on the `min` column inside the cycle.
     let m = refused(
         "query dist($from: String) @budget(rounds = 50) { match { from union(
-           { match { $p: Person { handle: $from }  $p knows $q } return { $q, 1 as d } },
-           { match { from dist($from)  $d < 3  $q knows $r } return { $r as q, $d + 1 as d } }) } return { $q, max($d) as d } }",
+           { match { $p: Person, $p knows $q } where $p.handle = $from return { $q, 1 as d } },
+           { match { from dist($from), $q knows $r } where $d < 3 return { $r as q, $d + 1 as d } }) } return { $q, max($d) as d } }",
         "T70",
     );
     assert!(m.contains("filter reads the `min`/`max` column"), "{m}");
     // An order and a limit over the recursive rows.
     let m = refused(
         "query cut($from: String) { match { from union(
-           { match { $p: Person { handle: $from } } return { $p as q } },
-           { match { from { match { from cut($from) } return { $q } order { $q.handle } limit 1 }  $q knows $r } return { $r as q } }) } return distinct { $q } }",
+           { match { $p: Person } where $p.handle = $from return { $p as q } },
+           { match { from { match { from cut($from) } return { $q } order { $q.handle } limit 1 }, $q knows $r } return { $r as q } }) } return distinct { $q } }",
         "T70",
     );
     assert!(m.contains("order") || m.contains("limit"), "{m}");
@@ -422,8 +424,8 @@ fn t70_for_a_non_monotone_cycle_and_a_budget_overrun() {
     // A recursion through two declared reads.
     let two = check(
         "query a($from: String) { match { from union(
-           { match { $p: Person { handle: $from } } return { $p as q } },
-           { match { from b($from)  $q knows $r } return { $r as q } }) } return distinct { $q } }
+           { match { $p: Person } where $p.handle = $from return { $p as q } },
+           { match { from b($from), $q knows $r } return { $r as q } }) } return distinct { $q } }
          query b($x: String) { match { from a($x) } return distinct { $q } }",
     );
     assert!(two.iter().all(|(_, r)| r.is_ok()), "{two:?}");
@@ -536,7 +538,7 @@ fn t65_with_the_from_fix() {
             "from rrf(",
         ),
         (
-            "query q($v: Vector(3)) { match { $d: Doc  distance($d.embedding, $v) < 1.0 } return { $d } }",
+            "query q($v: Vector(3)) { match { $d: Doc } where distance($d.embedding, $v) < 1.0 return { $d } }",
             "from distance(",
         ),
     ] {
@@ -550,21 +552,21 @@ fn t65_with_the_from_fix() {
 #[test]
 fn t40_lifted() {
     // A block value compares with any scalar in scope.
-    let src = "query full_collections() { match { $x: Collection  count { $d \"in\" $x } >= $x.min_docs } return { $x.slug } }";
+    let src = "query full_collections() { match { $x: Collection } where count { $d in $x } >= $x.min_docs return { $x.slug } }";
     ok(src);
     // It is a value: bound, returned and ordered.
     let c = ok(
-        "query degrees($min: I64) { match { $p: Person  let $degree = count { $p knows $q }  $degree >= $min } return { $p.name, $degree } order { $degree desc } }",
+        "query degrees($min: I64) { match { $p: Person, let $degree = count { $p knows $q } } where $degree >= $min return { $p.name, $degree } order { $degree desc } }",
     );
     assert_eq!(cols(&c)[1], ("degree".to_string(), "I64".to_string()));
     // `sum` over an empty block is null; `count` is not.
     let c = ok(
-        "query s() { match { $p: Person  let $y = sum($d.year) { $p authored $d } } return { $y } }",
+        "query s() { match { $p: Person, let $y = sum($d.year) { $p authored $d } } return { $y } }",
     );
     assert_eq!(cols(&c)[0].1, "F64?");
     // A block that reads no outer variable stays refused, as today.
     refused(
-        "query q() { match { $p: Person  count { $d: Doc } > 1 } return { $p } }",
+        "query q() { match { $p: Person } where count { $d: Doc } > 1 return { $p } }",
         "T39",
     );
 }
@@ -572,7 +574,7 @@ fn t40_lifted() {
 #[test]
 fn optional_served() {
     let c = ok(
-        "query q() { match { $p: Person  optional { $p worksAt $c } } return { $p.name, $c.name, $c } }",
+        "query q() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name, $c } }",
     );
     assert_eq!(
         cols(&c),
@@ -591,7 +593,9 @@ fn optional_served() {
 fn if_commit_and_valid_are_refused_with_the_writes_rfc_named() {
     for a in ["@if_commit($h)", "@valid($h)"] {
         let message = refused(
-            &format!("query r($h: String) {a} {{ $p: Person {{ handle: $h }}  delete $p }}"),
+            &format!(
+                "query r($h: String) {a} {{ match {{ $p: Person }} where $p.handle = $h delete $p }}"
+            ),
             "T80",
         );
         assert!(message.contains("writes RFC"), "{message}");
@@ -663,7 +667,7 @@ fn arithmetic_widens_and_propagates_null() {
         "T72",
     );
     // The term carries `can_fail`, so the planner keeps it behind its guards.
-    let c = ok("query q() { match { $p: Person  $p.age * 2 >= 10 } return { $p } }");
+    let c = ok("query q() { match { $p: Person } where $p.age * 2 >= 10 return { $p } }");
     fn find_filter(t: &Term) -> Option<&crate::ir::expr::IRExpr> {
         match t {
             Term::Filter { pred, .. } => Some(pred),
@@ -678,7 +682,8 @@ fn arithmetic_widens_and_propagates_null() {
 
 #[test]
 fn the_edge_binding_scans_an_edge_type() {
-    let c = ok("query q($h: String) { match { $k: WorksAt  $k.@src = $h } return { $k.@dst } }");
+    let c =
+        ok("query q($h: String) { match { $k: WorksAt } where $k.@src = $h return { $k.@dst } }");
     let mut ops = Vec::new();
     read_of(&c).term.operators(&mut ops);
     assert_eq!(ops[..3], ["Project", "Project", "Filter"]);
@@ -705,7 +710,7 @@ fn the_ranking_functions_type_their_result_columns() {
     assert_eq!(cols(&c)[0], ("score".into(), "F32".into()));
     // `rrf` yields the target and `score` only: the population's other
     // columns are gone after fusion.
-    let fused = "let $docs = { match { $p authored $d } return { $p, $d } }
+    let fused = "let $docs = { match { $p authored $d } return { $p, $d } },
                  from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $s), k: 60, weights: [2.0, 1.0])";
     let c = ok(&format!(
         "query q($s: String, $v: Vector(3)) {{ match {{ {fused} }} return {{ $d.title, $score }} }}"
@@ -724,7 +729,9 @@ fn the_ranking_functions_type_their_result_columns() {
         "T6",
     );
     // ... and a correlated `from` over the population draws them again.
-    ok(&format!("query q($s: String, $v: Vector(3)) {{ match {{ {fused}  from {{ match {{ from $docs  $d2: Doc  $d2 = $d }} return {{ $p }} }} }} return {{ $p.name, $score }} }}").replace("from $docs  $d2: Doc  $d2 = $d", "$p authored $d"));
+    ok(&format!(
+        "query q($s: String, $v: Vector(3)) {{ match {{ {fused}, from {{ match {{ $p authored $d }} return {{ $p }} }} }} return {{ $p.name, $score }} }}"
+    ));
 }
 
 #[test]
@@ -751,7 +758,7 @@ fn rrf_refusals() {
     ] {
         refused(
             &format!(
-                "query q($s: String, $v: Vector(3)) {{ match {{ {pop}  from rrf({arms}{opts}) }} return {{ $d }} }}"
+                "query q($s: String, $v: Vector(3)) {{ match {{ {pop}, from rrf({arms}{opts}) }} return {{ $d }} }}"
             ),
             "T75",
         );
@@ -759,7 +766,7 @@ fn rrf_refusals() {
     for opts in [", k: 0", ", weights: [1.0, 0.0]", ", depth: 2"] {
         refused(
             &format!(
-                "query q($s: String, $v: Vector(3)) {{ match {{ {pop}  from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s){opts}) }} return {{ $d }} }}"
+                "query q($s: String, $v: Vector(3)) {{ match {{ {pop}, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s){opts}) }} return {{ $d }} }}"
             ),
             "T71",
         );
@@ -767,7 +774,7 @@ fn rrf_refusals() {
     // Two arms over one population with different queries are distinct arms;
     // an ordered inline read is an arm.
     ok(&format!(
-        "query q($s: String, $t: String, $v: Vector(3)) {{ match {{ {pop}  from rrf(bm25($docs, $d.body, $s), bm25($docs, $d.body, $t), {{ match {{ $d: Doc }} return {{ $d }} order {{ $d.year desc }} limit 10 }}) }} return {{ $d, $score }} }}"
+        "query q($s: String, $t: String, $v: Vector(3)) {{ match {{ {pop}, from rrf(bm25($docs, $d.body, $s), bm25($docs, $d.body, $t), {{ match {{ $d: Doc }} return {{ $d }} order {{ $d.year desc }} limit 10 }}) }} return {{ $d, $score }} }}"
     ));
 }
 
@@ -806,8 +813,8 @@ fn a_call_binds_its_arguments_and_never_substitutes() {
     // scope that also binds `$p`. Substitution would make the body's binding
     // `$p: Person { handle: $p.handle }`, every person; binding keeps the
     // body closed.
-    let unit = "query friends_of($h: String) { match { $p: Person { handle: $h }  $p knows $q } return { $q } }
-                query q() { match { $p: Person { handle: \"erin\" }  from friends_of($p.handle) } return { $q } }";
+    let unit = "query friends_of($h: String) { match { $p: Person, $p knows $q } where $p.handle = $h return { $q } }
+                query q() { match { $p: Person, from friends_of($p.handle) } where $p.handle = \"erin\" return { $q } }";
     let all = check(unit);
     let CoreDecl::Read(r) = &all[1].1.as_ref().unwrap().core else {
         panic!()
@@ -834,22 +841,22 @@ fn a_call_binds_its_arguments_and_never_substitutes() {
         "T74",
     );
     let m = refused(
-        "query r() { match { $p: Person } return { $p } }\nquery w() { from r()  update $p set { city: null } }",
+        "query r() { match { $p: Person } return { $p } }\nquery w() { match { from r() }  update $p set { city: null } }",
         "T74",
     );
     assert!(m.contains("W2"), "{m}");
     // Arity and argument types.
     refused(
-        "query f($h: String) { match { $p: Person { handle: $h } } return { $p } }\nquery q() { match { from f() } return { $p } }",
+        "query f($h: String) { match { $p: Person } where $p.handle = $h return { $p } }\nquery q() { match { from f() } return { $p } }",
         "T7",
     );
     refused(
-        "query f($h: String) { match { $p: Person { handle: $h } } return { $p } }\nquery q() { match { from f(3) } return { $p } }",
+        "query f($h: String) { match { $p: Person } where $p.handle = $h return { $p } }\nquery q() { match { from f(3) } return { $p } }",
         "T7",
     );
     // A default fills an omitted trailing argument.
     ok(
-        "query f($h: String, $n: I64 = 3) { match { $p: Person { handle: $h } } return { $p } limit $n }\nquery q() { match { from f(\"a\") } return { $p } }",
+        "query f($h: String, $n: I64 = 3) { match { $p: Person } where $p.handle = $h return { $p } limit $n }\nquery q() { match { from f(\"a\") } return { $p } }",
     );
 }
 
@@ -879,7 +886,7 @@ fn write_of(c: &CoreDecl) -> &CoreWrite {
 #[test]
 fn write_groups_type_their_sinks() {
     let w = ok(
-        "query close_company($slug: String) { $c: Company { slug: $slug }  $p $k:worksAt $c  delete $k }",
+        "query close_company($slug: String) { match { $c: Company, $p $k:worksAt $c } where $c.slug = $slug  delete $k }",
     );
     let w = write_of(&w);
     assert_eq!(w.class, WriteClass::Destructive);
@@ -887,7 +894,7 @@ fn write_groups_type_their_sinks() {
         matches!(&w.groups[0].sinks[0], Sink::Delete { var, target } if var == "k" && target.is_edge())
     );
     let w = ok(
-        "query relocate($h: String) { $p: Person { handle: $h }  update $p set { city: null, age: $p.age + 1 } }",
+        "query relocate($h: String) { match { $p: Person } where $p.handle = $h  update $p set { city: null, age: $p.age + 1 } }",
     );
     let w = write_of(&w);
     assert!(
@@ -900,10 +907,10 @@ fn write_groups_type_their_sinks() {
     assert_eq!(write_of(&w).groups[0].input, Term::Unit);
     // An endpoint by bound reference, and the mismatch.
     ok(
-        "query link($a: String, $b: String) { $x: Person { handle: $a }  $y: Person { handle: $b }  insert Knows { from: $x, to: $y } }",
+        "query link($a: String, $b: String) { match { $x: Person, $y: Person } where $x.handle = $a and $y.handle = $b  insert Knows { from: $x, to: $y } }",
     );
     let m = refused(
-        "query link($a: String, $b: String) { $x: Person { handle: $a }  $d: Doc { id: $b }  insert Knows { from: $x, to: $d } }",
+        "query link($a: String, $b: String) { match { $x: Person, $d: Doc } where $x.handle = $a and $d.id = $b  insert Knows { from: $x, to: $d } }",
         "T78",
     );
     assert!(
@@ -912,28 +919,31 @@ fn write_groups_type_their_sinks() {
     );
     // A write fed by a ranked read, a `let` and an `optional`.
     ok(
-        "query tag_near($q: Vector(3)) { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20)  update $d set { tags: [\"near\"] } }",
+        "query tag_near($q: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) }  update $d set { tags: [\"near\"] } }",
     );
     ok(
-        "query w($h: String) { $p: Person { handle: $h }  let $n = count { $p knows $q }  optional { $p worksAt $c }  $n > 1  update $p set { city: \"busy\" } }",
+        "query w($h: String) { match { $p: Person, let $n = count { $p knows $q }, optional { $p worksAt $c } } where $p.handle = $h and $n > 1  update $p set { city: \"busy\" } }",
     );
     // Groups: a later group sees the earlier ones' effects; each has its own
     // clauses.
     let w = ok(
-        "query two($h: String) { insert Person { handle: $h, name: $h }  $p: Person { handle: $h }  update $p set { city: \"x\" } }",
+        "query two($h: String) { insert Person { handle: $h, name: $h }  match { $p: Person } where $p.handle = $h  update $p set { city: \"x\" } }",
     );
     assert_eq!(write_of(&w).groups.len(), 2);
     // `null` only where the property is nullable.
     refused(
-        "query w($h: String) { $p: Person { handle: $h }  update $p set { name: null } }",
+        "query w($h: String) { match { $p: Person } where $p.handle = $h  update $p set { name: null } }",
         "T3",
     );
     // A statement's variable must be a bound reference.
     refused("query w() { update $p set { city: null } }", "T77");
-    refused("query w() { $p: Person  let $n = 1  delete $n }", "T77");
+    refused(
+        "query w() { match { $p: Person, let $n = 1 }  delete $n }",
+        "T77",
+    );
     // Update of an edge is refused, as today (T16).
     refused(
-        "query w() { $p $k:worksAt $c  update $k set { since: 1 } }",
+        "query w() { match { $p $k:worksAt $c }  update $k set { since: 1 } }",
         "T16",
     );
 }
@@ -941,13 +951,13 @@ fn write_groups_type_their_sinks() {
 #[test]
 fn the_constructive_or_destructive_split_and_ordered_statements() {
     let m = refused(
-        "query retire($h: String) { $p: Person { handle: $h }  $p $k:worksAt $c  delete $k  update $p set { city: null } }",
+        "query retire($h: String) { match { $p: Person, $p $k:worksAt $c } where $p.handle = $h  delete $k  update $p set { city: null } }",
         "T76",
     );
     assert!(m.contains("split it into separate mutations"), "{m}");
     // Split across groups too: the split is per write.
     refused(
-        "query w($h: String) { $p: Person { handle: $h }  delete $p  insert Person { handle: $h, name: $h } }",
+        "query w($h: String) { match { $p: Person } where $p.handle = $h  delete $p  insert Person { handle: $h, name: $h } }",
         "T76",
     );
     // A group's statements run in order, the later effect winning: two
@@ -955,7 +965,7 @@ fn the_constructive_or_destructive_split_and_ordered_statements() {
     // are legal as today. A conflict through one statement's rows is found
     // only by running it (the `E` namespace).
     ok(
-        "query w($h: String) { $p: Person { handle: $h }  update $p set { city: \"a\" }  update $p set { city: \"b\" } }",
+        "query w($h: String) { match { $p: Person } where $p.handle = $h  update $p set { city: \"a\" }  update $p set { city: \"b\" } }",
     );
     ok(
         "query w() { insert Person { handle: \"a\", name: \"x\" }  insert Person { handle: \"a\", name: \"y\" } }",
@@ -965,7 +975,7 @@ fn the_constructive_or_destructive_split_and_ordered_statements() {
 #[test]
 fn as_commit_is_admitted_only_on_a_write_body() {
     let w = ok(
-        "query retire($h: String) as commit { $p: Person { handle: $h }  $p $k:worksAt $c  delete $k }",
+        "query retire($h: String) as commit { match { $p: Person, $p $k:worksAt $c } where $p.handle = $h  delete $k }",
     );
     assert_eq!(
         write_of(&w).write_mode,
@@ -982,42 +992,63 @@ fn the_reference_interpreter_probes() {
     let dist = |ret: &str, budget: &str, filter: &str| {
         format!(
             "query dist($from: String) {budget} {{ match {{ from union(
-               {{ match {{ $p: Person {{ handle: $from }}  $p knows $q }} return {{ $q, 1 as d }} }},
-               {{ match {{ from dist($from) {filter} $q knows $r }} return {{ $r as q, $d + 1 as d }} }}) }} return {{ {ret} }} }}"
+               {{ match {{ $p: Person, $p knows $q }} where $p.handle = $from return {{ $q, 1 as d }} }},
+               {{ match {{ from dist($from), $q knows $r }} {filter} return {{ $r as q, $d + 1 as d }} }}) }} return {{ {ret} }} }}"
         )
     };
     let probes: Vec<(&str, String, &str)> = vec![
-        ("inner_rebinding_in_not", "query x() { match { $p: Person  not { $p: Person { handle: \"bob\" } } } return { $p.name } }".into(), "ok"),
-        ("future_name_in_block", "query x() { match { $p: Person  not { $p knows $x }  $x: Person { handle: \"q\" } } return { $p.name } }".into(), "ok"),
-        ("from_collision", "query x() { match { $c: Company  from { match { $x: Company } return { $x as c } } } return { $c } }".into(), "T68"),
+        ("inner_rebinding_in_not", "query x() { match { $p: Person } where not exists { $p: Person where $p.handle = \"bob\" } return { $p.name } }".into(), "ok"),
+        ("future_name_in_block", "query x() { match { $p: Person, let $n = count { $p knows $x }, $x: Person } where $x.handle = \"q\" and $n = 0 return { $p.name } }".into(), "ok"),
+        ("from_collision", "query x() { match { $c: Company, from { match { $x: Company } return { $x as c } } } return { $c } }".into(), "T68"),
         ("union_mismatch", "query x() { match { from union({ match { $p: Person } return { $p.age as c } }, { match { $x: Company } return { $x.name as c } }) } return { $c } }".into(), "T73"),
         ("union_nullable", "query x() { match { from union({ match { $p: Person } return { $p.city as c } }, { match { $x: Company } return { $x.name as c } }) } return { $c } }".into(), "ok"),
-        ("not_over_recursion", "query bad($from: String) { match { from union({ match { $p: Person { handle: $from } } return { $p as m } }, { match { $q: Person  not { from bad($from)  $m knows $q } } return { $q as m } }) } return distinct { $m } }".into(), "T70"),
-        ("exists_over_recursion", "query members($from: String) { match { from union({ match { $p: Person { handle: $from } } return { $p as m } }, { match { $q: Person  exists { from members($from)  $m knows $q } } return { $q as m } }) } return distinct { $m } }".into(), "ok"),
+        ("not_over_recursion", "query bad($from: String) { match { from union({ match { $p: Person } where $p.handle = $from return { $p as m } }, { match { $q: Person } where not exists { from bad($from), $m knows $q } return { $q as m } }) } return distinct { $m } }".into(), "T70"),
+        ("exists_over_recursion", "query members($from: String) { match { from union({ match { $p: Person } where $p.handle = $from return { $p as m } }, { match { $q: Person } where exists { from members($from), $m knows $q } return { $q as m } }) } return distinct { $m } }".into(), "ok"),
         ("computed_recursive_arg", "query down($n: I64) { match { from union({ match { $p: Person } return { $p } }, { match { from down($n - 1) } return { $p } }) } return distinct { $p } }".into(), "T70"),
         ("invented_value_without_min", dist("$q, $d", "@budget(rounds = 50)", "").replace("return { $q, $d }", "return distinct { $q, $d }"), "T70"),
         ("min_without_rounds", dist("$q, min($d) as d", "", ""), "T70"),
         ("min_with_rounds", dist("$q, min($d) as d", "@budget(rounds = 50)", ""), "ok"),
-        ("filter_on_max_column", dist("$q, max($d) as d", "@budget(rounds = 50)", " $d < 3 "), "T70"),
-        ("age_times_two_into_age", "query w($h: String) { $p: Person { handle: $h }  update $p set { age: $p.age * 2 } }".into(), "ok"),
-        ("update_and_delete_one_write", "query w($h: String) { $p: Person { handle: $h }  $p $k:worksAt $c  delete $k  update $p set { city: null } }".into(), "T76"),
+        ("filter_on_max_column", dist("$q, max($d) as d", "@budget(rounds = 50)", "where $d < 3"), "T70"),
+        ("age_times_two_into_age", "query w($h: String) { match { $p: Person } where $p.handle = $h  update $p set { age: $p.age * 2 } }".into(), "ok"),
+        ("update_and_delete_one_write", "query w($h: String) { match { $p: Person, $p $k:worksAt $c } where $p.handle = $h  delete $k  update $p set { city: null } }".into(), "T76"),
     ];
     for (name, src, want) in probes {
         assert_eq!(code(&src), want, "{name}\n{src}");
     }
 }
 
-/// Section 3's refused respellings that need a type: `$d in $x` with `$x` a
-/// node is the reserved edge, refused with the quoted fix (`T7`); `contains`
-/// over a list is refused with the `in` fix.
+/// Section 3's refused respellings that need a type: `$d in $x` in `where`
+/// with `$x` a node is a triple, written in `match` (`T7`); `$d in $list`
+/// in `match` with a list on the right is the membership test, moved to
+/// `where` (`T7`); `contains` over a list is refused with the `in` fix.
 #[test]
-fn the_bare_in_edge_and_contains_over_a_list_are_type_errors() {
-    let e = check("query q() { match { $x: Collection  $d: Doc  $d in $x } return { $d } }");
+fn in_over_the_wrong_kind_and_contains_over_a_list_are_type_errors() {
+    let e = check("query q() { match { $x: Collection, $d: Doc } where $d in $x return { $d } }");
     let e = e[0].1.as_ref().unwrap_err();
     assert_eq!(e.code.as_str(), "T7");
-    assert_eq!(e.fix.as_deref(), Some("$d \"in\" $x"));
-    ok("query q() { match { $x: Collection  $d \"in\" $x } return { $d } }");
-    let e = check("query q() { match { $d: Doc  contains($d.tags, \"rust\") } return { $d } }");
+    assert_eq!(e.fix.as_deref(), Some("match { …, $d in $x }"));
+    ok("query q() { match { $x: Collection, $d in $x } return { $d } }");
+    for (written, intended) in [
+        (
+            "query q($tags: [String]) { match { $d: Doc, $d in $tags } return { $d } }",
+            "query q($tags: [String]) { match { $d: Doc } where $d in $tags return { $d } }",
+        ),
+        (
+            "query q($tags: [String]) { match { $d in $tags, $d: Doc } where $d.year > 1 return { $d } }",
+            "query q($tags: [String]) { match { $d: Doc } where $d.year > 1 and $d in $tags return { $d } }",
+        ),
+    ] {
+        let d = refused_with(written, "T7");
+        let edits = d.suggestion.expect("an edit").edits;
+        let repaired = crate::query::syntax::parse::apply_edits(written, &edits);
+        assert_eq!(
+            parse_source(&repaired).unwrap(),
+            parse_source(intended).unwrap(),
+            "{repaired}"
+        );
+    }
+    let e =
+        check("query q() { match { $d: Doc } where contains($d.tags, \"rust\") return { $d } }");
     let e = e[0].1.as_ref().unwrap_err();
     assert_eq!(
         (e.code.as_str(), e.fix.as_deref()),
@@ -1031,12 +1062,12 @@ fn the_bare_in_edge_and_contains_over_a_list_are_type_errors() {
 fn weighted_type_checks_with_the_population_renamed_before_d_is_bound() {
     ok("query weighted($q: String, $v: Vector(3)) {
   match {
-    let $docs = { match { $d: Doc } return { $d } }
-    let $docs2 = { match { from $docs } return { $d as d2 } }
-    from { match { from distance($docs, $d.embedding, $v) } return { $d, $distance as vec } }
-    from { match { from bm25($docs2, $d2.body, $q) } return { $d2, $score as lex } }
-    $d = $d2
+    let $docs = { match { $d: Doc } return { $d } },
+    let $docs2 = { match { from $docs } return { $d as d2 } },
+    from { match { from distance($docs, $d.embedding, $v) } return { $d, $distance as vec } },
+    from { match { from bm25($docs2, $d2.body, $q) } return { $d2, $score as lex } },
   }
+  where $d = $d2
   return { $d.title, 0.7 * (1.0 / (1.0 + $vec)) + 0.3 * $lex as s }
   order { s desc }
   limit 10
@@ -1047,40 +1078,40 @@ fn weighted_type_checks_with_the_population_renamed_before_d_is_bound() {
 /// whose suggestion is an edit, each reparsing to the intended text.
 const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
     (
-        r#"a bare in edge over a node"#,
+        r#"in over a list inside match"#,
         "T7",
-        r#"query q($s: String) {
-  match { $x: Collection { slug: $s }  $d in $x }
-  return { $d.title }
+        r#"query q($names: [String]) {
+  match { $p: Person, let $n = $p.name, $n in $names }
+  return { $p.name }
 }"#,
-        r#"query q($s: String) { match { $x: Collection { slug: $s } $d "in" $x } return { $d.title } }"#,
+        r#"query q($names: [String]) { match { $p: Person, let $n = $p.name } where $n in $names return { $p.name } }"#,
     ),
     (
         r#"infix contains over a list"#,
         "T7",
         r#"query q() {
-  match { $d: Doc  $d.tags contains "rust" }
+  match { $d: Doc } where $d.tags contains "rust"
   return { $d.title }
 }"#,
-        r#"query q() { match { $d: Doc "rust" in $d.tags } return { $d.title } }"#,
+        r#"query q() { match { $d: Doc } where "rust" in $d.tags return { $d.title } }"#,
     ),
     (
         r#"infix contains over a String"#,
         "T7",
         r#"query q() {
-  match { $d: Doc  $d.title contains "graph" }
+  match { $d: Doc } where $d.title contains "graph"
   return { $d.title }
 }"#,
-        r#"query q() { match { $d: Doc contains($d.title, "graph") } return { $d.title } }"#,
+        r#"query q() { match { $d: Doc } where contains($d.title, "graph") return { $d.title } }"#,
     ),
     (
         r#"infix starts_with"#,
         "T7",
         r#"query q() {
-  match { $p: Person  $p.name starts_with "A" }
+  match { $p: Person } where $p.name starts_with "A"
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person starts_with($p.name, "A") } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where starts_with($p.name, "A") return { $p.name } }"#,
     ),
     (
         r#"an unknown annotation"#,
@@ -1134,7 +1165,7 @@ fn refused_with(src: &str, code: &str) -> crate::query::diagnostic::QueryDiagnos
 #[test]
 fn t74_names_the_return_item_behind_an_unshaped_column() {
     let d = refused_with(
-        "query q() { match { from { match { $p: Person  $p worksAt $c } return { $c, count($p) } } } return { $c } }",
+        "query q() { match { from { match { $p: Person, $p worksAt $c } return { $c, count($p) } } } return { $c } }",
         "T74",
     );
     assert!(d.message.contains("`count($p)`"), "{d}");
@@ -1142,7 +1173,7 @@ fn t74_names_the_return_item_behind_an_unshaped_column() {
         d.fix.as_deref(),
         Some("alias it on the inner `return`: `count($p) as count_p`")
     );
-    let fixed = "query q() { match { from { match { $p: Person  $p worksAt $c } return { $c, count($p) as count_p } } } return { $c, $count_p } }";
+    let fixed = "query q() { match { from { match { $p: Person, $p worksAt $c } return { $c, count($p) as count_p } } } return { $c, $count_p } }";
     ok(fixed);
 }
 
@@ -1151,14 +1182,17 @@ fn t74_names_the_return_item_behind_an_unshaped_column() {
 #[test]
 fn t8_prints_the_block_an_aggregate_filter_means() {
     let d = refused_with(
-        "query q() { match { $p: Person  $p knows $f  count($f) > 3 } return { $p.name } }",
+        "query q() { match { $p: Person, $p knows $f } where count($f) > 3 return { $p.name } }",
         "T8",
     );
     let fix = d.fix.expect("a fix");
-    assert_eq!(fix, "match { $p: Person  count($f) { $p knows $f } > 3 }");
+    assert_eq!(
+        fix,
+        "match { $p: Person } where count($f) { $p knows $f } > 3"
+    );
     ok(&format!("query q() {{ {fix} return {{ $p.name }} }}"));
     let d = refused_with(
-        "query q() { match { $p: Person  count($p) > 3 } return { $p.name } }",
+        "query q() { match { $p: Person } where count($p) > 3 return { $p.name } }",
         "T8",
     );
     assert_eq!(d.fix.as_deref(), Some("return { count($p) as count_p }"));
@@ -1175,12 +1209,16 @@ fn t65_suggests_an_applicable_edit() {
             "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 3) } return { $d.title } order { $distance } limit 3 }",
         ),
         (
-            "query q($s: String) { match { $p: Person  $p authored $d } return { $d.title, bm25($d.body, $s) } order { bm25($d.body, $s) } limit 3 }",
-            "query q($s: String) { match { from bm25({ match { $p: Person  $p authored $d } return { $p, $d } }, $d.body, $s) } return { $d.title, $score as _score } order { $score desc } limit 3 }",
+            "query q($v: Vector(3)) { match { $d: Doc } where $d.year > 2000 return { $d.title } order { nearest($d.embedding, $v) } limit 3 }",
+            "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } where $d.year > 2000 return { $d } }, $d.embedding, $v, k: 3) } return { $d.title } order { $distance } limit 3 }",
+        ),
+        (
+            "query q($s: String) { match { $p: Person, $p authored $d } return { $d.title, bm25($d.body, $s) } order { bm25($d.body, $s) } limit 3 }",
+            "query q($s: String) { match { from bm25({ match { $p: Person, $p authored $d } return { $p, $d } }, $d.body, $s) } return { $d.title, $score as _score } order { $score desc } limit 3 }",
         ),
         (
             "query q($s: String, $v: Vector(3)) { match { $d: Doc } return { $d.title } order { rrf(nearest($d.embedding, $v), bm25($d.body, $s)) } limit 3 }",
-            "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) $d: Doc } return { $d.title } order { $score desc } limit 3 }",
+            "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60), $d: Doc } return { $d.title } order { $score desc } limit 3 }",
         ),
     ] {
         let d = refused_with(written, "T65");
@@ -1205,11 +1243,11 @@ fn t65_suggests_an_applicable_edit() {
 #[test]
 fn a_type_error_carries_the_position_of_its_clause() {
     let d = refused_with(
-        "query q() {\n  match {\n    $p: Person\n    $p.age > \"x\"\n  }\n  return { $p.name }\n}",
+        "query q() {\n  match { $p: Person }\n  where $p.age > \"x\"\n  return { $p.name }\n}",
         "T7",
     );
     let at = d.position.expect("a position");
-    assert_eq!((at.line, at.column), (4, 5));
+    assert_eq!((at.line, at.column), (3, 9));
     let d = refused_with(
         "query q() { match { $p: Person } return { $p.name } order { $p.nope } }",
         "T6",

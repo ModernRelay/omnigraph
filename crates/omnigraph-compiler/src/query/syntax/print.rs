@@ -1,10 +1,8 @@
 //! A printer for the parse tree.
 //!
 //! It writes the text the grammar reads back to an equal tree, inserting a
-//! parenthesis only where precedence requires one. The separators between
-//! `match` clauses and between `return` items are a [`Style`] choice, so the
-//! round-trip property can exercise the whitespace-separated forms the
-//! grammar admits.
+//! parenthesis only where precedence requires one: every list separated by
+//! commas, each pattern's `where` after its elements.
 
 use std::fmt::Write as _;
 
@@ -13,27 +11,7 @@ use crate::query::file::{MutationWriteMode, UnattachedBase};
 use crate::query::syntax::EdgeSelector;
 use crate::query::value::{AggFunc, CompOp, Literal};
 
-#[derive(Debug, Clone, Copy)]
-pub struct Style {
-    /// Between two `match` clauses (and two write-body clauses).
-    pub clause_sep: &'static str,
-    /// Between two `return` items.
-    pub projection_sep: &'static str,
-    /// Between two assignments of a statement.
-    pub assignment_sep: &'static str,
-}
-
-impl Default for Style {
-    fn default() -> Self {
-        Self {
-            clause_sep: "  ",
-            projection_sep: ", ",
-            assignment_sep: ", ",
-        }
-    }
-}
-
-pub fn print_file(file: &SourceFile, style: Style) -> String {
+pub fn print_file(file: &SourceFile) -> String {
     let mut out = String::from("");
     for setting in &file.settings {
         let _ = writeln!(out, "{setting:?}");
@@ -41,20 +19,20 @@ pub fn print_file(file: &SourceFile, style: Style) -> String {
     match &file.body {
         Body::Decls(decls) => {
             for d in decls {
-                out.push_str(&print_decl(d, style));
+                out.push_str(&print_decl(d));
                 out.push('\n');
             }
         }
         Body::Explain(d) => {
             out.push_str("explain ");
-            out.push_str(&print_decl(d, style));
+            out.push_str(&print_decl(d));
         }
         Body::Statement(_) => out.push_str("/* statement */"),
     }
     out
 }
 
-pub fn print_decl(d: &Decl, style: Style) -> String {
+pub fn print_decl(d: &Decl) -> String {
     let mut out = format!("query {}(", d.name);
     for (i, p) in d.params.iter().enumerate() {
         if i > 0 {
@@ -113,23 +91,21 @@ pub fn print_decl(d: &Decl, style: Style) -> String {
     }
     out.push_str(" { ");
     match &d.body {
-        DeclBody::Read(body) => out.push_str(&read_body(body, style)),
+        DeclBody::Read(body) => out.push_str(&read_body(body)),
         DeclBody::Write(body) => {
-            for (g, group) in body.groups.iter().enumerate() {
-                if g > 0 {
-                    out.push_str(style.clause_sep);
-                }
-                for c in &group.clauses {
-                    out.push_str(&clause(c, style));
-                    out.push_str(style.clause_sep);
-                }
-                for (i, s) in group.statements.iter().enumerate() {
-                    if i > 0 {
-                        out.push_str(style.clause_sep);
+            let groups: Vec<String> = body
+                .groups
+                .iter()
+                .map(|group| {
+                    let mut parts = Vec::new();
+                    if !group.pattern.elements.is_empty() {
+                        parts.push(match_pattern(&group.pattern));
                     }
-                    out.push_str(&statement(s, style));
-                }
-            }
+                    parts.extend(group.statements.iter().map(statement));
+                    parts.join("  ")
+                })
+                .collect();
+            out.push_str(&groups.join("  "));
         }
     }
     out.push_str(" }");
@@ -145,12 +121,12 @@ fn annotation_value(v: &AnnotationValue) -> String {
     }
 }
 
-fn statement(s: &Stmt, style: Style) -> String {
+fn statement(s: &Stmt) -> String {
     let assignments = |a: &[Assignment]| {
         a.iter()
             .map(|a| format!("{}: {}", a.property, expr(&a.value)))
             .collect::<Vec<_>>()
-            .join(style.assignment_sep)
+            .join(", ")
     };
     match s {
         Stmt::Insert {
@@ -165,35 +141,21 @@ fn statement(s: &Stmt, style: Style) -> String {
     }
 }
 
-pub fn read_body(body: &ReadBody, style: Style) -> String {
-    let mut out = String::from("match { ");
-    out.push_str(&clauses(&body.clauses, style));
-    out.push_str(" } return ");
+pub fn read_body(body: &ReadBody) -> String {
+    let mut out = match_pattern(&body.pattern);
+    out.push_str(" return ");
     if body.distinct {
         out.push_str("distinct ");
     }
-    out.push_str("{ ");
-    let comma = style.projection_sep.trim() == ",";
     let items: Vec<String> = body
         .projections
         .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            // A whitespace-separated item that begins with `-` would continue
-            // the previous item's expression.
-            let e = if i > 0 && !comma {
-                leading_minus_guarded(expr(&p.expr))
-            } else {
-                expr(&p.expr)
-            };
-            match &p.alias {
-                Some(a) => format!("{e} as {a}"),
-                None => e,
-            }
+        .map(|p| match &p.alias {
+            Some(a) => format!("{} as {a}", expr(&p.expr)),
+            None => expr(&p.expr),
         })
         .collect();
-    out.push_str(&items.join(style.projection_sep));
-    out.push_str(" }");
+    let _ = write!(out, "{{ {} }}", items.join(", "));
     if !body.order.is_empty() {
         let keys: Vec<String> = body
             .order
@@ -218,56 +180,57 @@ pub fn read_body(body: &ReadBody, style: Style) -> String {
     out
 }
 
-fn clauses(cs: &[Clause], style: Style) -> String {
-    cs.iter()
-        .map(|c| clause(c, style))
+/// `match { … }` and its `where`.
+pub fn match_pattern(p: &Pattern) -> String {
+    let mut out = format!("match {{ {} }}", elements(p));
+    if let Some(w) = &p.predicate {
+        let _ = write!(out, " where {}", expr(w));
+    }
+    out
+}
+
+/// A block's or an `optional`'s braces: its elements and its own `where`.
+fn braced(p: &Pattern) -> String {
+    match &p.predicate {
+        Some(w) => format!("{{ {} where {} }}", elements(p), expr(w)),
+        None => format!("{{ {} }}", elements(p)),
+    }
+}
+
+fn elements(p: &Pattern) -> String {
+    p.elements
+        .iter()
+        .map(element)
         .collect::<Vec<_>>()
-        .join(style.clause_sep)
+        .join(", ")
 }
 
-fn inline(body: &ReadBody, style: Style) -> String {
-    format!("{{ {} }}", read_body(body, style))
+fn inline(body: &ReadBody) -> String {
+    format!("{{ {} }}", read_body(body))
 }
 
-pub fn clause(c: &Clause, style: Style) -> String {
+pub fn element(c: &Element) -> String {
     match c {
-        Clause::Let { name, value } => match value {
-            LetValue::Relation(body) => format!("let ${name} = {}", inline(body, style)),
+        Element::Let { name, value } => match value {
+            LetValue::Relation(body) => format!("let ${name} = {}", inline(body)),
             LetValue::Expr(e) => format!("let ${name} = {}", expr(e)),
         },
-        Clause::From(rel) => format!("from {}", relation(rel, style)),
-        Clause::Not(cs) => format!("not {{ {} }}", clauses(cs, style)),
-        Clause::Optional(cs) => format!("optional {{ {} }}", clauses(cs, style)),
-        Clause::Binding {
+        Element::From(rel) => format!("from {}", relation(rel)),
+        Element::Optional(p) => format!("optional {}", braced(p)),
+        Element::Binding {
             variable,
             type_name,
-            prop_matches,
-        } => {
-            if prop_matches.is_empty() {
-                format!("${variable}: {type_name}")
-            } else {
-                let items: Vec<String> = prop_matches
-                    .iter()
-                    .map(|(k, v)| format!("{k}: {}", expr(v)))
-                    .collect();
-                format!("${variable}: {type_name} {{ {} }}", items.join(", "))
-            }
-        }
-        Clause::Traversal(t) => {
+        } => format!("${variable}: {type_name}"),
+        Element::Traversal(t) => {
             let mut out = format!("${} ", t.src);
             if let Some(b) = &t.edge_binding {
                 let _ = write!(out, "${b}:");
             }
             let sel = match &t.selector {
                 EdgeSelector::Wildcard => "*".to_string(),
-                EdgeSelector::Named(n) => edge(n),
-                EdgeSelector::Alternation(ns) if t.undirected => {
-                    ns.iter().map(|n| edge(n)).collect::<Vec<_>>().join(" | ")
-                }
-                EdgeSelector::Alternation(ns) => format!(
-                    "({})",
-                    ns.iter().map(|n| edge(n)).collect::<Vec<_>>().join(" | ")
-                ),
+                EdgeSelector::Named(n) => n.clone(),
+                EdgeSelector::Alternation(ns) if t.undirected => ns.join(" | "),
+                EdgeSelector::Alternation(ns) => format!("({})", ns.join(" | ")),
             };
             if t.undirected {
                 let _ = write!(out, "<{sel}>");
@@ -287,48 +250,24 @@ pub fn clause(c: &Clause, style: Style) -> String {
             let _ = write!(out, " ${}", t.dst);
             out
         }
-        Clause::Filter(e) => leading_minus_guarded(expr(e)),
     }
 }
 
-fn leading_minus_guarded(text: String) -> String {
-    if text.starts_with('-') {
-        format!("({text})")
-    } else {
-        text
-    }
-}
-
-const RESERVED: &[&str] = &["and", "or", "not", "is", "null", "in"];
-
-fn edge(name: &str) -> String {
-    if RESERVED.contains(&name)
-        || matches!(
-            name,
-            "let" | "from" | "true" | "false" | "insert" | "update" | "delete"
-        )
-    {
-        format!("\"{name}\"")
-    } else {
-        name.to_string()
-    }
-}
-
-fn relation(rel: &RelExpr, style: Style) -> String {
+fn relation(rel: &RelExpr) -> String {
     match rel {
-        RelExpr::Inline(body) => inline(body, style),
+        RelExpr::Inline(body) => inline(body),
         RelExpr::Call(c) => call(c),
         RelExpr::Variable(v) => format!("${v}"),
     }
 }
 
-fn block(b: &Block, style: Style) -> String {
+fn block(b: &Block) -> String {
     let head = match (b.func, &b.arg) {
         (BlockFunc::Exists, _) => "exists".to_string(),
         (BlockFunc::Agg(f), None) => agg(f).to_string(),
         (BlockFunc::Agg(f), Some(a)) => format!("{}({})", agg(f), expr(a)),
     };
-    format!("{head} {{ {} }}", clauses(&b.clauses, style))
+    format!("{head} {}", braced(&b.pattern))
 }
 
 fn agg(f: AggFunc) -> &'static str {
@@ -360,7 +299,7 @@ fn call(c: &Call) -> String {
         .iter()
         .map(|a| match a {
             Arg::Expr(e) => expr(e),
-            Arg::Inline(body) => inline(body, Style::default()),
+            Arg::Inline(body) => inline(body),
         })
         .collect();
     parts.extend(c.options.iter().map(|(k, v)| format!("{k}: {}", expr(v))));
@@ -416,7 +355,7 @@ pub fn expr(e: &Expr) -> String {
         Expr::Ident(i) => i.clone(),
         Expr::Call(c) => call(c),
         Expr::AggDistinct { func, arg } => format!("{}(distinct {})", agg(*func), expr(arg)),
-        Expr::Block(b) => block(b, Style::default()),
+        Expr::Block(b) => block(b),
         Expr::Neg(inner) => format!("-{}", at(inner, Prec::Unary)),
         Expr::Arith { op, left, right } => {
             let own = prec(e);

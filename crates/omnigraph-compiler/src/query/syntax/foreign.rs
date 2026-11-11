@@ -467,7 +467,7 @@ fn later_word(input: &str, start: usize, end: usize, prev: u8, depth: i32) -> Op
     }
 }
 
-/// `!knows($p, $q)`, Datalog's negated atom over an edge: `not { $p knows $q }`.
+/// `!knows($p, $q)`, Datalog's negated atom over an edge: `not exists { $p knows $q }`.
 fn datalog_negation(input: &str, at: usize) -> Option<Habit> {
     let rest = &input[at + 1..];
     let name_len = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
@@ -486,8 +486,8 @@ fn datalog_negation(input: &str, at: usize) -> Option<Habit> {
     let end = at + 1 + close + 1;
     Some(habit(
         (at, end),
-        &format!("not {{ {} {name} {} }}", args[0], args[1]),
-        "`!edge(a, b)` is Datalog's negated atom; GQ writes the triple in `not { … }`",
+        &format!("not exists {{ {} {name} {} }}", args[0], args[1]),
+        "`!edge(a, b)` is Datalog's negated atom; GQ writes the triple in `not exists { … }`",
     ))
 }
 
@@ -574,7 +574,7 @@ impl Tracked {
     }
 }
 
-/// The innermost clause, item, key, statement or assignment of `text` that
+/// The innermost element, `where`, item, key, statement or assignment of `text` that
 /// holds byte `pos`.
 fn construct_at(text: &str, pos: usize) -> Option<(usize, usize)> {
     let pairs = QueryParser::parse(Rule::query_file, text).ok()?;
@@ -582,7 +582,8 @@ fn construct_at(text: &str, pos: usize) -> Option<(usize, usize)> {
     for p in pairs.flatten() {
         if !matches!(
             p.as_rule(),
-            Rule::clause
+            Rule::element
+                | Rule::where_clause
                 | Rule::projection
                 | Rule::ordering
                 | Rule::mutation_stmt

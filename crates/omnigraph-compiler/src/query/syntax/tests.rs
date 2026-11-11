@@ -56,28 +56,41 @@ fn write(src: &str) -> WriteBody {
     }
 }
 
-/// The clauses of `query q() { match { <clauses> } return { 1 as one } }`.
+/// The elements of `query q() { match { <elements> } return { 1 as one } }`.
 #[track_caller]
-fn match_clauses(clauses: &str) -> Vec<Clause> {
+fn match_elements(elements: &str) -> Vec<Element> {
     read(&format!(
-        "query q() {{ match {{ {clauses} }} return {{ 1 as one }} }}"
+        "query q() {{ match {{ {elements} }} return {{ 1 as one }} }}"
     ))
-    .clauses
+    .pattern
+    .elements
 }
 
 #[track_caller]
-fn one_clause(text: &str) -> Clause {
-    let mut c = match_clauses(text);
+fn one_element(text: &str) -> Element {
+    let mut c = match_elements(text);
     assert_eq!(c.len(), 1, "{text} gave {c:#?}");
     c.remove(0)
 }
 
+/// The `where` of `query q() { match { $x: X } where <text> return { 1 as
+/// one } }`.
 #[track_caller]
-fn filter_expr(text: &str) -> Expr {
-    match one_clause(text) {
-        Clause::Filter(e) => e,
-        other => panic!("{text}: not a filter: {other:?}"),
-    }
+fn where_expr(text: &str) -> Expr {
+    read(&format!(
+        "query q() {{ match {{ $x: X }} where {text} return {{ 1 as one }} }}"
+    ))
+    .pattern
+    .predicate
+    .unwrap_or_else(|| panic!("{text}: no where"))
+}
+
+/// The refusal of `text` written as one element of a read's `match`.
+#[track_caller]
+fn element_refusal(text: &str) -> QueryDiagnostic {
+    refusal_of(&format!(
+        "query q() {{ match {{ {text} }} return {{ 1 as one }} }}"
+    ))
 }
 
 fn int(n: i128) -> Expr {
@@ -102,6 +115,143 @@ fn cmp(op: CompOp, l: Expr, r: Expr) -> Expr {
 }
 
 // ---------------------------------------------------------------------------
+// `match` holds the elements, `where` the predicate (section 3).
+
+#[test]
+fn match_holds_the_elements_and_where_the_predicate() {
+    let r = read(
+        "query colleagues($h: String) { match { $p: Person, $p worksAt $c, $q worksAt $c } where $p.handle = $h and $q != $p and not exists { $q blocked $p } return { $q.name } }",
+    );
+    assert_eq!(r.pattern.elements.len(), 3);
+    assert!(matches!(r.pattern.predicate, Some(Expr::And(..))));
+    // A trailing comma, and elements one per line.
+    assert_eq!(match_elements("$p: Person,").len(), 1);
+    assert_eq!(match_elements("\n  $p: Person,\n  $p knows $q,\n").len(), 2);
+    // A block holds elements and its own `where` inside its braces, and so
+    // does `optional`.
+    let Expr::Compare { left, .. } = where_expr("count { $x knows $q where $q.age > 30 } > 2")
+    else {
+        panic!()
+    };
+    let Expr::Block(b) = *left else { panic!() };
+    assert_eq!(b.pattern.elements.len(), 1);
+    assert!(b.pattern.predicate.is_some());
+    let Element::Optional(o) = one_element("optional { $p worksAt $c where $c.name = \"x\" }")
+    else {
+        panic!()
+    };
+    assert!(o.predicate.is_some());
+    // A write group selects with the same `match` and `where`.
+    let w = write(
+        "query relocate($slug: String) { match { $c: Company, $p worksAt $c } where $c.slug = $slug update $p set { city: null } }",
+    );
+    assert_eq!(w.groups[0].pattern.elements.len(), 2);
+    assert!(w.groups[0].pattern.predicate.is_some());
+}
+
+/// Each repair of a predicate written among the elements is one suggestion
+/// over the whole `match` and its `where`, which reparses to the intended
+/// tree (section 3's table).
+#[test]
+fn a_predicate_inside_match_prints_the_where_after_the_braces() {
+    for (src, code, intended) in [
+        (
+            "query q() { match { $p: Person, $p.age > 30 } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where $p.age > 30 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person where $p.age > 30 } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where $p.age > 30 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person, $p.age > 30 } where $p.age < 60 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where $p.age > 30 and $p.age < 60 return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person, $p.a = 1 or $p.b = 2 } return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where ($p.a = 1 or $p.b = 2) return { $p } }",
+        ),
+        (
+            "query q($h: String) { match { $p: Person { handle: $h }, $p knows $q } return { $q } }",
+            "Q010",
+            "query q($h: String) { match { $p: Person, $p knows $q } where $p.handle = $h return { $q } }",
+        ),
+        (
+            "query q() { match { $d: Doc { year >= 2025 } } return { $d } }",
+            "Q010",
+            "query q() { match { $d: Doc } where $d.year >= 2025 return { $d } }",
+        ),
+        (
+            "query q() { match { $p: Person, not { $p knows $q } } return { $p } }",
+            "Q012",
+            "query q() { match { $p: Person } where not exists { $p knows $q } return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person } where not { $p knows $q } return { $p } }",
+            "Q012",
+            "query q() { match { $p: Person } where not exists { $p knows $q } return { $p } }",
+        ),
+        (
+            "query q() { match { $p: Person $p knows $q } return { $q } }",
+            "Q016",
+            "query q() { match { $p: Person, $p knows $q } return { $q } }",
+        ),
+        (
+            "query q() { match { $p: Person } where count { $p knows $q $q.age > 3 } > 1 return { $p } }",
+            "Q017",
+            "query q() { match { $p: Person } where count { $p knows $q where $q.age > 3 } > 1 return { $p } }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), code, "{src}: {e:?}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(
+            parse_source(&fixed).unwrap_or_else(|e| panic!("{src}\n{fixed}\n{e:?}")),
+            parsed(intended),
+            "{src}\n{fixed}"
+        );
+    }
+}
+
+#[test]
+fn every_list_takes_commas_and_a_missing_one_prints_it() {
+    for (src, intended) in [
+        (
+            "query q() { match { $p: Person } return { $p.name $p.age } }",
+            "query q() { match { $p: Person } return { $p.name, $p.age } }",
+        ),
+        (
+            "query q() { match { $p: Person } return { $p.name } order { $p.age desc $p.name } }",
+            "query q() { match { $p: Person } return { $p.name } order { $p.age desc, $p.name } }",
+        ),
+        (
+            "query q() { match { $p: Person } where contains($p.name \"a\") return { $p.name } }",
+            "query q() { match { $p: Person } where contains($p.name, \"a\") return { $p.name } }",
+        ),
+        (
+            "query w() { insert Person { handle: \"h\" name: \"n\" } }",
+            "query w() { insert Person { handle: \"h\", name: \"n\" } }",
+        ),
+        (
+            "query w() { match { $p: Person } update $p set {\n  age: 3\n  city: null\n} }",
+            "query w() { match { $p: Person } update $p set { age: 3, city: null } }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q016", "{src}: {e:?}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(parse_source(&fixed).unwrap(), parsed(intended), "{fixed}");
+    }
+    // A trailing comma in every list but a call's arguments.
+    read("query q() { match { $p: Person, } return { $p.name, } order { $p.name, } }");
+    write("query w() { insert Person { handle: \"h\", } }");
+}
+
+// ---------------------------------------------------------------------------
 // Infix string predicates.
 
 /// An infix `contains` is a tree node the type checker refuses, since the
@@ -110,7 +260,7 @@ fn cmp(op: CompOp, l: Expr, r: Expr) -> Expr {
 #[test]
 fn an_infix_string_predicate_is_a_node_the_checker_refuses() {
     let f = parse_query_diagnostic(
-        "query q() { match { $d: Doc  $d.t contains \"x\" } return { $d.t } }",
+        "query q() { match { $d: Doc } where $d.t contains \"x\" return { $d.t } }",
     )
     .unwrap();
     let FileBody::Queries(decls) = f.body else {
@@ -120,155 +270,143 @@ fn an_infix_string_predicate_is_a_node_the_checker_refuses() {
         panic!("a read")
     };
     assert!(matches!(
-        body.clauses[1],
-        Clause::Filter(Expr::InfixString { .. })
+        body.pattern.predicate,
+        Some(Expr::InfixString { .. })
     ));
     // `gq` is an ordinary identifier.
     assert!(
-        parse_query_diagnostic("query gq() { match { $p: P { gq: 3 } } return { $p.gq } }").is_ok()
+        parse_query_diagnostic("query gq() { match { $p: P } where $p.gq = 3 return { $p.gq } }")
+            .is_ok()
     );
 }
 
 // ---------------------------------------------------------------------------
-// `let` and `from` in every clause position.
+// `let` and `from` in every element position.
 
 const LET: &str = "let $v = $p.age";
 const FROM: &str = "from { match { $p knows $q } return { $q } }";
 
 #[test]
-fn let_and_from_in_every_clause_position() {
+fn let_and_from_in_every_element_position() {
     for text in [LET, FROM] {
-        let probe = |c: &Clause| matches!(c, Clause::Let { .. } | Clause::From(_));
+        let probe = |c: &Element| matches!(c, Element::Let { .. } | Element::From(_));
         // First, middle and last of a `match`.
-        for clauses in [
-            format!("{text}  $p: Person"),
-            format!("$p: Person  {text}  $p.age > 1"),
-            format!("$p: Person  {text}"),
+        for elements in [
+            format!("{text}, $p: Person"),
+            format!("$p: Person, {text}, $p knows $q"),
+            format!("$p: Person, {text}"),
         ] {
-            let c = match_clauses(&clauses);
-            assert_eq!(c.len(), clauses.matches("  ").count() + 1, "{clauses}");
-            assert!(c.iter().any(probe), "{clauses}: {c:#?}");
+            let c = match_elements(&elements);
+            assert_eq!(c.len(), elements.matches(", ").count() + 1, "{elements}");
+            assert!(c.iter().any(probe), "{elements}: {c:#?}");
         }
         // Inside every block.
-        for block in ["not", "optional", "exists", "count"] {
-            let suffix = if block == "count" { " > 0" } else { "" };
-            let c = one_clause(&format!("{block} {{ $p: Person  {text} }}{suffix}"));
-            let inner = match c {
-                Clause::Not(c) | Clause::Optional(c) => c,
-                Clause::Filter(Expr::Block(b)) => b.clauses,
-                Clause::Filter(Expr::Compare { left, .. }) => match *left {
-                    Expr::Block(b) => b.clauses,
+        for block in ["optional", "exists", "count"] {
+            let pattern = if block == "optional" {
+                match one_element(&format!("{block} {{ $p: Person, {text} }}")) {
+                    Element::Optional(p) => p,
                     other => panic!("{block}: {other:?}"),
-                },
-                other => panic!("{block}: {other:?}"),
+                }
+            } else {
+                let suffix = if block == "count" { " > 0" } else { "" };
+                match where_expr(&format!("{block} {{ $p: Person, {text} }}{suffix}")) {
+                    Expr::Block(b) => b.pattern,
+                    Expr::Compare { left, .. } => match *left {
+                        Expr::Block(b) => b.pattern,
+                        other => panic!("{block}: {other:?}"),
+                    },
+                    other => panic!("{block}: {other:?}"),
+                }
             };
-            assert!(inner.iter().any(probe), "{block}: {inner:#?}");
+            assert!(pattern.elements.iter().any(probe), "{block}: {pattern:#?}");
         }
-        // As a block value's clause.
-        let e = filter_expr(&format!("$x.n < count {{ $p: Person  {text} }}"));
-        assert!(matches!(e, Expr::Compare { .. }));
         // Inside an inline read, as `from`'s and `let`'s relation.
-        let c = one_clause(&format!(
-            "from {{ match {{ $p: Person  {text} }} return {{ $p }} }}"
+        let c = one_element(&format!(
+            "from {{ match {{ $p: Person, {text} }} return {{ $p }} }}"
         ));
-        let Clause::From(RelExpr::Inline(body)) = c else {
+        let Element::From(RelExpr::Inline(body)) = c else {
             panic!()
         };
-        assert!(body.clauses.iter().any(probe));
-        // In a write body, before a statement.
+        assert!(body.pattern.elements.iter().any(probe));
+        // In a write group's `match`.
         let w = write(&format!(
-            "query w() {{ $p: Person  {text}  update $p set {{ age: 1 }} }}"
+            "query w() {{ match {{ $p: Person, {text} }} update $p set {{ age: 1 }} }}"
         ));
         assert!(
-            w.all_clauses().into_iter().any(probe),
+            w.all_elements().into_iter().any(probe),
             "{:#?}",
-            w.all_clauses()
+            w.all_elements()
         );
-        // As the only clause of a write body.
-        let w = write(&format!("query w() {{ {text}  delete $p }}"));
-        assert_eq!(w.all_clauses().len(), 1);
     }
 }
 
 #[test]
 fn from_takes_an_inline_read_a_variable_and_a_call() {
     assert!(matches!(
-        one_clause("from { match { $p: Person } return { $p } }"),
-        Clause::From(RelExpr::Inline(_))
+        one_element("from { match { $p: Person } return { $p } }"),
+        Element::From(RelExpr::Inline(_))
     ));
     assert!(matches!(
-        one_clause("from $docs"),
-        Clause::From(RelExpr::Variable(v)) if v == "docs"
+        one_element("from $docs"),
+        Element::From(RelExpr::Variable(v)) if v == "docs"
     ));
-    let Clause::From(RelExpr::Call(c)) = one_clause("from colleagues($x.handle)") else {
+    let Element::From(RelExpr::Call(c)) = one_element("from colleagues($x.handle)") else {
         panic!()
     };
     assert_eq!(c.name, "colleagues");
-    let Clause::From(RelExpr::Call(c)) = one_clause(
+    // A call's name need not touch its parenthesis.
+    let Element::From(RelExpr::Call(c)) = one_element("from colleagues ($x.handle)") else {
+        panic!()
+    };
+    assert_eq!(c.name, "colleagues");
+    let Element::From(RelExpr::Call(c)) = one_element(
         "from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20, recall: 0.9)",
     ) else {
         panic!()
     };
     assert_eq!((c.args.len(), c.options.len()), (3, 2));
     assert!(matches!(c.args[0], Arg::Inline(_)));
-    // `from` followed by anything else is a parse error at the word (section
-    // 7, as adopted on 2026-11-08: a bare filter named `from` is never well
-    // typed), and so is a bare name anywhere in a `match`.
+    // `from` followed by anything else is a parse error at the word, and so
+    // is a bare name anywhere in a `match`.
     for text in ["from = 1", "from", "from (1) = 1"] {
-        let e = refusal_of(&format!(
-            "query q() {{ match {{ {text} }} return {{ 1 as one }} }}"
-        ));
+        let e = element_refusal(text);
         assert!(["Q018", "Q019"].contains(&e.code.as_str()), "{text}: {e:?}");
         assert_eq!(e.position.unwrap().column, 21, "{text}: at the word");
     }
 }
 
+/// Inside `match` any word is an edge name, keywords included, and a quoted
+/// name is still accepted (section 7).
 #[test]
-fn let_and_from_are_property_edge_alias_and_assignment_names() {
-    for word in ["true", "false"] {
-        // The Boolean literals are not bare edge names either.
-        assert!(matches!(
-            one_clause(&format!("$a \"{word}\" $b")),
-            Clause::Traversal(_)
-        ));
-        let c = match_clauses(&format!("$ok {word} $p: Person"));
-        assert_eq!(c.len(), 3, "{word}: {c:#?}");
-        // Between two lone variables, refused with the quoted edge.
-        let e = refusal_of(&format!(
-            "query q() {{ match {{ $a {word} $b }} return {{ 1 as one }} }}"
-        ));
-        assert_eq!(e.code.as_str(), "Q017", "{word}");
-    }
-    for word in ["let", "from"] {
-        // A property after a dot, in a binding's braces and in return.
-        let r = read(&format!(
-            "query q() {{ match {{ $p: Person {{ {word}: 1 }}  $p.{word} > 0 }} return {{ $p.{word} as {word} }} order {{ {word} }} }}"
-        ));
-        assert_eq!(r.projections[0].alias.as_deref(), Some(word));
-        // An edge name: quoted, since `$ok  from $r` (a Boolean filter, then
-        // a `from` clause) and `$ok from $r` (a triple over `from`) are the
-        // same text.
-        let Clause::Traversal(t) = one_clause(&format!("$a \"{word}\" $b")) else {
+fn any_word_is_an_edge_name_inside_match() {
+    for word in [
+        "true", "false", "let", "from", "in", "and", "or", "not", "is", "null", "insert", "update",
+        "delete", "where", "match", "return",
+    ] {
+        let Element::Traversal(t) = one_element(&format!("$a {word} $b")) else {
             panic!("{word} as an edge")
         };
-        assert_eq!(t.selector, EdgeSelector::Named(word.into()));
+        assert_eq!(t.selector, EdgeSelector::Named(word.into()), "{word}");
+        let Element::Traversal(q) = one_element(&format!("$a \"{word}\" $b")) else {
+            panic!("{word} quoted")
+        };
+        assert_eq!(q, t, "{word}: the quoted name is the same triple");
         // A bound edge of that name, with bounds, undirected, alternated.
-        one_clause(&format!("$a $k:\"{word}\" $b"));
-        one_clause(&format!("$a \"{word}\"{{1,2}} $b"));
-        one_clause(&format!("$a <\"{word}\"> $b"));
-        one_clause(&format!("$a (\"{word}\" | knows) $b"));
-        // The bare form between two lone variables is refused, with the
-        // quoted edge as the fix (section 7, as adopted on 2026-11-08).
-        let e = refusal_of(&format!(
-            "query q() {{ match {{ $ok {word} $r }} return {{ 1 as one }} }}"
+        one_element(&format!("$a $k:{word} $b"));
+        one_element(&format!("$a {word}{{1,2}} $b"));
+        one_element(&format!("$a <{word}> $b"));
+        one_element(&format!("$a ({word} | knows) $b"));
+    }
+    // In a write group, a statement word between two variables in `match`
+    // is a triple, and the statement after the braces is a statement.
+    let w = write("query w() { match { $a: Person, $a delete $b } delete $b }");
+    assert_eq!((w.all_elements().len(), w.all_statements().len()), (2, 1));
+    for word in ["let", "from"] {
+        // A property after a dot, in `where` and in return.
+        let r = read(&format!(
+            "query q() {{ match {{ $p: Person }} where $p.{word} > 0 return {{ $p.{word} as {word} }} order {{ {word} }} }}"
         ));
-        assert_eq!(e.code.as_str(), "Q017", "{word}");
-        assert_eq!(
-            e.fix.as_deref(),
-            Some(format!("$ok \"{word}\" $r").as_str())
-        );
-        // A name that merely starts with the word is a bare edge.
-        one_clause(&format!("$a {word}s $b"));
+        assert_eq!(r.projections[0].alias.as_deref(), Some(word));
         // A bare mutation property.
         let w = write(&format!(
             "query w() {{ insert Person {{ {word}: 1, handle: \"h\" }} }}"
@@ -276,10 +414,10 @@ fn let_and_from_are_property_edge_alias_and_assignment_names() {
         assert!(
             matches!(&w.all_statements()[0], Stmt::Insert { assignments, .. } if assignments[0].property == word)
         );
-        // A registry row is never named a clause keyword (section 5), so
+        // A registry row is never named an element keyword (section 5), so
         // `from(1)` and `let(1)` are refused, not calls.
         let e = refusal_of(&format!(
-            "query q() {{ match {{ $x.a = {word}(1) }} return {{ 1 as one }} }}"
+            "query q() {{ match {{ $x: X }} where $x.a = {word}(1) return {{ 1 as one }} }}"
         ));
         assert_eq!(e.code.as_str(), "Q019", "{word}");
     }
@@ -296,43 +434,35 @@ fn let_and_from_are_property_edge_alias_and_assignment_names() {
 fn minus_is_arithmetic_and_the_arrow_is_refused() {
     let gt = |l| cmp(CompOp::Gt, l, int(0));
     assert_eq!(
-        filter_expr("$n - 1 > 0"),
+        where_expr("$n - 1 > 0"),
         gt(arith(ArithOp::Sub, var("n"), int(1)))
     );
-    // A binary minus has whitespace on both sides or neither (section 3, as
-    // adopted on 2026-11-08): `$n -1` and `$n- 1` are refused, and the
-    // suggestion applied is `$n - 1`.
-    for asym in ["$n -1 > 0", "$n- 1 > 0"] {
-        let src = format!("query q() {{ match {{ {asym} }} return {{ 1 as one }} }}");
-        let e = refusal_of(&src);
-        assert_eq!(e.code.as_str(), "Q016", "{asym}");
-        let fixed = super::parse::apply_edits(&src, &e.suggestion.as_ref().unwrap().edits);
-        assert_eq!(
-            parse_source(&fixed).unwrap(),
-            parse_text("query q() { match { $n - 1 > 0 } return { 1 as one } }").unwrap(),
-            "{asym}"
-        );
+    // A negative number is unary minus over a literal, so `$n -1`, `$n- 1`
+    // and `$n-1` are one subtraction (section 3).
+    for spelled in ["$n -1 > 0", "$n- 1 > 0", "$n-1 > 0"] {
+        assert_eq!(where_expr(spelled), where_expr("$n - 1 > 0"), "{spelled}");
     }
-    assert_eq!(filter_expr("$n-1 > 0"), filter_expr("$n - 1 > 0"));
     assert_eq!(
-        filter_expr("$n - $m > 0"),
+        where_expr("$n - $m > 0"),
         gt(arith(ArithOp::Sub, var("n"), var("m")))
     );
-    // Without spaces too.
-    assert_eq!(filter_expr("$n-$m > 0"), filter_expr("$n - $m > 0"));
+    assert_eq!(where_expr("$n-$m > 0"), where_expr("$n - $m > 0"));
+    // In `return`, items are separated by commas, so `$a -$b` is one item.
+    let r = read("query q() { match { $p: Person } return { $p.age -1 as a, -$p.age as b } }");
+    assert_eq!(r.projections.len(), 2);
     // `$a -knows- $b` is the arrow, refused with the triple as the fix.
-    let e = refusal_of("query q() { match { $a -knows- $b } return { $a } }");
+    let e = element_refusal("$a -knows- $b");
     assert_eq!(e.code.as_str(), "Q007");
     assert_eq!(e.fix.as_deref(), Some("$a <knows> $b"));
-    let e = refusal_of("query q() { match { $a -knows-> $b } return { $a } }");
+    let e = element_refusal("$a -knows-> $b");
     assert_eq!(e.fix.as_deref(), Some("$a knows $b"));
-    let e = refusal_of("query q() { match { $a <-knows- $b } return { $a } }");
+    let e = element_refusal("$a <-knows- $b");
     assert_eq!(e.fix.as_deref(), Some("$b knows $a"));
-    let e = refusal_of("query q() { match { $a -$k:knows{1,2}-> $b } return { $a } }");
+    let e = element_refusal("$a -$k:knows{1,2}-> $b");
     assert_eq!(e.fix.as_deref(), Some("$a $k:knows{1,2} $b"));
-    let e = refusal_of("query q() { match { $a -\"in\"-> $b } return { $a } }");
-    assert_eq!(e.fix.as_deref(), Some("$a \"in\" $b"));
-    let e = refusal_of("query q() { match { $a -(knows | likes)-> $b } return { $a } }");
+    let e = element_refusal("$a -in-> $b");
+    assert_eq!(e.fix.as_deref(), Some("$a in $b"));
+    let e = element_refusal("$a -(knows | likes)-> $b");
     assert_eq!(e.fix.as_deref(), Some("$a (knows | likes) $b"));
 }
 
@@ -341,7 +471,7 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
     // `*` binds tighter than `+`; both are left-associative; unary minus
     // binds tightest; comparison is below arithmetic and above `not`.
     assert_eq!(
-        filter_expr("$a + $b * $c > 0"),
+        where_expr("$a + $b * $c > 0"),
         cmp(
             CompOp::Gt,
             arith(
@@ -353,7 +483,7 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
         )
     );
     assert_eq!(
-        filter_expr("$a - $b - $c > 0"),
+        where_expr("$a - $b - $c > 0"),
         cmp(
             CompOp::Gt,
             arith(
@@ -365,7 +495,7 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
         )
     );
     assert_eq!(
-        filter_expr("$a / $b % $c > 0"),
+        where_expr("$a / $b % $c > 0"),
         cmp(
             CompOp::Gt,
             arith(
@@ -377,33 +507,29 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
         )
     );
     assert_eq!(
-        filter_expr("0 < -$a * $b"),
+        where_expr("0 < -$a * $b"),
         cmp(
             CompOp::Lt,
             int(0),
             arith(ArithOp::Mul, Expr::Neg(Box::new(var("a"))), var("b"))
         )
     );
-    // The leading-minus rule is gone (2026-11-08): a filter may begin with
-    // `-`, because a `-` after whitespace and before a word is never binary.
     assert_eq!(
-        filter_expr("-$a > 0"),
+        where_expr("-$a > 0"),
         cmp(CompOp::Gt, Expr::Neg(Box::new(var("a"))), int(0))
     );
     assert_eq!(
-        filter_expr("(-$a) > 0"),
+        where_expr("(-$a) > 0"),
         cmp(CompOp::Gt, Expr::Neg(Box::new(var("a"))), int(0))
     );
-    // Clauses have no separator: after an expression clause, `X  -Y` would
-    // continue it, so it is refused (Q016) instead of silently merging.
+    // A newline is not a separator: `$a.x` then `-$b.y` on the next line is
+    // one subtraction.
     assert_eq!(
-        refusal_of("query q() { match { $a.x\n  -$b.y > 0 } return { 1 } }")
-            .code
-            .as_str(),
-        "Q016"
+        where_expr("$a.x\n  -$b.y > 0"),
+        where_expr("$a.x - $b.y > 0")
     );
     assert_eq!(
-        filter_expr("$a * ($b + $c) > --1"),
+        where_expr("$a * ($b + $c) > --1"),
         cmp(
             CompOp::Gt,
             arith(
@@ -415,19 +541,18 @@ fn the_ladder_has_the_usual_precedence_and_associativity() {
         )
     );
     assert!(matches!(
-        filter_expr("not $a + 1 > 2 and $b"),
+        where_expr("not $a + 1 > 2 and $b"),
         Expr::And(l, _) if matches!(*l, Expr::Not(_))
     ));
     // Comparison stays non-associative.
-    assert!(parse_text("query q() { match { $a < $b < $c } return { $a } }").is_err());
-    // Arithmetic in `return`, `order`, `let`, a binding value and an
-    // assignment.
+    assert!(parse_text("query q() { match { $x: X } where $a < $b < $c return { $a } }").is_err());
+    // Arithmetic in `return`, `order`, `let`, `where` and an assignment.
     let r = read(
-        "query doubled($min: I32) { match { $p: Person { age: $min + 1 }  $p.age * 2 >= $min  let $born = 2026 - $p.age } return { $p.name, $p.age * 2 as twice, (2026 - $p.age) as born_about } order { -$p.age, $born % 10 desc } }",
+        "query doubled($min: I32) { match { $p: Person, let $born = 2026 - $p.age } where $p.age = $min + 1 and $p.age * 2 >= $min return { $p.name, $p.age * 2 as twice, (2026 - $p.age) as born_about } order { -$p.age, $born % 10 desc } }",
     );
     assert_eq!(r.projections.len(), 3);
     let w = write(
-        "query birthday($h: String) { $p: Person { handle: $h }  update $p set { age: $p.age + 1 } }",
+        "query birthday($h: String) { match { $p: Person } where $p.handle = $h update $p set { age: $p.age + 1 } }",
     );
     assert!(
         matches!(&w.all_statements()[0], Stmt::Update { assignments, .. } if matches!(assignments[0].value, Expr::Arith { .. }))
@@ -444,7 +569,7 @@ fn float_literals_take_an_exponent() {
         ("0.5", 0.5),
     ] {
         assert_eq!(
-            filter_expr(&format!("$x.f > {text}")),
+            where_expr(&format!("$x.f > {text}")),
             cmp(
                 CompOp::Gt,
                 Expr::Prop {
@@ -458,7 +583,7 @@ fn float_literals_take_an_exponent() {
     }
     // A negative exponent float is unary minus over the literal.
     assert!(matches!(
-        filter_expr("$x.f > -1.0e-3"),
+        where_expr("$x.f > -1.0e-3"),
         Expr::Compare { right, .. } if matches!(*right, Expr::Neg(_))
     ));
     // `1e3` without a fraction is not a float. The RFC's `float_lit` admits
@@ -556,38 +681,25 @@ fn the_reserved_set_is_the_six_words() {
     for word in CONTEXTUAL {
         // A property after a dot, an edge, an alias and a bare mutation
         // property.
-        // The statement words are quoted edges too.
-        let edge = if matches!(
-            *word,
-            "let" | "from" | "true" | "false" | "insert" | "update" | "delete"
-        ) {
-            format!("\"{word}\"")
-        } else {
-            word.to_string()
-        };
         let src = format!(
-            "query q() {{ match {{ $p: Person  $p.{word} = 1  $p {edge} $q }} return {{ $p.{word} as {word} }} }}"
+            "query q() {{ match {{ $p: Person, $p {word} $q }} where $p.{word} = 1 return {{ $p.{word} as {word} }} }}"
         );
         let r = read(&src);
         assert!(
-            matches!(&r.clauses[2], Clause::Traversal(_)),
+            matches!(&r.pattern.elements[1], Element::Traversal(_)),
             "`{word}` as an edge: {:#?}",
-            r.clauses
+            r.pattern.elements
         );
         assert_eq!(r.projections[0].alias.as_deref(), Some(*word), "{word}");
         let w = write(&format!("query w() {{ insert Person {{ {word}: 1 }} }}"));
         assert_eq!(w.all_statements().len(), 1, "{word}");
         let w = write(&format!(
-            "query w() {{ $p: Person  update $p set {{ {word}: 2 }} }}"
+            "query w() {{ match {{ $p: Person }} update $p set {{ {word}: 2 }} }}"
         ));
         assert_eq!(w.all_statements().len(), 1, "{word}");
-        // A binding's match key.
-        read(&format!(
-            "query q() {{ match {{ $p: Person {{ {word}: 1 }} }} return {{ $p }} }}"
-        ));
     }
     for word in RESERVED {
-        // Refused as an alias and as a bare edge; a property after a dot is
+        // Refused as an alias; a property after a dot and an edge name are
         // fine.
         assert!(
             parse_text(&format!(
@@ -597,40 +709,27 @@ fn the_reserved_set_is_the_six_words() {
             "{word} as an alias"
         );
         read(&format!(
-            "query q() {{ match {{ $p: P  $p.{word} = 1 }} return {{ $p.{word} }} }}"
+            "query q() {{ match {{ $p: P }} where $p.{word} = 1 return {{ $p.{word} }} }}"
         ));
-        let quoted = one_clause(&format!("$a \"{word}\" $b"));
-        assert!(matches!(quoted, Clause::Traversal(_)), "{word} quoted");
-        let bare = parse_text(&format!(
-            "query q() {{ match {{ $a {word} $b }} return {{ $a }} }}"
-        ));
-        match *word {
-            // `$a in $b` and `$a is …` are filters, not traversals.
-            "in" => assert!(matches!(bare.as_ref().map(|_| ()), Ok(()))),
-            _ => assert!(
-                bare.is_err()
-                    || !matches!(
-                        bare.as_ref().unwrap().body,
-                        Body::Decls(ref d) if matches!(&d[0].body, DeclBody::Read(r) if matches!(r.clauses[0], Clause::Traversal(_)))
-                    ),
-                "{word} bare is a traversal"
-            ),
-        }
+        assert!(
+            matches!(one_element(&format!("$a {word} $b")), Element::Traversal(_)),
+            "{word} as an edge"
+        );
     }
 }
 
+/// `$d in $x` inside `match` is a triple over the edge named `in`; in
+/// `where` it is the membership test, which the type checker refuses with
+/// the triple's place as the fix when `$x` is a node, and inside `match`
+/// with a list on the right it is `T7` with the `where` as the fix.
 #[test]
-fn an_edge_named_in_is_quoted_and_the_bare_form_is_a_membership_filter() {
-    let Clause::Traversal(t) = one_clause("$d \"in\" $x") else {
+fn in_is_an_edge_in_match_and_membership_in_where() {
+    let Element::Traversal(t) = one_element("$d in $x") else {
         panic!()
     };
     assert_eq!(t.selector, EdgeSelector::Named("in".into()));
-    // `$d in $x` is a legal membership filter (the fix for `unwind` is
-    // `$x in $list`), so the parser cannot refuse the bare edge: the type
-    // checker, seeing a node on the right of `in`, prints the quoted name
-    // (`T7`).
     assert_eq!(
-        filter_expr("$d in $x"),
+        where_expr("$d in $x"),
         Expr::In {
             needle: Box::new(var("d")),
             list: Box::new(var("x")),
@@ -643,12 +742,12 @@ fn an_edge_named_in_is_quoted_and_the_bare_form_is_a_membership_filter() {
 // Refused respellings with their fix.
 
 #[test]
-fn delete_and_update_with_where_print_the_binding_and_filter() {
+fn delete_and_update_with_where_print_the_group() {
     let e = refusal_of("query retire($h: String) { delete WorksAt where @src = $h }");
     assert_eq!(e.code.as_str(), "Q008");
     assert_eq!(
         e.fix.as_deref(),
-        Some("$x: WorksAt  $x.@src = $h  delete $x")
+        Some("match { $x: WorksAt } where $x.@src = $h  delete $x")
     );
     let e = refusal_of(
         "query retire($h: String) { update Person set { city: \"x\" } where handle = $h and age > 3 }",
@@ -656,16 +755,26 @@ fn delete_and_update_with_where_print_the_binding_and_filter() {
     assert_eq!(e.code.as_str(), "Q008");
     assert_eq!(
         e.fix.as_deref(),
-        Some("$x: Person  $x.handle = $h and $x.age > 3  update $x set { city: \"x\" }")
+        Some(
+            "match { $x: Person } where $x.handle = $h and $x.age > 3  update $x set { city: \"x\" }"
+        )
     );
-    // `where_stmt` is tried first and takes a variable too, so
-    // `delete $x where φ` prints the filter clause instead of reading `where`
-    // as a bare name after the statement.
-    let e = refusal_of("query q() { $x: Person  delete $x where $x.age > 3 }");
-    assert_eq!(e.code.as_str(), "Q008");
-    assert_eq!(e.fix.as_deref(), Some("$x.age > 3  delete $x"));
-    let e = refusal_of("query q() { $x: Person  update $x set { a: 1 } where $x.age > 3 }");
-    assert_eq!(e.fix.as_deref(), Some("$x.age > 3  update $x set { a: 1 }"));
+    // Over a bound variable the predicate joins the group's `where`.
+    for (src, intended) in [
+        (
+            "query q() { match { $x: Person } delete $x where $x.age > 3 }",
+            "query q() { match { $x: Person } where $x.age > 3 delete $x }",
+        ),
+        (
+            "query q() { match { $x: Person } where $x.age < 90 update $x set { a: 1 } where $x.age > 3 }",
+            "query q() { match { $x: Person } where $x.age < 90 and $x.age > 3 update $x set { a: 1 } }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q008", "{src}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(parse_source(&fixed).unwrap(), parsed(intended), "{fixed}");
+    }
 }
 
 #[test]
@@ -683,21 +792,16 @@ fn the_mutation_keyword_is_refused_with_query_as_the_fix() {
         "Q009"
     );
     // `mutation` stays an identifier everywhere else.
-    read("query mutation() { match { $p: P { mutation: 1 } } return { $p.mutation as mutation } }");
-}
-
-#[test]
-fn a_comparison_in_binding_braces_prints_the_filter_clause() {
-    let e = refusal_of("query q() { match { $d: Doc { year >= 2025 } } return { $d } }");
-    assert_eq!(e.code.as_str(), "Q010");
-    assert_eq!(e.fix.as_deref(), Some("$d: Doc  $d.year >= 2025"));
-    // A legal match list is unaffected, with or without a trailing comma.
-    read("query q() { match { $d: Doc { year: 2025, title: \"x\", } } return { $d } }");
+    read(
+        "query mutation() { match { $p: P } where $p.mutation = 1 return { $p.mutation as mutation } }",
+    );
 }
 
 #[test]
 fn as_commit_is_a_write_body_clause() {
-    let d = decl("query retire($h: String) as commit { $p: Person { handle: $h }  delete $p }");
+    let d = decl(
+        "query retire($h: String) as commit { match { $p: Person } where $p.handle = $h delete $p }",
+    );
     assert_eq!(d.write_mode, MutationWriteMode::AsCommit);
     let d = decl(
         "query propose($h: String) as unattached branch on $h { insert Person { handle: $h, name: $h } }",
@@ -710,24 +814,60 @@ fn as_commit_is_a_write_body_clause() {
 }
 
 #[test]
-fn a_clause_after_a_statement_prints_the_order() {
-    let e = refusal_of("query w() { $p: Person  delete $p  $q: Person }");
-    assert_eq!(e.code.as_str(), "Q013");
-    // Several statements after the clauses are fine.
+fn a_write_groups_elements_are_in_its_match() {
+    // Elements written without `match { }`, before or after the statements.
+    for (src, intended) in [
+        (
+            "query w($h: String) { $p: Person, $p.handle = $h delete $p }",
+            "query w($h: String) { match { $p: Person } where $p.handle = $h delete $p }",
+        ),
+        (
+            "query w($h: String) { $p: Person { handle: $h } delete $p }",
+            "query w($h: String) { match { $p: Person } where $p.handle = $h delete $p }",
+        ),
+        (
+            "query w() { delete $p  $p: Person }",
+            "query w() { match { $p: Person } delete $p }",
+        ),
+        (
+            "query w() { match { $p: Person } delete $p  $p.age > 3 }",
+            "query w() { match { $p: Person } where $p.age > 3 delete $p }",
+        ),
+    ] {
+        let e = refusal_of(src);
+        assert_eq!(e.code.as_str(), "Q013", "{src}: {e:?}");
+        let fixed = super::parse::apply_edits(src, &e.suggestion.as_ref().unwrap().edits);
+        assert_eq!(
+            parse_source(&fixed).unwrap_or_else(|e| panic!("{fixed}\n{e:?}")),
+            parsed(intended),
+            "{fixed}"
+        );
+    }
+    // Several statements after one selection, and later groups opening with
+    // their own `match`.
     let w = write(
-        "query close_company($slug: String) { $c: Company { slug: $slug }  $p $k:worksAt $c  delete $k  update $p set { city: null } }",
+        "query close_company($slug: String) { match { $c: Company, $p $k:worksAt $c } where $c.slug = $slug delete $k  update $p set { city: null } }",
     );
-    assert_eq!((w.all_clauses().len(), w.all_statements().len()), (2, 2));
+    assert_eq!((w.all_elements().len(), w.all_statements().len()), (2, 2));
+    let w = write(
+        "query two() { insert Person { handle: \"a\" } match { $p: Person } where $p.handle = \"a\" update $p set { age: 1 } match { $q: Person } update $q set { age: 2 } }",
+    );
+    assert_eq!(w.groups.len(), 3);
+    assert!(w.groups[0].pattern.elements.is_empty());
     // `null` is an assignment value; in operand position it stays a
     // reserved word.
     assert!(
         matches!(&w.all_statements()[1], Stmt::Update { assignments, .. }
+        if assignments[0].value == int(1))
+    );
+    let w = write("query w() { match { $p: P } update $p set { a: null, b: 1 } }");
+    assert!(
+        matches!(&w.all_statements()[0], Stmt::Update { assignments, .. }
         if assignments[0].value == Expr::Literal(crate::query::value::Literal::Null))
     );
-    write("query w() { insert P { a: null, b: 1 } }");
-    write("query w() { insert P { a: null  b: 1 } }");
+    write("query w() { insert P { a: null,  b: 1 } }");
     assert!(parse_text("query w() { insert P { a: null + 1 } }").is_err());
-    assert!(parse_text("query q() { match { $p: P  $p.a = null } return { $p } }").is_err());
+    assert!(parse_text("query q() { match { $p: P } where $p.a = null return { $p } }").is_err());
 }
 
 #[test]
@@ -738,25 +878,40 @@ fn other_respellings_print_their_fix() {
             "case when $d.year > 1 then 1 else 2 end = 1",
             "if($d.year > 1, 1, 2)",
         ),
-        ("for $x in $list", "$x in $list"),
-        ("unwind $list as $x", "$x in $list"),
-        ("let $x in $r", "from $r"),
-        ("let ($a, $b) in $r", "from $r"),
     ] {
         let e = refusal_of(&format!(
-            "query q() {{ match {{ $d: Doc  {src} }} return {{ $d }} }}"
+            "query q() {{ match {{ $d: Doc }} where {src} return {{ $d }} }}"
         ));
         assert_eq!(e.code.as_str(), "Q012", "{src}");
         assert_eq!(e.fix.as_deref(), Some(fix), "{src}");
     }
+    for (src, fix) in [
+        ("let $x in $r", "from $r"),
+        ("let ($a, $b) in $r", "from $r"),
+    ] {
+        let e = element_refusal(src);
+        assert_eq!(e.code.as_str(), "Q012", "{src}");
+        assert_eq!(e.fix.as_deref(), Some(fix), "{src}");
+    }
+    // Over a list there is no row form, and the parser cannot tell a list
+    // from a relation: both readings are printed.
+    for src in ["for $x in $list", "unwind $list as $x"] {
+        let e = element_refusal(src);
+        assert_eq!(e.code.as_str(), "Q012", "{src}");
+        let fix = e.fix.unwrap();
+        assert!(
+            fix.contains("from $list") && fix.contains("in $list"),
+            "{src}: {fix}"
+        );
+    }
     // Infix `contains` and `starts_with` parse to a node the type checker
     // refuses (`T7`), since the left operand's type picks the fix.
     for src in ["$d.title starts_with \"O\"", "$d.tags contains \"rust\""] {
-        assert!(matches!(filter_expr(src), Expr::InfixString { .. }));
+        assert!(matches!(where_expr(src), Expr::InfixString { .. }));
     }
     // Every annotation parses; the type checker decides which names it reads
     // (`T80`), so a later typed annotation is additive.
-    parse_text("query q() @if_commit($c) { $p: P  delete $p }").unwrap();
+    parse_text("query q() @if_commit($c) { match { $p: P } delete $p }").unwrap();
     parse_text("query q() @valid(from = 1) { match { $p: P } return { $p } }").unwrap();
     // `retrieve`, `having` and `view` are refused at the word, each naming
     // the GQ form (section 3's refused respellings).
@@ -788,18 +943,13 @@ fn one_keyword_and_the_body_shape_is_the_kind() {
         decl("query w() { insert P { a: 1 } }").body,
         DeclBody::Write(_)
     ));
-    // A write whose clauses come from a ranked read.
+    // A write whose selection comes from a ranked read.
     let w = write(
-        "query tag_near($q: Vector(3)) { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20)  update $d set { tags: [\"near\"] } }",
+        "query tag_near($q: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) } update $d set { tags: [\"near\"] } }",
     );
-    assert_eq!((w.all_clauses().len(), w.all_statements().len()), (1, 1));
-    // A write body's clauses are bare; a body opening with `match { }` is
-    // refused with the wrapper removed (section 5).
-    let e = refusal_of("query w() { match { $p: Person } delete $p }");
-    assert_eq!(e.code.as_str(), "Q005");
-    assert_eq!(e.fix.as_deref(), Some("$p: Person"));
+    assert_eq!((w.all_elements().len(), w.all_statements().len()), (1, 1));
     // A statement keyword stays a property name, after a dot and as a key.
-    write("query w() { $p: P { insert: 1 }  $p.update = 2  delete $p }");
+    write("query w() { match { $p: P } where $p.insert = 1 and $p.update = 2 delete $p }");
     // Parameters with defaults, `limit $k`, generic annotations.
     let d = decl(
         "query top_people($k: I64 = 10, $neg: I32 = -1, $s: String? = \"x\") @description(\"d\") @budget(plan = 1000) @example(\"e\") { match { $p: Person } return { $p.name } order { $p.age desc } limit $k }",
@@ -826,14 +976,16 @@ fn one_keyword_and_the_body_shape_is_the_kind() {
 
 #[test]
 fn calls_take_positionals_then_options_and_one_distinct_form() {
-    let Expr::Call(c) = filter_expr("fuzzy($x.title, $q, max_edits: 2)") else {
+    let Expr::Call(c) = where_expr("fuzzy($x.title, $q, max_edits: 2)") else {
         panic!()
     };
     assert_eq!((c.args.len(), c.options.len()), (2, 1));
-    // An option before a positional is refused.
-    assert!(parse_text("query q() { match { f(k: 1, $x) } return { 1 } }").is_err());
+    // An option before a positional is refused with the reordered arguments.
+    let e = refusal_of("query q() { match { $x: X } where f(k: 1, $x) return { 1 } }");
+    assert_eq!(e.code.as_str(), "Q005");
+    assert_eq!(e.fix.as_deref(), Some("$x, k: 1"));
     // Options only.
-    filter_expr("f(k: 1, mode: any)");
+    where_expr("f(k: 1, mode: any)");
     // `distinct` under any aggregate name (the type checker keeps T57).
     let r = read(
         "query q() { match { $p: P } return { count(distinct $p.city) as c, sum(distinct $p.age) as s } }",
@@ -841,158 +993,141 @@ fn calls_take_positionals_then_options_and_one_distinct_form() {
     assert!(matches!(r.projections[1].expr, Expr::AggDistinct { .. }));
     // `date("…")` is a literal everywhere, including inside a list.
     assert!(matches!(
-        filter_expr("$x.d in [date(\"2025-01-01\"), date(\"2025-01-02\")]"),
+        where_expr("$x.d in [date(\"2025-01-01\"), date(\"2025-01-02\")]"),
         Expr::In { .. }
     ));
     // Nested relation functions.
-    one_clause(
+    one_element(
         "from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $q), k: 60, weights: [0.7, 0.3])",
     );
     // A block value as an operand, compared with another binding's value.
-    let e = filter_expr("count { $d \"in\" $x } + 1 >= $x.min_docs");
+    let e = where_expr("count { $d in $x } + 1 >= $x.min_docs");
     assert!(matches!(e, Expr::Compare { left, .. } if matches!(*left, Expr::Arith { .. })));
 }
 
 #[test]
-fn a_block_in_clause_position_is_a_filter() {
+fn a_block_is_an_operand() {
     // One tree for one text: `count { p } > 1 or $x` is the disjunction, as
     // the same text is anywhere else an expression stands, never
     // `count { p } > (1 or $x)`.
     assert!(matches!(
-        one_clause("count { $a: P } > 1 or $x"),
-        Clause::Filter(Expr::Or(..))
+        where_expr("count { $a: P } > 1 or $x"),
+        Expr::Or(..)
     ));
-    assert!(matches!(
-        one_clause("exists { $a: P }"),
-        Clause::Filter(Expr::Block(_))
-    ));
+    assert!(matches!(where_expr("exists { $a: P }"), Expr::Block(_)));
+    // A block written among the elements is a predicate, moved to `where`.
+    assert_eq!(
+        element_refusal("$x: X, exists { $a: P }").code.as_str(),
+        "Q017"
+    );
 }
 
 #[test]
 fn a_product_of_two_variables_is_not_the_wildcard_triple() {
-    // `$a * $b` is the wildcard triple only when no operator follows
-    // (section 7); followed by one it is a product.
+    // `$a * $b` is the wildcard triple in `match` and a product in an
+    // expression; with predicates out of `match`, the two never meet.
     assert_eq!(
-        filter_expr("$n * $m > 10"),
+        where_expr("$n * $m > 10"),
         cmp(CompOp::Gt, arith(ArithOp::Mul, var("n"), var("m")), int(10))
     );
-    assert!(matches!(filter_expr("$n * $m or $ok"), Expr::Or(..)));
-    // The triple stays a triple, alone, bounded, bound or followed by a
-    // clause.
-    assert!(matches!(one_clause("$a * $b"), Clause::Traversal(_)));
-    assert!(matches!(one_clause("$a *{1,3} $b"), Clause::Traversal(_)));
-    assert!(matches!(one_clause("$a $k:* $b"), Clause::Traversal(_)));
-    let c = match_clauses("$a * $b  $b: Person  (-$x) > 0");
-    assert!(matches!(c[0], Clause::Traversal(_)), "{c:#?}");
-    assert_eq!(c.len(), 3);
+    assert!(matches!(where_expr("$n * $m or $ok"), Expr::Or(..)));
+    assert!(matches!(one_element("$a * $b"), Element::Traversal(_)));
+    assert!(matches!(one_element("$a *{1,3} $b"), Element::Traversal(_)));
+    assert!(matches!(one_element("$a $k:* $b"), Element::Traversal(_)));
+    let c = match_elements("$a * $b, $b: Person");
+    assert!(matches!(c[0], Element::Traversal(_)), "{c:#?}");
+    assert_eq!(c.len(), 2);
+    // Followed by an operator, it is a filter written among the elements.
+    assert_eq!(element_refusal("$a * $b > 3").code.as_str(), "Q017");
 }
 
 #[test]
-fn a_bare_from_or_let_filter_before_a_variable_is_the_clause() {
-    // The contextual keyword wins over a bare-name filter at clause start;
-    // a bare name is never a value in a read.
+fn a_bare_from_or_let_before_a_variable_is_the_element() {
+    // The contextual keyword wins over a bare name at element start; a bare
+    // name is never a value in a read.
     assert!(parse_text("query q() { match { from  $a: Person } return { 1 } }").is_err());
-    assert!(matches!(one_clause("let  $a = 1"), Clause::Let { .. }));
+    assert!(matches!(one_element("let  $a = 1"), Element::Let { .. }));
 }
 
 #[test]
-fn a_call_to_contains_after_a_boolean_filter_is_a_call() {
-    // The infix recognizer is word-bounded and does not touch `(`, so the
-    // second clause is a call, not `$p.active contains (…)`.
-    let c = match_clauses("$p.active  contains($p.name, \"a\")  starts_with($p.name, \"b\")");
-    assert_eq!(c.len(), 3, "{c:#?}");
+fn a_call_to_contains_is_a_call() {
+    // The infix recognizer is word-bounded and does not touch `(`, so this
+    // is a call, not `$p.active contains (…)`.
+    assert!(matches!(
+        where_expr("$p.active and contains($p.name, \"a\") and starts_with($p.name, \"b\")"),
+        Expr::And(..)
+    ));
     // The infix form with a space is still recognised, as the tree node the
     // type checker refuses.
     assert!(matches!(
-        filter_expr("$p.name contains \"a\""),
+        where_expr("$p.name contains \"a\""),
         Expr::InfixString { .. }
     ));
-    // A triple endpoint is never followed by `.`.
-    assert!(matches!(filter_expr("$a * $a.n = 0"), Expr::Compare { .. }));
 }
 
 #[test]
 fn a_date_call_is_the_date_literal() {
     // `date("…")` is the literal production, never a call to a function
-    // named `date`.
-    assert_eq!(
-        filter_expr("$x.d = date(\"2025-01-01\")"),
-        cmp(
-            CompOp::Eq,
-            Expr::Prop {
-                variable: "x".into(),
-                property: "d".into()
-            },
-            Expr::Literal(crate::query::value::Literal::Date("2025-01-01".into()))
-        )
-    );
+    // named `date`, with or without a space before its parenthesis.
+    for spelled in ["date(\"2025-01-01\")", "date (\"2025-01-01\")"] {
+        assert_eq!(
+            where_expr(&format!("$x.d = {spelled}")),
+            cmp(
+                CompOp::Eq,
+                Expr::Prop {
+                    variable: "x".into(),
+                    property: "d".into()
+                },
+                Expr::Literal(crate::query::value::Literal::Date("2025-01-01".into()))
+            )
+        );
+    }
     // With another argument shape it is a call.
     assert!(matches!(
-        filter_expr("$x.d = date($s)"),
+        where_expr("$x.d = date($s)"),
         Expr::Compare { right, .. } if matches!(*right, Expr::Call(_))
     ));
 }
 
 #[test]
 fn recognizers_shadow_only_ill_typed_text() {
-    // The arrow recognizer takes `$a - x - $b`, `x` a bare name, a
-    // string or a bare meta-field: legal grammar (a bare name is an operand),
-    // never well-typed arithmetic. The RFC's claim holds at the type level.
-    // Followed by a comparison, the recognized arrow leaves `> 0` with no
-    // clause to start, so the refusal is the generic Q001 at `>`.
+    // The arrow recognizer takes `$a - x - $b`, `x` a bare name, a string or
+    // a bare meta-field; in `where` such text is arithmetic over a bare name
+    // (refused at the word) or never well typed.
     for middle in ["x", "\"s\"", "@id"] {
-        let src = format!("query q() {{ match {{ $a - {middle} - $b }} return {{ 1 }} }}");
-        assert_eq!(code3(&src), "Q007", "{middle}");
-        let src = format!("query q() {{ match {{ $a - {middle} - $b > 0 }} return {{ 1 }} }}");
-        assert_eq!(code3(&src), "Q001", "{middle}");
+        assert_eq!(
+            element_refusal(&format!("$a - {middle} - $b"))
+                .code
+                .as_str(),
+            "Q007",
+            "{middle}"
+        );
     }
     // A number, a property or a parenthesised term in the middle is
     // arithmetic.
     for middle in ["1", "$x.n", "($x)"] {
-        filter_expr(&format!("$a - {middle} - $b > 0"));
+        where_expr(&format!("$a - {middle} - $b > 0"));
     }
-    // `let ($a) in …` is the refused respelling, so a call to a function
-    // named `let` with one variable, compared with `in`, is refused too.
-    assert_eq!(
-        code3("query q() { match { let($a) in [1] } return { 1 } }"),
-        "Q012"
-    );
+    // `let ($a) in …` is the refused respelling.
+    assert_eq!(element_refusal("let($a) in [1]").code.as_str(), "Q012");
 }
 
 #[test]
-fn reserved_words_between_two_variables() {
-    // Of the six reserved words, only `is` and `null`
-    // between two variables are parse errors. `and`, `or`, `in` and `not`
-    // there are legal expressions (`$a not $b` is two filters), so a bare
-    // edge of that name can be refused only by the type checker.
-    for word in ["and", "or", "in"] {
-        let c = match_clauses(&format!("$a: Person  $a {word} $b"));
-        assert!(matches!(c[1], Clause::Filter(_)), "{word}: {c:#?}");
-    }
-    assert_eq!(match_clauses("$a: Person  $a not $b").len(), 3);
+fn reserved_words_in_where() {
+    // `$a and $b` in `where` is the conjunction of two Boolean operands;
+    // `is` and `null` between two variables are parse errors.
+    assert!(matches!(where_expr("$a and $b"), Expr::And(..)));
+    assert!(matches!(where_expr("$a or $b"), Expr::Or(..)));
+    assert!(matches!(where_expr("$a in $b"), Expr::In { .. }));
     for word in ["is", "null"] {
         assert!(
             parse_text(&format!(
-                "query q() {{ match {{ $a: Person  $a {word} $b }} return {{ 1 }} }}"
+                "query q() {{ match {{ $a: Person }} where $a {word} $b return {{ 1 }} }}"
             ))
             .is_err(),
             "{word}"
         );
     }
-}
-
-#[test]
-fn a_date_literal_touches_its_parenthesis() {
-    // `date("…")` is the literal, and like a call its name touches its `(`:
-    // with a space it is the refused call spelling.
-    assert_eq!(
-        code3("query q() { match { $d: Doc  $d.at > date (\"2025-01-01\") } return { $d } }"),
-        "Q019"
-    );
-    assert!(matches!(
-        filter_expr("$d.at > date(\"2025-01-01\")"),
-        Expr::Compare { right, .. } if matches!(*right, Expr::Literal(crate::query::value::Literal::Date(_)))
-    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,14 +1156,18 @@ const SYNTAX_RULES: &[&str] = &[
     "as_commit_clause",
     "as_unattached_clause",
     "assignment",
+    "assignments",
+    "bare_elements_rec",
     "bare_name_rec",
     "base_type",
     "between_rec",
     "binding",
     "binding_brace_filter",
+    "binding_braces_rec",
     "binding_lower_rec",
     "binding_paren_head",
     "binding_paren_rec",
+    "block_body",
     "block_value",
     "blockless_rec",
     "bool_lit",
@@ -1046,15 +1185,14 @@ const SYNTAX_RULES: &[&str] = &[
     "branch_name",
     "branch_stmt",
     "call",
+    "call_arg",
     "call_args",
     "call_block_rec",
-    "call_head",
     "call_name",
     "call_option",
     "case_rec",
     "catalogue_edge",
     "chained_rec",
-    "clause",
     "commit_drop",
     "commit_publish",
     "commit_stmt",
@@ -1073,9 +1211,7 @@ const SYNTAX_RULES: &[&str] = &[
     "cypher_rel",
     "cypher_rel_body",
     "cypher_typed_node",
-    "date_head",
     "date_lit",
-    "datetime_head",
     "datetime_lit",
     "declaration",
     "delete_multi_rec",
@@ -1091,17 +1227,19 @@ const SYNTAX_RULES: &[&str] = &[
     "edge_alternation",
     "edge_alternatives",
     "edge_binding",
+    "edge_group_rec",
     "edge_ident",
     "edge_name",
     "edge_sel",
     "edge_wildcard",
-    "edge_word",
+    "element",
+    "elements",
     "eq_assign_rec",
     "exp_float_rec",
     "explain_stmt",
     "expr",
     "expr_ident",
-    "filter",
+    "filter_rec",
     "float_lit",
     "from_clause",
     "from_paren_rec",
@@ -1114,6 +1252,7 @@ const SYNTAX_RULES: &[&str] = &[
     "fw_else",
     "fw_end",
     "fw_ends",
+    "fw_filter",
     "fw_group",
     "fw_having",
     "fw_like",
@@ -1124,7 +1263,6 @@ const SYNTAX_RULES: &[&str] = &[
     "fw_starts",
     "fw_then",
     "fw_when",
-    "fw_where",
     "fw_with",
     "group_by_rec",
     "having_rec",
@@ -1133,10 +1271,10 @@ const SYNTAX_RULES: &[&str] = &[
     "in_paren_rec",
     "infix_string_op",
     "inline_read",
+    "inner_where_rec",
     "insert_paren_rec",
     "insert_stmt",
     "integer",
-    "keyword_call_head",
     "keyword_call_rec",
     "kw_after",
     "kw_all",
@@ -1147,6 +1285,8 @@ const SYNTAX_RULES: &[&str] = &[
     "kw_commit",
     "kw_create",
     "kw_csv",
+    "kw_date",
+    "kw_datetime",
     "kw_delete",
     "kw_delimiter",
     "kw_diff",
@@ -1208,20 +1348,20 @@ const SYNTAX_RULES: &[&str] = &[
     "load_option",
     "load_stmt",
     "load_target",
-    "match_block_rec",
     "match_clause",
     "match_nobrace_rec",
     "match_prefix_rec",
     "matchless_read_rec",
     "meta_assign_rec",
     "meta_field",
+    "missing_comma_rec",
     "missing_param_list",
-    "mixed_args_rec",
     "mutation_body",
     "mutation_decl",
     "mutation_stmt",
     "neg_sign",
-    "negation",
+    "negation_rec",
+    "not_block_rec",
     "not_expr",
     "not_in_rec",
     "null_compare_rec",
@@ -1257,7 +1397,6 @@ const SYNTAX_RULES: &[&str] = &[
     "query_decl",
     "query_file",
     "read_body",
-    "read_clause",
     "read_tail",
     "regex_rec",
     "relation_expr",
@@ -1275,24 +1414,20 @@ const SYNTAX_RULES: &[&str] = &[
     "setting_stmt",
     "setting_value",
     "show_stmt",
-    "spaced_call_head",
-    "spaced_call_rec",
     "sql_alias_rec",
     "star_item_rec",
     "starts_with_words_rec",
     "statement_trailer",
-    "stmt_edge_rec",
     "stmt_keyword",
     "stmt_var_rec",
-    "stmt_word",
     "stray_braces_rec",
     "string_char",
     "string_lit",
-    "subquery_block",
     "sum",
     "sum_op",
     "swapped_read_rec",
-    "trailing_clauses_rec",
+    "trailing_elements_rec",
+    "trailing_match_rec",
     "traversal",
     "traversal_bounds",
     "type_name",
@@ -1306,10 +1441,11 @@ const SYNTAX_RULES: &[&str] = &[
     "variable",
     "vector_type",
     "view_decl",
+    "where_clause",
     "where_stmt",
     "with_item",
     "with_rec",
-    "write_clause",
+    "write_element",
     "write_group",
 ];
 
@@ -1362,10 +1498,11 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"an exponent without a fraction"#,
         "Q005",
         r#"query q() {
-  match { $d: Doc  $d.year * 1.0 > 2e3 }
+  match { $d: Doc }
+  where $d.year * 1.0 > 2e3
   return { $d.title }
 }"#,
-        r#"query q() { match { $d: Doc $d.year * 1.0 > 2000.0 } return { $d.title } }"#,
+        r#"query q() { match { $d: Doc } where $d.year * 1.0 > 2000.0 return { $d.title } }"#,
     ),
     (
         r#"a reserved word as an alias"#,
@@ -1387,15 +1524,6 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query q($q: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) } return { $d.title } }"#,
     ),
     (
-        r#"a write body wrapped in match"#,
-        "Q005",
-        r#"query w($h: String) {
-  match { $p: Person { handle: $h } }
-  delete $p
-}"#,
-        r#"query w($h: String) { $p: Person { handle: $h } delete $p }"#,
-    ),
-    (
         r#"an endpoint written as a meta-field"#,
         "Q005",
         r#"query hire($h: String, $slug: String) {
@@ -1407,82 +1535,82 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"an assignment with ="#,
         "Q005",
         r#"query w($h: String) {
-  $p: Person { handle: $h }
+  match { $p: Person } where $p.handle = $h
   update $p set { age = 3 }
 }"#,
-        r#"query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }"#,
+        r#"query w($h: String) { match { $p: Person } where $p.handle = $h update $p set { age: 3 } }"#,
     ),
     (
         r#"a qualified assignment target"#,
         "Q005",
         r#"query w($h: String) {
-  $p: Person { handle: $h }
+  match { $p: Person } where $p.handle = $h
   update $p set { $p.age: 3 }
 }"#,
-        r#"query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }"#,
+        r#"query w($h: String) { match { $p: Person } where $p.handle = $h update $p set { age: 3 } }"#,
     ),
     (
         r#"update without set"#,
         "Q005",
         r#"query w($h: String) {
-  $p: Person { handle: $h }
+  match { $p: Person } where $p.handle = $h
   update $p { age: 3 }
 }"#,
-        r#"query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }"#,
+        r#"query w($h: String) { match { $p: Person } where $p.handle = $h update $p set { age: 3 } }"#,
     ),
     (
         r#"an untyped parameter"#,
         "Q005",
         r#"query q($h) {
-  match { $p: Person { handle: $h } }
+  match { $p: Person } where $p.handle = $h
   return { $p.name }
 }"#,
-        r#"query q($h: String) { match { $p: Person { handle: $h } } return { $p.name } }"#,
+        r#"query q($h: String) { match { $p: Person } where $p.handle = $h return { $p.name } }"#,
     ),
     (
         r#"an outgoing arrow"#,
         "Q007",
         r#"query q() {
-  match { $a: Person  $a -knows-> $b }
+  match { $a: Person, $a -knows-> $b }
   return { $b.name }
 }"#,
-        r#"query q() { match { $a: Person $a knows $b } return { $b.name } }"#,
+        r#"query q() { match { $a: Person, $a knows $b } return { $b.name } }"#,
     ),
     (
         r#"an incoming arrow"#,
         "Q007",
         r#"query q() {
-  match { $a: Person  $a <-knows- $b }
+  match { $a: Person, $a <-knows- $b }
   return { $b.name }
 }"#,
-        r#"query q() { match { $a: Person $b knows $a } return { $b.name } }"#,
+        r#"query q() { match { $a: Person, $b knows $a } return { $b.name } }"#,
     ),
     (
         r#"an undirected arrow"#,
         "Q007",
         r#"query q() {
-  match { $a: Person  $a -knows- $b }
+  match { $a: Person, $a -knows- $b }
   return { $b.name }
 }"#,
-        r#"query q() { match { $a: Person $a <knows> $b } return { $b.name } }"#,
+        r#"query q() { match { $a: Person, $a <knows> $b } return { $b.name } }"#,
     ),
     (
         r#"an arrow with an edge binding and bounds"#,
         "Q007",
         r#"query q() {
-  match { $a: Person  $a -$k:knows{1,2}-> $b }
+  match { $a: Person, $a -$k:knows{1,2}-> $b }
   return { $b.name }
 }"#,
-        r#"query q() { match { $a: Person $a $k:knows{1,2} $b } return { $b.name } }"#,
+        r#"query q() { match { $a: Person, $a $k:knows{1,2} $b } return { $b.name } }"#,
     ),
     (
         r#"Cypher's bracketed edge"#,
         "Q007",
         r#"query q() {
-  match { $a: Person  $a -[:knows]-> $b }
+  match { $a: Person, $a -[:knows]-> $b }
   return { $b.name }
 }"#,
-        r#"query q() { match { $a: Person $a knows $b } return { $b.name } }"#,
+        r#"query q() { match { $a: Person, $a knows $b } return { $b.name } }"#,
     ),
     (
         r#"delete T where"#,
@@ -1490,7 +1618,7 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query w($h: String) {
   delete Person where handle = $h
 }"#,
-        r#"query w($h: String) { $x: Person $x.handle = $h delete $x }"#,
+        r#"query w($h: String) { match { $x: Person } where $x.handle = $h delete $x }"#,
     ),
     (
         r#"update T set where"#,
@@ -1498,16 +1626,25 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query w($h: String) {
   update Person set { age: 3 } where handle = $h
 }"#,
-        r#"query w($h: String) { $x: Person $x.handle = $h update $x set { age: 3 } }"#,
+        r#"query w($h: String) { match { $x: Person } where $x.handle = $h update $x set { age: 3 } }"#,
     ),
     (
         r#"delete $x where"#,
         "Q008",
         r#"query w() {
-  $p: Person
+  match { $p: Person }
   delete $p where $p.age > 90
 }"#,
-        r#"query w() { $p: Person $p.age > 90 delete $p }"#,
+        r#"query w() { match { $p: Person } where $p.age > 90 delete $p }"#,
+    ),
+    (
+        r#"delete $x where beside the group's where"#,
+        "Q008",
+        r#"query w() {
+  match { $p: Person } where $p.age < 100 or $p.age > 120
+  delete $p where $p.age > 90 or $p.age < 3
+}"#,
+        r#"query w() { match { $p: Person } where ($p.age < 100 or $p.age > 120) and ($p.age > 90 or $p.age < 3) delete $p }"#,
     ),
     (
         r#"delete over an edge type where"#,
@@ -1515,7 +1652,7 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query w($h: String) {
   delete WorksAt where @src = $h
 }"#,
-        r#"query w($h: String) { $x: WorksAt $x.@src = $h delete $x }"#,
+        r#"query w($h: String) { match { $x: WorksAt } where $x.@src = $h delete $x }"#,
     ),
     (
         r#"a where fix that keeps a parameter"#,
@@ -1523,7 +1660,7 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query w($x: String) {
   delete Person where handle = $x
 }"#,
-        r#"query w($x: String) { $p: Person $p.handle = $x delete $p }"#,
+        r#"query w($x: String) { match { $p: Person } where $p.handle = $x delete $p }"#,
     ),
     (
         r#"a where fix that qualifies an assignment"#,
@@ -1531,7 +1668,7 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query w() {
   update Person set { name: handle } where age > 3
 }"#,
-        r#"query w() { $x: Person $x.age > 3 update $x set { name: $x.handle } }"#,
+        r#"query w() { match { $x: Person } where $x.age > 3 update $x set { name: $x.handle } }"#,
     ),
     (
         r#"the mutation keyword"#,
@@ -1551,13 +1688,22 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query big() { match { $c: Company } return { $c.name } }"#,
     ),
     (
+        r#"a property map"#,
+        "Q010",
+        r#"query q($h: String) {
+  match { $p: Person { handle: $h }, $p knows $q }
+  return { $q.name }
+}"#,
+        r#"query q($h: String) { match { $p: Person, $p knows $q } where $p.handle = $h return { $q.name } }"#,
+    ),
+    (
         r#"a comparison inside binding braces"#,
         "Q010",
         r#"query q() {
   match { $p: Person { age > 30 } }
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.age > 30 } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.age > 30 return { $p.name } }"#,
     ),
     (
         r#"a colon comparison inside binding braces"#,
@@ -1566,7 +1712,7 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
   match { $p: Person { age: > 30 } }
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.age > 30 } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.age > 30 return { $p.name } }"#,
     ),
     (
         r#"as commit on a read"#,
@@ -1576,24 +1722,6 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
   return { $p.name }
 }"#,
         r#"query q() { match { $p: Person } return { $p.name } }"#,
-    ),
-    (
-        r#"unwind"#,
-        "Q012",
-        r#"query q($list: [String]) {
-  match { unwind $list as $x  $p: Person { city: $x } }
-  return { $p.name }
-}"#,
-        r#"query q($list: [String]) { match { $x in $list $p: Person { city: $x } } return { $p.name } }"#,
-    ),
-    (
-        r#"for over a list"#,
-        "Q012",
-        r#"query q($list: [String]) {
-  match { for $x in $list  $p: Person { city: $x } }
-  return { $p.name }
-}"#,
-        r#"query q($list: [String]) { match { $x in $list $p: Person { city: $x } } return { $p.name } }"#,
     ),
     (
         r#"for over a relation"#,
@@ -1644,19 +1772,65 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"a chained comparison"#,
         "Q012",
         r#"query q() {
-  match { $p: Person  18 <= $p.age < 65 }
+  match { $p: Person }
+  where 18 <= $p.age < 65
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person 18 <= $p.age and $p.age < 65 } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where 18 <= $p.age and $p.age < 65 return { $p.name } }"#,
     ),
     (
-        r#"a clause after the last statement"#,
+        r#"not { } among the elements"#,
+        "Q012",
+        r#"query q() {
+  match { $p: Person, not { $p worksAt $c } }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person } where not exists { $p worksAt $c } return { $p.name } }"#,
+    ),
+    (
+        r#"not { } in where"#,
+        "Q012",
+        r#"query q() {
+  match { $p: Person }
+  where $p.age > 3 and not { $p worksAt $c }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person } where $p.age > 3 and not exists { $p worksAt $c } return { $p.name } }"#,
+    ),
+    (
+        r#"an element after the last statement"#,
         "Q013",
         r#"query w($h: String) {
   delete $p
-  $p: Person { handle: $h }
+  $p: Person
 }"#,
-        r#"query w($h: String) { $p: Person { handle: $h } delete $p }"#,
+        r#"query w($h: String) { match { $p: Person } delete $p }"#,
+    ),
+    (
+        r#"a match after its statement"#,
+        "Q013",
+        r#"query w() {
+  delete $p  match { $p: Person } where $p.age > 3
+}"#,
+        r#"query w() { match { $p: Person } where $p.age > 3 delete $p }"#,
+    ),
+    (
+        r#"a write's elements without match"#,
+        "Q013",
+        r#"query w($h: String) {
+  $p: Person, $p.handle = $h
+  delete $p
+}"#,
+        r#"query w($h: String) { match { $p: Person } where $p.handle = $h delete $p }"#,
+    ),
+    (
+        r#"a write's elements without match, with a property map"#,
+        "Q013",
+        r#"query w($h: String) {
+  $p: Person { handle: $h }
+  update $p set { age: 3 }
+}"#,
+        r#"query w($h: String) { match { $p: Person } where $p.handle = $h update $p set { age: 3 } }"#,
     ),
     (
         r#"a Cypher pattern in match"#,
@@ -1665,16 +1839,25 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
   match { (a:Person)-[:KNOWS]->(b) }
   return { $b.name }
 }"#,
-        r#"query q() { match { $a: Person $a knows $b } return { $b.name } }"#,
+        r#"query q() { match { $a: Person, $a knows $b } return { $b.name } }"#,
     ),
     (
-        r#"an uppercase WHERE"#,
-        "Q014",
+        r#"an uppercase WHERE inside match"#,
+        "Q017",
         r#"query q() {
   match { $p: Person WHERE $p.age > 30 }
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.age > 30 } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.age > 30 return { $p.name } }"#,
+    ),
+    (
+        r#"an uppercase WHERE after match"#,
+        "Q014",
+        r#"query q() {
+  match { $p: Person } WHERE $p.age > 30
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person } where $p.age > 30 return { $p.name } }"#,
     ),
     (
         r#"ORDER BY"#,
@@ -1699,10 +1882,11 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"Cypher's WITH"#,
         "Q014",
         r#"query q() {
-  match { $p worksAt $c  with $c, count($p) as n  $n > 3 }
+  match { $p worksAt $c, with $c, count($p) as n }
+  where $n > 3
   return { $c.name }
 }"#,
-        r#"query q() { match { from { match { $p worksAt $c } return { $c, count($p) as n } } $n > 3 } return { $c.name } }"#,
+        r#"query q() { match { from { match { $p worksAt $c } return { $c, count($p) as n } } } where $n > 3 return { $c.name } }"#,
     ),
     (
         r#"an uppercase COALESCE"#,
@@ -1717,10 +1901,11 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"STARTS WITH"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  $p.name STARTS WITH "A" }
+  match { $p: Person }
+  where $p.name STARTS WITH "A"
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person starts_with($p.name, "A") } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where starts_with($p.name, "A") return { $p.name } }"#,
     ),
     (
         r#"CREATE"#,
@@ -1734,73 +1919,77 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"SET"#,
         "Q014",
         r#"query w($h: String) {
-  $p: Person { handle: $h }
+  match { $p: Person } where $p.handle = $h
   set $p.age = 3
 }"#,
-        r#"query w($h: String) { $p: Person { handle: $h } update $p set { age: 3 } }"#,
+        r#"query w($h: String) { match { $p: Person } where $p.handle = $h update $p set { age: 3 } }"#,
     ),
     (
         r#"DETACH DELETE"#,
         "Q014",
         r#"query w($h: String) {
-  $p: Person { handle: $h }
+  match { $p: Person } where $p.handle = $h
   detach delete $p
 }"#,
-        r#"query w($h: String) { $p: Person { handle: $h } delete $p }"#,
+        r#"query w($h: String) { match { $p: Person } where $p.handle = $h delete $p }"#,
     ),
     (
         r#"OPTIONAL MATCH"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  optional match { $p worksAt $c } }
+  match { $p: Person, optional match { $p worksAt $c } }
   return { $p.name, $c.name }
 }"#,
-        r#"query q() { match { $p: Person optional { $p worksAt $c } } return { $p.name, $c.name } }"#,
+        r#"query q() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name } }"#,
     ),
     (
         r#"CALL { }"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  call { match { $p knows $q } return { $q } } }
+  match { $p: Person, call { match { $p knows $q } return { $q } } }
   return { $q.name }
 }"#,
-        r#"query q() { match { $p: Person from { match { $p knows $q } return { $q } } } return { $q.name } }"#,
+        r#"query q() { match { $p: Person, from { match { $p knows $q } return { $q } } } return { $q.name } }"#,
     ),
     (
         r#"!= null"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  $p.city != null }
+  match { $p: Person }
+  where $p.city != null
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.city is not null } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.city is not null return { $p.name } }"#,
     ),
     (
         r#"<>"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  $p.city <> "Berlin" }
+  match { $p: Person }
+  where $p.city <> "Berlin"
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.city != "Berlin" } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.city != "Berlin" return { $p.name } }"#,
     ),
     (
         r#"=="#,
         "Q014",
         r#"query q() {
-  match { $p: Person  $p.city == "Berlin" }
+  match { $p: Person }
+  where $p.city == "Berlin"
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.city = "Berlin" } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.city = "Berlin" return { $p.name } }"#,
     ),
     (
         r#"single quotes"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  $p.city = 'Berlin' }
+  match { $p: Person }
+  where $p.city = 'Berlin'
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.city = "Berlin" } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.city = "Berlin" return { $p.name } }"#,
     ),
     (
         r#"GROUP BY"#,
@@ -1816,55 +2005,61 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"LIKE"#,
         "Q014",
         r#"query q() {
-  match { $d: Doc  $d.title LIKE '%graph%' }
+  match { $d: Doc }
+  where $d.title LIKE '%graph%'
   return { $d.title }
 }"#,
-        r#"query q() { match { $d: Doc contains($d.title, "graph") } return { $d.title } }"#,
+        r#"query q() { match { $d: Doc } where contains($d.title, "graph") return { $d.title } }"#,
     ),
     (
         r#"BETWEEN"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  $p.age BETWEEN 18 AND 65 }
+  match { $p: Person }
+  where $p.age BETWEEN 18 AND 65
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.age >= 18 and $p.age <= 65 } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.age >= 18 and $p.age <= 65 return { $p.name } }"#,
     ),
     (
         r#"in over a parenthesised list"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  $p.age in (30, 40) }
+  match { $p: Person }
+  where $p.age in (30, 40)
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.age in [30, 40] } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.age in [30, 40] return { $p.name } }"#,
     ),
     (
         r#"not in"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  $p.city not in ["Berlin"] }
+  match { $p: Person }
+  where $p.city not in ["Berlin"]
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person not $p.city in ["Berlin"] } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where not $p.city in ["Berlin"] return { $p.name } }"#,
     ),
     (
         r#"&&"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  $p.age >= 18 && $p.age < 65 }
+  match { $p: Person }
+  where $p.age >= 18 && $p.age < 65
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.age >= 18 and $p.age < 65 } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.age >= 18 and $p.age < 65 return { $p.name } }"#,
     ),
     (
         r#"! for not"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  !($p.age > 3) }
+  match { $p: Person }
+  where !($p.age > 3)
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person not $p.age > 3 } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where not $p.age > 3 return { $p.name } }"#,
     ),
     (
         r#"a Cypher binding in parentheses"#,
@@ -1873,7 +2068,7 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
   match { $p: Person(handle: $h) }
   return { $p.name }
 }"#,
-        r#"query q($h: String) { match { $p: Person { handle: $h } } return { $p.name } }"#,
+        r#"query q($h: String) { match { $p: Person } where $p.handle = $h return { $p.name } }"#,
     ),
     (
         r#"a lowercase type"#,
@@ -1924,11 +2119,12 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"a SQL comment"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  -- adults only
-  $p.age > 18 }
+  match { $p: Person }
+  where -- adults only
+  $p.age > 18
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.age > 18 } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.age > 18 return { $p.name } }"#,
     ),
     (
         r#"a semicolon after a declaration"#,
@@ -1943,37 +2139,38 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"optional without braces"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  optional $p worksAt $c }
+  match { $p: Person, optional $p worksAt $c }
   return { $p.name, $c.name }
 }"#,
-        r#"query q() { match { $p: Person optional { $p worksAt $c } } return { $p.name, $c.name } }"#,
+        r#"query q() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name } }"#,
     ),
     (
         r#"not without braces"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  $q: Person  not $p knows $q }
+  match { $p: Person, $q: Person, not $p knows $q }
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $q: Person not { $p knows $q } } return { $p.name } }"#,
+        r#"query q() { match { $p: Person, $q: Person } where not exists { $p knows $q } return { $p.name } }"#,
     ),
     (
         r#"delete of two variables"#,
         "Q014",
         r#"query w() {
-  $p knows $q
+  match { $p knows $q }
   delete $p, $q
 }"#,
-        r#"query w() { $p knows $q delete $p delete $q }"#,
+        r#"query w() { match { $p knows $q } delete $p delete $q }"#,
     ),
     (
         r#"null in a read filter"#,
         "Q014",
         r#"query q() {
-  match { $p: Person  $p.city = null }
+  match { $p: Person }
+  where $p.city = null
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.city is null } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.city is null return { $p.name } }"#,
     ),
     (
         r#"a direction before its key"#,
@@ -1998,11 +2195,11 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"returning, a later stage"#,
         "Q015",
         r#"query w($h: String) {
-  $p: Person { handle: $h }
+  match { $p: Person } where $p.handle = $h
   delete $p
   returning { @id }
 }"#,
-        r#"query w($h: String) { $p: Person { handle: $h } delete $p }"#,
+        r#"query w($h: String) { match { $p: Person } where $p.handle = $h delete $p }"#,
     ),
     (
         r#"a namespaced type, a later stage"#,
@@ -2024,70 +2221,113 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query q() { match { $p: Person } return { $p.name } limit 10 }"#,
     ),
     (
-        r#"$n -1 after one space"#,
-        "Q016",
+        r#"a group of one edge name"#,
+        "Q012",
         r#"query q() {
-  match { $p: Person  let $n = $p.age  $n -1 > 0 }
-  return { $p.name }
+  match { $a: Person, $a (knows) $b }
+  return { $b.name }
 }"#,
-        r#"query q() { match { $p: Person let $n = $p.age $n - 1 > 0 } return { $p.name } }"#,
+        r#"query q() { match { $a: Person, $a knows $b } return { $b.name } }"#,
     ),
     (
-        r#"a leading minus on a new line in return"#,
+        r#"a missing comma between elements"#,
+        "Q016",
+        r#"query q() {
+  match {
+    $p: Person
+    $p knows $q
+  }
+  return { $q.name }
+}"#,
+        r#"query q() { match { $p: Person, $p knows $q } return { $q.name } }"#,
+    ),
+    (
+        r#"a missing comma between return items"#,
         "Q016",
         r#"query q() {
   match { $p: Person }
   return {
+    $p.name
     $p.age
-    -$p.age as neg
   }
 }"#,
-        r#"query q() { match { $p: Person } return { $p.age, -$p.age as neg } }"#,
+        r#"query q() { match { $p: Person } return { $p.name, $p.age } }"#,
     ),
     (
-        r#"a leading minus after two spaces in match"#,
+        r#"a missing comma between order keys"#,
         "Q016",
         r#"query q() {
-  match { $p: Person  let $x = $p.age  -1 < $x }
+  match { $p: Person }
+  return { $p.name }
+  order { $p.age desc $p.name }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.name } order { $p.age desc, $p.name } }"#,
+    ),
+    (
+        r#"a missing comma between arguments"#,
+        "Q016",
+        r#"query q() {
+  match { $p: Person }
+  where contains($p.name "a")
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person let $x = $p.age (-1 < $x) } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where contains($p.name, "a") return { $p.name } }"#,
     ),
     (
-        r#"from as a bare edge"#,
+        r#"a missing comma between assignments"#,
+        "Q016",
+        r#"query w() {
+  insert Person { handle: "h" name: "n" }
+}"#,
+        r#"query w() { insert Person { handle: "h", name: "n" } }"#,
+    ),
+    (
+        r#"a filter among the elements"#,
         "Q017",
         r#"query q() {
-  match { $a: Person  $a from $b }
-  return { $b.name }
+  match { $p: Person, $p.age > 30 }
+  return { $p.name }
 }"#,
-        r#"query q() { match { $a: Person $a "from" $b } return { $b.name } }"#,
+        r#"query q() { match { $p: Person } where $p.age > 30 return { $p.name } }"#,
     ),
     (
-        r#"insert as a bare edge in a write"#,
+        r#"a where inside the match braces"#,
         "Q017",
-        r#"query w() {
-  $a: Person  $a insert $b
-  delete $b
+        r#"query q() {
+  match { $p: Person where $p.age > 30 }
+  return { $p.name }
 }"#,
-        r#"query w() { $a: Person $a "insert" $b delete $b }"#,
+        r#"query q() { match { $p: Person } where $p.age > 30 return { $p.name } }"#,
+    ),
+    (
+        r#"a filter among a block's elements"#,
+        "Q017",
+        r#"query q() {
+  match { $p: Person }
+  where exists { $p knows $q, $q.age > 3 }
+  return { $p.name }
+}"#,
+        r#"query q() { match { $p: Person } where exists { $p knows $q where $q.age > 3 } return { $p.name } }"#,
     ),
     (
         r#"a bare property name"#,
         "Q018",
         r#"query q() {
-  match { $p: Person  name = "x" }
+  match { $p: Person }
+  where name = "x"
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.name = "x" } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.name = "x" return { $p.name } }"#,
     ),
     (
         r#"a bare parameter name"#,
         "Q018",
         r#"query q($h: String) {
-  match { $p: Person { handle: h } }
+  match { $p: Person }
+  where $p.handle = h
   return { $p.name }
 }"#,
-        r#"query q($h: String) { match { $p: Person { handle: $h } } return { $p.name } }"#,
+        r#"query q($h: String) { match { $p: Person } where $p.handle = $h return { $p.name } }"#,
     ),
     (
         r#"from with parentheses"#,
@@ -2099,36 +2339,23 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query q() { match { from { match { $p: Person } return { $p } } } return { $p.name } }"#,
     ),
     (
-        r#"a space before a call parenthesis"#,
-        "Q019",
-        r#"query colleagues($of: String) {
-  match { $p: Person { handle: $of }  $p worksAt $c  $q worksAt $c }
-  return { $q }
-}
-
-query q($h: String) {
-  match { from colleagues ($h) }
-  return { $q.name }
-}"#,
-        r#"query colleagues($of: String) { match { $p: Person { handle: $of } $p worksAt $c $q worksAt $c } return { $q } } query q($h: String) { match { from colleagues($h) } return { $q.name } }"#,
-    ),
-    (
         r#"exists as a function"#,
         "Q019",
         r#"query q() {
-  match { $p: Person  exists($p.city) }
+  match { $p: Person }
+  where exists($p.city)
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person $p.city is not null } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where $p.city is not null return { $p.name } }"#,
     ),
     (
         r#"an inline read without match"#,
         "Q020",
         r#"query q() {
-  match { $p: Person  from { match { $p knows $q } order { $q.age } } }
+  match { $p: Person, from { $p knows $q return { $p } order { $q.age } } }
   return { $p.name }
 }"#,
-        r#"query q() { match { $p: Person from { match { $p knows $q } return { $p } order { $q.age } } } return { $p.name } }"#,
+        r#"query q() { match { $p: Person, from { match { $p knows $q } return { $p } order { $q.age } } } return { $p.name } }"#,
     ),
     (
         r#"return without braces"#,

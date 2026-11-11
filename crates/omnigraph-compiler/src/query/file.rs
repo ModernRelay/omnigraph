@@ -484,7 +484,7 @@ impl QueryDecl {
                 annotations: Vec::new(),
                 write_mode: MutationWriteMode::Publish,
                 body: DeclBody::Read(ReadBody {
-                    clauses: Vec::new(),
+                    pattern: Default::default(),
                     distinct: false,
                     projections: Vec::new(),
                     order: Vec::new(),

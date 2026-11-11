@@ -1,18 +1,18 @@
 //! Parse, print, parse again over generated declarations
 //! (docs/rfcs/2026-11-07-gq-3.md, section 10).
 //!
-//! The generator builds random read declarations from the grammar:
-//! bindings, triples in every traversal form, filters over the arithmetic
-//! ladder and calls, `let`, `from` over inline reads, calls and `$r`, the
-//! blocks as clauses and as values, `optional`, and `return`, `order` and
-//! `limit`. The property is that printing a tree and parsing the text gives
-//! the tree back. Separators between clauses and between `return` items are
-//! drawn too, so the whitespace-separated forms the grammar admits are
-//! exercised.
+//! The generator builds random read and write declarations from the
+//! grammar: bindings, triples in every traversal form, `let`, `from` over
+//! inline reads, calls and `$r`, `optional` with its own `where`, a `where`
+//! over the arithmetic ladder, calls and blocks (each with its elements and
+//! its own `where`), `return`, `order` and `limit`, and write groups with
+//! their statements. The property is that printing a tree and parsing the
+//! text gives the tree back.
 //!
 //! Names are drawn from pools that include the contextual keywords (`let`,
 //! `from`, `count`, `match`, …), because an identifier that is also a
-//! keyword is where a grammar's lookahead is tested.
+//! keyword is where a grammar's lookahead is tested; inside `match` every
+//! edge name in the pool is written bare.
 //!
 //! The suite runs 2,000 cases.
 
@@ -21,7 +21,7 @@ use proptest::test_runner::{Config, TestRunner};
 
 use crate::query::file::MutationWriteMode;
 use crate::query::syntax::parse::parse_source;
-use crate::query::syntax::print::{Style, print_decl};
+use crate::query::syntax::print::print_decl;
 use crate::query::syntax::*;
 use crate::query::syntax::{EdgeSelector, Traversal};
 use crate::query::value::{AggFunc, CompOp, Literal};
@@ -31,8 +31,8 @@ const PROPS: &[&str] = &[
     "name", "age", "from", "let", "in", "order", "match", "count", "limit", "insert", "not",
 ];
 const EDGES: &[&str] = &[
-    "knows", "worksAt", "from", "let", "limit", "optional", "in", "and", "count", "exists", "true",
-    "delete", "update",
+    "knows", "worksAt", "from", "let", "limit", "optional", "in", "and", "not", "is", "null",
+    "count", "exists", "true", "delete", "update", "where", "match",
 ];
 const TYPES: &[&str] = &["Person", "Doc", "@Operator"];
 const ALIASES: &[&str] = &[
@@ -56,8 +56,8 @@ const IDENTS: &[&str] = &[
 const CALLS: &[&str] = &[
     // Not `date`/`datetime`: with one string argument the call is the date
     // literal production.
-    // Not `let`, `from`, `optional`, `exists`: a registry row is never named a
-    // clause keyword (section 5).
+    // Not `let`, `from`, `optional`, `exists`: a registry row is never named an
+    // element keyword (section 5).
     "f",
     "coalesce",
     "contains",
@@ -140,8 +140,8 @@ fn agg() -> impl Strategy<Value = AggFunc> {
     )
 }
 
-/// Expressions over the whole ladder. `depth` bounds nesting; clause-level
-/// recursion (blocks, inline reads) goes through [`clauses`].
+/// Expressions over the whole ladder. `depth` bounds nesting; pattern-level
+/// recursion (blocks, inline reads) goes through [`pattern`].
 fn expr(depth: u32) -> BoxedStrategy<Expr> {
     if depth == 0 {
         return leaf().boxed();
@@ -193,23 +193,23 @@ fn block(depth: u32) -> BoxedStrategy<Block> {
         (
             agg(),
             proptest::option::of(expr(depth)),
-            clauses(depth, 1..3)
+            pattern(depth, 1..3)
         )
-            .prop_map(|(f, arg, clauses)| Block {
+            .prop_map(|(f, arg, pattern)| Block {
                 func: BlockFunc::Agg(f),
                 arg: arg.map(Box::new),
-                clauses,
+                pattern,
             }),
-        clauses(depth, 1..3).prop_map(|clauses| Block {
+        pattern(depth, 1..3).prop_map(|pattern| Block {
             func: BlockFunc::Exists,
             arg: None,
-            clauses,
+            pattern,
         }),
     ]
     .boxed()
 }
 
-fn traversal() -> impl Strategy<Value = Clause> {
+fn traversal() -> impl Strategy<Value = Element> {
     let selector = prop_oneof![
         4 => pick(EDGES).prop_map(EdgeSelector::Named),
         1 => Just(EdgeSelector::Named("@property".into())),
@@ -231,7 +231,7 @@ fn traversal() -> impl Strategy<Value = Clause> {
     )
         .prop_map(
             |(src, edge_binding, selector, undirected, (min_hops, max_hops), dst)| {
-                Clause::Traversal(Traversal {
+                Element::Traversal(Traversal {
                     src,
                     selector,
                     dst,
@@ -253,76 +253,37 @@ fn relation(depth: u32) -> BoxedStrategy<RelExpr> {
     .boxed()
 }
 
-fn clause(depth: u32) -> BoxedStrategy<Clause> {
-    let binding = (
-        pick(VARS),
-        pick(TYPES),
-        proptest::collection::vec((pick(PROPS), expr(depth.min(1))), 0..3),
-    )
-        .prop_map(|(variable, type_name, prop_matches)| Clause::Binding {
-            variable,
-            type_name,
-            prop_matches,
-        });
-    let base = prop_oneof![
-        3 => binding,
-        3 => traversal(),
-        // A filter that is the bare name `from` or `let` and is followed by a
-        // `$` clause is that keyword's clause: the generator does not write
-        // that shape, which is never well typed. A product of two variables
-        // alone, `$a * $b`, is the wildcard triple; as a filter it is never
-        // Boolean.
-        3 => expr(depth.min(2))
-            // A lone name, string or bare meta-field as a whole filter
-            // sits between a lone-variable filter and a `$` clause as the
-            // edge of a triple; it is never Boolean.
-            .prop_filter("lone non-Boolean leaf", |e| !matches!(e,
-                Expr::Ident(_) | Expr::Meta(_) | Expr::Literal(crate::query::value::Literal::String(_))))
-            // ... and `not` over one is the brace-less `not` over that
-            // triple, refused (Q014); `not` of a number is never Boolean.
-            .prop_filter("a lone product of two variables", |e| {
-                let product = |e: &Expr| matches!(e,
-                    Expr::Arith { op: ArithOp::Mul, left, right }
-                        if matches!(**left, Expr::Variable(_)) && matches!(**right, Expr::Variable(_)));
-                !(product(e) || matches!(e, Expr::Not(inner) if product(inner)))
-            })
-            .prop_map(Clause::Filter),
-    ];
+fn element(depth: u32) -> BoxedStrategy<Element> {
+    let binding = (pick(VARS), pick(TYPES)).prop_map(|(variable, type_name)| Element::Binding {
+        variable,
+        type_name,
+    });
+    let base = prop_oneof![3 => binding, 3 => traversal()];
     if depth == 0 {
         return base.boxed();
     }
     let d = depth - 1;
     prop_oneof![
         6 => base,
-        2 => (pick(VARS), expr(d)).prop_map(|(name, e)| Clause::Let { name, value: LetValue::Expr(e) }),
-        1 => (pick(VARS), read_body(d)).prop_map(|(name, b)| Clause::Let { name, value: LetValue::Relation(Box::new(b)) }),
-        2 => relation(d).prop_map(Clause::From),
-        1 => clauses(d, 1..3).prop_map(Clause::Not),
-        1 => clauses(d, 1..3).prop_map(Clause::Optional),
+        2 => (pick(VARS), expr(d)).prop_map(|(name, e)| Element::Let { name, value: LetValue::Expr(e) }),
+        1 => (pick(VARS), read_body(d)).prop_map(|(name, b)| Element::Let { name, value: LetValue::Relation(Box::new(b)) }),
+        2 => relation(d).prop_map(Element::From),
+        1 => pattern(d, 1..3).prop_map(Element::Optional),
     ]
     .boxed()
 }
 
-/// A lone-variable filter, then `from $b`, or a Boolean literal and another
-/// lone-variable filter, is refused (Q017): it is the shape of a triple over
-/// an edge named `from`, `let`, `true` or `false`, which are written quoted.
-fn bare_edge_shape(cs: &[Clause]) -> bool {
-    let lone = |c: &Clause| matches!(c, Clause::Filter(Expr::Variable(_)));
-    cs.windows(2)
-        .any(|w| lone(&w[0]) && matches!(w[1], Clause::From(RelExpr::Variable(_))))
-        || cs.windows(3).any(|w| {
-            lone(&w[0])
-                && matches!(
-                    w[1],
-                    Clause::Filter(Expr::Literal(crate::query::value::Literal::Bool(_)))
-                )
-                && lone(&w[2])
+/// Elements and an optional `where`.
+fn pattern(depth: u32, n: std::ops::Range<usize>) -> BoxedStrategy<Pattern> {
+    (
+        proptest::collection::vec(element(depth), n),
+        proptest::option::of(expr(depth.min(2))),
+    )
+        .prop_map(|(elements, predicate)| Pattern {
+            elements,
+            predicate,
+            spans: Default::default(),
         })
-}
-
-fn clauses(depth: u32, n: std::ops::Range<usize>) -> BoxedStrategy<Vec<Clause>> {
-    proptest::collection::vec(clause(depth), n)
-        .prop_filter("a bare-edge shape (Q017)", |cs| !bare_edge_shape(cs))
         .boxed()
 }
 
@@ -339,15 +300,15 @@ fn read_body(depth: u32) -> BoxedStrategy<ReadBody> {
         pick(VARS).prop_map(Limit::Param),
     ]);
     (
-        clauses(depth, 1..4),
+        pattern(depth, 1..4),
         any::<bool>(),
         proptest::collection::vec(projection, 1..4),
         proptest::collection::vec(ordering, 0..3),
         limit,
     )
-        .prop_map(|(clauses, distinct, projections, order, limit)| ReadBody {
+        .prop_map(|(pattern, distinct, projections, order, limit)| ReadBody {
             spans: Default::default(),
-            clauses,
+            pattern: Box::new(pattern),
             distinct,
             projections,
             order,
@@ -411,19 +372,25 @@ fn statement() -> impl Strategy<Value = Stmt> {
     ]
 }
 
-/// Write groups. A group after the first has at least one clause: two
-/// adjacent groups with no clause between them print as one group with more
-/// statements (section 7: consecutive statements are one group).
+/// Write groups. A group after the first opens with its `match`: two
+/// adjacent groups with no `match` between them print as one group with more
+/// statements (section 7: consecutive statements are one group). A group
+/// with no `match` has no `where`.
 fn write_body() -> BoxedStrategy<WriteBody> {
     let group = |min: usize| {
         (
-            clauses(1, min..3),
+            pattern(1, min..3),
             proptest::collection::vec(statement(), 1..3),
         )
-            .prop_map(|(clauses, statements)| WriteGroup {
-                spans: Default::default(),
-                clauses,
-                statements,
+            .prop_map(|(mut pattern, statements)| {
+                if pattern.elements.is_empty() {
+                    pattern.predicate = None;
+                }
+                WriteGroup {
+                    spans: Default::default(),
+                    pattern,
+                    statements,
+                }
             })
     };
     (group(0), proptest::collection::vec(group(1), 0..2))
@@ -433,39 +400,16 @@ fn write_body() -> BoxedStrategy<WriteBody> {
         .boxed()
 }
 
-fn style() -> impl Strategy<Value = Style> {
-    (
-        proptest::sample::select(&["  ", "\n", " "][..]),
-        proptest::sample::select(&[", ", "  ", "\n"][..]),
-    )
-        .prop_map(|(clause_sep, projection_sep)| Style {
-            clause_sep,
-            projection_sep,
-            assignment_sep: ", ",
-        })
-}
-
-/// How one round trip ended.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Trip {
-    Equal,
-    /// The arrow recognizer took a generated filter of the shape
-    /// `$a - x - $b`, `x` a bare name, a string or a bare meta-field: legal
-    /// grammar, never well-typed arithmetic. Counted, not failed.
-    ArrowShadow,
-}
-
-/// One round trip: `Ok` when the reparse is the tree (or a counted known
-/// shadow), `Err` with the text otherwise.
-pub(crate) fn round_trip(d: &Decl, style: Style) -> Result<Trip, String> {
-    let text = print_decl(d, style);
+/// One round trip: `Ok` when the reparse is the tree, `Err` with the text
+/// otherwise.
+pub(crate) fn round_trip(d: &Decl) -> Result<(), String> {
+    let text = print_decl(d);
     match parse_source(&text) {
         Ok(SourceFile {
             body: Body::Decls(decls),
             ..
-        }) if decls.len() == 1 && decls[0] == *d => Ok(Trip::Equal),
+        }) if decls.len() == 1 && decls[0] == *d => Ok(()),
         Ok(other) => Err(format!("reparsed to another tree\n{text}\n{other:#?}")),
-        Err(e) if e.code.as_str() == "Q007" => Ok(Trip::ArrowShadow),
         Err(e) => Err(format!("refused: {e}\n{text}")),
     }
 }
@@ -477,23 +421,13 @@ fn print_then_parse(cases: u32) {
         failure_persistence: None,
         ..Config::default()
     });
-    let shadows = std::sync::atomic::AtomicUsize::new(0);
-    let result = runner.run(&(decl(), style()), |(d, s)| {
-        match round_trip(&d, s).map_err(TestCaseError::fail)? {
-            Trip::Equal => {}
-            Trip::ArrowShadow => {
-                shadows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
+    let result = runner.run(&decl(), |d| {
+        round_trip(&d).map_err(TestCaseError::fail)?;
         Ok(())
     });
     if let Err(e) = result {
         panic!("{e}");
     }
-    let shadows = shadows.into_inner();
-    // The shadow must stay rare: it needs a bare name, a string or a bare
-    // meta-field between two minus signs.
-    assert!(shadows * 50 < cases as usize, "{shadows} of {cases}");
 }
 
 #[test]
