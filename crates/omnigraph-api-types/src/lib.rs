@@ -2066,11 +2066,12 @@ pub enum AccessAction {
     CommitPublish,
     CommitDrop,
     InvokeQuery,
+    Maintain,
 }
 
 impl AccessAction {
     /// Every action the access report names, in report order.
-    pub const ALL: [AccessAction; 10] = [
+    pub const ALL: [AccessAction; 11] = [
         AccessAction::Read,
         AccessAction::Export,
         AccessAction::Change,
@@ -2081,6 +2082,7 @@ impl AccessAction {
         AccessAction::CommitPublish,
         AccessAction::CommitDrop,
         AccessAction::InvokeQuery,
+        AccessAction::Maintain,
     ];
 
     /// Whether the report decides this action from `branch` into
@@ -2097,7 +2099,8 @@ impl AccessAction {
 enum AccessSlot {
     /// Decided only graph-wide: the action names no branch.
     GraphWide,
-    /// The named branch is the source (`read`, `export`, `change`).
+    /// The named branch is the source (`read`, `export`, `change`,
+    /// `maintain`).
     Source,
     /// The named branch is the target (`schema_apply`, `branch_delete`,
     /// `commit_publish`, `commit_drop`).
@@ -2113,7 +2116,8 @@ enum AccessSlot {
 fn access_slot(action: omnigraph_policy::PolicyAction) -> Option<AccessSlot> {
     use omnigraph_policy::PolicyAction as P;
     match action {
-        P::Read | P::Export | P::Change => Some(AccessSlot::Source),
+        // `maintain` is decided on main, as the served optimize route asks it.
+        P::Read | P::Export | P::Change | P::Maintain => Some(AccessSlot::Source),
         P::SchemaApply | P::BranchDelete | P::CommitPublish | P::CommitDrop => {
             Some(AccessSlot::Target)
         }
@@ -2121,9 +2125,9 @@ fn access_slot(action: omnigraph_policy::PolicyAction) -> Option<AccessSlot> {
         P::InvokeQuery => Some(AccessSlot::GraphWide),
         // Server- or operator-scoped: no graph's access report names them.
         P::Admin | P::GraphList | P::ConfigManage => None,
-        // Maintenance runs only through the direct CLI and embedded callers;
-        // no served operation performs it, so the report does not name it.
-        P::Maintain | P::Reclaim => None,
+        // Cleanup runs only through the direct CLI and embedded callers; no
+        // served operation performs it, so the report does not name it.
+        P::Reclaim => None,
         P::BranchClaim => None,
     }
 }
@@ -2142,6 +2146,7 @@ impl From<AccessAction> for omnigraph_policy::PolicyAction {
             AccessAction::CommitPublish => P::CommitPublish,
             AccessAction::CommitDrop => P::CommitDrop,
             AccessAction::InvokeQuery => P::InvokeQuery,
+            AccessAction::Maintain => P::Maintain,
         }
     }
 }
@@ -2180,8 +2185,8 @@ pub struct AccessOutput {
 
 impl AccessOutput {
     /// Decide every action in the shape a policy decides it: graph-wide; on
-    /// `branch` (`read`, `export` and `change` as the request's branch, the
-    /// branch-targeted actions as its target); and from `branch` to
+    /// `branch` (`read`, `export`, `change` and `maintain` as the request's
+    /// branch, the branch-targeted actions as its target); and from `branch` to
     /// `target_branch` for `branch_create` and `branch_merge`. `allowed`
     /// is the decision for one action with its branch and target branch.
     pub fn evaluate<E>(

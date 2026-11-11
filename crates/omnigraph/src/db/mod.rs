@@ -5,6 +5,7 @@ pub(crate) mod graph_coordinator;
 pub(crate) mod legacy_sidecars;
 pub mod manifest;
 pub(crate) mod omnigraph;
+pub(crate) mod reprepare;
 mod schema_state;
 pub(crate) mod snapshot;
 #[cfg(test)]
@@ -24,14 +25,14 @@ pub use omnigraph::{
     FullTextIndexRebuildResult, GraphCreateReconciliation, IndexBuildResult, InitOptions,
     MergeOutcome, MergeResult, Omnigraph, OpenMode, OptimizeBeforePublish, OptimizeCancellation,
     OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport, OptimizeRequest,
-    PendingIndex, PreparedGraphCreate, PreparedSchemaApply, PreparedSchemaSettlement, ReadCheck,
-    RebuiltFullTextIndex, RepairAction, RepairClassification, RepairStats, ResourceExceeded,
-    ResourceMeasure, RetainedManifestVersions, RunCancellation, SYSTEM_COLUMNS_PREFLIGHT,
-    SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement, SchemaContractDigest,
-    SchemaNonPublicationProof, SkipReason, StagingVerdict, SystemColumnUpgradeFinding,
-    SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome, SystemColumnUpgradeReport,
-    TableCeilings, TableCollectionPlan, TableOptimizeOutcome, UnattachedTagRecord,
-    UnpublishedManifest, unattached_release_order,
+    PendingIndex, PreparedGraphCreate, PreparedSchemaApply, PreparedSchemaSettlement,
+    PublicationLookup, ReadCheck, RebuiltFullTextIndex, RepairAction, RepairClassification,
+    RepairStats, ResourceExceeded, ResourceMeasure, RetainedManifestVersions, RunCancellation,
+    SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
+    SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,
+    SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
+    SystemColumnUpgradeReport, TableCeilings, TableCollectionPlan, TableOptimizeOutcome,
+    UnattachedTagRecord, UnpublishedManifest, unattached_release_order,
 };
 pub(crate) use omnigraph::{EarlyRevalidation, WriteAuthorityToken, WriteTxn};
 pub(crate) use omnigraph::{

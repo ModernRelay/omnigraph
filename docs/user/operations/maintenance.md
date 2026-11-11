@@ -9,8 +9,8 @@ OmniGraph provides five direct-storage maintenance commands:
 - `cleanup` permanently removes unretained table versions and unused table
   forks left by branches created before storage format v11.
 
-They do not run through the HTTP server. Address a standalone graph directly,
-or select a graph from a cluster root:
+They do not run through the HTTP server; a cluster server runs optimize as a
+[recorded operation](recorded-operations.md). Address a graph directly, or from a cluster root:
 
 ```bash
 omnigraph optimize --target ./graph.omni
@@ -87,7 +87,8 @@ first deferred one, and `--tables` runs only the listed tables, in order. Each
 table's `outcome` is `optimized`, `unchanged`, `deferred`, `skipped` or
 `failed` (with its `error`; the other tables still publish). The report adds
 `input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
-and `artifact` outcomes, which never fail a published run.
+and `artifact` outcomes, which never fail a published run. A run first waits up
+to 10 s for writes in flight when the last run published (`writer_yield_ms`).
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of

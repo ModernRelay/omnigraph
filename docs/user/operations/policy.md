@@ -212,9 +212,10 @@ With the example graph policy above, `act-alice` gets:
   `read` here also decides the reads that name no branch: listing branches, the
   schema, `show` and `commit show`. A commit list authorizes `read` on its
   branch, `main` when the query names none.
-- With `branch`, `actions` lists the actions allowed on it: `read`, `export`
-  and `change`, and `branch_delete`, `commit_publish`, `commit_drop` and
-  `schema_apply` with that branch as their target. Schema apply and the
+- With `branch`, `actions` lists the actions allowed on it: `read`, `export`,
+  `change` and `maintain` (served optimize asks it on `main`), and
+  `branch_delete`, `commit_publish`, `commit_drop` and `schema_apply` with that
+  branch as their target. Schema apply and the
   system-column upgrade target `main` only, and a storage upgrade authorizes
   each live branch, so `schema_apply` on another branch does not make schema
   apply possible there. `branch_claim` is not listed: no command or route
@@ -235,8 +236,8 @@ authentication allows every graph action and reports `actor_id: null`. The MCP
 server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
 
 It reports policy actions, not actor views, so a view can still refuse a
-`change` the policy allows. It does not report `maintain` or `reclaim`, since
-no server route runs maintenance.
+`change` the policy allows. It does not report `reclaim`, since no server
+route runs cleanup.
 
 ## Actor identity
 

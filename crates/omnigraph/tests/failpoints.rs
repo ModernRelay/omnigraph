@@ -4984,11 +4984,508 @@ async fn optimize_cancelled_mid_run_publishes_nothing_and_the_next_run_does() {
     );
 }
 
+/// A run waits, before it takes the gates, for a writer that an earlier
+/// publication sent back to prepare again. Without the wait, runs submitted
+/// back to back take the gates while that writer prepares, publish, and send
+/// it back again, so on object storage one write waited through many runs
+/// (a writer's wait was bounded per run, not per write).
+///
+/// The writer's first attempt is parked before its gates while a run
+/// publishes over it; its second attempt is parked while the next run
+/// starts. That run must not take the gates until the write commits, and it
+/// then builds on the write's commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_waits_for_a_writer_preparing_again_after_a_publication() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    let optimize_db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let writer_db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+
+    let yields = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _yield_observer = {
+        let yields = Arc::clone(&yields);
+        catalog::GATE_WRITER_YIELD_ACQUIRE.observe(move || {
+            yields.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    // The writer crosses this seam once per attempt.
+    let attempts = helpers::failpoint::ParkedCrossings::new(
+        &catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        &[1, 2],
+    );
+    let writer = {
+        let writer_db = Arc::clone(&writer_db);
+        tokio::spawn(async move {
+            mutate_main(
+                &writer_db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "preparing-again")], &[("$age", 52)]),
+            )
+            .await
+        })
+    };
+    attempts.wait_until_reached(1).await;
+
+    // The first run publishes over the parked attempt. That writer is not
+    // preparing again yet, so the run does not wait for it.
+    let first_run = optimize_db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        first_run.graph_commit_id.is_some(),
+        "the seed leaves compaction work, so the run must publish over the writer"
+    );
+    assert!(first_run.writer_yield < std::time::Duration::from_secs(1));
+
+    // The run moved main under the attempt: it prepares again.
+    attempts.release(1);
+    attempts.wait_until_reached(2).await;
+
+    let second_run = {
+        let optimize_db = Arc::clone(&optimize_db);
+        tokio::spawn(async move {
+            optimize_db
+                .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                .await
+        })
+    };
+    for _ in 0..400 {
+        if yields.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        yields.load(Ordering::SeqCst),
+        2,
+        "the second run reached its wait"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !second_run.is_finished(),
+        "the second run must wait while the writer prepares again"
+    );
+
+    attempts.release(2);
+    writer
+        .await
+        .unwrap()
+        .expect("the writer commits on its second attempt");
+    let head_after_write = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let second_run = tokio::time::timeout(std::time::Duration::from_secs(20), second_run)
+        .await
+        .expect("the second run stops waiting once the write returns")
+        .unwrap()
+        .unwrap();
+    drop(attempts);
+    assert!(
+        second_run.writer_yield >= std::time::Duration::from_millis(200),
+        "the report records the wait: {:?}",
+        second_run.writer_yield
+    );
+    assert_eq!(
+        second_run.input_commit.as_deref(),
+        Some(head_after_write.as_str()),
+        "the second run builds on the write, not the other way round"
+    );
+    assert_eq!(
+        collect_column_strings(&read_table(&optimize_db, "node:Person").await, "name")
+            .iter()
+            .filter(|name| *name == "preparing-again")
+            .count(),
+        1
+    );
+}
+
+/// The writer the last run sent back may still be queued at main's gates
+/// behind another writer when the next run starts: it has not yet seen that
+/// main moved. The next run waits for it all the same, and builds on its
+/// commit, so the write prepares twice, not once per run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_waits_for_a_writer_still_queued_behind_another_after_a_publication() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    // One handle for every actor, as the server holds one per graph.
+    let db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let yields = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _yield_observer = {
+        let yields = Arc::clone(&yields);
+        catalog::GATE_WRITER_YIELD_ACQUIRE.observe(move || {
+            yields.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let branch_waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _branch_observer = {
+        let branch_waits = Arc::clone(&branch_waits);
+        catalog::GATE_BRANCH_ACQUIRE.observe(move || {
+            branch_waits.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let pre_gate = helpers::failpoint::ParkedCrossings::new(
+        &catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        &[1],
+    );
+    let under_gates =
+        helpers::failpoint::ParkedCrossings::new(&catalog::MUTATION_POST_TABLE_COMMIT, &[1]);
+    let spawn_insert = |name: &'static str| {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", name)], &[("$age", 3)]),
+            )
+            .await
+        })
+    };
+    let sent_back = spawn_insert("sent-back");
+    pre_gate.wait_until_reached(1).await;
+    let first = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(first.graph_commit_id.is_some());
+    // Another writer, which prepared after the run, holds main's gates; the
+    // sent-back writer queues behind it, not yet knowing main moved.
+    let holder = spawn_insert("holder");
+    under_gates.wait_until_reached(1).await;
+    let waits = branch_waits.load(Ordering::SeqCst);
+    pre_gate.release(1);
+    for _ in 0..400 {
+        if branch_waits.load(Ordering::SeqCst) > waits {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        branch_waits.load(Ordering::SeqCst) > waits,
+        "the writer queued at the gates"
+    );
+    let second = {
+        let db = Arc::clone(&db);
+        let request = omnigraph::db::OptimizeRequest::default()
+            .with_limits(
+                omnigraph::db::OptimizeLimits::default()
+                    .with_max_writer_yield(std::time::Duration::from_secs(30)),
+            )
+            .with_authority(omnigraph::db::AuthorityCapture::UnderGates);
+        tokio::spawn(async move { db.optimize_as(None, request).await })
+    };
+    for _ in 0..400 {
+        if yields.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    under_gates.release(1);
+    holder.await.unwrap().expect("the holder commits");
+    sent_back
+        .await
+        .unwrap()
+        .expect("the sent-back writer commits");
+    let head_after_write = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(20), second)
+        .await
+        .expect("the run stops waiting once the write returns")
+        .unwrap()
+        .unwrap();
+    assert!(
+        second.writer_yield >= std::time::Duration::from_millis(200),
+        "the run waited for the queued writer: {:?}",
+        second.writer_yield
+    );
+    assert_eq!(
+        second.input_commit.as_deref(),
+        Some(head_after_write.as_str()),
+        "the run builds on the sent-back write, not the other way round"
+    );
+}
+
+/// Writers that send each other back to prepare again do not hold an
+/// optimize run: only the writes an optimize publication sent back do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_does_not_wait_for_writers_another_writer_sent_back() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    let db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    // An earlier run published before either write started.
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    let attempts = helpers::failpoint::ParkedCrossings::new(
+        &catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        &[1, 3],
+    );
+    let slow = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "slow")], &[("$age", 4)]),
+            )
+            .await
+        })
+    };
+    attempts.wait_until_reached(1).await;
+    // The second write commits over the first, which prepares again.
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "fast")], &[("$age", 5)]),
+    )
+    .await
+    .unwrap();
+    attempts.release(1);
+    attempts.wait_until_reached(3).await;
+    let run = db
+        .optimize_as(
+            None,
+            omnigraph::db::OptimizeRequest::default().with_limits(
+                omnigraph::db::OptimizeLimits::default()
+                    .with_max_writer_yield(std::time::Duration::from_secs(30)),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        run.writer_yield < std::time::Duration::from_secs(1),
+        "a writer another writer sent back held the run: {:?}",
+        run.writer_yield
+    );
+    attempts.release(3);
+    slow.await.unwrap().expect("the slow writer commits");
+}
+
+/// A run cancelled while it is queued for main's writer gates behind a
+/// writer that holds them returns without them: it publishes nothing,
+/// reports every table cancelled and leaves the writer to commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_cancelled_while_queued_for_the_gates_returns_without_them() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    let db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+
+    let under_gates =
+        helpers::failpoint::ParkedCrossings::new(&catalog::MUTATION_POST_TABLE_COMMIT, &[1]);
+    let holder = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "holder")], &[("$age", 2)]),
+            )
+            .await
+        })
+    };
+    under_gates.wait_until_reached(1).await;
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+
+    // Counted from here, the only branch-gate wait is the run's.
+    let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _wait_observer = {
+        let waits = Arc::clone(&waits);
+        catalog::GATE_BRANCH_ACQUIRE.observe(move || {
+            waits.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let cancellation = omnigraph::db::OptimizeCancellation::new();
+    let run = {
+        let db = Arc::clone(&db);
+        let request = omnigraph::db::OptimizeRequest::default()
+            .with_authority(omnigraph::db::AuthorityCapture::UnderGates)
+            .with_cancellation(cancellation.clone());
+        tokio::spawn(async move { db.optimize_as(None, request).await })
+    };
+    for _ in 0..400 {
+        if waits.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        waits.load(Ordering::SeqCst),
+        1,
+        "the run queued for the gates"
+    );
+    cancellation.cancel();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("a run cancelled while queued returns while a writer holds the gates")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.cancellation,
+        omnigraph::db::RunCancellation::Cancelled
+    );
+    assert!(report.graph_commit_id.is_none());
+    assert_eq!(report.gate_hold, std::time::Duration::ZERO);
+    assert!(!report.tables.is_empty());
+    for stat in &report.tables {
+        assert_eq!(
+            stat.outcome,
+            omnigraph::db::TableOptimizeOutcome::Deferred(omnigraph::db::DeferReason::Cancelled),
+            "{stat:?}"
+        );
+    }
+
+    under_gates.release(1);
+    holder.await.unwrap().expect("the gate holder commits");
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 1,
+        "the write, and no optimize publication"
+    );
+}
+
+/// A run cancelled while it waits for a writer that is preparing again
+/// returns without queuing for main's writer gates. A writer holds those
+/// gates throughout; the run must not wait for them, publish nothing and
+/// report every table cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_cancelled_during_its_writer_yield_returns_without_the_gates() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    // One handle for every actor, as the server holds one per graph.
+    let db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+
+    let yields = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _yield_observer = {
+        let yields = Arc::clone(&yields);
+        catalog::GATE_WRITER_YIELD_ACQUIRE.observe(move || {
+            yields.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    // The sent-back writer parks at its second attempt, before its gates; the
+    // other writer parks under main's gates after its table commit.
+    let attempts = helpers::failpoint::ParkedCrossings::new(
+        &catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        &[1, 2],
+    );
+    let under_gates =
+        helpers::failpoint::ParkedCrossings::new(&catalog::MUTATION_POST_TABLE_COMMIT, &[1]);
+    let sent_back = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "sent_back")], &[("$age", 1)]),
+            )
+            .await
+        })
+    };
+    attempts.wait_until_reached(1).await;
+    let first = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(first.graph_commit_id.is_some());
+    attempts.release(1);
+    attempts.wait_until_reached(2).await;
+    let holder = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "holder")], &[("$age", 2)]),
+            )
+            .await
+        })
+    };
+    under_gates.wait_until_reached(1).await;
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+
+    let cancellation = omnigraph::db::OptimizeCancellation::new();
+    let run = {
+        let db = Arc::clone(&db);
+        let request = omnigraph::db::OptimizeRequest::default()
+            .with_limits(
+                omnigraph::db::OptimizeLimits::default()
+                    .with_max_writer_yield(std::time::Duration::from_secs(30)),
+            )
+            .with_authority(omnigraph::db::AuthorityCapture::UnderGates)
+            .with_cancellation(cancellation.clone());
+        tokio::spawn(async move { db.optimize_as(None, request).await })
+    };
+    for _ in 0..400 {
+        if yields.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(yields.load(Ordering::SeqCst), 2, "the run reached its wait");
+    cancellation.cancel();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("a run cancelled during its yield returns while a writer holds the gates")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.cancellation,
+        omnigraph::db::RunCancellation::Cancelled
+    );
+    assert!(report.graph_commit_id.is_none());
+    assert_eq!(report.gate_hold, std::time::Duration::ZERO);
+    assert!(!report.tables.is_empty());
+    for stat in &report.tables {
+        assert_eq!(
+            stat.outcome,
+            omnigraph::db::TableOptimizeOutcome::Deferred(omnigraph::db::DeferReason::Cancelled),
+            "{stat:?}"
+        );
+    }
+
+    under_gates.release(1);
+    holder.await.unwrap().expect("the gate holder commits");
+    attempts.release(2);
+    sent_back
+        .await
+        .unwrap()
+        .expect("the sent-back writer commits");
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 2,
+        "the two writes, and no optimize publication"
+    );
+}
+
 /// A cancellation that arrives while the adjacency-artifact refresh reads the
 /// edge tables, after the publication, abandons the refresh: no write is
 /// issued and the run reports the cancellation as arriving late (RFC 1.8,
 /// 3.4). Before the fix the refresh took no cancellation, ran to its end and
-/// wrote the artifact (stress/REPORT.md, the artifact refresh).
+/// wrote the artifact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(optimize)]
 async fn optimize_cancelled_during_the_artifact_scan_writes_no_artifact() {
@@ -5039,7 +5536,7 @@ async fn optimize_cancelled_during_the_artifact_scan_writes_no_artifact() {
 /// nothing and drain the queue; the pipeline must then plan the rest of the
 /// catalog instead of ending. Before the fix it ended there and reported the
 /// unplanned tail `deferred(gate_hold_limit)` with no `resume_at`, though no
-/// gate hold was set (stress/REPORT.md, the pipeline's early exit).
+/// gate hold was set.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(optimize)]
 async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrite() {
