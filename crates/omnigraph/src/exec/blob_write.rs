@@ -167,9 +167,9 @@ impl Omnigraph {
         const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
         let mut first = None;
-        // Held from the first re-preparation until this write returns, so an
-        // optimize run waits for it before publishing over it again.
-        let mut repreparing = None;
+        // Held until this write returns, so an optimize run waits for it
+        // when an earlier run published while it was in flight.
+        let _in_flight = self.write_queue().writer_in_flight(requested);
         for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
             match self
                 .write_blob_cell_attempt(
@@ -194,8 +194,6 @@ impl Omnigraph {
                         "prepared Blob write authority changed before effects; repreparing"
                     );
                     crate::instrumentation::record_mutation_reprepare();
-                    repreparing
-                        .get_or_insert_with(|| self.write_queue().mark_repreparing(requested));
                     self.refresh_coordinator_only().await?;
                 }
                 result => return result,

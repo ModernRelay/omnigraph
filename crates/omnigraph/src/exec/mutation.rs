@@ -1298,9 +1298,9 @@ impl Omnigraph {
         // Resolve request-scoped values such as now() once so a safe
         // pre-effect retry does not change the logical input.
         let resolved_params = enrich_mutation_params(params)?;
-        // Held from the first re-preparation until this mutation returns, so
-        // an optimize run waits for it before publishing over it again.
-        let mut repreparing = None;
+        // Held until this mutation returns, so an optimize run waits for it
+        // when an earlier run published while it was in flight.
+        let _in_flight = self.write_queue().writer_in_flight(Some(branch));
         for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
             let mut retryable = false;
             match self
@@ -1331,8 +1331,6 @@ impl Omnigraph {
                         "prepared mutation authority changed before effects; repreparing"
                     );
                     crate::instrumentation::record_mutation_reprepare();
-                    repreparing
-                        .get_or_insert_with(|| self.write_queue().mark_repreparing(Some(branch)));
                     self.refresh_coordinator_only().await?;
                 }
                 result => return result,

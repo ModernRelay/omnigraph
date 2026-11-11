@@ -913,7 +913,7 @@ pub async fn optimize_all_datasets(
     // a cancellation during the wait is seen at the pipeline's first check.
     let writer_yield = db
         .write_queue()
-        .yield_to_repreparing_writers(
+        .yield_to_writers_published_over(
             None,
             request
                 .limits
@@ -961,6 +961,35 @@ pub async fn optimize_all_datasets(
         .visit_order(&table_keys)
         .map_err(OmniError::before_effect)?;
     let full_catalog = request.tables.is_none();
+
+    // A run cancelled during its writer yield (or before it reaches the
+    // writer gates) stops here, holding only the shared schema permit that
+    // writers also share: it must not queue for main's gates behind writers,
+    // nor hold them, only to report every table cancelled.
+    if request
+        .cancellation
+        .as_ref()
+        .is_some_and(OptimizeCancellation::is_cancelled)
+    {
+        let tables = visit_order
+            .into_iter()
+            .filter(|table_key| authority_txn.base.dataset(table_key).is_some())
+            .map(|table_key| DatasetOptimizeStats::deferred(table_key, DeferReason::Cancelled))
+            .collect();
+        drop(schema_permit);
+        return Ok(OptimizeReport {
+            input_commit: authority_txn.authority.graph_head.clone(),
+            input_manifest_version: authority_txn.base.graph_manifest_version(),
+            graph_commit_id: None,
+            tables,
+            resume_at: None,
+            gate_hold: Duration::ZERO,
+            writer_yield,
+            configuration_clear: ConfigurationClear::NotRun,
+            artifact: ArtifactRefresh::Skipped(ArtifactSkip::Cancelled),
+            cancellation: RunCancellation::Cancelled,
+        });
+    }
 
     // Optimize's one visibility point advances main's graph head, so its
     // authority is branch-wide even though physical effects are table-local.
@@ -1097,6 +1126,9 @@ pub async fn optimize_all_datasets(
         )
         .await?;
         graph_commit_id = Some(commit.graph_commit_id);
+        // Every write in flight on main now started before this publication,
+        // so the next run waits for them (`yield_to_writers_published_over`).
+        db.write_queue().optimize_published(None);
         db.runtime_cache.invalidate_all().await;
         if edge_tables_committed {
             db.invalidate_graph_index().await;

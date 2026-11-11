@@ -757,9 +757,9 @@ async fn load_jsonl_data(
             LoadAttemptInput::Csv(request, &csv_input, handle)
         }
     };
-    // Held from the first re-preparation until this load returns, so an
-    // optimize run waits for it before publishing over it again.
-    let mut repreparing = None;
+    // Held until this load returns, so an optimize run waits for it when an
+    // earlier run published while it was in flight.
+    let _in_flight = db.write_queue().writer_in_flight(branch);
     for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
         let replay = BufReader::new(Cursor::new(data.as_bytes()));
         match load_jsonl_reader_once(
@@ -788,7 +788,6 @@ async fn load_jsonl_data(
                     "prepared load authority changed before effects; repreparing"
                 );
                 crate::instrumentation::record_mutation_reprepare();
-                repreparing.get_or_insert_with(|| db.write_queue().mark_repreparing(branch));
                 db.refresh_coordinator_only().await?;
             }
             result => return result,

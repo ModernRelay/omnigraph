@@ -254,13 +254,22 @@ moves main under it sends it back to prepare again (`ReadSetChanged`). While it
 does, it holds no place in the gate queue. Stress runs on RustFS and Azurite
 showed the effect: with optimize submitted back to back, each run took the
 gates while such a writer prepared, published, and sent it back again. One
-write waited 14 s through 9 runs whose longest hold was 3.9 s. So each such
-writer holds a mark until its write returns (`WriteQueueManager::mark_repreparing`),
-and a run, before its export exclusion, authority capture and gates, waits for
-the marks on main to clear (`yield_to_repreparing_writers`). The wait is
-bounded by `max_writer_yield` (default 10 s, not settable over HTTP), so
-conflicting writers cannot hold maintenance off for good, and it ends on the
-run's cancellation. The report and the record carry it as `writer_yield`
+write waited 14 s through 9 runs whose longest hold was 3.9 s. So every write
+holds a ticket from its first preparation until it returns, stamped with how
+many optimize runs had published on its branch when it started
+(`WriteQueueManager::writer_in_flight`), and a run, before its export
+exclusion, authority capture and gates, waits until no write that started
+before main's last optimize publication is in flight
+(`yield_to_writers_published_over`). That covers a writer the last run sent
+back whether it is preparing again or still queued at the gates behind another
+writer, and no writer that started after that publication: writers sending
+each other back do not hold the run. The wait is bounded by
+`max_writer_yield` (default 10 s, not settable over HTTP), so a slow writer
+cannot hold maintenance off for good, and it ends on the run's cancellation;
+a run cancelled there returns before it queues for the gates. Under steady
+writes on object storage with two or more writers, the writes a publication
+sent back keep sending each other back, so most runs wait the whole limit.
+The report and the record carry it as `writer_yield`
 (`timings.writer_yield_ms`). The rest of the cost, a second preparation for
 every write a publication overlaps, comes from comparing the whole branch
 authority rather than the rows a write read; #1331
