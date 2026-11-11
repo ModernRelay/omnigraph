@@ -15,10 +15,13 @@ version axes. Never derive one axis from another.
 
 ## Current storage contract
 
-The current binary serves **internal manifest schema v14 to v16**, with v16
+The current binary serves **internal manifest schema v14 to v17**, with v17
 current. `MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION` is 14 and
-`INTERNAL_MANIFEST_SCHEMA_VERSION` is 16; a v14 or v15 branch is served as it
-is and stamped 16 by the first publish of this binary. Each live branch's `__manifest`
+`INTERNAL_MANIFEST_SCHEMA_VERSION` is 17. A branch below 17 is served as it
+is: the first publish of this binary stamps a v14 or v15 branch 16, a publish
+on any other branch writes back the stamp it loaded, and no publish stamps a
+branch 17. A graph this binary creates is born at 17; an existing v14 to v16 graph
+reaches 17 only by the stamp-only route of `omnigraph upgrade`. Each live branch's `__manifest`
 carries one `schema_contract` row containing the accepted schema source,
 compiled IR and identity. Fresh initialization writes it in the genesis
 Create; schema apply and the system-column upgrade replace it in the same
@@ -32,8 +35,8 @@ feature set determines the vintage, never the storage stamp.
 supported standalone graph without changing its storage stamp. Normal open
 refuses a graph at any other stamp. The one in-place storage conversion is
 the offline `omnigraph upgrade`, from stamps 8 and 9 (release 0.11.x) and
-from stamp 13. The same command stamps a v14 or v15 graph to v16 in place,
-rewriting no row.
+from stamp 13. The same command stamps a v14, v15 or v16 graph to v17 in
+place, rewriting no row.
 
 - v4 was the last released pre-identity format, used by OmniGraph 0.8.x.
 - v5 was an unreleased development format that introduced SchemaIR v2,
@@ -167,9 +170,25 @@ rewriting no row.
   The rows a v15 binary reads are unchanged, but it would protect such a tag
   as a user tag forever and refuse to retire its branch, so the stamp refuses
   it before any open. A v15 graph is served as it is: each branch is stamped
-  16 by its first publish under this binary or by the stamp-only route of
-  `omnigraph upgrade`, and `as unattached branch` is refused on a ref below
-  16, naming that upgrade. A fresh graph is born at 16.
+  16 by its first publish under this binary, and `as unattached branch` is
+  refused on a ref below 16, naming `omnigraph upgrade`, whose stamp-only
+  route stamps the ref.
+- v17 adds control facts to a branch's `__manifest`: rows that change no
+  `table` row and no schema contract and record no graph commit
+  ([Graph access and cross-process writes](../rfcs/2026-10-16-graph-access-serving-and-cross-process-writes.md#engine-control-facts-on-the-version-cas)).
+  The first kind is the `writer_epoch` row, at most one per version, whose
+  payload (`epoch`, `native`, `attempt_id`) is the JSON of the `metadata`
+  column, as the `schema_contract` row's is. Every publish rewrites the hot
+  rows with the row it read, and a branch forked from a version holding one
+  carries a copy that reads as epoch 0 there, since `native` names the ref
+  that wrote it. A v16 binary refuses the row's type, so the stamp refuses it
+  before any open. v17 is the first stamp no publication raises a branch to:
+  a publish writes back the stamp it loaded (`stamp_after_publish`), a v14 or
+  v15 branch still taking 16 at its first publish, and a publish refuses to
+  write a control fact into a version stamped below 17. Only the stamp-only
+  route of `omnigraph upgrade` stamps a served graph's live refs 17, with
+  every process on the graph stopped; a cluster-managed graph, which
+  `upgrade` refuses, has no route to 17 yet. A fresh graph is born at 17.
 - the unreleased v7–v19 stamps of the rejected MemWAL experiment never shipped
   and are not supported migration inputs. Reuse of a numeric stamp by another
   design (RFC 0062, RFC 0042 or RFC 0040) does not make an experimental graph
@@ -181,24 +200,26 @@ it never migrates a graph. `omnigraph upgrade` is the one conversion, on a
 standalone root, under one protocol (`UPGRADE_PROTOCOL` 6) from the stamps in
 `UPGRADE_SOURCE_FORMATS` (8, 9 and 13). `UpgradeIntent.source_format` chooses
 the route, and the report names it per source:
-`history-lance-files-v8-to-v16`, `history-lance-files-v9-to-v16` and
-`history-lance-files-v13-to-v16`. A stop before any route is chosen (an
+`history-lance-files-v8-to-v17`, `history-lance-files-v9-to-v17` and
+`history-lance-files-v13-to-v17`. A stop before any route is chosen (an
 unreadable intent, or recovery sidecars on a stamp no route converts) names
-`history-lance-files-to-v16` as its failed handler. A graph at stamp 16
-reports `already_current`; a graph with a live ref at 14 or 15 takes
-`stamp-v14-to-v16`. A stamp above 16 is the finding
+`history-lance-files-to-v17` as its failed handler. A graph whose live refs
+are all at stamp 17 reports `already_current`; a graph with a live ref at 14,
+15 or 16 takes `stamp-v14-to-v17`. A stamp above 17 is the finding
 `newer_than_binary`, any other stamp outside `UPGRADE_SOURCE_FORMATS` is
 `unsupported_source` with the open guard's refusal text, and a `--to-format`
-other than 16 is `unsupported_target`, checked before the stamp. A graph
+other than 17 is `unsupported_target`, checked before the stamp. A graph
 carrying `UPGRADE_PENDING_KEY` (`omnigraph:storage_upgrade_pending`) stays
 refused by normal open; `--check` reports it `recovery_required` and a run
 without `--check` resumes the attempt its intent names.
 
-The stamp-only route `stamp-v14-to-v16` runs when main is served and any live
-ref is stamped below 16. It lists the live refs, main first, checks
+The stamp-only route `stamp-v14-to-v17` runs when main is served and any live
+ref is stamped below 17. It lists the live refs, main first, checks
 `schema_apply` policy per ref, and writes one metadata-only commit per ref
-still at 14 or 15: no fence, no pending key, no row rewrite, and retired refs are
-left untouched. `--check` reports `check_passed` with that route and
+still below 17: no fence, no pending key, no row rewrite, and retired refs are
+left untouched. The commit keeps the ref's fragments, cold block registry
+fragments included. It is the one way a served ref reaches 17, since no
+publication raises a branch to it. `--check` reports `check_passed` with that route and
 `work.live_refs`. A rerun stamps whatever an interrupted run left and reports
 `already_current` once no live ref is behind. Its boundaries are
 `stamped:main` and `stamped:ref '<native>'`.
@@ -376,14 +397,15 @@ and skipped required cases fail the job.
 
 | Source format | Normal open | `omnigraph upgrade` | Required coverage owner |
 |---|---|---|---|
-| Current / v16 | Accepted | `already_current` for the default or target 16; any other target is `unsupported_target` | `upgrade/tests.rs` and CLI `crossversion_upgrade.rs::storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph`; stamp tests in `migrations.rs` |
-| v15 (main builds 2026-10-10 to 2026-10-11) | Accepted; stamped 16 by its first publish | `stamp-v14-to-v16`: one metadata commit per live ref, main first; `check_passed` then `completed` | `upgrade/tests.rs::a_v15_graph_is_stamped_current_per_live_ref` and `a_v15_graph_is_served_and_stamped_by_its_first_publish`; stamp tests in `migrations.rs` |
-| v14 (main builds 2026-10-04 to 2026-10-10) | Accepted; stamped 16 by its first publish | `stamp-v14-to-v16`: one metadata commit per live ref, main first; `check_passed` then `completed` | `upgrade/tests.rs::a_v14_graph_is_stamped_current_per_live_ref` and `a_live_ref_left_at_v14_is_stamped_alone`; stamp tests in `migrations.rs` |
+| Current / v17 | Accepted | `already_current` for the default or target 17; any other target is `unsupported_target` | `upgrade/tests.rs` and CLI `crossversion_upgrade.rs::storage_upgrade_current_binary_reports_already_current_on_a_fresh_graph`; stamp tests in `migrations.rs` |
+| v16 (releases 0.14.x and 0.15.0) | Accepted; a publish keeps it at 16 | `stamp-v14-to-v17`: one metadata commit per live ref, main first; `check_passed` then `completed` | `upgrade/tests.rs::a_v16_graph_is_stamped_current_per_live_ref` and `a_v16_branch_holding_cold_registry_fragments_is_stamped_and_keeps_them`; `omnigraph-catalog` `tests.rs::v17_a_publish_writes_back_the_stamp_it_loaded`; CLI `crossversion_upgrade.rs::genuine_lance11_storage_upgrade_round_trip`, whose predecessor reads what the candidate published |
+| v15 (main builds 2026-10-10 to 2026-10-11) | Accepted; stamped 16 by its first publish | `stamp-v14-to-v17`: one metadata commit per live ref, main first; `check_passed` then `completed` | `upgrade/tests.rs::a_v15_graph_is_stamped_current_per_live_ref` and `a_v15_graph_is_served_and_stamped_by_its_first_publish`; stamp tests in `migrations.rs` |
+| v14 (main builds 2026-10-04 to 2026-10-10) | Accepted; stamped 16 by its first publish | `stamp-v14-to-v17`: one metadata commit per live ref, main first; `check_passed` then `completed` | `upgrade/tests.rs::a_v14_graph_is_stamped_current_per_live_ref` and `a_live_ref_left_at_v14_is_stamped_alone`; stamp tests in `migrations.rs` |
 | v13 (main builds 2026-10-01 to 2026-10-04), standalone | Refused, naming `omnigraph upgrade` | Converted in place: `check_passed`, then `completed`; branches and history kept | CLI `crossversion_upgrade.rs::genuine_v13_storage_upgrade_preserves_history` against the genuine `c0a4519f` binary; `upgrade/tests.rs` over `legacy::write::LegacyHistory` fixtures; `omnigraph-catalog` `legacy_` tests |
 | v9 (release 0.11.x), standalone | Refused, naming `omnigraph upgrade` | Converted in place; branches and history kept, one schema contract for every pre-upgrade commit, root schema objects left in place | CLI `crossversion_upgrade.rs::genuine_v0_11_0_storage_upgrade_preserves_history` and `genuine_v0_11_0_storage_upgrade_after_predecessor_cleanup` against the released 0.11.0 binary, `genuine_v0_10_0_to_stamp_9_by_default_storage_upgrade_preserves_history` against the released 0.10.0 and 0.11.0 binaries; `upgrade/tests.rs` over `LegacyHistory::create_stamped` fixtures (`a_stamp_9_root_reached_from_6_by_the_released_upgrade_converts_its_retained_versions` for the retained stamp-6/7/8 versions); `omnigraph-catalog` `RootContractSource` tests |
 | v8 (release 0.11.x, legacy system column spellings), standalone | Refused, naming `omnigraph upgrade` | Converted in place, as v9 | CLI `crossversion_upgrade.rs::genuine_v0_10_0_to_stamp_8_storage_upgrade_preserves_history` against the released 0.10.0 and 0.11.0 binaries; the stamp-8 cases of `upgrade/tests.rs` |
 | v8, v9 or v13, cluster-managed | Refused | Refused before any read; export and rebuild | `crossversion_upgrade.rs::storage_upgrade_refuses_cluster_path_aliases` |
-| Any other stamp | Refused | `unsupported_source` (`newer_than_binary` above 16); export and rebuild | `upgrade/tests.rs`, the format fences and the refuse-and-rebuild tests in `crossversion_upgrade.rs` |
+| Any other stamp | Refused | `unsupported_source` (`newer_than_binary` above 17); export and rebuild | `upgrade/tests.rs`, the format fences and the refuse-and-rebuild tests in `crossversion_upgrade.rs` |
 | Pending conversion marker | Refused | `--check`: `recovery_required`; execute: resumes its own intent, refuses another's | `upgrade/tests.rs` |
 
 These tests cover local standalone roots. Object-store backend qualification
@@ -463,7 +485,9 @@ irreversible while both shapes are read; conversion is each branch's next
 publish, so a graph holds both stamps across its branches until every branch
 has published, and every reader accepts that state; for a stamp no released binary
 wrote, the synthetic conversion test is the predecessor evidence and the matrix
-row says so. Steps 3 and 5 apply unchanged.
+row says so. Steps 3 and 5 apply unchanged. From v17 on that path is closed:
+no publication raises a branch's stamp, so a stamp above 16 reaches a served
+branch only by an explicit `omnigraph upgrade` route.
 
 ### Pins and schema contracts
 

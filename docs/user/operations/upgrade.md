@@ -1,7 +1,8 @@
 # Upgrading OmniGraph
 
-Normal open accepts storage formats v14 to v16 (a v14 or v15 graph is stamped v16 at its first
-publish, or by the [storage upgrade](#storage-upgrade)) and never migrates a graph. A standalone
+Normal open accepts storage formats v14 to v17 and never migrates a graph: a v14 or v15 branch
+is stamped v16 at its first publish, and only the [storage upgrade](#storage-upgrade) stamps an
+existing graph v17. A standalone
 graph at v8 or v9 (release 0.11.x) or at v13 is converted in place by that offline upgrade. A graph at any other
 format, and every cluster-managed graph below v14, is refused and takes the
 [export/import rebuild](#rebuild) with the binary that wrote the graph.
@@ -10,7 +11,7 @@ CLI configuration, HTTP/MCP, and client compatibility changes.
 
 ## Storage upgrade
 
-`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v16 in place, and stamps a v14 or v15 graph to v16 in place by the route `stamp-v14-to-v16`: one metadata-only commit per live branch still below v16, main first, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again.
+`omnigraph upgrade` converts a standalone v8, v9 or v13 graph to v17 in place, and stamps a v14, v15 or v16 graph to v17 in place by the route `stamp-v14-to-v17`: one metadata-only commit per live branch still below v17, main first, and nothing else (no pending marker, nothing under `__history/legacy/`, no table row rewritten); stop every reader and writer and take the backup as for any upgrade, and a run that stops part-way is finished by running it again.
 Branches, commit ids, commit history and table data are kept; no table row is
 rewritten. Only main builds from 2026-10-01 to 2026-10-04 wrote v13.
 
@@ -22,6 +23,13 @@ publish` and `commit drop` refuse a branch still at v14; `as unattached branch`
 refuses a branch still at v14 or v15. A standalone graph can use the offline
 command before using those features. Cluster graphs must first have an ordinary
 0.14 publication on the affected branch; `upgrade` cannot stamp cluster graphs.
+
+A v16 graph, written by 0.14.x or 0.15.0, opens as it is and its branches stay
+at v16: no publication stamps a branch v17. Only `omnigraph upgrade` does, with
+every process on the graph stopped. A binary that serves up to v16 then refuses
+the graph, so upgrade every binary first. A graph this binary creates is born
+at v17. A cluster graph created by an earlier binary stays at v16, since
+`upgrade` cannot stamp cluster graphs.
 
 The explicit `omnigraph upgrade` command is offline, and it cannot verify that itself:
 
@@ -48,9 +56,9 @@ anything under `__history/`.
 
 | `outcome` | Meaning | Exit |
 |---|---|---|
-| `check_passed` | v8, v9, v13, v14 or v15 graph, every check passed, nothing written | 0 |
-| `already_current` | v16 graph, no live branch below v16, nothing to do | 0 |
-| `completed` | converted, validated and served as v16, or every live branch stamped v16 | 0 |
+| `check_passed` | v8, v9, v13, v14, v15 or v16 graph, every check passed, nothing written | 0 |
+| `already_current` | v17 graph, no live branch below v17, nothing to do | 0 |
+| `completed` | converted, validated and served as v17, or every live branch stamped v17 | 0 |
 | `check_failed` | a finding below; nothing was written | 1 |
 | `recovery_required` | the graph is pending or holds leftover recovery files; follow `recovery.action` | 1 |
 
@@ -67,7 +75,7 @@ reports `retired_refs`, `orphan_writers`, `bookkeeping_versions`,
 
 | Finding | Names | What to do |
 |---|---|---|
-| `unsupported_target` | the target | `--to-format` accepts 16 only |
+| `unsupported_target` | the target | `--to-format` accepts 17 only |
 | `newer_than_binary` | the format | upgrade the binary |
 | `unsupported_source` | the format, layout, over-budget branch, or the unreadable, over-bound or table-mismatched root schema objects of a v8 or v9 graph | [rebuild](#rebuild) with the build that wrote the graph. For a retired branch, instead of rebuilding run `cleanup --keep <N> --confirm` with that build, then `upgrade --check` again; rebuild only when the retired branch stays. For root schema objects, restore the whole root from one backup, objects and tables together, then check again; the objects alone, from an older backup, no longer match the tables and are refused. An unreadable contract refuses the 0.11.x open too, so export with 0.11.x is no way out of it |
 | `source_recovery_required` | leftover recovery files, or a `.staging` root schema object of a v8 or v9 graph, each with or without a live `__schema_apply_lock__` branch | stop every writer, then open the graph read-write with 0.11.x: `omnigraph snapshot <graph>` is such an open (`upgrade --check` is not). The open removes the recovery files and finishes or rolls back a schema apply that changed the table set; a property-only `.staging` it refuses and names the manual choice between the live and the staging schema. The lock stays live after the open; the upgrade handles it (next row). Then check again |
@@ -102,14 +110,14 @@ After the upgrade, commit ids from before it resolve as before, and commit
 listing, the change feed, merges and `cleanup` read across the upgrade. A
 snapshot addressed by a catalog version below the upgrade serves the commit
 at that version, or the nearest commit below it. The upgrade lands the graph
-at v16, so a v14 or v15 development build older than this upgrade refuses the
-upgraded graph before any open: upgrade every binary first.
+at v17, so a binary that serves only up to v16 refuses the upgraded graph
+before any open: upgrade every binary first.
 
 A graph written by 0.11.x (v8 or v9) has limits of its own. Its checks read every catalog version since `init`, so a long history is slow to check.
 
 | Subject | After the upgrade |
 |---|---|
-| Root schema objects | `_schema.pg`, `_schema.ir.json` and `__schema_state.json` at the graph root are read as the graph's schema and must be present and consistent. The upgrade leaves them in place. v14 to v16 never read them, and they go stale at the next schema apply. `_graph_commit_recoveries.lance/` also stays, as an unreferenced dataset |
+| Root schema objects | `_schema.pg`, `_schema.ir.json` and `__schema_state.json` at the graph root are read as the graph's schema and must be present and consistent. The upgrade leaves them in place. v14 to v17 never read them, and they go stale at the next schema apply. `_graph_commit_recoveries.lance/` also stays, as an unreferenced dataset |
 | Unfinished schema apply | A `.staging` copy of a root schema object, or a leftover recovery file, is refused as `source_recovery_required`, with or without a live `__schema_apply_lock__` branch: open the graph read-write with 0.11.x (`omnigraph snapshot <graph>`), which removes the recovery file and finishes or rolls back an apply that changed the table set. An apply that changed properties only leaves a `.staging` that 0.11.x refuses as well; its message names the manual choice between the live and the staging schema. 0.11.x releases the lock only inside the process that took it, so the lock stays live after that open. A live lock on an otherwise clean root is handled by the upgrade: the converted graph does not hold it as a live branch, and the next schema apply is not refused as already in progress |
 | Schema of old commits | 0.11.x kept only the latest schema, so every commit from before the upgrade is recorded under the one schema live at the upgrade. The tables and rows of an old commit are exact. A read at an old commit id is planned against the live schema, as in 0.11.x: a type added later is absent there, and a type dropped later cannot be queried |
 | Table versions above a commit | An interrupted 0.11.x write can leave them. The upgrade opens each table only at the version main's head pins and does not report them. Reads and writes ignore them, `repair` reports `foreign_drift` and `cleanup` lists them as foreign versions |
@@ -145,7 +153,7 @@ v6, so a graph still on that format needs an [export/import rebuild](#rebuild).
 In v0.14, certified full-text indexes from Lance 11 remain searchable with
 Lance 13 because the analyzer generation is unchanged. Missing or incompatible
 analyzer proofs still fail closed. For a graph that normal open accepts
-(formats 14–16), use the explicit maintenance command on each branch that needs
+(formats 14–17), use the explicit maintenance command on each branch that needs
 new indexes:
 
 ```bash
@@ -208,7 +216,7 @@ mapping is:
 | v7 | the exact unreleased development build that wrote it |
 | v8, v9 | latest 0.11.x (v8: legacy system column spellings). A standalone graph takes the [storage upgrade](#storage-upgrade) instead |
 | v10 to v13 | the main development build that wrote it; the refusal names its build dates. A standalone v13 graph takes the [storage upgrade](#storage-upgrade) instead |
-| v14 to v16 | current binary; entity export/import is not required within this storage generation |
+| v14 to v17 | current binary; entity export/import is not required within this storage generation |
 
 If the graph's generation is newer than the binary, upgrade the binary instead.
 

@@ -19,6 +19,7 @@ Graph-scoped actions:
 | `branch_create` | Branch creation |
 | `branch_delete` | Branch deletion |
 | `branch_merge` | Branch merge |
+| `branch_claim` | Claim of a branch's [writer epoch](troubleshooting.md#writer-epoch) |
 | `commit_publish` | Publication of an unpublished commit onto its recorded target branch |
 | `commit_drop` | Drop of an unpublished commit |
 | `invoke_query` | Entry to a stored query |
@@ -126,7 +127,8 @@ bad request before any rule is evaluated (see
 [branch names](../branching/index.md#branch-names)). Server actions and graph-wide
 `invoke_query` rules do not take branch scopes. `commit_publish` and
 `commit_drop` take `target_branch_scope`: the scope is the branch the
-unpublished commit recorded as its target. Writing an unpublished commit
+unpublished commit recorded as its target. `branch_claim` takes
+`target_branch_scope` too: the scope is the branch the claim names. Writing an unpublished commit
 needs no new action: a mutation `as commit` is a `change` on its branch and a
 merge `as commit` is a `branch_merge`, so an actor with ordinary write rights
 can omit `as commit`; this is a voluntary review workflow, not an approval
@@ -203,7 +205,8 @@ With the example graph policy above, `act-alice` gets:
   `schema_apply` with that branch as their target. Schema apply and the
   system-column upgrade target `main` only, and a storage upgrade authorizes
   each live branch, so `schema_apply` on another branch does not make schema
-  apply possible there.
+  apply possible there. `branch_claim` is not listed: no command or route
+  performs it in this release.
 - With `target_branch` as well, `actions` also lists `branch_create` from
   `branch` into the target and `branch_merge` of `branch` into it.
 
