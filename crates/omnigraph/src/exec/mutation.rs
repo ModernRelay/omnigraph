@@ -1433,6 +1433,14 @@ impl Omnigraph {
         match exec_result {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => {
+                if !self.unpublished_view_is_current(&txn).await? {
+                    *retryable = true;
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("manifest_version:{addressed}"),
+                        Some(txn.manifest_probe.captured().version.to_string()),
+                        None,
+                    ));
+                }
                 if txn.caller_expected_graph_head.is_some() {
                     fail(&MUTATION_POST_NO_EFFECT_PRE_GATE)?;
                     // A no-op has no table transaction, so it never reaches

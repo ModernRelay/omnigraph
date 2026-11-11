@@ -73,6 +73,17 @@ pub enum ManifestConflictDetails {
     /// branches"), a kind that never publishes; distinct from the
     /// authority-moved conflict of a publishable proposal.
     UnattachedCannotPublish { graph_commit_id: String },
+    /// A publish or a claim refused by the branch's writer epoch, the
+    /// generation of the process allowed to move the branch's head: the branch
+    /// stands at another epoch than the attempt asserts. Nothing was written.
+    WriterFenced {
+        /// The epoch this process held on the branch; `None` when it held none.
+        held: Option<u64>,
+        /// The epoch a refused claim read at its first load; `None` for a publish.
+        read: Option<u64>,
+        /// The branch's epoch as the refused attempt loaded it.
+        current: u64,
+    },
 }
 
 #[derive(Debug, Clone, Error)]
@@ -82,8 +93,9 @@ pub struct ManifestError {
     pub message: String,
     pub details: Option<ManifestConflictDetails>,
     /// The graph commit of a publication that may be durable despite an
-    /// unavailable acknowledgement or readback; `None` when no publication is
-    /// in doubt. Retention guards must remain until authority proves it cannot
+    /// unavailable acknowledgement or readback, or the attempt id of a
+    /// control-fact publication, which records no graph commit; `None` when no
+    /// publication is in doubt. Retention guards must remain until authority proves it cannot
     /// still publish; the external error category remains `Internal`. The id
     /// is an engine identifier, never a storage path, so a log may name it
     /// where it names no message. A thin box keeps the field one word, so
@@ -1035,7 +1047,8 @@ impl OmniError {
     }
 
     /// A publication of graph commit `graph_commit_id` whose outcome is
-    /// unknown: it may be durable, now or later.
+    /// unknown: it may be durable, now or later. A control-fact publication
+    /// records no graph commit and is named by its attempt id.
     pub fn manifest_publish_in_doubt(
         graph_commit_id: impl Into<String>,
         message: impl Into<String>,
@@ -1101,6 +1114,37 @@ impl OmniError {
         Self::Manifest(
             ManifestError::new(ManifestErrorKind::Conflict, message)
                 .with_details(ManifestConflictDetails::UnattachedCannotPublish { graph_commit_id }),
+        )
+    }
+
+    /// The refusal of a publish, or with `read` of a claim, on `branch` by its
+    /// writer epoch. It states the three epochs and names no remedy: claiming
+    /// is a takeover, a decision the engine does not suggest.
+    pub fn manifest_writer_fenced(
+        branch: &str,
+        held: Option<u64>,
+        read: Option<u64>,
+        current: u64,
+    ) -> Self {
+        let held_text = held.map_or_else(|| "no epoch".to_string(), |held| format!("epoch {held}"));
+        let message = match read {
+            Some(read) => format!(
+                "writer fenced on branch '{branch}': this claim read writer epoch {read} and the \
+                 branch is at {current}; this process held {held_text} there and nothing was claimed"
+            ),
+            None => format!(
+                "writer fenced on branch '{branch}': the branch is at writer epoch {current} and \
+                 this process held {held_text} there; nothing was published"
+            ),
+        };
+        Self::Manifest(
+            ManifestError::new(ManifestErrorKind::Conflict, message).with_details(
+                ManifestConflictDetails::WriterFenced {
+                    held,
+                    read,
+                    current,
+                },
+            ),
         )
     }
 

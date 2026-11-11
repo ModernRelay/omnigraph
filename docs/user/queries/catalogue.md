@@ -94,8 +94,8 @@ value `show` reports before any `set`, `scope` whether any caller
 descriptive text of each setting stays in [Session settings](settings.md).
 
 **`@Engine`**: the one row describing the binary: `version` is its release
-version, `current_internal_schema_version` the storage format it writes,
-`min_supported_internal_schema_version` the oldest stored format it still
+version, `current_internal_schema_version` the storage format of a graph it
+creates, `min_supported_internal_schema_version` the oldest stored format it still
 serves. A graph's own stored stamp is in `omnigraph snapshot`, not here.
 
 **`@LogicalKind`**: one row per logical plan node kind with its routing
