@@ -470,15 +470,18 @@ fn rfc0067_matrix_child_process() {
         .block_on(async move {
             let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
             let outcome: omnigraph::error::Result<()> = match op.as_str() {
-                "cleanup" => db.cleanup(reclaim_everything()).await.map(|_| ()),
+                "cleanup" => db.cleanup_as(reclaim_everything(), None).await.map(|_| ()),
                 "cleanup_keep" => db
-                    .cleanup(CleanupPolicyOptions {
-                        keep_versions: Some(1),
-                        older_than: None,
-                    })
+                    .cleanup_as(
+                        CleanupPolicyOptions {
+                            keep_versions: Some(1),
+                            older_than: None,
+                        },
+                        None,
+                    )
                     .await
                     .map(|_| ()),
-                "ensure_indices" => db.ensure_indices().await.map(|_| ()),
+                "ensure_indices" => db.ensure_indices_as(None).await.map(|_| ()),
                 "merge" => db
                     .branch_merge(&format!("src_{name}"), "main")
                     .await
@@ -493,9 +496,15 @@ fn rfc0067_matrix_child_process() {
                     .unwrap();
                     db.apply_prepared_schema_as(&intent, None).await.map(|_| ())
                 }
-                "optimize" => db.optimize().await.map(|_| ()),
+                "optimize" => db
+                    .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                    .await
+                    .map(|_| ()),
                 "load" => load_two(&db, &name).await,
-                "fts_rebuild" => db.rebuild_full_text_indices_on("main").await.map(|_| ()),
+                "fts_rebuild" => db
+                    .rebuild_full_text_indices_on_as("main", None)
+                    .await
+                    .map(|_| ()),
                 "system_column_upgrade" => db
                     .upgrade_system_columns(upgrade_execute())
                     .await
@@ -753,7 +762,7 @@ async fn run_cell(
         )
         .await
         .unwrap();
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
     }
     // A clear cell clears a photo a put stored first.
     if writer == Writer::BlobClear {
@@ -794,8 +803,10 @@ async fn run_cell(
             let outcome: omnigraph::error::Result<()> = match writer {
                 Writer::Insert => insert(&db, &write_name).await,
                 Writer::MultiTable => insert_and_friend(&db, &write_name).await,
-                Writer::Cleanup => Box::pin(db.cleanup(reclaim_everything())).await.map(|_| ()),
-                Writer::EnsureIndices => db.ensure_indices().await.map(|_| ()),
+                Writer::Cleanup => Box::pin(db.cleanup_as(reclaim_everything(), None))
+                    .await
+                    .map(|_| ()),
+                Writer::EnsureIndices => db.ensure_indices_as(None).await.map(|_| ()),
                 Writer::Merge => db
                     .branch_merge(&format!("src_{write_name}"), "main")
                     .await
@@ -805,9 +816,15 @@ async fn run_cell(
                     .apply_prepared_schema_as(prepared.as_ref().unwrap(), None)
                     .await
                     .map(|_| ()),
-                Writer::Optimize => db.optimize().await.map(|_| ()),
+                Writer::Optimize => db
+                    .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                    .await
+                    .map(|_| ()),
                 Writer::Load => load_two(&db, &write_name).await,
-                Writer::FtsRebuild => db.rebuild_full_text_indices_on("main").await.map(|_| ()),
+                Writer::FtsRebuild => db
+                    .rebuild_full_text_indices_on_as("main", None)
+                    .await
+                    .map(|_| ()),
                 Writer::SystemColumnUpgrade => db
                     .upgrade_system_columns(upgrade_execute())
                     .await
@@ -837,6 +854,14 @@ async fn run_cell(
                 );
             }
             acknowledged = outcome.is_ok();
+            // A failure after one table's detached effect fails only that
+            // table, so the run itself succeeds.
+            if writer == Writer::Optimize && matches!(window, Window::PostDetached(_)) {
+                assert!(
+                    acknowledged,
+                    "{cell}: a table-local failure does not fail the run: {outcome:?}"
+                );
+            }
             if let Err(error) = outcome {
                 // A data writer that fails after a detached effect and before
                 // its publication never reports an outcome it cannot
@@ -959,7 +984,7 @@ async fn run_cell(
         }
         Recovery::Cleanup => {
             let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
-            Box::pin(fresh.cleanup(reclaim_everything()))
+            Box::pin(fresh.cleanup_as(reclaim_everything(), None))
                 .await
                 .unwrap_or_else(|error| panic!("{cell}: recovery cleanup failed: {error}"));
         }
@@ -1054,9 +1079,12 @@ async fn run_cell(
     if writer == Writer::Optimize && recovery != Recovery::ReadOnly {
         let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
         for run in 1..=2 {
-            fresh.optimize().await.unwrap_or_else(|error| {
-                panic!("{cell}: optimize run {run} after recovery failed: {error}")
-            });
+            fresh
+                .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{cell}: optimize run {run} after recovery failed: {error}")
+                });
             assert_pin_detached_and_head_unmoved(&cell, &fresh, &person_uri, head_before).await;
         }
         drop(fresh);
@@ -1064,12 +1092,12 @@ async fn run_cell(
     if writer == Writer::EnsureIndices && recovery != Recovery::ReadOnly {
         let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
         fresh
-            .ensure_indices()
+            .ensure_indices_as(None)
             .await
             .unwrap_or_else(|error| panic!("{cell}: index pass after recovery failed: {error}"));
         assert_pin_detached_and_head_unmoved(&cell, &fresh, &person_uri, head_before).await;
         fresh
-            .ensure_indices()
+            .ensure_indices_as(None)
             .await
             .unwrap_or_else(|error| panic!("{cell}: second index pass failed: {error}"));
         drop(fresh);
@@ -1078,7 +1106,7 @@ async fn run_cell(
         let fresh = helpers::session(Omnigraph::open(&root).await.unwrap());
         for run in 1..=2 {
             let rebuilt = fresh
-                .rebuild_full_text_indices_on("main")
+                .rebuild_full_text_indices_on_as("main", None)
                 .await
                 .unwrap_or_else(|error| {
                     panic!("{cell}: full-text rebuild run {run} after recovery failed: {error}")

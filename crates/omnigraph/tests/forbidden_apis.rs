@@ -28,7 +28,10 @@
 //! preceding line contains the sentinel comment
 //! `// forbidden-api-allow: <reason>` are exempt from the lexical deny-list —
 //! reviewers see the sentinel in diff and can ask whether the exemption is
-//! justified.
+//! justified. A qualified durable primitive (`Owner::name`) is matched where
+//! its path is spelled, in a call or a struct literal; an import that renames
+//! or glob-imports the owner (`use …::Operation::*`) is not resolved, so a
+//! qualified entry pins the spelled form, not every reachable one.
 //!
 //! The graph-write protocol guard is structural rather than grep-based. It
 //! parses Rust with `syn`, classifies all public async inherent `Omnigraph`
@@ -191,7 +194,6 @@ const SENTINEL: &str = "// forbidden-api-allow:";
 enum WriteProtocol {
     Exact(&'static str),
     Composed(&'static str),
-    ManifestAdoption,
     NativeRefControl,
     PhysicalOnly,
     EphemeralScratch,
@@ -206,7 +208,6 @@ impl WriteProtocol {
         match self {
             Self::Exact(name) => format!("exact adapter ({name})"),
             Self::Composed(name) => format!("composed protocol ({name})"),
-            Self::ManifestAdoption => "manifest adoption".into(),
             Self::NativeRefControl => "native ref control".into(),
             Self::PhysicalOnly => "physical-only maintenance".into(),
             Self::EphemeralScratch => "ephemeral scratch".into(),
@@ -266,13 +267,11 @@ write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Exact("writer epoch claim: one `__manifest` version whose only change is the `writer_epoch` row, through the manifest publisher under the branch incarnation the door opened; no head moves") => ["claim_branch_writer", "claim_branch_writer_as"],
     "db/omnigraph.rs" => WriteProtocol::Composed("proposal tag removal confirmed by a readback, then merge-input tag release") => ["drop_commit_as"],
     "db/omnigraph.rs" => INDICES_V9 => [
-        "ensure_indices", "ensure_indices_on", "ensure_indices_on_as",
-        "rebuild_full_text_indices_on", "rebuild_full_text_indices_on_as",
+        "ensure_indices_as", "ensure_indices_on_as", "rebuild_full_text_indices_on_as",
     ],
     "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test", "init_with_legacy_system_columns_for_tests"],
-    "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize"],
-    "db/omnigraph.rs" => WriteProtocol::ManifestAdoption => ["repair"],
-    "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup"],
+    "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize_as"],
+    "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup_as"],
     "db/omnigraph.rs" => WriteProtocol::NativeRefControl => ["branch_create", "branch_create_as", "branch_create_from", "branch_create_from_as", "branch_delete", "branch_delete_as"],
 }
 
@@ -298,6 +297,9 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "refresh"),
     ("db/omnigraph.rs", "cleanup_plan"),
+    // The repair report: it publishes nothing, but `maintain` gates it like
+    // the maintenance writers (`maintenance_entry_points_take_an_actor`).
+    ("db/omnigraph.rs", "repair_report_as"),
     ("db/omnigraph.rs", "cleanup_plan_missing_paths"),
     ("db/omnigraph.rs", "cleanup_plan_path_snapshot"),
     ("db/omnigraph.rs", "open_read_only_with_storage"),
@@ -355,6 +357,8 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "get_commit"),
     ("db/omnigraph.rs", "commit_target_branch"),
     ("db/omnigraph.rs", "list_commits"),
+    // A fresh read of main's head and its parent chain; no write.
+    ("db/omnigraph/resolution.rs", "resolve_publication"),
     ("db/omnigraph.rs", "list_commits_page"),
     ("db/omnigraph.rs", "list_commits_page_readable"),
     ("db/omnigraph.rs", "list_unpublished_commits"),
@@ -965,7 +969,7 @@ gateway_surfaces! {
         "predicted_materialized_blob_batch_bytes",
         "materialize_blob_batch_bounded_with_preflight_cache", "managed_blob_payloads",
         "can_fold_index", "has_foldable_unindexed_fragments", "index_is_vector",
-        "plan_table_compaction",
+        "plan_table_compaction", "managed_blob_bytes",
     ],
     "table_store.rs" => "TableStore" => GatewayDisposition::StageOnly => [
         "stage_create", "stage_keyed_write", "stage_proven_strict_insert", "stage_overwrite",
@@ -1079,12 +1083,6 @@ durable_calls! {
     ("omnigraph-catalog/commit.rs", "InsertBuilder::new(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/commit.rs", ".execute_uncommitted(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/commit.rs", "commit_builder(", 2, WriteProtocol::Exact("lowest manifest publisher gateway: the linear version with zero retries, or a detached candidate version whose only retry is the random version id")),
-    // The persisted CSR/CSC adjacency artifact (`__graph_index/csr-current.bin`):
-    // derived, regenerable topology written ONLY from `optimize`'s tail (never
-    // the query path, which only loads), outside graph visibility — a stale or
-    // partial object is rejected by its identity stamps + payload digest and
-    // rebuilt in memory, so this write can never change a query's result.
-    ("graph_index/persist.rs", ".write_bytes(", 1, WriteProtocol::PhysicalOnly),
     ("omnigraph-core/instrumentation.rs", ".write_bytes(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/instrumentation.rs", ".write_text(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
     ("omnigraph-core/instrumentation.rs", ".write_text_if_absent(", 1, WriteProtocol::Composed("instrumented storage forwarding")),
@@ -1159,7 +1157,6 @@ durable_calls! {
     ("db/omnigraph/table_ops.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("shared publisher")),
     ("db/omnigraph/schema_apply.rs", ".commit_changes_with_intent_and_expected(", 1, SCHEMA_V9),
     ("db/omnigraph/schema_apply/settlement.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("schema settlement: strict numeric neutral lineage publication")),
-    ("db/omnigraph/repair.rs", ".commit_updates_with_actor_with_expected(", 1, WriteProtocol::ManifestAdoption),
     ("db/graph_coordinator.rs", ".commit_changes_with_intent_and_expected(", 1, WriteProtocol::Exact("publisher gateway")),
     ("db/graph_coordinator.rs", ".commit_changes_with_lineage_and_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
     ("omnigraph-catalog/lib.rs", ".publish_with_precondition(", 1, WriteProtocol::Exact("lowest manifest publisher gateway")),
@@ -1211,11 +1208,19 @@ durable_calls! {
     ("db/omnigraph/collector.rs", ".dataset()", 17, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".delete(", 1, WriteProtocol::Composed("detached-only sweep through the table's own Lance store: freed files, then the published manifests no retained `__manifest` version pins (links before tips) and the dead stagings; an interrupted pass is re-swept by the next")),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
-    ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ManifestAdoption),
+    // The repair report reads raw transaction history; it publishes nothing.
+    ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
-    ("db/omnigraph/optimize.rs", ".dataset()", 9, WriteProtocol::Composed("Optimize planning + read-only coverage and native-fork inventory + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
+    ("db/omnigraph/optimize.rs", ".dataset()", 11, WriteProtocol::Composed("Optimize planning, including each plan's measure against its table ceilings, + read-only coverage and native-fork inventory + the configuration clear's read-back after a failed removal + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
     ("db/omnigraph/optimize.rs", ".into_dataset()", 1, WriteProtocol::PhysicalOnly),
+    // The persisted CSR/CSC adjacency artifact (`__graph_index/csr-current.bin`):
+    // derived, regenerable topology written ONLY from `optimize`'s tail (never
+    // the query path, which only loads), outside graph visibility — a stale or
+    // partial object is rejected by its identity stamps + payload digest and
+    // rebuilt in memory, so this write can never change a query's result. It
+    // runs in a task the run awaits, so a dropped run cannot drop it.
+    ("db/omnigraph/optimize.rs", ".write_bytes(", 1, WriteProtocol::PhysicalOnly),
     ("exec/merge.rs", "SnapshotHandle::new(", 4, MERGE_V9),
 }
 
@@ -1264,6 +1269,11 @@ const DURABLE_PRIMITIVES: &[&str] = &[
     "compact_files(",
     ".optimize_indices(",
     "cleanup_old_versions(",
+    // No engine writer creates a data overlay: Lance drops an index's coverage
+    // of a fragment whose overlay is newer than the index, and optimize's
+    // index-rows ceiling measures the lag before the rewrite (lance.md, "Index
+    // coverage"). A struct literal is the only construction (`visit_expr_struct`).
+    "Operation::DataOverlay",
     ".update_config(",
     ".update_schema_metadata(",
     "write_schema_contract_staging(",
@@ -1506,8 +1516,11 @@ fn path_ends_with(expr: &Expr, suffix: &[&str]) -> bool {
     let Expr::Path(path) = expr else {
         return false;
     };
+    syn_path_ends_with(&path.path, suffix)
+}
+
+fn syn_path_ends_with(path: &syn::Path, suffix: &[&str]) -> bool {
     let segments = path
-        .path
         .segments
         .iter()
         .map(|segment| segment.ident.to_string())
@@ -1781,6 +1794,24 @@ impl<'ast> Visit<'ast> for CallInventory {
             }
         }
         visit::visit_expr_call(self, node);
+    }
+
+    /// A struct literal constructs a qualified primitive as a call does:
+    /// `Operation::DataOverlay { groups }` is the only shape Lance accepts for
+    /// that variant, and a pattern (`| Operation::DataOverlay { .. }`) is not
+    /// an expression, so a read-side match never counts.
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        for primitive in DURABLE_PRIMITIVES {
+            let qualified = primitive.trim_start_matches('.').trim_end_matches('(');
+            if !qualified.contains("::") {
+                continue;
+            }
+            let suffix = qualified.split("::").collect::<Vec<_>>();
+            if syn_path_ends_with(&node.path, &suffix) {
+                self.record(*primitive);
+            }
+        }
+        visit::visit_expr_struct(self, node);
     }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
@@ -2208,6 +2239,107 @@ fn graph_write_surfaces_are_registered() {
     );
 }
 
+/// The public surfaces of maintenance: the graph writers registered under
+/// these protocols, plus the read-only repair report the same gate covers.
+fn is_maintenance_protocol(protocol: WriteProtocol) -> bool {
+    protocol == INDICES_V9 || protocol == OPTIMIZE_V9 || protocol == WriteProtocol::PhysicalOnly
+}
+
+const READ_ONLY_MAINTENANCE_SURFACES: &[(&str, &str)] = &[("db/omnigraph.rs", "repair_report_as")];
+
+/// Maintenance has no actor-less public form (invariant 10). Every public
+/// optimize, cleanup, index or repair entry point is an `_as` method taking the
+/// `actor: Option<&str>` its policy check judges, so neither an embedded nor a
+/// direct caller reaches maintenance around the gate; with a policy installed,
+/// a `None` actor is refused. `policy_engine_chassis.rs` owns which action and
+/// scope each one checks.
+#[test]
+fn maintenance_entry_points_take_an_actor() {
+    let src = engine_src_root();
+    let read_only = READ_ONLY_SURFACES.iter().copied().collect::<BTreeSet<_>>();
+    for surface in READ_ONLY_MAINTENANCE_SURFACES {
+        assert!(
+            read_only.contains(surface),
+            "{surface:?} must stay a registered read-only surface"
+        );
+    }
+    let surfaces = WRITE_SURFACES
+        .iter()
+        .filter(|surface| is_maintenance_protocol(surface.protocol))
+        .map(|surface| (surface.file, surface.function))
+        .chain(READ_ONLY_MAINTENANCE_SURFACES.iter().copied())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        surfaces,
+        BTreeSet::from([
+            ("db/omnigraph.rs", "cleanup_as"),
+            ("db/omnigraph.rs", "ensure_indices_as"),
+            ("db/omnigraph.rs", "ensure_indices_on_as"),
+            ("db/omnigraph.rs", "optimize_as"),
+            ("db/omnigraph.rs", "rebuild_full_text_indices_on_as"),
+            ("db/omnigraph.rs", "repair_report_as"),
+        ]),
+        "a maintenance surface was added or removed; give it an actor and a policy case"
+    );
+    for (file, function) in surfaces {
+        assert!(
+            function.ends_with("_as"),
+            "{file}::{function}: maintenance entry points are `_as` forms"
+        );
+        let path = guarded_path(&src, file);
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let ast = parse_rust_source(&contents, file);
+        let signatures = function_signatures(&ast, function);
+        assert_eq!(
+            signatures.len(),
+            1,
+            "{file}::{function} must resolve to exactly one function"
+        );
+        let takes_actor = signatures[0].inputs.iter().any(|input| {
+            let syn::FnArg::Typed(argument) = input else {
+                return false;
+            };
+            matches!(&*argument.pat, syn::Pat::Ident(name) if name.ident == "actor")
+                && type_final_ident(&argument.ty).is_some_and(|ident| ident == "Option")
+        });
+        assert!(
+            takes_actor,
+            "{file}::{function} must take `actor: Option<&str>` for its policy check"
+        );
+    }
+}
+
+fn function_signatures(ast: &syn::File, function_name: &str) -> Vec<syn::Signature> {
+    struct Finder<'a> {
+        function_name: &'a str,
+        signatures: Vec<syn::Signature>,
+    }
+
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            if node.sig.ident == self.function_name {
+                self.signatures.push(node.sig.clone());
+            }
+            visit::visit_item_fn(self, node);
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            if node.sig.ident == self.function_name {
+                self.signatures.push(node.sig.clone());
+            }
+            visit::visit_impl_item_fn(self, node);
+        }
+    }
+
+    let mut finder = Finder {
+        function_name,
+        signatures: Vec::new(),
+    };
+    finder.visit_file(ast);
+    finder.signatures
+}
+
 #[test]
 fn low_level_coordinator_surfaces_are_registered() {
     let src = engine_src_root();
@@ -2534,6 +2666,12 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         "cleanup reclaims a pre-v11 table fork no registration names; fork names carry a commit ULID and are never reused",
     ),
     (
+        "db/omnigraph/optimize.rs",
+        ".write_bytes(",
+        1,
+        "derived topology artifact stamped with its snapshot identity; a late older copy fails the stamp check and the reader builds in memory",
+    ),
+    (
         "db/omnigraph/prepared_create.rs",
         ".delete(",
         1,
@@ -2544,12 +2682,6 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
         ".delete_prefix(",
         2,
         "reconciles an unpublished graph create: its tables and manifest have no published version, and nothing recreates them under this claim",
-    ),
-    (
-        "graph_index/persist.rs",
-        ".write_bytes(",
-        1,
-        "derived topology artifact stamped with its snapshot identity; a late older copy fails the stamp check and the reader builds in memory",
     ),
     (
         "omnigraph-catalog/retention.rs",
@@ -4960,6 +5092,33 @@ fn in_process_waits_are_gates_in_write_queue() {
          mark the line `{SENTINEL} <why it is not a gate>` (a cache held across no \
          round trip).\n  {}",
         violations.join("\n  ")
+    );
+}
+
+/// A qualified durable primitive is found wherever its path is constructed: a
+/// call, and a struct literal such as Lance's `Operation::DataOverlay { .. }`.
+/// A match pattern on the same path is a read and counts nothing.
+#[test]
+fn durable_primitive_struct_literals_are_inventoried() {
+    let ast: syn::File = syn::parse_str(
+        "fn write(groups: Vec<G>) -> Operation {\n    \
+             lance::dataset::transaction::Operation::DataOverlay { groups }\n}\n\
+         fn read(op: &Operation) -> bool {\n    \
+             matches!(op, Operation::DataOverlay { .. } | Operation::Delete { .. })\n}\n\
+         fn call() { let _ = compact_files(1); }\n",
+    )
+    .unwrap();
+    let inventory = call_inventory(&ast);
+    assert_eq!(
+        inventory.counts.get("Operation::DataOverlay"),
+        Some(&1),
+        "the literal is counted once, the pattern not at all: {:?}",
+        inventory.counts
+    );
+    assert_eq!(
+        inventory.counts.get("compact_files"),
+        Some(&1),
+        "a plain call is recorded by its final identifier"
     );
 }
 

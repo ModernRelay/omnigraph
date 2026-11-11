@@ -310,7 +310,7 @@ struct DeploymentId {
     sequence: u64,
 }
 
-fn canonical_ulid(part: &str) -> bool {
+pub(crate) fn canonical_ulid(part: &str) -> bool {
     part.parse::<Ulid>().is_ok_and(|id| id.to_string() == part)
 }
 

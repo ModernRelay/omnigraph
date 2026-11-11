@@ -5,6 +5,7 @@ pub(crate) mod graph_coordinator;
 pub(crate) mod legacy_sidecars;
 pub mod manifest;
 pub(crate) mod omnigraph;
+pub(crate) mod reprepare;
 mod schema_state;
 pub(crate) mod snapshot;
 #[cfg(test)]
@@ -16,19 +17,22 @@ pub use commit_graph::{GraphCommit, GraphCommitKind};
 pub use graph_coordinator::{ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{DatasetEntry, DatasetUpdate};
 pub use omnigraph::{
-    BranchCreated, BranchDetail, BranchListing, BuiltIndex, BuiltIndexAction, BuiltIndexKind,
-    COMMIT_LIST_DEFAULT_PAGE_COMMITS, COMMIT_LIST_MAX_PAGE_COMMITS, CleanupPolicyOptions,
-    CollectorCost, CollectorPathSnapshot, CollectorReport, CollectorRowSummary, CommitListPage,
-    DatasetCleanupStats, DatasetOptimizeStats, DatasetRepairStats, EXPORT_CHUNK_MAX_BYTES,
-    ExportCut, FullTextIndexRebuildResult, GraphCreateReconciliation, IndexBuildResult,
-    InitOptions, MergeOutcome, MergeResult, Omnigraph, OpenMode, PendingIndex, PreparedGraphCreate,
-    PreparedSchemaApply, PreparedSchemaSettlement, ReadCheck, RebuiltFullTextIndex, RepairAction,
-    RepairClassification, RepairOptions, RepairStats, RetainedManifestVersions,
+    ArtifactRefresh, ArtifactSkip, AuthorityCapture, BranchCreated, BranchDetail, BranchListing,
+    BuiltIndex, BuiltIndexAction, BuiltIndexKind, COMMIT_LIST_DEFAULT_PAGE_COMMITS,
+    COMMIT_LIST_MAX_PAGE_COMMITS, CleanupPolicyOptions, CollectorCost, CollectorPathSnapshot,
+    CollectorReport, CollectorRowSummary, CommitListPage, ConfigurationClear, DatasetCleanupStats,
+    DatasetOptimizeStats, DatasetRepairStats, DeferReason, EXPORT_CHUNK_MAX_BYTES, ExportCut,
+    FullTextIndexRebuildResult, GraphCreateReconciliation, IndexBuildResult, InitOptions,
+    MergeOutcome, MergeResult, Omnigraph, OpenMode, OptimizeBeforePublish, OptimizeCancellation,
+    OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport, OptimizeRequest,
+    PendingIndex, PreparedGraphCreate, PreparedSchemaApply, PreparedSchemaSettlement,
+    PublicationLookup, ReadCheck, RebuiltFullTextIndex, RepairAction, RepairClassification,
+    RepairStats, ResourceExceeded, ResourceMeasure, RetainedManifestVersions, RunCancellation,
     SYSTEM_COLUMNS_PREFLIGHT, SchemaApplyReconciliation, SchemaApplyResult, SchemaApplySettlement,
     SchemaContractDigest, SchemaNonPublicationProof, SkipReason, StagingVerdict,
     SystemColumnUpgradeFinding, SystemColumnUpgradeOptions, SystemColumnUpgradeOutcome,
-    SystemColumnUpgradeReport, TableCollectionPlan, UnattachedTagRecord, UnpublishedManifest,
-    unattached_release_order,
+    SystemColumnUpgradeReport, TableCeilings, TableCollectionPlan, TableOptimizeOutcome,
+    UnattachedTagRecord, UnpublishedManifest, unattached_release_order,
 };
 pub(crate) use omnigraph::{EarlyRevalidation, WriteAuthorityToken, WriteRevalidation, WriteTxn};
 pub(crate) use omnigraph::{
