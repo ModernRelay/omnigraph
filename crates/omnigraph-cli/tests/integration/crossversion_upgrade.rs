@@ -2272,11 +2272,23 @@ fn genuine_lance11_storage_upgrade_round_trip() {
         ),
     )
     .unwrap();
-    // Both syntaxes spell these two queries alike, but the current one
-    // reserves the name `terms`: its file names that query `title_search`.
+    // The predecessor reads its own syntax; the current one reserves the name
+    // `terms`, so its file names that query `title_search`.
     let added_queries = r#"
-query terms($term: String) {
+query title_search($term: String) {
     match { $d: Doc } where search($d.title, $term)
+    return { $d.slug }
+    order { $d.slug }
+}
+query nullable_vectors() {
+    match { $v: NullableVector }
+    return { $v.name, $v.embedding }
+    order { $v.name }
+}
+"#;
+    let predecessor_added_queries = r#"
+query terms($term: String) {
+    match { $d: Doc search($d.title, $term) }
     return { $d.slug }
     order { $d.slug }
 }
@@ -2288,16 +2300,15 @@ query nullable_vectors() {
 "#;
     fs::write(
         &queries,
-        format!(
-            "{}\n{}",
-            journey_query_source(),
-            added_queries.replace("query terms(", "query title_search(")
-        ),
+        format!("{}\n{}", journey_query_source(), added_queries),
     )
     .unwrap();
     fs::write(
         &predecessor_queries,
-        format!("{}\n{added_queries}", predecessor_journey_query_source()),
+        format!(
+            "{}\n{predecessor_added_queries}",
+            predecessor_journey_query_source()
+        ),
     )
     .unwrap();
     let run = |binary: &Path, args: &[&str]| {
