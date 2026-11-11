@@ -238,7 +238,8 @@ export AWS_S3_FORCE_PATH_STYLE=true
 ```
 
 Set `AWS_ALLOW_HTTP=true` only for a trusted local development endpoint. Do not
-put credentials in `cluster.yaml` or graph URIs.
+put credentials in `cluster.yaml` or graph URIs. The store's requirements and
+encryption at rest are in [Storage](concepts/storage.md#s3-configuration).
 
 The same storage root must be visible to servers and out-of-band cluster or
 maintenance jobs. Submit schema/query changes and graph additions to the running
