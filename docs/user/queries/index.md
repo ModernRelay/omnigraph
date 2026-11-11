@@ -13,10 +13,8 @@ answers the plan a read query would run under instead of its rows (see
 
 ```gq
 query engineers($title: String) @description("People with a title") {
-  match {
-    $p: Person { title: $title }
-    $p worksAt $c
-  }
+  match { $p: Person, $p worksAt $c }
+  where $p.title = $title
   return { $p.name, $c.name as company }
   order { company asc, $p.name asc }
   limit 50
@@ -44,8 +42,12 @@ carries its type's whole range: a `U64` takes `0` to `18446744073709551615`.
 
 ## Match patterns
 
-A match binds nodes and follows typed relationships. For edge alternatives,
-wildcard, bounded hops, direction and edge identity, see
+A read is `match { ... }`, an optional `where`, then `return`, `order` and
+`limit`. `match` holds the elements that produce rows (bindings, triples,
+`optional { ... }`, `let` and `from`), separated by commas; `where` holds one
+Boolean expression, evaluated after every element, that removes rows. Every
+list takes commas. For the elements, the refusals that print their fix, edge
+alternatives, wildcard, bounded hops, direction and edge identity, see
 [Traversal and match patterns](traversal.md). Omitted bounds always mean
 exactly `{1,1}`; multiple hops require an explicit finite range. `from` draws
 the rows of a ranking into the match, and `let` names a relation for it; see
@@ -53,17 +55,16 @@ the rows of a ranking into the match, and `let` names a relation for it; see
 
 ### Boolean expressions and nulls
 
-Filters combine with `and`, `or`, `not` and parentheses. `or` binds loosest,
-then `and`, then `not`, then comparison, so `not $p.email is null` reads as
-`not ($p.email is null)`. Comparisons do not chain: `$a < $b < $c` is a parse
-error. `not {` stays the pattern negation. Operands of `and`, `or` and `not`
+A `where` combines its tests with `and`, `or`, `not` and parentheses. `or`
+binds loosest, then `and`, `not`, comparison and arithmetic, so
+`not $p.email is null` reads as `not ($p.email is null)`. Comparisons do not
+chain: `$a < $b < $c` is a parse error. Operands of `and`, `or` and `not`
 must be `Bool` (`T41`), as in
 `($d.stage = "open" or $d.stage = "paused") and not $d.amount < $cut`.
 
 A comparison or string test (`contains(...)`, `starts_with(...)`) with a null
-operand is null, and `not null` is null. A filter keeps only rows whose
-expression is true, so `not ($p.age > 30)` skips rows whose `age` is
-null.
+operand is null, and `not null` is null. A `where` keeps only rows whose
+expression is true, so `not ($p.age > 30)` skips rows whose `age` is null.
 
 Numeric comparisons choose their types before execution. A literal may use a
 property's type when its value is exactly representable in that type; otherwise
@@ -88,25 +89,24 @@ not. A parameter bound to `null` makes every comparison on it null. `is null`
 refuses a `Blob`.
 
 `and`, `or`, `not`, `is`, `null` and `in` are reserved words: none is a bare operand
-or a return alias. `$p.and` after a dot and `and: 1` in an assignment or
-binding match stay legal; `nothing` and `android` are ordinary identifiers.
+or a return alias. `$p.and` after a dot and `and: 1` in an assignment stay
+legal; `nothing` and `android` are ordinary identifiers.
 A bare name is never a value in a read (`Q018`): a property is `$x.name`, a
 parameter `$name` and a string `"name"`; the one bare name is a return alias in
 `order`.
-A traversal names its edge bare or as a string, the one spelling for an edge
-a reserved word names: `$i "in" $b` follows the edge `In`; `$i in $b` tests membership.
-
-Binding matches take constants evaluated once per invocation, such as
-`{ adult: true or $flag }`; a property or system field there is `T45`. A
-[write](../mutations/index.md) selects its rows with the same clauses.
+Inside `match` any word is an edge name, reserved words included: `$i in $b`
+follows the edge `In` there and tests membership in `where` (`T7` for the
+wrong side); a [write](../mutations/index.md) selects the same way.
 
 ### Correlated blocks
 
-`not { ... }`, `exists { ... }`, `count { ... } op value` and
-`sum(expr) { ... } op value` (also `min`, `max`, `avg`) match a pattern once per
-outer row. Each block must read a variable bound outside it. The row is kept
-when the aggregate comparison is true: `not` means `count = 0`, and `exists`
-means `count > 0`. The right side is a literal, `now()` or typed parameter;
+`exists { ... }`, `not exists { ... }`, `count { ... } op value` and
+`sum(expr) { ... } op value` (also `min`, `max`, `avg`) are operands of
+`where` that match a pattern once per outer row; a block holds elements and
+its own `where`, `count { $p knows $q where $q.age > 30 }`, and must read an
+outer variable (`T39`, `T9` under `not`). The row is kept when the aggregate
+comparison is true: `not exists` means `count = 0`, and `exists` means
+`count > 0`. The right side is a literal, `now()` or typed parameter;
 a column, such as `$p.quota`, type-checks but is refused by the planner
 (`P006`). Numeric bounds follow the [comparison rules](#boolean-expressions-and-nulls)
 for the aggregate's result type. Its argument is a scalar expression in the
@@ -130,18 +130,18 @@ connects to the outer row is reached through it, or the block runs once from a
 node it binds by key if that is cheaper (`strategy` in [explain](explain.md));
 a binding correlated only through a filter, or read by a text search, is
 scanned. A single-hop, filter-free `count { ... }` over a directed, unbound
-edge is answered from the graph index's degree. A bare aggregate in `match`,
-`count($d) > 2` without a block, is refused: it names no row to group by.
+edge is answered from the graph index's degree. A bare aggregate in `where`,
+`count($d) > 2` without a block, is refused (`T8`) with the block over the
+elements it counts as the fix.
 
 ```gq
 query prolific($least: I64) {
-    match {
-        $a: Author
-        count {
-            $p: Post { published: true }
-            $a authored $p
-        } >= $least
-    }
+    match { $a: Author }
+    where count {
+        $p: Post,
+        $a authored $p
+        where $p.published = true
+    } >= $least
     return { $a.name }
     order { $a.name }
     limit 20
@@ -175,8 +175,8 @@ identity of any binding, `$e.@src` and `$e.@dst` the endpoints of a bound
 edge. They work in filters, projections, and orderings (`$p.@id = $who`,
 `return { $p.@id }`, `order { $p.@id asc }`) and answer on every graph,
 whatever the stored column is called; a write reads them through its binding
-too (`$x.@src = $who`), and a bare `@id` is `T6`. A bare `id` (`$p.id`,
-`{ id: ... }`) always names a user property called `id`; where none is declared
+too (`$x.@src = $who`), and a bare `@id` is `T6`. A bare `id` (`$p.id`, or
+`id: ...` in an assignment) always names a user property called `id`; where none is declared
 it is the unknown-property error, which names the meta-field. Edge inserts
 address endpoints as `from` and `to`. `$e.@type` returns the bound edge's
 canonical schema type name as a non-null `String`, including on ordinary named

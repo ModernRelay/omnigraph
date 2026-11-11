@@ -73,7 +73,7 @@ replacement vectors; neither `merge` nor `overwrite` does that automatically.
 A ranking is a relation drawn into `match` with `from`:
 `from nearest(rel, $c.embedding, $q, k: n)`, `from bm25(rel, $d.title, $q)`,
 `from rrf(arm, arm, k: 60)`. `rel` is the population, an inline read
-`{ match { … } return { $c } }` whose `return` lists every binding the rest of
+`{ match { … } where … return { $c } }` whose `return` lists every binding the rest of
 the query reads, or a relation named with `let`. `from` adds the score column:
 `$distance` for `nearest`, `$score` for `bm25` and `rrf`. A ranking written as a
 call in `order` or `return` (`order { nearest($c.embedding, $q) }`) is refused
@@ -122,8 +122,8 @@ identical arms, or arms that rank two different bindings, are refused (`T75`):
 ```gq
 query hybrid($vq: Vector(1536), $tq: String) {
     match {
-        let $all = { match { $d: Doc } return { $d } }
-        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60)
+        let $all = { match { $d: Doc } return { $d } },
+        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60),
     }
     return { $d.slug, $d.title }
     order { $score desc }
@@ -176,12 +176,10 @@ draws from no ranking has no `ranking`.
 ### Text filter (not ranking — no `limit` required)
 
 ```gq fragment
-match {
-    $d: Doc
-    search($d.title, $q)          // full-text filter
-    fuzzy($d.title, $q, max_edits: 2)        // fuzzy filter, max 2 edits
-    match_text($d.body, $q)       // regular full-text filter (not phrase search)
-}
+match { $d: Doc }
+where search($d.title, $q)                    // full-text filter
+  and fuzzy($d.title, $q, max_edits: 2)       // fuzzy filter, max 2 edits
+  and match_text($d.body, $q)                 // regular full-text filter (not phrase search)
 ```
 
 A full-text call (`search`, `fuzzy`, `match_text`, `bm25`) needs a full-text
@@ -189,9 +187,10 @@ index on its property: a one-column `@index` or `@key` on a free-text String
 node property. A call on any other property, an enum included, is refused at
 type checking (`T27`); compare enums with `=`. The analyzer folds case and
 stems, so `"deep"` matches `"Deep Learning"`. `search`, `fuzzy` and
-`match_text` must stand alone or be compared `= true`, joined only by `and`;
-`= false`, `not search(...)` and `or` are refused (`T38`). Negate with a
-block: `not { search($d.title, $q) }`.
+`match_text` must stand alone as a conjunct of `where` or be compared
+`= true`, joined only by `and`; `= false`, `not search(...)` and `or` are
+refused (`T38`). Negate with a block that re-mentions the binding:
+`not exists { $d: Doc where search($d.title, $q) }`.
 
 ## The Key Pattern: Scope First, Rank Second
 
@@ -199,11 +198,9 @@ Filter with graph traversal inside the ranking's population. Constrain the ranke
 
 ```gq
 query related_chunks($artifact_slug: String, $q: Vector(1536)) {
-    match { from nearest({ match {
-        $c: Chunk                                 // the ranked binding
-        $c partOfArtifact $a                      // scope: only this artifact's chunks
-        $a.slug = $artifact_slug
-    } return { $c, $a } }, $c.embedding, $q, k: 10) }
+    match {
+      from nearest({ match { $c: Chunk, $c partOfArtifact $a } where $a.slug = $artifact_slug return { $c, $a } }, $c.embedding, $q, k: 10),
+    }
     return { $c.text }
     order { $distance }           // rank: vector similarity within scope
     limit 10
@@ -219,7 +216,7 @@ keeps the rows it reaches.
 
 The ranked binding starts the traversal whichever binding the population
 declares first, and whether or not it is declared: with
-`$a: InformationArtifact { … }` first, then `$c partOfArtifact $a`, ranked on
+`$a: InformationArtifact` first, then `$c partOfArtifact $a`, ranked on
 `$c`, the query ranks `Chunk` and keeps the chunks the traversal reaches.
 
 A standalone `nearest` ranking widens an underfilled candidate set, finally

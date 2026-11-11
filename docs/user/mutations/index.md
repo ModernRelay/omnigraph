@@ -19,22 +19,21 @@ An edge insert assigns its endpoints as `from` and `to`, the logical ids of exis
 ```gq fragment
 insert Person { email: $email, display_name: $name }
 
-$x: Person  $x.email = $email
+match { $x: Person } where $x.email = $email
 update $x set { display_name: $name }
 
-$x: Person  $x.email = $email
+match { $x: Person } where $x.email = $email
 delete $x
 ```
 
-A write body is one or more groups. A group's clauses, written bare, select its
-rows: a binding of the type to write and filters over it, as clauses
-(`$x: Person  $x.email = $email`) or in the braces
-(`$x: Person { email: $email }`). Its statements then run once per row:
-`update $x set { ... }` and `delete $x` name the bound variable (another is
-`T77`); an `insert T { ... }` with no clauses runs once. A clause after a
-statement opens the next group, which sees the effects of the ones before it.
-`update T set { ... } where ...` and `delete T where ...` are refused (`Q008`)
-with the binding and filter as the fix.
+A write body is one or more groups. A group selects its rows with a read's
+`match { ... }` and `where`, a binding of the type to write and a predicate
+over it, and its statements run once per row: `update $x set { ... }` and
+`delete $x` name the bound variable (another is `T77`). An `insert T { ... }`
+with no `match` runs once. A later group opens with its own `match` and sees
+the effects of the groups before it. A statement takes no `where`:
+`delete T where ...` is refused (`Q008`) with the group form as the fix, and
+elements written without `match { }` are refused (`Q013`).
 
 A filter takes the expressions of a
 [read filter](../queries/index.md#boolean-expressions-and-nulls) over the
@@ -44,13 +43,13 @@ only the rows whose expression is true. On four `Knows` edges, `ab1` and `ab2`
 from `a` to `b`, `ac`, and `db`:
 
 ```gq
-query exact() { $x: Knows  $x.@src = "a" and $x.@dst = "b"  delete $x }
+query exact() { match { $x: Knows } where $x.@src = "a" and $x.@dst = "b"  delete $x }
 ```
 
 removes `ab1` and `ab2` and nothing else: `affected: nodes=0 edges=2`. An
 unbound variable is `T6` and an aggregate `T8`. The planner takes one binding
 of the written type and filters over it; a traversal, block or search
-predicate among a write's clauses is refused (`P006`). A filter that tests
+predicate in a write's selection is refused (`P006`). A filter that tests
 over four properties twice each with `=`, `!=` or `in` is refused.
 
 Assignment values are constants: literals, parameters, `now()`, and comparisons
@@ -60,7 +59,7 @@ the read rules for null: with `$flag` null, `true or $flag` is `true` and
 `$age > 30` with `$age` null is null. A null result, or `null` written as the
 value, clears a nullable property, a `Blob` included; on a non-nullable
 property it is refused with a typed error that names the property. A value
-that reads the row, such as `{ age: $x.age }`, is refused (`P006`).
+that reads the row, such as `age: $x.age`, is refused (`P006`).
 
 A mutation query may contain several inserts and updates, or several deletes,
 but not both (`T76`). Split that workflow into two queries, or run them on a

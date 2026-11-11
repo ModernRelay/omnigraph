@@ -48,7 +48,7 @@ Run lint after every `.gq` or `.pg` edit. Wire into precommit.
 
 ```gq
 query get_signal($slug: String) {
-    match { $s: Signal { slug: $slug } }
+    match { $s: Signal } where $s.slug = $slug
     return { $s.slug, $s.name }
 }
 ```
@@ -61,17 +61,24 @@ omnigraph query get_signal --query signals.gq --params '{"slug":"sig-foo"}'
 
 The compiler typechecks parameter values against declared types.
 
-> For one-off/ad-hoc execution, pass the query inline instead of a file with `-e/--query-string`: `omnigraph query -e 'query q($slug: String){ match { $s: Signal { slug: $slug } } return { $s.name } }' --params '{"slug":"sig-foo"}'` (and `omnigraph mutate -e '...'`). `-e` is mutually exclusive with `--query <file>`; ad-hoc execution uses one of them, and omitting both invokes the served stored query named by the positional `<name>`. (Operator aliases are invoked via the separate `omnigraph alias <name>` subcommand.)
+> For one-off/ad-hoc execution, pass the query inline instead of a file with `-e/--query-string`: `omnigraph query -e 'query q($slug: String){ match { $s: Signal } where $s.slug = $slug return { $s.name } }' --params '{"slug":"sig-foo"}'` (and `omnigraph mutate -e '...'`). `-e` is mutually exclusive with `--query <file>`; ad-hoc execution uses one of them, and omitting both invokes the served stored query named by the positional `<name>`. (Operator aliases are invoked via the separate `omnigraph alias <name>` subcommand.)
 
 ## Query Structure
 
-### Match → Return → Order → Limit
+### Match → Where → Return → Order → Limit
+
+`match { … }` holds the elements, the forms that produce rows: bindings
+`$x: Type` (no property braces), triples `$a edge $b`, `optional { … }`, `let`
+and `from`, separated by commas (a trailing comma is allowed; a newline is not
+a separator). `where`, after the braces, holds one Boolean expression that sees
+every element and removes rows. A filter or `where` inside the braces is
+`Q017`, a property map `$s: Signal { slug: $slug }` is `Q010`, and a missing
+comma is `Q016`; each prints the corrected text. Every list takes commas:
+return items, order keys, call arguments and assignments.
 
 ```gq
 query recent_signals() {
-    match {
-        $s: Signal
-    }
+    match { $s: Signal }
     return { $s.slug, $s.name, $s.stagingTimestamp }
     order { $s.stagingTimestamp desc }
     limit 50
@@ -84,22 +91,23 @@ Schema edges are PascalCase; traversal uses lowerCamelCase:
 
 ```gq fragment
 match {
-    $s: Signal { slug: $slug }
-    $s formsPattern $p         // edge FormsPattern: Signal -> Pattern
+    $s: Signal,
+    $s formsPattern $p,        // edge FormsPattern: Signal -> Pattern
 }
+where $s.slug = $slug
 ```
+
+Inside `match` any word is an edge name, keywords included (`$d in $c` follows
+an edge `In`); a quoted name is accepted too.
 
 ### Multi-hop
 
-Chain traversal clauses:
+Chain triples:
 
 ```gq
 query friends_of_friends($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $mid
-        $mid knows $fof
-    }
+    match { $p: Person, $p knows $mid, $mid knows $fof }
+    where $p.name = $name
     return { $fof.name }
 }
 ```
@@ -126,10 +134,8 @@ Flip the subject/object:
 
 ```gq
 query employees_of($company: String) {
-    match {
-        $c: Company { name: $company }
-        $p worksAt $c
-    }
+    match { $c: Company, $p worksAt $c }
+    where $c.name = $company
     return { $p.name }
 }
 ```
@@ -142,10 +148,8 @@ pattern replaces querying both directions and merging:
 
 ```gq
 query related_to($slug: String) {
-    match {
-        $i: Issue { slug: $slug }
-        $i <issueRelated> $r
-    }
+    match { $i: Issue, $i <issueRelated> $r }
+    where $i.slug = $slug
     return { $r.slug }
 }
 ```
@@ -158,48 +162,45 @@ anywhere a node field is:
 
 ```gq
 query asserted_links($slug: String) {
-    match {
-        $i: Issue { slug: $slug }
-        $i $w:issueRelated $r
-        $w.confidence = "asserted"
-    }
+    match { $i: Issue, $i $w:issueRelated $r }
+    where $i.slug = $slug and $w.confidence = "asserted"
     return { $r.slug, $w.confidence }
 }
 ```
 
 Rules: composes with the undirected form (`$a $w:<related> $b`) and inside
-`not { }`. A bound traversal returns **one row per matching edge**, so
+`not exists { }`. A bound traversal returns **one row per matching edge**, so
 parallel edges between the same endpoints appear individually (unbound
 traversals keep set-of-pairs semantics). Rejected with `T23`: binding a
 `{min,max}` multi-hop, rebinding a taken variable name, or projecting bare
 `$w` (project a property instead).
 
-Composes with hop bounds (`$a <knows>{1,3} $b`) and `not { }` ("no edge in
+Composes with hop bounds (`$a <knows>{1,3} $b`) and `not exists { }` ("no edge in
 either direction"). Asymmetric edges (e.g. `Comment -> Issue`) are rejected at
 typecheck (T22) — use the directional form there.
 
 ### Correlated blocks
 
-A block matches its pattern once per outer row and keeps the row by a
-comparison on the aggregate of its matches: `not { ... }` (no match),
-`exists { ... }` (at least one), `count { ... } > 2`, and
-`sum($d.size) { ... } > 100` (also `min`, `max`, `avg`). The block must read
-at least one outer variable; the right side is a literal, `now()` or a parameter.
+A block is an operand of `where`: it matches its pattern once per outer row
+and keeps the row by a comparison on the aggregate of its matches:
+`not exists { ... }` (no match), `exists { ... }` (at least one),
+`count { ... } > 2`, and `sum($d.size) { ... } > 100` (also `min`, `max`,
+`avg`). A block holds elements and its own `where` inside its braces,
+`count { $s formsPattern $p where $p.kind = "x" }`, and correlates on every
+element of the enclosing `match`; it must read at least one outer variable.
+The right side is a literal, `now()` or a parameter. `not { ... }` is refused
+with `not exists { ... }` as the fix (`Q012`).
 
 ```gq
 query orphan_signals() {
-    match {
-        $s: Signal
-        not { $s formsPattern $_ }
-    }
+    match { $s: Signal }
+    where not exists { $s formsPattern $_ }
     return { $s.slug }
 }
 
 query busy_signals($least: I64) {
-    match {
-        $s: Signal
-        count { $s formsPattern $p } >= $least
-    }
+    match { $s: Signal }
+    where count { $s formsPattern $p } >= $least
     return { $s.slug }
 }
 ```
@@ -242,24 +243,18 @@ range fails the read instead of printing.
 ### Text search
 
 ```gq fragment
-match {
-    $d: Doc
-    search($d.title, $q)       // full-text; needs @index or @key on the String (T27)
-}
+match { $d: Doc }
+where search($d.title, $q)     // full-text; needs @index or @key on the String (T27)
 ```
 
 ```gq fragment
-match {
-    $d: Doc
-    fuzzy($d.title, $q, max_edits: 2)     // fuzzy match, max 2 edits
-}
+match { $d: Doc }
+where fuzzy($d.title, $q, max_edits: 2)     // fuzzy match, max 2 edits
 ```
 
 ```gq fragment
-match {
-    $d: Doc
-    match_text($d.body, $q)    // regular full-text match (not phrase search)
-}
+match { $d: Doc }
+where match_text($d.body, $q)  // regular full-text match (not phrase search)
 ```
 
 ### Vector/ranking
@@ -299,8 +294,8 @@ differ and rank one binding (`T75`):
 ```gq
 query hybrid_search($vq: Vector(3072), $tq: String) {
     match {
-        let $all = { match { $d: Doc } return { $d } }
-        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60)
+        let $all = { match { $d: Doc } return { $d } },
+        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60),
     }
     return { $d.slug, $d.title }
     order { $score desc }
@@ -312,12 +307,9 @@ query hybrid_search($vq: Vector(3072), $tq: String) {
 
 ```gq
 query friend_counts() {
-    match {
-        $p: Person
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
     return {
-        $p.name
+        $p.name,
         count($f) as friends
     }
     order { friends desc }
@@ -369,28 +361,28 @@ parameter or literal, one query instead of one per candidate; the right side
 must be a list of the value's type.
 
 ```gq fragment
-match {
-    $p: Person
-    $p.age > 30
-    contains($p.name, "Al")
-    starts_with($p.name, "A")
-}
+match { $p: Person }
+where $p.age > 30
+  and contains($p.name, "Al")
+  and starts_with($p.name, "A")
 ```
 
 ## Mutations
 
 > **No `mutation` keyword.** Agents trained on GraphQL reflexively write `mutation { insert T { ... } }` or `mutation name(...)` — both are parse errors (`Q009` for the keyword). Every executable block in a `.gq` file is a named `query`; a body that ends in statements (`insert` / `update` / `delete`) is a write. Dispatch via `omnigraph mutate` (not `query`).
 
-A write body is one or more groups. A group's clauses, written bare (not inside
-`match { }`), bind the rows to write and filter them: `$x: Signal  $x.slug = $slug`
-or `$x: Signal { slug: $slug }`. Its statements follow and run once per row:
-`update $x set { … }`, `delete $x`. An `insert T { … }` with no clauses runs
-once. Filters always name properties through the binding (`$x.slug`,
-`$x.@src`). `update T set { … } where …` and `delete T where …` are refused
-(`Q008`), and the diagnostic prints the binding form. The planner runs one
-binding of the written type plus filters over it; a traversal, block or search
-predicate in a write's clauses, or an assignment that reads the row
-(`{ age: $x.age }`), is refused (`P006`).
+A write body is one or more groups. A group selects its rows with the same
+`match { … }` and `where` a read writes, `match { $x: Signal } where $x.slug = $slug`,
+and its statements follow and run once per row: `update $x set { … }`,
+`delete $x`. An `insert T { … }` with no `match` runs once; a later group opens
+with its own `match` and sees the groups before it. The `where` always names
+properties through the binding (`$x.slug`, `$x.@src`). A statement takes no
+`where`: `update T set { … } where …` and `delete T where …` are refused
+(`Q008`), and a write's elements written without `match { }` are refused
+(`Q013`); each diagnostic prints the group form. The planner runs one binding
+of the written type plus a `where` over it; a traversal, block or search
+predicate in a write's selection, or an assignment that reads the row
+(`age: $x.age`), is refused (`P006`).
 
 ### Insert
 
@@ -433,19 +425,19 @@ query link_signal_forms_pattern($signal: String, $pattern: String) {
 
 A propertyless edge needs only `from` and `to`, which are logical endpoint IDs.
 GQ has no nested `data {}` block. These assignments are distinct from the
-endpoint meta-fields used in filters: `$x: FormsPattern  $x.@src = $signal  delete $x`.
+endpoint meta-fields used in a `where`: `match { $x: FormsPattern } where $x.@src = $signal  delete $x`.
 
 ### Update
 
 ```gq
 query retitle_signal($slug: String, $new_title: String) {
-    $x: Signal  $x.slug = $slug
+    match { $x: Signal } where $x.slug = $slug
     update $x set { name: $new_title }
 }
 ```
 
 An `update` cannot assign a `@key` property (refused when it runs, not by
-`lint`): delete and re-insert instead. `null` as a value (`{ note: null }`)
+`lint`): delete and re-insert instead. `null` as a value (`note: null`)
 clears a nullable property; a null assigned to a non-nullable property is
 refused before any row is matched.
 
@@ -453,7 +445,7 @@ refused before any row is matched.
 
 ```gq
 query remove_signal($slug: String) {
-    $x: Signal  $x.slug = $slug
+    match { $x: Signal } where $x.slug = $slug
     delete $x
 }
 ```

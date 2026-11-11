@@ -155,10 +155,8 @@ rebuilds the graph from an export refuses it. An orphan query lists them:
 
 ```gq
 query people_without_employer() {
-    match {
-        $p: Person
-        not { $p worksAt $c }
-    }
+    match { $p: Person }
+    where not exists { $p worksAt $c }
     return { $p.email }
 }
 ```

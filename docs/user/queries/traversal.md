@@ -1,10 +1,11 @@
 # Traversal and match patterns
 
-Inside `match { ... }`:
+Inside `match { ... }` the elements are separated by commas; after the
+braces, `where` holds one Boolean expression:
 
 | Pattern | Meaning |
 |---|---|
-| `$p: Person { name: $name }` | Bind nodes and filter properties. |
+| `$p: Person` | Bind nodes of a type. |
 | `$person worksAt $company` | Follow a directed edge. |
 | `$a knows{1,3} $b` | Follow a path from one to three hops. |
 | `$a <related> $b` | Match the edge in either direction. The edge must connect the same node type at both ends. |
@@ -13,11 +14,29 @@ Inside `match { ... }`:
 | `$a *{1,3} $b` | Follow one through three hops across compatible edge types; declare both endpoint node types. |
 | `$a <knows \| likes> $b` or `$a <*> $b` | Follow the selected edges in either direction. |
 | `$a $e:(knows \| likes) $b` or `$a $e:* $b` | Bind each concrete selected edge. |
-| `$p.age >= 18` | Apply a filter expression. |
-| `not { $p blocked $other }` | Keep rows for which the inner pattern has no match. |
-| `exists { $p blocked $other }` | Keep rows for which the inner pattern has at least one match. |
-| `count { $a authored $p } > 2` | Keep rows whose inner pattern matches more than two times. |
-| `sum($d.size) { $p owns $d } > 100` | Aggregate a property over the inner matches, then compare. |
+| `where $p.age >= 18` | Apply a filter expression. |
+| `where not exists { $p blocked $other }` | Keep rows for which the inner pattern has no match. |
+| `where exists { $p blocked $other }` | Keep rows for which the inner pattern has at least one match. |
+| `where count { $a authored $p } > 2` | Keep rows whose inner pattern matches more than two times. |
+| `where sum($d.size) { $p owns $d } > 100` | Aggregate a property over the inner matches, then compare. |
+
+```gq
+query colleagues($h: String) {
+  match { $p: Person, $p worksAt $c, $q worksAt $c }
+  where $p.handle = $h and $q != $p and not exists { $q blocked $p }
+  return { $q.name }
+}
+```
+
+The elements are bindings `$x: Type`, triples, `optional { ... }`, `let` and
+`from`, separated by commas with a trailing comma allowed; a newline is not a
+separator. `where` sees every variable the elements bind and is evaluated
+after all of them, `let` included, so a `let` whose expression can fail is
+guarded with `if(...)` or computed in `return`. A filter, a `where` or a
+comparison inside the braces is refused (`Q017`), and so is a missing comma
+(`Q016`); a property map `$p: Person { handle: $h }` is refused (`Q010`) with
+the binding and the conjunct `$p.handle = $h`, and `not { ... }` with
+`not exists { ... }` (`Q012`). Each refusal prints the corrected text.
 
 Omitted bounds always mean exactly `{1,1}`. Explicit `{1,1}` is equivalent.
 Multiple hops require a finite `{min,max}` with `1 <= min <= max`; `*` selects
@@ -26,8 +45,9 @@ edge types and never means repetition. Duplicate alternatives select a type once
 All members must connect the same source and destination node types, with
 direction resolved separately for each member. Wildcards require explicit node
 declarations for both endpoint variables in the same lexical block or a visible
-outer scope. A declaration in the same block may follow the traversal. Later
-outer declarations are not visible inside an earlier nested block. Undirected
+outer scope. A declaration in the same block may follow the traversal. A block
+in `where` sees every element of the enclosing `match`; a block in a `let` sees
+the elements before it. Undirected
 traversal and any hop bound above one, on a named edge or a selection, require
 the same node type at both ends: a hop ends on the destination type and the
 next one must start on the source type, so `$p worksAt{1,2} $c` over
@@ -77,12 +97,14 @@ see the setting for the cost and batching rules.
 Each `$_` is a distinct anonymous node: two anonymous traversals from one
 variable are independent, so a source with two neighbours matches two by two
 rows. Binding a variable a second time (`$p: Person` after `$p` is already
-bound, at the top level or inside `not { }`) adds the second binding's
-property matches as constraints on the same rows; it never introduces a
-second `$p`. Variable names beginning with `__` are reserved.
+bound, at the top level or inside `not exists { }`) constrains the same rows;
+it never introduces a second `$p`, so `not exists { $p: Person where $p.name =
+"bob" }` is "`$p` is not bob". Variable names beginning with `__` are reserved.
 
 Bare traversal names begin with a lowercase letter (`worksAt` for the declared
-edge `WorksAt`); edge lookup itself is case-insensitive.
+edge `WorksAt`); edge lookup itself is case-insensitive. Any word is an edge
+name inside `match`, keywords included (`$d in $c` follows an edge `In`), and a
+quoted name is accepted too.
 
 Comparison operators are `=`, `!=`, `<`, `<=`, `>`, and `>=`.
 

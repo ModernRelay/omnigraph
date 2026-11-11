@@ -162,8 +162,8 @@ the same scale. Name the population once with `let` and rank it in both arms;
 ```gq
 query hybrid($vector: Vector(4), $text: String) {
   match {
-    let $all = { match { $d: Document } return { $d } }
-    from rrf(nearest($all, $d.embedding, $vector, k: 10), bm25($all, $d.body, $text), k: 60)
+    let $all = { match { $d: Document } return { $d } },
+    from rrf(nearest($all, $d.embedding, $vector, k: 10), bm25($all, $d.body, $text), k: 60),
   }
   return { $d.slug, $d.title }
   order { $score desc }
@@ -191,10 +191,9 @@ declared at all; its `return` lists every binding the rest of the query reads:
 
 ```gq
 query passages($matter: String, $q: String) {
-  match { from bm25({ match {
-    $r: SourceRevision { matter_number: $matter }
-    $r hasPassage $p
-  } return { $r, $p } }, $p.text, $q) }
+  match {
+    from bm25({ match { $r: SourceRevision, $r hasPassage $p } where $r.matter_number = $matter return { $r, $p } }, $p.text, $q),
+  }
   return { $r.path, $p.locator }
   order { $score desc }
   limit 5

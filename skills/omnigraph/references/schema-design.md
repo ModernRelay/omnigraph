@@ -363,10 +363,8 @@ needs the same query for conclusions:
 ```gq
 // GraphPolicy pol-assertion-has-span, check_query: assertions_without_span
 query assertions_without_span() {
-    match {
-        $a: Assertion
-        not { $a extractedFrom $s }
-    }
+    match { $a: Assertion }
+    where not exists { $a extractedFrom $s }
     return { $a.slug }
 }
 ```
@@ -388,10 +386,8 @@ well supported an assertion is instead of storing a `support_count`.
 
 ```gq
 query support_count($slug: String) {
-    match {
-        $a: Assertion { slug: $slug }
-        $s supports $a
-    }
+    match { $a: Assertion, $s supports $a }
+    where $a.slug = $slug
     return { count($s) as supporting }
 }
 ```
@@ -464,7 +460,7 @@ Agents use it in three ways:
 - **Before writing**, read the active policies, so writes conform from the
   start.
 - **To lint**, run each policy's `check_query` for mechanical rules (usually a
-  `not { ... }` negation that returns the rows that break it), and apply the
+  `not exists { ... }` negation that returns the rows that break it), and apply the
   `statement` with judgment for rules a query cannot express.
 - **To fix**, correct small breaks directly and propose larger ones on a branch
   for review.
@@ -483,7 +479,7 @@ node or adds, moves or removes one of its edges, so a non-zero minimum such as
 load, and schema apply refuses a new required link from an existing node type.
 It does not count a node until a write touches it, so nodes older versions
 wrote without the link can sit below the minimum, and a traversal along that
-link silently misses them. Give every required link an orphan check, the same `not { ... }`
+link silently misses them. Give every required link an orphan check, the same `not exists { ... }`
 shape as the example below ([principle 6](#6-layer-derived-knowledge-over-raw-sources)
 shows one for extraction lineage).
 
@@ -494,10 +490,8 @@ query:
 ```gq
 // GraphPolicy pol-strategic-has-owner, check_query: strategic_without_owner
 query strategic_without_owner() {
-    match {
-        $c: Customer { tier: "strategic" }
-        not { $c accountOwner $p }
-    }
+    match { $c: Customer }
+    where $c.tier = "strategic" and not exists { $c accountOwner $p }
     return { $c.slug }
 }
 ```
@@ -588,11 +582,9 @@ unit you want back, not on a whole document.
 
 ```gq
 query customer_evidence($slug: String, $q: String) {
-    match { from nearest({ match {
-        $c: Customer { slug: $slug }
-        $a: Assertion
-        $a about $c
-    } return { $c, $a } }, $a.embedding, $q, k: 10) }
+    match {
+      from nearest({ match { $c: Customer, $a: Assertion, $a about $c } where $c.slug = $slug return { $c, $a } }, $a.embedding, $q, k: 10),
+    }
     return { $a.statement }
     order { $distance }
     limit 10

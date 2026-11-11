@@ -46,10 +46,8 @@ query joins them:
 
 ```gq
 query jobs_naming_no_operator() {
-  match {
-    $j: Job
-    not { $o: @Operator $o.name = $j.uses }
-  }
+  match { $j: Job }
+  where not exists { $o: @Operator where $o.name = $j.uses }
   return { $j.name }
 }
 ```

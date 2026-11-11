@@ -19,7 +19,7 @@ environment), `request` (the `settings` field, a `set` query parameter or
 set merge_lineage = verify;
 
 query reports($who: String) {
-  match { $p: Person { name: $who }  $p reportsTo{1,3} $m }
+  match { $p: Person, $p reportsTo{1,3} $m } where $p.name = $who
   return { $m.name }
 }
 ```

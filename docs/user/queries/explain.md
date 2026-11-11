@@ -13,10 +13,8 @@ or invoke the embedding client.
 
 ```gq
 explain query adults() {
-  match {
-    $p: Person
-    $p.age > 30
-  }
+  match { $p: Person }
+  where $p.age > 30
   return { $p.name }
 }
 ```
