@@ -105,6 +105,13 @@ route.
 - `key_conflict`: an append or strict insert found an existing id. Decide
   whether that entity is the intended one; do not silently turn the operation
   into an upsert.
+- `writer_fenced` (HTTP `409` with `writer_fenced: {held?, read?, current}`):
+  the branch's writer epoch refused the writing process, because another
+  process claimed the branch or the serving one holds no claim. Nothing was
+  written and the same request to the same process is refused again. No CLI
+  command or HTTP route claims a branch in this release; report it to the
+  operator and do not retry. A process another one replaced can answer reads
+  from before the claim until a write of its own is refused.
 - `recovery_required` (HTTP `503` with `recovery_required.operation_id`):
   when it identifies an already published schema apply or system-column upgrade,
   the table pins and accepted schema contract are durable together; only the

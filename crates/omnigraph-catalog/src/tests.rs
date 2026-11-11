@@ -375,7 +375,8 @@ async fn stamp_14_record_without_registry_children_decodes() {
         .unwrap();
     assert_eq!(
         super::migrations::read_stamp(&outcome.dataset),
-        Some(INTERNAL_MANIFEST_SCHEMA_VERSION)
+        Some(16),
+        "a publish raises a v14 branch to 16 and no further"
     );
     assert_eq!(
         outcome.dataset.version().version,
@@ -3800,6 +3801,7 @@ fn record_states_batch() -> RecordBatch {
         schema_contract_head: None,
         schema_contract: None,
         registry: Default::default(),
+        writer_epoch: None,
         tables: vec![probe_table(
             7,
             TableState::Dropped {
@@ -4056,7 +4058,7 @@ async fn stamps_11_and_12_are_refused_by_open_read_and_publish() {
             let message = error.to_string();
             assert!(
                 message.contains(&format!("internal schema v{stamp}"))
-                    && message.contains("reads only v14 to v16")
+                    && message.contains("reads only v14 to v17")
                     && !message.contains("omnigraph upgrade"),
                 "{what} of a stamp {stamp} manifest: {message}"
             );
@@ -8125,6 +8127,7 @@ fn replaced_table_rows_store_the_delta_against_the_current_row() {
         schema_contract_head: None,
         schema_contract: None,
         registry: Default::default(),
+        writer_epoch: None,
         tables: vec![
             probe_table(7, pin(9, current_metadata)),
             probe_table(
@@ -8243,6 +8246,7 @@ fn replaced_row_measure_and_stored(
         schema_contract_head: None,
         schema_contract: None,
         registry: Default::default(),
+        writer_epoch: None,
         tables: current,
         head: probe_commit("c9", Some("c8")),
         buffer: CommitBuffer {
@@ -8517,6 +8521,7 @@ fn settled_commit_rows_imply_their_parent_and_inherit_their_contract() {
         schema_contract_head: None,
         schema_contract: None,
         registry: Default::default(),
+        writer_epoch: None,
         tables: Vec::new(),
         head: commit("c4", Some("c3"), Some(2)),
         buffer: CommitBuffer {
@@ -8583,6 +8588,7 @@ fn manifest_rows_refuse_a_buffer_that_is_not_a_run_behind_the_head() {
             schema_contract_head: None,
             schema_contract: None,
             registry: Default::default(),
+            writer_epoch: None,
             tables: Vec::new(),
             head,
             buffer,
@@ -11135,6 +11141,7 @@ async fn missing_or_inconsistent_archived_schema_content_fails_closed() {
         schema_contract_head: None,
         schema_contract: None,
         registry: Default::default(),
+        writer_epoch: None,
         tables: Vec::new(),
         head: unnamed.commit,
         buffer: CommitBuffer::default(),
@@ -14137,7 +14144,7 @@ async fn stamps_13_is_refused_by_open_read_and_publish_naming_the_upgrade() {
         .to_string();
     for clause in [
         "internal schema v13",
-        "reads only v14 to v16",
+        "reads only v14 to v17",
         "For a standalone root, stop all readers, writers and maintenance",
         "run `omnigraph upgrade <graph> --check` and then `omnigraph upgrade <graph>`",
         "A cluster-managed graph has no in-place route yet: with a main development build from \
@@ -15534,5 +15541,1534 @@ fn manifest_incarnation_supersedes_newer_equal_and_other_lifetimes_but_not_older
         !at(9, &recreated, "e").same_lifetime(&installed)
             && at(6, &main, "b").same_lifetime(&installed),
         "same_lifetime compares the branch identifier alone"
+    );
+}
+
+/// A publish writes back the stamp it loaded: 16 stays 16, 17 stays 17, and
+/// a v14 or v15 branch takes 16, never the control-fact stamp.
+#[tokio::test]
+async fn v17_a_publish_writes_back_the_stamp_it_loaded() {
+    for (loaded, written) in [(14, 16), (15, 16), (16, 16), (17, 17)] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        ManifestCoordinator::init(uri, &build_test_catalog())
+            .await
+            .unwrap();
+        let mut dataset = open_manifest_dataset(uri, None).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut dataset, loaded)
+            .await
+            .unwrap();
+        let rows = read_manifest_rows(&dataset).await.unwrap();
+        let (published, _) = super::commit::overwrite(dataset, &rows, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::migrations::read_stamp(&published),
+            Some(written),
+            "the version above one loaded at {loaded}"
+        );
+        let outcome = GraphNamespacePublisher::new(uri, None)
+            .publish(&[], &HashMap::new(), Some(&lineage_intent(None, None)))
+            .await
+            .unwrap();
+        assert_eq!(
+            super::migrations::read_stamp(&outcome.dataset),
+            Some(written),
+            "the next publish on a branch loaded at {loaded}"
+        );
+    }
+}
+
+/// A publish names a version's cold registry fragments again on a branch at
+/// any stamp from 15 up, not only at the stamp this binary writes.
+#[tokio::test]
+async fn v17_a_publish_below_the_current_stamp_keeps_cold_registry_fragments() {
+    use super::state::{cold_fragments, read_cold_registry};
+    for loaded in [15, 16, 17] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        ManifestCoordinator::init(uri, &build_test_catalog())
+            .await
+            .unwrap();
+        let dataset = open_manifest_dataset(uri, None).await.unwrap();
+        let mut rows = read_manifest_rows(&dataset).await.unwrap();
+        let mut registry = probe_runs(1, 70);
+        let pushed = registry
+            .cold_push()
+            .expect("70 rows are over the hot bound");
+        rows.registry = registry;
+        let (mut held, _) = super::commit::overwrite(dataset, &rows, Some(&pushed))
+            .await
+            .unwrap();
+        let cold = cold_fragments(&held);
+        assert_eq!(cold.len(), 1);
+        super::migrations::set_stamp_for_test(&mut held, loaded)
+            .await
+            .unwrap();
+
+        let (published, _) = super::commit::overwrite(held, &rows, None).await.unwrap();
+        let kept = cold_fragments(&published);
+        assert_eq!(kept.len(), 1, "loaded at {loaded}");
+        assert_eq!(kept[0].files, cold[0].files, "loaded at {loaded}");
+        assert_eq!(
+            read_cold_registry(&published, &kept).await.unwrap(),
+            pushed,
+            "loaded at {loaded}"
+        );
+    }
+}
+
+/// A `writer_epoch` row at `epoch` written on the native ref `native`.
+fn probe_writer_epoch(epoch: u64, native: Option<&str>) -> super::state::WriterEpochRow {
+    super::state::WriterEpochRow {
+        epoch,
+        native: native.map(str::to_string),
+        attempt_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+    }
+}
+
+/// A fresh graph at `uri` whose main holds `row` from its second version on;
+/// answers that version.
+async fn main_holding_writer_epoch(uri: &str, row: &super::state::WriterEpochRow) -> Dataset {
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let dataset = open_manifest_dataset(uri, None).await.unwrap();
+    let mut rows = read_manifest_rows(&dataset).await.unwrap();
+    rows.writer_epoch = Some(row.clone());
+    super::commit::overwrite(dataset, &rows, None)
+        .await
+        .unwrap()
+        .0
+}
+
+/// A publisher of main at `uri` whose process holds `row`'s epoch, as after
+/// the claim that wrote `row`.
+fn publisher_holding(uri: &str, row: &super::state::WriterEpochRow) -> GraphNamespacePublisher {
+    use super::writer_epoch::{HolderKey, WriterEpochHolders};
+    let holders = Arc::<WriterEpochHolders>::default();
+    holders.record_claim(
+        &HolderKey::resolve(uri, None).unwrap(),
+        row.native.as_deref(),
+        row.epoch,
+        0,
+    );
+    GraphNamespacePublisher::new_holding(uri, None, holders)
+}
+
+/// The one-row logical batch `row` with its Utf8 column `column` set to `value`.
+fn with_string_cell(row: &RecordBatch, column: &str, value: Option<&str>) -> RecordBatch {
+    let schema = row.schema();
+    let columns = schema
+        .fields()
+        .iter()
+        .zip(row.columns())
+        .map(|(field, held)| match field.name() == column {
+            true => Arc::new(StringArray::from(vec![value])) as arrow_array::ArrayRef,
+            false => held.clone(),
+        })
+        .collect();
+    RecordBatch::try_new(schema, columns).unwrap()
+}
+
+/// The `writer_epoch` row is stored as the JSON of its payload in `metadata`,
+/// ahead of the contract row, and decodes from a batch and from a version.
+#[tokio::test]
+async fn v17_the_writer_epoch_row_round_trips_through_a_batch_and_a_version() {
+    use super::record::{compact_to_storage, manifest_storage_schema};
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let row = probe_writer_epoch(3, Some("feature.01"));
+    let published = main_holding_writer_epoch(uri, &row).await;
+    let rows = read_manifest_rows(&published).await.unwrap();
+    assert_eq!(rows.writer_epoch.as_ref(), Some(&row));
+
+    let logical = rows.to_batch().unwrap();
+    let cell = |column: &str, at: usize| {
+        string_column(&logical, column)
+            .unwrap()
+            .value(at)
+            .to_string()
+    };
+    let at = logical.num_rows() - 2;
+    assert_eq!(
+        [
+            cell("object_id", at),
+            cell("object_type", at),
+            cell("object_type", at + 1)
+        ],
+        [
+            WRITER_EPOCH_OBJECT_ID,
+            OBJECT_TYPE_WRITER_EPOCH,
+            OBJECT_TYPE_SCHEMA_CONTRACT
+        ]
+    );
+    assert_eq!(
+        cell("metadata", at),
+        r#"{"epoch":3,"native":"feature.01","attempt_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#
+    );
+    let stored = compact_to_storage(&logical, &manifest_storage_schema(HashMap::new())).unwrap();
+    assert_eq!(
+        super::state::rows_of_batch(&stored).unwrap().writer_epoch,
+        Some(row)
+    );
+}
+
+/// A branch reads the epoch of its own row, and 0 with no row or with the row
+/// its fork source wrote, which the fork still carries.
+#[tokio::test]
+async fn v17_a_branch_reads_its_own_epoch_and_0_from_a_row_its_source_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let row = probe_writer_epoch(4, None);
+    main_holding_writer_epoch(uri, &row).await;
+    let mut main = ManifestCoordinator::open(uri).await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
+
+    let on_main = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(read_manifest_state(&on_main).await.unwrap().writer_epoch, 4);
+    let on_fork = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let native = on_fork.manifest().branch.clone();
+    assert!(native.is_some());
+    assert_eq!(
+        read_manifest_rows(&on_fork).await.unwrap().writer_epoch,
+        Some(row)
+    );
+    assert_eq!(read_manifest_state(&on_fork).await.unwrap().writer_epoch, 0);
+
+    let mut rows = read_manifest_rows(&on_main).await.unwrap();
+    let own = probe_writer_epoch(2, native.as_deref());
+    for (held, read_on, epoch) in [
+        (None, None, 0),
+        (None, native.as_deref(), 0),
+        (Some(own.clone()), native.as_deref(), 2),
+        (Some(own), None, 0),
+        (
+            Some(probe_writer_epoch(2, Some("other"))),
+            native.as_deref(),
+            0,
+        ),
+    ] {
+        rows.writer_epoch = held;
+        assert_eq!(
+            rows.state(1, read_on).unwrap().writer_epoch,
+            epoch,
+            "{:?} read on {read_on:?}",
+            rows.writer_epoch
+        );
+    }
+}
+
+/// The decoder refuses a second `writer_epoch` row, one under another object
+/// id, a payload it cannot read, a field of another row type, and a row in a
+/// cold fragment.
+#[tokio::test]
+async fn v17_a_malformed_writer_epoch_row_is_refused() {
+    use super::record::{compact_to_storage, manifest_storage_schema};
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let published = main_holding_writer_epoch(uri, &probe_writer_epoch(1, None)).await;
+    let logical = read_manifest_rows(&published)
+        .await
+        .unwrap()
+        .to_batch()
+        .unwrap();
+    let at = logical.num_rows() - 2;
+    let (before, epoch, contract) = (
+        logical.slice(0, at),
+        logical.slice(at, 1),
+        logical.slice(at + 1, 1),
+    );
+    let refusal = |rows: &[RecordBatch]| {
+        let parts = std::iter::once(&before)
+            .chain(rows)
+            .chain(std::iter::once(&contract));
+        let logical = datafusion::arrow::compute::concat_batches(&logical.schema(), parts).unwrap();
+        let stored =
+            compact_to_storage(&logical, &manifest_storage_schema(HashMap::new())).unwrap();
+        super::state::rows_of_batch(&stored)
+            .expect_err("a malformed writer_epoch row decodes")
+            .to_string()
+    };
+    for (rows, expected) in [
+        (
+            vec![epoch.clone(), epoch.clone()],
+            "manifest has two writer_epoch rows".to_string(),
+        ),
+        (
+            vec![with_string_cell(
+                &epoch,
+                "object_id",
+                Some("writer_epoch:main"),
+            )],
+            format!(
+                "manifest writer_epoch row at index {at} has object_id 'writer_epoch:main', \
+                 expected 'writer_epoch'"
+            ),
+        ),
+        (
+            vec![with_string_cell(
+                &epoch,
+                "metadata",
+                Some(r#"{"epoch":1,"native":null,"attempt_id":"a","holder":"b"}"#),
+            )],
+            "failed to decode writer_epoch metadata: unknown field `holder`".to_string(),
+        ),
+        (
+            vec![with_string_cell(&epoch, "metadata", None)],
+            "manifest writer_epoch row missing metadata".to_string(),
+        ),
+        (
+            vec![with_string_cell(&epoch, "table_key", Some("node:Person"))],
+            format!("manifest writer_epoch row at index {at} carries fields of another row type"),
+        ),
+    ] {
+        let message = refusal(&rows);
+        assert!(message.contains(&expected), "{message}");
+    }
+
+    let schema = manifest_storage_schema(published.schema().metadata.clone());
+    let alone = super::commit::commit_overwrite(
+        published,
+        vec![compact_to_storage(&epoch, &schema).unwrap()],
+    )
+    .await
+    .unwrap();
+    let message = super::state::read_cold_registry(&alone, alone.fragments())
+        .await
+        .expect_err("a control fact in a cold fragment is read as registry rows")
+        .to_string();
+    assert!(
+        message.contains("a cold fragment of `__manifest` holds rows beside the block registry"),
+        "{message}"
+    );
+}
+
+/// A publish refuses to write a control fact into a version stamped below 17,
+/// which a binary that refuses the row's type may still open.
+#[tokio::test]
+async fn v17_a_control_fact_is_refused_below_its_stamp() {
+    for loaded in [14, 15, 16] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        ManifestCoordinator::init(uri, &build_test_catalog())
+            .await
+            .unwrap();
+        let mut dataset = open_manifest_dataset(uri, None).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut dataset, loaded)
+            .await
+            .unwrap();
+        let version = dataset.version().version;
+        let mut rows = read_manifest_rows(&dataset).await.unwrap();
+        rows.writer_epoch = Some(probe_writer_epoch(1, None));
+        let error = super::commit::overwrite(dataset, &rows, None)
+            .await
+            .expect_err("a control fact landed below its stamp")
+            .to_string();
+        assert!(
+            error.contains("stamped v16 cannot hold a control fact; control facts need v17"),
+            "loaded at {loaded}: {error}"
+        );
+        let unmoved = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(unmoved.version().version, version, "loaded at {loaded}");
+    }
+}
+
+/// A publish that records a commit rewrites the hot rows with the
+/// `writer_epoch` row it read, from the version and from its own cached batch.
+#[tokio::test]
+async fn v17_a_publish_keeps_the_writer_epoch_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let row = probe_writer_epoch(2, None);
+    let held = main_holding_writer_epoch(uri, &row).await;
+    let outcome = publisher_holding(uri, &row)
+        .publish(&[], &HashMap::new(), Some(&lineage_intent(None, None)))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.dataset.version().version,
+        held.version().version + 1
+    );
+    assert_eq!(
+        (
+            outcome.writer_epoch.as_ref(),
+            outcome.known_state.writer_epoch
+        ),
+        (Some(&row), 2)
+    );
+
+    let mut coordinator = ManifestCoordinator::open(uri)
+        .await
+        .unwrap()
+        .with_batch_publisher(Arc::new(publisher_holding(uri, &row)));
+    for _ in 0..2 {
+        coordinator
+            .commit_changes_with_lineage(&[], &HashMap::new(), Some(&lineage_intent(None, None)))
+            .await
+            .unwrap();
+        let published = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(published.version().version, coordinator.version());
+        assert_eq!(
+            read_manifest_rows(&published).await.unwrap().writer_epoch,
+            Some(row.clone())
+        );
+        assert_eq!(
+            read_manifest_state(&published).await.unwrap().writer_epoch,
+            2
+        );
+    }
+}
+
+/// A publish that writes nothing answers with the `writer_epoch` row it read
+/// and moves no version.
+#[tokio::test]
+async fn v17_a_no_op_publish_answers_with_the_writer_epoch_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let row = probe_writer_epoch(2, None);
+    let held = main_holding_writer_epoch(uri, &row).await;
+    let outcome = publisher_holding(uri, &row)
+        .publish(&[], &HashMap::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.dataset.version().version, held.version().version);
+    assert_eq!(
+        (outcome.writer_epoch, outcome.known_state.writer_epoch),
+        (Some(row), 2)
+    );
+}
+
+/// The `writer_epoch` row of the detached version a write `as commit` or
+/// `as unattached branch` leaves over a main that holds `row`.
+async fn detached_writer_epoch(
+    unattached: bool,
+    row: &super::state::WriterEpochRow,
+) -> Option<super::state::WriterEpochRow> {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let held = main_holding_writer_epoch(uri, row).await;
+    let coordinator = ManifestCoordinator::open(uri).await.unwrap();
+    let person = coordinator
+        .snapshot()
+        .dataset("node:Person")
+        .unwrap()
+        .clone();
+    let changes = [ManifestChange::Update(
+        append_person_and_make_update(uri, &person, "Alice").await,
+    )];
+    let expected = expect_person(&person, 1);
+    let authority = GraphHeadExpectation::new(
+        None,
+        lance::dataset::refs::BranchIdentifier::main(),
+        coordinator.exact_graph_head(),
+    );
+    let publisher = GraphNamespacePublisher::new(uri, None);
+    let detached_version = match unattached {
+        true => {
+            publisher
+                .write_unattached_candidate(
+                    &changes,
+                    &expected,
+                    &unattached_intent(None),
+                    &authority,
+                    &UnattachedWriteBase::Head,
+                )
+                .await
+                .unwrap()
+                .detached_version
+        }
+        false => {
+            let intent = LineageIntent {
+                graph_commit_id: ulid::Ulid::new().to_string(),
+                ..lineage_intent(None, None)
+            };
+            publisher
+                .write_candidate(&changes, &expected, &intent, &authority, None)
+                .await
+                .unwrap()
+                .detached_version
+        }
+    };
+    let detached = held
+        .checkout_version(lance::dataset::refs::Ref::Version(
+            None,
+            Some(detached_version),
+        ))
+        .await
+        .unwrap();
+    read_manifest_rows(&detached).await.unwrap().writer_epoch
+}
+
+/// The detached version of an unpublished graph commit holds the
+/// `writer_epoch` row its branch held.
+#[tokio::test]
+async fn v17_an_unpublished_commit_keeps_the_writer_epoch_row() {
+    let row = probe_writer_epoch(2, None);
+    assert_eq!(detached_writer_epoch(false, &row).await, Some(row));
+}
+
+/// The detached version of an unattached graph branch holds the
+/// `writer_epoch` row its target held.
+#[tokio::test]
+async fn v17_an_unattached_branch_keeps_the_writer_epoch_row() {
+    let row = probe_writer_epoch(2, None);
+    assert_eq!(detached_writer_epoch(true, &row).await, Some(row));
+}
+
+/// The writer epoch check: an ordinary publication proceeds only at the epoch
+/// its process holds, 0 when it holds none; a claim returns to its owner,
+/// proceeds at the epoch it first read and is refused anywhere else.
+#[test]
+fn v17_the_writer_epoch_check_outcomes() {
+    use super::writer_epoch::EpochAssertion::{Claim, Publish};
+    use super::writer_epoch::EpochVerdict::{AlreadyHeld, Proceed};
+    use super::writer_epoch::{Fenced, check_writer_epoch};
+    let fenced = |held, read, current| {
+        Err(Fenced {
+            held,
+            read,
+            current,
+        })
+    };
+    for (held, current, assertion, expected) in [
+        (None, 0, Publish, Ok(Proceed)),
+        (Some(3), 3, Publish, Ok(Proceed)),
+        (None, 3, Publish, fenced(None, None, 3)),
+        (Some(2), 3, Publish, fenced(Some(2), None, 3)),
+        (Some(3), 0, Publish, fenced(Some(3), None, 0)),
+        (None, 0, Claim { read: 0 }, Ok(Proceed)),
+        (None, 3, Claim { read: 3 }, Ok(Proceed)),
+        (Some(2), 3, Claim { read: 3 }, Ok(Proceed)),
+        (Some(3), 3, Claim { read: 3 }, Ok(AlreadyHeld)),
+        (Some(3), 3, Claim { read: 2 }, Ok(AlreadyHeld)),
+        (None, 3, Claim { read: 2 }, fenced(None, Some(2), 3)),
+        (Some(2), 3, Claim { read: 2 }, fenced(Some(2), Some(2), 3)),
+    ] {
+        assert_eq!(
+            check_writer_epoch(held, current, assertion),
+            expected,
+            "holding {held:?} at {current} for {assertion:?}"
+        );
+    }
+}
+
+/// A holder counts only on the native ref its claim was published on, and the
+/// lookup that finds another native ref drops it.
+#[test]
+fn v17_a_holder_counts_only_on_the_native_ref_of_its_claim() {
+    use super::writer_epoch::{HolderKey, WriterEpochHolders};
+    let holders = WriterEpochHolders::default();
+    assert!(holders.holds_nothing());
+    let key = HolderKey::resolve("/graphs/a", Some("feature")).unwrap();
+    holders.record_claim(&key, Some("feature.01"), 4, 7);
+    assert!(!holders.holds_nothing());
+    for (other_root, other_branch) in [("/graphs/a", None), ("/graphs/b", Some("feature"))] {
+        let other = HolderKey::resolve(other_root, other_branch).unwrap();
+        assert_eq!(holders.held(&other, Some("feature.01")), None);
+    }
+    assert_eq!(holders.held(&key, Some("feature.01")), Some(4));
+    assert_eq!(holders.held(&key, Some("feature.02")), None);
+    assert_eq!(
+        holders.held(&key, Some("feature.01")),
+        None,
+        "the lookup on another native ref dropped the entry"
+    );
+    holders.record_claim(&key, Some("feature.02"), 1, 9);
+    holders.clear(&key, 4);
+    assert_eq!(
+        holders.held(&key, Some("feature.02")),
+        Some(1),
+        "a refusal that read another epoch leaves a newer claim's entry"
+    );
+    holders.clear(&key, 1);
+    assert!(holders.holds_nothing());
+}
+
+/// What the probe skip compares: the version of the process's last landed
+/// publication on its claim's native ref, the claim included, through any of
+/// its publishers. A failed or dropped attempt withdraws it until one lands.
+#[tokio::test]
+async fn v17_the_holder_version_follows_each_landed_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let identifier = live_identifier(uri, None).await;
+    let process = Arc::default();
+    let publisher = publisher_in(uri, None, &process);
+    assert_eq!(publisher.held_writer_version(None), None);
+    let claim = publisher.claim_writer_epoch(&identifier).await.unwrap();
+    let claimed = claim.published.dataset.version().version;
+    assert_eq!(publisher.held_writer_version(None), Some(claimed));
+    assert_eq!(publisher.held_writer_version(Some("feature.01")), None);
+
+    let publish = || publish_a_commit(&publisher, None);
+    publish().await.unwrap();
+    assert_eq!(publisher.held_writer_version(None), Some(claimed + 1));
+    publish_a_commit(&publisher_in(uri, None, &process), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        publisher.held_writer_version(None),
+        Some(claimed + 2),
+        "another publisher of the process raised the version"
+    );
+
+    {
+        let mut dropped = std::pin::pin!(publish());
+        assert!(futures::poll!(dropped.as_mut()).is_pending());
+    }
+    assert_eq!(
+        publisher.held_writer_version(None),
+        None,
+        "a publish dropped before its answer withdraws the version"
+    );
+    publish().await.unwrap();
+    assert_eq!(publisher.held_writer_version(None), Some(claimed + 3));
+
+    let stale = PublishPrecondition::ExactGraphHead(GraphHeadExpectation::new(
+        None,
+        identifier,
+        Some("no-such-head".to_string()),
+    ));
+    publisher
+        .publish_with_precondition(
+            &[],
+            &HashMap::new(),
+            Some(&lineage_intent(None, None)),
+            &stale,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        publisher.held_writer_version(None),
+        None,
+        "a refused publish withdraws the version, so the handles probe"
+    );
+
+    publish().await.unwrap();
+    assert_eq!(publisher.held_writer_version(None), Some(claimed + 4));
+}
+
+/// How a claim whose put returned no answer settles from the row of the
+/// version it attempted.
+#[test]
+fn v17_an_unanswered_claim_settles_by_the_attempt_id_of_the_version_it_attempted() {
+    use super::writer_epoch::UnansweredClaim::{InDoubt, Landed, Lost};
+    use super::writer_epoch::settle_unanswered_claim;
+    let own = probe_writer_epoch(2, None);
+    let other = super::state::WriterEpochRow {
+        attempt_id: "01BX5ZZKBKACTAV9WEVGEMMVRZ".to_string(),
+        ..own.clone()
+    };
+    for (attempted, after_ack, settled) in [
+        (Some(&own), false, Landed),
+        (Some(&own), true, Landed),
+        (Some(&other), false, Lost),
+        (None, false, Lost),
+        (Some(&other), true, InDoubt),
+        (None, true, InDoubt),
+    ] {
+        assert_eq!(
+            settle_unanswered_claim(attempted, &own.attempt_id, after_ack),
+            settled,
+            "{attempted:?}, acknowledged: {after_ack}"
+        );
+    }
+}
+
+/// A publisher of `branch` whose process is `holders`: two registries stand
+/// for two processes on one root.
+fn publisher_in(
+    uri: &str,
+    branch: Option<&str>,
+    holders: &Arc<super::writer_epoch::WriterEpochHolders>,
+) -> GraphNamespacePublisher {
+    GraphNamespacePublisher::new_holding(uri, branch, Arc::clone(holders))
+}
+
+/// The identifier of the live incarnation of `branch`, as a coordinator
+/// opened on it captures.
+async fn live_identifier(
+    uri: &str,
+    branch: Option<&str>,
+) -> lance::dataset::refs::BranchIdentifier {
+    match branch {
+        None => lance::dataset::refs::BranchIdentifier::main(),
+        Some(_) => open_manifest_dataset(uri, branch)
+            .await
+            .unwrap()
+            .branch_identifier()
+            .await
+            .unwrap(),
+    }
+}
+
+/// The `(held, read, current)` of a `WriterFenced` refusal.
+fn writer_fenced(error: &OmniError) -> (Option<u64>, Option<u64>, u64) {
+    match error {
+        OmniError::Manifest(ManifestError {
+            details:
+                Some(ManifestConflictDetails::WriterFenced {
+                    held,
+                    read,
+                    current,
+                }),
+            ..
+        }) => (*held, *read, *current),
+        other => panic!("expected a WriterFenced refusal, got {other:?}"),
+    }
+}
+
+/// An ordinary publication on `branch` that records one graph commit.
+async fn publish_a_commit(
+    publisher: &GraphNamespacePublisher,
+    branch: Option<&str>,
+) -> Result<PublishOutcome> {
+    publisher
+        .publish(&[], &HashMap::new(), Some(&lineage_intent(branch, None)))
+        .await
+}
+
+/// A claim writes one version whose only change is the `writer_epoch` row at
+/// the epoch it read plus one: the head, tables and buffer are the ones it
+/// loaded, no graph commit is recorded and the stamp stays.
+#[tokio::test]
+async fn v17_a_claim_writes_one_version_holding_only_the_next_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let before = open_manifest_dataset(uri, None).await.unwrap();
+    let read = read_manifest_rows(&before).await.unwrap();
+    let holders = Arc::default();
+    let publisher = publisher_in(uri, None, &holders);
+
+    let claimed = publisher
+        .claim_writer_epoch(&live_identifier(uri, None).await)
+        .await
+        .unwrap();
+    assert_eq!(claimed.epoch, 1);
+    let published = claimed.published;
+    assert_eq!(
+        published.dataset.version().version,
+        before.version().version + 1
+    );
+    assert_eq!(
+        super::migrations::read_stamp(&published.dataset),
+        Some(INTERNAL_MANIFEST_SCHEMA_VERSION)
+    );
+    assert_eq!(
+        (
+            published.parent_commit_id.as_deref(),
+            published.known_state.writer_epoch
+        ),
+        (None, 1)
+    );
+
+    let rows = read_manifest_rows(&published.dataset).await.unwrap();
+    let row = rows.writer_epoch.clone().expect("the claim wrote the row");
+    assert_eq!((row.epoch, row.native.as_deref()), (1, None));
+    assert!(
+        ulid::Ulid::from_string(&row.attempt_id).is_ok(),
+        "{}",
+        row.attempt_id
+    );
+    assert_eq!(published.writer_epoch, Some(row));
+    assert_eq!(
+        (
+            &rows.tables,
+            &rows.head,
+            &rows.buffer,
+            &rows.schema_contract,
+            &rows.registry
+        ),
+        (
+            &read.tables,
+            &read.head,
+            &read.buffer,
+            &read.schema_contract,
+            &read.registry
+        )
+    );
+    assert_eq!(
+        (&published.tables, &published.head, &published.buffer),
+        (&read.tables, &read.head, &read.buffer)
+    );
+}
+
+/// The process that holds a branch claims it again, through the same
+/// publisher or another one of the process: the answer is the epoch it holds
+/// and no version is written.
+#[tokio::test]
+async fn v17_the_owners_second_claim_returns_its_epoch_and_writes_no_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let holders = Arc::default();
+    let main = live_identifier(uri, None).await;
+    let first = publisher_in(uri, None, &holders);
+    let claimed = first.claim_writer_epoch(&main).await.unwrap();
+    let version = claimed.published.dataset.version().version;
+
+    for publisher in [first, publisher_in(uri, None, &holders)] {
+        let again = publisher.claim_writer_epoch(&main).await.unwrap();
+        assert_eq!(
+            (again.epoch, again.published.dataset.version().version),
+            (1, version)
+        );
+        assert_eq!(again.published.writer_epoch, claimed.published.writer_epoch);
+    }
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(latest.version().version, version);
+}
+
+/// A claim by a second process fences the first: the owner's next publish is
+/// refused with the epoch it held and writes nothing, the refusal is not
+/// retried and names no remedy, and the successor publishes.
+#[tokio::test]
+async fn v17_a_claim_by_another_process_fences_the_owners_next_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let main = live_identifier(uri, None).await;
+    let owner = publisher_in(uri, None, &Arc::default());
+    let successor = publisher_in(uri, None, &Arc::default());
+    assert_eq!(owner.claim_writer_epoch(&main).await.unwrap().epoch, 1);
+    publish_a_commit(&owner, None).await.unwrap();
+
+    let claimed = successor.claim_writer_epoch(&main).await.unwrap();
+    assert_eq!(claimed.epoch, 2);
+    let version = claimed.published.dataset.version().version;
+    let refused = publish_a_commit(&owner, None)
+        .await
+        .expect_err("a fenced owner published");
+    assert_eq!(writer_fenced(&refused), (Some(1), None, 2));
+    assert!(!is_retryable_publish_conflict(&refused));
+    assert_eq!(
+        refused.to_string(),
+        "writer fenced on branch 'main': the branch is at writer epoch 2 and this process held \
+         epoch 1 there; nothing was published"
+    );
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(latest.version().version, version);
+
+    let landed = publish_a_commit(&successor, None).await.unwrap();
+    assert_eq!(landed.dataset.version().version, version + 1);
+    assert_eq!(landed.known_state.writer_epoch, 2);
+}
+
+/// The owner's last write lands between a successor's claim's load and its
+/// put: the claim loses that version, reloads the epoch it read and lands one
+/// version above, and the owner's next publish is refused.
+#[tokio::test]
+async fn v17_a_claim_lands_above_a_late_write_of_the_generation_it_fences() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let main = live_identifier(uri, None).await;
+    let owner = publisher_in(uri, None, &Arc::default());
+    let successor = publisher_in(uri, None, &Arc::default());
+    let held = owner.claim_writer_epoch(&main).await.unwrap();
+    let version = held.published.dataset.version().version;
+
+    let claimed = successor
+        .claim_writer_epoch_interleaved(&main, async {
+            let late = publish_a_commit(&owner, None).await.unwrap();
+            assert_eq!(late.dataset.version().version, version + 1);
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (claimed.epoch, claimed.published.dataset.version().version),
+        (2, version + 2)
+    );
+    let rows = read_manifest_rows(&claimed.published.dataset)
+        .await
+        .unwrap();
+    assert_eq!(rows.writer_epoch, claimed.published.writer_epoch);
+    assert_eq!(rows.head, claimed.published.head);
+
+    let refused = publish_a_commit(&owner, None)
+        .await
+        .expect_err("a fenced owner published");
+    assert_eq!(writer_fenced(&refused), (Some(1), None, 2));
+    let landed = publish_a_commit(&successor, None).await.unwrap();
+    assert_eq!(landed.dataset.version().version, version + 3);
+}
+
+/// Two claims that read one epoch: the one whose put lands holds the next
+/// epoch, and the other, whose retry finds the rows past what it read, is
+/// refused with the epoch it read.
+#[tokio::test]
+async fn v17_of_two_claims_that_read_one_epoch_one_holds_and_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let main = live_identifier(uri, None).await;
+    let before = open_manifest_dataset(uri, None).await.unwrap();
+    let winner = publisher_in(uri, None, &Arc::default());
+    let loser = publisher_in(uri, None, &Arc::default());
+
+    let refused = loser
+        .claim_writer_epoch_interleaved(&main, async {
+            assert_eq!(winner.claim_writer_epoch(&main).await.unwrap().epoch, 1);
+        })
+        .await
+        .expect_err("two claims that read epoch 0 both landed");
+    assert_eq!(writer_fenced(&refused), (None, Some(0), 1));
+    assert_eq!(
+        refused.to_string(),
+        "writer fenced on branch 'main': this claim read writer epoch 0 and the branch is at 1; \
+         this process held no epoch there and nothing was claimed"
+    );
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(latest.version().version, before.version().version + 1);
+    assert_eq!(read_manifest_state(&latest).await.unwrap().writer_epoch, 1);
+
+    publish_a_commit(&winner, None).await.unwrap();
+    let bystander = publish_a_commit(&loser, None)
+        .await
+        .expect_err("the refused claimer published");
+    assert_eq!(writer_fenced(&bystander), (None, None, 1));
+}
+
+/// A process that holds nothing is refused on a claimed branch, also for a
+/// publish that would write nothing, and a refusal clears what the refused
+/// process held: its next refusal reports nothing held.
+#[tokio::test]
+async fn v17_a_process_holding_nothing_is_refused_and_a_refusal_clears_the_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let main = live_identifier(uri, None).await;
+    let owner = publisher_in(uri, None, &Arc::default());
+    let claimed = owner.claim_writer_epoch(&main).await.unwrap();
+    let version = claimed.published.dataset.version().version;
+
+    let bystander = publisher_in(uri, None, &Arc::default());
+    for lineage in [None, Some(lineage_intent(None, None))] {
+        let refused = bystander
+            .publish(&[], &HashMap::new(), lineage.as_ref())
+            .await
+            .expect_err("a process holding nothing published on a claimed branch");
+        assert_eq!(writer_fenced(&refused), (None, None, 1));
+    }
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(latest.version().version, version);
+
+    assert_eq!(bystander.claim_writer_epoch(&main).await.unwrap().epoch, 2);
+    for held in [Some(1), None] {
+        let refused = publish_a_commit(&owner, None)
+            .await
+            .expect_err("a fenced owner published");
+        assert_eq!(writer_fenced(&refused), (held, None, 2));
+    }
+}
+
+/// A claim names the branch incarnation its caller captured: a head moved
+/// since the capture does not refuse it, and a branch recreated under its
+/// name does, by the identifier.
+#[tokio::test]
+async fn v17_a_claim_is_refused_on_a_recreated_branch_and_not_by_a_moved_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    main.create_branch("feature", None).await.unwrap();
+    let captured = live_identifier(uri, Some("feature")).await;
+    publish_a_commit(
+        &GraphNamespacePublisher::new(uri, Some("feature")),
+        Some("feature"),
+    )
+    .await
+    .unwrap();
+
+    let claimed = publisher_in(uri, Some("feature"), &Arc::default())
+        .claim_writer_epoch(&captured)
+        .await
+        .unwrap();
+    assert_eq!(claimed.epoch, 1);
+
+    main.delete_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
+    let recreated = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    let refused = publisher_in(uri, Some("feature"), &Arc::default())
+        .claim_writer_epoch(&captured)
+        .await
+        .expect_err("a claim landed on another incarnation of the branch");
+    assert!(
+        matches!(
+            &refused,
+            OmniError::Manifest(ManifestError {
+                details: Some(ManifestConflictDetails::ReadSetChanged { member, .. }),
+                ..
+            }) if member == "branch_identifier:feature"
+        ),
+        "{refused:?}"
+    );
+    let latest = open_manifest_dataset(uri, Some("feature")).await.unwrap();
+    assert_eq!(latest.version().version, recreated.version().version);
+}
+
+/// A process that held a deleted branch is refused on the branch recreated
+/// under its name once a successor claimed that one to the same epoch: what
+/// it held was published on another native ref and counts for nothing.
+#[tokio::test]
+async fn v17_a_holder_of_a_deleted_branch_is_refused_on_the_branch_recreated_under_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    main.create_branch("feature", None).await.unwrap();
+    let old_owner = publisher_in(uri, Some("feature"), &Arc::default());
+    let first = live_identifier(uri, Some("feature")).await;
+    assert_eq!(old_owner.claim_writer_epoch(&first).await.unwrap().epoch, 1);
+
+    main.delete_branch("feature").await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
+    let second = live_identifier(uri, Some("feature")).await;
+    let successor = publisher_in(uri, Some("feature"), &Arc::default());
+    assert_eq!(
+        successor.claim_writer_epoch(&second).await.unwrap().epoch,
+        1
+    );
+
+    let refused = publish_a_commit(&old_owner, Some("feature"))
+        .await
+        .expect_err("the holder of a deleted incarnation published on the new one");
+    assert_eq!(writer_fenced(&refused), (None, None, 1));
+    publish_a_commit(&successor, Some("feature")).await.unwrap();
+}
+
+/// A claim on a branch stamped below the control-fact stamp is refused before
+/// any write and names the upgrade.
+#[tokio::test]
+async fn v17_a_claim_below_the_control_fact_stamp_is_refused_naming_the_upgrade() {
+    for stamp in [14, 15, 16] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        ManifestCoordinator::init(uri, &build_test_catalog())
+            .await
+            .unwrap();
+        let mut dataset = open_manifest_dataset(uri, None).await.unwrap();
+        super::migrations::set_stamp_for_test(&mut dataset, stamp)
+            .await
+            .unwrap();
+        let version = dataset.version().version;
+        let holders = Arc::default();
+        let error = publisher_in(uri, None, &holders)
+            .claim_writer_epoch(&live_identifier(uri, None).await)
+            .await
+            .expect_err("a claim landed below the control-fact stamp")
+            .to_string();
+        for clause in [
+            format!("__manifest is stamped at internal schema v{stamp}; control facts"),
+            "need v17".to_string(),
+            "run `omnigraph upgrade <graph> --check` and then `omnigraph upgrade <graph>`"
+                .to_string(),
+        ] {
+            assert!(error.contains(&clause), "stamp {stamp}: {error}");
+        }
+        let unmoved = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(unmoved.version().version, version, "stamp {stamp}");
+        assert!(holders.holds_nothing(), "stamp {stamp}");
+    }
+}
+
+/// A claim moves the version, so a publication prepared under
+/// `ExactGraphVersion` below it is refused: with `ReadSetChanged` when its
+/// process holds the branch after the claim, as fenced when it does not.
+#[tokio::test]
+async fn v17_a_claim_refuses_a_publication_prepared_at_the_version_below_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let coordinator = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let main = live_identifier(uri, None).await;
+    let precondition = &PublishPrecondition::ExactGraphVersion {
+        authority: GraphHeadExpectation::new(None, main.clone(), coordinator.exact_graph_head()),
+        version: coordinator.version(),
+    };
+    let owner = Arc::default();
+    publisher_in(uri, None, &owner)
+        .claim_writer_epoch(&main)
+        .await
+        .unwrap();
+
+    let prepared = |holders| async move {
+        publisher_in(uri, None, &holders)
+            .publish_with_precondition(
+                &[],
+                &HashMap::new(),
+                Some(&lineage_intent(None, None)),
+                precondition,
+            )
+            .await
+            .expect_err("a publication prepared below a claim landed")
+    };
+    let by_the_owner = prepared(Arc::clone(&owner)).await;
+    assert!(
+        matches!(
+            &by_the_owner,
+            OmniError::Manifest(ManifestError {
+                details: Some(ManifestConflictDetails::ReadSetChanged { member, .. }),
+                ..
+            }) if member == "prepared_schema_manifest_version"
+        ),
+        "{by_the_owner:?}"
+    );
+    assert_eq!(
+        writer_fenced(&prepared(Arc::default()).await),
+        (None, None, 1)
+    );
+}
+
+/// A branch forked from a claimed branch carries the source's row and reads
+/// epoch 0: a process holding nothing publishes there, its first claim writes
+/// epoch 1 under the fork's own native ref, and the source stays held.
+#[tokio::test]
+async fn v17_a_fork_of_a_claimed_branch_starts_unclaimed_and_claims_under_its_own_native_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let owner = publisher_in(uri, None, &Arc::default());
+    let on_main = owner
+        .claim_writer_epoch(&live_identifier(uri, None).await)
+        .await
+        .unwrap();
+    let mut main = ManifestCoordinator::open(uri).await.unwrap();
+    main.create_branch("feature", None).await.unwrap();
+
+    let other = publisher_in(uri, Some("feature"), &Arc::default());
+    let published = publish_a_commit(&other, Some("feature")).await.unwrap();
+    assert_eq!(
+        (&published.writer_epoch, published.known_state.writer_epoch),
+        (&on_main.published.writer_epoch, 0)
+    );
+
+    let claimed = other
+        .claim_writer_epoch(&live_identifier(uri, Some("feature")).await)
+        .await
+        .unwrap();
+    let native = claimed.published.dataset.manifest().branch.clone();
+    assert!(native.is_some());
+    let row = claimed.published.writer_epoch.expect("the fork's own row");
+    assert_eq!((claimed.epoch, row.epoch, row.native), (1, 1, native));
+
+    publish_a_commit(&owner, None).await.unwrap();
+    publish_a_commit(&other, Some("feature")).await.unwrap();
+}
+
+/// A coordinator's claim installs the version the claim wrote, and its
+/// publishes land above it under the epoch its process holds.
+#[tokio::test]
+async fn v17_a_coordinator_claims_installs_the_version_and_publishes_above_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut coordinator = ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let base = coordinator.version();
+    let head = coordinator.head().clone();
+
+    assert_eq!(coordinator.claim_writer_epoch().await.unwrap(), 1);
+    assert_eq!(
+        (coordinator.version(), coordinator.known_state.writer_epoch),
+        (base + 1, 1)
+    );
+    assert_eq!(coordinator.head(), &head);
+    assert_eq!(coordinator.claim_writer_epoch().await.unwrap(), 1);
+    assert_eq!(coordinator.version(), base + 1);
+
+    let committed = coordinator
+        .commit_changes_with_lineage(&[], &HashMap::new(), Some(&lineage_intent(None, None)))
+        .await
+        .unwrap();
+    assert_eq!(
+        (committed.version, coordinator.known_state.writer_epoch),
+        (base + 2, 1)
+    );
+}
+
+/// A claim of main by the process `holders` whose every `__manifest` create
+/// gets no answer, `between` run on a store that answers before its put.
+/// Answers the claim, marked as `claim_writer_epoch` marks it, and its creates.
+async fn claim_whose_creates_get_no_answer<Between>(
+    uri: &str,
+    holders: &Arc<super::writer_epoch::WriterEpochHolders>,
+    between: Between,
+) -> (Result<super::publisher::WriterEpochClaim>, usize)
+where
+    Between: std::future::Future<Output = ()>,
+{
+    let main = live_identifier(uri, None).await;
+    let fault = ManifestRequestFault::new(ManifestFault::EveryManifestPut);
+    let unanswered = crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(fault.clone())),
+        ..Default::default()
+    };
+    let answered = crate::instrumentation::with_query_io_probes(Default::default(), between);
+    let claimed = crate::instrumentation::with_query_io_probes(
+        unanswered,
+        publisher_in(uri, None, holders).claim_writer_epoch_interleaved(&main, answered),
+    )
+    .await
+    .map_err(OmniError::unpublished);
+    let creates = fault
+        .manifest_puts
+        .load(std::sync::atomic::Ordering::SeqCst);
+    (claimed, creates)
+}
+
+/// A claim whose `__manifest` create gets no answer reads the version it
+/// attempted: another claim holds it, so this one is refused with the epoch
+/// it read, and the refusal clears what its process held.
+#[tokio::test]
+async fn v17_a_claim_that_lost_its_version_to_another_claim_is_refused_with_what_it_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let main = live_identifier(uri, None).await;
+    let holders = Arc::default();
+    let first = publisher_in(uri, None, &holders);
+    assert_eq!(first.claim_writer_epoch(&main).await.unwrap().epoch, 1);
+    let second = publisher_in(uri, None, &Arc::default());
+    assert_eq!(second.claim_writer_epoch(&main).await.unwrap().epoch, 2);
+
+    let mut winner = None;
+    let (refused, creates) = claim_whose_creates_get_no_answer(uri, &holders, async {
+        let third = publisher_in(uri, None, &Arc::default());
+        winner = Some(third.claim_writer_epoch(&main).await.unwrap());
+    })
+    .await;
+    let refused = refused.expect_err("a claim landed on a version another claim holds");
+    assert_eq!(writer_fenced(&refused), (Some(1), Some(2), 3));
+    assert_eq!(
+        creates,
+        1 + crate::manifest_request::CONDITIONAL_REQUEST_REISSUES as usize
+    );
+    assert!(holders.holds_nothing());
+
+    let winner = winner.expect("the other claim ran").published;
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(latest.version().version, winner.dataset.version().version);
+    assert_eq!(
+        read_manifest_rows(&latest).await.unwrap().writer_epoch,
+        winner.writer_epoch
+    );
+}
+
+/// A claim whose `__manifest` create gets no answer and whose version an
+/// ordinary publish holds is not fenced: the create's error comes back as
+/// `Unpublished`, its process holds nothing and claims again one version up.
+#[tokio::test]
+async fn v17_a_claim_that_lost_its_version_to_an_ordinary_publish_is_not_fenced() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let main = live_identifier(uri, None).await;
+    let owner = publisher_in(uri, None, &Arc::default());
+    let held = owner.claim_writer_epoch(&main).await.unwrap();
+    let version = held.published.dataset.version().version;
+
+    let holders = Arc::default();
+    let (failed, creates) = claim_whose_creates_get_no_answer(uri, &holders, async {
+        let late = publish_a_commit(&owner, None).await.unwrap();
+        assert_eq!(late.dataset.version().version, version + 1);
+    })
+    .await;
+    let failed = failed.expect_err("a claim landed on a version a publish holds");
+    assert!(failed.storage_failure().is_some(), "{failed:?}");
+    assert!(!failed.is_manifest_publish_in_doubt(), "{failed:?}");
+    assert_eq!(
+        failed.completion_evidence(),
+        Some(crate::error::CompletionEvidence::Unpublished),
+        "{failed:?}"
+    );
+    assert_eq!(
+        creates,
+        1 + crate::manifest_request::CONDITIONAL_REQUEST_REISSUES as usize
+    );
+    assert!(holders.holds_nothing());
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(latest.version().version, version + 1);
+    assert_eq!(read_manifest_state(&latest).await.unwrap().writer_epoch, 1);
+
+    let again = publisher_in(uri, None, &holders)
+        .claim_writer_epoch(&main)
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.epoch, again.published.dataset.version().version),
+        (2, version + 2)
+    );
+}
+
+/// A fenced owner claims again: it takes the epoch above its successor's, its
+/// publishes land, and the successor's next publish is refused in its turn.
+#[tokio::test]
+async fn v17_a_fenced_owner_that_claims_again_publishes_and_fences_its_successor() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let main = live_identifier(uri, None).await;
+    let owner = publisher_in(uri, None, &Arc::default());
+    let successor = publisher_in(uri, None, &Arc::default());
+    assert_eq!(owner.claim_writer_epoch(&main).await.unwrap().epoch, 1);
+    assert_eq!(successor.claim_writer_epoch(&main).await.unwrap().epoch, 2);
+    let refused = publish_a_commit(&owner, None)
+        .await
+        .expect_err("a fenced owner published");
+    assert_eq!(writer_fenced(&refused), (Some(1), None, 2));
+
+    let claimed = owner.claim_writer_epoch(&main).await.unwrap();
+    assert_eq!(claimed.epoch, 3);
+    let version = claimed.published.dataset.version().version;
+    let landed = publish_a_commit(&owner, None).await.unwrap();
+    assert_eq!(
+        (
+            landed.dataset.version().version,
+            landed.known_state.writer_epoch
+        ),
+        (version + 1, 3)
+    );
+    let refused = publish_a_commit(&successor, None)
+        .await
+        .expect_err("a fenced successor published");
+    assert_eq!(writer_fenced(&refused), (Some(2), None, 3));
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(latest.version().version, version + 1);
+}
+
+/// A claim on a branch that does not exist is refused as `BranchNotFound`:
+/// it creates no branch, writes no version and its process holds nothing.
+#[tokio::test]
+async fn v17_a_claim_on_a_branch_that_does_not_exist_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let version = open_manifest_dataset(uri, None)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let holders = Arc::default();
+    let refused = publisher_in(uri, Some("absent"), &holders)
+        .claim_writer_epoch(&lance::dataset::refs::BranchIdentifier::main())
+        .await
+        .expect_err("a claim landed on a branch that does not exist");
+    assert!(
+        matches!(&refused, OmniError::BranchNotFound { branch } if branch == "absent"),
+        "{refused:?}"
+    );
+    assert!(holders.holds_nothing());
+    assert!(matches!(
+        open_manifest_dataset(uri, Some("absent")).await,
+        Err(OmniError::BranchNotFound { .. })
+    ));
+    let unmoved = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(unmoved.version().version, version);
+}
+
+/// Two publishers of one process claim at once: the one whose put lost its
+/// version finds its process holding the epoch the other landed, answers it
+/// and writes nothing.
+#[tokio::test]
+async fn v17_two_claims_of_one_process_hold_one_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let main = live_identifier(uri, None).await;
+    let holders = Arc::default();
+    let first = publisher_in(uri, None, &holders);
+    let second = publisher_in(uri, None, &holders);
+
+    let mut landed = None;
+    let claimed = first
+        .claim_writer_epoch_interleaved(&main, async {
+            landed = Some(second.claim_writer_epoch(&main).await.unwrap());
+        })
+        .await
+        .unwrap();
+    let landed = landed.expect("the other claim ran");
+    let version = landed.published.dataset.version().version;
+    assert_eq!(
+        (
+            landed.epoch,
+            claimed.epoch,
+            claimed.published.dataset.version().version
+        ),
+        (1, 1, version)
+    );
+    assert_eq!(
+        claimed.published.writer_epoch,
+        landed.published.writer_epoch
+    );
+    let key = super::writer_epoch::HolderKey::resolve(uri, None).unwrap();
+    assert_eq!(holders.held(&key, None), Some(1));
+    let latest = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(latest.version().version, version);
+}
+
+/// A branch at the largest epoch has no next one: a claim by a process that
+/// holds nothing fails as `Unpublished` and writes no version, and the
+/// process that holds that epoch is answered with it.
+#[tokio::test]
+async fn v17_a_claim_at_the_largest_epoch_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let row = probe_writer_epoch(u64::MAX, None);
+    let published = main_holding_writer_epoch(uri, &row).await;
+    let version = published.version().version;
+    let main = live_identifier(uri, None).await;
+
+    let holders = Arc::default();
+    let (failed, evidence) = publisher_in(uri, None, &holders)
+        .claim_writer_epoch(&main)
+        .await
+        .expect_err("a claim landed above the largest epoch")
+        .into_completion_evidence();
+    assert!(
+        matches!(
+            &failed,
+            OmniError::Manifest(ManifestError {
+                kind: crate::error::ManifestErrorKind::Internal,
+                message,
+                ..
+            }) if message.contains("writer epoch overflows")
+        ),
+        "{failed:?}"
+    );
+    assert_eq!(
+        evidence,
+        Some(crate::error::CompletionEvidence::Unpublished)
+    );
+    assert!(holders.holds_nothing());
+
+    let held = publisher_holding(uri, &row)
+        .claim_writer_epoch(&main)
+        .await
+        .unwrap();
+    assert_eq!(
+        (held.epoch, held.published.dataset.version().version),
+        (u64::MAX, version)
+    );
+    let unmoved = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(unmoved.version().version, version);
+}
+
+/// A fork of a fork that never claimed carries the row main wrote: both forks
+/// read epoch 0, the first also after its own publishes, and the second's
+/// first claim writes epoch 1 under its own native ref.
+#[tokio::test]
+async fn v17_a_fork_of_a_fork_reads_epoch_0_and_claims_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let row = probe_writer_epoch(3, None);
+    main_holding_writer_epoch(uri, &row).await;
+    let mut main = ManifestCoordinator::open(uri).await.unwrap();
+    main.create_branch("first", None).await.unwrap();
+    let on_first = publisher_in(uri, Some("first"), &Arc::default());
+    for _ in 0..2 {
+        let published = publish_a_commit(&on_first, Some("first")).await.unwrap();
+        assert_eq!(
+            (
+                published.writer_epoch.as_ref(),
+                published.known_state.writer_epoch
+            ),
+            (Some(&row), 0)
+        );
+    }
+    let mut first = ManifestCoordinator::open_at_branch(uri, "first")
+        .await
+        .unwrap();
+    first.create_branch("second", None).await.unwrap();
+
+    for branch in ["first", "second"] {
+        let dataset = open_manifest_dataset(uri, Some(branch)).await.unwrap();
+        let rows = read_manifest_rows(&dataset).await.unwrap();
+        assert_eq!(rows.writer_epoch.as_ref(), Some(&row), "{branch}");
+        let state = read_manifest_state(&dataset).await.unwrap();
+        assert_eq!(state.writer_epoch, 0, "{branch}");
+    }
+    let claimed = publisher_in(uri, Some("second"), &Arc::default())
+        .claim_writer_epoch(&live_identifier(uri, Some("second")).await)
+        .await
+        .unwrap();
+    let native = claimed.published.dataset.manifest().branch.clone();
+    assert!(native.is_some());
+    let own = claimed.published.writer_epoch.expect("the fork's own row");
+    assert_eq!((claimed.epoch, own.epoch, own.native), (1, 1, native));
+}
+
+/// A graph created again at its root reads epoch 0 on main, below what a
+/// process held there: that process's first publish is refused once, the
+/// refusal clears what it held and its next publish lands.
+#[tokio::test]
+async fn v17_a_main_entry_above_a_recreated_roots_epoch_is_refused_once_and_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let holders = Arc::default();
+    let claimed = publisher_in(uri, None, &holders)
+        .claim_writer_epoch(&live_identifier(uri, None).await)
+        .await
+        .unwrap();
+    assert_eq!(claimed.epoch, 1);
+    std::fs::remove_dir_all(dir.path()).unwrap();
+    ManifestCoordinator::init(uri, &build_test_catalog())
+        .await
+        .unwrap();
+    let fresh = open_manifest_dataset(uri, None).await.unwrap();
+    let version = fresh.version().version;
+    assert_eq!(read_manifest_state(&fresh).await.unwrap().writer_epoch, 0);
+
+    let publisher = publisher_in(uri, None, &holders);
+    let refused = publish_a_commit(&publisher, None)
+        .await
+        .expect_err("a publish landed under an epoch another graph's main held");
+    assert_eq!(writer_fenced(&refused), (Some(1), None, 0));
+    assert!(holders.holds_nothing());
+    let unmoved = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(unmoved.version().version, version);
+
+    let landed = publish_a_commit(&publisher, None).await.unwrap();
+    assert_eq!(
+        (
+            landed.dataset.version().version,
+            landed.known_state.writer_epoch
+        ),
+        (version + 1, 0)
     );
 }
