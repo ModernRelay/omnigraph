@@ -296,7 +296,9 @@ history stays one chain. An insert, an append and an overwrite carry; an
 update or delete of a fragment a rewrite replaced is a conflict Lance reports,
 which stays `ReadSetChanged`. Any other publication in between, a row change
 or a schema change, refuses as before. A caller's `--if-commit` head and an
-unattached base are not carried. `QueryIoProbes::writes_carried_over_row_preserving`
+unattached base are not carried, and neither is a publication by another
+handle that lands after the beside-staging probe: the publisher's CAS refuses
+that one, as above. `QueryIoProbes::writes_carried_over_row_preserving`
 counts carries.
 
 The index writer (`ensure_indices`, which `omnigraph index build` runs on any

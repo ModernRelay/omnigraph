@@ -3310,7 +3310,7 @@ where
     rows
 }
 
-/// An insert on main that an optimize run on another handle overtakes
+/// An insert on main that an optimize run on the same handle overtakes
 /// between its staging and its writer gates, beside the same insert with
 /// nothing in between. The run compacts `node:Person`, the insert's own
 /// table, and publishes; the insert is carried over that row-preserving
@@ -3333,9 +3333,10 @@ fn carried_write_cost_rows(replay: &str) -> String {
             .unwrap();
         }
 
-        /// Compact on a fresh handle of the same store, on its own thread
-        /// and runtime, while the overtaken writer's thread waits.
-        fn optimize_on_another_handle(root: String, adapter: Arc<dyn StorageAdapter>) {
+        /// Compact on the writer's handle, on another thread and runtime,
+        /// while the overtaken writer's thread waits: a server's optimize
+        /// runs on the handle its writes use.
+        fn optimize_beside(db: Session) {
             std::thread::scope(|scope| {
                 scope
                     .spawn(move || {
@@ -3349,10 +3350,7 @@ fn carried_write_cost_rows(replay: &str) -> String {
                                 .install(Arc::new(omnigraph::dst_ids::SeededUlids::new(24_911)));
                             let _clock = omnigraph::dst_clock::CLOCK
                                 .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
-                            let other = session(
-                                Omnigraph::open_with_storage(&root, adapter).await.unwrap(),
-                            );
-                            let stats = other.optimize().await.unwrap();
+                            let stats = db.optimize().await.unwrap();
                             assert!(
                                 stats
                                     .iter()
@@ -3398,15 +3396,14 @@ fn carried_write_cost_rows(replay: &str) -> String {
             let probes = omnigraph::instrumentation::QueryIoProbes::default();
             {
                 let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let root = resources.root.clone();
-                let adapter = resources.adapter.clone();
+                let writer = db.clone();
                 let _overtake = omnigraph::seams::catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE
                     .observe(move || {
                         if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                             return;
                         }
                         omnigraph_dst::cost::set_label("_carried_optimize");
-                        Self::optimize_on_another_handle(root.clone(), adapter.clone());
+                        Self::optimize_beside(writer.clone());
                         omnigraph_dst::cost::set_label("CarriedInsert");
                     });
                 omnigraph_dst::cost::set_label("CarriedInsert");

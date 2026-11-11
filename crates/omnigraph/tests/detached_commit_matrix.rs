@@ -355,10 +355,14 @@ async fn observe_photo(db: &Omnigraph) -> Option<Vec<u8>> {
     }
 }
 
-/// Run optimize to completion on a fresh handle of `root`, on its own thread
-/// and runtime, while the caller's thread waits: the overtaking run of the
-/// CarriedInsert writer.
-fn optimize_on_another_handle(root: String) {
+/// Run optimize to completion on the writer's own handle, on another thread
+/// and runtime, while the writer's thread waits: the overtaking run of the
+/// CarriedInsert writer, as a server's maintenance runs on the handle its
+/// writes use. (A publication by another handle or process after the write's
+/// beside-staging probe is the publisher's CAS to refuse, and the write then
+/// prepares again; the carry covers what the revalidation under the gates
+/// sees.)
+fn optimize_beside(db: Session) {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
@@ -367,7 +371,6 @@ fn optimize_on_another_handle(root: String) {
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    let db = helpers::session(Omnigraph::open(&root).await.unwrap());
                     let stats = db.optimize().await.unwrap();
                     assert!(
                         stats
@@ -383,20 +386,20 @@ fn optimize_on_another_handle(root: String) {
 }
 
 /// Overtake the next write that reaches its writer gates with an optimize
-/// run on another handle of `root`, once.
-fn overtake_next_write_with_optimize(root: &str) -> impl Sized {
+/// run on `db`, once.
+fn overtake_next_write_with_optimize(db: &Session) -> impl Sized {
     let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let root = root.to_string();
+    let db = db.clone();
     catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE.observe(move || {
         if !fired.swap(true, Ordering::SeqCst) {
-            optimize_on_another_handle(root.clone());
+            optimize_beside(db.clone());
         }
     })
 }
 
 /// The CarriedInsert writer's op.
-async fn carried_insert(db: &Session, root: &str, name: &str) -> omnigraph::error::Result<()> {
-    let _overtaken = overtake_next_write_with_optimize(root);
+async fn carried_insert(db: &Session, name: &str) -> omnigraph::error::Result<()> {
+    let _overtaken = overtake_next_write_with_optimize(db);
     insert(db, name).await
 }
 
@@ -499,7 +502,7 @@ fn rfc0067_matrix_child_process() {
                     .map(|_| ()),
                 "blob_put" => put_photo(&db, &name).await,
                 "blob_clear" => clear_photo(&db).await,
-                "carried_insert" => carried_insert(&db, &uri, &name).await,
+                "carried_insert" => carried_insert(&db, &name).await,
                 _ => insert(&db, &name).await,
             };
             if let Err(error) = outcome {
@@ -814,7 +817,7 @@ async fn run_cell(
                 Writer::CarriedInsert => {
                     omnigraph::instrumentation::with_query_io_probes(
                         probes.clone(),
-                        carried_insert(&db, &root, &write_name),
+                        carried_insert(&db, &write_name),
                     )
                     .await
                 }

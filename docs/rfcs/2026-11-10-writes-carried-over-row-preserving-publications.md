@@ -49,6 +49,8 @@ The served-optimize change (PR #1282) bounds the symptom with a writer yield: an
 
 A publication ***changes no row*** when every table pin it moved reaches the previous pin through commits whose Lance operation is `Rewrite` or `CreateIndex`, and it changed neither the schema contract nor any registration's identity, location, native ref or row count. Optimize compaction, deletion materialization, dropped-column erasure, index folds and builds, full-text rebuilds and full-text declarations all publish such commits. The rule reads what the commits record, not who published them, so a later maintenance operation qualifies by the same proof without a code change, and any other commit, a row change, a schema change, a merge that moved a table, disqualifies.
 
+The carry covers the publications revalidation sees under the gates. A write on its handle's bound branch probes the head beside its staging and, when nothing installed on the handle since, trusts that probe under the gates; a publication by another handle or process after the probe is then refused by the publisher's CAS, after the write's detached commits, and the write prepares again as today. A server's optimize runs on the handle its writes use, so its publication always reaches revalidation.
+
 Any publication that changes a row still sends the write back as before. Several row-preserving publications in a row carry as one, up to 32 commits per table (`ROW_PRESERVING_CHAIN_MAX_LINKS`); past that the write prepares again.
 
 The write's graph commit is parented on the head it was carried to, so lineage shows the optimize commit, then the write. The committed table keeps the compaction: its new pin is a detached commit that read the compacted version.
