@@ -391,7 +391,8 @@ pub enum ArtifactSkip {
     /// A declared edge type has no table yet, so the artifact has no complete
     /// identity to stamp.
     IncompleteEdgeTables,
-    /// The run was cancelled, so the edge scan did not start.
+    /// The run was cancelled: the refresh stopped before its write, or
+    /// never started.
     Cancelled,
     /// The artifact would pass `OptimizeLimits::artifact_bytes`: its lower
     /// bound did before the scan, or the counting build's running bound did
@@ -455,8 +456,8 @@ pub enum RunCancellation {
     /// `deferred(cancelled)`.
     Cancelled,
     /// The cancellation arrived after the run passed its last check before
-    /// the publication, so the run finished; only the artifact scan was
-    /// skipped.
+    /// the publication, so the run finished. The artifact refresh stopped
+    /// before its write, or, if the write had already started, completed.
     ArrivedLate,
 }
 
@@ -1147,11 +1148,11 @@ pub async fn optimize_all_datasets(
     drop(main_branch_guard);
     drop(schema_permit);
 
-    let artifact = if cancelled || cancel_requested() {
+    let artifact = if cancelled {
         ArtifactRefresh::Skipped(ArtifactSkip::Cancelled)
     } else {
-        // The scan reads only, so a cancellation that arrives during it
-        // abandons it; the write is issued only when none is pending.
+        // A cancellation that arrives from here on is the refresh's own to
+        // see: it stops the refresh before its write.
         match persist_graph_index_artifact(
             db,
             &catalog,
@@ -1391,7 +1392,19 @@ async fn run_table_pipeline(
     let (resume_at, unvisited) = match stop {
         Some(PipelineStop::Bound(index, reason)) => (Some(keys[index].clone()), reason),
         Some(PipelineStop::Cancelled) => (None, DeferReason::Cancelled),
-        None => (None, DeferReason::GateHoldLimit),
+        // With no stop the loop ends only once every table was visited, so
+        // an unvisited table here is a broken exit, not a bound: fail the
+        // run rather than report a deferral no bound caused.
+        None => {
+            if let Some(index) = visited.iter().position(Option::is_none) {
+                return Err(OmniError::manifest_internal(format!(
+                    "optimize pipeline returned with {} unvisited and no stop",
+                    keys[index]
+                ))
+                .with_completion_evidence(CompletionEvidence::Unpublished));
+            }
+            (None, DeferReason::GateHoldLimit)
+        }
     };
     let tables = visited
         .into_iter()
@@ -1449,7 +1462,10 @@ async fn persist_graph_index_artifact(
     cancellation: Option<&OptimizeCancellation>,
 ) -> Result<ArtifactRefresh> {
     // Everything before the write reads only, so a cancellation (a shutdown,
-    // a deployment) abandons it wherever it stands.
+    // a deployment) abandons it at its next await: the scan awaits once per
+    // batch, but the adjacency build and the serialization run without one,
+    // and a cancellation during them is seen only by the check before the
+    // write.
     let prepare = prepare_graph_index_artifact(db, catalog, edge_tables_committed, limit);
     let prepared = match cancellation {
         Some(cancellation) => tokio::select! {
