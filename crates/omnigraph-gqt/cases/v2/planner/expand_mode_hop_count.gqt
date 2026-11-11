@@ -26,10 +26,7 @@ edge Knows: Person -> Person
 --- query
 set engine = v2;
 query one_hop() {
-    match {
-        $a: Person
-        $a knows $b
-    }
+    match { $a: Person, $a knows $b }
     return { $b.name }
 }
 
@@ -48,10 +45,7 @@ pass expand_mode
 --- query
 set engine = v2;
 query two_hops() {
-    match {
-        $a: Person
-        $a knows{1,2} $b
-    }
+    match { $a: Person, $a knows{1,2} $b }
     return { $b.name }
 }
 

@@ -1178,7 +1178,7 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
     let by_rank = temp.path().join("by_rank.gq");
     fs::write(
         &by_rank,
-        "explain query by_rank() {\n  match {\n    $t: Tag\n    $t.rank > 1\n  }\n  return { $t.slug }\n}\n",
+        "explain query by_rank() {\n  match { $t: Tag }\n  where $t.rank > 1\n  return { $t.slug }\n}\n",
     )
     .unwrap();
     assert_eq!(scan_access(&graph, &by_rank, "feature").0, "sequential");
@@ -1521,13 +1521,13 @@ node Policy {
         &query_path,
         r#"
 query update_policy($slug: String, $name: String) {
-    $x: Policy  $x.slug = $slug
+    match { $x: Policy } where $x.slug = $slug
     update $x set { name: $name }
 }
 
 query list_policies() {
     match { $p: Policy }
-    return { $p.name $p.effectiveTo }
+    return { $p.name, $p.effectiveTo }
 }
 "#,
     );
@@ -1601,7 +1601,7 @@ node Person {
         &query_path,
         r#"
 query broken($slug: String) {
-    $x: Person  $x.slug = $slug
+    match { $x: Person } where $x.slug = $slug
     update $x set { missing: "nope" }
 }
 "#,
@@ -1837,7 +1837,7 @@ node Policy {
         &query_path,
         r#"
 query update_policy($slug: String, $name: String) {
-    $x: Policy  $x.slug = $slug
+    match { $x: Policy } where $x.slug = $slug
     update $x set { name: $name }
 }
 "#,
@@ -1880,7 +1880,7 @@ node Policy {
         &query_path,
         r#"
 query bad_update($slug: String) {
-    $x: Policy  $x.slug = $slug
+    match { $x: Policy } where $x.slug = $slug
     update $x set { priority_level: "high" }
 }
 "#,
@@ -2700,7 +2700,7 @@ query insert_person($name: String, $age: I32) {
             .arg("--target")
             .arg(&graph)
             .arg("-e")
-            .arg("query no_match() { $x: Person  $x.name = \"Nobody\"  update $x set { age: 99 } }")
+            .arg("query no_match() { match { $x: Person } where $x.name = \"Nobody\"  update $x set { age: 99 } }")
             .arg("--json"),
     ));
     assert_eq!(no_op["affected_nodes"], 0);
@@ -2717,7 +2717,7 @@ query insert_person($name: String, $age: I32) {
 /// door's refusal.
 #[test]
 fn explain_statement_answers_the_plan_as_rows() {
-    const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match {\n        $p: Person\n        $p.age > 30\n    }\n    return { $p.name }\n}\n";
+    const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match { $p: Person }\n    where $p.age > 30\n    return { $p.name }\n}\n";
 
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -2913,9 +2913,8 @@ fn load_statement_answers_the_executed_plan_beside_the_change() {
 /// older work, so this cannot claim whole-command no effects or exit 4.
 #[test]
 fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
-    const FIND_PERSON: &str =
-        "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
-    const SET_AGE: &str = "query set_age($name: String, $age: I32) { $x: Person  $x.name = $name  update $x set { age: $age } }";
+    const FIND_PERSON: &str = "query find($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }";
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { match { $x: Person } where $x.name = $name  update $x set { age: $age } }";
 
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -2998,7 +2997,7 @@ fn mutate_if_commit_lost_cas_preserves_details_embedded_issue_365() {
 /// stop even a conditional mutation before its data request is dispatched.
 #[test]
 fn remote_if_commit_fails_closed_against_an_older_server() {
-    const SET_AGE: &str = "query set_age($name: String, $age: I32) { $x: Person  $x.name = $name  update $x set { age: $age } }";
+    const SET_AGE: &str = "query set_age($name: String, $age: I32) { match { $x: Person } where $x.name = $name  update $x set { age: $age } }";
 
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
     for (status, headers) in [
@@ -3940,7 +3939,7 @@ fn read_supports_inline_query_string() {
             .arg("query")
             .arg("--target").arg(&repo)
             .arg("-e")
-            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
+            .arg("query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.age } }")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
             .arg("--json"),
@@ -4486,7 +4485,7 @@ fn change_supports_inline_query_string() {
             .arg("query")
             .arg("--target").arg(&repo)
             .arg("-e")
-            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name } }")
+            .arg("query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }")
             .arg("--params")
             .arg(r#"{"name":"Inline"}"#)
             .arg("--json"),

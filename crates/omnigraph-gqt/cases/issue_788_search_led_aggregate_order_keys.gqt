@@ -83,7 +83,7 @@ n: I64
 --- query
 set engine = v2;
 query fused_largest_group($t: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60), $d: Doc }
     return { $d.kind, count($d) as n }
     order { n desc }
     limit 1
@@ -102,7 +102,7 @@ n: I64
 --- query
 set engine = v2;
 query fused_smallest_group($t: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60), $d: Doc }
     return { $d.kind, count($d) as n }
     order { n asc }
     limit 1

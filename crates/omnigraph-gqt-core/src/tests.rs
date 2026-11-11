@@ -82,7 +82,7 @@ async fn generated_params_supply_a_step_and_are_refused_outside_their_contract()
         "--- params generate: v1 seed: 7\nparams:\n  n: {kind: key, prefix: gen-, width: 3}\n";
     let text = format!(
         "{HDR}{SCHEMA}{SEED}{MUTATE}{GENERATED}--- expect affected: nodes=1 edges=0\n\
-         --- query\nquery named() {{\n    match {{ $p: Person {{ name: \"gen-000\" }} }}\n    return {{ $p.name }}\n}}\n\
+         --- query\nquery named() {{\n    match {{ $p: Person }}\n    where $p.name = \"gen-000\"\n    return {{ $p.name }}\n}}\n\
          --- expect unordered\n{{\"p.name\": \"gen-000\"}}\n{SHAPE}"
     );
     let case = parse_case("generated_params", &text).unwrap();
@@ -1384,7 +1384,7 @@ fn accepts_empty_expect_body_as_empty_result_assertion() {
 #[test]
 fn search_construct_sets_the_index_decision() {
     let schema = "--- runner\ntimeout_ms: 10000\nenvironments:\n  - target: omnigraph-engine\n    storage: local-filesystem\n\n--- schema\nnode Doc {\n    slug: String @key\n    text: String @index\n}\n";
-    let query = "--- query\nquery q($q: String) {\n    match {\n        $d: Doc\n        search($d.text, $q)\n    }\n    return { $d.slug }\n}\n";
+    let query = "--- query\nquery q($q: String) {\n    match { $d: Doc }\n    where search($d.text, $q)\n    return { $d.slug }\n}\n";
     let text = format!(
         "{HDR}{schema}--- seed\n{query}--- params\n{{\"q\": \"needle\"}}\n--- expect unordered\n--- expect shape\nd.slug: String\n"
     );
@@ -2541,13 +2541,13 @@ fn pin_violation_names_the_path_that_ran() {
 fn expects_expand_ignores_bound_edges_and_plain_bindings() {
     let unbound = parse_query(TRAVERSAL_QUERY.trim_start_matches("--- query\n")).unwrap();
     assert!(expects_expand(unbound.single_decl()));
-    let bound = "query f($n: String) {\n    match {\n        $a: Person\n        $a.name = $n\n        \
-                 $a $k:knows $b\n    }\n    return { $b.name }\n}\n";
+    let bound = "query f($n: String) {\n    match {\n        $a: Person,\n        \
+                 $a $k:knows $b,\n    }\n    where $a.name = $n\n    return { $b.name }\n}\n";
     let bound = parse_query(bound).unwrap();
     assert!(!expects_expand(bound.single_decl()));
     let plain = parse_query(QUERY.trim_start_matches("--- query\n")).unwrap();
     assert!(!expects_expand(plain.single_decl()));
-    let negated = "query f() {\n    match {\n        $a: Person\n        not { $a knows $x }\n    }\n    \
+    let negated = "query f() {\n    match { $a: Person }\n    where not exists { $a knows $x }\n    \
                    return { $a.name }\n}\n";
     let negated = parse_query(negated).unwrap();
     assert!(!expects_expand(negated.single_decl()));
@@ -2559,8 +2559,8 @@ const TRAVERSAL_SCHEMA: &str = "--- runner\ntimeout_ms: 10000\nenvironments:\n  
 const TRAVERSAL_SEED: &str = "--- seed\n{\"type\":\"Person\",\"data\":{\"name\":\"alice\"}}\n\
                               {\"type\":\"Person\",\"data\":{\"name\":\"bob\"}}\n\
                               {\"edge\":\"Knows\",\"id\":\"k-1\",\"from\":\"alice\",\"to\":\"bob\",\"data\":{\"since\":2020}}\n";
-const TRAVERSAL_QUERY: &str = "--- query\nquery friends($n: String) {\n    match {\n        $a: Person\n        \
-                               $a.name = $n\n        $a knows $b\n    }\n    return { $b.name }\n}\n";
+const TRAVERSAL_QUERY: &str = "--- query\nquery friends($n: String) {\n    match {\n        $a: Person,\n        \
+                               $a knows $b,\n    }\n    where $a.name = $n\n    return { $b.name }\n}\n";
 const TRAVERSAL_PARAMS: &str = "--- params\n{\"n\": \"alice\"}\n";
 const TRAVERSAL_EXPECT: &str =
     "--- expect unordered\n{\"b.name\": \"bob\"}\n--- expect shape\nb.name: String\n";
@@ -2708,7 +2708,7 @@ async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
 
 #[test]
 fn refuses_ordered_expect_with_an_aggregate_in_return() {
-    let query = "--- query\nquery q($t: String) {\n    match { from bm25({ match { $p: Person\n        search($p.name, $t) } return { $p } }, $p.name, $t) }\n    \
+    let query = "--- query\nquery q($t: String) {\n    match { from bm25({ match { $p: Person }\n        where search($p.name, $t) return { $p } }, $p.name, $t) }\n    \
                  return { count($p) as total }\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
     assert!(refusal("x", &text).contains("order` clause"));
@@ -2739,7 +2739,7 @@ fn refuses_ordered_expect_with_rank_only_distinct_issue_953() {
             "$score desc",
         ),
         (
-            "let $all = { match { $p: Person } return { $p } }  from rrf(nearest($all, $p.vec, $v, k: 3), bm25($all, $p.name, $t), k: 60)",
+            "let $all = { match { $p: Person } return { $p } }, from rrf(nearest($all, $p.vec, $v, k: 3), bm25($all, $p.name, $t), k: 60)",
             "$score desc",
         ),
     ] {
@@ -2923,7 +2923,7 @@ async fn bless_never_rewrites_on_a_kind_mismatch() {
 
 #[tokio::test]
 async fn params_refusal_satisfies_an_error_expect() {
-    let query = "--- query\nquery q($q: String) {\n    match {\n        $p: Person\n        $p.name = $q\n    }\n    return { $p.name }\n}\n";
+    let query = "--- query\nquery q($q: String) {\n    match { $p: Person }\n    where $p.name = $q\n    return { $p.name }\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect error: q\n");
     let case = parse_case("x", &text).unwrap();
     execute_case(&case, Path::new("unused.gqt"), false)

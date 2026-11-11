@@ -26,12 +26,8 @@ node Person {
 --- query
 set engine = v2;
 query two_clauses() {
-    match {
-        $p: Person
-        $q: Person
-        $p.age > $q.age
-        $p.score > $q.score
-    }
+    match { $p: Person, $q: Person }
+    where $p.age > $q.age and $p.score > $q.score
     return { $p.slug, $q.slug }
 }
 
@@ -54,11 +50,8 @@ not pass predicate_pushdown
 --- query
 set engine = v2;
 query joined_with_and() {
-    match {
-        $p: Person
-        $q: Person
-        $p.age > $q.age and $p.score > $q.score
-    }
+    match { $p: Person, $q: Person }
+    where $p.age > $q.age and $p.score > $q.score
     return { $p.slug, $q.slug }
 }
 

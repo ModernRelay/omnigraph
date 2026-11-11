@@ -38,7 +38,7 @@ pipeline 1: Sort => consumer after 0
 --- query
 set engine = v2;
 query one_hop() {
-    match { $p: Person $p knows $q }
+    match { $p: Person, $p knows $q }
     return { $q.name }
 }
 --- expect unordered
@@ -52,7 +52,7 @@ pipeline 1: Scan -> Expand -> HashJoin(probe) -> Projection => consumer after 0
 --- query
 set engine = v2;
 query two_hops() {
-    match { $p: Person $p knows{1,2} $q }
+    match { $p: Person, $p knows{1,2} $q }
     return { $q.name }
 }
 --- expect unordered
@@ -67,10 +67,8 @@ pipeline 2: Expand -> HashJoin(probe) -> Projection => consumer after 0, 1
 --- query
 set engine = v2;
 query knows_nobody() {
-    match {
-        $p: Person
-        not { $p knows $q }
-    }
+    match { $p: Person }
+    where not exists { $p knows $q }
     return { $p.name }
 }
 --- expect unordered

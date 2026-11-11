@@ -304,7 +304,7 @@ async fn legacy_vintage_graph_mutates_diffs_evolves_and_reopens() {
 
     let result = query_main(
         &db,
-        "query coworkers() {\n    match {\n        $p: Person\n        $p worksat $c\n    }\n    return { $p.name, $c.name }\n}",
+        "query coworkers() {\n    match { $p: Person, $p worksat $c }\n    return { $p.name, $c.name }\n}",
         "coworkers",
         &ParamMap::new(),
     )
@@ -318,7 +318,7 @@ async fn legacy_vintage_graph_mutates_diffs_evolves_and_reopens() {
 
     let result = query_main(
         &db,
-        "query ids() {\n    match {\n        $p: Person\n        $p $w:worksat $c\n    }\n    return { $p.@id, $w.@src, $w.@dst }\n    order { $p.@id asc }\n}",
+        "query ids() {\n    match { $p: Person, $p $w:worksat $c }\n    return { $p.@id, $w.@src, $w.@dst }\n    order { $p.@id asc }\n}",
         "ids",
         &ParamMap::new(),
     )
@@ -366,7 +366,7 @@ async fn legacy_vintage_graph_mutates_diffs_evolves_and_reopens() {
 
     mutate_main(
         &db,
-        "query raise($name: String, $age: I32) {\n    $x: Person  $x.@id = $name\n    update $x set { age: $age }\n}",
+        "query raise($name: String, $age: I32) {\n    match { $x: Person } where $x.@id = $name\n    update $x set { age: $age }\n}",
         "raise",
         &{
             let mut params = ParamMap::new();
@@ -379,7 +379,7 @@ async fn legacy_vintage_graph_mutates_diffs_evolves_and_reopens() {
     .unwrap();
     mutate_main(
         &db,
-        "query fire($name: String) {\n    $x: Person  $x.@id = $name\n    delete $x\n}",
+        "query fire($name: String) {\n    match { $x: Person } where $x.@id = $name\n    delete $x\n}",
         "fire",
         &{
             let mut params = ParamMap::new();
@@ -563,7 +563,7 @@ edge WorksAt: Person -> Company {
     assert_eq!(reopened.catalog().system_columns.src, "src");
     let result = query_main(
         &reopened,
-        "query people() {\n    match {\n        $p: Person\n    }\n    return { $p.name }\n}",
+        "query people() {\n    match { $p: Person }\n    return { $p.name }\n}",
         "people",
         &ParamMap::new(),
     )
@@ -651,7 +651,7 @@ async fn legacy_endpoint_constraint_keeps_the_accepted_shape_hash(constraint: &s
     drop(db);
     let db = helpers::session(Omnigraph::open(uri).await.unwrap());
     let result = query_main(&db,
-        "query endpoints() { match { $p: Person\n        $p $e:knows $f } return { min($e.@src), max($e.@dst) } }",
+        "query endpoints() { match { $p: Person, $p $e:knows $f } return { min($e.@src), max($e.@dst) } }",
         "endpoints", &ParamMap::new()).await.unwrap();
     assert_eq!(
         collect_column_strings(result.batches(), "e.@src"),

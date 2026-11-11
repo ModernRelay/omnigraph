@@ -1491,10 +1491,8 @@ edge WorksAt: Person -> Company
 {"edge":"WorksAt","from":"Alice","to":"Acme"}"#;
     let query = r#"
 query company($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p worksAt $c
-    }
+    match { $p: Person, $p worksAt $c }
+    where $p.name = $name
     return { $c.name }
 }
 "#;
@@ -1615,10 +1613,8 @@ async fn null_values_in_filter_and_projection() {
     // Filter: age > 30 should exclude Bob (null) and Alice (30), keep Charlie (35)
     let queries = r#"
 query older_than_30() {
-    match {
-        $p: Person
-        $p.age > 30
-    }
+    match { $p: Person }
+    where $p.age > 30
     return { $p.name, $p.age }
     order { $p.age desc }
 }
@@ -1845,10 +1841,8 @@ node Item {
     // Query with filter — value > 490
     let queries = r#"
 query high_value() {
-    match {
-        $i: Item
-        $i.value > 490
-    }
+    match { $i: Item }
+    where $i.value > 490
     return { $i.name, $i.value }
     order { $i.value asc }
 }

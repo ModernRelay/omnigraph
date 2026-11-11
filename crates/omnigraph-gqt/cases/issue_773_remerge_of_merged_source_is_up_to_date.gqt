@@ -43,7 +43,7 @@ branch merge s
 
 --- mutate
 query delete_z() {
-    $x: Person  $x.name = "z"
+    match { $x: Person } where $x.name = "z"
     delete $x
 }
 

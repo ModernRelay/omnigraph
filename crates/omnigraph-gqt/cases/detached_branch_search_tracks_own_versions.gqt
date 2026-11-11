@@ -39,7 +39,7 @@ branch create work
 --- expect ok
 
 --- mutate branch: work
-query move_a($e: Vector(4)) { $x: Doc  $x.slug = "a"  update $x set { embedding: $e } }
+query move_a($e: Vector(4)) { match { $x: Doc } where $x.slug = "a"  update $x set { embedding: $e } }
 --- params
 {"e":[30.0,0.0,0.0,0.0]}
 --- expect affected: nodes=1 edges=0
@@ -77,7 +77,7 @@ query nearest_docs($q: Vector(4)) {
 d.slug: String
 
 --- mutate branch: work
-query delete_b() { $x: Doc  $x.slug = "b"  delete $x }
+query delete_b() { match { $x: Doc } where $x.slug = "b"  delete $x }
 --- expect affected: nodes=1 edges=0
 
 --- restart

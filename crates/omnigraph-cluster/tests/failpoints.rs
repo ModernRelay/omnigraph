@@ -30,7 +30,7 @@ node Person {
 
 const QUERY: &str = r#"
 query find_person($name: String) {
-  match { $p: Person { name: $name } }
+  match { $p: Person } where $p.name = $name
   return { $p.name, $p.age }
 }
 "#;

@@ -237,7 +237,7 @@ node Document {
 
         let deleted = db.mutate_with_receipt(
             "main",
-            "query del() { $x: Document  $x.slug != \"\"  delete $x }",
+            "query del() { match { $x: Document } where $x.slug != \"\"  delete $x }",
             "del",
             &ParamMap::new(),
         ).await.unwrap().commit.unwrap();
@@ -458,7 +458,7 @@ async fn changes_page_unproven_op_scan_term_grows_with_table_extent() {
             let deleted = db
                 .mutate_with_receipt(
                     "main",
-                    "query del() { $x: Person  $x.name = \"p00000\"  delete $x }",
+                    "query del() { match { $x: Person } where $x.name = \"p00000\"  delete $x }",
                     "del",
                     &ParamMap::new(),
                 )
@@ -1450,7 +1450,7 @@ async fn diff_of_a_column_patch_commit_takes_row_identity_issue_1264() {
             .graph_commit_id;
         db.mutate(
             "main",
-            "query bump() { $x: Doc  $x.age >= 32  update $x set { score: 3 } }",
+            "query bump() { match { $x: Doc } where $x.age >= 32  update $x set { score: 3 } }",
             "bump",
             &ParamMap::new(),
         )

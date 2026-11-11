@@ -1030,7 +1030,7 @@ async fn cross_branch_diff_detects_empty_string_to_null_update() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    body: String?\n}";
     const SET_BODY: &str = r#"
 query set_body($slug: String, $body: String) {
-    $x: Doc  $x.slug = $slug
+    match { $x: Doc } where $x.slug = $slug
     update $x set { body: $body }
 }
 "#;
@@ -1088,7 +1088,7 @@ async fn cross_branch_diff_detects_row_prefix_named_property_update() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    row_notes: String?\n}";
     const SET_NOTES: &str = r#"
 query set_notes($slug: String, $notes: String) {
-    $x: Doc  $x.slug = $slug
+    match { $x: Doc } where $x.slug = $slug
     update $x set { row_notes: $notes }
 }
 "#;
@@ -1358,7 +1358,7 @@ async fn change_feed_describes_ranged_external_blob_and_advances_past_it() {
     let db = helpers::session(db);
     db.mutate(
         "main",
-        "query drop_document($title: String) {\n    $x: Document  $x.title = $title\n    delete $x\n}\n",
+        "query drop_document($title: String) {\n    match { $x: Document } where $x.title = $title\n    delete $x\n}\n",
         "drop_document",
         &helpers::params(&[("$title", "ranged")]),
     )
@@ -2669,12 +2669,12 @@ node Ghost {
     .unwrap();
     let writes = r#"
 query set_note($name: String, $note: String) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     update $x set { note: $note }
 }
 
 query set_attachment($name: String, $attachment: Blob) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     update $x set { attachment: $attachment }
 }
 "#;

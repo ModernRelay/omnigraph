@@ -24,7 +24,7 @@ node Person {
 
 --- mutate
 query nested_comparison() {
-    $x: Person  ($x.age > 30) = true
+    match { $x: Person } where ($x.age > 30) = true
     update $x set { adult: true }
 }
 
@@ -32,7 +32,7 @@ query nested_comparison() {
 
 --- mutate
 query nested_null_test() {
-    $x: Person  ($x.nick is null) = true
+    match { $x: Person } where ($x.nick is null) = true
     update $x set { nick: "bee" }
 }
 
@@ -40,7 +40,7 @@ query nested_null_test() {
 
 --- mutate
 query nested_not() {
-    $x: Person  (not ($x.age > 30)) = true
+    match { $x: Person } where (not ($x.age > 30)) = true
     delete $x
 }
 

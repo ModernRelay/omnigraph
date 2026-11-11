@@ -2721,17 +2721,17 @@ fn update_patch_cost_rows(replay: &str) -> String {
     const WIDE_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    title: String?\n    content: Blob?\n    emb: Vector(2048)?\n}\n";
     const UPDATES: &str = r#"
 query patch() {
-    $x: Doc  $x.slug = "d1"
+    match { $x: Doc } where $x.slug = "d1"
     update $x set { score: 1 }
 }
 query rewrite() {
-    $x: Doc  $x.slug = "d1"
+    match { $x: Doc } where $x.slug = "d1"
     update $x set { score: 2 }
-    $x: Doc  $x.slug = "nobody"
+    match { $x: Doc } where $x.slug = "nobody"
     update $x set { score: 2 }
 }
 query widen($title: String) {
-    $x: Doc  $x.slug = "d1"
+    match { $x: Doc } where $x.slug = "d1"
     update $x set { title: $title }
 }
 "#;
@@ -2862,15 +2862,13 @@ query widen($title: String) {
 /// graph carries `commits` small update commits on main before the reopen.
 const WARM_READ_QUERIES: &str = r#"
 query get_person($name: String) {
-    match { $p: Person { name: $name } }
+    match { $p: Person } where $p.name = $name
     return { $p.name, $p.age }
 }
 
 query friends_of($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $q
-    }
+    match { $p: Person, $p knows $q }
+    where $p.name = $name
     return { $q.name }
 }
 "#;

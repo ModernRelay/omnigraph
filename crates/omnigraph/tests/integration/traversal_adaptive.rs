@@ -56,20 +56,16 @@ fn clique_jsonl(n: usize) -> String {
 
 const REACH_3: &str = r#"
 query reach($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows{1,3} $f
-    }
+    match { $p: Person, $p knows{1,3} $f }
+    where $p.name = $name
     return { $f.name }
 }
 "#;
 
 const REACH_3_CAPPED: &str = r#"
 query reach_capped($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows{1,3} $f
-    }
+    match { $p: Person, $p knows{1,3} $f }
+    where $p.name = $name
     return { $f.name }
     limit 10
 }
@@ -173,10 +169,8 @@ async fn adaptive_switch_from_a_later_seed_returns_identical_rows() {
 async fn adaptive_switch_undirected_returns_identical_rows() {
     const REACH_3_UNDIRECTED: &str = r#"
 query reach_u($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p <knows>{1,3} $f
-    }
+    match { $p: Person, $p <knows>{1,3} $f }
+    where $p.name = $name
     return { $f.name }
 }
 "#;
@@ -207,10 +201,8 @@ query reach_u($name: String) {
 async fn min_hops_gate_survives_the_switch() {
     const REACH_2_3: &str = r#"
 query far($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows{2,3} $f
-    }
+    match { $p: Person, $p knows{2,3} $f }
+    where $p.name = $name
     return { $f.name }
 }
 "#;
@@ -285,10 +277,8 @@ async fn capped_unordered_limit_returns_valid_subset() {
 async fn cap_above_answer_size_returns_everything() {
     const REACH_BIG_LIMIT: &str = r#"
 query reach_big($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows{1,3} $f
-    }
+    match { $p: Person, $p knows{1,3} $f }
+    where $p.name = $name
     return { $f.name }
     limit 100000
 }

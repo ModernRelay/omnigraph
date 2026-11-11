@@ -57,10 +57,7 @@ tables:
 
 --- query
 query cites() {
-    match {
-        $a: Doc
-        $a cites $b
-    }
+    match { $a: Doc, $a cites $b }
     return { $a.slug, $b.slug }
 }
 --- expect unordered

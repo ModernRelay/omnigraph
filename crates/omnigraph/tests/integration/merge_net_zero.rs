@@ -45,17 +45,17 @@ node Document {
 
 const ADOPT_EQUALITY_QUERIES: &str = r#"
 query set_note($slug: String, $note: String) {
-    $x: Document  $x.slug = $slug
+    match { $x: Document } where $x.slug = $slug
     update $x set { note: $note }
 }
 
 query move_separator($slug: String, $first: String, $second: String) {
-    $x: Document  $x.slug = $slug
+    match { $x: Document } where $x.slug = $slug
     update $x set { first: $first, second: $second }
 }
 
 query set_near_miss_row_property($slug: String, $value: String) {
-    $x: Document  $x.slug = $slug
+    match { $x: Document } where $x.slug = $slug
     update $x set { row_id: $value }
 }
 "#;
@@ -236,7 +236,7 @@ node Document {
 "#;
     const QUERIES: &str = r#"
 query set_note($title: String, $note: String) {
-    $x: Document  $x.title = $title
+    match { $x: Document } where $x.title = $title
     update $x set { note: $note }
 }
 "#;
@@ -429,7 +429,7 @@ node Document {
 "#;
     const QUERIES: &str = r#"
 query replace_content($title: String, $content: Blob) {
-    $x: Document  $x.title = $title
+    match { $x: Document } where $x.title = $title
     update $x set { content: $content }
 }
 "#;

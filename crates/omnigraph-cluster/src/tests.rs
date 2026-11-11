@@ -21,7 +21,7 @@ node Person {
 
 const QUERY: &str = r#"
 query find_person($name: String) {
-  match { $p: Person { name: $name } }
+  match { $p: Person } where $p.name = $name
   return { $p.name, $p.age }
 }
 "#;
@@ -3603,7 +3603,7 @@ fn queries_directory_discovers_every_declaration() {
     fs::create_dir(dir.path().join("queries")).unwrap();
     fs::write(
             dir.path().join("queries/people.gq"),
-            "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n\nquery all_people() {\n  match { $p: Person }\n  return { $p.name }\n}\n",
+            "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n\nquery all_people() {\n  match { $p: Person }\n  return { $p.name }\n}\n",
         )
         .unwrap();
     fs::write(
@@ -3777,7 +3777,7 @@ fn queries_list_and_single_file_forms_discover() {
     .unwrap();
     fs::write(
             dir.path().join("a.gq"),
-            "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+            "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
         )
         .unwrap();
     fs::write(
@@ -3827,7 +3827,7 @@ fn query_discovery_rejects_duplicates_and_parse_errors() {
         "\nnode Person {\n  name: String @key\n}\n",
     )
     .unwrap();
-    let decl = "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n";
+    let decl = "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n";
     fs::write(dir.path().join("a.gq"), decl).unwrap();
     fs::write(dir.path().join("b.gq"), decl).unwrap();
     fs::write(

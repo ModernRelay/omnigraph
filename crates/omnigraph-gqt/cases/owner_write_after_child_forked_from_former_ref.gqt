@@ -25,7 +25,7 @@ branch create feature
 
 --- mutate branch: feature
 query feature_write() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 31 }
 }
 
@@ -43,7 +43,7 @@ branch merge feature
 
 --- mutate
 query main_write() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 32 }
 }
 
@@ -63,7 +63,7 @@ query child_writes() {
 
 --- mutate branch: feature
 query owner_writes_after_child_wrote() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 34 }
 }
 
@@ -127,7 +127,7 @@ branch delete child
 
 --- mutate branch: feature
 query owner_writes_after_child_deleted() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 35 }
 }
 

@@ -32,7 +32,7 @@ branch create x
 
 --- mutate branch: x
 query set_a_on_x() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 1 }
 }
 
@@ -50,7 +50,7 @@ branch delete x
 
 --- mutate branch: s
 query set_b_on_s() {
-    $x: Person  $x.name = "b"
+    match { $x: Person } where $x.name = "b"
     update $x set { age: 1 }
 }
 

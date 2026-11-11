@@ -30,10 +30,7 @@ edge Knows: Person -> Person
 --- query
 set engine = v2;
 query one_hop() {
-    match {
-        $a: Person
-        $a knows $b
-    }
+    match { $a: Person, $a knows $b }
     return { $b.name }
 }
 --- expect unordered
@@ -48,10 +45,7 @@ expand $a Knows $b: mode indexed_scan ran indexed_scan
 --- query
 set engine = v2;
 query two_hops() {
-    match {
-        $a: Person
-        $a knows{1,2} $b
-    }
+    match { $a: Person, $a knows{1,2} $b }
     return { $b.name }
 }
 --- expect unordered
@@ -66,10 +60,7 @@ expand $a Knows $b: mode csr ran csr
 --- query
 set engine = v2;
 query one_hop() {
-    match {
-        $a: Person
-        $a knows $b
-    }
+    match { $a: Person, $a knows $b }
     return { $b.name }
 }
 --- expect unordered

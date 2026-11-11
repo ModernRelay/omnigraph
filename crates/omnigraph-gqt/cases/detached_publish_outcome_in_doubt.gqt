@@ -45,7 +45,7 @@ p.name: String
 
 --- query
 query edge_exactly_once() {
-    match { $p: Person $p $e:knows $q }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 --- expect unordered
@@ -71,7 +71,7 @@ p.name: String
 
 --- query
 query durable_edge_exactly_once() {
-    match { $p: Person $p $e:knows $q }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 --- expect unordered

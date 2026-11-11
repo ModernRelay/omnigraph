@@ -79,7 +79,7 @@ node Doc { slug: String @key n: I64 @index embedding: Vector(4) @index }
 --- query
 set ann_nprobes = 1;
 query nearest_matching_rows($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc $d.n > 3 } return { $d } }, $d.embedding, $q, k: 3) }
+    match { from nearest({ match { $d: Doc } where $d.n > 3 return { $d } }, $d.embedding, $q, k: 3) }
     return { $d.slug }
     order { $distance }
     limit 3

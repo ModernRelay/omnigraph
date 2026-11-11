@@ -80,7 +80,7 @@ edge Likes: Person -> Doc
 "#;
 
 const QUERY: &str = r#"query liked() {
-    match { $p: Person  $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, $d.title }
     order { $p.name, $d.title }
 }"#;

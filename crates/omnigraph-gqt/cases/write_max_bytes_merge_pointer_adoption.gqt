@@ -33,7 +33,7 @@ branch create feature;
 
 --- mutate
 query lengthen() {
-    $x: Doc  $x.slug = "w"
+    match { $x: Doc } where $x.slug = "w"
     update $x set { note: "long" }
 }
 

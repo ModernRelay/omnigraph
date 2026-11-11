@@ -177,7 +177,7 @@ fn selection(name: &str, input: &Term) -> Result<Option<(String, IRExpr)>> {
             _ => {
                 return Err(unsupported(
                     name,
-                    "a write group whose clauses are more than a filtered scan of the target",
+                    "a write group whose selection is more than a filtered scan of the target",
                 ));
             }
         }

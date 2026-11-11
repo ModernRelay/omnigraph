@@ -187,14 +187,14 @@ async fn planning_cost_key_lookup_at_200k_rows_is_within_twice_identity_lookup()
     let keyed = run(
         &view.snapshot,
         &catalog,
-        "query lookup($value: String) { match { $p: Person $p.slug = $value } return { $p.slug } }",
+        "query lookup($value: String) { match { $p: Person } where $p.slug = $value return { $p.slug } }",
         &params,
     )
     .await;
     let identity = run(
         &view.snapshot,
         &catalog,
-        "query lookup($value: String) { match { $p: Person $p.@id = $value } return { $p.slug } }",
+        "query lookup($value: String) { match { $p: Person } where $p.@id = $value return { $p.slug } }",
         &params,
     )
     .await;
@@ -225,7 +225,7 @@ async fn planning_cost_key_lookup_at_200k_rows_is_within_twice_identity_lookup()
     let sequential = run_with_access(
         &view.snapshot,
         &catalog,
-        "query lookup($value: String) { match { $p: Person $p.slug = $value } return { $p.slug } }",
+        "query lookup($value: String) { match { $p: Person } where $p.slug = $value return { $p.slug } }",
         &params,
         true,
     )
@@ -243,7 +243,7 @@ async fn persisted_historical_key_spellings_are_never_narrowed_to_current_ids() 
         (
             "day: Date @key",
             HashMap::from([("day", Arc::new(Date32Array::from(vec![19723])) as ArrayRef)]),
-            "query lookup($value: Date) { match { $p: Person $p.day = $value } return { $p.@id as id } }",
+            "query lookup($value: Date) { match { $p: Person } where $p.day = $value return { $p.@id as id } }",
             ParamMap::from([("value".into(), Literal::Date("2024-01-01".into()))]),
             "2024-01-01",
         ),
@@ -253,7 +253,7 @@ async fn persisted_historical_key_spellings_are_never_narrowed_to_current_ids() 
                 "score",
                 Arc::new(Float32Array::from(vec![16_777_216.0])) as ArrayRef,
             )]),
-            "query lookup($value: F32) { match { $p: Person $p.score = $value } return { $p.@id as id } }",
+            "query lookup($value: F32) { match { $p: Person } where $p.score = $value return { $p.@id as id } }",
             ParamMap::from([("value".into(), Literal::Float(16_777_216.0))]),
             "16777217",
         ),
@@ -266,7 +266,7 @@ async fn persisted_historical_key_spellings_are_never_narrowed_to_current_ids() 
                 ),
                 ("slot", Arc::new(Int64Array::from(vec![7])) as ArrayRef),
             ]),
-            "query lookup() { match { $p: Person { tenant: \"acme\", slot: 7 } } return { $p.@id as id } }",
+            "query lookup() { match { $p: Person } where $p.tenant = \"acme\" and $p.slot = 7 return { $p.@id as id } }",
             ParamMap::new(),
             "7",
         ),

@@ -33,7 +33,7 @@ load validate edge_ri edge:Knows from Person: access scan
 load validate edge_ri edge:Knows to Person: access scan
 
 --- query
-query loaded() { match { $a: Person $a knows $b } return { count($b) as n } }
+query loaded() { match { $a: Person, $a knows $b } return { count($b) as n } }
 --- expect unordered
 {"n": 1}
 --- expect shape

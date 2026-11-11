@@ -25,11 +25,8 @@ node Matter {
 --- query
 set engine = v2;
 query cites() {
-    match {
-        $p: Paper
-        $m: Matter
-        contains($p.text, $m.number)
-    }
+    match { $p: Paper, $m: Matter }
+    where contains($p.text, $m.number)
     return { $p.slug, $m.number }
 }
 --- expect unordered
@@ -44,10 +41,7 @@ pipeline 1: Scan -> ContainsJoin(probe) -> Projection => consumer after 0
 --- query
 set engine = v2;
 query pairs() {
-    match {
-        $p: Paper
-        $m: Matter
-    }
+    match { $p: Paper, $m: Matter }
     return { $p.slug, $m.number }
 }
 --- expect unordered

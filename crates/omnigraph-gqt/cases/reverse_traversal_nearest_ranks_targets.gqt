@@ -66,10 +66,9 @@ edge Knows: Doc -> Doc {
 
 --- query
 query nearest_edge_targets($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc
-        $t knows $d
-    } return { $d, $t } }, $d.embedding, $q, k: 2) }
+    match {
+      from nearest({ match { $d: Doc, $t knows $d } return { $d, $t } }, $d.embedding, $q, k: 2),
+    }
     return { $d.slug }
     order { $distance }
     limit 2

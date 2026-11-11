@@ -24,7 +24,7 @@ node Thing {
 
 --- query
 query thing_by_id($id: String) {
-    match { $t: Thing { id: $id } }
+    match { $t: Thing } where $t.id = $id
     return { $t.id, $t.name }
 }
 
@@ -40,7 +40,7 @@ t.name: String?
 
 --- query
 query thing_by_id_without_params($id: String) {
-    match { $t: Thing { id: $id } }
+    match { $t: Thing } where $t.id = $id
     return { $t.id }
 }
 
@@ -48,7 +48,7 @@ query thing_by_id_without_params($id: String) {
 
 --- query
 query thing_by_id_with_empty_params($id: String) {
-    match { $t: Thing { id: $id } }
+    match { $t: Thing } where $t.id = $id
     return { $t.id }
 }
 
@@ -59,7 +59,7 @@ query thing_by_id_with_empty_params($id: String) {
 
 --- query
 query thing_by_id_with_null($id: String) {
-    match { $t: Thing { id: $id } }
+    match { $t: Thing } where $t.id = $id
     return { $t.id }
 }
 
@@ -70,7 +70,7 @@ query thing_by_id_with_null($id: String) {
 
 --- mutate
 query delete_thing_by_id_without_params($id: String) {
-    $x: Thing  $x.id = $id
+    match { $x: Thing } where $x.id = $id
     delete $x
 }
 
@@ -78,7 +78,7 @@ query delete_thing_by_id_without_params($id: String) {
 
 --- mutate
 query rename_thing_by_id_with_empty_params($id: String, $name: String) {
-    $x: Thing  $x.id = $id
+    match { $x: Thing } where $x.id = $id
     update $x set { name: $name }
 }
 
@@ -96,7 +96,7 @@ query insert_thing_without_params($id: String) {
 
 --- mutate
 query unused_required_mutation_param($unused: I32) {
-    $x: Thing  $x.id = "missing"
+    match { $x: Thing } where $x.id = "missing"
     update $x set { name: "changed" }
 }
 
@@ -119,7 +119,7 @@ t.name: String?
 
 --- query
 query things_by_name_omitted_nullable($name: String?) {
-    match { $t: Thing { name: $name } }
+    match { $t: Thing } where $t.name = $name
     return { $t.id }
 }
 

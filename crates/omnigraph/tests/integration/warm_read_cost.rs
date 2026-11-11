@@ -2729,9 +2729,9 @@ async fn an_unlowered_declaration_is_refused_before_any_storage_access() {
         let dir = tempfile::tempdir().unwrap();
         init_and_load(&dir).await;
         let db = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
-        let read = "query friends($name: String) { match { $p: Person { name: $name }  optional { $p knows $f } } return { $p.name } }";
-        let write = "query rename($name: String) { $p: Person { name: $name }  $p knows $f  update $f set { age: 1 } }";
-        let ill_typed = "query q() { match { $p: Person  $p.name + 1 > 0 } return { $p.name } }";
+        let read = "query friends($name: String) { match { $p: Person, optional { $p knows $f } } where $p.name = $name return { $p.name } }";
+        let write = "query rename($name: String) { match { $p: Person, $p knows $f } where $p.name = $name  update $f set { age: 1 } }";
+        let ill_typed = "query q() { match { $p: Person } where $p.name + 1 > 0 return { $p.name } }";
         let cases = [
             (
                 measure(db.query(

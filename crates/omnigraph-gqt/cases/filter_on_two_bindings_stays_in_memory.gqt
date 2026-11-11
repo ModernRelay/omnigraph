@@ -23,11 +23,8 @@ node Doc {
 
 --- query
 query same_state_pairs() {
-    match {
-        $a: Doc
-        $b: Doc
-        $a.state = $b.state
-    }
+    match { $a: Doc, $b: Doc }
+    where $a.state = $b.state
     return { $a.slug, $b.slug }
 }
 

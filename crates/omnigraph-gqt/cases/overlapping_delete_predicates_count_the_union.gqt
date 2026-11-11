@@ -31,11 +31,11 @@ edge Knows: Person -> Person
 
 --- mutate
 query delete_three_overlapping($threshold: I32) {
-    $x: Person  $x.team = "red"
+    match { $x: Person } where $x.team = "red"
     delete $x
-    $x: Person  $x.age > $threshold
+    match { $x: Person } where $x.age > $threshold
     delete $x
-    $x: Person  $x.name = "Alice"
+    match { $x: Person } where $x.name = "Alice"
     delete $x
 }
 
@@ -58,7 +58,7 @@ p.name: String
 
 --- query
 query remaining_edges() {
-    match { $a: Person  $a knows $b }
+    match { $a: Person, $a knows $b }
     return { $a.name, $b.name }
 }
 

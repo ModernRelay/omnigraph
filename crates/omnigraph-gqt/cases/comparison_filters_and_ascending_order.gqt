@@ -42,10 +42,8 @@ p.age: I32?
 
 --- query
 query young($age: I32) {
-    match {
-        $p: Person
-        $p.age < $age
-    }
+    match { $p: Person }
+    where $p.age < $age
     return { $p.name, $p.age }
     order { $p.age asc }
 }
@@ -62,10 +60,8 @@ p.age: I32?
 
 --- query
 query at_least_30() {
-    match {
-        $p: Person
-        $p.age >= 30
-    }
+    match { $p: Person }
+    where $p.age >= 30
     return { $p.name }
     order { $p.age asc }
 }
@@ -79,10 +75,8 @@ p.name: String
 
 --- query
 query at_most_28() {
-    match {
-        $p: Person
-        $p.age <= 28
-    }
+    match { $p: Person }
+    where $p.age <= 28
     return { $p.name }
     order { $p.age asc }
 }
@@ -96,10 +90,8 @@ p.name: String
 
 --- query
 query not_alice() {
-    match {
-        $p: Person
-        $p.name != "Alice"
-    }
+    match { $p: Person }
+    where $p.name != "Alice"
     return { $p.name }
     order { $p.name asc }
 }

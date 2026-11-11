@@ -24,13 +24,13 @@ edge SegmentOf: Segment -> Artifact
 
 const QUERIES: &str = r#"
 query segment_counts() {
-    match { $s: Segment $s segmentOf $t }
+    match { $s: Segment, $s segmentOf $t }
     return { $t.slug, count($s) as segments }
     order { segments desc }
     limit 10
 }
 query requested_payload() {
-    match { $s: Segment $s segmentOf $t }
+    match { $s: Segment, $s segmentOf $t }
     return { $t.content }
 }
 "#;

@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::helpers::*;
 
 const WILDCARD_LIKES_QUERY: &str = r#"query selected() {
-    match { $p: Person $d: Doc $p $e:* $d }
+    match { $p: Person, $d: Doc, $p $e:* $d }
     return { $p.name as person, $d.title as title, $e.@type as edge_type }
     order { $p.name, $d.title, $e.@type }
 }"#;
@@ -43,7 +43,7 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
     let destinations = query_main(
         &db,
         r#"query destinations() {
-            match { $p: Person $p.name != "hub" }
+            match { $p: Person } where $p.name != "hub"
             return { $p.name as name, $p.@id as id }
         }"#,
         "destinations",
@@ -67,7 +67,7 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
     db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
     db.ensure_indices().await.unwrap();
     let query = r#"query selected_page() {
-        match { let $all = { match { $p: Person } return { $p } }  from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "needle needle"), k: 60) $p: Person $p $e:(knows | likes) $q }
+        match { let $all = { match { $p: Person } return { $p } }, from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "needle needle"), k: 60), $p: Person, $p $e:(knows | likes) $q }
         return { $e.@type as edge_type, $e.@id as edge_id, $q.name as target }
         order { $score desc }
         limit 1
@@ -325,7 +325,7 @@ async fn selected_cold_indexed_route_uses_persisted_members_without_building_csr
     let csr = probes.expand_csr_runs.clone();
     let switches = probes.traversal_mid_switches.clone();
     let builds = probes.graph_build_count.clone();
-    let query = r#"query selected() { match { $p: Person $p (bookmarks | likes) $d } return { $p.name, $d.title } }"#;
+    let query = r#"query selected() { match { $p: Person, $p (bookmarks | likes) $d } return { $p.name, $d.title } }"#;
     let run = with_query_io_probes(
         probes,
         db.query_inspected("main", query, "selected", &ParamMap::new()),
@@ -366,7 +366,7 @@ async fn limit_stops_selected_traversal_before_admitting_later_source_windows_is
         .unwrap();
     let cap = 8_192 + sources + 8_192;
     let query = format!(
-        "set traversal_work_limit = {cap}; query selected() {{ match {{ $p: Person $p (knows | knows) $q }} return {{ $q.@id }} limit 1 }}"
+        "set traversal_work_limit = {cap}; query selected() {{ match {{ $p: Person, $p (knows | knows) $q }} return {{ $q.@id }} limit 1 }}"
     );
     let probes = QueryMemoryProbes::default();
     let limited = with_query_memory_probes(
@@ -491,17 +491,17 @@ const PEOPLE_SEED: &[&str] = &[
 
 const PEOPLE_QUERIES: &str = r#"
 query liked() {
-    match { $p: Person $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, $d.title }
     order { $p.name, $d.title }
 }
 query first_liked() {
-    match { $p: Person $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, $d.title }
     limit 1
 }
 query likes_nothing() {
-    match { $p: Person not { $p likes $d } }
+    match { $p: Person } where not exists { $p likes $d }
     return { $p.name }
 }
 query none_ordered() {
@@ -536,22 +536,21 @@ edge Knows: Doc -> Doc
 
 const DOC_QUERIES: &str = r#"
 query nearest_with_edge($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc
-        $d knows $t
-    } return { $d, $t } }, $d.embedding, $q, k: 3) }
+    match {
+      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
+    }
     return { $d.slug }
     order { $distance }
     limit 3
 }
 query fused($t: String, $q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60), $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 3
 }
 query fused_vectors($q: Vector(4), $r: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $r, k: 3), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $r, k: 3), k: 60), $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 3
@@ -582,12 +581,8 @@ const CITATION_SEED: &[&str] = &[
 
 const CITATION_QUERIES: &str = r#"
 query cited() {
-    match {
-        $m: Matter
-        $p: Passage
-        contains($p.text, $m.number)
-        $m.mid != $p.pid
-    }
+    match { $m: Matter, $p: Passage }
+    where contains($p.text, $m.number) and $m.mid != $p.pid
     return { $m.mid, $p.pid }
     order { $m.mid, $p.pid }
 }
@@ -783,7 +778,7 @@ async fn legacy_two_hop_plan_corrects_assumed_coverage_before_execution() {
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
     let query = r#"query two_hops() {
-        match { $a: Doc { slug: "d00" } $a knows{1,2} $b }
+        match { $a: Doc, $a knows{1,2} $b } where $a.slug = "d00"
         return { $b.slug }
     }"#;
     let run = db
@@ -1372,7 +1367,7 @@ async fn a_read_reports_its_ranking() {
 
     const RANKED: &str = r#"
 query two_texts($a: String, $b: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $a), bm25($all, $d.text, $b), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $a), bm25($all, $d.text, $b), k: 60), $d: Doc }
     return {
         $d.slug,
         $score as fused,
@@ -1774,7 +1769,7 @@ async fn a_plan_refusal_is_a_typed_bad_request_and_a_ranked_destination_replays_
     let db = docs(&dir).await;
     let source = r#"
 query nearest_destination($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc $d knows $t } return { $d, $t } }, $t.embedding, $q, k: 1) }
+    match { from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $t.embedding, $q, k: 1) }
     return { $t.slug }
     order { $distance }
     limit 1
@@ -1817,7 +1812,7 @@ query nearest_destination($q: Vector(4)) {
     // target would be a pair.
     for (name, first, second) in [("d_first", "$d", "$t"), ("t_first", "$t", "$d")] {
         let source = format!(
-            "query {name}() {{\n    match {{ from rrf(bm25({{ match {{ $d: Doc }} return {{ $d }} }}, $d.text, \"needle\"), bm25({{ match {{ $t: Doc }} return {{ $t }} }}, $t.text, \"needle\"))  {first}: Doc {second}: Doc $d knows $t }}\n    return {{ $d.slug, $t.slug }}\n    order {{ $score desc }}\n    limit 1\n}}\n"
+            "query {name}() {{\n    match {{ from rrf(bm25({{ match {{ $d: Doc }} return {{ $d }} }}, $d.text, \"needle\"), bm25({{ match {{ $t: Doc }} return {{ $t }} }}, $t.text, \"needle\")), {first}: Doc, {second}: Doc, $d knows $t }}\n    return {{ $d.slug, $t.slug }}\n    order {{ $score desc }}\n    limit 1\n}}\n"
         );
         let refused = db
             .query(ReadTarget::branch("main"), &source, name, &ParamMap::new())
@@ -1840,7 +1835,7 @@ query nearest_destination($q: Vector(4)) {
     let csr = with_traversal(&db, omnigraph_compiler::settings::Traversal::Csr);
     let wildcard = r#"
 query wildcard() {
-    match { $a: Doc $b: Doc $a * $b }
+    match { $a: Doc, $b: Doc, $a * $b }
     return { $b.slug }
 }
 "#;
@@ -2122,7 +2117,7 @@ async fn sibling_detached_edge_pins_refuse_traversal_plan_replay() {
 #[tokio::test]
 async fn an_exact_subset_member_replays_only_with_its_derivation() {
     const SOURCE: &str = r#"query elders($min: I64) {
-    match { $p: Person $p.age >= $min }
+    match { $p: Person } where $p.age >= $min
     return { $p.name, $p.age as age }
     order { $p.age desc }
     limit 2
@@ -2220,7 +2215,7 @@ async fn an_envelope_of_another_version_asks_for_the_query_again() {
 #[tokio::test]
 async fn a_replay_rechecks_recorded_full_text_coverage() {
     const SOURCE: &str = r#"query recent($t: String) {
-    match { from bm25({ match { $d: Doc $d.year >= 2000 } return { $d } }, $d.text, $t) }
+    match { from bm25({ match { $d: Doc } where $d.year >= 2000 return { $d } }, $d.text, $t) }
     return { $d.slug, $score as score }
     order { $score desc }
 }"#;
@@ -2437,15 +2432,15 @@ async fn saved_property_leaf_types_refuse_drift_before_pushdown_or_empty_input()
     let db = people(&dir).await;
     let queries = r#"
 query pushed() {
-    match { $p: Person $p.age > 35 }
+    match { $p: Person } where $p.age > 35
     return { $p.name }
 }
 query no_matches() {
-    match { $p: Person $p.age > 100 }
+    match { $p: Person } where $p.age > 100
     return { $p.name }
 }
 query skipped() {
-    match { $p: Person $p.age > 35 }
+    match { $p: Person } where $p.age > 35
     return { $p.name }
     limit 0
 }
@@ -2551,7 +2546,7 @@ async fn saved_count_variable_types_refuse_drift_with_metadata_or_empty_aggregat
     let dir = tempfile::tempdir().unwrap();
     let db = people(&dir).await;
     let empty = r#"query empty_count() {
-        match { $p: Person $p.age > 100 }
+        match { $p: Person } where $p.age > 100
         return { count($p) as n }
     }"#;
     for (source, name, kind) in [
@@ -2678,7 +2673,7 @@ async fn saved_temporal_params_keep_fresh_shape_refusals_on_empty_input() {
     ] {
         for predicate in ["$p.age > 0", "$p.age > 100"] {
             let source = format!(
-                "query temporal($values: {type_name}) {{ match {{ $p: Person {predicate} }} return {{ $values as values }} }}"
+                "query temporal($values: {type_name}) {{ match {{ $p: Person }} where {predicate} return {{ $values as values }} }}"
             );
             let params = ParamMap::from([("values".into(), Literal::List(vec![valid.clone()]))]);
             let run = db

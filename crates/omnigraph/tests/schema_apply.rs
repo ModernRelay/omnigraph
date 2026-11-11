@@ -25,7 +25,7 @@ async fn warmed_wildcard_rechecks_members_after_schema_apply_issue_659() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let source = r#"query neighbor_since() {
-        match { $p: Person { name: "Alice" } $f: Person $p $e:* $f }
+        match { $p: Person, $f: Person, $p $e:* $f } where $p.name = "Alice"
         return { $f.name, $e.since }
     }"#;
     assert_eq!(
@@ -2041,12 +2041,12 @@ node Tag {
     .unwrap();
     let writes = r#"
 query set_summary($title: String, $summary: String) {
-    $x: Document  $x.title = $title
+    match { $x: Document } where $x.title = $title
     update $x set { summary: $summary }
 }
 
 query set_strength($name: String, $strength: I32) {
-    $x: Tag  $x.name = $name
+    match { $x: Tag } where $x.name = $name
     update $x set { strength: $strength }
 }
 "#;
@@ -2068,26 +2068,20 @@ query set_strength($name: String, $strength: I32) {
     .unwrap();
     let reads = r#"
 query scored($min: I32) {
-    match {
-        $d: Document
-        $d.score >= $min
-    }
+    match { $d: Document }
+    where $d.score >= $min
     return { $d.title }
 }
 
 query summarized() {
-    match {
-        $d: Document
-        $d.summary != ""
-    }
+    match { $d: Document }
+    where $d.summary != ""
     return { $d.title }
 }
 
 query strong($min: I32) {
-    match {
-        $t: Tag
-        $t.strength >= $min
-    }
+    match { $t: Tag }
+    where $t.strength >= $min
     return { $t.name }
 }
 "#;
@@ -3253,7 +3247,7 @@ async fn full_text_analyzer_survives_schema_evolution_issue_904() {
         let db = &db;
         async move {
             let source = format!(
-                "query docs($q: String) {{ match {{ $d: Doc search($d.{column}, $q) }} return {{ $d.slug }} }}"
+                "query docs($q: String) {{ match {{ $d: Doc }} where search($d.{column}, $q) return {{ $d.slug }} }}"
             );
             first_column_sorted(
                 &query_main(db, &source, "docs", &params(&[("q", "deep")]))
@@ -4010,7 +4004,7 @@ async fn issue_721_deleted_null_row_is_purged_by_promotion() {
             .unwrap();
         mutate_main(
             &db,
-            "query rm($slug: String) { $x: Decision  $x.slug = $slug  delete $x }",
+            "query rm($slug: String) { match { $x: Decision } where $x.slug = $slug  delete $x }",
             "rm",
             &params(&[("slug", "gone")]),
         )

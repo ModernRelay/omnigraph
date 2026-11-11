@@ -33,7 +33,7 @@ query w() {
 --- expect ok
 
 --- query
-query n_knows() { match { $a: Person $a knows $b } return { count($b) as n } }
+query n_knows() { match { $a: Person, $a knows $b } return { count($b) as n } }
 --- expect unordered
 {"n":1}
 

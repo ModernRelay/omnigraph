@@ -20,9 +20,7 @@ node Pair {
 
 --- query
 query same_alias_twice() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.name as value, $a.num as value }
 }
 
@@ -30,9 +28,7 @@ query same_alias_twice() {
 
 --- query
 query same_property_twice() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.num, $a.num }
 }
 
@@ -40,9 +36,7 @@ query same_property_twice() {
 
 --- query
 query two_literals() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { 1, 2 }
 }
 
@@ -50,9 +44,7 @@ query two_literals() {
 
 --- query
 query alias_named_like_a_literal() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.num as literal, 2 }
 }
 
@@ -60,9 +52,7 @@ query alias_named_like_a_literal() {
 
 --- query
 query property_and_aggregate_over_it() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.name, count($a.name) }
 }
 
@@ -70,10 +60,7 @@ query property_and_aggregate_over_it() {
 
 --- query
 query variable_and_alias_named_like_it() {
-    match {
-        $a: Pair
-        $b: Pair
-    }
+    match { $a: Pair, $b: Pair }
     return { $a, $b.name as a }
 }
 
@@ -81,9 +68,7 @@ query variable_and_alias_named_like_it() {
 
 --- query
 query parameter_and_alias_named_like_it($x: I64) {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $x, $a.name as x }
 }
 
@@ -94,9 +79,7 @@ query parameter_and_alias_named_like_it($x: I64) {
 
 --- query
 query two_aggregates_one_alias() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { count($a) as n, sum($a.num) as n }
 }
 
@@ -104,9 +87,7 @@ query two_aggregates_one_alias() {
 
 --- query
 query third_occurrence() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.name as v, $a.num as w, $a.name as v }
 }
 
@@ -114,9 +95,7 @@ query third_occurrence() {
 
 --- query
 query distinct_aliases() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.name as who, $a.num as how_many }
 }
 
@@ -129,9 +108,7 @@ how_many: I64
 
 --- query
 query property_and_aliased_aggregate() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.name, count($a.num) as n }
 }
 
@@ -144,9 +121,7 @@ n: I64
 
 --- query
 query two_aliased_literals() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { 1 as one, 2 as two }
 }
 

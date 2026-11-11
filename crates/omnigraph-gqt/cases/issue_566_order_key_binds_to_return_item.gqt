@@ -50,7 +50,7 @@ edge RelevantMarket: Deal -> Market {}
 --- query
 set engine = v2;
 query per_market($slug: String) {
-    match { $p: Person { slug: $slug }  $d: Deal  $d ledByPerson $p  $d relevantMarket $m }
+    match { $p: Person, $d: Deal, $d ledByPerson $p, $d relevantMarket $m } where $p.slug = $slug
     return { $m.name, count($d) as deals }
     order { count($d) desc }
     limit 25
@@ -70,7 +70,7 @@ deals: I64
 --- query
 set engine = v2;
 query top_market($slug: String) {
-    match { $p: Person { slug: $slug }  $d: Deal  $d ledByPerson $p  $d relevantMarket $m }
+    match { $p: Person, $d: Deal, $d ledByPerson $p, $d relevantMarket $m } where $p.slug = $slug
     return { $m.name, count($d) as deals }
     order { count($d) desc }
     limit 1
@@ -89,7 +89,7 @@ deals: I64
 --- query
 set engine = v2;
 query smallest_market_unaliased($slug: String) {
-    match { $p: Person { slug: $slug }  $d: Deal  $d ledByPerson $p  $d relevantMarket $m }
+    match { $p: Person, $d: Deal, $d ledByPerson $p, $d relevantMarket $m } where $p.slug = $slug
     return { $m.name, count($d) }
     order { count($d) }
     limit 1
@@ -108,7 +108,7 @@ d: I64
 --- query
 set engine = v2;
 query per_market_by_max() {
-    match { $d: Deal  $d relevantMarket $m }
+    match { $d: Deal, $d relevantMarket $m }
     return { $m.name, count($d) as deals }
     order { max($d.amount) }
 }

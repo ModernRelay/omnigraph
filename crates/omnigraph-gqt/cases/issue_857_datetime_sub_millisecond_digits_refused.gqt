@@ -19,17 +19,17 @@ node Event { name: String @key at: DateTime }
 {"type":"Event","data":{"name":"a","at":"2024-01-01T00:00:00.123Z"}}
 
 --- query
-query at_param($t: DateTime) { match { $e: Event $e.at = $t } return { $e.name } }
+query at_param($t: DateTime) { match { $e: Event } where $e.at = $t return { $e.name } }
 --- params
 {"t": "2024-01-01T00:00:00.123456Z"}
 --- expect error: param 't': invalid DateTime literal '2024-01-01T00:00:00.123456Z': a DateTime has millisecond precision; fractional-second digits past the third must be zero
 
 --- query
-query at_literal() { match { $e: Event $e.at = datetime("2024-01-01T00:00:00.123456Z") } return { $e.name } }
+query at_literal() { match { $e: Event } where $e.at = datetime("2024-01-01T00:00:00.123456Z") return { $e.name } }
 --- expect error: invalid DateTime literal '2024-01-01T00:00:00.123456Z'
 
 --- query
-query zero_padded($us: DateTime, $ns: DateTime) { match { $e: Event $e.at = $us $e.at = $ns } return { $e.name } }
+query zero_padded($us: DateTime, $ns: DateTime) { match { $e: Event } where $e.at = $us and $e.at = $ns return { $e.name } }
 --- params
 {"us": "2024-01-01T00:00:00.123000Z", "ns": "2024-01-01T05:00:00.123000000+05:00"}
 --- expect unordered
@@ -38,17 +38,17 @@ query zero_padded($us: DateTime, $ns: DateTime) { match { $e: Event $e.at = $us 
 e.name: String
 
 --- query
-query at_now() { match { $e: Event $e.at = now() } return { $e.name } }
+query at_now() { match { $e: Event } where $e.at = now() return { $e.name } }
 --- params
 {"__nanograph_now": "2024-01-01T00:00:00.123456Z"}
 --- expect error: param '__nanograph_now': reserved for now() and cannot be bound
 
 --- mutate
-query move_now() { $x: Event  $x.at = now()  update $x set { at: datetime("2025-01-01T00:00:00Z") } }
+query move_now() { match { $x: Event } where $x.at = now()  update $x set { at: datetime("2025-01-01T00:00:00Z") } }
 --- params
 {"__nanograph_now": "2024-01-01T00:00:00.123456Z"}
 --- expect error: param '__nanograph_now': reserved for now() and cannot be bound
 
 --- mutate
-query set_now() { $x: Event  $x.name = "a"  update $x set { at: now() } }
+query set_now() { match { $x: Event } where $x.name = "a"  update $x set { at: now() } }
 --- expect affected: nodes=1 edges=0

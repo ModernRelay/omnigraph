@@ -1,5 +1,5 @@
 # issue: none
-# notes: The compiler refuses `from` as a bare edge name with `Q017`; nothing executes.
+# notes: The compiler refuses a Blob property compared in `where` with `T24`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $a: Person  $a from $b } return { $b.name } }
+query q($b: String) { match { $d: Doc } where $d.payload = $b return { $d.title } }
 
---- expect error: parse error: Q017:
+--- expect error: type error: T24:

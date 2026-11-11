@@ -20,7 +20,7 @@ node Counter {
 --- query
 set engine = v2;
 query rounded($n: F64) {
-    match { $c: Counter $c.number = $n }
+    match { $c: Counter } where $c.number = $n
     return { $c.number }
 }
 --- params

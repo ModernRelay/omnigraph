@@ -22,20 +22,14 @@ edge AccountTransferAccount: Account -> Account {
 
 const QUERY: &str = r#"
 query top_senders() {
-    match {
-        $src: Account
-        $src $t:accountTransferAccount $dst
-    }
+    match { $src: Account, $src $t:accountTransferAccount $dst }
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
     order { sent desc, $src.accountId }
     limit 20
 }
 
 query first_transfers() {
-    match {
-        $src: Account
-        $src $t:accountTransferAccount $dst
-    }
+    match { $src: Account, $src $t:accountTransferAccount $dst }
     return { $src.accountId, $dst.accountId, $t.@id as edge_id, $t.amount }
     order { $src.accountId, $dst.accountId, $t.@id }
     limit 1025

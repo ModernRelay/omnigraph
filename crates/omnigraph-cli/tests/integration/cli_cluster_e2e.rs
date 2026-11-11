@@ -271,7 +271,7 @@ fn live_apply_changes_schema_queries_and_adds_graph_without_restart(storage_root
         "node Person { name: String @key age: I32? bio: String? }\n",
     )
     .unwrap();
-    fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.bio } }\n").unwrap();
+    fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.bio } }\n").unwrap();
     fs::write(
         temp.path().join("tools.pg"),
         "node Tool { name: String @key }\n",
@@ -591,7 +591,7 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
             "node Person { name: String @key age: I32? bio: String? }\n",
         )
         .unwrap();
-        fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.bio } }\n").unwrap();
+        fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.bio } }\n").unwrap();
         let output = output_success(
             cli()
                 .args([
@@ -745,7 +745,7 @@ fn cluster_e2e_apply_schema_query_and_noop_each_have_exact_receipts() {
     )
     .unwrap();
     fs::write(temp.path().join("people.gq"),
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.bio } }\n").unwrap();
+        "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.bio } }\n").unwrap();
     let evolved = apply_cluster_fixture(temp.path());
     assert_ne!(first["result"]["id"], evolved["result"]["id"]);
     let schema = output_success(
@@ -825,7 +825,7 @@ fn cluster_e2e_destroyed_graph_is_not_silently_recreated() {
     fs::write(
         temp.path().join("people.gq"),
         "query find_person($name: String) {
-  match { $p: Person { name: $name } }
+  match { $p: Person } where $p.name = $name
   return { $p.name }
 }
 ",
@@ -1594,7 +1594,7 @@ fn live_policy_assert_granted_row(server: &TestServer) {
         "--graph",
         "knowledge",
         "-e",
-        "query policy_read($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
+        "query policy_read($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }",
         "--params",
         r#"{"name":"PolicyGranted"}"#,
         "--json",

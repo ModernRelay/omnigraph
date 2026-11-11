@@ -407,9 +407,9 @@ node Apart {
 --- mutate
 set write_max_bytes = 2047;
 query retitle_one_byte_short() {
-    $x: Doc  $x.slug = "big"
+    match { $x: Doc } where $x.slug = "big"
     update $x set { title: "new" }
-    $x: Doc  $x.slug = "nobody"
+    match { $x: Doc } where $x.slug = "nobody"
     update $x set { title: "none" }
 }
 
@@ -431,9 +431,9 @@ d.title: String
 --- mutate
 set write_max_bytes = 2048;
 query retitle_exact() {
-    $x: Doc  $x.slug = "big"
+    match { $x: Doc } where $x.slug = "big"
     update $x set { title: "new" }
-    $x: Doc  $x.slug = "nobody"
+    match { $x: Doc } where $x.slug = "nobody"
     update $x set { title: "none" }
 }
 
@@ -455,7 +455,7 @@ d.title: String
 --- mutate
 set write_max_bytes = 2047;
 query retitle_alone() {
-    $x: Doc  $x.slug = "big"
+    match { $x: Doc } where $x.slug = "big"
     update $x set { title: "patched" }
 }
 
@@ -477,9 +477,9 @@ d.title: String
 --- mutate
 set write_max_bytes = 2047;
 query carry_after_patch_still_counts_the_payload() {
-    $x: Doc  $x.slug = "big"
+    match { $x: Doc } where $x.slug = "big"
     update $x set { title: "new" }
-    $x: Doc  $x.slug = "nobody"
+    match { $x: Doc } where $x.slug = "nobody"
     update $x set { title: "none" }
 }
 
@@ -488,7 +488,7 @@ query carry_after_patch_still_counts_the_payload() {
 --- mutate
 set write_max_bytes = 2047;
 query clear_and_retitle($c: Blob?) {
-    $x: Doc  $x.slug = "big"
+    match { $x: Doc } where $x.slug = "big"
     update $x set { content: $c, title: "cleared" }
 }
 
@@ -513,7 +513,7 @@ d.title: String
 --- mutate
 set write_max_bytes = 2047;
 query retitle_indexed_alone() {
-    $x: Indexed  $x.slug = "big"
+    match { $x: Indexed } where $x.slug = "big"
     update $x set { title: "patched" }
 }
 
@@ -522,7 +522,7 @@ query retitle_indexed_alone() {
 --- mutate
 set write_max_bytes = 8191;
 query retitle_packed_alone() {
-    $x: Packed  $x.slug = "big"
+    match { $x: Packed } where $x.slug = "big"
     update $x set { title: "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt" }
 }
 
@@ -543,7 +543,7 @@ d.title: String
 
 --- query
 query packed_title_after_patch() {
-    match { $d: Packed { slug: "big" } }
+    match { $d: Packed } where $d.slug = "big"
     return { $d.slug, $d.title }
 }
 
@@ -569,7 +569,7 @@ tables:
 --- mutate
 set write_max_bytes = 4096;
 query retitle_shared_fragment() {
-    $x: Shared  $x.slug = "big"
+    match { $x: Shared } where $x.slug = "big"
     update $x set { title: "patched" }
 }
 
@@ -578,7 +578,7 @@ query retitle_shared_fragment() {
 --- mutate
 set write_max_bytes = 4096;
 query retitle_apart_fragment() {
-    $x: Apart  $x.slug = "big"
+    match { $x: Apart } where $x.slug = "big"
     update $x set { title: "patched" }
 }
 
@@ -586,10 +586,8 @@ query retitle_apart_fragment() {
 
 --- query
 query titles_after_fragment_independent_updates() {
-    match {
-        $s: Shared { slug: "big" }
-        $a: Apart { slug: "big" }
-    }
+    match { $s: Shared, $a: Apart }
+    where $s.slug = "big" and $a.slug = "big"
     return { $s.title, $a.title }
 }
 

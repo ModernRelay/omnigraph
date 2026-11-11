@@ -1,5 +1,5 @@
 # issue: none
-# notes: The compiler refuses a clause after the last statement with `Q013`; nothing executes.
+# notes: The compiler refuses a call named by an element keyword, Cypher's `exists(x)`, with `Q019`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -42,7 +42,7 @@ edge In: Doc -> Collection
 {"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
---- mutate
-query w($h: String) { $p: Person { handle: $h }  delete $p  $q: Person }
+--- query
+query q() { match { $p: Person } where exists($p.city) return { $p.name } }
 
---- expect error: parse error: Q013:
+--- expect error: parse error: Q019:

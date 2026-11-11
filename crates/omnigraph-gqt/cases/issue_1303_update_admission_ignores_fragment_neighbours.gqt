@@ -168,7 +168,7 @@ tables:
 --- mutate
 set write_max_bytes = 2048;
 query retitle_apart() {
-    $x: Apart  $x.slug = "row000"
+    match { $x: Apart } where $x.slug = "row000"
     update $x set { title: "new" }
 }
 
@@ -177,7 +177,7 @@ query retitle_apart() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_shared() {
-    $x: Shared  $x.slug = "row000"
+    match { $x: Shared } where $x.slug = "row000"
     update $x set { title: "new" }
 }
 
@@ -186,7 +186,7 @@ query retitle_shared() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_apart_doc_carrying_its_blob() {
-    $x: ApartDoc  $x.slug = "row000"
+    match { $x: ApartDoc } where $x.slug = "row000"
     update $x set { title: "new" }
 }
 
@@ -195,7 +195,7 @@ query retitle_apart_doc_carrying_its_blob() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_shared_doc_carrying_its_blob() {
-    $x: SharedDoc  $x.slug = "row000"
+    match { $x: SharedDoc } where $x.slug = "row000"
     update $x set { title: "new" }
 }
 
@@ -204,7 +204,7 @@ query retitle_shared_doc_carrying_its_blob() {
 --- mutate
 set write_max_bytes = 2048;
 query clear_apart_doc($c: Blob?) {
-    $x: ApartDocCleared  $x.slug = "row000"
+    match { $x: ApartDocCleared } where $x.slug = "row000"
     update $x set { content: $c, title: "cleared" }
 }
 
@@ -216,7 +216,7 @@ query clear_apart_doc($c: Blob?) {
 --- mutate
 set write_max_bytes = 2048;
 query clear_shared_doc($c: Blob?) {
-    $x: SharedDocCleared  $x.slug = "row000"
+    match { $x: SharedDocCleared } where $x.slug = "row000"
     update $x set { content: $c, title: "cleared" }
 }
 
@@ -228,9 +228,9 @@ query clear_shared_doc($c: Blob?) {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_apart_doc_in_two_statements() {
-    $x: ApartDocTwice  $x.slug = "row000"
+    match { $x: ApartDocTwice } where $x.slug = "row000"
     update $x set { title: "twice" }
-    $x: ApartDocTwice  $x.slug = "nobody"
+    match { $x: ApartDocTwice } where $x.slug = "nobody"
     update $x set { title: "twice" }
 }
 
@@ -239,9 +239,9 @@ query retitle_apart_doc_in_two_statements() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_shared_doc_in_two_statements() {
-    $x: SharedDocTwice  $x.slug = "row000"
+    match { $x: SharedDocTwice } where $x.slug = "row000"
     update $x set { title: "twice" }
-    $x: SharedDocTwice  $x.slug = "nobody"
+    match { $x: SharedDocTwice } where $x.slug = "nobody"
     update $x set { title: "twice" }
 }
 
@@ -249,10 +249,8 @@ query retitle_shared_doc_in_two_statements() {
 
 --- query
 query titles_after_updates() {
-    match {
-        $s: Shared { slug: "row000" }
-        $a: Apart { slug: "row000" }
-    }
+    match { $s: Shared, $a: Apart }
+    where $s.slug = "row000" and $a.slug = "row000"
     return { $s.title, $a.title }
 }
 
@@ -266,13 +264,19 @@ a.title: String
 --- query
 query doc_titles_after_updates() {
     match {
-        $s: SharedDoc { slug: "row000" }
-        $a: ApartDoc { slug: "row000" }
-        $sc: SharedDocCleared { slug: "row000" }
-        $ac: ApartDocCleared { slug: "row000" }
-        $st: SharedDocTwice { slug: "row000" }
-        $at: ApartDocTwice { slug: "row000" }
+        $s: SharedDoc,
+        $a: ApartDoc,
+        $sc: SharedDocCleared,
+        $ac: ApartDocCleared,
+        $st: SharedDocTwice,
+        $at: ApartDocTwice,
     }
+    where $s.slug = "row000"
+      and $a.slug = "row000"
+      and $sc.slug = "row000"
+      and $ac.slug = "row000"
+      and $st.slug = "row000"
+      and $at.slug = "row000"
     return { $s.title, $a.title, $sc.title, $ac.title, $st.title, $at.title }
 }
 

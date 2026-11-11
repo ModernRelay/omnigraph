@@ -35,7 +35,7 @@ edge Knows: Person -> Doc
 
 --- query
 query connected_rrf_d_first($q: Vector(4)) {
-    match { from rrf(nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1), nearest({ match { $t: Doc } return { $t } }, $t.embedding, $q, k: 1))  $d: Doc $t: Doc $p: Person $p knows $d $p knows $t }
+    match { from rrf(nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1), nearest({ match { $t: Doc } return { $t } }, $t.embedding, $q, k: 1)), $d: Doc, $t: Doc, $p: Person, $p knows $d, $p knows $t }
     return { $d.slug, $t.slug }
     order { $score desc }
     limit 1
@@ -46,7 +46,7 @@ query connected_rrf_d_first($q: Vector(4)) {
 
 --- query
 query connected_rrf_t_first($q: Vector(4)) {
-    match { from rrf(nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1), nearest({ match { $t: Doc } return { $t } }, $t.embedding, $q, k: 1))  $t: Doc $d: Doc $p: Person $p knows $d $p knows $t }
+    match { from rrf(nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1), nearest({ match { $t: Doc } return { $t } }, $t.embedding, $q, k: 1)), $t: Doc, $d: Doc, $p: Person, $p knows $d, $p knows $t }
     return { $d.slug, $t.slug }
     order { $score desc }
     limit 1
@@ -58,7 +58,7 @@ query connected_rrf_t_first($q: Vector(4)) {
 --- query
 set engine = v2;
 query search_only_order_with_an_unranked_binding($q: Vector(4)) {
-    match { from nearest({ match { $c: Doc $z: Zone } return { $c, $z } }, $c.embedding, $q, k: 3) }
+    match { from nearest({ match { $c: Doc, $z: Zone } return { $c, $z } }, $c.embedding, $q, k: 3) }
     return { $c.slug, $z.name }
     order { $distance }
     limit 3
@@ -78,7 +78,7 @@ sort tiebreak [$c, $z]
 --- query
 set engine = v2;
 query nearest_on_a_traversal_destination($q: Vector(4)) {
-    match { from nearest({ match { $p: Person $p knows $d } return { $p, $d } }, $d.embedding, $q, k: 1) }
+    match { from nearest({ match { $p: Person, $p knows $d } return { $p, $d } }, $d.embedding, $q, k: 1) }
     return { $d.slug }
     order { $distance }
     limit 1

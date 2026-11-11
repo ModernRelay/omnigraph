@@ -55,7 +55,7 @@ load validate edge_ri edge:WideLink to Wide: probe judged
 load executed: partitions 1 rows 2
 
 --- query
-query small_rows() { match { $a: Small $a smallLink $b } return { $a.id, $b.id } }
+query small_rows() { match { $a: Small, $a smallLink $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": 0, "b.id": 1}
 {"a.id": 7, "b.id": 6}
@@ -64,7 +64,7 @@ a.id: U32
 b.id: U32
 
 --- query
-query wide_rows() { match { $a: Wide $a wideLink $b } return { $a.id, $b.id } }
+query wide_rows() { match { $a: Wide, $a wideLink $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": 0, "b.id": 1}
 {"a.id": 7, "b.id": 6}

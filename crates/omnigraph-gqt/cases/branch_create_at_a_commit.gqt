@@ -35,7 +35,7 @@ query insert_carol() {
 
 --- mutate
 query age_alice() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 31 }
 }
 
@@ -43,7 +43,7 @@ query age_alice() {
 
 --- mutate
 query remove_bob() {
-    $x: Person  $x.name = "bob"
+    match { $x: Person } where $x.name = "bob"
     delete $x
 }
 

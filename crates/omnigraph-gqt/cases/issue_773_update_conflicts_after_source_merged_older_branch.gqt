@@ -29,7 +29,7 @@ branch create b0
 
 --- mutate
 query set_alice_1() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 1 }
 }
 
@@ -75,7 +75,7 @@ branch merge b0 into b1
 
 --- mutate
 query set_alice_2() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 2 }
 }
 

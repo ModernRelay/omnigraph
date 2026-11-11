@@ -33,7 +33,7 @@ branch create a
 
 --- mutate branch: a
 query promote() {
-    $x: Person  $x.name = "p5"
+    match { $x: Person } where $x.name = "p5"
     update $x set { title: "Lead" }
 }
 
@@ -48,7 +48,7 @@ branch create b from a
 
 --- mutate branch: b
 query promote() {
-    $x: Person  $x.name = "p7"
+    match { $x: Person } where $x.name = "p7"
     update $x set { title: "Principal" }
 }
 

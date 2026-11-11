@@ -34,24 +34,18 @@ const KEYS: &[&str] = &["a", "b", "c", "d", "e"];
 
 const QUERIES: &str = r#"
 query friends($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows{1,3} $f
-    }
+    match { $p: Person, $p knows{1,3} $f }
+    where $p.name = $name
     return { $f.name }
 }
 query related($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p <knows>{1,3} $f
-    }
+    match { $p: Person, $p <knows>{1,3} $f }
+    where $p.name = $name
     return { $f.name }
 }
 query employers($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p worksAt $c
-    }
+    match { $p: Person, $p worksAt $c }
+    where $p.name = $name
     return { $c.name }
 }
 query all_persons() {
@@ -59,17 +53,12 @@ query all_persons() {
     return { $p.name }
 }
 query employed() {
-    match {
-        $p: Person
-        $p worksAt $c
-    }
+    match { $p: Person, $p worksAt $c }
     return { $p.name }
 }
 query unemployed() {
-    match {
-        $p: Person
-        not { $p worksAt $_ }
-    }
+    match { $p: Person }
+    where not exists { $p worksAt $_ }
     return { $p.name }
 }
 "#;
@@ -260,7 +249,7 @@ fn prop_results_subset_of_existing_nodes() {
         .unwrap();
 }
 
-// INVARIANT 3: anti-join complement. `not { $p worksAt $_ }` and its complement
+// INVARIANT 3: anti-join complement. `not exists { $p worksAt $_ }` and its complement
 // (persons WITH a worksAt) must be disjoint and together cover all persons.
 #[test]
 fn prop_antijoin_partitions_persons() {
@@ -291,38 +280,39 @@ fn prop_antijoin_partitions_persons() {
 
 /// Correlated blocks bound by a key on one of their own bindings, as
 /// `(outer pattern, block)`. Each runs as written and again with `FORCE` set
-/// to a conjunct that reads the outer row (`$p.name = $p.name`, always true),
+/// to a conjunct that reads the outer row (` and $p.name = $p.name`, always
+/// true, joined to the block's `where`),
 /// which keeps the twin `correlated`; written, the planner may run the block as
 /// a key set from the bound binding. The last shape repeats each `$p` once per
 /// outer `knows` edge.
 const KEY_SET_SHAPES: &[(&str, &str)] = &[
     (
         "$p: Person",
-        "not { $p knows{1,3} $x  $x: Person { name: $name } FORCE }",
+        "not exists { $p knows{1,3} $x, $x: Person where $x.name = $nameFORCE }",
     ),
     (
         "$p: Person",
-        "not { $x knows{1,2} $p  $x: Person { name: $name } FORCE }",
+        "not exists { $x knows{1,2} $p, $x: Person where $x.name = $nameFORCE }",
     ),
     (
         "$p: Person",
-        "count { $p <knows>{1,2} $x  $x: Person { name: $name } FORCE } = 1",
+        "count { $p <knows>{1,2} $x, $x: Person where $x.name = $nameFORCE } = 1",
     ),
     (
         "$p: Person",
-        "not { $p knows{2,2} $x  $x: Person { name: $name } FORCE }",
+        "not exists { $p knows{2,2} $x, $x: Person where $x.name = $nameFORCE }",
     ),
     (
         "$p: Person",
-        "count { $p $k:knows $x  $x: Person { name: $name } FORCE } = 1",
+        "count { $p $k:knows $x, $x: Person where $x.name = $nameFORCE } = 1",
     ),
     (
         "$p: Person",
-        "not { $p knows $m  $p worksAt $c  $c: Company { name: $name } FORCE }",
+        "not exists { $p knows $m, $p worksAt $c, $c: Company where $c.name = $nameFORCE }",
     ),
     (
-        "$p: Person  $p knows $q",
-        "not { $p worksAt $c  $c: Company { name: $name } FORCE }",
+        "$p: Person, $p knows $q",
+        "not exists { $p worksAt $c, $c: Company where $c.name = $nameFORCE }",
     ),
 ];
 
@@ -336,7 +326,7 @@ async fn block_run(
     params: &ParamMap,
 ) -> (Vec<String>, omnigraph_planner::AntiJoinStrategy) {
     let query = format!(
-        "query q($name: String) {{ match {{ {outer} {} }} return {{ $p.name }} }}",
+        "query q($name: String) {{ match {{ {outer} }} where {} return {{ $p.name }} }}",
         block.replace("FORCE", force)
     );
     let executed = db
@@ -389,7 +379,7 @@ fn prop_key_set_block_eq_correlated() {
                         let params = one_param(key);
                         let (written, strategy) = block_run(&db, outer, block, "", &params).await;
                         let (forced, twin) =
-                            block_run(&db, outer, block, "$p.name = $p.name", &params).await;
+                            block_run(&db, outer, block, " and $p.name = $p.name", &params).await;
                         assert_eq!(twin, AntiJoinStrategy::Correlated, "{block}");
                         if strategy == AntiJoinStrategy::KeySet {
                             key_set_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

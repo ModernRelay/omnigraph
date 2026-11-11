@@ -26,11 +26,7 @@ edge Knows: Person -> Person
 
 --- query
 query knows_anyone_twice() {
-    match {
-        $p: Person
-        $p knows $_
-        $p knows $_
-    }
+    match { $p: Person, $p knows $_, $p knows $_ }
     return { $p.name }
 }
 
@@ -43,10 +39,8 @@ p.name: String
 
 --- query
 query bound_twice() {
-    match {
-        $p: Person
-        $p: Person { name: "bob" }
-    }
+    match { $p: Person, $p: Person }
+    where $p.name = "bob"
     return { $p.name }
 }
 
@@ -58,10 +52,8 @@ p.name: String
 
 --- query
 query bound_twice_in_negation() {
-    match {
-        $p: Person
-        not { $p: Person { name: "bob" } }
-    }
+    match { $p: Person }
+    where not exists { $p: Person where $p.name = "bob" }
     return { $p.name }
 }
 
@@ -73,11 +65,7 @@ p.name: String
 
 --- query
 query self_loop_twice() {
-    match {
-        $p: Person
-        $p knows $p
-        $p knows $p
-    }
+    match { $p: Person, $p knows $p, $p knows $p }
     return { $p.name }
 }
 
@@ -89,14 +77,12 @@ p.name: String
 
 --- query
 query rebind_inside_negation_non_root() {
-    match {
-        $p: Person
-        $p knows $q
-        not {
-            $r: Person
-            $r knows $q
-            $q: Person { name: "zzz" }
-        }
+    match { $p: Person, $p knows $q }
+    where not exists {
+        $r: Person,
+        $r knows $q,
+        $q: Person
+        where $q.name = "zzz"
     }
     return { $p.name }
 }

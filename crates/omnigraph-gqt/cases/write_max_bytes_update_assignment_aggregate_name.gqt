@@ -32,7 +32,7 @@ query seed_docs() {
 --- mutate
 set write_max_bytes = 30000;
 query assign_both_rows($payload: Blob) {
-    $x: Doc  $x.note = "n"
+    match { $x: Doc } where $x.note = "n"
     update $x set { content: $payload }
 }
 

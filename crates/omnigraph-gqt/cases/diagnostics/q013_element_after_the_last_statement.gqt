@@ -1,5 +1,5 @@
 # issue: none
-# notes: The compiler refuses a property value inside a binding's braces with `T45`; nothing executes.
+# notes: The compiler refuses an element after the last statement with `Q013`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -42,7 +42,7 @@ edge In: Doc -> Collection
 {"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
---- query
-query q() { match { $p: Person  $q: Person { name: $p.name } } return { $q.handle } }
+--- mutate
+query w($h: String) { match { $p: Person } where $p.handle = $h delete $p  $q: Person }
 
---- expect error: type error: T45:
+--- expect error: parse error: Q013:

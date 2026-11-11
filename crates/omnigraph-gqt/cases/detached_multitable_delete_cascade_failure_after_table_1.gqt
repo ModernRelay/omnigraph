@@ -40,7 +40,7 @@ scope: next_step
 
 --- mutate branch: main
 query w() {
-    $x: Person  $x.name = "eve"
+    match { $x: Person } where $x.name = "eve"
     delete $x
 }
 --- expect error: injected failpoint triggered: mutation.post_table_commit
@@ -54,7 +54,7 @@ query before_restart_person() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query
-query before_restart_knows() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+query before_restart_knows() { match { $p: Person, $p knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"alice"}
 {"p.name":"eve","q.name":"alice"}
@@ -63,7 +63,7 @@ p.name: String
 q.name: String
 
 --- query
-query before_restart_worksat() { match { $p: Person $p worksAt $c } return { $p.name, $c.name } }
+query before_restart_worksat() { match { $p: Person, $p worksAt $c } return { $p.name, $c.name } }
 --- expect unordered
 {"c.name":"acme","p.name":"alice"}
 {"c.name":"acme","p.name":"eve"}
@@ -82,7 +82,7 @@ query after_restart_person() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query
-query after_restart_knows() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+query after_restart_knows() { match { $p: Person, $p knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"alice"}
 {"p.name":"eve","q.name":"alice"}
@@ -91,7 +91,7 @@ p.name: String
 q.name: String
 
 --- query
-query after_restart_worksat() { match { $p: Person $p worksAt $c } return { $p.name, $c.name } }
+query after_restart_worksat() { match { $p: Person, $p worksAt $c } return { $p.name, $c.name } }
 --- expect unordered
 {"c.name":"acme","p.name":"alice"}
 {"c.name":"acme","p.name":"eve"}
@@ -101,7 +101,7 @@ c.name: String
 
 --- mutate branch: main
 query w() {
-    $x: Person  $x.name = "eve"
+    match { $x: Person } where $x.name = "eve"
     delete $x
 }
 --- expect affected: nodes=1 edges=2
@@ -116,7 +116,7 @@ query landed_person() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query
-query landed_knows() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+query landed_knows() { match { $p: Person, $p knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"alice"}
 --- expect shape
@@ -124,7 +124,7 @@ p.name: String
 q.name: String
 
 --- query
-query landed_worksat() { match { $p: Person $p worksAt $c } return { $p.name, $c.name } }
+query landed_worksat() { match { $p: Person, $p worksAt $c } return { $p.name, $c.name } }
 --- expect unordered
 {"c.name":"acme","p.name":"alice"}
 --- expect shape

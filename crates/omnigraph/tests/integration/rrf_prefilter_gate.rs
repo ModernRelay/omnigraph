@@ -126,9 +126,11 @@ fn gate_seed_data() -> String {
 /// ranked variable is always `$c`.
 const GATE_QUERIES: &str = r#"
 query single_hop_both_bm25($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        $c chunkOfArtifact $a
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
+      $c chunkOfArtifact $a,
     }
     return { $c.slug }
     order { $score desc }
@@ -136,20 +138,24 @@ query single_hop_both_bm25($q1: String, $q2: String) {
 }
 
 query search_filter_single_hop($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        $c chunkOfArtifact $a
-        search($c.text, $q1)
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
+      $c chunkOfArtifact $a,
     }
+    where search($c.text, $q1)
     return { $c.slug }
     order { $score desc }
     limit 5
 }
 
 query bm25_secondary_position($v: Vector(4), $q: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(nearest($all, $c.embedding, $v, k: 5), bm25($all, $c.text, $q), k: 60)
-        $c: Chunk
-        $c chunkOfArtifact $a
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(nearest($all, $c.embedding, $v, k: 5), bm25($all, $c.text, $q), k: 60),
+      $c: Chunk,
+      $c chunkOfArtifact $a,
     }
     return { $c.slug }
     order { $score desc }
@@ -157,9 +163,11 @@ query bm25_secondary_position($v: Vector(4), $q: String) {
 }
 
 query multi_hop($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        $c chunkCites{1,2} $d
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
+      $c chunkCites{1,2} $d,
     }
     return { $c.slug }
     order { $score desc }
@@ -167,9 +175,11 @@ query multi_hop($q1: String, $q2: String) {
 }
 
 query multi_hop_min_two($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        $c chunkCites{2,2} $d
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
+      $c chunkCites{2,2} $d,
     }
     return { $c.slug }
     order { $score desc }
@@ -177,20 +187,24 @@ query multi_hop_min_two($q1: String, $q2: String) {
 }
 
 query dst_filtered($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        $c chunkOfArtifact $a
-        $a.slug = "art-0"
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
+      $c chunkOfArtifact $a,
     }
+    where $a.slug = "art-0"
     return { $c.slug }
     order { $score desc }
     limit 5
 }
 
 query direction_both($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        $c <chunkCites> $d
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
+      $c <chunkCites> $d,
     }
     return { $c.slug }
     order { $score desc }
@@ -198,9 +212,11 @@ query direction_both($q1: String, $q2: String) {
 }
 
 query direction_in($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        $d chunkCites $c
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
+      $d chunkCites $c,
     }
     return { $c.slug }
     order { $score desc }
@@ -208,10 +224,12 @@ query direction_in($q1: String, $q2: String) {
 }
 
 query several_expands($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        $c chunkOfArtifact $a
-        $c chunkCites $d
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
+      $c chunkOfArtifact $a,
+      $c chunkCites $d,
     }
     return { $c.slug }
     order { $score desc }
@@ -219,19 +237,23 @@ query several_expands($q1: String, $q2: String) {
 }
 
 query antijoin_only($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        not { $c chunkOfArtifact $a }
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
     }
+    where not exists { $c chunkOfArtifact $a }
     return { $c.slug }
     order { $score desc }
     limit 5
 }
 
 query undeclared_ranked_destination($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $d: Chunk
-        $d chunkCites $c
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $d: Chunk,
+      $d chunkCites $c,
     }
     return { $c.slug }
     order { $score desc }
@@ -239,8 +261,10 @@ query undeclared_ranked_destination($q1: String, $q2: String) {
 }
 
 query no_traversal($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
     }
     return { $c.slug }
     order { $score desc }

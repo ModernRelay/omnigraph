@@ -43,7 +43,7 @@ query ins_b() { insert Knows { from: "0", to: "1" } }
 --- expect affected: nodes=0 edges=1
 
 --- mutate
-query del_main() { $x: Person  $x.id = 1  delete $x }
+query del_main() { match { $x: Person } where $x.id = 1  delete $x }
 --- expect affected: nodes=1 edges=0
 
 --- mutate

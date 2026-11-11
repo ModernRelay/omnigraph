@@ -8,7 +8,7 @@ environments:
     storage: local-filesystem
 
 --- query
-query destination_projection() { match { $p: Person $p knows $q } return { $q.name } }
+query destination_projection() { match { $p: Person, $p knows $q } return { $q.name } }
 --- expect unordered
 {"q.name":"p000000"}
 {"q.name":"p000001"}
@@ -34,7 +34,7 @@ query destination_projection() { match { $p: Person $p knows $q } return { $q.na
 q.name: String
 
 --- query
-query destination_projection() { match { $p: Person $p knows $q } return { $q.name } }
+query destination_projection() { match { $p: Person, $p knows $q } return { $q.name } }
 --- expect unordered
 {"q.name":"p000000"}
 {"q.name":"p000001"}
@@ -60,7 +60,7 @@ query destination_projection() { match { $p: Person $p knows $q } return { $q.na
 q.name: String
 
 --- query
-query destination_projection() { match { $p: Person $p knows $q } return { $q.name } }
+query destination_projection() { match { $p: Person, $p knows $q } return { $q.name } }
 --- expect unordered
 {"q.name":"p000000"}
 {"q.name":"p000001"}

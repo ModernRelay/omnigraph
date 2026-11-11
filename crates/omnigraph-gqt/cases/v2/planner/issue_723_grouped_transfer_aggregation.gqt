@@ -33,10 +33,7 @@ edge AccountTransferAccount: Account -> Account {
 --- query
 set engine = v2;
 query top_senders() {
-    match {
-        $src: Account
-        $src $t:accountTransferAccount $dst
-    }
+    match { $src: Account, $src $t:accountTransferAccount $dst }
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
     order { sent desc, $src.accountId }
     limit 20
@@ -58,7 +55,7 @@ not pass aggregate_pushdown
 --- query
 set engine = v2;
 query top_two_senders() {
-    match { $src: Account $src $t:accountTransferAccount $dst }
+    match { $src: Account, $src $t:accountTransferAccount $dst }
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
     order { sent desc, $src.accountId }
     limit 2
@@ -73,7 +70,7 @@ sent: F64?
 --- query
 set engine = v2;
 query filtered_transfers() {
-    match { $src: Account $src $t:accountTransferAccount $dst $t.amount > 10 }
+    match { $src: Account, $src $t:accountTransferAccount $dst } where $t.amount > 10
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
 }
 --- expect unordered
@@ -88,7 +85,7 @@ not pass aggregate_pushdown
 --- query
 set engine = v2;
 query empty_frontier() {
-    match { $src: Account { accountId: "absent" } $src $t:accountTransferAccount $dst }
+    match { $src: Account, $src $t:accountTransferAccount $dst } where $src.accountId = "absent"
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
 }
 --- expect unordered
@@ -100,7 +97,7 @@ sent: F64?
 --- query
 set engine = v2;
 query empty_expansion() {
-    match { $src: Account { accountId: "orphan" } $src $t:accountTransferAccount $dst }
+    match { $src: Account, $src $t:accountTransferAccount $dst } where $src.accountId = "orphan"
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
 }
 --- expect unordered
@@ -112,7 +109,7 @@ sent: F64?
 --- query
 set engine = v2;
 query no_qualifying_edges() {
-    match { $src: Account $src $t:accountTransferAccount $dst $t.amount > 100 }
+    match { $src: Account, $src $t:accountTransferAccount $dst } where $t.amount > 100
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
 }
 --- expect unordered
@@ -131,10 +128,8 @@ query add_direction_boundaries() {
 --- query
 set engine = v2;
 query reverse_transfers() {
-    match {
-        $dst: Account { accountId: "a" }
-        $src $t:accountTransferAccount $dst
-    }
+    match { $dst: Account, $src $t:accountTransferAccount $dst }
+    where $dst.accountId = "a"
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
 }
 --- expect unordered
@@ -148,10 +143,8 @@ sent: F64?
 --- query
 set engine = v2;
 query either_direction_once_per_edge() {
-    match {
-        $src: Account { accountId: "a" }
-        $src $t:<accountTransferAccount> $dst
-    }
+    match { $src: Account, $src $t:<accountTransferAccount> $dst }
+    where $src.accountId = "a"
     return { count($dst) as edges, count($t.amount) as transfers, sum($t.amount) as sent }
 }
 --- expect unordered
@@ -164,11 +157,8 @@ sent: F64?
 --- query
 set engine = v2;
 query repeated_source_rows() {
-    match {
-        $copy: Account
-        $src: Account { accountId: "a" }
-        $src $t:accountTransferAccount $dst
-    }
+    match { $copy: Account, $src: Account, $src $t:accountTransferAccount $dst }
+    where $src.accountId = "a"
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
 }
 --- expect unordered
@@ -181,11 +171,8 @@ sent: F64?
 --- query
 set engine = v2;
 query filtered_destination() {
-    match {
-        $src: Account { accountId: "a" }
-        $src $t:accountTransferAccount $dst
-        $dst: Account { accountId: "sink" }
-    }
+    match { $src: Account, $src $t:accountTransferAccount $dst, $dst: Account }
+    where $src.accountId = "a" and $dst.accountId = "sink"
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
 }
 --- expect unordered
@@ -198,7 +185,7 @@ sent: F64?
 --- query
 set engine = v2;
 query largest_individual_transfers() {
-    match { $src: Account $src $t:accountTransferAccount $dst }
+    match { $src: Account, $src $t:accountTransferAccount $dst }
     return { $src.accountId, $dst.accountId, $t.amount }
     order { $t.amount desc, $src.accountId, $dst.accountId }
     limit 2

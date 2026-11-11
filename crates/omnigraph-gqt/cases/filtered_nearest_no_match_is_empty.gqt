@@ -22,10 +22,9 @@ node Doc {
 
 --- query
 query nearest_without_matches($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc
-        starts_with($d.name, "doc-9")
-    } return { $d } }, $d.embedding, $q, k: 2) }
+    match {
+      from nearest({ match { $d: Doc } where starts_with($d.name, "doc-9") return { $d } }, $d.embedding, $q, k: 2),
+    }
     return { $d.slug }
     order { $distance }
     limit 2

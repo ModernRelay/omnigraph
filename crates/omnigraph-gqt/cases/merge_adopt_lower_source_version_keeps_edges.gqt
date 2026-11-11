@@ -46,7 +46,7 @@ query add_c_a() {
 
 --- mutate branch: feature
 query drop_b_c() {
-    $x: Knows  $x.@src = "b"
+    match { $x: Knows } where $x.@src = "b"
     delete $x
 }
 
@@ -71,10 +71,7 @@ branch merge main into feature
 
 --- query branch: feature
 query edges_on_feature() {
-    match {
-        $x: Person
-        $x knows $y
-    }
+    match { $x: Person, $x knows $y }
     return { $x.name, $y.name }
 }
 
@@ -103,10 +100,7 @@ branch merge feature
 
 --- query
 query edges_on_main() {
-    match {
-        $x: Person
-        $x knows $y
-    }
+    match { $x: Person, $x knows $y }
     return { $x.name, $y.name }
 }
 

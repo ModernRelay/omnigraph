@@ -43,7 +43,7 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q($h: String) { match { $p: Person { handle: $h }  optional { $p knows $q } } return { $p.name } }
+query q($h: String) { match { $p: Person, optional { $p knows $q } } where $p.handle = $h return { $p.name } }
 
 --- params
 {"h": "ada"}

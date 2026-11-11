@@ -35,12 +35,14 @@ edge ChunkOfArtifact: Chunk -> Artifact
 
 --- query
 query recall_two_terms($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        $a: Artifact
-        $c chunkOfArtifact $a
-        search($c.text, $q1)
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
+      $a: Artifact,
+      $c chunkOfArtifact $a,
     }
+    where search($c.text, $q1)
     return { $c.slug }
     order { $score desc }
     limit 1
@@ -61,12 +63,14 @@ rank fuse row tiebreak [$a.@id]
 
 --- query
 query recall_alternation($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        $a: Artifact
-        $c (chunkOfArtifact | chunkOfArtifact) $a
-        search($c.text, $q1)
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
+      $a: Artifact,
+      $c (chunkOfArtifact | chunkOfArtifact) $a,
     }
+    where search($c.text, $q1)
     return { $c.slug }
     order { $score desc }
     limit 1
@@ -88,12 +92,14 @@ expand $c $a: mode indexed_scan ran indexed_scan
 
 --- query
 query recall_wildcard($q1: String, $q2: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-        $c: Chunk
-        $a: Artifact
-        $c * $a
-        search($c.text, $q1)
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      $c: Chunk,
+      $a: Artifact,
+      $c * $a,
     }
+    where search($c.text, $q1)
     return { $c.slug }
     order { $score desc }
     limit 1

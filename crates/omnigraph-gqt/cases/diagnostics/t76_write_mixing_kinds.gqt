@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- mutate
-query w($h: String) { $p: Person { handle: $h }  $p $k:worksAt $c  delete $k  update $p set { city: "x" } }
+query w($h: String) { match { $p: Person, $p $k:worksAt $c } where $p.handle = $h  delete $k  update $p set { city: "x" } }
 
 --- expect error: type error: T76:

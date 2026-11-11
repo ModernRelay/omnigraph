@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q($h) { match { $p: Person { handle: $h } } return { $p.name } }
+query q($h) { match { $p: Person } where $p.handle = $h return { $p.name } }
 
 --- expect error: parse error: Q005:

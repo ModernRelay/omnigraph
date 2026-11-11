@@ -49,7 +49,7 @@ branch create b1
 
 --- mutate branch: b1
 query delete_w() {
-    $x: Person  $x.name = "w"
+    match { $x: Person } where $x.name = "w"
     delete $x
 }
 

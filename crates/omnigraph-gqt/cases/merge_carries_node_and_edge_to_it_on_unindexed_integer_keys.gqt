@@ -39,7 +39,7 @@ branch merge b
 --- expect outcome: fast_forward
 
 --- query
-query merged() { match { $a: Person $a knows $b } return { count($b) as n } }
+query merged() { match { $a: Person, $a knows $b } return { count($b) as n } }
 --- expect unordered
 {"n": 1}
 --- expect shape

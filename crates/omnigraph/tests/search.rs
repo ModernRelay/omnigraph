@@ -47,14 +47,14 @@ query vector_search_literal() {
 }
 
 query hybrid_search_vector($vq: Vector(4), $tq: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $vq, k: 3), bm25($all, $d.title, $tq), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $vq, k: 3), bm25($all, $d.title, $tq), k: 60), $d: Doc }
     return { $d.slug, $d.title }
     order { $score desc }
     limit 3
 }
 
 query hybrid_search_string($vq: String, $tq: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $vq, k: 3), bm25($all, $d.title, $tq), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $vq, k: 3), bm25($all, $d.title, $tq), k: 60), $d: Doc }
     return { $d.slug, $d.title }
     order { $score desc }
     limit 3
@@ -107,19 +107,20 @@ const RANKED_EDGE_DATA: &str = r#"{"type":"RankedDoc","data":{"slug":"rank-1","e
 
 const RANKED_EDGE_QUERIES: &str = r#"
 query nearest_edges($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: RankedDoc
-        $d $w:rankedLink $target
-    } return { $d, $w, $target } }, $d.embedding, $q, k: 4) }
+    match {
+      from nearest({ match { $d: RankedDoc, $d $w:rankedLink $target } return { $d, $w, $target } }, $d.embedding, $q, k: 4),
+    }
     return { $d.slug, $w.label }
     order { $distance }
     limit 4
 }
 
 query rrf_edges($q1: Vector(4), $q2: Vector(4)) {
-    match { let $all = { match { $d: RankedDoc } return { $d } }  from rrf(nearest($all, $d.embedding, $q1, k: 4), nearest($all, $d.embedding, $q2, k: 4), k: 60)
-        $d: RankedDoc
-        $d $w:rankedLink $target
+    match {
+      let $all = { match { $d: RankedDoc } return { $d } },
+      from rrf(nearest($all, $d.embedding, $q1, k: 4), nearest($all, $d.embedding, $q2, k: 4), k: 60),
+      $d: RankedDoc,
+      $d $w:rankedLink $target,
     }
     return { $d.slug, $w.label }
     order { $score desc }
@@ -127,10 +128,9 @@ query rrf_edges($q1: Vector(4), $q2: Vector(4)) {
 }
 
 query nearest_hops($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: RankedDoc
-        $d rankedLink{1,2} $target
-    } return { $d, $target } }, $d.embedding, $q, k: 2) }
+    match {
+      from nearest({ match { $d: RankedDoc, $d rankedLink{1,2} $target } return { $d, $target } }, $d.embedding, $q, k: 2),
+    }
     return { $d.slug, $target.slug }
     order { $distance }
     limit 2
@@ -157,10 +157,9 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 
 const UNDERFILL_AGG_QUERY: &str = r#"
 query recall_count($q: String) {
-    match { from bm25({ match {
-        $c: Chunk
-        search($c.text, $q)
-    } return { $c } }, $c.text, $q) }
+    match {
+      from bm25({ match { $c: Chunk } where search($c.text, $q) return { $c } }, $c.text, $q),
+    }
     return { count($c) as total }
     limit 2
 }
@@ -168,11 +167,13 @@ query recall_count($q: String) {
 
 const UNDERFILL_RRF_QUERY: &str = r#"
 query recall_rrf($q: String) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q), bm25($all, $c.text, "needle needle"), k: 60)
-        $c: Chunk
-        $c chunkOfArtifact $a
-        search($c.text, $q)
+    match {
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q), bm25($all, $c.text, "needle needle"), k: 60),
+      $c: Chunk,
+      $c chunkOfArtifact $a,
     }
+    where search($c.text, $q)
     return { $c.slug, $a.slug }
     order { $score desc }
     limit 2
@@ -448,24 +449,23 @@ const ISSUE_567_FAR_QUERY: [f32; 4] = [13_300.0, 0.0, 0.0, 0.0];
 #[cfg(feature = "failpoints")]
 const ISSUE_567_QUERIES: &str = r#"
 query filtered_nearest($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc { keep: true } } return { $d } }, $d.embedding, $q, k: 10) }
+    match { from nearest({ match { $d: Doc } where $d.keep = true return { $d } }, $d.embedding, $q, k: 10) }
     return { $d.slug }
     order { $distance }
     limit 10
 }
 
 query rrf_all($q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 17000), nearest($all, $d.embedding, [0.0, 0.0, 0.0, 0.0], k: 17000), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 17000), nearest($all, $d.embedding, [0.0, 0.0, 0.0, 0.0], k: 17000), k: 60), $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 17000
 }
 
 query nearest_friends($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc
-        $d knows $t
-    } return { $d, $t } }, $d.embedding, $q, k: 10) }
+    match {
+      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10),
+    }
     return { $d.slug }
     order { $distance }
     limit 10
@@ -479,24 +479,23 @@ query nearest_all($q: Vector(4)) {
 }
 
 query rrf_keep($q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 10), nearest($all, $d.embedding, [0.0, 0.0, 0.0, 0.0], k: 10), k: 60) $d: Doc { keep: true } }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 10), nearest($all, $d.embedding, [0.0, 0.0, 0.0, 0.0], k: 10), k: 60), $d: Doc } where $d.keep = true
     return { $d.slug }
     order { $score desc }
     limit 10
 }
 
 query nearest_far_friends($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc
-        $d far $t
-    } return { $d, $t } }, $d.embedding, $q, k: 10) }
+    match {
+      from nearest({ match { $d: Doc, $d far $t } return { $d, $t } }, $d.embedding, $q, k: 10),
+    }
     return { $d.slug }
     order { $distance }
     limit 10
 }
 
 query nearest_far_flag($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc { far: true } } return { $d } }, $d.embedding, $q, k: 10) }
+    match { from nearest({ match { $d: Doc } where $d.far = true return { $d } }, $d.embedding, $q, k: 10) }
     return { $d.slug }
     order { $distance }
     limit 10
@@ -594,7 +593,7 @@ edge Far: Doc -> Doc {
 "#;
     let delete_query = r#"
 query delete_middle() {
-    $x: Doc  $x.drop = true
+    match { $x: Doc } where $x.drop = true
     delete $x
 }
 "#;
@@ -1404,20 +1403,18 @@ edge Knows: Doc -> Doc {
 
 const ISSUE_567_LINE_QUERIES: &str = r#"
 query nearest_friends($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc
-        $d knows $t
-    } return { $d, $t } }, $d.embedding, $q, k: 10) }
+    match {
+      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10),
+    }
     return { $d.slug }
     order { $distance }
     limit 10
 }
 
 query nearest_friends_count($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc
-        $d knows $t
-    } return { $d, $t } }, $d.embedding, $q, k: 10) }
+    match {
+      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10),
+    }
     return { count($d) as total }
     limit 10
 }
@@ -2287,20 +2284,18 @@ async fn rrf_arms_scan_uncapped_in_one_pass() {
 async fn capped_bm25_matches_uncapped_prefix_on_partially_covered_index() {
     const PREFIX_QUERIES: &str = r#"
 query capped($q: String) {
-    match { from bm25({ match {
-        $c: Chunk
-        search($c.text, $q)
-    } return { $c } }, $c.text, $q) }
+    match {
+      from bm25({ match { $c: Chunk } where search($c.text, $q) return { $c } }, $c.text, $q),
+    }
     return { $c.slug }
     order { $score desc }
     limit 2
 }
 
 query uncapped_all($q: String) {
-    match { from bm25({ match {
-        $c: Chunk
-        search($c.text, $q)
-    } return { $c } }, $c.text, $q) }
+    match {
+      from bm25({ match { $c: Chunk } where search($c.text, $q) return { $c } }, $c.text, $q),
+    }
     return { $c.slug }
     order { $score desc }
 }
@@ -2771,11 +2766,11 @@ node Note {
 
 const ANALYZER_QUERIES: &str = r#"
 query docs($q: String) {
-    match { $d: Doc search($d.body, $q) }
+    match { $d: Doc } where search($d.body, $q)
     return { $d.slug }
 }
 query notes($q: String) {
-    match { $n: Note search($n.body, $q) }
+    match { $n: Note } where search($n.body, $q)
     return { $n.slug }
 }
 "#;

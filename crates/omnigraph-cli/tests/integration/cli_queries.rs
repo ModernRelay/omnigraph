@@ -85,7 +85,7 @@ fn listed_names(output: &std::process::Output) -> Vec<String> {
         .collect()
 }
 
-const SET_AGE: &str = "query set_age($name: String, $age: I32) { $x: Person  $x.name = $name  update $x set { age: $age } }";
+const SET_AGE: &str = "query set_age($name: String, $age: I32) { match { $x: Person } where $x.name = $name  update $x set { age: $age } }";
 
 #[test]
 fn branch_statements_embedded_print_the_verb_lines() {
@@ -1256,7 +1256,7 @@ fn queries_list_on_a_server_target_prints_the_route_body() {
             "query described($name: String) \
                 @description(\"Find a person by exact name.\") \
                 @instruction(\"Use for exact lookups.\") \
-                {{ match {{ $p: Person {{ name: $name }} }} return {{ $p.age }} }}\n{SET_AGE}\n"
+                {{ match {{ $p: Person }} where $p.name = $name return {{ $p.age }} }}\n{SET_AGE}\n"
         ),
         "      - ./stored.gq\n",
     );
@@ -1362,7 +1362,7 @@ fn converged_cluster_with_query(
 fn queries_validate_exits_zero_on_clean_registry() {
     let cluster = converged_cluster_with_query(
         "find_person.gq",
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+        "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }",
         "      find_person:\n        file: ./find_person.gq\n",
     );
     let output = output_success(
@@ -1391,10 +1391,10 @@ fn cluster_apply_rejects_a_broken_query_naming_it_and_where() {
         ),
         (
             "broken",
-            "query broken() { match { $p: Person $p.age > } return { $p.name } }",
+            "query broken() { match { $p: Person } where $p.age > } return { $p.name } }",
             &[
-                "broken: parse error: expected an operator that continues the expression or a clause",
-                "  --> line 1, column 67",
+                "broken: parse error: expected an expression; found `}`",
+                "  --> line 1, column 54",
             ],
         ),
     ];
@@ -1438,7 +1438,7 @@ fn cluster_apply_rejects_a_broken_query_naming_it_and_where() {
 fn queries_list_prints_registered_query() {
     let cluster = converged_cluster_with_query(
         "find_person.gq",
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+        "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }",
         "      find_person:\n        file: ./find_person.gq\n",
     );
     let output = output_success(
@@ -1467,7 +1467,7 @@ fn queries_list_surfaces_description_and_instruction() {
         "query described($name: String) \
             @description(\"Find a person by exact name.\") \
             @instruction(\"Use for exact lookups; prefer search for fuzzy matches.\") \
-            { match { $p: Person { name: $name } } return { $p.age } }",
+            { match { $p: Person } where $p.name = $name return { $p.age } }",
         "      described:\n        file: ./described.gq\n",
     );
 
@@ -1521,7 +1521,7 @@ fn queries_list_indents_multiline_annotation_continuation() {
         "multi.gq",
         "query multi($name: String) \
             @description(\"line one\\nline two\") \
-            { match { $p: Person { name: $name } } return { $p.age } }",
+            { match { $p: Person } where $p.name = $name return { $p.age } }",
         "      multi:\n        file: ./multi.gq\n",
     );
     let output = output_success(

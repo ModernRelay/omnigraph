@@ -27,10 +27,8 @@ set engine = v2;
 
 --- query
 query repeated_now_over_rows() {
-    match {
-        $i: Item
-        now() = now()
-    }
+    match { $i: Item }
+    where now() = now()
     return { count(now()) as first, count(now()) as second }
 }
 

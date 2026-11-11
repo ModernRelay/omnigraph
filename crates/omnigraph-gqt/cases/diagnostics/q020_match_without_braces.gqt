@@ -1,5 +1,5 @@
 # issue: none
-# notes: The compiler refuses a `match` whose clauses are not inside braces with `Q020`; nothing executes.
+# notes: The compiler refuses a `match` whose elements are not inside braces with `Q020`; nothing executes.
 
 --- runner
 timeout_ms: 10000

@@ -199,15 +199,13 @@ edge Measures: BenchmarkRun -> BenchmarkPoint @card(1..1) {
 
 const PROJECTION_QUERIES: &str = r#"
 query list_points_page($after_key: String) {
-    match {
-        $point: BenchmarkPoint
-        $point.point_id > $after_key
-    }
+    match { $point: BenchmarkPoint }
+    where $point.point_id > $after_key
     return {
-        $point.point_id as point_id
-        $point.point_name as point_name
-        $point.point_identity_version as point_identity_version
-        $point.scenario as scenario
+        $point.point_id as point_id,
+        $point.point_name as point_name,
+        $point.point_identity_version as point_identity_version,
+        $point.scenario as scenario,
         $point.run_spec_json as run_spec_json
     }
     order { point_id asc }
@@ -215,81 +213,77 @@ query list_points_page($after_key: String) {
 }
 
 query list_runs_for_point_page($point_id: String, $after_key: String) {
-    match {
-        $run: BenchmarkRun
-        $point: BenchmarkPoint { point_id: $point_id }
-        $run measures $point
-        $run.invocation_id > $after_key
-    }
+    match { $run: BenchmarkRun, $point: BenchmarkPoint, $run measures $point }
+    where $point.point_id = $point_id and $run.invocation_id > $after_key
     return {
-        $run.invocation_id as invocation_id
-        $run.record_sha256 as record_sha256
-        $point.point_id as point_id
-        $run.session_id as session_id
-        $run.invoked_at_unix_ms as invoked_at_unix_ms
-        $run.case_id as case_id
-        $run.case_digest as case_digest
-        $run.sut_evidence as sut_evidence
-        $run.package_version as package_version
-        $run.source_commit as source_commit
-        $run.source_tree_dirty as source_tree_dirty
-        $run.build_profile as build_profile
-        $run.build_opt_level as build_opt_level
-        $run.debug_assertions as debug_assertions
-        $run.target_triple as target_triple
-        $run.rustc_version as rustc_version
-        $run.build_declared_release_lto as build_declared_release_lto
-        $run.build_declared_release_codegen_units as build_declared_release_codegen_units
-        $run.build_declared_release_strip as build_declared_release_strip
-        $run.build_cargo_encoded_rustflags_present as build_cargo_encoded_rustflags_present
-        $run.build_release_profile_environment_overrides_supported as build_release_profile_environment_overrides_supported
-        $run.build_effective_codegen_options_proved as build_effective_codegen_options_proved
-        $run.worker_executable_sha256 as worker_executable_sha256
-        $run.sut_fingerprint as sut_fingerprint
-        $run.sut_json as sut_json
-        $run.client_build_json as client_build_json
-        $run.client_machine_json as client_machine_json
-        $run.machine_fingerprint as machine_fingerprint
-        $run.machine_format_version as machine_format_version
-        $run.machine_os_name as machine_os_name
-        $run.machine_os_version as machine_os_version
-        $run.machine_kernel_version as machine_kernel_version
-        $run.machine_architecture as machine_architecture
-        $run.machine_cpu_model as machine_cpu_model
-        $run.machine_logical_cores as machine_logical_cores
-        $run.machine_physical_cores as machine_physical_cores
-        $run.machine_total_memory_bytes as machine_total_memory_bytes
-        $run.machine_resource_control_json as machine_resource_control_json
-        $run.machine_scheduling_json as machine_scheduling_json
-        $run.machine_resource_limits_json as machine_resource_limits_json
-        $run.machine_label as machine_label
-        $run.backend_evidence as backend_evidence
-        $run.backend_fingerprint as backend_fingerprint
-        $run.backend_json as backend_json
-        $run.fixture_manifest_sha256 as fixture_manifest_sha256
-        $run.fixture_logical_sha256 as fixture_logical_sha256
-        $run.fixture_physical_sha256 as fixture_physical_sha256
-        $run.acquisition_status as acquisition_status
-        $run.claim_eligible as claim_eligible
-        $run.terminal_failed_repetition as terminal_failed_repetition
-        $run.terminal_stage as terminal_stage
-        $run.terminal_code as terminal_code
-        $run.requested_repetitions as requested_repetitions
-        $run.observed_repetitions as observed_repetitions
-        $run.min_us as min_us
-        $run.p50_us as p50_us
-        $run.max_us as max_us
-        $run.p95_us as p95_us
-        $run.p95_supported as p95_supported
-        $run.wall_evidence as wall_evidence
-        $run.floor_multiplier_millis as floor_multiplier_millis
-        $run.lance_data_plane_logical_calls_min as lance_data_plane_logical_calls_min
-        $run.lance_data_plane_logical_calls_p50 as lance_data_plane_logical_calls_p50
-        $run.lance_data_plane_logical_calls_max as lance_data_plane_logical_calls_max
-        $run.control_plane_logical_calls_min as control_plane_logical_calls_min
-        $run.control_plane_logical_calls_p50 as control_plane_logical_calls_p50
-        $run.control_plane_logical_calls_max as control_plane_logical_calls_max
-        $run.logical_counts_presence_json as logical_counts_presence_json
+        $run.invocation_id as invocation_id,
+        $run.record_sha256 as record_sha256,
+        $point.point_id as point_id,
+        $run.session_id as session_id,
+        $run.invoked_at_unix_ms as invoked_at_unix_ms,
+        $run.case_id as case_id,
+        $run.case_digest as case_digest,
+        $run.sut_evidence as sut_evidence,
+        $run.package_version as package_version,
+        $run.source_commit as source_commit,
+        $run.source_tree_dirty as source_tree_dirty,
+        $run.build_profile as build_profile,
+        $run.build_opt_level as build_opt_level,
+        $run.debug_assertions as debug_assertions,
+        $run.target_triple as target_triple,
+        $run.rustc_version as rustc_version,
+        $run.build_declared_release_lto as build_declared_release_lto,
+        $run.build_declared_release_codegen_units as build_declared_release_codegen_units,
+        $run.build_declared_release_strip as build_declared_release_strip,
+        $run.build_cargo_encoded_rustflags_present as build_cargo_encoded_rustflags_present,
+        $run.build_release_profile_environment_overrides_supported as build_release_profile_environment_overrides_supported,
+        $run.build_effective_codegen_options_proved as build_effective_codegen_options_proved,
+        $run.worker_executable_sha256 as worker_executable_sha256,
+        $run.sut_fingerprint as sut_fingerprint,
+        $run.sut_json as sut_json,
+        $run.client_build_json as client_build_json,
+        $run.client_machine_json as client_machine_json,
+        $run.machine_fingerprint as machine_fingerprint,
+        $run.machine_format_version as machine_format_version,
+        $run.machine_os_name as machine_os_name,
+        $run.machine_os_version as machine_os_version,
+        $run.machine_kernel_version as machine_kernel_version,
+        $run.machine_architecture as machine_architecture,
+        $run.machine_cpu_model as machine_cpu_model,
+        $run.machine_logical_cores as machine_logical_cores,
+        $run.machine_physical_cores as machine_physical_cores,
+        $run.machine_total_memory_bytes as machine_total_memory_bytes,
+        $run.machine_resource_control_json as machine_resource_control_json,
+        $run.machine_scheduling_json as machine_scheduling_json,
+        $run.machine_resource_limits_json as machine_resource_limits_json,
+        $run.machine_label as machine_label,
+        $run.backend_evidence as backend_evidence,
+        $run.backend_fingerprint as backend_fingerprint,
+        $run.backend_json as backend_json,
+        $run.fixture_manifest_sha256 as fixture_manifest_sha256,
+        $run.fixture_logical_sha256 as fixture_logical_sha256,
+        $run.fixture_physical_sha256 as fixture_physical_sha256,
+        $run.acquisition_status as acquisition_status,
+        $run.claim_eligible as claim_eligible,
+        $run.terminal_failed_repetition as terminal_failed_repetition,
+        $run.terminal_stage as terminal_stage,
+        $run.terminal_code as terminal_code,
+        $run.requested_repetitions as requested_repetitions,
+        $run.observed_repetitions as observed_repetitions,
+        $run.min_us as min_us,
+        $run.p50_us as p50_us,
+        $run.max_us as max_us,
+        $run.p95_us as p95_us,
+        $run.p95_supported as p95_supported,
+        $run.wall_evidence as wall_evidence,
+        $run.floor_multiplier_millis as floor_multiplier_millis,
+        $run.lance_data_plane_logical_calls_min as lance_data_plane_logical_calls_min,
+        $run.lance_data_plane_logical_calls_p50 as lance_data_plane_logical_calls_p50,
+        $run.lance_data_plane_logical_calls_max as lance_data_plane_logical_calls_max,
+        $run.control_plane_logical_calls_min as control_plane_logical_calls_min,
+        $run.control_plane_logical_calls_p50 as control_plane_logical_calls_p50,
+        $run.control_plane_logical_calls_max as control_plane_logical_calls_max,
+        $run.logical_counts_presence_json as logical_counts_presence_json,
         $run.physical_counts_presence_json as physical_counts_presence_json
     }
     order { invocation_id asc }
@@ -297,15 +291,11 @@ query list_runs_for_point_page($point_id: String, $after_key: String) {
 }
 
 query projection_inventory_page($after_key: String) {
-    match {
-        $run: BenchmarkRun
-        $point: BenchmarkPoint
-        $run measures $point
-        $run.invocation_id > $after_key
-    }
+    match { $run: BenchmarkRun, $point: BenchmarkPoint, $run measures $point }
+    where $run.invocation_id > $after_key
     return {
-        $run.invocation_id as invocation_id
-        $run.record_sha256 as record_sha256
+        $run.invocation_id as invocation_id,
+        $run.record_sha256 as record_sha256,
         $point.point_id as point_id
     }
     order { invocation_id asc }
@@ -313,15 +303,13 @@ query projection_inventory_page($after_key: String) {
 }
 
 query projection_point_rows_page($after_key: String) {
-    match {
-        $point: BenchmarkPoint
-        $point.point_id > $after_key
-    }
+    match { $point: BenchmarkPoint }
+    where $point.point_id > $after_key
     return {
-        $point.point_id as point_id
-        $point.point_name as point_name
-        $point.point_identity_version as point_identity_version
-        $point.scenario as scenario
+        $point.point_id as point_id,
+        $point.point_name as point_name,
+        $point.point_identity_version as point_identity_version,
+        $point.scenario as scenario,
         $point.run_spec_json as run_spec_json
     }
     order { point_id asc }
@@ -329,80 +317,78 @@ query projection_point_rows_page($after_key: String) {
 }
 
 query projection_run_rows_page($after_key: String) {
-    match {
-        $run: BenchmarkRun
-        $run.invocation_id > $after_key
-    }
+    match { $run: BenchmarkRun }
+    where $run.invocation_id > $after_key
     return {
-        $run.invocation_id as invocation_id
-        $run.record_sha256 as record_sha256
-        $run.archive_object as archive_object
-        $run.archive_pointer as archive_pointer
-        $run.session_id as session_id
-        $run.invoked_at_unix_ms as invoked_at_unix_ms
-        $run.case_id as case_id
-        $run.case_digest as case_digest
-        $run.sut_evidence as sut_evidence
-        $run.package_version as package_version
-        $run.source_commit as source_commit
-        $run.source_tree_dirty as source_tree_dirty
-        $run.build_profile as build_profile
-        $run.build_opt_level as build_opt_level
-        $run.debug_assertions as debug_assertions
-        $run.target_triple as target_triple
-        $run.rustc_version as rustc_version
-        $run.build_declared_release_lto as build_declared_release_lto
-        $run.build_declared_release_codegen_units as build_declared_release_codegen_units
-        $run.build_declared_release_strip as build_declared_release_strip
-        $run.build_cargo_encoded_rustflags_present as build_cargo_encoded_rustflags_present
-        $run.build_release_profile_environment_overrides_supported as build_release_profile_environment_overrides_supported
-        $run.build_effective_codegen_options_proved as build_effective_codegen_options_proved
-        $run.worker_executable_sha256 as worker_executable_sha256
-        $run.sut_fingerprint as sut_fingerprint
-        $run.sut_json as sut_json
-        $run.client_build_json as client_build_json
-        $run.client_machine_json as client_machine_json
-        $run.machine_fingerprint as machine_fingerprint
-        $run.machine_format_version as machine_format_version
-        $run.machine_os_name as machine_os_name
-        $run.machine_os_version as machine_os_version
-        $run.machine_kernel_version as machine_kernel_version
-        $run.machine_architecture as machine_architecture
-        $run.machine_cpu_model as machine_cpu_model
-        $run.machine_logical_cores as machine_logical_cores
-        $run.machine_physical_cores as machine_physical_cores
-        $run.machine_total_memory_bytes as machine_total_memory_bytes
-        $run.machine_resource_control_json as machine_resource_control_json
-        $run.machine_scheduling_json as machine_scheduling_json
-        $run.machine_resource_limits_json as machine_resource_limits_json
-        $run.machine_label as machine_label
-        $run.backend_evidence as backend_evidence
-        $run.backend_fingerprint as backend_fingerprint
-        $run.backend_json as backend_json
-        $run.fixture_manifest_sha256 as fixture_manifest_sha256
-        $run.fixture_logical_sha256 as fixture_logical_sha256
-        $run.fixture_physical_sha256 as fixture_physical_sha256
-        $run.acquisition_status as acquisition_status
-        $run.claim_eligible as claim_eligible
-        $run.terminal_failed_repetition as terminal_failed_repetition
-        $run.terminal_stage as terminal_stage
-        $run.terminal_code as terminal_code
-        $run.requested_repetitions as requested_repetitions
-        $run.observed_repetitions as observed_repetitions
-        $run.min_us as min_us
-        $run.p50_us as p50_us
-        $run.max_us as max_us
-        $run.p95_us as p95_us
-        $run.p95_supported as p95_supported
-        $run.wall_evidence as wall_evidence
-        $run.floor_multiplier_millis as floor_multiplier_millis
-        $run.lance_data_plane_logical_calls_min as lance_data_plane_logical_calls_min
-        $run.lance_data_plane_logical_calls_p50 as lance_data_plane_logical_calls_p50
-        $run.lance_data_plane_logical_calls_max as lance_data_plane_logical_calls_max
-        $run.control_plane_logical_calls_min as control_plane_logical_calls_min
-        $run.control_plane_logical_calls_p50 as control_plane_logical_calls_p50
-        $run.control_plane_logical_calls_max as control_plane_logical_calls_max
-        $run.logical_counts_presence_json as logical_counts_presence_json
+        $run.invocation_id as invocation_id,
+        $run.record_sha256 as record_sha256,
+        $run.archive_object as archive_object,
+        $run.archive_pointer as archive_pointer,
+        $run.session_id as session_id,
+        $run.invoked_at_unix_ms as invoked_at_unix_ms,
+        $run.case_id as case_id,
+        $run.case_digest as case_digest,
+        $run.sut_evidence as sut_evidence,
+        $run.package_version as package_version,
+        $run.source_commit as source_commit,
+        $run.source_tree_dirty as source_tree_dirty,
+        $run.build_profile as build_profile,
+        $run.build_opt_level as build_opt_level,
+        $run.debug_assertions as debug_assertions,
+        $run.target_triple as target_triple,
+        $run.rustc_version as rustc_version,
+        $run.build_declared_release_lto as build_declared_release_lto,
+        $run.build_declared_release_codegen_units as build_declared_release_codegen_units,
+        $run.build_declared_release_strip as build_declared_release_strip,
+        $run.build_cargo_encoded_rustflags_present as build_cargo_encoded_rustflags_present,
+        $run.build_release_profile_environment_overrides_supported as build_release_profile_environment_overrides_supported,
+        $run.build_effective_codegen_options_proved as build_effective_codegen_options_proved,
+        $run.worker_executable_sha256 as worker_executable_sha256,
+        $run.sut_fingerprint as sut_fingerprint,
+        $run.sut_json as sut_json,
+        $run.client_build_json as client_build_json,
+        $run.client_machine_json as client_machine_json,
+        $run.machine_fingerprint as machine_fingerprint,
+        $run.machine_format_version as machine_format_version,
+        $run.machine_os_name as machine_os_name,
+        $run.machine_os_version as machine_os_version,
+        $run.machine_kernel_version as machine_kernel_version,
+        $run.machine_architecture as machine_architecture,
+        $run.machine_cpu_model as machine_cpu_model,
+        $run.machine_logical_cores as machine_logical_cores,
+        $run.machine_physical_cores as machine_physical_cores,
+        $run.machine_total_memory_bytes as machine_total_memory_bytes,
+        $run.machine_resource_control_json as machine_resource_control_json,
+        $run.machine_scheduling_json as machine_scheduling_json,
+        $run.machine_resource_limits_json as machine_resource_limits_json,
+        $run.machine_label as machine_label,
+        $run.backend_evidence as backend_evidence,
+        $run.backend_fingerprint as backend_fingerprint,
+        $run.backend_json as backend_json,
+        $run.fixture_manifest_sha256 as fixture_manifest_sha256,
+        $run.fixture_logical_sha256 as fixture_logical_sha256,
+        $run.fixture_physical_sha256 as fixture_physical_sha256,
+        $run.acquisition_status as acquisition_status,
+        $run.claim_eligible as claim_eligible,
+        $run.terminal_failed_repetition as terminal_failed_repetition,
+        $run.terminal_stage as terminal_stage,
+        $run.terminal_code as terminal_code,
+        $run.requested_repetitions as requested_repetitions,
+        $run.observed_repetitions as observed_repetitions,
+        $run.min_us as min_us,
+        $run.p50_us as p50_us,
+        $run.max_us as max_us,
+        $run.p95_us as p95_us,
+        $run.p95_supported as p95_supported,
+        $run.wall_evidence as wall_evidence,
+        $run.floor_multiplier_millis as floor_multiplier_millis,
+        $run.lance_data_plane_logical_calls_min as lance_data_plane_logical_calls_min,
+        $run.lance_data_plane_logical_calls_p50 as lance_data_plane_logical_calls_p50,
+        $run.lance_data_plane_logical_calls_max as lance_data_plane_logical_calls_max,
+        $run.control_plane_logical_calls_min as control_plane_logical_calls_min,
+        $run.control_plane_logical_calls_p50 as control_plane_logical_calls_p50,
+        $run.control_plane_logical_calls_max as control_plane_logical_calls_max,
+        $run.logical_counts_presence_json as logical_counts_presence_json,
         $run.physical_counts_presence_json as physical_counts_presence_json
     }
     order { invocation_id asc }

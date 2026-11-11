@@ -59,7 +59,7 @@ query before_restart_company() { match { $c: Company } return { $c.name } }
 c.name: String
 
 --- query
-query before_restart_worksat() { match { $p: Person $p worksAt $c } return { $p.name, $c.name } }
+query before_restart_worksat() { match { $p: Person, $p worksAt $c } return { $p.name, $c.name } }
 --- expect unordered
 {"c.name":"acme","p.name":"alice"}
 {"c.name":"acme","p.name":"eve"}
@@ -86,7 +86,7 @@ query after_restart_company() { match { $c: Company } return { $c.name } }
 c.name: String
 
 --- query
-query after_restart_worksat() { match { $p: Person $p worksAt $c } return { $p.name, $c.name } }
+query after_restart_worksat() { match { $p: Person, $p worksAt $c } return { $p.name, $c.name } }
 --- expect unordered
 {"c.name":"acme","p.name":"alice"}
 {"c.name":"acme","p.name":"eve"}
@@ -123,7 +123,7 @@ query landed_company() { match { $c: Company } return { $c.name } }
 c.name: String
 
 --- query
-query landed_worksat() { match { $p: Person $p worksAt $c } return { $p.name, $c.name } }
+query landed_worksat() { match { $p: Person, $p worksAt $c } return { $p.name, $c.name } }
 --- expect unordered
 {"c.name":"acme","p.name":"alice"}
 {"c.name":"acme","p.name":"eve"}

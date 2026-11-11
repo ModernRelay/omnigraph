@@ -15,7 +15,7 @@ use crate::support::*;
 #[tokio::test(flavor = "multi_thread")]
 async fn stored_wildcard_keeps_both_authorization_gates_issue_659() {
     let source = r#"query neighbors() {
-        match { $p: Person { name: "Alice" } $f: Person $p * $f }
+        match { $p: Person, $f: Person, $p * $f } where $p.name = "Alice"
         return { $f.name }
     }"#;
     let (_temp, app) = app_with_stored_queries(
@@ -150,7 +150,7 @@ async fn server_boots_with_a_valid_stored_query_registry() {
     let graph = graph_path(temp.path());
     let registry = stored_query_registry(&[(
         "find_person",
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+        "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }",
         false,
     )]);
     let state = AppState::open_single_with_queries(
@@ -984,7 +984,7 @@ async fn list_queries_surfaces_query_description_and_instruction() {
     let described = "query described($name: String) \
         @description(\"Find a person by exact name.\") \
         @instruction(\"Use for exact lookups; prefer search for fuzzy matches.\") \
-        { match { $p: Person { name: $name } } return { $p.age } }";
+        { match { $p: Person } where $p.name = $name return { $p.age } }";
     let (_temp, app) = app_with_stored_queries(
         &[
             ("described", described, true),
@@ -1151,7 +1151,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
     assert_receipt_commit_matches_get(&app, &body, "t-full").await;
 }
 
-const OLDER_OR_NAMED_GQ: &str = "query older_or_named($name: String) { match { $p: Person  $p.age > 30 or $p.name = $name } return { $p.name } }";
+const OLDER_OR_NAMED_GQ: &str = "query older_or_named($name: String) { match { $p: Person } where ($p.age > 30 or $p.name = $name) return { $p.name } }";
 
 /// [`app_with_stored_queries`] with the process defaults every invocation's
 /// session starts from, seeded here instead of the process environment.
@@ -1318,7 +1318,7 @@ graphs:
     .unwrap();
     std::fs::write(
         rewritten.path().join("mutations.gq"),
-        "query add_person($slug: String, $n: I64) { insert Person { slug: $slug, conj: $n } }\nquery clear_flag() { $x: Person  $x.conj = 1  update $x set { conj: 0 } }\n",
+        "query add_person($slug: String, $n: I64) { insert Person { slug: $slug, conj: $n } }\nquery clear_flag() { match { $x: Person } where $x.conj = 1  update $x set { conj: 0 } }\n",
     )
     .unwrap();
     std::fs::write(

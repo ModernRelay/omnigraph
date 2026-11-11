@@ -23,7 +23,7 @@ node Job {
 --- query
 set engine = v2;
 query jobs_with_a_real_operator() {
-    match { $j: Job $o: @Operator $j.uses = $o.name }
+    match { $j: Job, $o: @Operator } where $j.uses = $o.name
     return { $j.name, $o.inputs }
     order { $j.name }
 }
@@ -39,10 +39,8 @@ o.inputs: [I64]
 --- query
 set engine = v2;
 query jobs_naming_no_operator() {
-    match {
-        $j: Job
-        not { $o: @Operator $o.name = $j.uses }
-    }
+    match { $j: Job }
+    where not exists { $o: @Operator where $o.name = $j.uses }
     return { $j.name }
 }
 
@@ -54,7 +52,7 @@ j.name: String
 
 --- mutate
 query rename_scan() {
-    $x: @Operator  $x.name = "Scan"
+    match { $x: @Operator } where $x.name = "Scan"
     update $x set { name: "Read" }
 }
 
@@ -70,7 +68,7 @@ query add_operator() {
 --- query
 set engine = v2;
 query search_operators($q: String) {
-    match { $o: @Operator match_text($o.name, $q) }
+    match { $o: @Operator } where match_text($o.name, $q)
     return { $o.name }
 }
 

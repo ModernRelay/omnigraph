@@ -49,25 +49,19 @@ edge Knows: Actor -> Actor {}
 
 --- query
 query bare_aggregate_in_match_stays_rejected() {
-    match {
-        $n: Actor
-        $m: Artifact
-        $m artifactOwnedByActor $n
-        count($m) > 2
-    }
+    match { $n: Actor, $m: Artifact, $m artifactOwnedByActor $n }
+    where count($m) > 2
     return { $n.slug }
 }
---- expect error: T8: `count($m)` is an aggregate; in a filter it is a block over the clauses it counts
+--- expect error: T8: `count($m)` is an aggregate; in a filter it is a block over the elements it counts
 
 --- query
 query more_than_two() {
-    match {
-        $n: Actor
-        count {
-            $m: Artifact
-            $m artifactOwnedByActor $n
-        } > 2
-    }
+    match { $n: Actor }
+    where count {
+        $m: Artifact,
+        $m artifactOwnedByActor $n
+    } > 2
     return { $n.slug }
     limit 5
 }
@@ -78,12 +72,10 @@ n.slug: String
 
 --- query
 query at_most_one() {
-    match {
-        $n: Actor
-        count {
-            $m artifactOwnedByActor $n
-        } <= 1
-    }
+    match { $n: Actor }
+    where count {
+        $m artifactOwnedByActor $n
+    } <= 1
     return { $n.slug }
 }
 --- expect unordered
@@ -95,12 +87,10 @@ n.slug: String
 --- loop $degree 0 4
 --- query
 query exact_degree($degree: I64) {
-    match {
-        $n: Actor
-        count {
-            $m artifactOwnedByActor $n
-        } = $degree
-    }
+    match { $n: Actor }
+    where count {
+        $m artifactOwnedByActor $n
+    } = $degree
     return { $n.followers }
 }
 --- params
@@ -113,13 +103,11 @@ n.followers: I64
 
 --- query
 query exactly_three_distinct_neighbours_off_the_bulk_path() {
-    match {
-        $n: Actor
-        count {
-            $m artifactOwnedByActor $n
-            $m.slug != "none"
-        } = 3
-    }
+    match { $n: Actor }
+    where count {
+        $m artifactOwnedByActor $n
+        where $m.slug != "none"
+    } = 3
     return { $n.slug }
 }
 --- expect unordered
@@ -129,12 +117,10 @@ n.slug: String
 
 --- query
 query bound_edge_counts_edge_rows() {
-    match {
-        $n: Actor
-        count {
-            $m $e:artifactOwnedByActor $n
-        } = 4
-    }
+    match { $n: Actor }
+    where count {
+        $m $e:artifactOwnedByActor $n
+    } = 4
     return { $n.slug }
 }
 --- expect unordered
@@ -144,12 +130,10 @@ n.slug: String
 
 --- query
 query undirected_degree_takes_the_slow_path() {
-    match {
-        $n: Actor
-        count {
-            $n <knows> $m
-        } = 2
-    }
+    match { $n: Actor }
+    where count {
+        $n <knows> $m
+    } = 2
     return { $n.slug }
 }
 --- expect unordered
@@ -159,12 +143,10 @@ n.slug: String
 
 --- query
 query undirected_existence_reads_both_directions() {
-    match {
-        $n: Actor
-        count {
-            $n <knows> $m
-        } > 0
-    }
+    match { $n: Actor }
+    where count {
+        $n <knows> $m
+    } > 0
     return { $n.slug }
 }
 --- expect unordered
@@ -176,24 +158,20 @@ n.slug: String
 
 --- query
 query outer_property_as_the_bound_is_refused() {
-    match {
-        $n: Actor
-        count {
-            $m artifactOwnedByActor $n
-        } >= $n.followers
-    }
+    match { $n: Actor }
+    where count {
+        $m artifactOwnedByActor $n
+    } >= $n.followers
     return { $n.slug }
 }
 --- expect error: P006: `outer_property_as_the_bound_is_refused`: the planner does not lower a block value compared with a column
 
 --- query
 query not_equal_to_a_parameter($bound: I64) {
-    match {
-        $n: Actor
-        count {
-            $m artifactOwnedByActor $n
-        } != $bound
-    }
+    match { $n: Actor }
+    where count {
+        $m artifactOwnedByActor $n
+    } != $bound
     return { $n.slug }
 }
 --- params
@@ -207,12 +185,10 @@ n.slug: String
 
 --- query
 query predicate_narrows_before_limit() {
-    match {
-        $n: Actor
-        count {
-            $m artifactOwnedByActor $n
-        } >= 1
-    }
+    match { $n: Actor }
+    where count {
+        $m artifactOwnedByActor $n
+    } >= 1
     return { $n.slug }
     order { $n.slug }
     limit 2
@@ -225,11 +201,9 @@ n.slug: String
 
 --- query
 query not_agrees_with_zero() {
-    match {
-        $n: Actor
-        not {
-            $m artifactOwnedByActor $n
-        }
+    match { $n: Actor }
+    where not exists {
+        $m artifactOwnedByActor $n
     }
     return { $n.slug }
 }
@@ -240,12 +214,10 @@ n.slug: String
 
 --- query
 query count_cannot_be_negative() {
-    match {
-        $n: Actor
-        count {
-            $m artifactOwnedByActor $n
-        } < 0
-    }
+    match { $n: Actor }
+    where count {
+        $m artifactOwnedByActor $n
+    } < 0
     return { $n.slug }
 }
 --- expect unordered
@@ -254,12 +226,10 @@ n.slug: String
 
 --- query
 query null_count_bound_satisfies_nothing($bound: I64?) {
-    match {
-        $n: Actor
-        count {
-            $m artifactOwnedByActor $n
-        } != $bound
-    }
+    match { $n: Actor }
+    where count {
+        $m artifactOwnedByActor $n
+    } != $bound
     return { $n.slug }
 }
 --- params
@@ -270,14 +240,12 @@ n.slug: String
 
 --- query
 query nested_count_is_correlated_to_each_peer() {
-    match {
-        $n: Actor
-        exists {
-            $n knows $peer
-            count {
-                $m artifactOwnedByActor $peer
-            } >= 3
-        }
+    match { $n: Actor }
+    where exists {
+        $n knows $peer
+        where count {
+            $m artifactOwnedByActor $peer
+        } >= 3
     }
     return { $n.slug }
 }

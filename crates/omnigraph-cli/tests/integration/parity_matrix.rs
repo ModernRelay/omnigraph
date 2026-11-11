@@ -468,7 +468,7 @@ fn parity_mutate() {
     let (l, r) = p.run(&[
         "mutate",
         "-e",
-        "query no_match() { $x: Person  $x.name = \"Nobody\"  update $x set { age: 99 } }",
+        "query no_match() { match { $x: Person } where $x.name = \"Nobody\"  update $x set { age: 99 } }",
         "--json",
     ]);
     assert_parity("no-op mutate", &l, &r);

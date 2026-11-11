@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $d: Doc  fuzzy($d.body, "graf", 2) } return { $d.title } }
+query q() { match { $d: Doc } where fuzzy($d.body, "graf", 2) return { $d.title } }
 
 --- expect error: type error: T71:

@@ -41,7 +41,7 @@ show merge_lineage;
 --- mutate
 reset all;
 query birthday() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 33 }
 }
 
@@ -103,7 +103,7 @@ branch create target_verify;
 
 --- mutate branch: source
 query update_source() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 31 }
 }
 
@@ -111,7 +111,7 @@ query update_source() {
 
 --- mutate branch: target_off
 query update_target() {
-    $x: Person  $x.name = "bob"
+    match { $x: Person } where $x.name = "bob"
     update $x set { age: 41 }
 }
 
@@ -119,7 +119,7 @@ query update_target() {
 
 --- mutate branch: target_on
 query update_target() {
-    $x: Person  $x.name = "bob"
+    match { $x: Person } where $x.name = "bob"
     update $x set { age: 41 }
 }
 
@@ -127,7 +127,7 @@ query update_target() {
 
 --- mutate branch: target_verify
 query update_target() {
-    $x: Person  $x.name = "bob"
+    match { $x: Person } where $x.name = "bob"
     update $x set { age: 41 }
 }
 

@@ -529,7 +529,7 @@ embedding: Vector(4)
     fn check_passes_for_valid_query() {
         let reg = QueryRegistry::from_specs(vec![spec(
             "find_user",
-            "query find_user($name: String) { match { $u: User { name: $name } } return { $u.age } }",
+            "query find_user($name: String) { match { $u: User } where $u.name = $name return { $u.age } }",
             false,
         )])
         .unwrap();
@@ -630,7 +630,7 @@ embedding: Vector(4)
         // only `Vector(_)` triggers the warning).
         let reg = QueryRegistry::from_specs(vec![spec(
             "find_user",
-            "query find_user($name: String) { match { $u: User { name: $name } } return { $u.name } }",
+            "query find_user($name: String) { match { $u: User } where $u.name = $name return { $u.name } }",
             true,
         )])
         .unwrap();

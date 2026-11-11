@@ -23,10 +23,9 @@ node Chunk {
 
 --- query
 query ranked($q: String) {
-    match { from bm25({ match {
-        $c: Chunk
-        search($c.text, $q)
-    } return { $c } }, $c.text, $q) }
+    match {
+      from bm25({ match { $c: Chunk } where search($c.text, $q) return { $c } }, $c.text, $q),
+    }
     return { $c.slug }
     order { $score desc }
 }

@@ -92,11 +92,13 @@ node Probe {
 --- query
 set engine = v2;
 query fused_v2($t: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60)
-        $d: Doc
-        $p: Probe
-        $d.n = $p.n
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60),
+      $d: Doc,
+      $p: Probe,
     }
+    where $d.n = $p.n
     return { $p.slug }
     order { $score desc }
     limit 5
@@ -118,11 +120,13 @@ p.slug: String
 --- query
 set engine = v2;
 query fused_explicit_id($t: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60)
-        $d: Doc
-        $p: Probe
-        $d.n = $p.n
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60),
+      $d: Doc,
+      $p: Probe,
     }
+    where $d.n = $p.n
     return { $p.slug }
     order { $score desc, $p.@id }
     limit 1
@@ -143,11 +147,13 @@ rank fuse row tiebreak [$p.@id]
 --- query
 set engine = v2;
 query fused_covered_return($t: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60)
-        $d: Doc
-        $p: Probe
-        $d.n = $p.n
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60),
+      $d: Doc,
+      $p: Probe,
     }
+    where $d.n = $p.n
     return { $p.slug }
     order { $score desc, $p.slug }
     limit 1

@@ -73,11 +73,7 @@ load executed: partitions 1 rows 3
 
 --- query
 query replaced() {
-    match {
-        $a: Person
-        $b: Person
-        $a knows $b
-    }
+    match { $a: Person, $b: Person, $a knows $b }
     return { $a.email, $b.email }
 }
 

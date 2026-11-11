@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $p: Person  $p: Company } return { $p } }
+query q() { match { $p: Person, $p: Company } return { $p } }
 
 --- expect error: type error: T50:

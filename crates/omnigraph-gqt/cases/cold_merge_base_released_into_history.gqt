@@ -36,7 +36,7 @@ branch create s from b
 
 --- mutate branch: s
 query set_bob_on_s() {
-    $x: Person  $x.name = "bob"
+    match { $x: Person } where $x.name = "bob"
     update $x set { age: 7 }
 }
 
@@ -45,7 +45,7 @@ query set_bob_on_s() {
 --- loop $i 1 5
 --- mutate branch: b
 query bump_alice($n: I32) {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: $n }
 }
 --- params

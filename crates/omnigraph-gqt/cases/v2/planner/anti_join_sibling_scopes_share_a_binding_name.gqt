@@ -33,16 +33,14 @@ node B {
 --- query
 set engine = v2;
 query independent_negations() {
-    match {
-        $p: P
-        not {
-            $x: A
-            $x.foo = $p.foo
-        }
-        not {
-            $x: B
-            $x.bar = $p.bar
-        }
+    match { $p: P }
+    where not exists {
+        $x: A
+        where $x.foo = $p.foo
+    }
+      and not exists {
+        $x: B
+        where $x.bar = $p.bar
     }
     return { $p.name }
 }

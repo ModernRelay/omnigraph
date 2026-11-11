@@ -48,10 +48,8 @@ edge Owns: Person -> Doc
 
 --- query
 query concrete_edges() {
-    match {
-        $from: Person { name: "a" }
-        $from $edge:(knows | likes) $to
-    }
+    match { $from: Person, $from $edge:(knows | likes) $to }
+    where $from.name = "a"
     return { $to.name as destination, $edge.@type as edge_type, $edge.@id as edge_id, $edge.weight as weight }
 }
 
@@ -74,10 +72,8 @@ expand $from $to: mode indexed_scan ran indexed_scan
 
 --- query
 query distinct_neighbors() {
-    match {
-        $from: Person { name: "a" }
-        $from (knows | likes) $to
-    }
+    match { $from: Person, $from (knows | likes) $to }
+    where $from.name = "a"
     return { $to.name as destination }
 }
 
@@ -91,10 +87,8 @@ destination: String
 
 --- query
 query exactly_two_hops() {
-    match {
-        $from: Person { name: "a" }
-        $from (knows | likes){2,2} $to
-    }
+    match { $from: Person, $from (knows | likes){2,2} $to }
+    where $from.name = "a"
     return { $to.name as destination }
 }
 
@@ -106,10 +100,8 @@ destination: String
 
 --- query
 query exactly_three_hops() {
-    match {
-        $from: Person { name: "a" }
-        $from (knows | likes){3,3} $to
-    }
+    match { $from: Person, $from (knows | likes){3,3} $to }
+    where $from.name = "a"
     return { $to.name as destination }
 }
 
@@ -121,10 +113,8 @@ destination: String
 
 --- query
 query bounded_reachable_people() {
-    match {
-        $from: Person { name: "a" }
-        $from (knows | likes){1,3} $to
-    }
+    match { $from: Person, $from (knows | likes){1,3} $to }
+    where $from.name = "a"
     return { $to.name as destination }
 }
 
@@ -140,11 +130,8 @@ destination: String
 
 --- query
 query wildcard_concrete_edges() {
-    match {
-        $from: Person { name: "a" }
-        $to: Person
-        $from $edge:* $to
-    }
+    match { $from: Person, $to: Person, $from $edge:* $to }
+    where $from.name = "a"
     return { $to.name as destination, $edge.@type as edge_type, $edge.@id as edge_id, $edge.weight as weight }
 }
 

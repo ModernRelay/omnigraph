@@ -27,7 +27,7 @@ node Span {
 
 --- mutate
 query delete_by_interval() {
-    $x: Span  $x.interval = 1
+    match { $x: Span } where $x.interval = 1
     delete $x
 }
 
@@ -35,7 +35,7 @@ query delete_by_interval() {
 
 --- mutate
 query delete_by_exists() {
-    $x: Span  $x.exists = 2
+    match { $x: Span } where $x.exists = 2
     delete $x
 }
 
@@ -43,13 +43,13 @@ query delete_by_exists() {
 
 --- mutate
 query chained_updates() {
-    $x: Span  $x.trim = 3
+    match { $x: Span } where $x.trim = 3
     update $x set { exists: 5 }
-    $x: Span  $x.exists = 5
+    match { $x: Span } where $x.exists = 5
     update $x set { trim: 7 }
-    $x: Span  $x.trim = 7
+    match { $x: Span } where $x.trim = 7
     update $x set { interval: 8 }
-    $x: Span  $x.interval = 8
+    match { $x: Span } where $x.interval = 8
     update $x set { exists: 6 }
 }
 

@@ -32,7 +32,7 @@ branch create work
 --- expect ok
 
 --- mutate branch: work
-query delete_bob() { $x: Person  $x.name = "bob"  delete $x }
+query delete_bob() { match { $x: Person } where $x.name = "bob"  delete $x }
 
 --- expect affected: nodes=1 edges=3
 
@@ -48,7 +48,7 @@ query nodes_before_restart() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query branch: work
-query edges_before_restart() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query edges_before_restart() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 
 --- expect unordered
 {"p.name":"carol","q.name":"dave"}
@@ -71,7 +71,7 @@ query nodes_after_restart() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query branch: work
-query edges_after_restart() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query edges_after_restart() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 
 --- expect unordered
 {"p.name":"carol","q.name":"dave"}
@@ -105,7 +105,7 @@ query durable_nodes() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query branch: work
-query durable_edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query durable_edges() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 
 --- expect unordered
 {"p.name":"alice","q.name":"bob"}
@@ -128,7 +128,7 @@ query main_nodes_unchanged() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query branch: main
-query main_edges_unchanged() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query main_edges_unchanged() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 
 --- expect unordered
 {"p.name":"alice","q.name":"bob"}

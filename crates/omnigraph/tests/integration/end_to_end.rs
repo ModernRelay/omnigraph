@@ -423,7 +423,7 @@ async fn query_treats_missing_nullable_param_as_null() {
     let db = init_and_load(&dir).await;
     let query = r#"
         query optional_name($name: String?) {
-            match { $p: Person { name: $name } }
+            match { $p: Person } where $p.name = $name
             return { $p.name }
         }
     "#;
@@ -620,10 +620,8 @@ edge WorksAt: Person -> Company
 "#;
     let queries = r#"
 query unemployed() {
-    match {
-        $p: Person
-        not { $p worksAt $_ }
-    }
+    match { $p: Person }
+    where not exists { $p worksAt $_ }
     return { $p.name }
 }
 "#;
@@ -960,7 +958,7 @@ async fn mutation_update_key_property_rejected() {
 
     let queries = r#"
 query rename_person($old_name: String, $new_name: String) {
-    $x: Person  $x.name = $old_name
+    match { $x: Person } where $x.name = $old_name
     update $x set { name: $new_name }
 }
 "#;
@@ -998,13 +996,13 @@ query all_docs() {
 }
 
 query get_doc($title: String) {
-    match { $d: Document { title: $title } }
+    match { $d: Document } where $d.title = $title
     return { $d.title }
 }
 
 query get_doc_clause($title: String) {
-    match { $d: Document
-        $d.title = $title }
+    match { $d: Document }
+    where $d.title = $title
     return { $d.title }
 }
 "#;
@@ -1015,18 +1013,18 @@ query insert_doc($title: String, $content: Blob) {
 }
 
 query update_doc_content($title: String, $content: Blob) {
-    $x: Document  $x.title = $title
+    match { $x: Document } where $x.title = $title
     update $x set { content: $content }
 }
 
 query clear_doc_content($title: String, $content: Blob?) {
-    $x: Document  $x.title = $title
+    match { $x: Document } where $x.title = $title
     update $x set { content: $content }
 }
 
 query insert_then_clear_doc_content($title: String, $content: Blob, $cleared: Blob?) {
     insert Document { title: $title, content: $content }
-    $x: Document  $x.title = $title
+    match { $x: Document } where $x.title = $title
     update $x set { content: $cleared }
 }
 "#;
@@ -1838,7 +1836,7 @@ node Person {
 "#;
     let queries = r#"
 query set_age($name: String, $age: I32) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     update $x set { age: $age }
 }
 "#;
@@ -1912,7 +1910,7 @@ node Order {
 "#;
     let queries = r#"
 query set_label($code: String, $label: String) {
-    $x: Order  $x.code = $code
+    match { $x: Order } where $x.code = $code
     update $x set { label: $label }
 }
 "#;
@@ -2010,11 +2008,11 @@ query insert_article($slug: String, $attachment: Blob, $summary: String, $rating
     insert Article { slug: $slug, attachment: $attachment, summary: $summary, rating: $rating }
 }
 query update_summary($slug: String, $summary: String) {
-    $x: Article  $x.slug = $slug
+    match { $x: Article } where $x.slug = $slug
     update $x set { summary: $summary }
 }
 query get_article($slug: String) {
-    match { $a: Article { slug: $slug } }
+    match { $a: Article } where $a.slug = $slug
     return { $a.slug, $a.summary, $a.rating }
 }
 "#;
@@ -2845,7 +2843,7 @@ async fn update_edge_type_returns_error_not_panic() {
     // execute_update must not panic with HashMap key-not-found.
     let mutations = r#"
 query update_edge($from: String) {
-    $x: Knows  $x.@src = $from
+    match { $x: Knows } where $x.@src = $from
     update $x set { since: "2025-01-01" }
 }
 "#;
@@ -2870,7 +2868,7 @@ async fn date_literal_with_quote_is_escaped() {
     // This tests that literal_to_sql escapes Date/DateTime values.
     let queries = r#"
 query filter_date($d: String) {
-    match { $p: Person { name: $d } }
+    match { $p: Person } where $p.name = $d
     return { $p.name }
 }
 "#;
@@ -3047,10 +3045,8 @@ node Doc {
 
     let queries = r#"
 query docs_with_tag($tag: String) {
-    match {
-        $d: Doc
-        $tag in $d.tags
-    }
+    match { $d: Doc }
+    where $tag in $d.tags
     return { $d.slug }
 }
 "#;

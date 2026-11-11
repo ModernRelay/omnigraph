@@ -46,11 +46,8 @@ edge Owns: Person -> Doc
 
 --- query
 query same_id_edges_have_a_total_order() {
-    match {
-        $from: Person { name: "a" }
-        $from $edge:(knows | likes) $to
-        $edge.@id = "shared"
-    }
+    match { $from: Person, $from $edge:(knows | likes) $to }
+    where $from.name = "a" and $edge.@id = "shared"
     return { $edge.@type as edge_type, $edge.@id as edge_id }
     order { $from.name }
     limit 2
@@ -70,11 +67,8 @@ sort tiebreak [$edge.@type, $edge.@id, $from.@id, $to.@id]
 
 --- query
 query same_id_order_keeps_type_tiebreak() {
-    match {
-        $from: Person { name: "a" }
-        $from $edge:(knows | likes) $to
-        $edge.@id = "shared"
-    }
+    match { $from: Person, $from $edge:(knows | likes) $to }
+    where $from.name = "a" and $edge.@id = "shared"
     return { $edge.@type as edge_type, $edge.@id as edge_id }
     order { $edge.@id }
     limit 1
@@ -92,12 +86,8 @@ sort tiebreak [$edge.@type, $from.@id, $to.@id]
 
 --- query
 query same_id_alias_order_keeps_wildcard_type_tiebreak() {
-    match {
-        $from: Person { name: "a" }
-        $to: Person
-        $from $edge:* $to
-        $edge.@id = "shared"
-    }
+    match { $from: Person, $to: Person, $from $edge:* $to }
+    where $from.name = "a" and $edge.@id = "shared"
     return { $edge.@type as edge_type, $edge.@id as edge_id }
     order { edge_id }
     limit 1
@@ -116,10 +106,8 @@ sort tiebreak [$edge.@type, $from.@id, $to.@id]
 
 --- query
 query union_explicit_one() {
-    match {
-        $from: Person { name: "a" }
-        $from (knows | likes){1,1} $to
-    }
+    match { $from: Person, $from (knows | likes){1,1} $to }
+    where $from.name = "a"
     return { $to.name as destination }
 }
 
@@ -133,11 +121,8 @@ destination: String
 
 --- query
 query wildcard_default() {
-    match {
-        $from: Person { name: "a" }
-        $to: Person
-        $from * $to
-    }
+    match { $from: Person, $to: Person, $from * $to }
+    where $from.name = "a"
     return { $to.name as destination }
 }
 
@@ -151,11 +136,8 @@ destination: String
 
 --- query
 query wildcard_explicit_one() {
-    match {
-        $from: Person { name: "a" }
-        $to: Person
-        $from *{1,1} $to
-    }
+    match { $from: Person, $to: Person, $from *{1,1} $to }
+    where $from.name = "a"
     return { $to.name as destination }
 }
 
@@ -169,10 +151,8 @@ destination: String
 
 --- query
 query undirected_union_default() {
-    match {
-        $from: Person { name: "e" }
-        $from <knows | likes> $to
-    }
+    match { $from: Person, $from <knows | likes> $to }
+    where $from.name = "e"
     return { $to.name as destination }
 }
 
@@ -184,10 +164,8 @@ destination: String
 
 --- query
 query undirected_union_explicit_one() {
-    match {
-        $from: Person { name: "e" }
-        $from <knows | likes>{1,1} $to
-    }
+    match { $from: Person, $from <knows | likes>{1,1} $to }
+    where $from.name = "e"
     return { $to.name as destination }
 }
 
@@ -199,11 +177,8 @@ destination: String
 
 --- query
 query undirected_wildcard_default() {
-    match {
-        $from: Person { name: "e" }
-        $to: Person
-        $from <*> $to
-    }
+    match { $from: Person, $to: Person, $from <*> $to }
+    where $from.name = "e"
     return { $to.name as destination }
 }
 
@@ -215,11 +190,8 @@ destination: String
 
 --- query
 query undirected_wildcard_explicit_one() {
-    match {
-        $from: Person { name: "e" }
-        $to: Person
-        $from <*>{1,1} $to
-    }
+    match { $from: Person, $to: Person, $from <*>{1,1} $to }
+    where $from.name = "e"
     return { $to.name as destination }
 }
 
@@ -231,10 +203,8 @@ destination: String
 
 --- query
 query duplicate_members() {
-    match {
-        $from: Person { name: "a" }
-        $from (knows | kNOWS | likes | likes) $to
-    }
+    match { $from: Person, $from (knows | kNOWS | likes | likes) $to }
+    where $from.name = "a"
     return { $to.name as destination }
 }
 
@@ -248,11 +218,8 @@ destination: String
 
 --- query
 query wildcard_mixed_path() {
-    match {
-        $from: Person { name: "a" }
-        $to: Person
-        $from *{3,3} $to
-    }
+    match { $from: Person, $to: Person, $from *{3,3} $to }
+    where $from.name = "a"
     return { $to.name as destination }
 }
 
@@ -264,10 +231,8 @@ destination: String
 
 --- query
 query bound_union_explicit_one() {
-    match {
-        $from: Person { name: "a" }
-        $from $edge:(knows | likes){1,1} $to
-    }
+    match { $from: Person, $from $edge:(knows | likes){1,1} $to }
+    where $from.name = "a"
     return { $edge.@type as edge_type, $edge.@id as edge_id }
 }
 
@@ -284,11 +249,8 @@ edge_id: String
 
 --- query
 query bound_wildcard_explicit_one() {
-    match {
-        $from: Person { name: "a" }
-        $to: Person
-        $from $edge:*{1,1} $to
-    }
+    match { $from: Person, $to: Person, $from $edge:*{1,1} $to }
+    where $from.name = "a"
     return { $edge.@type as edge_type, $edge.@id as edge_id }
 }
 
@@ -305,10 +267,8 @@ edge_id: String
 
 --- query
 query bound_undirected_union() {
-    match {
-        $from: Person { name: "a" }
-        $from $edge:<knows | likes> $to
-    }
+    match { $from: Person, $from $edge:<knows | likes> $to }
+    where $from.name = "a"
     return { $edge.@type as edge_type, $edge.@id as edge_id }
 }
 
@@ -326,11 +286,8 @@ edge_id: String
 
 --- query
 query bound_undirected_wildcard() {
-    match {
-        $from: Person { name: "a" }
-        $to: Person
-        $from $edge:<*> $to
-    }
+    match { $from: Person, $to: Person, $from $edge:<*> $to }
+    where $from.name = "a"
     return { $edge.@type as edge_type, $edge.@id as edge_id }
 }
 
@@ -348,10 +305,8 @@ edge_id: String
 
 --- query
 query count_distinct_neighbors() {
-    match {
-        $from: Person { name: "a" }
-        count { $from (knows | likes) $to } = 3
-    }
+    match { $from: Person }
+    where $from.name = "a" and count { $from (knows | likes) $to } = 3
     return { $from.name as name }
 }
 
@@ -363,10 +318,8 @@ name: String
 
 --- query
 query count_physical_edges() {
-    match {
-        $from: Person { name: "a" }
-        count { $from $edge:(knows | likes) $to } = 5
-    }
+    match { $from: Person }
+    where $from.name = "a" and count { $from $edge:(knows | likes) $to } = 5
     return { $from.name as name }
 }
 
@@ -378,10 +331,8 @@ name: String
 
 --- query
 query exists_mixed_path() {
-    match {
-        $from: Person { name: "a" }
-        exists { $from (knows | likes){3,3} $to }
-    }
+    match { $from: Person }
+    where $from.name = "a" and exists { $from (knows | likes){3,3} $to }
     return { $from.name as name }
 }
 
@@ -393,10 +344,8 @@ name: String
 
 --- query
 query not_mixed_path() {
-    match {
-        $from: Person { name: "a" }
-        not { $from (knows | likes){4,4} $to }
-    }
+    match { $from: Person }
+    where $from.name = "a" and not exists { $from (knows | likes){4,4} $to }
     return { $from.name as name }
 }
 
@@ -409,11 +358,12 @@ name: String
 --- query
 query huge_finite_bound_before_selection() {
     match {
-        $a: Person { name: "a" }
-        $b: Person { name: "b" }
-        $a knows{1,4294967295} $b
-        $b (knows | likes) $c
+        $a: Person,
+        $b: Person,
+        $a knows{1,4294967295} $b,
+        $b (knows | likes) $c,
     }
+    where $a.name = "a" and $b.name = "b"
     return { $c.name as destination }
 }
 
@@ -426,7 +376,7 @@ destination: String
 
 --- query
 query named_type_count_preserves_parallel_edges() {
-    match { $a: Person { name: "a" } $a $e:knows $b }
+    match { $a: Person, $a $e:knows $b } where $a.name = "a"
     return { count($e.@type) as total }
 }
 --- expect unordered
@@ -436,7 +386,7 @@ total: I64
 
 --- query
 query type_filter_selects_one_member() {
-    match { $a: Person { name: "a" } $a $e:(knows | likes) $b $e.@type = "Likes" }
+    match { $a: Person, $a $e:(knows | likes) $b } where $a.name = "a" and $e.@type = "Likes"
     return { $b.name as destination, $e.@id as edge_id }
 }
 --- expect unordered
@@ -447,7 +397,7 @@ edge_id: String
 
 --- query
 query group_by_concrete_type() {
-    match { $a: Person { name: "a" } $a $e:(knows | likes) $b }
+    match { $a: Person, $a $e:(knows | likes) $b } where $a.name = "a"
     return { $e.@type as kind, count($e.@id) as total }
 }
 --- expect unordered
@@ -459,7 +409,7 @@ total: I64
 
 --- query
 query type_metadata_inside_count_block() {
-    match { $a: Person { name: "a" } count($e.@type) { $a $e:(knows | likes) $b $e.@type = "Likes" } = 1 }
+    match { $a: Person } where $a.name = "a" and count($e.@type) { $a $e:(knows | likes) $b where $e.@type = "Likes" } = 1
     return { $a.name as name }
 }
 --- expect unordered
@@ -469,7 +419,7 @@ name: String
 
 --- query
 query undirected_recursive_alternation() {
-    match { $a: Person { name: "e" } $b: Person $a <knows | likes>{1,3} $b }
+    match { $a: Person, $b: Person, $a <knows | likes>{1,3} $b } where $a.name = "e"
     return { $b.name as destination }
 }
 --- expect unordered
@@ -484,7 +434,7 @@ expand $a $b: selection alternation [Knows both, Likes both]
 
 --- query
 query undirected_recursive_wildcard() {
-    match { $a: Person { name: "e" } $b: Person $a <*>{2,3} $b }
+    match { $a: Person, $b: Person, $a <*>{2,3} $b } where $a.name = "e"
     return { $b.name as destination }
 }
 --- expect unordered
@@ -498,7 +448,7 @@ expand $a $b: selection wildcard [Knows both, Likes both]
 
 --- query
 query source_cycle_without_self_loop() {
-    match { $a: Person { name: "b" } $a (knows | likes){1,3} $b }
+    match { $a: Person, $a (knows | likes){1,3} $b } where $a.name = "b"
     return { $b.name as destination }
 }
 --- expect unordered
@@ -511,7 +461,7 @@ destination: String
 
 --- query
 query named_unprojected_type_order() {
-    match { $a: Person { name: "a" } $a $e:knows $b }
+    match { $a: Person, $a $e:knows $b } where $a.name = "a"
     return { $b.name as destination }
     order { $e.@type }
     limit 1
@@ -525,7 +475,7 @@ sort tiebreak [$a.@id, $b.@id, $e.@id]
 
 --- query
 query singleton_selection_type_order() {
-    match { $a: Person { name: "a" } $a $e:(knows | knows) $b }
+    match { $a: Person, $a $e:(knows | knows) $b } where $a.name = "a"
     return { $b.name as destination }
     order { $e.@type }
     limit 1
@@ -539,7 +489,7 @@ sort tiebreak [$a.@id, $b.@id, $e.@type, $e.@id]
 
 --- query
 query named_aliased_type_order() {
-    match { $a: Person { name: "a" } $a $e:knows $b }
+    match { $a: Person, $a $e:knows $b } where $a.name = "a"
     return { $e.@type as kind, $b.name as destination }
     order { kind }
     limit 1
@@ -554,7 +504,7 @@ sort tiebreak [$a.@id, $b.@id, $e.@id]
 
 --- query
 query named_constant_only_order() {
-    match { $a: Person { name: "a" } $a $e:knows $b }
+    match { $a: Person, $a $e:knows $b } where $a.name = "a"
     return { $e.@type as kind }
     order { $e.@type }
     limit 1
@@ -568,7 +518,7 @@ sort no tiebreak
 
 --- query
 query named_type_aggregate_order() {
-    match { $a: Person { name: "a" } $a $e:knows $b }
+    match { $a: Person, $a $e:knows $b } where $a.name = "a"
     return { count($e.@type) as total }
     order { count($e.@type) }
     limit 1

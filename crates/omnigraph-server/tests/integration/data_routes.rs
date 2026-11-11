@@ -2430,7 +2430,7 @@ async fn disconnected_writes_keep_admission_until_the_original_operation_finishe
                 assert_eq!(status, StatusCode::NOT_FOUND, "the clear published");
             }
         } else {
-            let (status, rows) = json_response(&app, json_post("/query", &json!({"query": "query q() { match { $p: Person { name: \"Owned\" } $p worksAt $c } return { $p.name, $c.name } }"}))).await;
+            let (status, rows) = json_response(&app, json_post("/query", &json!({"query": "query q() { match { $p: Person, $p worksAt $c } where $p.name = \"Owned\" return { $p.name, $c.name } }"}))).await;
             assert_eq!(status, StatusCode::OK, "{rows}");
             assert_eq!(
                 rows["rows"],
@@ -3274,12 +3274,12 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
         // recurses over it; parsed, it would exhaust the worker's stack and
         // abort the server for every caller.
         let deep = format!(
-            "query q() {{ match {{ $p: Person {}$p.age > 1{} }} return {{ $p.name }} }}",
+            "query q() {{ match {{ $p: Person }} where {} and $p.age > 1 and {} return {{ $p.name }} }}",
             "(".repeat(100_000),
             ")".repeat(100_000)
         );
         let chain = format!(
-            "query q() {{ match {{ $p: Person {} }} return {{ $p.name }} }}",
+            "query q() {{ match {{ $p: Person }} where {} return {{ $p.name }} }}",
             vec!["$p.age > 1"; 50_000].join(" or ")
         );
         for source in [deep, chain] {
@@ -4626,7 +4626,7 @@ async fn query_endpoint_runs_inline_read() {
     assert_eq!(body["rows"][0]["p.name"], "Alice");
 }
 
-const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match {\n        $p: Person\n        $p.age > 30\n    }\n    return { $p.name }\n}\n";
+const EXPLAIN_ADULTS: &str = "explain query adults() {\n    match { $p: Person }\n    where $p.age > 30\n    return { $p.name }\n}\n";
 
 /// One tree of an `explain` answer, rebuilt from its pre-order rows: a node
 /// is its `detail` fields plus `node`, its children the rows one level deeper
@@ -4868,7 +4868,7 @@ async fn query_endpoint_answers_an_explain_statement_as_rows() {
 
 const EXPLAIN_INSERT_PERSON: &str = "explain query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}\n";
 
-const EXPLAIN_OLDER_PAIRS: &str = "explain query older_pairs() {\n    match {\n        $a: Person\n        $b: Person\n        $a.age > $b.age\n    }\n    return { $a.name, $b.name }\n}\n";
+const EXPLAIN_OLDER_PAIRS: &str = "explain query older_pairs() {\n    match { $a: Person, $b: Person }\n    where $a.age > $b.age\n    return { $a.name, $b.name }\n}\n";
 
 /// The `explain` answer lists the lowered DataFusion tree after the physical
 /// tree: a filter over two bindings, which no scan can take, runs in the
@@ -5587,7 +5587,7 @@ async fn query_rows_omit_null_cells() {
     let (_temp, app) = app_for_loaded_graph().await;
 
     let request = QueryRequest {
-        query: "query knows_since() {\n    match {\n        $a: Person\n        $a $k:knows $b\n    }\n    return { $a.name, $k.since }\n}\n"
+        query: "query knows_since() {\n    match { $a: Person, $a $k:knows $b }\n    return { $a.name, $k.since }\n}\n"
             .to_string(),
         name: Some("knows_since".to_string()),
         params: None,
@@ -6452,7 +6452,7 @@ async fn query_envelope_reports_its_ranking() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    title: String @index\n}\n";
     const QUERIES: &str = r#"
 query fused($a: String, $b: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.title, $a), bm25($all, $d.title, $b), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $a), bm25($all, $d.title, $b), k: 60), $d: Doc }
     return {
         $d.slug,
         $score as fused,
@@ -6786,9 +6786,9 @@ async fn removed_id_memory_refusals_keep_graph_and_admission_usable() {
         (
             "/mutate",
             json!({"query": "query clear() {\n\
-                $x: First  $x.name != \"\"\n\
+                match { $x: First } where $x.name != \"\"\n\
                 delete $x\n\
-                $y: Second  $y.name != \"\"\n\
+                match { $y: Second } where $y.name != \"\"\n\
                 delete $y\n\
             }"}),
         ),

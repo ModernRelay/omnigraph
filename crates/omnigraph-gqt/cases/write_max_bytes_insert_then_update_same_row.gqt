@@ -24,7 +24,7 @@ node Doc {
 set write_max_bytes = 4093;
 query insert_then_update($payload: Blob) {
     insert Doc { slug: "twice", content: $payload, note: "n" }
-    $x: Doc  $x.slug = "twice"
+    match { $x: Doc } where $x.slug = "twice"
     update $x set { note: "u" }
 }
 

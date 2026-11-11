@@ -869,21 +869,19 @@ edge Likes: Person -> Doc
 
     const QUERIES: &str = r#"
 query liked() {
-    match { $p: Person $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, $d.title }
 }
 query nobody_older() {
-    match {
-        $p: Person
-        not {
-            $q: Person
-            $q.age > $p.age
-        }
+    match { $p: Person }
+    where not exists {
+        $q: Person
+        where $q.age > $p.age
     }
     return { $p.name }
 }
 query likes_nothing() {
-    match { $p: Person not { $p likes $d } }
+    match { $p: Person } where not exists { $p likes $d }
     return { $p.name }
 }
 query people() { match { $p: Person } return { count($p) as n } }

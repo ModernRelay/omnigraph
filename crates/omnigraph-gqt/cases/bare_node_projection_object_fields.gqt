@@ -46,7 +46,7 @@ result columns [p: Person, p.embedding: Vector(2)?]
 
 --- query
 query zero_rows() {
-    match { $p: Person { name: "nobody" } }
+    match { $p: Person } where $p.name = "nobody"
     return { $p }
 }
 
@@ -75,10 +75,7 @@ result columns [n: I64?]
 
 --- query
 query friends_per_person() {
-    match {
-        $p: Person
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
     return { $p, count($f) as friends }
 }
 

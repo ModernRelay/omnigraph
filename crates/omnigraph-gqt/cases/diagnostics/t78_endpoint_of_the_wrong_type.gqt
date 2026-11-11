@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- mutate
-query w() { $c: Company  insert WorksAt { from: $c, to: $c } }
+query w() { match { $c: Company }  insert WorksAt { from: $c, to: $c } }
 
 --- expect error: type error: T78:

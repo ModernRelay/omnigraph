@@ -47,7 +47,7 @@ query mark() {
 
 --- mutate
 query alice_ages() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 31 }
 }
 
@@ -55,7 +55,7 @@ query alice_ages() {
 
 --- mutate
 query alice_ages_again() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 32 }
 }
 
@@ -70,7 +70,7 @@ query erin_arrives() {
 
 --- mutate
 query dave_leaves() {
-    $x: Person  $x.name = "dave"
+    match { $x: Person } where $x.name = "dave"
     delete $x
 }
 
@@ -78,7 +78,7 @@ query dave_leaves() {
 
 --- mutate
 query carol_leaves() {
-    $x: Person  $x.name = "carol"
+    match { $x: Person } where $x.name = "carol"
     delete $x
 }
 
@@ -131,7 +131,7 @@ branch create sibling_b
 
 --- mutate branch: sibling_a
 query erin_ages_on_a() {
-    $x: Person  $x.name = "erin"
+    match { $x: Person } where $x.name = "erin"
     update $x set { age: 26 }
 }
 
@@ -141,7 +141,7 @@ query erin_ages_on_a() {
 
 --- mutate branch: sibling_b
 query erin_ages_on_b() {
-    $x: Person  $x.name = "erin"
+    match { $x: Person } where $x.name = "erin"
     update $x set { age: 27 }
 }
 

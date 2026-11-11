@@ -156,14 +156,14 @@ fn node_ids(plan: &PhysicalPlan, want: impl Fn(&PhysicalNode) -> bool) -> Vec<us
 }
 
 const FILTERED: &str = r#"query q($min: I64) {
-    match { $d: Doc { open: true } $d.year >= $min }
+    match { $d: Doc } where $d.open = true and $d.year >= $min
     return { $d.slug, $d.year as year }
     order { $d.year desc }
     limit 2
 }"#;
 
 const RANKED: &str = r#"query q($q: String) {
-    match { from bm25({ match { $d: Doc $d.year > 2000 } return { $d } }, $d.title, $q) }
+    match { from bm25({ match { $d: Doc } where $d.year > 2000 return { $d } }, $d.title, $q) }
     return { $d.slug, $score as score }
     order { $score desc, $d.year }
     limit 3
@@ -188,7 +188,7 @@ fn the_planned_plans_are_accepted() {
     }
     let outside = Fixture::new(
         r#"query q() {
-    match { $d: Doc contains($d.title, "graph") }
+    match { $d: Doc } where contains($d.title, "graph")
     return { $d.slug }
 }"#,
         &[],
@@ -346,7 +346,7 @@ fn a_strategy_its_inner_tree_lacks_fails_block_strategy() {
     use crate::source::PlanSource;
     use omnigraph_compiler::types::Direction;
     let mut fixture = Fixture::new(
-        "query q($s: String) { match { $d: Doc not { $d cites $e $e: Doc { slug: $s } } } return { $d.slug } }",
+        "query q($s: String) { match { $d: Doc } where not exists { $d cites $e, $e: Doc where $e.slug = $s } return { $d.slug } }",
         &[("s", Literal::String("x".to_string()))],
     );
     let strategies = |plan: &PhysicalPlan| -> Vec<crate::AntiJoinStrategy> {
@@ -434,7 +434,7 @@ fn an_unwritten_conjunct_fails_predicate_origin() {
 }
 
 const KEYED: &str = r#"query q($s: String) {
-    match { $d: Doc { slug: $s } }
+    match { $d: Doc } where $d.slug = $s
     return { $d.title }
 }"#;
 
@@ -540,7 +540,7 @@ fn a_key_narrowing_is_accepted_only_with_the_derived_id() {
 #[test]
 fn edited_hop_bounds_fail_traversal_identity() {
     let fixture = Fixture::new(
-        "query q() { match { $d: Doc $d cites{1,2} $e } return { $d.slug, $e.slug } }",
+        "query q() { match { $d: Doc, $d cites{1,2} $e } return { $d.slug, $e.slug } }",
         &[],
     );
     let plan = fixture.plan();
@@ -572,7 +572,7 @@ fn drop_first_sort_key(plan: &mut PhysicalPlan) {
 fn fused_and_grouped_searches_sort_as_the_query_requires() {
     let q = [("q", Literal::String("graph".into()))];
     let fused = Fixture::new(
-        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60) $d: Doc } return { $d.slug } order { $score desc, $d.slug desc } limit 2 }",
+        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60), $d: Doc } return { $d.slug } order { $score desc, $d.slug desc } limit 2 }",
         &q,
     );
     let grouped = Fixture::new(
@@ -728,7 +728,7 @@ fn an_unwritten_row_cut_fails_the_row_cut() {
     };
 
     let unlimited = Fixture::new(
-        "query q() { match { $d: Doc contains($d.title, \"graph\") } return { $d.slug } }",
+        "query q() { match { $d: Doc } where contains($d.title, \"graph\") return { $d.slug } }",
         &[],
     );
     let mut plan = unlimited.plan();
@@ -846,7 +846,7 @@ fn another_alias_or_item_fails_the_projection() {
 #[test]
 fn changed_aggregate_comparison_returns_are_refused() {
     let fixture = Fixture::new(
-        "query q() { match { $d: Doc { open: true } } return { $d.title as n, count($d.year) > 1 as many } }",
+        "query q() { match { $d: Doc } where $d.open = true return { $d.title as n, count($d.year) > 1 as many } }",
         &[],
     );
     for mutation in ["alias", "constant", "distinct", "group", "unused"] {
@@ -919,7 +919,7 @@ fn changed_aggregate_comparison_returns_are_refused() {
 #[test]
 fn a_second_projection_cannot_introduce_grouping() {
     let fixture = Fixture::new(
-        "query q() { match { $d: Doc contains($d.title, \"graph\") } return { $d.year } }",
+        "query q() { match { $d: Doc } where contains($d.title, \"graph\") return { $d.year } }",
         &[],
     );
     let mut plan = fixture.plan();
@@ -998,7 +998,7 @@ fn an_exhausted_budget_is_a_resource_outcome() {
 }
 
 const NEAREST: &str = r#"query q($v: Vector(2)) {
-    match { from nearest({ match { $d: Doc $d cites $e } return { $d, $e } }, $d.embedding, $v, k: 3) }
+    match { from nearest({ match { $d: Doc, $d cites $e } return { $d, $e } }, $d.embedding, $v, k: 3) }
     return { $d.slug }
     order { $distance }
     limit 3
@@ -1103,12 +1103,12 @@ fn scope_of(query: &str, params: &[(&str, Literal)]) -> ValidationScope {
 fn membership_admits_the_fragment_and_nothing_else() {
     let members = [
         "query q() { match { $d: Doc } return { $d.slug } }",
-        "query q() { match { $d: Doc { open: true } } return { $d.slug } }",
-        "query q($y: I64) { match { $d: Doc $d.year >= $y } return { $d.slug } }",
-        "query q() { match { $d: Doc $d.year != 3 and not ($d.title < \"m\" or $d.open) } return { $d.slug } }",
-        "query q() { match { $d: Doc $d.rank is null or $d.rank > 2 } return { $d.slug, $d.rank } }",
-        "query q() { match { $d: Doc $d.open } return { $d.title as t } order { $d.year desc, $d.title } limit 4 }",
-        "query q($t: String) { match { $d: Doc $d.title = $t } return { $d.slug } limit 0 }",
+        "query q() { match { $d: Doc } where $d.open = true return { $d.slug } }",
+        "query q($y: I64) { match { $d: Doc } where $d.year >= $y return { $d.slug } }",
+        "query q() { match { $d: Doc } where $d.year != 3 and not ($d.title < \"m\" or $d.open) return { $d.slug } }",
+        "query q() { match { $d: Doc } where ($d.rank is null or $d.rank > 2) return { $d.slug, $d.rank } }",
+        "query q() { match { $d: Doc } where $d.open return { $d.title as t } order { $d.year desc, $d.title } limit 4 }",
+        "query q($t: String) { match { $d: Doc } where $d.title = $t return { $d.slug } limit 0 }",
         "query q($q: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $q) } return { $score as s, $d.slug } order { $score desc, $d.slug desc } limit 2 }",
     ];
     for query in members {
@@ -1129,20 +1129,20 @@ fn membership_admits_the_fragment_and_nothing_else() {
         );
     }
     let outside = [
-        "query q() { match { $d: Doc contains($d.title, \"g\") } return { $d.slug } }",
-        "query q() { match { $d: Doc $d.score > 1.5 } return { $d.slug } }",
-        "query q() { match { $d: Doc $d.born > date(\"2020-01-01\") } return { $d.slug } }",
-        "query q() { match { $d: Doc { tags: \"a\" } } return { $d.slug } }",
-        "query q() { match { $d: Doc $d cites $e } return { $d.slug } }",
-        "query q() { match { $d: Doc $e: Doc } return { $d.slug } }",
-        "query q() { match { $d: Doc not { $d cites $e } } return { $d.slug } }",
+        "query q() { match { $d: Doc } where contains($d.title, \"g\") return { $d.slug } }",
+        "query q() { match { $d: Doc } where $d.score > 1.5 return { $d.slug } }",
+        "query q() { match { $d: Doc } where $d.born > date(\"2020-01-01\") return { $d.slug } }",
+        "query q() { match { $d: Doc } where \"a\" in $d.tags return { $d.slug } }",
+        "query q() { match { $d: Doc, $d cites $e } return { $d.slug } }",
+        "query q() { match { $d: Doc, $e: Doc } return { $d.slug } }",
+        "query q() { match { $d: Doc } where not exists { $d cites $e } return { $d.slug } }",
         "query q() { match { $d: Doc } return { count($d) as n } }",
         "query q() { match { $d: Doc } return { $d } }",
         "query q() { match { $d: Doc } return { $d.@id } }",
         "query q() { match { $d: Doc } return { $d.slug } order { $d.score } }",
-        "query q() { match { $d: Doc search($d.title, \"g\") } return { $d.slug } }",
+        "query q() { match { $d: Doc } where search($d.title, \"g\") return { $d.slug } }",
         "query q($v: Vector(2)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2) } return { $d.slug } order { $distance } limit 2 }",
-        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60) $d: Doc } return { $d.slug } order { $score desc } limit 2 }",
+        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60), $d: Doc } return { $d.slug } order { $score desc } limit 2 }",
     ];
     for query in outside {
         let params = [
@@ -1227,8 +1227,8 @@ fn derivation_cost_grows_with_the_query() {
             .map(|index| format!("$d.year != {index}"))
             .collect();
         let query = format!(
-            "query q() {{ match {{ $d: Doc {} }} return {{ $d.slug }} order {{ $d.year }} limit 10 }}",
-            filter.join(" ")
+            "query q() {{ match {{ $d: Doc }} where {} return {{ $d.slug }} order {{ $d.year }} limit 10 }}",
+            filter.join(" and ")
         );
         let fixture = Fixture::new(&query, &[]);
         let traced = fixture.traced();
@@ -1269,8 +1269,8 @@ fn the_derivation_arena_keeps_only_current_nodes() {
         .map(|index| format!("$d.title != \"{index}\""))
         .collect();
     let query = format!(
-        "query q() {{ match {{ $d: Doc {} }} return {{ $d.slug }} order {{ $d.year }} limit 10 }}",
-        filter.join(" ")
+        "query q() {{ match {{ $d: Doc }} where {} return {{ $d.slug }} order {{ $d.year }} limit 10 }}",
+        filter.join(" and ")
     );
     let fixture = Fixture::new(&query, &[]);
     let derivation = fixture.derivation().expect("an exact-subset member");
@@ -1314,7 +1314,7 @@ fn a_reference_to_an_unreached_or_superseded_node_is_refused() {
 fn a_constant_return_needs_no_tiebreak() {
     let fixture = Fixture::new(
         r#"query q() {
-    match { $p: Doc $d: Doc $p $e:cites $d }
+    match { $p: Doc, $d: Doc, $p $e:cites $d }
     return { $p.slug as source, $d.slug as target, $e.@type as edge_type }
     order { $p.slug, $d.slug, $e.@type }
 }"#,
@@ -1340,7 +1340,7 @@ fn a_constant_return_needs_no_tiebreak() {
 #[test]
 fn a_constant_order_still_sorts() {
     let query = r#"query q() {
-    match { $p: Doc $d: Doc $p $e:cites $d }
+    match { $p: Doc, $d: Doc, $p $e:cites $d }
     return { $d.slug as target }
     order { $e.@type }
 }"#;
@@ -1394,20 +1394,18 @@ fn a_distinct_return_sorts_its_groups() {
 fn a_full_text_call_needs_a_recorded_index_segment() {
     use crate::source::FullTextCoverage;
     let search = r#"query q($q: String) {
-    match { $d: Doc search($d.title, $q) }
+    match { $d: Doc } where search($d.title, $q)
     return { $d.slug }
 }"#;
     let inherited = r#"query q($q: String) {
-    match { $d: Doc not { $d cites $x search($d.title, $q) } }
+    match { $d: Doc } where not exists { $d cites $x where search($d.title, $q) }
     return { $d.slug }
 }"#;
     let nested = r#"query q($q: String) {
-    match {
-        $p: Doc
-        not {
-            $p cites $d
-            not { $d cites $x search($d.title, $q) }
-        }
+    match { $p: Doc }
+    where not exists {
+        $p cites $d
+        where not exists { $d cites $x where search($d.title, $q) }
     }
     return { $p.slug }
 }"#;
@@ -1456,11 +1454,9 @@ fn a_full_text_call_needs_a_recorded_index_segment() {
         "{SCHEMA}\nnode Note {{ slug: String @key title: String @index }}\nedge Annotates: Doc -> Note"
     );
     let query = r#"query q($q: String) {
-    match {
-        $p: Doc
-        not { $d: Doc $p cites $d search($d.title, $q) }
-        not { $d: Note $p annotates $d search($d.title, $q) }
-    }
+    match { $p: Doc }
+    where not exists { $d: Doc, $p cites $d where search($d.title, $q) }
+      and not exists { $d: Note, $p annotates $d where search($d.title, $q) }
     return { $p.slug }
 }"#;
     let mut fixture =

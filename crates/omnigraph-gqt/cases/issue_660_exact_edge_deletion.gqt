@@ -32,7 +32,7 @@ edge Knows: Person -> Person {}
 
 --- mutate
 query group_the_middle_ranks() {
-    $x: Person  $x.rank > 1 and $x.rank < 4
+    match { $x: Person } where $x.rank > 1 and $x.rank < 4
     update $x set { group: "middle" }
 }
 
@@ -61,7 +61,7 @@ branch create exact
 
 --- mutate branch: exact
 query delete_the_pair() {
-    $x: Knows  $x.@src = "a" and $x.@dst = "b"
+    match { $x: Knows } where $x.@src = "a" and $x.@dst = "b"
     delete $x
 }
 
@@ -69,7 +69,7 @@ query delete_the_pair() {
 
 --- query branch: exact
 query edges_on_the_branch() {
-    match { $p: Person  $p $e:knows $q }
+    match { $p: Person, $p $e:knows $q }
     return { $e.@id as id }
 }
 
@@ -82,7 +82,7 @@ id: String
 
 --- query branch: main
 query edges_on_main_before_merge() {
-    match { $p: Person  $p $e:knows $q }
+    match { $p: Person, $p $e:knows $q }
     return { $e.@id as id }
 }
 
@@ -104,7 +104,7 @@ branch merge exact
 
 --- query branch: main
 query edges_on_main_after_merge_and_restart() {
-    match { $p: Person  $p $e:knows $q }
+    match { $p: Person, $p $e:knows $q }
     return { $e.@id as id }
 }
 
@@ -117,7 +117,7 @@ id: String
 
 --- mutate branch: main
 query delete_by_parameters($src: String, $dst: String) {
-    $x: Knows  $x.@src = $src and $x.@dst = $dst
+    match { $x: Knows } where $x.@src = $src and $x.@dst = $dst
     delete $x
 }
 
@@ -128,7 +128,7 @@ query delete_by_parameters($src: String, $dst: String) {
 
 --- query branch: main
 query the_last_edge() {
-    match { $p: Person  $p $e:knows $q }
+    match { $p: Person, $p $e:knows $q }
     return { $e.@id as id }
 }
 

@@ -31,11 +31,11 @@ branch create "idle3" from main
 
 --- loop $cycle 0 4
 --- mutate branch: idle0
-query unrelated_one() { $x: Hot  $x.key = "hot"  update $x set { value: 1 } }
+query unrelated_one() { match { $x: Hot } where $x.key = "hot"  update $x set { value: 1 } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: idle0
-query unrelated_zero() { $x: Hot  $x.key = "hot"  update $x set { value: 0 } }
+query unrelated_zero() { match { $x: Hot } where $x.key = "hot"  update $x set { value: 0 } }
 --- expect affected: nodes=1 edges=0
 
 --- endloop

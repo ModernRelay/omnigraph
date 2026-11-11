@@ -1279,7 +1279,7 @@ fn mutation_queries(diverged_tables: usize) -> String {
         let ty = edge_type_name(table);
         writeln!(
             source,
-            "query del_{table}($c: String) {{\n    $x: {ty}  $x.cohort = $c\n    delete $x\n}}\n"
+            "query del_{table}($c: String) {{\n    match {{ $x: {ty} }} where $x.cohort = $c\n    delete $x\n}}\n"
         )
         .expect("writing to String cannot fail");
     }

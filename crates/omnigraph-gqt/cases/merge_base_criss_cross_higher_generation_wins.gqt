@@ -32,7 +32,7 @@ branch create right;
 
 --- mutate branch: right
 query right_first() {
-    $x: Person  $x.name = "b"
+    match { $x: Person } where $x.name = "b"
     update $x set { age: 1 }
 }
 
@@ -40,7 +40,7 @@ query right_first() {
 
 --- mutate branch: left
 query left_first() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 1 }
 }
 
@@ -48,7 +48,7 @@ query left_first() {
 
 --- mutate branch: left
 query left_second() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 2 }
 }
 
@@ -76,7 +76,7 @@ branch merge left_old into right;
 
 --- mutate branch: right
 query right_later() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 7 }
 }
 

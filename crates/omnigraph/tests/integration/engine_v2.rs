@@ -173,10 +173,8 @@ edge Knows: Person -> Person
 
 const FAN_OUT_QUERIES: &str = r#"
 query friends_of_hub() {
-    match {
-        $a: Person { name: "hub" }
-        $a knows $b
-    }
+    match { $a: Person, $a knows $b }
+    where $a.name = "hub"
     return { $b.name }
 }
 "#;
@@ -358,11 +356,7 @@ edge Likes: Person -> Person
 
 const TWO_STEP_QUERIES: &str = r#"
 query liked_by_friends() {
-    match {
-        $a: Person
-        $a knows $b
-        $b likes $c
-    }
+    match { $a: Person, $a knows $b, $b likes $c }
     return { $c.name }
 }
 "#;
@@ -470,7 +464,7 @@ async fn explain_resolves_omitted_nullable_parameters_before_planning() {
         .unwrap(),
     );
     let source =
-        "query adults($min: I64?) { match { $p: Person $p.age > $min } return { $p.name } }";
+        "query adults($min: I64?) { match { $p: Person } where $p.age > $min return { $p.name } }";
     let omitted = omnigraph_compiler::ir::ParamMap::new();
     let explicit = [(
         "min".to_string(),
@@ -588,18 +582,12 @@ async fn a_streamed_scan_gathers_small_fragments_into_one_batch() {
 
 const HOP_QUERIES: &str = r#"
 query one_hop() {
-    match {
-        $a: Person
-        $a knows $b
-    }
+    match { $a: Person, $a knows $b }
     return { $b.name }
 }
 
 query two_hops() {
-    match {
-        $a: Person
-        $a knows{1,2} $b
-    }
+    match { $a: Person, $a knows{1,2} $b }
     return { $b.name }
 }
 "#;
@@ -704,7 +692,7 @@ async fn explain_search_uses_vector_params_without_initializing_embeddings() {
             true,
         ),
         (
-            "let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60)",
+            "let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60)",
             "$score desc",
             "Vector(4)",
             vector_param("q", &[0.0; 4]),
@@ -718,7 +706,7 @@ async fn explain_search_uses_vector_params_without_initializing_embeddings() {
             false,
         ),
         (
-            "let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60)",
+            "let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60)",
             "$score desc",
             "String",
             params(&[("q", "a")]),
@@ -790,7 +778,7 @@ async fn rrf_order_runs_a_cross_join_over_multiple_probe_batches() {
     );
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     let db = with_setting(&db, "engine", "v2");
-    let source = "query fused($t: String) {\n    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, \"needle needle\"), k: 60)\n        $d: Doc\n        $p: Probe\n        $d.n = $p.n\n    }\n    return { $d.slug }\n    order { $score desc }\n    limit 1\n}";
+    let source = "query fused($t: String) {\n    match {\n      let $all = { match { $d: Doc } return { $d } },\n      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, \"needle needle\"), k: 60),\n      $d: Doc,\n      $p: Probe,\n    }\n    where $d.n = $p.n\n    return { $d.slug }\n    order { $score desc }\n    limit 1\n}";
     let result = query_main(
         &db,
         &format!("explain {source}"),
@@ -874,13 +862,13 @@ edge Tags: Source -> Doc
 "#;
     let source = r#"
 query rows($q: Vector(4)) {
-    match { from nearest({ match { $s: Source $s links $d $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
+    match { from nearest({ match { $s: Source, $s links $d, $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
     return { $s.slug, $d.slug, $t.slug }
     order { $distance }
     limit 10
 }
 query total($q: Vector(4)) {
-    match { from nearest({ match { $s: Source $s links $d $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
+    match { from nearest({ match { $s: Source, $s links $d, $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
     return { count($d) as n }
     limit 10
 }
@@ -964,19 +952,22 @@ edge TouchpointByIdentity: Touchpoint -> ExternalID
 const KEY_SET_QUERY: &str = r#"
 query lookalikes($channel: String, $exclude: String) {
     match {
-        $c: Channel { slug: $channel }
-        $s: Source
-        $c channelWatchesSource $s
-        $t: Touchpoint { action: "star" }
-        $t touchpointOnSource $s
-        $x: ExternalID
-        $t touchpointByIdentity $x
-        not {
-            $s0: Source { slug: $exclude }
-            $t0: Touchpoint
-            $t0 touchpointOnSource $s0
-            $t0 touchpointByIdentity $x
-        }
+        $c: Channel,
+        $s: Source,
+        $c channelWatchesSource $s,
+        $t: Touchpoint,
+        $t touchpointOnSource $s,
+        $x: ExternalID,
+        $t touchpointByIdentity $x,
+    }
+    where $c.slug = $channel
+      and $t.action = "star"
+      and not exists {
+        $s0: Source,
+        $t0: Touchpoint,
+        $t0 touchpointOnSource $s0,
+        $t0 touchpointByIdentity $x
+        where $s0.slug = $exclude
     }
     return { $x.slug, count($t) as repos }
 }
@@ -1148,7 +1139,7 @@ node Doc {
 edge Likes: Person -> Doc
 "#;
     const ADULTS: &str = "query adults($min: I64) {
-    match { $p: Person $p.age >= $min }
+    match { $p: Person } where $p.age >= $min
     return { $p.name }
     order { $p.age desc }
     limit 2
@@ -1160,17 +1151,17 @@ edge Likes: Person -> Doc
     limit 2
 }";
     const LIKED: &str = "query liked() {
-    match { $p: Person $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, count($d) as n }
     order { $p.name }
 }";
     const RANKED_DESTINATION: &str = "query ranked_destination($q: String) {
-    match { from bm25({ match { $p: Person $p likes $d } return { $p, $d } }, $d.title, $q) }
+    match { from bm25({ match { $p: Person, $p likes $d } return { $p, $d } }, $d.title, $q) }
     return { $d.slug }
     order { $score desc }
 }";
     const WILDCARD: &str = "query wildcard() {
-    match { $p: Person $d: Doc $p * $d }
+    match { $p: Person, $d: Doc, $p * $d }
     return { $d.slug }
 }";
     let dir = tempfile::tempdir().unwrap();

@@ -43,7 +43,7 @@ query readd() {
 
 --- mutate branch: b1
 query delete() {
-    $x: Knows  $x.@src = "alice"
+    match { $x: Knows } where $x.@src = "alice"
     delete $x
 }
 
@@ -61,10 +61,7 @@ branch merge b0
 
 --- query
 query edges_on_main() {
-    match {
-        $a: Person
-        $a knows $b
-    }
+    match { $a: Person, $a knows $b }
     return { $a.name, $b.name }
 }
 

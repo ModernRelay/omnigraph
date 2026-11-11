@@ -39,7 +39,7 @@ whole: Bool
 
 --- mutate
 query assign($age: I64) {
-    $x: Person  $x.slug = "a"
+    match { $x: Person } where $x.slug = "a"
     update $x set { adult: $age = 2.7 }
 }
 
@@ -63,7 +63,7 @@ p.adult: Bool
 --- query
 set engine = v2;
 query pushed_filter() {
-    match { $p: Person  $p.age = 2.7 }
+    match { $p: Person } where $p.age = 2.7
     return { $p.slug }
 }
 
@@ -75,7 +75,7 @@ p.slug: String
 --- query
 set engine = v2;
 query pushed_filter_below() {
-    match { $p: Person  $p.age < 2.7 }
+    match { $p: Person } where $p.age < 2.7
     return { $p.slug }
 }
 
@@ -87,7 +87,7 @@ p.slug: String
 
 --- mutate
 query pushed_mutation() {
-    $x: Person  $x.age = 2.7
+    match { $x: Person } where $x.age = 2.7
     update $x set { adult: true }
 }
 

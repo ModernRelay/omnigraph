@@ -24,7 +24,7 @@ node Deal {
 
 --- mutate
 query delete_open_large_deals() {
-    $x: Deal  $x.dealStage = "open" and $x.amountUsd > 10
+    match { $x: Deal } where $x.dealStage = "open" and $x.amountUsd > 10
     delete $x
 }
 
@@ -32,7 +32,7 @@ query delete_open_large_deals() {
 
 --- mutate
 query close_large_deals($floor: I32) {
-    $x: Deal  $x.amountUsd > $floor
+    match { $x: Deal } where $x.amountUsd > $floor
     update $x set { dealStage: "closed" }
 }
 

@@ -74,10 +74,8 @@ aggregate n: count(Person) count error -> I64?
 
 --- query
 query totals_of_nobody() {
-    match {
-        $p: Person
-        $p.name = "nobody"
-    }
+    match { $p: Person }
+    where $p.name = "nobody"
     return { count($p) as n, sum($p.age) as total, avg($p.age) as mean }
 }
 

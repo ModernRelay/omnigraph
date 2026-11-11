@@ -1,5 +1,5 @@
 # issue: none
-# notes: The compiler refuses SQL's `where` at clause start with `Q014`; nothing executes.
+# notes: The compiler refuses SQL's uppercase `WHERE` after the `match` braces with `Q014`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $p: Person  where $p.age > 30 } return { $p.name } }
+query q() { match { $p: Person } WHERE $p.age > 30 return { $p.name } }
 
 --- expect error: parse error: Q014:

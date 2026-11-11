@@ -51,10 +51,8 @@ query ins_t() { insert Person { name: "t1", value: 2000, text: "needle" } }
 
 --- query branch: tgt
 query scalar_read() {
-    match {
-        $p: Person
-        $p.value = 0
-    }
+    match { $p: Person }
+    where $p.value = 0
     return { $p.name }
 }
 
@@ -66,10 +64,8 @@ p.name: String
 
 --- query branch: tgt
 query text_read() {
-    match {
-        $p: Person
-        search($p.text, "needle")
-    }
+    match { $p: Person }
+    where search($p.text, "needle")
     return { count($p) as n }
 }
 

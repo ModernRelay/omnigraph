@@ -22,7 +22,7 @@ node Person {
 
 --- mutate
 query assign($xs: [I64]) {
-    $x: Person  $x.slug = "a"
+    match { $x: Person } where $x.slug = "a"
     update $x set { adult: 1.0 in $xs }
 }
 
@@ -52,7 +52,7 @@ folded: Bool
 
 --- mutate
 query assign_null_needle($xs: [I64], $needle: F64?) {
-    $x: Person  $x.slug = "a"
+    match { $x: Person } where $x.slug = "a"
     update $x set { maybe: $needle in $xs }
 }
 

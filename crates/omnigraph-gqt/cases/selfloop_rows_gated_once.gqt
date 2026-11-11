@@ -30,10 +30,7 @@ query two_loops() {
 
 --- query
 query gated() {
-    match {
-        $p: Person
-        $p knows $q
-    }
+    match { $p: Person, $p knows $q }
     return { $p.name, $q.name }
 }
 
@@ -46,10 +43,7 @@ q.name: String
 
 --- query
 query bound_rows() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { count($q.name) as n }
 }
 

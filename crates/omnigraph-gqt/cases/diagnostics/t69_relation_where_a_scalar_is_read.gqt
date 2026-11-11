@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { let $r = { match { $p: Person } return { $p } }  $r = 1 } return { 1 as one } }
+query q() { match { let $r = { match { $p: Person } return { $p } } } where $r = 1 return { 1 as one } }
 
 --- expect error: type error: T69:

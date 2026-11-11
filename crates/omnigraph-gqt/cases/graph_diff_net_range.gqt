@@ -36,7 +36,7 @@ query mark() {
 
 --- mutate
 query alice_ages() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 31 }
 }
 
@@ -44,7 +44,7 @@ query alice_ages() {
 
 --- mutate
 query alice_reverts() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 30 }
 }
 
@@ -59,7 +59,7 @@ query gina_arrives() {
 
 --- mutate
 query gina_leaves() {
-    $x: Person  $x.name = "gina"
+    match { $x: Person } where $x.name = "gina"
     delete $x
 }
 
@@ -67,7 +67,7 @@ query gina_leaves() {
 
 --- mutate
 query hank_leaves() {
-    $x: Person  $x.name = "hank"
+    match { $x: Person } where $x.name = "hank"
     delete $x
 }
 
@@ -82,7 +82,7 @@ query hank_returns() {
 
 --- mutate
 query ivan_leaves() {
-    $x: Person  $x.name = "ivan"
+    match { $x: Person } where $x.name = "ivan"
     delete $x
 }
 
@@ -106,7 +106,7 @@ query jill_arrives() {
 
 --- mutate
 query jill_ages() {
-    $x: Person  $x.name = "jill"
+    match { $x: Person } where $x.name = "jill"
     update $x set { age: 19 }
 }
 

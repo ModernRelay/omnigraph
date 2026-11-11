@@ -632,7 +632,7 @@ query insert_then_update_same_person(
     $name: String, $insert_age: I32, $update_age: I32
 ) {
     insert Person { name: $name, age: $insert_age }
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     update $x set { age: $update_age }
 }
 
@@ -649,7 +649,7 @@ query person_with_two_friends($name: String, $age: I32, $a: String, $b: String) 
 
 query mixed_insert_and_delete($name: String, $age: I32, $victim: String) {
     insert Person { name: $name, age: $age }
-    $x: Person  $x.name = $victim
+    match { $x: Person } where $x.name = $victim
     delete $x
 }
 
@@ -657,28 +657,28 @@ query update_then_filter_by_old_value(
     $first_name: String, $first_new_age: I32,
     $second_threshold: I32, $second_new_age: I32
 ) {
-    $x: Person  $x.name = $first_name
+    match { $x: Person } where $x.name = $first_name
     update $x set { age: $first_new_age }
-    $x: Person  $x.age > $second_threshold
+    match { $x: Person } where $x.age > $second_threshold
     update $x set { age: $second_new_age }
 }
 
 query delete_two_persons($first: String, $second: String) {
-    $x: Person  $x.name = $first
+    match { $x: Person } where $x.name = $first
     delete $x
-    $x: Person  $x.name = $second
+    match { $x: Person } where $x.name = $second
     delete $x
 }
 
 query delete_overlapping_persons($name: String, $threshold: I32) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     delete $x
-    $x: Person  $x.age > $threshold
+    match { $x: Person } where $x.age > $threshold
     delete $x
 }
 
 query update_age_by_name($name: String, $age: I32) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     update $x set { age: $age }
 }
 "#;
@@ -1694,7 +1694,7 @@ async fn mutation_update_row_cap_accepts_limit_and_rejects_one_over_pre_effect()
     const SCHEMA: &str = "node Thing { key: String @key marked: Bool? }\n";
     const UPDATE_ALL: &str = r#"
 query update_all() {
-    $x: Thing  $x.key != ""
+    match { $x: Thing } where $x.key != ""
     update $x set { marked: true }
 }
 "#;
@@ -1792,14 +1792,14 @@ node Document {
 "#;
     const UPDATE: &str = r#"
 query update_note($note: String) {
-    $x: Document  $x.title = "wide"
+    match { $x: Document } where $x.title = "wide"
     update $x set { note: $note }
-    $x: Document  $x.title = "nobody"
+    match { $x: Document } where $x.title = "nobody"
     update $x set { note: $note }
 }
 
 query patch_note($note: String) {
-    $x: Document  $x.title = "wide"
+    match { $x: Document } where $x.title = "wide"
     update $x set { note: $note }
 }
 "#;
@@ -1932,7 +1932,7 @@ query patch_note($note: String) {
 
     const REPLACE: &str = r#"
 query replace_content($c: Blob) {
-    $x: Document  $x.title = "wide"
+    match { $x: Document } where $x.title = "wide"
     update $x set { content: $c }
 }
 "#;
@@ -1986,14 +1986,14 @@ node Document {
 "#;
     const UPDATE: &str = r#"
 query update_shelf($note: String) {
-    $x: Document  $x.shelf = "a"
+    match { $x: Document } where $x.shelf = "a"
     update $x set { note: $note }
-    $x: Document  $x.title = "nobody"
+    match { $x: Document } where $x.title = "nobody"
     update $x set { note: $note }
 }
 
 query patch_shelf($note: String) {
-    $x: Document  $x.shelf = "a"
+    match { $x: Document } where $x.shelf = "a"
     update $x set { note: $note }
 }
 "#;
@@ -2393,7 +2393,7 @@ edge Attachment: Document -> Document {
 "#;
     const CLEAR_BOTH: &str = r#"
 query clear_both($content: Blob?, $preview: Blob?) {
-    $x: Document  $x.title = "by-update"
+    match { $x: Document } where $x.title = "by-update"
     update $x set { content: $content, preview: $preview }
 }
 "#;
@@ -2528,19 +2528,19 @@ node Document {
 "#;
     const MUTATIONS: &str = r#"
 query update_note($note: String) {
-    $x: Document  $x.title = "doc"
+    match { $x: Document } where $x.title = "doc"
     update $x set { note: $note }
 }
 
 query update_note_beside_another($note: String) {
-    $x: Document  $x.title = "doc"
+    match { $x: Document } where $x.title = "doc"
     update $x set { note: $note }
-    $x: Document  $x.title = "nobody"
+    match { $x: Document } where $x.title = "nobody"
     update $x set { note: $note }
 }
 
 query set_content($c: Blob?) {
-    $x: Document  $x.title = "doc"
+    match { $x: Document } where $x.title = "doc"
     update $x set { content: $c }
 }
 "#;
@@ -2821,9 +2821,9 @@ async fn removed_ids_summed_across_types_refuse_delete_and_overwrite_before_stag
     const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\nedge WorksAt: Person -> Company\n";
     const TABLES: [&str; 2] = ["node:Person", "node:Company"];
     const CLEAR: &str = r#"query clear() {
-        $x: Person  $x.name != ""
+        match { $x: Person } where $x.name != ""
         delete $x
-        $x: Company  $x.name != ""
+        match { $x: Company } where $x.name != ""
         delete $x
     }"#;
 
@@ -2915,7 +2915,7 @@ async fn removed_ids_summed_across_types_refuse_delete_and_overwrite_before_stag
     let removed = db
         .mutate(
             "main",
-            r#"query one() { $x: Person  $x.name = "small"  delete $x }"#,
+            r#"query one() { match { $x: Person } where $x.name = "small"  delete $x }"#,
             "one",
             &params(&[]),
         )
@@ -2962,7 +2962,7 @@ edge Right: Hub -> Leaf
     let error = db
         .mutate(
             "main",
-            r#"query drop_hub() { $x: Hub  $x.name = "hub"  delete $x }"#,
+            r#"query drop_hub() { match { $x: Hub } where $x.name = "hub"  delete $x }"#,
             "drop_hub",
             &params(&[]),
         )
@@ -3034,9 +3034,9 @@ edge Knows: Person -> Person
 
     let q = r#"
 query del_age_then_name($threshold: I32, $name: String) {
-    $x: Person  $x.age > $threshold
+    match { $x: Person } where $x.age > $threshold
     delete $x
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     delete $x
 }
 "#;
@@ -3593,9 +3593,9 @@ async fn multi_statement_delete_on_same_node_table() {
 async fn cascade_delete_node_then_explicit_delete_edge_on_same_table() {
     const QUERY: &str = r#"
 query cascade_then_explicit($name: String, $other: String) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     delete $x
-    $x: Knows  $x.@src = $other
+    match { $x: Knows } where $x.@src = $other
     delete $x
 }
 "#;
@@ -3810,7 +3810,7 @@ query insert_then_update_note(
     $title: String, $blob: String, $note: String
 ) {
     insert Document { title: $title, content: $blob }
-    $x: Document  $x.title = $title
+    match { $x: Document } where $x.title = $title
     update $x set { note: $note }
 }
 
@@ -3818,7 +3818,7 @@ query insert_then_replace_blob(
     $title: String, $first: String, $second: String
 ) {
     insert Document { title: $title, content: $first }
-    $x: Document  $x.title = $title
+    match { $x: Document } where $x.title = $title
     update $x set { content: $second }
 }
 "#;
@@ -3888,7 +3888,7 @@ query insert_then_replace_blob(
         .query(
             ReadTarget::branch("main"),
             r#"query get_doc($title: String) {
-                match { $d: Document { title: $title } }
+                match { $d: Document } where $d.title = $title
                 return { $d.title, $d.note }
             }"#,
             "get_doc",
@@ -3957,12 +3957,12 @@ query insert_then_set_first(
     $slug: String, $a: Blob, $title: String, $b: Blob, $rank: I64, $first: Blob
 ) {
     insert Doc { slug: $slug, first: $a, title: $title, second: $b, rank: $rank }
-    $x: Doc  $x.rank > 0
+    match { $x: Doc } where $x.rank > 0
     update $x set { first: $first }
 }
 
 query clear_second($second: Blob?) {
-    $x: Doc  $x.rank > 0
+    match { $x: Doc } where $x.rank > 0
     update $x set { second: $second }
 }
 "#;
@@ -4272,8 +4272,8 @@ async fn camelcase_mutation_predicate_updates_and_deletes() {
     db.load_jsonl(CC_DATA, LoadMode::Overwrite).await.unwrap();
 
     let m = r#"
-query set_status($repo: String, $st: String) { $x: Doc  $x.repoName = $repo  update $x set { status: $st } }
-query del($repo: String) { $x: Doc  $x.repoName = $repo  delete $x }
+query set_status($repo: String, $st: String) { match { $x: Doc } where $x.repoName = $repo  update $x set { status: $st } }
+query del($repo: String) { match { $x: Doc } where $x.repoName = $repo  delete $x }
 "#;
 
     let upd = db
@@ -4318,9 +4318,9 @@ async fn camelcase_chained_mutation_reads_pending_by_camelcase() {
     // camelCase column, so it must match op-1's pending row.
     let m = r#"
 query chain($repo: String) {
-    $x: Doc  $x.repoName = $repo
+    match { $x: Doc } where $x.repoName = $repo
     update $x set { status: "stage1" }
-    $x: Doc  $x.repoName = $repo
+    match { $x: Doc } where $x.repoName = $repo
     update $x set { status: "stage2" }
 }
 "#;
@@ -4458,7 +4458,7 @@ async fn post_publish_fold_matches_fresh_reopen() {
 
 const FIND_PERSON_QUERY: &str = r#"
 query find_person($name: String) {
-    match { $p: Person { name: $name } }
+    match { $p: Person } where $p.name = $name
     return { $p.name }
 }
 "#;
@@ -5002,13 +5002,13 @@ query seed_knows() {
 }
 
 query replace_knows() {
-    $x: Knows  $x.@src = "Alice"
+    match { $x: Knows } where $x.@src = "Alice"
     delete $x
     insert Knows { from: "Alice", to: "Bob", since: "2021" }
 }
 
 query drop_knows() {
-    $x: Knows  $x.@src = "Alice"
+    match { $x: Knows } where $x.@src = "Alice"
     delete $x
 }
 "#;
@@ -5047,7 +5047,7 @@ async fn update_refuses_edge_types_pinning_key_immutability() {
 
     const MUTATIONS: &str = r#"
 query set_since() {
-    $x: Knows  $x.@src = "Alice"
+    match { $x: Knows } where $x.@src = "Alice"
     update $x set { since: "2021" }
 }
 "#;
@@ -5089,11 +5089,11 @@ node Doc {
 "#;
     const UPDATE: &str = r#"
 query bump($slug: String) {
-    $x: Doc  $x.slug = $slug
+    match { $x: Doc } where $x.slug = $slug
     update $x set { score: 1 }
 }
 query bump_all() {
-    $x: Doc  $x.age >= 0
+    match { $x: Doc } where $x.age >= 0
     update $x set { score: 2 }
 }
 "#;

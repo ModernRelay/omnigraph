@@ -31,11 +31,8 @@ node Passage {
 --- query
 set engine = v2;
 query found_numbers() {
-    match {
-        $m: Matter
-        $p: Passage
-        contains($p.text, $m.number)
-    }
+    match { $m: Matter, $p: Passage }
+    where contains($p.text, $m.number)
     return { $m.mid, $p, $p.embedding }
 }
 

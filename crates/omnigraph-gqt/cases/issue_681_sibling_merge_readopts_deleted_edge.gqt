@@ -42,7 +42,7 @@ query readd() {
 
 --- mutate branch: b1
 query delete() {
-    $x: Knows  $x.@src = "alice"
+    match { $x: Knows } where $x.@src = "alice"
     delete $x
 }
 
@@ -55,10 +55,7 @@ branch merge b1
 
 --- query
 query after_delete_merge() {
-    match {
-        $a: Person
-        $a knows $b
-    }
+    match { $a: Person, $a knows $b }
     return { $a.name, $b.name }
 }
 
@@ -75,10 +72,7 @@ branch merge b0
 
 --- query
 query after_readd_merge() {
-    match {
-        $a: Person
-        $a knows $b
-    }
+    match { $a: Person, $a knows $b }
     return { $a.name, $b.name }
 }
 

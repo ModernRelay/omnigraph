@@ -72,7 +72,7 @@ branch merge b0
 
 --- mutate branch: b1
 query delete_w2() {
-    $x: Person  $x.name = "w2"
+    match { $x: Person } where $x.name = "w2"
     delete $x
 }
 

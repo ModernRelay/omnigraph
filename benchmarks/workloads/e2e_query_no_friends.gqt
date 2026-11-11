@@ -8,7 +8,7 @@ environments:
     storage: local-filesystem
 
 --- query
-query no_friends() { match { $p: Person not { $p knows $q } } return { $p.name } }
+query no_friends() { match { $p: Person } where not exists { $p knows $q } return { $p.name } }
 --- expect unordered
 {"p.name":"p000501"}
 {"p.name":"p000503"}
@@ -64,7 +64,7 @@ query no_friends() { match { $p: Person not { $p knows $q } } return { $p.name }
 p.name: String
 
 --- query
-query no_friends() { match { $p: Person not { $p knows $q } } return { $p.name } }
+query no_friends() { match { $p: Person } where not exists { $p knows $q } return { $p.name } }
 --- expect unordered
 {"p.name":"p000501"}
 {"p.name":"p000503"}
@@ -122,7 +122,7 @@ p.name: String
 --- restart
 
 --- query
-query no_friends() { match { $p: Person not { $p knows $q } } return { $p.name } }
+query no_friends() { match { $p: Person } where not exists { $p knows $q } return { $p.name } }
 --- expect unordered
 {"p.name":"p000501"}
 {"p.name":"p000503"}

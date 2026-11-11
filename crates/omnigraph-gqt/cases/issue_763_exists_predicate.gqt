@@ -36,14 +36,11 @@ edge ArtifactOwnedByActor: Artifact -> Actor {}
 
 --- query
 query exists_preserves_outer_duplicates() {
-    match {
-        $n: Actor
-        $m: Artifact
-        $m artifactOwnedByActor $n
-        exists {
-            $image: Artifact { kind: "image" }
-            $image artifactOwnedByActor $n
-        }
+    match { $n: Actor, $m: Artifact, $m artifactOwnedByActor $n }
+    where exists {
+        $image: Artifact,
+        $image artifactOwnedByActor $n
+        where $image.kind = "image"
     }
     return { $n.slug }
 }
@@ -56,11 +53,9 @@ n.slug: String
 
 --- query
 query has_any_artifact() {
-    match {
-        $n: Actor
-        exists {
-            $m artifactOwnedByActor $n
-        }
+    match { $n: Actor }
+    where exists {
+        $m artifactOwnedByActor $n
     }
     return { $n.slug }
 }
@@ -72,12 +67,10 @@ n.slug: String
 
 --- query
 query has_any_image_filtered_after() {
-    match {
-        $n: Actor
-        exists {
-            $m artifactOwnedByActor $n
-            $m.kind = "image"
-        }
+    match { $n: Actor }
+    where exists {
+        $m artifactOwnedByActor $n
+        where $m.kind = "image"
     }
     return { $n.slug }
 }
@@ -89,13 +82,12 @@ n.slug: String
 --- query
 set engine = v2;
 query outer_variable_rebound_after_the_inner_binding() {
-    match {
-        $n: Actor
-        exists {
-            $m: Artifact { kind: "image" }
-            $n: Actor
-            $m artifactOwnedByActor $n
-        }
+    match { $n: Actor }
+    where exists {
+        $m: Artifact,
+        $n: Actor,
+        $m artifactOwnedByActor $n
+        where $m.kind = "image"
     }
     return { $n.slug }
 }
@@ -109,14 +101,12 @@ pass projection_pushdown
 
 --- query
 query search_inside_the_block_runs_after_a_rebinding() {
-    match {
-        $n: Actor
-        exists {
-            $n: Actor
-            $m: Artifact
-            search($m.text, "photo")
-            $m artifactOwnedByActor $n
-        }
+    match { $n: Actor }
+    where exists {
+        $n: Actor,
+        $m: Artifact,
+        $m artifactOwnedByActor $n
+        where search($m.text, "photo")
     }
     return { $n.slug }
 }
@@ -127,13 +117,11 @@ n.slug: String
 
 --- query
 query search_inside_the_block_runs() {
-    match {
-        $n: Actor
-        exists {
-            $m: Artifact
-            search($m.text, "photo")
-            $m artifactOwnedByActor $n
-        }
+    match { $n: Actor }
+    where exists {
+        $m: Artifact,
+        $m artifactOwnedByActor $n
+        where search($m.text, "photo")
     }
     return { $n.slug }
 }
@@ -144,11 +132,10 @@ n.slug: String
 
 --- query
 query block_must_read_an_outer_variable() {
-    match {
-        $n: Actor
-        exists {
-            $a: Artifact { kind: "image" }
-        }
+    match { $n: Actor }
+    where exists {
+        $a: Artifact
+        where $a.kind = "image"
     }
     return { $n.slug }
 }

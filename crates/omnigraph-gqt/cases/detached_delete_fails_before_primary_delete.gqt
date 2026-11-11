@@ -28,7 +28,7 @@ action: fail
 scope: next_step
 
 --- mutate
-query delete_bob() { $x: Person  $x.name = "bob"  delete $x }
+query delete_bob() { match { $x: Person } where $x.name = "bob"  delete $x }
 --- expect error: injected failpoint triggered: mutation.delete_node_pre_primary_delete
 
 --- query branch: main
@@ -41,7 +41,7 @@ p.name: String
 p.age: I64
 
 --- query branch: main
-query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query edges() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"bob"}
 {"p.name":"bob","q.name":"alice"}
@@ -50,7 +50,7 @@ p.name: String
 q.name: String
 
 --- mutate
-query delete_bob() { $x: Person  $x.name = "bob"  delete $x }
+query delete_bob() { match { $x: Person } where $x.name = "bob"  delete $x }
 --- expect affected: nodes=1 edges=2
 
 --- restart

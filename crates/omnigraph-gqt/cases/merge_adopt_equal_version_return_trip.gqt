@@ -74,10 +74,7 @@ branch merge feature
 
 --- query
 query edges_on_main() {
-    match {
-        $x: Person
-        $x knows $y
-    }
+    match { $x: Person, $x knows $y }
     return { $x.name, $y.name }
 }
 

@@ -10,7 +10,7 @@ environments:
     storage: local-filesystem
 
 --- mutate
-query next_write() as unattached branch { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
+query next_write() as unattached branch { match { $x: HistoryRow } where $x.key = "hot"  update $x set { value: 1 } }
 --- expect affected: nodes=1 edges=0
 --- bind commit $m
 

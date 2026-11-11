@@ -140,57 +140,42 @@ const PEOPLE_SEED: &[&str] = &[
 
 const PEOPLE_QUERIES: &str = r#"
 query older_pairs() {
-    match {
-        $p: Person
-        $q: Person
-        $p.age > $q.age
-    }
+    match { $p: Person, $q: Person }
+    where $p.age > $q.age
     return { $p.name, $q.name }
 }
 query older_likers() {
-    match {
-        $p: Person
-        $q: Person
-        $p likes $d
-        $p.age > $q.age
-    }
+    match { $p: Person, $q: Person, $p likes $d }
+    where $p.age > $q.age
     return { $p.name, $q.name, $d.title }
 }
 query older_than_likers_of_d0_or_bob() {
-    match {
-        $p: Person
-        $q: Person
-        $q likes $d
-        $p.age > $q.age
-        $d.title = "d0" or $p.name = "bob"
-    }
+    match { $p: Person, $q: Person, $q likes $d }
+    where $p.age > $q.age and ($d.title = "d0" or $p.name = "bob")
     return { $p.name, $q.name, $d.title }
 }
 query liked() {
-    match { $p: Person $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, $d.title }
 }
 query likes_nothing() {
-    match { $p: Person not { $p likes $d } }
+    match { $p: Person } where not exists { $p likes $d }
     return { $p.name }
 }
 query nobody_older() {
-    match {
-        $p: Person
-        not {
-            $q: Person
-            $q.age > $p.age
-        }
+    match { $p: Person }
+    where not exists {
+        $q: Person
+        where $q.age > $p.age
     }
     return { $p.name }
 }
 query skips_d1() {
-    match {
-        $p: Person
-        not {
-            $p likes $d
-            $d: Doc { title: "d1" }
-        }
+    match { $p: Person }
+    where not exists {
+        $p likes $d,
+        $d: Doc
+        where $d.title = "d1"
     }
     return { $p.name }
 }
@@ -373,29 +358,20 @@ const CITATION_SEED: &[&str] = &[
 ];
 
 const CITED: &str = r#"query cited() {
-    match {
-        $m: Matter
-        $p: Passage
-        contains($p.text, $m.number)
-    }
+    match { $m: Matter, $p: Passage }
+    where contains($p.text, $m.number)
     return { $m.mid, $p.pid }
 }"#;
 
 const CITED_PASSAGE_FIRST: &str = r#"query cited() {
-    match {
-        $p: Passage
-        $m: Matter
-        contains($p.text, $m.number)
-    }
+    match { $p: Passage, $m: Matter }
+    where contains($p.text, $m.number)
     return { $m.mid, $p.pid }
 }"#;
 
 const OLDER_PAIRS: &str = r#"query older_pairs() {
-    match {
-        $p: Person
-        $q: Person
-        $p.age > $q.age
-    }
+    match { $p: Person, $q: Person }
+    where $p.age > $q.age
     return { $p.name, $q.name }
 }"#;
 
@@ -616,12 +592,8 @@ async fn a_text_contains_join_filters_its_right_scan_and_pairs_only_the_found_pa
 
 /// `m2`'s pair fails the second filter, which only `m1` and `p9` can pass.
 const CITED_BY_M1: &str = r#"query cited() {
-    match {
-        $m: Matter
-        $p: Passage
-        contains($p.text, $m.number)
-        $m.mid = "m1" or $p.pid = "p9"
-    }
+    match { $m: Matter, $p: Passage }
+    where contains($p.text, $m.number) and ($m.mid = "m1" or $p.pid = "p9")
     return { $m.mid, $p.pid }
 }"#;
 
@@ -991,22 +963,21 @@ query by_text($t: String) {
     limit 3
 }
 query fused($t: String, $q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60), $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 3
 }
 query fused_then_slug($t: String, $q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60), $d: Doc }
     return { $d.slug }
     order { $score desc, $d.slug }
     limit 3
 }
 query nearest_with_edge($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc
-        $d knows $t
-    } return { $d, $t } }, $d.embedding, $q, k: 3) }
+    match {
+      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
+    }
     return { $d.slug }
     order { $distance }
     limit 3

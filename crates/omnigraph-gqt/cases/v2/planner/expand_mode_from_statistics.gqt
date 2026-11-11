@@ -27,10 +27,7 @@ edge Links: Person -> Person
 --- query
 set engine = v2;
 query linked() {
-    match {
-        $s: Person
-        $s links $d
-    }
+    match { $s: Person, $s links $d }
     return { $s.name, $d.name }
 }
 

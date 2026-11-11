@@ -28,13 +28,13 @@ branch create source
 --- mutate branch: source
 query source_changes() {
     insert Person { name: "carol", age: 50 }
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 31 }
 }
 --- expect affected: nodes=2 edges=0
 
 --- mutate branch: source
-query delete_bob() { $x: Person  $x.name = "bob"  delete $x }
+query delete_bob() { match { $x: Person } where $x.name = "bob"  delete $x }
 --- expect affected: nodes=1 edges=2
 
 --- seam

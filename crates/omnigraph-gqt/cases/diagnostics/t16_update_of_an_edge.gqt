@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- mutate
-query w() { $a: Person  $a $k:knows $b  update $k set { since: 1 } }
+query w() { match { $a: Person, $a $k:knows $b }  update $k set { since: 1 } }
 
 --- expect error: type error: T16:

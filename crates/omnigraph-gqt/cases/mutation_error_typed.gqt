@@ -31,7 +31,7 @@ query insert_missing_key($age: I32) {
 
 --- mutate
 query delete_absent($name: String) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     delete $x
 }
 

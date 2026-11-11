@@ -25,7 +25,7 @@ query insert_person($name: String, $role: String) {
 }
 
 query set_role($name: String, $role: String) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     update $x set { role: $role }
 }
 "#;
@@ -44,7 +44,7 @@ query insert_person($name: String, $age: I32) {
 }
 
 query set_age($name: String, $age: I32) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     update $x set { age: $age }
 }
 "#;
@@ -98,7 +98,7 @@ edge WorksAt: Person -> Company @card(1..)
 
 const CARD_MIN_DELETE_MUTATIONS: &str = r#"
 query drop_employment($person: String) {
-    $x: WorksAt  $x.@src = $person
+    match { $x: WorksAt } where $x.@src = $person
     delete $x
 }
 "#;
@@ -804,9 +804,9 @@ async fn chained_unique_update_then_reuse_freed_value_is_not_a_violation() {
     .await;
     const Q: &str = r#"
 query reassign() {
-    $x: User  $x.name = "Alice"
+    match { $x: User } where $x.name = "Alice"
     update $x set { email: "temp" }
-    $x: User  $x.name = "Alice"
+    match { $x: User } where $x.name = "Alice"
     update $x set { email: "final" }
     insert User { name: "Carol", email: "temp" }
 }

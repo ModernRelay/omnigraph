@@ -25,7 +25,7 @@ node Person {
 --- query
 set engine = v2;
 query disjunction() {
-    match { $p: Person  $p.age > 30 or $p.name = "bob" }
+    match { $p: Person } where ($p.age > 30 or $p.name = "bob")
     return { $p.slug }
 }
 
@@ -38,7 +38,7 @@ p.slug: String
 
 --- query
 query leading_nearest_runs($q: Vector(2)) {
-    match { from nearest({ match { $p: Person  $p.enabled = true } return { $p } }, $p.embedding, $q, k: 1) }
+    match { from nearest({ match { $p: Person } where $p.enabled = true return { $p } }, $p.embedding, $q, k: 1) }
     return { $p.slug }
     order { $distance }
     limit 1
@@ -55,7 +55,7 @@ p.slug: String
 --- query
 set engine = v2;
 query bare_boolean_property() {
-    match { $p: Person  $p.enabled }
+    match { $p: Person } where $p.enabled
     return { $p.slug }
 }
 
@@ -69,7 +69,7 @@ p.slug: String
 --- query
 set engine = v2;
 query bare_boolean_parameter($flag: Bool) {
-    match { $p: Person  $flag }
+    match { $p: Person } where $flag
     return { $p.slug }
 }
 
@@ -87,11 +87,8 @@ p.slug: String
 --- query
 set engine = v2;
 query comparison_of_comparisons() {
-    match {
-        $p: Person
-        $q: Person { slug: "b" }
-        ($p.age > 30) = ($q.age > 30)
-    }
+    match { $p: Person, $q: Person }
+    where $q.slug = "b" and ($p.age > 30) = ($q.age > 30)
     return { $p.slug }
 }
 
@@ -104,7 +101,7 @@ p.slug: String
 --- query
 set engine = v2;
 query type_fault_inside_compound() {
-    match { $p: Person  $p.enabled and $p.name }
+    match { $p: Person } where $p.enabled and $p.name
     return { $p.slug }
 }
 
@@ -112,7 +109,7 @@ query type_fault_inside_compound() {
 
 --- mutate
 query compound_where_runs($cut: I64) {
-    $x: Person  $x.age < $cut or $x.name = "carol"
+    match { $x: Person } where ($x.age < $cut or $x.name = "carol")
     update $x set { enabled: false }
 }
 

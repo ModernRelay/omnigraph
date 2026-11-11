@@ -28,7 +28,7 @@ r1: ok
 r2: ok
 
 --- mutate
-query age_alice() { $x: Person  $x.name = "alice"  update $x set { age: 99 } }
+query age_alice() { match { $x: Person } where $x.name = "alice"  update $x set { age: 99 } }
 --- expect ok
 
 --- query

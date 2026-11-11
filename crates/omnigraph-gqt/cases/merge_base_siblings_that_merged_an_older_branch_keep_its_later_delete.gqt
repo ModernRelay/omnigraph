@@ -36,7 +36,7 @@ branch create b;
 
 --- mutate branch: a
 query touch_p_once() {
-    $x: Person  $x.name = "p"
+    match { $x: Person } where $x.name = "p"
     update $x set { age: 0 }
 }
 
@@ -44,7 +44,7 @@ query touch_p_once() {
 
 --- mutate branch: a
 query touch_p_twice() {
-    $x: Person  $x.name = "p"
+    match { $x: Person } where $x.name = "p"
     update $x set { age: 0 }
 }
 
@@ -69,7 +69,7 @@ branch create right from a;
 
 --- mutate branch: left
 query set_l() {
-    $x: Person  $x.name = "l"
+    match { $x: Person } where $x.name = "l"
     update $x set { age: 1 }
 }
 
@@ -77,7 +77,7 @@ query set_l() {
 
 --- mutate branch: right
 query set_r() {
-    $x: Person  $x.name = "r"
+    match { $x: Person } where $x.name = "r"
     update $x set { age: 1 }
 }
 
@@ -95,7 +95,7 @@ branch merge b into right;
 
 --- mutate branch: right
 query delete_w() {
-    $x: Person  $x.name = "w"
+    match { $x: Person } where $x.name = "w"
     delete $x
 }
 

@@ -1,5 +1,5 @@
 # issue: none
-# notes: `not { }` over a traversal: a predicated inner pipeline, a nested double negation,
+# notes: `not exists { }` over a traversal: a predicated inner pipeline, a nested double negation,
 # notes: the bare-expand and filtered-inner forms of the same negation, and a destination
 # notes: binding inside the negation. Replaces the Rust tests anti_join_predicated_negation,
 # notes: nested_anti_join_double_negation, anti_join_fast_and_slow_paths_agree and
@@ -44,12 +44,10 @@ edge WorksAt: Person -> Company
 
 --- query
 query not_at_acme() {
-    match {
-        $p: Person
-        not {
-            $p worksAt $c
-            $c.name = "Acme"
-        }
+    match { $p: Person }
+    where not exists {
+        $p worksAt $c
+        where $c.name = "Acme"
     }
     return { $p.name }
 }
@@ -64,12 +62,11 @@ p.name: String
 
 --- query
 query not_at_acme_binding() {
-    match {
-        $p: Person
-        not {
-            $p worksAt $c
-            $c: Company { name: "Acme" }
-        }
+    match { $p: Person }
+    where not exists {
+        $p worksAt $c,
+        $c: Company
+        where $c.name = "Acme"
     }
     return { $p.name }
 }
@@ -84,14 +81,10 @@ p.name: String
 
 --- query
 query no_nonacme_employer() {
-    match {
-        $p: Person
-        not {
-            $p worksAt $c
-            not {
-                $c.name = "Acme"
-            }
-        }
+    match { $p: Person }
+    where not exists {
+        $p worksAt $c
+        where not exists { $c: Company where $c.name = "Acme" }
     }
     return { $p.name }
 }
@@ -106,10 +99,8 @@ p.name: String
 
 --- query
 query unemployed_bare_expand() {
-    match {
-        $p: Person
-        not { $p worksAt $_ }
-    }
+    match { $p: Person }
+    where not exists { $p worksAt $_ }
     return { $p.name }
 }
 
@@ -122,12 +113,10 @@ p.name: String
 
 --- query
 query unemployed_filtered_inner() {
-    match {
-        $p: Person
-        not {
-            $p worksAt $c
-            $c.name != ""
-        }
+    match { $p: Person }
+    where not exists {
+        $p worksAt $c
+        where $c.name != ""
     }
     return { $p.name }
 }

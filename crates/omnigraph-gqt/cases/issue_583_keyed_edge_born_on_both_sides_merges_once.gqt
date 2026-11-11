@@ -51,10 +51,7 @@ branch merge s
 
 --- query
 query bound_edges() {
-    match {
-        $p: Person
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
     return { $p.name, $f.name, $w.since }
 }
 
@@ -68,10 +65,7 @@ w.since: I32
 
 --- query
 query edge_count() {
-    match {
-        $p: Person
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
     return { count($w.since) as n }
 }
 

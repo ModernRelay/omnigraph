@@ -36,7 +36,7 @@ branch create work
 --- expect ok
 
 --- mutate branch: work
-query empty_person_on_work() { $x: Person  $x.id = "p1" or $x.id = "p2"  delete $x }
+query empty_person_on_work() { match { $x: Person } where ($x.id = "p1" or $x.id = "p2")  delete $x }
 
 --- expect affected: nodes=2 edges=0
 
@@ -71,7 +71,7 @@ load write: overwrite fragments
 load executed: partitions 1 rows 2
 
 --- mutate
-query empty_person_on_main() { $x: Person  $x.id = "p1" or $x.id = "p2"  delete $x }
+query empty_person_on_main() { match { $x: Person } where ($x.id = "p1" or $x.id = "p2")  delete $x }
 
 --- expect affected: nodes=2 edges=0
 

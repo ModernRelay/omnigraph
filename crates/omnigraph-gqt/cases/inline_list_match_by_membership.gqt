@@ -1,8 +1,8 @@
 # issue: none
-# notes: An inline binding match on a `[String]` property takes the scalar
-# notes: element type and selects by membership, with a literal and with a
-# notes: parameter; a list value there keeps its refusal, T3 for a literal and
-# notes: T7 for a parameter.
+# notes: Membership in a `[String]` property is `<value> in $p.tags` in
+# notes: `where`, with a literal and with a parameter; a list compared with
+# notes: the property for equality is refused with T7, and a list parameter
+# notes: as the needle of `in` is refused with T7.
 
 --- runner
 timeout_ms: 10000
@@ -25,7 +25,7 @@ node Person {
 
 --- query
 query literal_membership() {
-    match { $p: Person { tags: "rust" } }
+    match { $p: Person } where "rust" in $p.tags
     return { $p.slug }
 }
 
@@ -37,7 +37,7 @@ p.slug: String
 
 --- query
 query parameter_membership($tag: String) {
-    match { $p: Person { tags: $tag } }
+    match { $p: Person } where $tag in $p.tags
     return { $p.slug }
 }
 
@@ -53,16 +53,16 @@ p.slug: String
 
 --- query
 query list_literal_refused() {
-    match { $p: Person { tags: ["rust"] } }
-    return { $p.slug }
-}
-
---- expect error: T3: list equality is not supported for property `tags`; use a scalar value to match list membership
-
---- query
-query list_parameter_refused($tags: [String]) {
-    match { $p: Person { tags: $tags } }
+    match { $p: Person } where $p.tags = ["rust"]
     return { $p.slug }
 }
 
 --- expect error: T7: list equality is not supported: cannot compare [String] with [String]
+
+--- query
+query list_parameter_refused($tags: [String]) {
+    match { $p: Person } where $tags in $p.tags
+    return { $p.slug }
+}
+
+--- expect error: T7: `in` tests membership in [String]: the needle must be String, got [String]

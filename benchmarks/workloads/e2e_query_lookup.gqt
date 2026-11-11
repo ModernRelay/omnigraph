@@ -8,7 +8,7 @@ environments:
     storage: local-filesystem
 
 --- query
-query lookup() { match { $p: Person { name: "p000500" } } return { $p.name, $p.age } }
+query lookup() { match { $p: Person } where $p.name = "p000500" return { $p.name, $p.age } }
 --- expect unordered
 {"p.name":"p000500","p.age":0}
 --- expect shape
@@ -16,7 +16,7 @@ p.name: String
 p.age: I64
 
 --- query
-query lookup() { match { $p: Person { name: "p000500" } } return { $p.name, $p.age } }
+query lookup() { match { $p: Person } where $p.name = "p000500" return { $p.name, $p.age } }
 --- expect unordered
 {"p.name":"p000500","p.age":0}
 --- expect shape
@@ -26,7 +26,7 @@ p.age: I64
 --- restart
 
 --- query
-query lookup() { match { $p: Person { name: "p000500" } } return { $p.name, $p.age } }
+query lookup() { match { $p: Person } where $p.name = "p000500" return { $p.name, $p.age } }
 --- expect unordered
 {"p.name":"p000500","p.age":0}
 --- expect shape

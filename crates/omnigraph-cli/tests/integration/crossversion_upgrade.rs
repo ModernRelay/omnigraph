@@ -1499,11 +1499,11 @@ query docs() {
     order { $d.slug }
 }
 query edges() {
-    match { $a: Doc $a $c:cites $b }
+    match { $a: Doc, $a $c:cites $b }
     return { $a.slug, $b.slug, $c.note }
 }
 query title_search($term: String) {
-    match { $d: Doc search($d.title, $term) }
+    match { $d: Doc } where search($d.title, $term)
     return { $d.slug }
     order { $d.slug }
 }
@@ -1519,8 +1519,8 @@ query vectors($q: Vector(4)) {
     order { $distance }
     limit 1
 }
-query retitle($title: String) { $x: Doc  $x.slug = "ml-intro"  update $x set { title: $title } }
-query revise($body: String) { $x: Doc  $x.slug = "dl-basics"  update $x set { body: $body } }
+query retitle($title: String) { match { $x: Doc } where $x.slug = "ml-intro"  update $x set { title: $title } }
+query revise($body: String) { match { $x: Doc } where $x.slug = "dl-basics"  update $x set { body: $body } }
 "#;
     fs::write(&predecessor_queries, predecessor_query_source).unwrap();
     fs::write(
@@ -2040,12 +2040,12 @@ query docs() {
     order { $d.slug }
 }
 query edges() {
-    match { $a: Doc $a $c:cites $b }
+    match { $a: Doc, $a $c:cites $b }
     return { $a.slug, $b.slug, $c.note }
 }
-query retitle($title: String) { $x: Doc  $x.slug = "ml-intro"  update $x set { title: $title } }
-query remove() { $x: Doc  $x.slug = "rl-intro"  delete $x }
-query revise() { $x: Doc  $x.slug = "dl-basics"  update $x set { body: "written after storage upgrade" } }
+query retitle($title: String) { match { $x: Doc } where $x.slug = "ml-intro"  update $x set { title: $title } }
+query remove() { match { $x: Doc } where $x.slug = "rl-intro"  delete $x }
+query revise() { match { $x: Doc } where $x.slug = "dl-basics"  update $x set { body: "written after storage upgrade" } }
 query vectors($q: Vector(4)) {
     match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1) }
     return { $d.slug }
@@ -2134,7 +2134,7 @@ query rated() {
     return { $d.slug, $d.rating }
     order { $d.slug }
 }
-query rate() { $x: Doc  $x.slug = "ml-intro"  update $x set { rating: 5 } }
+query rate() { match { $x: Doc } where $x.slug = "ml-intro"  update $x set { rating: 5 } }
 "#;
 
 /// [`RATED_QUERY_SOURCE`] in the predecessor syntax.
@@ -2276,7 +2276,7 @@ fn genuine_lance11_storage_upgrade_round_trip() {
     // reserves the name `terms`: its file names that query `title_search`.
     let added_queries = r#"
 query terms($term: String) {
-    match { $d: Doc search($d.title, $term) }
+    match { $d: Doc } where search($d.title, $term)
     return { $d.slug }
     order { $d.slug }
 }

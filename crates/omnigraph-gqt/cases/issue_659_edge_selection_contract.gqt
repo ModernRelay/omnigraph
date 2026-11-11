@@ -37,22 +37,22 @@ edge Owns: Person -> Doc
 
 
 --- query
-query missing_common_property() { match { $p: Person $p $e:(knows | likes) $q } return { $e.since } }
+query missing_common_property() { match { $p: Person, $p $e:(knows | likes) $q } return { $e.since } }
 
 --- expect error: must exist with compatible types on every selected edge
 
 --- query
-query empty_has_no_property() { match { $a: Doc $b: Doc $a $e:* $b } return { $e.weight } }
+query empty_has_no_property() { match { $a: Doc, $b: Doc, $a $e:* $b } return { $e.weight } }
 
 --- expect error: empty wildcard has no inferable property
 
 --- query
-query missing_wildcard_endpoint() { match { $p: Person $p * $q } return { $p.name } }
+query missing_wildcard_endpoint() { match { $p: Person, $p * $q } return { $p.name } }
 
 --- expect error: requires explicitly declared source and destination node bindings
 
 --- query
-query inferred_wildcard_endpoint() { match { $p: Person $p knows $q $p * $q } return { $p.name } }
+query inferred_wildcard_endpoint() { match { $p: Person, $p knows $q, $p * $q } return { $p.name } }
 
 --- expect unordered
 {"p.name": "a"}
@@ -63,44 +63,44 @@ query inferred_wildcard_endpoint() { match { $p: Person $p knows $q $p * $q } re
 p.name: String
 
 --- query
-query incompatible_members() { match { $p: Person $p (knows | owns) $q } return { $p.name } }
+query incompatible_members() { match { $p: Person, $p (knows | owns) $q } return { $p.name } }
 
 --- expect error: T5:
 
 --- query
-query recursive_edge_binding() { match { $p: Person $p $e:(knows | likes){1,2} $q } return { $e.@id } }
+query recursive_edge_binding() { match { $p: Person, $p $e:(knows | likes){1,2} $q } return { $e.@id } }
 
 --- expect error: T23:
 
 --- query
-query zero_hops() { match { $p: Person $p (knows | likes){0,1} $q } return { $p.name } }
+query zero_hops() { match { $p: Person, $p (knows | likes){0,1} $q } return { $p.name } }
 
 --- expect error: T15:
 
 --- query
-query unbounded_hops() { match { $p: Person $p (knows | likes){1,} $q } return { $p.name } }
+query unbounded_hops() { match { $p: Person, $p (knows | likes){1,} $q } return { $p.name } }
 
 --- expect error: unbounded traversal is disabled
 
 --- query
-query reverse_bounds() { match { $p: Person $p (knows | likes){3,2} $q } return { $p.name } }
+query reverse_bounds() { match { $p: Person, $p (knows | likes){3,2} $q } return { $p.name } }
 
 --- expect error: max must be >= min
 
 --- query
-query unknown_member() { match { $p: Person $p (knows | missing) $q } return { $p.name } }
+query unknown_member() { match { $p: Person, $p (knows | missing) $q } return { $p.name } }
 
 --- expect error: unknown edge type `missing`
 
 --- query
 set traversal_work_limit = 1;
-query tiny_work_budget() { match { $p: Person { name: "a" } $p (knows | likes) $q } return { $q.name } }
+query tiny_work_budget() { match { $p: Person, $p (knows | likes) $q } where $p.name = "a" return { $q.name } }
 
 --- expect error: traversal_work_limit
 
 --- query
 query empty_wildcard_identity() {
-    match { $a: Doc $b: Doc $a $e:* $b }
+    match { $a: Doc, $b: Doc, $a $e:* $b }
     return { $e.@type as edge_type, $e.@id as edge_id, $e.@src as source, $e.@dst as destination }
 }
 
@@ -117,7 +117,7 @@ expand $a $b: selection wildcard []
 
 --- query
 query after_budget_error() {
-    match { $p: Person { name: "a" } $p (knows | likes) $q }
+    match { $p: Person, $p (knows | likes) $q } where $p.name = "a"
     return { $q.name as destination }
 }
 
@@ -131,7 +131,7 @@ destination: String
 
 --- query
 query single_name_group_is_not_edge_alternation() {
-    match { $a: Person $b: Person $a (knows) $b }
+    match { $a: Person, $b: Person, $a (knows) $b }
     return { $a.name }
 }
---- expect error: Q018: `knows` is a bare name, which is not a value in a read: a property is `$x.knows`, a parameter `$knows`, a string `"knows"`; a bare name is a return alias in `order` only
+--- expect error: Q012: a group of one edge name is that name; an alternation is `(a | b)`

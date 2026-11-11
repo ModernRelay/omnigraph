@@ -29,7 +29,7 @@ node Person {
 --- query
 set engine = v2;
 query contactable($min: I64) {
-    match { $p: Person  $p.email is not null }
+    match { $p: Person } where $p.email is not null
     return { $p.slug, $p.age > $min as adult }
 }
 

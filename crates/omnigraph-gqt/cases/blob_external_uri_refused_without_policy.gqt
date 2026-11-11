@@ -33,7 +33,7 @@ query insert_external_uri($content: Blob?) {
 
 --- mutate
 query update_to_external_uri($content: Blob?) {
-    $x: Doc  $x.slug = "a"
+    match { $x: Doc } where $x.slug = "a"
     update $x set { content: $content, title: "changed" }
 }
 
@@ -44,7 +44,7 @@ query update_to_external_uri($content: Blob?) {
 
 --- mutate
 query update_to_external_uri_matching_no_row($content: Blob?) {
-    $x: Doc  $x.slug = "nobody"
+    match { $x: Doc } where $x.slug = "nobody"
     update $x set { content: $content }
 }
 

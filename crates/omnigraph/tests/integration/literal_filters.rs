@@ -68,9 +68,9 @@ async fn float_literal_filters_execute() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
     let q = r#"
-query gt() { match { $m: Metric  $m.score > 1.5 } return { $m.name } }
-query le() { match { $m: Metric  $m.ratio <= 0.25 } return { $m.name } }
-query inline() { match { $m: Metric { score: 3.0 } } return { $m.name } }
+query gt() { match { $m: Metric } where $m.score > 1.5 return { $m.name } }
+query le() { match { $m: Metric } where $m.ratio <= 0.25 return { $m.name } }
+query inline() { match { $m: Metric } where $m.score = 3.0 return { $m.name } }
 "#;
     // F64 standalone: scores 2.5, 3.0 > 1.5
     assert_eq!(
@@ -96,9 +96,9 @@ async fn int_and_f32_literal_pushdown_coercion() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
     let q = r#"
-query count_eq() { match { $m: Metric { count: 2 } } return { $m.name } }
-query ratio_eq() { match { $m: Metric { ratio: 0.25 } } return { $m.name } }
-query count_ge() { match { $m: Metric  $m.count >= 3 } return { $m.name } }
+query count_eq() { match { $m: Metric } where $m.count = 2 return { $m.name } }
+query ratio_eq() { match { $m: Metric } where $m.ratio = 0.25 return { $m.name } }
+query count_ge() { match { $m: Metric } where $m.count >= 3 return { $m.name } }
 "#;
     // I32 column, integer literal coerced Int64 -> Int32: count == 2 is m2 only.
     assert_eq!(
@@ -126,7 +126,7 @@ async fn fractional_float_equality_on_int_column_returns_no_rows() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
     let q = r#"
-query count_frac() { match { $m: Metric { count: 2.7 } } return { $m.name } }
+query count_frac() { match { $m: Metric } where $m.count = 2.7 return { $m.name } }
 "#;
     assert!(
         sorted_metric_names(&mut db, q, "count_frac")
@@ -141,9 +141,9 @@ async fn bool_literal_filters_execute() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
     let q = r#"
-query standalone() { match { $m: Metric  $m.active = true } return { $m.name } }
-query inline() { match { $m: Metric { active: true } } return { $m.name } }
-query negated() { match { $m: Metric  $m.active != true } return { $m.name } }
+query standalone() { match { $m: Metric } where $m.active = true return { $m.name } }
+query inline() { match { $m: Metric } where $m.active = true return { $m.name } }
+query negated() { match { $m: Metric } where $m.active != true return { $m.name } }
 "#;
     assert_eq!(
         sorted_metric_names(&mut db, q, "standalone").await,
@@ -164,10 +164,10 @@ async fn date_and_datetime_literal_filters_execute() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
     let q = r#"
-query born_ge() { match { $m: Metric  $m.born >= date("2024-01-01") } return { $m.name } }
-query seen_lt() { match { $m: Metric  $m.seen < datetime("2024-01-01T00:00:00Z") } return { $m.name } }
-query born_eq() { match { $m: Metric { born: date("2024-06-01") } } return { $m.name } }
-query seen_eq() { match { $m: Metric { seen: datetime("2024-06-01T12:00:00Z") } } return { $m.name } }
+query born_ge() { match { $m: Metric } where $m.born >= date("2024-01-01") return { $m.name } }
+query seen_lt() { match { $m: Metric } where $m.seen < datetime("2024-01-01T00:00:00Z") return { $m.name } }
+query born_eq() { match { $m: Metric } where $m.born = date("2024-06-01") return { $m.name } }
+query seen_eq() { match { $m: Metric } where $m.seen = datetime("2024-06-01T12:00:00Z") return { $m.name } }
 "#;
     // born: m1 2024-06, m3 2025 >= 2024-01-01
     assert_eq!(
@@ -195,7 +195,7 @@ async fn date_param_with_a_time_of_day_is_refused_from_a_rust_param_map() {
         omnigraph_compiler::Literal::Date("2024-06-01T02:00:00+05:00".to_string()),
     );
     let q = r#"
-query born_eq_param($d: Date) { match { $m: Metric  $m.born = $d } return { $m.name } }
+query born_eq_param($d: Date) { match { $m: Metric } where $m.born = $d return { $m.name } }
 "#;
     let err = query_main(&db, q, "born_eq_param", &params)
         .await
@@ -208,7 +208,7 @@ query born_eq_param($d: Date) { match { $m: Metric  $m.born = $d } return { $m.n
     );
 
     let m = r#"
-query touch_born($d: Date) { $x: Metric  $x.born = $d  update $x set { active: false } }
+query touch_born($d: Date) { match { $x: Metric } where $x.born = $d  update $x set { active: false } }
 "#;
     let err = db
         .mutate("main", m, "touch_born", &params)
@@ -264,13 +264,13 @@ async fn datetime_param_with_sub_millisecond_digits_is_refused_from_a_rust_param
     let db = metric_db(&dir).await;
     let datetime = |value: &str| omnigraph_compiler::Literal::DateTime(value.to_string());
     let q = r#"
-query seen_eq_param($t: DateTime) { match { $m: Metric  $m.seen = $t } return { $m.name } }
-query seen_in_param($ts: [DateTime]) { match { $m: Metric  $m.seen in $ts } return { $m.name } }
-query seen_opt_param($t: DateTime?) { match { $m: Metric  $m.seen = $t } return { $m.name } }
-query seen_in_opt_param($ts: [DateTime]?) { match { $m: Metric  $m.seen in $ts } return { $m.name } }
+query seen_eq_param($t: DateTime) { match { $m: Metric } where $m.seen = $t return { $m.name } }
+query seen_in_param($ts: [DateTime]) { match { $m: Metric } where $m.seen in $ts return { $m.name } }
+query seen_opt_param($t: DateTime?) { match { $m: Metric } where $m.seen = $t return { $m.name } }
+query seen_in_opt_param($ts: [DateTime]?) { match { $m: Metric } where $m.seen in $ts return { $m.name } }
 "#;
     let m = r#"
-query touch_seen($t: DateTime) { $x: Metric  $x.seen = $t  update $x set { active: false } }
+query touch_seen($t: DateTime) { match { $x: Metric } where $x.seen = $t  update $x set { active: false } }
 "#;
 
     let mut params = ParamMap::new();
@@ -406,11 +406,11 @@ async fn string_predicate_filters_execute_on_scanned_variable() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
     let q = r#"
-query prefix() { match { $m: Metric  starts_with($m.label, "alp") } return { $m.name } }
-query prefix_param($q: String) { match { $m: Metric  starts_with($m.label, $q) } return { $m.name } }
-query substr() { match { $m: Metric  contains($m.label, "ta r") } return { $m.name } }
-query substr_all() { match { $m: Metric  contains($m.label, "a") } return { $m.name } }
-query key_prefix() { match { $m: Metric  starts_with($m.name, "m") } return { $m.name } }
+query prefix() { match { $m: Metric } where starts_with($m.label, "alp") return { $m.name } }
+query prefix_param($q: String) { match { $m: Metric } where starts_with($m.label, $q) return { $m.name } }
+query substr() { match { $m: Metric } where contains($m.label, "ta r") return { $m.name } }
+query substr_all() { match { $m: Metric } where contains($m.label, "a") return { $m.name } }
+query key_prefix() { match { $m: Metric } where starts_with($m.name, "m") return { $m.name } }
 "#;
     // Prefix: "alpha one", "alps" start with "alp"; NULL label (m4) is not a match.
     assert_eq!(
@@ -448,11 +448,8 @@ async fn cross_variable_string_predicate_is_not_hoisted() {
     let db = metric_db(&dir).await;
     let q = r#"
 query cross() {
-    match {
-        $a: Metric
-        $b: Metric
-        starts_with($b.label, $a.label)
-    }
+    match { $a: Metric, $b: Metric }
+    where starts_with($b.label, $a.label)
     return { $a.name, $b.name }
 }
 "#;
@@ -477,10 +474,8 @@ async fn string_contains_resolves_inside_negation() {
     let mut db = metric_db(&dir).await;
     let q = r#"
 query not_sal_tagged() {
-    match {
-        $m: Metric
-        not { $m tagged $t  contains($t.tname, "sal") }
-    }
+    match { $m: Metric }
+    where not exists { $m tagged $t where contains($t.tname, "sal") }
     return { $m.name }
 }
 "#;
@@ -505,17 +500,13 @@ async fn reversed_and_same_variable_string_predicates_execute() {
     let mut db = metric_db(&dir).await;
     let q = r#"
 query reversed() {
-    match {
-        $m: Metric
-        contains("the alps are tall", $m.label)
-    }
+    match { $m: Metric }
+    where contains("the alps are tall", $m.label)
     return { $m.name }
 }
 query same_var() {
-    match {
-        $m: Metric
-        starts_with($m.label, $m.name)
-    }
+    match { $m: Metric }
+    where starts_with($m.label, $m.name)
     return { $m.name }
 }
 "#;
@@ -546,7 +537,7 @@ async fn standalone_string_predicate_is_hoisted_into_scan() {
 
     let dir = tempfile::tempdir().unwrap();
     let db = metric_db(&dir).await;
-    let q = r#"query prefix() { match { $m: Metric  starts_with($m.label, "alp") } return { $m.name } }"#;
+    let q = r#"query prefix() { match { $m: Metric } where starts_with($m.label, "alp") return { $m.name } }"#;
 
     let probes = QueryIoProbes::default();
     let r = with_query_io_probes(
@@ -581,18 +572,13 @@ async fn string_predicates_compose_with_search_and_negation() {
     db.ensure_indices().await.unwrap();
     let q = r#"
 query prefix_and_search() {
-    match {
-        $m: Metric
-        search($m.label, "alps")
-        starts_with($m.label, "al")
-    }
+    match { $m: Metric }
+    where search($m.label, "alps") and starts_with($m.label, "al")
     return { $m.name }
 }
 query not_alp_tagged() {
-    match {
-        $m: Metric
-        not { $m tagged $t  starts_with($t.tname, "alp") }
-    }
+    match { $m: Metric }
+    where not exists { $m tagged $t where starts_with($t.tname, "alp") }
     return { $m.name }
 }
 "#;
@@ -615,8 +601,8 @@ async fn string_predicate_filters_execute_on_expanded_variable() {
     // $t is introduced by the traversal, so these standalone filters take the
     // in-memory arm — results must match the pushdown arm's semantics.
     let q = r#"
-query tag_prefix() { match { $m: Metric  $m tagged $t  starts_with($t.tname, "alp") } return { $m.name } }
-query tag_substr() { match { $m: Metric  $m tagged $t  contains($t.tname, "sal") } return { $m.name } }
+query tag_prefix() { match { $m: Metric, $m tagged $t } where starts_with($t.tname, "alp") return { $m.name } }
+query tag_substr() { match { $m: Metric, $m tagged $t } where contains($t.tname, "sal") return { $m.name } }
 "#;
     // Only m1 is tagged "alpine".
     assert_eq!(
@@ -649,8 +635,7 @@ async fn camelcase_property_filter_executes() {
     let db = session(Omnigraph::init(uri, CC_SCHEMA).await.unwrap());
     db.load_jsonl(CC_DATA, LoadMode::Overwrite).await.unwrap();
 
-    let q =
-        r#"query by_repo($r: String) { match { $d: Doc { repoName: $r } } return { $d.slug } }"#;
+    let q = r#"query by_repo($r: String) { match { $d: Doc } where $d.repoName = $r return { $d.slug } }"#;
     let r = query_main(&db, q, "by_repo", &params(&[("$r", "acme")]))
         .await
         .expect("camelCase property filter must execute, not fail at the Lance scan");
@@ -681,7 +666,7 @@ async fn unused_mutation_parameters_are_checked_before_a_noop() {
         ("F64", Literal::Float(f64::NAN), Literal::Float(1.25)),
     ] {
         let source = format!(
-            "query unused($value: {type_name}) {{ $x: Metric  $x.name = \"missing\"  update $x set {{ active: false }} }}"
+            "query unused($value: {type_name}) {{ match {{ $x: Metric }} where $x.name = \"missing\"  update $x set {{ active: false }} }}"
         );
         let error = db
             .mutate(
@@ -722,7 +707,7 @@ async fn mutation_assignment_parameter_is_checked_before_an_empty_scan_after_hea
     let dir = tempfile::tempdir().unwrap();
     let db = metric_db(&dir).await;
     let source = r#"query assigned($value: I32) {
-        $x: Metric  $x.name = "missing"
+        match { $x: Metric } where $x.name = "missing"
         update $x set { count: $value }
     }"#;
     let params = ParamMap::from([("value".into(), Literal::Integer(i128::from(i32::MAX) + 1))]);
@@ -771,7 +756,7 @@ async fn omitted_nullable_mutation_parameters_are_null_from_a_rust_param_map() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
     let predicate = r#"query optional_predicate($name: String?) {
-        $x: Metric  $x.name = $name
+        match { $x: Metric } where $x.name = $name
         update $x set { active: false }
     }"#;
     for params in [
@@ -788,7 +773,7 @@ async fn omitted_nullable_mutation_parameters_are_null_from_a_rust_param_map() {
     }
 
     let assignment = r#"query optional_assignment($count: I32?) {
-        $x: Metric  $x.name = "m1"
+        match { $x: Metric } where $x.name = "m1"
         update $x set { count: $count }
     }"#;
     let receipt = db
@@ -799,7 +784,7 @@ async fn omitted_nullable_mutation_parameters_are_null_from_a_rust_param_map() {
     assert_eq!(receipt.result.affected_edges, 0);
     assert!(receipt.commit.is_some());
     let cleared = r#"query cleared() {
-        match { $m: Metric $m.count is null }
+        match { $m: Metric } where $m.count is null
         return { $m.name }
     }"#;
     assert_eq!(

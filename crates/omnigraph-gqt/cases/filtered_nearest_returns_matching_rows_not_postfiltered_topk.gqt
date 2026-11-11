@@ -30,7 +30,7 @@ node Doc {
 
 --- query
 query filtered_nearest($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc { status: "hit" } } return { $d } }, $d.embedding, $q, k: 3) }
+    match { from nearest({ match { $d: Doc } where $d.status = "hit" return { $d } }, $d.embedding, $q, k: 3) }
     return { $d.slug }
     order { $distance }
     limit 3
@@ -49,8 +49,9 @@ d.slug: String
 
 --- query
 query filtered_nearest_clause_eq($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc
-        $d.status = "hit" } return { $d } }, $d.embedding, $q, k: 3) }
+    match {
+      from nearest({ match { $d: Doc } where $d.status = "hit" return { $d } }, $d.embedding, $q, k: 3),
+    }
     return { $d.slug }
     order { $distance }
     limit 3
@@ -69,8 +70,9 @@ d.slug: String
 
 --- query
 query filtered_nearest_clause_range($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc
-        $d.status <= "hit" } return { $d } }, $d.embedding, $q, k: 3) }
+    match {
+      from nearest({ match { $d: Doc } where $d.status <= "hit" return { $d } }, $d.embedding, $q, k: 3),
+    }
     return { $d.slug }
     order { $distance }
     limit 3

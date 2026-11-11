@@ -21,10 +21,9 @@ node Chunk {
 
 --- query
 query top_chunks($q: String) {
-    match { from bm25({ match {
-        $c: Chunk
-        search($c.text, $q)
-    } return { $c } }, $c.text, $q) }
+    match {
+      from bm25({ match { $c: Chunk } where search($c.text, $q) return { $c } }, $c.text, $q),
+    }
     return { $c }
     order { $score desc }
     limit 2
@@ -42,7 +41,7 @@ c: Chunk
 
 --- query
 query hybrid_chunks($q: String, $v: Vector(2)) {
-    match { let $all = { match { $c: Chunk } return { $c } }  from rrf(nearest($all, $c.embedding, $v, k: 3), bm25($all, $c.text, $q), k: 60) $c: Chunk }
+    match { let $all = { match { $c: Chunk } return { $c } }, from rrf(nearest($all, $c.embedding, $v, k: 3), bm25($all, $c.text, $q), k: 60), $c: Chunk }
     return { $c }
     order { $score desc }
     limit 3

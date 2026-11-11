@@ -22,7 +22,7 @@ node Doc {
 --- query
 set engine = v2;
 query omitted_nullable_fuzzy_option($edits: I64?) {
-    match { $d: Doc fuzzy($d.text, "needle", max_edits: $edits) }
+    match { $d: Doc } where fuzzy($d.text, "needle", max_edits: $edits)
     return { $d.key }
 }
 --- params
@@ -32,7 +32,7 @@ query omitted_nullable_fuzzy_option($edits: I64?) {
 --- query
 set engine = v2;
 query negative_fuzzy_option($edits: I64) {
-    match { $d: Doc fuzzy($d.text, "needle", max_edits: $edits) }
+    match { $d: Doc } where fuzzy($d.text, "needle", max_edits: $edits)
     return { $d.key }
 }
 --- params
@@ -42,7 +42,7 @@ query negative_fuzzy_option($edits: I64) {
 --- query
 set engine = v2;
 query oversized_fuzzy_option($edits: U64) {
-    match { $d: Doc fuzzy($d.text, "needle", max_edits: $edits) }
+    match { $d: Doc } where fuzzy($d.text, "needle", max_edits: $edits)
     return { $d.key }
 }
 --- params
@@ -52,7 +52,7 @@ query oversized_fuzzy_option($edits: U64) {
 --- query
 set engine = v2;
 query null_rrf_option($k: I64?) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
     return { $d.key }
     order { $score desc }
     limit 1
@@ -64,7 +64,7 @@ query null_rrf_option($k: I64?) {
 --- query
 set engine = v2;
 query zero_rrf_option($k: I64) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
     return { $d.key }
     order { $score desc }
     limit 1
@@ -76,7 +76,7 @@ query zero_rrf_option($k: I64) {
 --- query
 set engine = v2;
 query oversized_rrf_option($k: U64) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
     return { $d.key }
     order { $score desc }
     limit 1
@@ -88,7 +88,7 @@ query oversized_rrf_option($k: U64) {
 --- query
 set engine = v2;
 query typed_rrf_option($k: U32) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
     return { $d.key }
     order { $score desc }
     limit 1
@@ -103,7 +103,7 @@ d.key: String
 --- query
 set engine = v2;
 query null_search_query($q: String?) {
-    match { $d: Doc search($d.text, $q) }
+    match { $d: Doc } where search($d.text, $q)
     return { $d.key }
 }
 --- params

@@ -4125,10 +4125,7 @@ edge Knows: Person -> Person
 --- query
 set engine = v2;
 query any_reached() {
-    match {
-        $p: Person
-        $p knows{1,2} $f
-    }
+    match { $p: Person, $p knows{1,2} $f }
     return { $f.role }
     limit 1
 }
@@ -4141,10 +4138,7 @@ f.role: String
 --- query
 set engine = v2;
 query pair_count() {
-    match {
-        $p: Person
-        $p knows{1,2} $f
-    }
+    match { $p: Person, $p knows{1,2} $f }
     return { count($f) as n }
 }
 

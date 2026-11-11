@@ -28,7 +28,7 @@ branch create feature
 
 --- mutate
 query a_2_on_main() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 2 }
 }
 
@@ -36,7 +36,7 @@ query a_2_on_main() {
 
 --- mutate
 query a_3_on_main() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 3 }
 }
 
@@ -44,7 +44,7 @@ query a_3_on_main() {
 
 --- mutate
 query a_4_on_main() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 4 }
 }
 
@@ -52,7 +52,7 @@ query a_4_on_main() {
 
 --- mutate
 query a_5_on_main() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 5 }
 }
 
@@ -60,7 +60,7 @@ query a_5_on_main() {
 
 --- mutate branch: feature
 query b_9_on_feature() {
-    $x: Person  $x.name = "b"
+    match { $x: Person } where $x.name = "b"
     update $x set { age: 9 }
 }
 
@@ -73,7 +73,7 @@ branch merge main into feature
 
 --- mutate branch: feature
 query a_50_on_feature() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 50 }
 }
 

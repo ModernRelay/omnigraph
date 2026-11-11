@@ -39,7 +39,7 @@ params:
 
 --- query
 query by_slug($slug: String) {
-    match { $d: Doc { slug: $slug } }
+    match { $d: Doc } where $d.slug = $slug
     return { $d.slug }
 }
 

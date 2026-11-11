@@ -143,7 +143,7 @@ hit: Bool
 --- query
 set engine = v2;
 query rrf_threshold_expression($v: Vector(2), $q: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, $q), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, $q), k: 60), $d: Doc }
     return { $d.slug, $score > 0.0325 as high }
     order { $score desc, ($score > 0.0325) asc }
     limit 2
@@ -163,7 +163,7 @@ high: Bool
 --- query
 set engine = v2;
 query rrf_threshold_alias($v: Vector(2), $q: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, $q), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, $q), k: 60), $d: Doc }
     return { $d.slug, $score > 0.0325 as high }
     order { $score desc, high asc }
     limit 2

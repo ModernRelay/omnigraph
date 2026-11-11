@@ -52,7 +52,7 @@ p.name: String
 
 --- query branch: work
 query uncertain_edge_exists_once() {
-    match { $p: Person $p $e:knows $q }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 --- expect unordered
@@ -85,7 +85,7 @@ p.name: String
 
 --- query branch: work
 query work_edge_survives_once() {
-    match { $p: Person $p $e:knows $q }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 --- expect unordered
@@ -107,7 +107,7 @@ p.name: String
 
 --- query branch: main
 query main_has_no_work_edges() {
-    match { $p: Person $p $e:knows $q }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 --- expect unordered

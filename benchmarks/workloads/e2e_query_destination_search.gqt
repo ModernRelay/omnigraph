@@ -9,7 +9,7 @@ environments:
 
 --- query
 query destination_search() {
-    match { $p: Person $p knows $q search($q.body, "needle") }
+    match { $p: Person, $p knows $q } where search($q.body, "needle")
     return { $q.name }
 }
 --- expect unordered
@@ -20,7 +20,7 @@ q.name: String
 
 --- query
 query destination_search() {
-    match { $p: Person $p knows $q search($q.body, "needle") }
+    match { $p: Person, $p knows $q } where search($q.body, "needle")
     return { $q.name }
 }
 --- expect unordered
@@ -33,7 +33,7 @@ q.name: String
 
 --- query
 query destination_search() {
-    match { $p: Person $p knows $q search($q.body, "needle") }
+    match { $p: Person, $p knows $q } where search($q.body, "needle")
     return { $q.name }
 }
 --- expect unordered

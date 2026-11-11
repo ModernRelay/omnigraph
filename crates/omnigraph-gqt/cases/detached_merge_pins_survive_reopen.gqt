@@ -42,7 +42,7 @@ query people() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query branch: main
-query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query edges() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"alice"}
 {"p.name":"bob","q.name":"alice"}
@@ -59,7 +59,7 @@ query people() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query branch: source
-query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query edges() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"alice"}
 {"p.name":"bob","q.name":"alice"}
@@ -79,7 +79,7 @@ query people() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query branch: main
-query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query edges() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"alice"}
 {"p.name":"bob","q.name":"alice"}
@@ -104,7 +104,7 @@ query people() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query branch: main
-query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query edges() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"alice"}
 {"p.name":"bob","q.name":"alice"}
@@ -122,7 +122,7 @@ query people() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- query branch: source
-query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query edges() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"alice"}
 {"p.name":"bob","q.name":"alice"}

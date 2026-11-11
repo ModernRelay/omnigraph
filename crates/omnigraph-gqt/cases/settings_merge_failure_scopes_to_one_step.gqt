@@ -33,7 +33,7 @@ branch create source;
 
 --- mutate branch: source
 query bump_on_source() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 31 }
 }
 
@@ -41,7 +41,7 @@ query bump_on_source() {
 
 --- mutate
 query bump_on_main() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 32 }
 }
 

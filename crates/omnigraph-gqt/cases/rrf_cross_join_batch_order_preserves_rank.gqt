@@ -8219,11 +8219,13 @@ node Probe {
 
 --- query
 query fused($t: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60)
-        $d: Doc
-        $p: Probe
-        $d.n = $p.n
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60),
+      $d: Doc,
+      $p: Probe,
     }
+    where $d.n = $p.n
     return { $d.slug }
     order { $score desc }
     limit 1

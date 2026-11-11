@@ -97,7 +97,7 @@ not pass late_materialization
 --- query
 set engine = v2;
 query process_settings() {
-    match { $s: @Setting $s.scope = "process" }
+    match { $s: @Setting } where $s.scope = "process"
     return { $s.name }
     order { $s.name }
 }

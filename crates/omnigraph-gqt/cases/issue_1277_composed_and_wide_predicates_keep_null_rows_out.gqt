@@ -38,10 +38,8 @@ node Wide {
 
 --- query
 query four_properties_tested_twice() {
-    match {
-        $w: Wide
-        not (($w.p1 in ["a"]) and ($w.p1 in ["b"])) or not (($w.p2 in ["a"]) and ($w.p2 in ["b"])) or not (($w.p3 in ["a"]) and ($w.p3 in ["b"])) or not (($w.p4 in ["a"]) and ($w.p4 in ["b"]))
-    }
+    match { $w: Wide }
+    where (not (($w.p1 in ["a"]) and ($w.p1 in ["b"])) or not (($w.p2 in ["a"]) and ($w.p2 in ["b"])) or not (($w.p3 in ["a"]) and ($w.p3 in ["b"])) or not (($w.p4 in ["a"]) and ($w.p4 in ["b"])))
     return { $w.slug }
 }
 
@@ -53,10 +51,8 @@ w.slug: String
 
 --- query
 query five_properties_tested_twice() {
-    match {
-        $w: Wide
-        not (($w.p1 in ["a"]) and ($w.p1 in ["b"])) or not (($w.p2 in ["a"]) and ($w.p2 in ["b"])) or not (($w.p3 in ["a"]) and ($w.p3 in ["b"])) or not (($w.p4 in ["a"]) and ($w.p4 in ["b"])) or not (($w.p5 in ["a"]) and ($w.p5 in ["b"]))
-    }
+    match { $w: Wide }
+    where (not (($w.p1 in ["a"]) and ($w.p1 in ["b"])) or not (($w.p2 in ["a"]) and ($w.p2 in ["b"])) or not (($w.p3 in ["a"]) and ($w.p3 in ["b"])) or not (($w.p4 in ["a"]) and ($w.p4 in ["b"])) or not (($w.p5 in ["a"]) and ($w.p5 in ["b"])))
     return { $w.slug }
 }
 
@@ -68,7 +64,7 @@ w.slug: String
 
 --- mutate
 query update_five_properties_tested_twice() {
-    $x: Wide  not (($x.p1 in ["a"]) and ($x.p1 in ["b"])) or not (($x.p2 in ["a"]) and ($x.p2 in ["b"])) or not (($x.p3 in ["a"]) and ($x.p3 in ["b"])) or not (($x.p4 in ["a"]) and ($x.p4 in ["b"])) or not (($x.p5 in ["a"]) and ($x.p5 in ["b"]))
+    match { $x: Wide } where (not (($x.p1 in ["a"]) and ($x.p1 in ["b"])) or not (($x.p2 in ["a"]) and ($x.p2 in ["b"])) or not (($x.p3 in ["a"]) and ($x.p3 in ["b"])) or not (($x.p4 in ["a"]) and ($x.p4 in ["b"])) or not (($x.p5 in ["a"]) and ($x.p5 in ["b"])))
     update $x set { tag: "hit" }
 }
 
@@ -76,7 +72,7 @@ query update_five_properties_tested_twice() {
 
 --- mutate
 query update_four_properties_tested_twice() {
-    $x: Wide  not (($x.p1 in ["a"]) and ($x.p1 in ["b"])) or not (($x.p2 in ["a"]) and ($x.p2 in ["b"])) or not (($x.p3 in ["a"]) and ($x.p3 in ["b"])) or not (($x.p4 in ["a"]) and ($x.p4 in ["b"]))
+    match { $x: Wide } where (not (($x.p1 in ["a"]) and ($x.p1 in ["b"])) or not (($x.p2 in ["a"]) and ($x.p2 in ["b"])) or not (($x.p3 in ["a"]) and ($x.p3 in ["b"])) or not (($x.p4 in ["a"]) and ($x.p4 in ["b"])))
     update $x set { tag: "hit" }
 }
 
@@ -84,11 +80,11 @@ query update_four_properties_tested_twice() {
 
 --- mutate
 query delete_after_disjoint_negated_statements() {
-    $x: Item  not ($x.s in ["y"])
+    match { $x: Item } where not ($x.s in ["y"])
     delete $x
-    $x: Item  not ($x.s in ["x"])
+    match { $x: Item } where not ($x.s in ["x"])
     delete $x
-    $x: Item  $x.t = "k"
+    match { $x: Item } where $x.t = "k"
     delete $x
 }
 

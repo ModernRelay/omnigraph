@@ -1449,7 +1449,7 @@ pub struct QueryRequest {
     /// It requires the load's `change` permission before probing source metadata,
     /// reads no payload byte, and publishes nothing.
     #[schema(
-        example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+        example = "query get_person($name: String) {\n    match { $p: Person }\n    where $p.name = $name\n    return { $p.name, $p.age }\n}"
     )]
     pub query: String,
     /// Name of the query to run when `query` declares multiple. Optional when

@@ -69,11 +69,7 @@ p.active: Bool?
 
 --- query
 query knows() {
-    match {
-        $a: Person
-        $b: Person
-        $a knows $b
-    }
+    match { $a: Person, $b: Person, $a knows $b }
     return { $a.firstName, $b.id }
 }
 

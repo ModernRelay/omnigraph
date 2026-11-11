@@ -88,7 +88,7 @@ query insert_person($name: String, $age: I32) {
 }
 
 query delete_person($name: String) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     delete $x
 }
 
@@ -97,35 +97,29 @@ query insert_knows($from: String, $to: String) {
 }
 
 query delete_knows_from($from: String) {
-    $x: Knows  $x.@src = $from
+    match { $x: Knows } where $x.@src = $from
     delete $x
 }
 
 query set_person_age($name: String, $age: I32) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     update $x set { age: $age }
 }
 
 query get_person($name: String) {
-    match {
-        $p: Person { name: $name }
-    }
+    match { $p: Person }
+    where $p.name = $name
     return { $p.name, $p.age }
 }
 
 query all_knows() {
-    match {
-        $a: Person
-        $a $w:knows $b
-    }
+    match { $a: Person, $a $w:knows $b }
     return { $a.name, $b.name }
 }
 
 query knows_of($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
+    where $p.name = $name
     return { $f.name }
 }
 "#;

@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- mutate
-mutation w($h: String) { $p: Person { handle: $h }  delete $p }
+mutation w($h: String) { match { $p: Person } where $p.handle = $h delete $p }
 
 --- expect error: parse error: Q009:

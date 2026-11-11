@@ -82,14 +82,12 @@ const DATA: &str = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
 
 const QUERIES: &str = r#"
 query get_person($name: String) {
-    match { $p: Person { name: $name } }
+    match { $p: Person } where $p.name = $name
     return { $p.name, $p.age }
 }
 query friends_of($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
+    where $p.name = $name
     return { $f.name }
 }
 query insert_person($name: String, $age: I32) {

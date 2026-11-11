@@ -206,7 +206,7 @@ async fn handled_lint_failure_allows_a_following_successful_invocation() {
     std::fs::write(&schema, "node Person {\n    slug: String @key\n}\n").unwrap();
     for (source, expected) in [
         (
-            "query broken($slug: String) { $x: Person  $x.slug = $slug  update $x set { missing: \"nope\" } }",
+            "query broken($slug: String) { match { $x: Person } where $x.slug = $slug  update $x set { missing: \"nope\" } }",
             1,
         ),
         (

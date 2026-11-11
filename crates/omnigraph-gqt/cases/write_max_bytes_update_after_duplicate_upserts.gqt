@@ -25,7 +25,7 @@ set write_max_bytes = 30000;
 query upsert_then_assign($payload: Blob) {
     insert Doc { slug: "same", note: "first" }
     insert Doc { slug: "same", note: "second" }
-    $x: Doc  $x.slug = "same"
+    match { $x: Doc } where $x.slug = "same"
     update $x set { content: $payload }
 }
 

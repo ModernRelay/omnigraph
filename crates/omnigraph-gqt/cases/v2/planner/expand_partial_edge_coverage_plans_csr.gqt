@@ -24,10 +24,8 @@ edge Knows: Person -> Person
 --- query
 set engine = v2;
 query two_hops() {
-    match {
-        $a: Person { name: "start" }
-        $a knows{1,2} $b
-    }
+    match { $a: Person, $a knows{1,2} $b }
+    where $a.name = "start"
     return { $b.name }
 }
 --- expect unordered
@@ -54,10 +52,8 @@ query link_side() {
 --- query
 set engine = v2;
 query two_hops() {
-    match {
-        $a: Person { name: "start" }
-        $a knows{1,2} $b
-    }
+    match { $a: Person, $a knows{1,2} $b }
+    where $a.name = "start"
     return { $b.name }
 }
 --- expect unordered

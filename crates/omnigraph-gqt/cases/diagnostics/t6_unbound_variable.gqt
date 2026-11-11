@@ -1,5 +1,5 @@
 # issue: none
-# notes: The compiler refuses a variable no clause binds with `T6`; nothing executes.
+# notes: The compiler refuses a variable no element binds with `T6`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $p: Person  $q.age > 1 } return { $p.name } }
+query q() { match { $p: Person } where $q.age > 1 return { $p.name } }
 
 --- expect error: type error: T6:

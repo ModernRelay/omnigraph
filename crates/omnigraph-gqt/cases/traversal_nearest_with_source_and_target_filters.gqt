@@ -104,11 +104,9 @@ edge Likes: Doc -> Doc {
 
 --- query
 query nearest_with_source_filter($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc
-        $d.n > 15
-        $d knows $t
-    } return { $d, $t } }, $d.embedding, $q, k: 2) }
+    match {
+      from nearest({ match { $d: Doc, $d knows $t } where $d.n > 15 return { $d, $t } }, $d.embedding, $q, k: 2),
+    }
     return { $d.slug }
     order { $distance }
     limit 2
@@ -126,11 +124,9 @@ d.slug: String
 
 --- query
 query nearest_with_target_filter($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc
-        $d knows $t
-        $t.n > 25
-    } return { $d, $t } }, $d.embedding, $q, k: 2) }
+    match {
+      from nearest({ match { $d: Doc, $d knows $t } where $t.n > 25 return { $d, $t } }, $d.embedding, $q, k: 2),
+    }
     return { $d.slug }
     order { $distance }
     limit 2
@@ -148,11 +144,9 @@ d.slug: String
 
 --- query
 query nearest_with_source_filter_above_gate($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc
-        $d.n > 15
-        $d likes $t
-    } return { $d, $t } }, $d.embedding, $q, k: 2) }
+    match {
+      from nearest({ match { $d: Doc, $d likes $t } where $d.n > 15 return { $d, $t } }, $d.embedding, $q, k: 2),
+    }
     return { $d.slug }
     order { $distance }
     limit 2

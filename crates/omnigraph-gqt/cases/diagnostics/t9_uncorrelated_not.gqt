@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $p: Person  not { $c: Company } } return { $p.name } }
+query q() { match { $p: Person } where not exists { $c: Company } return { $p.name } }
 
 --- expect error: type error: T9:

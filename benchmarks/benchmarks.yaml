@@ -96,7 +96,7 @@ scenarios:
     ordinal: 1
     text: |
       --- mutate
-      query hot_write() { $x: Hot  $x.key = "hot"  update $x set { value: 1 } }
+      query hot_write() { match { $x: Hot } where $x.key = "hot"  update $x set { value: 1 } }
 - id: hot-table-idle-branches-4-aged
   fixture: fixtures/hot_table_idle_branches_4_aged.gqt
   workload: workloads/hot_table_idle_branches_4_aged.gqt
@@ -104,7 +104,7 @@ scenarios:
     ordinal: 1
     text: |
       --- mutate
-      query hot_write() { $x: Hot  $x.key = "hot"  update $x set { value: 1 } }
+      query hot_write() { match { $x: Hot } where $x.key = "hot"  update $x set { value: 1 } }
 - id: hot-table-idle-branches-4
   fixture: fixtures/hot_table_idle_branches_4.gqt
   workload: workloads/hot_table_idle_branches_4.gqt
@@ -112,7 +112,7 @@ scenarios:
     ordinal: 1
     text: |
       --- mutate
-      query hot_write() { $x: Hot  $x.key = "hot"  update $x set { value: 1 } }
+      query hot_write() { match { $x: Hot } where $x.key = "hot"  update $x set { value: 1 } }
 - id: hot-table-idle-tables-4
   fixture: fixtures/hot_table_idle_tables_4.gqt
   workload: workloads/hot_table_idle_tables_4.gqt
@@ -120,7 +120,7 @@ scenarios:
     ordinal: 1
     text: |
       --- mutate
-      query hot_write() { $x: Hot  $x.key = "hot"  update $x set { value: 1 } }
+      query hot_write() { match { $x: Hot } where $x.key = "hot"  update $x set { value: 1 } }
 - id: identity-lifecycle
   fixture: fixtures/identity_lifecycle.gqt
   workload: workloads/identity_lifecycle.gqt
@@ -128,7 +128,7 @@ scenarios:
     ordinal: 1
     text: |
       --- mutate branch: feature
-      query new_lifetime_write() { $x: Item  $x.key = "alice"  update $x set { value: 1 } }
+      query new_lifetime_write() { match { $x: Item } where $x.key = "alice"  update $x set { value: 1 } }
 - id: nearest-ranks-updated-embedding
   fixture: fixtures/nearest_ranks_updated_embedding.gqt
   workload: workloads/nearest_ranks_updated_embedding.gqt
@@ -163,7 +163,7 @@ scenarios:
     text: |
       --- mutate
       query update_tables() {
-          $x: T0  $x.key = "row"
+          match { $x: T0 } where $x.key = "row"
           update $x set { value: 1 }
       }
 - id: parallel-tables-2
@@ -174,9 +174,9 @@ scenarios:
     text: |
       --- mutate
       query update_tables() {
-          $x: T0  $x.key = "row"
+          match { $x: T0 } where $x.key = "row"
           update $x set { value: 1 }
-          $x: T1  $x.key = "row"
+          match { $x: T1 } where $x.key = "row"
           update $x set { value: 1 }
       }
 - id: parallel-tables-4
@@ -187,13 +187,13 @@ scenarios:
     text: |
       --- mutate
       query update_tables() {
-          $x: T0  $x.key = "row"
+          match { $x: T0 } where $x.key = "row"
           update $x set { value: 1 }
-          $x: T1  $x.key = "row"
+          match { $x: T1 } where $x.key = "row"
           update $x set { value: 1 }
-          $x: T2  $x.key = "row"
+          match { $x: T2 } where $x.key = "row"
           update $x set { value: 1 }
-          $x: T3  $x.key = "row"
+          match { $x: T3 } where $x.key = "row"
           update $x set { value: 1 }
       }
 - id: repeated-deletion-recreation-branches
@@ -333,7 +333,7 @@ scenarios:
     ordinal: 1
     text: |
       --- mutate
-      query next_write() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
+      query next_write() { match { $x: HistoryRow } where $x.key = "hot"  update $x set { value: 1 } }
 - id: very-long-history-10000-read
   fixture: fixtures/very_long_history_10000.gqt
   workload: workloads/very_long_history_read.gqt
@@ -355,7 +355,7 @@ scenarios:
     ordinal: 1
     text: |
       --- mutate
-      query next_write() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
+      query next_write() { match { $x: HistoryRow } where $x.key = "hot"  update $x set { value: 1 } }
 - id: very-long-history-100000-read
   fixture: fixtures/very_long_history_100000.gqt
   workload: workloads/very_long_history_read.gqt
@@ -377,7 +377,7 @@ scenarios:
     ordinal: 1
     text: |
       --- mutate
-      query next_write() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
+      query next_write() { match { $x: HistoryRow } where $x.key = "hot"  update $x set { value: 1 } }
 - id: very-long-history-32-read
   fixture: fixtures/very_long_history_32.gqt
   workload: workloads/very_long_history_read.gqt
@@ -399,7 +399,7 @@ scenarios:
     ordinal: 1
     text: |
       --- mutate
-      query next_write() { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
+      query next_write() { match { $x: HistoryRow } where $x.key = "hot"  update $x set { value: 1 } }
 - id: very-long-history-32-write-unattached
   fixture: fixtures/very_long_history_32.gqt
   workload: workloads/very_long_history_write_unattached.gqt
@@ -407,7 +407,7 @@ scenarios:
     ordinal: 1
     text: |
       --- mutate
-      query next_write() as unattached branch { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
+      query next_write() as unattached branch { match { $x: HistoryRow } where $x.key = "hot"  update $x set { value: 1 } }
 - id: unattached-chain-32-write
   fixture: fixtures/unattached_chain_32.gqt
   workload: workloads/very_long_history_write_unattached.gqt
@@ -415,7 +415,7 @@ scenarios:
     ordinal: 1
     text: |
       --- mutate
-      query next_write() as unattached branch { $x: HistoryRow  $x.key = "hot"  update $x set { value: 1 } }
+      query next_write() as unattached branch { match { $x: HistoryRow } where $x.key = "hot"  update $x set { value: 1 } }
 - id: e2e-merge-all-changed
   fixture: fixtures/e2e_merge_all_changed.gqt
   workload: workloads/e2e_merge_all_changed.gqt
@@ -521,7 +521,7 @@ scenarios:
     text: |
       --- query
       query filtered_nearest($q: Vector(4)) {
-          match { from nearest({ match { $d: Doc { status: "hit" } } return { $d } }, $d.embedding, $q, k: 3) }
+          match { from nearest({ match { $d: Doc } where $d.status = "hit" return { $d } }, $d.embedding, $q, k: 3) }
           return { $d.slug }
           order { $distance }
           limit 3
@@ -535,7 +535,7 @@ scenarios:
       --- query
       set ann_nprobes = 1;
       query nearest_matching_rows($q: Vector(4)) {
-          match { from nearest({ match { $d: Doc $d.n > 3 } return { $d } }, $d.embedding, $q, k: 3) }
+          match { from nearest({ match { $d: Doc } where $d.n > 3 return { $d } }, $d.embedding, $q, k: 3) }
           return { $d.slug }
           order { $distance }
           limit 3
@@ -548,12 +548,14 @@ scenarios:
     text: |
       --- query
       query recall_two_terms($q1: String, $q2: String) {
-          match { let $all = { match { $c: Chunk } return { $c } }  from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60)
-              $c: Chunk
-              $a: Artifact
-              $c chunkOfArtifact $a
-              search($c.text, $q1)
+          match {
+            let $all = { match { $c: Chunk } return { $c } },
+            from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+            $c: Chunk,
+            $a: Artifact,
+            $c chunkOfArtifact $a,
           }
+          where search($c.text, $q1)
           return { $c.slug }
           order { $score desc }
           limit 1
@@ -581,7 +583,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query filter() { match { $p: Person $p.age >= 90 } return { $p.name, $p.age } }
+      query filter() { match { $p: Person } where $p.age >= 90 return { $p.name, $p.age } }
 - id: e2e-query-lookup
   fixture: fixtures/e2e_query_shapes.gqt
   workload: workloads/e2e_query_lookup.gqt
@@ -589,7 +591,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query lookup() { match { $p: Person { name: "p000500" } } return { $p.name, $p.age } }
+      query lookup() { match { $p: Person } where $p.name = "p000500" return { $p.name, $p.age } }
 - id: e2e-query-count
   fixture: fixtures/e2e_query_shapes.gqt
   workload: workloads/e2e_query_count.gqt
@@ -629,7 +631,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query friends() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+      query friends() { match { $p: Person, $p knows $q } return { $p.name, $q.name } }
 - id: e2e-query-filtered-friends
   fixture: fixtures/e2e_query_shapes.gqt
   workload: workloads/e2e_query_filtered_friends.gqt
@@ -638,7 +640,7 @@ scenarios:
     text: |
       --- query
       query filtered_friends() {
-          match { $p: Person $p.age >= 90 $p knows $q }
+          match { $p: Person, $p knows $q } where $p.age >= 90
           return { $p.name, $q.name }
       }
 - id: e2e-query-no-friends
@@ -648,7 +650,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query no_friends() { match { $p: Person not { $p knows $q } } return { $p.name } }
+      query no_friends() { match { $p: Person } where not exists { $p knows $q } return { $p.name } }
 - id: e2e-query-count-bare
   fixture: fixtures/e2e_query_issues.gqt
   workload: workloads/e2e_query_count_bare.gqt
@@ -664,7 +666,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query destination_projection() { match { $p: Person $p knows $q } return { $q.name } }
+      query destination_projection() { match { $p: Person, $p knows $q } return { $q.name } }
 - id: e2e-query-grouped-fanout
   fixture: fixtures/e2e_query_issues.gqt
   workload: workloads/e2e_query_grouped_fanout.gqt
@@ -673,7 +675,7 @@ scenarios:
     text: |
       --- query
       query grouped_fanout() {
-          match { $p: Person $p knows $q }
+          match { $p: Person, $p knows $q }
           return { $p.team, count($q) as n }
       }
 - id: e2e-query-destination-search
@@ -684,7 +686,7 @@ scenarios:
     text: |
       --- query
       query destination_search() {
-          match { $p: Person $p knows $q search($q.body, "needle") }
+          match { $p: Person, $p knows $q } where search($q.body, "needle")
           return { $q.name }
       }
 - id: e2e-traversal-hop1
@@ -695,11 +697,7 @@ scenarios:
     text: |
       --- query
       query hop1() {
-          match {
-              $a: Person
-              $b: Person
-              $a knows $b
-          }
+          match { $a: Person, $b: Person, $a knows $b }
           return { $a.name, $b.name }
       }
 - id: e2e-traversal-hop2
@@ -710,13 +708,7 @@ scenarios:
     text: |
       --- query
       query hop2() {
-          match {
-              $a: Person
-              $b: Person
-              $c: Person
-              $a knows $b
-              $b knows $c
-          }
+          match { $a: Person, $b: Person, $c: Person, $a knows $b, $b knows $c }
           return { $a.name, $c.name }
       }
 - id: e2e-traversal-hop3
@@ -728,13 +720,13 @@ scenarios:
       --- query
       query hop3() {
           match {
-              $a: Person
-              $b: Person
-              $c: Person
-              $d: Person
-              $a knows $b
-              $b knows $c
-              $c knows $d
+              $a: Person,
+              $b: Person,
+              $c: Person,
+              $d: Person,
+              $a knows $b,
+              $b knows $c,
+              $c knows $d,
           }
           return { $a.name, $d.name }
       }
@@ -746,10 +738,8 @@ scenarios:
     text: |
       --- query
       query sel($name: String) {
-          match {
-              $a: Person { name: $name }
-              $a knows{1,2} $b
-          }
+          match { $a: Person, $a knows{1,2} $b }
+          where $a.name = $name
           return { $b.name }
       }
 - id: e2e-traversal-selective-indexed
@@ -760,10 +750,8 @@ scenarios:
     text: |
       --- query
       query sel($name: String) {
-          match {
-              $a: Person { name: $name }
-              $a knows{1,2} $b
-          }
+          match { $a: Person, $a knows{1,2} $b }
+          where $a.name = $name
           return { $b.name }
       }
 - id: e2e-query-scan-served
@@ -809,7 +797,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query filter() { match { $p: Person $p.age >= 90 } return { $p.name, $p.age } }
+      query filter() { match { $p: Person } where $p.age >= 90 return { $p.name, $p.age } }
   environment:
     target: omnigraph-server
     network_position: same-host
@@ -827,7 +815,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query lookup() { match { $p: Person { name: "p000500" } } return { $p.name, $p.age } }
+      query lookup() { match { $p: Person } where $p.name = "p000500" return { $p.name, $p.age } }
   environment:
     target: omnigraph-server
     network_position: same-host
@@ -907,7 +895,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query friends() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+      query friends() { match { $p: Person, $p knows $q } return { $p.name, $q.name } }
   environment:
     target: omnigraph-server
     network_position: same-host
@@ -926,7 +914,7 @@ scenarios:
     text: |
       --- query
       query filtered_friends() {
-          match { $p: Person $p.age >= 90 $p knows $q }
+          match { $p: Person, $p knows $q } where $p.age >= 90
           return { $p.name, $q.name }
       }
   environment:
@@ -946,7 +934,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query no_friends() { match { $p: Person not { $p knows $q } } return { $p.name } }
+      query no_friends() { match { $p: Person } where not exists { $p knows $q } return { $p.name } }
   environment:
     target: omnigraph-server
     network_position: same-host
@@ -982,7 +970,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query destination_projection() { match { $p: Person $p knows $q } return { $q.name } }
+      query destination_projection() { match { $p: Person, $p knows $q } return { $q.name } }
   environment:
     target: omnigraph-server
     network_position: same-host
@@ -1001,7 +989,7 @@ scenarios:
     text: |
       --- query
       query grouped_fanout() {
-          match { $p: Person $p knows $q }
+          match { $p: Person, $p knows $q }
           return { $p.team, count($q) as n }
       }
   environment:
@@ -1022,11 +1010,7 @@ scenarios:
     text: |
       --- query
       query hop1() {
-          match {
-              $a: Person
-              $b: Person
-              $a knows $b
-          }
+          match { $a: Person, $b: Person, $a knows $b }
           return { $a.name, $b.name }
       }
   environment:
@@ -1047,13 +1031,7 @@ scenarios:
     text: |
       --- query
       query hop2() {
-          match {
-              $a: Person
-              $b: Person
-              $c: Person
-              $a knows $b
-              $b knows $c
-          }
+          match { $a: Person, $b: Person, $c: Person, $a knows $b, $b knows $c }
           return { $a.name, $c.name }
       }
   environment:
@@ -1075,13 +1053,13 @@ scenarios:
       --- query
       query hop3() {
           match {
-              $a: Person
-              $b: Person
-              $c: Person
-              $d: Person
-              $a knows $b
-              $b knows $c
-              $c knows $d
+              $a: Person,
+              $b: Person,
+              $c: Person,
+              $d: Person,
+              $a knows $b,
+              $b knows $c,
+              $c knows $d,
           }
           return { $a.name, $d.name }
       }

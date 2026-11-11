@@ -44,12 +44,10 @@ edge ArtifactOwnedByActor: Artifact -> Actor {}
 
 --- query
 query total_above_100() {
-    match {
-        $n: Actor
-        sum($m.size) {
-            $m artifactOwnedByActor $n
-        } > 100
-    }
+    match { $n: Actor }
+    where sum($m.size) {
+        $m artifactOwnedByActor $n
+    } > 100
     return { $n.slug }
 }
 --- expect unordered
@@ -59,12 +57,10 @@ n.slug: String
 
 --- query
 query largest_artifact_at_most_21() {
-    match {
-        $n: Actor
-        max($m.size) {
-            $m artifactOwnedByActor $n
-        } <= 21
-    }
+    match { $n: Actor }
+    where max($m.size) {
+        $m artifactOwnedByActor $n
+    } <= 21
     return { $n.slug }
 }
 --- expect unordered
@@ -74,12 +70,10 @@ n.slug: String
 
 --- query
 query smallest_artifact_is_50() {
-    match {
-        $n: Actor
-        min($m.size) {
-            $m artifactOwnedByActor $n
-        } = 50
-    }
+    match { $n: Actor }
+    where min($m.size) {
+        $m artifactOwnedByActor $n
+    } = 50
     return { $n.slug }
 }
 --- expect unordered
@@ -89,12 +83,10 @@ n.slug: String
 
 --- query
 query integer_inputs_have_a_fractional_average() {
-    match {
-        $n: Actor
-        avg($m.size) {
-            $m artifactOwnedByActor $n
-        } = 15.5
-    }
+    match { $n: Actor }
+    where avg($m.size) {
+        $m artifactOwnedByActor $n
+    } = 15.5
     return { $n.slug }
 }
 --- expect unordered
@@ -104,12 +96,10 @@ n.slug: String
 
 --- query
 query no_match_has_no_aggregate() {
-    match {
-        $n: Actor
-        sum($m.size) {
-            $m artifactOwnedByActor $n
-        } >= 0
-    }
+    match { $n: Actor }
+    where sum($m.size) {
+        $m artifactOwnedByActor $n
+    } >= 0
     return { $n.slug }
 }
 --- expect unordered
@@ -120,12 +110,10 @@ n.slug: String
 
 --- query
 query newest_artifact_after_a_date($since: Date) {
-    match {
-        $n: Actor
-        max($m.created) {
-            $m artifactOwnedByActor $n
-        } > $since
-    }
+    match { $n: Actor }
+    where max($m.created) {
+        $m artifactOwnedByActor $n
+    } > $since
     return { $n.slug }
 }
 --- params
@@ -141,12 +129,10 @@ no cast max($m.created)
 
 --- query
 query oldest_artifact_before_a_date_literal() {
-    match {
-        $n: Actor
-        min($m.created) {
-            $m artifactOwnedByActor $n
-        } < date("2024-02-01")
-    }
+    match { $n: Actor }
+    where min($m.created) {
+        $m artifactOwnedByActor $n
+    } < date("2024-02-01")
     return { $n.slug }
 }
 --- expect unordered
@@ -158,13 +144,11 @@ block aggregate min($m.created): min(Date) extremum error -> Date?
 
 --- query
 query scan_introduced_block_binding_loads_the_argument() {
-    match {
-        $n: Actor
-        sum($a.size) {
-            $a: Artifact { published: true }
-            $a.label != $n.slug
-        } > 60
-    }
+    match { $n: Actor }
+    where sum($a.size) {
+        $a: Artifact
+        where $a.published = true and $a.label != $n.slug
+    } > 60
     return { $n.slug }
 }
 --- expect unordered
@@ -176,12 +160,10 @@ n.slug: String
 
 --- query
 query count_over_a_column_counts_its_values() {
-    match {
-        $n: Actor
-        count($m.label) {
-            $m artifactOwnedByActor $n
-        } > 1
-    }
+    match { $n: Actor }
+    where count($m.label) {
+        $m artifactOwnedByActor $n
+    } > 1
     return { $n.slug }
 }
 --- expect unordered
@@ -194,12 +176,10 @@ type count($m.label): I64?
 
 --- query
 query null_bound_satisfies_nothing($s: String?) {
-    match {
-        $n: Actor
-        max($m.label) {
-            $m artifactOwnedByActor $n
-        } != $s
-    }
+    match { $n: Actor }
+    where max($m.label) {
+        $m artifactOwnedByActor $n
+    } != $s
     return { $n.slug }
 }
 --- params
@@ -213,12 +193,10 @@ type $s: String?
 
 --- query
 query unsigned_above_the_signed_range_is_kept() {
-    match {
-        $n: Actor
-        max($m.big) {
-            $m artifactOwnedByActor $n
-        } > 0
-    }
+    match { $n: Actor }
+    where max($m.big) {
+        $m artifactOwnedByActor $n
+    } > 0
     return { $n.slug }
 }
 --- expect unordered
@@ -232,12 +210,10 @@ no cast max($m.big)
 
 --- query
 query largest_label() {
-    match {
-        $n: Actor
-        max($m.label) {
-            $m artifactOwnedByActor $n
-        } = "d"
-    }
+    match { $n: Actor }
+    where max($m.label) {
+        $m artifactOwnedByActor $n
+    } = "d"
     return { $n.slug }
 }
 --- expect unordered
@@ -249,36 +225,30 @@ block aggregate max($m.label): max(String?) extremum error -> String?
 
 --- query
 query sum_over_a_string_is_refused() {
-    match {
-        $n: Actor
-        sum($m.label) {
-            $m artifactOwnedByActor $n
-        } > 1
-    }
+    match { $n: Actor }
+    where sum($m.label) {
+        $m artifactOwnedByActor $n
+    } > 1
     return { $n.slug }
 }
 --- expect error: T8: sum requires numeric type, got String?
 
 --- query
 query date_aggregate_against_a_number_is_refused() {
-    match {
-        $n: Actor
-        max($m.created) {
-            $m artifactOwnedByActor $n
-        } > 2024
-    }
+    match { $n: Actor }
+    where max($m.created) {
+        $m artifactOwnedByActor $n
+    } > 2024
     return { $n.slug }
 }
 --- expect error: T7: cannot compare Date? with I64
 
 --- query
 query count_null_values_and_empty_input_are_zero() {
-    match {
-        $n: Actor
-        count($m.big) {
-            $m artifactOwnedByActor $n
-        } = 0
-    }
+    match { $n: Actor }
+    where count($m.big) {
+        $m artifactOwnedByActor $n
+    } = 0
     return { $n.slug }
 }
 --- expect unordered
@@ -291,12 +261,10 @@ block aggregate count($m.big): count(U64?) count error -> I64?
 
 --- query
 query float_average_skips_null_values($mean: F64) {
-    match {
-        $n: Actor
-        avg($m.score) {
-            $m artifactOwnedByActor $n
-        } = $mean
-    }
+    match { $n: Actor }
+    where avg($m.score) {
+        $m artifactOwnedByActor $n
+    } = $mean
     return { $n.slug }
 }
 --- params
@@ -308,12 +276,10 @@ n.slug: String
 
 --- query
 query largest_boolean() {
-    match {
-        $n: Actor
-        max($m.published) {
-            $m artifactOwnedByActor $n
-        } = true
-    }
+    match { $n: Actor }
+    where max($m.published) {
+        $m artifactOwnedByActor $n
+    } = true
     return { $n.slug }
 }
 --- expect unordered
@@ -326,10 +292,8 @@ block aggregate max($m.published): max(Bool) extremum error -> Bool?
 
 --- query
 query minimum_f32_retains_its_declared_domain() {
-    match {
-        $n: Actor
-        min($m.weight) { $m artifactOwnedByActor $n } = 0.10000000149011612
-    }
+    match { $n: Actor }
+    where min($m.weight) { $m artifactOwnedByActor $n } = 0.10000000149011612
     return { $n.slug }
 }
 --- expect unordered
@@ -343,10 +307,8 @@ no cast min($m.weight)
 
 --- query
 query maximum_f32_widens_only_after_finalization($bound: F64) {
-    match {
-        $n: Actor
-        max($m.weight) { $m artifactOwnedByActor $n } > $bound
-    }
+    match { $n: Actor }
+    where max($m.weight) { $m artifactOwnedByActor $n } > $bound
     return { $n.slug }
 }
 --- params
@@ -362,10 +324,8 @@ no cast $bound
 
 --- query
 query count_over_a_node_is_row_count($bound: U64) {
-    match {
-        $n: Actor
-        count($m) { $m artifactOwnedByActor $n } >= $bound
-    }
+    match { $n: Actor }
+    where count($m) { $m artifactOwnedByActor $n } >= $bound
     return { $n.slug }
 }
 --- params

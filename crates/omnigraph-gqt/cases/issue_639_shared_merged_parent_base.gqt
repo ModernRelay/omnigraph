@@ -34,7 +34,7 @@ branch create t
 
 --- mutate branch: x
 query set_a_on_x() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 1 }
 }
 
@@ -52,7 +52,7 @@ branch merge x into t
 
 --- mutate
 query set_a_on_main() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 2 }
 }
 
@@ -60,7 +60,7 @@ query set_a_on_main() {
 
 --- mutate branch: t
 query set_b_on_t() {
-    $x: Person  $x.name = "b"
+    match { $x: Person } where $x.name = "b"
     update $x set { age: 1 }
 }
 

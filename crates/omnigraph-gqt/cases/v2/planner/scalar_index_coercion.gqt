@@ -21,7 +21,7 @@ node Person {
 --- query
 set engine = v2;
 query reversed() {
-    match { $p: Person 11 = $p.age }
+    match { $p: Person } where 11 = $p.age
     return { $p.slug }
 }
 --- expect unordered
@@ -42,7 +42,7 @@ query append_person() {
 --- query
 set engine = v2;
 query partial() {
-    match { $p: Person $p.age = 11 }
+    match { $p: Person } where $p.age = 11
     return { $p.slug }
 }
 --- expect unordered
@@ -56,7 +56,7 @@ scan Person as $p: access index_probe age
 --- query
 set engine = v2;
 query appended_key() {
-    match { $p: Person { slug: "gamma" } }
+    match { $p: Person } where $p.slug = "gamma"
     return { $p.slug }
 }
 --- expect unordered

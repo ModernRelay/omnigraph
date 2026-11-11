@@ -10,13 +10,13 @@ environments:
 --- query
 query hop3() {
     match {
-        $a: Person
-        $b: Person
-        $c: Person
-        $d: Person
-        $a knows $b
-        $b knows $c
-        $c knows $d
+        $a: Person,
+        $b: Person,
+        $c: Person,
+        $d: Person,
+        $a knows $b,
+        $b knows $c,
+        $c knows $d,
     }
     return { $a.name, $d.name }
 }
@@ -156,13 +156,13 @@ d.name: String
 --- query
 query hop3() {
     match {
-        $a: Person
-        $b: Person
-        $c: Person
-        $d: Person
-        $a knows $b
-        $b knows $c
-        $c knows $d
+        $a: Person,
+        $b: Person,
+        $c: Person,
+        $d: Person,
+        $a knows $b,
+        $b knows $c,
+        $c knows $d,
     }
     return { $a.name, $d.name }
 }
@@ -302,13 +302,13 @@ d.name: String
 --- query
 query hop3() {
     match {
-        $a: Person
-        $b: Person
-        $c: Person
-        $d: Person
-        $a knows $b
-        $b knows $c
-        $c knows $d
+        $a: Person,
+        $b: Person,
+        $c: Person,
+        $d: Person,
+        $a knows $b,
+        $b knows $c,
+        $c knows $d,
     }
     return { $a.name, $d.name }
 }

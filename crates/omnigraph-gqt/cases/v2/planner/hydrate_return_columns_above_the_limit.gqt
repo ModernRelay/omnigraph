@@ -70,10 +70,7 @@ scan Doc as $d: columns [__id, slug, rank, body, title]
 
 --- query
 query cited_twice() {
-    match {
-        $a: Doc
-        $a cites $b
-    }
+    match { $a: Doc, $a cites $b }
     return { $a.slug, $b.slug, $b.body, $b.embedding }
     order { $a.slug }
     limit 2
@@ -96,10 +93,8 @@ hash join $b
 
 --- query
 query first_citation() {
-    match {
-        $a: Doc { slug: "d02" }
-        $a cites $b
-    }
+    match { $a: Doc, $a cites $b }
+    where $a.slug = "d02"
     return { $b.body }
     limit 1
 }
@@ -156,7 +151,7 @@ not pass late_materialization
 
 --- query
 query one_body() {
-    match { $d: Doc { slug: "d03" } }
+    match { $d: Doc } where $d.slug = "d03"
     return { $d.body }
     limit 1
 }

@@ -27,7 +27,7 @@ edge Cites: Doc -> Doc
 
 --- query
 query secondary_key_breaks_fused_tie() {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, "alpha"), bm25($all, $d.text, "beta"), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "alpha"), bm25($all, $d.text, "beta"), k: 60), $d: Doc }
     return { $d.slug }
     order { $score desc, $d.slug desc }
     limit 1
@@ -41,7 +41,7 @@ d.slug: String
 
 --- query
 query id_breaks_fused_tie() {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, "beta"), bm25($all, $d.text, "alpha"), k: 60) $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "beta"), bm25($all, $d.text, "alpha"), k: 60), $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 1
@@ -55,9 +55,11 @@ d.slug: String
 
 --- query
 query secondary_key_orders_fanout_rows() {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "alpha"), k: 60)
-        $d: Doc
-        $d cites $c
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "alpha"), k: 60),
+      $d: Doc,
+      $d cites $c,
     }
     return { $c.slug }
     order { $score desc, $c.slug desc }

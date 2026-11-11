@@ -1,5 +1,5 @@
 # issue: none
-# notes: The compiler refuses a minus with whitespace on one side only with `Q016`; nothing executes.
+# notes: The compiler refuses two elements separated by whitespace alone with `Q016`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $p: Person  $p.age -1 > 0 } return { $p.name } }
+query q() { match { $p: Person $p knows $q } return { $q.name } }
 
 --- expect error: parse error: Q016:

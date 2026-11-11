@@ -32,7 +32,7 @@ edge Likes: Person -> Doc
 
 --- query
 query first_by_rank() {
-    match { $p: Person $p likes $_ }
+    match { $p: Person, $p likes $_ }
     return { $p.name }
     order { $p.rank }
     limit 1
@@ -46,7 +46,7 @@ p.name: String
 
 --- query
 query all_by_rank() {
-    match { $p: Person $p likes $_ }
+    match { $p: Person, $p likes $_ }
     return { $p.name }
     order { $p.rank }
 }

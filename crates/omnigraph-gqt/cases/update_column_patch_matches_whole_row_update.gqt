@@ -64,7 +64,7 @@ branch create rows
 
 --- mutate
 query patch_scores() {
-    $x: Doc  $x.age >= 2
+    match { $x: Doc } where $x.age >= 2
     update $x set { score: 5 }
 }
 
@@ -72,9 +72,9 @@ query patch_scores() {
 
 --- mutate branch: rows
 query rewrite_scores() {
-    $x: Doc  $x.age >= 2
+    match { $x: Doc } where $x.age >= 2
     update $x set { score: 5 }
-    $x: Doc  $x.slug = "nobody"
+    match { $x: Doc } where $x.slug = "nobody"
     update $x set { score: 0 }
 }
 
@@ -222,7 +222,7 @@ branch diff "${seeded}" to rows
 
 --- mutate
 query patch_out_of_range() {
-    $x: Doc  $x.age = 0
+    match { $x: Doc } where $x.age = 0
     update $x set { score: 500 }
 }
 
@@ -230,9 +230,9 @@ query patch_out_of_range() {
 
 --- mutate branch: rows
 query rewrite_out_of_range() {
-    $x: Doc  $x.age = 0
+    match { $x: Doc } where $x.age = 0
     update $x set { score: 500 }
-    $x: Doc  $x.slug = "nobody"
+    match { $x: Doc } where $x.slug = "nobody"
     update $x set { score: 0 }
 }
 
@@ -240,7 +240,7 @@ query rewrite_out_of_range() {
 
 --- mutate
 query patch_duplicate_code() {
-    $x: Doc  $x.age = 0
+    match { $x: Doc } where $x.age = 0
     update $x set { code: "c-03" }
 }
 
@@ -248,9 +248,9 @@ query patch_duplicate_code() {
 
 --- mutate branch: rows
 query rewrite_duplicate_code() {
-    $x: Doc  $x.age = 0
+    match { $x: Doc } where $x.age = 0
     update $x set { code: "c-03" }
-    $x: Doc  $x.slug = "nobody"
+    match { $x: Doc } where $x.slug = "nobody"
     update $x set { score: 0 }
 }
 
@@ -258,7 +258,7 @@ query rewrite_duplicate_code() {
 
 --- mutate
 query delete_one() {
-    $x: Doc  $x.slug = "d-01"
+    match { $x: Doc } where $x.slug = "d-01"
     delete $x
 }
 
@@ -266,7 +266,7 @@ query delete_one() {
 
 --- mutate branch: rows
 query delete_one() {
-    $x: Doc  $x.slug = "d-01"
+    match { $x: Doc } where $x.slug = "d-01"
     delete $x
 }
 
@@ -274,7 +274,7 @@ query delete_one() {
 
 --- mutate
 query patch_again() {
-    $x: Doc  $x.age < 4
+    match { $x: Doc } where $x.age < 4
     update $x set { score: 7 }
 }
 
@@ -282,9 +282,9 @@ query patch_again() {
 
 --- mutate branch: rows
 query rewrite_again() {
-    $x: Doc  $x.age < 4
+    match { $x: Doc } where $x.age < 4
     update $x set { score: 7 }
-    $x: Doc  $x.slug = "nobody"
+    match { $x: Doc } where $x.slug = "nobody"
     update $x set { score: 0 }
 }
 
@@ -333,7 +333,7 @@ branch create feature from main
 
 --- mutate branch: feature
 query patch_on_feature() {
-    $x: Doc  $x.age = 5
+    match { $x: Doc } where $x.age = 5
     update $x set { score: 9 }
 }
 
@@ -341,7 +341,7 @@ query patch_on_feature() {
 
 --- mutate
 query patch_on_main() {
-    $x: Doc  $x.age = 0
+    match { $x: Doc } where $x.age = 0
     update $x set { score: 8 }
 }
 
@@ -359,9 +359,9 @@ branch create feature_rows from rows
 
 --- mutate branch: feature_rows
 query rewrite_on_feature() {
-    $x: Doc  $x.age = 5
+    match { $x: Doc } where $x.age = 5
     update $x set { score: 9 }
-    $x: Doc  $x.slug = "nobody"
+    match { $x: Doc } where $x.slug = "nobody"
     update $x set { score: 0 }
 }
 
@@ -369,9 +369,9 @@ query rewrite_on_feature() {
 
 --- mutate branch: rows
 query rewrite_on_rows() {
-    $x: Doc  $x.age = 0
+    match { $x: Doc } where $x.age = 0
     update $x set { score: 8 }
-    $x: Doc  $x.slug = "nobody"
+    match { $x: Doc } where $x.slug = "nobody"
     update $x set { score: 0 }
 }
 

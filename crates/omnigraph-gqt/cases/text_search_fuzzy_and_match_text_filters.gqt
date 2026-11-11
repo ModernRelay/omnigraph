@@ -41,10 +41,8 @@ node Fresh {
 
 --- query
 query text_search($q: String) {
-    match {
-        $d: Doc
-        search($d.title, $q)
-    }
+    match { $d: Doc }
+    where search($d.title, $q)
     return { $d.slug, $d.title }
 }
 
@@ -62,10 +60,8 @@ d.title: String
 
 --- query
 query text_search_unknown($q: String) {
-    match {
-        $d: Doc
-        search($d.title, $q)
-    }
+    match { $d: Doc }
+    where search($d.title, $q)
     return { $d.slug, $d.title }
 }
 
@@ -80,10 +76,8 @@ d.title: String
 
 --- query
 query fuzzy_search($q: String) {
-    match {
-        $d: Doc
-        fuzzy($d.title, $q, max_edits: 2)
-    }
+    match { $d: Doc }
+    where fuzzy($d.title, $q, max_edits: 2)
     return { $d.slug, $d.title }
 }
 
@@ -98,10 +92,8 @@ d.title: String
 
 --- query
 query phrase_search($q: String) {
-    match {
-        $d: Doc
-        match_text($d.body, $q)
-    }
+    match { $d: Doc }
+    where match_text($d.body, $q)
     return { $d.slug, $d.title }
 }
 
@@ -117,10 +109,8 @@ d.title: String
 
 --- query
 query phrase_search_token_fallback($q: String) {
-    match {
-        $d: Doc
-        match_text($d.body, $q)
-    }
+    match { $d: Doc }
+    where match_text($d.body, $q)
     return { $d.slug, $d.title }
 }
 
@@ -136,10 +126,8 @@ d.title: String
 
 --- query
 query phrase_search_one_token($q: String) {
-    match {
-        $d: Doc
-        match_text($d.body, $q)
-    }
+    match { $d: Doc }
+    where match_text($d.body, $q)
     return { $d.slug, $d.title }
 }
 
@@ -162,10 +150,8 @@ query add_fresh() {
 
 --- query
 query fresh_search($q: String) {
-    match {
-        $f: Fresh
-        search($f.body, $q)
-    }
+    match { $f: Fresh }
+    where search($f.body, $q)
     return { $f.slug }
 }
 
@@ -180,7 +166,7 @@ f.slug: String
 
 --- mutate
 query retitle_fresh() {
-    $x: Fresh  $x.slug = "fresh-1"
+    match { $x: Fresh } where $x.slug = "fresh-1"
     update $x set { body: "Deep Learning Systems" }
 }
 
@@ -188,10 +174,8 @@ query retitle_fresh() {
 
 --- query
 query fresh_search($q: String) {
-    match {
-        $f: Fresh
-        search($f.body, $q)
-    }
+    match { $f: Fresh }
+    where search($f.body, $q)
     return { $f.slug }
 }
 
@@ -213,7 +197,7 @@ query add_second_fresh() {
 
 --- mutate
 query drop_first_fresh() {
-    $x: Fresh  $x.slug = "fresh-1"
+    match { $x: Fresh } where $x.slug = "fresh-1"
     delete $x
 }
 
@@ -221,10 +205,8 @@ query drop_first_fresh() {
 
 --- query
 query fresh_search($q: String) {
-    match {
-        $f: Fresh
-        search($f.body, $q)
-    }
+    match { $f: Fresh }
+    where search($f.body, $q)
     return { $f.slug }
 }
 

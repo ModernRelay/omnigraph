@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $d: Doc  search($d.body, "graph") or $d.year > 1 } return { $d.title } }
+query q() { match { $d: Doc } where (search($d.body, "graph") or $d.year > 1) return { $d.title } }
 
 --- expect error: type error: T38:

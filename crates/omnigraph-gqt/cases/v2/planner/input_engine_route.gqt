@@ -25,11 +25,8 @@ edge Knows: Person -> Person
 --- query
 set engine = v2;
 query older_friends($min: I64) {
-    match {
-        $p: Person
-        $p knows $q
-        $q.age > $min
-    }
+    match { $p: Person, $p knows $q }
+    where $q.age > $min
     return { $p.name, $q.name }
     order { $p.name }
 }

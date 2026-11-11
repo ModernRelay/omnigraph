@@ -50,7 +50,7 @@ f.slug: String
 
 --- mutate
 query literal_on_a_plain_type() {
-    $x: Switch  $x.flag = false
+    match { $x: Switch } where $x.flag = false
     delete $x
 }
 

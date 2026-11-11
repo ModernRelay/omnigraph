@@ -37,14 +37,10 @@ edge WorksAt: Person -> Company
 
 --- query
 query no_nonacme_employer() {
-    match {
-        $p: Person
-        not {
-            $p worksAt $c
-            not {
-                $c.name = "Acme"
-            }
-        }
+    match { $p: Person }
+    where not exists {
+        $p worksAt $c
+        where not exists { $c: Company where $c.name = "Acme" }
     }
     return { $p.name }
 }

@@ -29,7 +29,7 @@ node Doc {
 
 --- mutate
 query assign_first_carry_second($slug: String, $first: Blob?) {
-    $x: Doc  $x.slug = $slug
+    match { $x: Doc } where $x.slug = $slug
     update $x set { first: $first }
 }
 
@@ -40,7 +40,7 @@ query assign_first_carry_second($slug: String, $first: Blob?) {
 
 --- mutate
 query clear_first_carry_second($slug: String, $first: Blob?) {
-    $x: Doc  $x.slug = $slug
+    match { $x: Doc } where $x.slug = $slug
     update $x set { first: $first }
 }
 
@@ -51,7 +51,7 @@ query clear_first_carry_second($slug: String, $first: Blob?) {
 
 --- mutate
 query assign_scalar_carry_both($slug: String) {
-    $x: Doc  $x.slug = $slug
+    match { $x: Doc } where $x.slug = $slug
     update $x set { title: "renamed" }
 }
 
@@ -62,7 +62,7 @@ query assign_scalar_carry_both($slug: String) {
 
 --- mutate
 query assign_both($slug: String, $first: Blob?, $second: Blob?) {
-    $x: Doc  $x.slug = $slug
+    match { $x: Doc } where $x.slug = $slug
     update $x set { first: $first, second: $second }
 }
 
@@ -74,7 +74,7 @@ query assign_both($slug: String, $first: Blob?, $second: Blob?) {
 --- mutate
 query insert_then_assign_second($first: Blob?, $second: Blob?) {
     insert Doc { slug: "c", first: $first, title: "gamma", rank: 3 }
-    $x: Doc  $x.slug = "c"
+    match { $x: Doc } where $x.slug = "c"
     update $x set { second: $second }
 }
 
@@ -85,7 +85,7 @@ query insert_then_assign_second($first: Blob?, $second: Blob?) {
 
 --- mutate
 query assign_scalar_over_null_and_stored_blobs() {
-    $x: Doc  $x.rank > 1
+    match { $x: Doc } where $x.rank > 1
     update $x set { rank: 9 }
 }
 
@@ -109,7 +109,7 @@ d.rank: I64
 
 --- mutate
 query null_on_non_nullable_scalar_matching_no_row($slug: String, $rank: I64?) {
-    $x: Doc  $x.slug = $slug
+    match { $x: Doc } where $x.slug = $slug
     update $x set { rank: $rank }
 }
 

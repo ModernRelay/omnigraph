@@ -25,7 +25,7 @@ branch create parent
 
 --- mutate branch: parent
 query parent_first_write() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 31 }
 }
 
@@ -48,7 +48,7 @@ branch merge main into parent
 
 --- mutate branch: parent
 query owner_next_write() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 32 }
 }
 

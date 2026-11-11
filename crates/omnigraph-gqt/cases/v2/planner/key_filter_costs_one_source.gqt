@@ -218,7 +218,7 @@ edge Links: Person -> Person
 --- query
 set engine = v2;
 query one_start() {
-    match { $a: Person { name: "p000" } $a links{1,2} $b }
+    match { $a: Person, $a links{1,2} $b } where $a.name = "p000"
     return { $b.name }
 }
 --- expect unordered
@@ -233,7 +233,7 @@ scan Person as $b: access id_lookup
 --- query
 set engine = v2;
 query one_member() {
-    match { $a: Person $a.name in ["p000"] $a links{1,2} $b }
+    match { $a: Person, $a links{1,2} $b } where $a.name in ["p000"]
     return { $b.name }
 }
 --- expect unordered
@@ -248,7 +248,7 @@ scan Person as $b: access id_lookup
 --- query
 set engine = v2;
 query two_members($names: [String]) {
-    match { $a: Person $a.name in $names $a links{1,2} $b }
+    match { $a: Person, $a links{1,2} $b } where $a.name in $names
     return { $b.name }
 }
 --- params

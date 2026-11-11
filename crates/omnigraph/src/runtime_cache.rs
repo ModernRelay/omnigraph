@@ -651,7 +651,7 @@ node Chunk { slug: String @key  n: I64 @index }
 "#;
         const QUERIES: &str = r#"
 query put($slug: String, $n: I64) { insert Chunk { slug: $slug, n: $n } }
-query since($n: I64) { match { $c: Chunk  $c.n >= $n } return { $c.slug } }
+query since($n: I64) { match { $c: Chunk } where $c.n >= $n return { $c.slug } }
 "#;
         const COMMITS: i64 = 40;
         let dir = tempfile::tempdir().unwrap();
@@ -736,7 +736,7 @@ node Chunk { slug: String @key  n: I64 @index }
 "#;
         const QUERIES: &str = r#"
 query put($slug: String, $n: I64) { insert Chunk { slug: $slug, n: $n } }
-query since($n: I64) { match { $c: Chunk  $c.n >= $n } return { $c.slug } }
+query since($n: I64) { match { $c: Chunk } where $c.n >= $n return { $c.slug } }
 "#;
         let dir = tempfile::tempdir().unwrap();
         let graph = Arc::new(

@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $d: Doc  match_terms($d.body, terms()) } return { $d.title } }
+query q() { match { $d: Doc } where match_terms($d.body, terms()) return { $d.title } }
 
 --- expect error: type error: T19:

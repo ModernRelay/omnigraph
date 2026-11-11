@@ -1,66 +1,51 @@
 // Basic: find person by name
 query get_person($name: String) {
-    match {
-        $p: Person { name: $name }
-    }
+    match { $p: Person }
+    where $p.name = $name
     return { $p.name, $p.age }
 }
 
 // Filter by age
 query adults() {
-    match {
-        $p: Person
-        $p.age > 30
-    }
+    match { $p: Person }
+    where $p.age > 30
     return { $p.name, $p.age }
     order { $p.age desc }
 }
 
 // One hop traversal
 query friends_of($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
+    where $p.name = $name
     return { $f.name, $f.age }
 }
 
 // Reverse traversal: who works at a company
 query employees_of($company: String) {
-    match {
-        $c: Company { name: $company }
-        $p worksAt $c
-    }
+    match { $c: Company, $p worksAt $c }
+    where $c.name = $company
     return { $p.name }
 }
 
 // Two hop: friends of friends
 query friends_of_friends($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $mid
-        $mid knows $fof
-    }
+    match { $p: Person, $p knows $mid, $mid knows $fof }
+    where $p.name = $name
     return { $fof.name }
 }
 
 // Negation: people who don't work anywhere
 query unemployed() {
-    match {
-        $p: Person
-        not { $p worksAt $_ }
-    }
+    match { $p: Person }
+    where not exists { $p worksAt $_ }
     return { $p.name }
 }
 
 // Aggregation: friend count
 query friend_counts() {
-    match {
-        $p: Person
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
     return {
-        $p.name
+        $p.name,
         count($f) as friends
     }
     order { friends desc }
@@ -69,9 +54,7 @@ query friend_counts() {
 
 // Order and limit
 query top_by_age() {
-    match {
-        $p: Person
-    }
+    match { $p: Person }
     return { $p.name, $p.age }
     order { $p.age desc }
     limit 2
@@ -79,34 +62,26 @@ query top_by_age() {
 
 // Aggregation: global count (no group key)
 query total_people() {
-    match {
-        $p: Person
-    }
+    match { $p: Person }
     return { count($p) as total }
 }
 
 // Aggregation: sum/avg/min/max of age per company
 query age_stats() {
-    match {
-        $p: Person
-        $p worksAt $c
-    }
+    match { $p: Person, $p worksAt $c }
     return {
-        $c.name
-        sum($p.age) as total_age
-        avg($p.age) as avg_age
-        min($p.age) as youngest
-        max($p.age) as oldest
+        $c.name,
+        sum($p.age) as total_age,
+        avg($p.age) as avg_age,
+        min($p.age) as youngest,
+        max($p.age) as oldest,
         count($p) as headcount
     }
 }
 
 // Aggregation: most connected person
 query top_connected() {
-    match {
-        $p: Person
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
     return { $p.name, count($f) as friends }
     order { friends desc }
     limit 1

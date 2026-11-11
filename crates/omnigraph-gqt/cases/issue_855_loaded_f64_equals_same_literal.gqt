@@ -30,10 +30,8 @@ query insert_literal() {
 
 --- query
 query loaded_f64_equals_literal() {
-    match {
-        $p: Person
-        $p.x = 123456789.12345679
-    }
+    match { $p: Person }
+    where $p.x = 123456789.12345679
     return { $p.name }
 }
 
@@ -47,10 +45,8 @@ p.name: String
 
 --- query
 query f64_param_equals_literal($v: F64) {
-    match {
-        $p: Person
-        $p.x = $v
-    }
+    match { $p: Person }
+    where $p.x = $v
     return { $p.name }
 }
 

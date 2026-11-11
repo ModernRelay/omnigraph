@@ -49,11 +49,8 @@ edge HasMember: Forum -> Person
 --- query
 set engine = v2;
 query members_plain() {
-    match {
-        $f: Forum
-        $f hasMember $p
-        contains($f.title, "graph")
-    }
+    match { $f: Forum, $f hasMember $p }
+    where contains($f.title, "graph")
     return { $p.name }
 }
 
@@ -71,11 +68,8 @@ p.name: String
 --- query
 set engine = v2;
 query members_distinct() {
-    match {
-        $f: Forum
-        $f hasMember $p
-        contains($f.title, "graph")
-    }
+    match { $f: Forum, $f hasMember $p }
+    where contains($f.title, "graph")
     return distinct { $p.name }
 }
 
@@ -104,11 +98,8 @@ p.city: String?
 --- query
 set engine = v2;
 query first_two_names() {
-    match {
-        $f: Forum
-        $f hasMember $p
-        contains($f.title, "graph")
-    }
+    match { $f: Forum, $f hasMember $p }
+    where contains($f.title, "graph")
     return distinct { $p.name }
     order { $p.name asc }
     limit 2
@@ -142,11 +133,8 @@ name: String
 --- query
 set engine = v2;
 query members_as_nodes() {
-    match {
-        $f: Forum
-        $f hasMember $p
-        contains($f.title, "graph")
-    }
+    match { $f: Forum, $f hasMember $p }
+    where contains($f.title, "graph")
     return distinct { $p }
     order { $p }
 }
@@ -214,7 +202,7 @@ id: String
 --- query
 set engine = v2;
 query projected_endpoints() {
-    match { $f: Forum $f $e:hasMember $p }
+    match { $f: Forum, $f $e:hasMember $p }
     return distinct { $e.@src, $e.@dst as member }
     order { $e.@src, $e.@dst }
 }

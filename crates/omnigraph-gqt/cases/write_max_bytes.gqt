@@ -98,7 +98,7 @@ query wide_scalar($note: String) {
 --- mutate
 set write_max_bytes = 4093;
 query carry_payload() {
-    $x: Doc  $x.slug = "accepted"
+    match { $x: Doc } where $x.slug = "accepted"
     update $x set { note: "updated" }
 }
 
@@ -107,7 +107,7 @@ query carry_payload() {
 --- mutate
 set write_max_bytes = 1;
 query removed_ids() {
-    $x: Doc  $x.slug = "accepted"
+    match { $x: Doc } where $x.slug = "accepted"
     delete $x
 }
 

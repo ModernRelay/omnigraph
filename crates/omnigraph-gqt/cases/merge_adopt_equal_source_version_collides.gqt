@@ -64,10 +64,7 @@ branch merge main into feature
 
 --- query branch: feature
 query edges_on_feature() {
-    match {
-        $x: Person
-        $x knows $y
-    }
+    match { $x: Person, $x knows $y }
     return { $x.name, $y.name }
 }
 

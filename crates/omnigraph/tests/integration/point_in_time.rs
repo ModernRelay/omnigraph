@@ -14,7 +14,7 @@ async fn wildcard_reads_refuse_historical_targets_issue_659() {
     let version = version_main(&db).await.unwrap();
     let snapshot = snapshot_id(&db, "main").await.unwrap();
     let source = r#"query neighbors() {
-        match { $p: Person { name: "Alice" } $f: Person $p * $f }
+        match { $p: Person, $f: Person, $p * $f } where $p.name = "Alice"
         return { $f.name }
     }"#;
     assert_eq!(
@@ -88,7 +88,7 @@ async fn historical_explicit_unions_pin_all_members_and_refuse_a_member_absent_a
     .unwrap();
     let captured = version_main(&db).await.unwrap();
     let selected = r#"query neighbors() {
-        match { $p: Person { name: "Alice" } $p $e:(knows | likes) $f }
+        match { $p: Person, $p $e:(knows | likes) $f } where $p.name = "Alice"
         return { $e.@type as edge_type, $f.name }
     }"#;
     assert_eq!(
@@ -137,7 +137,7 @@ async fn historical_explicit_unions_pin_all_members_and_refuse_a_member_absent_a
         for route in routes {
             let db = with_traversal(&db, route);
             let query = format!(
-                "query missing() {{ match {{ $p: Person {{ name: \"Alice\" }} $p {pattern} $f }} return {{ $f.@id }} }}"
+                "query missing() {{ match {{ $p: Person, $p {pattern} $f }} where $p.name = \"Alice\" return {{ $f.@id }} }}"
             );
             let error = db
                 .run_query_at(before, &query, "missing", &ParamMap::new())
@@ -166,9 +166,7 @@ async fn historical_explicit_unions_pin_all_members_and_refuse_a_member_absent_a
 
 const ALL_PERSONS_QUERY: &str = r#"
 query all_persons() {
-    match {
-        $p: Person
-    }
+    match { $p: Person }
     return { $p.name, $p.age }
     order { $p.name asc }
 }
@@ -176,10 +174,8 @@ query all_persons() {
 
 const FRIENDS_QUERY: &str = r#"
 query friends_of($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
+    where $p.name = $name
     return { $f.name }
     order { $f.name asc }
 }
@@ -187,10 +183,8 @@ query friends_of($name: String) {
 
 const UNEMPLOYED_QUERY: &str = r#"
 query unemployed() {
-    match {
-        $p: Person
-        not { $p worksAt $_ }
-    }
+    match { $p: Person }
+    where not exists { $p worksAt $_ }
     return { $p.name }
     order { $p.name asc }
 }
@@ -198,10 +192,8 @@ query unemployed() {
 
 const FILTERED_QUERY: &str = r#"
 query older_than($min_age: I32) {
-    match {
-        $p: Person
-        $p.age > $min_age
-    }
+    match { $p: Person }
+    where $p.age > $min_age
     return { $p.name, $p.age }
     order { $p.name asc }
 }
@@ -209,9 +201,8 @@ query older_than($min_age: I32) {
 
 const GET_PERSON_QUERY: &str = r#"
 query get_person($name: String) {
-    match {
-        $p: Person { name: $name }
-    }
+    match { $p: Person }
+    where $p.name = $name
     return { $p.name, $p.age }
 }
 "#;
@@ -451,7 +442,7 @@ async fn historical_query_binds_properties_by_identity_not_name() {
     .await
     .unwrap();
 
-    let note = "query q() { match { $p: Person { name: \"Alice\" } } return { $p.note } }";
+    let note = "query q() { match { $p: Person } where $p.name = \"Alice\" return { $p.note } }";
     let live = query_main(&db, note, "q", &ParamMap::new()).await.unwrap();
     assert!(
         collect_column_strings(live.batches(), "p.note").is_empty(),
@@ -464,7 +455,7 @@ async fn historical_query_binds_properties_by_identity_not_name() {
     for (source, expected) in [
         (note.to_string(), missing("note", "node type 'Person'")),
         (
-            "query q() { match { $p: Person\n $p.note = \"secret\" } return { $p.name } }"
+            "query q() { match { $p: Person } where $p.note = \"secret\" return { $p.name } }"
                 .to_string(),
             missing("note", "node type 'Person'"),
         ),
@@ -479,7 +470,7 @@ async fn historical_query_binds_properties_by_identity_not_name() {
             missing("age", "node type 'Person'"),
         ),
         (
-            "query q() { match { $p: Person $p $k:knows $f } return { $f.name, $k.since } }"
+            "query q() { match { $p: Person, $p $k:knows $f } return { $f.name, $k.since } }"
                 .to_string(),
             missing("since", "edge type 'Knows'"),
         ),
@@ -799,7 +790,7 @@ async fn negation_delete_edge_grows_antijoin_result() {
         &db,
         r#"
 query fire($from: String) {
-    $x: WorksAt  $x.@src = $from
+    match { $x: WorksAt } where $x.@src = $from
     delete $x
 }
 "#,
@@ -907,11 +898,8 @@ async fn multi_hop_traversal_historical_version() {
 
     let fof_query = r#"
 query fof($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $mid
-        $mid knows $f
-    }
+    match { $p: Person, $p knows $mid, $mid knows $f }
+    where $p.name = $name
     return { $f.name }
     order { $f.name asc }
 }

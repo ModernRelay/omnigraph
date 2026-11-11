@@ -1,6 +1,6 @@
 # issue: none
 # notes: The context rules of the shared expression model as typed errors: a non-Boolean operand of `and`/`or`/`not`, a non-Boolean filter or
-# notes: mutation `where` (T41), an aggregate in a filter (T7), a Boolean item in an aggregate return (T9), a search call under `or` (T38), an unaliased comparison in return (T43), an aggregate or search call in a mutation `where` or an assignment (T44), a property leaf in an assignment or inline match (T45).
+# notes: mutation `where` (T41), an aggregate in a filter (T7), a Boolean item in an aggregate return (T9), a search call under `or` (T38), an unaliased comparison in return (T43), an aggregate or search call in a mutation `where` or an assignment (T44), and a bare property name in an assignment or a `where` (Q018).
 
 --- runner
 timeout_ms: 10000
@@ -23,7 +23,7 @@ node Person {
 --- query
 set engine = v2;
 query and_over_non_boolean() {
-    match { $p: Person  $p.age and $p.name }
+    match { $p: Person } where $p.age and $p.name
     return { $p.slug }
 }
 
@@ -32,7 +32,7 @@ query and_over_non_boolean() {
 --- query
 set engine = v2;
 query not_over_non_boolean() {
-    match { $p: Person  not $p.age }
+    match { $p: Person } where not $p.age
     return { $p.slug }
 }
 
@@ -41,7 +41,7 @@ query not_over_non_boolean() {
 --- query
 set engine = v2;
 query aggregate_in_a_filter() {
-    match { $p: Person  count($p) > 1 }
+    match { $p: Person } where count($p) > 1
     return { $p.slug }
 }
 
@@ -50,11 +50,11 @@ query aggregate_in_a_filter() {
 --- query
 set engine = v2;
 query search_under_or() {
-    match { $p: Person  search($p.text, "hello") or $p.age > 30 }
+    match { $p: Person } where (search($p.text, "hello") or $p.age > 30)
     return { $p.slug }
 }
 
---- expect error: T38: `search` is a search predicate; it must stand alone as a filter clause
+--- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
 
 --- query
 set engine = v2;
@@ -67,7 +67,7 @@ query unaliased_comparison_in_return() {
 
 --- mutate
 query count_in_a_mutation_where() {
-    $x: Person  count($x.age) > 1
+    match { $x: Person } where count($x.age) > 1
     update $x set { adult: true }
 }
 
@@ -75,7 +75,7 @@ query count_in_a_mutation_where() {
 
 --- mutate
 query property_leaf_in_an_assignment() {
-    $x: Person  $x.slug = "a"
+    match { $x: Person } where $x.slug = "a"
     update $x set { adult: age > 30 }
 }
 
@@ -83,8 +83,8 @@ query property_leaf_in_an_assignment() {
 
 --- query
 set engine = v2;
-query property_leaf_in_an_inline_match() {
-    match { $p: Person { adult: age > 30 } }
+query property_leaf_in_a_where() {
+    match { $p: Person } where $p.adult = (age > 30)
     return { $p.slug }
 }
 
@@ -92,7 +92,7 @@ query property_leaf_in_an_inline_match() {
 
 --- mutate
 query search_in_a_mutation_where() {
-    $x: Person  search($x.text, "hello")
+    match { $x: Person } where search($x.text, "hello")
     delete $x
 }
 
@@ -108,7 +108,7 @@ query count_in_an_assignment() {
 --- query
 set engine = v2;
 query or_over_non_boolean() {
-    match { $p: Person  $p.adult or $p.name }
+    match { $p: Person } where ($p.adult or $p.name)
     return { $p.slug }
 }
 
@@ -117,7 +117,7 @@ query or_over_non_boolean() {
 --- query
 set engine = v2;
 query string_as_a_filter() {
-    match { $p: Person  $p.name }
+    match { $p: Person } where $p.name
     return { $p.slug }
 }
 
@@ -125,7 +125,7 @@ query string_as_a_filter() {
 
 --- mutate
 query string_as_a_mutation_where() {
-    $x: Person  $x.name
+    match { $x: Person } where $x.name
     delete $x
 }
 

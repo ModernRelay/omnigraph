@@ -175,10 +175,7 @@ async fn inline_count_with_no_friends() {
     // But Alice(2) and Bob(1) do. Verify the count matches.
     let queries = r#"
 query fc() {
-    match {
-        $p: Person
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
     return { $p.name, count($f) as friends }
     order { friends desc }
 }
@@ -232,7 +229,7 @@ async fn inline_min_max_string() {
 query name_range() {
     match { $p: Person }
     return {
-        min($p.name) as first_name
+        min($p.name) as first_name,
         max($p.name) as last_name
     }
 }
@@ -267,11 +264,8 @@ async fn inline_multi_hop_aggregate() {
     // Friends of friends count per person
     let queries = r#"
 query fof_counts($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $mid
-        $mid knows $fof
-    }
+    match { $p: Person, $p knows $mid, $mid knows $fof }
+    where $p.name = $name
     return { $p.name, count($fof) as fof_count }
 }
 "#;

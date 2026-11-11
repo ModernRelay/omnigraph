@@ -49,10 +49,7 @@ p.name: String
 
 --- query
 query endpoints() {
-    match {
-        $p: Person
-        $p $e:knows $f
-    }
+    match { $p: Person, $p $e:knows $f }
     return { $e.@src as from, $e.@dst as to, $e.since }
 }
 
@@ -66,8 +63,7 @@ e.since: I32?
 
 --- query
 query edge_properties_beside_endpoints() {
-    match { $p: Person
-        $p $e:knows $f }
+    match { $p: Person, $p $e:knows $f }
     return { $e.id, $e.src, $e.dst, $e.@src, $e.@dst }
 }
 
@@ -107,8 +103,7 @@ p.@id: String?
 
 --- query
 query minimum_endpoint() {
-    match { $p: Person
-        $p $e:knows $f }
+    match { $p: Person, $p $e:knows $f }
     return { min($e.@src), max($e.@dst) }
 }
 
@@ -136,8 +131,7 @@ n: I64
 
 --- query
 query grouped_endpoint_order() {
-    match { $p: Person
-        $p $e:knows $f }
+    match { $p: Person, $p $e:knows $f }
     return { $e.@src, count($e.@id) as n }
     order { $e.@src }
 }
@@ -173,10 +167,8 @@ d.@id: String
 
 --- query
 query by_identity($who: String) {
-    match {
-        $p: Person
-        $p.@id = $who
-    }
+    match { $p: Person }
+    where $p.@id = $who
     return { $p.name }
 }
 
@@ -205,10 +197,8 @@ p.@id: String
 
 --- query
 query filter_endpoint() {
-    match { $p: Person
-        $p $e:knows $f
-        $e.@dst = "bob"
-    }
+    match { $p: Person, $p $e:knows $f }
+    where $e.@dst = "bob"
     return { $e.@id, $f.@id }
 }
 
@@ -220,13 +210,12 @@ e.@id: String
 f.@id: String
 
 --- mutate
-query birthday() { $x: Person  $x.@id = "bob"  update $x set { age: 26 } }
+query birthday() { match { $x: Person } where $x.@id = "bob"  update $x set { age: 26 } }
 
 --- expect affected: nodes=1 edges=0
 
 --- query
-query updated() { match { $p: Person
-    $p.@id = "bob" } return { $p.age } }
+query updated() { match { $p: Person } where $p.@id = "bob" return { $p.age } }
 
 --- expect unordered
 {"p.age":26}
@@ -235,12 +224,12 @@ query updated() { match { $p: Person
 p.age: I32?
 
 --- mutate
-query absent_edge_identity() { $x: Knows  $x.@id = "absent"  delete $x }
+query absent_edge_identity() { match { $x: Knows } where $x.@id = "absent"  delete $x }
 
 --- expect affected: nodes=0 edges=0
 
 --- mutate
-query absent_edge_endpoint() { $x: Knows  $x.@dst = "absent"  delete $x }
+query absent_edge_endpoint() { match { $x: Knows } where $x.@dst = "absent"  delete $x }
 
 --- expect affected: nodes=0 edges=0
 
@@ -255,25 +244,22 @@ query node_has_no_owner() { match { $p: Person } return { $p.@owner } }
 --- expect error: T6: binding `$p` has no meta-field `@owner`; its meta-fields are `@id`
 
 --- query
-query bare_node_id_filter() { match { $p: Person { id: "alice" } } return { $p.name } }
+query bare_node_id_filter() { match { $p: Person } where $p.id = "alice" return { $p.name } }
 
---- expect error: T2: type `Person` has no property `id`; the system identity is `$p.@id`
+--- expect error: T6: type `Person` has no property `id`; the system identity is `$p.@id`
 
 --- query
-query bare_edge_id() { match { $p: Person
- $p $e:bare $f } return { $e.id } }
+query bare_edge_id() { match { $p: Person, $p $e:bare $f } return { $e.id } }
 
 --- expect error: T6: edge `Bare` has no property `id`; the system identity is `$e.@id`
 
 --- query
-query bare_edge_source() { match { $p: Person
- $p $e:bare $f } return { $e.src } }
+query bare_edge_source() { match { $p: Person, $p $e:bare $f } return { $e.src } }
 
 --- expect error: T6: edge `Bare` has no property `src`; the system endpoint is `$e.@src`
 
 --- query
-query bare_edge_destination() { match { $p: Person
- $p $e:bare $f } return { $e.dst } }
+query bare_edge_destination() { match { $p: Person, $p $e:bare $f } return { $e.dst } }
 
 --- expect error: T6: edge `Bare` has no property `dst`; the system endpoint is `$e.@dst`
 
@@ -288,7 +274,7 @@ query insert_node_id_property() { insert Person { name: "x", id: "x" } }
 --- expect error: T11: type `Person` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 
 --- mutate
-query update_node_id_property() { $x: Person  $x.@id = "alice"  update $x set { id: "x" } }
+query update_node_id_property() { match { $x: Person } where $x.@id = "alice"  update $x set { id: "x" } }
 
 --- expect error: T11: type `Person` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 
@@ -298,27 +284,27 @@ query insert_edge_id_property() { insert Bare { from: "alice", to: "bob", id: "x
 --- expect error: T11: type `Bare` has no property `id`; the engine assigns system identity; it cannot be set through a property assignment
 
 --- mutate
-query delete_by_bare_source() { $x: Bare  $x.src = "alice"  delete $x }
+query delete_by_bare_source() { match { $x: Bare } where $x.src = "alice"  delete $x }
 
 --- expect error: T6: edge `Bare` has no property `src`; the system endpoint is `$x.@src`
 
 --- mutate
-query delete_by_bare_destination() { $x: Bare  $x.dst = "bob"  delete $x }
+query delete_by_bare_destination() { match { $x: Bare } where $x.dst = "bob"  delete $x }
 
 --- expect error: T6: edge `Bare` has no property `dst`; the system endpoint is `$x.@dst`
 
 --- mutate
-query delete_node_by_source() { $x: Person  $x.@src = "alice"  delete $x }
+query delete_node_by_source() { match { $x: Person } where $x.@src = "alice"  delete $x }
 
 --- expect error: T6: binding `$x` has no meta-field `@src`; its meta-fields are `@id`
 
 --- mutate
-query delete_edge_by_owner() { $x: Knows  $x.@owner = "alice"  delete $x }
+query delete_edge_by_owner() { match { $x: Knows } where $x.@owner = "alice"  delete $x }
 
 --- expect error: T6: binding `$x` has no meta-field `@owner`; its meta-fields are `@id`, `@src`, `@dst` and `@type`
 
 --- mutate
-query wrong_identity_type($n: I32) { $x: Person  $x.@id = $n  delete $x }
+query wrong_identity_type($n: I32) { match { $x: Person } where $x.@id = $n  delete $x }
 
 --- params
 {"n":1}
@@ -335,7 +321,7 @@ query bare_id_is_not_the_identity() {
 
 --- mutate
 query unlink($who: String) {
-    $x: Knows  $x.@src = $who
+    match { $x: Knows } where $x.@src = $who
     delete $x
 }
 
@@ -346,7 +332,7 @@ query unlink($who: String) {
 
 --- mutate
 query forget($who: String) {
-    $x: Person  $x.@id = $who
+    match { $x: Person } where $x.@id = $who
     delete $x
 }
 
@@ -357,7 +343,7 @@ query forget($who: String) {
 
 --- mutate
 query forget_by_bare_id($who: String) {
-    $x: Person  $x.id = $who
+    match { $x: Person } where $x.id = $who
     delete $x
 }
 

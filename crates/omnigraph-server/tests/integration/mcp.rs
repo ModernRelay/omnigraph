@@ -63,7 +63,7 @@ rules:
         ),
         (
             "person",
-            "query person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+            "query person($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }",
             true,
         ),
         (
@@ -748,7 +748,7 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
 
     // `query` with source answers exactly `POST /query`'s body, including
     // branch reads.
-    let source = "query adults($min: I32) { match { $p: Person $p.age >= $min } return { $p.name } order { $p.name asc } }";
+    let source = "query adults($min: I32) { match { $p: Person } where $p.age >= $min return { $p.name } order { $p.name asc } }";
     for arguments in [
         json!({"graph":"default","query":source,"params":{"min":30}}),
         json!({"graph":"default","query":source,"params":{"min":30},"branch":"main"}),
@@ -828,8 +828,8 @@ async fn mcp_schema_and_adhoc_read_reuse_their_routes_and_policy() {
     let before = manifest_dataset_version(&graph_path(temp.path())).await;
     for query in [
         "query add() { insert Person { name: \"Mallory\", age: 1 } }",
-        "query bump() { $x: Person  $x.name = \"Alice\"  update $x set { age: 99 } }",
-        "query drop() { $x: Person  $x.name = \"Alice\"  delete $x }",
+        "query bump() { match { $x: Person } where $x.name = \"Alice\"  update $x set { age: 99 } }",
+        "query drop() { match { $x: Person } where $x.name = \"Alice\"  delete $x }",
         "branch create feature from main",
     ] {
         let refused = call(
@@ -1039,7 +1039,7 @@ fn mcp_tool_calls_fit_a_server_worker_stack() {
             ("snapshot", json!({"graph":"default"})),
             (
                 "query",
-                json!({"graph":"default","query":"query adults() { match { $p: Person $p.age >= 30 } return { $p.name } }"}),
+                json!({"graph":"default","query":"query adults() { match { $p: Person } where $p.age >= 30 return { $p.name } }"}),
             ),
             (
                 "mutate",

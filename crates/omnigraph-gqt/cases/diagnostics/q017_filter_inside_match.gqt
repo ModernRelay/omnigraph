@@ -1,5 +1,5 @@
 # issue: none
-# notes: The compiler refuses a Blob property in a binding's braces with `T3`; nothing executes.
+# notes: The compiler refuses a filter written inside the `match` braces with `Q017`; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q($b: String) { match { $d: Doc { payload: $b } } return { $d.title } }
+query q() { match { $p: Person, $p.age > 30 } return { $p.name } }
 
---- expect error: type error: T3:
+--- expect error: parse error: Q017:

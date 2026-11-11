@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $d: Doc  $d.tags contains "rust" } return { $d.title } }
+query q() { match { $d: Doc } where $d.tags contains "rust" return { $d.title } }
 
 --- expect error: type error: T7:

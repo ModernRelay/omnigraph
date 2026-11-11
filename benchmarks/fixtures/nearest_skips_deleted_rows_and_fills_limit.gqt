@@ -27,7 +27,7 @@ node Doc {
 
 --- mutate
 query delete_doc($s: String) {
-    $x: Doc  $x.slug = $s
+    match { $x: Doc } where $x.slug = $s
     delete $x
 }
 
@@ -38,7 +38,7 @@ query delete_doc($s: String) {
 
 --- mutate
 query delete_doc($s: String) {
-    $x: Doc  $x.slug = $s
+    match { $x: Doc } where $x.slug = $s
     delete $x
 }
 
@@ -49,7 +49,7 @@ query delete_doc($s: String) {
 
 --- mutate
 query delete_doc($s: String) {
-    $x: Doc  $x.slug = $s
+    match { $x: Doc } where $x.slug = $s
     delete $x
 }
 

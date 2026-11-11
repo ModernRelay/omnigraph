@@ -23,10 +23,8 @@ node Doc {
 --- query
 set engine = v2;
 query open_docs() {
-    match {
-        $d: Doc
-        $d.state = "open"
-    }
+    match { $d: Doc }
+    where $d.state = "open"
     return { $d.slug }
 }
 
@@ -46,11 +44,8 @@ pass projection_pushdown
 --- query
 set engine = v2;
 query same_state_pairs() {
-    match {
-        $a: Doc
-        $b: Doc
-        $a.state = $b.state
-    }
+    match { $a: Doc, $b: Doc }
+    where $a.state = $b.state
     return { $a.slug, $b.slug }
 }
 

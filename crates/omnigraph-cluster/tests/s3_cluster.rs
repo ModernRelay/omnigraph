@@ -31,7 +31,7 @@ use ulid::Ulid;
 
 const SCHEMA_V1: &str = "node Person {\n  name: String @key\n}\n";
 const SCHEMA_V2: &str = "node Person {\n  name: String @key\n  title: String?\n}\n";
-const FIND_PERSON_GQ: &str = "query find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n";
+const FIND_PERSON_GQ: &str = "query find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n";
 const INSERT_PERSON_GQ: &str =
     "query insert_person($name: String) {\n  insert Person { name: $name }\n}\n";
 const POLICY_YAML: &str = r#"

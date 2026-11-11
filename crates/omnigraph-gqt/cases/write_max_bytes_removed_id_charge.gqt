@@ -35,7 +35,7 @@ edge LoadRef: LoadDoc -> LoadDoc
 --- mutate
 set write_max_bytes = 26;
 query delete_multibyte_under() {
-    $x: Doc  $x.slug = "日"
+    match { $x: Doc } where $x.slug = "日"
     delete $x
 }
 
@@ -44,7 +44,7 @@ query delete_multibyte_under() {
 --- mutate
 set write_max_bytes = 27;
 query delete_multibyte_exact() {
-    $x: Doc  $x.slug = "日"
+    match { $x: Doc } where $x.slug = "日"
     delete $x
 }
 
@@ -53,7 +53,7 @@ query delete_multibyte_exact() {
 --- mutate
 set write_max_bytes = 49;
 query delete_pair_under() {
-    $x: Doc  $x.grp = "pair"
+    match { $x: Doc } where $x.grp = "pair"
     delete $x
 }
 
@@ -62,7 +62,7 @@ query delete_pair_under() {
 --- mutate
 set write_max_bytes = 50;
 query delete_pair_exact() {
-    $x: Doc  $x.grp = "pair"
+    match { $x: Doc } where $x.grp = "pair"
     delete $x
 }
 
@@ -71,7 +71,7 @@ query delete_pair_exact() {
 --- mutate
 set write_max_bytes = 74;
 query delete_hub_under() {
-    $x: Doc  $x.slug = "x"
+    match { $x: Doc } where $x.slug = "x"
     delete $x
 }
 
@@ -92,7 +92,7 @@ d.slug: String
 
 --- query
 query cites_after_refused_cascade() {
-    match { $a: Doc $a $e:cites $b }
+    match { $a: Doc, $a $e:cites $b }
     return { $a.slug, $b.slug }
 }
 
@@ -106,7 +106,7 @@ b.slug: String
 --- mutate
 set write_max_bytes = 75;
 query delete_hub_exact() {
-    $x: Doc  $x.slug = "x"
+    match { $x: Doc } where $x.slug = "x"
     delete $x
 }
 
@@ -126,7 +126,7 @@ d.slug: String
 
 --- query
 query cites_after_cascade() {
-    match { $a: Doc $a $e:cites $b }
+    match { $a: Doc, $a $e:cites $b }
     return { $a.slug, $b.slug }
 }
 

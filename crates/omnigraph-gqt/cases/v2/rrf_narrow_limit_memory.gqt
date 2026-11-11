@@ -22,7 +22,7 @@ tables:
 set engine = v2;
 set query_memory_bytes = 4194304;
 query narrow_fused_limit() {
-  match { let $all = { match { $d: Doc } return { $d } }  from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: 60) }
+  match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: 60) }
   return { 1 as one }
   order { $score desc }
   limit 1

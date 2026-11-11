@@ -50,11 +50,8 @@ edge LikesComment: Person -> Comment
 
 --- query
 query likes_counted() {
-    match {
-        $p: Person { slug: "raf" }
-        $c commentHasCreator $p
-        $p2 likesComment $c
-    }
+    match { $p: Person, $c commentHasCreator $p, $p2 likesComment $c }
+    where $p.slug = "raf"
     return { count($p2) as likes }
 }
 
@@ -66,11 +63,8 @@ likes: I64
 
 --- query
 query likers_counted() {
-    match {
-        $p: Person { slug: "raf" }
-        $c commentHasCreator $p
-        $p2 likesComment $c
-    }
+    match { $p: Person, $c commentHasCreator $p, $p2 likesComment $c }
+    where $p.slug = "raf"
     return { count(distinct $p2) as likers }
 }
 
@@ -82,11 +76,8 @@ likers: I64
 
 --- query
 query names_counted() {
-    match {
-        $p: Person { slug: "raf" }
-        $c commentHasCreator $p
-        $p2 likesComment $c
-    }
+    match { $p: Person, $c commentHasCreator $p, $p2 likesComment $c }
+    where $p.slug = "raf"
     return { count($p2.name) as names, count(distinct $p2.name) as distinct_names }
 }
 
@@ -99,11 +90,8 @@ distinct_names: I64
 
 --- query
 query nulls_not_counted() {
-    match {
-        $p: Person { slug: "raf" }
-        $c commentHasCreator $p
-        $p2 likesComment $c
-    }
+    match { $p: Person, $c commentHasCreator $p, $p2 likesComment $c }
+    where $p.slug = "raf"
     return { count($p2.city) as cities, count(distinct $p2.city) as distinct_cities }
 }
 
@@ -116,11 +104,8 @@ distinct_cities: I64
 
 --- query
 query comments_liked_per_city() {
-    match {
-        $p: Person { slug: "raf" }
-        $c commentHasCreator $p
-        $p2 likesComment $c
-    }
+    match { $p: Person, $c commentHasCreator $p, $p2 likesComment $c }
+    where $p.slug = "raf"
     return { $p2.city as city, count(distinct $c) as comments, count($c) as likes }
     order { count(distinct $c) desc }
 }
@@ -136,11 +121,8 @@ likes: I64
 
 --- query
 query distinct_names_ordered() {
-    match {
-        $p: Person { slug: "raf" }
-        $c commentHasCreator $p
-        $p2 likesComment $c
-    }
+    match { $p: Person, $c commentHasCreator $p, $p2 likesComment $c }
+    where $p.slug = "raf"
     return {
         $c.length as length,
         count(distinct $p2.name) as names,
@@ -160,11 +142,8 @@ likes: I64
 
 --- query
 query ordinary_names_ordered() {
-    match {
-        $p: Person { slug: "raf" }
-        $c commentHasCreator $p
-        $p2 likesComment $c
-    }
+    match { $p: Person, $c commentHasCreator $p, $p2 likesComment $c }
+    where $p.slug = "raf"
     return {
         $c.length as length,
         count(distinct $p2.name) as names,
@@ -196,10 +175,8 @@ people: I64
 
 --- query
 query nothing_matched() {
-    match {
-        $p: Person { slug: "nobody" }
-        $c commentHasCreator $p
-    }
+    match { $p: Person, $c commentHasCreator $p }
+    where $p.slug = "nobody"
     return { count(distinct $c) as comments }
 }
 

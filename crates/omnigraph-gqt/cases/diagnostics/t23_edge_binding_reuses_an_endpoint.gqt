@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { $a: Person  $a $a:knows $b } return { $b.name } }
+query q() { match { $a: Person, $a $a:knows $b } return { $b.name } }
 
 --- expect error: type error: T23:

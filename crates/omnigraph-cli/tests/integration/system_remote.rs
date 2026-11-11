@@ -206,7 +206,7 @@ query insert_person($name: String, $age: I32) {
             .arg("--graph")
             .arg(GRAPH_ID)
             .arg("-e")
-            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
+            .arg("query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.age } }")
             .arg("--params")
             .arg(r#"{"name":"Mina"}"#)
             .arg("--json"),
@@ -234,7 +234,7 @@ query insert_person($name: String, $age: I32) {
         .post(format!("{}/graphs/{GRAPH_ID}/query", server.base_url))
         .json(&json!({
             "branch": "main",
-            "query": "query find($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
+            "query": "query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }",
             "params": { "name": "Inline" }
         }))
         .send()
@@ -396,9 +396,8 @@ fn remote_read_preserves_projection_order_in_json_and_csv() {
         &ordered_query,
         r#"
 query ordered_person($name: String) {
-    match {
-        $p: Person { name: $name }
-    }
+    match { $p: Person }
+    where $p.name = $name
     return { $p.age, $p.name }
 }
 "#,
@@ -737,7 +736,7 @@ fn assert_merge_delivery_loss_never_replays_committed_effect(statement: bool) {
                     .post(format!("{graph_url}/query"))
                     .json(&json!({
                         "branch": branch,
-                        "query": "query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }",
+                        "query": "query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.age } }",
                         "params": {"name": marker}
                     }))
                     .send()
@@ -938,7 +937,7 @@ fn remote_commit_delivery_loss_never_replays_committed_effect() {
             let rows = client
                 .post(format!("{graph_url}/query"))
                 .json(&json!({
-                    "query": "query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }",
+                    "query": "query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.age } }",
                     "params": {"name": marker}
                 }))
                 .send()
@@ -1398,7 +1397,7 @@ fn remote_deployment_delivery_loss_preserves_owned_completion() {
         );
         let response = client.post(format!("{}/graphs/{GRAPH_ID}/query", server.base_url))
             .timeout(Duration::from_secs(3))
-            .bearer_auth(TOKEN).json(&json!({"query": format!("query inspect() {{ match {{ $p: Person {{ name: \"Alice\" }} }} return {{ $p.name, $p.{property} }} }}")}))
+            .bearer_auth(TOKEN).json(&json!({"query": format!("query inspect() {{ match {{ $p: Person }} where $p.name = \"Alice\" return {{ $p.name, $p.{property} }} }}")}))
             .send().unwrap();
         let status = response.status();
         let rows = response.json::<serde_json::Value>().unwrap();
@@ -2203,7 +2202,7 @@ fn graphs_list_against_multi_graph_server() {
         .arg("--target")
         .fixture_target(&server.base_url)
         .arg("-e")
-        .arg("query q { match { $p: Person { name: \"x\" } } return { $p.name } }")
+        .arg("query q { match { $p: Person } where $p.name = \"x\" return { $p.name } }")
         .output()
         .unwrap();
     assert!(
@@ -2225,8 +2224,7 @@ fn graphs_list_against_multi_graph_server() {
 /// that path degrades exit 4 to the generic 1.
 #[test]
 fn mutate_if_commit_lost_cas_exits_4_issue_365() {
-    const FIND_ALICE: &str =
-        "query find($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+    const FIND_ALICE: &str = "query find($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }";
     const ADD_PERSON: &str =
         "query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }";
     fn mutate_cmd(base_url: &str, name: &str, if_commit: Option<&str>) -> std::process::Output {

@@ -29,7 +29,7 @@ edge Knows: Person -> Doc
 --- query
 set engine = v2;
 query nearest_person_docs($q: Vector(2)) {
-    match { from nearest({ match { $p: Person $p knows $d } return { $p, $d } }, $p.embedding, $q, k: 2) }
+    match { from nearest({ match { $p: Person, $p knows $d } return { $p, $d } }, $p.embedding, $q, k: 2) }
     return { $p.name, $d.slug }
     order { $distance }
     limit 2

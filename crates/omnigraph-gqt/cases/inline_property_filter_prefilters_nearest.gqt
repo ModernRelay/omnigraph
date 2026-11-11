@@ -29,9 +29,9 @@ node Doc {
 
 --- query
 query nearest_inline_filter($q: Vector(4)) {
-    match { from nearest({ match {
-        $d: Doc { n: 7 }
-    } return { $d } }, $d.embedding, $q, k: 3) }
+    match {
+      from nearest({ match { $d: Doc } where $d.n = 7 return { $d } }, $d.embedding, $q, k: 3),
+    }
     return { $d.slug }
     order { $distance }
     limit 3

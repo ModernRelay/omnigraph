@@ -108,7 +108,7 @@ query put_membership($tenant: String, $slot: U32, $label: String) {
 }
 
 query move_membership($tenant: String, $next_slot: U32) {
-    $x: Membership  $x.tenant = $tenant
+    match { $x: Membership } where $x.tenant = $tenant
     update $x set { slot: $next_slot }
 }
 "#;

@@ -29,7 +29,7 @@ branch create s
 
 --- mutate branch: s
 query set_a_on_s() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 1 }
 }
 
@@ -37,7 +37,7 @@ query set_a_on_s() {
 
 --- mutate
 query set_b_on_main() {
-    $x: Person  $x.name = "b"
+    match { $x: Person } where $x.name = "b"
     update $x set { age: 1 }
 }
 
@@ -57,7 +57,7 @@ branch merge s
 
 --- mutate
 query set_b_again_on_main() {
-    $x: Person  $x.name = "b"
+    match { $x: Person } where $x.name = "b"
     update $x set { age: 2 }
 }
 
@@ -75,7 +75,7 @@ branch create t from s
 
 --- mutate branch: t
 query set_c_on_t() {
-    $x: Person  $x.name = "c"
+    match { $x: Person } where $x.name = "c"
     update $x set { age: 1 }
 }
 
@@ -120,7 +120,7 @@ branch merge s
 
 --- mutate branch: s
 query set_a_on_recreated_s() {
-    $x: Person  $x.name = "a"
+    match { $x: Person } where $x.name = "a"
     update $x set { age: 5 }
 }
 

@@ -39,7 +39,7 @@ branch create feature
 
 --- mutate branch: feature
 query age_alice() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 31 }
 }
 

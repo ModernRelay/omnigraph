@@ -9,8 +9,8 @@ environments:
 
 --- query branch: main
 query reserved_accounts() {
-    match { $a: Account
-        starts_with($a.accountId, "omnigraph-bench-fin-v1-") }
+    match { $a: Account }
+    where starts_with($a.accountId, "omnigraph-bench-fin-v1-")
     return { $a.accountId as account, $a.createTime as created, $a.isBlocked as blocked, $a.accountType as kind, $a.freqLoginType as login, $a.accountLevel as level, $a.nickname as nickname, $a.phonenum as phonenum, $a.email as email, $a.lastLoginTime as last_login }
 }
 --- expect unordered
@@ -28,9 +28,8 @@ last_login: DateTime?
 
 --- query branch: main
 query reserved_transfers() {
-    match { $a: Account
-        $a $e:accounttransferaccount $b
-        starts_with($e.orderNum, "omnigraph-bench-fin-v1-") }
+    match { $a: Account, $a $e:accounttransferaccount $b }
+    where starts_with($e.orderNum, "omnigraph-bench-fin-v1-")
     return { $e.@src as src, $e.@dst as dst, $e.amount as amount, $e.createTime as created, $e.orderNum as order_num, $e.payType as pay, $e.goodsType as goods, $e.comment as comment }
 }
 --- expect unordered
@@ -58,8 +57,8 @@ query prepare_src() {
 
 --- query branch: bench-source
 query reserved_accounts() {
-    match { $a: Account
-        starts_with($a.accountId, "omnigraph-bench-fin-v1-") }
+    match { $a: Account }
+    where starts_with($a.accountId, "omnigraph-bench-fin-v1-")
     return { $a.accountId as account, $a.createTime as created, $a.isBlocked as blocked, $a.accountType as kind, $a.freqLoginType as login, $a.accountLevel as level, $a.nickname as nickname, $a.phonenum as phonenum, $a.email as email, $a.lastLoginTime as last_login }
 }
 --- expect unordered
@@ -79,9 +78,8 @@ last_login: DateTime?
 
 --- query branch: bench-source
 query reserved_transfers() {
-    match { $a: Account
-        $a $e:accounttransferaccount $b
-        starts_with($e.orderNum, "omnigraph-bench-fin-v1-") }
+    match { $a: Account, $a $e:accounttransferaccount $b }
+    where starts_with($e.orderNum, "omnigraph-bench-fin-v1-")
     return { $e.@src as src, $e.@dst as dst, $e.amount as amount, $e.createTime as created, $e.orderNum as order_num, $e.payType as pay, $e.goodsType as goods, $e.comment as comment }
 }
 --- expect unordered
@@ -108,8 +106,7 @@ n: I64
 
 --- query branch: bench-source
 query transfer_count() {
-    match { $a: Account
-        $a $e:accounttransferaccount $b }
+    match { $a: Account, $a $e:accounttransferaccount $b }
     return { count($e) as n }
 }
 --- expect unordered
@@ -131,8 +128,8 @@ query prepare_tgt() {
 
 --- query branch: bench-target
 query reserved_accounts() {
-    match { $a: Account
-        starts_with($a.accountId, "omnigraph-bench-fin-v1-") }
+    match { $a: Account }
+    where starts_with($a.accountId, "omnigraph-bench-fin-v1-")
     return { $a.accountId as account, $a.createTime as created, $a.isBlocked as blocked, $a.accountType as kind, $a.freqLoginType as login, $a.accountLevel as level, $a.nickname as nickname, $a.phonenum as phonenum, $a.email as email, $a.lastLoginTime as last_login }
 }
 --- expect unordered
@@ -152,9 +149,8 @@ last_login: DateTime?
 
 --- query branch: bench-target
 query reserved_transfers() {
-    match { $a: Account
-        $a $e:accounttransferaccount $b
-        starts_with($e.orderNum, "omnigraph-bench-fin-v1-") }
+    match { $a: Account, $a $e:accounttransferaccount $b }
+    where starts_with($e.orderNum, "omnigraph-bench-fin-v1-")
     return { $e.@src as src, $e.@dst as dst, $e.amount as amount, $e.createTime as created, $e.orderNum as order_num, $e.payType as pay, $e.goodsType as goods, $e.comment as comment }
 }
 --- expect unordered
@@ -181,8 +177,7 @@ n: I64
 
 --- query branch: bench-target
 query transfer_count() {
-    match { $a: Account
-        $a $e:accounttransferaccount $b }
+    match { $a: Account, $a $e:accounttransferaccount $b }
     return { count($e) as n }
 }
 --- expect unordered
@@ -192,8 +187,8 @@ n: I64
 
 --- query branch: main
 query reserved_accounts() {
-    match { $a: Account
-        starts_with($a.accountId, "omnigraph-bench-fin-v1-") }
+    match { $a: Account }
+    where starts_with($a.accountId, "omnigraph-bench-fin-v1-")
     return { $a.accountId as account, $a.createTime as created, $a.isBlocked as blocked, $a.accountType as kind, $a.freqLoginType as login, $a.accountLevel as level, $a.nickname as nickname, $a.phonenum as phonenum, $a.email as email, $a.lastLoginTime as last_login }
 }
 --- expect unordered
@@ -211,9 +206,8 @@ last_login: DateTime?
 
 --- query branch: main
 query reserved_transfers() {
-    match { $a: Account
-        $a $e:accounttransferaccount $b
-        starts_with($e.orderNum, "omnigraph-bench-fin-v1-") }
+    match { $a: Account, $a $e:accounttransferaccount $b }
+    where starts_with($e.orderNum, "omnigraph-bench-fin-v1-")
     return { $e.@src as src, $e.@dst as dst, $e.amount as amount, $e.createTime as created, $e.orderNum as order_num, $e.payType as pay, $e.goodsType as goods, $e.comment as comment }
 }
 --- expect unordered
@@ -239,8 +233,7 @@ n: I64
 
 --- query branch: main
 query transfer_count() {
-    match { $a: Account
-        $a $e:accounttransferaccount $b }
+    match { $a: Account, $a $e:accounttransferaccount $b }
     return { count($e) as n }
 }
 --- expect unordered

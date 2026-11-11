@@ -23,10 +23,8 @@ node Doc {
 --- query
 set engine = v2;
 query count_non_x_docs() {
-    match {
-        $d: Doc
-        not { starts_with($d.slug, "x") }
-    }
+    match { $d: Doc }
+    where not exists { $d: Doc where starts_with($d.slug, "x") }
     return { count($d) as n }
 }
 

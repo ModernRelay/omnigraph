@@ -27,7 +27,7 @@ query add_both() { insert Person { id: 100 } insert Knows { from: "0", to: "100"
 --- expect affected: nodes=1 edges=1
 
 --- query
-query loaded() { match { $a: Person $a knows $b } return { count($b) as n } }
+query loaded() { match { $a: Person, $a knows $b } return { count($b) as n } }
 --- expect unordered
 {"n": 1}
 --- expect shape

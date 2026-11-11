@@ -40,17 +40,17 @@ query add_friend($from: String, $to: String) {
 }
 
 query set_age($name: String, $age: I32) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     update $x set { age: $age }
 }
 
 query remove_person($name: String) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     delete $x
 }
 
 query remove_friendship($from: String) {
-    $x: Knows  $x.@src = $from
+    match { $x: Knows } where $x.@src = $from
     delete $x
 }
 

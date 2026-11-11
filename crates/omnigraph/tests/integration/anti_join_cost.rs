@@ -40,23 +40,24 @@ edge TouchpointByIdentity: Touchpoint -> ExternalID
 "#;
 
 const OUTER: &str = r#"
-        $c: Channel { slug: $channel }
-        $s: Source
-        $c channelWatchesSource $s
-        $t: Touchpoint { action: "star" }
-        $t touchpointOnSource $s
-        $t.observed_at >= $since
-        $x: ExternalID
-        $t touchpointByIdentity $x
+        $c: Channel,
+        $s: Source,
+        $c channelWatchesSource $s,
+        $t: Touchpoint,
+        $t touchpointOnSource $s,
+        $x: ExternalID,
+        $t touchpointByIdentity $x,
 "#;
 
+const WHERE: &str = r#"$c.slug = $channel and $t.action = "star" and $t.observed_at >= $since"#;
+
 const BLOCK: &str = r#"
-        not {
-            $s0: Source { slug: $exclude }
-            $t0: Touchpoint
-            $t0 touchpointOnSource $s0
+      and not exists {
+            $s0: Source,
+            $t0: Touchpoint,
+            $t0 touchpointOnSource $s0,
             $t0 touchpointByIdentity $x
-            FORCE
+            where $s0.slug = $excludeFORCE
         }
 "#;
 
@@ -71,7 +72,7 @@ const RETURN: &str = r#"
 fn reads() -> [(&'static str, String); 3] {
     let query = |block: &str| {
         format!(
-            "query lookalikes($channel: String, $since: DateTime, $exclude: String) {{\n    match {{{OUTER}{block}    }}{RETURN}}}"
+            "query lookalikes($channel: String, $since: DateTime, $exclude: String) {{\n    match {{{OUTER}    }}\n    where {WHERE}{block}{RETURN}}}"
         )
     };
     [
@@ -79,7 +80,7 @@ fn reads() -> [(&'static str, String); 3] {
         ("key_set", query(&BLOCK.replace("FORCE", ""))),
         (
             "correlated",
-            query(&BLOCK.replace("FORCE", "$x.slug = $x.slug")),
+            query(&BLOCK.replace("FORCE", " and $x.slug = $x.slug")),
         ),
     ]
 }

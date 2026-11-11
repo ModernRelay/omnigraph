@@ -30,10 +30,8 @@ edge Next: Item -> Item
 
 --- query
 query overlapping_lists_control() {
-    match {
-        $i: Item
-        not ($i.s in ["y"]) or not ($i.s in ["x", "y"])
-    }
+    match { $i: Item }
+    where (not ($i.s in ["y"]) or not ($i.s in ["x", "y"]))
     return { $i.slug }
 }
 
@@ -45,10 +43,8 @@ i.slug: String
 
 --- query
 query or_of_negated_memberships() {
-    match {
-        $i: Item
-        not ($i.s in ["x"]) or not ($i.s in ["y"])
-    }
+    match { $i: Item }
+    where (not ($i.s in ["x"]) or not ($i.s in ["y"]))
     return { $i.slug }
 }
 
@@ -60,10 +56,8 @@ i.slug: String
 
 --- query
 query negated_disjoint_conjunction() {
-    match {
-        $i: Item
-        not (($i.s in ["x"]) and ($i.s in ["y"]))
-    }
+    match { $i: Item }
+    where not (($i.s in ["x"]) and ($i.s in ["y"]))
     return { $i.slug }
 }
 
@@ -75,10 +69,8 @@ i.slug: String
 
 --- query
 query negated_in_minus_superset_i64() {
-    match {
-        $i: Item
-        not (($i.n in [1]) and not ($i.n in [1, 2, 0, 5]))
-    }
+    match { $i: Item }
+    where not (($i.n in [1]) and not ($i.n in [1, 2, 0, 5]))
     return { $i.slug }
 }
 
@@ -90,10 +82,8 @@ i.slug: String
 
 --- query
 query equality_disjunctions_without_in() {
-    match {
-        $i: Item
-        not ((($i.s = "x") or ($i.s = "w")) and (($i.s = "y") or ($i.s = "v")))
-    }
+    match { $i: Item }
+    where not ((($i.s = "x") or ($i.s = "w")) and (($i.s = "y") or ($i.s = "v")))
     return { $i.slug }
 }
 
@@ -106,10 +96,8 @@ i.slug: String
 --- query
 set engine = v2;
 query equality_disjunction_keeps_the_index() {
-    match {
-        $i: Item
-        $i.n = 1 or $i.n = 2
-    }
+    match { $i: Item }
+    where ($i.n = 1 or $i.n = 2)
     return { $i.slug }
 }
 
@@ -125,10 +113,8 @@ scan Item as $i: access index_probe n
 --- query
 set engine = v2;
 query overlapping_equality_disjunctions_keep_the_index() {
-    match {
-        $i: Item
-        ($i.n = 1 or $i.n = 2) and ($i.n = 1 or $i.n = 3)
-    }
+    match { $i: Item }
+    where ($i.n = 1 or $i.n = 2) and ($i.n = 1 or $i.n = 3)
     return { $i.slug }
 }
 
@@ -143,11 +129,8 @@ scan Item as $i: access index_probe n
 
 --- query
 query traversal_target() {
-    match {
-        $src: Item
-        $src next $t
-        not ($t.s in ["x"]) or not ($t.s in ["y"])
-    }
+    match { $src: Item, $src next $t }
+    where (not ($t.s in ["x"]) or not ($t.s in ["y"]))
     return { $src.slug, $t.slug }
 }
 
@@ -160,10 +143,8 @@ t.slug: String
 
 --- query
 query not_block() {
-    match {
-        $i: Item
-        not { $i next $t  not ($t.s in ["x"]) or not ($t.s in ["y"]) }
-    }
+    match { $i: Item }
+    where not exists { $i next $t where (not ($t.s in ["x"]) or not ($t.s in ["y"])) }
     return { $i.slug }
 }
 
@@ -176,10 +157,8 @@ i.slug: String
 
 --- query
 query exists_block() {
-    match {
-        $i: Item
-        exists { $i next $t  not ($t.s in ["x"]) or not ($t.s in ["y"]) }
-    }
+    match { $i: Item }
+    where exists { $i next $t where (not ($t.s in ["x"]) or not ($t.s in ["y"])) }
     return { $i.slug }
 }
 
@@ -191,7 +170,7 @@ i.slug: String
 
 --- mutate
 query update_or_of_negated_memberships() {
-    $x: Item  not ($x.s in ["x"]) or not ($x.s in ["y"])
+    match { $x: Item } where (not ($x.s in ["x"]) or not ($x.s in ["y"]))
     update $x set { tag: "hit" }
 }
 
@@ -199,10 +178,8 @@ query update_or_of_negated_memberships() {
 
 --- query
 query tagged() {
-    match {
-        $i: Item
-        $i.tag = "hit"
-    }
+    match { $i: Item }
+    where $i.tag = "hit"
     return { $i.slug }
 }
 
@@ -214,7 +191,7 @@ i.slug: String
 
 --- mutate
 query delete_or_of_negated_memberships() {
-    $x: Item  not ($x.s in ["x"]) or not ($x.s in ["y"])
+    match { $x: Item } where (not ($x.s in ["x"]) or not ($x.s in ["y"]))
     delete $x
 }
 

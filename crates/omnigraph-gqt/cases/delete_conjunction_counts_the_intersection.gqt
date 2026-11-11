@@ -25,7 +25,7 @@ node Person {
 
 --- mutate
 query note_a_names_tagged_y() {
-    $x: Person  starts_with($x.name, "a") and "y" in $x.tags
+    match { $x: Person } where starts_with($x.name, "a") and "y" in $x.tags
     update $x set { note: "seen" }
 }
 
@@ -33,7 +33,7 @@ query note_a_names_tagged_y() {
 
 --- mutate
 query delete_a_names_tagged_x() {
-    $x: Person  starts_with($x.name, "a") and "x" in $x.tags
+    match { $x: Person } where starts_with($x.name, "a") and "x" in $x.tags
     delete $x
 }
 

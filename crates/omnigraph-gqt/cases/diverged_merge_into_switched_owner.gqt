@@ -28,7 +28,7 @@ branch create feature
 
 --- mutate branch: feature
 query feature_write() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 31 }
 }
 
@@ -41,7 +41,7 @@ branch merge feature
 
 --- mutate
 query main_write() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 32 }
 }
 
@@ -66,7 +66,7 @@ branch create hotfix
 
 --- mutate branch: hotfix
 query hotfix_write() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { age: 33 }
 }
 

@@ -33,7 +33,7 @@ query insert_person($name: String, $age: I32) {
 }
 
 query set_age($name: String, $age: I32) {
-    $x: Person  $x.name = $name
+    match { $x: Person } where $x.name = $name
     update $x set { age: $age }
 }
 "#;
@@ -219,8 +219,7 @@ rules:
       branch_scope: any
 "#;
 
-pub const FIND_PERSON_GQ: &str =
-    "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+pub const FIND_PERSON_GQ: &str = "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }";
 
 /// RFC-011 cluster-only: the single-graph convenience apps built by the
 /// `app_for_loaded_graph*` helpers serve the graph under the reserved id
@@ -1228,7 +1227,7 @@ pub async fn converged_cluster_dir(policies_yaml: &str) -> tempfile::TempDir {
     .unwrap();
     fs::write(
         temp.path().join("people.gq"),
-        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+        "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
     )
     .unwrap();
     fs::write(

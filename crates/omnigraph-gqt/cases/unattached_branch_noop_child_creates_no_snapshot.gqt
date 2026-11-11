@@ -30,7 +30,7 @@ query root_bob() as unattached branch {
 
 --- mutate
 query noop_child() as unattached branch on "${r}" {
-    $x: Person  $x.name = "nobody"
+    match { $x: Person } where $x.name = "nobody"
     update $x set { age: 99 }
 }
 

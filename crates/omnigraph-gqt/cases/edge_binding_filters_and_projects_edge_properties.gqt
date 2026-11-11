@@ -37,11 +37,8 @@ edge Knows: Person -> Person {
 
 --- query
 query recent_friends($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p $w:knows $f
-        $w.since >= date("2023-01-01")
-    }
+    match { $p: Person, $p $w:knows $f }
+    where $p.name = $name and $w.since >= date("2023-01-01")
     return { $f.name, $w.since }
 }
 
@@ -57,10 +54,8 @@ w.since: Date?
 
 --- query
 query all_friend_edges($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
+    where $p.name = $name
     return { $f.name, $w.since }
 }
 
@@ -79,10 +74,8 @@ w.since: Date?
 
 --- query
 query empty_source_edge_projection($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
+    where $p.name = $name
     return { $w.since }
 }
 
@@ -96,11 +89,8 @@ w.since: Date?
 
 --- query
 query no_outgoing_edge_filter($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p $w:knows $f
-        $w.since >= date("2023-01-01")
-    }
+    match { $p: Person, $p $w:knows $f }
+    where $p.name = $name and $w.since >= date("2023-01-01")
     return { $w.since }
 }
 
@@ -114,12 +104,10 @@ w.since: Date?
 
 --- query
 query no_future_friend() {
-    match {
-        $p: Person
-        not {
-            $p $w:knows $f
-            $w.since >= date("2030-01-01")
-        }
+    match { $p: Person }
+    where not exists {
+        $p $w:knows $f
+        where $w.since >= date("2030-01-01")
     }
     return { $p.name }
 }
@@ -135,10 +123,8 @@ p.name: String
 
 --- query
 query knows_counts($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
+    where $p.name = $name
     return { $f.name, count($w.since) }
 }
 

@@ -55,7 +55,7 @@ query hire_with_employer() {
 
 --- mutate
 query retitle() {
-    $x: Person  $x.name = "alice"
+    match { $x: Person } where $x.name = "alice"
     update $x set { title: "cto" }
 }
 

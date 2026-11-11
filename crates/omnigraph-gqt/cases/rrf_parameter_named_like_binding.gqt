@@ -30,9 +30,11 @@ edge Knows: Doc -> Doc {
 --- query
 set engine = v2;
 query fused_v2($q: Vector(4), $t: String) {
-    match { let $all = { match { $d: Doc } return { $d } }  from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.text, $t), k: 60)
-        $d: Doc
-        $d knows $t
+    match {
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.text, $t), k: 60),
+      $d: Doc,
+      $d knows $t,
     }
     return { $d.slug }
     order { $score desc }

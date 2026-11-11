@@ -37,7 +37,7 @@ branch merge child into main
 --- query
 set engine = v2;
 query fast_forwarded($s: String) {
-    match { $p: Person $p.slug = $s }
+    match { $p: Person } where $p.slug = $s
     return { $p.age }
 }
 --- params
@@ -52,7 +52,7 @@ pass key_to_id
 
 --- mutate branch: child
 query bump_alpha() {
-    $x: Person  $x.slug = "alpha"
+    match { $x: Person } where $x.slug = "alpha"
     update $x set { age: 44 }
 }
 --- expect affected: nodes=1 edges=0
@@ -71,7 +71,7 @@ branch merge child into main
 --- query
 set engine = v2;
 query merged_update($s: String) {
-    match { $p: Person $p.slug = $s }
+    match { $p: Person } where $p.slug = $s
     return { $p.age }
 }
 --- params
@@ -87,7 +87,7 @@ pass key_to_id
 --- query
 set engine = v2;
 query merged_main_insert($s: String) {
-    match { $p: Person $p.slug = $s }
+    match { $p: Person } where $p.slug = $s
     return { $p.age }
 }
 --- params
@@ -102,7 +102,7 @@ scan Person as $p: access index_probe __id
 --- query
 set engine = v2;
 query merged_child_insert($s: String) {
-    match { $p: Person $p.slug = $s }
+    match { $p: Person } where $p.slug = $s
     return { $p.age }
 }
 --- params

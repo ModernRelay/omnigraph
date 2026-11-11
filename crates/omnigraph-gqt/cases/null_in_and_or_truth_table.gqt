@@ -49,7 +49,7 @@ both: Bool?
 --- query
 set engine = v2;
 query and_keeps_only_true() {
-    match { $p: Person  $p.x = 1 and $p.flag }
+    match { $p: Person } where $p.x = 1 and $p.flag
     return { $p.slug }
 }
 
@@ -62,7 +62,7 @@ p.slug: String
 --- query
 set engine = v2;
 query null_parameter_selects_no_row($v: I64?) {
-    match { $p: Person  $p.x = $v or $p.x = 1 and $p.flag }
+    match { $p: Person } where ($p.x = $v or $p.x = 1 and $p.flag)
     return { $p.slug }
 }
 
@@ -78,7 +78,7 @@ p.slug: String
 --- query
 set engine = v2;
 query not_excludes_the_null_row() {
-    match { $p: Person  not ($p.x = 1) }
+    match { $p: Person } where not ($p.x = 1)
     return { $p.slug }
 }
 
@@ -92,7 +92,7 @@ p.slug: String
 --- query
 set engine = v2;
 query is_null_selects_exactly_the_null_rows() {
-    match { $p: Person  $p.x is null }
+    match { $p: Person } where $p.x is null
     return { $p.slug }
 }
 
@@ -106,7 +106,7 @@ p.slug: String
 --- query
 set engine = v2;
 query is_not_null_on_non_nullable_selects_every_row() {
-    match { $p: Person  $p.age is not null }
+    match { $p: Person } where $p.age is not null
     return { $p.slug }
 }
 
@@ -124,7 +124,7 @@ p.slug: String
 --- query
 set engine = v2;
 query null_partition_completes_the_negation() {
-    match { $p: Person  not ($p.x = 1) or $p.x is null }
+    match { $p: Person } where (not ($p.x = 1) or $p.x is null)
     return { $p.slug }
 }
 

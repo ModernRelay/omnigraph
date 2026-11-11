@@ -20,7 +20,7 @@ node Person {
 
 --- query
 query folded_inline_match() {
-    match { $p: Person { adult: true or false } }
+    match { $p: Person } where $p.adult = (true or false)
     return { $p.slug }
 }
 

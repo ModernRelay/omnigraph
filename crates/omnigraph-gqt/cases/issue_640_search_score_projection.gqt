@@ -85,7 +85,7 @@ _score: F32
 
 --- query
 query nearest_projected_no_match($v: Vector(2)) {
-    match { from nearest({ match { $p: Person { name: "absent" } } return { $p } }, $p.embedding, $v, k: 2) }
+    match { from nearest({ match { $p: Person } where $p.name = "absent" return { $p } }, $p.embedding, $v, k: 2) }
     return { $p.name, $distance as score }
     order { $distance }
     limit 2
@@ -102,7 +102,7 @@ score: F32
 
 --- query
 query bm25_projected_no_match($q: String) {
-    match { from bm25({ match { $p: Person { name: "absent" } } return { $p } }, $p.bio, $q) }
+    match { from bm25({ match { $p: Person } where $p.name = "absent" return { $p } }, $p.bio, $q) }
     return { $p.name, $score as score }
     order { $score desc }
     limit 3
@@ -156,7 +156,7 @@ query nearest_projected_under_aggregate($v: Vector(2)) {
 
 --- query
 query rrf_projected($q: String, $v: Vector(2)) {
-    match { let $all = { match { $p: Person } return { $p } }  from rrf(nearest($all, $p.embedding, $v, k: 3), bm25($all, $p.bio, $q), k: 60) $p: Person }
+    match { let $all = { match { $p: Person } return { $p } }, from rrf(nearest($all, $p.embedding, $v, k: 3), bm25($all, $p.bio, $q), k: 60), $p: Person }
     return { $p.name, $score as fused }
     order { $score desc, $score }
     limit 3
@@ -182,7 +182,7 @@ query search_projected($q: String) {
 --- params
 {"q": "needle"}
 
---- expect error: T38: `search` is a search predicate; it must stand alone as a filter clause
+--- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
 
 --- query
 query alias_projected_again() {
@@ -195,10 +195,9 @@ query alias_projected_again() {
 
 --- query
 query nearest_projected_through_traversal($v: Vector(2)) {
-    match { from nearest({ match {
-        $p: Person
-        $p knows $f
-    } return { $p, $f } }, $p.embedding, $v, k: 3) }
+    match {
+      from nearest({ match { $p: Person, $p knows $f } return { $p, $f } }, $p.embedding, $v, k: 3),
+    }
     return { $f.name, $distance as score }
     order { $distance, $f.name }
     limit 3
