@@ -2124,6 +2124,7 @@ fn access_slot(action: omnigraph_policy::PolicyAction) -> Option<AccessSlot> {
         // Maintenance runs only through the direct CLI and embedded callers;
         // no served operation performs it, so the report does not name it.
         P::Maintain | P::Reclaim => None,
+        P::BranchClaim => None,
     }
 }
 
@@ -2462,6 +2463,10 @@ error_codes! {
     /// Distinct from `conflict`, the authority-moved refusal of a publishable
     /// proposal.
     UnattachedCannotPublish = "unattached_cannot_publish", [409];
+    /// The branch's writer epoch refused the write: another process claimed
+    /// the branch, or the serving process holds no claim on it; see
+    /// `writer_fenced`. Nothing was written.
+    WriterFenced = "writer_fenced", [409];
     /// The request body, or the work it asks for, exceeds a bounded limit;
     /// `resource_limit` names the limit when it is the operation's. Split or
     /// reduce the request.
@@ -2563,6 +2568,7 @@ impl ErrorCode {
             Self::Forbidden
             | Self::PreconditionFailed
             | Self::Conflict
+            | Self::WriterFenced
             | Self::ExternalBlobSource
             | Self::ChangeFeedGap
             | Self::Internal => DispositionAction::Refresh,
@@ -2590,6 +2596,18 @@ pub struct ReadSetConflictOutput {
     pub member: String,
     pub expected: Option<String>,
     pub actual: Option<String>,
+}
+
+/// The writer epochs of a publish or claim a claimed branch refused. `held`
+/// is the serving process's epoch, absent when it holds none; `read` is the
+/// epoch a refused claim read; `current` is the branch's epoch.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WriterFencedOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<u64>,
+    pub current: u64,
 }
 
 /// A strict insert rejected because `entity_id` already names an entity in the
@@ -2928,6 +2946,10 @@ pub struct ErrorOutput {
     /// Set when a prepared write's logical authority changed before effects.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_set_conflict: Option<ReadSetConflictOutput>,
+    /// Set with HTTP 409 and `writer_fenced` when the branch's writer epoch
+    /// refused a publish or a claim. Nothing was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_fenced: Option<WriterFencedOutput>,
     /// Set when a strict keyed insert found an existing or concurrently
     /// inserted logical id.  The caller may choose a different id; replaying
     /// the same strict operation will not convert it into an upsert.
@@ -3010,6 +3032,7 @@ impl ErrorOutput {
             merge_conflicts: Vec::new(),
             published_dataset_version_conflict: None,
             read_set_conflict: None,
+            writer_fenced: None,
             key_conflict: None,
             resource_limit: None,
             blob_range: None,
@@ -3761,6 +3784,28 @@ mod tests {
             transitions,
             [AccessAction::BranchCreate, AccessAction::BranchMerge]
         );
+    }
+
+    /// No route performs the claim, so no access report names it and the
+    /// report's wire enum has no variant for it.
+    #[test]
+    fn branch_claim_is_named_by_no_access_report() {
+        use super::{AccessAction, access_slot};
+        assert_eq!(
+            access_slot(omnigraph_policy::PolicyAction::BranchClaim),
+            None
+        );
+        assert!(serde_json::from_str::<AccessAction>("\"branch_claim\"").is_err());
+    }
+
+    /// The writer epoch's refusal is the state's, not the request's: its own
+    /// 409 code, asking for a refresh.
+    #[test]
+    fn branch_claim_refusal_code_is_a_409_that_asks_for_a_refresh() {
+        use super::{DispositionAction, ErrorCode};
+        let fenced: ErrorCode = serde_json::from_str("\"writer_fenced\"").unwrap();
+        assert_eq!(fenced.http_statuses(), [409]);
+        assert_eq!(fenced.action(), DispositionAction::Refresh);
     }
 
     #[test]

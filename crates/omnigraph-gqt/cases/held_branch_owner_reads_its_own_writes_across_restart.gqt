@@ -1,0 +1,89 @@
+# issue: none
+# notes: The process that holds the writer epoch of `main` reads and writes it like any other: a keyed read returns the
+# notes: row of the insert that just landed, and a scan after a restart, on a reopened handle of the process that still
+# notes: holds the branch, returns it again. A second insert after the restart lands and is counted.
+# writer: held
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+
+--- query
+query all_before() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+query add_bob() {
+    insert Person { name: "bob", age: 40 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query bob_by_key() {
+    match { $p: Person { name: "bob" } }
+    return { $p.name, $p.age }
+}
+
+--- expect unordered
+{"p.name": "bob", "p.age": 40}
+
+--- expect shape
+p.name: String
+p.age: I32
+
+--- restart
+
+--- query
+query all_reopened() {
+    match { $p: Person }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "alice"}
+{"p.name": "bob"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+query add_carol() {
+    insert Person { name: "carol", age: 50 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query count_after_second_insert() {
+    match { $p: Person }
+    return { count($p) as n }
+}
+
+--- expect unordered
+{"n": 3}
+
+--- expect shape
+n: I64

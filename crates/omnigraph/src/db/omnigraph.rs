@@ -306,6 +306,9 @@ pub(crate) struct WriteTxn {
     /// current and fall back to a full coherent capture on mismatch. The
     /// publisher still performs its own fresh CAS read.
     pub(crate) manifest_probe: crate::db::manifest::CapturedManifestProbe,
+    /// Whether the open took the version this process holds on record for
+    /// the branch's head in place of a probe.
+    pub(crate) head_on_record: bool,
     /// Set on a child unattached write: `base` is then the base snapshot's
     /// view at its detached version, not the live head, while `authority`
     /// stays the live head the chain's root captured.
@@ -1616,6 +1619,7 @@ impl Omnigraph {
     pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
         let branch = normalize_branch_name(branch.unwrap_or("main"))?;
 
+        let head_on_record = self.holds_head_of(branch.as_deref());
         let (branch_identifier, graph_head, effective_graph_head, snapshot, manifest_probe) = self
             .write_authority_for_known_branch(branch.as_deref(), true)
             .await?;
@@ -1629,8 +1633,35 @@ impl Omnigraph {
             caller_expected_graph_head: None,
             catalog,
             manifest_probe,
+            head_on_record,
             unattached_base: None,
         })
+    }
+
+    /// Whether `branch` is the handle's bound branch and this process holds
+    /// it with its last publication on record, so a write's open and
+    /// revalidation take that record for the head.
+    fn holds_head_of(&self, branch: Option<&str>) -> bool {
+        let coord = self.coordinator.load_full();
+        branch == coord.current_branch() && coord.held_head().is_some()
+    }
+
+    /// Whether a write that staged nothing may answer from its view. No
+    /// publication checks such a write, so a view its open took on record is
+    /// probed: the head is the view's, or the version on record now.
+    pub(crate) async fn unpublished_view_is_current(&self, txn: &WriteTxn) -> Result<bool> {
+        if !txn.head_on_record {
+            return Ok(true);
+        }
+        let captured = txn.manifest_probe.captured();
+        let latest = txn.manifest_probe.probe_latest_incarnation().await?;
+        if latest.matches(captured) {
+            return Ok(true);
+        }
+        let coord = self.coordinator.load_full();
+        Ok(latest.same_lifetime(captured)
+            && txn.branch.as_deref() == coord.current_branch()
+            && coord.held_head() == Some(latest.version))
     }
 
     /// The write transaction of a child unattached snapshot (RFC "Unattached
@@ -1656,6 +1687,7 @@ impl Omnigraph {
             )));
         }
         base.require_extendable()?;
+        let head_on_record = self.holds_head_of(target.as_deref());
         let (branch_identifier, graph_head, effective_graph_head, live, manifest_probe) = self
             .write_authority_for_known_branch(target.as_deref(), true)
             .await?;
@@ -1691,6 +1723,7 @@ impl Omnigraph {
             caller_expected_graph_head: None,
             catalog,
             manifest_probe,
+            head_on_record,
             unattached_base: Some(UnattachedTxnBase::of(base)),
         })
     }
@@ -1764,6 +1797,7 @@ impl Omnigraph {
                 caller_expected_graph_head: None,
                 catalog: Arc::clone(&catalog),
                 manifest_probe,
+                head_on_record: false,
                 unattached_base: None,
             };
         Ok((
@@ -1908,22 +1942,14 @@ impl Omnigraph {
         let bound = {
             let coord = self.coordinator.load_full();
             let bound = branch == coord.current_branch();
-            if bound {
-                let current = if fresh {
-                    let held = coord.manifest_incarnation();
-                    coord.probe_latest_incarnation().await?.matches(&held)
-                } else {
-                    true
-                };
-                if current {
-                    return Ok((
-                        coord.branch_identifier().await?,
-                        coord.exact_graph_head(),
-                        coord.effective_graph_head().await?,
-                        coord.snapshot(),
-                        coord.captured_manifest_probe(),
-                    ));
-                }
+            if bound && (!fresh || coord.head_is_current().await?) {
+                return Ok((
+                    coord.branch_identifier().await?,
+                    coord.exact_graph_head(),
+                    coord.effective_graph_head().await?,
+                    coord.snapshot(),
+                    coord.captured_manifest_probe(),
+                ));
             }
             bound
         };
@@ -2110,11 +2136,11 @@ impl Omnigraph {
     /// gates are held, beside the staging puts: the answer serves
     /// [`Self::revalidate_write_txn_with`] under the gates when no publish
     /// installed on this handle in between. `None` when the write is not on
-    /// the bound branch, or when the probe failed, so the revalidation
-    /// probes itself.
+    /// the bound branch, when this process holds the branch and owes no
+    /// probe, or when the probe failed, so the revalidation probes itself.
     pub(crate) async fn early_revalidation(&self, txn: &WriteTxn) -> Option<EarlyRevalidation> {
         let coord = self.coordinator.load_full();
-        if txn.branch.as_deref() != coord.current_branch() {
+        if txn.branch.as_deref() != coord.current_branch() || coord.held_head().is_some() {
             return None;
         }
         let held = coord.manifest_incarnation();
@@ -2686,8 +2712,7 @@ impl Omnigraph {
                     }
                     return self.coordinator.load_full().resolve_target(target).await;
                 }
-                let held = coord.manifest_incarnation();
-                if coord.probe_latest_incarnation().await?.matches(&held) {
+                if coord.head_is_current().await? {
                     return warm_resolved_target(&coord, target).await;
                 }
                 let copy = GraphCoordinator::clone(&coord);
@@ -4857,6 +4882,41 @@ impl Omnigraph {
             self.invalidate_graph_index().await;
         }
         Ok(published.commit)
+    }
+
+    /// [`Self::claim_branch_writer_as`] with no actor.
+    pub async fn claim_branch_writer(&self, branch: &str) -> Result<u64> {
+        self.claim_branch_writer_as(branch, None).await
+    }
+
+    /// Claim the writer epoch of `branch` for this process, under
+    /// `branch_claim` on that branch, and answer the epoch the process holds
+    /// from then on. The claim raises the branch's epoch by one in a
+    /// `__manifest` version of its own, moving no head and recording no graph
+    /// commit; from that version on, a publish on the branch by a process
+    /// holding a lower epoch, or none, is refused `WriterFenced`. The process
+    /// that already holds the branch gets its epoch back and nothing is
+    /// written. Every claim is a takeover: the engine does not decide that
+    /// the previous owner is gone.
+    pub async fn claim_branch_writer_as(&self, branch: &str, actor: Option<&str>) -> Result<u64> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::BranchClaim,
+            &omnigraph_policy::ResourceScope::TargetBranch(branch.to_string()),
+            actor,
+        )?;
+        let target = normalize_branch_name(branch)?;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
+        let installed = self.coordinator.load_full();
+        let mut claimed = self
+            .open_coordinator_for_branch(target.as_deref())
+            .await
+            .map_err(OmniError::before_effect)?;
+        let epoch = claimed.claim_writer_epoch().await;
+        if target.as_deref() == installed.current_branch() {
+            self.install_coordinator(claimed, &installed);
+        }
+        epoch
     }
 
     /// Drop the unpublished commit `commit_id`, under `commit_drop` on its

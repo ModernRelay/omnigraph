@@ -264,6 +264,7 @@ write_surfaces! {
     "exec/merge.rs" => MERGE_V9 => ["branch_merge", "branch_merge_as"],
     "exec/merge.rs" => WriteProtocol::Composed("Merge v9, published either as the target head or as an unpublished commit that keeps its merge-input tags") => ["branch_merge_as_with_options"],
     "db/omnigraph.rs" => WriteProtocol::Exact("unpublished commit publication: the proposal's recorded changes replayed through the manifest publisher under its captured authority, required to allocate the proposal's own id") => ["publish_commit_as"],
+    "db/omnigraph.rs" => WriteProtocol::Exact("writer epoch claim: one `__manifest` version whose only change is the `writer_epoch` row, through the manifest publisher under the branch incarnation the door opened; no head moves") => ["claim_branch_writer", "claim_branch_writer_as"],
     "db/omnigraph.rs" => WriteProtocol::Composed("proposal tag removal confirmed by a readback, then merge-input tag release") => ["drop_commit_as"],
     "db/omnigraph.rs" => INDICES_V9 => [
         "ensure_indices_as", "ensure_indices_on_as", "rebuild_full_text_indices_on_as",
@@ -444,6 +445,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "probe_latest_incarnation",
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "head_is_current",
     ),
     (
         "db/graph_coordinator.rs",
@@ -743,6 +749,14 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
         WriteProtocol::NativeRefControl,
     ),
     (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
+        "claim_writer_epoch",
+        WriteProtocol::Exact(
+            "writer epoch claim through the lowest manifest publisher gateway: one version whose only change is the `writer_epoch` row, the head unchanged",
+        ),
+    ),
+    (
         "db/graph_coordinator.rs",
         "GraphCoordinator",
         "propose_changes",
@@ -757,6 +771,12 @@ const LOW_LEVEL_WRITE_SURFACES: &[(&str, &str, &str, WriteProtocol)] = &[
         WriteProtocol::Exact(
             "publication of an unpublished commit through the shared publisher gateway",
         ),
+    ),
+    (
+        "db/graph_coordinator.rs",
+        "GraphCoordinator",
+        "claim_writer_epoch",
+        WriteProtocol::Exact("writer epoch claim through the shared publisher gateway"),
     ),
     (
         "db/graph_coordinator.rs",
@@ -987,6 +1007,9 @@ gateway_surfaces! {
     ],
     "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::ReadOrPure => [
         "cached_rows",
+        "held_writer_version",
+        "withdraw_held_version",
+        "release_writer_epoch",
     ],
     "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("manifest publisher gateway")) => [
         "publish_with_precondition",
@@ -996,6 +1019,9 @@ gateway_surfaces! {
     ],
     "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("unattached snapshot gateway: the complete rows of a root or a child as a detached `__manifest` version under the root's exact captured authority, addressed by a put-if-absent candidate tag and acknowledged only after that authority is revalidated; the branch head is unchanged")) => [
         "write_unattached_candidate",
+    ],
+    "omnigraph-catalog/publisher.rs" => "ManifestBatchPublisher" => GatewayDisposition::Durable(WriteProtocol::Exact("writer epoch claim gateway: the loaded rows with the `writer_epoch` row one epoch above the one the claim first read, as the next `__manifest` version under the branch incarnation the caller captured; the branch head is unchanged and no graph commit is recorded")) => [
+        "claim_writer_epoch",
     ],
     "omnigraph-catalog/publisher.rs" => "GraphNamespacePublisher" => GatewayDisposition::ReadOrPure => [
         "new_with_session",
@@ -3367,6 +3393,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         "commit_updates_with_actor",
         "commit_updates_with_actor_with_expected",
         "commit_changes_with_intent_and_expected",
+        "claim_writer_epoch",
     ];
     for method in coordinator_methods {
         let visibilities = coordinator_ast
@@ -3409,6 +3436,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         "create_branch_at",
         "delete_branch",
         "delete_branch_with_expected",
+        "claim_writer_epoch",
     ] {
         let hidden = catalog_ast
             .items
@@ -3445,6 +3473,7 @@ fn graph_manifest_writer_methods_are_not_public_escape_hatches() {
         "create_branch_at",
         "delete_branch",
         "delete_branch_with_expected",
+        "claim_writer_epoch",
     ];
     let shim = "db/manifest.rs";
     let file = guarded_path(&src, shim);
@@ -4214,6 +4243,157 @@ fn lance_branch_enumeration_stays_behind_retry_boundary() {
         owner_inventory.counts.get("list_branches"),
         Some(&1),
         "list_branch_contents(dataset: &Dataset) must own the one raw Lance call"
+    );
+}
+
+/// A branch's writer epoch has one production writer, the claim: one call
+/// records what the process holds, in `put_claim`, and one literal builds
+/// the row. A second site of either holds or raises an epoch with no claim.
+#[test]
+fn branch_claim_is_the_only_writer_of_the_epoch_row_and_the_holder() {
+    let src = engine_src_root();
+    let publisher = "omnigraph-catalog/publisher.rs";
+    let mut holder_writes = Vec::new();
+    let mut row_tokens = Vec::new();
+    for (relative, file) in labeled_scan_files(&src, true) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let recorded = call_inventory(&ast)
+            .counts
+            .get("record_claim")
+            .copied()
+            .unwrap_or(0);
+        if recorded > 0 {
+            holder_writes.push((relative.clone(), recorded));
+        }
+        let tokens = contents.matches("WriterEpochRow {").count();
+        if tokens > 0 {
+            row_tokens.push((relative, tokens));
+        }
+    }
+    holder_writes.sort();
+    row_tokens.sort();
+    assert_eq!(
+        holder_writes,
+        vec![(publisher.to_string(), 1)],
+        "the process's holder is set by the landed claim alone"
+    );
+    assert_eq!(
+        row_tokens,
+        vec![
+            (publisher.to_string(), 1),
+            ("omnigraph-catalog/state.rs".to_string(), 2),
+        ],
+        "the `writer_epoch` row is built by one literal, the claim's; state.rs holds the \
+         type's definition and its impl"
+    );
+
+    let contents = std::fs::read_to_string(guarded_path(&src, publisher))
+        .expect("read omnigraph-catalog/publisher.rs for the claim's owner function");
+    let ast = parse_rust_source(&contents, publisher);
+    let owners = function_blocks(&ast, "put_claim");
+    assert_eq!(owners.len(), 1, "{publisher} defines one `put_claim`");
+    assert_eq!(
+        method_call_count(&owners[0], "record_claim"),
+        1,
+        "`put_claim` records the holder, after the put that landed the claim"
+    );
+}
+
+/// The publisher puts a head-moving `__manifest` version at two sites. A
+/// publish records the held version at its two landed returns, under the guard
+/// that withdraws it otherwise; the claim withdraws before its put.
+#[test]
+fn a_held_head_moves_only_where_its_version_is_recorded_or_withdrawn() {
+    let src = engine_src_root();
+    let publisher = "omnigraph-catalog/publisher.rs";
+    let contents = std::fs::read_to_string(guarded_path(&src, publisher))
+        .expect("read omnigraph-catalog/publisher.rs for its `__manifest` puts");
+    let ast = parse_rust_source(&contents, publisher);
+    let calls = call_inventory(&ast).counts;
+    let count = |name: &str| calls.get(name).copied().unwrap_or(0);
+    assert_eq!(
+        (count("merge_rows"), count("record_landed")),
+        (2, 2),
+        "{publisher}: the puts that move a head, and the records of a landed publish; a third \
+         put, or a landed return that does not record, moves a held head with no record of it"
+    );
+    let within = |function: &str, method: &str| {
+        let owners = function_blocks(&ast, function);
+        assert_eq!(owners.len(), 1, "{publisher} defines one `{function}`");
+        method_call_count(&owners[0], method)
+    };
+    assert_eq!(
+        (
+            within("publish_attempts", "merge_rows"),
+            within("publish_attempts", "record_landed"),
+            within("publish_with_precondition", "publish_attempts"),
+        ),
+        (1, 2, 1),
+        "an ordinary publish puts once and records at both landed returns, under the guard \
+         `publish_with_precondition` builds"
+    );
+    assert_eq!(
+        (
+            within("put_claim", "merge_rows"),
+            within("put_claim", "withdraw_version"),
+        ),
+        (1, 1),
+        "a claim withdraws the held version before its put"
+    );
+}
+
+/// A branch delete retires the ref in one catalog function, between the
+/// withdrawal of the version the process holds there and the holder's drop.
+/// The upgrade retires its own lock ref, which no process claims.
+#[test]
+fn branch_claim_is_dropped_where_its_process_retires_the_branch() {
+    let src = engine_src_root();
+    let catalog = "omnigraph-catalog/lib.rs";
+    let mut sites = Vec::new();
+    for (relative, file) in labeled_scan_files(&src, true) {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let ast = parse_rust_source(&contents, &relative);
+        let retires = call_inventory(&ast)
+            .counts
+            .get("retire_branch_recoverably")
+            .copied()
+            .unwrap_or(0);
+        if retires > 0 {
+            sites.push((relative, retires));
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![("db/upgrade.rs".to_string(), 1), (catalog.to_string(), 1)],
+        "a branch ref is retired by the catalog's one function and the upgrade's lock release; \
+         another site deletes a branch its process still holds, which a bound handle then \
+         reads with no probe"
+    );
+
+    let contents = std::fs::read_to_string(guarded_path(&src, catalog))
+        .expect("read omnigraph-catalog/lib.rs for the branch retire's owner function");
+    let ast = parse_rust_source(&contents, catalog);
+    let owners = function_blocks(&ast, "retire_held_branch");
+    assert_eq!(
+        owners.len(),
+        1,
+        "{catalog} defines one `retire_held_branch`"
+    );
+    let mut retire = CallInventory::default();
+    retire.visit_block(&owners[0]);
+    let count = |name: &str| retire.counts.get(name).copied().unwrap_or(0);
+    assert_eq!(
+        (
+            count("withdraw_held_version"),
+            count("retire_branch_recoverably"),
+            count("release_writer_epoch"),
+        ),
+        (1, 1, 1),
+        "the retire runs between the withdrawal of the held version and the holder's drop"
     );
 }
 

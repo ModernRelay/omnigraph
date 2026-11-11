@@ -23,6 +23,10 @@ pub enum PolicyAction {
     BranchCreate,
     BranchDelete,
     BranchMerge,
+    /// Claim a branch's writer epoch, a takeover that fences every other
+    /// writer of the branch (`Omnigraph::claim_branch_writer_as`).
+    /// Target-branch scoped: the scope is the branch claimed.
+    BranchClaim,
     /// Publish an unpublished graph commit onto its recorded target branch
     /// (`commit publish "<id>"`). Target-branch scoped like `branch_merge`:
     /// the scope is the branch the commit lands on.
@@ -65,6 +69,7 @@ impl PolicyAction {
             Self::BranchCreate => "branch_create",
             Self::BranchDelete => "branch_delete",
             Self::BranchMerge => "branch_merge",
+            Self::BranchClaim => "branch_claim",
             Self::CommitPublish => "commit_publish",
             Self::CommitDrop => "commit_drop",
             Self::Maintain => "maintain",
@@ -90,6 +95,7 @@ impl PolicyAction {
                 | Self::SchemaApply
                 | Self::BranchDelete
                 | Self::BranchMerge
+                | Self::BranchClaim
                 | Self::CommitPublish
                 | Self::CommitDrop
         )
@@ -111,6 +117,7 @@ impl PolicyAction {
             | Self::BranchCreate
             | Self::BranchDelete
             | Self::BranchMerge
+            | Self::BranchClaim
             | Self::CommitPublish
             | Self::CommitDrop
             | Self::Maintain
@@ -175,6 +182,7 @@ impl FromStr for PolicyAction {
             "branch_create" => Ok(Self::BranchCreate),
             "branch_delete" => Ok(Self::BranchDelete),
             "branch_merge" => Ok(Self::BranchMerge),
+            "branch_claim" => Ok(Self::BranchClaim),
             "commit_publish" => Ok(Self::CommitPublish),
             "commit_drop" => Ok(Self::CommitDrop),
             "maintain" => Ok(Self::Maintain),
@@ -959,6 +967,7 @@ namespace Omnigraph {
     action "branch_create" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_delete" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "branch_claim" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "commit_publish" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "commit_drop" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "maintain" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
@@ -1536,6 +1545,58 @@ rules:
     allow:
       actors: { group: reviewers }
       actions: [commit_publish]
+      branch_scope: protected
+"#,
+        )
+        .unwrap();
+        let err = branch_scoped.validate().unwrap_err();
+        assert!(err.to_string().contains("unsupported action"));
+    }
+
+    #[test]
+    fn branch_claim_uses_target_branch_scope() {
+        let policy: PolicyConfig = yaml_serde::from_str(
+            r#"
+version: 1
+groups:
+  owners: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: owners-claim
+    allow:
+      actors: { group: owners }
+      actions: [branch_claim]
+      target_branch_scope: protected
+"#,
+        )
+        .unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+        let claim: PolicyAction = "branch_claim".parse().unwrap();
+        assert_eq!(claim.as_str(), "branch_claim");
+        for (branch, allowed) in [("main", true), ("feature", false)] {
+            let decision = engine
+                .authorize(
+                    "act-ragnor",
+                    &PolicyRequest {
+                        action: claim,
+                        branch: None,
+                        target_branch: Some(branch.to_string()),
+                    },
+                )
+                .unwrap();
+            assert_eq!(decision.allowed, allowed, "branch_claim on {branch}");
+        }
+
+        let branch_scoped: PolicyConfig = yaml_serde::from_str(
+            r#"
+version: 1
+groups:
+  owners: [act-ragnor]
+rules:
+  - id: bad
+    allow:
+      actors: { group: owners }
+      actions: [branch_claim]
       branch_scope: protected
 "#,
         )
