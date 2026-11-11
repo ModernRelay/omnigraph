@@ -51,6 +51,9 @@ on every member; nullability and enum domains widen.
 statements using selections. Full selected-table sizes count before scans, even
 for selective neighborhoods. A result limit cannot replace this cap. Exhaustion
 terminates the query with an error; received rows do not become partial success.
+On a server a request cannot raise it past the server's ceiling (the larger of
+its process default and 1000000); ask the operator to raise
+`OMNIGRAPH_TRAVERSAL_WORK_LIMIT` instead.
 Historical wildcard targets are refused. Stored-query validation can refuse a
 schema addition that would invalidate a wildcard common-property reference.
 See [traversal](../../docs/user/queries/traversal.md) and
