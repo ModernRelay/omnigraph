@@ -920,7 +920,10 @@ mod tests {
             config.witness,
             Arc::new(AtomicBool::new(false)),
             DEFAULT_SHUTDOWN_GRACE,
-        );
+        )
+        // The deployed graph has no policy; the operator token reads it
+        // through the opt-in, since this test is about the handoff, not policy.
+        .with_reads_without_policy(true);
         super::deployment::initialize_boot_activation(&state);
         let app = super::build_app(state);
         let (code, ready) = response(&app, "GET", "/readyz", Value::Null).await;

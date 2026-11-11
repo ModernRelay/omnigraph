@@ -344,6 +344,30 @@ fn rfc023_external_writer_process() {
                     db.branch_create("t").await.unwrap();
                     db.load("t", &payload, mode).await.unwrap();
                 }
+                "branch_claim" => {
+                    let (branch, epoch) = payload.split_once('=').expect("<branch>=<epoch>");
+                    assert_eq!(
+                        db.claim_branch_writer(branch).await.unwrap(),
+                        epoch.parse::<u64>().unwrap()
+                    );
+                }
+                "branch_claim_then_load" => {
+                    let (epoch, row) = payload.split_once('=').expect("<epoch>=<row>");
+                    assert_eq!(
+                        db.claim_branch_writer("main").await.unwrap(),
+                        epoch.parse::<u64>().unwrap()
+                    );
+                    db.load("main", row, mode).await.unwrap();
+                }
+                "branch_delete" | "branch_recreate" | "branch_recreate_and_claim" => {
+                    db.branch_delete(&payload).await.unwrap();
+                    if action != "branch_delete" {
+                        db.branch_create(&payload).await.unwrap();
+                    }
+                    if action == "branch_recreate_and_claim" {
+                        assert_eq!(db.claim_branch_writer(&payload).await.unwrap(), 1);
+                    }
+                }
                 other => panic!("unknown external writer action '{other}'"),
             }
         });
@@ -11446,5 +11470,682 @@ async fn concurrent_stale_refreshes_on_one_handle_keep_the_newest_installed() {
             .await
             .unwrap();
         assert_eq!(rows.num_rows(), 1, "{name} after the newest install");
+    }
+}
+
+/// Run `action` on `payload` in a second process on `uri`: it holds no writer
+/// epoch of its own and shares none of this process's gates.
+async fn second_process(
+    uri: &str,
+    action: &'static str,
+    payload: &str,
+) -> std::result::Result<(), String> {
+    let (uri, payload) = (uri.to_string(), payload.to_string());
+    tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer_action(uri, LoadMode::Append, payload, action)
+    })
+    .await
+    .unwrap()
+}
+
+/// The epochs of a `WriterFenced` refusal: held, read, current.
+fn writer_fenced(error: OmniError) -> (Option<u64>, Option<u64>, u64) {
+    match error.into_completion_evidence().0 {
+        OmniError::Manifest(manifest) => match manifest.details {
+            Some(omnigraph::error::ManifestConflictDetails::WriterFenced {
+                held,
+                read,
+                current,
+            }) => (held, read, current),
+            details => panic!(
+                "not a writer-fenced refusal: {details:?}: {}",
+                manifest.message
+            ),
+        },
+        other => panic!("not a writer-fenced refusal: {other:?}"),
+    }
+}
+
+async fn try_insert(db: &Session, branch: &str, name: &str) -> omnigraph::error::Result<()> {
+    db.mutate(
+        branch,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", name)], &[("$age", 30)]),
+    )
+    .await
+    .map(|_| ())
+}
+
+fn person_row(name: &str) -> String {
+    format!(r#"{{"type":"Person","data":{{"name":"{name}","age":50}}}}"#)
+}
+
+/// A second process claims `main` while the owner's publish is parked before
+/// its `__manifest` put: the publish is refused with nothing written, and the
+/// refusal leaves the owner holding nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_fences_a_publish_parked_before_its_put() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+    let people = count_rows(&db, "node:Person").await;
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_PRE_MERGE);
+    let owner = Arc::clone(&db);
+    let write = tokio::spawn(async move { try_insert(&owner, "main", "fenced-out").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_claim", "main=2")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = write
+        .await
+        .unwrap()
+        .expect_err("a claim landed below the parked put");
+    assert_eq!(writer_fenced(refused), (Some(1), None, 2));
+    let next = try_insert(&db, "main", "still-fenced")
+        .await
+        .expect_err("the owner was fenced");
+    assert_eq!(
+        writer_fenced(next),
+        (None, None, 2),
+        "the refusal cleared what the owner held"
+    );
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(count_rows(&reader, "node:Person").await, people);
+}
+
+/// A claim parked before its put loses that version to a write of the
+/// generation it fences: the claim lands one version above, and the next
+/// write by a process that holds nothing is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_lands_above_a_late_write_and_fences_the_next() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    let people = count_rows(&db, "node:Person").await;
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_PRE_MERGE);
+    let claimer = Arc::clone(&db);
+    let claim = tokio::spawn(async move { claimer.claim_branch_writer("main").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "load", &person_row("late-writer"))
+        .await
+        .unwrap();
+    parked.release();
+    assert_eq!(claim.await.unwrap().unwrap(), 1);
+
+    let refused = second_process(&uri, "load", &person_row("fenced-writer"))
+        .await
+        .expect_err("the branch is claimed and that process holds nothing");
+    assert!(
+        refused.contains("WriterFenced { held: None, read: None, current: 1 }"),
+        "{refused}"
+    );
+    insert_person(&db, "main", "owner-writer").await;
+    let names = collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    assert_eq!(names.len(), people + 2, "{names:?}");
+    for (name, present) in [
+        ("late-writer", true),
+        ("owner-writer", true),
+        ("fenced-writer", false),
+    ] {
+        assert_eq!(names.iter().any(|row| row == name), present, "{name}");
+    }
+}
+
+/// Two processes claim `main` at once: the claim that loses the version is
+/// refused with the epoch it read, and a later claim is a takeover that lands
+/// above the winner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_race_refuses_the_loser_with_the_epoch_it_read() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_PRE_MERGE);
+    let claimer = Arc::clone(&db);
+    let claim = tokio::spawn(async move { claimer.claim_branch_writer("main").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_claim", "main=1")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = claim
+        .await
+        .unwrap()
+        .expect_err("the other claim took the version");
+    assert_eq!(writer_fenced(refused), (None, Some(0), 1));
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 2);
+    insert_person(&db, "main", "second-owner").await;
+}
+
+/// A branch whose claiming process has exited has no owner: every writer is
+/// refused until it claims, and the owner's own claim answers its epoch and
+/// writes no version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_is_required_of_every_writer_once_a_branch_is_claimed() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    second_process(&uri, "branch_claim", "main=1")
+        .await
+        .unwrap();
+
+    let refused = try_insert(&db, "main", "no-owner")
+        .await
+        .expect_err("the claimer exited and this process holds nothing");
+    assert_eq!(writer_fenced(refused), (None, None, 1));
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 2);
+    let version = version_main(&db).await.unwrap();
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 2);
+    assert_eq!(version_main(&db).await.unwrap(), version);
+    insert_person(&db, "main", "owner").await;
+}
+
+/// A second process claims `main` while a schema apply is parked before its
+/// effects: the apply's publication is refused by the epoch and the schema
+/// stays as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_refuses_a_parked_schema_apply() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(helpers::session(
+        Omnigraph::init(&uri, SCHEMA_V1).await.unwrap(),
+    ));
+
+    let parked =
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT);
+    let applier = Arc::clone(&db);
+    let apply = tokio::spawn(async move { applier.apply_schema(SCHEMA_V2_ADDED_TYPE).await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_claim", "main=1")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = apply
+        .await
+        .unwrap()
+        .expect_err("the claim fenced the applying process");
+    assert_eq!(writer_fenced(refused), (None, None, 1));
+    let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert!(!reopened.schema_source().contains("Company"));
+}
+
+/// A second process deletes `feature` and creates it again while a claim of
+/// it waits to load: the name now names another branch, and the claim is
+/// refused on the branch identity it captured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_refuses_a_branch_recreated_under_its_name() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_LOAD_STATE);
+    let claimer = Arc::clone(&db);
+    let claim = tokio::spawn(async move { claimer.claim_branch_writer("feature").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_recreate", "feature")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = claim
+        .await
+        .unwrap()
+        .expect_err("the incarnation the claim captured is gone");
+    assert!(
+        matches!(
+            refused.into_completion_evidence().0,
+            OmniError::Manifest(manifest) if matches!(
+                &manifest.details,
+                Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged { member, .. })
+                    if member == "branch_identifier:feature"
+            )
+        ),
+        "the refusal names the branch identity"
+    );
+    assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+}
+
+/// What a process held on a deleted branch does not count on the branch
+/// created again under its name, equal epochs included: its publish there is
+/// refused as a process that holds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_of_a_deleted_branch_does_not_count_on_its_successor() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    let people = count_rows(&db, "node:Person").await;
+    db.branch_create("feature").await.unwrap();
+    assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+    insert_person(&db, "feature", "first-life").await;
+
+    second_process(&uri, "branch_recreate_and_claim", "feature")
+        .await
+        .unwrap();
+    let refused = try_insert(&db, "feature", "second-life")
+        .await
+        .expect_err("the epoch held on the deleted branch is not this branch's");
+    assert_eq!(writer_fenced(refused), (None, None, 1));
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        helpers::count_rows_branch(&reader, "feature", "node:Person").await,
+        people
+    );
+}
+
+/// A claim whose acknowledgement is lost reads the version it attempted,
+/// finds its own attempt there and answers the epoch: the process holds the
+/// branch and its next write lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_settles_a_lost_acknowledgement_from_the_version_it_wrote() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let version = version_main(&db).await.unwrap();
+
+    let claimed = {
+        let _lost = catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1);
+        db.claim_branch_writer("main").await
+    };
+    assert_eq!(claimed.unwrap(), 1);
+    assert_eq!(version_main(&db).await.unwrap(), version + 1);
+    insert_person(&db, "main", "after-the-lost-acknowledgement").await;
+}
+
+/// A claim that can read neither its acknowledgement nor the version it
+/// attempted is in doubt and holds nothing; the next claim settles it by
+/// landing above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_in_doubt_is_settled_by_the_next_claim() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    let unsettled = {
+        let _lost = catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1);
+        let _unread = catalog::PUBLISH_READ_BACK.fail_once_at(1);
+        db.claim_branch_writer("main").await
+    }
+    .expect_err("neither the acknowledgement nor the version was read");
+    assert!(unsettled.is_manifest_publish_in_doubt(), "{unsettled}");
+    assert!(
+        unsettled
+            .to_string()
+            .contains("writer epoch claim outcome is in doubt"),
+        "{unsettled}"
+    );
+
+    let refused = try_insert(&db, "main", "unsettled")
+        .await
+        .expect_err("the claim landed and this process does not hold it");
+    assert_eq!(writer_fenced(refused), (None, None, 1));
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 2);
+    insert_person(&db, "main", "settled").await;
+}
+
+/// A merge of a claimed fork into its claimed branch keeps the branch's own
+/// epoch: the owner's claim answers it and writes no version, and a process
+/// that holds nothing is still refused there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_survives_a_merge_of_a_claimed_fork_into_its_branch() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    let people = count_rows(&db, "node:Person").await;
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+    db.branch_create("feature").await.unwrap();
+    assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+    insert_person(&db, "feature", "merged-in").await;
+    db.branch_merge("feature", "main").await.unwrap();
+
+    let version = version_main(&db).await.unwrap();
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+    assert_eq!(version_main(&db).await.unwrap(), version);
+    let refused = second_process(&uri, "load", &person_row("fenced-writer"))
+        .await
+        .expect_err("the branch is claimed and that process holds nothing");
+    assert!(
+        refused.contains("WriterFenced { held: None, read: None, current: 1 }"),
+        "{refused}"
+    );
+    let names = collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    assert_eq!(names.len(), people + 1, "{names:?}");
+    assert!(names.iter().any(|row| row == "merged-in"), "{names:?}");
+}
+
+/// A ref delete asserts no epoch: a process that holds nothing deletes a
+/// branch another process claimed, and the branch created again under its
+/// name is at epoch 0 and takes that process's write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_does_not_refuse_deleting_the_branch() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    let people = count_rows(&db, "node:Person").await;
+    db.branch_create("feature").await.unwrap();
+    second_process(&uri, "branch_claim", "feature=1")
+        .await
+        .unwrap();
+
+    db.branch_delete("feature").await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    insert_person(&db, "feature", "second-life").await;
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        people + 1
+    );
+}
+
+/// A merge publishes on its target: a process that holds nothing is refused
+/// merging its own unclaimed fork into a branch another process claimed, and
+/// that branch keeps the rows it held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_refuses_a_non_holders_merge_into_the_branch() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    second_process(&uri, "branch_claim", "main=1")
+        .await
+        .unwrap();
+    db.branch_create("feature").await.unwrap();
+    insert_person(&db, "feature", "never-merged").await;
+    let held = collect_column_strings(&read_table(&db, "node:Person").await, "name");
+
+    let refused = db
+        .branch_merge("feature", "main")
+        .await
+        .map(|_| ())
+        .expect_err("a process holding nothing merged into a claimed branch");
+    assert_eq!(writer_fenced(refused), (None, None, 1));
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let names = collect_column_strings(&read_table(&reader, "node:Person").await, "name");
+    assert_eq!(names, held);
+    assert!(!names.iter().any(|row| row == "never-merged"), "{names:?}");
+}
+
+/// Insert `name` on `main` and drop the write's future after its `__manifest`
+/// commit is durable and before the publisher records it: the acknowledgement
+/// is lost and the write is aborted while its read-back is parked.
+async fn insert_dropped_after_its_commit(db: &Arc<Session>, name: &'static str) {
+    let _lost = catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1);
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_READ_BACK);
+    let owner = Arc::clone(db);
+    let write = tokio::spawn(async move { try_insert(&owner, "main", name).await });
+    parked.wait_until_reached().await;
+    write.abort();
+    parked.release();
+    let dropped = write.await.expect_err("the write's future ran to its end");
+    assert!(dropped.is_cancelled(), "{dropped}");
+    assert!(!parked.timed_out(), "released, not timed out");
+}
+
+/// A write whose future is dropped after its commit landed is read by the
+/// handle that wrote it, and that handle's next write lands, whether or not
+/// the process holds the branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_owner_reads_a_write_whose_future_was_dropped_after_its_commit() {
+    for claim in [false, true] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = Arc::new(init_and_load(&dir).await);
+        if claim {
+            assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+        }
+        let people = count_rows(&db, "node:Person").await;
+
+        insert_dropped_after_its_commit(&db, "dropped-after-commit").await;
+        let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        assert_eq!(
+            count_rows(&reader, "node:Person").await,
+            people + 1,
+            "claim={claim}: the dropped write committed"
+        );
+
+        assert_eq!(
+            count_rows(&db, "node:Person").await,
+            people + 1,
+            "claim={claim}: the writing handle reads the write"
+        );
+        insert_person(&db, "main", "after-the-dropped-write").await;
+        assert_eq!(count_rows(&db, "node:Person").await, people + 2);
+    }
+}
+
+/// The handle that wrote a row in a write whose future was dropped after its
+/// commit deletes that row, whether or not the process holds the branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_owner_deletes_a_row_whose_write_future_was_dropped() {
+    for claim in [false, true] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = Arc::new(init_and_load(&dir).await);
+        if claim {
+            assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+        }
+        let people = count_rows(&db, "node:Person").await;
+
+        insert_dropped_after_its_commit(&db, "dropped-after-commit").await;
+        let deleted = db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "remove_person",
+                &mixed_params(&[("$name", "dropped-after-commit")], &[]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.affected_nodes, 1, "claim={claim}");
+        let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        assert_eq!(
+            count_rows(&reader, "node:Person").await,
+            people,
+            "claim={claim}: the row is gone from the store"
+        );
+    }
+}
+
+/// A second process claims `main` at `epoch` and writes `name` there.
+async fn claim_and_write_in_a_second_process(uri: &str, epoch: u64, name: &str) {
+    second_process(
+        uri,
+        "branch_claim_then_load",
+        &format!("{epoch}={}", person_row(name)),
+    )
+    .await
+    .unwrap();
+}
+
+/// A replaced owner reads from before the claim until a write of its own is
+/// refused. Its delete of a row its successor wrote matches nothing in its
+/// view and is fenced all the same: the row stays and the stale reads end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_replaced_owner_is_refused_a_delete_that_matches_nothing_in_its_view() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+    let people = count_rows(&db, "node:Person").await;
+    claim_and_write_in_a_second_process(&uri, 2, "successor-row").await;
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        people,
+        "a replaced owner reads from before the claim"
+    );
+
+    let refused = db
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "remove_person",
+            &mixed_params(&[("$name", "successor-row")], &[]),
+        )
+        .await
+        .map(|deleted| deleted.affected_nodes)
+        .expect_err("a replaced owner's delete answered from its stale view");
+    assert_eq!(writer_fenced(refused), (Some(1), None, 2));
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        people + 1,
+        "the stale reads end with the refused delete"
+    );
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(count_rows(&reader, "node:Person").await, people + 1);
+}
+
+/// A replaced owner whose next claim stays in doubt holds no version from
+/// before that claim: its handle probes from then on, and reads what a later
+/// owner writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_in_doubt_withdraws_the_version_a_replaced_owner_held() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+    let people = count_rows(&db, "node:Person").await;
+    claim_and_write_in_a_second_process(&uri, 2, "successor-row").await;
+
+    let unsettled = {
+        let _lost = catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1);
+        let _unread = catalog::PUBLISH_READ_BACK.fail_once_at(1);
+        db.claim_branch_writer("main").await
+    }
+    .expect_err("neither the acknowledgement nor the version was read");
+    assert!(unsettled.is_manifest_publish_in_doubt(), "{unsettled}");
+    claim_and_write_in_a_second_process(&uri, 4, "later-row").await;
+    assert_eq!(count_rows(&db, "node:Person").await, people + 2);
+}
+
+/// What a read of `feature` on `db` finds for the `Person` named `name`.
+async fn people_named_on_feature(
+    db: &Session,
+    name: &str,
+) -> std::result::Result<usize, OmniError> {
+    db.query(
+        ReadTarget::branch("feature"),
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", name)]),
+    )
+    .await
+    .map(|rows| rows.num_rows())
+    .map_err(|error| error.into_completion_evidence().0)
+}
+
+/// After a process deletes a branch it holds, a handle bound to the branch
+/// probes again: it reads the branch as gone and then the branch created
+/// again, as it does when the process never claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_ends_when_its_process_deletes_the_branch() {
+    for claim in [false, true] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = init_and_load(&dir).await;
+        db.branch_create("feature").await.unwrap();
+        db.sync_branch("feature").await.unwrap();
+        if claim {
+            assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+        }
+        insert_person(&db, "feature", "first-life").await;
+
+        let sibling = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        sibling.branch_delete("feature").await.unwrap();
+        let gone = people_named_on_feature(&db, "first-life").await;
+        assert!(
+            matches!(gone, Err(OmniError::BranchNotFound { .. })),
+            "claim={claim}: the bound handle read the deleted branch as {gone:?}"
+        );
+        sibling.branch_create("feature").await.unwrap();
+        assert_eq!(
+            people_named_on_feature(&db, "first-life").await.unwrap(),
+            0,
+            "claim={claim}: the branch created again holds no row of the deleted one"
+        );
+    }
+}
+
+/// Another process's delete of a branch asserts no epoch and reaches the owner
+/// by no path but a probe, so a handle bound to the held branch serves the
+/// deleted incarnation until a publish of its own loads the branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_owner_serves_a_bound_branch_deleted_under_it_until_its_next_write() {
+    for recreated in [false, true] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = init_and_load(&dir).await;
+        db.branch_create("feature").await.unwrap();
+        db.sync_branch("feature").await.unwrap();
+        assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+        insert_person(&db, "feature", "first-life").await;
+
+        let action = if recreated {
+            "branch_recreate"
+        } else {
+            "branch_delete"
+        };
+        second_process(&uri, action, "feature").await.unwrap();
+        assert_eq!(
+            people_named_on_feature(&db, "first-life").await.unwrap(),
+            1,
+            "recreated={recreated}: the owner reads the deleted incarnation"
+        );
+
+        let wrote = try_insert(&db, "feature", "next-write").await;
+        let first_life = people_named_on_feature(&db, "first-life").await;
+        if recreated {
+            wrote.expect("the write lands on the branch created again, at epoch 0");
+            assert!(
+                matches!(first_life, Ok(0)),
+                "the handle probes again after its write: {first_life:?}"
+            );
+            assert_eq!(people_named_on_feature(&db, "next-write").await.unwrap(), 1);
+        } else {
+            wrote.expect_err("the write finds the branch gone");
+            assert!(
+                matches!(first_life, Err(OmniError::BranchNotFound { .. })),
+                "the handle probes again after its write: {first_life:?}"
+            );
+        }
     }
 }

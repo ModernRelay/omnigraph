@@ -411,6 +411,24 @@ impl GraphCoordinator {
         self.manifest.probe_latest_incarnation().await
     }
 
+    /// Whether the head this coordinator holds is the branch's latest: no
+    /// request while this process holds the branch, whose head no other
+    /// process can move, and the probe otherwise.
+    pub(crate) async fn head_is_current(&self) -> Result<bool> {
+        if let Some(landed) = self.manifest.held_writer_version() {
+            return Ok(self.manifest.version() >= landed);
+        }
+        let held = self.manifest_incarnation();
+        Ok(self.probe_latest_incarnation().await?.matches(&held))
+    }
+
+    /// The version of this process's last publication on this branch while
+    /// it holds the branch with that publication on record, so
+    /// [`Self::head_is_current`] answers without a probe.
+    pub(crate) fn held_head(&self) -> Option<u64> {
+        self.manifest.held_writer_version()
+    }
+
     /// The lineage of the head this coordinator holds. Every operation that
     /// asks for history reads it here; the read of `__history` behind it is
     /// skipped while the history cache holds the head's parents.
@@ -593,35 +611,31 @@ impl GraphCoordinator {
     pub async fn resolve_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
         let normalized = normalize_branch_name(branch)?;
         let opened;
-        let coordinator = if normalized.as_deref() == self.current_branch()
-            && self
-                .probe_latest_incarnation()
-                .await?
-                .matches(&self.manifest_incarnation())
-        {
-            self
-        } else {
-            opened = match normalized.as_deref() {
-                Some(branch) => {
-                    GraphCoordinator::open_branch_with_session(
-                        self.root_uri(),
-                        branch,
-                        Arc::clone(&self.storage),
-                        &self.manifest.control_session(),
-                    )
-                    .await?
-                }
-                None => {
-                    GraphCoordinator::open_with_session(
-                        self.root_uri(),
-                        Arc::clone(&self.storage),
-                        &self.manifest.control_session(),
-                    )
-                    .await?
-                }
+        let coordinator =
+            if normalized.as_deref() == self.current_branch() && self.head_is_current().await? {
+                self
+            } else {
+                opened = match normalized.as_deref() {
+                    Some(branch) => {
+                        GraphCoordinator::open_branch_with_session(
+                            self.root_uri(),
+                            branch,
+                            Arc::clone(&self.storage),
+                            &self.manifest.control_session(),
+                        )
+                        .await?
+                    }
+                    None => {
+                        GraphCoordinator::open_with_session(
+                            self.root_uri(),
+                            Arc::clone(&self.storage),
+                            &self.manifest.control_session(),
+                        )
+                        .await?
+                    }
+                };
+                &opened
             };
-            &opened
-        };
 
         Ok(coordinator
             .effective_graph_head()
@@ -1121,6 +1135,12 @@ impl GraphCoordinator {
             _snapshot_id: SnapshotId::new(commit.graph_commit_id.clone()),
             commit,
         })
+    }
+
+    /// Claim this coordinator's branch for the process, on the incarnation
+    /// this view captured when it opened.
+    pub(crate) async fn claim_writer_epoch(&mut self) -> Result<u64> {
+        self.manifest.claim_writer_epoch().await
     }
 
     /// Mint a [`LineageIntent`] for the next commit on the current branch: a

@@ -373,6 +373,7 @@ impl Failure {
             || output.precondition_failure.is_some()
             || output.blob_precondition_failure.is_some()
             || output.read_set_conflict.is_some()
+            || output.writer_fenced.is_some()
             || output.published_dataset_version_conflict.is_some()
             || output.key_conflict.is_some()
             || output.resource_limit.is_some()
@@ -467,6 +468,7 @@ pub(crate) fn is_plain_refusal(output: &ErrorOutput) -> bool {
     output.merge_conflicts.is_empty()
         && output.published_dataset_version_conflict.is_none()
         && output.read_set_conflict.is_none()
+        && output.writer_fenced.is_none()
         && output.key_conflict.is_none()
         && output.resource_limit.is_none()
         && output.blob_range.is_none()
@@ -550,6 +552,26 @@ mod tests {
             assert_eq!(disposition(&failure)["action"], action, "{message}");
             assert_eq!(failure.exit, crate::EXIT_OUTCOME_UNKNOWN, "{message}");
         }
+    }
+
+    /// An embedded write a claimed branch refused wrote nothing: it exits 1
+    /// with the refusal's own code and epochs, and asks for a refresh.
+    #[test]
+    fn branch_claim_refusal_of_an_embedded_write_exits_1_and_asks_for_a_refresh() {
+        let refused = Failure::classify(
+            EngineWriteError(OmniError::manifest_writer_fenced("main", None, None, 1)).into(),
+            embedded_write(),
+        );
+        assert_eq!(refused.exit, 1);
+        assert_eq!(refused.output.code, Some(ErrorCode::WriterFenced));
+        assert_eq!(
+            disposition(&refused),
+            serde_json::json!({"effects":"none","action":"refresh"}),
+        );
+        assert_eq!(
+            serde_json::to_value(&refused.output.writer_fenced).unwrap(),
+            serde_json::json!({"current": 1}),
+        );
     }
 
     /// A read changes nothing, so an engine error never has unknown effects.

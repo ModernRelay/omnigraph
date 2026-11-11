@@ -460,6 +460,18 @@ async fn single_insert_data_write_is_bounded() {
     );
 }
 
+/// The writer epoch check reads what the publish already loaded, so holding a
+/// branch costs a write no request.
+#[tokio::test]
+async fn branch_claim_adds_no_request_to_a_write() {
+    let (unclaimed, held) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    helpers::cost::assert_branch_claim_adds_no_request_to_a_write(
+        &local_graph(&unclaimed).await,
+        &local_graph(&held).await,
+    )
+    .await;
+}
+
 /// At a fixed shallow depth, the per-write object-store read count is below a
 /// documented ceiling. Fails the moment a change *adds* a round-trip on the write
 /// path — the "no new round-trip" guard.

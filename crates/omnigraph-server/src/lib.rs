@@ -531,6 +531,7 @@ enum ApiErrorDetails {
     MergeConflicts(Vec<api::MergeConflictOutput>),
     PublishedDatasetVersionConflict(api::PublishedDatasetVersionConflictOutput),
     ReadSetConflict(api::ReadSetConflictOutput),
+    WriterFenced(api::WriterFencedOutput),
     KeyConflict(api::KeyConflictOutput),
     ResourceLimit(api::ResourceLimitOutput),
     BlobRange(api::BlobRangeOutput),
@@ -569,6 +570,7 @@ impl ApiErrorDetails {
             Self::MergeConflicts(_)
             | Self::PublishedDatasetVersionConflict(_)
             | Self::ReadSetConflict(_)
+            | Self::WriterFenced(_)
             | Self::KeyConflict(_)
             | Self::ResourceLimit(_)
             | Self::ExternalBlobSource(_)
@@ -1391,6 +1393,13 @@ impl ApiError {
         Self::conflict(message).with_details(ApiErrorDetails::ReadSetConflict(details))
     }
 
+    /// HTTP 409 `writer_fenced`: the branch's writer epoch refused a publish
+    /// or a claim before its put, with the `writer_fenced` detail.
+    fn writer_fenced(message: String, details: api::WriterFencedOutput) -> Self {
+        Self::new(ErrorCode::WriterFenced, message)
+            .with_details(ApiErrorDetails::WriterFenced(details))
+    }
+
     fn key_conflict(message: String, details: api::KeyConflictOutput) -> Self {
         Self::conflict(message).with_details(ApiErrorDetails::KeyConflict(details))
     }
@@ -1627,6 +1636,18 @@ impl ApiError {
                     Some(ManifestConflictDetails::UnattachedCannotPublish { .. }) => {
                         Self::unattached_cannot_publish(err.message)
                     }
+                    Some(ManifestConflictDetails::WriterFenced {
+                        held,
+                        read,
+                        current,
+                    }) => Self::writer_fenced(
+                        err.message,
+                        api::WriterFencedOutput {
+                            held,
+                            read,
+                            current,
+                        },
+                    ),
                     _ => Self::conflict(err.message),
                 },
                 ManifestErrorKind::Internal => Self::internal(err.message),
@@ -2017,6 +2038,7 @@ impl ApiError {
                     output.published_dataset_version_conflict = Some(value)
                 }
                 ApiErrorDetails::ReadSetConflict(value) => output.read_set_conflict = Some(value),
+                ApiErrorDetails::WriterFenced(value) => output.writer_fenced = Some(value),
                 ApiErrorDetails::KeyConflict(value) => output.key_conflict = Some(value),
                 ApiErrorDetails::ResourceLimit(value) => output.resource_limit = Some(value),
                 ApiErrorDetails::BlobRange(value) => output.blob_range = Some(value),
@@ -2222,6 +2244,53 @@ mod api_error_tests {
         assert_eq!(details.expected_published_dataset_version, 7);
         assert_eq!(details.actual_published_dataset_version, 9);
         assert!(!error.error.contains("edge:Knows"));
+    }
+
+    #[tokio::test]
+    async fn branch_claim_refusal_is_409_writer_fenced_with_its_epochs() {
+        async fn body_of(error: ApiError) -> serde_json::Value {
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let publish = body_of(
+            ApiError::from_omni(OmniError::manifest_writer_fenced(
+                "feature",
+                Some(1),
+                None,
+                2,
+            ))
+            .after_owned_write(),
+        )
+        .await;
+        assert_eq!(publish["code"], "writer_fenced", "{publish}");
+        assert_eq!(
+            publish["writer_fenced"],
+            serde_json::json!({"held": 1, "current": 2}),
+            "{publish}"
+        );
+        assert_eq!(
+            publish["disposition"],
+            serde_json::json!({"effects": "none", "action": "refresh"}),
+            "{publish}"
+        );
+
+        let claim = body_of(ApiError::from_omni(OmniError::manifest_writer_fenced(
+            "feature",
+            None,
+            Some(0),
+            1,
+        )))
+        .await;
+        assert_eq!(
+            claim["writer_fenced"],
+            serde_json::json!({"read": 0, "current": 1}),
+            "{claim}"
+        );
     }
 
     #[tokio::test]
