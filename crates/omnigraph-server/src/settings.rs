@@ -615,10 +615,47 @@ pub(crate) fn parse_bearer_tokens_json(value: &str) -> Result<Vec<(String, Strin
 }
 
 pub(crate) fn read_bearer_tokens_file(path: &str) -> Result<Vec<(String, String)>> {
+    check_bearer_tokens_file_permissions(path)?;
     let contents = fs::read_to_string(path)
         .wrap_err_with(|| format!("failed to read bearer tokens file at {path}"))?;
     parse_bearer_tokens_json(&contents)
         .wrap_err_with(|| format!("failed to parse bearer tokens file at {path}"))
+}
+
+/// Refuse a bearer-tokens file another account can write, which could add a
+/// token for any actor, and warn when another account can read it. The mode
+/// is the file's own, after following symlinks: a Kubernetes secret mount is a
+/// symlink whose target carries the volume's `defaultMode` (0644 unless set),
+/// so readable-by-others warns rather than refuses.
+#[cfg(unix)]
+fn check_bearer_tokens_file_permissions(path: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path)
+        .wrap_err_with(|| format!("failed to read bearer tokens file at {path}"))?;
+    if !metadata.is_file() {
+        bail!("bearer tokens file at {path} is not a regular file");
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o022 != 0 {
+        bail!(
+            "bearer tokens file at {path} is writable by other accounts (mode {mode:03o}); \
+             restrict it with `chmod 600 {path}`"
+        );
+    }
+    if mode & 0o044 != 0 {
+        warn!(
+            mode = %format!("{mode:03o}"),
+            "bearer tokens file is readable by other accounts; restrict it with chmod 600 \
+             (or a Kubernetes secret volume's defaultMode: 0400)"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_bearer_tokens_file_permissions(_path: &str) -> Result<()> {
+    Ok(())
 }
 
 pub(crate) fn validate_bearer_tokens(
@@ -1520,6 +1557,11 @@ mod tests {
             r#"{"team-01":"token-one","team-02":"token-two"}"#,
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tokens_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
 
         let _guard = EnvGuard::set(&[
             ("OMNIGRAPH_SERVER_BEARER_TOKEN", Some(" legacy-token ")),
@@ -1539,6 +1581,46 @@ mod tests {
                 ("team-02".to_string(), "token-two".to_string()),
             ]
         );
+    }
+
+    /// A tokens file another account can write is refused before it is read;
+    /// one it can only read is accepted with a warning, which keeps the
+    /// default Kubernetes secret mode (0644) working.
+    #[cfg(unix)]
+    #[test]
+    fn bearer_tokens_file_writable_by_others_is_refused() {
+        use super::read_bearer_tokens_file;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tokens.json");
+        fs::write(&path, r#"{"team-01":"token-one"}"#).unwrap();
+        for (mode, refused) in [
+            (0o600, false),
+            (0o400, false),
+            (0o640, false),
+            (0o644, false),
+            (0o620, true),
+            (0o602, true),
+            (0o666, true),
+        ] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let result = read_bearer_tokens_file(path.to_str().unwrap());
+            assert_eq!(result.is_err(), refused, "mode {mode:03o}: {result:?}");
+            if refused {
+                assert!(
+                    result.unwrap_err().to_string().contains("chmod 600"),
+                    "mode {mode:03o}"
+                );
+            }
+        }
+        // A symlink is judged by its target, as a Kubernetes mount is.
+        let link = temp.path().join("link.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_bearer_tokens_file(link.to_str().unwrap()).is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_bearer_tokens_file(link.to_str().unwrap()).is_err());
     }
 
     /// Every file under `root` with its bytes, so a boot attempt can prove it
