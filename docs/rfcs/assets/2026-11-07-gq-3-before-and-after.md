@@ -8,8 +8,8 @@ supported** and only the edition 3 form is shown. Where the two are the
 same, the text is shown once and marked unchanged.
 
 Edition 2 text is checked against today's `query.pest`. Edition 3 text is
-the RFC's grammar as of its 2026-11-07 decision log; every edition 3 file
-begins with `gq 3;`, omitted below.
+the RFC's grammar as of its 2026-11-10 decision log; edition 3 has no
+edition line.
 
 ## The schema, shared by every example
 
@@ -712,8 +712,8 @@ query namespaced() {
 ## 8. Statements outside a declaration
 
 Unchanged in both editions: `show`, `branch`, `commit`, `load`, `explain`,
-and the `set` settings. Edition 3 adds the edition line `gq 3;` at the top
-of a file and nothing else at this level.
+and the `set` settings. Edition 3 adds nothing at this level and has no
+edition line.
 
 ## What the rewriter does to the edition 2 column
 
@@ -721,6 +721,8 @@ Every edition 2 example above that differs from its edition 3 form is one of
 the seven rewriter rows: the infix string predicates, the list `contains`,
 the positional `fuzzy` option, `nearest` and `bm25` out of `order` and
 `return`, `rrf` out of `order`, and the `where` on `update` and `delete`.
-`queries migrate` applies all seven; six are proved IR-equal and the `rrf`
+The one-shot rewriter applied all seven to this repository's text, and no
+shipped command does; a stored source in the old syntax fails with a
+diagnostic whose fix applies the row; six are proved IR-equal and the `rrf`
 row rows-equal. Every "Not supported" above is new text that
 edition 2 never parsed, so it rewrites nothing.

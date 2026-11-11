@@ -21,7 +21,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 
 | GQ 3 | GQL | Cypher | SQL | Datalog |
 |---|---|---|---|---|
-| `gq 3;` edition line (`edition`) | none; `SESSION SET` for session state | `CYPHER 5` / `CYPHER 25` query prefix (Neo4j 5) | none; `SET` for session state (PG) | none; `.pragma` (Soufflé) |
+| none: one grammar, no edition line | none; `SESSION SET` for session state | `CYPHER 5` / `CYPHER 25` query prefix (Neo4j 5) | none; `SET` for session state (PG) | none; `.pragma` (Soufflé) |
 | `query name($p: T = lit) @ann { read_body }`, a stored declared read (`query_decl`) | none in the language; procedures are catalog objects created outside GQL and invoked with `CALL` | none in openCypher; Neo4j has no stored Cypher (APOC `apoc.custom.declareProcedure`) | `CREATE VIEW v AS SELECT …` (no parameters); `CREATE FUNCTION f(p T) RETURNS TABLE (…) AS $$ … $$` (SQL/PSM, PG) | every rule is a named relation: `.decl r(x: T)` and `r(X) :- …` |
 | `query name(…) [as commit \| as unattached branch] { mutation_body }`: the same keyword, the body's shape is the kind | none; write statements run inline inside a transaction | none | `CREATE PROCEDURE` (SQL/PSM) | none; pure Datalog has no writes |
 | several declarations in one request, run on one snapshot and answered with one result each (a request shape, no keyword) | a procedure body: statements joined by `NEXT` | a script of `;`-separated statements | a transaction block | a program is a set of rules |
@@ -95,7 +95,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | a `Call` chain fits a plan budget; a monotone cycle is a recursion (`Fix`), a non-monotone one is `T70` | n/a | n/a | a recursive view is refused; `WITH RECURSIVE` is the recursion door | recursion is the point |
 | a relation-valued parameter: refused | none | a list parameter | a table-valued parameter (T-SQL), an array (PG) | an input relation |
 | a relation-valued column: refused | none; `LIST<…>` and `RECORD` values | lists and maps as values | arrays, `ROW`, JSON (PG) | records, ADTs (Soufflé) |
-| union of two reads: no surface form (the core `Union` is reached only by alternation, `<e>` and `optional`) | `UNION [ALL \| DISTINCT]`, `EXCEPT`, `INTERSECT`, `OTHERWISE` | `UNION [ALL]` | `UNION \| INTERSECT \| EXCEPT [ALL]` | two rules with one head |
+| union of two reads: `union(rel, …)`, a relation function lowering to `Union`; alternation and `<e>` are edge selectors inside one `Expand` | `UNION [ALL \| DISTINCT]`, `EXCEPT`, `INTERSECT`, `OTHERWISE` | `UNION [ALL]` | `UNION \| INTERSECT \| EXCEPT [ALL]` | two rules with one head |
 | a list to rows: no form | `FOR x IN list` | `UNWIND list AS x` | `FROM unnest($1)` (PG) | n/a |
 
 ## 7. Ranking and search
@@ -133,12 +133,12 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | `= != < <= > >=`, non-associative (`comp_op`) | `= <> < <= > >=` | `= <> < <= > >=` | `= <> < <= > >=` (`!=` in PG) | `= != < <= > >=` |
 | `x in [list]` (`kw_in` in `comparison`) | `x IN list` | `x IN list` | `x IN (…)`, `x = ANY(array)` | none; a relation |
 | `x is [not] null` (`null_test`) | `IS [NOT] NULL` | `IS [NOT] NULL` | `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM` | no nulls |
-| arithmetic: the core names it and section 7 writes `0.7 * (…) + 0.3 * $lex`, but neither today's grammar nor section 6 has a production for it | `+ - * / %`, unary `-` | `+ - * / % ^`, unary `-` | `+ - * / %`, unary `-` | `+ - * / % ^`, `band bor bxor`, unary `-` (Soufflé) |
-| negative numbers: no unary minus and no signed literal in `query.pest` (`schema.pest` has `signed_integer` for `@range`) | `-1` | `-1` | `-1` | `-1` |
+| arithmetic `+ - * / %` and unary `-`; overflow and a zero divisor are typed errors | `+ - * / %`, unary `-` | `+ - * / % ^`, unary `-` | `+ - * / %`, unary `-` | `+ - * / % ^`, `band bor bxor`, unary `-` (Soufflé) |
+| negative numbers: unary `-` over a literal | `-1` | `-1` | `-1` | `-1` |
 | float literal `1.5` only; no exponent form | `1.5`, `1e3` | `1.5`, `1e3` | `1.5`, `1e3` | `1.5`, `1e3` (Soufflé) |
 | string predicates as registry calls: `starts_with($s, "x")`, `contains($s, "x")`; the infix forms print the call as the fix | none in 39075 (string functions `UPPER`, `TRIM`, `CHAR_LENGTH` and `\|\|` only) | `STARTS WITH`, `ENDS WITH`, `CONTAINS`, `=~` | `LIKE`, `SIMILAR TO`, `~` (PG), `\|\|` | `contains(a, b)`, `match(re, s)`, `cat`, `substr`, `strlen` (Soufflé) |
-| string concatenation: none | `\|\|` | `+`, `\|\|` (Neo4j 5) | `\|\|` | `cat(a, b)` |
-| conditional: none (`CASE`, `coalesce` would be registry rows) | `CASE … END`, `COALESCE`, `NULLIF` | `CASE … END`, `coalesce` | `CASE … END`, `COALESCE`, `NULLIF` | a rule per case |
+| string concatenation: the registry row `concat(a, …)` | `\|\|` | `+`, `\|\|` (Neo4j 5) | `\|\|` | `cat(a, b)` |
+| conditional: the registry rows `if(c, a, b)` and `coalesce(a, …)`, each evaluating only the arguments it selects | `CASE … END`, `COALESCE`, `NULLIF` | `CASE … END`, `coalesce` | `CASE … END`, `COALESCE`, `NULLIF` | a rule per case |
 | type test: `$x.@type = "Person"` today, `$x is Person` once the polymorphism RFC lands | `x IS [NOT] LABELED :Person`, `x IS TYPED INT` | `x:Person`, `labels(x)`, `x IS :: INTEGER` (Neo4j 5) | none in general; `pg_typeof` (PG) | a relation per type |
 | meta-fields `$x.@id`, `$e.@src`, `$e.@dst`, `$e.@type` (`meta_field`) | `ELEMENT_ID(x)`, `e IS SOURCE OF`, `e IS DESTINATION OF` predicates | `elementId(x)`, `startNode(e)`, `endNode(e)`, `type(e)` | columns of the table | arguments |
 | `$x.prop`, one level deep (`prop_access`) | `x.prop`, nested record access `x.a.b` | `x.prop`, `x["prop"]`, map projection `x {.a, .b}` | `t.col`, `(row).field`, `j->'k'` | an argument of the relation |
@@ -212,7 +212,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | exact versus approximate | two operators, the text says which, recall declared | n/a | a function versus a procedure | the planner's choice, undeclared | n/a |
 | order ties | a total order over node identities | unspecified | unspecified | unspecified | n/a |
 | totality | every read terminates with a declared cost bound (A1) | terminates | terminates | `WITH RECURSIVE` need not | stratified Datalog terminates; functors can loop |
-| data complexity | polynomial, degree set by `Correlate`, `Expand` and `Fix` nesting | polynomial with path quantifiers | polynomial; lists widen it | polynomial, recursion included; procedures are Turing complete | polynomial; Turing complete with functors |
+| data complexity | polynomial, its degree composed from the operators' bounds (the RFC's envelope) | polynomial for endpoint reachability under `WALK`; NP-complete to decide under `TRAIL`, `ACYCLIC` or `SIMPLE` with a regular pattern; returning every path can be exponential | trail semantics by default, so path matching is NP-complete in general; lists widen it | polynomial for linear recursion over stored values; unbounded once a recursion computes values; procedures are Turing complete | polynomial; Turing complete with functors |
 | expressive class | stratified Datalog with monotone aggregation, plus ordering and two declared-quality operators; invented values bounded | first-order with counting plus regular path queries | the same with list comprehension | relational algebra plus aggregation, windows and linear recursion | least fixpoint over Horn clauses |
 
 ## 15. Forms the four have and GQ 3 does not, classified
@@ -231,11 +231,11 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | `RETURNING`, `RETURN` after a write | all three | the writes stage (`returning`) |
 | `OFFSET` / `SKIP` | all three | the paging stage |
 | `IS LABELED`, `x:Label` as a predicate | GQL, Cypher | the polymorphism stage (`is`) |
-| `UNION` of two reads | all four | **gap**: the core has `Union`; the surface has no form for a reader to union two reads |
-| a list to rows (`FOR`, `UNWIND`, `unnest`) | GQL, Cypher, SQL | **gap**: `from` takes a relation only, and no form turns a list parameter into rows |
-| arithmetic, unary minus, negative and exponent literals | all four | **gap in the text**: the core and section 7 use arithmetic; section 6 and `query.pest` have no production |
-| `CASE`, `COALESCE`, `NULLIF` | GQL, Cypher, SQL | absent; the registry rule admits `coalesce(a, b)` and `if(c, a, b)` as rows without a grammar change |
-| string concatenation | all four | absent; a registry row (`concat`) |
+| `UNION` of two reads | all four | present as `union(rel, …)` |
+| a list to rows (`FOR`, `UNWIND`, `unnest`) | GQL, Cypher, SQL | absent by decision (the RFC's Alternatives); a relation-typed parameter, stage RP, is the form for rows a client supplies |
+| exponent literals (`1e3`) | all four | absent; arithmetic and unary minus are present |
+| `CASE`, `NULLIF` | GQL, Cypher, SQL | absent as grammar; `if(c, a, b)` and `coalesce(a, …)` are registry rows |
+| `\|\|` concatenation | all four | absent as an operator; the registry row `concat` |
 | `NULL` as a read literal | GQL, Cypher, SQL | refused today; the comparison `is null` covers the common case, `coalesce` would cover the rest |
 | anonymous endpoints `()`, `_` | GQL, Cypher, Datalog | absent by design: every end is a variable |
 | `MERGE` / upsert in the language | Cypher, SQL | outside the language (`load --mode`) |
