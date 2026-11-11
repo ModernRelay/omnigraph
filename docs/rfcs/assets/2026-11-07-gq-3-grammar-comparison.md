@@ -1,9 +1,10 @@
 # GQ 3 against GQL, Cypher, SQL and Datalog, construct by construct
 
 **Status:** evidence asset of the [GQ 3 RFC](../2026-11-07-gq-3.md)
-(2026-11-07). One row per GQ 3 production or semantic rule; the
-four columns give the form the other grammar has for the same job, `none`
-when it has no form, and a note when the nearest form differs in meaning.
+(2026-11-07, surface revised 2026-11-11). One row per GQ 3 production or
+semantic rule; the four columns give the form the other grammar has for the
+same job, `none` when it has no form, and a note when the nearest form
+differs in meaning.
 
 Reference grammars:
 
@@ -33,8 +34,8 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 
 | GQ 3 | GQL | Cypher | SQL | Datalog |
 |---|---|---|---|---|
-| `match { … } return { … } order { … }? limit n?`, fixed order, braces (`read_body`) | a linear statement: `MATCH … [LET \| FOR \| FILTER \| CALL \| ORDER BY \| LIMIT]* RETURN …`, clauses in any order, `NEXT` chains statements | `MATCH … WHERE … WITH … RETURN … ORDER BY … SKIP … LIMIT`, chained freely through `WITH` | `SELECT … FROM … WHERE … GROUP BY … HAVING … ORDER BY … LIMIT`, fixed order | `head(X, Y) :- body.`, no order beyond head and body |
-| clauses separated by whitespace inside `match { }` (`clause+`) | keywords separate statements | keywords | keywords | `,` |
+| `match { … } where φ? return { … } order { … }? limit n?`, fixed order, braces (`read_body`) | a linear statement: `MATCH … [LET \| FOR \| FILTER \| CALL \| ORDER BY \| LIMIT]* RETURN …`, clauses in any order, `NEXT` chains statements | `MATCH … WHERE … WITH … RETURN … ORDER BY … SKIP … LIMIT`, chained freely through `WITH` | `SELECT … FROM … WHERE … GROUP BY … HAVING … ORDER BY … LIMIT`, fixed order | `head(X, Y) :- body.`, no order beyond head and body |
+| elements separated by commas inside `match { }`, a trailing comma allowed (`elements`); every other list takes commas too | `,` between path patterns; keywords separate statements | `,` between patterns; keywords | `,` between `FROM` items; keywords | `,` |
 | `match { }` as the one pattern block | `MATCH <graph pattern>`, repeatable | `MATCH`, repeatable | `FROM … JOIN …`; SQL/PGQ `GRAPH_TABLE(g MATCH … COLUMNS (…))` | the rule body |
 | no mid-query pipeline; `from { read }` nests instead | a second `MATCH`, `NEXT` | `WITH` | subqueries, CTEs | an auxiliary relation |
 | `explain` as a statement prefix (`explain_stmt`) | none in the standard | `EXPLAIN` / `PROFILE` prefix | `EXPLAIN [ANALYZE]` | `.printsize`, `--profile` (Soufflé CLI) |
@@ -43,11 +44,11 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 
 | GQ 3 | GQL | Cypher | SQL | Datalog |
 |---|---|---|---|---|
-| `$x: Type { prop: expr, … }` (`binding`) | `(x:Type {prop: expr})` | `(x:Type {prop: expr})` | `FROM type_table x WHERE x.prop = expr` | `type(X), prop(X, V)` or `node(X, "Type", …)` |
+| `$x: Type`, no property map; an equality is written in `where` (`binding`) | `(x:Type {prop: expr})` | `(x:Type {prop: expr})` | `FROM type_table x WHERE x.prop = expr` | `type(X), prop(X, V)` or `node(X, "Type", …)` |
 | variable sigil `$x`; `$x` is also a parameter, told apart by declaration | bare `x`; `$x` is a parameter | bare `x`; `$x` is a parameter | an alias `x`; `$1` a parameter | capitalised `X`; no parameters |
 | the type is required and one name, `UpperCamel` (`type_ref`) | label optional; label expressions `:A\|B`, `:A&B`, `:!A` | label optional; `:A\|B`, `:A&B`, `:!A` (Neo4j 5) | the table is required | the relation is required |
 | an interface binds every implementor: `$n: Named` (stage Poly; `T1` until then) | none; labels are sets, a node may carry several | none | none (PG table inheritance is the nearest) | a rule per subtype, or a union relation |
-| a property match value is any `expr`; a comparison is a filter clause, not a match | `(n {p: v})` literal map; `(n WHERE n.p > 1)` inside the element | `(n {p: v})`; `WHERE` outside | `WHERE` | a constraint in the body |
+| every predicate, an equality included, is in `where`; a property map is refused with the conjunct as the fix | `(n {p: v})` literal map; `(n WHERE n.p > 1)` inside the element | `(n {p: v})`; `WHERE` outside | `WHERE` | a constraint in the body |
 | no anonymous endpoint: every end is a variable | `()` and `-[]->` | `()` and `-->` | n/a | `_` |
 | `$k:knows` binds the edge (`edge_binding`) | `-[k:KNOWS]->` | `-[k:KNOWS]->` | an alias on the edge table | an edge-id argument, `knows(X, Y, K)` |
 | `a::b::Type` namespace segments (`type_ref`, a later stage) | `/schema/path` and `USE graph` | none; `USE db` (Neo4j) | `schema.table` | none; Soufflé components `.comp` |
@@ -64,7 +65,7 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | `e{m,n}`, `*{m,n}`: bounded hops, one row per endpoint pair at its shortest distance (`traversal_bounds`) | `-[:E]->{m,n}`, `((a)-[:E]->(b)){m,n}`; one row per path; path modes `WALK \| TRAIL \| ACYCLIC \| SIMPLE`; `ANY SHORTEST`, `ALL SHORTEST`, `SHORTEST k`, `ANY k` | `-[:E*m..n]->`, one row per path (TRAIL: no relationship repeats); `shortestPath()`, `allShortestPaths()`; quantified path patterns `{m,n}` and `SHORTEST k` (Neo4j 5) | `WITH RECURSIVE` with a depth column | a recursive rule with a depth argument |
 | unbounded reachability: a declared read calling itself, compiled to `Fix` (stage Rec) | `-[:E]->+`, `->*`, `{1,}` | `-[:E*]->` | `WITH RECURSIVE` | native: `path(X, Y) :- edge(X, Z), path(Z, Y).` |
 | a path value: refused | `p = (a)-[]->*(b)`, `PATH_LENGTH(p)`, `NODES(p)` | `p = …`, `nodes(p)`, `length(p)` | none in `GRAPH_TABLE` | none (a list encoding) |
-| `$d "in" $coll`, a quoted edge name (`string_lit` in `edge_sel`) | `` `in` ``, backtick-delimited | `` `in` `` | `"in"` (a delimited identifier) | none |
+| `$d in $coll`: inside `match` any word is an edge name, keywords included, since no expression is written there; a quoted name is also accepted (`edge_ident`, `string_lit` in `edge_sel`) | `` `in` ``, backtick-delimited | `` `in` `` | `"in"` (a delimited identifier) | none |
 | `@edge` of the catalogue (`catalogue_edge`, stage S) | none | none | none | none |
 | the written-incoming order (`$c worksAt $p`) is accepted and `fmt` rewrites it | the arrow says it; no rewrite | the arrow says it; LangChain's `CypherQueryCorrector` is the rewrite, after generation | the join keys say it | the argument order says it |
 | `-e->`, `<-e-`, `-e-`: recognised to print the triple as the fix (`arrow_traversal`) | the form itself | the form itself | n/a | n/a |
@@ -73,11 +74,11 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 
 | GQ 3 | GQL | Cypher | SQL | Datalog |
 |---|---|---|---|---|
-| a bare `expr` clause inside `match` (`filter`) | `WHERE` after `MATCH`, `WHERE` inside an element pattern, a standalone `FILTER` | `WHERE` | `WHERE`, `ON`, `HAVING` | a constraint atom, `X > 1` |
-| `exists { clauses }` (`exists_block`) | `EXISTS { pattern }`, `EXISTS { nested query }` | `EXISTS { }` (Neo4j 5); openCypher 9 has the pattern predicate `WHERE (n)-->()` | `EXISTS (subquery)` | a body atom is existential |
-| `not { clauses }` (`negation`) | `NOT EXISTS { }` | `NOT EXISTS { }`, `WHERE NOT (n)-->()` | `NOT EXISTS` | `!p(X)`, stratified |
-| `count { p } op expr`, `sum(e) { p }`, `avg`, `min`, `max` as a predicate (`subquery_predicate`) and, new, as a value (`block_value`) | none as a block; `CALL { MATCH … RETURN count(*) AS n }` | `COUNT { }`, `COLLECT { }` (Neo4j 5); `size([(n)-->() \| 1])` in openCypher | a scalar subquery `(SELECT count(*) FROM … WHERE …)` | `N = count : { p(X, Y) }`, `S = sum Y : { … }` (Soufflé) |
-| `optional { clauses }`, the one outer join (`optional_block`) | `OPTIONAL MATCH`, `OPTIONAL CALL` | `OPTIONAL MATCH` | `LEFT [OUTER] JOIN`, `LEFT JOIN LATERAL` | none; a second rule with negation supplies the default |
+| `where φ` after `match { }`, one Boolean expression; a block's own `where` inside its braces (`where_clause`) | `WHERE` after `MATCH`, `WHERE` inside an element pattern, a standalone `FILTER` | `WHERE` | `WHERE`, `ON`, `HAVING` | a constraint atom, `X > 1` |
+| `exists { elements where φ? }`, a Boolean operand (`block_value`) | `EXISTS { pattern }`, `EXISTS { nested query }` | `EXISTS { }` (Neo4j 5); openCypher 9 has the pattern predicate `WHERE (n)-->()` | `EXISTS (subquery)` | a body atom is existential |
+| `not exists { … }`, `not` over the operand | `NOT EXISTS { }` | `NOT EXISTS { }`, `WHERE NOT (n)-->()` | `NOT EXISTS` | `!p(X)`, stratified |
+| `count { p }`, `sum(e) { p }`, `avg`, `min`, `max` as values, in `where`, `let`, `return` and `order` (`block_value`) | none as a block; `CALL { MATCH … RETURN count(*) AS n }` | `COUNT { }`, `COLLECT { }` (Neo4j 5); `size([(n)-->() \| 1])` in openCypher | a scalar subquery `(SELECT count(*) FROM … WHERE …)` | `N = count : { p(X, Y) }`, `S = sum Y : { … }` (Soufflé) |
+| `optional { elements where φ? }`, the one outer join, an element (`optional_block`) | `OPTIONAL MATCH`, `OPTIONAL CALL` | `OPTIONAL MATCH` | `LEFT [OUTER] JOIN`, `LEFT JOIN LATERAL` | none; a second rule with negation supplies the default |
 | an inner read sees outer variables by name, implicitly | `CALL (x, y) { … }`: an explicit import list (the variable scope clause) | `CALL { WITH x … }` importing `WITH` (Neo4j 4/5); `CALL (x) { … }` (Cypher 25) | `LATERAL` for a derived table; a correlated subquery elsewhere | shared variable names across atoms |
 | a forward reference or a self-reference in `let` is an error | a variable must be bound before use | same | same | no order: any atom may bind |
 
@@ -167,10 +168,10 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 
 | GQ 3 | GQL | Cypher | SQL | Datalog |
 |---|---|---|---|---|
-| writes in a `query` whose body ends in statements, after a read's clauses; the kind is the body's shape, known at parse time, as in SQL, Cypher and GQL, not a head keyword as in GraphQL | reads and writes mix in one linear statement: `MATCH … INSERT … SET … RETURN …` | `MATCH … CREATE … SET … DELETE … RETURN …` | `INSERT … SELECT`, `UPDATE … FROM`, `DELETE … USING` | none; delta rules in Dedalus and LogicBlox |
+| writes in a `query` whose body ends in statements, after a read's `match` and `where`; the kind is the body's shape, known at parse time, as in SQL, Cypher and GQL, not a head keyword as in GraphQL | reads and writes mix in one linear statement: `MATCH … INSERT … SET … RETURN …` | `MATCH … CREATE … SET … DELETE … RETURN …` | `INSERT … SELECT`, `UPDATE … FROM`, `DELETE … USING` | none; delta rules in Dedalus and LogicBlox |
 | `insert Type { prop: expr, … }` (`insert_stmt`) | `INSERT (n:Type {p: v})` | `CREATE (n:Type {p: v})` | `INSERT INTO t (cols) VALUES (…)` | a fact `t(…).` |
 | an edge by its endpoint keys: `insert WorksAt { from: $h, to: $slug }` (`from`/`to` reserved assignment names) | `INSERT (a)-[:E]->(b)` on bound variables | `CREATE (a)-[:E]->(b)` on bound variables | `INSERT INTO e (src, dst) VALUES (…)` | a fact |
-| `update $x set { p: v }` over a bound entity; edition 2's `update T set { … } where φ` is rewritten to a binding and filter (`update_stmt`) | `MATCH … SET n.p = v`, `REMOVE n.p` | `SET n.p = v`, `SET n += {…}`, `REMOVE n.p` | `UPDATE t SET p = v WHERE …` | none |
+| `update $x set { p: v }` over a bound entity; edition 2's `update T set { … } where φ` is rewritten to `match { $x: T } where φ` (`update_stmt`) | `MATCH … SET n.p = v`, `REMOVE n.p` | `SET n.p = v`, `SET n += {…}`, `REMOVE n.p` | `UPDATE t SET p = v WHERE …` | none |
 | `delete $x` over a bound entity; edition 2's `delete T where φ` is rewritten (`delete_stmt`) | `MATCH … DELETE n`, `DETACH DELETE`, `NODETACH DELETE` | `DELETE n`, `DETACH DELETE n` | `DELETE FROM t WHERE …` | none |
 | upsert: outside the language (`load --mode`) | none | `MERGE … ON CREATE SET … ON MATCH SET …` | `MERGE INTO … WHEN MATCHED …`, `INSERT … ON CONFLICT` (PG) | n/a |
 | an edge by bound references: `$p $k:worksAt $c  delete $k` | the pattern binds the endpoints | the pattern binds the endpoints | `DELETE … USING` with a join | n/a |
@@ -222,10 +223,10 @@ GQ 3 cells quote the production of the RFC's section 7 or today's
 | unbounded reachability, `*`, `WITH RECURSIVE`, recursive rules | all four | present as a monotone self-calling read (`Fix`, stage Rec); non-monotone recursion and unbounded value invention refused (A1) |
 | path values | GQL, Cypher | refused by decision |
 | relation-valued columns, lists of rows, maps as values | GQL, Cypher, SQL (arrays, JSON), Datalog (records) | refused by decision (first-order algebra) |
-| reads feeding writes in one statement | GQL, Cypher, SQL | present since 2026-11-04: a write body's clauses feed its statements; a write inside a read stays refused (A7) |
+| reads feeding writes in one statement | GQL, Cypher, SQL | present since 2026-11-04: a write body's `match` and `where` feed its statements; a write inside a read stays refused (A7) |
 | `WITH` / `NEXT` pipelines | GQL, Cypher | derived: `let` and `from` |
 | `LEFT JOIN`, `OPTIONAL MATCH` | GQL, Cypher, SQL | present: `optional { }` |
-| `HAVING` | SQL | derived: a filter after `from { … }` |
+| `HAVING` | SQL | derived: a `where` after `from { … }` |
 | `GROUP BY` | SQL, GQL | implicit |
 | `CALL { }` subquery | GQL, Cypher | present as `from { }` |
 | `RETURNING`, `RETURN` after a write | all three | the writes stage (`returning`) |

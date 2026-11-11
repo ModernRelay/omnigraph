@@ -8,7 +8,7 @@ supported** and only the edition 3 form is shown. Where the two are the
 same, the text is shown once and marked unchanged.
 
 Edition 2 text is checked against today's `query.pest`. Edition 3 text is
-the RFC's grammar as of its 2026-11-10 decision log; edition 3 has no
+the RFC's grammar as of its 2026-11-11 decision log; edition 3 has no
 edition line.
 
 ## The schema, shared by every example
@@ -26,7 +26,7 @@ edge WorksAt: Person -> Company @card(0..1)
 edge Knows: Person -> Person
 edge Authored: Person -> Doc
 edge Cites: Doc -> Doc
-edge In: Doc -> Collection        // traversed as "in": the bare name is reserved
+edge In: Doc -> Collection        // edition 2 quotes it, "in"; edition 3 writes in
 ```
 
 The schema is `.pg` text and is the same in both editions; the `analyzer`
@@ -34,20 +34,43 @@ and `distance` options are edition 3's additive declarations.
 
 ## 1. Lookups and filters
 
-**Key lookup.** Unchanged.
+**Key lookup.** Edition 3 has no property map: the key becomes an equality
+in `where`.
 
 ```gq
+// edition 2
 query person($h: String) {
   match { $p: Person { handle: $h } }
   return { $p.name, $p.city }
 }
 ```
 
-**Comparison filter.** Unchanged.
+```gq
+// edition 3
+query person($h: String) {
+  match { $p: Person }
+  where $p.handle = $h
+  return { $p.name, $p.city }
+}
+```
+
+**Comparison filter.** The comparison is the same; edition 3 moves it out
+of `match` into `where`.
 
 ```gq
+// edition 2
 query adults($min: I32) {
   match { $p: Person  $p.age >= $min }
+  return { $p.name }
+  order { $p.age desc }
+}
+```
+
+```gq
+// edition 3
+query adults($min: I32) {
+  match { $p: Person }
+  where $p.age >= $min
   return { $p.name }
   order { $p.age desc }
 }
@@ -66,16 +89,28 @@ query titled() {
 ```gq
 // edition 3
 query titled() {
-  match { $d: Doc  contains($d.title, "graph")  starts_with($d.title, "The") }
+  match { $d: Doc }
+  where contains($d.title, "graph") and starts_with($d.title, "The")
   return { $d.title }
 }
 ```
 
-**Membership in a list literal.** Unchanged.
+**Membership in a list literal.** The `in` test is the same; edition 3
+moves it to `where`.
 
 ```gq
+// edition 2
 query in_cities() {
   match { $p: Person  $p.city in ["Berlin", "Paris"] }
+  return { $p.name }
+}
+```
+
+```gq
+// edition 3
+query in_cities() {
+  match { $p: Person }
+  where $p.city in ["Berlin", "Paris"]
   return { $p.name }
 }
 ```
@@ -94,16 +129,28 @@ query tagged() {
 ```gq
 // edition 3
 query tagged() {
-  match { $d: Doc  "rust" in $d.tags }
+  match { $d: Doc }
+  where "rust" in $d.tags
   return { $d.title }
 }
 ```
 
-**Null test.** Unchanged.
+**Null test.** The `is null` test is the same; edition 3 moves it to
+`where`.
 
 ```gq
+// edition 2
 query homeless() {
   match { $p: Person  $p.city is null }
+  return { $p.name }
+}
+```
+
+```gq
+// edition 3
+query homeless() {
+  match { $p: Person }
+  where $p.city is null
   return { $p.name }
 }
 ```
@@ -126,7 +173,8 @@ operators.
 ```gq
 // edition 3
 query doubled($min: I32) {
-  match { $p: Person  $p.age * 2 >= $min }
+  match { $p: Person }
+  where $p.age * 2 >= $min
   return { $p.name, $p.age * 2 as twice, (2026 - $p.age) as born_about }
 }
 ```
@@ -143,18 +191,33 @@ query with_city() {
 
 ## 2. Traversal
 
-**One hop, directed, with the edge bound.** Unchanged.
+**One hop, directed, with the edge bound.** The triple is the same;
+edition 3 separates it from the binding with a comma and moves the key
+equality to `where`.
 
 ```gq
+// edition 2
 query employer($h: String) {
   match { $p: Person { handle: $h }  $p $k:worksAt $c }
   return { $c.name, $k.@src, $k.@dst }
 }
 ```
 
-**Either orientation, alternation, bounded hops, any edge.** Unchanged.
+```gq
+// edition 3
+query employer($h: String) {
+  match { $p: Person, $p $k:worksAt $c }
+  where $p.handle = $h
+  return { $c.name, $k.@src, $k.@dst }
+}
+```
+
+**Either orientation, alternation, bounded hops, any edge.** The triples
+are the same; edition 3 separates them with commas and moves the key
+equality to `where`.
 
 ```gq
+// edition 2
 query around($h: String) {
   match {
     $p: Person { handle: $h }
@@ -167,6 +230,21 @@ query around($h: String) {
 }
 ```
 
+```gq
+// edition 3
+query around($h: String) {
+  match {
+    $p: Person,
+    $p <knows> $friend,
+    $p knows{2,2} $second,
+    $near: Person,
+    $p *{1,3} $near,
+  }
+  where $p.handle = $h
+  return { $friend.name, count($second) as seconds, count($near) as near }
+}
+```
+
 **Unbounded reachability.** Edition 2: **Not supported.** Every traversal
 needs a bound.
 
@@ -175,28 +253,50 @@ needs a bound.
 query reachable($from: String) {
   match {
     from union(
-      { match { $p: Person { handle: $from }  $p knows $q } return { $q } },
-      { match { from reachable($from)  $q knows $r } return { $r as q } })
+      { match { $p: Person, $p knows $q } where $p.handle = $from return { $q } },
+      { match { from reachable($from), $q knows $r } return { $r as q } }),
   }
   return distinct { $q }
 }
 ```
 
-**Edge whose name is a reserved word.** Unchanged: quoted in both editions.
+**Edge whose name is a reserved word.** Edition 2 quotes it; edition 3
+writes the bare name, since no expression is written inside `match`, and
+moves the key equality to `where`.
 
 ```gq
+// edition 2
 query in_collection($slug: String) {
   match { $x: Collection { slug: $slug }  $d "in" $x }
   return { $d.title }
 }
 ```
 
-**Written against schema order.** Unchanged in meaning; edition 3's `fmt`
-rewrites it to schema order.
+```gq
+// edition 3
+query in_collection($slug: String) {
+  match { $x: Collection, $d in $x }
+  where $x.slug = $slug
+  return { $d.title }
+}
+```
+
+**Written against schema order.** The same meaning in both editions;
+edition 3's `fmt` rewrites it to schema order.
 
 ```gq
+// edition 2
 query boss($slug: String) {
   match { $c: Company { slug: $slug }  $c worksAt $p }   // fmt: $p worksAt $c
+  return { $p.name }
+}
+```
+
+```gq
+// edition 3
+query boss($slug: String) {
+  match { $c: Company, $c worksAt $p }   // fmt: $p worksAt $c
+  where $c.slug = $slug
   return { $p.name }
 }
 ```
@@ -225,9 +325,12 @@ query headcount() {
 }
 ```
 
-**Distinct rows and distinct counts.** Unchanged.
+**Distinct rows and distinct counts.** `return distinct` and
+`count(distinct …)` are the same; edition 3 moves the key equality to
+`where`.
 
 ```gq
+// edition 2
 query reach($h: String) {
   match { $p: Person { handle: $h }  $p knows{1,2} $q }
   return distinct { $q.name }
@@ -239,19 +342,32 @@ query distinct_cities() {
 }
 ```
 
+```gq
+// edition 3
+query reach($h: String) {
+  match { $p: Person, $p knows{1,2} $q }
+  where $p.handle = $h
+  return distinct { $q.name }
+}
+
+query distinct_cities() {
+  match { $p: Person }
+  return { count(distinct $p.city) as cities }
+}
+```
+
 **Filter on an aggregate.** Edition 2 writes a literal or parameter bound
-with a count block, `$c: Company  count { $p worksAt $c } >= 100`, and that
-form stays. New in edition 3 is a threshold over a grouped column, which a
-count block cannot express: no `having`, and a filter cannot see a `return`
-column.
+with a count block, `$c: Company  count { $p worksAt $c } >= 100`, and
+edition 3 keeps the block as an expression in `where`,
+`where count { $p worksAt $c } >= 100`. New in edition 3 is a threshold
+over a grouped column, which a count block cannot express: no `having`, and
+a filter cannot see a `return` column.
 
 ```gq
 // edition 3
 query big_employers() {
-  match {
-    from { match { $p worksAt $c } return { $c, count($p) as n } }
-    $n >= 100
-  }
+  match { from { match { $p worksAt $c } return { $c, count($p) as n } } }
+  where $n >= 100
   return { $c.name, $n }
   order { $n desc }
 }
@@ -265,16 +381,27 @@ different terms, not two spellings of one.
 ```gq
 // edition 3
 query average_headcount() {
-  match { $c: Company  let $n = count { $p worksAt $c } }
+  match { $c: Company, let $n = count { $p worksAt $c } }
   return { avg($n) as mean, max($n) as largest }
 }
 ```
 
-**Count block as a predicate with a literal or parameter bound.** Unchanged.
+**Count block as a predicate with a literal or parameter bound.** The block
+is the same; edition 3 writes it as an expression in `where`.
 
 ```gq
+// edition 2
 query well_connected($min: I64) {
   match { $p: Person  count { $p knows $q } >= $min }
+  return { $p.name }
+}
+```
+
+```gq
+// edition 3
+query well_connected($min: I64) {
+  match { $p: Person }
+  where count { $p knows $q } >= $min
   return { $p.name }
 }
 ```
@@ -286,7 +413,8 @@ parameter).
 ```gq
 // edition 3
 query full_collections() {
-  match { $x: Collection  count { $d "in" $x } >= $x.min_docs }
+  match { $x: Collection }
+  where count { $d in $x } >= $x.min_docs
   return { $x.slug }
 }
 ```
@@ -298,25 +426,33 @@ ordered on.
 ```gq
 // edition 3
 query degrees($min: I64) {
-  match {
-    $p: Person
-    let $degree = count { $p knows $q }
-    $degree >= $min
-  }
+  match { $p: Person, let $degree = count { $p knows $q } }
+  where $degree >= $min
   return { $p.name, $degree }
   order { $degree desc }
 }
 ```
 
-**Existence and absence.** Unchanged.
+**Existence and absence.** Edition 3 writes both as expressions in
+`where`, and absence as `not exists { }`.
 
 ```gq
+// edition 2
 query authors_without_citations() {
   match {
     $p: Person
     exists { $p authored $d }
     not { $p authored $d2  $other cites $d2 }
   }
+  return { $p.name }
+}
+```
+
+```gq
+// edition 3
+query authors_without_citations() {
+  match { $p: Person }
+  where exists { $p authored $d } and not exists { $p authored $d2, $other cites $d2 }
   return { $p.name }
 }
 ```
@@ -329,7 +465,7 @@ is dropped.
 ```gq
 // edition 3
 query people_and_employers() {
-  match { $p: Person  optional { $p worksAt $c } }
+  match { $p: Person, optional { $p worksAt $c } }
   return { $p.name, $c.name }
 }
 ```
@@ -342,7 +478,7 @@ query people_and_companies() {
   match {
     from union(
       { match { $p: Person } return { $p.name as name, "person" as kind } },
-      { match { $c: Company } return { $c.name as name, "company" as kind } })
+      { match { $c: Company } return { $c.name as name, "company" as kind } }),
   }
   return { $name, $kind }
 }
@@ -354,14 +490,15 @@ Each stored query is self-contained.
 ```gq
 // edition 3
 query colleagues($of: String) {
-  match { $p: Person { handle: $of }  $p worksAt $c  $q worksAt $c  $q != $p }
+  match { $p: Person, $p worksAt $c, $q worksAt $c }
+  where $p.handle = $of and $q != $p
   return { $q }
 }
 
 query colleagues_of_colleagues($of: String) {
   match {
-    from { match { from colleagues($of) } return { $q.handle as h1 } }   // the call's $q enters scope; a second call needs it renamed (T68)
-    from colleagues($h1)
+    from { match { from colleagues($of) } return { $q.handle as h1 } },   // the call's $q enters scope; a second call needs it renamed (T68)
+    from colleagues($h1),
   }
   return distinct { $q.name }
 }
@@ -374,8 +511,8 @@ query colleagues_of_colleagues($of: String) {
 // edition 3
 query latest_per_author() {
   match {
-    $p: Person
-    from { match { $p authored $d } return { $d } order { $d.year desc } limit 3 }
+    $p: Person,
+    from { match { $p authored $d } return { $d } order { $d.year desc } limit 3 },
   }
   return { $p.name, $d.title, $d.year }
 }
@@ -412,7 +549,7 @@ query similar($q: Vector(3)) {
 ```gq
 // edition 3
 query similar($q: Vector(3)) {
-  match { from nearest({ match { $d: Doc  $d.year >= 2025 } return { $d } }, $d.embedding, $q, k: 20) }
+  match { from nearest({ match { $d: Doc } where $d.year >= 2025 return { $d } }, $d.embedding, $q, k: 20) }
   return { $d.title }
   order { $distance }
 }
@@ -448,8 +585,8 @@ documents.
 // edition 3
 query cited_near($coll: String, $q: Vector(3)) {
   match {
-    from nearest({ match { $d "in" $x  $x: Collection { slug: $coll } } return { $d } }, $d.embedding, $q, k: 20)
-    $d cites $other
+    from nearest({ match { $d in $x, $x: Collection } where $x.slug = $coll return { $d } }, $d.embedding, $q, k: 20),
+    $d cites $other,
   }
   return { $d.title, $distance, count($other) as cites }
   order { $distance }
@@ -463,10 +600,8 @@ form answers a different question.
 ```gq
 // edition 3
 query within_radius($q: Vector(3), $r: F32) {
-  match {
-    from distance({ match { $d: Doc  $d.year >= 2025 } return { $d } }, $d.embedding, $q)
-    $distance <= $r
-  }
+  match { from distance({ match { $d: Doc } where $d.year >= 2025 return { $d } }, $d.embedding, $q) }
+  where $distance <= $r
   return { $d.title, $distance }
   order { $distance, $d.id }
   limit 10
@@ -495,8 +630,8 @@ query about($q: String) {
 }
 ```
 
-**Lexical filter without a score.** Unchanged: the predicates stay registry
-calls; only the positional option moves.
+**Lexical filter without a score.** The predicates stay registry calls;
+edition 3 moves them to `where` and names the positional option.
 
 ```gq
 // edition 2
@@ -509,7 +644,8 @@ query mentions($q: String) {
 ```gq
 // edition 3
 query mentions($q: String) {
-  match { $d: Doc  search($d.body, $q)  fuzzy($d.body, $q, max_edits: 2) }
+  match { $d: Doc }
+  where search($d.body, $q) and fuzzy($d.body, $q, max_edits: 2)
   return { $d.title }
 }
 ```
@@ -531,8 +667,8 @@ query hybrid($q: String, $v: Vector(3)) {
 // edition 3
 query hybrid($q: String, $v: Vector(3)) {
   match {
-    let $docs = { match { $d: Doc } return { $d } }
-    from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $q), k: 60)
+    let $docs = { match { $d: Doc } return { $d } },
+    from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $q), k: 60),
   }
   return { $d.title, $score }
   order { $score desc }
@@ -547,12 +683,12 @@ and there is no arithmetic.
 // edition 3
 query weighted($q: String, $v: Vector(3)) {
   match {
-    let $docs = { match { $d: Doc } return { $d } }
-    let $docs2 = { match { from $docs } return { $d as d2 } }               // the second arm's column renamed before it is ranked (T68)
-    from { match { from distance($docs, $d.embedding, $v) } return { $d, $distance as vec } }
-    from { match { from bm25($docs2, $d2.body, $q) } return { $d2, $score as lex } }
-    $d = $d2
+    let $docs = { match { $d: Doc } return { $d } },
+    let $docs2 = { match { from $docs } return { $d as d2 } },              // the second arm's column renamed before it is ranked (T68)
+    from { match { from distance($docs, $d.embedding, $v) } return { $d, $distance as vec } },
+    from { match { from bm25($docs2, $d2.body, $q) } return { $d2, $score as lex } },
   }
+  where $d = $d2
   return { $d.title, 0.7 * (1.0 / (1.0 + $vec)) + 0.3 * $lex as s }
   order { s desc }
   limit 10
@@ -584,9 +720,10 @@ query hire($h: String, $slug: String) {
 ```
 
 **Update and delete by predicate.** Edition 2 names the type and a `where`;
-edition 3 binds the entity and names it. Neither edition mixes a `delete`
-with an `update` in one write, and edition 2 cannot assign `null`, so
-clearing a property is edition 3 only.
+edition 3 binds the entity in a `match`, filters it in that `match`'s
+`where`, and names it. Neither edition mixes a `delete` with an `update` in
+one write, and edition 2 cannot assign `null`, so clearing a property is
+edition 3 only.
 
 ```gq
 // edition 2
@@ -602,13 +739,12 @@ query relocate($h: String) {
 ```gq
 // edition 3
 query retire($h: String) as commit {
-  $p: Person { handle: $h }
-  $p $k:worksAt $c
+  match { $p: Person, $p $k:worksAt $c } where $p.handle = $h
   delete $k
 }
 
 query relocate($h: String) {
-  $p: Person { handle: $h }
+  match { $p: Person } where $p.handle = $h
   update $p set { city: null }
 }
 ```
@@ -621,8 +757,8 @@ the ids first and writes `in [ids]` on a second snapshot.
 ```gq
 // edition 3
 query close_office($slug: String, $city: String) {
-  $c: Company { slug: $slug }
-  $p: Person { city: $city }  $p $k:worksAt $c
+  match { $c: Company, $p: Person, $p $k:worksAt $c }
+  where $c.slug = $slug and $p.city = $city
   delete $k
 }
 ```
@@ -632,7 +768,7 @@ query close_office($slug: String, $city: String) {
 ```gq
 // edition 3
 query birthday($h: String) {
-  $p: Person { handle: $h }
+  match { $p: Person } where $p.handle = $h
   update $p set { age: $p.age + 1 }
 }
 ```
@@ -643,7 +779,7 @@ supported.**
 ```gq
 // edition 3
 query tag_near($q: Vector(3)) {
-  from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20)
+  match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) }
   update $d set { tags: ["near"] }
 }
 ```
@@ -670,13 +806,25 @@ query operators() {
 
 **Annotations on a declaration.** `@description` and `@instruction` are
 unchanged; edition 3 admits any `@name(args)` and keeps unknown names as
-metadata.
+metadata. The body's filter moves to `where`.
 
 ```gq
+// edition 2
 query people_over($cutoff: I32)
   @description("People over a given age")
   @instruction("Pass the age as an integer") {
   match { $p: Person  $p.age > $cutoff }
+  return { $p.name }
+}
+```
+
+```gq
+// edition 3
+query people_over($cutoff: I32)
+  @description("People over a given age")
+  @instruction("Pass the age as an integer") {
+  match { $p: Person }
+  where $p.age > $cutoff
   return { $p.name }
 }
 ```
@@ -688,12 +836,12 @@ alone is refused by name, so that it is never silently kept as metadata.
 ```gq
 // edition 3, later stages
 query schema_types() {
-  match { $t: @Type  $p: @Property  $t @property $p }       // the schema catalogue
+  match { $t: @Type, $p: @Property, $t @property $p }       // the schema catalogue
   return { $t.name, $p.name }
 }
 
 query retract($h: String, $c: Commit) @if_commit($c) {      // the writes RFC
-  $p: Person { handle: $h }
+  match { $p: Person } where $p.handle = $h
   delete $p
   returning { @id }
 }
@@ -717,12 +865,16 @@ edition line.
 
 ## What the rewriter does to the edition 2 column
 
-Every edition 2 example above that differs from its edition 3 form is one of
-the seven rewriter rows: the infix string predicates, the list `contains`,
-the positional `fuzzy` option, `nearest` and `bm25` out of `order` and
-`return`, `rrf` out of `order`, and the `where` on `update` and `delete`.
-The one-shot rewriter applied all seven to this repository's text, and no
-shipped command does; a stored source in the old syntax fails with a
-diagnostic whose fix applies the row; six are proved IR-equal and the `rrf`
-row rows-equal. Every "Not supported" above is new text that
+Every difference between the columns is a rewriter row. Most examples
+differ only by the respelling rows: commas between elements, items and
+assignments; filters and property maps moved into one `where`; `not { }`
+written `not exists { }`; a block's filters in its own `where`; a write's
+selection in a `match`; and the bare name of a reserved edge. The others
+are the infix string predicates, the list `contains`, the positional
+`fuzzy` option, `nearest` and `bm25` out of `order` and `return`, `rrf` out
+of `order`, and the `where` on `update` and `delete`. The one-shot rewriter
+applies every row to this repository's text in the break, and no shipped
+command does; a stored source in the old syntax fails with a diagnostic
+whose fix applies the row; every row but `rrf` is proved IR-equal and the
+`rrf` row rows-equal. Every "Not supported" above is new text that
 edition 2 never parsed, so it rewrites nothing.
