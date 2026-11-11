@@ -1512,19 +1512,14 @@ impl TableStorage for TableStore {
         current: &SnapshotHandle,
         chain: &crate::table_store::RowPreservingChain,
     ) -> Result<std::result::Result<StagedHandle, String>> {
-        Ok(
-            match crate::table_store::rebase_staged_write(
-                base.dataset(),
-                staged.into_staged(),
-                current.dataset(),
-                chain,
-            )
-            .await?
-            {
-                crate::table_store::StagedRebase::Rebased(staged) => Ok(StagedHandle::new(staged)),
-                crate::table_store::StagedRebase::Conflict(reason) => Err(reason),
-            },
+        Ok(crate::table_store::rebase_staged_write(
+            base.dataset(),
+            staged.into_staged(),
+            current.dataset(),
+            chain,
         )
+        .await?
+        .map(StagedHandle::new))
     }
 
     async fn commit_staged_detached(

@@ -312,7 +312,7 @@ pub(crate) struct WriteTxn {
 /// ([`Omnigraph::revalidate_write_txn_carrying`]).
 pub(crate) enum WriteRevalidation {
     /// The captured authority is the current one; the snapshot is current.
-    Current(Snapshot),
+    Current(Box<Snapshot>),
     /// The head moved only through publications that changed no row: `txn`
     /// is the attempt re-anchored on the current head, schema contract and
     /// pins (its `base` is the current snapshot), and `tables` holds every
@@ -2155,7 +2155,7 @@ impl Omnigraph {
         early: Option<EarlyRevalidation>,
     ) -> Result<Snapshot> {
         match self.revalidate_write_txn_inner(txn, early, false).await? {
-            WriteRevalidation::Current(snapshot) => Ok(snapshot),
+            WriteRevalidation::Current(snapshot) => Ok(*snapshot),
             WriteRevalidation::RowPreserving { .. } => Err(OmniError::manifest_internal(
                 "a revalidation that may not carry the write carried it",
             )),
@@ -2283,7 +2283,7 @@ impl Omnigraph {
         }
         validate_bound_catalog_against_snapshot(&txn.catalog, &snapshot)?;
         let Some(tables) = carried else {
-            return Ok(WriteRevalidation::Current(snapshot));
+            return Ok(WriteRevalidation::Current(Box::new(snapshot)));
         };
         tracing::debug!(
             branch = txn.branch.as_deref().unwrap_or("main"),

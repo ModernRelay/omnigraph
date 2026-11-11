@@ -814,17 +814,6 @@ pub(crate) async fn row_preserving_chain(
     Ok(None)
 }
 
-/// What [`rebase_staged_write`] made of a staged write.
-#[derive(Debug)]
-pub(crate) enum StagedRebase {
-    /// The write, now reading `current`: commit it detached there.
-    Rebased(StagedWrite),
-    /// Lance's conflict rules refuse to carry the write over a link (an
-    /// update or delete of a fragment a rewrite replaced, for one). The
-    /// message is Lance's.
-    Conflict(String),
-}
-
 /// Carry a staged write prepared on `base` over the row-preserving `chain`
 /// to `current`, the chain's last version, with Lance's own conflict
 /// resolver (`TransactionRebase`, the pass `commit_transaction` runs for a
@@ -833,12 +822,17 @@ pub(crate) enum StagedRebase {
 /// `current` as the version it read, so the detached commit links to the
 /// table's current pin like any other write. Nothing is written for the
 /// operations the chain can hold, so a refusal leaves no effect.
+///
+/// The inner `Ok` is the write, now reading `current`, to commit detached
+/// there; the inner `Err` is Lance's message when its conflict rules refuse
+/// to carry the write over a link (an update or delete of a fragment a
+/// rewrite replaced, for one).
 pub(crate) async fn rebase_staged_write(
     base: &Dataset,
     staged: StagedWrite,
     current: &Dataset,
     chain: &RowPreservingChain,
-) -> Result<StagedRebase> {
+) -> Result<std::result::Result<StagedWrite, String>> {
     let StagedWrite {
         transaction,
         commit_metadata,
@@ -858,9 +852,7 @@ pub(crate) async fn rebase_staged_write(
             return match error {
                 lance::Error::RetryableCommitConflict { .. }
                 | lance::Error::IncompatibleTransaction { .. }
-                | lance::Error::CommitConflict { .. } => {
-                    Ok(StagedRebase::Conflict(error.to_string()))
-                }
+                | lance::Error::CommitConflict { .. } => Ok(Err(error.to_string())),
                 other => Err(OmniError::storage(other)),
             };
         }
@@ -871,11 +863,11 @@ pub(crate) async fn rebase_staged_write(
             error @ (lance::Error::RetryableCommitConflict { .. }
             | lance::Error::IncompatibleTransaction { .. }
             | lance::Error::CommitConflict { .. }),
-        ) => return Ok(StagedRebase::Conflict(error.to_string())),
+        ) => return Ok(Err(error.to_string())),
         Err(error) => return Err(OmniError::storage(error)),
     };
     transaction.read_version = current.version().version;
-    Ok(StagedRebase::Rebased(StagedWrite {
+    Ok(Ok(StagedWrite {
         transaction,
         commit_metadata,
         new_fragments,

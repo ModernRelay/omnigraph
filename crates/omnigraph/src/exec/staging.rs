@@ -1231,13 +1231,15 @@ impl StagedMutation {
         // only read keeps its moved pin. Otherwise mutation inserts and load
         // append/merge reprepare at their outer bounded retry loop, and strict
         // read-modify-write operations return the typed conflict.
-        let (snapshot, carried_txn, mut carried) =
-            match db.revalidate_write_txn_carrying(txn, early).await? {
-                crate::db::WriteRevalidation::Current(snapshot) => (snapshot, None, HashMap::new()),
-                crate::db::WriteRevalidation::RowPreserving { txn, tables } => {
-                    (txn.base.clone(), Some(txn), tables)
-                }
-            };
+        let (snapshot, carried_txn, mut carried) = match db
+            .revalidate_write_txn_carrying(txn, early)
+            .await?
+        {
+            crate::db::WriteRevalidation::Current(snapshot) => (*snapshot, None, HashMap::new()),
+            crate::db::WriteRevalidation::RowPreserving { txn, tables } => {
+                (txn.base.clone(), Some(txn), tables)
+            }
+        };
         let txn = carried_txn.as_deref().unwrap_or(txn);
         let pins = txn
             .unattached_base
