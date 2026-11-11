@@ -1109,6 +1109,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "PublishedDatasetVersionConflictOutput",
     "SnapshotDatasetOutput",
     "SnapshotOutput",
+    "WriterFencedOutput",
 ];
 
 #[test]
@@ -1471,6 +1472,7 @@ fn error_output_schema_has_expected_fields() {
     assert!(props.contains_key("merge_conflicts"));
     assert!(props.contains_key("published_dataset_version_conflict"));
     assert!(props.contains_key("read_set_conflict"));
+    assert!(props.contains_key("writer_fenced"));
     assert!(props.contains_key("key_conflict"));
     assert!(props.contains_key("resource_limit"));
     assert!(props.contains_key("blob_range"));
@@ -1806,6 +1808,7 @@ fn error_code_schema_has_expected_variants() {
             "conflict",
             "branch_start_refusal",
             "unattached_cannot_publish",
+            "writer_fenced",
             "payload_too_large",
             "unsupported_media_type",
             "range_not_satisfiable",

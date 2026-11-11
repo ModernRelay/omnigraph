@@ -54,7 +54,7 @@ query engine_formats() {
 }
 
 --- expect unordered
-{"e.current_internal_schema_version":16,"e.min_supported_internal_schema_version":14}
+{"e.current_internal_schema_version":17,"e.min_supported_internal_schema_version":14}
 
 --- expect shape
 e.current_internal_schema_version: I64

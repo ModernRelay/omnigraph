@@ -88,16 +88,12 @@ default branch instead.
 Codex, or any agent that can read a URL and run a shell command:
 
 ```text
-Help me set up Omnigraph
-
-1. Read the docs at https://github.com/ModernRelay/omnigraph, starting with
-   docs/user/clusters/index.md, then docs/user/deployment.md.
-2. Skim the starter graphs and seed data in the cookbooks:
-   https://github.com/ModernRelay/omnigraph-cookbooks
-3. Ask me what I want to build (company brain, agent memory, dev graph,
-   research / R&D layer, …). Then stand up a cluster for it, load a little
-   data, and run a query so I can see it working.
+Read https://github.com/ModernRelay/omnigraph/blob/main/skills/omnigraph/references/onboarding.md and follow it to set up Omnigraph for me.
 ```
+
+The agent installs the CLI, asks what the graph is for, builds and queries a
+small local graph, and then points to the cookbooks, a cluster or Omnigraph
+Cloud.
 
 For ready-to-run graphs with real seed data (company brain, VC operating system,
 pharma & industry intel),

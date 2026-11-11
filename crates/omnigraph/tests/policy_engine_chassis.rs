@@ -653,6 +653,59 @@ async fn branch_delete_as_allows_when_policy_permits_actor() {
         .expect("act-allowed should be able to BranchDelete");
 }
 
+/// `claim_branch_writer_as` is gated by `branch_claim` on the branch it
+/// names: a grant scoped to protected branches lets its actor claim `main`
+/// and not `feature`, and a claim with no actor is refused.
+#[tokio::test]
+async fn branch_claim_is_enforced_on_the_branch_the_claim_names() {
+    const CLAIM_POLICY: &str = r#"
+version: 1
+groups:
+  owners: [act-allowed]
+  readers: [act-denied]
+protected_branches: [main]
+rules:
+  - id: owners-claim-protected
+    allow:
+      actors: { group: owners }
+      actions: [branch_claim]
+      target_branch_scope: protected
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _engine) = {
+        let db = init_and_load(&dir).await;
+        db.branch_create_from(ReadTarget::branch("main"), "feature")
+            .await
+            .unwrap();
+        drop(db);
+        let db = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+        install_policy_source(db, dir.path(), CLAIM_POLICY)
+    };
+
+    assert_denied(
+        db.claim_branch_writer_as("main", Some("act-denied")).await,
+        "a claim by an actor without the grant",
+    );
+    assert_denied(
+        db.claim_branch_writer_as("feature", Some("act-allowed"))
+            .await,
+        "a claim of a branch outside the grant's scope",
+    );
+    assert!(
+        matches!(
+            db.claim_branch_writer("main").await,
+            Err(OmniError::Policy(_))
+        ),
+        "a claim with no actor under an installed policy"
+    );
+    assert_eq!(
+        db.claim_branch_writer_as("main", Some("act-allowed"))
+            .await
+            .unwrap(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn branch_merge_as_denies_when_policy_rejects_actor() {
     let dir = tempfile::tempdir().unwrap();

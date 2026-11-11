@@ -281,6 +281,13 @@ impl<'n> NodeRead<'n> {
         Ok(())
     }
 
+    /// Every live row of the table reaches the consumer: no pushed filter
+    /// and no full-text query, so the read's first rows are the table's
+    /// first live rows and a `Limit` over it can reach Lance (#1335).
+    pub(super) fn reads_every_row(&self) -> bool {
+        self.filter_expr.is_none() && self.fts_query.is_none()
+    }
+
     pub(super) fn plan_with_filter(
         &self,
     ) -> futures::future::BoxFuture<'static, Result<PlannedScan>> {
