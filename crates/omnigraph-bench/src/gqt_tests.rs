@@ -600,6 +600,21 @@ fn selected_echo_loop_write_prefix_and_implicit_suffix_refuse() {
     let c = omnigraph_gqt_core::parse_case("dst_only", &dst).unwrap();
     assert!(admit_queries(&c, &p.definition.workload.measured_step).is_err());
 }
+/// A workload file runs on the bench's store, so the pin's claim of `main`
+/// would stay there.
+#[test]
+fn writer_pin_is_refused_on_a_workload_file() {
+    let p = plan("tiny-read");
+    let held = p
+        .queries
+        .text
+        .replacen("# issue: none\n", "# issue: none\n# writer: held\n", 1);
+    let c = omnigraph_gqt_core::parse_case("held_workload", &held).unwrap();
+    let refused = admit_queries(&c, &p.definition.workload.measured_step)
+        .err()
+        .unwrap_or_default();
+    assert!(refused.contains("`# writer: held` cannot"), "{refused}");
+}
 #[tokio::test]
 async fn selected_read_restart_mutation_branch_and_single_load_use_engine_receipts() {
     for name in [
@@ -1007,6 +1022,23 @@ fn raw_dataset_plan_needs_no_measured_operation_and_unions_query_indexes() {
     assert!(indexed.needs_indices);
     assert_eq!(indexed.recipe_sha256, measured.recipe_sha256);
     assert_eq!(indexed, measured.dataset_build_plan().unwrap());
+
+    let scratch = tempfile::tempdir().unwrap();
+    let held = scratch.path().join("held.gqt");
+    let text = std::fs::read_to_string(&dataset).unwrap();
+    std::fs::write(
+        &held,
+        text.replacen("# issue: none\n", "# issue: none\n# writer: held\n", 1),
+    )
+    .unwrap();
+    let refused = dataset_file(
+        &held,
+        None,
+        measured.definition.environment.backend.clone(),
+        measured.definition.protocol.reset,
+    )
+    .unwrap_err();
+    assert!(refused.contains("`# writer: held` cannot"), "{refused}");
 }
 #[test]
 fn acquisition_receipts_fit_before_dataset_io() {

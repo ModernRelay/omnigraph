@@ -1543,6 +1543,41 @@ fn dst_schema_ops_randomized_oracles_hold_and_replay() {
     assert!(a.verified > 0);
 }
 
+/// Writer claims interleave the wide, schema-applying workload on one
+/// process: every claim answers 1 and every later publish on a claimed
+/// branch passes the fence check, under the full oracle stack and replay.
+#[test]
+#[serial]
+fn dst_writer_claims_randomized_oracles_hold_and_replay() {
+    let sc = Scenario {
+        seed: 6,
+        ops: 60,
+        wide: true,
+        schema_ops: true,
+        writer_claims: true,
+        ..Default::default()
+    };
+    let a = run_universe("shared-memory://dst-writer-claims-a", &sc);
+    let b = run_universe("shared-memory://dst-writer-claims-b", &sc);
+    println!(
+        "dst writer claims: {} claims, {} writes on a claimed branch, {} legal rejections, {} checks",
+        a.writer_claims, a.writes_on_claimed, a.legal_rejections, a.verified
+    );
+    omnigraph_dst::harness::assert_strict_replay(
+        &a,
+        &b,
+        "writer-claim universes must replay identically",
+    );
+    assert!(
+        a.writer_claims > 0 && a.writes_on_claimed > 0,
+        "the claim face should emit and a later write should land on a claimed branch \
+         (writer_claims={}, writes_on_claimed={})",
+        a.writer_claims,
+        a.writes_on_claimed
+    );
+    assert!(a.verified > 0);
+}
+
 /// SCHEMA-APPLY CRASH WINDOWS under the randomized workload: a failure at the
 /// effect gate or detached table commit, judged by reconcile,
 /// recovery reopen and the full oracle stack (bite-and-replay).
@@ -3368,6 +3403,51 @@ fn branch_write_cost_rows(replay: &str) -> String {
     )
 }
 
+/// The first claim of `main` on a reopened handle: one `__manifest` version
+/// and no data-table call.
+fn writer_claim_cost_rows(replay: &str) -> String {
+    struct WriterClaimCost;
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for WriterClaimCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_writer_claim_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            let detached = db.detach();
+            let db = detached.attach(Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ));
+            omnigraph_dst::cost::set_label("WriterClaim");
+            let epoch = db.claim_branch_writer("main").await;
+            omnigraph_dst::cost::set_label("_writer_claim_verify");
+            assert_eq!(epoch.unwrap(), 1);
+        }
+    }
+
+    labeled_cost_rows(
+        format!("shared-memory://dst-writer-claim-cost-{replay}"),
+        &WriterClaimCost,
+        "WriterClaim",
+    )
+}
+
 /// A graph diff's first page and its continuation on a reopened handle, for
 /// the two-point and the branch form, beside one and nine idle branches. A
 /// continuation resolves its sides again and opens each token commit through
@@ -3995,6 +4075,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&warm_read_cost_rows("a"));
     table.push_str(&update_patch_cost_rows("a"));
     table.push_str(&nearest_cost_rows("a"));
+    table.push_str(&writer_claim_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -4009,6 +4090,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&warm_read_cost_rows("b"));
     table2.push_str(&update_patch_cost_rows("b"));
     table2.push_str(&nearest_cost_rows("b"));
+    table2.push_str(&writer_claim_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"
