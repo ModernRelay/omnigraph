@@ -72,7 +72,11 @@ Ordinary unbound named traversal and eligible bulk `AntiJoin` probes can use a
 CSR/CSC `GraphIndex` scoped to the edge types actually referenced by the query. The cache key includes each
 covered edge table's physical identity and version, so unrelated edge types do
 not force a graph-wide scan and a lazy branch may reuse an identical inherited
-table view.
+table view. A write (mutation, merge) evicts only the cached indexes that cover an
+edge table it changed, and a branch create or delete only those that cover a
+table ref of that branch (each create mints a fresh ref incarnation, so a
+recreated branch never meets a dead one's key); a refresh, schema apply and
+optimize clear the whole cache.
 
 An explicitly bound edge must scan its edge table because topology alone does
 not contain edge properties. Every edge probe (`graph.rs::scan_edges_stream`:

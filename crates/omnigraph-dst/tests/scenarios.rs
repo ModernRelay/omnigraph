@@ -3071,6 +3071,108 @@ fn warm_read_cost_rows(replay: &str) -> String {
     rows
 }
 
+/// The labels [`GraphIndexRetentionCost`] measures, in order.
+const GRAPH_INDEX_RETENTION_LABELS: [&str; 5] = [
+    "CsrHopCold",
+    "CsrHopWarm",
+    "CsrHopAfterOtherEdgeWrite",
+    "CsrHopAfterBranchCreate",
+    "CsrHopAfterOwnEdgeWrite",
+];
+
+/// One handle (as a server holds one) writes and reads: a `knows` hop forced
+/// onto the CSR path, cold and warm, then after a `WorksAt` insert, after a
+/// branch create, and after a `Knows` insert. The cached topology is keyed by
+/// each edge table's stamp, so only the last write may rebuild `Knows`; the
+/// other rows pin that a write or branch control leaves untouched edge types'
+/// topology cached.
+struct GraphIndexRetentionCost;
+
+impl GraphIndexRetentionCost {
+    async fn hop(db: &Session) -> serde_json::Value {
+        db.query(
+            omnigraph::db::ReadTarget::branch("main"),
+            WARM_READ_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap()
+        .to_rust_json()
+        .unwrap()
+    }
+}
+
+impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
+    for GraphIndexRetentionCost
+{
+    type Output = ();
+
+    async fn run(&self, resources: &mut omnigraph_dst::memory::MemoryStorage, _workload_seed: u64) {
+        const HIRE: &str = r#"
+query hire($person: String, $company: String) {
+    insert WorksAt { from: $person, to: $company }
+}
+"#;
+        let [cold, warm, after_other, after_branch, after_own] = GRAPH_INDEX_RETENTION_LABELS;
+        omnigraph_dst::cost::set_label("_retention_setup");
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            ),
+            SessionSettings::default().with_traversal(omnigraph_compiler::settings::Traversal::Csr),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+        omnigraph_dst::cost::set_label(cold);
+        let before = Self::hop(&db).await;
+        omnigraph_dst::cost::set_label(warm);
+        assert_eq!(Self::hop(&db).await, before);
+        omnigraph_dst::cost::set_label("_retention_other_edge_write");
+        db.mutate(
+            "main",
+            HIRE,
+            "hire",
+            &params(&[("$person", "Alice"), ("$company", "Globex")]),
+        )
+        .await
+        .unwrap();
+        omnigraph_dst::cost::set_label(after_other);
+        assert_eq!(Self::hop(&db).await, before);
+        omnigraph_dst::cost::set_label("_retention_branch_create");
+        db.branch_create("retention").await.unwrap();
+        omnigraph_dst::cost::set_label(after_branch);
+        assert_eq!(Self::hop(&db).await, before);
+        omnigraph_dst::cost::set_label("_retention_own_edge_write");
+        db.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "add_friend",
+            &params(&[("$from", "Alice"), ("$to", "Diana")]),
+        )
+        .await
+        .unwrap();
+        omnigraph_dst::cost::set_label(after_own);
+        let after = Self::hop(&db).await;
+        omnigraph_dst::cost::set_label("_retention_verify");
+        assert_ne!(after, before, "the Knows insert must show in the next hop");
+    }
+}
+
+fn graph_index_retention_cost_rows(replay: &str) -> String {
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-graph-index-retention-cost-{replay}"),
+        &GraphIndexRetentionCost,
+        &GRAPH_INDEX_RETENTION_LABELS,
+    )
+}
+
 /// A `nearest` read over the vector index the engine builds, on a freshly
 /// opened handle and again on the warm one. Before it uses the index, the scan
 /// reads the column's vector index details (issue #1297, through
@@ -4075,6 +4177,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&overwrite_removal_cost_rows("a"));
     table.push_str(&endpoint_probe_cost_rows("a"));
     table.push_str(&warm_read_cost_rows("a"));
+    table.push_str(&graph_index_retention_cost_rows("a"));
     table.push_str(&update_patch_cost_rows("a"));
     table.push_str(&nearest_cost_rows("a"));
     table.push_str(&writer_claim_cost_rows("a"));
@@ -4090,6 +4193,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&overwrite_removal_cost_rows("b"));
     table2.push_str(&endpoint_probe_cost_rows("b"));
     table2.push_str(&warm_read_cost_rows("b"));
+    table2.push_str(&graph_index_retention_cost_rows("b"));
     table2.push_str(&update_patch_cost_rows("b"));
     table2.push_str(&nearest_cost_rows("b"));
     table2.push_str(&writer_claim_cost_rows("b"));
