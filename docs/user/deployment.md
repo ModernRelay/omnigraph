@@ -238,7 +238,8 @@ export AWS_S3_FORCE_PATH_STYLE=true
 ```
 
 Set `AWS_ALLOW_HTTP=true` only for a trusted local development endpoint. Do not
-put credentials in `cluster.yaml` or graph URIs.
+put credentials in `cluster.yaml` or graph URIs. The store's requirements and
+encryption at rest are in [Storage](concepts/storage.md#s3-configuration).
 
 The same storage root must be visible to servers and out-of-band cluster or
 maintenance jobs. Submit schema/query changes and graph additions to the running
@@ -327,7 +328,7 @@ Configure tokens from environment or a mounted secret file:
 
 - `OMNIGRAPH_SERVER_BEARER_TOKEN`
 - `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON`
-- `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE`
+- `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` (mode 600, or `defaultMode: 0400` for a Kubernetes secret volume; a file other accounts can write is refused)
 - `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` in the AWS-enabled build
 
 Policy bundles come from the applied cluster. See

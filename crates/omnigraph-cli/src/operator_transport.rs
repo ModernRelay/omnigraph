@@ -445,9 +445,17 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
                 .unwrap();
-            tokio::io::copy_bidirectional(&mut downstream, &mut upstream)
-                .await
-                .unwrap();
+            match tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await {
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::NotConnected
+                    ) => {}
+                Err(error) => panic!("proxy tunnel failed: {error}"),
+            }
         });
         let server_task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
