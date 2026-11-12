@@ -105,21 +105,30 @@ impl AttemptIdentity {
 }
 
 /// What one attempt of a write carries: the writer gates it prepared under,
-/// if any, the identity of the write's first attempt, and whether this
-/// attempt's admission found that identity changed.
+/// if any, the identity of the write's first attempt, whether this attempt
+/// was admitted, and whether its admission found that identity changed.
 #[derive(Default)]
 pub(crate) struct WriteAttempt {
     gates: Option<BranchWriteGates>,
     first: Option<AttemptIdentity>,
+    admitted: bool,
     identity_changed: bool,
 }
 
 impl WriteAttempt {
     /// The schema permit and branch gate this attempt prepared under, for
-    /// `commit_all` to complete with the table gates; `None` on a first
-    /// attempt, which takes them at its revalidation.
-    pub(crate) fn take_gates(&mut self) -> Option<BranchWriteGates> {
-        self.gates.take()
+    /// its commit point to complete with the table gates; `None` on a first
+    /// attempt, which takes them at its revalidation. An attempt that never
+    /// passed [`WriteAttempt::admit`] cannot commit: a writer that forgot to
+    /// admit its capture would otherwise rerun across a recreated branch or a
+    /// schema change unchecked.
+    pub(crate) fn admitted_gates(&mut self) -> Result<Option<BranchWriteGates>> {
+        if !self.admitted {
+            return Err(OmniError::manifest_internal(
+                "a write attempt reached its commit without admitting its capture",
+            ));
+        }
+        Ok(self.gates.take())
     }
 
     /// Admit the authority this attempt captured. The first attempt records
@@ -130,21 +139,19 @@ impl WriteAttempt {
     pub(crate) fn admit(&mut self, txn: &WriteTxn, selects_rows: bool) -> Result<()> {
         let identity = AttemptIdentity::of(txn);
         match &self.first {
-            None => {
-                self.first = Some(identity);
-                Ok(())
-            }
-            Some(_) if !selects_rows => Ok(()),
-            Some(first) => match identity.changed_since(first, txn.branch.as_deref()) {
-                Some(changed) => {
+            None => self.first = Some(identity),
+            Some(_) if !selects_rows => {}
+            Some(first) => {
+                if let Some(changed) = identity.changed_since(first, txn.branch.as_deref()) {
                     // An earlier attempt may have staged detached effects,
                     // so this refusal claims no proof that nothing was.
                     self.identity_changed = true;
-                    Err(changed.without_pre_effect_evidence())
+                    return Err(changed.without_pre_effect_evidence());
                 }
-                None => Ok(()),
-            },
+            }
         }
+        self.admitted = true;
+        Ok(())
     }
 }
 
@@ -215,6 +222,7 @@ impl<'a> PreEffectReprepares<'a> {
         self.current = WriteAttempt {
             gates: Some(gates),
             first,
+            admitted: false,
             identity_changed: false,
         };
         self.db.refresh_coordinator_only().await

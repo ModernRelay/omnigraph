@@ -2658,11 +2658,96 @@ async fn named_branch_write_refuses_delete_recreate_before_effects() {
     assert_eq!(helpers::graph_native_ref(&uri, "feature").await, new_ref);
 }
 
+/// A mutation that is overtaken prepares again only on the schema its first
+/// attempt was compiled against when it selects existing rows: an update
+/// whose later attempt sees an accepted schema change is refused with
+/// `ReadSetChanged` for `schema_ir_hash`, without effect, while an insert
+/// overtaken the same way crosses the change and commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn rerun_across_a_schema_change_refuses_an_update_and_carries_an_insert_issue_1331() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(init_and_load(&dir).await);
+    let company = "node Company {\n    name: String @key\n}";
+    assert!(helpers::TEST_SCHEMA.contains(company));
+    let with = |properties: &str| {
+        helpers::TEST_SCHEMA.replace(
+            company,
+            &format!("node Company {{\n    name: String @key\n{properties}}}"),
+        )
+    };
+    let ages_before = person_ages_on(&db, "main", "Alice").await;
+
+    let update = {
+        let db = Arc::clone(&db);
+        async move {
+            db.mutate(
+                "main",
+                OCC_DISJOINT_MUTATIONS,
+                "set_age",
+                &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+            )
+            .await
+            .map(|_| ())
+        }
+    };
+    let schema_commits = std::sync::Arc::new(std::sync::Mutex::new(0));
+    let during = {
+        let db = Arc::clone(&db);
+        let schema_commits = std::sync::Arc::clone(&schema_commits);
+        let schema = with("    tag: String?\n");
+        async move {
+            db.apply_schema(&schema).await.unwrap();
+            *schema_commits.lock().unwrap() = main_commit_count(&db).await;
+        }
+    };
+    let (outcome, reprepares, _) = issue_1331_park_write(&db, update, during).await;
+    let error = outcome.expect_err("a schema change refuses the update's rerun");
+    assert_refused_before_effects(error, "schema_ir_hash");
+    assert_eq!(
+        reprepares, 1,
+        "the update prepared again once, then refused"
+    );
+    assert_eq!(
+        main_commit_count(&db).await,
+        *schema_commits.lock().unwrap(),
+        "the refused update published nothing"
+    );
+    assert_eq!(person_ages_on(&db, "main", "Alice").await, ages_before);
+
+    let companies_before = count_rows(&db, "node:Company").await;
+    let insert = {
+        let db = Arc::clone(&db);
+        async move {
+            db.mutate(
+                "main",
+                OCC_DISJOINT_MUTATIONS,
+                "insert_company",
+                &params(&[("$name", "AfterSchemaCo")]),
+            )
+            .await
+            .map(|_| ())
+        }
+    };
+    let during = {
+        let db = Arc::clone(&db);
+        let schema = with("    tag: String?\n    region: String?\n");
+        async move {
+            db.apply_schema(&schema).await.unwrap();
+        }
+    };
+    let (outcome, reprepares, _) = issue_1331_park_write(&db, insert, during).await;
+    outcome.expect("an insert crosses a schema change on its rerun");
+    assert_eq!(reprepares, 1, "the insert prepared again once");
+    assert_eq!(count_rows(&db, "node:Company").await, companies_before + 1);
+}
+
 /// A caller graph-head precondition is terminal even when the race occurs
-/// after the initial capture. Update and delete are intentionally not eligible
-/// for internal reprepare, so the authoritative under-gate check must map both
-/// shapes to `PreconditionFailed` rather than leaking the engine's internal
-/// `ReadSetChanged` classification.
+/// after the initial capture. The under-gate check maps a moved head to
+/// `PreconditionFailed` for both an update and a delete, which never prepares
+/// again, rather than leaking the engine's internal `ReadSetChanged`
+/// classification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn conditional_update_and_delete_races_return_precondition_failed_before_effects() {

@@ -1,0 +1,48 @@
+# issue: 1331
+# red_on: main 9e75ede6: the parked update is refused with `write authority 'graph_head:…' changed during preparation` instead of rerunning.
+# notes: An update overtaken by a write to the very row it selects reruns its query on the new head. It does not replay the first attempt's selection: alice no longer matches `age = 30`, so the rerun changes nothing and alice keeps the other writer's 40.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine-dst
+    storage: in-memory-object-store
+    seeds: [0, 42]
+
+--- schema
+node Person {
+    name: String @key
+    age: I32
+}
+
+--- seed
+{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":31}}
+
+--- concurrent
+u1: query bump_thirty() { update Person set { age: 99 } where age = 30 }
+u2: query age_alice() { update Person set { age: 40 } where name = "alice" }
+order: u1 park put nodes/, u2, u1 put nodes/, u1
+--- expect
+u1: ok
+u2: ok
+
+--- query
+query people() { match { $p: Person } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"alice","p.age":40}
+{"p.name":"bob","p.age":31}
+--- expect shape
+p.name: String
+p.age: I32
+
+--- restart
+
+--- query
+query people_after_reopen() { match { $p: Person } return { $p.name, $p.age } }
+--- expect unordered
+{"p.name":"alice","p.age":40}
+{"p.name":"bob","p.age":31}
+--- expect shape
+p.name: String
+p.age: I32

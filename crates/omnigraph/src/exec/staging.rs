@@ -1215,7 +1215,7 @@ impl StagedMutation {
         // exclusive side excludes every writer, RFC
         // 2026-09-18-shared-schema-gate), branch gate, then sorted
         // per-table gates. Hold the full set through manifest publish.
-        let branch_gates = match attempt.take_gates() {
+        let branch_gates = match attempt.admitted_gates()? {
             Some(held) if held.branch_key() == branch => held,
             Some(held) => {
                 return Err(OmniError::manifest_internal(format!(

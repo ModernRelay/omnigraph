@@ -1440,7 +1440,7 @@ impl Omnigraph {
                     // ordering as effectful writes (shared permit — this pass
                     // only reads the accepted view), revalidate the complete
                     // authority and map a moved caller head to terminal 412.
-                    let _gates = match attempt.take_gates() {
+                    let _gates = match attempt.admitted_gates()? {
                         Some(held) => held,
                         None => {
                             self.write_queue()
