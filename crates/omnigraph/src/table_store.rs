@@ -4089,26 +4089,11 @@ impl TableStore {
         source_ids: &[String],
         system_columns: SystemColumns,
     ) -> Result<Option<String>> {
-        use datafusion::prelude::{col, lit};
-
         exact_id_primary_key_field_id(ds, system_columns, "first_existing_id")?;
         if source_ids.is_empty() {
             return Ok(None);
         }
-        let filter = col(system_columns.id)
-            .in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
-        let mut target_ids = Self::scan_stream_with(
-            ds,
-            Some(&[system_columns.id]),
-            None,
-            None,
-            false,
-            |scanner| {
-                scanner.filter_expr(filter);
-                Ok(())
-            },
-        )
-        .await?;
+        let mut target_ids = Self::exact_id_scan(ds, source_ids, system_columns).await?;
         while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
             let ids =
                 string_id_column(&batch, system_columns, "stage_keyed_write strict preflight")?;
@@ -4121,21 +4106,20 @@ impl TableStore {
         Ok(None)
     }
 
-    /// How many members of `source_ids` the pinned table holds, through the
-    /// same exact-id predicate as [`Self::first_existing_id`].
-    async fn existing_id_count(
+    /// The id column of the pinned table's rows whose id is a member of
+    /// `source_ids`: the one structured, scalar-index-eligible exact-id
+    /// predicate both id probes run, which Lance serves from a covering
+    /// BTREE and by a filtered scan of the fragments it leaves uncovered.
+    async fn exact_id_scan(
         ds: &Dataset,
         source_ids: &[String],
         system_columns: SystemColumns,
-    ) -> Result<usize> {
+    ) -> Result<DatasetRecordBatchStream> {
         use datafusion::prelude::{col, lit};
 
-        if source_ids.is_empty() {
-            return Ok(0);
-        }
         let filter = col(system_columns.id)
             .in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
-        let mut target_ids = Self::scan_stream_with(
+        Self::scan_stream_with(
             ds,
             Some(&[system_columns.id]),
             None,
@@ -4146,7 +4130,20 @@ impl TableStore {
                 Ok(())
             },
         )
-        .await?;
+        .await
+    }
+
+    /// How many members of `source_ids` the pinned table holds, through the
+    /// same exact-id predicate as [`Self::first_existing_id`].
+    async fn existing_id_count(
+        ds: &Dataset,
+        source_ids: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<usize> {
+        if source_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut target_ids = Self::exact_id_scan(ds, source_ids, system_columns).await?;
         let mut present = HashSet::new();
         while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
             let ids = string_id_column(&batch, system_columns, "stage_keyed_write upsert probe")?;

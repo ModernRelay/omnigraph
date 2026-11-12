@@ -1,1 +1,1 @@
-- A one-row keyed `insert`, `update ... where <key> = v` or `load --mode merge` reads its rows through the `id` index instead of every fragment, so its cost stops growing with the table.
+- On a table with an `id` index, a one-row keyed `insert`, `update ... where <key> = v` or `load --mode merge` reads its rows through the index instead of the `id` column of every fragment. A merge of rows that all exist does so only while the fragments the index does not yet cover are few and hold at most 1 MiB; otherwise it reads the `id` column of every fragment, as before.

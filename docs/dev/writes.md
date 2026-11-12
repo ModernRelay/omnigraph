@@ -610,9 +610,13 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
   the BTREE leaves uncovered times the source ids stay within one keyed batch
   (8,192), since Lance plans the probe's `IN` list once per uncovered
   fragment. Rows all new stage through the absence-proven insert writer; rows
-  all present stage as a known-present update while the BTREE covers more
-  fragments than it leaves, since that indexed merge reads each uncovered
-  fragment again. Otherwise the upsert takes Lance's full-table merge join
+  all present stage as a known-present update only while the BTREE covers
+  more fragments than it leaves and those uncovered fragments' recorded
+  data-file sizes are known and total at most 1 MiB
+  (`KNOWN_PRESENT_TAIL_MAX_BYTES`): that indexed merge scans each uncovered
+  fragment for every source column (Lance 13), so the fragment rule bounds
+  its requests and the byte budget bounds its bytes whatever the row width.
+  Otherwise the upsert takes Lance's full-table merge join
   (`use_index(false)`), which builds the inserted-row key filter;
 - an `update` whose predicate has `<key> = v` on a single String `@key` adds
   the derived `id = v` conjunct to its match scan when the table has an id
