@@ -18,7 +18,9 @@ use futures::StreamExt;
 use super::load_budget::{LoadBudget, ShareClass};
 use crate::engine::context::{QueryWorkLease, QueryWorkScope};
 use crate::error::OmniError;
-use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue,
+};
 
 pub(in crate::engine) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -827,7 +829,41 @@ impl WorkMemory {
         let input_limit = crate::table_store::sort_input_batch_bytes(self.resources.limit);
         let plan = crate::table_store::cap_sort_inputs_and_merge_partitions(plan, input_limit)?;
         let stream = plan.execute(0, Arc::clone(&self.ctx))?;
+        self.share_spills(&plan);
         Ok((plan, stream))
+    }
+
+    /// Registers the spill counters of `plan`, a DataFusion plan this
+    /// memory's operator runs itself, on the operator's own metrics. Such a
+    /// plan is not a child in the tree, so the report reaches its spills only
+    /// through the operator's row. The counters are DataFusion's own, shared,
+    /// not copied: whenever the report reads the row, after the run finished,
+    /// failed, or was cut short by a `Limit` while the operator's worker was
+    /// still being cancelled, it reads what the plan has spilled so far.
+    /// DataFusion's spilling operators (sort, aggregate) create their
+    /// counters in `execute`, which has run here. A plan with no spilling
+    /// operator registers nothing; a spilling operator registers its counters
+    /// even when it writes no file, and the report keeps only counters that
+    /// spilled. A spilling operator below a child that executes its input
+    /// lazily, such as a multi-partition `CoalescePartitionsExec`, whose
+    /// spawned tasks call `execute` later, has no counters yet and is not
+    /// seen.
+    fn share_spills(&self, plan: &Arc<dyn ExecutionPlan>) {
+        if let Some(metrics) = plan.metrics() {
+            for metric in metrics.iter() {
+                if matches!(
+                    metric.value(),
+                    MetricValue::SpillCount(_)
+                        | MetricValue::SpilledBytes(_)
+                        | MetricValue::SpilledRows(_)
+                ) {
+                    self.metrics.register(Arc::clone(metric));
+                }
+            }
+        }
+        for child in plan.children() {
+            self.share_spills(child);
+        }
     }
 
     pub(in crate::engine) fn slice_bytes(
