@@ -844,7 +844,9 @@ operator's metrics. The counters are shared, not copied, so the row reads what
 the plan has spilled whenever the report is built, including when a `Limit`
 cut the run short and the operator's cancelled worker has not yet wound down.
 DataFusion's spilling operators create these counters in `execute`, before
-they are polled.
+they are polled, so only operators that the plan's own `execute` reaches at
+once are seen: a spilling operator below a multi-partition
+`CoalescePartitionsExec`, whose spawned tasks execute its input later, is not.
 
 Polled is read off the operator's metrics: omnigraph's operators count a
 `polls` metric on every poll of the streams they hand out (`operators::polled`),

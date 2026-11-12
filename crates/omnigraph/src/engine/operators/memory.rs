@@ -841,8 +841,13 @@ impl WorkMemory {
     /// failed, or was cut short by a `Limit` while the operator's worker was
     /// still being cancelled, it reads what the plan has spilled so far.
     /// DataFusion's spilling operators (sort, aggregate) create their
-    /// counters in `execute`, which has run here; a plan that never spills
-    /// leaves nothing registered.
+    /// counters in `execute`, which has run here. A plan with no spilling
+    /// operator registers nothing; a spilling operator registers its counters
+    /// even when it writes no file, and the report keeps only counters that
+    /// spilled. A spilling operator below a child that executes its input
+    /// lazily, such as a multi-partition `CoalescePartitionsExec`, whose
+    /// spawned tasks call `execute` later, has no counters yet and is not
+    /// seen.
     fn share_spills(&self, plan: &Arc<dyn ExecutionPlan>) {
         if let Some(metrics) = plan.metrics() {
             for metric in metrics.iter() {
