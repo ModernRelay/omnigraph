@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use crate::error::Result;
 
 pub use omnigraph_storage::{
-    CapturedStorageBinding, FrozenDirectory, ListDirBounds, StorageDestination, StorageIoScope,
-    StorageKind, join_uri, redacted_storage_uri,
+    CapturedStorageBinding, FrozenDirectory, ListDirBounds, ReadThroughMount, StorageDestination,
+    StorageIoScope, StorageKind, join_uri, redacted_storage_uri,
 };
 
 #[async_trait]
@@ -23,6 +23,12 @@ pub trait StorageAdapter: Debug + Send + Sync {
         None
     }
     fn io_scope(&self) -> Option<StorageIoScope> {
+        None
+    }
+    /// The mount this adapter reads through. A handle opened with such an
+    /// adapter builds its Lance stores over the same mount, so a wrapper
+    /// around the adapter must forward this.
+    fn read_through_mount(&self) -> Option<ReadThroughMount> {
         None
     }
     async fn read_text(&self, uri: &str) -> Result<String>;
@@ -198,6 +204,9 @@ impl StorageAdapter for ObjectStorageAdapter {
     fn io_scope(&self) -> Option<StorageIoScope> {
         omnigraph_storage::StorageAdapter::io_scope(&self.inner)
     }
+    fn read_through_mount(&self) -> Option<ReadThroughMount> {
+        omnigraph_storage::StorageAdapter::read_through_mount(&self.inner)
+    }
     async fn read_text(&self, uri: &str) -> Result<String> {
         Ok(omnigraph_storage::StorageAdapter::read_text(&self.inner, uri).await?)
     }
@@ -331,6 +340,44 @@ pub fn storage_for_uri_scoped(uri: &str, scope: StorageIoScope) -> Result<Arc<dy
     };
     Ok(Arc::new(ObjectStorageAdapter {
         inner,
+        binding: None,
+    }))
+}
+
+/// Storage for the graph root `root_uri` read through the base `base_uri`,
+/// two root URIs of one backend, local directories in this phase: the graph
+/// starts as the one the base holds, every write lands under the root, and
+/// the base is never written. A handle opened with it reads its Lance
+/// datasets through the same mount.
+///
+/// # Errors
+/// When the two roots are not of one kind or that kind is not local, when
+/// one lies inside the other, or when the base or the root's delete markers
+/// cannot be listed.
+pub async fn storage_read_through(
+    base_uri: &str,
+    root_uri: &str,
+) -> Result<Arc<dyn StorageAdapter>> {
+    Ok(Arc::new(ObjectStorageAdapter {
+        inner: omnigraph_storage::ObjectStorageAdapter::durable_read_through(base_uri, root_uri)
+            .await?,
+        binding: None,
+    }))
+}
+
+/// [`storage_read_through`] whose mutations belong to the supplied owner; a
+/// handle opened with it carries the scope over the mount in its Lance stores
+/// too, so a clone and a scoped local root differ in the mount alone.
+pub async fn storage_read_through_scoped(
+    base_uri: &str,
+    root_uri: &str,
+    scope: StorageIoScope,
+) -> Result<Arc<dyn StorageAdapter>> {
+    Ok(Arc::new(ObjectStorageAdapter {
+        inner: omnigraph_storage::ObjectStorageAdapter::durable_read_through_scoped(
+            base_uri, root_uri, scope,
+        )
+        .await?,
         binding: None,
     }))
 }

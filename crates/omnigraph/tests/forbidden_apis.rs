@@ -251,7 +251,7 @@ write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options", "init_with_storage"],
     "db/omnigraph/prepared_create.rs" => WriteProtocol::Bootstrap => ["apply_prepared_graph_create", "apply_prepared_graph_create_with_io_scope", "apply_prepared_graph_create_with_storage"],
     "db/omnigraph/prepared_create.rs" => WriteProtocol::Exact("quiesced birth settlement: exact init claim, bounded original empty tables, no published manifest or refs") => ["settle_prepared_graph_create_after_quiescence", "settle_prepared_graph_create_after_quiescence_with_storage"],
-    "db/omnigraph.rs" => WriteProtocol::Composed("read-write admission + owned local-root create-if-absent capability probe") => ["open", "open_with_storage", "open_with_io_scope"],
+    "db/omnigraph.rs" => WriteProtocol::Composed("read-write admission + owned local-root create-if-absent capability probe") => ["open", "open_with_storage", "open_with_io_scope", "open_clone"],
     "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_with_receipt", "mutate_as", "mutate_as_with_receipt", "mutate_as_with_expected_head", "mutate_as_with_expected_head_receipt", "mutate_as_with_optional_branch_receipt"],
     "exec/blob_write.rs" => MUTATION_V9 => ["put_blob_at_as", "clear_blob_at_as"],
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_with_receipt", "load_file", "load_graph_batch"],
@@ -888,7 +888,7 @@ gateway_surfaces! {
         "manifest_scan_dataset",
     ],
     "omnigraph-core/storage.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
-        "binding", "io_scope", "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
+        "binding", "io_scope", "read_through_mount", "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
         "read_bytes_if_exists_bounded", "exists",
         "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
@@ -897,7 +897,7 @@ gateway_surfaces! {
         "write_text_if_match", "delete_prefix",
     ],
     "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
-        "io_scope", "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
+        "io_scope", "read_through_mount", "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
         "read_bytes_if_exists_bounded", "read_text_versioned_if_exists_bounded", "exists",
         "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
@@ -1115,8 +1115,9 @@ durable_calls! {
     ("omnigraph-storage/scoped.rs", ".put_part(", 1, WriteProtocol::Composed("tracked child of an owned multipart upload")),
     ("omnigraph-storage/scoped.rs", ".complete(", 1, WriteProtocol::Composed("owned multipart publication, never success after uncertain part completion")),
     ("omnigraph-storage/scoped.rs", ".abort(", 1, WriteProtocol::Composed("owned multipart cleanup retained across detached abort")),
-    ("omnigraph-storage/read_through.rs", ".put_opts(", 5, WriteProtocol::Composed("memory-layer put over a frozen directory (a prepared store under DST): overwrite, create, update of a layer object, update of a directory object landing as a create, and the copy's put")),
-    ("omnigraph-storage/read_through.rs", ".delete(", 1, WriteProtocol::Composed("memory-layer delete over a frozen directory, which it masks")),
+    ("omnigraph-storage/read_through.rs", ".put(", 2, WriteProtocol::Composed("durable read-through store only, two empty objects under the clone root's reserved `__clone/`: `created`, written once when a mount is first built over a clone root that has none, so that every clone root is told apart from a base; and `deleted/<key>`, the whiteout written before a delete of a base object takes effect so that a later mount over the same clone root hides that object again. A whiteout that lands after its caller gave up hides the base object from the next open on and nothing else, since a later create lives in the clone root; a repeated write lands the same empty object, and the in-memory form never writes either")),
+    ("omnigraph-storage/read_through.rs", ".put_opts(", 5, WriteProtocol::Composed("layer put over a frozen directory (the memory layer of a prepared store under DST, or a durable layer): overwrite, create, update of a layer object, update of a directory object landing as a create, and the copy's put")),
+    ("omnigraph-storage/read_through.rs", ".delete(", 2, WriteProtocol::Composed("layer delete over a frozen directory, which it masks; and the delete half of the store's own rename, which runs only for a source the base does not hold, so it is a plain clone-root delete after the copy")),
     ("engine/operators/memory.rs", ".abort(", 1, WriteProtocol::ReadTaskCancellation),
     ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
@@ -2847,8 +2848,8 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
     (
         "omnigraph-storage/read_through.rs",
         ".delete(",
-        1,
-        "the read-through store's delete removes the memory layer's object in this process and masks the frozen directory's; DST only, nothing lands late",
+        2,
+        "the read-through store forwards its caller's delete to the layer and masks the frozen directory's object; it issues no delete of its own, so a late landing is the caller's, argued where that caller is registered. Under DST the layer is memory in this process and nothing lands late; in the durable form the marker that masks the directory's object is written before the forward. The second site is the delete half of the store's own rename, which runs only for a source the base does not hold, so it is the caller's rename-source delete on a clone-root key and lands late exactly as a rename on a plain store does",
     ),
     (
         "storage_layer.rs",
@@ -3629,6 +3630,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "storage.rs: omnigraph_core::storage::DecorateStorage",
     "storage.rs: omnigraph_core::storage::ListDirBounds",
     "storage.rs: omnigraph_core::storage::ObjectStorageAdapter",
+    "storage.rs: omnigraph_core::storage::ReadThroughMount",
     "storage.rs: omnigraph_core::storage::STORAGE",
     "storage.rs: omnigraph_core::storage::StorageAdapter",
     "storage.rs: omnigraph_core::storage::StorageDestination",
@@ -3642,6 +3644,8 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "storage.rs: omnigraph_core::storage::storage_for_uri",
     "storage.rs: omnigraph_core::storage::storage_for_uri_scoped",
     "storage.rs: omnigraph_core::storage::storage_kind_for_uri",
+    "storage.rs: omnigraph_core::storage::storage_read_through",
+    "storage.rs: omnigraph_core::storage::storage_read_through_scoped",
     "table_store.rs: omnigraph_core::dataset_index::IndexCoverage",
 ];
 

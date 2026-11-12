@@ -572,6 +572,28 @@ retains the recording error and the complete structured acquisition error as
 separate fields.
 Controlled cloud orchestration remains a later, separately reviewed slice.
 
+`run --local-route direct|object-store|read-through` selects how an
+engine-target repetition reaches its fixture. `direct`, the default, is today's
+repetition: a restored working copy opened on Lance's direct local file path.
+`object-store` opens the same restored copy with every read and write through
+the object store, as a handle opened with an I/O scope does. `read-through`
+opens an empty clone root over the frozen fixture through read-through storage
+(the graph shallow clone RFC), under the same I/O scope; nothing is restored.
+The frozen fixture's metadata is checked before every repetition, as on every
+route, and after the last repetition of a successful run every byte of it is
+read again: a change caught before a repetition fails as `template metadata
+changed`, one the byte read finds fails the run as `template bytes changed`.
+The option takes no base: the base is the cache entry's frozen `template`
+directory and the clone root is its `active` sibling. A route other than
+`direct` is a comparison: the argument parser refuses `--archive` beside the
+option, a served scenario refuses the route, the `--json` output of a completed
+run carries `local_route` with the route's name (a refused or failed run's does
+not), and its runs have `durable_record: false`.
+`scripts/compare-local-routes.py` runs the three routes in alternating order
+over several passes into a fresh output directory and prints the per-route
+p50, the ratios, the storage calls of the measured step and the verdict on the
+read-through threshold.
+
 Machine-readable diagnostic-mode failures keep the suite/case/point identity
 and all completed runs or repetitions. A worker killed at its hard deadline
 contributes structured process-containment evidence, but never a partial

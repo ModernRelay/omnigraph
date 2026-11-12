@@ -47,6 +47,7 @@ mod rrf_prefilter_gate;
 mod s3_storage;
 mod scalar_indexes;
 mod scan_limit_cost;
+mod shallow_clone;
 mod traversal_adaptive;
 mod traversal_indexed;
 mod validators;
