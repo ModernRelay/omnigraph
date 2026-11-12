@@ -1031,6 +1031,7 @@ impl AppState {
                 .set(id, &value, omnigraph::settings::Source::Request)
                 .map_err(|error| ApiError::bad_request(error.to_string()))?;
         }
+        refuse_raised_budgets(session.settings(), &self.process_defaults.settings)?;
         Ok(session)
     }
 
@@ -1167,6 +1168,60 @@ impl AppState {
             _ => Err(oidc_identity::OidcRefusal::Invalid),
         }
     }
+}
+
+/// Refuse request settings that raise a resource budget past this server's
+/// ceiling: the larger of its own value and the built-in default. A served
+/// request may lower `traversal_work_limit`, `query_memory_bytes`,
+/// `write_max_bytes` and `load_source_max_bytes`, or raise one back to the
+/// default an operator lowered it from; going further is the operator's
+/// decision, made through the process environment, since a raised budget is
+/// work or memory one request may hold.
+pub(crate) fn refuse_raised_budgets(
+    requested: &omnigraph::settings::SessionSettings,
+    server: &omnigraph::settings::SessionSettings,
+) -> std::result::Result<(), ApiError> {
+    use omnigraph_compiler::settings::SettingId;
+    let default = omnigraph::settings::SessionSettings::default();
+    let budgets = [
+        (
+            SettingId::TraversalWorkLimit,
+            requested.traversal_work_limit(),
+            server
+                .traversal_work_limit()
+                .max(default.traversal_work_limit()),
+        ),
+        (
+            SettingId::QueryMemoryBytes,
+            requested.query_memory_bytes(),
+            server
+                .query_memory_bytes()
+                .max(default.query_memory_bytes()),
+        ),
+        (
+            SettingId::WriteMaxBytes,
+            requested.write_max_bytes(),
+            server.write_max_bytes().max(default.write_max_bytes()),
+        ),
+        (
+            SettingId::LoadSourceMaxBytes,
+            requested.load_source_max_bytes(),
+            server
+                .load_source_max_bytes()
+                .max(default.load_source_max_bytes()),
+        ),
+    ];
+    for (id, asked, limit) in budgets {
+        if asked > limit {
+            return Err(ApiError::bad_request(format!(
+                "setting `{}` = {asked} is above this server's ceiling of {limit}; the operator \
+                 raises the ceiling with `{}`",
+                id.name(),
+                id.spec().env
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn hash_bearer_tokens(bearer_tokens: Vec<(String, String)>) -> Arc<[(BearerTokenHash, Arc<str>)]> {

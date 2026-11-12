@@ -823,6 +823,20 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
     }
 
+    /// Open a shallow clone of the graph at `base_uri`, rooted at `root_uri`
+    /// (`docs/rfcs/2026-11-10-graph-shallow-clone.md`): the clone starts with
+    /// every branch, version, commit and index of the base, every write lands
+    /// under `root_uri`, and the base is never written. Both are local
+    /// directories in this phase, and `root_uri` is an empty directory or a
+    /// clone root a previous open built. A caller that wraps storage builds
+    /// it with [`crate::storage::storage_read_through`] and opens with
+    /// [`Self::open_with_storage`], as the benchmark harness does to count
+    /// store calls.
+    pub async fn open_clone(base_uri: &str, root_uri: &str) -> Result<Self> {
+        let storage = crate::storage::storage_read_through(base_uri, root_uri).await?;
+        Self::open_with_storage_and_mode(root_uri, storage, OpenMode::ReadWrite).await
+    }
+
     /// Open an existing graph for read-only consumers (NDJSON export,
     /// `commit list`, etc.). Performs no open-time writes — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {

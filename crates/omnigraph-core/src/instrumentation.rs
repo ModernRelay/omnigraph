@@ -2300,6 +2300,9 @@ impl StorageAdapter for CountingStorageAdapter {
     fn io_scope(&self) -> Option<crate::storage::StorageIoScope> {
         self.inner.io_scope()
     }
+    fn read_through_mount(&self) -> Option<crate::storage::ReadThroughMount> {
+        self.inner.read_through_mount()
+    }
     async fn read_text(&self, uri: &str) -> Result<String> {
         self.counts.read_text.fetch_add(1, Ordering::Relaxed);
         self.inner.read_text(uri).await
