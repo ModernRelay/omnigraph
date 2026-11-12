@@ -43,7 +43,9 @@ accept local paths and `file://` URIs and, with the server stopped, an inline
 `AWS_REGION` or `AWS_DEFAULT_REGION`; see
 [S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
 Every direct writer on the root (`cluster apply`, maintenance) takes the
-cluster's admission lock and keeps it after it finishes; `cluster plan` and
+cluster's admission lock. Maintenance keeps it after it finishes; `cluster
+apply` releases it when its deployment converges and every write it sent has
+settled, and keeps it otherwise. `cluster plan` and
 `cluster status` only observe the lock, and `cluster status --json` reports the
 current holder's `lock_id`. Before the next writer or the server starts,
 establish that the holder has stopped and its I/O has settled, then release
@@ -59,8 +61,7 @@ mkdir -p ./company-data
 omnigraph cluster validate --config ./company-brain
 omnigraph cluster plan --target ./company-data --config ./company-brain --json
 omnigraph cluster apply --target ./company-data --config ./company-brain --as act-alice --json
-# After the previous owner has stopped and its accepted I/O has settled:
-omnigraph cluster force-unlock '<LOCK_ID>' --target ./company-data
+# A converged apply has released its lock; start the server.
 omnigraph-server --cluster file:///absolute/company-data --bind 127.0.0.1:8080 --unauthenticated
 ```
 

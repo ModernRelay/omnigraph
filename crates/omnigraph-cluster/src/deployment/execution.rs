@@ -1677,6 +1677,9 @@ async fn apply_direct_bundle(
             return Ok(found);
         }
     }
+    // Every control and graph write of this deployment runs in one storage
+    // scope, so a converged result can prove them settled before release.
+    let store = store.with_io_scope(omnigraph_storage::StorageIoScope::new())?;
     let admission = admission::acquire_with_store(&store, ClusterAdmissionPurpose::Deployment)
         .await?
         .ok_or_else(|| refusal("state_missing", "cluster ledger is missing"))?;
@@ -1701,7 +1704,37 @@ async fn apply_direct_bundle(
             }
         };
     }
-    result
+    match result {
+        Ok(DeploymentLookup::Complete { result }) if result.converged => {
+            release_converged_deployment(admission, &result.id).await?;
+            Ok(DeploymentLookup::Complete { result })
+        }
+        other => other,
+    }
+}
+
+/// A converged direct deployment hands its root to the next owner by the
+/// proof a clean server shutdown uses (#1359): its storage scope closes with
+/// every accepted request settled and none uncertain. Without a tracked scope
+/// (Azure keeps its stopped-process boundary) the lock stays held, as does a
+/// failed, outstanding or unconverged deployment, for exact-ID reconciliation.
+async fn release_converged_deployment(
+    admission: ClusterAdmission,
+    deployment_id: &str,
+) -> Result<(), Diagnostic> {
+    if admission.io_scope().is_none() {
+        return Ok(());
+    }
+    let lock_id = admission.lock_id().to_owned();
+    admission.release_after_settlement().await.map_err(|error| {
+        refusal(
+            &error.code,
+            format!(
+                "deployment {deployment_id} converged, but admission {lock_id} remains held: {}",
+                error.message
+            ),
+        )
+    })
 }
 
 /// Execute under the existing sole writer. The server supplies its paused live

@@ -1694,11 +1694,23 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let results = state["deployment_results"].as_array().unwrap();
             assert_eq!(results.len(), 1);
             let id = results[0]["id"].as_str().unwrap();
-            let lock = status.lock_id.as_deref().unwrap();
             let message = format!("{error:#}");
             assert!(message.contains(id), "{message}");
-            assert!(message.contains(lock), "{message}");
+            assert!(message.contains("Admission lock: "), "{message}");
             assert!(!message.contains("\"disposition\""));
+            // The converged apply released its lock (#1359). A later owner that
+            // stops without release leaves the lock the checks below deliver.
+            assert!(status.lock_id.is_none());
+            let later = omnigraph_cluster::acquire_cluster_admission(
+                root,
+                omnigraph_cluster::ClusterAdmissionPurpose::GraphOperation,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let lock = later.lock_id().to_owned();
+            drop(later);
+            let lock = lock.as_str();
             let receipt = omnigraph_cluster::deployment_status(root, Some(id), &caller)
                 .await
                 .unwrap()
@@ -1723,7 +1735,7 @@ async fn direct_deployment_delivery_failure_retains_one_result_and_original_iden
             let lock_bytes = std::fs::read(&lock_path).unwrap();
 
             // Resubmitting the known identity observes the original result even
-            // while admission is retained. It must not run the deployment again.
+            // while another owner's admission is retained. It must not run the deployment again.
             let mut observed = Vec::new();
             let mut custody = Vec::new();
             apply_source(

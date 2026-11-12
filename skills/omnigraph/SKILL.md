@@ -321,9 +321,11 @@ Direct `init`/`load` write local storage, and direct **`cluster apply`** writes 
   whole deployment (graphs, schemas, stored queries, policies, optional S3/Azure
   `storage:` root); `omnigraph cluster apply` converges it and
   `omnigraph-server --cluster .` (or `--cluster s3://bucket/prefix`,
-  config-free) serves it. A direct apply keeps its admission lock: once its
-  writes have settled, release that exact lock with
-  `cluster force-unlock <LOCK_ID>` before starting the server, and send later
+  config-free) serves it. A direct apply that converges releases its
+  admission lock once its writes have settled; one that fails or does not
+  converge keeps it (`cluster status --json` reports its `lock_id`), and after
+  its writes have settled you release that exact lock with
+  `cluster force-unlock <LOCK_ID>` before starting the server. Send later
   changes with `cluster apply --target NAME --config DIR` using a registered server target.
   See `references/cluster.md`.
 - **Direct / embedded access — no server.** Address a graph's storage directly

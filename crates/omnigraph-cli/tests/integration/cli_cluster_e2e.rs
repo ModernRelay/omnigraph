@@ -628,7 +628,11 @@ fn cluster_e2e_offline_deployment_has_root_only_receipts_and_explicit_unlock() {
         ])));
         assert_eq!(status["lookup"], deployed);
         assert_eq!(status["next_sequence"], 3);
-        let lock_id = status["lock_id"].as_str().unwrap();
+        // The converged apply released its lock (#1359); a later direct writer
+        // that stopped without release holds the one recovery must name.
+        assert!(status["lock_id"].is_null(), "{status}");
+        let lock_id = "later-writer-lock";
+        write_cluster_lock(temp.path(), lock_id, "graph_operation");
         let ledger_before = fs::read(temp.path().join("__cluster/state.json")).unwrap();
         let lock_before = fs::read(temp.path().join("__cluster/lock.json")).unwrap();
         let refused = output_failure(&mut rooted(&[

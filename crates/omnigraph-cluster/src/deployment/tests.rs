@@ -39,7 +39,7 @@ fn add_second_graph(dir: &Path) {
 }
 
 #[tokio::test]
-async fn bootstrap_and_add_graph_use_one_v2_protocol_without_reset() {
+async fn bootstrap_and_add_graph_use_one_v2_protocol_without_reset_or_unlock_issue_1359() {
     let dir = crate::tests::identity_fixture();
     let root = dir.path().to_str().unwrap();
     let first = bootstrap(dir.path()).await;
@@ -61,7 +61,15 @@ async fn bootstrap_and_add_graph_use_one_v2_protocol_without_reset() {
         .await
         .unwrap()
         .graph_manifest_version();
-    unlock(root).await;
+    // A converged direct apply settles its I/O and releases its own lock, so
+    // the next writer needs no exact-ID force-unlock (#1359).
+    assert_eq!(
+        deployment_status(root, None, &owner())
+            .await
+            .unwrap()
+            .lock_id,
+        None
+    );
     add_second_graph(dir.path());
     let added = bootstrap(dir.path()).await;
     assert_eq!(added.graphs.len(), 1);
@@ -98,7 +106,14 @@ async fn bootstrap_and_add_graph_use_one_v2_protocol_without_reset() {
         "{:?}",
         snapshot.diagnostics
     );
-    unlock(root).await;
+    // The first server is admitted straight after the second apply.
+    assert_eq!(
+        deployment_status(root, None, &owner())
+            .await
+            .unwrap()
+            .lock_id,
+        None
+    );
     let admission = acquire_cluster_admission(root, ClusterAdmissionPurpose::Serve)
         .await
         .unwrap()
