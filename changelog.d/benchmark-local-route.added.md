@@ -1,0 +1,1 @@
+- `omnigraph-bench run --local-route direct|object-store|read-through` compares how an engine-target repetition reaches its fixture; `read-through` opens an empty clone root over the frozen fixture.
