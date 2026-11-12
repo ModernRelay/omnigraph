@@ -2658,14 +2658,14 @@ async fn named_branch_write_refuses_delete_recreate_before_effects() {
     assert_eq!(helpers::graph_native_ref(&uri, "feature").await, new_ref);
 }
 
-/// A mutation that is overtaken prepares again only on the schema its first
-/// attempt was compiled against when it selects existing rows: an update
-/// whose later attempt sees an accepted schema change is refused with
+/// An overtaken write that selects existing rows prepares again only on the
+/// schema its first attempt was compiled against: an update and an overwrite
+/// load whose later attempt sees an accepted schema change are refused with
 /// `ReadSetChanged` for `schema_ir_hash`, without effect, while an insert
 /// overtaken the same way crosses the change and commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn rerun_across_a_schema_change_refuses_an_update_and_carries_an_insert_issue_1331() {
+async fn rerun_across_a_schema_change_refuses_updates_and_overwrites_issue_1331() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(init_and_load(&dir).await);
@@ -2716,6 +2716,46 @@ async fn rerun_across_a_schema_change_refuses_an_update_and_carries_an_insert_is
     );
     assert_eq!(person_ages_on(&db, "main", "Alice").await, ages_before);
 
+    let people_before = count_rows(&db, "node:Person").await;
+    let overwrite = {
+        let db = Arc::clone(&db);
+        async move {
+            db.load(
+                "main",
+                r#"{"type":"Person","data":{"name":"Alice","age":31}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Diana","age":28}}"#,
+                LoadMode::Overwrite,
+            )
+            .await
+            .map(|_| ())
+        }
+    };
+    let during = {
+        let db = Arc::clone(&db);
+        let schema_commits = std::sync::Arc::clone(&schema_commits);
+        let schema = with("    tag: String?\n    region: String?\n");
+        async move {
+            db.apply_schema(&schema).await.unwrap();
+            *schema_commits.lock().unwrap() = main_commit_count(&db).await;
+        }
+    };
+    let (outcome, reprepares, _) = issue_1331_park_write(&db, overwrite, during).await;
+    let error = outcome.expect_err("a schema change refuses the overwrite's rerun");
+    assert_refused_before_effects(error, "schema_ir_hash");
+    assert_eq!(
+        reprepares, 1,
+        "the overwrite prepared again once, then refused"
+    );
+    assert_eq!(
+        main_commit_count(&db).await,
+        *schema_commits.lock().unwrap(),
+        "the refused overwrite published nothing"
+    );
+    assert_eq!(count_rows(&db, "node:Person").await, people_before);
+    assert_eq!(person_ages_on(&db, "main", "Alice").await, ages_before);
+
     let companies_before = count_rows(&db, "node:Company").await;
     let insert = {
         let db = Arc::clone(&db);
@@ -2732,7 +2772,7 @@ async fn rerun_across_a_schema_change_refuses_an_update_and_carries_an_insert_is
     };
     let during = {
         let db = Arc::clone(&db);
-        let schema = with("    tag: String?\n    region: String?\n");
+        let schema = with("    tag: String?\n    region: String?\n    size: I32?\n");
         async move {
             db.apply_schema(&schema).await.unwrap();
         }
@@ -2745,9 +2785,9 @@ async fn rerun_across_a_schema_change_refuses_an_update_and_carries_an_insert_is
 
 /// A caller graph-head precondition is terminal even when the race occurs
 /// after the initial capture. The under-gate check maps a moved head to
-/// `PreconditionFailed` for both an update and a delete, which never prepares
-/// again, rather than leaking the engine's internal `ReadSetChanged`
-/// classification.
+/// `PreconditionFailed` for a conditional update and a conditional delete,
+/// which never prepare again, rather than leaking the engine's internal
+/// `ReadSetChanged` classification.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn conditional_update_and_delete_races_return_precondition_failed_before_effects() {
