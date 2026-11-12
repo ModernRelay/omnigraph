@@ -605,7 +605,22 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
 
 - strict insert probes the pinned parent and returns `KeyConflict` for an
   existing ID;
-- upsert updates or inserts without changing modes on retry;
+- upsert updates or inserts without changing modes on retry. With an id
+  BTREE it first runs the strict insert's exact-id probe, while the fragments
+  the BTREE leaves uncovered times the source ids stay within one keyed batch
+  (8,192), since Lance plans the probe's `IN` list once per uncovered
+  fragment. Rows all new stage through the absence-proven insert writer; rows
+  all present stage as a known-present update only while the BTREE covers
+  more fragments than it leaves and those uncovered fragments' recorded
+  data-file sizes are known and total at most 1 MiB
+  (`KNOWN_PRESENT_TAIL_MAX_BYTES`): that indexed merge scans each uncovered
+  fragment for every source column (Lance 13), so the fragment rule bounds
+  its requests and the byte budget bounds its bytes whatever the row width.
+  Otherwise the upsert takes Lance's full-table merge join
+  (`use_index(false)`), which builds the inserted-row key filter;
+- an `update` whose predicate has `<key> = v` on a single String `@key` adds
+  the derived `id = v` conjunct to its match scan when the table has an id
+  BTREE, as a node delete does, so the scan reads the index;
 - a bare Lance Append is not a production graph-table write;
 - one table's keyed input is bounded to 8,192 rows and the effective
   `write_max_bytes` (default 32 MiB) before its data is staged.

@@ -140,6 +140,17 @@ pub(crate) const ORDERED_SCAN_MAX_INPUT_BATCH_BYTES: u64 = ORDERED_SCAN_MEMORY_B
 pub(crate) const ID_SCAN_BATCH_ROWS: usize = 1024;
 pub(crate) const ID_SCAN_BATCH_BYTES: u64 = 1024 * 1024;
 
+/// The most data-file bytes, as the manifest records them, that the fragments
+/// an id BTREE leaves uncovered may hold for an all-present upsert to take
+/// Lance's indexed merge route instead of the id join. That route scans those
+/// fragments for every source column, so this bounds what the switch can read
+/// beyond the BTREE whatever the row width. One MiB is the id column alone of
+/// tens of thousands of rows, so above that table size the switch reads less
+/// than the join even at the bound, and below it the switch reads at most this
+/// much more. A narrow one-row tail, the state a write leaves between index
+/// builds, is a few KiB.
+pub(crate) const KNOWN_PRESENT_TAIL_MAX_BYTES: u64 = 1024 * 1024;
+
 /// The byte cap of one batch entering a `SortExec` under a pool of `memory_limit` bytes.
 pub(crate) fn sort_input_batch_bytes(memory_limit: u64) -> usize {
     (memory_limit / 4).clamp(1, ORDERED_SCAN_MAX_INPUT_BATCH_BYTES) as usize
@@ -3608,7 +3619,7 @@ impl TableStore {
         ds: Dataset,
         type_key: &str,
         batch: RecordBatch,
-        semantics: KeyedWriteSemantics,
+        mut semantics: KeyedWriteSemantics,
         system_columns: SystemColumns,
         write_budget: WriteBudget,
     ) -> Result<StagedWrite> {
@@ -3654,6 +3665,62 @@ impl TableStore {
                     write_budget,
                 )
                 .await;
+        }
+        // Lance's insert-capable merge route joins the source against every
+        // id of the table. An upsert whose rows are all new or all present
+        // needs neither that join nor its inserted-key filter: the exact-id
+        // probe a strict insert runs decides which, through the id BTREE.
+        // All new, it stages through the absence-proven insert writer and
+        // reads no more than the probe. All present, it may stage as a
+        // known-present update, whose indexed merge reads the BTREE's pages
+        // and then scans each fragment the BTREE leaves uncovered for every
+        // source column (Lance 13 `merge_insert.rs`, the indexed route's
+        // unindexed union), where the join reads only the id column of every
+        // fragment. So it switches only while both costs of that tail are
+        // bounded: the BTREE covers more fragments than it leaves (requests),
+        // and the tail's recorded data files hold at most
+        // `KNOWN_PRESENT_TAIL_MAX_BYTES` (bytes, whatever the row width). An
+        // unrecorded file size keeps the join. A mixed batch keeps the join,
+        // and so does a table without the BTREE, where the probe itself would
+        // read every id. Lance plans the probe's IN list once per uncovered
+        // fragment, so the probe runs only while those copies hold no more
+        // ids than one keyed batch (#1225).
+        let tail = match semantics {
+            KeyedWriteSemantics::Upsert => {
+                crate::dataset_index::key_column_uncovered_tail(&ds, system_columns.id)
+                    .await?
+                    .filter(|tail| {
+                        tail.fragments.saturating_mul(source_ids.len()) <= KEYED_WRITE_MAX_ROWS
+                    })
+            }
+            _ => None,
+        };
+        if let Some(tail) = tail {
+            let present = Self::existing_id_count(&ds, &source_ids, system_columns).await?;
+            if present == 0 {
+                return self
+                    .stage_absence_proven_strict_insert(
+                        ds,
+                        type_key,
+                        batch,
+                        source_ids,
+                        id_field_id,
+                        &expected_schema_preorder_ids,
+                        "stage_keyed_write",
+                        system_columns,
+                        write_budget,
+                    )
+                    .await;
+            }
+            let covered = ds.fragments().len().saturating_sub(tail.fragments);
+            if present == source_ids.len()
+                && tail.fragments < covered
+                && tail
+                    .data_file_bytes
+                    .is_some_and(|bytes| bytes <= KNOWN_PRESENT_TAIL_MAX_BYTES)
+            {
+                semantics = KeyedWriteSemantics::KnownPresentUpdate;
+            }
         }
 
         // MergeInsertBuilder does not expose WriteParams and therefore cannot
@@ -4033,26 +4100,11 @@ impl TableStore {
         source_ids: &[String],
         system_columns: SystemColumns,
     ) -> Result<Option<String>> {
-        use datafusion::prelude::{col, lit};
-
         exact_id_primary_key_field_id(ds, system_columns, "first_existing_id")?;
         if source_ids.is_empty() {
             return Ok(None);
         }
-        let filter = col(system_columns.id)
-            .in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
-        let mut target_ids = Self::scan_stream_with(
-            ds,
-            Some(&[system_columns.id]),
-            None,
-            None,
-            false,
-            |scanner| {
-                scanner.filter_expr(filter);
-                Ok(())
-            },
-        )
-        .await?;
+        let mut target_ids = Self::exact_id_scan(ds, source_ids, system_columns).await?;
         while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
             let ids =
                 string_id_column(&batch, system_columns, "stage_keyed_write strict preflight")?;
@@ -4063,6 +4115,56 @@ impl TableStore {
             }
         }
         Ok(None)
+    }
+
+    /// The id column of the pinned table's rows whose id is a member of
+    /// `source_ids`: the one structured, scalar-index-eligible exact-id
+    /// predicate both id probes run, which Lance serves from a covering
+    /// BTREE and by a filtered scan of the fragments it leaves uncovered.
+    async fn exact_id_scan(
+        ds: &Dataset,
+        source_ids: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<DatasetRecordBatchStream> {
+        use datafusion::prelude::{col, lit};
+
+        let filter = col(system_columns.id)
+            .in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
+        Self::scan_stream_with(
+            ds,
+            Some(&[system_columns.id]),
+            None,
+            None,
+            false,
+            |scanner| {
+                scanner.filter_expr(filter);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// How many members of `source_ids` the pinned table holds, through the
+    /// same exact-id predicate as [`Self::first_existing_id`].
+    async fn existing_id_count(
+        ds: &Dataset,
+        source_ids: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<usize> {
+        if source_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut target_ids = Self::exact_id_scan(ds, source_ids, system_columns).await?;
+        let mut present = HashSet::new();
+        while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
+            let ids = string_id_column(&batch, system_columns, "stage_keyed_write upsert probe")?;
+            for row in 0..ids.len() {
+                if ids.is_valid(row) {
+                    present.insert(ids.value(row).to_string());
+                }
+            }
+        }
+        Ok(present.len())
     }
 
     async fn stage_keyed_write_from_stream(
