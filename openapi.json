@@ -281,7 +281,7 @@
             }
           },
           "500": {
-            "description": "Internal failure (code `internal`) while evaluating deployment access, or a storage read of the cluster state file or its lock that fails the same way on every read (`effects: none`)",
+            "description": "Internal failure (code `internal`) while evaluating deployment access, or a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read (`effects: none`)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -302,7 +302,7 @@
             }
           },
           "503": {
-            "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline. Also a storage read of the cluster state file or its lock that failed temporarily or for an unknown reason (`effects: none`; retry); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline. Also a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -666,7 +666,7 @@
             }
           },
           "500": {
-            "description": "Internal failure (code `internal`), or unsettled deployment completion (code `outcome_unknown`); reconcile the original deployment identity before submitting another deployment. Also, before any effect, a storage read of the cluster state file or its lock that fails the same way on every read (`effects: none`)",
+            "description": "Internal failure (code `internal`), or unsettled deployment completion (code `outcome_unknown`); reconcile the original deployment identity before submitting another deployment. Also, before any effect, a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read (`effects: none`)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -947,7 +947,7 @@
             }
           },
           "500": {
-            "description": "Internal failure (code `internal`), or a storage read of the cluster state file or its lock that fails the same way on every read (`effects: none`)",
+            "description": "Internal failure (code `internal`), or a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read (`effects: none`)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -968,7 +968,7 @@
             }
           },
           "503": {
-            "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline. Also a storage read of the cluster state file or its lock that failed temporarily or for an unknown reason (`effects: none`; retry); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline. Also a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1313,7 +1313,7 @@
             }
           },
           "500": {
-            "description": "Internal failure (code `internal`) while evaluating deployment access or planning, or a storage read of the cluster state file or its lock that fails the same way on every read (`effects: none`)",
+            "description": "Internal failure (code `internal`) while evaluating deployment access or planning, or a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read (`effects: none`)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1334,7 +1334,7 @@
             }
           },
           "503": {
-            "description": "Nothing was planned: a storage read of the cluster state file or its lock that failed temporarily or for an unknown reason (`effects: none`; retry); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "Nothing was planned: a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {

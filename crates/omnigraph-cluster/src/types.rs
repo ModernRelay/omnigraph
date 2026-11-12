@@ -22,8 +22,8 @@ pub struct Diagnostic {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<Box<omnigraph_compiler::QueryDiagnostic>>,
     /// The storage crate's class of the failure, when a storage read of a
-    /// control object (the state file, its lock, the operation record)
-    /// failed. A served route answers such a failure by this class: only it
+    /// control object (the state file, its lock, the operation record, a
+    /// catalog payload) failed. A served route answers such a failure by this class: only it
     /// says whether the same request can succeed later. Not serialized.
     #[serde(skip)]
     pub storage_failure: Option<omnigraph_storage::StorageFailureKind>,

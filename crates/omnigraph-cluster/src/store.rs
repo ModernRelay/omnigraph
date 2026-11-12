@@ -733,7 +733,7 @@ impl ClusterStore {
         &self,
         kind: &ResourceKind,
         digest: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>, omnigraph_storage::StorageError> {
         let Some(relative) = Self::payload_relative(kind, digest) else {
             return Ok(None);
         };
@@ -745,12 +745,6 @@ impl ClusterStore {
             )
             .await
             .map(|read| read.map(|(text, _)| text))
-            .map_err(|err| {
-                format!(
-                    "could not read catalog payload '{}': {err}",
-                    self.display(&relative)
-                )
-            })
     }
 
     /// Immutable content-addressed write. Existing bytes must verify against
@@ -923,6 +917,7 @@ impl ClusterStore {
                     self.display(&relative)
                 ),
             )
+            .with_storage_failure(&err)
         })?.ok_or_else(|| Diagnostic::error("catalog_payload_missing", address, "applied catalog payload is absent"))?;
         if sha256_hex(text.as_bytes()) != digest {
             return Err(Diagnostic::error(

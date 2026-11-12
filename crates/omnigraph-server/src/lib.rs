@@ -1363,8 +1363,8 @@ impl ApiError {
     }
 
     /// The answer to a cluster diagnostic reporting a failed storage read of
-    /// a control object (the state file, its lock, the operation record), or
-    /// `None` for any other diagnostic. Every caller maps a diagnostic it got
+    /// a control object (the state file, its lock, the operation record, a
+    /// catalog payload), or `None` for any other diagnostic. Every caller maps a diagnostic it got
     /// before the request had effects, so nothing changed; the storage
     /// crate's class of the failure decides whether the same request can
     /// succeed later. Only positive transient evidence, or no typed evidence
