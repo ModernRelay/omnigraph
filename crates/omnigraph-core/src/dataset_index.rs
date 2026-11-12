@@ -222,20 +222,22 @@ pub async fn key_column_index_coverage(ds: &Dataset, column: &str) -> Result<Ind
     ))
 }
 
-/// How many current fragments of `ds` a `key_col IN (...)` filter reads by a
+/// The current fragments of `ds` that a `key_col IN (...)` filter reads by a
 /// filtered scan beside the BTREE, under [`key_column_index_coverage`]'s
 /// rule: `None` when Lance serves no part of the filter from a BTREE (no
 /// BTREE, another index kind on the column, unknown coverage, a fragment
-/// without `physical_rows`, or no fragment), else the largest count of
-/// fragments one index on the column leaves uncovered. Lance plans the
-/// filter once per uncovered fragment, so this counts the copies of the IN
-/// list a probe holds.
-pub async fn key_column_uncovered_fragments(ds: &Dataset, column: &str) -> Result<Option<usize>> {
+/// without `physical_rows`, or no fragment), else the widest tail one index
+/// on the column leaves uncovered. Lance plans the filter once per uncovered
+/// fragment, so `fragments` counts the copies of the IN list a probe holds.
+pub async fn key_column_uncovered_tail(
+    ds: &Dataset,
+    column: &str,
+) -> Result<Option<KeyColumnTail>> {
     let Some(field_id) = ds.schema().field(column).map(|field| field.id) else {
         return Ok(None);
     };
     let indices = ds.load_indices().await.map_err(OmniError::storage)?;
-    Ok(key_column_tails(
+    let Ok(tails) = key_column_tails(
         &indices,
         field_id,
         column,
@@ -243,14 +245,47 @@ pub async fn key_column_uncovered_fragments(ds: &Dataset, column: &str) -> Resul
         ds.fragments()
             .iter()
             .all(|fragment| fragment.physical_rows.is_some()),
-    )
-    .ok()
-    .and_then(|tails| {
-        tails
-            .into_iter()
-            .map(|(_, tail)| tail.ok())
-            .try_fold(0, |widest, uncovered| Some(widest.max(uncovered?)))
-    }))
+    ) else {
+        return Ok(None);
+    };
+    let mut widest = KeyColumnTail {
+        fragments: 0,
+        data_file_bytes: Some(0),
+    };
+    for (_, tail) in tails {
+        let Ok(uncovered) = tail else {
+            return Ok(None);
+        };
+        let data_file_bytes = ds
+            .fragments()
+            .iter()
+            .filter(|fragment| uncovered.contains(&fragment.id))
+            .flat_map(|fragment| fragment.files.iter())
+            .try_fold(0u64, |total, file| {
+                file.file_size_bytes
+                    .get()
+                    .map(|size| total.saturating_add(size.get()))
+            });
+        widest = KeyColumnTail {
+            fragments: widest.fragments.max(uncovered.len()),
+            data_file_bytes: widest
+                .data_file_bytes
+                .zip(data_file_bytes)
+                .map(|(widest, bytes)| widest.max(bytes)),
+        };
+    }
+    Ok(Some(widest))
+}
+
+/// The fragments a BTREE on a key column leaves uncovered, as
+/// [`key_column_uncovered_tail`] reports them: the largest count of such
+/// fragments one index leaves, and the largest total of their data-file
+/// sizes as the manifest records them, `None` when a file's size is not
+/// recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyColumnTail {
+    pub fragments: usize,
+    pub data_file_bytes: Option<u64>,
 }
 
 /// [`key_column_index_coverage`] over already-loaded metadata.
@@ -267,8 +302,9 @@ pub fn key_column_coverage(
             for (name, tail) in tails {
                 match tail {
                     Err(reason) => return IndexCoverage::Degraded { reason },
-                    Ok(0) => {}
+                    Ok(uncovered) if uncovered.is_empty() => {}
                     Ok(uncovered) => {
+                        let uncovered = uncovered.len();
                         return IndexCoverage::Degraded {
                             reason: format!(
                                 "{uncovered} fragment(s) not covered by the index '{name}' on '{column}'"
@@ -282,8 +318,8 @@ pub fn key_column_coverage(
     }
 }
 
-/// Each index keyed on `field_id`, in name order, with the count of current
-/// fragments it leaves uncovered or why it cannot serve the column; `Err`
+/// Each index keyed on `field_id`, in name order, with the current fragments
+/// it leaves uncovered or why it cannot serve the column; `Err`
 /// when no BTREE can serve it at all.
 #[allow(clippy::type_complexity)]
 fn key_column_tails<'a>(
@@ -292,7 +328,7 @@ fn key_column_tails<'a>(
     column: &str,
     current: &BTreeSet<u64>,
     physical_rows_known: bool,
-) -> std::result::Result<Vec<(&'a str, std::result::Result<usize, String>)>, String> {
+) -> std::result::Result<Vec<(&'a str, std::result::Result<BTreeSet<u64>, String>)>, String> {
     let mut by_name = BTreeMap::<&str, Vec<&IndexMetadata>>::new();
     for index in indices
         .iter()
@@ -331,7 +367,10 @@ fn key_column_tails<'a>(
                     )),
                 );
             }
-            (name, Ok(current.len() - coverage.covered.len()))
+            (
+                name,
+                Ok(current.difference(&coverage.covered).copied().collect()),
+            )
         })
         .collect())
 }

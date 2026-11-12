@@ -140,6 +140,17 @@ pub(crate) const ORDERED_SCAN_MAX_INPUT_BATCH_BYTES: u64 = ORDERED_SCAN_MEMORY_B
 pub(crate) const ID_SCAN_BATCH_ROWS: usize = 1024;
 pub(crate) const ID_SCAN_BATCH_BYTES: u64 = 1024 * 1024;
 
+/// The most data-file bytes, as the manifest records them, that the fragments
+/// an id BTREE leaves uncovered may hold for an all-present upsert to take
+/// Lance's indexed merge route instead of the id join. That route scans those
+/// fragments for every source column, so this bounds what the switch can read
+/// beyond the BTREE whatever the row width. One MiB is the id column alone of
+/// tens of thousands of rows, so above that table size the switch reads less
+/// than the join even at the bound, and below it the switch reads at most this
+/// much more. A narrow one-row tail, the state a write leaves between index
+/// builds, is a few KiB.
+pub(crate) const KNOWN_PRESENT_TAIL_MAX_BYTES: u64 = 1024 * 1024;
+
 /// The byte cap of one batch entering a `SortExec` under a pool of `memory_limit` bytes.
 pub(crate) fn sort_input_batch_bytes(memory_limit: u64) -> usize {
     (memory_limit / 4).clamp(1, ORDERED_SCAN_MAX_INPUT_BATCH_BYTES) as usize
@@ -3649,26 +3660,31 @@ impl TableStore {
         // needs neither that join nor its inserted-key filter: the exact-id
         // probe a strict insert runs decides which, through the id BTREE.
         // All new, it stages through the absence-proven insert writer and
-        // reads no more than the probe. All present, it stages as a
-        // known-present update, whose indexed merge reads each fragment the
-        // BTREE leaves uncovered once more, where the join reads every
-        // fragment once; so it does while the BTREE covers more fragments
-        // than it leaves. A mixed batch keeps the join, and so does a table
-        // without the BTREE, where the probe itself would read every id.
-        // Lance plans the probe's IN list once per uncovered fragment, so the
-        // probe runs only while those copies hold no more ids than one keyed
-        // batch (#1225).
-        let uncovered = match semantics {
+        // reads no more than the probe. All present, it may stage as a
+        // known-present update, whose indexed merge reads the BTREE's pages
+        // and then scans each fragment the BTREE leaves uncovered for every
+        // source column (Lance 13 `merge_insert.rs`, the indexed route's
+        // unindexed union), where the join reads only the id column of every
+        // fragment. So it switches only while both costs of that tail are
+        // bounded: the BTREE covers more fragments than it leaves (requests),
+        // and the tail's recorded data files hold at most
+        // `KNOWN_PRESENT_TAIL_MAX_BYTES` (bytes, whatever the row width). An
+        // unrecorded file size keeps the join. A mixed batch keeps the join,
+        // and so does a table without the BTREE, where the probe itself would
+        // read every id. Lance plans the probe's IN list once per uncovered
+        // fragment, so the probe runs only while those copies hold no more
+        // ids than one keyed batch (#1225).
+        let tail = match semantics {
             KeyedWriteSemantics::Upsert => {
-                crate::dataset_index::key_column_uncovered_fragments(&ds, system_columns.id)
+                crate::dataset_index::key_column_uncovered_tail(&ds, system_columns.id)
                     .await?
-                    .filter(|uncovered| {
-                        uncovered.saturating_mul(source_ids.len()) <= KEYED_WRITE_MAX_ROWS
+                    .filter(|tail| {
+                        tail.fragments.saturating_mul(source_ids.len()) <= KEYED_WRITE_MAX_ROWS
                     })
             }
             _ => None,
         };
-        if let Some(uncovered) = uncovered {
+        if let Some(tail) = tail {
             let present = Self::existing_id_count(&ds, &source_ids, system_columns).await?;
             if present == 0 {
                 return self
@@ -3685,8 +3701,13 @@ impl TableStore {
                     )
                     .await;
             }
-            let covered = ds.fragments().len().saturating_sub(uncovered);
-            if present == source_ids.len() && uncovered < covered {
+            let covered = ds.fragments().len().saturating_sub(tail.fragments);
+            if present == source_ids.len()
+                && tail.fragments < covered
+                && tail
+                    .data_file_bytes
+                    .is_some_and(|bytes| bytes <= KNOWN_PRESENT_TAIL_MAX_BYTES)
+            {
                 semantics = KeyedWriteSemantics::KnownPresentUpdate;
             }
         }

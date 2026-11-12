@@ -929,6 +929,113 @@ async fn upsert_skips_the_merge_join_when_the_id_btree_decides_its_rows_issue_12
     assert_eq!(routes(&mixed), (1, 0, 0), "a mixed batch keeps the join");
 }
 
+/// Issue #1248: Lance's indexed merge route scans each fragment the id BTREE
+/// leaves uncovered for every source column, so an all-present upsert takes
+/// it only while that tail's recorded data files fit
+/// `KNOWN_PRESENT_TAIL_MAX_BYTES`. A wide tail keeps the id join, whose read
+/// does not grow with the row width; a narrow tail of the same fragment count
+/// still switches.
+#[tokio::test]
+async fn all_present_upsert_keeps_the_join_over_a_wide_uncovered_tail_issue_1248() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    // Two covered fragments, then one uncovered fragment of `tail` rows.
+    let table = |name: &'static str, tail: Vec<String>| {
+        let uri = format!("{}/{name}.lance", dir.path().to_str().unwrap());
+        async move {
+            let ds = TableStore::write_dataset(
+                &uri,
+                person_pk_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+            )
+            .await
+            .unwrap();
+            let mut ds = TableStore::append_or_create_batch(
+                &uri,
+                Some(ds),
+                person_pk_batch(&[("erin", Some(20))]),
+            )
+            .await
+            .unwrap();
+            ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+                .name("id_idx".to_string())
+                .await
+                .unwrap();
+            let ds = Dataset::open(&uri).await.unwrap();
+            let rows: Vec<(&str, Option<i32>)> =
+                tail.iter().map(|id| (id.as_str(), Some(1))).collect();
+            TableStore::append_or_create_batch(&uri, Some(ds), person_pk_batch(&rows))
+                .await
+                .unwrap()
+        }
+    };
+    let route = |ds: Dataset| {
+        let probes = MergeWriteProbes::default();
+        let staged = with_merge_write_probes(
+            probes.clone(),
+            store.stage_keyed_write(
+                ds,
+                "Person",
+                person_pk_batch(&[("alice", Some(31))]),
+                KeyedWriteSemantics::Upsert,
+                SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
+            ),
+        );
+        async move {
+            staged.await.unwrap();
+            (
+                probes.stage_merge_insert_calls(),
+                probes.stage_fenced_insert_calls(),
+                probes.stage_known_present_update_calls(),
+            )
+        }
+    };
+    // Ids that do not compress, so the data files hold their full width.
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let wide: Vec<String> = (0..1_100)
+        .map(|row| {
+            let mut id = format!("wide-{row}-");
+            while id.len() < 1_024 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                id.push_str(&format!("{seed:016x}"));
+            }
+            id
+        })
+        .collect();
+
+    let narrow = table("narrow", vec!["frank".to_string()]).await;
+    let tail = crate::dataset_index::key_column_uncovered_tail(&narrow, "id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.fragments, 1);
+    assert!(tail.data_file_bytes.unwrap() <= super::KNOWN_PRESENT_TAIL_MAX_BYTES);
+    assert_eq!(
+        route(narrow).await,
+        (0, 0, 1),
+        "a narrow tail: the known-present update"
+    );
+
+    let wide = table("wide", wide).await;
+    let tail = crate::dataset_index::key_column_uncovered_tail(&wide, "id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.fragments, 1);
+    assert!(tail.data_file_bytes.unwrap() > super::KNOWN_PRESENT_TAIL_MAX_BYTES);
+    assert_eq!(
+        route(wide).await,
+        (1, 0, 0),
+        "a tail above the byte budget keeps the join"
+    );
+}
+
 #[tokio::test]
 async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode_issue_1261() {
     let dir = tempfile::tempdir().unwrap();
