@@ -505,7 +505,7 @@ fn destination_column(dense: Vec<u32>, ids: DenseIds<'_>, memory: &WorkMemory) -
     memory
         .grow(ids.offset_bytes(dense.len()))
         .map_err(|error| memory.error(error))?;
-    ids.column(&UInt32Array::from(dense))
+    ids.column(&UInt32Array::from(dense), bytes)
 }
 
 /// The pending chunk as pairs ready to emit: its destinations resolved

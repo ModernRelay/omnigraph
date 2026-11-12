@@ -513,7 +513,7 @@ impl Walk {
             .expect("a destination lies inside its dictionary");
         work.string(bytes)?;
         work.grow(ids.offset_bytes(rows))?;
-        let destination = ids.column(&dst).map_err(external)?;
+        let destination = ids.column(&dst, bytes).map_err(external)?;
         let output = align_sources(batch, &ordinals, destination, &[], schema, &work)?;
         sender.send_bounded(output, work).await
     }
