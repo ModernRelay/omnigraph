@@ -29,6 +29,16 @@ pub fn native_branch_name(logical: &str, incarnation: &str) -> String {
     format!("{logical}.{incarnation}")
 }
 
+/// Whether the native table ref `native` belongs to the logical branch
+/// `logical`: its legacy ref (native == logical) or any incarnation of it.
+pub fn native_ref_of_branch(native: &str, logical: &str) -> bool {
+    native == logical
+        || native
+            .strip_prefix(logical)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .is_some_and(is_incarnation)
+}
+
 /// Names can conservatively retain unpublished forks, never authorize ownership.
 /// Unknown generated names lack enough evidence to reclaim safely.
 pub fn retain_unpublished_table_fork(
@@ -409,6 +419,25 @@ mod tests {
         ] {
             assert!(unattached_tag_parts(&malformed).is_err(), "{malformed}");
             assert!(!is_unattached_tag(&malformed), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn native_ref_of_branch_matches_its_legacy_ref_and_incarnations_only() {
+        let incarnation = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        assert!(native_ref_of_branch("feature", "feature"));
+        assert!(native_ref_of_branch(
+            &native_branch_name("feature", incarnation),
+            "feature"
+        ));
+        for other in [
+            "feature2",
+            "feature.x",
+            "feature.x.01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "fork.01ARZ3NDEKTSV4RRFFQ69G5FAV.m42.01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            "other.01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ] {
+            assert!(!native_ref_of_branch(other, "feature"), "{other}");
         }
     }
 

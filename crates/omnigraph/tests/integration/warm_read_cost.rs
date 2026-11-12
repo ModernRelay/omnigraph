@@ -1863,9 +1863,10 @@ async fn single_edge_query_builds_only_referenced_edge() {
 
 /// A write keeps the cached topology of the edge tables it did not change. The
 /// cache key carries each covered table's stamp, so after a `WorksAt` insert, a
-/// node-only insert and a `WorksAt` merge from a branch, a `Knows` traversal on
-/// the writing handle reuses its CSR (no build), and a `Knows` insert makes the
-/// next one build once and see the new edge.
+/// node-only insert, a branch create, a `WorksAt` merge from that branch and its
+/// delete, a `Knows` traversal on main on the writing handle reuses its CSR (no
+/// build), and a `Knows` insert makes the next one build once and see the new
+/// edge.
 #[tokio::test]
 async fn write_keeps_graph_index_of_untouched_edge_tables() {
     const HIRE: &str = r#"
@@ -1951,14 +1952,22 @@ query hire($person: String, $company: String) {
     )
     .await
     .unwrap();
-    // The branch create cleared the caches (the e_tag-less recreated-branch
-    // fallback); warm main again before the merge.
-    assert_eq!(friends_of_walker().await.1, 1);
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 0),
+        "creating and writing another branch must keep main's cached Knows topology"
+    );
     db.branch_merge("hiring", "main").await.unwrap();
     assert_eq!(
         friends_of_walker().await,
         (vec!["Alice".to_string()], 0),
         "a merge that changed only WorksAt must keep the cached Knows topology"
+    );
+    db.branch_delete("hiring").await.unwrap();
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 0),
+        "deleting another branch must keep main's cached Knows topology"
     );
 
     mutate_main(

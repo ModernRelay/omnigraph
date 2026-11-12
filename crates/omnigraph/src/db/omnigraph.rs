@@ -2455,6 +2455,23 @@ impl Omnigraph {
         }
     }
 
+    /// After the logical branch `branch` is created or deleted: drop the read
+    /// state held for its own table refs and keep everything else. A create
+    /// mints a fresh native incarnation, so no cache key of a dead incarnation
+    /// can match the new branch; this frees the dead state and covers legacy
+    /// refs without an incarnation suffix.
+    async fn invalidate_read_caches_for_branch(&self, branch: &str) {
+        self.runtime_cache.invalidate_branch(branch).await;
+        self.read_caches.handles.invalidate_branch(branch).await;
+        let mut feed_cut = self.feed_cut_cache.write().await;
+        if feed_cut
+            .as_ref()
+            .is_some_and(|(_, cut)| cut.branch.as_deref() == Some(branch))
+        {
+            *feed_cut = None;
+        }
+    }
+
     async fn invalidate_read_caches(&self) {
         self.runtime_cache.invalidate_all().await;
         self.read_caches.handles.invalidate_all().await;
@@ -3996,7 +4013,7 @@ impl Omnigraph {
         // before the authority change. Do it explicitly after success instead:
         // old branch-incarnation handles/topology can never leak into a later
         // recreation, while a failed control leaves warm state untouched.
-        self.invalidate_read_caches().await;
+        self.invalidate_read_caches_for_branch(branch).await;
         Ok(())
     }
 
@@ -4075,7 +4092,7 @@ impl Omnigraph {
             .await
             .map_err(OmniError::before_effect)?;
         source_coord.branch_create(&target).await?;
-        self.invalidate_read_caches().await;
+        self.invalidate_read_caches_for_branch(&target).await;
         Ok(())
     }
 
@@ -4243,7 +4260,7 @@ impl Omnigraph {
                 unreachable!("a commit start captures the commit's record with its source")
             }
         };
-        self.invalidate_read_caches().await;
+        self.invalidate_read_caches_for_branch(&target_branch).await;
         Ok(created)
     }
 

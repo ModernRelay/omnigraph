@@ -140,6 +140,32 @@ impl RuntimeCache {
         cache.artifact_negative.retain(untouched);
     }
 
+    /// A branch was created or deleted: drop the scoped indexes, failed-load
+    /// verdicts and shelf that cover a table on one of its own refs (see
+    /// `TableHandleCache::invalidate_branch`), and keep the rest.
+    pub async fn invalidate_branch(&self, branch: &str) {
+        let on_branch = |table_branch: Option<&str>| {
+            table_branch.is_some_and(|native| {
+                omnigraph_core::branch_names::native_ref_of_branch(native, branch)
+            })
+        };
+        let untouched = |key: &GraphIndexCacheKey| {
+            !key.edge_tables
+                .iter()
+                .any(|table| on_branch(table.table_branch.as_deref()))
+        };
+        let mut cache = self.graph_indices.lock().await;
+        cache.entries.retain(untouched);
+        cache.artifact_negative.retain(untouched);
+        if cache
+            .shelf
+            .as_ref()
+            .is_some_and(|(stamps, _)| stamps.iter().any(|stamp| on_branch(stamp.table_branch())))
+        {
+            cache.shelf = None;
+        }
+    }
+
     /// Build (or fetch) the CSR/CSC graph index scoped to exactly `edge_types` —
     /// the edge types the query actually traverses, not every edge type in the
     /// catalog. Scoping is what keeps a single-edge join (`$x identifiesPerson

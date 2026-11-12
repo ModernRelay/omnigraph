@@ -4088,18 +4088,18 @@ fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
             .get(function_name)
             .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
         assert_eq!(
-            method_call_count(&function.block, "invalidate_read_caches"),
+            method_call_count(&function.block, "invalidate_read_caches_for_branch"),
             1,
-            "Omnigraph::{function_name} must invalidate derived caches after successful ref creation"
+            "Omnigraph::{function_name} must invalidate the created branch's derived caches after successful ref creation"
         );
     }
     let delete_helper = functions
         .get("delete_captured_branch_storage")
         .expect("missing Omnigraph::delete_captured_branch_storage");
     assert_eq!(
-        method_call_count(&delete_helper.block, "invalidate_read_caches"),
+        method_call_count(&delete_helper.block, "invalidate_read_caches_for_branch"),
         1,
-        "captured branch deletion must invalidate derived caches after successful ref removal"
+        "captured branch deletion must invalidate the deleted branch's derived caches after successful ref removal"
     );
 }
 
