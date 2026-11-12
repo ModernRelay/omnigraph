@@ -33,7 +33,7 @@ for `not_retained`.
 | 404 | Graph, query, branch, entity, or route is unavailable | Check the name and applied cluster revision; stored-query denials may also appear as 404 |
 | 405 | The path is served, but not with this method (`method_not_allowed`) | Use a method the `Allow` header lists |
 | 408 | The request body did not arrive before its deadline (`request_timeout`) | Send the request again; nothing was admitted |
-| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, incompatible full-text index, or a commit no branch can start at (`branch_start_refusal`) | Inspect structured details; not every conflict is retryable |
+| 409 | Concurrent change, duplicate ID, merge conflict, existing resource, incompatible full-text index, a branch whose writer epoch refuses the writing process (`writer_fenced`), or a commit no branch can start at (`branch_start_refusal`) | Inspect structured details; not every conflict is retryable |
 | 410 | Required change-feed history was reclaimed, or the commit a branch start names (`branch_start_refusal`, `not_retained`) | Capture and durably install a new baseline, then resume from its terminal cursor; start the branch at a retained commit |
 | 412 | Blob entity-tag or graph-commit precondition failed (`precondition_failed`), or `Omnigraph-If-Actor` named another actor than the credential (`actor_mismatch`) | For `precondition_failed`, refresh the Blob ETag (a Blob write's `blob_precondition_failure` names the current one), or re-read the branch and retry the mutation with its current graph commit. For `actor_mismatch` nothing ran: use the named actor's credential or correct the header; retrying unchanged fails again |
 | 413 | Request or operation exceeded a bounded resource limit (`payload_too_large`) | Split or reduce the operation using the reported limit. Blob limits are listed in [Blob limits](../blobs.md#limits) |
@@ -84,7 +84,7 @@ the request it answered by the first row that matches:
 |---|---|---|
 | Any error before the request submitted a write | `none` | the refusal's own |
 | A write whose completion the server could not settle; `code` becomes `outcome_unknown` unless the action is `recover` | `unknown` | `reconcile`, or `recover` |
-| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a resource limit, an external Blob source, a query diagnostic), or a failure the engine proved published nothing, such as a storage failure before publication; `code` is kept | `none`, or `partial` when an earlier step of the write published, such as a load that forked its missing branch | the refusal's own |
+| A refusal before the write started (`401`, `403`, `412`, `429`, `api_contract_mismatch`, `actor_mismatch`), a typed refusal of its one publication (a merge, key, read-set or dataset-version conflict, a writer-epoch refusal, a resource limit, an external Blob source, a query diagnostic), or a failure the engine proved published nothing, such as a storage failure before publication; `code` is kept | `none`, or `partial` when an earlier step of the write published, such as a load that forked its missing branch | the refusal's own |
 | Any other error after a write, which may follow its publication; `code` is kept | `unknown` | `reconcile`, or `recover` |
 
 A refusal's own action follows its code: `recover` for a recovery intent or a
@@ -95,7 +95,7 @@ full-text index to build, `retry` for `too_many_requests`,
 `branch_start_refusal`, `payload_too_large`, `unsupported_media_type` and
 `range_not_satisfiable`, and
 `refresh` for the rest: `forbidden`, `precondition_failed`, `conflict`,
-`external_blob_source`, `change_feed_gap` and `internal`. A write the server
+`writer_fenced`, `external_blob_source`, `change_feed_gap` and `internal`. A write the server
 could not settle answers `500`.
 
 The CLI reports the server's disposition when that request was the command's
@@ -197,6 +197,44 @@ A `409` is not one universal retry signal:
   [Search indexes](../search/index.md#indexes).
 - “Already initialized” means the target already contains a graph. Choose a new
   root or deliberately use the command's destructive option when appropriate.
+- `code: "writer_fenced"` means the branch's [writer epoch](#writer-epoch)
+  refused the writing process. Repeating the request to that process is
+  refused again.
+
+### Writer epoch
+
+A branch at storage format v17 carries a writer epoch, a number that starts at
+0. A claim raises it by one and makes the claiming process the branch's
+owner; a claim by the process that already holds the epoch writes nothing.
+From then on, every publication to the branch, which is how a mutation, a
+load, a merge into the branch and a schema apply land, is refused unless the
+writing process holds the branch's current epoch. A process whose own claim
+another process has since replaced is refused like one that never claimed.
+The owner serves reads of a held branch its handle is bound to from its own
+last publication, without checking the branch first. So a replaced owner can
+keep answering reads from before the claim until a write of its own is refused.
+The refusal is HTTP 409, `code: "writer_fenced"` and
+`writer_fenced: { "held": …, "read": …, "current": … }`: `current` is the
+branch's epoch, `held` the refused process's own and absent when it holds
+none, `read` the epoch a refused claim read. Nothing was written. Deleting
+the branch is not refused: an owner whose branch another process deleted
+keeps answering reads from the deleted branch until its own next write
+there.
+
+No CLI command or HTTP route claims a branch in this release. Only a program
+that embeds the engine does, through `Omnigraph::claim_branch_writer`, under
+the [`branch_claim`](policy.md#actions) action, and only on a branch at
+storage format v17: below it the claim is refused and names
+`omnigraph upgrade`. A branch nobody claimed stays at epoch 0 and accepts
+every writer as before. A process holds its claim until it exits or another
+process claims the branch, so an owner that restarts claims again before it
+writes. The epoch of a claimed branch never goes back: after the owner exits,
+every writer is refused until a process claims the branch again. The graph
+records the epoch and not its holder, so no command names the process that
+holds a branch. So `omnigraph-server` and direct CLI commands cannot write a
+claimed branch in this release; write to it through the embedding program
+that holds it. A branch deleted and created again under its name starts at
+epoch 0.
 
 Writes are atomic at the graph-commit boundary. A normal validation, conflict,
 or limit error does not mean that a subset became visible. When

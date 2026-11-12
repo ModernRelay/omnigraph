@@ -188,6 +188,17 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
   together; the removed file-installation protocol supplies no distributed
   lock. Branch creation/deletion and cleanup retain their existing
   single-writer-process control boundary.
+- The writer epoch fences publications that move a branch's head, on a branch
+  some process claimed ([writes](writes.md#writer-epoch)). Only the embedded
+  engine claims: no command or route does, so a claimed branch refuses the
+  server and the CLI. Ref metadata and ref deletes, the collector's deletes
+  and `optimize`'s configuration commit are not fenced. The process that holds
+  its handle's bound branch reads it, and opens and revalidates its writes on
+  it, with no head probe ([writes](writes.md#writer-epoch) lists the sites and
+  the captures that still probe), so the reads of an owner another process
+  replaced, or whose branch another process deleted, are stale until its next
+  publish on the branch. One mutation-capable writer process per cluster
+  remains the supported topology.
 - Physical index reconciliation is explicit; there is no background scheduler
   whose queue is a second authority.
 

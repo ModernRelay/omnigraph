@@ -42,7 +42,7 @@ async fn manifest_version(uri: &str) -> u64 {
 
 const RERUN: (&str, &str) = (
     "this omnigraph executable",
-    "then rerun `omnigraph upgrade <graph> --to-format 16` without `--check`",
+    "then rerun `omnigraph upgrade <graph> --to-format 17` without `--check`",
 );
 const PRESERVE_AND_CHECK: (&str, &str) = (
     "the omnigraph executable that started the conversion",
@@ -58,11 +58,11 @@ const FENCING_EXECUTABLE: (&str, &str) = (
 
 /// The route names a report carries, spelled out: a change of `handler` is a
 /// change of what operators and their tooling read.
-const UNROUTED: &str = "history-lance-files-to-v16";
-const FROM_8: &str = "history-lance-files-v8-to-v16";
-const FROM_9: &str = "history-lance-files-v9-to-v16";
-const FROM_13: &str = "history-lance-files-v13-to-v16";
-const STAMP: &str = "stamp-v14-to-v16";
+const UNROUTED: &str = "history-lance-files-to-v17";
+const FROM_8: &str = "history-lance-files-v8-to-v17";
+const FROM_9: &str = "history-lance-files-v9-to-v17";
+const FROM_13: &str = "history-lance-files-v13-to-v17";
+const STAMP: &str = "stamp-v14-to-v17";
 
 fn route_name(stamp: u32) -> &'static str {
     match stamp {
@@ -494,7 +494,7 @@ async fn served(root: &str, native: Option<&str>) -> (Vec<String>, Vec<(String, 
     (keys, heads)
 }
 
-/// Every live ref of `source` is converted: served under stamp 16 with its
+/// Every live ref of `source` is converted: served under stamp 17 with its
 /// own head alone, and main is activated three versions above its source.
 async fn assert_converted(source: &Source) {
     let root = source.root.as_str();
@@ -651,8 +651,8 @@ async fn a_target_other_than_the_served_format_is_unsupported() {
         assert_eq!(codes(&report), ["unsupported_target"]);
         assert_eq!(
             report.findings[0].message,
-            "this binary converts storage formats v8, v9 and v13 to v16, stamps v14 to v16 and \
-             serves both; `--to-format` accepts 16 only"
+            "this binary converts storage formats v8, v9 and v13 to v17, stamps v14 to v17 and \
+             serves both; `--to-format` accepts 17 only"
         );
         assert_eq!(report.target_format, target);
         assert!(!report.target_defaulted);
@@ -725,7 +725,7 @@ async fn a_pending_conversion_with_a_valid_intent_is_reported_by_check_as_pendin
         let guidance = pending_report(&json, true, "pending_upgrade", handler).await;
         assert!(
             guidance.contains(&format!(
-                "the pending storage conversion of attempt {attempt} to format v16"
+                "the pending storage conversion of attempt {attempt} to format v17"
             )) && guidance.contains(
                 "rerun `omnigraph upgrade <graph>` without `--check` with this executable"
             ),
@@ -837,7 +837,7 @@ async fn converted_once(stamp: u32) {
     );
     for again in [check(&source.root).await, execute(&source.root).await] {
         assert_eq!(again.outcome, UpgradeOutcome::AlreadyCurrent, "{again:?}");
-        assert_eq!(again.observed_format, Some(16));
+        assert_eq!(again.observed_format, Some(17));
     }
     assert_eq!(stored_files(source.dir.path()), files, "v{stamp}");
 }
@@ -880,6 +880,13 @@ async fn a_v15_graph_is_stamped_current_per_live_ref() {
     stamped_current_per_live_ref(15).await;
 }
 
+/// A v16 graph takes the same stamp route, the only way one reaches 17: the
+/// stamp fences a v16 binary off control-fact rows, nothing in its rows changes.
+#[tokio::test]
+async fn a_v16_graph_is_stamped_current_per_live_ref() {
+    stamped_current_per_live_ref(16).await;
+}
+
 async fn stamped_current_per_live_ref(stamp: u32) {
     let (dir, uri) = fresh_graph().await;
     let feature = forked_branch(&uri, "feature").await;
@@ -910,8 +917,8 @@ async fn stamped_current_per_live_ref(stamp: u32) {
         Some(format!("stamped:ref '{feature}'").as_str())
     );
     assert_eq!(report.work.live_refs, 2);
-    assert_eq!(stamp_of(&uri, None).await, Some(16));
-    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(16));
+    assert_eq!(stamp_of(&uri, None).await, Some(17));
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(17));
     assert_eq!(version_of(&uri, None).await, versions.0 + 1);
     assert_eq!(version_of(&uri, Some(&feature)).await, versions.1 + 1);
 
@@ -937,17 +944,17 @@ async fn a_live_ref_left_at_v14_is_stamped_alone() {
 
     let report = execute(&uri).await;
     assert_eq!(report.outcome, UpgradeOutcome::Completed, "{report:?}");
-    assert_eq!(report.observed_format, Some(16));
+    assert_eq!(report.observed_format, Some(17));
     assert_eq!(report.completed_handlers, [STAMP]);
-    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(16));
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(17));
     assert_eq!(version_of(&uri, None).await, main_version);
     assert_eq!(version_of(&uri, Some(&feature)).await, feature_version + 1);
     assert_eq!(execute(&uri).await.outcome, UpgradeOutcome::AlreadyCurrent);
 }
 
-/// A v15 graph is served as it is: reads and ordinary publishes need no
-/// upgrade, the first publish on a ref stamps that ref 16 and leaves the
-/// other at 15, and the stamp-only route finishes the rest.
+/// A v15 graph is served as it is: a ref's first publish stamps it 16 and
+/// leaves the other ref at 15, and only the stamp-only route raises both to
+/// 17, where a publish keeps them.
 #[tokio::test]
 async fn a_v15_graph_is_served_and_stamped_by_its_first_publish() {
     let (_dir, uri) = fresh_graph().await;
@@ -966,6 +973,8 @@ async fn a_v15_graph_is_served_and_stamped_by_its_first_publish() {
     insert(&graph, "main", "served").await;
     assert_eq!(stamp_of(&uri, None).await, Some(16));
     assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(15));
+    insert(&graph, "main", "served again").await;
+    assert_eq!(stamp_of(&uri, None).await, Some(16));
     drop(graph);
 
     let report = execute(&uri).await;
@@ -975,8 +984,101 @@ async fn a_v15_graph_is_served_and_stamped_by_its_first_publish() {
         report.last_durable_completed_boundary.as_deref(),
         Some(format!("stamped:ref '{feature}'").as_str())
     );
-    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(16));
+    assert_eq!(stamp_of(&uri, None).await, Some(17));
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(17));
     assert_eq!(execute(&uri).await.outcome, UpgradeOutcome::AlreadyCurrent);
+
+    let graph = Arc::new(Omnigraph::open(&uri).await.unwrap());
+    for branch in ["main", "feature"] {
+        insert(&graph, branch, "raised").await;
+    }
+    assert_eq!(stamp_of(&uri, None).await, Some(17));
+    assert_eq!(stamp_of(&uri, Some(&feature)).await, Some(17));
+}
+
+/// The data files of every fragment of `manifest`, in fragment id order: the
+/// hot fragment's last, the cold registry fragments' before it.
+fn fragment_files(manifest: &Dataset) -> Vec<Vec<String>> {
+    let mut fragments = manifest.fragments().as_ref().clone();
+    fragments.sort_by_key(|fragment| fragment.id);
+    fragments
+        .iter()
+        .map(|fragment| {
+            fragment
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect()
+        })
+        .collect()
+}
+
+/// A v16 main whose `__manifest` holds cold block registry fragments is
+/// raised by the stamp-only route with every fragment named again, and the
+/// next publish at 17 still names the cold ones.
+#[tokio::test]
+async fn a_v16_branch_holding_cold_registry_fragments_is_stamped_and_keeps_them() {
+    let (_dir, uri) = fresh_graph().await;
+    let mut number = 1_000;
+    while open(&uri, None).await.unwrap().fragments().len() == 1 {
+        assert!(
+            number < 1_300,
+            "300 releasing publishes pushed no registry row cold"
+        );
+        publish(&uri, None, number, 1).await;
+        number += 1;
+    }
+    let mut manifest = open(&uri, None).await.unwrap();
+    set_stamp_for_test(&mut manifest, 16).await.unwrap();
+    let held = fragment_files(&manifest);
+    let (_hot, cold) = held.split_last().unwrap();
+    assert!(!cold.is_empty());
+
+    publish(&uri, None, number, HISTORY_RELEASE_BYTES).await;
+    let published = open(&uri, None).await.unwrap();
+    assert_eq!(read_stamp(&published), Some(16));
+    assert_eq!(fragment_files(&published).split_last().unwrap().1, cold);
+    let held = fragment_files(&published);
+
+    let report = execute(&uri).await;
+    assert_eq!(report.outcome, UpgradeOutcome::Completed, "{report:?}");
+    assert_eq!(report.completed_handlers, [STAMP]);
+    let raised = open(&uri, None).await.unwrap();
+    assert_eq!(read_stamp(&raised), Some(17));
+    assert_eq!(raised.version().version, published.version().version + 1);
+    assert_eq!(fragment_files(&raised), held);
+
+    publish(&uri, None, number + 1, HISTORY_RELEASE_BYTES).await;
+    let published = open(&uri, None).await.unwrap();
+    assert_eq!(read_stamp(&published), Some(17));
+    assert_eq!(fragment_files(&published).split_last().unwrap().1, cold);
+}
+
+/// A claim of a main stamped v16 is refused naming the upgrade and writes no
+/// version, and the handle it was asked of keeps serving: it reads what it
+/// read before and its next insert lands.
+#[tokio::test]
+async fn v17_a_claim_refused_below_the_stamp_leaves_the_handle_serving() {
+    let (_dir, uri) = fresh_graph().await;
+    let mut manifest = open(&uri, None).await.unwrap();
+    set_stamp_for_test(&mut manifest, 16).await.unwrap();
+    let graph = Arc::new(Omnigraph::open(&uri).await.unwrap());
+    insert(&graph, "main", "before").await;
+    let version = version_of(&uri, None).await;
+    let served = names(&graph, "main").await;
+    assert_eq!(served, ["before"]);
+
+    let refused = graph
+        .claim_branch_writer("main")
+        .await
+        .expect_err("a claim landed below the control-fact stamp")
+        .to_string();
+    assert!(refused.contains("omnigraph upgrade"), "{refused}");
+    assert_eq!(version_of(&uri, None).await, version);
+    assert_eq!(names(&graph, "main").await, served);
+
+    insert(&graph, "main", "after").await;
+    assert_eq!(names(&graph, "main").await, ["after", "before"]);
 }
 
 #[tokio::test]
@@ -2784,7 +2886,7 @@ async fn cleanup_after_upgrade_with_keep_four_and_older_than() {
         .collect();
     assert_eq!(links.len(), 1, "{links:?}");
     for (round, options) in [week, keep(4)].into_iter().enumerate() {
-        let stats = graph.cleanup(options).await.unwrap();
+        let stats = graph.cleanup_as(options, None).await.unwrap();
         let reclaimed = |table_key: &str| {
             if round == 0 && table_key == PERSON {
                 links.len() as u64
@@ -2832,7 +2934,7 @@ async fn merge_with_legacy_base_pins_and_collector_keeps_it() {
         "the merge base of feature and main pins Person version {}: {roots:?}",
         source.a_root
     );
-    let stats = graph.cleanup(keep(1)).await.unwrap();
+    let stats = graph.cleanup_as(keep(1), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
 
     session(&graph)
@@ -2929,7 +3031,7 @@ async fn leftover_merge_input_tag_on_bookkeeping_version_resolves() {
         roots.is_superset(&[source.b_root, source.c_root].into()),
         "{roots:?}"
     );
-    let stats = graph.cleanup(keep(1)).await.unwrap();
+    let stats = graph.cleanup_as(keep(1), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     assert_eq!(
         open(root, None)
@@ -3772,7 +3874,7 @@ mod interrupted {
             assert!(resumed.recovery.is_none(), "{context}: {resumed:?}");
             if !activated {
                 assert_eq!(resumed.outcome, UpgradeOutcome::Completed, "{context}");
-                assert_eq!(resumed.observed_format, Some(16), "{context}");
+                assert_eq!(resumed.observed_format, Some(17), "{context}");
                 assert_eq!(resumed.route, [route_name(stamp)], "{context}");
                 assert_eq!(
                     resumed.work.census_reads > 0,

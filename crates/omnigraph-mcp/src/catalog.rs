@@ -590,7 +590,7 @@ pub(super) fn access_output_schema() -> Value {
         "type": "array",
         "items": {"type": "string", "enum": [
             "read", "export", "change", "schema_apply", "branch_create", "branch_delete",
-            "branch_merge", "commit_publish", "commit_drop", "invoke_query"
+            "branch_merge", "commit_publish", "commit_drop", "invoke_query", "maintain"
         ]},
     });
     json!({

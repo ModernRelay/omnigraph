@@ -64,6 +64,7 @@ pub mod retention;
 pub mod state;
 pub mod unattached;
 pub mod unpublished;
+mod writer_epoch;
 pub use branch_detail::{GraphBranchDetail, GraphBranchListing, list_graph_branches_detailed};
 pub use branch_names::is_merge_input_tag;
 pub use migrations::{
@@ -120,8 +121,8 @@ pub use state::{
 };
 use state::{ManifestRows, ManifestState, read_manifest_state};
 
-/// The maximum supported storage-format stamp, the one this binary writes; the
-/// served range starts at [`MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION`].
+/// The maximum supported storage-format stamp, the one a graph this binary
+/// creates is born at; the served range starts at [`MIN_SUPPORTED_INTERNAL_SCHEMA_VERSION`].
 /// Read a graph's per-branch stamp with [`internal_schema_stamp_at_with_session`].
 pub const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = migrations::INTERNAL_MANIFEST_SCHEMA_VERSION;
 /// The lowest storage-format stamp normal open serves.
@@ -136,6 +137,10 @@ pub const OBJECT_TYPE_TABLE: &str = "table";
 /// id.
 pub const OBJECT_TYPE_SCHEMA_CONTRACT: &str = "schema_contract";
 pub const SCHEMA_CONTRACT_OBJECT_ID: &str = "schema_contract";
+/// The writer epoch of a branch, a control fact: at most one row per
+/// `__manifest` version, its payload a [`state::WriterEpochRow`] in `metadata`.
+pub const OBJECT_TYPE_WRITER_EPOCH: &str = "writer_epoch";
+pub const WRITER_EPOCH_OBJECT_ID: &str = "writer_epoch";
 pub const OBJECT_TYPE_GRAPH_COMMIT: &str = "graph_commit";
 /// The record of a buffered commit: a first-parent ancestor of the head that
 /// the branch has not appended to `__history`. `object_id` is the commit's id.
@@ -886,7 +891,7 @@ impl HistoryRecord {
         native: Option<&str>,
         session: &Arc<lance::session::Session>,
     ) -> Result<Snapshot> {
-        let state = state::manifest_state(&self.tables, &self.commit, version, native)?;
+        let state = state::manifest_state(&self.tables, &self.commit, None, version, native)?;
         let mut snapshot =
             ManifestCoordinator::snapshot_from_state(root_uri, state, Arc::clone(session));
         snapshot.contract_source = ContractSource::Archive(self.commit.schema_content_hash.clone());
@@ -962,6 +967,11 @@ impl CapturedManifestProbe {
             .probe_latest_incarnation()
             .await?
             .matches(&self.captured))
+    }
+
+    /// The incarnation this handle was captured at.
+    pub fn captured(&self) -> &ManifestIncarnation {
+        &self.captured
     }
 }
 
@@ -2337,21 +2347,11 @@ impl ManifestCoordinator {
             });
         }
 
-        let PublishOutcome {
-            dataset,
-            parent_commit_id,
-            known_state,
-            head,
-            tables,
-            buffer,
-            schema_contract,
-            registry,
-        } = self
+        let published = self
             .publisher
             .publish_with_precondition(changes, expected_table_versions, lineage, precondition)
             .await?;
-        self.dataset = dataset;
-        self.known_state = known_state;
+        let parent_commit_id = published.parent_commit_id.clone();
         let recorded = parent_commit_id.is_some();
         let merged = lineage
             .filter(|_| recorded)
@@ -2360,6 +2360,57 @@ impl ManifestCoordinator {
             .flat_map(BranchRecords::commits)
             .cloned()
             .collect();
+        let head = self.install_outcome(published, merged);
+        Ok(CommitOutcome {
+            version: self.version(),
+            parent_commit_id,
+            commit: recorded.then_some(head),
+        })
+    }
+
+    /// Claim this branch's writer epoch for this process, on the incarnation
+    /// this coordinator captured, and install the version the claim wrote.
+    /// Answers the epoch the process holds from here on; the process that
+    /// already holds the branch gets its epoch back and writes nothing.
+    #[doc(hidden)]
+    pub async fn claim_writer_epoch(&mut self) -> Result<u64> {
+        let publisher::WriterEpochClaim { epoch, published } = self
+            .publisher
+            .claim_writer_epoch(&self.branch_identifier)
+            .await?;
+        self.install_outcome(published, Vec::new());
+        Ok(epoch)
+    }
+
+    /// The version of this process's last publication on this branch while it
+    /// holds the branch's writer epoch and no publish attempt has failed or
+    /// been dropped since; `None` otherwise, and the caller probes for the head.
+    #[doc(hidden)]
+    pub fn held_writer_version(&self) -> Option<u64> {
+        self.publisher
+            .held_writer_version(self.native_branch.as_deref())
+    }
+
+    /// Install the version `outcome` holds as this coordinator's view, with
+    /// `merged` entering the history cache, and answer its head.
+    fn install_outcome(
+        &mut self,
+        outcome: PublishOutcome,
+        merged: Vec<GraphLineageRow>,
+    ) -> GraphLineageRow {
+        let PublishOutcome {
+            dataset,
+            parent_commit_id: _,
+            known_state,
+            head,
+            tables,
+            buffer,
+            schema_contract,
+            registry,
+            writer_epoch,
+        } = outcome;
+        self.dataset = dataset;
+        self.known_state = known_state;
         let rows = ManifestRows {
             schema_contract_head: schema_contract.as_ref().map(|row| row.head.clone()),
             tables,
@@ -2367,13 +2418,10 @@ impl ManifestCoordinator {
             buffer,
             schema_contract,
             registry,
+            writer_epoch,
         };
         self.install_head(rows, merged);
-        Ok(CommitOutcome {
-            version: self.version(),
-            parent_commit_id,
-            commit: recorded.then_some(head),
-        })
+        head
     }
 
     /// The head commit's record of `branch`, from the latest version of its
@@ -2748,12 +2796,29 @@ impl ManifestCoordinator {
             .identifier
             .clone();
         self.settle_head_of(&ds, &native, name).await?;
-        crate::branch_control::retire_branch_recoverably(&ds, &native, &expected_identifier)
+        self.retire_held_branch(&ds, name, &native, &expected_identifier)
             .await
             // Legacy control is also used to finish a schema apply. Its
             // caller may already have effects, so an inner refusal cannot
             // certify the whole operation as effect-free.
             .map_err(OmniError::without_pre_effect_evidence)?;
+        Ok(())
+    }
+
+    /// Retire the incarnation `native` of `branch`. What this process holds
+    /// there is withdrawn before the retire's first request and dropped once
+    /// it has landed, so a handle bound to the branch probes from here on.
+    async fn retire_held_branch(
+        &self,
+        control: &Dataset,
+        branch: &str,
+        native: &str,
+        expected_identifier: &lance::dataset::refs::BranchIdentifier,
+    ) -> Result<()> {
+        self.publisher.withdraw_held_version(branch);
+        crate::branch_control::retire_branch_recoverably(control, native, expected_identifier)
+            .await?;
+        self.publisher.release_writer_epoch(branch, native);
         Ok(())
     }
 
@@ -2779,7 +2844,8 @@ impl ManifestCoordinator {
             .await
             .map_err(OmniError::before_effect)?;
         self.settle_head_of(&ds, &native, name).await?;
-        crate::branch_control::retire_branch_recoverably(&ds, &native, expected_identifier).await
+        self.retire_held_branch(&ds, name, &native, expected_identifier)
+            .await
     }
 
     /// Logical graph branches, `main` first. Each live native ref maps to
