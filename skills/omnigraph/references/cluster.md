@@ -71,9 +71,11 @@ The CLI prints the resolved target on stderr before execution. `.` in
 `--config .` means the current source directory. Source-bearing direct/server
 plan and apply default that source path to `.`.
 
-Direct apply creates graphs, not rows; use `load` or `mutate` for data. It retains
-its exact admission lock after completion. Exclude other writers and establish
-prior I/O settlement before an exact-ID unlock. A lock is cooperative exclusion,
+Direct apply creates graphs, not rows; use `load` or `mutate` for data. It
+releases its admission lock only when the deployment converges and its writes
+have settled, and never on Azure; otherwise it keeps that exact lock. Before an
+exact-ID unlock of a kept lock, exclude other writers and establish prior I/O
+settlement. A lock is cooperative exclusion,
 not fencing for older binaries or raw storage tools. Azure writers also require
 `omnigraph-azure-admission` and remain a qualification preview.
 

@@ -213,7 +213,8 @@ actor retention, and target-output failure before writable admission. Extend
 
 Cluster delivery tests extend the application and output owners. Direct apply
 tests fail supplied stdout/stderr writes and flushes, then inspect the original
-receipt, retained lock, single deployment result and stable graph history. The
+receipt, the released lock of the converged apply, single deployment result and
+stable graph history. The
 served adapter's tests verify identity delivery before POST and receipt/timeout output failures without
 resubmission. `cli_cluster` and `cli_queries` own exact unlock refusals, graph
 filtering and wrong-plane refusal before configuration or HTTP access. The existing

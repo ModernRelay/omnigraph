@@ -387,10 +387,15 @@ impl ClusterAdmission {
         }
     }
 
-    /// Explicitly release a uniquely owned admission after the caller has
-    /// proved all graph/native effects and accepted control I/O settled.
+    /// Explicitly release a uniquely owned admission.
     ///
-    /// This method does not establish that proof. Error, cancellation, an
+    /// With a tracked storage scope this method proves storage settlement
+    /// itself: it closes the scope, waits until every accepted request has
+    /// finished and refuses `cluster_admission_io_uncertain` while any is
+    /// uncertain. The caller must still prove the logical outcome, that its
+    /// work ended in a state the next owner may take over (a converged
+    /// deployment, a drained server), and, without a tracked scope, that its
+    /// graph/native effects and control I/O settled. Error, cancellation, an
     /// outstanding clone, or abandonment never authorizes release. On S3 the
     /// held version becomes a unique released marker by CAS; the key remains
     /// present so a delayed release or original bootstrap create cannot
@@ -844,6 +849,38 @@ mod tests {
         // prevent its capture; graph-open errors belong to per-graph startup.
         assert!(!graph.join("__manifest").exists());
         next.release_after_settlement().await.unwrap();
+    }
+
+    /// A converged direct apply (#1359) relies on the release itself to refuse
+    /// uncertain storage: unlike the server, it checks nothing before the call.
+    #[tokio::test]
+    async fn uncertain_scope_keeps_the_lock_through_a_settled_release_issue_1359() {
+        let dir = state_fixture(2, false);
+        let root = dir.path().to_str().unwrap();
+        let store = crate::store::ClusterStore::for_storage_root(root)
+            .unwrap()
+            .with_io_scope(omnigraph_storage::StorageIoScope::new())
+            .unwrap();
+        let owner = acquire_with_store(&store, ClusterAdmissionPurpose::Deployment)
+            .await
+            .unwrap()
+            .unwrap();
+        let lock_id = owner.lock_id().to_owned();
+        let graph = dir.path().join("graphs/knowledge.omni");
+        let adapter = owner
+            .store()
+            .graph_storage(graph.to_str().unwrap())
+            .unwrap();
+        // A write to a mutable key, abandoned in flight: the payload is large
+        // enough that the local write cannot finish within its first poll.
+        let payload = "x".repeat(64 << 20);
+        let target = graph.join("_refs/probe.json");
+        let write = adapter.write_text(target.to_str().unwrap(), &payload);
+        let _ = tokio::time::timeout(std::time::Duration::ZERO, write).await;
+        let error = owner.release_after_settlement().await.unwrap_err();
+        assert_eq!(error.code, "cluster_admission_io_uncertain");
+        let lock = std::fs::read_to_string(dir.path().join("__cluster/lock.json")).unwrap();
+        assert!(lock.contains(&lock_id), "{lock}");
     }
 
     #[tokio::test]
