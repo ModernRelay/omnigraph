@@ -2328,7 +2328,6 @@ impl Omnigraph {
             moved_tables = tables.len(),
             "prepared write carried over publications that changed no row"
         );
-        crate::instrumentation::record_write_carried_over_row_preserving();
         let mut carried_txn = txn.clone();
         carried_txn.base = snapshot;
         carried_txn.authority.graph_head = graph_head;

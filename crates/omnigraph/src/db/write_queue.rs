@@ -479,6 +479,31 @@ impl HeldWriteGates {
     }
 }
 
+/// The first two gates of a write's envelope, the shared schema permit and
+/// one branch's gate, taken before the write prepares. A write sent back to
+/// prepare again holds them from its next capture through its publication
+/// ([`crate::db::reprepare::PreEffectReprepares`]), so no publisher in the
+/// process can move the branch under that attempt; `commit_all` adds the
+/// table gates in the usual order.
+#[must_use = "dropping the gates releases the branch"]
+pub(crate) struct BranchWriteGates {
+    branch_key: Option<String>,
+    schema: SchemaSharedPermit,
+    branch: QueueGuard,
+}
+
+impl BranchWriteGates {
+    /// The branch these gates hold, `None` for main.
+    pub(crate) fn branch_key(&self) -> Option<&str> {
+        self.branch_key.as_deref()
+    }
+
+    /// Complete the envelope with `tables`, taken after the branch gate.
+    pub(crate) fn with_tables(self, tables: Vec<QueueGuard>) -> HeldWriteGates {
+        HeldWriteGates::new(self.schema, self.branch, tables)
+    }
+}
+
 /// Non-cloneable ownership of the sole immutable export cut for one graph.
 ///
 /// The root registry stores weak references, so retaining the manager here is
@@ -596,6 +621,21 @@ impl WriteQueueManager {
     pub(crate) async fn acquire_branch(&self, branch: Option<&str>) -> QueueGuard {
         let key = branch.map(str::to_string);
         scheduled_lock(self.branch_slot(&key)).await
+    }
+
+    /// Take the shared schema permit, then `branch`'s gate (`None` for
+    /// main), in the writer order.
+    pub(crate) async fn acquire_branch_write_gates(
+        &self,
+        branch: Option<&str>,
+    ) -> BranchWriteGates {
+        let schema = self.acquire_schema_shared().await;
+        let guard = self.acquire_branch(branch).await;
+        BranchWriteGates {
+            branch_key: branch.map(str::to_string),
+            schema,
+            branch: guard,
+        }
     }
 
     /// Take the schema gate's shared side: proof that no

@@ -199,14 +199,16 @@ pub struct QueryIoProbes {
     /// This must equal the newly deleted offset count; a fragment scan would
     /// make it grow with the compacted catalog's history instead.
     pub projection_identity_rows: Arc<AtomicU64>,
-    /// Pre-effect reprepares a mutation or a load took after a `ReadSetChanged`
-    /// (bounded by `MAX_PRE_EFFECT_REPREPARES`). The caller sees only the
-    /// exhaustion of that loop, so this is the one view of the attempts behind
-    /// an acknowledged write.
+    /// Pre-effect reprepares a mutation, a load or a Blob write took after a
+    /// `ReadSetChanged` (bounded by `MAX_PRE_EFFECT_REPREPARES`); each such
+    /// attempt prepares under the branch's writer gates. The caller sees only
+    /// the exhaustion of that loop, so this is the one view of the attempts
+    /// behind an acknowledged write.
     pub mutation_reprepares: Arc<AtomicU64>,
-    /// Writes whose captured authority was carried, under the writer gates,
-    /// over publications that changed no row (an optimize compaction or an
-    /// index build), instead of preparing again or refusing.
+    /// Attempts carried, under the writer gates, over publications that
+    /// changed no row (an optimize compaction or an index build), every staged
+    /// table rebased, instead of preparing again. An attempt whose carry Lance
+    /// refused is not counted; it prepares again.
     pub writes_carried_over_row_preserving: Arc<AtomicU64>,
     /// The Lance `ObjectStore`s behind the opens that carried
     /// `manifest_wrapper` / `history_wrapper` / `table_wrapper`. A store's own

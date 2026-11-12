@@ -1182,14 +1182,18 @@ impl StagedMutation {
     /// a table this attempt does not write. Under the ordered gates we compare
     /// the complete immutable token. A safe insert/Append/Merge caller discards
     /// and fully reprepares; strict Update/Delete/Overwrite returns
-    /// `ReadSetChanged`. Both outcomes occur before any detached commit, so
-    /// staged transaction files remain unreferenced and reclaimable.
+    /// `ReadSetChanged`, unless every publication in between changed no row
+    /// and only Lance refused the carry (`attempt` records it, and the write
+    /// prepares again). Both outcomes occur before any detached commit, so
+    /// staged transaction files remain unreferenced and reclaimable. An
+    /// attempt that prepared under its writer gates brings them in `attempt`.
     pub(crate) async fn commit_all(
         self,
         db: &crate::db::Omnigraph,
         branch: Option<&str>,
         txn: &crate::db::WriteTxn,
         early: Option<crate::db::EarlyRevalidation>,
+        attempt: &mut crate::db::reprepare::WriteAttempt,
     ) -> Result<CommittedMutation> {
         let StagedMutation {
             mut staged,
@@ -1211,10 +1215,19 @@ impl StagedMutation {
         // exclusive side excludes every writer, RFC
         // 2026-09-18-shared-schema-gate), branch gate, then sorted
         // per-table gates. Hold the full set through manifest publish.
-        let schema = db.write_queue().acquire_schema_shared().await;
-        let branch_guard = db.write_queue().acquire_branch(branch).await;
+        let branch_gates = match attempt.take_gates() {
+            Some(held) if held.branch_key() == branch => held,
+            Some(held) => {
+                return Err(OmniError::manifest_internal(format!(
+                    "a write on branch '{}' prepared under the gates of branch '{}'",
+                    branch.unwrap_or("main"),
+                    held.branch_key().unwrap_or("main"),
+                )));
+            }
+            None => db.write_queue().acquire_branch_write_gates(branch).await,
+        };
         let table_guards = db.write_queue().acquire_many(&queue_keys).await;
-        let gates = crate::db::write_queue::HeldWriteGates::new(schema, branch_guard, table_guards);
+        let gates = branch_gates.with_tables(table_guards);
 
         // Re-capture manifest pins under the queue (PR 2 / MR-686).
         //
@@ -1292,6 +1305,7 @@ impl StagedMutation {
                         "Lance's conflict rules refuse to carry the staged write over the table's \
                          row-preserving commits"
                     );
+                    attempt.note_carry_refused();
                     return Err(refused);
                 }
             }
@@ -1305,6 +1319,7 @@ impl StagedMutation {
                     expected.table_version = entry.published_dataset_version;
                 }
             }
+            crate::instrumentation::record_write_carried_over_row_preserving();
         }
         // An empty load/mutation has no independently durable table effect.
         // It may still publish its fixed lineage intent.

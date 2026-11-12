@@ -1906,12 +1906,15 @@ async fn update_beside_the_fragments_optimize_rewrote_commits_issue_1331() {
 }
 
 /// Issue #1331: an update of a row whose fragment an `optimize` publication
-/// rewrote meanwhile still refuses with `ReadSetChanged`, as Lance's own
-/// conflict rules decide for an `Update` over an overlapping `Rewrite`, and
-/// changes nothing.
+/// rewrote meanwhile cannot be carried (Lance's conflict rules refuse an
+/// `Update` over an overlapping `Rewrite`), but every publication in between
+/// changed no row, so the rows the update read still hold: it prepares again,
+/// once, under the writer gates, and commits instead of returning
+/// `ReadSetChanged` to the caller.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn update_of_a_fragment_optimize_rewrote_meanwhile_still_refuses_issue_1331() {
+async fn update_of_a_fragment_optimize_rewrote_meanwhile_prepares_again_under_the_gates_issue_1331()
+{
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(init_and_load(&dir).await);
@@ -1936,33 +1939,217 @@ async fn update_of_a_fragment_optimize_rewrote_meanwhile_still_refuses_issue_133
             issue_1331_optimize_person_only(&db).await;
         }
     };
-    let head_after_optimize = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let during = {
-        let db = Arc::clone(&db);
-        let head = std::sync::Arc::clone(&head_after_optimize);
-        async move {
-            during.await;
-            *head.lock().unwrap() = Some(helpers::version_main(&db).await.unwrap());
-        }
-    };
     let (outcome, reprepares, carried) = issue_1331_park_write(&db, write, during).await;
-    let error = outcome.expect_err("the update overlaps the rewrite");
+    outcome.expect("the update commits after preparing again over the rewrite");
+    assert_eq!(
+        reprepares, 1,
+        "the refused carry sends the update back once"
+    );
+    assert_eq!(carried, 0, "a refused carry is not counted as a carry");
+    assert_eq!(person_ages(&db, "early-0").await, vec![99]);
+    assert_eq!(count_rows(&db, "node:Person").await, 6);
+}
+
+/// Issue #1331: an upsert of a row in a fragment the `optimize` publication
+/// rewrote, a keyed insert of an existing key or a load merge, cannot be
+/// carried either; it prepares again once, under the writer gates, and
+/// commits the new value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn upsert_of_a_row_optimize_rewrote_meanwhile_prepares_again_once_issue_1331() {
+    for kind in ["keyed insert", "load merge"] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(init_and_load(&dir).await);
+        issue_1331_fragment_person(&db, "early").await;
+
+        let write = {
+            let db = Arc::clone(&db);
+            async move {
+                if kind == "keyed insert" {
+                    mutate_main(
+                        &db,
+                        MUTATION_QUERIES,
+                        "insert_person",
+                        &mixed_params(&[("$name", "early-0")], &[("$age", 77)]),
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    db.load(
+                        "main",
+                        r#"{"type":"Person","data":{"name":"early-0","age":77}}"#,
+                        LoadMode::Merge,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            }
+        };
+        let during = {
+            let db = Arc::clone(&db);
+            async move {
+                issue_1331_optimize_person_only(&db).await;
+            }
+        };
+        let (outcome, reprepares, carried) = issue_1331_park_write(&db, write, during).await;
+        outcome.unwrap_or_else(|error| panic!("{kind} refused: {error}"));
+        assert_eq!(
+            reprepares, 1,
+            "{kind}: one send-back, then the gated attempt"
+        );
+        assert_eq!(carried, 0, "{kind}");
+        assert_eq!(person_ages(&db, "early-0").await, vec![77], "{kind}");
+        assert_eq!(count_rows(&db, "node:Person").await, 6, "{kind}");
+    }
+}
+
+/// Run `optimize` on `db` over `table_key` alone, as a server runs it (its
+/// authority captured again under the gates when a writer moved main while it
+/// waited), and prove it compacted the table.
+async fn issue_1331_optimize_only(db: &Session, table_key: &str) {
+    let stats = db
+        .optimize_as(
+            None,
+            omnigraph::db::OptimizeRequest::default()
+                .with_tables([table_key])
+                .with_authority(omnigraph::db::AuthorityCapture::UnderGates),
+        )
+        .await
+        .unwrap()
+        .tables;
+    let stat = stats
+        .iter()
+        .find(|s| s.type_key == table_key)
+        .unwrap_or_else(|| panic!("optimize reports {table_key}"));
     assert!(
-        error.is_read_set_changed(),
-        "an overlapping rewrite refuses with ReadSetChanged: {error}"
+        stat.committed() && stat.fragments_removed > 1,
+        "optimize must compact {table_key}: {stat:?}"
     );
-    assert_eq!(reprepares, 0, "an update never prepares again");
-    assert_eq!(carried, 1, "the authority itself was carried");
+}
+
+/// Issue #1331: a write that an optimize on another handle of an unheld
+/// branch sent back (the publisher's CAS refuses it: its revalidation trusted
+/// the head probe it took beside its staging) prepares again under the writer
+/// gates, so the next optimize run, on that other handle, waits for it
+/// instead of publishing over the second attempt too. The write prepares
+/// again once, however many runs follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+async fn a_write_another_handles_optimize_sent_back_holds_off_the_next_run_issue_1331() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(init_and_load(&dir).await);
+    issue_1331_fragment_company(&db, "acme").await;
+    issue_1331_fragment_person(&db, "early").await;
+    let other = Arc::new(helpers::session(
+        Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap(),
+    ));
+
+    let parked = helpers::failpoint::ParkedCrossings::new(
+        &catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        &[1, 2],
+    );
+    let probes = QueryIoProbes::default();
+    let writer = {
+        let db = Arc::clone(&db);
+        let probes = probes.clone();
+        tokio::spawn(async move {
+            with_query_io_probes(
+                probes,
+                mutate_main(
+                    &db,
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+                ),
+            )
+            .await
+        })
+    };
+    parked.wait_until_reached(1).await;
+    issue_1331_optimize_only(&other, "node:Company").await;
+    parked.release(1);
+
+    // The second attempt is parked after its staging, holding main's gates.
+    parked.wait_until_reached(2).await;
+    let next_run = {
+        let other = Arc::clone(&other);
+        tokio::spawn(async move { issue_1331_optimize_only(&other, "node:Person").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !next_run.is_finished(),
+        "the next run published over the write's gated attempt"
+    );
+    parked.release(2);
+
+    writer
+        .await
+        .unwrap()
+        .expect("the write commits on its gated attempt");
+    next_run.await.unwrap();
     assert_eq!(
-        helpers::version_main(&db).await.unwrap(),
-        head_after_optimize.lock().unwrap().expect("optimize ran"),
-        "the refused update published nothing"
+        probes.mutation_reprepares.load(Ordering::Relaxed),
+        1,
+        "one send-back by the first run, none by the second"
     );
     assert_eq!(
-        person_ages(&db, "early-0").await,
-        vec![40],
-        "the refused update changed nothing"
+        probes
+            .writes_carried_over_row_preserving
+            .load(Ordering::Relaxed),
+        0
     );
+    let fresh = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+    assert_eq!(count_rows(&fresh, "node:Person").await, 7);
+}
+
+/// Issue #1331: on a branch its process holds, a write takes no head probe
+/// beside its staging, and a publication by any handle of the process is
+/// seen under the gates: an insert overtaken by an optimize, on its own handle
+/// or another, is carried without preparing again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_write_on_a_held_branch_is_carried_over_any_handles_optimize_issue_1331() {
+    for optimizer in ["the writer's handle", "another handle"] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(init_and_load(&dir).await);
+        issue_1331_fragment_person(&db, "early").await;
+        db.claim_branch_writer("main").await.unwrap();
+        let other = Arc::new(helpers::session(
+            Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap(),
+        ));
+
+        let write = {
+            let db = Arc::clone(&db);
+            async move {
+                mutate_main(
+                    &db,
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+                )
+                .await
+                .map(|_| ())
+            }
+        };
+        let during = {
+            let runner = if optimizer == "another handle" {
+                Arc::clone(&other)
+            } else {
+                Arc::clone(&db)
+            };
+            async move {
+                issue_1331_optimize_only(&runner, "node:Person").await;
+            }
+        };
+        let (outcome, reprepares, carried) = issue_1331_park_write(&db, write, during).await;
+        outcome.unwrap_or_else(|error| panic!("optimize on {optimizer}: {error}"));
+        assert_eq!(reprepares, 0, "optimize on {optimizer}");
+        assert_eq!(carried, 1, "optimize on {optimizer}");
+        assert_eq!(count_rows(&db, "node:Person").await, 7, "{optimizer}");
+    }
 }
 
 /// Issue #1331: a row change between a write's capture and its gates still

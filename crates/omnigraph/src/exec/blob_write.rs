@@ -168,7 +168,7 @@ impl Omnigraph {
         let mut reprepares =
             crate::db::reprepare::PreEffectReprepares::begin(self, requested, "Blob write");
         loop {
-            match self
+            let result = self
                 .write_blob_cell_attempt(
                     requested,
                     cell,
@@ -179,9 +179,10 @@ impl Omnigraph {
                     history_release_bytes,
                     write_budget,
                     &mut first,
+                    reprepares.attempt(),
                 )
-                .await
-            {
+                .await;
+            match result {
                 Err(error) if reprepares.may_prepare_again(&error, true) => {
                     reprepares.prepare_again().await?;
                 }
@@ -202,6 +203,7 @@ impl Omnigraph {
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
         first: &mut Option<AttemptIdentity>,
+        attempt: &mut crate::db::reprepare::WriteAttempt,
     ) -> Result<BlobWriteOutcome> {
         let first_attempt = first.is_none();
         let txn = self.open_write_txn(requested).await.map_err(|error| {
@@ -375,6 +377,7 @@ impl Omnigraph {
                 actor_id,
                 stage_write_concurrency,
                 history_release_bytes,
+                attempt,
             )
             .await?;
         // The validator evidence comes from the exact detached version the pin

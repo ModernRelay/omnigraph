@@ -99,8 +99,9 @@ enum Writer {
     /// A Blob clear of Alice's seeded `photo`: the same single-row upsert
     /// carrying a null value.
     BlobClear,
-    /// An insert into Person that an optimize run on another handle
-    /// overtakes between its staging and its writer gates: the run compacts
+    /// An insert into Person that an optimize run on the writer's own handle,
+    /// on another thread, overtakes between its staging and its writer gates
+    /// ([`optimize_beside`]): the run compacts
     /// Person and publishes, and the insert is carried over that
     /// row-preserving publication (its staged transaction rebased onto the
     /// compacted version) instead of preparing again.
@@ -359,9 +360,9 @@ async fn observe_photo(db: &Omnigraph) -> Option<Vec<u8>> {
 /// and runtime, while the writer's thread waits: the overtaking run of the
 /// CarriedInsert writer, as a server's maintenance runs on the handle its
 /// writes use. (A publication by another handle or process after the write's
-/// beside-staging probe is the publisher's CAS to refuse, and the write then
-/// prepares again; the carry covers what the revalidation under the gates
-/// sees.)
+/// beside-staging probe, on a branch the process does not hold, is the
+/// publisher's CAS to refuse; the write then prepares again under the writer
+/// gates. The carry covers what the revalidation under the gates sees.)
 fn optimize_beside(db: Session) {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)

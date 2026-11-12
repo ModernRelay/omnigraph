@@ -32,30 +32,34 @@ Issue #1331 measured the cost on RustFS (S3) with back-to-back optimize runs and
 
 Under invariant 7, compaction and index builds are derived physical state that "may change cost but not correctness". The write path contradicts it: a physical rewrite invalidates every overlapping logical write. Lance itself does not: its transaction specification makes `Append` compatible with `Rewrite`, and `Update` and `Delete` conflict with `Rewrite` "only if overlapping fragments", as a retryable conflict. Delta Lake (`dataChange = false` on `OPTIMIZE`) and Iceberg (`rewrite_data_files`) follow the same rule. Omnigraph is stricter than its substrate because it never asks the substrate: every graph-table write is a detached commit, which runs no conflict pass, and the graph-level check compares the whole authority token.
 
-The served-optimize change (PR #1282) bounds the symptom with a writer yield: an optimize run waits up to `max_writer_yield` (10 s) for writes that started before the previous optimize publication. It keeps the documented bound, but every overlapping writer still prepares again once, and under steady writes with two or more writers most runs wait the full 10 s. This RFC removes the cause, and with it the yield, which has nothing left to wait for.
+The served-optimize change (PR #1282) bounds the symptom with a writer yield: an optimize run waits up to `max_writer_yield` (10 s) for writes that started before the previous optimize publication. It keeps the documented bound, but every overlapping writer still prepares again once, and under steady writes with two or more writers most runs wait the full 10 s. This RFC removes the cause for the common case, carrying the write, and bounds the rest by construction, so the yield goes too.
 
 ## User and operational behavior
 
 | Write overlapping a publication that changed no row | Before | After |
 |---|---|---|
 | Mutation `insert`, load `append` | prepares again from the start | commits; nothing prepared again |
-| Load `merge`, Blob write | prepares again from the start | commits, unless it updates a row in a fragment a rewrite replaced: then it prepares again, as before |
+| Load `merge`, Blob write, keyed `insert` of an existing key (an upsert) | prepares again from the start | commits, unless it updates a row in a fragment a rewrite replaced: then it prepares again once, under the writer gates |
 | Mutation `update`/`delete` on tables the publication did not move | `ReadSetChanged` (409) | commits |
 | Mutation `update`/`delete` of rows in fragments the publication did not rewrite | `ReadSetChanged` (409) | commits |
-| Mutation `update`/`delete` of rows in a fragment a rewrite replaced | `ReadSetChanged` (409) | `ReadSetChanged` (409), unchanged |
+| Mutation `update`/`delete` of rows in a fragment a rewrite replaced | `ReadSetChanged` (409) | prepares again once, under the writer gates, and commits |
 | Load `overwrite` | `ReadSetChanged` (409) | commits |
 | Write with a caller head (`--if-commit`, `expected_head`) | `PreconditionFailed` (412) | `PreconditionFailed` (412), unchanged |
 | Child unattached write (`as unattached branch on …`) | refuses | refuses, unchanged |
 
 A publication ***changes no row*** when every table pin it moved reaches the previous pin through commits whose Lance operation is `Rewrite` or `CreateIndex`, and it changed neither the schema contract nor any registration's identity, location, native ref or row count. Optimize compaction, deletion materialization, dropped-column erasure, index folds and builds, full-text rebuilds and full-text declarations all publish such commits. The rule reads what the commits record, not who published them, so a later maintenance operation qualifies by the same proof without a code change, and any other commit, a row change, a schema change, a merge that moved a table, disqualifies.
 
-The carry covers the publications revalidation sees under the gates. A write on its handle's bound branch probes the head beside its staging and, when nothing installed on the handle since, trusts that probe under the gates; a publication by another handle or process after the probe is then refused by the publisher's CAS, after the write's detached commits, and the write prepares again as today. A server's optimize runs on the handle its writes use, so its publication always reaches revalidation.
+The carry covers the publications revalidation sees under the gates. On a branch its process does not hold, a write on its handle's bound branch probes the head beside its staging and, when nothing installed on the handle since, trusts that probe under the gates; a publication by another handle or process after the probe is then refused by the publisher's CAS, after the write's detached commits, and the write prepares again. On a branch its process holds, a write takes no probe: another process cannot publish there, and a publication by another handle of the process is seen under the gates, so it is carried. A server's optimize runs on the handle its writes use, so its publication always reaches revalidation.
 
 Any publication that changes a row still sends the write back as before. Several row-preserving publications in a row carry as one, up to 32 commits per table (`ROW_PRESERVING_CHAIN_MAX_LINKS`); past that the write prepares again.
 
+**A write is sent back at most once by this process.** Whatever sends a write back (a row change, a carry Lance refuses, the publisher's CAS after another handle's publication), its next attempt prepares with the branch's writer gates held, the shared schema permit and the branch gate, from its capture through its publication (`PreEffectReprepares`, the one owner of the mutation, load and Blob write loops). Every publisher on the branch in the process, optimize included, takes that branch gate, so nothing in the process moves the branch under the second attempt. The bound needs no cooperation from maintenance: no run waits for writers, and back-to-back runs cannot send one write back again and again. A publication by another process is outside it (one mutation-capable writer process is the supported topology); the publisher's CAS refuses it, and the write prepares again within `MAX_PRE_EFFECT_REPREPARES` (32).
+
+**A send-back with no logical cause is never the caller's.** When every publication since the capture changed no row and only Lance refuses to carry a staged table, the rows the write read are unchanged, so a fresh execution reads the same ones. Such a write prepares again whatever its kind; a strict update or delete no longer returns `ReadSetChanged` because optimize moved its row to another fragment. A strict write sent back by anything else still returns `ReadSetChanged`.
+
 The write's graph commit is parented on the head it was carried to, so lineage shows the optimize commit, then the write. The committed table keeps the compaction: its new pin is a detached commit that read the compacted version.
 
-The engine's query cost probe counts carried writes (`QueryIoProbes::writes_carried_over_row_preserving`) beside the existing `mutation_reprepares`.
+The engine's query cost probe counts carried attempts, each staged table rebased (`QueryIoProbes::writes_carried_over_row_preserving`), beside the existing `mutation_reprepares`, which counts the attempts that prepared again under the gates. An attempt whose carry Lance refused counts as a re-preparation, not a carry.
 
 ## Design
 
@@ -82,7 +86,7 @@ For each touched table whose pin moved:
 - **Staged.** The staged transaction goes through `TransactionRebase::try_new` on the captured pin, `check_txn` for every link, then `finish` on the current pin; its `read_version` becomes the current pin's version, and it commits detached there. The table's expected version becomes the current one, and its update's `published_dataset_version` is that plus one, as for any write.
 - **Touched with nothing staged** (a delete that matched no row). Its expectation becomes the current pin.
 
-`check_txn` is where the operation matters. An insert-only `Update` (a strict insert or the inserting arm of a merge) and an `Append` are compatible with `Rewrite` and `CreateIndex`. An `Update` or `Delete` whose modified fragments a `Rewrite` replaced is a retryable conflict, which this design returns as today's `ReadSetChanged`. An `Overwrite` is compatible with both. For these operations against these links `finish` returns the transaction unchanged; it writes nothing, so a refusal leaves no effect. Lance assigns fragment ids and stable row ids when it builds the manifest from the version a commit reads, so rows inserted over a compaction take ids from the compacted version, which kept the row-id high-water mark.
+`check_txn` is where the operation matters. An insert-only `Update` (a strict insert or the inserting arm of a merge) and an `Append` are compatible with `Rewrite` and `CreateIndex`. An `Update` or `Delete` whose modified fragments a `Rewrite` replaced is a retryable conflict: the attempt is sent back with `ReadSetChanged`, marked as a refused carry, and prepares again under the gates whatever its kind. An `Overwrite` is compatible with both. For these operations against these links `finish` returns the transaction unchanged; it writes nothing, so a refusal leaves no effect. Lance assigns fragment ids and stable row ids when it builds the manifest from the version a commit reads, so rows inserted over a compaction take ids from the compacted version, which kept the row-id high-water mark.
 
 ### Publication, lineage and the collector
 
@@ -101,13 +105,13 @@ Every table's history stays one chain of `read_version` links: the compaction re
 5. **Crash convergence.** Unchanged. Before the carry nothing durable exists; after it the write's detached commits are unreachable until the publication names them, with a witness the collector can judge. `detached_commit_matrix.rs` runs the carried writer through every window.
 6. **Stable identity.** The proof compares table identities, never names or paths alone, and a schema change disqualifies.
 7. **Physical acceleration is derived state.** This RFC is what makes it true for writers: compaction and index builds no longer change a write's outcome.
-8. **Integrity failures are loud.** A conflict Lance reports is the typed `ReadSetChanged` it is today. Nothing is weakened: validation ran against rows the current pins still hold.
+8. **Integrity failures are loud.** A conflict Lance reports sends the attempt back; it prepares again and validates afresh. Nothing is weakened: a carried attempt's validation ran against rows the current pins still hold, and a re-prepared one validates against the current rows.
 9. **Query semantics are typed.** Not affected.
 10. **Trust and policy.** The policy decision was made for the actor and branch before preparing; neither changes.
-11. **Bounded and observable.** The walk reads at most 32 transactions per moved table, each from its version's manifest; it is counted and traced. A refusal costs what it costs today plus the walk.
+11. **Bounded and observable.** The walk reads at most 32 transactions per moved table, each from its version's manifest; it is counted and traced. It runs under the writer gates, and its cost grows with the number of tables the publications moved, not with the write's footprint: an optimize that compacted many tables makes each overlapping write open each of them once and read up to 32 links, all at once. An update keeps a table's row count, so ordinary contention pays one open and one transaction read before it is refused. A send-back costs one more preparation, under the gates, and no more: other writers on the branch wait for that one preparation.
 12. **One source of truth.** No new record. The proof is derived from `__manifest` and Lance transactions every time.
 
-Deny-list: no custom transaction manager (the conflict rules are Lance's), no process-local authority (the proof reads storage), no silent retry (a carry is an exact equivalence, not a retry, and a conflict is reported).
+Deny-list: no custom transaction manager (the conflict rules are Lance's), no process-local authority (the proof reads storage; the gated retry is the existing writer gates, a liveness bound for this process, not distributed fencing), no silent retry (a carry is an exact equivalence, not a retry; a re-preparation is counted, bounded and traced, and a strict write prepares again only when the proof shows its reads unchanged).
 
 ## Compatibility and reversibility
 
@@ -137,11 +141,20 @@ Record on each graph commit whether it was maintenance, and accept a moved head 
 
 ### E. Keep the writer yield
 
-PR #1282's yield bounds the wait but keeps one re-preparation per overlapping write and makes optimize wait up to 10 s under steady writes. It would stay correct beside the carry, but once an optimize publication no longer sends a write back it only delays the run, and its tickets and per-branch publication count are a second record of writer state. This change removes it: the per-write tickets (`InFlightWrite`), `yield_to_writers_published_over`, `OptimizeLimits::max_writer_yield`, the report's `writer_yield` and the record's `timings.writer_yield_ms`, and the `writer_yield` gate seams. `PreEffectReprepares` keeps only the bounded reprepare loop.
+PR #1282's yield had an optimize run wait, up to 10 s, for writes that started before the last optimize publication. The carry alone does not make it redundant: an upsert or update of a row in a rewritten fragment, and a write overtaken by another handle's publication on an unheld branch, are still sent back, and without a bound back-to-back runs could send one such write back once per run. But the yield bounds the wrong party. It schedules maintenance around the writers maintenance hurts, keeps a second record of writer state (per-write tickets, a per-branch publication count), covers only optimize and not writers that send each other back, and gives up after 10 s.
+
+### F. A narrowed yield
+
+Take a ticket only where a write is actually sent back after a row-preserving publication, and have optimize wait for those. It stores less than E, but it still has maintenance wait on writers, and the other-handle case cannot be classified as row-preserving without running the proof again outside the gates.
+
+### Chosen: the gated retry
+
+A write's second attempt prepares under the branch's writer gates (§User and operational behavior). The bound holds by construction, for every cause and every writer kind, in the one owner every writer already uses; it needs nothing from maintenance and no record beside the gates. Its cost appears only after a send-back: one preparation runs while other writers on the branch wait. This change therefore removes the yield: the per-write tickets (`InFlightWrite`), `yield_to_writers_published_over`, `OptimizeLimits::max_writer_yield`, the report's `writer_yield` and the record's `timings.writer_yield_ms`, and the `writer_yield` gate seams.
 
 ## Evidence and tests
 
-- `crates/omnigraph/tests/failpoints.rs`, the owner of pre-effect authority races: each `issue_1331` test parks a write after staging (`mutation.post_stage_pre_effect_gate`), runs optimize, and counts `mutation_reprepares` and carries. An insert beside a compaction of another table commits without preparing again; an update beside it succeeds; an insert into the compacted table commits without preparing again and its detached commit reads the compacted version, so the compaction stays; an update of a rewritten fragment still refuses; a row change after the optimize still sends the insert back; append and overwrite loads commit without preparing again.
+- `crates/omnigraph/tests/failpoints.rs`, the owner of pre-effect authority races: each `issue_1331` test parks a write after staging (`mutation.post_stage_pre_effect_gate`), runs optimize, and counts `mutation_reprepares` and carries. An insert beside a compaction of another table commits without preparing again; an update beside it succeeds; an insert into the compacted table commits without preparing again and its detached commit reads the compacted version, so the compaction stays; an update of a rewritten fragment, and an upsert of one by a keyed insert or a load merge, prepare again once and commit; a row change after the optimize still sends the insert back; append and overwrite loads commit without preparing again. Two tests own the gated retry and the held-branch path: a write another handle's optimize sent back prepares again under the gates while the next run on that handle waits for it, and fails without the gates (two re-preparations); on a held branch an insert is carried over an optimize on its own handle or another. Each fails with the mechanism turned off.
+- `crates/omnigraph/tests/lance_surface_guards.rs`: `TransactionRebase` carries an append, a keyed insert of a new key and an overwrite over a compaction `Rewrite`, and refuses a delete and an upsert of a rewritten row as retryable conflicts.
 - `crates/omnigraph/tests/detached_commit_matrix.rs`: a carried insert, through every window and recovery actor of the existing writer matrix.
 - The DST collector oracle over a run that carries writes.
 - `crates/omnigraph-dst/cost_table.txt`: the storage calls of a carried insert, against the calls of the same insert with nothing to carry.
@@ -149,13 +162,13 @@ PR #1282's yield bounds the wait but keeps one re-preparation per overlapping wr
 
 ## Rollout
 
-One change: the proof, the carry and its tests land together, behind no setting, and remove the writer yield of PR #1282. No release shipped the yield; an operation record that an unreleased build wrote with `timings.writer_yield_ms` no longer reads, since the record refuses unknown fields.
+One change: the proof, the carry, the gated retry and their tests land together, behind no setting, and remove the writer yield of PR #1282. No release shipped the yield. An operation record that a build of `main` wrote in between still decodes: `OperationTimings` reads its `writer_yield_ms` and drops it.
 
 ## Unresolved questions
 
-- Whether an update or delete that Lance refuses over an overlapping rewrite should prepare again automatically instead of returning 409. Today's contract keeps strict read-modify-write writes caller-visible; this RFC does not change it.
+- One owner for "which Lance commits move no row". The carry (`row_preserving_chain`), the pure-insert merge proof (`is_index_only_commit`) and change discovery (`transaction_is_row_set_preserving`) each classify transactions and walk `read_version` links with their own bounds. A bounded walker in `table_store` returning typed link effects would make the rule hold by construction; this RFC does not add it.
 
 ## Decision log
 
 - 2026-11-10: drafted for issue #1331. Chose Lance's resolver before effects over "maintenance loses" (compaction starvation, a weaker pin CAS, forked table histories) and over a maintenance flag (format change, claims instead of proof).
-- 2026-11-11: after PR #1282 merged, removed its writer yield in this change (alternative E), and kept `PreEffectReprepares` as the one bounded reprepare loop. The carry stays in `StagedMutation::commit_all` under the gates, which the mutation, load and Blob write paths share; the reprepare owner runs outside the gates and holds no staged table to carry.
+- 2026-11-11: after PR #1282 merged, chose the gated retry over keeping its writer yield (E) or narrowing it (F), and removed the yield. `PreEffectReprepares` owns the gated retry for every writer; the carry stays in `StagedMutation::commit_all`, under the gates, which the mutation, load and Blob write paths share. A refused carry prepares again for strict writes too, which resolves this RFC's open question about update and delete.

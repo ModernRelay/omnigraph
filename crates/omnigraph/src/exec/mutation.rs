@@ -1300,7 +1300,8 @@ impl Omnigraph {
             crate::db::reprepare::PreEffectReprepares::begin(self, Some(branch), "mutation");
         loop {
             let mut retryable = false;
-            match self
+            let first_attempt = reprepares.is_first();
+            let result = self
                 .mutate_one_attempt(
                     branch,
                     query_source,
@@ -1310,13 +1311,14 @@ impl Omnigraph {
                     expected_head,
                     stage_write_concurrency,
                     history_release_bytes,
-                    reprepares.is_first(),
+                    first_attempt,
                     &mut retryable,
                     write_budget,
                     route,
+                    reprepares.attempt(),
                 )
-                .await
-            {
+                .await;
+            match result {
                 Err(err) if reprepares.may_prepare_again(&err, retryable) => {
                     reprepares.prepare_again().await?;
                 }
@@ -1339,6 +1341,7 @@ impl Omnigraph {
         retryable: &mut bool,
         write_budget: WriteBudget,
         route: &WriteRoute,
+        attempt: &mut crate::db::reprepare::WriteAttempt,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
         let addressed = requested.as_deref().unwrap_or("main").to_string();
@@ -1403,7 +1406,10 @@ impl Omnigraph {
         // Only an insert-only mutation is safe to replay automatically after a
         // pre-effect authority mismatch. Update/Delete keep strict caller-visible
         // `ReadSetChanged`; replaying their stale read-modify-write plan would be
-        // a semantic rebase rather than a fresh execution contract.
+        // a semantic rebase rather than a fresh execution contract. The one
+        // exception is a send-back by publications that changed no row: the
+        // rows the plan read are unchanged, so a fresh execution reads the
+        // same ones (`WriteAttempt::note_carry_refused`).
         *retryable = ir
             .ops
             .iter()
@@ -1438,11 +1444,14 @@ impl Omnigraph {
                     // ordering as effectful writes (shared permit — this pass
                     // only reads the accepted view), revalidate the complete
                     // authority and map a moved caller head to terminal 412.
-                    let _schema_permit = self.write_queue().acquire_schema_shared().await;
-                    let _branch_guard = self
-                        .write_queue()
-                        .acquire_branch(requested.as_deref())
-                        .await;
+                    let _gates = match attempt.take_gates() {
+                        Some(held) => held,
+                        None => {
+                            self.write_queue()
+                                .acquire_branch_write_gates(requested.as_deref())
+                                .await
+                        }
+                    };
                     self.revalidate_write_txn(&txn).await?;
                 }
                 Ok(crate::MutationReceipt {
@@ -1460,6 +1469,7 @@ impl Omnigraph {
                         actor_id,
                         stage_write_concurrency,
                         history_release_bytes,
+                        attempt,
                     )
                     .await?;
                 let plans = std::mem::take(&mut committed.plans);
@@ -1489,6 +1499,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
+        attempt: &mut crate::db::reprepare::WriteAttempt,
     ) -> Result<CommittedStagedMutation> {
         let requested = txn.branch.as_deref();
         let plans = self.validate_staged_mutation(&staging, txn).await?;
@@ -1507,7 +1518,7 @@ impl Omnigraph {
             .await
             .map_err(OmniError::unpublished)?;
         let committed = staged
-            .commit_all(self, requested, txn, early)
+            .commit_all(self, requested, txn, early, attempt)
             .await
             .map_err(OmniError::unpublished)?;
         Ok(CommittedStagedMutation {

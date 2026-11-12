@@ -137,9 +137,8 @@ durable before any effect and before the response. From then on:
 - **Restart.** An unfinished record is resolved from main's history, and the
   run is never executed again.
 - **Writes.** While a run holds the writer gates, writes to main wait. The
-  request bounds that wait (§1.2), and a run's publication does not send a
-  write that overlaps it back to prepare again, so runs back to back do not
-  compound it. This slice does not promise low write latency during a run.
+  request bounds that wait (§1.2), and a write that overlaps a run prepares
+  again at most once, so runs back to back do not compound it. This slice does not promise low write latency during a run.
 
 ### Sources of truth
 
@@ -247,20 +246,23 @@ the publication, plus the configuration clear.** Plans that are still running
 at the deadline are dropped: they read only. The report records the gate-hold
 time and each table's duration, so the bound can be checked against a run.
 
-**A write that overlaps a run does not prepare again.** A mutation, load or
-Blob write prepares outside the gates. Stress runs on RustFS and Azurite showed
-what happens when a run's publication sends such a write back to prepare again
-(`ReadSetChanged`): with optimize submitted back to back, each run took the
-gates while the write prepared again, published, and sent it back once more.
-One write waited 14 s through 9 runs whose longest hold was 3.9 s. An
-optimize publication changes no row, so a write prepared before it is carried
-over it under the gates, onto the current head, instead of being sent back
-([carried writes](2026-11-10-writes-carried-over-row-preserving-publications.md)).
-Only an update or delete of a row in a fragment the run rewrote still reports
-the conflict, which its caller retries. A run therefore waits for no writer before it
-takes the gates. The first implementation of this RFC waited for such writers
-(a writer yield, bounded at 10 s, with per-write tickets); the carry removed
-both, and the report and the record carry no yield.
+**A write that overlaps a run prepares again at most once.** A mutation, load
+or Blob write prepares outside the gates. Stress runs on RustFS and Azurite
+showed what happens when a run's publication sends such a write back to
+prepare again (`ReadSetChanged`): with optimize submitted back to back, each
+run took the gates while the write prepared again, published, and sent it back
+once more. One write waited 14 s through 9 runs whose longest hold was 3.9 s.
+An optimize publication changes no row, so a write prepared before it is
+carried over it under the gates, onto the current head, instead of being sent
+back ([carried writes](2026-11-10-writes-carried-over-row-preserving-publications.md)).
+A write that is still sent back (an upsert or update of a row in a fragment
+the run rewrote, or a write the run on another handle overtook) prepares again
+with the branch's writer gates held through its publication, so no later run
+can publish under that attempt; even a strict update or delete prepares again
+then, since the run changed no row it read. A run therefore waits for no
+writer before it takes the gates. The first implementation of this RFC waited
+for such writers (a writer yield, bounded at 10 s, with per-write tickets); the
+gated retry replaced it, and the report and the record carry no yield.
 
 Keeping today's gates is the cost this slice accepts. The bound keeps the
 stall finite. A new way to share the gates with writers is a second design.

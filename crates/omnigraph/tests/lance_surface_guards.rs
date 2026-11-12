@@ -7685,6 +7685,99 @@ async fn transaction_rebase_carries_an_append_over_a_rewrite_and_refuses_an_over
     );
 }
 
+/// The same carry for the operations the engine stages most: a keyed
+/// `merge_insert` (`Operation::Update`) and a load overwrite. Over a
+/// compaction `Rewrite` of the version they were staged on, `TransactionRebase`
+/// carries the insert of a new key and the overwrite, and refuses the upsert
+/// of a row whose fragment the rewrite replaced as a retryable conflict; the
+/// engine then prepares that write again under the writer gates. Red when
+/// Lance changes any of the three rules.
+#[tokio::test]
+async fn transaction_rebase_carries_keyed_inserts_and_overwrites_over_a_rewrite_and_refuses_an_overlapping_upsert()
+ {
+    use lance::io::commit::conflict_resolver::TransactionRebase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("t.lance");
+    let uri = uri.to_str().unwrap();
+    let v1 = rfc0067_create(uri).await;
+    let v2 = rfc0067_append(v1, &["b1"]).await;
+    let base = rfc0067_append(v2, &["c1"]).await;
+    let base_arc = Arc::new(base.clone());
+
+    let new_key = stage_pk_merge(
+        Arc::clone(&base_arc),
+        rfc0067_batch(&["e1"]),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    let upsert = stage_pk_merge(
+        Arc::clone(&base_arc),
+        rfc0067_batch(&["b1"]),
+        "id",
+        WhenMatched::UpdateAll,
+        WhenNotMatched::InsertAll,
+        Some(false),
+    )
+    .await;
+    assert!(
+        matches!(upsert.transaction.operation, Operation::Update { .. }),
+        "a keyed write stages an Update: {:?}",
+        upsert.transaction.operation
+    );
+    let overwrite = InsertBuilder::new(Arc::clone(&base_arc))
+        .with_params(&WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![rfc0067_batch(&["z1"])])
+        .await
+        .unwrap();
+
+    let mut compacted = base.clone();
+    compact_files(&mut compacted, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        compacted.get_fragments().len(),
+        1,
+        "every fragment rewritten"
+    );
+    let rewrite = compacted.read_transaction().await.unwrap().unwrap();
+    assert!(matches!(rewrite.operation, Operation::Rewrite { .. }));
+    let rewrite_version = compacted.version().version;
+
+    let mut rebase =
+        TransactionRebase::try_new(&base, new_key.transaction, new_key.affected_rows.as_ref())
+            .await
+            .unwrap();
+    rebase
+        .check_txn(&rewrite, rewrite_version)
+        .expect("the insert of a new key carries over the rewrite");
+    rebase.finish(&compacted).await.unwrap();
+
+    let mut rebase = TransactionRebase::try_new(&base, overwrite, None)
+        .await
+        .unwrap();
+    rebase
+        .check_txn(&rewrite, rewrite_version)
+        .expect("an overwrite carries over the rewrite");
+    rebase.finish(&compacted).await.unwrap();
+
+    let mut rebase =
+        TransactionRebase::try_new(&base, upsert.transaction, upsert.affected_rows.as_ref())
+            .await
+            .unwrap();
+    let refused = rebase.check_txn(&rewrite, rewrite_version).unwrap_err();
+    assert!(
+        matches!(refused, lance::Error::RetryableCommitConflict { .. }),
+        "an upsert of a rewritten row is a retryable conflict: {refused}"
+    );
+}
+
 /// RFC 0067 §Promotion: replaying the transaction recorded in a detached
 /// manifest linearly at its base lands an identical twin: same uuid, same
 /// fragment ids, same rows, and the linear row stamps the change feed and
