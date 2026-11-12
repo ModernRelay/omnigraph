@@ -18,7 +18,9 @@ use futures::StreamExt;
 use super::load_budget::{LoadBudget, ShareClass};
 use crate::engine::context::{QueryWorkLease, QueryWorkScope};
 use crate::error::OmniError;
-use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue,
+};
 
 pub(in crate::engine) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -370,19 +372,6 @@ pub(in crate::engine) struct WorkMemory {
     share: OnceLock<Option<LoadShare>>,
 }
 
-/// Adds the spills of a plan an operator ran itself to that operator's
-/// metrics when dropped; see [`WorkMemory::spills_of`].
-pub(in crate::engine) struct RecordSpills {
-    memory: Arc<WorkMemory>,
-    plan: Arc<dyn ExecutionPlan>,
-}
-
-impl Drop for RecordSpills {
-    fn drop(&mut self) {
-        self.memory.record_spills(&self.plan);
-    }
-}
-
 impl Drop for WorkMemory {
     fn drop(&mut self) {
         let held = self.scratch.size();
@@ -586,58 +575,6 @@ impl WorkMemory {
             .entry(name)
             .or_insert_with(|| MetricBuilder::new(&self.metrics).counter(name, 0))
             .add(value);
-    }
-
-    /// A guard that adds the spills of `plan`, a DataFusion plan this
-    /// memory's operator runs itself, to the operator's own `spill_count`,
-    /// `spilled_bytes` and `spilled_rows` when dropped: such a plan is not a
-    /// child in the tree, so its metrics reach the report only through its
-    /// operator. Dropping covers every way the run of `plan` ends: finished,
-    /// failed, or cancelled when a consumer such as a `Limit` drops the
-    /// operator's stream.
-    pub(in crate::engine) fn spills_of(
-        self: &Arc<Self>,
-        plan: Arc<dyn ExecutionPlan>,
-    ) -> RecordSpills {
-        RecordSpills {
-            memory: Arc::clone(self),
-            plan,
-        }
-    }
-
-    fn record_spills(&self, plan: &Arc<dyn ExecutionPlan>) {
-        fn visit(plan: &Arc<dyn ExecutionPlan>, totals: &mut [usize; 3]) {
-            if let Some(metrics) = plan.metrics() {
-                totals[0] += metrics.spill_count().unwrap_or(0);
-                totals[1] += metrics.spilled_bytes().unwrap_or(0);
-                totals[2] += metrics.spilled_rows().unwrap_or(0);
-            }
-            for child in plan.children() {
-                visit(child, totals);
-            }
-        }
-        let mut totals = [0; 3];
-        visit(plan, &mut totals);
-        if totals[0] == 0 {
-            return;
-        }
-        let mut counts = locked(&self.metric_counts);
-        for (name, value) in ["spill_count", "spilled_bytes", "spilled_rows"]
-            .into_iter()
-            .zip(totals)
-        {
-            counts
-                .entry(name)
-                .or_insert_with(|| {
-                    let builder = MetricBuilder::new(&self.metrics);
-                    match name {
-                        "spill_count" => builder.spill_count(0),
-                        "spilled_bytes" => builder.spilled_bytes(0),
-                        _ => builder.spilled_rows(0),
-                    }
-                })
-                .add(value);
-        }
     }
 
     pub(in crate::engine) fn error(&self, error: DataFusionError) -> OmniError {
@@ -892,7 +829,36 @@ impl WorkMemory {
         let input_limit = crate::table_store::sort_input_batch_bytes(self.resources.limit);
         let plan = crate::table_store::cap_sort_inputs_and_merge_partitions(plan, input_limit)?;
         let stream = plan.execute(0, Arc::clone(&self.ctx))?;
+        self.share_spills(&plan);
         Ok((plan, stream))
+    }
+
+    /// Registers the spill counters of `plan`, a DataFusion plan this
+    /// memory's operator runs itself, on the operator's own metrics. Such a
+    /// plan is not a child in the tree, so the report reaches its spills only
+    /// through the operator's row. The counters are DataFusion's own, shared,
+    /// not copied: whenever the report reads the row, after the run finished,
+    /// failed, or was cut short by a `Limit` while the operator's worker was
+    /// still being cancelled, it reads what the plan has spilled so far.
+    /// DataFusion's spilling operators (sort, aggregate) create their
+    /// counters in `execute`, which has run here; a plan that never spills
+    /// leaves nothing registered.
+    fn share_spills(&self, plan: &Arc<dyn ExecutionPlan>) {
+        if let Some(metrics) = plan.metrics() {
+            for metric in metrics.iter() {
+                if matches!(
+                    metric.value(),
+                    MetricValue::SpillCount(_)
+                        | MetricValue::SpilledBytes(_)
+                        | MetricValue::SpilledRows(_)
+                ) {
+                    self.metrics.register(Arc::clone(metric));
+                }
+            }
+        }
+        for child in plan.children() {
+            self.share_spills(child);
+        }
     }
 
     pub(in crate::engine) fn slice_bytes(

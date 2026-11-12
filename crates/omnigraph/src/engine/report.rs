@@ -60,10 +60,11 @@ pub(crate) struct ReportRow {
     pub(crate) operator: String,
     pub(crate) status: RowStatus,
     pub(crate) attempts: Vec<Attempt>,
-    /// What the pass's operator spilled, moved to the report's own `spill`
-    /// list when the row is recorded; never part of the row itself.
+    /// What the pass's operator spilled, as the pass's entry for the
+    /// report's own `spill` list, moved there when the row is recorded;
+    /// never part of the row itself.
     #[serde(skip)]
-    pub(super) spilled: Option<Spilled>,
+    spill: Option<SpillRow>,
 }
 
 /// What one operator wrote to scratch files in one pass: DataFusion's
@@ -124,7 +125,7 @@ impl ReportRow {
                 actual_rows,
                 drained,
             }],
-            spilled,
+            spill: spilled.map(|spilled| SpillRow { id, rung, spilled }),
         }
     }
 }
@@ -264,14 +265,8 @@ impl ExecutionReport {
     /// `executed` once any pass polled its operator.
     pub(super) fn record(&mut self, pass: Vec<ReportRow>) {
         for mut row in pass {
-            if let Some(spilled) = row.spilled.take() {
-                for attempt in &row.attempts {
-                    self.spill.push(SpillRow {
-                        id: row.id,
-                        rung: attempt.rung,
-                        spilled,
-                    });
-                }
+            if let Some(spill) = row.spill.take() {
+                self.spill.push(spill);
             }
             match self.rows.iter_mut().find(|met| met.id == row.id) {
                 None => self.rows.push(row),

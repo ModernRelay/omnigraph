@@ -25,7 +25,8 @@ use tokio::sync::Notify;
 use super::operators::memory::{QueryResources, locked};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ORDERED_SCAN_EXECUTION_BATCH_ROWS, ORDERED_SCAN_SCRATCH_BYTES, sort_spill_reservation_bytes,
+    ORDERED_SCAN_EXECUTION_BATCH_ROWS, ORDERED_SCAN_SCRATCH_BYTES, SPILL_COMPRESSION,
+    sort_spill_reservation_bytes,
 };
 
 /// The pool size for tests that build a context without a plan: the ordered
@@ -38,15 +39,6 @@ pub(super) fn query_memory_limit() -> u64 {
     crate::instrumentation::query_memory_limit()
         .unwrap_or(crate::table_store::ORDERED_SCAN_MEMORY_BYTES)
 }
-
-/// The codec of every spill file a query writes. A spill file counts against
-/// the scratch quota by its compressed size, and a query whose spills outgrow
-/// the quota is refused, so the codec is chosen for size: zstd. Spilled pairs
-/// repeat a row's values across a fan-out further apart than LZ4's 64 KiB
-/// window, which zstd's window still reaches, and on unique rows zstd's files
-/// are about half LZ4's for roughly one and a half times its CPU time.
-pub(super) const SPILL_COMPRESSION: datafusion::common::config::SpillCompression =
-    datafusion::common::config::SpillCompression::Zstd;
 
 pub(super) struct QueryContext {
     session: SessionContext,

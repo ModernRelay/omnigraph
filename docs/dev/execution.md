@@ -549,8 +549,9 @@ space for arbitrary wide graph allocations, which can still be refused.
 
 DataFusion operators that support spilling, including sorts, may use the
 query's scratch directory under its 100 GiB quota. Spill files are
-zstd-compressed Arrow IPC (`SPILL_COMPRESSION` in `engine/context.rs`), and
-the quota counts them at their compressed size. The custom graph breakers
+zstd-compressed Arrow IPC (`SPILL_COMPRESSION` in `table_store.rs`, which
+ordered scans use as well), and the quota counts them at their compressed
+size. The custom graph breakers
 do not spill: a refused reservation returns `OmniError::ResourceLimitExceeded`
 with `query_memory_bytes`. Exhausted DataFusion memory and scratch quotas are
 classified as `query_memory_bytes` and `query_scratch_bytes`, respectively.
@@ -837,10 +838,13 @@ list, kept apart from the rows so that replays, which compare the rows, do
 not depend on the memory a run had: the node's `id`, the pass's `rung`, and
 the operator's `spill_count`, `spilled_bytes` (bytes written, after
 compression) and `spilled_rows`. A DataFusion plan an operator runs itself,
-outside the tree, reaches it through that operator: the bound-edge `Expand`
-adds its pair sort's spills to its own metrics when the sort's run ends
-(`WorkMemory::spills_of`), whether it finished, failed or was dropped by a
-consumer.
+outside the tree, reaches it through that operator: `WorkMemory::stream`,
+which executes every such plan, registers the plan's own spill counters on the
+operator's metrics. The counters are shared, not copied, so the row reads what
+the plan has spilled whenever the report is built, including when a `Limit`
+cut the run short and the operator's cancelled worker has not yet wound down.
+DataFusion's spilling operators create these counters in `execute`, before
+they are polled.
 
 Polled is read off the operator's metrics: omnigraph's operators count a
 `polls` metric on every poll of the streams they hand out (`operators::polled`),

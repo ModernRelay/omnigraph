@@ -188,6 +188,16 @@ pub(crate) fn sort_spill_reservation_bytes(memory_limit: u64) -> usize {
     (memory_limit / 3).min(40 * 1024 * 1024) as usize
 }
 
+/// The codec of every spill file the engine writes, in a query's session and
+/// in an ordered scan's. A spill file counts against its scratch quota by its
+/// compressed size, and a run whose spills outgrow the quota is refused, so
+/// the codec is chosen for size: zstd. Spilled pairs repeat a row's values
+/// across a fan-out further apart than LZ4's 64 KiB window, which zstd's
+/// window still reaches, and on unique rows zstd's files are about half
+/// LZ4's for roughly one and a half times its CPU time.
+pub(crate) const SPILL_COMPRESSION: datafusion::common::config::SpillCompression =
+    datafusion::common::config::SpillCompression::Zstd;
+
 /// The built read and its scanner-normalized filter.
 pub(crate) type PlannedScan = (Arc<dyn ExecutionPlan>, Option<Expr>);
 
@@ -2915,7 +2925,8 @@ impl TableStore {
         // counter. Per-operation ownership makes the envelope and its cleanup
         // exact without maintaining another long-lived runtime view.
         let mut session_config = SessionConfig::new()
-            .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes(memory_limit));
+            .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes(memory_limit))
+            .with_spill_compression(SPILL_COMPRESSION);
         if let Some(target_partitions) = options.target_partition {
             session_config = session_config.with_target_partitions(target_partitions);
         }

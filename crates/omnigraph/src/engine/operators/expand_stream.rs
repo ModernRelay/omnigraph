@@ -410,7 +410,6 @@ async fn emit_bound(
     .expect("bound edge pairs have source, edge and destination keys");
     let sort: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering, pairs));
     let (sort, mut stream) = memory.stream(sort)?;
-    let _spills = memory.spills_of(Arc::clone(&sort));
     while let Some(batch) = stream.next().await {
         let batch = batch?;
         let sorted = memory.child("sorted expand pairs")?;
