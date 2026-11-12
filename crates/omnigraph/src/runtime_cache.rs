@@ -122,9 +122,9 @@ impl RuntimeCache {
     /// after the write, and a written table's next read misses on its new
     /// stamp anyway. The shelf stays: `shelf_serve` verifies each requested
     /// table's current stamp, so it stops serving a written table and keeps
-    /// serving untouched ones. Lifetime changes (branch create and delete, a
-    /// refresh, schema apply, optimize) still clear everything through
-    /// `invalidate_all`, the e_tag-less fallback for recreated branches.
+    /// serving untouched ones. A branch create or delete drops its own refs
+    /// (`invalidate_branch`); a refresh, schema apply and optimize still clear
+    /// everything through `invalidate_all`.
     pub async fn invalidate_edge_tables<'a>(&self, table_keys: impl IntoIterator<Item = &'a str>) {
         let written: std::collections::HashSet<&str> = table_keys.into_iter().collect();
         if written.is_empty() {
