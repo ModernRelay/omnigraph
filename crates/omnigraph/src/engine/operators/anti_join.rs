@@ -29,9 +29,7 @@ use omnigraph_planner::{AggregateSpec, AntiJoinStrategy};
 use super::key_groups::KeyGroups;
 use super::memory::WorkMemory;
 use super::shape::{Breaker, work};
-use super::subquery_aggregate::{
-    RowCountPredicate, SubqueryAggregate, ValueAccumulator, absorb_inner_batch,
-};
+use super::subquery_aggregate::{RowCountPredicate, SubqueryAggregate, ValueAccumulator};
 use super::{drain_one, external};
 use crate::engine::graph::{GraphIndexHandle, bulk_anti_join_mask};
 use crate::error::{OmniError, Result};
@@ -373,21 +371,15 @@ impl ExecutionPlan for AntiJoinMaskExec {
                         let filled = FilledSlot(&slot);
                         let result: DfResult<()> = async {
                             let mut inner = inner.execute(0, inner_ctx)?;
-                            while let Some(batch) = inner.next().await {
-                                let batch = batch?;
-                                reservation.metric("input_rows", batch.num_rows());
-                                absorb_inner_batch(
-                                    &mut aggregate,
-                                    &batch,
-                                    &tag_column,
-                                    predicate.left.arg(),
-                                    &|batch, arg| {
-                                        crate::engine::expr::evaluate_expr(batch, arg, &params)
-                                    },
-                                )
-                                .map_err(external)?;
-                            }
-                            Ok(())
+                            fold_inner(
+                                &mut inner,
+                                &mut aggregate,
+                                &predicate,
+                                &params,
+                                &reservation,
+                                |batch| tag_array(batch, &tag_column),
+                            )
+                            .await
                         }
                         .await;
                         drop(filled);
@@ -428,17 +420,48 @@ async fn key_set_mask(
     let mut aggregate =
         SubqueryAggregate::new(predicate, aggregate_spec, params, group_count).map_err(external)?;
     let (mut hashes, mut inner_groups) = (Vec::new(), Vec::new());
+    fold_inner(
+        &mut inner,
+        &mut aggregate,
+        predicate,
+        params,
+        reservation,
+        |batch| {
+            let inner_keys = key_array(batch, key_column).map_err(external)?;
+            groups.probe(inner_keys, &mut hashes, &mut inner_groups)?;
+            Ok(UInt32Array::from_iter_values(
+                inner_groups.iter().map(|group| group.unwrap_or(discarded)),
+            ))
+        },
+    )
+    .await?;
+    let verdicts = aggregate.keep_mask().map_err(external)?;
+    Ok(row_groups
+        .into_iter()
+        .map(|group| Some(verdicts.value(group.unwrap_or(unmatched) as usize)))
+        .collect())
+}
+
+/// Folds every batch of `inner` into `aggregate` as the stream yields it, then
+/// drops it, so no inner batch outlives its own fold: the one inner loop of
+/// both strategies, which differ only in each row's group (`tags`: the
+/// correlated path's tag column, the key-set path's key group). The block's
+/// argument executes in the inner scope.
+async fn fold_inner(
+    inner: &mut SendableRecordBatchStream,
+    aggregate: &mut SubqueryAggregate,
+    predicate: &SubqueryPredicate,
+    params: &ParamMap,
+    reservation: &WorkMemory,
+    mut tags: impl FnMut(&RecordBatch) -> DfResult<UInt32Array>,
+) -> DfResult<()> {
     while let Some(batch) = inner.next().await {
         let batch = batch?;
         reservation.metric("input_rows", batch.num_rows());
         if batch.num_rows() == 0 {
             continue;
         }
-        let inner_keys = key_array(&batch, key_column).map_err(external)?;
-        groups.probe(inner_keys, &mut hashes, &mut inner_groups)?;
-        let tags = UInt32Array::from_iter_values(
-            inner_groups.iter().map(|group| group.unwrap_or(discarded)),
-        );
+        let tags = tags(&batch)?;
         let values = predicate
             .left
             .arg()
@@ -447,11 +470,26 @@ async fn key_set_mask(
             .map_err(external)?;
         aggregate.absorb(&tags, values.as_ref()).map_err(external)?;
     }
-    let verdicts = aggregate.keep_mask().map_err(external)?;
-    Ok(row_groups
-        .into_iter()
-        .map(|group| Some(verdicts.value(group.unwrap_or(unmatched) as usize)))
-        .collect())
+    Ok(())
+}
+
+/// The correlation tag of every row of a correlated block's inner batch.
+fn tag_array(batch: &RecordBatch, tag_column: &str) -> DfResult<UInt32Array> {
+    batch
+        .column_by_name(tag_column)
+        .ok_or_else(|| {
+            OmniError::manifest_internal("anti-join inner pipeline dropped the correlation column")
+        })
+        .and_then(|column| {
+            column
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .cloned()
+                .ok_or_else(|| {
+                    OmniError::manifest_internal(format!("'{tag_column}' column is not UInt32"))
+                })
+        })
+        .map_err(external)
 }
 
 /// The correlation binding's identity column of a key-set batch.

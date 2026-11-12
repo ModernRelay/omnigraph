@@ -6,12 +6,11 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array, RecordBatch,
-    UInt32Array,
+    Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array, UInt32Array,
 };
 use arrow_schema::DataType;
 use datafusion::common::ScalarValue;
-use omnigraph_compiler::ir::{BlockAggregateExpr, IRExpr, ParamMap, SubqueryPredicate};
+use omnigraph_compiler::ir::{BlockAggregateExpr, ParamMap, SubqueryPredicate};
 use omnigraph_compiler::query::ast::{AggFunc, CompOp};
 use omnigraph_compiler::types::{AggSignature, ExprType};
 use omnigraph_planner::{Accumulator, AggregateSpec, plan_block_aggregate};
@@ -451,31 +450,6 @@ impl SubqueryAggregate {
     }
 }
 
-/// Fold one tagged inner batch; the argument's expression executes in the inner scope.
-pub(crate) fn absorb_inner_batch(
-    aggregate: &mut SubqueryAggregate,
-    batch: &RecordBatch,
-    tag_column: &str,
-    arg: Option<&IRExpr>,
-    evaluate: &dyn Fn(&RecordBatch, &IRExpr) -> Result<ArrayRef>,
-) -> Result<()> {
-    if batch.num_rows() == 0 {
-        return Ok(());
-    }
-    let tags = batch
-        .column_by_name(tag_column)
-        .ok_or_else(|| {
-            OmniError::manifest_internal("anti-join inner pipeline dropped the correlation column")
-        })?
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| {
-            OmniError::manifest_internal(format!("'{tag_column}' column is not UInt32"))
-        })?;
-    let values = arg.map(|arg| evaluate(batch, arg)).transpose()?;
-    aggregate.absorb(tags, values.as_ref())
-}
-
 /// Convert toward the stored accumulator, retaining original typed extrema.
 enum Column {
     Exact(Decimal128Array),
@@ -529,6 +503,7 @@ impl Column {
 mod tests {
     use super::*;
     use arrow_array::{Float32Array, Int64Array, UInt64Array};
+    use omnigraph_compiler::ir::IRExpr;
     use omnigraph_compiler::query::ast::Literal;
     use omnigraph_compiler::types::{PropType, ScalarType};
 

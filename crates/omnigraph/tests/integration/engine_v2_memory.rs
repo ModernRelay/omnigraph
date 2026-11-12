@@ -460,7 +460,7 @@ async fn nested_hydration_uses_the_query_pool_and_releases_on_refusal() {
 }
 
 /// Two projected batches fit together; concatenating them exceeds the pool.
-/// GQT cannot select the pool or observe the collector's reservation owner.
+/// GQT cannot observe the collector's reservation owner.
 #[tokio::test]
 #[serial]
 async fn result_collection_refuses_its_own_concatenation_and_releases() {
@@ -2193,7 +2193,9 @@ async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251
 /// of inner payload runs under a 12 MiB pool. Holding the inner output first
 /// was refused even under 24 MiB. The conjunct that reads the outer row keeps
 /// the block off the key-set path, and `max` keeps it off the bulk row count.
-/// GQT cannot select the pool.
+/// `issue_1338_correlated_block_folds_inner_batches.gqt` guards the rows and the
+/// refusal; this test adds what GQT cannot assert, that the run releases every
+/// reservation it took.
 #[tokio::test]
 #[serial]
 async fn correlated_block_folds_inner_batches_as_they_stream_issue_1338() {
