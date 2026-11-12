@@ -2969,7 +2969,7 @@ query update_one() {
                     .join("\n");
                 db.load_jsonl(&rows, LoadMode::Append).await.unwrap();
             }
-            db.ensure_indices().await.unwrap();
+            db.ensure_indices_as(None).await.unwrap();
             drop(db);
             let db = session(
                 Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
