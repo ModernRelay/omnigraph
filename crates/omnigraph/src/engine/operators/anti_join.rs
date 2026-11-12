@@ -444,7 +444,7 @@ async fn key_set_mask(
 
 /// Folds every batch of `inner` into `aggregate` as the stream yields it, then
 /// drops it, so no inner batch outlives its own fold: the one inner loop of
-/// both strategies, which differ only in each row's group (`tags`: the
+/// both strategies, which differ only in each row's group (`group_of`: the
 /// correlated path's tag column, the key-set path's key group). The block's
 /// argument executes in the inner scope.
 async fn fold_inner(
@@ -453,7 +453,7 @@ async fn fold_inner(
     predicate: &SubqueryPredicate,
     params: &ParamMap,
     reservation: &WorkMemory,
-    mut tags: impl FnMut(&RecordBatch) -> DfResult<UInt32Array>,
+    mut group_of: impl FnMut(&RecordBatch) -> DfResult<UInt32Array>,
 ) -> DfResult<()> {
     while let Some(batch) = inner.next().await {
         let batch = batch?;
@@ -461,7 +461,7 @@ async fn fold_inner(
         if batch.num_rows() == 0 {
             continue;
         }
-        let tags = tags(&batch)?;
+        let tags = group_of(&batch)?;
         let values = predicate
             .left
             .arg()
