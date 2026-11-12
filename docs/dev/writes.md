@@ -413,6 +413,15 @@ gates. The bound is the process's: another process's publication is refused
 by the publisher's CAS and prepares the write again, within
 `MAX_PRE_EFFECT_REPREPARES` (32).
 
+The gated attempt costs other writers more than its own branch. Writers on the
+branch wait for its one preparation. The shared schema permit it holds also
+makes a branch create, a schema apply or a system-column upgrade wait, since
+each takes the permit exclusively, and the schema gate is fair: while such a
+request waits, new shared requests wait behind it, so writers on every branch
+wait too. Each wait lasts one preparation, as a branch merge's planning under
+the same permit already does. For a large merge load on object storage that
+can be seconds.
+
 Optimize captures its write authority before it takes the shared schema,
 main-branch and table gates, and rechecks it under them. On the direct path
 (`AuthorityCapture::BeforeGates`, the default) a head that moved while the

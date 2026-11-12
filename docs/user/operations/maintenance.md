@@ -64,10 +64,10 @@ Optimize runs beside live writers: a write that lands on a table while its
 compaction is staged fails the run with a read-set conflict, and the next run
 re-plans from the new state. A write prepared before an optimize published goes
 ahead, or prepares again once, holding writes off, if it changes a row the run
-moved; only an update in another process can still report the conflict. Lance
-compacts neighbouring fragments only when the same indexes cover them, so a
-table whose index coverage was uneven before a run may coalesce fully only on
-the next run, after the rebuilt coverage is in place.
+moved; only an update from another process, or another handle of an unheld
+branch, still reports it. Lance compacts neighbouring fragments only when the
+same indexes cover them, so a table whose index coverage was uneven before a run
+may coalesce fully only on the next run, after the rebuilt coverage is in place.
 
 Compacting a table with Blob properties reads each managed Blob value into
 memory. Optimize sizes each compaction batch from its largest row, whatever
