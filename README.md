@@ -1,8 +1,6 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/omnigraph-wordmark-dark.svg">
-    <img alt="OMNIGRAPH" src="assets/omnigraph-wordmark.svg" width="420">
-  </picture>
+  <img alt="OMNIGRAPH" src="assets/omnigraph-wordmark.svg#gh-light-mode-only" width="420">
+  <img alt="OMNIGRAPH" src="assets/omnigraph-wordmark-dark.svg#gh-dark-mode-only" width="420">
 </p>
 
 <p align="center">
