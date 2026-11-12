@@ -167,3 +167,6 @@ NearestOpen                  l.get        calls=3
 NearestOpen                  l.list       calls=2
 NearestColdIndexed           l.get        calls=9
 NearestWarmIndexed           l.get        calls=2
+WriterClaim                  l.get        calls=7
+WriterClaim                  l.list       calls=2
+WriterClaim                  l.put        calls=3

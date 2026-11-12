@@ -3269,6 +3269,29 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
             Some((1, 11)),
             "{path}"
         );
+
+        // A source nested past the bound is refused before the grammar
+        // recurses over it; parsed, it would exhaust the worker's stack and
+        // abort the server for every caller.
+        let deep = format!(
+            "query q() {{ match {{ $p: Person {}$p.age > 1{} }} return {{ $p.name }} }}",
+            "(".repeat(100_000),
+            ")".repeat(100_000)
+        );
+        let chain = format!(
+            "query q() {{ match {{ $p: Person {} }} return {{ $p.name }} }}",
+            vec!["$p.age > 1"; 50_000].join(" or ")
+        );
+        for source in [deep, chain] {
+            let body = json!({field: source, "branch": "main"});
+            let (status, out) = json_response(&app, send(path, token, body, expected_head)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
+            let error: ErrorOutput = serde_json::from_value(out).unwrap();
+            let diagnostic = error
+                .diagnostic
+                .expect("a refused query carries its diagnostic");
+            assert_eq!(diagnostic.code, "Q006", "{path}");
+        }
     }
 }
 
@@ -3897,6 +3920,77 @@ fn assert_settings_refusal(status: StatusCode, body: &Value, error: &str) {
 
 /// A refusal whose sentence the settings definition owns: the 400 and the
 /// claim, never the whole message, which the definition's own tests pin.
+/// A served request may lower a resource budget, or raise it back to the
+/// built-in default, but not past the server's ceiling: the larger of the two.
+/// The operator raises the ceiling through the environment.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_budgets_stop_at_the_server_ceiling() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let read = |source: String, settings: Value| {
+        json_post("/query", &json!({"query": source, "settings": settings}))
+    };
+    for (setting, above) in [
+        ("traversal_work_limit", "9223372036854775807"),
+        ("query_memory_bytes", "1099511627776"),
+        ("write_max_bytes", "1099511627776"),
+        ("load_source_max_bytes", "1099511627776"),
+    ] {
+        let (status, body) = json_response(
+            &app,
+            read(
+                format!("set {setting} = {above}; show {setting};"),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_settings_refusal_needle(status, &body, "ceiling");
+        let (status, body) = json_response(
+            &app,
+            read(
+                format!("show {setting};"),
+                json!({setting: above.parse::<u64>().unwrap()}),
+            ),
+        )
+        .await;
+        assert_settings_refusal_needle(status, &body, "ceiling");
+        let (status, body) = json_response(
+            &app,
+            read(format!("set {setting} = 1024; show {setting};"), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{setting} lowered: {body}");
+    }
+
+    let (settings, sources) = omnigraph::settings::from_env_with(|variable| {
+        (variable == "OMNIGRAPH_TRAVERSAL_WORK_LIMIT").then(|| "5000000".to_string())
+    })
+    .unwrap();
+    let (_temp, raised) =
+        app_for_loaded_graph_with_process_defaults(ProcessDefaults { settings, sources }).await;
+    let (status, body) = json_response(
+        &raised,
+        read(
+            "set traversal_work_limit = 5000000; show traversal_work_limit;".to_string(),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "up to an operator-raised value: {body}"
+    );
+    let (status, body) = json_response(
+        &raised,
+        read(
+            "set traversal_work_limit = 5000001; show traversal_work_limit;".to_string(),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_settings_refusal_needle(status, &body, "OMNIGRAPH_TRAVERSAL_WORK_LIMIT");
+}
+
 fn assert_settings_refusal_needle(status: StatusCode, body: &Value, needle: &str) {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["code"], "bad_request", "{body}");

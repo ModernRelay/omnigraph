@@ -60,14 +60,26 @@ impl ReadDispatch {
     }
 }
 
-/// The `process` scope rule at a remote door: a `set` or `reset` of a
-/// `process` setting in a request's text is refused before anything runs.
+/// The scope rules at a remote door, before anything runs: a `set` or
+/// `reset` of a `process` setting in a request's text is refused, and so is a
+/// `set` that raises a resource budget past the server's own value
+/// ([`crate::refuse_raised_budgets`]).
 pub(super) fn refuse_process_settings(
     settings: &[SettingStmt],
+    server: &omnigraph::settings::SessionSettings,
 ) -> std::result::Result<(), ApiError> {
     for id in settings.iter().filter_map(SettingStmt::id) {
         id.refuse_from_request()
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    }
+    for stmt in settings {
+        if let SettingStmt::Set { id, value } = stmt {
+            let mut requested = server.clone();
+            requested
+                .set(*id, value)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            crate::refuse_raised_budgets(&requested, server)?;
+        }
     }
     Ok(())
 }

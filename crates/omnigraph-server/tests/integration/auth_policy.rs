@@ -377,12 +377,13 @@ async fn signed_data_requires_cedar_and_rejects_forgery_on_every_protected_route
     assert!(body.get("actor").is_none(), "{body}");
     assert_eq!(body["graph_wide"], json!([]), "{body}");
     assert_eq!(body["actions"], json!([]), "{body}");
+    // A static token gets nothing on a graph without a policy either.
     let (status, _) = json_response(
         &app,
         get_request(&g("/snapshot?branch=main"), "static-token"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::FORBIDDEN);
     let policy_path = temp.path().join("other-principal.yaml");
     fs::write(&policy_path, permit_all_policy_yaml(&["someone-else"])).unwrap();
     let unknown_actor_app = build_app(
@@ -3590,26 +3591,47 @@ async fn oversized_request_body_returns_payload_too_large() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// Tokens are not scoped to graphs, so a `read` permit on a graph without a
+/// policy would reach every such graph on the server: it is refused like every
+/// other action unless the operator sets `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY`.
 #[tokio::test(flavor = "multi_thread")]
-async fn default_deny_mode_allows_read_for_authenticated_actor() {
-    let (_temp, app) = app_for_graph_with_auth_tokens_only(
-        &fs::read_to_string(fixture("test.pg")).unwrap(),
-        &[("act-andrew", "demo-token")],
-    )
-    .await;
-
-    let (status, _body) = json_response(
-        &app,
+async fn default_deny_mode_refuses_read_unless_the_operator_opts_in() {
+    let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+    let read = |path: &str| {
         Request::builder()
             .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
-            .uri(g("/snapshot"))
+            .uri(g(path))
             .method(Method::GET)
             .header(AUTHORIZATION, "Bearer demo-token")
             .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+            .unwrap()
+    };
+    for (allow_reads, expected) in [(false, StatusCode::FORBIDDEN), (true, StatusCode::OK)] {
+        let (_temp, app) = app_for_graph_with_auth_tokens_only_reading(
+            &schema,
+            &[("act-andrew", "demo-token")],
+            allow_reads,
+        )
+        .await;
+        for path in ["/snapshot", "/schema", "/branches", "/commits"] {
+            let (status, body) = json_response(&app, read(path)).await;
+            assert_eq!(status, expected, "{path} with opt-in {allow_reads}: {body}");
+        }
+        let query = json!({"query": FIND_PERSON_GQ, "params": {"name": "Alice"}});
+        let (status, body) = json_response(
+            &app,
+            Request::builder()
+                .header(HTTP_API_CONTRACT_HEADER, HTTP_API_CONTRACT)
+                .uri(g("/query"))
+                .method(Method::POST)
+                .header(AUTHORIZATION, "Bearer demo-token")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&query).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, expected, "/query with opt-in {allow_reads}: {body}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4479,6 +4501,11 @@ rules:
       actors: { group: slots }
       actions: [branch_create]
       target_branch_scope: unprotected
+  - id: maintain-protected
+    allow:
+      actors: { group: slots }
+      actions: [maintain]
+      branch_scope: protected
 "#,
     )
     .unwrap();
@@ -4494,7 +4521,7 @@ rules:
     for (query, actions) in [
         (
             "?branch=main&target_branch=feature",
-            json!(["schema_apply", "branch_create"]),
+            json!(["maintain", "schema_apply", "branch_create"]),
         ),
         (
             "?branch=feature&target_branch=main",
@@ -4507,23 +4534,26 @@ rules:
         assert_eq!(body["actions"], actions, "{query}");
     }
 
-    // Without a graph policy a static token only reads, as `authorize`
-    // decides; without authentication every graph action is open.
+    // Without a graph policy a static token may do nothing, or only read
+    // under the operator opt-in, as `authorize` decides; without
+    // authentication every graph action is open.
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path()).to_string_lossy().to_string();
-    let app = build_app(
-        AppState::open_with_bearer_tokens(
-            graph.clone(),
-            vec![("act-bruno".to_string(), "bruno-token".to_string())],
-        )
-        .await
-        .unwrap(),
-    );
-    let (status, body) = access(&app, "?branch=main", Some("bruno-token")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["graph_wide"], json!(["read"]));
-    assert_eq!(body["actions"], json!(["read"]));
-    drop(app);
+    for (allow_reads, expected) in [(false, json!([])), (true, json!(["read"]))] {
+        let app = build_app(
+            AppState::open_with_bearer_tokens(
+                graph.clone(),
+                vec![("act-bruno".to_string(), "bruno-token".to_string())],
+            )
+            .await
+            .unwrap()
+            .with_reads_without_policy(allow_reads),
+        );
+        let (status, body) = access(&app, "?branch=main", Some("bruno-token")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["graph_wide"], expected, "opt-in {allow_reads}");
+        assert_eq!(body["actions"], expected, "opt-in {allow_reads}");
+    }
 
     let app = build_app(AppState::open(graph).await.unwrap());
     let (status, body) = access(&app, "?branch=main&target_branch=feature", None).await;
@@ -4541,7 +4571,8 @@ rules:
             "branch_merge",
             "commit_publish",
             "commit_drop",
-            "invoke_query"
+            "invoke_query",
+            "maintain"
         ])
     );
     assert_eq!(
@@ -4550,6 +4581,7 @@ rules:
             "read",
             "export",
             "change",
+            "maintain",
             "schema_apply",
             "branch_delete",
             "commit_publish",

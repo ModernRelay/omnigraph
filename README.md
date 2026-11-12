@@ -15,6 +15,7 @@
   <a href="docs/user/index.md">Docs</a> &nbsp;·&nbsp;
   <a href="https://github.com/ModernRelay/omnigraph-cookbooks">Cookbooks</a> &nbsp;·&nbsp;
   <a href="docs/user/cli/reference.md">CLI</a> &nbsp;·&nbsp;
+  <a href="https://www.omnigraph.dev/studio?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=studio">Studio</a> &nbsp;·&nbsp;
   <a href="https://www.omnigraph.dev/llms.txt">llms.txt</a>
 </p>
 
@@ -40,7 +41,7 @@ Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace
 | **Branching** | Agents propose reviewable changes instead of writing to main: a branch per agent or task, three-way merge, time travel across the whole graph. |
 | **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers and policies. `cluster plan` previews, `cluster apply` converges, Terraform-style. |
 | **Security as code** | Cedar policy enforced **server-side on every mutation**, per graph or server-wide; bearer auth, server-resolved actors, audit tracking. |
-| **Object-storage native, open format** | Decoupled storage and compute. Store graphs on local disk or S3-compatible storage: RustFS / MinIO, AWS S3 / R2 / GCS, or Azure preview. Graph data uses open, versioned [Lance](https://github.com/lance-format/lance), including Blob values. |
+| **Object-storage native, open format** | Decoupled storage and compute. Store graphs on local disk or S3-compatible storage: RustFS / MinIO, AWS S3 / R2, or Azure preview. Graph data uses open, versioned [Lance](https://github.com/lance-format/lance), including Blob values. |
 
 ## What you can build
 
@@ -66,6 +67,23 @@ brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
 
+## Studio
+
+[Omnigraph Studio](https://www.omnigraph.dev/studio?utm_source=github&utm_medium=readme&utm_campaign=studio) is the desktop app for your graphs. Browse each type as
+a table, follow relationships on a canvas, write queries with the compiler's
+errors as you type, and review what a branch changes before you merge it. It is
+a native Rust app on GPUI, the framework behind Zed, for macOS, Windows and Linux.
+
+<a href="https://www.omnigraph.dev/studio?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=studio"><img alt="Omnigraph Studio showing what a branch adds, changes and removes, inline in a table" src="https://www.omnigraph.dev/studio/studio-demo-poster.jpg" width="800"></a>
+
+Open a graph on one of your server targets in Studio:
+
+```bash
+omnigraph studio --target <server> --graph <graph>
+```
+
+[Download Studio](https://www.omnigraph.dev/studio?utm_source=github&utm_medium=readme&utm_campaign=studio) or read [its source](https://github.com/ModernRelay/omnigraph-studio).
+
 ## Set it up with an AI agent
 
 Omnigraph is built to be run by coding agents. Two ways in:
@@ -88,16 +106,12 @@ default branch instead.
 Codex, or any agent that can read a URL and run a shell command:
 
 ```text
-Help me set up Omnigraph
-
-1. Read the docs at https://github.com/ModernRelay/omnigraph, starting with
-   docs/user/clusters/index.md, then docs/user/deployment.md.
-2. Skim the starter graphs and seed data in the cookbooks:
-   https://github.com/ModernRelay/omnigraph-cookbooks
-3. Ask me what I want to build (company brain, agent memory, dev graph,
-   research / R&D layer, …). Then stand up a cluster for it, load a little
-   data, and run a query so I can see it working.
+Read https://github.com/ModernRelay/omnigraph/blob/main/skills/omnigraph/references/onboarding.md and follow it to set up Omnigraph for me.
 ```
+
+The agent installs the CLI, asks what the graph is for, builds and queries a
+small local graph, and then points to the cookbooks, a cluster or Omnigraph
+Cloud.
 
 For ready-to-run graphs with real seed data (company brain, VC operating system,
 pharma & industry intel),
@@ -171,8 +185,11 @@ everyday commands stay short. Stored queries and mutations run **by name**:
 ```bash
 omnigraph query  search_docs --params '{"q":"AI safety"}'
 omnigraph mutate add_person  --params '{"name":"Mina"}'
+```
 
-# Branch, review, merge across the whole graph; agents write in isolation
+Branch, review and merge across the whole graph, so agents write in isolation:
+
+```bash
 omnigraph branch create --from main agent/ingest-42
 omnigraph branch merge  agent/ingest-42 --into main
 ```
@@ -199,6 +216,7 @@ See the [policy guide](docs/user/operations/policy.md).
 |---|---|---|
 | **TypeScript SDK** | typed access from Node / TS | [`@modernrelay/omnigraph`](https://www.npmjs.com/package/@modernrelay/omnigraph) · [source](https://github.com/ModernRelay/omnigraph-ts) |
 | **Built-in MCP** | connect an agent to the server's `/mcp`, directly or through `omnigraph mcp --target NAME` | [MCP guide](docs/user/operations/mcp.md) |
+| **Omnigraph Studio** | browse, query and review a graph in a desktop app | [download](https://www.omnigraph.dev/studio?utm_source=github&utm_medium=readme&utm_campaign=studio) · [source](https://github.com/ModernRelay/omnigraph-studio) |
 | **HTTP / OpenAPI** | use the wire contract from any language | [HTTP guide](docs/user/operations/server.md) · [OpenAPI](openapi.json) |
 
 Match the client's HTTP contract to the server's. The 0.14 server requires

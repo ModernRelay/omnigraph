@@ -289,6 +289,7 @@ fn settings_from_snapshot_inner(
     }
 
     let env_unauth = env_flag("OMNIGRAPH_UNAUTHENTICATED");
+    let env_reads_without_policy = env_flag("OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY");
 
     Ok(ServerConfig {
         mode: ServerConfigMode::Multi {
@@ -299,6 +300,7 @@ fn settings_from_snapshot_inner(
         },
         bind: cli_bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
         allow_unauthenticated: cli_allow_unauthenticated || env_unauth,
+        allow_reads_without_policy: env_reads_without_policy,
         require_all_graphs,
         witness,
         // The binary resolves the flag, then the environment, then the default
@@ -523,7 +525,8 @@ fn env_flag(name: &str) -> bool {
 ///   operator opt-in.
 /// * **DefaultDeny** — tokens configured but no policy file. The
 ///   server requires a valid bearer token; once authenticated, every
-///   action except `Read` is denied with 403. Closes the "tokens but
+///   graph action is denied with 403 (a static token may `read` under the
+///   `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY` opt-in). Closes the "tokens but
 ///   forgot the policy file" trap.
 /// * **PolicyEnabled** — policy file configured and at least one
 ///   bearer token configured. Cedar evaluates every authenticated
@@ -583,10 +586,24 @@ pub(crate) fn normalize_bearer_token(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The actor prefix signed data and OIDC identities resolve to
+/// (`principal:<id>`). Policy sees only the actor string, so a static token
+/// may not claim it.
+pub(crate) const SIGNED_ACTOR_PREFIX: &str = "principal:";
+
 pub(crate) fn normalize_bearer_actor(value: String) -> Result<String> {
     let value = value.trim().to_string();
     if value.is_empty() {
         bail!("bearer token actor names must not be blank");
+    }
+    if value
+        .get(..SIGNED_ACTOR_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SIGNED_ACTOR_PREFIX))
+    {
+        bail!(
+            "bearer token actor '{value}' uses the reserved prefix '{SIGNED_ACTOR_PREFIX}', \
+             which names signed and OIDC identities; choose another actor name"
+        );
     }
     Ok(value)
 }
@@ -598,10 +615,47 @@ pub(crate) fn parse_bearer_tokens_json(value: &str) -> Result<Vec<(String, Strin
 }
 
 pub(crate) fn read_bearer_tokens_file(path: &str) -> Result<Vec<(String, String)>> {
+    check_bearer_tokens_file_permissions(path)?;
     let contents = fs::read_to_string(path)
         .wrap_err_with(|| format!("failed to read bearer tokens file at {path}"))?;
     parse_bearer_tokens_json(&contents)
         .wrap_err_with(|| format!("failed to parse bearer tokens file at {path}"))
+}
+
+/// Refuse a bearer-tokens file another account can write, which could add a
+/// token for any actor, and warn when another account can read it. The mode
+/// is the file's own, after following symlinks: a Kubernetes secret mount is a
+/// symlink whose target carries the volume's `defaultMode` (0644 unless set),
+/// so readable-by-others warns rather than refuses.
+#[cfg(unix)]
+fn check_bearer_tokens_file_permissions(path: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path)
+        .wrap_err_with(|| format!("failed to read bearer tokens file at {path}"))?;
+    if !metadata.is_file() {
+        bail!("bearer tokens file at {path} is not a regular file");
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o022 != 0 {
+        bail!(
+            "bearer tokens file at {path} is writable by other accounts (mode {mode:03o}); \
+             restrict it with `chmod 600 {path}`"
+        );
+    }
+    if mode & 0o044 != 0 {
+        warn!(
+            mode = %format!("{mode:03o}"),
+            "bearer tokens file is readable by other accounts; restrict it with chmod 600 \
+             (or a Kubernetes secret volume's defaultMode: 0400)"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_bearer_tokens_file_permissions(_path: &str) -> Result<()> {
+    Ok(())
 }
 
 pub(crate) fn validate_bearer_tokens(
@@ -660,6 +714,7 @@ mod tests {
         GraphId, GraphKey, GraphStartupConfig, RegistryLookup, ServerConfig, ServerConfigMode,
         ServerRuntimeState, StartupFailure, classify_server_runtime_state, hash_bearer_token,
         normalize_bearer_token, parse_bearer_tokens_json, serve, server_bearer_tokens_from_env,
+        validate_bearer_tokens,
     };
     use serial_test::serial;
     use std::env;
@@ -890,7 +945,10 @@ mod tests {
             config.witness,
             Arc::new(AtomicBool::new(false)),
             DEFAULT_SHUTDOWN_GRACE,
-        );
+        )
+        // The deployed graph has no policy; the operator token reads it
+        // through the opt-in, since this test is about the handoff, not policy.
+        .with_reads_without_policy(true);
         super::deployment::initialize_boot_activation(&state);
         let app = super::build_app(state);
         let (code, ready) = response(&app, "GET", "/readyz", Value::Null).await;
@@ -1038,10 +1096,20 @@ mod tests {
             authorize(Some(&actor), None, req(PolicyAction::Change)).unwrap(),
             Authz::Denied(_)
         ));
-        // `read` is the one per-graph action permitted without a policy.
+        // `read` is denied too: tokens are not scoped to graphs.
         assert!(matches!(
             authorize(Some(&actor), None, req(PolicyAction::Read)).unwrap(),
+            Authz::Denied(_)
+        ));
+        // The operator opt-in restores `read`, and only `read`.
+        let reader = actor.clone().with_policy_less_reads(true);
+        assert!(matches!(
+            authorize(Some(&reader), None, req(PolicyAction::Read)).unwrap(),
             Authz::Allowed
+        ));
+        assert!(matches!(
+            authorize(Some(&reader), None, req(PolicyAction::Change)).unwrap(),
+            Authz::Denied(_)
         ));
         // Open mode (no actor, no policy) → allowed.
         assert!(matches!(
@@ -1286,6 +1354,7 @@ mod tests {
             },
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
+            allow_reads_without_policy: false,
             require_all_graphs: false,
             witness: crate::BootWitness::default(),
             shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,
@@ -1345,6 +1414,7 @@ mod tests {
             },
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
+            allow_reads_without_policy: false,
             require_all_graphs: false,
             witness: crate::BootWitness::default(),
             shutdown_grace: crate::DEFAULT_SHUTDOWN_GRACE,
@@ -1394,6 +1464,32 @@ mod tests {
             assert!(
                 msg.contains("every request would 401"),
                 "rejection message must name the failure mode; got: {msg}"
+            );
+        }
+    }
+
+    /// Signed and OIDC identities resolve to `principal:<id>`, and policy sees
+    /// only the actor string: a static actor in that namespace would match
+    /// their rules.
+    #[test]
+    fn static_actors_cannot_claim_the_signed_identity_prefix() {
+        for reserved in [
+            "principal:alice",
+            " principal:alice ",
+            "PRINCIPAL:alice",
+            "principal:",
+        ] {
+            let err = validate_bearer_tokens(vec![(reserved.to_string(), "tok".to_string())])
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("reserved prefix"),
+                "{reserved}: {err}"
+            );
+        }
+        for allowed in ["alice", "principal", "my-principal:alice", "principalalice"] {
+            assert!(
+                validate_bearer_tokens(vec![(allowed.to_string(), "tok".to_string())]).is_ok(),
+                "{allowed}"
             );
         }
     }
@@ -1461,6 +1557,11 @@ mod tests {
             r#"{"team-01":"token-one","team-02":"token-two"}"#,
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tokens_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
 
         let _guard = EnvGuard::set(&[
             ("OMNIGRAPH_SERVER_BEARER_TOKEN", Some(" legacy-token ")),
@@ -1480,6 +1581,46 @@ mod tests {
                 ("team-02".to_string(), "token-two".to_string()),
             ]
         );
+    }
+
+    /// A tokens file another account can write is refused before it is read;
+    /// one it can only read is accepted with a warning, which keeps the
+    /// default Kubernetes secret mode (0644) working.
+    #[cfg(unix)]
+    #[test]
+    fn bearer_tokens_file_writable_by_others_is_refused() {
+        use super::read_bearer_tokens_file;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tokens.json");
+        fs::write(&path, r#"{"team-01":"token-one"}"#).unwrap();
+        for (mode, refused) in [
+            (0o600, false),
+            (0o400, false),
+            (0o640, false),
+            (0o644, false),
+            (0o620, true),
+            (0o602, true),
+            (0o666, true),
+        ] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let result = read_bearer_tokens_file(path.to_str().unwrap());
+            assert_eq!(result.is_err(), refused, "mode {mode:03o}: {result:?}");
+            if refused {
+                assert!(
+                    result.unwrap_err().to_string().contains("chmod 600"),
+                    "mode {mode:03o}"
+                );
+            }
+        }
+        // A symlink is judged by its target, as a Kubernetes mount is.
+        let link = temp.path().join("link.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_bearer_tokens_file(link.to_str().unwrap()).is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_bearer_tokens_file(link.to_str().unwrap()).is_err());
     }
 
     /// Every file under `root` with its bytes, so a boot attempt can prove it

@@ -164,10 +164,10 @@ impl Omnigraph {
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
     ) -> Result<BlobWriteOutcome> {
-        const MAX_PRE_EFFECT_REPREPARES: usize = 32;
-
         let mut first = None;
-        for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
+        let mut reprepares =
+            crate::db::reprepare::PreEffectReprepares::begin(self, requested, "Blob write");
+        loop {
             match self
                 .write_blob_cell_attempt(
                     requested,
@@ -182,21 +182,12 @@ impl Omnigraph {
                 )
                 .await
             {
-                Err(error)
-                    if error.is_read_set_changed() && attempt < MAX_PRE_EFFECT_REPREPARES =>
-                {
-                    tracing::debug!(
-                        attempt = attempt + 1,
-                        branch = requested.unwrap_or("main"),
-                        "prepared Blob write authority changed before effects; repreparing"
-                    );
-                    crate::instrumentation::record_mutation_reprepare();
-                    self.refresh_coordinator_only().await?;
+                Err(error) if reprepares.may_prepare_again(&error, true) => {
+                    reprepares.prepare_again().await?;
                 }
                 result => return result,
             }
         }
-        unreachable!("bounded Blob write retry loop always returns")
     }
 
     #[allow(clippy::too_many_arguments)]
