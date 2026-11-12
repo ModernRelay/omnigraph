@@ -396,15 +396,28 @@ async fn released(probes: &QueryMemoryProbes) {
     .expect("every traversal worker and reservation must be released");
 }
 
+/// `len` printable characters that LZ4 and zstd barely shrink (splitmix64
+/// over `seed` and the position), so spilled bytes stay near their
+/// uncompressed size whatever the session's spill codec.
+fn noise(seed: usize, len: usize) -> String {
+    (0..len)
+        .map(|position| {
+            let mut z = ((seed as u64) << 32 | position as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            char::from(b'!' + (z % 90) as u8)
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn selected_bound_sort_spills_and_refuses_its_scratch_quota_issue_659() {
     const MIB: u64 = 1024 * 1024;
     let mut seed = people();
     for member in ["Knows", "Likes"] {
         for index in 0..64 {
-            let payload = (0..1024)
-                .map(|position| char::from(b'!' + ((position * 37 + index * 17) % 90) as u8))
-                .collect::<String>();
+            let payload = noise(index * 2 + usize::from(member == "Likes"), 1024);
             let (src, dst) = if member == "Knows" {
                 ("a", "b")
             } else {
@@ -418,14 +431,6 @@ async fn selected_bound_sort_spills_and_refuses_its_scratch_quota_issue_659() {
     let result = with_query_memory_probes(sufficient.clone(), async {
         let ctx =
             QueryContext::with_scratch_limit(4 * MIB, NonZeroU64::new(20_000), 64 * MIB).unwrap();
-        assert!(matches!(
-            ctx.task_ctx()
-                .session_config()
-                .options()
-                .execution
-                .spill_compression,
-            datafusion::common::config::SpillCompression::Uncompressed
-        ));
         execute_selected(sources(&[128]), &env, selected_step(true, 1), &ctx).await
     })
     .await

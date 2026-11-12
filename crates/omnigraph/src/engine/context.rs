@@ -1,7 +1,7 @@
 //! The DataFusion session and shared memory pool for one v2 read. Every
 //! lowered operator and nested scan executes through its `TaskContext`.
 //! Graph breakers refuse reservations beyond the pool's budget; DataFusion
-//! sorts and aggregates may spill within the scratch quota.
+//! sorts and aggregates may spill, zstd-compressed, within the scratch quota.
 
 use std::fmt;
 use std::future::Future;
@@ -25,7 +25,8 @@ use tokio::sync::Notify;
 use super::operators::memory::{QueryResources, locked};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ORDERED_SCAN_EXECUTION_BATCH_ROWS, ORDERED_SCAN_SCRATCH_BYTES, sort_spill_reservation_bytes,
+    ORDERED_SCAN_EXECUTION_BATCH_ROWS, ORDERED_SCAN_SCRATCH_BYTES, SPILL_COMPRESSION,
+    sort_spill_reservation_bytes,
 };
 
 /// The pool size for tests that build a context without a plan: the ordered
@@ -215,7 +216,8 @@ impl QueryContext {
         let config = SessionConfig::new()
             .with_target_partitions(1)
             .with_batch_size(ORDERED_SCAN_EXECUTION_BATCH_ROWS)
-            .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes(memory_limit));
+            .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes(memory_limit))
+            .with_spill_compression(SPILL_COMPRESSION);
         let pool = Arc::new(SpillHeadroomPool::new(memory_limit as usize));
         let work = QueryWorkScope::default();
         let runtime = RuntimeEnvBuilder::new()
