@@ -23,7 +23,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_table::format::Manifest;
 use lance_table::io::commit::ManifestLocation;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use lance::Dataset;
@@ -44,11 +44,17 @@ use super::commit;
 use super::history;
 use super::layout::open_manifest_dataset_with_session;
 use super::metadata::parse_namespace_version_request;
-use super::migrations::{guard_stamp, is_served_stamp, read_stamp, require_unpublished_commits};
+use super::migrations::{
+    guard_stamp, is_served_stamp, read_stamp, require_control_facts, require_unpublished_commits,
+};
 use super::state::{
     BranchRecords, CommitBuffer, GraphLineageRow, HeldRecord, ManifestRows, ManifestState,
-    ReplacedRow, ReplacedTable, TablePin, TableRow, TableState, exact_head, manifest_state,
-    read_manifest_rows,
+    ReplacedRow, ReplacedTable, TablePin, TableRow, TableState, WriterEpochRow, exact_head,
+    manifest_state, read_manifest_rows,
+};
+use super::writer_epoch::{
+    EpochAssertion, EpochVerdict, HolderKey, UnansweredClaim, WriterEpochHolders,
+    check_writer_epoch, settle_unanswered_claim,
 };
 use super::{
     ExpectedTableVersions, HistoryReleaseBytes, MAIN_BRANCH_HEAD_KEY, ManifestChange, NativeRefPin,
@@ -189,6 +195,14 @@ pub enum PublishPrecondition {
         authority: GraphHeadExpectation,
         graph_commit_id: String,
     },
+    /// The claim of a writer epoch: the branch incarnation alone, by its name
+    /// and Lance-native identifier. A moved head does not refuse it and a
+    /// branch recreated under its name does.
+    ExactBranchIdentity {
+        /// `None` means main.
+        branch: Option<String>,
+        branch_identifier: lance::dataset::refs::BranchIdentifier,
+    },
 }
 
 /// What writing a candidate version established: the proposal's identity
@@ -271,6 +285,19 @@ pub struct PublishOutcome {
     pub schema_contract: Option<crate::SchemaContractRow>,
     /// The block registry rows `dataset`'s version keeps in its hot fragment.
     pub registry: crate::state::LineageRegistry,
+    /// The `writer_epoch` row of `dataset`'s version: as a publish read it, or
+    /// as the claim that put the version wrote it.
+    pub writer_epoch: Option<crate::state::WriterEpochRow>,
+}
+
+/// What a writer epoch claim established.
+#[derive(Debug)]
+pub struct WriterEpochClaim {
+    /// The epoch this process holds for the branch from here on.
+    pub epoch: u64,
+    /// The version the claim wrote, or the one it loaded when this process
+    /// already held the branch.
+    pub published: PublishOutcome,
 }
 
 #[async_trait]
@@ -337,6 +364,33 @@ pub trait ManifestBatchPublisher: Send + Sync {
             "this manifest publisher writes no unattached branches",
         ))
     }
+
+    /// Claim the bound branch's writer epoch for this process on the
+    /// incarnation `branch_identifier` names: one version whose only change is
+    /// the `writer_epoch` row, or none when this process already holds it.
+    async fn claim_writer_epoch(
+        &self,
+        _branch_identifier: &lance::dataset::refs::BranchIdentifier,
+    ) -> Result<WriterEpochClaim> {
+        Err(OmniError::manifest_internal(
+            "this manifest publisher claims no writer epoch",
+        ))
+    }
+
+    /// The `__manifest` version of this process's last publication on the
+    /// bound branch's native ref `native`, while it holds the branch and no
+    /// publish attempt has failed or been dropped since; `None` otherwise.
+    fn held_writer_version(&self, _native: Option<&str>) -> Option<u64> {
+        None
+    }
+
+    /// This process is about to delete `branch`: the version it holds there
+    /// stops standing for the head, so a handle bound to the branch probes.
+    fn withdraw_held_version(&self, _branch: &str) {}
+
+    /// This process deleted the incarnation `native` of `branch`: it holds
+    /// nothing there from here on.
+    fn release_writer_epoch(&self, _branch: &str, _native: &str) {}
 }
 
 pub struct GraphNamespacePublisher {
@@ -344,6 +398,8 @@ pub struct GraphNamespacePublisher {
     branch: Option<String>,
     control_session: Arc<lance::session::Session>,
     published_rows: Mutex<Option<PublishedRows>>,
+    holders: Arc<WriterEpochHolders>,
+    holder_key: OnceLock<HolderKey>,
 }
 
 pub(crate) const PUBLISHED_ROWS_CACHE_BYTES: usize = 8 * 1024 * 1024;
@@ -425,6 +481,43 @@ pub(crate) struct HeldRows<'a> {
     pub(crate) buffer: &'a CommitBuffer,
 }
 
+/// The version the process holds on a publisher's branch, across one publish.
+/// Dropped before the publish settles it, the version is withdrawn: an error,
+/// or a future dropped after its request landed, may have moved the head.
+struct HeldVersion<'a> {
+    publisher: &'a GraphNamespacePublisher,
+    settled: bool,
+}
+
+impl HeldVersion<'_> {
+    /// Raise what the process holds on `native` to the version this publish
+    /// landed there.
+    fn record_landed(&mut self, native: Option<&str>, version: u64) {
+        if let Some(key) = self.publisher.holder_key.get() {
+            self.publisher
+                .holders
+                .record_publication(key, native, version);
+        }
+        self.settled = true;
+    }
+
+    /// The publish answers with no version of its own and none in flight, so
+    /// what the process holds stands.
+    fn keep(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for HeldVersion<'_> {
+    fn drop(&mut self) {
+        if !self.settled
+            && let Some(key) = self.publisher.holder_key.get()
+        {
+            self.publisher.holders.withdraw_version(key);
+        }
+    }
+}
+
 decide_seam! {
     /// The publisher's `load_publish_state` read, inside the CAS retry loop.
     /// Contention here proves the outer retry re-runs the load.
@@ -489,6 +582,22 @@ impl GraphNamespacePublisher {
                 .map(ToOwned::to_owned),
             control_session,
             published_rows: Mutex::new(None),
+            holders: WriterEpochHolders::of_process(),
+            holder_key: OnceLock::new(),
+        }
+    }
+
+    /// A publisher whose process is `holders`: a registry of its own stands
+    /// for a second process on the root.
+    #[cfg(test)]
+    pub(crate) fn new_holding(
+        root_uri: &str,
+        branch: Option<&str>,
+        holders: Arc<WriterEpochHolders>,
+    ) -> Self {
+        Self {
+            holders,
+            ..Self::new(root_uri, branch)
         }
     }
 
@@ -530,6 +639,50 @@ impl GraphNamespacePublisher {
             None => read_manifest_rows(&dataset).await?,
         };
         Ok(LoadedPublishState { dataset, rows })
+    }
+
+    /// This publisher's branch in the holder registry, resolved once.
+    fn holder_key(&self) -> Result<&HolderKey> {
+        if let Some(key) = self.holder_key.get() {
+            return Ok(key);
+        }
+        let key = HolderKey::resolve(&self.root_uri, self.branch.as_deref())?;
+        Ok(self.holder_key.get_or_init(|| key))
+    }
+
+    /// The registry key of `branch` on this publisher's root, which may not
+    /// be its own branch; `None` while this process holds no branch at all.
+    fn held_key_of(&self, branch: &str) -> Option<HolderKey> {
+        if self.holders.holds_nothing() {
+            return None;
+        }
+        HolderKey::resolve(&self.root_uri, Some(branch)).ok()
+    }
+
+    /// The writer epoch check of one attempt whose load read `current` on the
+    /// chain `native` names. A refusal clears what the process held there. A
+    /// process that holds nothing anywhere resolves no key and reads no path.
+    fn assert_writer_epoch(
+        &self,
+        current: u64,
+        native: Option<&str>,
+        assertion: EpochAssertion,
+    ) -> Result<EpochVerdict> {
+        let held = match self.holders.holds_nothing() {
+            true => None,
+            false => self.holders.held(self.holder_key()?, native),
+        };
+        check_writer_epoch(held, current, assertion).map_err(|fenced| {
+            if let (Some(key), Some(held)) = (self.holder_key.get(), fenced.held) {
+                self.holders.clear(key, held);
+            }
+            OmniError::manifest_writer_fenced(
+                self.branch.as_deref().unwrap_or("main"),
+                fenced.held,
+                fenced.read,
+                fenced.current,
+            )
+        })
     }
 
     /// The `table` rows after `changes`, and whether `changes` wrote any row.
@@ -978,13 +1131,17 @@ impl GraphNamespacePublisher {
         head: &GraphLineageRow,
         precondition: &PublishPrecondition,
     ) -> Result<()> {
-        let expected = match precondition {
+        let (branch, branch_identifier, expected) = match precondition {
             PublishPrecondition::Any => return Ok(()),
             PublishPrecondition::ExactGraphHead(expected)
             | PublishPrecondition::ExactCandidate {
                 authority: expected,
                 ..
-            } => expected,
+            } => (
+                &expected.branch,
+                &expected.branch_identifier,
+                Some(expected),
+            ),
             PublishPrecondition::ExactGraphVersion { authority, version } => {
                 if dataset.version().version != *version {
                     return Err(OmniError::manifest_read_set_changed(
@@ -993,14 +1150,19 @@ impl GraphNamespacePublisher {
                         Some(dataset.version().version.to_string()),
                     ));
                 }
-                authority
+                (
+                    &authority.branch,
+                    &authority.branch_identifier,
+                    Some(authority),
+                )
             }
+            PublishPrecondition::ExactBranchIdentity {
+                branch,
+                branch_identifier,
+            } => (branch, branch_identifier, None),
         };
 
-        let expected_branch = expected
-            .branch
-            .as_deref()
-            .filter(|branch| *branch != "main");
+        let expected_branch = branch.as_deref().filter(|branch| *branch != "main");
         if expected_branch != self.branch.as_deref() {
             return Err(OmniError::manifest_internal(format!(
                 "publish graph-head precondition targets branch '{}' but publisher is bound to '{}'",
@@ -1011,12 +1173,11 @@ impl GraphNamespacePublisher {
 
         let branch_identity_member =
             format!("branch_identifier:{}", expected_branch.unwrap_or("main"));
-        let expected_branch_identifier = serde_json::to_string(&expected.branch_identifier)
-            .map_err(|e| {
-                OmniError::manifest_internal(format!(
-                    "failed to encode expected Lance branch identifier: {e}"
-                ))
-            })?;
+        let expected_branch_identifier = serde_json::to_string(branch_identifier).map_err(|e| {
+            OmniError::manifest_internal(format!(
+                "failed to encode expected Lance branch identifier: {e}"
+            ))
+        })?;
         let observed_identifier = match dataset.manifest().branch.as_deref() {
             Some(native) => {
                 crate::branch_control::get_live_manifest_branch_contents(dataset, native)
@@ -1036,7 +1197,7 @@ impl GraphNamespacePublisher {
             }
             Err(err) => return Err(err),
         };
-        if actual_branch_identifier != expected.branch_identifier {
+        if actual_branch_identifier != *branch_identifier {
             let actual = serde_json::to_string(&actual_branch_identifier).map_err(|e| {
                 OmniError::manifest_internal(format!(
                     "failed to encode current Lance branch identifier: {e}"
@@ -1049,6 +1210,9 @@ impl GraphNamespacePublisher {
             ));
         }
 
+        let Some(expected) = expected else {
+            return Ok(());
+        };
         let actual = exact_head(head, dataset.manifest().branch.as_deref())
             .map(|head| head.graph_commit_id.clone());
         if actual != expected.head_commit_id {
@@ -1163,6 +1327,24 @@ fn publish_outcome_in_doubt(
     )
 }
 
+/// The in-doubt outcome of a claim, which records no graph commit: keyed by
+/// the attempt id its `writer_epoch` row would carry. A later claim settles
+/// it, landing above this one if this one landed.
+fn claim_outcome_in_doubt(
+    original: &OmniError,
+    attempt_id: &str,
+    cause: &dyn std::fmt::Display,
+) -> OmniError {
+    OmniError::manifest_publish_in_doubt(
+        attempt_id,
+        format!(
+            "writer epoch claim outcome is in doubt: the claim with attempt id {attempt_id} may \
+             be durable but it could not be confirmed ({cause}); a new claim settles it, landing \
+             above this one if it is. original error: {original}"
+        ),
+    )
+}
+
 /// Where a publication attempt failed, relative to the store's
 /// acknowledgement of its conditional manifest request.
 enum PublishAttemptFailure {
@@ -1199,9 +1381,19 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
         lineage: Option<&LineageIntent>,
         precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome> {
-        self.publish_attempts(changes, expected_table_versions, lineage, precondition)
-            .await
-            .map_err(OmniError::unpublished)
+        let mut held = HeldVersion {
+            publisher: self,
+            settled: false,
+        };
+        self.publish_attempts(
+            changes,
+            expected_table_versions,
+            lineage,
+            precondition,
+            &mut held,
+        )
+        .await
+        .map_err(OmniError::unpublished)
     }
 
     async fn write_candidate(
@@ -1239,6 +1431,37 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
         }
         .await
         .map_err(OmniError::unpublished)
+    }
+
+    fn held_writer_version(&self, native: Option<&str>) -> Option<u64> {
+        if self.holders.holds_nothing() {
+            return None;
+        }
+        self.holders.landed_version(self.holder_key().ok()?, native)
+    }
+
+    fn withdraw_held_version(&self, branch: &str) {
+        if let Some(key) = self.held_key_of(branch) {
+            self.holders.withdraw_version(&key);
+        }
+    }
+
+    fn release_writer_epoch(&self, branch: &str, native: &str) {
+        if let Some(key) = self.held_key_of(branch) {
+            self.holders.release(&key, native);
+        }
+    }
+
+    /// A claim's one durable effect is its version, so an opaque failure is
+    /// marked `Unpublished` unless the attempt that put it marked it in
+    /// doubt; a typed refusal is returned as it is.
+    async fn claim_writer_epoch(
+        &self,
+        branch_identifier: &lance::dataset::refs::BranchIdentifier,
+    ) -> Result<WriterEpochClaim> {
+        self.claim_attempts(&mut self.claim_intent(branch_identifier))
+            .await
+            .map_err(OmniError::unpublished)
     }
 }
 
@@ -1365,6 +1588,7 @@ impl GraphNamespacePublisher {
                     buffer,
                     schema_contract,
                     registry,
+                    writer_epoch,
                     ..
                 },
         } = self.load_publish_state().await?;
@@ -1423,6 +1647,7 @@ impl GraphNamespacePublisher {
             buffer: CommitBuffer::default(),
             schema_contract,
             registry,
+            writer_epoch,
         };
         let (detached, _) =
             commit::overwrite_detached(dataset.clone(), &rows, property.encode()?).await?;
@@ -1494,6 +1719,7 @@ impl GraphNamespacePublisher {
         expected_table_versions: &ExpectedTableVersions,
         lineage: Option<&LineageIntent>,
         precondition: &PublishPrecondition,
+        held: &mut HeldVersion<'_>,
     ) -> Result<PublishOutcome> {
         for attempt in 0..=PUBLISHER_RETRY_BUDGET {
             // Route a retryable `load_publish_state` error through the SAME retry
@@ -1517,11 +1743,17 @@ impl GraphNamespacePublisher {
                         buffer,
                         schema_contract,
                         registry,
+                        writer_epoch,
                         ..
                     },
             } = loaded;
             let native_branch = dataset.manifest().branch.clone();
 
+            self.assert_writer_epoch(
+                WriterEpochRow::resolved(writer_epoch.as_ref(), native_branch.as_deref()),
+                native_branch.as_deref(),
+                EpochAssertion::Publish,
+            )?;
             self.check_publish_precondition(&dataset, &head, precondition)
                 .await?;
 
@@ -1574,9 +1806,11 @@ impl GraphNamespacePublisher {
                     buffer,
                     schema_contract: next_contract,
                     registry,
+                    writer_epoch,
                 };
                 let known_state =
                     rows.state(dataset.version().version, native_branch.as_deref())?;
+                held.keep();
                 return Ok(PublishOutcome {
                     dataset,
                     parent_commit_id: None,
@@ -1586,13 +1820,15 @@ impl GraphNamespacePublisher {
                     buffer: rows.buffer,
                     schema_contract: rows.schema_contract,
                     registry: rows.registry,
+                    writer_epoch: rows.writer_epoch,
                 });
             };
             if lineage.is_none() && !cfg!(any(test, feature = "test-util")) {
                 return Err(OmniError::manifest_internal(
-                    "a publish that changes `__manifest` rows records a graph commit, so that \
-                     the `table` rows of every version are the state as of its head commit; \
-                     this publish carries changes and no lineage intent"
+                    "a publish that changes `table` rows or the schema contract records a graph \
+                     commit, so that the `table` rows of every version are the state as of its \
+                     head commit, and only a control fact is written without one; this publish \
+                     carries changes and no lineage intent"
                         .to_string(),
                 ));
             }
@@ -1633,6 +1869,7 @@ impl GraphNamespacePublisher {
             let mut known_state = manifest_state(
                 &next_tables,
                 &next_head,
+                writer_epoch.as_ref(),
                 new_manifest_version,
                 native_branch.as_deref(),
             )?;
@@ -1682,6 +1919,7 @@ impl GraphNamespacePublisher {
                 head: next_head,
                 schema_contract: next_contract,
                 registry,
+                writer_epoch,
             };
             let cold = next.registry.cold_push();
 
@@ -1697,6 +1935,7 @@ impl GraphNamespacePublisher {
                         .with_completion_evidence(CompletionEvidence::Uncertain));
                     }
                     known_state.version = new_dataset.version().version;
+                    held.record_landed(native_branch.as_deref(), new_manifest_version);
                     return Ok(PublishOutcome {
                         dataset: new_dataset,
                         parent_commit_id,
@@ -1706,6 +1945,7 @@ impl GraphNamespacePublisher {
                         buffer: next.buffer,
                         schema_contract: next.schema_contract,
                         registry: next.registry,
+                        writer_epoch: next.writer_epoch,
                     });
                 }
                 Err(failure) => {
@@ -1755,6 +1995,10 @@ impl GraphNamespacePublisher {
                                     // the exact success outcome this attempt
                                     // would have produced.
                                     known_state.version = reloaded.version().version;
+                                    held.record_landed(
+                                        native_branch.as_deref(),
+                                        new_manifest_version,
+                                    );
                                     return Ok(PublishOutcome {
                                         dataset: reloaded,
                                         parent_commit_id,
@@ -1764,6 +2008,7 @@ impl GraphNamespacePublisher {
                                         buffer: next.buffer,
                                         schema_contract: next.schema_contract,
                                         registry: next.registry,
+                                        writer_epoch: next.writer_epoch,
                                     });
                                 }
                                 if rows.head.graph_commit_id == next.head.graph_commit_id {
@@ -1812,6 +2057,242 @@ impl GraphNamespacePublisher {
             "manifest publish exhausted {} retries against concurrent writers",
             PUBLISHER_RETRY_BUDGET
         )))
+    }
+}
+
+/// What a claim carries across its attempts: the identity of its control
+/// fact, the epoch its first load read, and the incarnation it claims.
+struct ClaimIntent {
+    attempt_id: String,
+    read: Option<u64>,
+    identity: PublishPrecondition,
+}
+
+/// One claim attempt after its load and its checks.
+enum PreparedClaim {
+    /// This process holds the rows' epoch, so the claim writes nothing.
+    Held(WriterEpochClaim),
+    /// `rows`, holding the row at `read + 1`, go in as the version after `dataset`.
+    Put {
+        dataset: Dataset,
+        rows: ManifestRows,
+        read: u64,
+        known_state: ManifestState,
+    },
+}
+
+impl GraphNamespacePublisher {
+    fn claim_intent(
+        &self,
+        branch_identifier: &lance::dataset::refs::BranchIdentifier,
+    ) -> ClaimIntent {
+        ClaimIntent {
+            attempt_id: crate::dst_ids::new_ulid().to_string(),
+            read: None,
+            identity: PublishPrecondition::ExactBranchIdentity {
+                branch: self.branch.clone(),
+                branch_identifier: branch_identifier.clone(),
+            },
+        }
+    }
+
+    /// The outcome of a version that records no graph commit: `rows` as
+    /// `dataset`'s version holds them.
+    fn control_fact_outcome(
+        dataset: Dataset,
+        rows: ManifestRows,
+        known_state: ManifestState,
+    ) -> PublishOutcome {
+        PublishOutcome {
+            dataset,
+            parent_commit_id: None,
+            known_state,
+            head: rows.head,
+            tables: rows.tables,
+            buffer: rows.buffer,
+            schema_contract: rows.schema_contract,
+            registry: rows.registry,
+            writer_epoch: rows.writer_epoch,
+        }
+    }
+
+    /// Load the branch and run one claim attempt's checks: the stamp, the
+    /// writer epoch against what the claim first read, and the incarnation.
+    async fn prepare_claim(&self, claim: &mut ClaimIntent) -> Result<PreparedClaim> {
+        self.holder_key()?;
+        let LoadedPublishState { dataset, mut rows } = self.load_publish_state().await?;
+        require_control_facts(guard_stamp(&dataset)?)?;
+        let native = dataset.manifest().branch.clone();
+        let current = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native.as_deref());
+        let read = *claim.read.get_or_insert(current);
+        let verdict =
+            self.assert_writer_epoch(current, native.as_deref(), EpochAssertion::Claim { read })?;
+        self.check_publish_precondition(&dataset, &rows.head, &claim.identity)
+            .await?;
+        let version = dataset.version().version;
+        if verdict == EpochVerdict::AlreadyHeld {
+            let known_state = rows.state(version, native.as_deref())?;
+            return Ok(PreparedClaim::Held(WriterEpochClaim {
+                epoch: current,
+                published: Self::control_fact_outcome(dataset, rows, known_state),
+            }));
+        }
+        let epoch = read
+            .checked_add(1)
+            .ok_or_else(|| OmniError::manifest_internal("writer epoch overflows"))?;
+        rows.writer_epoch = Some(WriterEpochRow {
+            epoch,
+            native: native.clone(),
+            attempt_id: claim.attempt_id.clone(),
+        });
+        let known_state = rows.state(version + 1, native.as_deref())?;
+        Ok(PreparedClaim::Put {
+            dataset,
+            rows,
+            read,
+            known_state,
+        })
+    }
+
+    /// Put a prepared claim and record what the process holds from here on.
+    /// The version held before it is withdrawn first: the put moves the head,
+    /// and one that is dropped or stays in doubt leaves no record.
+    async fn put_claim(
+        &self,
+        claim: &ClaimIntent,
+        dataset: Dataset,
+        mut rows: ManifestRows,
+        read: u64,
+        mut known_state: ManifestState,
+    ) -> Result<WriterEpochClaim> {
+        let key = self.holder_key()?;
+        let native = dataset.manifest().branch.clone();
+        let cold = rows.registry.cold_push();
+        self.holders.withdraw_version(key);
+        let landed = match self.merge_rows(dataset.clone(), &rows, cold.as_ref()).await {
+            Ok(landed) => landed,
+            Err(failure) => self.read_back_claim(claim, &dataset, read, failure).await?,
+        };
+        let epoch = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native.as_deref());
+        known_state.version = landed.version().version;
+        self.holders
+            .record_claim(key, native.as_deref(), epoch, known_state.version);
+        Ok(WriterEpochClaim {
+            epoch,
+            published: Self::control_fact_outcome(landed, rows, known_state),
+        })
+    }
+
+    /// Settle a claim whose put returned no answer from the version it
+    /// attempted: the row with this claim's attempt id is the claim landed,
+    /// answered with that version.
+    async fn read_back_claim(
+        &self,
+        claim: &ClaimIntent,
+        dataset: &Dataset,
+        read: u64,
+        failure: PublishAttemptFailure,
+    ) -> Result<Dataset> {
+        let after_ack = matches!(failure, PublishAttemptFailure::AfterAck(_));
+        let err = match failure {
+            PublishAttemptFailure::BeforeAck(err)
+                if err.completion_evidence().is_some() || !err.outcome_opaque() =>
+            {
+                return Err(err);
+            }
+            PublishAttemptFailure::BeforeAck(err) | PublishAttemptFailure::AfterAck(err) => err,
+        };
+        let in_doubt = |cause: &dyn std::fmt::Display| {
+            Err(claim_outcome_in_doubt(&err, &claim.attempt_id, cause))
+        };
+        if let Err(readback_err) = fail(&PUBLISH_READ_BACK) {
+            return in_doubt(&readback_err);
+        }
+        let attempted = match dataset
+            .checkout_version(dataset.version().version + 1)
+            .await
+        {
+            Ok(attempted) => attempted,
+            Err(readback_err) => return in_doubt(&readback_err),
+        };
+        let rows = match read_manifest_rows(&attempted).await {
+            Ok(rows) => rows,
+            Err(scan_err) => return in_doubt(&scan_err),
+        };
+        match settle_unanswered_claim(rows.writer_epoch.as_ref(), &claim.attempt_id, after_ack) {
+            UnansweredClaim::Landed => Ok(attempted),
+            UnansweredClaim::InDoubt => {
+                in_doubt(&"the acknowledged version holds another publication")
+            }
+            UnansweredClaim::Lost => {
+                let native = dataset.manifest().branch.as_deref();
+                let current = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native);
+                self.assert_writer_epoch(current, native, EpochAssertion::Claim { read })?;
+                Err(err)
+            }
+        }
+    }
+
+    /// The claim's attempts: a put that lost its version to another
+    /// publication loads again and asserts the epoch the first load read.
+    async fn claim_attempts(&self, claim: &mut ClaimIntent) -> Result<WriterEpochClaim> {
+        let mut attempt = 0;
+        loop {
+            let attempted = match self.prepare_claim(claim).await {
+                Ok(PreparedClaim::Held(claimed)) => return Ok(claimed),
+                Ok(PreparedClaim::Put {
+                    dataset,
+                    rows,
+                    read,
+                    known_state,
+                }) => {
+                    self.put_claim(claim, dataset, rows, read, known_state)
+                        .await
+                }
+                Err(err) => Err(err),
+            };
+            match attempted {
+                Err(err)
+                    if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) =>
+                {
+                    attempt += 1;
+                }
+                attempted => return attempted,
+            }
+        }
+    }
+
+    /// The claim with `between` run after its first attempt's load and checks
+    /// and before its put, so a test lands a racing publication there.
+    #[cfg(test)]
+    pub(crate) async fn claim_writer_epoch_interleaved<Between>(
+        &self,
+        branch_identifier: &lance::dataset::refs::BranchIdentifier,
+        between: Between,
+    ) -> Result<WriterEpochClaim>
+    where
+        Between: std::future::Future<Output = ()>,
+    {
+        let mut claim = self.claim_intent(branch_identifier);
+        let first = match self.prepare_claim(&mut claim).await? {
+            PreparedClaim::Held(claimed) => return Ok(claimed),
+            PreparedClaim::Put {
+                dataset,
+                rows,
+                read,
+                known_state,
+            } => {
+                between.await;
+                self.put_claim(&claim, dataset, rows, read, known_state)
+                    .await
+            }
+        };
+        match first {
+            Err(err) if is_retryable_publish_conflict(&err) => {
+                self.claim_attempts(&mut claim).await
+            }
+            first => first,
+        }
     }
 }
 
@@ -1910,6 +2391,7 @@ impl GraphNamespacePublisher {
             head: parent,
             schema_contract,
             registry,
+            writer_epoch,
             ..
         } = source;
         let tables: TableRows = tables
@@ -1963,6 +2445,7 @@ impl GraphNamespacePublisher {
             buffer: CommitBuffer::default(),
             schema_contract,
             registry,
+            writer_epoch,
         };
         let (detached, _) =
             commit::overwrite_detached(dataset.clone(), &rows, property.encode()?).await?;

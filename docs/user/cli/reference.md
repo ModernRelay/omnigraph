@@ -56,7 +56,7 @@ operations on nonlocal storage. The retired `--quiet` cannot hide the destinatio
 | `schema upgrade-system-columns` | Respell a graph's system columns in place; needs a graph that normal open accepts and keeps its storage format | direct |
 | `lint` | Validate `.gq` source | local schema or direct graph |
 | `upgrade` | Convert a v8, v9 or v13 graph's storage to the format this binary serves, offline; `--check` writes nothing | direct standalone |
-| `optimize` | Compact data and reconcile declared indexes on `main` | direct |
+| `optimize` | Compact data and reconcile declared indexes on `main`; a server target runs it as a [recorded operation](../operations/recorded-operations.md), waiting for its record unless `--no-wait` | direct or served |
 | `index build` | Build a branch's missing declared indexes and refresh lagging BTREE and vector coverage ([Maintenance](../operations/maintenance.md#build-indexes)) | direct |
 | `index rebuild --kind full-text` | Replace full-text indexes on one branch; `rebuild-full-text-indexes` is its deprecated spelling | direct |
 | `repair` | Report each table's Lance history against its registration (`no_drift` or `foreign_drift`) | direct |
@@ -151,13 +151,13 @@ omnigraph schema upgrade-system-columns --target ./graph.omni --check --json
 ```
 
 `omnigraph upgrade --target ADDRESS`
-converts a standalone v8, v9 (release 0.11.x) or v13 graph to v16, offline and
-in place, keeping branches and commit history, and stamps a v14 or v15 graph
-to v16 with one metadata-only commit per live branch; stop every process using
+converts a standalone v8, v9 (release 0.11.x) or v13 graph to v17, offline and
+in place, keeping branches and commit history, and stamps a v14, v15 or v16 graph
+to v17 with one metadata-only commit per live branch; stop every process using
 the graph and retain a verified whole-root backup first. `--check` writes
-nothing; `--to-format` accepts 16 only. `check_passed`, `already_current` (a
-v16 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
-other format below 14, `newer_than_binary` above 16, `unsupported_target`)
+nothing; `--to-format` accepts 17 only. `check_passed`, `already_current` (a
+v17 graph) and `completed` exit 0; `check_failed` (`unsupported_source` for any
+other format below 14, `newer_than_binary` above 17, `unsupported_target`)
 and `recovery_required` (a pending attempt, finished as `recovery.action` says,
 or leftover recovery files) exit 1. The report names the formats, the route,
 the `work` counts, findings and the recovery action. Server and cluster

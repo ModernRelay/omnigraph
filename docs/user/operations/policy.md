@@ -19,8 +19,11 @@ Graph-scoped actions:
 | `branch_create` | Branch creation |
 | `branch_delete` | Branch deletion |
 | `branch_merge` | Branch merge |
+| `branch_claim` | Claim of a branch's [writer epoch](troubleshooting.md#writer-epoch) |
 | `commit_publish` | Publication of an unpublished commit onto its recorded target branch |
 | `commit_drop` | Drop of an unpublished commit |
+| `maintain` | Content-preserving maintenance: optimize, index builds, the full-text rebuild and the repair report |
+| `reclaim` | Cleanup, which permanently removes table versions and files no retained commit needs |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved graph administration |
 
@@ -41,6 +44,16 @@ The reserved graph `admin` action does not grant cluster management.
 
 A stored mutation requires both `invoke_query` and `change`. A stored read
 requires `invoke_query` and `read`.
+
+`maintain` and `reclaim` are separate from `change`, so an automation account
+can compact a graph without the right to write data, and can hold `maintain`
+without the right to delete history. `maintain` is judged on the branch the
+operation maintains (`main` for optimize and the repair report) and takes
+`branch_scope`; `reclaim` covers every branch's history and takes no branch
+scope. `change` admits no maintenance: index builds and the full-text rebuild
+need `maintain` on their branch. The engine checks these actions whenever a policy is installed on the
+graph handle; the direct maintenance commands load no policy (see
+[maintenance](maintenance.md)).
 
 ## Bind a policy
 
@@ -124,9 +137,10 @@ empty, has leading or trailing whitespace, or contains a control character
 fails policy validation, and a request naming such a branch is refused as a
 bad request before any rule is evaluated (see
 [branch names](../branching/index.md#branch-names)). Server actions and graph-wide
-`invoke_query` rules do not take branch scopes. `commit_publish` and
+`invoke_query` and `reclaim` rules do not take branch scopes. `commit_publish` and
 `commit_drop` take `target_branch_scope`: the scope is the branch the
-unpublished commit recorded as its target. Writing an unpublished commit
+unpublished commit recorded as its target. `branch_claim` takes
+`target_branch_scope` too: the scope is the branch the claim names. Writing an unpublished commit
 needs no new action: a mutation `as commit` is a `change` on its branch and a
 merge `as commit` is a `branch_merge`, so an actor with ordinary write rights
 can omit `as commit`; this is a voluntary review workflow, not an approval
@@ -198,12 +212,14 @@ With the example graph policy above, `act-alice` gets:
   `read` here also decides the reads that name no branch: listing branches, the
   schema, `show` and `commit show`. A commit list authorizes `read` on its
   branch, `main` when the query names none.
-- With `branch`, `actions` lists the actions allowed on it: `read`, `export`
-  and `change`, and `branch_delete`, `commit_publish`, `commit_drop` and
-  `schema_apply` with that branch as their target. Schema apply and the
+- With `branch`, `actions` lists the actions allowed on it: `read`, `export`,
+  `change` and `maintain` (served optimize asks it on `main`), and
+  `branch_delete`, `commit_publish`, `commit_drop` and `schema_apply` with that
+  branch as their target. Schema apply and the
   system-column upgrade target `main` only, and a storage upgrade authorizes
   each live branch, so `schema_apply` on another branch does not make schema
-  apply possible there.
+  apply possible there. `branch_claim` is not listed: no command or route
+  performs it in this release.
 - With `target_branch` as well, `actions` also lists `branch_create` from
   `branch` into the target and `branch_merge` of `branch` into it.
 
@@ -220,7 +236,8 @@ authentication allows every graph action and reports `actor_id: null`. The MCP
 server or managed target ([what you may do at a target](../cli/targets.md#what-you-may-do-at-a-target)).
 
 It reports policy actions, not actor views, so a view can still refuse a
-`change` the policy allows.
+`change` the policy allows. It does not report `reclaim`, since no server
+route runs cleanup.
 
 ## Actor identity
 

@@ -1390,7 +1390,6 @@ pub(crate) mod tests {
     // even a complete process round trip need not consume a fixed duration.
     const TEST_ELAPSED_US: u64 = 0;
     const QUICK_DEADLINE: Duration = Duration::from_millis(250);
-    const BOUNDED_AUXILIARY_DEADLINE: Duration = Duration::from_secs(2);
     const BOUNDED_POST_SETTLE_DEADLINE: Duration = Duration::from_millis(500);
     const GENEROUS_DEADLINE: Duration = Duration::from_secs(10);
     const GENEROUS_AUXILIARY_DEADLINE: Duration = Duration::from_secs(10);
@@ -1700,7 +1699,6 @@ pub(crate) mod tests {
     fn supervised_repetitions_use_distinct_worker_processes() {
         let placeholder = PathBuf::from("/placeholder");
         let (_workspace, mut input) = supervision_input(placeholder);
-        input.auxiliary_deadline_override = Some(Duration::from_secs(5));
         let expected = valid_sample(&input);
         let body = format!(
             "printf '%s\\n' \"$$\" >> \"$0.pids\"\nwhile [ \"$(grep -c '' \"$0.pids\")\" -lt 2 ]; do sleep 0.01; done\n{}",
@@ -1790,7 +1788,6 @@ pub(crate) mod tests {
     fn worker_verification_hang_after_settled_is_bounded() {
         let placeholder = PathBuf::from("/placeholder");
         let (_workspace, mut input) = supervision_input(placeholder);
-        input.auxiliary_deadline_override = Some(BOUNDED_AUXILIARY_DEADLINE);
         input.post_settle_deadline_override = Some(BOUNDED_POST_SETTLE_DEADLINE);
         let body = format!(
             "IFS= read -r request || exit 90\n{}IFS= read -r begin || exit 91\n{}sleep 300\n",
@@ -1813,7 +1810,6 @@ pub(crate) mod tests {
     fn worker_that_reports_complete_but_does_not_exit_is_killed() {
         let placeholder = PathBuf::from("/placeholder");
         let (_workspace, mut input) = supervision_input(placeholder);
-        input.auxiliary_deadline_override = Some(BOUNDED_AUXILIARY_DEADLINE);
         input.post_settle_deadline_override = Some(BOUNDED_POST_SETTLE_DEADLINE);
         let sample = valid_sample(&input);
         let mut body = normal_exchange(&input, complete_frame(&input, sample));

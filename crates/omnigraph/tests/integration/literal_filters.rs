@@ -579,7 +579,7 @@ async fn standalone_string_predicate_is_hoisted_into_scan() {
 async fn string_predicates_compose_with_search_and_negation() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = metric_db(&dir).await;
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let q = r#"
 query prefix_and_search() {
     match {
