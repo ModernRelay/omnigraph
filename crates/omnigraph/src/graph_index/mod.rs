@@ -271,6 +271,13 @@ impl DenseIds<'_> {
             )));
         }
         let values = dense.values();
+        // A caller that passes fewer bytes than the ids hold would make the
+        // value buffer grow uncharged and could pass the guard above.
+        debug_assert_eq!(
+            self.value_bytes(values),
+            Some(value_bytes),
+            "column was given another byte count than value_bytes returns"
+        );
         let mut column = StringBuilder::with_capacity(values.len(), value_bytes);
         match self {
             Self::Index(ids) => {
@@ -727,6 +734,18 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    /// `column` sizes its buffer and its `i32::MAX` guard from the byte count
+    /// it is given, so a debug build refuses a count other than the one
+    /// `value_bytes` returns.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "another byte count than value_bytes returns")]
+    fn dense_ids_column_refuses_a_byte_count_its_ids_do_not_hold() {
+        let mut interner = IdInterner::new();
+        interner.get_or_insert("ccc");
+        let _ = DenseIds::Interned(interner.ids()).column(&UInt32Array::from(vec![0u32]), 2);
     }
 
     /// A destination column holds no more than its dictionary says it
