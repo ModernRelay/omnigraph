@@ -65,8 +65,10 @@ Binaries are installed in `%USERPROFILE%\.local\bin`.
 
 ## Release channels
 
-The default is the latest stable release; if none exists, the installer falls
-back to `edge`.
+The default is the latest stable release, and the installer prints its tag
+before downloading. Only when no stable release publishes the platform's archive
+(HTTP 404) does it fall back to `edge`, and it says so; a network or server
+failure stops the install instead of switching channels.
 
 Edge builds are prereleases built once a day from the tip of `main`, after its
 whole CI run passes, when `main` has moved since the last one. Each is
@@ -226,15 +228,20 @@ An incompatible change to either contract requires its discovery number to chang
 uses `actor_id` in place of protocol 1's `actor`. `protocols.studio` identifies
 the [Studio link](cli/studio.md#the-link), `studio --json`, and the `home` and
 `binding` digests `target inspect --json` reports for checking a link.
-`internal_schema.writes` is the storage-format stamp this binary's commits
-write, and `internal_schema.serves` is the inclusive range, lowest first, that
+`internal_schema.writes` is the storage-format stamp of a graph this binary
+creates, the highest it writes, and `internal_schema.serves` is the inclusive range, lowest first, that
 normal open accepts; `snapshot --json` reports a graph's own stamp as
 `internal_schema_version`. `omnigraph --version` (`-v`) prints only the first
 line.
 
 Release archives from v0.14.0 on, and every `edge-<date>-<commit>` build, carry
-a build provenance attestation. Check that an archive was built by this
-repository's release workflow, and from which commit:
+a build provenance attestation. When the GitHub CLI (2.49 or later) is installed
+and signed in, both installers verify it after the checksum and refuse an
+archive that fails; otherwise they say the provenance was not checked.
+`VERIFY_ATTESTATION=require` refuses to install without the check,
+`VERIFY_ATTESTATION=off` skips it. An explicitly requested `VERSION` older than
+v0.14.0 has no attestation and installs with a warning. To check an archive
+yourself:
 
 ```bash
 gh attestation verify omnigraph-linux-x86_64.tar.gz --repo ModernRelay/omnigraph

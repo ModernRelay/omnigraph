@@ -45,14 +45,23 @@ fi
 
 bind="${OMNIGRAPH_BIND:-0.0.0.0:8080}"
 
-# Cluster mode first, and exclusive (the server's mode-inference rule 0):
-# a deployment serves from cluster state XOR omnigraph.yaml, never a merge.
-# Fail fast here with the same contract the server enforces.
-if [ -n "${OMNIGRAPH_CLUSTER:-}" ]; then
-  if [ -n "${OMNIGRAPH_TARGET_URI:-}" ] || [ -n "${OMNIGRAPH_CONFIG:-}" ] || [ -n "${OMNIGRAPH_TARGET:-}" ]; then
-    echo "OMNIGRAPH_CLUSTER is an exclusive boot source; unset OMNIGRAPH_TARGET_URI/OMNIGRAPH_CONFIG/OMNIGRAPH_TARGET" >&2
+# The server boots only from a cluster. The single-graph variables of earlier
+# releases name arguments the server no longer accepts (a positional URI,
+# `--config`, `--target`), so they are refused by name instead of failing
+# later in argument parsing.
+for removed in OMNIGRAPH_TARGET_URI OMNIGRAPH_CONFIG OMNIGRAPH_TARGET; do
+  case "$removed" in
+    OMNIGRAPH_TARGET_URI) value="${OMNIGRAPH_TARGET_URI:-}" ;;
+    OMNIGRAPH_CONFIG) value="${OMNIGRAPH_CONFIG:-}" ;;
+    OMNIGRAPH_TARGET) value="${OMNIGRAPH_TARGET:-}" ;;
+  esac
+  if [ -n "$value" ]; then
+    echo "$removed is no longer supported: the server boots only from a cluster; unset it and set OMNIGRAPH_CLUSTER to the cluster directory or storage root" >&2
     exit 64
   fi
+done
+
+if [ -n "${OMNIGRAPH_CLUSTER:-}" ]; then
   set -- --cluster "${OMNIGRAPH_CLUSTER}" --bind "${bind}"
   case "${OMNIGRAPH_REQUIRE_ALL_GRAPHS:-}" in
     ""|0|false|FALSE) ;;
@@ -61,36 +70,14 @@ if [ -n "${OMNIGRAPH_CLUSTER:-}" ]; then
   exec_server "${OMNIGRAPH_CLUSTER}" "$@"
 fi
 
-# URI comes from the env var (the positional arg wins over any config
-# `graphs` block in resolve_target_uri). OMNIGRAPH_CONFIG, when also set,
-# is forwarded as --config purely to supply a policy file — the two
-# compose. Without OMNIGRAPH_CONFIG the behavior is unchanged.
-if [ -n "${OMNIGRAPH_TARGET_URI:-}" ]; then
-  exec "$SERVER_BIN" "${OMNIGRAPH_TARGET_URI}" \
-    ${OMNIGRAPH_CONFIG:+--config "$OMNIGRAPH_CONFIG"} \
-    --bind "${bind}"
-fi
-
-if [ -n "${OMNIGRAPH_CONFIG:-}" ]; then
-  if [ -n "${OMNIGRAPH_TARGET:-}" ]; then
-    exec "$SERVER_BIN" --config "${OMNIGRAPH_CONFIG}" --target "${OMNIGRAPH_TARGET}" --bind "${bind}"
-  fi
-  exec "$SERVER_BIN" --config "${OMNIGRAPH_CONFIG}" --bind "${bind}"
-fi
-
 cat >&2 <<'EOF'
-omnigraph-server container startup requires one of:
-  - OMNIGRAPH_CLUSTER     (serve a cluster directory's applied revision;
-                           exclusive — cannot combine with the others)
-  - OMNIGRAPH_TARGET_URI
-  - OMNIGRAPH_CONFIG
+omnigraph-server container startup requires:
+  - OMNIGRAPH_CLUSTER     (a cluster directory or storage root, such as
+                           s3://bucket/prefix or az://container/prefix)
 
 Optional:
   - OMNIGRAPH_BIND (default: 0.0.0.0:8080)
-  - OMNIGRAPH_REQUIRE_ALL_GRAPHS (cluster mode: fail startup unless every
-    applied graph is healthy)
-  - OMNIGRAPH_TARGET (used with OMNIGRAPH_CONFIG)
-  - OMNIGRAPH_CONFIG (may also accompany OMNIGRAPH_TARGET_URI to add a
-    policy file; the URI still comes from OMNIGRAPH_TARGET_URI)
+  - OMNIGRAPH_REQUIRE_ALL_GRAPHS (fail startup unless every applied graph is
+    healthy)
 EOF
 exit 64

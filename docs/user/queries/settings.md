@@ -44,6 +44,14 @@ server from its environment, and a direct CLI run (`--target`) from its
 environment, its `--set` values and the file; a served caller's `settings`
 field, `set` query parameter or `set` line naming one is refused.
 
+On a server, the resource budgets `traversal_work_limit`, `query_memory_bytes`,
+`write_max_bytes` and `load_source_max_bytes` also have a ceiling: the larger of
+the server's process default and the built-in default. A request may set any
+value up to it, lowering a budget or restoring one an operator lowered; a value
+above it is refused before anything runs, and the operator raises the ceiling
+through the setting's environment variable. Embedded sessions and direct
+`--target` CLI runs have no ceiling.
+
 A setting reaches the engine through one of three doors:
 
 - CLI: `--set name=value`, repeatable, on `omnigraph query`, `mutate`,
@@ -125,7 +133,8 @@ Lance merge-insert, which does not expose this option and keeps its native
 buffering defaults. Row and Blob admission limits still apply to those writes.
 
 Neither byte setting has a fixed maximum. A lower environment value is a
-process default, so a request may still select any value of at least `1`.
+process default, so a request may still select any value of at least `1` up to
+the server's ceiling (see above).
 Raising `write_max_bytes` above the default admits a larger staged-write
 input (a JSONL load's typed batch, a CSV overwrite's reader batch), held in
 memory at commit; raising `load_source_max_bytes` admits a

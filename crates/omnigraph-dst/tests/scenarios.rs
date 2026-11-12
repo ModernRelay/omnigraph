@@ -1045,7 +1045,7 @@ async fn dst_memory_graph_end_to_end() {
     db.load_jsonl(TEST_DATA, LoadMode::Overwrite)
         .await
         .expect("load test data");
-    db.ensure_indices().await.expect("ensure indices");
+    db.ensure_indices_as(None).await.expect("ensure indices");
 
     let persons = count_rows(&db, "node:Person").await;
     assert!(persons > 0, "loaded graph must have Person rows");
@@ -1539,6 +1539,41 @@ fn dst_schema_ops_randomized_oracles_hold_and_replay() {
         a.schema_applies > 0,
         "the schema face should actually emit (schema_applies={})",
         a.schema_applies
+    );
+    assert!(a.verified > 0);
+}
+
+/// Writer claims interleave the wide, schema-applying workload on one
+/// process: every claim answers 1 and every later publish on a claimed
+/// branch passes the fence check, under the full oracle stack and replay.
+#[test]
+#[serial]
+fn dst_writer_claims_randomized_oracles_hold_and_replay() {
+    let sc = Scenario {
+        seed: 6,
+        ops: 60,
+        wide: true,
+        schema_ops: true,
+        writer_claims: true,
+        ..Default::default()
+    };
+    let a = run_universe("shared-memory://dst-writer-claims-a", &sc);
+    let b = run_universe("shared-memory://dst-writer-claims-b", &sc);
+    println!(
+        "dst writer claims: {} claims, {} writes on a claimed branch, {} legal rejections, {} checks",
+        a.writer_claims, a.writes_on_claimed, a.legal_rejections, a.verified
+    );
+    omnigraph_dst::harness::assert_strict_replay(
+        &a,
+        &b,
+        "writer-claim universes must replay identically",
+    );
+    assert!(
+        a.writer_claims > 0 && a.writes_on_claimed > 0,
+        "the claim face should emit and a later write should land on a claimed branch \
+         (writer_claims={}, writes_on_claimed={})",
+        a.writer_claims,
+        a.writes_on_claimed
     );
     assert!(a.verified > 0);
 }
@@ -2677,7 +2712,9 @@ fn instrument_filtered_update_cost_over_per_commit_fragments() {
             omnigraph_dst::cost::set_label("UpdateWarmBeforeOptimize");
             Self::set_age(&db, 41).await;
             omnigraph_dst::cost::set_label("_optimize");
-            db.optimize().await.unwrap();
+            db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                .await
+                .unwrap();
             let db = Self::reopen(db, resources).await;
             omnigraph_dst::cost::set_label("UpdateColdAfterOptimize");
             Self::set_age(&db, 42).await;
@@ -3123,7 +3160,7 @@ query nearest_docs($q: Vector(2)) {
                 .collect::<Vec<_>>()
                 .join("\n");
             writer.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
-            writer.ensure_indices().await.unwrap();
+            writer.ensure_indices_as(None).await.unwrap();
             omnigraph_dst::cost::set_label(LABELS[0]);
             let reader = Session::from_defaults(
                 Arc::new(
@@ -3365,6 +3402,51 @@ fn branch_write_cost_rows(replay: &str) -> String {
         format!("shared-memory://dst-branch-write-cost-{replay}"),
         &BranchWriteCost,
         "BranchWrite",
+    )
+}
+
+/// The first claim of `main` on a reopened handle: one `__manifest` version
+/// and no data-table call.
+fn writer_claim_cost_rows(replay: &str) -> String {
+    struct WriterClaimCost;
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for WriterClaimCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_writer_claim_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            let detached = db.detach();
+            let db = detached.attach(Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ));
+            omnigraph_dst::cost::set_label("WriterClaim");
+            let epoch = db.claim_branch_writer("main").await;
+            omnigraph_dst::cost::set_label("_writer_claim_verify");
+            assert_eq!(epoch.unwrap(), 1);
+        }
+    }
+
+    labeled_cost_rows(
+        format!("shared-memory://dst-writer-claim-cost-{replay}"),
+        &WriterClaimCost,
+        "WriterClaim",
     )
 }
 
@@ -3995,6 +4077,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&warm_read_cost_rows("a"));
     table.push_str(&update_patch_cost_rows("a"));
     table.push_str(&nearest_cost_rows("a"));
+    table.push_str(&writer_claim_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -4009,6 +4092,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&warm_read_cost_rows("b"));
     table2.push_str(&update_patch_cost_rows("b"));
     table2.push_str(&nearest_cost_rows("b"));
+    table2.push_str(&writer_claim_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"
@@ -4327,7 +4411,9 @@ fn reborn_branch_cache_poison_body() {
         .expect("op1");
         db.branch_create("b0").await.expect("op2");
         world_read(&db).await; // ARMING READ 1 (the universe's op-2 verify)
-        db.optimize().await.expect("op3");
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .expect("op3");
         m!(
             db,
             "b0",
@@ -4341,7 +4427,7 @@ fn reborn_branch_cache_poison_body() {
         Box::pin(db.branch_merge("b0", "main"))
             .await
             .expect("op6 merge");
-        db.ensure_indices().await.expect("op7");
+        db.ensure_indices_as(None).await.expect("op7");
         db.branch_delete("b0").await.expect("op8");
         m!(
             db,
@@ -4375,7 +4461,7 @@ fn reborn_branch_cache_poison_body() {
             &[]
         )
         .expect("op12");
-        db.ensure_indices().await.expect("op13");
+        db.ensure_indices_as(None).await.expect("op13");
         m!(
             db,
             "main",
@@ -4416,10 +4502,13 @@ fn reborn_branch_cache_poison_body() {
             &[("$age", 20)]
         )
         .expect("op20");
-        db.cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        db.cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .expect("op21");
         m!(
@@ -4438,10 +4527,13 @@ fn reborn_branch_cache_poison_body() {
             &[("$age", 14), ("$ver", 8)]
         )
         .expect("op23");
-        db.cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        db.cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .expect("op24");
         db.branch_create("b0").await.expect("op25");
@@ -5856,7 +5948,7 @@ fn dst_classa_ablation_matrix_body() {
                 db.branch_create("b0").await.expect("bc b0 life1");
             }
             if o {
-                db.optimize().await.expect("optimize");
+                db.optimize_as(None, omnigraph::db::OptimizeRequest::default()).await.expect("optimize");
             }
             if r {
                 upsert(&db, "b0", "w6", 45, 2).await;
@@ -5869,20 +5961,20 @@ fn dst_classa_ablation_matrix_body() {
             upsert(&db, "main", "w1", 19, 3).await;
             upsert(&db, "main", "w7", 7, 6).await;
             if c {
-                db.cleanup(omnigraph::db::CleanupPolicyOptions {
+                db.cleanup_as(omnigraph::db::CleanupPolicyOptions {
                     keep_versions: Some(1),
                     older_than: None,
-                })
+                }, None)
                 .await
                 .expect("cleanup 1");
             }
             upsert(&db, "main", "w7", 17, 7).await;
             upsert(&db, "main", "w5", 14, 8).await;
             if c {
-                db.cleanup(omnigraph::db::CleanupPolicyOptions {
+                db.cleanup_as(omnigraph::db::CleanupPolicyOptions {
                     keep_versions: Some(1),
                     older_than: None,
-                })
+                }, None)
                 .await
                 .expect("cleanup 2");
             }
@@ -5943,26 +6035,26 @@ fn dst_classa_ablation_matrix_body() {
             m!(db, "main", "set_age_v", &[("$name", "w5")], &[("$age", 70), ("$ver", 1)]).expect("op0");
             m!(db, "main", "insert_person", &[("$name", "w6")], &[("$age", 7)]).expect("op1");
             db.branch_create("b0").await.expect("op2");
-            db.optimize().await.expect("op3");
+            db.optimize_as(None, omnigraph::db::OptimizeRequest::default()).await.expect("op3");
             m!(db, "b0", "set_age_v", &[("$name", "w6")], &[("$age", 45), ("$ver", 2)]).expect("op4");
             m!(db, "b0", "remove_friendships_from", &[("$from", "w6")], &[]).expect("op5");
             Box::pin(db.branch_merge("b0", "main")).await.expect("op6 merge");
-            db.ensure_indices().await.expect("op7");
+            db.ensure_indices_as(None).await.expect("op7");
             db.branch_delete("b0").await.expect("op8");
             m!(db, "main", "remove_friendships_from", &[("$from", "w2")], &[]).expect("op9");
             m!(db, "main", "insert_person_v", &[("$name", "w1")], &[("$age", 19), ("$ver", 3)]).expect("op10");
             m!(db, "main", "set_age_v", &[("$name", "w2")], &[("$age", 3), ("$ver", 4)]).expect("op11");
             m!(db, "main", "add_friend", &[("$from", "Charlie"), ("$to", "w6")], &[]).expect("op12");
-            db.ensure_indices().await.expect("op13");
+            db.ensure_indices_as(None).await.expect("op13");
             m!(db, "main", "insert_person", &[("$name", "w1")], &[("$age", 52)]).expect("op15");
             m!(db, "main", "remove_friendships_from", &[("$from", "w3")], &[]).expect("op16");
             m!(db, "main", "set_age_v", &[("$name", "w3")], &[("$age", 24), ("$ver", 5)]).expect("op18");
             m!(db, "main", "set_age_v", &[("$name", "w7")], &[("$age", 7), ("$ver", 6)]).expect("op19");
             m!(db, "main", "insert_person", &[("$name", "w7")], &[("$age", 20)]).expect("op20");
-            db.cleanup(omnigraph::db::CleanupPolicyOptions { keep_versions: Some(1), older_than: None }).await.expect("op21");
+            db.cleanup_as(omnigraph::db::CleanupPolicyOptions { keep_versions: Some(1), older_than: None }, None).await.expect("op21");
             m!(db, "main", "set_age_v", &[("$name", "w7")], &[("$age", 17), ("$ver", 7)]).expect("op22");
             m!(db, "main", "set_age_v", &[("$name", "w5")], &[("$age", 14), ("$ver", 8)]).expect("op23");
-            db.cleanup(omnigraph::db::CleanupPolicyOptions { keep_versions: Some(1), older_than: None }).await.expect("op24");
+            db.cleanup_as(omnigraph::db::CleanupPolicyOptions { keep_versions: Some(1), older_than: None }, None).await.expect("op24");
             db.branch_create("b0").await.expect("op25");
             let empty_merge = Box::pin(db.branch_merge("b0", "main")).await;
             println!("faithful op26 empty merge: {:?}", empty_merge.map(|_| "ok"));
@@ -6032,7 +6124,7 @@ fn dst_liveness_oracle_survives_cross_thread_work() {
         tokio::time::resume();
         let lively = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            Box::pin(db.ensure_indices()),
+            Box::pin(db.ensure_indices_as(None)),
         )
         .await;
         tokio::time::pause();
@@ -6984,7 +7076,7 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                                 .expect("optimize handle"),
                         );
                         barrier.wait();
-                        for round in 0..80u32 {
+                        'rounds: for round in 0..80u32 {
                             // Real work first: an optimize over an unchanged
                             // store is a near-no-op that never walks refs.
                             // Two mutations per round keep compaction honest
@@ -6997,29 +7089,41 @@ fn dst_optimize_races_branch_delete_minimal_two_thread_negative() {
                                 let _ =
                                     mutate_main(&db, MUTATION_QUERIES, "set_age", &params).await;
                             }
-                            match Box::pin(db.optimize()).await {
-                                Ok(_) => {}
-                                Err(err) => {
-                                    let rendered = format!("{err:?}");
-                                    let raw_refs_not_found = rendered.contains("Not found")
-                                        && rendered.contains("_refs/branches/");
-                                    if raw_refs_not_found {
-                                        println!(
-                                            "OPTIMIZE-RACE REPRODUCED (round {round}): \
-                                             {rendered}"
-                                        );
-                                        caught.store(true, std::sync::atomic::Ordering::SeqCst);
-                                        break;
-                                    }
-                                    // Anything typed (Conflict et al.) is a legal
-                                    // maintenance rejection under churn — keep going.
-                                    assert!(
-                                        rendered.contains("kind: Conflict"),
-                                        "optimize failed with an UNEXPECTED shape \
-                                         (neither the finding nor a typed Conflict): \
+                            // A table whose own planning or rewrite fails is a
+                            // failed outcome in a successful report, so the
+                            // finding can arrive either way.
+                            let failures: Vec<String> = match Box::pin(
+                                db.optimize_as(None, omnigraph::db::OptimizeRequest::default()),
+                            )
+                            .await
+                            {
+                                Ok(report) => report
+                                    .tables
+                                    .iter()
+                                    .filter_map(|table| table.failure.as_ref())
+                                    .map(|err| format!("{err:?}"))
+                                    .collect(),
+                                Err(err) => vec![format!("{err:?}")],
+                            };
+                            for rendered in failures {
+                                let raw_refs_not_found = rendered.contains("Not found")
+                                    && rendered.contains("_refs/branches/");
+                                if raw_refs_not_found {
+                                    println!(
+                                        "OPTIMIZE-RACE REPRODUCED (round {round}): \
                                          {rendered}"
                                     );
+                                    caught.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    break 'rounds;
                                 }
+                                // Anything typed (Conflict et al.) is a legal
+                                // maintenance rejection under churn — keep going.
+                                assert!(
+                                    rendered.contains("kind: Conflict"),
+                                    "optimize failed with an UNEXPECTED shape \
+                                     (neither the finding nor a typed Conflict): \
+                                     {rendered}"
+                                );
                             }
                             tokio::task::yield_now().await;
                         }

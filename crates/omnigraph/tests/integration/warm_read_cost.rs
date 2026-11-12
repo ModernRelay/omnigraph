@@ -221,6 +221,161 @@ async fn external_commit_observed_by_warm_reader() {
     );
 }
 
+/// On a bound branch its process holds, a warm read binds the installed
+/// snapshot with no request to `__manifest`, where the same read probed before
+/// the claim. A held branch that is not the bound one is read as before it.
+#[tokio::test]
+async fn held_bound_branch_read_issues_no_probe() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        let none = params(&[]);
+        let total_people = |branch| {
+            db.query_with_head(
+                ReadTarget::branch(branch),
+                TEST_QUERIES,
+                "total_people",
+                &none,
+            )
+        };
+        let (out, io) = measure(total_people("main")).await;
+        out.unwrap();
+        assert_eq!(io.version_probes, 1, "an unclaimed branch is probed");
+
+        assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+        let (out, io) = measure(total_people("main")).await;
+        out.unwrap();
+        assert_eq!(io.version_probes, 0, "{io:?}");
+        assert_eq!(io.manifest_reads, 0, "{:#?}", last_manifest_reads());
+
+        db.branch_create("feature").await.unwrap();
+        total_people("feature").await.unwrap();
+        let (out, unclaimed) = measure(total_people("feature")).await;
+        out.unwrap();
+        assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+        total_people("feature").await.unwrap();
+        let (out, held) = measure(total_people("feature")).await;
+        out.unwrap();
+        assert!(
+            unclaimed.version_probes + unclaimed.manifest_reads > 0,
+            "{unclaimed:?}"
+        );
+        assert_eq!(
+            (held.version_probes, held.manifest_reads),
+            (unclaimed.version_probes, unclaimed.manifest_reads),
+            "a held branch that is not the bound one is read as an unclaimed one: {held:?}"
+        );
+    })
+    .await;
+}
+
+/// A second handle of the owner process learns the first one's publish from
+/// the holder: it reaches that publish with no probe, a read installs the
+/// reload, and from then on it issues no request to `__manifest`.
+#[tokio::test]
+async fn held_bound_branch_second_handle_reaches_the_owners_publish_without_a_probe() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = init_and_load(&dir).await;
+        let reader = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+        assert_eq!(writer.claim_branch_writer("main").await.unwrap(), 1);
+        mutate_main(
+            &writer,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "held_new_person")], &[("$age", 41)]),
+        )
+        .await
+        .unwrap();
+        let published = writer.resolve_snapshot("main").await.unwrap();
+
+        let (resolved, io) = measure(reader.resolve_snapshot("main")).await;
+        assert_eq!(
+            resolved.unwrap(),
+            published,
+            "the handle behind the holder reaches the owner's publish"
+        );
+        assert_eq!(io.version_probes, 0, "{io:?}");
+        let (snapshot, io) = measure(reader.snapshot_of(ReadTarget::branch("main"))).await;
+        snapshot.unwrap();
+        assert_eq!(io.version_probes, 0, "{io:?}");
+        let (resolved, io) = measure(reader.resolve_snapshot("main")).await;
+        assert_eq!(resolved.unwrap(), published);
+        assert_eq!(io.version_probes, 0, "{io:?}");
+        assert_eq!(io.manifest_reads, 0, "{:#?}", last_manifest_reads());
+    })
+    .await;
+}
+
+async fn main_manifest_version(root: &str) -> u64 {
+    lance::Dataset::open(&format!("{root}/__manifest"))
+        .await
+        .unwrap()
+        .version()
+        .version
+}
+
+/// `optimize`'s configuration commit is a Lance commit outside the publisher:
+/// on a held bound branch it moves the `__manifest` version and neither a row
+/// nor the head, so the owner's other handle reads on with no request.
+#[tokio::test]
+async fn held_bound_branch_reads_and_writes_across_an_optimize_configuration_commit() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let owner = init_and_load(&dir).await;
+        owner
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap();
+        lance::Dataset::open(&format!("{uri}/__manifest"))
+            .await
+            .unwrap()
+            .update_config([("lance.auto_cleanup.interval", Some("1"))])
+            .await
+            .unwrap();
+        assert_eq!(owner.claim_branch_writer("main").await.unwrap(), 1);
+        let second = session(Omnigraph::open(uri).await.unwrap());
+        let people = count_rows(&second, "node:Person").await;
+
+        let claimed = main_manifest_version(uri).await;
+        owner
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            main_manifest_version(uri).await,
+            claimed + 1,
+            "the second optimize commits the configuration and publishes nothing"
+        );
+
+        let (rows, io) = measure(count_rows(&second, "node:Person")).await;
+        assert_eq!(rows, people);
+        assert_eq!(io.version_probes, 0, "{io:?}");
+        assert_eq!(io.manifest_reads, 0, "{:#?}", last_manifest_reads());
+
+        mutate_main(
+            &second,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "past_the_commit")], &[("$age", 41)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count_rows(&second, "node:Person").await,
+            people + 1,
+            "the write lands past the configuration commit"
+        );
+        assert_eq!(
+            count_rows(&owner, "node:Person").await,
+            people + 1,
+            "the handle that ran optimize reads it"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn cold_open_admits_contract_and_state_in_one_scan() {
     cost_harness(async {
@@ -956,10 +1111,13 @@ async fn assert_cached_borrower_survives_branch_delete(
             "{branch} payload changed"
         );
     }
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     assert!(
@@ -995,10 +1153,13 @@ async fn assert_cached_borrower_survives_branch_delete(
         .unwrap();
     let recreated_pin = helpers::pinned_version(writer, "feature", "node:Person").await;
     assert_ne!(recreated_pin, source_pin);
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     let pins = helpers::collector::detached_versions(&table_uri).await;

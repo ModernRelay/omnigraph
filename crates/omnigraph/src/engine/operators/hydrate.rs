@@ -475,6 +475,7 @@ impl Hydration {
                             .interleave_once(
                                 &source.values,
                                 &fetched.rows,
+                                &fetched.row_bytes,
                                 &fetched.picks[..keep],
                                 OUTPUT,
                             )
@@ -534,10 +535,13 @@ impl Streamed for Hydration {
 
 /// One source's rows for a window: `rows` holds the deferred columns of each
 /// distinct row Lance decoded, one row per batch and each held by the chunk,
-/// and a null row last when an address is null; `picks` names each window
-/// row's `(batch, row)`.
+/// and a null row last when an address is null; `row_bytes` holds each
+/// batch's `WorkMemory::row_bytes`, taken once when the row is fetched, for
+/// every estimate of the window's copy; `picks` names each window row's
+/// `(batch, row)`.
 struct Fetched {
     rows: Vec<RecordBatch>,
+    row_bytes: Vec<Vec<usize>>,
     picks: Vec<(usize, usize)>,
 }
 
@@ -554,7 +558,11 @@ enum Fetch {
 /// from every source.
 fn copy_bytes(fetched: &[Fetched], rows: usize, chunk: &WorkMemory) -> DfResult<usize> {
     fetched.iter().try_fold(0usize, |sum, source| {
-        Ok(sum.saturating_add(chunk.interleave_bytes(&source.rows, &source.picks[..rows])?))
+        Ok(sum.saturating_add(chunk.interleave_bytes(
+            &source.rows,
+            &source.row_bytes,
+            &source.picks[..rows],
+        )?))
     })
 }
 
@@ -588,7 +596,16 @@ async fn fetch_window(
         unique.sort_unstable();
         unique.dedup();
         chunk.entries::<(u64, (usize, usize))>(unique.len())?;
+        // Each row's bytes: a vector of one `usize`, for every row and the
+        // null row.
+        chunk.grow(
+            unique
+                .len()
+                .saturating_add(1)
+                .saturating_mul(std::mem::size_of::<Vec<usize>>() + std::mem::size_of::<usize>()),
+        )?;
         let mut rows = Vec::with_capacity(unique.len() + 1);
+        let mut row_bytes = Vec::with_capacity(unique.len() + 1);
         let mut positions: HashMap<u64, (usize, usize)> = HashMap::with_capacity(unique.len());
         let mut decoded = source.rows(unique);
         while let Some(batch) = decoded.next().await {
@@ -626,6 +643,7 @@ async fn fetch_window(
             *fetched_bytes = fetched_bytes.saturating_add(bytes);
             widest = widest.max(bytes / row.num_rows().max(1));
             peak.set_max(*fetched_bytes);
+            row_bytes.push(chunk.row_bytes(&row)?);
             rows.push(row);
             if limit.is_some_and(|limit| *fetched_bytes > limit) {
                 return Ok(Fetch::Stopped { widest });
@@ -653,6 +671,7 @@ async fn fetch_window(
                             .collect();
                         let nulls = RecordBatch::try_new(Arc::clone(&source.values), columns)?;
                         chunk.hold(&nulls)?;
+                        row_bytes.push(chunk.row_bytes(&nulls)?);
                         rows.push(nulls);
                         *null_row.insert((rows.len() - 1, 0))
                     }
@@ -660,7 +679,11 @@ async fn fetch_window(
             };
             picks.push(pick);
         }
-        fetched.push(Fetched { rows, picks });
+        fetched.push(Fetched {
+            rows,
+            row_bytes,
+            picks,
+        });
     }
     Ok(Fetch::Complete(fetched))
 }

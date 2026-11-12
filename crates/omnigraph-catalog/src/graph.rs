@@ -172,6 +172,7 @@ pub(crate) async fn init_manifest_graph(
         head,
         buffer: Default::default(),
         registry: Default::default(),
+        writer_epoch: None,
     };
     // The internal-schema stamp rides the Create write's schema metadata, so
     // the stamp is atomic with manifest birth: no crash window can leave

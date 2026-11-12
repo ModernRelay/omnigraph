@@ -10,7 +10,6 @@
 //! they stream, and each outer row takes its key's verdict (`key_set_mask`).
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +26,7 @@ use omnigraph_compiler::ir::{ParamMap, SubqueryPredicate};
 use omnigraph_compiler::types::Direction;
 use omnigraph_planner::{AggregateSpec, AntiJoinStrategy};
 
+use super::key_groups::KeyGroups;
 use super::memory::WorkMemory;
 use super::shape::{Breaker, work};
 use super::subquery_aggregate::{
@@ -416,16 +416,8 @@ async fn key_set_mask(
 ) -> DfResult<BooleanArray> {
     let outer_keys = key_array(wide, key_column).map_err(external)?;
     let num_rows = wide.num_rows();
-    reservation.entries::<(&str, u32)>(num_rows)?;
-    reservation.entries::<u32>(num_rows)?;
-    let mut groups: HashMap<&str, u32> = HashMap::new();
-    let mut row_groups = Vec::with_capacity(num_rows);
-    for row in 0..num_rows {
-        row_groups.push(outer_keys.is_valid(row).then(|| {
-            let next = groups.len() as u32;
-            *groups.entry(outer_keys.value(row)).or_insert(next)
-        }));
-    }
+    KeyGroups::charge(reservation, num_rows)?;
+    let (groups, row_groups) = KeyGroups::build_numbered(outer_keys)?;
     let unmatched = groups.len() as u32;
     let discarded = unmatched + 1;
     let group_count = groups.len() + 2;
@@ -435,6 +427,7 @@ async fn key_set_mask(
     }
     let mut aggregate =
         SubqueryAggregate::new(predicate, aggregate_spec, params, group_count).map_err(external)?;
+    let (mut hashes, mut inner_groups) = (Vec::new(), Vec::new());
     while let Some(batch) = inner.next().await {
         let batch = batch?;
         reservation.metric("input_rows", batch.num_rows());
@@ -442,13 +435,10 @@ async fn key_set_mask(
             continue;
         }
         let inner_keys = key_array(&batch, key_column).map_err(external)?;
-        let tags = UInt32Array::from_iter_values((0..batch.num_rows()).map(|row| {
-            inner_keys
-                .is_valid(row)
-                .then(|| groups.get(inner_keys.value(row)).copied())
-                .flatten()
-                .unwrap_or(discarded)
-        }));
+        groups.probe(inner_keys, &mut hashes, &mut inner_groups)?;
+        let tags = UInt32Array::from_iter_values(
+            inner_groups.iter().map(|group| group.unwrap_or(discarded)),
+        );
         let values = predicate
             .left
             .arg()

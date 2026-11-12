@@ -30,6 +30,7 @@ mod deployment;
 mod diff;
 mod graph_read;
 mod lease;
+mod operations;
 mod serve;
 mod state_lock;
 mod store;
@@ -43,8 +44,9 @@ pub mod lease_protocol {
     pub use crate::state_lock::leased_lock_record;
 }
 pub use admission::{
-    ClusterAdmission, ClusterAdmissionPurpose, acquire_cluster_admission, acquire_graph_admission,
-    acquire_graph_admission_with_binding, canonical_graph_uri,
+    ClusterAdmission, ClusterAdmissionPurpose, OperationsLock, OperationsUpdate,
+    acquire_cluster_admission, acquire_graph_admission, acquire_graph_admission_with_binding,
+    canonical_graph_uri,
 };
 pub use authorization::{
     AuthorizedEffect, AuthorizedPlanOutput, IdentityAuthorization, PlanAuthorization,
@@ -57,6 +59,15 @@ use config::{
 pub use deployment::*;
 use diff::{ResourceKind, compute_blast_radius, resource_kind};
 pub use graph_read::GraphReadAuthority;
+pub use operations::{
+    AdmissionRefusal, AdmissionScope, Admitted, CLUSTER_OPERATIONS_FILE, KindStates,
+    MAX_OPERATION_BYTES, MAX_OUTCOME_DETAIL_BYTES, MAX_TABLE_OUTCOMES, MAX_TERMINAL_OPERATIONS,
+    MAX_TERMINAL_OPERATIONS_BYTES, MAX_UNRESOLVED_OPERATIONS, Operation, OperationKind,
+    OperationOutcome, OperationRecord, OperationRequest, OperationState, OperationTimings,
+    OperationWrite, OptimizeOptions, OptimizeOutcome, OptimizeState, Resolution,
+    ResolutionProgress, TableOutcome, TailOutcome, canonical_operation_id, new_operation_id,
+    operation_id_time_ms, operation_request_digest, truncate_detail,
+};
 #[cfg(any(test, feature = "test-util"))]
 pub use serve::read_serving_snapshot_with_display_root;
 pub use serve::{

@@ -160,7 +160,10 @@ Graph-scoped actions are:
 | `change` | Mutations, loads, `load csv` (and its `explain` source probe), and Blob put/clear |
 | `schema_apply` | Schema changes: `cluster apply --target` needs it on each existing graph whose schema changes |
 | `branch_create`, `branch_delete`, `branch_merge` | Corresponding branch operation |
+| `branch_claim` | Claim of a branch's writer epoch; no CLI command or HTTP route claims in this release, only a program embedding the engine |
 | `commit_publish`, `commit_drop` | Publish or drop an unpublished commit; drop an unattached commit |
+| `maintain` | Optimize, index builds, the full-text rebuild (which also accepts `change` for now) and the repair report |
+| `reclaim` | Cleanup, which permanently removes unretained history |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved; no current public operation |
 
@@ -206,12 +209,12 @@ rules:
       actions: [invoke_query]
 ```
 
-`branch_scope` is valid only with `read`, `export`, and `change`;
+`branch_scope` is valid only with `read`, `export`, `change`, and `maintain`;
 `target_branch_scope` only with `branch_create`, `branch_delete`,
-`branch_merge`, `schema_apply`, `commit_publish`, and `commit_drop`. Any other pairing, or both scopes on one
+`branch_merge`, `branch_claim`, `schema_apply`, `commit_publish`, and `commit_drop`. Any other pairing, or both scopes on one
 rule, is refused. Values are `any`, `protected`, or `unprotected`, where
 protected branches are the bundle's top-level `protected_branches: [main, …]`
-list. `invoke_query`, `graph_list` and `config_manage` take no branch scope.
+list. `invoke_query`, `reclaim`, `graph_list` and `config_manage` take no branch scope.
 
 ```bash
 omnigraph policy validate --target ./company-data --graph knowledge
