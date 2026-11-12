@@ -1439,15 +1439,16 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
     );
 }
 
-/// A recreated branch can reuse the same edge table `(branch, version)`. The
-/// graph-index cache is keyed (A1) by each edge table's physical identity
-/// `(table_key, version, table_branch, e_tag)`; on local FS the e_tag is `None`,
-/// so a recreated branch at the same version has the same key — the stale topology
-/// is instead evicted by the same-branch manifest refresh (`invalidate_all` on the
-/// `version_probes == 2` stale path), the documented e_tag-less fallback. This
-/// traversal takes the indexed path (single-source frontier), so it also exercises
-/// the table-handle cache incarnation; the assertion is that recreated-branch
-/// topology is never stale regardless of path.
+/// A recreated branch reuses the same edge table, native ref (`main`'s) and
+/// version number as the deleted one. The graph-index cache key (A1) carries each
+/// edge table's identity, version, detached pin (`staged_version`), native ref and
+/// e_tag; on local FS the e_tag is `None`, so the recreated branch's new random
+/// detached pin is what keeps its key apart from the dead branch's. This reader is
+/// a second handle, so it also takes the manifest refresh; this traversal takes
+/// the indexed path (single-source frontier), so it also exercises the table-handle
+/// cache; the assertion is that recreated-branch topology is never stale
+/// regardless of path. `recreated_branch_misses_cached_topology_on_its_new_pin`
+/// pins the same on one handle, with no refresh to clear the cache.
 #[tokio::test]
 async fn recreated_branch_traversal_uses_graph_index_incarnation() {
     cost_harness(async {
@@ -1982,6 +1983,92 @@ query hire($person: String, $company: String) {
         friends_of_walker().await,
         (vec!["Alice".to_string(), "Bob".to_string()], 1),
         "a Knows insert must rebuild the Knows topology and show the new edge"
+    );
+}
+
+/// On one handle, with no refresh in between, a branch deleted and recreated
+/// at the same edge-table version misses the dead branch's cached topology. A
+/// branch control clears no cache: both incarnations stage on `main`'s ref at
+/// the same version number, and only the new random detached pin in the key
+/// keeps them apart (docs/dev/execution.md, traversal and joins).
+#[tokio::test]
+async fn recreated_branch_misses_cached_topology_on_its_new_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let csr_db = with_traversal(&db, Traversal::Csr);
+    let friends_on_feature = || async {
+        let builds = Arc::new(AtomicU64::new(0));
+        let probes = QueryIoProbes {
+            graph_build_count: Arc::clone(&builds),
+            ..Default::default()
+        };
+        let result = with_query_io_probes(
+            probes,
+            csr_db.query(
+                ReadTarget::branch("feature"),
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "Walker")]),
+            ),
+        )
+        .await
+        .unwrap();
+        (first_column_sorted(&result), builds.load(Ordering::Relaxed))
+    };
+    let write_walker_friend = |friend: &'static str| {
+        let db = &db;
+        async move {
+            mutate_branch(
+                db,
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person_and_friend",
+                &mixed_params(&[("$name", "Walker"), ("$friend", friend)], &[("$age", 41)]),
+            )
+            .await
+            .unwrap();
+        }
+    };
+    let knows_entry = || async {
+        db.snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .dataset("edge:Knows")
+            .unwrap()
+            .clone()
+    };
+
+    db.branch_create("feature").await.unwrap();
+    write_walker_friend("Alice").await;
+    assert_eq!(
+        friends_on_feature().await,
+        (vec!["Alice".to_string()], 1),
+        "test setup: the first traversal builds the branch's Knows topology"
+    );
+    let old_entry = knows_entry().await;
+    let old_pin = helpers::pinned_version(&db, "feature", "edge:Knows").await;
+
+    db.branch_delete("feature").await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    write_walker_friend("Bob").await;
+    let new_entry = knows_entry().await;
+    assert_eq!(
+        (
+            new_entry.native_dataset_branch.as_deref(),
+            new_entry.published_dataset_version
+        ),
+        (None, old_entry.published_dataset_version),
+        "test setup: both incarnations stage on main's ref at the same version"
+    );
+    assert_ne!(
+        helpers::pinned_version(&db, "feature", "edge:Knows").await,
+        old_pin,
+        "test setup: the recreated branch's write stages a new detached pin"
+    );
+    assert_eq!(
+        friends_on_feature().await,
+        (vec!["Bob".to_string()], 1),
+        "the recreated branch must miss the dead branch's topology and build its own"
     );
 }
 

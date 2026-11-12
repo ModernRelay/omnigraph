@@ -199,21 +199,6 @@ impl TableHandleCache {
         inner.entries.invalidate_all();
     }
 
-    /// Drop the held handles of the logical branch `branch`'s own table refs
-    /// (`crate::branch_names::native_ref_of_branch`), after that branch is
-    /// created or deleted. Every create mints a fresh incarnation ref, so a
-    /// recreated branch never meets a dead incarnation's key; this frees the
-    /// dead handles and covers legacy refs, which carry no incarnation. Handles
-    /// on other refs, main's included, stay.
-    pub async fn invalidate_branch(&self, branch: &str) {
-        let mut inner = self.inner.lock().await;
-        inner.entries.retain(|key| {
-            !key.table_branch
-                .as_deref()
-                .is_some_and(|native| crate::branch_names::native_ref_of_branch(native, branch))
-        });
-    }
-
     /// Return the dataset for `(dataset_path, branch, version, e_tag)`, reusing a
     /// held handle (0 open IO) or opening it once at `location` with the shared
     /// `session` on a miss. A `statement_wrapper` stacks over the per-query

@@ -122,8 +122,8 @@ impl RuntimeCache {
     /// after the write, and a written table's next read misses on its new
     /// stamp anyway. The shelf stays: `shelf_serve` verifies each requested
     /// table's current stamp, so it stops serving a written table and keeps
-    /// serving untouched ones. A branch create or delete drops its own refs
-    /// (`invalidate_branch`); a refresh, schema apply and optimize still clear
+    /// serving untouched ones. A branch create or delete clears nothing (it
+    /// changes no key); a refresh, schema apply and optimize still clear
     /// everything through `invalidate_all`.
     pub async fn invalidate_edge_tables<'a>(&self, table_keys: impl IntoIterator<Item = &'a str>) {
         let written: std::collections::HashSet<&str> = table_keys.into_iter().collect();
@@ -138,32 +138,6 @@ impl RuntimeCache {
         let mut cache = self.graph_indices.lock().await;
         cache.entries.retain(untouched);
         cache.artifact_negative.retain(untouched);
-    }
-
-    /// A branch was created or deleted: drop the scoped indexes, failed-load
-    /// verdicts and shelf that cover a table on one of its own refs (see
-    /// `TableHandleCache::invalidate_branch`), and keep the rest.
-    pub async fn invalidate_branch(&self, branch: &str) {
-        let on_branch = |table_branch: Option<&str>| {
-            table_branch.is_some_and(|native| {
-                omnigraph_core::branch_names::native_ref_of_branch(native, branch)
-            })
-        };
-        let untouched = |key: &GraphIndexCacheKey| {
-            !key.edge_tables
-                .iter()
-                .any(|table| on_branch(table.table_branch.as_deref()))
-        };
-        let mut cache = self.graph_indices.lock().await;
-        cache.entries.retain(untouched);
-        cache.artifact_negative.retain(untouched);
-        if cache
-            .shelf
-            .as_ref()
-            .is_some_and(|(stamps, _)| stamps.iter().any(|stamp| on_branch(stamp.table_branch())))
-        {
-            cache.shelf = None;
-        }
     }
 
     /// Build (or fetch) the CSR/CSC graph index scoped to exactly `edge_types` —

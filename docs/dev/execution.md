@@ -72,11 +72,28 @@ Ordinary unbound named traversal and eligible bulk `AntiJoin` probes can use a
 CSR/CSC `GraphIndex` scoped to the edge types actually referenced by the query. The cache key includes each
 covered edge table's physical identity and version, so unrelated edge types do
 not force a graph-wide scan and a lazy branch may reuse an identical inherited
-table view. A write (mutation, merge) evicts only the cached indexes that cover an
-edge table it changed, and a branch create or delete only those that cover a
-table ref of that branch (each create mints a fresh ref incarnation, so a
-recreated branch never meets a dead one's key); a refresh, schema apply and
-optimize clear the whole cache.
+table view.
+
+The key also carries each table's detached pin (`staged_version`), native ref
+and e_tag. Every write makes a new version or a new random detached pin, so a
+later snapshot never matches a stale key, and eviction only frees memory. A
+write (mutation, merge) evicts the cached indexes that cover an edge table it
+changed, on any branch; a publish of an unpublished commit evicts those of
+every edge table its commit lists, which is every edge type. A branch create
+or delete clears nothing, because it changes no key: graph tables never carry
+a branch's own ref (a branch write stages detached on the inherited ref; see
+"Table forks" in [Lance alignment](lance.md)), so a recreated branch's tables
+share `main`'s ref and can repeat a dead branch's version numbers, and only the
+new random pin keeps them apart. A deleted branch's indexes and held table
+handles stay until the LRUs drop them (8 indexes; 64 handles or 64 MiB). A
+refresh, schema apply, optimize and the system-column upgrade clear the whole
+cache.
+
+The shelf, the last full-catalog decode of the persisted artifact, is cleared
+only by those four and replaced only by a newer decode. It checks each
+requested table's stamp on every serve, so it stops serving a written edge
+table, but on a handle that writes edges after one artifact load it keeps that
+stale full-catalog topology for the handle's life (at most one).
 
 An explicitly bound edge must scan its edge table because topology alone does
 not contain edge properties. Every edge probe (`graph.rs::scan_edges_stream`:

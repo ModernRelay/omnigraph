@@ -133,12 +133,6 @@ pub(crate) struct TableStamp {
     to_type: String,
 }
 
-impl TableStamp {
-    pub(crate) fn table_branch(&self) -> Option<&str> {
-        self.table_branch.as_deref()
-    }
-}
-
 /// The artifact's fixed object URI under a store root.
 pub(crate) fn artifact_uri(root_uri: &str) -> String {
     format!(
