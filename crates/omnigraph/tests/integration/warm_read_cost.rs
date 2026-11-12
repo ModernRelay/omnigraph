@@ -2547,6 +2547,150 @@ async fn by_id_read_of_a_commit_held_elsewhere_scans_the_likely_branches_first()
     .await;
 }
 
+/// A by-id read remembers the branch it found a commit's history block on. A
+/// later read of a commit of that block, as a history list or a review reads
+/// a branch's commits one after another, opens `__manifest` once and scans
+/// that branch alone. Once the branch is gone, the commit is found as before.
+#[tokio::test]
+async fn by_id_read_of_a_block_found_before_scans_only_its_branch() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = init_and_load(&dir).await;
+        let insert_on = |branch: &'static str, name: &'static str| {
+            let person = mixed_params(&[("$name", name)], &[("$age", 30)]);
+            let writer = &writer;
+            async move {
+                mutate_branch(writer, branch, MUTATION_QUERIES, "insert_person", &person)
+                    .await
+                    .unwrap();
+            }
+        };
+        for branch in ["task", "b_idle", "c_idle", "d_idle", "z_recent"] {
+            writer.branch_create(branch).await.unwrap();
+        }
+        insert_on("task", "First").await;
+        insert_on("task", "Second").await;
+        let task = writer.list_commits(Some("task")).await.unwrap();
+        let (second, first) = (task[0].clone(), task[1].clone());
+        let block = |id: &str| id.split('.').nth(1).map(str::to_string);
+        assert_eq!(
+            block(&first.graph_commit_id),
+            block(&second.graph_commit_id),
+            "one branch wrote both commits, so they share a history block"
+        );
+        let main_head = writer.list_commits(Some("main")).await.unwrap().remove(0);
+
+        let reader = session(Omnigraph::open(uri).await.unwrap());
+        let (found, held_io) = measure(reader.get_commit(&main_head.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), main_head);
+        let opens_and_scans = |io: &helpers::cost::IoCounts| {
+            (
+                io.internal_open_count - held_io.internal_open_count,
+                io.manifest_scan_count - held_io.manifest_scan_count,
+            )
+        };
+
+        let (found, io) = measure(reader.get_commit(&first.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), first);
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 6),
+            "main, then the four branches created after `task`, then `task`"
+        );
+
+        let (found, io) = measure(reader.get_commit(&second.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), second);
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 1),
+            "a commit of a block found before: the branch it was found on, alone"
+        );
+        assert_eq!(
+            people_as_of(&reader, &second).await,
+            people_as_of(&reader, &main_head).await + 2,
+            "the graph as of a commit read from the branch it was found on"
+        );
+
+        // `task` releases the block to `__history`: the hint now names a
+        // branch that no longer buffers it.
+        let release_writer = with_setting(&writer, "history_release_bytes", "2048");
+        let control = omnigraph_core::lance_access::control_session();
+        for published in 0..=TAIL_MAX_COMMITS + 1 {
+            let released =
+                omnigraph_catalog::history::read_commit(uri, &control, &first.graph_commit_id)
+                    .await
+                    .unwrap();
+            if released.is_some() {
+                break;
+            }
+            assert!(
+                published <= TAIL_MAX_COMMITS,
+                "test setup: {published} publishes on `task` released nothing"
+            );
+            let name = format!("Release{published}");
+            let person = mixed_params(&[("$name", &name)], &[("$age", 30)]);
+            mutate_branch(
+                &release_writer,
+                "task",
+                MUTATION_QUERIES,
+                "insert_person",
+                &person,
+            )
+            .await
+            .unwrap();
+        }
+        let (found, io) = measure(reader.get_commit(&first.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), first);
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 1),
+            "the hinted branch, which no longer holds the block, then `__history`"
+        );
+        let (found, io) = measure(reader.get_commit(&second.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), second);
+        assert_eq!(
+            opens_and_scans(&io),
+            (0, 0),
+            "the miss dropped the hint: `__history` alone"
+        );
+
+        // A deleted branch keeps its hint while its tree is on disk: the
+        // checkout opens the tree without reading the ref, and the retired
+        // tree still buffers the block, so every later lookup of the block
+        // reads that tree, until `cleanup` reclaims it.
+        insert_on("d_idle", "Third").await;
+        insert_on("d_idle", "Fourth").await;
+        let idle = writer.list_commits(Some("d_idle")).await.unwrap();
+        let (fourth, third) = (idle[0].clone(), idle[1].clone());
+        assert_eq!(
+            block(&third.graph_commit_id),
+            block(&fourth.graph_commit_id),
+            "one branch wrote both commits, so they share a history block"
+        );
+        let (found, _) = measure(reader.get_commit(&third.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), third, "the first lookup learns the hint");
+        writer.branch_delete("d_idle").await.unwrap();
+        for commit in [&fourth, &third, &fourth] {
+            let (found, io) = measure(reader.get_commit(&commit.graph_commit_id)).await;
+            assert_eq!(&found.unwrap(), commit);
+            assert_eq!(
+                opens_and_scans(&io),
+                (1, 1),
+                "the deleted branch's retired tree answers, and the hint stays"
+            );
+        }
+
+        writer.branch_delete("task").await.unwrap();
+        let resolved = reader.get_commit(&first.graph_commit_id).await.unwrap();
+        assert_eq!(
+            resolved, first,
+            "a commit of a deleted branch is found in `__history`"
+        );
+    })
+    .await;
+}
+
 /// A merge appends the source commits after the merge base it resolved: three merges
 /// of one open source branch into main, main releasing its buffer after each so it
 /// holds no merge commit at the next, archive each source commit in one range extent.
