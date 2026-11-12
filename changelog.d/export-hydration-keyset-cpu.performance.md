@@ -1,1 +1,1 @@
-- Export copies each ordered chunk once instead of twice, and correlated blocks, bound edge traversals and column hydration spend less CPU. Results are unchanged.
+- Export copies each ordered chunk once instead of twice, which lowers its peak memory from three copies of the chunk to two. Column hydration sizes each fetched row once instead of on every estimate, and correlated `not { }` blocks, bound edge traversals and the hash join hash their keys in one vectorized pass. Results are unchanged.

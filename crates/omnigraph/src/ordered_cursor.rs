@@ -75,6 +75,14 @@ pub(crate) fn row_id_ref<'a>(batch: &'a RecordBatch, row: usize, id_col: &str) -
     Ok(ids.value(row))
 }
 
+/// The rows of `batches` at `order` (`(batch, row)` pairs), in that order,
+/// as one batch: a single interleave that copies each picked row once.
+fn ordered_rows(batches: &[RecordBatch], order: &[(usize, usize)]) -> Result<RecordBatch> {
+    let batches: Vec<&RecordBatch> = batches.iter().collect();
+    arrow_select::interleave::interleave_record_batch(&batches, order)
+        .map_err(OmniError::arrow_internal)
+}
+
 /// The key filter of an ordered walk: a SQL predicate or a structured one.
 pub(crate) enum KeyFilter<'a> {
     Sql(&'a str),
@@ -339,10 +347,7 @@ impl OrderedRowCursor {
             .expect("fill leaves a chunk with rows remaining");
         let order = &chunk.order[self.hydrated_pos..];
         self.hydrated_pos = 0;
-        let batches: Vec<&RecordBatch> = chunk.batches.iter().collect();
-        let ordered = arrow_select::interleave::interleave_record_batch(&batches, order)
-            .map_err(OmniError::arrow_internal)?;
-        Ok(Some(ordered))
+        ordered_rows(&chunk.batches, order).map(Some)
     }
 
     /// Make a hydrated chunk with rows remaining current; false at the end.
@@ -588,5 +593,132 @@ impl OrderedRowCursor {
             chunk: HydratedChunk { batches, order },
             bytes: retained_bytes,
         })
+    }
+}
+
+#[cfg(test)]
+mod ordered_rows_tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_array::{ArrayRef, Float64Array, Int64Array};
+
+    use super::*;
+
+    /// The concat-then-take the interleave replaced, kept here only as the
+    /// instrument's baseline and oracle: it copies the chunk twice.
+    fn concat_then_take(batches: &[RecordBatch], order: &[(usize, usize)]) -> RecordBatch {
+        let mut offsets = Vec::with_capacity(batches.len());
+        let mut total = 0u64;
+        for batch in batches {
+            offsets.push(total);
+            total += batch.num_rows() as u64;
+        }
+        let indices = UInt64Array::from_iter_values(
+            order
+                .iter()
+                .map(|(batch, row)| offsets[*batch] + *row as u64),
+        );
+        let all = arrow_select::concat::concat_batches(&batches[0].schema(), batches).unwrap();
+        arrow_select::take::take_record_batch(&all, &indices).unwrap()
+    }
+
+    /// `batches` of `rows` rows each, shaped like a wide export chunk (id,
+    /// integer, float, 200-byte text, 128-dimension vector), and every row
+    /// once in a shuffled order.
+    fn chunk(batches: usize, rows: usize) -> (Vec<RecordBatch>, Vec<(usize, usize)>) {
+        let batches: Vec<RecordBatch> = (0..batches)
+            .map(|batch| {
+                let ids: ArrayRef = Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|row| format!("id-{batch:04}-{row:06}")),
+                ));
+                let ints: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                    (0..rows).map(|row| (batch * rows + row) as i64),
+                ));
+                let floats: ArrayRef = Arc::new(Float64Array::from_iter_values(
+                    (0..rows).map(|row| row as f64 / 3.0),
+                ));
+                let texts: ArrayRef = Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|row| format!("{row:0>200}")),
+                ));
+                let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 128);
+                for row in 0..rows {
+                    vectors.values().append_slice(&[row as f32; 128]);
+                    vectors.append(true);
+                }
+                let vectors: ArrayRef = Arc::new(vectors.finish());
+                RecordBatch::try_from_iter([
+                    ("id", ids),
+                    ("int", ints),
+                    ("float", floats),
+                    ("text", texts),
+                    ("vector", vectors),
+                ])
+                .unwrap()
+            })
+            .collect();
+        let mut order: Vec<(usize, usize)> = (0..batches.len())
+            .flat_map(|batch| (0..rows).map(move |row| (batch, row)))
+            .collect();
+        // A fixed multiplicative shuffle, so every run orders the rows alike.
+        let len = order.len();
+        let mut shuffled = vec![(0, 0); len];
+        for (index, pick) in order.drain(..).enumerate() {
+            shuffled[(index * 7919) % len] = pick;
+        }
+        (batches, shuffled)
+    }
+
+    /// The ordered rows equal the concat-then-take's, schema and values,
+    /// including a repeated pick and a pick of a sliced batch.
+    #[test]
+    fn ordered_rows_equal_concat_then_take() {
+        let (mut batches, mut order) = chunk(3, 5);
+        batches[1] = batches[1].slice(1, 3);
+        order.retain(|&(batch, row)| batch != 1 || row < 3);
+        order.push(order[0]);
+        assert_eq!(
+            ordered_rows(&batches, &order).unwrap(),
+            concat_then_take(&batches, &order)
+        );
+    }
+
+    fn best_of(runs: usize, mut run: impl FnMut()) -> Duration {
+        (0..runs)
+            .map(|_| {
+                let start = Instant::now();
+                run();
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    /// Decision instrument for the export ordered chunk's CPU: one interleave
+    /// against the concat-then-take it replaced, over 8 × 1,024 wide rows in
+    /// shuffled key order, best of 30. Run in a release build:
+    /// `cargo test --release -p omnigraph-engine --lib ordered_rows_against_concat_then_take_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "instrument: CPU of the export ordered chunk's interleave against concat-then-take (run with --release)"]
+    fn ordered_rows_against_concat_then_take_cost() {
+        let (batches, order) = chunk(8, 1024);
+        let expected = concat_then_take(&batches, &order);
+        let baseline = best_of(30, || {
+            assert_eq!(concat_then_take(&batches, &order).num_rows(), order.len());
+        });
+        let interleaved = best_of(30, || {
+            assert_eq!(
+                ordered_rows(&batches, &order).unwrap().num_rows(),
+                order.len()
+            );
+        });
+        assert_eq!(ordered_rows(&batches, &order).unwrap(), expected);
+        println!(
+            "ordered chunk of {} rows: concat-then-take {} µs, interleave {} µs",
+            order.len(),
+            baseline.as_micros(),
+            interleaved.as_micros(),
+        );
     }
 }

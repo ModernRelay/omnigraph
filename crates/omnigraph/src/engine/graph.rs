@@ -933,6 +933,13 @@ where
         })?;
     u32::try_from(src_ids.len())
         .map_err(|_| OmniError::manifest_internal("expand source ordinal exceeds UInt32"))?;
+    // A bound source is a node the frontier holds, and a node's id is never
+    // null: a null here is an integrity fault, refused rather than dropped.
+    if src_ids.null_count() > 0 {
+        return Err(OmniError::manifest_internal(format!(
+            "bound expand frontier has a null '{src_name}'"
+        )));
+    }
     // The source groups, each group's wide rows (`group_starts` into
     // `group_rows`, in row order) and one owned key per group.
     super::operators::KeyGroups::charge(&source_memory, src_ids.len())
@@ -947,8 +954,8 @@ where
         .charge_traversal(src_ids.len() as u64)
         .map_err(|error| memory.error(error))?;
     source_memory.check().map_err(|error| memory.error(error))?;
-    let (src_groups, row_groups) =
-        super::operators::KeyGroups::build(src_ids).map_err(|error| memory.error(error))?;
+    let (src_groups, row_groups) = super::operators::KeyGroups::build_numbered(src_ids)
+        .map_err(|error| memory.error(error))?;
     let mut group_starts = vec![0u32; src_groups.len() + 1];
     for group in row_groups.iter().flatten() {
         group_starts[*group as usize + 1] += 1;

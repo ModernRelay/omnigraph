@@ -1952,4 +1952,112 @@ mod row_bytes_tests {
                 .is_err()
         );
     }
+
+    /// The estimate the row bytes replaced, kept here only as the
+    /// instrument's baseline: per column, every batch's `to_data()` and a
+    /// one-row slice of every pick.
+    fn per_slice_estimate(batches: &[RecordBatch], picks: &[(usize, usize)]) -> usize {
+        let mut bytes = 0usize;
+        let mut scratch_bytes = 0usize;
+        for column in 0..batches[0].num_columns() {
+            let data: Vec<ArrayData> = batches
+                .iter()
+                .map(|batch| batch.column(column).to_data())
+                .collect();
+            scratch_bytes += take_scratch_size(&data[0], picks.len());
+            let picked: usize = picks
+                .iter()
+                .map(|&(batch, row)| slice_memory_size(&data[batch], row, 1).unwrap() + 16)
+                .sum();
+            bytes += picked + 128;
+        }
+        bytes + scratch_bytes
+    }
+
+    fn best_of(runs: usize, mut run: impl FnMut()) -> std::time::Duration {
+        (0..runs)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                run();
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    /// Decision instrument for the hydration estimate's CPU: the per-slice
+    /// estimate against one `row_bytes` pass per fetched row plus the
+    /// estimate from those sizes, over 1,024 one-row batches (id, integer,
+    /// float, 200-byte text, 128-dimension vector) and 2,048 picks, best of
+    /// 30. A window is estimated once and again on every halving, so the
+    /// per-estimate figure is the one each halving repeats. Run in a
+    /// release build:
+    /// `cargo test --release -p omnigraph-engine --lib interleave_estimate_from_row_bytes_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "instrument: CPU of the hydration estimate from row bytes against the per-slice estimate (run with --release)"]
+    fn interleave_estimate_from_row_bytes_cost() {
+        let limit = 1 << 30;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let resources = Arc::new(QueryResources::new(pool, limit as u64));
+        let ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_extension(resources)),
+        );
+        let memory = WorkMemory::new(ctx, "interleave estimate cost").unwrap();
+        let batches: Vec<RecordBatch> = (0..1024)
+            .map(|row| {
+                let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 128);
+                vectors.values().append_slice(&[row as f32; 128]);
+                vectors.append(true);
+                let columns: [(&str, ArrayRef); 5] = [
+                    (
+                        "id",
+                        Arc::new(StringArray::from(vec![format!("id-{row:06}")])),
+                    ),
+                    ("int", Arc::new(Int64Array::from(vec![row as i64]))),
+                    (
+                        "float",
+                        Arc::new(arrow_array::Float64Array::from(vec![row as f64])),
+                    ),
+                    (
+                        "text",
+                        Arc::new(StringArray::from(vec![format!("{row:0>200}")])),
+                    ),
+                    ("vector", Arc::new(vectors.finish())),
+                ];
+                RecordBatch::try_from_iter(columns).unwrap()
+            })
+            .collect();
+        let picks: Vec<(usize, usize)> = (0..2048).map(|pick| ((pick * 7) % 1024, 0)).collect();
+        let sizes: Vec<Vec<usize>> = batches
+            .iter()
+            .map(|batch| memory.row_bytes(batch).unwrap())
+            .collect();
+        let expected = per_slice_estimate(&batches, &picks);
+        assert_eq!(
+            memory.interleave_bytes(&batches, &sizes, &picks).unwrap(),
+            expected
+        );
+        let per_slice = best_of(30, || {
+            assert_eq!(per_slice_estimate(&batches, &picks), expected);
+        });
+        let sizing = best_of(30, || {
+            for batch in &batches {
+                assert_eq!(memory.row_bytes(batch).unwrap().len(), 1);
+            }
+        });
+        let summed = best_of(30, || {
+            assert_eq!(
+                memory.interleave_bytes(&batches, &sizes, &picks).unwrap(),
+                expected
+            );
+        });
+        println!(
+            "hydration estimate, 1,024 rows, 2,048 picks: per-slice {} µs per estimate; \
+             row bytes {} µs once per window, then {} µs per estimate",
+            per_slice.as_micros(),
+            sizing.as_micros(),
+            summed.as_micros(),
+        );
+    }
 }

@@ -407,7 +407,7 @@ async fn key_set_mask(
     let outer_keys = key_array(wide, key_column).map_err(external)?;
     let num_rows = wide.num_rows();
     KeyGroups::charge(reservation, num_rows)?;
-    let (groups, row_groups) = KeyGroups::build(outer_keys)?;
+    let (groups, row_groups) = KeyGroups::build_numbered(outer_keys)?;
     let unmatched = groups.len() as u32;
     let discarded = unmatched + 1;
     let group_count = groups.len() + 2;
