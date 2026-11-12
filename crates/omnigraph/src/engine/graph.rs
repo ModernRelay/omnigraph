@@ -493,11 +493,11 @@ fn source_node_key(source: usize, node: u32) -> u64 {
 
 /// The destination column of one chunk: `dense` resolved through `ids`, the
 /// dictionary of the walk's destination space, charged to `memory` first.
-fn destination_column(dense: &[u32], ids: DenseIds<'_>, memory: &WorkMemory) -> Result<ArrayRef> {
+fn destination_column(dense: Vec<u32>, ids: DenseIds<'_>, memory: &WorkMemory) -> Result<ArrayRef> {
     // One pass checks every id against the dictionary and sums the bytes;
     // the column is then built straight from the dictionary.
     let mut bytes = 0usize;
-    for &d in dense {
+    for &d in &dense {
         let len = ids.byte_len(d).ok_or_else(|| {
             OmniError::manifest_internal(format!(
                 "dense destination id {d} is outside its dictionary of {} ids",
@@ -507,10 +507,15 @@ fn destination_column(dense: &[u32], ids: DenseIds<'_>, memory: &WorkMemory) -> 
         bytes = bytes.saturating_add(len);
     }
     memory.string(bytes).map_err(|error| memory.error(error))?;
+    // The gathered offsets: a graph index gathers i64 offsets and narrows
+    // them to i32, both alive during the cast.
     memory
-        .grow((dense.len() + 1).saturating_mul(std::mem::size_of::<i32>()))
+        .grow(
+            (dense.len() + 1)
+                .saturating_mul(std::mem::size_of::<i64>() + std::mem::size_of::<i32>()),
+        )
         .map_err(|error| memory.error(error))?;
-    ids.column(&UInt32Array::from(dense.to_vec()))
+    ids.column(&UInt32Array::from(dense))
 }
 
 /// The pending chunk as pairs ready to emit: its destinations resolved
@@ -531,8 +536,11 @@ fn take_pending_pairs(
         .entries::<(u32, u32)>(chunk_rows)
         .map_err(|error| memory.error(error))?;
     memory.metric("expand_pairs", emitted_src.len());
-    let destination = destination_column(emitted_dst, ids, emission_memory)?;
-    emitted_dst.clear();
+    let destination = destination_column(
+        std::mem::replace(emitted_dst, Vec::with_capacity(chunk_rows)),
+        ids,
+        emission_memory,
+    )?;
     Ok(ExpandedPairs {
         source_rows: std::mem::replace(emitted_src, Vec::with_capacity(chunk_rows)),
         destination,
@@ -1609,7 +1617,11 @@ where
             ActiveExpandSource::Indexed(src) => DenseIds::Interned(src.interner.ids()),
             ActiveExpandSource::Csr(CsrSource { dst_idx, .. }) => DenseIds::Index(dst_idx.ids()),
         };
-        Some(destination_column(&emitted_dst, ids, &emission_memory)?)
+        Some(destination_column(
+            std::mem::take(&mut emitted_dst),
+            ids,
+            &emission_memory,
+        )?)
     };
     drop(active);
     drop(frontiers);

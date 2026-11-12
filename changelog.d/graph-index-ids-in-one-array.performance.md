@@ -1,1 +1,1 @@
-- The graph index keeps each node id once, in one Arrow array: traversals look ids up faster, and building or loading the index uses less time and memory. Results are unchanged.
+- The graph index keeps each node id once, in one Arrow array, so building or loading it holds less memory. Results are unchanged.

@@ -473,11 +473,13 @@ fn decode_body(header: &Header, payload: &[u8]) -> Result<GraphIndex> {
         // bounds the possible id count regardless of what `count` claims,
         // and the id bytes regardless of how they split.
         let capacity_ceiling = section.len() / 4;
+        let capacity = usize::try_from(dict.count)
+            .unwrap_or(0)
+            .min(capacity_ceiling);
+        // The id bytes are the section less one length prefix per id.
         let mut ids = TypeIndexBuilder::with_capacity(
-            usize::try_from(dict.count)
-                .unwrap_or(0)
-                .min(capacity_ceiling),
-            section.len(),
+            capacity,
+            section.len().saturating_sub(capacity.saturating_mul(4)),
         );
         let mut d = 0usize;
         while d < section.len() {
@@ -783,11 +785,14 @@ impl ArtifactCount {
         }
     }
 
-    pub(crate) fn add_ids(&mut self, type_name: &str, ids: &[String]) {
+    /// Counts `ids` new ids of `type_name` holding `bytes` UTF-8 bytes in
+    /// all: each a 4-byte length prefix, its bytes and its widening.
+    pub(crate) fn add_ids(&mut self, type_name: &str, ids: usize, bytes: usize) {
         let widen = self.per_id.get(type_name).copied().unwrap_or(0);
-        for id in ids {
-            self.counted = self.counted.saturating_add(4 + id.len() as u64 + widen);
-        }
+        self.counted = self
+            .counted
+            .saturating_add((ids as u64).saturating_mul(4 + widen))
+            .saturating_add(bytes as u64);
     }
 
     pub(crate) fn add_edges(&mut self, edges: u64) {
@@ -872,7 +877,8 @@ mod tests {
             ("Person".to_string(), "Person".to_string()),
         );
         let mut count = ArtifactCount::new(widest, u64::MAX, &edge_types);
-        count.add_ids("Person", index.parts().0["Person"].ids());
+        let ids = index.parts().0["Person"].ids();
+        count.add_ids("Person", ids.len(), ids.value_data().len());
         count.add_edges(edges);
         assert!(actual <= count.counted(), "{actual} vs {}", count.counted());
         // Exact apart from the header's count and length digits.

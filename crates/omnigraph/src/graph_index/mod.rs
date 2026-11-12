@@ -3,8 +3,9 @@ pub(crate) mod persist;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::builder::StringBuilder;
-use arrow_array::{Array, ArrayRef, StringArray, UInt32Array};
+use arrow_array::builder::LargeStringBuilder;
+use arrow_array::{Array, ArrayRef, LargeStringArray, StringArray, UInt32Array};
+use arrow_schema::DataType;
 use futures::TryStreamExt;
 use hashbrown::HashTable;
 use omnigraph_compiler::SystemColumns;
@@ -12,30 +13,23 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
 
-/// The seeds of the id hash (over an id's UTF-8 bytes): fixed, so a
-/// dictionary hashes the same way in every process; the table itself is
-/// never persisted.
-const ID_HASH_SEEDS: (u64, u64, u64, u64) = (
-    0x6f6d_6e69_6772_6170,
-    0x6874_7970_6569_6478,
-    0x6964_5f74_6f5f_6465,
-    0x6e73_655f_7461_626c,
-);
-
+/// The id hash (over an id's UTF-8 bytes), keyed at random per dictionary:
+/// node ids come from writers, and a public fixed key would let ids that
+/// share a bucket make building and lookups quadratic. The table is never
+/// persisted, and each dictionary keeps the state it was built with.
 fn id_hash_state() -> ahash::RandomState {
-    let (a, b, c, d) = ID_HASH_SEEDS;
-    ahash::RandomState::with_seeds(a, b, c, d)
+    ahash::RandomState::new()
 }
 
 /// The dense u32 mapping of one node type in a built or loaded graph index:
-/// the ids in dense order as one Arrow `Utf8` array (index `i` holds the id
+/// the ids in dense order as one Arrow `LargeUtf8` array (index `i` holds the id
 /// of dense `i`, in first-seen order), and a table of dense ids that hashes
 /// and compares through that array. No id is held twice and none is a
 /// separate allocation; destination columns are gathered from `ids` with
 /// Arrow's `take`. Immutable: built by [`TypeIndexBuilder`].
 #[derive(Debug, Clone)]
 pub struct TypeIndex {
-    ids: StringArray,
+    ids: LargeStringArray,
     dense_of: HashTable<u32>,
     state: ahash::RandomState,
 }
@@ -61,7 +55,7 @@ impl TypeIndex {
     }
 
     /// The dense-ordered id dictionary (index `i` holds the id of dense `i`).
-    pub(crate) fn ids(&self) -> &StringArray {
+    pub(crate) fn ids(&self) -> &LargeStringArray {
         &self.ids
     }
 
@@ -76,11 +70,13 @@ impl TypeIndex {
     }
 }
 
-/// Builds a [`TypeIndex`]: appends each new id to one growing `Utf8` buffer
-/// and its dense id to the table, in first-seen order.
+/// Builds a [`TypeIndex`]: appends each new id to one growing `LargeUtf8`
+/// buffer and its dense id to the table, in first-seen order. The buffer's
+/// i64 offsets hold any dictionary a graph can have; only a dense id past
+/// `u32` is refused.
 #[derive(Debug)]
 pub(crate) struct TypeIndexBuilder {
-    ids: StringBuilder,
+    ids: LargeStringBuilder,
     len: usize,
     dense_of: HashTable<u32>,
     state: ahash::RandomState,
@@ -94,7 +90,7 @@ impl TypeIndexBuilder {
     /// Room for `ids` ids of `bytes` bytes in total.
     pub(crate) fn with_capacity(ids: usize, bytes: usize) -> Self {
         Self {
-            ids: StringBuilder::with_capacity(ids, bytes),
+            ids: LargeStringBuilder::with_capacity(ids, bytes),
             len: 0,
             dense_of: HashTable::with_capacity(ids),
             state: id_hash_state(),
@@ -113,18 +109,13 @@ impl TypeIndexBuilder {
     }
 
     fn push(&mut self, hash: u64, id: &str) -> Result<u32> {
-        // A `Utf8` array addresses its bytes with i32 offsets, and dense ids
-        // are u32: refuse past either rather than let the builder panic.
-        let bytes = self.ids.values_slice().len().saturating_add(id.len());
-        let dense = u32::try_from(self.len)
-            .ok()
-            .filter(|_| i32::try_from(bytes).is_ok())
-            .ok_or_else(|| {
-                OmniError::manifest(format!(
-                    "graph index dictionary outgrew one Utf8 array ({} ids, {bytes} bytes)",
-                    self.len
-                ))
-            })?;
+        // Dense ids are u32, as the CSR rows they index are.
+        let dense = u32::try_from(self.len).map_err(|_| {
+            OmniError::manifest_internal(format!(
+                "graph index dictionary outgrew u32 dense ids ({} ids)",
+                self.len
+            ))
+        })?;
         self.ids.append_value(id);
         self.len += 1;
         let (state, offsets, values) = (
@@ -162,6 +153,11 @@ impl TypeIndexBuilder {
 
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// The UTF-8 bytes of every id appended so far.
+    pub(crate) fn value_bytes(&self) -> usize {
+        self.ids.values_slice().len()
     }
 
     pub(crate) fn finish(mut self) -> TypeIndex {
@@ -220,7 +216,7 @@ impl IdInterner {
 /// index's [`TypeIndex`] or the walk's own [`IdInterner`].
 #[derive(Clone, Copy)]
 pub(crate) enum DenseIds<'a> {
-    Index(&'a StringArray),
+    Index(&'a LargeStringArray),
     Interned(&'a [String]),
 }
 
@@ -246,12 +242,18 @@ impl DenseIds<'_> {
 
     /// The `Utf8` column of the ids of `dense`, every one inside the
     /// dictionary (the caller checked); a graph index's ids are gathered
-    /// with Arrow's `take`.
+    /// with Arrow's `take`, then narrowed to `Utf8`: a chunk is bounded by
+    /// the batch bytes, so its offsets fit i32, and the cast rewrites only
+    /// the offsets and keeps the gathered value buffer.
     pub(crate) fn column(&self, dense: &UInt32Array) -> Result<ArrayRef> {
+        let failed = |error: arrow_schema::ArrowError| {
+            OmniError::manifest_internal(format!("gathering destination ids failed: {error}"))
+        };
         match self {
-            Self::Index(ids) => arrow_select::take::take(*ids, dense, None).map_err(|error| {
-                OmniError::manifest_internal(format!("gathering destination ids failed: {error}"))
-            }),
+            Self::Index(ids) => {
+                let gathered = arrow_select::take::take(*ids, dense, None).map_err(failed)?;
+                arrow_cast::cast(&gathered, &DataType::Utf8).map_err(failed)
+            }
             Self::Interned(ids) => Ok(Arc::new(StringArray::from_iter_values(
                 dense.values().iter().map(|&d| ids[d as usize].as_str()),
             ))),
@@ -428,8 +430,12 @@ impl GraphIndex {
 
             let mut edges: Vec<(u32, u32)> = Vec::new();
             while let Some(batch) = batches.try_next().await.map_err(OmniError::storage)? {
-                let from_before = type_indices[from_type].len();
-                let to_before = type_indices[to_type].len();
+                let appended = |builders: &HashMap<String, TypeIndexBuilder>, name: &str| {
+                    let builder = &builders[name];
+                    (builder.len(), builder.value_bytes())
+                };
+                let from_before = appended(&builders, from_type);
+                let to_before = appended(&builders, to_type);
                 let srcs = string_column(&batch, system_columns.src)?;
                 let dsts = string_column(&batch, system_columns.dst)?;
 
@@ -445,10 +451,12 @@ impl GraphIndex {
                     edges.push((src_dense, dst_dense));
                 }
                 if let Some(count) = count.as_deref_mut() {
-                    count.add_ids(from_type, &type_indices[from_type].ids()[from_before..]);
+                    let (ids, bytes) = appended(&builders, from_type);
+                    count.add_ids(from_type, ids - from_before.0, bytes - from_before.1);
                     // A type on both ends of the edge has one dictionary.
                     if to_type != from_type {
-                        count.add_ids(to_type, &type_indices[to_type].ids()[to_before..]);
+                        let (ids, bytes) = appended(&builders, to_type);
+                        count.add_ids(to_type, ids - to_before.0, bytes - to_before.1);
                     }
                     count.add_edges(batch.num_rows() as u64);
                     if count.passed() {
@@ -615,7 +623,7 @@ mod tests {
         assert_eq!(idx.len(), 3);
         assert_eq!(
             idx.ids(),
-            &StringArray::from(vec!["Alice", "Bob", "Charlie"])
+            &LargeStringArray::from(vec!["Alice", "Bob", "Charlie"])
         );
     }
 
