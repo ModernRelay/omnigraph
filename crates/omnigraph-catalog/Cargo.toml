@@ -28,7 +28,6 @@ bytes = { workspace = true }
 lance-namespace = { workspace = true }
 lance-table = { workspace = true }
 arrow-array = { workspace = true }
-arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
