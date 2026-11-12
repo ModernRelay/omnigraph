@@ -502,8 +502,8 @@ for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
 `optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph`, with region
 and endpoint captured from the environment
 ([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
-Each direct writer except a converged `cluster apply` keeps its admission
-lock; `cluster force-unlock` it before starting the server. Inline local paths and `file://`
+Each direct writer except a converged `cluster apply` (never on Azure) keeps
+its admission lock; `cluster force-unlock` it before starting the server. Inline local paths and `file://`
 URIs are accepted; remote endpoints must be registered. Server targets own auth;
 managed targets reference a profile and pin cluster identity/incarnation.
 Graph operations need `--graph` or target `default_graph`; direct graphs reject

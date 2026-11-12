@@ -228,7 +228,9 @@ stored-query inspection, policy tooling and graph listing. Their reports use the
 application's supplied writers. Served apply writes and flushes its original ID
 before sending the POST. Direct apply's core identity callback cannot return an
 error: the CLI captures any diagnostic delivery failure, lets that one core call
-finish, then returns the failure with its original ID, root and retained lock.
+finish, then returns the failure with its original ID and root. The lock
+follows the apply's outcome: a converged apply has still released it (never on
+Azure).
 Neither path replays work to recover output. Deployment and recovery authority
 remain in the cluster crate.
 
