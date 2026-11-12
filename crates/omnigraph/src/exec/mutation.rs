@@ -1293,12 +1293,12 @@ impl Omnigraph {
         write_budget: WriteBudget,
         route: &WriteRoute,
     ) -> Result<crate::MutationReceipt> {
-        const MAX_PRE_EFFECT_REPREPARES: usize = 32;
-
         // Resolve request-scoped values such as now() once so a safe
         // pre-effect retry does not change the logical input.
         let resolved_params = enrich_mutation_params(params)?;
-        for attempt in 0..=MAX_PRE_EFFECT_REPREPARES {
+        let mut reprepares =
+            crate::db::reprepare::PreEffectReprepares::begin(self, Some(branch), "mutation");
+        loop {
             let mut retryable = false;
             match self
                 .mutate_one_attempt(
@@ -1310,30 +1310,19 @@ impl Omnigraph {
                     expected_head,
                     stage_write_concurrency,
                     history_release_bytes,
-                    attempt == 0,
+                    reprepares.is_first(),
                     &mut retryable,
                     write_budget,
                     route,
                 )
                 .await
             {
-                Err(err)
-                    if retryable
-                        && err.is_read_set_changed()
-                        && attempt < MAX_PRE_EFFECT_REPREPARES =>
-                {
-                    tracing::debug!(
-                        attempt = attempt + 1,
-                        branch,
-                        "prepared mutation authority changed before effects; repreparing"
-                    );
-                    crate::instrumentation::record_mutation_reprepare();
-                    self.refresh_coordinator_only().await?;
+                Err(err) if reprepares.may_prepare_again(&err, retryable) => {
+                    reprepares.prepare_again().await?;
                 }
                 result => return result,
             }
         }
-        unreachable!("bounded mutation retry loop always returns")
     }
 
     async fn mutate_one_attempt(
@@ -1433,6 +1422,14 @@ impl Omnigraph {
         match exec_result {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => {
+                if !self.unpublished_view_is_current(&txn).await? {
+                    *retryable = true;
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("manifest_version:{addressed}"),
+                        Some(txn.manifest_probe.captured().version.to_string()),
+                        None,
+                    ));
+                }
                 if txn.caller_expected_graph_head.is_some() {
                     fail(&MUTATION_POST_NO_EFFECT_PRE_GATE)?;
                     // A no-op has no table transaction, so it never reaches
@@ -1499,17 +1496,18 @@ impl Omnigraph {
         // effect is a fresh file or a detached version no manifest names: a
         // failure here is definite (`Unpublished`), whatever its cause, and a
         // server must not treat it as an outcome it cannot establish.
-        let staged = staging
-            .stage_all_with_concurrency(self, requested, stage_write_concurrency)
-            .await
-            .map_err(OmniError::unpublished)?;
+        let (staged, early) = futures::join!(
+            staging.stage_all_with_concurrency(self, requested, stage_write_concurrency),
+            self.early_revalidation(txn),
+        );
+        let staged = staged.map_err(OmniError::unpublished)?;
         fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
         let lineage_intent = self
             .new_lineage_intent_for_branch(requested, actor_id, history_release_bytes)
             .await
             .map_err(OmniError::unpublished)?;
         let committed = staged
-            .commit_all(self, requested, txn)
+            .commit_all(self, requested, txn, early)
             .await
             .map_err(OmniError::unpublished)?;
         Ok(CommittedStagedMutation {

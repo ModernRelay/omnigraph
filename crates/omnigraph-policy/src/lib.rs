@@ -23,6 +23,10 @@ pub enum PolicyAction {
     BranchCreate,
     BranchDelete,
     BranchMerge,
+    /// Claim a branch's writer epoch, a takeover that fences every other
+    /// writer of the branch (`Omnigraph::claim_branch_writer_as`).
+    /// Target-branch scoped: the scope is the branch claimed.
+    BranchClaim,
     /// Publish an unpublished graph commit onto its recorded target branch
     /// (`commit publish "<id>"`). Target-branch scoped like `branch_merge`:
     /// the scope is the branch the commit lands on.
@@ -30,6 +34,16 @@ pub enum PolicyAction {
     /// Drop an unpublished graph commit (`commit drop "<id>"`). Target-branch
     /// scoped: the branch the proposal would have landed on.
     CommitDrop,
+    /// Content-preserving maintenance: optimize, index builds, the full-text
+    /// rebuild and the repair report. Branch scoped like `change`: the scope
+    /// is the branch whose tables the operation maintains, `main` for
+    /// optimize and repair. It grants no right to change data or to delete
+    /// history.
+    Maintain,
+    /// Reclaim storage: cleanup, which permanently deletes table versions and
+    /// files no retained commit needs. A run covers every branch's history,
+    /// so the action is graph scoped and takes no branch scope.
+    Reclaim,
     /// Reserved action; no current engine or HTTP operation uses this grant.
     Admin,
     /// List the server's graph registry. This is server-scoped, with no branch
@@ -55,8 +69,11 @@ impl PolicyAction {
             Self::BranchCreate => "branch_create",
             Self::BranchDelete => "branch_delete",
             Self::BranchMerge => "branch_merge",
+            Self::BranchClaim => "branch_claim",
             Self::CommitPublish => "commit_publish",
             Self::CommitDrop => "commit_drop",
+            Self::Maintain => "maintain",
+            Self::Reclaim => "reclaim",
             Self::Admin => "admin",
             Self::GraphList => "graph_list",
             Self::InvokeQuery => "invoke_query",
@@ -65,7 +82,10 @@ impl PolicyAction {
     }
 
     fn uses_branch_scope(self) -> bool {
-        matches!(self, Self::Read | Self::Export | Self::Change)
+        matches!(
+            self,
+            Self::Read | Self::Export | Self::Change | Self::Maintain
+        )
     }
 
     fn uses_target_branch_scope(self) -> bool {
@@ -75,6 +95,7 @@ impl PolicyAction {
                 | Self::SchemaApply
                 | Self::BranchDelete
                 | Self::BranchMerge
+                | Self::BranchClaim
                 | Self::CommitPublish
                 | Self::CommitDrop
         )
@@ -96,8 +117,11 @@ impl PolicyAction {
             | Self::BranchCreate
             | Self::BranchDelete
             | Self::BranchMerge
+            | Self::BranchClaim
             | Self::CommitPublish
             | Self::CommitDrop
+            | Self::Maintain
+            | Self::Reclaim
             | Self::Admin
             | Self::InvokeQuery => PolicyResourceKind::Graph,
         }
@@ -158,8 +182,11 @@ impl FromStr for PolicyAction {
             "branch_create" => Ok(Self::BranchCreate),
             "branch_delete" => Ok(Self::BranchDelete),
             "branch_merge" => Ok(Self::BranchMerge),
+            "branch_claim" => Ok(Self::BranchClaim),
             "commit_publish" => Ok(Self::CommitPublish),
             "commit_drop" => Ok(Self::CommitDrop),
+            "maintain" => Ok(Self::Maintain),
+            "reclaim" => Ok(Self::Reclaim),
             "admin" => Ok(Self::Admin),
             "graph_list" => Ok(Self::GraphList),
             "invoke_query" => Ok(Self::InvokeQuery),
@@ -940,8 +967,11 @@ namespace Omnigraph {
     action "branch_create" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_delete" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "branch_claim" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "commit_publish" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "commit_drop" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "maintain" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "reclaim" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "admin" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "invoke_query" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
 
@@ -1523,6 +1553,58 @@ rules:
         assert!(err.to_string().contains("unsupported action"));
     }
 
+    #[test]
+    fn branch_claim_uses_target_branch_scope() {
+        let policy: PolicyConfig = yaml_serde::from_str(
+            r#"
+version: 1
+groups:
+  owners: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: owners-claim
+    allow:
+      actors: { group: owners }
+      actions: [branch_claim]
+      target_branch_scope: protected
+"#,
+        )
+        .unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+        let claim: PolicyAction = "branch_claim".parse().unwrap();
+        assert_eq!(claim.as_str(), "branch_claim");
+        for (branch, allowed) in [("main", true), ("feature", false)] {
+            let decision = engine
+                .authorize(
+                    "act-ragnor",
+                    &PolicyRequest {
+                        action: claim,
+                        branch: None,
+                        target_branch: Some(branch.to_string()),
+                    },
+                )
+                .unwrap();
+            assert_eq!(decision.allowed, allowed, "branch_claim on {branch}");
+        }
+
+        let branch_scoped: PolicyConfig = yaml_serde::from_str(
+            r#"
+version: 1
+groups:
+  owners: [act-ragnor]
+rules:
+  - id: bad
+    allow:
+      actors: { group: owners }
+      actions: [branch_claim]
+      branch_scope: protected
+"#,
+        )
+        .unwrap();
+        let err = branch_scoped.validate().unwrap_err();
+        assert!(err.to_string().contains("unsupported action"));
+    }
+
     // ─── MR-668 — server-scoped action (graph_list) ─
 
     #[test]
@@ -1950,5 +2032,159 @@ rules:
             );
             assert!(PolicyEngine::load_cluster_from_source(&mixed).is_err());
         }
+    }
+
+    #[test]
+    fn every_action_round_trips_through_its_name() {
+        use clap::ValueEnum;
+        for &action in PolicyAction::value_variants() {
+            let name = action.as_str();
+            assert_eq!(action.to_string(), name);
+            assert_eq!(name.parse::<PolicyAction>().unwrap(), action, "{name}");
+            assert_eq!(
+                serde_json::to_value(action).unwrap(),
+                serde_json::Value::String(name.to_string())
+            );
+            assert_eq!(
+                serde_json::from_value::<PolicyAction>(serde_json::json!(name)).unwrap(),
+                action
+            );
+        }
+        assert_eq!(
+            "maintain".parse::<PolicyAction>().unwrap(),
+            PolicyAction::Maintain
+        );
+        assert_eq!(
+            "reclaim".parse::<PolicyAction>().unwrap(),
+            PolicyAction::Reclaim
+        );
+        assert!("maintenance".parse::<PolicyAction>().is_err());
+    }
+
+    /// A rule granting any one action compiles under the Cedar schema and
+    /// allows that action, so no action can be added to the enum without its
+    /// declaration.
+    #[test]
+    fn every_action_is_declared_in_the_cedar_schema() {
+        use clap::ValueEnum;
+        for &action in PolicyAction::value_variants() {
+            let source = format!(
+                "version: 1\ngroups:\n  g: [act]\nrules:\n  - id: r\n    allow:\n      actors: {{ group: g }}\n      actions: [{}]\n",
+                action.as_str()
+            );
+            let engine = match action.resource_kind() {
+                PolicyResourceKind::Graph => PolicyEngine::load_graph_from_source(&source, "graph"),
+                PolicyResourceKind::Server => PolicyEngine::load_server_from_source(&source),
+                PolicyResourceKind::Cluster => PolicyEngine::load_cluster_from_source(&source),
+            }
+            .unwrap_or_else(|error| panic!("{action}: {error}"));
+            let decision = engine
+                .authorize(
+                    "act",
+                    &PolicyRequest {
+                        action,
+                        branch: None,
+                        target_branch: None,
+                    },
+                )
+                .unwrap();
+            assert!(decision.allowed, "{action}: {}", decision.message);
+        }
+    }
+
+    #[test]
+    fn maintain_is_branch_scoped_and_reclaim_takes_no_branch_scope() {
+        let policy: PolicyConfig = yaml_serde::from_str(
+            r#"
+version: 1
+groups:
+  automation: [act-bot]
+  writers: [act-writer]
+protected_branches: [main]
+rules:
+  - id: automation-maintains-unprotected
+    allow:
+      actors: { group: automation }
+      actions: [maintain]
+      branch_scope: unprotected
+  - id: writers-change
+    allow:
+      actors: { group: writers }
+      actions: [change]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+        let decide = |actor: &str, action, branch: Option<&str>| {
+            engine
+                .authorize(
+                    actor,
+                    &PolicyRequest {
+                        action,
+                        branch: branch.map(str::to_string),
+                        target_branch: None,
+                    },
+                )
+                .unwrap()
+                .allowed
+        };
+        assert!(decide("act-bot", PolicyAction::Maintain, Some("feature")));
+        assert!(!decide("act-bot", PolicyAction::Maintain, Some("main")));
+        // Maintenance grants neither data writes nor reclamation.
+        assert!(!decide("act-bot", PolicyAction::Change, Some("feature")));
+        assert!(!decide("act-bot", PolicyAction::Reclaim, None));
+        // And `change` grants no maintenance.
+        assert!(!decide(
+            "act-writer",
+            PolicyAction::Maintain,
+            Some("feature")
+        ));
+        assert!(!decide("act-writer", PolicyAction::Reclaim, None));
+
+        let reclaim = r#"
+version: 1
+groups:
+  automation: [act-bot]
+rules:
+  - id: automation-reclaims
+    allow:
+      actors: { group: automation }
+      actions: [reclaim]
+"#;
+        let engine = PolicyEngine::load_graph_from_source(reclaim, "graph").unwrap();
+        let allowed = engine
+            .authorize(
+                "act-bot",
+                &PolicyRequest {
+                    action: PolicyAction::Reclaim,
+                    branch: None,
+                    target_branch: None,
+                },
+            )
+            .unwrap();
+        assert!(allowed.allowed);
+        assert_eq!(
+            PolicyAction::Reclaim.resource_kind(),
+            PolicyResourceKind::Graph
+        );
+        for scope in ["branch_scope", "target_branch_scope"] {
+            let scoped = reclaim.replace(
+                "actions: [reclaim]",
+                &format!("actions: [reclaim]\n      {scope}: any"),
+            );
+            let Err(error) = PolicyEngine::load_graph_from_source(&scoped, "graph") else {
+                panic!("{scope} on reclaim must be refused");
+            };
+            assert!(
+                error.to_string().contains("unsupported action 'reclaim'"),
+                "{scope}: {error}"
+            );
+        }
+        let target_scoped_maintain = reclaim.replace("[reclaim]", "[maintain]").replace(
+            "actions: [maintain]",
+            "actions: [maintain]\n      target_branch_scope: any",
+        );
+        assert!(PolicyEngine::load_graph_from_source(&target_scoped_maintain, "graph").is_err());
     }
 }

@@ -1662,8 +1662,9 @@ fn measure_counts_schema_contract_requests_issue_817() {
     }
     assert_eq!(
         repeated_heads(2, "table_meta"),
-        1,
-        "the second insert reopens the first insert's manifest for its index section"
+        0,
+        "the second insert reopens nothing: the first insert's commit left its handle in \
+         the table handle cache under the pin the published row carries"
     );
     assert_eq!(
         repeated_heads(3, "manifest_meta"),

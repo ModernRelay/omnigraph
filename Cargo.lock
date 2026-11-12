@@ -5516,7 +5516,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-api-types"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "arrow-schema",
  "omnigraph-compiler",
@@ -5529,7 +5529,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-azure-admission"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -5549,7 +5549,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-bench"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5579,7 +5579,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-catalog"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -5613,7 +5613,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cli"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -5656,7 +5656,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cluster"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "async-trait",
  "omnigraph-compiler",
@@ -5679,7 +5679,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-compiler"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -5700,7 +5700,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-core"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5740,7 +5740,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-dst"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "arrow-array",
  "async-trait",
@@ -5764,7 +5764,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-engine"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -5824,7 +5824,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "async-trait",
  "datatest-stable",
@@ -5846,7 +5846,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt-core"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5869,7 +5869,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-gqt-served"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "axum",
  "datatest-stable",
@@ -5883,7 +5883,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-mcp"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "axum",
  "color-eyre",
@@ -5897,7 +5897,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-planner"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "arrow-schema",
  "futures",
@@ -5911,7 +5911,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-policy"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "cedar-policy",
  "clap",
@@ -5924,7 +5924,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-reference-engine"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -5948,7 +5948,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-seams"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "syn",
  "tempfile",
@@ -5958,7 +5958,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-server"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -6012,11 +6012,11 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-skill"
-version = "0.15.0"
+version = "0.15.1"
 
 [[package]]
 name = "omnigraph-storage"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6032,7 +6032,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-vocabulary-guard"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "clap",
  "proc-macro2",
@@ -7666,9 +7666,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.3.0"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b88db56b8ae316560e9e868b6b978ea940f27cb883323fc90e07435e44158f5c"
+checksum = "d24a7e92f4bcaa36b97fa93c4fa7ca8f3e669eced949345b3462dba333c7f909"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -7679,12 +7679,14 @@ dependencies = [
  "http-body 1.0.1",
  "http-body-util",
  "indexmap 2.14.0",
+ "libc",
  "pastey",
  "pin-project-lite",
  "rand 0.10.2",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sse-stream",
  "thiserror",
  "tokio",
@@ -7765,9 +7767,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.0",
  "errno",

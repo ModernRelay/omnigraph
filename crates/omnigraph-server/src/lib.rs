@@ -11,6 +11,8 @@ mod handlers;
 mod http_contract;
 mod http_operations;
 mod ingress;
+mod recorded_operations;
+pub use recorded_operations::OperationSettings;
 mod mcp;
 pub mod operations;
 mod redacted_cause;
@@ -123,6 +125,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         (name = "cluster", description = "Cluster deployment planning and execution"),
         (name = "commits", description = "Graph commit history and publication"),
         (name = "health", description = "Process health and readiness probes"),
+        (name = "operations", description = "Recorded operations: optimize through the serving owner, looked up and cancelled by id"),
         (name = "management", description = "Server graph inventory and OAuth resource metadata"),
         (name = "mutations", description = "Graph mutations and data loading"),
         (name = "queries", description = "Inline and stored queries, and graph exports"),
@@ -170,6 +173,9 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_merge_base,
         handlers::server_changes_feed,
         handlers::server_changes_baseline,
+        recorded_operations::start_optimize,
+        recorded_operations::get_operation,
+        recorded_operations::cancel_operation,
     ),
     components(schemas(api::EntityKind, api::CommitListing, api::ChangeBaselineRecord, api::ChangeErrorOutput)),
     modifiers(&SecurityAddon),
@@ -229,6 +235,11 @@ pub struct ServerConfig {
     /// who set up auth and forgot the policy file would otherwise ship
     /// the illusion of protection.
     pub allow_unauthenticated: bool,
+    /// Operator opt-in, from `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` only,
+    /// that lets every static bearer token `read` a graph with no applied
+    /// policy. Off by default: tokens are not scoped to graphs, so the
+    /// permit reaches every policy-less graph on the server.
+    pub allow_reads_without_policy: bool,
     /// Operator opt-in for fail-fast cluster boot. By default, graph-local
     /// startup failures quarantine that graph and healthy graphs still serve.
     /// When true, any quarantined or failed graph aborts startup.
@@ -421,6 +432,9 @@ pub struct AppState {
     // drain is not qualified native settlement, so the server never unlocks.
     cluster_admission: Option<omnigraph_cluster::ClusterAdmission>,
     deployments: Arc<deployment::DeploymentRuntime>,
+    /// Recorded operations: the record gate, the admission gates and the
+    /// runs this process holds.
+    recorded: Arc<recorded_operations::RecordedOperations>,
     /// Runtime routing and availability for every configured graph.
     /// Middleware injects an admitted `serving::GraphRequest` or refuses a blocked
     /// graph before collecting its request body.
@@ -430,6 +444,9 @@ pub struct AppState {
     workload: Arc<workload::WorkloadController>,
     operations: operations::OperationRuntime,
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
+    /// Whether a static bearer token may `read` a graph with no applied
+    /// policy ([`ServerConfig::allow_reads_without_policy`]).
+    allow_reads_without_policy: bool,
     data_token_trust: Option<Arc<data_tokens::DataTokenTrust>>,
     oidc_identity_trust: Option<Arc<oidc_identity::OidcIdentityTrust>>,
     /// MCP boot settings: the extra `Host` values `/mcp` admits.
@@ -523,6 +540,7 @@ enum ApiErrorDetails {
     MergeConflicts(Vec<api::MergeConflictOutput>),
     PublishedDatasetVersionConflict(api::PublishedDatasetVersionConflictOutput),
     ReadSetConflict(api::ReadSetConflictOutput),
+    WriterFenced(api::WriterFencedOutput),
     KeyConflict(api::KeyConflictOutput),
     ResourceLimit(api::ResourceLimitOutput),
     BlobRange(api::BlobRangeOutput),
@@ -561,6 +579,7 @@ impl ApiErrorDetails {
             Self::MergeConflicts(_)
             | Self::PublishedDatasetVersionConflict(_)
             | Self::ReadSetConflict(_)
+            | Self::WriterFenced(_)
             | Self::KeyConflict(_)
             | Self::ResourceLimit(_)
             | Self::ExternalBlobSource(_)
@@ -860,6 +879,7 @@ impl AppState {
         Self {
             cluster_admission: None,
             deployments: Arc::new(deployment::DeploymentRuntime::default()),
+            recorded: Arc::new(recorded_operations::RecordedOperations::default()),
             routing: GraphRouting {
                 registry,
                 config_path: None,
@@ -868,6 +888,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            allow_reads_without_policy: false,
             mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
@@ -914,6 +935,7 @@ impl AppState {
         Ok(Self {
             cluster_admission: None,
             deployments: Arc::new(deployment::DeploymentRuntime::default()),
+            recorded: Arc::new(recorded_operations::RecordedOperations::default()),
             routing: GraphRouting {
                 registry,
                 config_path,
@@ -922,6 +944,7 @@ impl AppState {
             bearer_tokens,
             data_token_trust: None,
             oidc_identity_trust: None,
+            allow_reads_without_policy: false,
             mcp: Arc::new(McpSettings::default()),
             operations: operations::OperationRuntime::new(),
             export_transport: export_transport::ExportTransport::with_defaults(),
@@ -1008,6 +1031,7 @@ impl AppState {
                 .set(id, &value, omnigraph::settings::Source::Request)
                 .map_err(|error| ApiError::bad_request(error.to_string()))?;
         }
+        refuse_raised_budgets(session.settings(), &self.process_defaults.settings)?;
         Ok(session)
     }
 
@@ -1040,6 +1064,23 @@ impl AppState {
     #[must_use]
     pub fn with_mcp_settings(mut self, mcp: McpSettings) -> Self {
         self.mcp = Arc::new(mcp);
+        self
+    }
+
+    /// Attach the recorded-operation settings; the routes are off without
+    /// them.
+    #[must_use]
+    pub fn with_operation_settings(mut self, settings: OperationSettings) -> Self {
+        self.recorded = Arc::new(recorded_operations::RecordedOperations::new(settings));
+        self
+    }
+
+    /// Let every static bearer token `read` a graph with no applied policy,
+    /// the behaviour before reads were denied like every other action
+    /// ([`ServerConfig::allow_reads_without_policy`]).
+    #[must_use]
+    pub fn with_reads_without_policy(mut self, allow: bool) -> Self {
+        self.allow_reads_without_policy = allow;
         self
     }
 
@@ -1105,7 +1146,8 @@ impl AppState {
             }
         }
         if let Some(actor) = matched {
-            return Ok(AuthenticatedActor::cluster_static(actor));
+            return Ok(AuthenticatedActor::cluster_static(actor)
+                .with_policy_less_reads(self.allow_reads_without_policy));
         }
         let Some(now) = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1126,6 +1168,60 @@ impl AppState {
             _ => Err(oidc_identity::OidcRefusal::Invalid),
         }
     }
+}
+
+/// Refuse request settings that raise a resource budget past this server's
+/// ceiling: the larger of its own value and the built-in default. A served
+/// request may lower `traversal_work_limit`, `query_memory_bytes`,
+/// `write_max_bytes` and `load_source_max_bytes`, or raise one back to the
+/// default an operator lowered it from; going further is the operator's
+/// decision, made through the process environment, since a raised budget is
+/// work or memory one request may hold.
+pub(crate) fn refuse_raised_budgets(
+    requested: &omnigraph::settings::SessionSettings,
+    server: &omnigraph::settings::SessionSettings,
+) -> std::result::Result<(), ApiError> {
+    use omnigraph_compiler::settings::SettingId;
+    let default = omnigraph::settings::SessionSettings::default();
+    let budgets = [
+        (
+            SettingId::TraversalWorkLimit,
+            requested.traversal_work_limit(),
+            server
+                .traversal_work_limit()
+                .max(default.traversal_work_limit()),
+        ),
+        (
+            SettingId::QueryMemoryBytes,
+            requested.query_memory_bytes(),
+            server
+                .query_memory_bytes()
+                .max(default.query_memory_bytes()),
+        ),
+        (
+            SettingId::WriteMaxBytes,
+            requested.write_max_bytes(),
+            server.write_max_bytes().max(default.write_max_bytes()),
+        ),
+        (
+            SettingId::LoadSourceMaxBytes,
+            requested.load_source_max_bytes(),
+            server
+                .load_source_max_bytes()
+                .max(default.load_source_max_bytes()),
+        ),
+    ];
+    for (id, asked, limit) in budgets {
+        if asked > limit {
+            return Err(ApiError::bad_request(format!(
+                "setting `{}` = {asked} is above this server's ceiling of {limit}; the operator \
+                 raises the ceiling with `{}`",
+                id.name(),
+                id.spec().env
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn hash_bearer_tokens(bearer_tokens: Vec<(String, String)>) -> Arc<[(BearerTokenHash, Arc<str>)]> {
@@ -1371,6 +1467,13 @@ impl ApiError {
         Self::conflict(message).with_details(ApiErrorDetails::ReadSetConflict(details))
     }
 
+    /// HTTP 409 `writer_fenced`: the branch's writer epoch refused a publish
+    /// or a claim before its put, with the `writer_fenced` detail.
+    fn writer_fenced(message: String, details: api::WriterFencedOutput) -> Self {
+        Self::new(ErrorCode::WriterFenced, message)
+            .with_details(ApiErrorDetails::WriterFenced(details))
+    }
+
     fn key_conflict(message: String, details: api::KeyConflictOutput) -> Self {
         Self::conflict(message).with_details(ApiErrorDetails::KeyConflict(details))
     }
@@ -1440,6 +1543,16 @@ impl ApiError {
     /// leave effects unknown.
     pub(crate) fn after_owned_write(mut self) -> Self {
         self.owned_write = true;
+        self
+    }
+
+    /// Mark an error as a definite refusal that applied nothing: the store
+    /// refused the write, or the server refused it before sending one. Its
+    /// effects are none even after an owned write started, as an engine
+    /// step's proof that it published nothing makes them.
+    pub(crate) fn applied_nothing(mut self) -> Self {
+        self.completion_uncertain = false;
+        self.unpublished = true;
         self
     }
 
@@ -1607,6 +1720,18 @@ impl ApiError {
                     Some(ManifestConflictDetails::UnattachedCannotPublish { .. }) => {
                         Self::unattached_cannot_publish(err.message)
                     }
+                    Some(ManifestConflictDetails::WriterFenced {
+                        held,
+                        read,
+                        current,
+                    }) => Self::writer_fenced(
+                        err.message,
+                        api::WriterFencedOutput {
+                            held,
+                            read,
+                            current,
+                        },
+                    ),
                     _ => Self::conflict(err.message),
                 },
                 ManifestErrorKind::Internal => Self::internal(err.message),
@@ -1997,6 +2122,7 @@ impl ApiError {
                     output.published_dataset_version_conflict = Some(value)
                 }
                 ApiErrorDetails::ReadSetConflict(value) => output.read_set_conflict = Some(value),
+                ApiErrorDetails::WriterFenced(value) => output.writer_fenced = Some(value),
                 ApiErrorDetails::KeyConflict(value) => output.key_conflict = Some(value),
                 ApiErrorDetails::ResourceLimit(value) => output.resource_limit = Some(value),
                 ApiErrorDetails::BlobRange(value) => output.blob_range = Some(value),
@@ -2205,6 +2331,53 @@ mod api_error_tests {
     }
 
     #[tokio::test]
+    async fn branch_claim_refusal_is_409_writer_fenced_with_its_epochs() {
+        async fn body_of(error: ApiError) -> serde_json::Value {
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let publish = body_of(
+            ApiError::from_omni(OmniError::manifest_writer_fenced(
+                "feature",
+                Some(1),
+                None,
+                2,
+            ))
+            .after_owned_write(),
+        )
+        .await;
+        assert_eq!(publish["code"], "writer_fenced", "{publish}");
+        assert_eq!(
+            publish["writer_fenced"],
+            serde_json::json!({"held": 1, "current": 2}),
+            "{publish}"
+        );
+        assert_eq!(
+            publish["disposition"],
+            serde_json::json!({"effects": "none", "action": "refresh"}),
+            "{publish}"
+        );
+
+        let claim = body_of(ApiError::from_omni(OmniError::manifest_writer_fenced(
+            "feature",
+            None,
+            Some(0),
+            1,
+        )))
+        .await;
+        assert_eq!(
+            claim["writer_fenced"],
+            serde_json::json!({"read": 0, "current": 1}),
+            "{claim}"
+        );
+    }
+
+    #[tokio::test]
     async fn change_feed_gap_is_typed_410() {
         let response = ApiError::from_omni(OmniError::ChangeFeedGap {
             cursor: Some("opaque-cursor".to_string()),
@@ -2321,6 +2494,27 @@ mod api_error_tests {
         let error = output_of(marked).await;
         assert_eq!(error.code, Some(ErrorCode::Conflict));
         assert_eq!(error.disposition, partial(DispositionAction::Refresh));
+
+        // A refusal the store or the server made before anything applied
+        // (a refused operation record write, a graph closing for a
+        // deployment) applied nothing, after an owned write started too; a
+        // 503 is retried.
+        let error = output_of(
+            ApiError::new(ErrorCode::ServiceUnavailable, "nothing was accepted")
+                .after_owned_write()
+                .applied_nothing(),
+        )
+        .await;
+        assert_eq!(error.code, Some(ErrorCode::ServiceUnavailable));
+        assert_eq!(error.disposition, none(DispositionAction::Retry));
+        let error =
+            output_of(ApiError::new(ErrorCode::ServiceUnavailable, "refused").after_owned_write())
+                .await;
+        assert_eq!(
+            error.disposition,
+            unknown(DispositionAction::Reconcile),
+            "without the mark, an error after an owned write may follow its effect"
+        );
 
         // Refusals a write meets before it starts took no effect, unless an
         // earlier step of the operation published.
@@ -3990,12 +4184,18 @@ async fn serve_config(
         ),
         ServerRuntimeState::DefaultDeny => warn!(
             "bearer tokens are configured but no policy file is set — running in \
-             default-deny mode (static credentials permit `read`; signed data \
-             credentials require an explicit policy permit). Declare required policy \
-             bundles when bootstrapping; this deployment class keeps existing policy \
-             bindings fixed."
+             default-deny mode: every graph action is refused until a policy permits \
+             it. Declare required policy bundles when bootstrapping; this deployment \
+             class keeps existing policy bindings fixed."
         ),
         ServerRuntimeState::PolicyEnabled => {}
+    }
+    if config.allow_reads_without_policy {
+        warn!(
+            "OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY is set: every static bearer token \
+             may read every graph that has no applied policy. Tokens are not scoped \
+             to graphs; apply a policy to each graph instead."
+        );
     }
 
     let bind = config.bind.clone();
@@ -4054,7 +4254,12 @@ async fn serve_config(
             shutdown_grace,
         )
         .with_process_defaults(process_defaults)
-        .with_mcp_settings(mcp);
+        .with_mcp_settings(mcp)
+        .with_operation_settings(
+            OperationSettings::from_env()
+                .map_err(|error| eyre!("operation setting refused at startup: {error}"))?,
+        )
+        .with_reads_without_policy(config.allow_reads_without_policy);
     deployment::initialize_boot_activation(&state);
     let retained_admission = state.cluster_admission.clone();
     if let Some(admission) = retained_admission.as_ref() {

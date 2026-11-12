@@ -12,8 +12,10 @@ use super::commit_graph::{
     CommitGraph, FirstParentPage, GraphCommit, HistoryCache, Lineage,
     graph_commit_from_manifest_row,
 };
+#[cfg(any(test, feature = "failpoints"))]
+use super::manifest::DatasetUpdate;
 use super::manifest::{
-    BranchRecords, CapturedManifestProbe, CommitBuffer, DatasetUpdate, ExpectedTableVersions,
+    BranchRecords, CapturedManifestProbe, CommitBuffer, ExpectedTableVersions,
     GenesisManifestAttempt, GraphHeadExpectation, HistoryRecord, HistoryReleaseBytes,
     LineageIntent, ManifestChange, ManifestCoordinator, ManifestIncarnation, ManifestInitError,
     PublishPrecondition, SchemaContractRow, UnattachedCommit, UnattachedIntent,
@@ -411,6 +413,24 @@ impl GraphCoordinator {
         self.manifest.probe_latest_incarnation().await
     }
 
+    /// Whether the head this coordinator holds is the branch's latest: no
+    /// request while this process holds the branch, whose head no other
+    /// process can move, and the probe otherwise.
+    pub(crate) async fn head_is_current(&self) -> Result<bool> {
+        if let Some(landed) = self.manifest.held_writer_version() {
+            return Ok(self.manifest.version() >= landed);
+        }
+        let held = self.manifest_incarnation();
+        Ok(self.probe_latest_incarnation().await?.matches(&held))
+    }
+
+    /// The version of this process's last publication on this branch while
+    /// it holds the branch with that publication on record, so
+    /// [`Self::head_is_current`] answers without a probe.
+    pub(crate) fn held_head(&self) -> Option<u64> {
+        self.manifest.held_writer_version()
+    }
+
     /// The lineage of the head this coordinator holds. Every operation that
     /// asks for history reads it here; the read of `__history` behind it is
     /// skipped while the history cache holds the head's parents.
@@ -593,35 +613,31 @@ impl GraphCoordinator {
     pub async fn resolve_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
         let normalized = normalize_branch_name(branch)?;
         let opened;
-        let coordinator = if normalized.as_deref() == self.current_branch()
-            && self
-                .probe_latest_incarnation()
-                .await?
-                .matches(&self.manifest_incarnation())
-        {
-            self
-        } else {
-            opened = match normalized.as_deref() {
-                Some(branch) => {
-                    GraphCoordinator::open_branch_with_session(
-                        self.root_uri(),
-                        branch,
-                        Arc::clone(&self.storage),
-                        &self.manifest.control_session(),
-                    )
-                    .await?
-                }
-                None => {
-                    GraphCoordinator::open_with_session(
-                        self.root_uri(),
-                        Arc::clone(&self.storage),
-                        &self.manifest.control_session(),
-                    )
-                    .await?
-                }
+        let coordinator =
+            if normalized.as_deref() == self.current_branch() && self.head_is_current().await? {
+                self
+            } else {
+                opened = match normalized.as_deref() {
+                    Some(branch) => {
+                        GraphCoordinator::open_branch_with_session(
+                            self.root_uri(),
+                            branch,
+                            Arc::clone(&self.storage),
+                            &self.manifest.control_session(),
+                        )
+                        .await?
+                    }
+                    None => {
+                        GraphCoordinator::open_with_session(
+                            self.root_uri(),
+                            Arc::clone(&self.storage),
+                            &self.manifest.control_session(),
+                        )
+                        .await?
+                    }
+                };
+                &opened
             };
-            &opened
-        };
 
         Ok(coordinator
             .effective_graph_head()
@@ -760,6 +776,8 @@ impl GraphCoordinator {
             // that method here (or `published_record`), even boxed or behind
             // a trait object, overflows the compiler's query depth limit in
             // the cluster crate's `bootstrap_serving` from a clean build.
+            // `resolve_commit` writes the same order; a new step goes in all
+            // three.
             None => match self.manifest.record_in_hinted_branch(id).await? {
                 Some(record) => Some(record),
                 None => match self
@@ -816,6 +834,8 @@ impl GraphCoordinator {
     /// in `__history`, else in a live branch. The first answers a branch's
     /// commits read one after another, as a history list or a review does,
     /// with one branch scan instead of a scan of every live branch each.
+    /// `commit_state` and `resolve_commit` write the same order out; a new
+    /// step goes in all three.
     async fn record_held_elsewhere(&self, id: &str) -> Result<Option<HistoryRecord>> {
         if let Some(record) = self.manifest.record_in_hinted_branch(id).await? {
             return Ok(Some(record));
@@ -869,7 +889,9 @@ impl GraphCoordinator {
     /// The commit `snapshot_id` names: the head of the active branch or a
     /// commit its `__manifest` buffers, a commit buffered on the branch a
     /// lookup last found its block on, a settled commit of `__history`, or
-    /// what [`Self::record_in_live_branches`] finds.
+    /// what [`Self::record_in_live_branches`] finds. The order after the
+    /// held commits is `record_held_elsewhere`'s, which `commit_state` also
+    /// writes out; a new step goes in all three.
     pub async fn resolve_commit(&self, snapshot_id: &SnapshotId) -> Result<GraphCommit> {
         let id = snapshot_id.as_str();
         if let Some(commit) = self.manifest.held_commit(id) {
@@ -1005,7 +1027,10 @@ impl GraphCoordinator {
     /// each immutable table identity matches what the caller observed before
     /// writing; the diagnostic alias is checked as part of the expectation.
     /// Mismatches surface as `OmniError::Manifest` with
-    /// `ManifestConflictDetails::PublishedDatasetVersionMismatch`.
+    /// `ManifestConflictDetails::PublishedDatasetVersionMismatch`. It publishes
+    /// over whatever head the branch has (`PublishPrecondition::Any`), so no
+    /// production writer uses it; tests and failpoint fixtures do.
+    #[cfg(any(test, feature = "failpoints"))]
     pub(crate) async fn commit_updates_with_actor_with_expected(
         &mut self,
         updates: &[DatasetUpdate],
@@ -1024,6 +1049,7 @@ impl GraphCoordinator {
     /// no separate write, no `commit_graph.refresh()` to pick a parent (the
     /// publisher resolves it under the CAS). The in-memory commit cache is then
     /// updated from the intent + the resolved parent without a re-read.
+    #[cfg(any(test, feature = "failpoints"))]
     async fn commit_changes_with_actor_with_expected(
         &mut self,
         changes: &[ManifestChange],
@@ -1146,6 +1172,12 @@ impl GraphCoordinator {
             _snapshot_id: SnapshotId::new(commit.graph_commit_id.clone()),
             commit,
         })
+    }
+
+    /// Claim this coordinator's branch for the process, on the incarnation
+    /// this view captured when it opened.
+    pub(crate) async fn claim_writer_epoch(&mut self) -> Result<u64> {
+        self.manifest.claim_writer_epoch().await
     }
 
     /// Mint a [`LineageIntent`] for the next commit on the current branch: a
@@ -1298,6 +1330,7 @@ pub(crate) fn commit_not_found(snapshot_id: &SnapshotId) -> OmniError {
 }
 
 /// Wrap each `DatasetUpdate` as a `ManifestChange::Update` for the publisher.
+#[cfg(any(test, feature = "failpoints"))]
 fn updates_to_changes(updates: &[DatasetUpdate]) -> Vec<ManifestChange> {
     updates
         .iter()

@@ -1057,6 +1057,10 @@ pub struct StagedWrite {
     /// adds without removing anything); populated from
     /// `Operation::Update.removed_fragment_ids` for keyed writes.
     removed_fragment_ids: Vec<u64>,
+    /// Rows `stage_delete` removes, as Lance's delete scan counted them while
+    /// staging. `None` for every other effect, including `stage_delete_rows`,
+    /// whose rows the caller supplies and Lance does not count.
+    deleted_rows: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1183,6 +1187,7 @@ impl StagedWrite {
             commit_metadata: StagedCommitMetadata::default(),
             new_fragments,
             removed_fragment_ids,
+            deleted_rows: None,
         }
     }
 
@@ -1197,7 +1202,19 @@ impl StagedWrite {
             commit_metadata,
             new_fragments,
             removed_fragment_ids,
+            deleted_rows: None,
         }
+    }
+
+    fn with_deleted_rows(mut self, deleted_rows: u64) -> Self {
+        self.deleted_rows = Some(deleted_rows);
+        self
+    }
+
+    /// Rows a `stage_delete` removes, as Lance's delete scan counted them;
+    /// `None` for any other effect, including `stage_delete_rows`.
+    pub(crate) fn deleted_rows(&self) -> Option<u64> {
+        self.deleted_rows
     }
 
     pub fn new_fragments(&self) -> &[Fragment] {
@@ -3373,12 +3390,15 @@ impl TableStore {
             }
         };
 
-        Ok(Some(StagedWrite::with_commit_metadata(
-            uncommitted.transaction,
-            StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
-            new_fragments,
-            removed_fragment_ids,
-        )))
+        Ok(Some(
+            StagedWrite::with_commit_metadata(
+                uncommitted.transaction,
+                StagedCommitMetadata::affected_rows(uncommitted.affected_rows),
+                new_fragments,
+                removed_fragment_ids,
+            )
+            .with_deleted_rows(uncommitted.num_deleted_rows),
+        ))
     }
 
     /// Stage the delete of exactly the rows at `row_addrs`, captured by the
@@ -4796,6 +4816,41 @@ impl TableStore {
     /// nothing); after an early stop, a lower bound that already derives one-row batches.
     /// `None` when a nested or non-Blob-v2 Blob field cannot be sized.
     async fn max_row_blob_bytes(ds: &Dataset, fragments: Vec<Fragment>) -> Result<Option<u64>> {
+        let mut max = 0_u64;
+        let sized = Self::visit_row_blob_bytes(ds, fragments, |rows| {
+            max = rows.iter().copied().fold(max, u64::max);
+            compaction_blob_batch_rows(max) != 1
+        })
+        .await?;
+        Ok(sized.then_some(max))
+    }
+
+    /// Managed Blob bytes in `fragments`, from descriptors (externals count nothing and
+    /// are never fetched); the count stops once it passes `ceiling`, so a value above
+    /// `ceiling` is a lower bound. `None` when a nested or non-Blob-v2 Blob field cannot
+    /// be sized.
+    pub(crate) async fn managed_blob_bytes(
+        ds: &Dataset,
+        fragments: Vec<Fragment>,
+        ceiling: u64,
+    ) -> Result<Option<u64>> {
+        let mut total = 0_u64;
+        let sized = Self::visit_row_blob_bytes(ds, fragments, |rows| {
+            total = rows.iter().fold(total, |sum, row| sum.saturating_add(*row));
+            total <= ceiling
+        })
+        .await?;
+        Ok(sized.then_some(total))
+    }
+
+    /// Scan the Blob descriptors of `fragments` and hand each batch's per-row managed
+    /// bytes to `visit`, which returns false to stop. Returns false, scanning nothing,
+    /// when a nested or non-Blob-v2 Blob field cannot be sized.
+    async fn visit_row_blob_bytes(
+        ds: &Dataset,
+        fragments: Vec<Fragment>,
+        mut visit: impl FnMut(&[u64]) -> bool,
+    ) -> Result<bool> {
         if nested_blob_field(ds.schema()).is_some()
             || ds
                 .schema()
@@ -4803,7 +4858,7 @@ impl TableStore {
                 .iter()
                 .any(|field| field.is_blob() && !field.is_blob_v2())
         {
-            return Ok(None);
+            return Ok(false);
         }
         let blob_columns = ds
             .schema()
@@ -4812,13 +4867,15 @@ impl TableStore {
             .filter(|field| field.is_blob())
             .map(|field| field.name.as_str())
             .collect::<Vec<_>>();
+        if blob_columns.is_empty() {
+            return Ok(true);
+        }
         let mut stream =
             Self::scan_stream_with(ds, Some(&blob_columns), None, None, false, |scanner| {
                 scanner.with_fragments(fragments);
                 Ok(())
             })
             .await?;
-        let mut max = 0_u64;
         while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
             let mut row_bytes = vec![0_u64; batch.num_rows()];
             for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
@@ -4839,12 +4896,11 @@ impl TableStore {
                     }
                 }
             }
-            max = row_bytes.into_iter().fold(max, u64::max);
-            if compaction_blob_batch_rows(max) == 1 {
+            if !visit(&row_bytes) {
                 break;
             }
         }
-        Ok(Some(max))
+        Ok(true)
     }
 
     /// Stage creation of a new dataset without publishing its first manifest.
@@ -5853,7 +5909,7 @@ impl TableStore {
                 .await?
         };
         let mut account = PendingScanAccount::new(budget)?;
-        account.add_batches(&pending)?;
+        let pending = account.retain_all(pending)?;
 
         let scan_rows = account.next_scan_rows();
         let scan_bytes = account.next_scan_bytes();
@@ -5887,8 +5943,7 @@ impl TableStore {
             if batch.num_rows() == 0 {
                 continue;
             }
-            account.add_batch(&batch)?;
-            committed.push(batch);
+            committed.push(account.retain(batch)?);
         }
 
         committed.extend(pending);
@@ -6024,7 +6079,7 @@ impl TableStore {
                 .collect::<Result<Vec<_>>>()?,
         };
         let mut account = PendingScanAccount::new(budget)?;
-        account.add_batches(&pending)?;
+        let pending = account.retain_all(pending)?;
         let carried_without_blobs: Option<SchemaRef> =
             (!carried.fields.iter().any(|field| field.is_blob()))
                 .then(|| Arc::new((&carried).into()));
@@ -6067,20 +6122,22 @@ impl TableStore {
                 continue;
             }
             account.ensure_additional_rows(batch.num_rows())?;
+            if let Some(schema) = &carried_without_blobs {
+                let carried_rows = predicate_rows_as(schema, &batch)?;
+                committed.push(account.retain(carried_rows)?);
+                continue;
+            }
+
             // This predicate scan contains every logical non-blob column and
             // `_rowid`, but no blob descriptors/payloads. Charge the logical
             // columns now so an already-overwide match fails before
-            // `take_rows` performs the second full-row read.
+            // `take_rows` performs the second full-row read. A scanner batch
+            // can share buffers with rows it does not contain, so measure a
+            // copy of the matched rows, as `PendingScanAccount::retain` does.
+            let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
             let non_blob_bytes = non_blob_column_bytes(committed_ds, &batch)?;
             account.remaining_bytes_after(non_blob_bytes)?;
             let payload_budget = account.write_budget.bytes() - account.payload_bytes;
-
-            if let Some(schema) = &carried_without_blobs {
-                let carried_rows = predicate_rows_as(schema, &batch)?;
-                account.add_batch(&carried_rows)?;
-                committed.push(carried_rows);
-                continue;
-            }
 
             let row_ids = batch
                 .column_by_name("_rowid")
@@ -6136,8 +6193,7 @@ impl TableStore {
                 Err(error) => return Err(error),
                 Ok(materialized) => materialized,
             };
-            account.add_batch(&materialized)?;
-            committed.push(materialized);
+            committed.push(account.retain(materialized)?);
         }
 
         committed.extend(pending);
@@ -6401,8 +6457,7 @@ impl TableStore {
          -> Result<UpdateMatches> {
             let mut batches = Vec::with_capacity(scanned.len());
             for (rows, _) in scanned {
-                account.add_batch(&rows)?;
-                batches.push(rows);
+                batches.push(account.retain(rows)?);
             }
             Ok(UpdateMatches {
                 mode: UpdateWriteMode::ColumnPatch,
@@ -6420,8 +6475,8 @@ impl TableStore {
             let mut trial = account.clone();
             let mut batches = Vec::with_capacity(scanned_whole.len());
             for whole in scanned_whole {
-                match trial.add_batch(&whole) {
-                    Ok(()) => batches.push(whole),
+                match trial.retain(whole) {
+                    Ok(whole) => batches.push(whole),
                     Err(OmniError::ResourceLimitExceeded { .. }) => {
                         cost.rows_over_budget = true;
                         return patch(scanned, &mut account, cost);
@@ -6501,7 +6556,7 @@ impl TableStore {
                     &trial,
                 )
                 .await
-                .and_then(|whole| trial.add_batch(&whole).map(|()| whole))
+                .and_then(|whole| trial.retain(whole))
             {
                 Ok(whole) => whole,
                 Err(OmniError::ResourceLimitExceeded { .. }) => {
@@ -7041,7 +7096,9 @@ fn value_bytes(batch: &RecordBatch) -> u64 {
 ///
 /// The retained `Vec<RecordBatch>` never grows past this account: pending
 /// results are charged first, and each committed scanner emission is charged
-/// only after pending-key shadowing. `initial_rows` represents this table's
+/// only after pending-key shadowing. Every kept batch goes through
+/// [`Self::retain`], so neither the charge nor the memory held depends on the
+/// rows stored beside a match. `initial_rows` represents this table's
 /// retained batches, while `initial_bytes` represents every table retained by
 /// `MutationStaging`, so a chained cross-table update receives only the
 /// remaining graph-operation byte budget.
@@ -7074,17 +7131,33 @@ impl PendingScanAccount {
         &self.table_key
     }
 
-    fn add_batches(&mut self, batches: &[RecordBatch]) -> Result<()> {
-        for batch in batches {
-            self.add_batch(batch)?;
-        }
-        Ok(())
+    /// [`Self::retain`] each batch in order.
+    fn retain_all(&mut self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+        batches
+            .into_iter()
+            .map(|batch| self.retain(batch))
+            .collect()
     }
 
-    fn add_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+    /// The one way a pending-aware scan keeps a batch, and the only method
+    /// that charges one: copy its rows into buffers of their own, then charge
+    /// the copy, and return the copy to keep.
+    ///
+    /// A Lance scanner batch can share buffers with rows it does not contain,
+    /// so charging (or keeping) it as emitted could count rows stored beside
+    /// a match. Copying first makes both the charge and the memory held
+    /// depend only on the kept rows, never on storage layout (issue #1303).
+    /// There is deliberately no separate batch charge method. Only `new` and
+    /// `retain` call `add_usage`, by convention rather than by the compiler,
+    /// so a new retention point should keep its batches through `retain`, and
+    /// must not charge an uncopied batch through `add_usage`. The copy is
+    /// made before the charge: its size is bounded by the input batch, not by
+    /// the budget, so an over-budget copy is made and then refused.
+    fn retain(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+        let batch = copy_batch_range(&batch, 0, batch.num_rows())?;
         let rows = u64::try_from(batch.num_rows())
             .map_err(|_| OmniError::manifest_internal("pending scan row count exceeds u64"))?;
-        let usage = write_batch_bytes(batch)?;
+        let usage = write_batch_bytes(&batch)?;
         let payload_bytes = self
             .payload_bytes
             .checked_add(usage.payload)
@@ -7093,7 +7166,7 @@ impl PendingScanAccount {
             .check(MATERIALIZED_BLOB_PAYLOAD_BYTES, payload_bytes)?;
         self.add_usage(rows, usage.rows)?;
         self.payload_bytes = payload_bytes;
-        Ok(())
+        Ok(batch)
     }
 
     fn add_usage(&mut self, rows: u64, bytes: u64) -> Result<()> {

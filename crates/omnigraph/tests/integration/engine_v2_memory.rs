@@ -520,7 +520,7 @@ node Doc {
         seed.push('\n');
     }
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let v2 = with_setting(&db, "engine", "v2");
     let source = r#"query fused($q: String) {
         match { $d: Doc }
@@ -608,7 +608,7 @@ edge Knows: Doc -> Doc
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let v2 = with_setting(
         &with_setting(&db, "engine", "v2"),
         "rrf_plan",
@@ -724,7 +724,7 @@ edge Knows: Person -> Person
         )
         .await
         .unwrap();
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
         let v2 = with_setting(&db, "engine", "v2");
         let queries = r#"
 query fused($q: String) {
@@ -846,7 +846,9 @@ async fn hash_join_output_is_the_refusing_reservation() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.optimize().await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     let v2 = with_setting(&db, "engine", "v2");
 
     let limit = 8 * MIB;
@@ -929,7 +931,9 @@ async fn underestimated_hash_build_retries_id_lookup() {
     db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.optimize().await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     let v2 = with_setting(&db, "engine", "v2");
     let limit = 16 * MIB;
     let explain = with_query_memory_limit(

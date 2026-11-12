@@ -40,7 +40,7 @@ Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace
 | **Branching** | Agents propose reviewable changes instead of writing to main: a branch per agent or task, three-way merge, time travel across the whole graph. |
 | **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers and policies. `cluster plan` previews, `cluster apply` converges, Terraform-style. |
 | **Security as code** | Cedar policy enforced **server-side on every mutation**, per graph or server-wide; bearer auth, server-resolved actors, audit tracking. |
-| **Object-storage native, open format** | Decoupled storage and compute. Store graphs on local disk or S3-compatible storage: RustFS / MinIO, AWS S3 / R2 / GCS, or Azure preview. Graph data uses open, versioned [Lance](https://github.com/lance-format/lance), including Blob values. |
+| **Object-storage native, open format** | Decoupled storage and compute. Store graphs on local disk or S3-compatible storage: RustFS / MinIO, AWS S3 / R2, or Azure preview. Graph data uses open, versioned [Lance](https://github.com/lance-format/lance), including Blob values. |
 
 ## What you can build
 
@@ -88,16 +88,12 @@ default branch instead.
 Codex, or any agent that can read a URL and run a shell command:
 
 ```text
-Help me set up Omnigraph
-
-1. Read the docs at https://github.com/ModernRelay/omnigraph, starting with
-   docs/user/clusters/index.md, then docs/user/deployment.md.
-2. Skim the starter graphs and seed data in the cookbooks:
-   https://github.com/ModernRelay/omnigraph-cookbooks
-3. Ask me what I want to build (company brain, agent memory, dev graph,
-   research / R&D layer, …). Then stand up a cluster for it, load a little
-   data, and run a query so I can see it working.
+Read https://github.com/ModernRelay/omnigraph/blob/main/skills/omnigraph/references/onboarding.md and follow it to set up Omnigraph for me.
 ```
+
+The agent installs the CLI, asks what the graph is for, builds and queries a
+small local graph, and then points to the cookbooks, a cluster or Omnigraph
+Cloud.
 
 For ready-to-run graphs with real seed data (company brain, VC operating system,
 pharma & industry intel),

@@ -1,6 +1,6 @@
 use super::*;
 use crate::dataset_index::is_full_text_index;
-use crate::error::missing_graph_type_at_snapshot;
+use crate::error::{ManifestConflictDetails, ManifestError, missing_graph_type_at_snapshot};
 use crate::seams::{decide_seam, fail};
 use crate::table_store::{RefreshedIndex, TableStore};
 use lance::index::DatasetIndexExt;
@@ -36,13 +36,16 @@ pub(super) async fn graph_index_for_resolved(
         .await
 }
 
-pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<IndexBuildResult> {
+pub(super) async fn ensure_indices_as(
+    db: &Omnigraph,
+    actor: Option<&str>,
+) -> Result<IndexBuildResult> {
     let current_branch = db
         .coordinator
         .load_full()
         .current_branch()
         .map(str::to_string);
-    ensure_indices_on_as(db, current_branch.as_deref().unwrap_or("main"), None).await
+    ensure_indices_on_as(db, current_branch.as_deref().unwrap_or("main"), actor).await
 }
 
 pub(super) async fn ensure_indices_on_as(
@@ -53,7 +56,7 @@ pub(super) async fn ensure_indices_on_as(
     let branch = normalize_branch_name(branch)?;
     let public_branch = branch.as_deref().unwrap_or("main");
     db.enforce(
-        omnigraph_policy::PolicyAction::Change,
+        omnigraph_policy::PolicyAction::Maintain,
         &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
         actor,
     )?;
@@ -168,7 +171,7 @@ pub(super) async fn rebuild_full_text_indices_on_as(
     let branch = normalize_branch_name(branch)?;
     let public_branch = branch.as_deref().unwrap_or("main");
     db.enforce(
-        omnigraph_policy::PolicyAction::Change,
+        omnigraph_policy::PolicyAction::Maintain,
         &omnigraph_policy::ResourceScope::Branch(public_branch.to_string()),
         actor,
     )?;
@@ -616,6 +619,7 @@ async fn maintain_indices_for_branch(
             &txn,
             lineage,
             Publication::Publish,
+            None,
         )
         .await?;
         Some(published.graph_commit_id)
@@ -1573,10 +1577,28 @@ async fn publish_prepared(
     }
 }
 
+/// What a publication's before-publish hook learns: the lineage intent's
+/// nonce, which every attempt's history id carries
+/// (`omnigraph_core::graph_commit_id::commit_id_answers` matches one to it),
+/// and the head every attempt must read.
+#[derive(Debug, Clone)]
+pub(crate) struct PublicationIntent {
+    pub(crate) nonce: String,
+    pub(crate) input_commit: Option<String>,
+    pub(crate) input_manifest_version: u64,
+}
+
+/// A hook the shared publication helper calls once before publishing.
+pub(crate) type BeforePublishHook<'a> = &'a (
+        dyn Fn(PublicationIntent) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync
+    );
+
 /// Commit updates with a publisher-level OCC fence. The
 /// `expected_table_versions` map asserts the manifest's pre-write per-table
 /// versions; mismatches surface as `ManifestConflictDetails::PublishedDatasetVersionMismatch`.
 /// `publication` chooses the head-advancing publish or an unpublished commit.
+/// `before_publish`, when given, runs once after the updates are prepared and
+/// before the publisher's first attempt; its failure publishes nothing.
 pub(super) async fn commit_updates_on_branch_with_expected(
     db: &Omnigraph,
     branch: Option<&str>,
@@ -1586,6 +1608,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     txn: &crate::db::WriteTxn,
     lineage_intent: crate::db::manifest::LineageIntent,
     publication: Publication,
+    before_publish: Option<BeforePublishHook<'_>>,
 ) -> Result<crate::db::GraphCommit> {
     if branch != txn.branch.as_deref() {
         return Err(OmniError::manifest_internal(
@@ -1598,6 +1621,25 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn))
         .await
         .map_err(OmniError::unpublished)?;
+
+    // Once, not per attempt: every attempt reads the same head and carries
+    // the same nonce, so another call would record no new fact. The hook runs
+    // before the coordinator lock, and the publisher has not been called, so
+    // whatever the hook's own error says, the graph did not move.
+    if let Some(before_publish) = before_publish {
+        before_publish(PublicationIntent {
+            nonce: lineage_intent.graph_commit_id.clone(),
+            input_commit: txn.authority.graph_head.clone(),
+            input_manifest_version: txn.base.graph_manifest_version(),
+        })
+        .await
+        .map_err(|error| {
+            error
+                .into_completion_evidence()
+                .0
+                .with_completion_evidence(crate::error::CompletionEvidence::Unpublished)
+        })?;
+    }
 
     debug_assert_eq!(lineage_intent.actor_id.as_deref(), actor_id);
     let changes = prepared
@@ -1646,7 +1688,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         )
         .await;
         db.install_coordinator(next, &installed);
-        outcome?
+        outcome.map_err(|error| caller_precondition_at_publish(txn, branch, error))?
     } else {
         // An operation on a non-bound branch owns its coordinator locally;
         // it must never temporarily change this handle's query/write binding.
@@ -1691,23 +1733,49 @@ pub(super) async fn commit_updates_on_branch_with_expected(
             expectation,
             publication,
         )
-        .await?;
+        .await
+        .map_err(|error| caller_precondition_at_publish(txn, branch, error))?;
         *db.merge_authority_cache.lock().await = Some((cache_key.to_string(), coordinator));
         published
     };
     if advances_head {
-        evict_superseded_handles(db, &txn.base, updates).await;
+        demote_superseded_handles(db, &txn.base, updates).await;
     }
     Ok(published)
 }
 
-/// Drop the held handle of every pin this publication replaced on its
-/// branch. The branch now names the new pins, so the base versions left its
-/// working set; holding them kept one decoded manifest, which lists every
-/// fragment, per superseded version of a steadily written table (issue 859).
-/// Keys stay version-exact, so this is memory hygiene: another branch still
-/// at a base pin pays at most one reopen.
-async fn evict_superseded_handles(
+/// The publisher's refusal on the branch head is the caller's `--if-commit`
+/// miss when the write carries one: terminal `PreconditionFailed` naming the
+/// head the publisher read, as the under-gate revalidation answers it.
+fn caller_precondition_at_publish(
+    txn: &crate::db::WriteTxn,
+    branch: Option<&str>,
+    error: OmniError,
+) -> OmniError {
+    let Some(expected) = txn.caller_expected_graph_head.as_deref() else {
+        return error;
+    };
+    let branch = branch.unwrap_or("main");
+    match error {
+        OmniError::Manifest(ManifestError {
+            details:
+                Some(ManifestConflictDetails::ReadSetChanged {
+                    ref member,
+                    ref actual,
+                    ..
+                }),
+            ..
+        }) if *member == format!("graph_head:{branch}") => {
+            OmniError::precondition_failed(branch, expected, actual.clone())
+        }
+        other => other,
+    }
+}
+
+/// Move the held handle of every pin this publication replaced to the cache's
+/// eviction front: still warm for a reader or fork at that pin, first out
+/// under the byte budget (issue 859).
+async fn demote_superseded_handles(
     db: &Omnigraph,
     base: &crate::db::Snapshot,
     updates: &[crate::db::DatasetUpdate],
@@ -1723,7 +1791,7 @@ async fn evict_superseded_handles(
             || entry.version_metadata.e_tag() != update.version_metadata.e_tag();
         if replaced {
             handles
-                .evict(&omnigraph_core::handle_cache::TableHandleKey::new(
+                .demote(&omnigraph_core::handle_cache::TableHandleKey::new(
                     &entry.dataset_path,
                     entry.native_dataset_branch.as_deref(),
                     entry.published_dataset_version,

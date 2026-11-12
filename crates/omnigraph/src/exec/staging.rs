@@ -1184,6 +1184,7 @@ impl StagedMutation {
         db: &crate::db::Omnigraph,
         branch: Option<&str>,
         txn: &crate::db::WriteTxn,
+        early: Option<crate::db::EarlyRevalidation>,
     ) -> Result<CommittedMutation> {
         let StagedMutation {
             staged,
@@ -1220,7 +1221,7 @@ impl StagedMutation {
         // the complete attempt before effects. Mutation inserts and load
         // append/merge may then reprepare at their outer bounded retry loop;
         // strict read-modify-write operations return the typed conflict.
-        let snapshot = db.revalidate_write_txn(txn).await?;
+        let snapshot = db.revalidate_write_txn_with(txn, early).await?;
         let pins = txn
             .unattached_base
             .as_ref()
@@ -1305,6 +1306,17 @@ impl StagedMutation {
                 .with_table_fork_owner(table_fork_owner)
                 .with_staged(state.version, identity.uuid.clone())
                 .with_last_linear_version(path.entry.version_metadata.last_linear_version());
+            db.read_caches()
+                .handles
+                .insert(
+                    &path.entry.dataset_path,
+                    path.table_branch.as_deref(),
+                    target,
+                    Some(state.version),
+                    version_metadata.e_tag(),
+                    detached.dataset().clone(),
+                )
+                .await;
             let update = DatasetUpdate {
                 identity: path.identity,
                 type_key: table_key.clone(),

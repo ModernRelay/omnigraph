@@ -6,7 +6,7 @@
 # --cfg tokio_unstable comes from the workspace .cargo/config.toml.
 [package]
 name = "omnigraph-dst"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -16,8 +16,8 @@ default = ["failpoints"]
 failpoints = ["omnigraph-engine/failpoints"]
 
 [dependencies]
-omnigraph-engine = { path = "../omnigraph", version = "0.15.0", features = ["dst"] }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.0" }
+omnigraph-engine = { path = "../omnigraph", version = "0.15.1", features = ["dst"] }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1" }
 arrow-array = { workspace = true }
 lance-core = { workspace = true }
 lance-io = { workspace = true }
@@ -35,12 +35,12 @@ tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 # The frozen directory a prepared store mounts, and the control-object
 # adapter the cluster lock's protocol writes through in `scenarios.rs`.
-omnigraph-storage = { path = "../omnigraph-storage", version = "0.15.0" }
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.15.1" }
 
 [dev-dependencies]
 serial_test = "3"
 # The cluster lock's lease protocol, simulated in `scenarios.rs`.
-omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.15.0", features = ["test-util"] }
+omnigraph-cluster = { path = "../omnigraph-cluster", version = "0.15.1", features = ["test-util"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }

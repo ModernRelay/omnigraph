@@ -1253,10 +1253,11 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
 
 #[test]
 fn maintenance_refuses_server_targets_before_network() {
+    // `optimize` runs served maintenance on a server target; the rest are
+    // direct-storage commands.
     let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
     for command in [
-        &["optimize"][..],
-        &["index", "build"],
+        &["index", "build"][..],
         &["index", "rebuild", "--kind", "full-text"],
         &["rebuild-full-text-indexes"],
         &["repair"],
@@ -1278,6 +1279,49 @@ fn maintenance_refuses_server_targets_before_network() {
         assert!(server.requests().is_empty());
     }
     server.assert_complete();
+}
+
+/// `--timeout` bounds every wait, the submission included: a server that
+/// answers the submission only after the deadline does not hold the CLI,
+/// which names the operation and exits as in doubt.
+#[test]
+fn optimize_timeout_bounds_a_stalled_submission() {
+    use std::io::BufRead;
+    let server = crate::support::managed_http::IntentApiFixture::graph_with_response_delay(
+        vec![crate::support::managed_http::IntentReply::json(
+            202,
+            serde_json::json!({"lookup": "found", "operation": {"state": "accepted"}}),
+        )],
+        std::time::Duration::from_secs(8),
+    );
+    let mut child = crate::support::cli_process()
+        .args(["optimize", "--timeout", "1", "--target"])
+        .fixture_target(&server.origin)
+        .args(["--graph", "knowledge"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Timed from the submission, so the process's own start-up (slow on a
+    // freshly linked binary) does not count against the deadline.
+    let mut submitted = None;
+    let mut stderr = String::new();
+    for line in std::io::BufReader::new(child.stderr.take().unwrap()).lines() {
+        let line = line.unwrap();
+        if line.starts_with("operation id:") {
+            submitted = Some(std::time::Instant::now());
+        }
+        stderr.push_str(&line);
+        stderr.push('\n');
+    }
+    let status = child.wait().unwrap();
+    let waited = submitted.expect("the CLI names the operation").elapsed();
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    assert!(
+        waited < std::time::Duration::from_secs(5),
+        "the deadline bounds the submission: {waited:?}"
+    );
+    assert!(stderr.contains("stopped waiting"), "{stderr}");
 }
 
 #[test]
@@ -1384,7 +1428,8 @@ fn repair_json_reports_noop_on_clean_graph() {
 
     assert!(payload.get("confirm").is_none());
     assert!(payload.get("force").is_none());
-    assert_eq!(payload["graph_manifest_version"], Value::Null);
+    // The report publishes nothing, so it names no graph manifest version.
+    assert!(payload.get("graph_manifest_version").is_none());
     assert!(payload.get("manifest_version").is_none());
     assert!(payload.get("tables").is_none());
     let datasets = payload["datasets"].as_array().unwrap();
@@ -1469,7 +1514,7 @@ fn repair_reports_foreign_drift_and_refuses_removed_flags() {
             .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["graph_manifest_version"], Value::Null);
+    assert!(payload.get("graph_manifest_version").is_none());
     let person = payload["datasets"]
         .as_array()
         .unwrap()
@@ -2277,6 +2322,168 @@ fn policy_explain_reports_decision_and_matched_rule() {
     let deny_stdout = stdout_string(&deny);
     assert!(deny_stdout.contains("decision: deny"));
     assert!(deny_stdout.contains("message: policy denied action 'change' on branch 'main'"));
+}
+
+/// The documented layout binds one bundle to the graph and one to the
+/// `cluster` scope. The policy commands answer each action from the bundle
+/// serving asks for it: graph actions from the graph's bundle, `graph_list`
+/// and `config_manage` from the cluster bundle, each compiled as its kind.
+#[test]
+fn policy_commands_route_each_action_to_its_bound_bundle_issue_761() {
+    let explain = |cluster: &std::path::Path, actor: &str, action: &str| {
+        let output = output_success(
+            cli()
+                .arg("policy")
+                .arg("explain")
+                .arg("--target")
+                .arg(cluster)
+                .arg("--graph")
+                .arg("knowledge")
+                .arg("--actor")
+                .arg(actor)
+                .arg("--action")
+                .arg(action),
+        );
+        stdout_string(&output)
+    };
+
+    // Both bundles, as docs/user/operations/policy.md binds them.
+    let both = converged_policy_cluster("knowledge", Some(POLICY_YAML), Some(CLUSTER_POLICY_YAML));
+    let validate = stdout_string(&output_success(
+        cli()
+            .arg("policy")
+            .arg("validate")
+            .arg("--target")
+            .arg(both.path())
+            .arg("--graph")
+            .arg("knowledge"),
+    ));
+    assert!(
+        validate.contains("policy valid: bundle 'graph-access' [2 actors]"),
+        "{validate}"
+    );
+    assert!(
+        validate.contains("policy valid: bundle 'server-access' [1 actors]"),
+        "{validate}"
+    );
+
+    let read = explain(both.path(), "act-bruno", "read");
+    assert!(read.contains("decision: allow"), "{read}");
+    assert!(read.contains("matched_rule: team-read"), "{read}");
+    let graph_list = explain(both.path(), "act-andrew", "graph-list");
+    assert!(graph_list.contains("decision: allow"), "{graph_list}");
+    assert!(
+        graph_list.contains("matched_rule: owners-list-graphs"),
+        "{graph_list}"
+    );
+    let config_manage = explain(both.path(), "act-andrew", "config-manage");
+    assert!(config_manage.contains("decision: allow"), "{config_manage}");
+    assert!(
+        config_manage.contains("matched_rule: owners-manage-config"),
+        "{config_manage}"
+    );
+    // The cluster bundle names no graph actor, and the graph bundle grants
+    // no inventory: no answer falls back to the other scope.
+    let bruno_list = explain(both.path(), "act-bruno", "graph-list");
+    assert!(bruno_list.contains("decision: deny"), "{bruno_list}");
+
+    // A test file mixing graph and cluster cases runs each against its bundle.
+    let tests = both.path().join("policy.tests.yaml");
+    fs::write(
+        &tests,
+        r#"
+version: 1
+cases:
+  - id: bruno-reads
+    actor: act-bruno
+    action: read
+    branch: main
+    expect: allow
+  - id: andrew-lists-graphs
+    actor: act-andrew
+    action: graph_list
+    expect: allow
+  - id: bruno-cannot-list-graphs
+    actor: act-bruno
+    action: graph_list
+    expect: deny
+"#,
+    )
+    .unwrap();
+    let tested = stdout_string(&output_success(
+        cli()
+            .arg("policy")
+            .arg("test")
+            .arg("--target")
+            .arg(both.path())
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--tests")
+            .arg(&tests),
+    ));
+    assert!(tested.contains("policy tests passed: 3 cases"), "{tested}");
+
+    // Only the cluster bundle: it compiles as a cluster bundle.
+    let cluster_only = converged_policy_cluster("knowledge", None, Some(CLUSTER_POLICY_YAML));
+    for graph in [Some("knowledge"), None] {
+        let mut command = cli();
+        command
+            .arg("policy")
+            .arg("validate")
+            .arg("--target")
+            .arg(cluster_only.path());
+        if let Some(graph) = graph {
+            command.arg("--graph").arg(graph);
+        }
+        let validate = stdout_string(&output_success(&mut command));
+        assert!(
+            validate.contains("policy valid: bundle 'server-access' [1 actors]"),
+            "{validate}"
+        );
+    }
+    let only_list = explain(cluster_only.path(), "act-andrew", "graph-list");
+    assert!(only_list.contains("decision: allow"), "{only_list}");
+    // A graph action has no bundle to answer it; the cluster one is not used.
+    let refused = output_failure(
+        cli()
+            .arg("policy")
+            .arg("explain")
+            .arg("--target")
+            .arg(cluster_only.path())
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--actor")
+            .arg("act-andrew")
+            .arg("--action")
+            .arg("read"),
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("no policy bundle bound to graph `knowledge`"),
+        "{stderr}"
+    );
+
+    // Only the graph bundle: an inventory action has no cluster bundle to
+    // answer it, rather than a deny from the graph bundle.
+    let graph_only = converged_policy_cluster("knowledge", Some(POLICY_YAML), None);
+    let refused = output_failure(
+        cli()
+            .arg("policy")
+            .arg("explain")
+            .arg("--target")
+            .arg(graph_only.path())
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--actor")
+            .arg("act-andrew")
+            .arg("--action")
+            .arg("graph-list"),
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("no policy bundle bound to the cluster scope"),
+        "{stderr}"
+    );
 }
 
 #[test]
