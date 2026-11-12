@@ -1,6 +1,6 @@
 ---
 name: omnigraph
-description: Operate Omnigraph graphs and deployments. Use for `.pg` schemas, `.gq` queries, Omnigraph CLI commands, `file://`/`s3://`/`az://` graph URIs, `cluster.yaml`, operator config, bearer-authenticated servers, graph-backed knowledge or memory, Blob values, embeddings, branches, commits, and change feeds. Apply especially before schema changes, bulk loads, and retries after uncertain remote outcomes.
+description: Operate Omnigraph graphs and deployments. Use for first-time setup and onboarding, `.pg` schemas, `.gq` queries, Omnigraph CLI commands, `file://`/`s3://`/`az://` graph URIs, `cluster.yaml`, operator config, bearer-authenticated servers, graph-backed knowledge or memory, Blob values, embeddings, branches, commits, and change feeds. Apply especially before schema changes, bulk loads, and retries after uncertain remote outcomes.
 license: MIT (see LICENSE at repo root)
 compatibility: Covers the current Omnigraph CLI and server, using HTTP contract 0.14. Upgrade the CLI, server and HTTP integrations together; the storage formats `omnigraph version` reports are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
 metadata:
@@ -18,9 +18,10 @@ instructions. This skill tracks the current CLI/server contract, including
 `Omnigraph-Http-Api: 0.14`; older HTTP contracts are unsupported, and a
 request across contracts is refused with `api_contract_mismatch` before any
 effect. The engine
-reports `internal-schema 16 (serves v14 to v16)`: the storage format it
-writes, then the range it serves. A v14 or v15 branch is served as it is and
-stamped v16 by its first publication. New graphs use `__id`/`__src`/`__dst` system columns; a graph
+reports `internal-schema 17 (serves v14 to v17)`: the storage format of a
+graph it creates, then the range it serves. A v14 or v15 branch is served as
+it is and stamped v16 by its first publication; no publication stamps a
+branch v17, only the offline `omnigraph upgrade` does. New graphs use `__id`/`__src`/`__dst` system columns; a graph
 that already spells them `id`/`src`/`dst` keeps its physical columns. A
 standalone v8, v9 or v13 graph is converted in place by the offline
 `omnigraph upgrade`; any other format is rebuilt by export and load. See
@@ -50,6 +51,9 @@ on every member; nullability and enum domains widen.
 statements using selections. Full selected-table sizes count before scans, even
 for selective neighborhoods. A result limit cannot replace this cap. Exhaustion
 terminates the query with an error; received rows do not become partial success.
+On a server a request cannot raise it past the server's ceiling (the larger of
+its process default and 1000000); ask the operator to raise
+`OMNIGRAPH_TRAVERSAL_WORK_LIMIT` instead.
 Historical wildcard targets are refused. Stored-query validation can refuse a
 schema addition that would invalidate a wildcard common-property reference.
 See [traversal](../../docs/user/queries/traversal.md) and
@@ -437,8 +441,8 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Assuming Blob-bearing data cannot compact | unnecessary skipped maintenance | Lance 13 Blob compaction is supported; `optimize` preserves null/empty/non-empty values |
 | `@unique`/`@index` on a Blob column, `@unique` on a list or vector | schema parse/validation rejection | Blob properties cannot be keys, unique, or indexed; list and vector properties cannot be keys or unique |
 | Full-text search refused with `FullTextIndexRebuildRequired` | the index has no certified analyzer | Run `index rebuild --kind full-text --branch <b>` on every live branch that needs text search; `upgrade` does not rebuild indexes |
-| Opening a graph at a format below v14 | refused: `this omnigraph reads only v14 to v16` | A standalone v8, v9 or v13 graph is converted by `upgrade` (next row); any other format is rebuilt by export with the binary that wrote it, then `init` and `load --mode overwrite` |
-| Opening a v8, v9 or v13 graph | refused: normal open serves v14 to v16 only and names `omnigraph upgrade` | Stop every process using the graph, back up the whole root, then run `upgrade --target ./graph.omni --check --json` and `upgrade --target ./graph.omni --json` on a standalone graph; a cluster-managed graph below v14 is exported with the build that wrote it and rebuilt. The message's positional `<graph>` examples predate `--target`. See [converting a graph](references/migrations.md#convert-a-v8-v9-or-v13-graph) |
+| Opening a graph at a format below v14 | refused: `this omnigraph reads only v14 to v17` | A standalone v8, v9 or v13 graph is converted by `upgrade` (next row); any other format is rebuilt by export with the binary that wrote it, then `init` and `load --mode overwrite` |
+| Opening a v8, v9 or v13 graph | refused: normal open serves v14 to v17 only and names `omnigraph upgrade` | Stop every process using the graph, back up the whole root, then run `upgrade --target ./graph.omni --check --json` and `upgrade --target ./graph.omni --json` on a standalone graph; a cluster-managed graph below v14 is exported with the build that wrote it and rebuilt. The message's positional `<graph>` examples predate `--target`. See [converting a graph](references/migrations.md#convert-a-v8-v9-or-v13-graph) |
 | `as commit`, `commit publish` or `as unattached branch` on a branch still at format v14 or v15 | refused at v14 (unattached also at v15) | Make one ordinary write on that branch, or run the offline `upgrade` stamp-only route on a standalone graph |
 | Using `data.id` for identity on a new graph | `unknown input field 'id': move data.id to the top-level 'id' field` | Put identity in top-level JSONL `id`; `data` contains user properties |
 | Re-running a `--mode merge` load with unkeyed edges | duplicate edges | Supply stable top-level edge `id`s, or declare `@key(@src, @dst)` when creating the edge type |
@@ -453,6 +457,7 @@ For anything beyond the basics, load the relevant reference file. Each is self-c
 
 | Reference | When to load |
 |-----------|--------------|
+| [`references/onboarding.md`](references/onboarding.md) | Setting Omnigraph up for a new user: install, version-matched skill, a first schema, local graph, load, query and branch, then next steps |
 | [`references/schema.md`](references/schema.md) | Editing `.pg` files, running `schema plan`/`apply`, renaming types, backfilling required fields |
 | [`references/schema-design.md`](references/schema-design.md) | Designing or reviewing a schema: Gruber's criteria, design flow, identity, provenance, `GraphPolicy` rules, composition, and measuring convergence across agents |
 | [`references/queries.md`](references/queries.md) | Writing or linting `.gq` files, search functions, aggregations, multi-hop patterns |

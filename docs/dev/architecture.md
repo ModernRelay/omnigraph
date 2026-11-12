@@ -295,7 +295,11 @@ gates for single-writer ownership.
   (`Omnigraph::install_coordinator`). A read and a write sharing one handle
   and branch (for example, the server's requests on `main`) no longer wait
   for each other; a read that starts while a publish is in flight binds the
-  installed state and sees the publish once it is installed.
+  installed state and sees the publish once it is installed. While the
+  process holds the branch's [writer epoch](writes.md#writer-epoch) with its
+  last publication there on record, a read of the handle's bound branch takes
+  the installed state at or above that publication with no probe of the
+  branch's head.
 - Write preparation may overlap. Durable effects are ordered by the shared
   schema, branch, and sorted-table gates, then fenced again by persisted
   authority and Lance transaction identity.

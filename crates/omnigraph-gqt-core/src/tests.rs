@@ -2517,6 +2517,89 @@ fn traversal_header_forces_index_builds() {
 }
 
 #[test]
+fn writer_header_takes_held_once_and_only_on_the_cases_own_store() {
+    let plain = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let plain = parse_case("x", &plain).unwrap();
+    assert!(!plain.writer_held);
+    admit_served(&plain).unwrap();
+
+    let text = format!("{HDR}# writer: held\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let case = parse_case("x", &text).unwrap();
+    assert!(case.writer_held);
+    assert!(!case.needs_indices);
+    case.admit_store(None).unwrap();
+    let refused = admit_served(&case).unwrap_err();
+    assert!(refused.contains("the `# writer:` pin"), "{refused}");
+
+    let runner = SCHEMA.split("--- schema").next().unwrap();
+    let on_a_store = |header: &str| {
+        let text = format!("{HDR}{header}{runner}{QUERY}{EXPECT}");
+        parse_case("x", &text)
+            .unwrap()
+            .admit_store(Some("file:///tmp/graph"))
+    };
+    on_a_store("").unwrap();
+    let refused = on_a_store("# writer: held\n").unwrap_err();
+    assert!(
+        refused.contains("`# writer: held` cannot run on --store"),
+        "{refused}"
+    );
+
+    let text = format!("{HDR}# writer: Held\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let reason = refusal("x", &text);
+    assert!(reason.contains("`# writer:` takes `held`"), "{reason}");
+    let twice = format!("{HDR}# writer: held\n# writer: held\n{SCHEMA}{SEED}{QUERY}{EXPECT}");
+    let reason = refusal("x", &twice);
+    assert!(reason.contains("duplicate `# writer:` header"), "{reason}");
+}
+
+/// The `# writer: held` pin makes the case's process the writer of `main`:
+/// the runner's claim is one `__manifest` version that moves no head, and a
+/// claim after the case answers that epoch and writes nothing.
+#[tokio::test]
+async fn writer_header_claims_main_in_one_version_that_moves_no_head() {
+    for held in [false, true] {
+        let pin = if held { "# writer: held\n" } else { "" };
+        let text = format!("{HDR}{pin}{SCHEMA}{SEED}{QUERY}{EXPECT}");
+        let case = parse_case("x", &text).unwrap();
+        let (session, uri, _dir) = open_case_store(&case, Engine::V2).await.unwrap();
+        let (seeded, head) = main_version_and_head(session.db()).await;
+
+        let session = execute_steps(
+            &case,
+            Path::new("unused.gqt"),
+            false,
+            session,
+            &uri,
+            None,
+            &PlainHost,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            main_version_and_head(session.db()).await,
+            (seeded + u64::from(held), head.clone()),
+            "held={held}"
+        );
+        assert_eq!(session.db().claim_branch_writer("main").await.unwrap(), 1);
+        assert_eq!(
+            main_version_and_head(session.db()).await,
+            (seeded + 1, head),
+            "held={held}: one claim version stands above the seed, whoever claimed first"
+        );
+    }
+}
+
+async fn main_version_and_head(db: &omnigraph::db::Omnigraph) -> (u64, omnigraph::db::SnapshotId) {
+    (
+        db.graph_manifest_version_of(ReadTarget::branch("main"))
+            .await
+            .unwrap(),
+        db.resolve_snapshot("main").await.unwrap(),
+    )
+}
+
+#[test]
 fn pin_violation_names_the_path_that_ran() {
     assert_eq!(pin_violation("indexed", 3, 0, true), None);
     assert_eq!(pin_violation("csr", 0, 2, true), None);

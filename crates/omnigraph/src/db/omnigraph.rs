@@ -39,6 +39,7 @@ pub(crate) mod optimize;
 mod prepared_create;
 pub(crate) mod promotion;
 mod repair;
+mod resolution;
 pub(crate) mod schema_apply;
 pub(crate) mod system_column_upgrade;
 pub(crate) mod table_ops;
@@ -53,12 +54,17 @@ pub use export::{EXPORT_CHUNK_MAX_BYTES, ExportCut};
 pub(crate) use export::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
-pub use optimize::{CleanupPolicyOptions, DatasetCleanupStats, DatasetOptimizeStats, SkipReason};
+pub use optimize::{
+    ArtifactRefresh, ArtifactSkip, AuthorityCapture, CleanupPolicyOptions, ConfigurationClear,
+    DatasetCleanupStats, DatasetOptimizeStats, DeferReason, OptimizeBeforePublish,
+    OptimizeCancellation, OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport,
+    OptimizeRequest, ResourceExceeded, ResourceMeasure, RunCancellation, SkipReason, TableCeilings,
+    TableOptimizeOutcome,
+};
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
-pub use repair::{
-    DatasetRepairStats, RepairAction, RepairClassification, RepairOptions, RepairStats,
-};
+pub use repair::{DatasetRepairStats, RepairAction, RepairClassification, RepairStats};
+pub use resolution::PublicationLookup;
 pub use schema_apply::{
     PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplyReconciliation,
     SchemaApplySettlement, SchemaContractDigest, SchemaNonPublicationProof,
@@ -302,6 +308,9 @@ pub(crate) struct WriteTxn {
     /// current and fall back to a full coherent capture on mismatch. The
     /// publisher still performs its own fresh CAS read.
     pub(crate) manifest_probe: crate::db::manifest::CapturedManifestProbe,
+    /// Whether the open took the version this process holds on record for
+    /// the branch's head in place of a probe.
+    pub(crate) head_on_record: bool,
     /// Set on a child unattached write: `base` is then the base snapshot's
     /// view at its detached version, not the live head, while `authority`
     /// stays the live head the chain's root captured.
@@ -787,6 +796,20 @@ impl Omnigraph {
     ) -> Result<Self> {
         let storage = crate::storage::storage_for_uri_scoped(uri, scope)?;
         Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
+    }
+
+    /// Open a shallow clone of the graph at `base_uri`, rooted at `root_uri`
+    /// (`docs/rfcs/2026-11-10-graph-shallow-clone.md`): the clone starts with
+    /// every branch, version, commit and index of the base, every write lands
+    /// under `root_uri`, and the base is never written. Both are local
+    /// directories in this phase, and `root_uri` is an empty directory or a
+    /// clone root a previous open built. A caller that wraps storage builds
+    /// it with [`crate::storage::storage_read_through`] and opens with
+    /// [`Self::open_with_storage`], as the benchmark harness does to count
+    /// store calls.
+    pub async fn open_clone(base_uri: &str, root_uri: &str) -> Result<Self> {
+        let storage = crate::storage::storage_read_through(base_uri, root_uri).await?;
+        Self::open_with_storage_and_mode(root_uri, storage, OpenMode::ReadWrite).await
     }
 
     /// Open an existing graph for read-only consumers (NDJSON export,
@@ -1484,6 +1507,12 @@ impl Omnigraph {
         self.storage.as_ref()
     }
 
+    /// A shared handle on the storage adapter, for work that must outlive the
+    /// call that starts it.
+    pub(crate) fn storage_adapter_handle(&self) -> Arc<dyn crate::storage::StorageAdapter> {
+        Arc::clone(&self.storage)
+    }
+
     /// Root-scoped writer queues (schema, branch, and `(table, branch)` gates).
     ///
     /// Engine-internal writers (mutation finalize, schema_apply,
@@ -1606,6 +1635,7 @@ impl Omnigraph {
     pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
         let branch = normalize_branch_name(branch.unwrap_or("main"))?;
 
+        let head_on_record = self.holds_head_of(branch.as_deref());
         let (branch_identifier, graph_head, effective_graph_head, snapshot, manifest_probe) = self
             .write_authority_for_known_branch(branch.as_deref(), true)
             .await?;
@@ -1619,8 +1649,35 @@ impl Omnigraph {
             caller_expected_graph_head: None,
             catalog,
             manifest_probe,
+            head_on_record,
             unattached_base: None,
         })
+    }
+
+    /// Whether `branch` is the handle's bound branch and this process holds
+    /// it with its last publication on record, so a write's open and
+    /// revalidation take that record for the head.
+    fn holds_head_of(&self, branch: Option<&str>) -> bool {
+        let coord = self.coordinator.load_full();
+        branch == coord.current_branch() && coord.held_head().is_some()
+    }
+
+    /// Whether a write that staged nothing may answer from its view. No
+    /// publication checks such a write, so a view its open took on record is
+    /// probed: the head is the view's, or the version on record now.
+    pub(crate) async fn unpublished_view_is_current(&self, txn: &WriteTxn) -> Result<bool> {
+        if !txn.head_on_record {
+            return Ok(true);
+        }
+        let captured = txn.manifest_probe.captured();
+        let latest = txn.manifest_probe.probe_latest_incarnation().await?;
+        if latest.matches(captured) {
+            return Ok(true);
+        }
+        let coord = self.coordinator.load_full();
+        Ok(latest.same_lifetime(captured)
+            && txn.branch.as_deref() == coord.current_branch()
+            && coord.held_head() == Some(latest.version))
     }
 
     /// The write transaction of a child unattached snapshot (RFC "Unattached
@@ -1646,6 +1703,7 @@ impl Omnigraph {
             )));
         }
         base.require_extendable()?;
+        let head_on_record = self.holds_head_of(target.as_deref());
         let (branch_identifier, graph_head, effective_graph_head, live, manifest_probe) = self
             .write_authority_for_known_branch(target.as_deref(), true)
             .await?;
@@ -1681,6 +1739,7 @@ impl Omnigraph {
             caller_expected_graph_head: None,
             catalog,
             manifest_probe,
+            head_on_record,
             unattached_base: Some(UnattachedTxnBase::of(base)),
         })
     }
@@ -1754,6 +1813,7 @@ impl Omnigraph {
                 caller_expected_graph_head: None,
                 catalog: Arc::clone(&catalog),
                 manifest_probe,
+                head_on_record: false,
                 unattached_base: None,
             };
         Ok((
@@ -1898,22 +1958,14 @@ impl Omnigraph {
         let bound = {
             let coord = self.coordinator.load_full();
             let bound = branch == coord.current_branch();
-            if bound {
-                let current = if fresh {
-                    let held = coord.manifest_incarnation();
-                    coord.probe_latest_incarnation().await?.matches(&held)
-                } else {
-                    true
-                };
-                if current {
-                    return Ok((
-                        coord.branch_identifier().await?,
-                        coord.exact_graph_head(),
-                        coord.effective_graph_head().await?,
-                        coord.snapshot(),
-                        coord.captured_manifest_probe(),
-                    ));
-                }
+            if bound && (!fresh || coord.head_is_current().await?) {
+                return Ok((
+                    coord.branch_identifier().await?,
+                    coord.exact_graph_head(),
+                    coord.effective_graph_head().await?,
+                    coord.snapshot(),
+                    coord.captured_manifest_probe(),
+                ));
             }
             bound
         };
@@ -2100,11 +2152,11 @@ impl Omnigraph {
     /// gates are held, beside the staging puts: the answer serves
     /// [`Self::revalidate_write_txn_with`] under the gates when no publish
     /// installed on this handle in between. `None` when the write is not on
-    /// the bound branch, or when the probe failed, so the revalidation
-    /// probes itself.
+    /// the bound branch, when this process holds the branch and owes no
+    /// probe, or when the probe failed, so the revalidation probes itself.
     pub(crate) async fn early_revalidation(&self, txn: &WriteTxn) -> Option<EarlyRevalidation> {
         let coord = self.coordinator.load_full();
-        if txn.branch.as_deref() != coord.current_branch() {
+        if txn.branch.as_deref() != coord.current_branch() || coord.held_head().is_some() {
             return None;
         }
         let held = coord.manifest_incarnation();
@@ -2676,8 +2728,7 @@ impl Omnigraph {
                     }
                     return self.coordinator.load_full().resolve_target(target).await;
                 }
-                let held = coord.manifest_incarnation();
-                if coord.probe_latest_incarnation().await?.matches(&held) {
+                if coord.head_is_current().await? {
                     return warm_resolved_target(&coord, target).await;
                 }
                 let copy = GraphCoordinator::clone(&coord);
@@ -3760,15 +3811,10 @@ impl Omnigraph {
         table_ops::graph_index_for_resolved(self, resolved, edge_types, system_columns).await
     }
 
-    /// [`Self::ensure_indices_on`] on this handle's current branch.
-    pub async fn ensure_indices(&self) -> Result<Vec<PendingIndex>> {
-        Ok(table_ops::ensure_indices(self).await?.pending)
-    }
-
-    /// [`Self::ensure_indices_on_as`] with no actor, returning only what it
-    /// left pending. With a policy installed, use the actor-aware counterpart.
-    pub async fn ensure_indices_on(&self, branch: &str) -> Result<Vec<PendingIndex>> {
-        Ok(self.ensure_indices_on_as(branch, None).await?.pending)
+    /// [`Self::ensure_indices_on_as`] on this handle's current branch,
+    /// returning only what it left pending.
+    pub async fn ensure_indices_as(&self, actor: Option<&str>) -> Result<Vec<PendingIndex>> {
+        Ok(table_ops::ensure_indices_as(self, actor).await?.pending)
     }
 
     /// Bring the selected branch's declared indexes up to its rows: build
@@ -3780,7 +3826,7 @@ impl Omnigraph {
     /// keep their indexes. Idempotent: a branch with nothing to do publishes
     /// nothing.
     ///
-    /// Requires `Change` on the selected branch before any effect and
+    /// Requires `maintain` on the selected branch before any effect and
     /// records the actor in the publication. Plans from one graph-manifest
     /// and schema token and builds the artifacts before taking the schema →
     /// branch → sorted table gates, then revalidates that authority under
@@ -3806,19 +3852,13 @@ impl Omnigraph {
     /// Rebuilt full-text indexes use the engine's default analyzer, including
     /// indexes originally created externally with custom tokenizer settings.
     ///
-    /// Unlike [`Self::ensure_indices_on`], this replaces existing FTS indexes
-    /// even when their row coverage is complete. It establishes the supported
-    /// analyzer generation after an upgrade; it does not rewrite old history.
-    /// With a policy installed, use the actor-aware counterpart.
-    pub async fn rebuild_full_text_indices_on(
-        &self,
-        branch: &str,
-    ) -> Result<FullTextIndexRebuildResult> {
-        self.rebuild_full_text_indices_on_as(branch, None).await
-    }
-
-    /// Actor-aware full-text rebuilding. Requires `Change` on the selected
-    /// branch before any effects and records the actor in the graph publication.
+    /// Unlike [`Self::ensure_indices_on_as`], this replaces existing FTS
+    /// indexes even when their row coverage is complete. It establishes the
+    /// supported analyzer generation after an upgrade; it does not rewrite old
+    /// history.
+    ///
+    /// Requires `maintain` or `change` on the selected branch before any
+    /// effect and records the actor in the graph publication.
     pub async fn rebuild_full_text_indices_on_as(
         &self,
         branch: &str,
@@ -3844,27 +3884,36 @@ impl Omnigraph {
         .await
     }
 
-    /// Compact small Lance fragments into fewer larger ones across every
-    /// backing dataset for a node or edge type on `main`. See [`optimize`] for details.
-    pub async fn optimize(&self) -> Result<Vec<optimize::DatasetOptimizeStats>> {
-        optimize::optimize_all_datasets(self).await
+    /// Compact small Lance fragments into fewer larger ones across the
+    /// backing datasets `request` selects on `main`, and catch up their
+    /// indexes. See [`optimize`] for details. Requires `maintain` on `main`
+    /// before any effect and records `actor` in the publication.
+    pub async fn optimize_as(
+        &self,
+        actor: Option<&str>,
+        request: optimize::OptimizeRequest,
+    ) -> Result<optimize::OptimizeReport> {
+        optimize::optimize_all_datasets(self, actor, request).await
     }
 
-    /// Classify and explicitly repair uncovered graph-manifest/Lance-HEAD drift. See
-    /// [`repair`] for the distinction between safe maintenance drift and
-    /// suspicious/unverifiable drift.
-    pub async fn repair(&self, options: repair::RepairOptions) -> Result<repair::RepairStats> {
-        repair::repair_all_datasets(self, options).await
+    /// Report, per table on `main`, how its Lance linear history stands
+    /// against its registration. See [`repair`] for the classifications. The
+    /// report publishes nothing and adopts no drift. Requires `maintain` on
+    /// `main`.
+    pub async fn repair_report_as(&self, actor: Option<&str>) -> Result<repair::RepairStats> {
+        repair::repair_report(self, actor).await
     }
 
     /// Remove Lance manifests (and the fragments they uniquely own) per the
     /// given [`optimize::CleanupPolicyOptions`]. Destructive to version
-    /// history. See [`optimize`] for details.
-    pub async fn cleanup(
+    /// history. See [`optimize`] for details. Requires `reclaim` before any
+    /// effect; a run covers every branch, so the check names none.
+    pub async fn cleanup_as(
         &self,
         options: optimize::CleanupPolicyOptions,
+        actor: Option<&str>,
     ) -> Result<Vec<optimize::DatasetCleanupStats>> {
-        optimize::cleanup_all_datasets(self, options).await
+        optimize::cleanup_all_datasets(self, options, actor).await
     }
 
     /// The tracing collector's plan for `options`, deleting nothing and taking
@@ -4851,6 +4900,41 @@ impl Omnigraph {
         Ok(published.commit)
     }
 
+    /// [`Self::claim_branch_writer_as`] with no actor.
+    pub async fn claim_branch_writer(&self, branch: &str) -> Result<u64> {
+        self.claim_branch_writer_as(branch, None).await
+    }
+
+    /// Claim the writer epoch of `branch` for this process, under
+    /// `branch_claim` on that branch, and answer the epoch the process holds
+    /// from then on. The claim raises the branch's epoch by one in a
+    /// `__manifest` version of its own, moving no head and recording no graph
+    /// commit; from that version on, a publish on the branch by a process
+    /// holding a lower epoch, or none, is refused `WriterFenced`. The process
+    /// that already holds the branch gets its epoch back and nothing is
+    /// written. Every claim is a takeover: the engine does not decide that
+    /// the previous owner is gone.
+    pub async fn claim_branch_writer_as(&self, branch: &str, actor: Option<&str>) -> Result<u64> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::BranchClaim,
+            &omnigraph_policy::ResourceScope::TargetBranch(branch.to_string()),
+            actor,
+        )?;
+        let target = normalize_branch_name(branch)?;
+        let _schema_permit = self.write_queue().acquire_schema_shared().await;
+        let _branch_guard = self.write_queue().acquire_branch(target.as_deref()).await;
+        let installed = self.coordinator.load_full();
+        let mut claimed = self
+            .open_coordinator_for_branch(target.as_deref())
+            .await
+            .map_err(OmniError::before_effect)?;
+        let epoch = claimed.claim_writer_epoch().await;
+        if target.as_deref() == installed.current_branch() {
+            self.install_coordinator(claimed, &installed);
+        }
+        epoch
+    }
+
     /// Drop the unpublished commit `commit_id`, under `commit_drop` on its
     /// recorded target branch and that branch's write gate, which it shares
     /// with the publication: its tag is removed and its held merge inputs
@@ -5003,6 +5087,7 @@ impl Omnigraph {
             txn,
             lineage_intent,
             publication,
+            None,
         )
         .await
     }
@@ -6709,7 +6794,7 @@ edge WorksAt: Person -> Company
         );
 
         // The reconciler materializes it (Person has a row).
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
         let snapshot = db.snapshot().await;
         let ds = db
             .storage()
@@ -6741,7 +6826,7 @@ edge WorksAt: Person -> Company
         db.apply_schema(&desired).await.unwrap();
 
         // After the rewrite the reconciler restores index coverage.
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
         let snapshot = db.snapshot().await;
         let ds = db
             .storage()

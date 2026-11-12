@@ -96,6 +96,11 @@ impl Session {
         &self.settings
     }
 
+    /// The settings this session started from, which `reset` returns to.
+    pub fn baseline(&self) -> &SessionSettings {
+        &self.baseline
+    }
+
     pub fn sources(&self) -> &Sources {
         &self.sources
     }

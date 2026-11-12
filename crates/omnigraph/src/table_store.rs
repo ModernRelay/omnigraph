@@ -140,6 +140,17 @@ pub(crate) const ORDERED_SCAN_MAX_INPUT_BATCH_BYTES: u64 = ORDERED_SCAN_MEMORY_B
 pub(crate) const ID_SCAN_BATCH_ROWS: usize = 1024;
 pub(crate) const ID_SCAN_BATCH_BYTES: u64 = 1024 * 1024;
 
+/// The most data-file bytes, as the manifest records them, that the fragments
+/// an id BTREE leaves uncovered may hold for an all-present upsert to take
+/// Lance's indexed merge route instead of the id join. That route scans those
+/// fragments for every source column, so this bounds what the switch can read
+/// beyond the BTREE whatever the row width. One MiB is the id column alone of
+/// tens of thousands of rows, so above that table size the switch reads less
+/// than the join even at the bound, and below it the switch reads at most this
+/// much more. A narrow one-row tail, the state a write leaves between index
+/// builds, is a few KiB.
+pub(crate) const KNOWN_PRESENT_TAIL_MAX_BYTES: u64 = 1024 * 1024;
+
 /// The byte cap of one batch entering a `SortExec` under a pool of `memory_limit` bytes.
 pub(crate) fn sort_input_batch_bytes(memory_limit: u64) -> usize {
     (memory_limit / 4).clamp(1, ORDERED_SCAN_MAX_INPUT_BATCH_BYTES) as usize
@@ -187,6 +198,16 @@ pub(crate) fn cap_sort_inputs_and_merge_partitions(
 pub(crate) fn sort_spill_reservation_bytes(memory_limit: u64) -> usize {
     (memory_limit / 3).min(40 * 1024 * 1024) as usize
 }
+
+/// The codec of every spill file the engine writes, in a query's session and
+/// in an ordered scan's. A spill file counts against its scratch quota by its
+/// compressed size, and a run whose spills outgrow the quota is refused, so
+/// the codec is chosen for size: zstd. Spilled pairs repeat a row's values
+/// across a fan-out further apart than LZ4's 64 KiB window, which zstd's
+/// window still reaches, and on unique rows zstd's files are about half
+/// LZ4's for roughly one and a half times its CPU time.
+pub(crate) const SPILL_COMPRESSION: datafusion::common::config::SpillCompression =
+    datafusion::common::config::SpillCompression::Zstd;
 
 /// The built read and its scanner-normalized filter.
 pub(crate) type PlannedScan = (Arc<dyn ExecutionPlan>, Option<Expr>);
@@ -2915,7 +2936,8 @@ impl TableStore {
         // counter. Per-operation ownership makes the envelope and its cleanup
         // exact without maintaining another long-lived runtime view.
         let mut session_config = SessionConfig::new()
-            .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes(memory_limit));
+            .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes(memory_limit))
+            .with_spill_compression(SPILL_COMPRESSION);
         if let Some(target_partitions) = options.target_partition {
             session_config = session_config.with_target_partitions(target_partitions);
         }
@@ -3597,7 +3619,7 @@ impl TableStore {
         ds: Dataset,
         type_key: &str,
         batch: RecordBatch,
-        semantics: KeyedWriteSemantics,
+        mut semantics: KeyedWriteSemantics,
         system_columns: SystemColumns,
         write_budget: WriteBudget,
     ) -> Result<StagedWrite> {
@@ -3643,6 +3665,62 @@ impl TableStore {
                     write_budget,
                 )
                 .await;
+        }
+        // Lance's insert-capable merge route joins the source against every
+        // id of the table. An upsert whose rows are all new or all present
+        // needs neither that join nor its inserted-key filter: the exact-id
+        // probe a strict insert runs decides which, through the id BTREE.
+        // All new, it stages through the absence-proven insert writer and
+        // reads no more than the probe. All present, it may stage as a
+        // known-present update, whose indexed merge reads the BTREE's pages
+        // and then scans each fragment the BTREE leaves uncovered for every
+        // source column (Lance 13 `merge_insert.rs`, the indexed route's
+        // unindexed union), where the join reads only the id column of every
+        // fragment. So it switches only while both costs of that tail are
+        // bounded: the BTREE covers more fragments than it leaves (requests),
+        // and the tail's recorded data files hold at most
+        // `KNOWN_PRESENT_TAIL_MAX_BYTES` (bytes, whatever the row width). An
+        // unrecorded file size keeps the join. A mixed batch keeps the join,
+        // and so does a table without the BTREE, where the probe itself would
+        // read every id. Lance plans the probe's IN list once per uncovered
+        // fragment, so the probe runs only while those copies hold no more
+        // ids than one keyed batch (#1225).
+        let tail = match semantics {
+            KeyedWriteSemantics::Upsert => {
+                crate::dataset_index::key_column_uncovered_tail(&ds, system_columns.id)
+                    .await?
+                    .filter(|tail| {
+                        tail.fragments.saturating_mul(source_ids.len()) <= KEYED_WRITE_MAX_ROWS
+                    })
+            }
+            _ => None,
+        };
+        if let Some(tail) = tail {
+            let present = Self::existing_id_count(&ds, &source_ids, system_columns).await?;
+            if present == 0 {
+                return self
+                    .stage_absence_proven_strict_insert(
+                        ds,
+                        type_key,
+                        batch,
+                        source_ids,
+                        id_field_id,
+                        &expected_schema_preorder_ids,
+                        "stage_keyed_write",
+                        system_columns,
+                        write_budget,
+                    )
+                    .await;
+            }
+            let covered = ds.fragments().len().saturating_sub(tail.fragments);
+            if present == source_ids.len()
+                && tail.fragments < covered
+                && tail
+                    .data_file_bytes
+                    .is_some_and(|bytes| bytes <= KNOWN_PRESENT_TAIL_MAX_BYTES)
+            {
+                semantics = KeyedWriteSemantics::KnownPresentUpdate;
+            }
         }
 
         // MergeInsertBuilder does not expose WriteParams and therefore cannot
@@ -4022,26 +4100,11 @@ impl TableStore {
         source_ids: &[String],
         system_columns: SystemColumns,
     ) -> Result<Option<String>> {
-        use datafusion::prelude::{col, lit};
-
         exact_id_primary_key_field_id(ds, system_columns, "first_existing_id")?;
         if source_ids.is_empty() {
             return Ok(None);
         }
-        let filter = col(system_columns.id)
-            .in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
-        let mut target_ids = Self::scan_stream_with(
-            ds,
-            Some(&[system_columns.id]),
-            None,
-            None,
-            false,
-            |scanner| {
-                scanner.filter_expr(filter);
-                Ok(())
-            },
-        )
-        .await?;
+        let mut target_ids = Self::exact_id_scan(ds, source_ids, system_columns).await?;
         while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
             let ids =
                 string_id_column(&batch, system_columns, "stage_keyed_write strict preflight")?;
@@ -4052,6 +4115,56 @@ impl TableStore {
             }
         }
         Ok(None)
+    }
+
+    /// The id column of the pinned table's rows whose id is a member of
+    /// `source_ids`: the one structured, scalar-index-eligible exact-id
+    /// predicate both id probes run, which Lance serves from a covering
+    /// BTREE and by a filtered scan of the fragments it leaves uncovered.
+    async fn exact_id_scan(
+        ds: &Dataset,
+        source_ids: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<DatasetRecordBatchStream> {
+        use datafusion::prelude::{col, lit};
+
+        let filter = col(system_columns.id)
+            .in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
+        Self::scan_stream_with(
+            ds,
+            Some(&[system_columns.id]),
+            None,
+            None,
+            false,
+            |scanner| {
+                scanner.filter_expr(filter);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// How many members of `source_ids` the pinned table holds, through the
+    /// same exact-id predicate as [`Self::first_existing_id`].
+    async fn existing_id_count(
+        ds: &Dataset,
+        source_ids: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<usize> {
+        if source_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut target_ids = Self::exact_id_scan(ds, source_ids, system_columns).await?;
+        let mut present = HashSet::new();
+        while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
+            let ids = string_id_column(&batch, system_columns, "stage_keyed_write upsert probe")?;
+            for row in 0..ids.len() {
+                if ids.is_valid(row) {
+                    present.insert(ids.value(row).to_string());
+                }
+            }
+        }
+        Ok(present.len())
     }
 
     async fn stage_keyed_write_from_stream(
@@ -4816,6 +4929,41 @@ impl TableStore {
     /// nothing); after an early stop, a lower bound that already derives one-row batches.
     /// `None` when a nested or non-Blob-v2 Blob field cannot be sized.
     async fn max_row_blob_bytes(ds: &Dataset, fragments: Vec<Fragment>) -> Result<Option<u64>> {
+        let mut max = 0_u64;
+        let sized = Self::visit_row_blob_bytes(ds, fragments, |rows| {
+            max = rows.iter().copied().fold(max, u64::max);
+            compaction_blob_batch_rows(max) != 1
+        })
+        .await?;
+        Ok(sized.then_some(max))
+    }
+
+    /// Managed Blob bytes in `fragments`, from descriptors (externals count nothing and
+    /// are never fetched); the count stops once it passes `ceiling`, so a value above
+    /// `ceiling` is a lower bound. `None` when a nested or non-Blob-v2 Blob field cannot
+    /// be sized.
+    pub(crate) async fn managed_blob_bytes(
+        ds: &Dataset,
+        fragments: Vec<Fragment>,
+        ceiling: u64,
+    ) -> Result<Option<u64>> {
+        let mut total = 0_u64;
+        let sized = Self::visit_row_blob_bytes(ds, fragments, |rows| {
+            total = rows.iter().fold(total, |sum, row| sum.saturating_add(*row));
+            total <= ceiling
+        })
+        .await?;
+        Ok(sized.then_some(total))
+    }
+
+    /// Scan the Blob descriptors of `fragments` and hand each batch's per-row managed
+    /// bytes to `visit`, which returns false to stop. Returns false, scanning nothing,
+    /// when a nested or non-Blob-v2 Blob field cannot be sized.
+    async fn visit_row_blob_bytes(
+        ds: &Dataset,
+        fragments: Vec<Fragment>,
+        mut visit: impl FnMut(&[u64]) -> bool,
+    ) -> Result<bool> {
         if nested_blob_field(ds.schema()).is_some()
             || ds
                 .schema()
@@ -4823,7 +4971,7 @@ impl TableStore {
                 .iter()
                 .any(|field| field.is_blob() && !field.is_blob_v2())
         {
-            return Ok(None);
+            return Ok(false);
         }
         let blob_columns = ds
             .schema()
@@ -4832,13 +4980,15 @@ impl TableStore {
             .filter(|field| field.is_blob())
             .map(|field| field.name.as_str())
             .collect::<Vec<_>>();
+        if blob_columns.is_empty() {
+            return Ok(true);
+        }
         let mut stream =
             Self::scan_stream_with(ds, Some(&blob_columns), None, None, false, |scanner| {
                 scanner.with_fragments(fragments);
                 Ok(())
             })
             .await?;
-        let mut max = 0_u64;
         while let Some(batch) = stream.try_next().await.map_err(OmniError::storage)? {
             let mut row_bytes = vec![0_u64; batch.num_rows()];
             for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
@@ -4859,12 +5009,11 @@ impl TableStore {
                     }
                 }
             }
-            max = row_bytes.into_iter().fold(max, u64::max);
-            if compaction_blob_batch_rows(max) == 1 {
+            if !visit(&row_bytes) {
                 break;
             }
         }
-        Ok(Some(max))
+        Ok(true)
     }
 
     /// Stage creation of a new dataset without publishing its first manifest.

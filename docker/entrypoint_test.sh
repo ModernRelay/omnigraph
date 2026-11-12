@@ -50,21 +50,39 @@ check() {
   fi
 }
 
-got=$(OMNIGRAPH_TARGET_URI="s3://b/g" OMNIGRAPH_BIND="0.0.0.0:8080" sh "$ep")
-check "TARGET_URI only (legacy)" \
-  "ARGS: s3://b/g --bind 0.0.0.0:8080" "$got"
+# The single-graph variables of earlier releases are refused by name (exit
+# 64), alone or beside OMNIGRAPH_CLUSTER, before the server is started.
+for combo in "OMNIGRAPH_TARGET_URI=s3://b/g" "OMNIGRAPH_CONFIG=/etc/o.yaml" "OMNIGRAPH_TARGET=active"; do
+  for cluster in "" "/data/cluster"; do
+    if out=$(env "$combo" OMNIGRAPH_CLUSTER="$cluster" sh "$ep" 2>&1); then
+      echo "FAIL: ${combo%%=*} (cluster '$cluster') unexpectedly succeeded: $out"
+      fail=1
+    else
+      status=$?
+      case "$out" in
+        *"${combo%%=*} is no longer supported"*) named=1 ;;
+        *) named=0 ;;
+      esac
+      if [ "$status" -ne 64 ] || [ "$named" -ne 1 ] || echo "$out" | grep -q '^ARGS:'; then
+        echo "FAIL: ${combo%%=*} (cluster '$cluster') exited $status: $out"
+        fail=1
+      else
+        echo "ok: ${combo%%=*} (cluster '$cluster') refused (64)"
+      fi
+    fi
+  done
+done
 
-got=$(OMNIGRAPH_TARGET_URI="s3://b/g" OMNIGRAPH_CONFIG="/etc/omnigraph/omnigraph.yaml" OMNIGRAPH_BIND="0.0.0.0:8080" sh "$ep")
-check "TARGET_URI + CONFIG composes (policy)" \
-  "ARGS: s3://b/g --config /etc/omnigraph/omnigraph.yaml --bind 0.0.0.0:8080" "$got"
-
-got=$(OMNIGRAPH_CONFIG="/etc/omnigraph/omnigraph.yaml" OMNIGRAPH_BIND="0.0.0.0:8080" sh "$ep")
-check "CONFIG only" \
-  "ARGS: --config /etc/omnigraph/omnigraph.yaml --bind 0.0.0.0:8080" "$got"
-
-got=$(OMNIGRAPH_CONFIG="/etc/omnigraph/omnigraph.yaml" OMNIGRAPH_TARGET="active" OMNIGRAPH_BIND="0.0.0.0:8080" sh "$ep")
-check "CONFIG + TARGET" \
-  "ARGS: --config /etc/omnigraph/omnigraph.yaml --target active --bind 0.0.0.0:8080" "$got"
+if out=$(sh "$ep" 2>&1); then
+  echo "FAIL: no boot source unexpectedly succeeded: $out"
+  fail=1
+else
+  status=$?
+  case "$out" in
+    *OMNIGRAPH_CLUSTER*) echo "ok: no boot source refused ($status)" ;;
+    *) echo "FAIL: no boot source: $out"; fail=1 ;;
+  esac
+fi
 
 got=$(sh "$ep" some-uri --bind 1.2.3.4:9 --extra)
 check "explicit args passthrough" \
@@ -85,22 +103,6 @@ check "explicit Azure cluster enters admission before server" \
 got=$(sh "$ep" --cluster=az://omnigraph/clusters/company-brain --bind 1.2.3.4:9)
 check "explicit equals-form Azure cluster enters admission before server" \
   "ADMISSION: run --mode server --root az://omnigraph/clusters/company-brain --grace-seconds 90 -- $work/bin/omnigraph-server --cluster=az://omnigraph/clusters/company-brain --bind 1.2.3.4:9" "$got"
-
-# Exclusivity: OMNIGRAPH_CLUSTER refuses every combination, exit 64.
-for combo in "OMNIGRAPH_TARGET_URI=s3://b/g" "OMNIGRAPH_CONFIG=/etc/o.yaml" "OMNIGRAPH_TARGET=active"; do
-  if out=$(env "$combo" OMNIGRAPH_CLUSTER="/data/cluster" sh "$ep" 2>&1); then
-    echo "FAIL: CLUSTER + ${combo%%=*} unexpectedly succeeded: $out"
-    fail=1
-  else
-    status=$?
-    if [ "$status" -ne 64 ]; then
-      echo "FAIL: CLUSTER + ${combo%%=*} exited $status, want 64"
-      fail=1
-    else
-      echo "ok: CLUSTER + ${combo%%=*} refused (64)"
-    fi
-  fi
-done
 
 if [ "$fail" -ne 0 ]; then
   echo "entrypoint_test: FAILED"

@@ -221,6 +221,161 @@ async fn external_commit_observed_by_warm_reader() {
     );
 }
 
+/// On a bound branch its process holds, a warm read binds the installed
+/// snapshot with no request to `__manifest`, where the same read probed before
+/// the claim. A held branch that is not the bound one is read as before it.
+#[tokio::test]
+async fn held_bound_branch_read_issues_no_probe() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = init_and_load(&dir).await;
+        let none = params(&[]);
+        let total_people = |branch| {
+            db.query_with_head(
+                ReadTarget::branch(branch),
+                TEST_QUERIES,
+                "total_people",
+                &none,
+            )
+        };
+        let (out, io) = measure(total_people("main")).await;
+        out.unwrap();
+        assert_eq!(io.version_probes, 1, "an unclaimed branch is probed");
+
+        assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+        let (out, io) = measure(total_people("main")).await;
+        out.unwrap();
+        assert_eq!(io.version_probes, 0, "{io:?}");
+        assert_eq!(io.manifest_reads, 0, "{:#?}", last_manifest_reads());
+
+        db.branch_create("feature").await.unwrap();
+        total_people("feature").await.unwrap();
+        let (out, unclaimed) = measure(total_people("feature")).await;
+        out.unwrap();
+        assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+        total_people("feature").await.unwrap();
+        let (out, held) = measure(total_people("feature")).await;
+        out.unwrap();
+        assert!(
+            unclaimed.version_probes + unclaimed.manifest_reads > 0,
+            "{unclaimed:?}"
+        );
+        assert_eq!(
+            (held.version_probes, held.manifest_reads),
+            (unclaimed.version_probes, unclaimed.manifest_reads),
+            "a held branch that is not the bound one is read as an unclaimed one: {held:?}"
+        );
+    })
+    .await;
+}
+
+/// A second handle of the owner process learns the first one's publish from
+/// the holder: it reaches that publish with no probe, a read installs the
+/// reload, and from then on it issues no request to `__manifest`.
+#[tokio::test]
+async fn held_bound_branch_second_handle_reaches_the_owners_publish_without_a_probe() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = init_and_load(&dir).await;
+        let reader = Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap();
+        assert_eq!(writer.claim_branch_writer("main").await.unwrap(), 1);
+        mutate_main(
+            &writer,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "held_new_person")], &[("$age", 41)]),
+        )
+        .await
+        .unwrap();
+        let published = writer.resolve_snapshot("main").await.unwrap();
+
+        let (resolved, io) = measure(reader.resolve_snapshot("main")).await;
+        assert_eq!(
+            resolved.unwrap(),
+            published,
+            "the handle behind the holder reaches the owner's publish"
+        );
+        assert_eq!(io.version_probes, 0, "{io:?}");
+        let (snapshot, io) = measure(reader.snapshot_of(ReadTarget::branch("main"))).await;
+        snapshot.unwrap();
+        assert_eq!(io.version_probes, 0, "{io:?}");
+        let (resolved, io) = measure(reader.resolve_snapshot("main")).await;
+        assert_eq!(resolved.unwrap(), published);
+        assert_eq!(io.version_probes, 0, "{io:?}");
+        assert_eq!(io.manifest_reads, 0, "{:#?}", last_manifest_reads());
+    })
+    .await;
+}
+
+async fn main_manifest_version(root: &str) -> u64 {
+    lance::Dataset::open(&format!("{root}/__manifest"))
+        .await
+        .unwrap()
+        .version()
+        .version
+}
+
+/// `optimize`'s configuration commit is a Lance commit outside the publisher:
+/// on a held bound branch it moves the `__manifest` version and neither a row
+/// nor the head, so the owner's other handle reads on with no request.
+#[tokio::test]
+async fn held_bound_branch_reads_and_writes_across_an_optimize_configuration_commit() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let owner = init_and_load(&dir).await;
+        owner
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap();
+        lance::Dataset::open(&format!("{uri}/__manifest"))
+            .await
+            .unwrap()
+            .update_config([("lance.auto_cleanup.interval", Some("1"))])
+            .await
+            .unwrap();
+        assert_eq!(owner.claim_branch_writer("main").await.unwrap(), 1);
+        let second = session(Omnigraph::open(uri).await.unwrap());
+        let people = count_rows(&second, "node:Person").await;
+
+        let claimed = main_manifest_version(uri).await;
+        owner
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            main_manifest_version(uri).await,
+            claimed + 1,
+            "the second optimize commits the configuration and publishes nothing"
+        );
+
+        let (rows, io) = measure(count_rows(&second, "node:Person")).await;
+        assert_eq!(rows, people);
+        assert_eq!(io.version_probes, 0, "{io:?}");
+        assert_eq!(io.manifest_reads, 0, "{:#?}", last_manifest_reads());
+
+        mutate_main(
+            &second,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "past_the_commit")], &[("$age", 41)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count_rows(&second, "node:Person").await,
+            people + 1,
+            "the write lands past the configuration commit"
+        );
+        assert_eq!(
+            count_rows(&owner, "node:Person").await,
+            people + 1,
+            "the handle that ran optimize reads it"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn cold_open_admits_contract_and_state_in_one_scan() {
     cost_harness(async {
@@ -956,10 +1111,13 @@ async fn assert_cached_borrower_survives_branch_delete(
             "{branch} payload changed"
         );
     }
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     assert!(
@@ -995,10 +1153,13 @@ async fn assert_cached_borrower_survives_branch_delete(
         .unwrap();
     let recreated_pin = helpers::pinned_version(writer, "feature", "node:Person").await;
     assert_ne!(recreated_pin, source_pin);
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     let pins = helpers::collector::detached_versions(&table_uri).await;
@@ -2381,6 +2542,150 @@ async fn by_id_read_of_a_commit_held_elsewhere_scans_the_likely_branches_first()
             opens_and_scans(&io),
             (1, 3),
             "the handle's branch, main, then the branch created last"
+        );
+    })
+    .await;
+}
+
+/// A by-id read remembers the branch it found a commit's history block on. A
+/// later read of a commit of that block, as a history list or a review reads
+/// a branch's commits one after another, opens `__manifest` once and scans
+/// that branch alone. Once the branch is gone, the commit is found as before.
+#[tokio::test]
+async fn by_id_read_of_a_block_found_before_scans_only_its_branch() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = init_and_load(&dir).await;
+        let insert_on = |branch: &'static str, name: &'static str| {
+            let person = mixed_params(&[("$name", name)], &[("$age", 30)]);
+            let writer = &writer;
+            async move {
+                mutate_branch(writer, branch, MUTATION_QUERIES, "insert_person", &person)
+                    .await
+                    .unwrap();
+            }
+        };
+        for branch in ["task", "b_idle", "c_idle", "d_idle", "z_recent"] {
+            writer.branch_create(branch).await.unwrap();
+        }
+        insert_on("task", "First").await;
+        insert_on("task", "Second").await;
+        let task = writer.list_commits(Some("task")).await.unwrap();
+        let (second, first) = (task[0].clone(), task[1].clone());
+        let block = |id: &str| id.split('.').nth(1).map(str::to_string);
+        assert_eq!(
+            block(&first.graph_commit_id),
+            block(&second.graph_commit_id),
+            "one branch wrote both commits, so they share a history block"
+        );
+        let main_head = writer.list_commits(Some("main")).await.unwrap().remove(0);
+
+        let reader = session(Omnigraph::open(uri).await.unwrap());
+        let (found, held_io) = measure(reader.get_commit(&main_head.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), main_head);
+        let opens_and_scans = |io: &helpers::cost::IoCounts| {
+            (
+                io.internal_open_count - held_io.internal_open_count,
+                io.manifest_scan_count - held_io.manifest_scan_count,
+            )
+        };
+
+        let (found, io) = measure(reader.get_commit(&first.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), first);
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 6),
+            "main, then the four branches created after `task`, then `task`"
+        );
+
+        let (found, io) = measure(reader.get_commit(&second.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), second);
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 1),
+            "a commit of a block found before: the branch it was found on, alone"
+        );
+        assert_eq!(
+            people_as_of(&reader, &second).await,
+            people_as_of(&reader, &main_head).await + 2,
+            "the graph as of a commit read from the branch it was found on"
+        );
+
+        // `task` releases the block to `__history`: the hint now names a
+        // branch that no longer buffers it.
+        let release_writer = with_setting(&writer, "history_release_bytes", "2048");
+        let control = omnigraph_core::lance_access::control_session();
+        for published in 0..=TAIL_MAX_COMMITS + 1 {
+            let released =
+                omnigraph_catalog::history::read_commit(uri, &control, &first.graph_commit_id)
+                    .await
+                    .unwrap();
+            if released.is_some() {
+                break;
+            }
+            assert!(
+                published <= TAIL_MAX_COMMITS,
+                "test setup: {published} publishes on `task` released nothing"
+            );
+            let name = format!("Release{published}");
+            let person = mixed_params(&[("$name", &name)], &[("$age", 30)]);
+            mutate_branch(
+                &release_writer,
+                "task",
+                MUTATION_QUERIES,
+                "insert_person",
+                &person,
+            )
+            .await
+            .unwrap();
+        }
+        let (found, io) = measure(reader.get_commit(&first.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), first);
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 1),
+            "the hinted branch, which no longer holds the block, then `__history`"
+        );
+        let (found, io) = measure(reader.get_commit(&second.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), second);
+        assert_eq!(
+            opens_and_scans(&io),
+            (0, 0),
+            "the miss dropped the hint: `__history` alone"
+        );
+
+        // A deleted branch keeps its hint while its tree is on disk: the
+        // checkout opens the tree without reading the ref, and the retired
+        // tree still buffers the block, so every later lookup of the block
+        // reads that tree, until `cleanup` reclaims it.
+        insert_on("d_idle", "Third").await;
+        insert_on("d_idle", "Fourth").await;
+        let idle = writer.list_commits(Some("d_idle")).await.unwrap();
+        let (fourth, third) = (idle[0].clone(), idle[1].clone());
+        assert_eq!(
+            block(&third.graph_commit_id),
+            block(&fourth.graph_commit_id),
+            "one branch wrote both commits, so they share a history block"
+        );
+        let (found, _) = measure(reader.get_commit(&third.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), third, "the first lookup learns the hint");
+        writer.branch_delete("d_idle").await.unwrap();
+        for commit in [&fourth, &third, &fourth] {
+            let (found, io) = measure(reader.get_commit(&commit.graph_commit_id)).await;
+            assert_eq!(&found.unwrap(), commit);
+            assert_eq!(
+                opens_and_scans(&io),
+                (1, 1),
+                "the deleted branch's retired tree answers, and the hint stays"
+            );
+        }
+
+        writer.branch_delete("task").await.unwrap();
+        let resolved = reader.get_commit(&first.graph_commit_id).await.unwrap();
+        assert_eq!(
+            resolved, first,
+            "a commit of a deleted branch is found in `__history`"
         );
     })
     .await;

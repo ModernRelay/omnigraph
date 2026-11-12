@@ -570,6 +570,22 @@ async fn execute(
         .map_err(|error| ApiError::conflict(error.to_string()))?
         .close()
         .map_err(|error| ApiError::conflict(error.to_string()))?;
+    // A recorded run on an affected graph stops at its next safe boundary;
+    // the drain then waits for at most one table's rewrite, the publication,
+    // the configuration clear and an issued artifact write. The cancel comes
+    // after admission closed and under the record gate: a submission that
+    // already holds its graph request either became live before this (and is
+    // told) or finds its graph closed when it takes the gate and accepts
+    // nothing.
+    {
+        let lock = owner.lock_operations().await;
+        state.recorded.cancel_under(
+            &lock,
+            None,
+            Some(&affected),
+            &format!("deployment {}", request.deployment_id),
+        );
+    }
     if let Err(error) = transition.wait_requests().await {
         return Err(abort_before_effects(
             &state,

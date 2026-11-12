@@ -261,6 +261,19 @@ Timings include waits, overlap and accumulate across concurrent partitions;
 their sum is not query latency. Diagnostics may vary on replay and do not
 change probe decisions, result ordering or replay policy.
 
+An operator that wrote scratch files reports `node` `spill`, one row per
+pass that spilled:
+
+| `detail` key | Meaning |
+|---|---|
+| `id`, `rung` | the plan node and overfetch pass |
+| `spill_count` | the spill files the node's operator wrote, including a sort it ran itself, such as the pair sort of a bound-edge `Expand` |
+| `spilled_bytes` | the bytes of those files as written; spill files are zstd-compressed, and the query's scratch quota counts these bytes |
+| `spilled_rows` | the rows written to them |
+
+A pass with no spill has no row. Whether an operator spills depends on the
+query's memory budget, so these rows can differ between runs of one plan.
+
 An `Aggregate` node's `aggregates` array aligns with `exprs`, with `null` for
 group keys. Each aggregate records its result `column`, `func`, declared `input`
 and `result` types, `accumulator`, and `overflow` conversion. A type's `?` marks

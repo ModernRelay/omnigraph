@@ -324,7 +324,7 @@ fn rfc023_external_writer_process() {
                 }
                 "collector_advance_merge_source" => {
                     db.load("source", &payload, mode).await.unwrap();
-                    let rows = db.cleanup(keep_one()).await.unwrap();
+                    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
                     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
                 }
                 "collector_retired" => {
@@ -345,6 +345,30 @@ fn rfc023_external_writer_process() {
                     db.branch_delete("t").await.unwrap();
                     db.branch_create("t").await.unwrap();
                     db.load("t", &payload, mode).await.unwrap();
+                }
+                "branch_claim" => {
+                    let (branch, epoch) = payload.split_once('=').expect("<branch>=<epoch>");
+                    assert_eq!(
+                        db.claim_branch_writer(branch).await.unwrap(),
+                        epoch.parse::<u64>().unwrap()
+                    );
+                }
+                "branch_claim_then_load" => {
+                    let (epoch, row) = payload.split_once('=').expect("<epoch>=<row>");
+                    assert_eq!(
+                        db.claim_branch_writer("main").await.unwrap(),
+                        epoch.parse::<u64>().unwrap()
+                    );
+                    db.load("main", row, mode).await.unwrap();
+                }
+                "branch_delete" | "branch_recreate" | "branch_recreate_and_claim" => {
+                    db.branch_delete(&payload).await.unwrap();
+                    if action != "branch_delete" {
+                        db.branch_create(&payload).await.unwrap();
+                    }
+                    if action == "branch_recreate_and_claim" {
+                        assert_eq!(db.claim_branch_writer(&payload).await.unwrap(), 1);
+                    }
                 }
                 other => panic!("unknown external writer action '{other}'"),
             }
@@ -516,7 +540,7 @@ async fn branch_start_refuses_a_commit_an_interrupted_cleanup_emptied() {
 
     {
         let _fp = catalog::CLEANUP_SWEEP_PRE_MANIFEST_DELETE.fire_always();
-        let _ = db.cleanup(keep_one()).await;
+        let _ = db.cleanup_as(keep_one(), None).await;
     }
     assert!(
         detached_versions(&person_uri).await.contains(&eve_person),
@@ -548,7 +572,7 @@ async fn branch_start_refuses_a_commit_an_interrupted_cleanup_emptied() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
     assert_eq!(version_main(&db).await.unwrap(), main_version);
 
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     let person = stats
         .iter()
         .find(|row| row.type_key == "node:Person")
@@ -625,7 +649,7 @@ async fn branch_delete_cleanup_failure_converges_on_retry() {
     );
     {
         let _fp = catalog::CLEANUP_TABLE_GC.fire_always();
-        main.cleanup(keep_one()).await.unwrap();
+        main.cleanup_as(keep_one(), None).await.unwrap();
     }
     assert!(
         detached_versions(&person_uri)
@@ -633,7 +657,7 @@ async fn branch_delete_cleanup_failure_converges_on_retry() {
             .contains(&former_staging),
         "failed cleanup preserves the deleted branch's staging"
     );
-    main.cleanup(keep_one()).await.unwrap();
+    main.cleanup_as(keep_one(), None).await.unwrap();
     assert!(
         !detached_versions(&person_uri)
             .await
@@ -725,7 +749,7 @@ async fn recreate_over_a_deleted_branch_writes_without_cleanup() {
         "writes do not collect the former staging"
     );
     assert!(remaining.contains(&second_staging));
-    main.cleanup(keep_one()).await.unwrap();
+    main.cleanup_as(keep_one(), None).await.unwrap();
     let remaining = detached_versions(&person_uri).await;
     assert!(!remaining.contains(&first_staging));
     assert!(
@@ -782,7 +806,7 @@ async fn branch_delete_acknowledges_with_staging_awaiting_cleanup() {
             .contains(&former_staging),
         "delete and reopen defer collection of the branch's staging"
     );
-    main.cleanup(keep_one()).await.unwrap();
+    main.cleanup_as(keep_one(), None).await.unwrap();
     assert!(
         !detached_versions(&person_uri)
             .await
@@ -852,7 +876,7 @@ async fn branch_recreate_completes_while_old_staging_awaits_cleanup() {
     let remaining = detached_versions(&person_uri).await;
     assert!(remaining.contains(&first_staging));
     assert!(remaining.contains(&second_staging));
-    main.cleanup(keep_one()).await.unwrap();
+    main.cleanup_as(keep_one(), None).await.unwrap();
     let remaining = detached_versions(&person_uri).await;
     assert!(!remaining.contains(&first_staging));
     assert!(remaining.contains(&second_staging));
@@ -925,10 +949,13 @@ async fn branch_write_ignores_unavailable_cleanup_classifier() {
         helpers::count_rows_branch(&db, "feature", "node:Person").await,
         5
     );
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     let branches = lance::Dataset::open(&person_uri)
@@ -972,10 +999,13 @@ async fn cleanup_isolates_single_table_failure() {
     // One table's version GC fails once; the sweep must isolate it.
     let _fp = catalog::CLEANUP_TABLE_GC.fire_once_at(1);
     let stats = db
-        .cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        .cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .expect("a single table's GC failure must not abort cleanup");
 
@@ -1026,10 +1056,13 @@ async fn cleanup_isolates_reconcile_failure() {
     // not abort.
     {
         let _fp = catalog::CLEANUP_RECONCILE_FORK.fire_once_at(1);
-        db.cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        db.cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .expect("a reconcile force-delete failure must not abort cleanup");
     }
@@ -1046,10 +1079,13 @@ async fn cleanup_isolates_reconcile_failure() {
         );
     }
     // A second cleanup with no injected failure converges.
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     {
@@ -1098,10 +1134,13 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     // branch is live but unreadable) → cleanup must SKIP it, not delete.
     {
         let _fp = catalog::CLASSIFY_FRESH_READ.fire_always();
-        db.cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: None,
-        })
+        db.cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: None,
+            },
+            None,
+        )
         .await
         .unwrap();
         let ds = lance::Dataset::open(&person_uri).await.unwrap();
@@ -1116,10 +1155,13 @@ async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges()
     }
 
     // Read succeeds now → cleanup confirms the orphan and reclaims it (converges).
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: None,
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        },
+        None,
+    )
     .await
     .unwrap();
     {
@@ -2683,7 +2725,7 @@ async fn merge_target_delete_waits_and_source_delete_does_not_issue_643() {
                 .unwrap()
                 .unwrap_or_else(|error| panic!("deleting the target after the merge: {error}"));
         } else {
-            let rows = db.cleanup(keep_one()).await.unwrap();
+            let rows = db.cleanup_as(keep_one(), None).await.unwrap();
             assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
             assert_eq!(
                 helpers::count_rows_branch(&db, "t", "node:Person").await,
@@ -3076,7 +3118,7 @@ async fn cancelled_merge_leaves_the_target_whole_issue_643() {
         )
         .await
         .unwrap_or_else(|error| panic!("{seam}: a later write on the target: {error}"));
-        let rows = db.cleanup(keep_one()).await.unwrap();
+        let rows = db.cleanup_as(keep_one(), None).await.unwrap();
         assert!(
             rows.iter().all(|row| row.error.is_none()),
             "{seam}: {rows:?}"
@@ -3722,7 +3764,7 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
         &catalog::ENSURE_INDICES_POST_STAGE_PRE_COMMIT_BTREE,
     );
     let writer_a_db = std::sync::Arc::clone(&db);
-    let writer_a = tokio::spawn(async move { writer_a_db.ensure_indices().await });
+    let writer_a = tokio::spawn(async move { writer_a_db.ensure_indices_as(None).await });
     rendezvous.wait_until_reached().await;
 
     db.load(
@@ -4060,15 +4102,9 @@ async fn schema_apply_retry_preserves_the_original_empty_create() {
         assert_eq!(entry.published_dataset_version, if changed { 2 } else { 1 });
         assert_eq!(entry.version_metadata.staged_version().is_some(), changed);
         assert_eq!(entry.version_metadata.last_linear_version(), Some(1));
-        recovered
-            .repair(omnigraph::db::RepairOptions {
-                confirm: true,
-                force: false,
-            })
-            .await
-            .unwrap();
-        recovered.ensure_indices().await.unwrap();
-        let cleaned = recovered.cleanup(keep_one()).await.unwrap();
+        recovered.repair_report_as(None).await.unwrap();
+        recovered.ensure_indices_as(None).await.unwrap();
+        let cleaned = recovered.cleanup_as(keep_one(), None).await.unwrap();
         assert!(cleaned.iter().all(|row| row.error.is_none()), "{cleaned:?}");
         drop(recovered);
         let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
@@ -4492,7 +4528,10 @@ async fn optimize_pre_publish_failure_leaves_no_residue() {
         .version;
     {
         let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let err = db.optimize().await.unwrap_err();
+        let err = db
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains(
                 "injected failpoint triggered: optimize.post_phase_b_pre_manifest_commit"
@@ -4519,11 +4558,12 @@ async fn optimize_pre_publish_failure_leaves_no_residue() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 4);
     assert_eq!(helpers::count_rows(&db, "node:Company").await, 4);
     let stats = db
-        .optimize()
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
-        .expect("the retry re-plans from the pins");
+        .expect("the retry re-plans from the pins")
+        .tables;
     assert!(
-        stats.iter().any(|stat| stat.committed),
+        stats.iter().any(|stat| stat.committed()),
         "the retry compacts what the failed attempt staged again"
     );
     assert_person_pin_detached(&db, "main", person_head).await;
@@ -4534,6 +4574,50 @@ async fn optimize_pre_publish_failure_leaves_no_residue() {
     db.apply_schema(&desired)
         .await
         .expect("schema apply after optimize must succeed");
+}
+
+/// Once Optimize's graph commit is durable, a failed configuration clear is
+/// reported beside it and fails nothing: the run returns its commit, and
+/// the writer gates are released for the next writer.
+#[tokio::test]
+#[serial(optimize)]
+async fn optimize_reports_a_failed_configuration_clear_after_its_publication() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_two_productive_optimize_tables(&uri).await;
+    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let report = {
+        let _failpoint = catalog::OPTIMIZE_CONFIGURATION_CLEAR.fire_always();
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .expect("a post-commit clear failure does not fail the run")
+    };
+    let published = report
+        .graph_commit_id
+        .clone()
+        .expect("the productive run published");
+    assert!(
+        matches!(
+            report.configuration_clear,
+            omnigraph::db::ConfigurationClear::Failed(_)
+        ),
+        "{:?}",
+        report.configuration_clear
+    );
+    assert_eq!(
+        db.list_commits(None).await.unwrap()[0].graph_commit_id,
+        published,
+        "the reported commit is main's head"
+    );
+    db.mutate(
+        "main",
+        OCC_DISJOINT_MUTATIONS,
+        "insert_company",
+        &params(&[("$name", "after-optimize")]),
+    )
+    .await
+    .expect("the run released its writer gates");
 }
 
 /// RFC 0067: a lost acknowledgement of Optimize's manifest commit reports
@@ -4550,7 +4634,7 @@ async fn optimize_lost_publish_acknowledgement_leaves_published_detached_pins() 
         let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
         let before = person_head_and_published(&db, "main").await;
         let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
-        db.optimize()
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
             .await
             .expect_err("a lost publish acknowledgement surfaces as an error");
         before
@@ -4566,11 +4650,15 @@ async fn optimize_lost_publish_acknowledgement_leaves_published_detached_pins() 
         before.1
     );
     assert_person_pin_detached(&recovered, "main", before.0).await;
-    let stats = recovered.optimize().await.unwrap();
+    let stats = recovered
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     assert!(
         stats
             .iter()
-            .all(|stat| stat.type_key == "__manifest" || !stat.committed),
+            .all(|stat| stat.type_key == "__manifest" || !stat.committed()),
         "nothing is left to compact after the published compaction: {stats:?}"
     );
 }
@@ -4602,7 +4690,7 @@ node Embedding {
     )
     .await
     .unwrap();
-    let pending = db.ensure_indices().await.unwrap();
+    let pending = db.ensure_indices_as(None).await.unwrap();
     assert!(
         pending
             .iter()
@@ -4615,7 +4703,9 @@ node Embedding {
     )
     .await
     .unwrap();
-    db.optimize().await.unwrap();
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
     let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
     let embedding = snapshot.open_dataset("node:Embedding").await.unwrap();
     assert!(embedding.has_unindexed_fragments().await.unwrap());
@@ -4652,7 +4742,10 @@ node Embedding {
         .version;
     {
         let _failpoint = catalog::OPTIMIZE_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_once_at(1);
-        let error = db.optimize().await.unwrap_err();
+        let error = db
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap_err();
         assert!(
             !matches!(error, OmniError::RecoveryRequired { .. }),
             "{error}"
@@ -4680,17 +4773,24 @@ node Embedding {
     );
     drop(db);
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    let stats = db.optimize().await.unwrap();
+    let stats = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap()
+        .tables;
     let work = stats
         .iter()
         .find(|stat| stat.type_key == "node:Work")
         .expect("Work stat present");
-    assert!(work.committed, "the retry compacts Work");
+    assert!(work.committed(), "the retry compacts Work");
     let embedding = stats
         .iter()
         .find(|stat| stat.type_key == "node:Embedding")
         .expect("Embedding stat present");
-    assert!(!embedding.committed, "pending-only table must stay a no-op");
+    assert!(
+        !embedding.committed(),
+        "pending-only table must stay a no-op"
+    );
     assert!(
         embedding
             .pending_indexes
@@ -4709,94 +4809,810 @@ node Embedding {
     );
 }
 
-/// RFC 0067: a failure after one table's detached rewrite and before the
-/// batch publishes leaves no residue: no pin moves, no lineage is added,
-/// no linear HEAD moves, and the retry compacts every table.
+/// A failure after one table's detached rewrite fails only that table: its
+/// pin stays, the other table's rewrite publishes in the run's one commit, no
+/// linear HEAD moves, and the next run compacts the failed table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(optimize)]
-async fn optimize_partial_table_effect_leaves_no_residue() {
+async fn optimize_table_failure_fails_only_that_table_and_publishes_the_rest() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     seed_two_productive_optimize_tables(&uri).await;
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let pin = |snapshot: &omnigraph::db::Snapshot, key: &str| {
+        snapshot.dataset(key).unwrap().published_dataset_version
+    };
     let snapshot_before = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
-    let person_pin = snapshot_before
-        .dataset("node:Person")
-        .unwrap()
-        .published_dataset_version;
-    let company_pin = snapshot_before
-        .dataset("node:Company")
-        .unwrap()
-        .published_dataset_version;
     let commits_before = db.list_commits(Some("main")).await.unwrap().len();
-    let person_uri = node_table_uri(&db, "Person").await;
-    let company_uri = node_table_uri(&db, "Company").await;
-    let person_head = helpers::open_dataset_head_exact(&person_uri, None)
-        .await
-        .version()
-        .version;
-    let company_head = helpers::open_dataset_head_exact(&company_uri, None)
-        .await
-        .version()
-        .version;
-    let _failpoint = catalog::OPTIMIZE_POST_TABLE_EFFECT.fire_once_at(1);
-    let error = db.optimize().await.unwrap_err();
-    assert!(
-        !matches!(error, OmniError::RecoveryRequired { .. }),
-        "a partial batch before publication needs no recovery: {error}"
+    let mut heads = Vec::new();
+    for type_name in ["Company", "Person"] {
+        let table_uri = node_table_uri(&db, type_name).await;
+        let head = helpers::open_dataset_head_exact(&table_uri, None)
+            .await
+            .version()
+            .version;
+        heads.push((table_uri, head));
+    }
+
+    let report = {
+        let _failpoint = catalog::OPTIMIZE_POST_TABLE_EFFECT.fire_once_at(1);
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+            .unwrap()
+    };
+    let failed = report
+        .tables
+        .iter()
+        .filter(|stat| stat.outcome == omnigraph::db::TableOptimizeOutcome::Failed)
+        .collect::<Vec<_>>();
+    assert_eq!(failed.len(), 1, "{report:?}");
+    let failed = failed[0];
+    assert_eq!(
+        failed.failure.as_ref().unwrap().completion_evidence(),
+        Some(omnigraph::error::CompletionEvidence::Unpublished),
+        "{failed:?}"
     );
-    assert_no_recovery_sidecars(dir.path());
+    let published = report
+        .tables
+        .iter()
+        .find(|stat| stat.committed())
+        .expect("the other table publishes");
+    assert_ne!(published.type_key, failed.type_key);
+    assert!(report.graph_commit_id.is_some(), "{report:?}");
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 1,
+        "the finished table publishes in one commit"
+    );
     let snapshot_after = db
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
     assert_eq!(
-        snapshot_after
-            .dataset("node:Person")
+        pin(&snapshot_after, &failed.type_key),
+        pin(&snapshot_before, &failed.type_key),
+        "the failed table's pin stays"
+    );
+    assert_ne!(
+        pin(&snapshot_after, &published.type_key),
+        pin(&snapshot_before, &published.type_key),
+        "the other table's rewrite is published"
+    );
+    assert_no_recovery_sidecars(dir.path());
+    for (table_uri, head_before) in &heads {
+        let head = lance::Dataset::open(table_uri)
+            .await
             .unwrap()
-            .published_dataset_version,
-        person_pin
-    );
-    assert_eq!(
-        snapshot_after
-            .dataset("node:Company")
-            .unwrap()
-            .published_dataset_version,
-        company_pin
-    );
-    assert_eq!(
-        db.list_commits(Some("main")).await.unwrap().len(),
-        commits_before,
-        "a partial Optimize publishes no lineage"
-    );
-    for (uri, head_before) in [(&person_uri, person_head), (&company_uri, company_head)] {
-        let head = lance::Dataset::open(uri).await.unwrap().version().version;
+            .version()
+            .version;
         assert_eq!(
-            head, head_before,
+            head, *head_before,
             "a detached rewrite never moves the linear HEAD"
         );
     }
+
     drop(db);
     let recovered = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(helpers::count_rows(&recovered, "node:Person").await, 4);
     assert_eq!(helpers::count_rows(&recovered, "node:Company").await, 4);
+    let retry = recovered
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    let compacted = retry
+        .tables
+        .iter()
+        .filter(|stat| stat.committed())
+        .map(|stat| stat.type_key.as_str())
+        .collect::<Vec<_>>();
     assert_eq!(
-        recovered.list_commits(Some("main")).await.unwrap().len(),
-        commits_before
+        compacted,
+        [failed.type_key.as_str()],
+        "the next run compacts the failed table: {retry:?}"
     );
-    let stats = recovered.optimize().await.unwrap();
+}
+
+/// A cancellation while a table's staging is under way publishes nothing:
+/// every staged and unstarted table is deferred as cancelled, no pin moves,
+/// and the next run publishes both tables.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn optimize_cancelled_mid_run_publishes_nothing_and_the_next_run_does() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_two_productive_optimize_tables(&uri).await;
+    let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+
+    let cancellation = omnigraph::db::OptimizeCancellation::new();
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(&catalog::OPTIMIZE_BEFORE_COMPACT);
+    let run = {
+        let uri = uri.clone();
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+            db.optimize_as(
+                None,
+                omnigraph::db::OptimizeRequest::default().with_cancellation(cancellation),
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    cancellation.cancel();
+    rendezvous.release();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(20), run)
+        .await
+        .expect("optimize task hung")
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        stats
+        report.cancellation,
+        omnigraph::db::RunCancellation::Cancelled
+    );
+    assert_eq!(report.graph_commit_id, None, "{report:?}");
+    for key in ["node:Company", "node:Person"] {
+        let stat = report
+            .tables
             .iter()
-            .filter(|stat| stat.type_key != "__manifest" && stat.committed)
-            .count(),
-        2,
-        "the retry compacts both tables: {stats:?}"
+            .find(|stat| stat.type_key == key)
+            .unwrap();
+        assert_eq!(
+            stat.outcome,
+            omnigraph::db::TableOptimizeOutcome::Deferred(omnigraph::db::DeferReason::Cancelled),
+            "{stat:?}"
+        );
+    }
+    assert!(report.tables.iter().all(|stat| !stat.committed()));
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before,
+        "a cancelled run publishes nothing"
     );
+
+    let next = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        next.tables.iter().filter(|stat| stat.committed()).count(),
+        2,
+        "{next:?}"
+    );
+}
+
+/// A run waits, before it takes the gates, for a writer that an earlier
+/// publication sent back to prepare again. Without the wait, runs submitted
+/// back to back take the gates while that writer prepares, publish, and send
+/// it back again, so on object storage one write waited through many runs
+/// (a writer's wait was bounded per run, not per write).
+///
+/// The writer's first attempt is parked before its gates while a run
+/// publishes over it; its second attempt is parked while the next run
+/// starts. That run must not take the gates until the write commits, and it
+/// then builds on the write's commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_waits_for_a_writer_preparing_again_after_a_publication() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    let optimize_db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let writer_db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+
+    let yields = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _yield_observer = {
+        let yields = Arc::clone(&yields);
+        catalog::GATE_WRITER_YIELD_ACQUIRE.observe(move || {
+            yields.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    // The writer crosses this seam once per attempt.
+    let attempts = helpers::failpoint::ParkedCrossings::new(
+        &catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        &[1, 2],
+    );
+    let writer = {
+        let writer_db = Arc::clone(&writer_db);
+        tokio::spawn(async move {
+            mutate_main(
+                &writer_db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "preparing-again")], &[("$age", 52)]),
+            )
+            .await
+        })
+    };
+    attempts.wait_until_reached(1).await;
+
+    // The first run publishes over the parked attempt. That writer is not
+    // preparing again yet, so the run does not wait for it.
+    let first_run = optimize_db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        first_run.graph_commit_id.is_some(),
+        "the seed leaves compaction work, so the run must publish over the writer"
+    );
+    assert!(first_run.writer_yield < std::time::Duration::from_secs(1));
+
+    // The run moved main under the attempt: it prepares again.
+    attempts.release(1);
+    attempts.wait_until_reached(2).await;
+
+    let second_run = {
+        let optimize_db = Arc::clone(&optimize_db);
+        tokio::spawn(async move {
+            optimize_db
+                .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                .await
+        })
+    };
+    for _ in 0..400 {
+        if yields.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        yields.load(Ordering::SeqCst),
+        2,
+        "the second run reached its wait"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !second_run.is_finished(),
+        "the second run must wait while the writer prepares again"
+    );
+
+    attempts.release(2);
+    writer
+        .await
+        .unwrap()
+        .expect("the writer commits on its second attempt");
+    let head_after_write = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let second_run = tokio::time::timeout(std::time::Duration::from_secs(20), second_run)
+        .await
+        .expect("the second run stops waiting once the write returns")
+        .unwrap()
+        .unwrap();
+    drop(attempts);
+    assert!(
+        second_run.writer_yield >= std::time::Duration::from_millis(200),
+        "the report records the wait: {:?}",
+        second_run.writer_yield
+    );
+    assert_eq!(
+        second_run.input_commit.as_deref(),
+        Some(head_after_write.as_str()),
+        "the second run builds on the write, not the other way round"
+    );
+    assert_eq!(
+        collect_column_strings(&read_table(&optimize_db, "node:Person").await, "name")
+            .iter()
+            .filter(|name| *name == "preparing-again")
+            .count(),
+        1
+    );
+}
+
+/// The writer the last run sent back may still be queued at main's gates
+/// behind another writer when the next run starts: it has not yet seen that
+/// main moved. The next run waits for it all the same, and builds on its
+/// commit, so the write prepares twice, not once per run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_waits_for_a_writer_still_queued_behind_another_after_a_publication() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    // One handle for every actor, as the server holds one per graph.
+    let db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let yields = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _yield_observer = {
+        let yields = Arc::clone(&yields);
+        catalog::GATE_WRITER_YIELD_ACQUIRE.observe(move || {
+            yields.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let branch_waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _branch_observer = {
+        let branch_waits = Arc::clone(&branch_waits);
+        catalog::GATE_BRANCH_ACQUIRE.observe(move || {
+            branch_waits.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let pre_gate = helpers::failpoint::ParkedCrossings::new(
+        &catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        &[1],
+    );
+    let under_gates =
+        helpers::failpoint::ParkedCrossings::new(&catalog::MUTATION_POST_TABLE_COMMIT, &[1]);
+    let spawn_insert = |name: &'static str| {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", name)], &[("$age", 3)]),
+            )
+            .await
+        })
+    };
+    let sent_back = spawn_insert("sent-back");
+    pre_gate.wait_until_reached(1).await;
+    let first = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(first.graph_commit_id.is_some());
+    // Another writer, which prepared after the run, holds main's gates; the
+    // sent-back writer queues behind it, not yet knowing main moved.
+    let holder = spawn_insert("holder");
+    under_gates.wait_until_reached(1).await;
+    let waits = branch_waits.load(Ordering::SeqCst);
+    pre_gate.release(1);
+    for _ in 0..400 {
+        if branch_waits.load(Ordering::SeqCst) > waits {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        branch_waits.load(Ordering::SeqCst) > waits,
+        "the writer queued at the gates"
+    );
+    let second = {
+        let db = Arc::clone(&db);
+        let request = omnigraph::db::OptimizeRequest::default()
+            .with_limits(
+                omnigraph::db::OptimizeLimits::default()
+                    .with_max_writer_yield(std::time::Duration::from_secs(30)),
+            )
+            .with_authority(omnigraph::db::AuthorityCapture::UnderGates);
+        tokio::spawn(async move { db.optimize_as(None, request).await })
+    };
+    for _ in 0..400 {
+        if yields.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    under_gates.release(1);
+    holder.await.unwrap().expect("the holder commits");
+    sent_back
+        .await
+        .unwrap()
+        .expect("the sent-back writer commits");
+    let head_after_write = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(20), second)
+        .await
+        .expect("the run stops waiting once the write returns")
+        .unwrap()
+        .unwrap();
+    assert!(
+        second.writer_yield >= std::time::Duration::from_millis(200),
+        "the run waited for the queued writer: {:?}",
+        second.writer_yield
+    );
+    assert_eq!(
+        second.input_commit.as_deref(),
+        Some(head_after_write.as_str()),
+        "the run builds on the sent-back write, not the other way round"
+    );
+}
+
+/// Writers that send each other back to prepare again do not hold an
+/// optimize run: only the writes an optimize publication sent back do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_does_not_wait_for_writers_another_writer_sent_back() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    let db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    // An earlier run published before either write started.
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    let attempts = helpers::failpoint::ParkedCrossings::new(
+        &catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        &[1, 3],
+    );
+    let slow = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "slow")], &[("$age", 4)]),
+            )
+            .await
+        })
+    };
+    attempts.wait_until_reached(1).await;
+    // The second write commits over the first, which prepares again.
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "fast")], &[("$age", 5)]),
+    )
+    .await
+    .unwrap();
+    attempts.release(1);
+    attempts.wait_until_reached(3).await;
+    let run = db
+        .optimize_as(
+            None,
+            omnigraph::db::OptimizeRequest::default().with_limits(
+                omnigraph::db::OptimizeLimits::default()
+                    .with_max_writer_yield(std::time::Duration::from_secs(30)),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        run.writer_yield < std::time::Duration::from_secs(1),
+        "a writer another writer sent back held the run: {:?}",
+        run.writer_yield
+    );
+    attempts.release(3);
+    slow.await.unwrap().expect("the slow writer commits");
+}
+
+/// A run cancelled while it is queued for main's writer gates behind a
+/// writer that holds them returns without them: it publishes nothing,
+/// reports every table cancelled and leaves the writer to commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_cancelled_while_queued_for_the_gates_returns_without_them() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    let db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+
+    let under_gates =
+        helpers::failpoint::ParkedCrossings::new(&catalog::MUTATION_POST_TABLE_COMMIT, &[1]);
+    let holder = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "holder")], &[("$age", 2)]),
+            )
+            .await
+        })
+    };
+    under_gates.wait_until_reached(1).await;
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+
+    // Counted from here, the only branch-gate wait is the run's.
+    let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _wait_observer = {
+        let waits = Arc::clone(&waits);
+        catalog::GATE_BRANCH_ACQUIRE.observe(move || {
+            waits.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    let cancellation = omnigraph::db::OptimizeCancellation::new();
+    let run = {
+        let db = Arc::clone(&db);
+        let request = omnigraph::db::OptimizeRequest::default()
+            .with_authority(omnigraph::db::AuthorityCapture::UnderGates)
+            .with_cancellation(cancellation.clone());
+        tokio::spawn(async move { db.optimize_as(None, request).await })
+    };
+    for _ in 0..400 {
+        if waits.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        waits.load(Ordering::SeqCst),
+        1,
+        "the run queued for the gates"
+    );
+    cancellation.cancel();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("a run cancelled while queued returns while a writer holds the gates")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.cancellation,
+        omnigraph::db::RunCancellation::Cancelled
+    );
+    assert!(report.graph_commit_id.is_none());
+    assert_eq!(report.gate_hold, std::time::Duration::ZERO);
+    assert!(!report.tables.is_empty());
+    for stat in &report.tables {
+        assert_eq!(
+            stat.outcome,
+            omnigraph::db::TableOptimizeOutcome::Deferred(omnigraph::db::DeferReason::Cancelled),
+            "{stat:?}"
+        );
+    }
+
+    under_gates.release(1);
+    holder.await.unwrap().expect("the gate holder commits");
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 1,
+        "the write, and no optimize publication"
+    );
+}
+
+/// A run cancelled while it waits for a writer that is preparing again
+/// returns without queuing for main's writer gates. A writer holds those
+/// gates throughout; the run must not wait for them, publish nothing and
+/// report every table cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_cancelled_during_its_writer_yield_returns_without_the_gates() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    seed_optimize_race_graph(&dir).await;
+    // One handle for every actor, as the server holds one per graph.
+    let db = Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+
+    let yields = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _yield_observer = {
+        let yields = Arc::clone(&yields);
+        catalog::GATE_WRITER_YIELD_ACQUIRE.observe(move || {
+            yields.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    // The sent-back writer parks at its second attempt, before its gates; the
+    // other writer parks under main's gates after its table commit.
+    let attempts = helpers::failpoint::ParkedCrossings::new(
+        &catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE,
+        &[1, 2],
+    );
+    let under_gates =
+        helpers::failpoint::ParkedCrossings::new(&catalog::MUTATION_POST_TABLE_COMMIT, &[1]);
+    let sent_back = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "sent_back")], &[("$age", 1)]),
+            )
+            .await
+        })
+    };
+    attempts.wait_until_reached(1).await;
+    let first = db
+        .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    assert!(first.graph_commit_id.is_some());
+    attempts.release(1);
+    attempts.wait_until_reached(2).await;
+    let holder = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            mutate_main(
+                &db,
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", "holder")], &[("$age", 2)]),
+            )
+            .await
+        })
+    };
+    under_gates.wait_until_reached(1).await;
+    let commits_before = db.list_commits(Some("main")).await.unwrap().len();
+
+    let cancellation = omnigraph::db::OptimizeCancellation::new();
+    let run = {
+        let db = Arc::clone(&db);
+        let request = omnigraph::db::OptimizeRequest::default()
+            .with_limits(
+                omnigraph::db::OptimizeLimits::default()
+                    .with_max_writer_yield(std::time::Duration::from_secs(30)),
+            )
+            .with_authority(omnigraph::db::AuthorityCapture::UnderGates)
+            .with_cancellation(cancellation.clone());
+        tokio::spawn(async move { db.optimize_as(None, request).await })
+    };
+    for _ in 0..400 {
+        if yields.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(yields.load(Ordering::SeqCst), 2, "the run reached its wait");
+    cancellation.cancel();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("a run cancelled during its yield returns while a writer holds the gates")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.cancellation,
+        omnigraph::db::RunCancellation::Cancelled
+    );
+    assert!(report.graph_commit_id.is_none());
+    assert_eq!(report.gate_hold, std::time::Duration::ZERO);
+    assert!(!report.tables.is_empty());
+    for stat in &report.tables {
+        assert_eq!(
+            stat.outcome,
+            omnigraph::db::TableOptimizeOutcome::Deferred(omnigraph::db::DeferReason::Cancelled),
+            "{stat:?}"
+        );
+    }
+
+    under_gates.release(1);
+    holder.await.unwrap().expect("the gate holder commits");
+    attempts.release(2);
+    sent_back
+        .await
+        .unwrap()
+        .expect("the sent-back writer commits");
+    assert_eq!(
+        db.list_commits(Some("main")).await.unwrap().len(),
+        commits_before + 2,
+        "the two writes, and no optimize publication"
+    );
+}
+
+/// A cancellation that arrives while the adjacency-artifact refresh reads the
+/// edge tables, after the publication, abandons the refresh: no write is
+/// issued and the run reports the cancellation as arriving late (RFC 1.8,
+/// 3.4). Before the fix the refresh took no cancellation, ran to its end and
+/// wrote the artifact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn optimize_cancelled_during_the_artifact_scan_writes_no_artifact() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(helpers::init_and_load(&dir).await);
+    let artifact = dir.path().join("__graph_index").join("csr-current.bin");
+    let _ = std::fs::remove_file(&artifact);
+
+    let cancellation = omnigraph::db::OptimizeCancellation::new();
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(&catalog::OPTIMIZE_ARTIFACT_SCAN);
+    let run = {
+        let uri = uri.clone();
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+            db.optimize_as(
+                None,
+                omnigraph::db::OptimizeRequest::default().with_cancellation(cancellation),
+            )
+            .await
+        })
+    };
+    rendezvous.wait_until_reached().await;
+    cancellation.cancel();
+    rendezvous.release();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .expect("optimize task hung")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        report.artifact,
+        omnigraph::db::ArtifactRefresh::Skipped(omnigraph::db::ArtifactSkip::Cancelled),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.cancellation,
+        omnigraph::db::RunCancellation::ArrivedLate,
+        "{report:?}"
+    );
+    assert!(!artifact.exists(), "a cancelled refresh writes no artifact");
+}
+
+/// While one table's rewrite is in flight, the planner runs `planning` tables
+/// ahead into the ready queue. When those are no-ops, their turns stage
+/// nothing and drain the queue; the pipeline must then plan the rest of the
+/// catalog instead of ending. Before the fix it ended there and reported the
+/// unplanned tail `deferred(gate_hold_limit)` with no `resume_at`, though no
+/// gate hold was set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial(optimize)]
+async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrite() {
+    let _scenario = FailScenario::setup();
+    let mut schema = String::new();
+    for n in 0..12 {
+        schema += &format!("node T{n:02} {{\n    k: String @key\n}}\n");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::session(Omnigraph::init(&uri, &schema).await.unwrap());
+    for n in 0..12 {
+        let row = format!(r#"{{"type": "T{n:02}", "data": {{"k": "a"}}}}"#);
+        db.load_jsonl(&row, LoadMode::Merge).await.unwrap();
+    }
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+        .await
+        .unwrap();
+    for planning in [1usize, 2, 8] {
+        // Three small fragments on the first table only: its rewrite is the
+        // run's one productive turn, parked until the planner ran ahead.
+        for i in 0..3 {
+            let row = format!(r#"{{"type": "T00", "data": {{"k": "p{planning}x{i}"}}}}"#);
+            db.load_jsonl(&row, LoadMode::Merge).await.unwrap();
+        }
+        let rendezvous =
+            helpers::failpoint::Rendezvous::park_first(&catalog::OPTIMIZE_BEFORE_COMPACT);
+        let run = {
+            let uri = uri.clone();
+            tokio::spawn(async move {
+                let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+                db.optimize_as(
+                    None,
+                    omnigraph::db::OptimizeRequest::default()
+                        .with_concurrency(omnigraph::db::OptimizeConcurrency::new(planning, 1)),
+                )
+                .await
+            })
+        };
+        rendezvous.wait_until_reached().await;
+        // Let the planner fill its ready queue with the no-op tables. No seam
+        // marks a filled queue, so this waits a fixed time: on a host slower
+        // than that the test passes without reproducing the early exit (a
+        // false green, never a false red).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        rendezvous.release();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("optimize task hung")
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.tables.len(), 12, "{report:?}");
+        let deferred = report
+            .tables
+            .iter()
+            .filter(|stat| {
+                matches!(
+                    stat.outcome,
+                    omnigraph::db::TableOptimizeOutcome::Deferred(_)
+                )
+            })
+            .map(|stat| stat.type_key.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            deferred.is_empty(),
+            "planning {planning}: no bound was set, yet {deferred:?} were deferred"
+        );
+        assert_eq!(report.resume_at, None, "planning {planning}");
+        assert_eq!(
+            report.tables[0].outcome,
+            omnigraph::db::TableOptimizeOutcome::Optimized,
+            "planning {planning}: {report:?}"
+        );
+    }
 }
 
 /// Optimize captures a complete authority token before entering any writer
@@ -4836,7 +5652,11 @@ async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
         &catalog::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
     );
     let optimize_task_db = std::sync::Arc::clone(&optimize_db);
-    let optimize = tokio::spawn(async move { optimize_task_db.optimize().await });
+    let optimize = tokio::spawn(async move {
+        optimize_task_db
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
+    });
     rendezvous.wait_until_reached().await;
 
     // Advance the graph head underneath it with an ordinary committed write, so
@@ -4872,6 +5692,11 @@ async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
     let error = outcome.expect_err(
         "Optimize must refuse a token whose graph head moved before it acquired its gates",
     );
+    assert_eq!(
+        error.completion_evidence(),
+        Some(CompletionEvidence::BeforeEffect),
+        "a refusal at authority revalidation happens before any effect: {error}"
+    );
     let rendered = error.to_string();
     assert!(
         rendered.contains("read set")
@@ -4897,6 +5722,121 @@ async fn optimize_refuses_when_graph_authority_moves_before_its_gates() {
         sidecars.is_empty(),
         "a pre-effect authority refusal must leave no Optimize sidecar: {sidecars:?}",
     );
+}
+
+/// The served path asks for its authority under the gates
+/// (`AuthorityCapture::UnderGates`): writers in the same process move main
+/// while a run waits for its gates, and none can move it while they are held,
+/// so the run captures again there instead of refusing, and publishes on the
+/// moved head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+#[serial(optimize)]
+async fn optimize_captures_its_authority_under_the_gates_when_asked() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    seed_optimize_race_graph(&dir).await;
+
+    let optimize_db = std::sync::Arc::new(helpers::session(Omnigraph::open(&uri).await.unwrap()));
+    let writer_db = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let person_uri = node_table_uri(optimize_db.as_ref(), "Person").await;
+    let graph_head_before = branch_head_commit_id(dir.path(), "main").await.unwrap();
+
+    let rendezvous = helpers::failpoint::Rendezvous::park_first(
+        &catalog::OPTIMIZE_POST_AUTHORITY_CAPTURE_PRE_GATES,
+    );
+    let optimize_task_db = std::sync::Arc::clone(&optimize_db);
+    let optimize = tokio::spawn(async move {
+        optimize_task_db
+            .optimize_as(
+                None,
+                omnigraph::db::OptimizeRequest::default()
+                    .with_authority(omnigraph::db::AuthorityCapture::UnderGates),
+            )
+            .await
+    });
+    rendezvous.wait_until_reached().await;
+
+    mutate_main(
+        &writer_db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "authority-mover")], &[("$age", 41)]),
+    )
+    .await
+    .expect("the concurrent write must commit while Optimize waits");
+    let graph_head_after = branch_head_commit_id(dir.path(), "main").await.unwrap();
+    assert_ne!(
+        graph_head_before, graph_head_after,
+        "the fixture must actually move the graph head, or this test is vacuous",
+    );
+    let person_head_after_write = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    let person_rows_after_write = helpers::count_rows(&writer_db, "node:Person").await;
+
+    rendezvous.release();
+    let report = tokio::time::timeout(std::time::Duration::from_secs(20), optimize)
+        .await
+        .expect("Optimize task hung after releasing the authority-capture rendezvous")
+        .unwrap()
+        .expect("a run capturing under its gates publishes on the moved head");
+    drop(rendezvous);
+
+    assert_eq!(
+        report.input_commit.as_deref(),
+        Some(graph_head_after.as_str()),
+        "the capture under the gates is the attempt's authority: {report:?}"
+    );
+    assert!(
+        report.tables.iter().any(|stat| stat.committed()),
+        "the seeded compaction work must publish: {report:?}"
+    );
+    assert_eq!(
+        report.graph_commit_id.as_deref(),
+        Some(
+            branch_head_commit_id(dir.path(), "main")
+                .await
+                .unwrap()
+                .as_str()
+        ),
+        "the run's commit is main's head"
+    );
+    // Every table write is a detached commit, so Person's linear HEAD never
+    // moves; the rewrite shows in the report and in main's new head.
+    assert_eq!(
+        lance::Dataset::open(&person_uri)
+            .await
+            .unwrap()
+            .version()
+            .version,
+        person_head_after_write,
+        "a table's linear HEAD stays where it was",
+    );
+    assert!(
+        report
+            .tables
+            .iter()
+            .any(|stat| stat.type_key == "node:Person" && stat.committed()),
+        "Person was rewritten on top of the concurrent write: {report:?}",
+    );
+    // The rewrite planned under the new capture keeps the row that moved
+    // main: a plan from the old capture would have dropped it.
+    let fresh = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        helpers::count_rows(&fresh, "node:Person").await,
+        person_rows_after_write,
+        "the concurrent insert survives the rewrite",
+    );
+    let recovery_dir = dir.path().join("__recovery");
+    let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
+        .map(|entries| entries.filter_map(|entry| entry.ok()).collect())
+        .unwrap_or_default();
+    assert!(sidecars.is_empty(), "no Optimize sidecar: {sidecars:?}");
 }
 
 /// Optimize retains main's branch gate after its final recovery relist and
@@ -4932,7 +5872,8 @@ async fn optimize_holds_main_gate_through_disjoint_table_effects() {
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
         let db = helpers::session(Omnigraph::open(&uri_opt).await.unwrap());
-        db.optimize().await
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
     });
     rendezvous.wait_until_reached().await;
 
@@ -4976,7 +5917,7 @@ async fn optimize_holds_main_gate_through_disjoint_table_effects() {
         1,
         "queued table-disjoint Company insert must persist",
     );
-    db.optimize()
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .expect("graph must remain healthy / re-optimizable");
 }
@@ -5016,7 +5957,8 @@ async fn optimize_serializes_concurrent_delete_across_handles() {
     let uri_opt = uri.clone();
     let optimize = tokio::spawn(async move {
         let db = helpers::session(Omnigraph::open(&uri_opt).await.unwrap());
-        db.optimize().await
+        db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+            .await
     });
     rendezvous.wait_until_reached().await;
 
@@ -5076,7 +6018,7 @@ async fn optimize_serializes_concurrent_delete_across_handles() {
         3,
         "the concurrent delete must persist (alice removed)",
     );
-    db.optimize()
+    db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
         .await
         .expect("graph must remain healthy / re-optimizable");
 }
@@ -5431,7 +6373,7 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
         )
         .await
         .unwrap();
-        db.ensure_indices().await.unwrap();
+        db.ensure_indices_as(None).await.unwrap();
     }
 
     // Setup: trigger the failpoint. Steady-state ensure_indices
@@ -5441,7 +6383,7 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
     {
         let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
         let _failpoint = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let err = db.ensure_indices().await.unwrap_err();
+        let err = db.ensure_indices_as(None).await.unwrap_err();
         assert!(
             err.to_string().contains(
                 "injected failpoint triggered: ensure_indices.post_phase_b_pre_manifest_commit"
@@ -7359,7 +8301,7 @@ async fn ensure_indices_failure_before_publish_leaves_no_residue() {
     let version = helpers::version_main(&db).await.unwrap();
     {
         let _failpoint = catalog::ENSURE_INDICES_POST_TABLE_EFFECT.fire_always();
-        let err = db.ensure_indices().await.unwrap_err();
+        let err = db.ensure_indices_as(None).await.unwrap_err();
         assert!(
             err.to_string()
                 .contains("injected failpoint triggered: ensure_indices.post_table_effect"),
@@ -7370,7 +8312,7 @@ async fn ensure_indices_failure_before_publish_leaves_no_residue() {
     assert_eq!(person_head_and_published(&db, "main").await, before);
     assert_eq!(helpers::version_main(&db).await.unwrap(), version);
 
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     assert_person_pin_detached(&db, "main", before.0).await;
     assert_eq!(
         person_head_and_published(&db, "main").await.1,
@@ -7431,7 +8373,7 @@ async fn full_text_rebuild_on_a_branch_stages_on_the_inherited_table() {
     db.load_jsonl(SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db.branch_create("rebuild").await.unwrap();
     let main_before = doc_head_and_published(&db, "main").await;
     let main_entry = helpers::snapshot_main(&db)
@@ -7443,7 +8385,7 @@ async fn full_text_rebuild_on_a_branch_stages_on_the_inherited_table() {
     let main_pin = pinned_version(&db, "main", "node:Doc").await;
     let branch_version = helpers::version_branch(&db, "rebuild").await.unwrap();
 
-    db.rebuild_full_text_indices_on("rebuild")
+    db.rebuild_full_text_indices_on_as("rebuild", None)
         .await
         .expect("a branch rebuild stages on the inherited table and never forks");
     assert!(sidecar_operation_ids(dir.path()).is_empty());
@@ -7540,7 +8482,7 @@ async fn assert_optimize_detached_pin_survives_next_write(uri: &str) {
     {
         let _failpoint = catalog::GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT.fire_once_at(1);
         let error = db
-            .optimize()
+            .optimize_as(None, omnigraph::db::OptimizeRequest::default())
             .await
             .expect_err("compaction published before its acknowledgement was lost");
         assert!(
@@ -8626,10 +9568,13 @@ async fn rfc_0067_cleanup_reaps_aged_surplus_detached_manifests() {
         }
     }
     for _ in 0..2 {
-        db.cleanup(omnigraph::db::CleanupPolicyOptions {
-            keep_versions: Some(1),
-            older_than: Some(std::time::Duration::ZERO),
-        })
+        db.cleanup_as(
+            omnigraph::db::CleanupPolicyOptions {
+                keep_versions: Some(1),
+                older_than: Some(std::time::Duration::ZERO),
+            },
+            None,
+        )
         .await
         .unwrap();
     }
@@ -8694,10 +9639,13 @@ async fn rfc_0067_zero_age_cleanup_keeps_a_fresh_unpublished_detached_manifest()
         "the interrupted write must strand at least one detached manifest"
     );
 
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: Some(std::time::Duration::ZERO),
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: Some(std::time::Duration::ZERO),
+        },
+        None,
+    )
     .await
     .unwrap();
     let after = detached_files();
@@ -8713,10 +9661,13 @@ async fn rfc_0067_zero_age_cleanup_keeps_a_fresh_unpublished_detached_manifest()
             .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
             .unwrap();
     }
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: Some(std::time::Duration::ZERO),
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: Some(std::time::Duration::ZERO),
+        },
+        None,
+    )
     .await
     .unwrap();
     let aged = detached_files();
@@ -8738,10 +9689,13 @@ fn rfc_0067_external_cleanup_process() {
         .unwrap()
         .block_on(async {
             let db = Omnigraph::open(&uri).await.unwrap();
-            db.cleanup(omnigraph::db::CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: Some(std::time::Duration::ZERO),
-            })
+            db.cleanup_as(
+                omnigraph::db::CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: Some(std::time::Duration::ZERO),
+                },
+                None,
+            )
             .await
             .unwrap();
         });
@@ -9352,20 +10306,20 @@ async fn live_handle_writes_after_every_write_family_seam_failure() {
                 db.apply_schema(&render_schema(&schema_props, age_indexed))
                     .await
                     .expect("ensure-row schema setup");
-                db.ensure_indices()
+                db.ensure_indices_as(None)
                     .await
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             }
             Driver::Optimize => db
-                .optimize()
+                .optimize_as(None, omnigraph::db::OptimizeRequest::default())
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
-            Driver::Cleanup => Box::pin(db.cleanup(omnigraph::db::CleanupPolicyOptions {
+            Driver::Cleanup => Box::pin(db.cleanup_as(omnigraph::db::CleanupPolicyOptions {
                 keep_versions: Some(1),
                 older_than: None,
-            }))
+            }, None))
             .await
             .map(|_| ())
             .map_err(|error| error.to_string()),
@@ -9441,10 +10395,13 @@ async fn rfc_0067_merge_diff_keeps_every_chunk() {
         after_rows - before_rows
     );
     db.branch_delete("feature").await.unwrap();
-    db.cleanup(omnigraph::db::CleanupPolicyOptions {
-        keep_versions: Some(1),
-        older_than: Some(std::time::Duration::ZERO),
-    })
+    db.cleanup_as(
+        omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: Some(std::time::Duration::ZERO),
+        },
+        None,
+    )
     .await
     .unwrap();
     let person_uri = node_table_uri(&db, "Person").await;
@@ -9484,10 +10441,13 @@ async fn rfc_0067_cleanup_window_keeps_version_gc_on_a_written_table() {
 
     for pass in 0..2 {
         let stats = db
-            .cleanup(omnigraph::db::CleanupPolicyOptions {
-                keep_versions: Some(1),
-                older_than: Some(std::time::Duration::from_secs(7 * 24 * 60 * 60)),
-            })
+            .cleanup_as(
+                omnigraph::db::CleanupPolicyOptions {
+                    keep_versions: Some(1),
+                    older_than: Some(std::time::Duration::from_secs(7 * 24 * 60 * 60)),
+                },
+                None,
+            )
             .await
             .unwrap();
         let person = stats
@@ -9565,7 +10525,7 @@ async fn collector_keeps_live_staging_and_reclaims_it_once_the_head_moves() {
         );
         assert!(staging.bytes > 0);
     }
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     let row = stats
         .iter()
         .find(|row| row.type_key == "node:Person")
@@ -9592,7 +10552,7 @@ async fn collector_keeps_live_staging_and_reclaims_it_once_the_head_moves() {
             staging.verdict
         );
     }
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     let row = stats
         .iter()
         .find(|row| row.type_key == "node:Person")
@@ -9684,7 +10644,7 @@ async fn collector_keeps_pins_published_by_a_late_branch_in_another_process() {
         let expected_rows = count_rows(&db, "node:Person").await + 1;
         let cleaner = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
         let (guard, hold) = catalog::CLEANUP_COLLECTOR_POST_SNAPSHOT.hold();
-        let cleanup = tokio::spawn(async move { cleaner.cleanup(keep_one()).await });
+        let cleanup = tokio::spawn(async move { cleaner.cleanup_as(keep_one(), None).await });
         let reached = hold.clone();
         tokio::task::spawn_blocking(move || reached.wait_until_reached())
             .await
@@ -9727,7 +10687,7 @@ async fn collector_keeps_pins_published_by_a_late_branch_in_another_process() {
                     path.display()
                 );
             }
-            let retry = reader.cleanup(keep_one()).await.unwrap();
+            let retry = reader.cleanup_as(keep_one(), None).await.unwrap();
             assert!(retry.iter().all(|row| row.error.is_none()), "{retry:?}");
             assert_eq!(count_rows(&reader, "node:Person").await, expected_rows - 1);
             continue;
@@ -9774,7 +10734,7 @@ async fn collector_refuses_mixed_branch_captures_before_deleting() {
             count_rows(&db, "node:Person").await + usize::from(action == "collector_mixed");
         let cleaner = helpers::session(Omnigraph::open(db.uri()).await.unwrap());
         let (guard, hold) = catalog::CLEANUP_COLLECTOR_MID_BRANCH_READ.hold();
-        let cleanup = tokio::spawn(async move { cleaner.cleanup(keep_one()).await });
+        let cleanup = tokio::spawn(async move { cleaner.cleanup_as(keep_one(), None).await });
         let reached = hold.clone();
         tokio::task::spawn_blocking(move || reached.wait_until_reached())
             .await
@@ -9812,7 +10772,7 @@ async fn collector_refuses_mixed_branch_captures_before_deleting() {
         let pin = pinned_version(&reader, "main", "node:Person").await;
         assert!(detached_versions(&person_uri).await.contains(&pin));
         assert_eq!(count_rows(&reader, "node:Person").await, expected_rows);
-        let retry = reader.cleanup(keep_one()).await.unwrap();
+        let retry = reader.cleanup_as(keep_one(), None).await.unwrap();
         assert!(retry.iter().all(|row| row.error.is_none()), "{retry:?}");
         assert!(detached_versions(&person_uri).await.contains(&pin));
     }
@@ -9830,7 +10790,7 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
 
     let stats = {
         let _fp = catalog::CLEANUP_SWEEP_BETWEEN_MANIFESTS.fail_once_at(1);
-        db.cleanup(keep_one()).await.unwrap()
+        db.cleanup_as(keep_one(), None).await.unwrap()
     };
     let row = stats
         .iter()
@@ -9846,7 +10806,7 @@ async fn collector_pass_interrupted_mid_sweep_counts_nothing_and_retries_whole()
         row.manifests_removed, 1,
         "the pass stopped after its first manifest: {row:?}"
     );
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     let row = stats
         .iter()
         .find(|row| row.type_key == "node:Person")
@@ -9913,7 +10873,7 @@ async fn assert_collector_retry_treats_an_index_directory_an_interrupted_pass_re
 
     let stats = {
         let _fp = catalog::CLEANUP_SWEEP_PRE_FILE_DELETE.fire_always();
-        db.cleanup(keep_one()).await.unwrap()
+        db.cleanup_as(keep_one(), None).await.unwrap()
     };
     let row = stats
         .iter()
@@ -9946,7 +10906,7 @@ async fn assert_collector_retry_treats_an_index_directory_an_interrupted_pass_re
 
     let stats = {
         let _fp = catalog::CLEANUP_SWEEP_PRE_MANIFEST_DELETE.fire_always();
-        db.cleanup(keep_one()).await.unwrap()
+        db.cleanup_as(keep_one(), None).await.unwrap()
     };
     let row = stats
         .iter()
@@ -9967,7 +10927,7 @@ async fn assert_collector_retry_treats_an_index_directory_an_interrupted_pass_re
         );
     }
 
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     let row = stats
         .iter()
@@ -10053,7 +11013,7 @@ async fn assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_
 
     let stats = {
         let _fp = catalog::CLEANUP_SWEEP_BETWEEN_MANIFESTS.fire_always();
-        db.cleanup(keep_one()).await.unwrap()
+        db.cleanup_as(keep_one(), None).await.unwrap()
     };
     let row = stats
         .iter()
@@ -10101,7 +11061,7 @@ async fn assert_collector_retry_after_a_pass_stopped_between_manifests_finishes_
         plan.sweep_paths
     );
 
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     let row = stats
         .iter()
@@ -10156,7 +11116,7 @@ async fn assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_r
     let before = detached_versions(&person_uri).await;
     {
         let _fp = catalog::ENSURE_INDICES_POST_PHASE_B_PRE_MANIFEST_COMMIT.fire_always();
-        let outcome = db.ensure_indices().await;
+        let outcome = db.ensure_indices_as(None).await;
         assert!(
             outcome.is_err(),
             "the seam fails the index build before publish"
@@ -10194,7 +11154,7 @@ async fn assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_r
 
     let stats = {
         let _fp = catalog::CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE.fire_always();
-        db.cleanup(keep_one()).await.unwrap()
+        db.cleanup_as(keep_one(), None).await.unwrap()
     };
     let row = stats
         .iter()
@@ -10235,7 +11195,7 @@ async fn assert_collector_retry_after_a_pass_stopped_before_the_dead_manifests_r
         plan.dead_paths
     );
 
-    let stats = db.cleanup(keep_one()).await.unwrap();
+    let stats = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(stats.iter().all(|row| row.error.is_none()), "{stats:?}");
     let row = stats
         .iter()
@@ -10380,7 +11340,7 @@ async fn branch_merge_in_doubt_keeps_input_tags_until_cleanup() {
         "the acknowledged source and target guards must survive an in-doubt fast-forward"
     );
 
-    let rows = db.cleanup(keep_one()).await.unwrap();
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     assert!(
         !native
@@ -10914,7 +11874,7 @@ async fn unattached_live_chain_pins_are_rooted_and_survive_cleanup() {
         report.retained_unattached_tags
     );
 
-    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    let rows = db.cleanup_as(keep_one_at_any_age(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     let remaining = detached_versions(&person_uri).await;
     assert!(
@@ -10959,7 +11919,7 @@ async fn unattached_live_chain_pins_are_rooted_and_survive_cleanup() {
     let plan = main_plan(&report, "node:Person");
     assert!(plan.roots.contains(&grandchild_pin));
     assert!(plan.roots.contains(&root_pin));
-    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    let rows = db.cleanup_as(keep_one_at_any_age(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     let remaining = detached_versions(&person_uri).await;
     assert!(remaining.contains(&grandchild_pin));
@@ -11035,7 +11995,9 @@ async fn cleanup_releases_expired_unattached_tags_descendants_first() {
 
     let interrupted = {
         let _fp = catalog::CLEANUP_POST_UNATTACHED_RELEASE.fail_once_at(1);
-        db.cleanup(keep_one_at_any_age()).await.unwrap_err()
+        db.cleanup_as(keep_one_at_any_age(), None)
+            .await
+            .unwrap_err()
     };
     assert!(
         interrupted
@@ -11049,7 +12011,7 @@ async fn cleanup_releases_expired_unattached_tags_descendants_first() {
         "the child's tag went first; the root's stays for the retry"
     );
 
-    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    let rows = db.cleanup_as(keep_one_at_any_age(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     assert!(unattached_tags(&uri).await.is_empty());
     let at = |id: &str| ReadTarget::snapshot(SnapshotId::new(id.to_string()));
@@ -11067,7 +12029,7 @@ async fn cleanup_releases_expired_unattached_tags_descendants_first() {
         person_count_at(&db, ReadTarget::branch("main")).await,
         main_before + 1
     );
-    let rows = db.cleanup(keep_one_at_any_age()).await.unwrap();
+    let rows = db.cleanup_as(keep_one_at_any_age(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
 }
 
@@ -11131,7 +12093,7 @@ async fn abandoned_merge_input_tags_expire_after_target_advances() {
     )
     .await
     .unwrap();
-    let rows = db.cleanup(keep_one()).await.unwrap();
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     assert!(
         captured_path.is_file(),
@@ -11144,7 +12106,7 @@ async fn abandoned_merge_input_tags_expire_after_target_advances() {
     )
     .await
     .unwrap();
-    let rows = db.cleanup(keep_one()).await.unwrap();
+    let rows = db.cleanup_as(keep_one(), None).await.unwrap();
     assert!(rows.iter().all(|row| row.error.is_none()), "{rows:?}");
     assert!(
         !captured_path.exists(),
@@ -11196,7 +12158,7 @@ async fn cleanup_keeps_a_late_retired_merge_base_provider() {
     db.branch_create("target").await.unwrap();
     let cleaner = helpers::session(Omnigraph::open(&uri).await.unwrap());
     let parked = helpers::failpoint::Rendezvous::park_first(&catalog::CLEANUP_TABLE_GC);
-    let cleanup = tokio::spawn(async move { cleaner.cleanup(keep_one()).await });
+    let cleanup = tokio::spawn(async move { cleaner.cleanup_as(keep_one(), None).await });
     parked.wait_until_reached().await;
     let child_uri = uri.clone();
     let child = tokio::task::spawn_blocking(move || {
@@ -11260,7 +12222,7 @@ async fn planning_source_failures_keep_their_error_class() {
     )
     .await
     .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let lookup = params(&[("$name", "Planned")]);
     for seam in [
         &catalog::QUERY_INDEX_FACTS_PRE_LOAD,
@@ -11450,5 +12412,682 @@ async fn concurrent_stale_refreshes_on_one_handle_keep_the_newest_installed() {
             .await
             .unwrap();
         assert_eq!(rows.num_rows(), 1, "{name} after the newest install");
+    }
+}
+
+/// Run `action` on `payload` in a second process on `uri`: it holds no writer
+/// epoch of its own and shares none of this process's gates.
+async fn second_process(
+    uri: &str,
+    action: &'static str,
+    payload: &str,
+) -> std::result::Result<(), String> {
+    let (uri, payload) = (uri.to_string(), payload.to_string());
+    tokio::task::spawn_blocking(move || {
+        run_rfc023_external_writer_action(uri, LoadMode::Append, payload, action)
+    })
+    .await
+    .unwrap()
+}
+
+/// The epochs of a `WriterFenced` refusal: held, read, current.
+fn writer_fenced(error: OmniError) -> (Option<u64>, Option<u64>, u64) {
+    match error.into_completion_evidence().0 {
+        OmniError::Manifest(manifest) => match manifest.details {
+            Some(omnigraph::error::ManifestConflictDetails::WriterFenced {
+                held,
+                read,
+                current,
+            }) => (held, read, current),
+            details => panic!(
+                "not a writer-fenced refusal: {details:?}: {}",
+                manifest.message
+            ),
+        },
+        other => panic!("not a writer-fenced refusal: {other:?}"),
+    }
+}
+
+async fn try_insert(db: &Session, branch: &str, name: &str) -> omnigraph::error::Result<()> {
+    db.mutate(
+        branch,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", name)], &[("$age", 30)]),
+    )
+    .await
+    .map(|_| ())
+}
+
+fn person_row(name: &str) -> String {
+    format!(r#"{{"type":"Person","data":{{"name":"{name}","age":50}}}}"#)
+}
+
+/// A second process claims `main` while the owner's publish is parked before
+/// its `__manifest` put: the publish is refused with nothing written, and the
+/// refusal leaves the owner holding nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_fences_a_publish_parked_before_its_put() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+    let people = count_rows(&db, "node:Person").await;
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_PRE_MERGE);
+    let owner = Arc::clone(&db);
+    let write = tokio::spawn(async move { try_insert(&owner, "main", "fenced-out").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_claim", "main=2")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = write
+        .await
+        .unwrap()
+        .expect_err("a claim landed below the parked put");
+    assert_eq!(writer_fenced(refused), (Some(1), None, 2));
+    let next = try_insert(&db, "main", "still-fenced")
+        .await
+        .expect_err("the owner was fenced");
+    assert_eq!(
+        writer_fenced(next),
+        (None, None, 2),
+        "the refusal cleared what the owner held"
+    );
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(count_rows(&reader, "node:Person").await, people);
+}
+
+/// A claim parked before its put loses that version to a write of the
+/// generation it fences: the claim lands one version above, and the next
+/// write by a process that holds nothing is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_lands_above_a_late_write_and_fences_the_next() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    let people = count_rows(&db, "node:Person").await;
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_PRE_MERGE);
+    let claimer = Arc::clone(&db);
+    let claim = tokio::spawn(async move { claimer.claim_branch_writer("main").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "load", &person_row("late-writer"))
+        .await
+        .unwrap();
+    parked.release();
+    assert_eq!(claim.await.unwrap().unwrap(), 1);
+
+    let refused = second_process(&uri, "load", &person_row("fenced-writer"))
+        .await
+        .expect_err("the branch is claimed and that process holds nothing");
+    assert!(
+        refused.contains("WriterFenced { held: None, read: None, current: 1 }"),
+        "{refused}"
+    );
+    insert_person(&db, "main", "owner-writer").await;
+    let names = collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    assert_eq!(names.len(), people + 2, "{names:?}");
+    for (name, present) in [
+        ("late-writer", true),
+        ("owner-writer", true),
+        ("fenced-writer", false),
+    ] {
+        assert_eq!(names.iter().any(|row| row == name), present, "{name}");
+    }
+}
+
+/// Two processes claim `main` at once: the claim that loses the version is
+/// refused with the epoch it read, and a later claim is a takeover that lands
+/// above the winner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_race_refuses_the_loser_with_the_epoch_it_read() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_PRE_MERGE);
+    let claimer = Arc::clone(&db);
+    let claim = tokio::spawn(async move { claimer.claim_branch_writer("main").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_claim", "main=1")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = claim
+        .await
+        .unwrap()
+        .expect_err("the other claim took the version");
+    assert_eq!(writer_fenced(refused), (None, Some(0), 1));
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 2);
+    insert_person(&db, "main", "second-owner").await;
+}
+
+/// A branch whose claiming process has exited has no owner: every writer is
+/// refused until it claims, and the owner's own claim answers its epoch and
+/// writes no version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_is_required_of_every_writer_once_a_branch_is_claimed() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    second_process(&uri, "branch_claim", "main=1")
+        .await
+        .unwrap();
+
+    let refused = try_insert(&db, "main", "no-owner")
+        .await
+        .expect_err("the claimer exited and this process holds nothing");
+    assert_eq!(writer_fenced(refused), (None, None, 1));
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 2);
+    let version = version_main(&db).await.unwrap();
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 2);
+    assert_eq!(version_main(&db).await.unwrap(), version);
+    insert_person(&db, "main", "owner").await;
+}
+
+/// A second process claims `main` while a schema apply is parked before its
+/// effects: the apply's publication is refused by the epoch and the schema
+/// stays as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_refuses_a_parked_schema_apply() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(helpers::session(
+        Omnigraph::init(&uri, SCHEMA_V1).await.unwrap(),
+    ));
+
+    let parked =
+        helpers::failpoint::Rendezvous::park_first(&catalog::SCHEMA_APPLY_POST_LOCK_PRE_EFFECT);
+    let applier = Arc::clone(&db);
+    let apply = tokio::spawn(async move { applier.apply_schema(SCHEMA_V2_ADDED_TYPE).await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_claim", "main=1")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = apply
+        .await
+        .unwrap()
+        .expect_err("the claim fenced the applying process");
+    assert_eq!(writer_fenced(refused), (None, None, 1));
+    let reopened = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert!(!reopened.schema_source().contains("Company"));
+}
+
+/// A second process deletes `feature` and creates it again while a claim of
+/// it waits to load: the name now names another branch, and the claim is
+/// refused on the branch identity it captured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_refuses_a_branch_recreated_under_its_name() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = Arc::new(init_and_load(&dir).await);
+    db.branch_create("feature").await.unwrap();
+
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_LOAD_STATE);
+    let claimer = Arc::clone(&db);
+    let claim = tokio::spawn(async move { claimer.claim_branch_writer("feature").await });
+    parked.wait_until_reached().await;
+    second_process(&uri, "branch_recreate", "feature")
+        .await
+        .unwrap();
+    parked.release();
+
+    let refused = claim
+        .await
+        .unwrap()
+        .expect_err("the incarnation the claim captured is gone");
+    assert!(
+        matches!(
+            refused.into_completion_evidence().0,
+            OmniError::Manifest(manifest) if matches!(
+                &manifest.details,
+                Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged { member, .. })
+                    if member == "branch_identifier:feature"
+            )
+        ),
+        "the refusal names the branch identity"
+    );
+    assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+}
+
+/// What a process held on a deleted branch does not count on the branch
+/// created again under its name, equal epochs included: its publish there is
+/// refused as a process that holds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_of_a_deleted_branch_does_not_count_on_its_successor() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    let people = count_rows(&db, "node:Person").await;
+    db.branch_create("feature").await.unwrap();
+    assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+    insert_person(&db, "feature", "first-life").await;
+
+    second_process(&uri, "branch_recreate_and_claim", "feature")
+        .await
+        .unwrap();
+    let refused = try_insert(&db, "feature", "second-life")
+        .await
+        .expect_err("the epoch held on the deleted branch is not this branch's");
+    assert_eq!(writer_fenced(refused), (None, None, 1));
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(
+        helpers::count_rows_branch(&reader, "feature", "node:Person").await,
+        people
+    );
+}
+
+/// A claim whose acknowledgement is lost reads the version it attempted,
+/// finds its own attempt there and answers the epoch: the process holds the
+/// branch and its next write lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_settles_a_lost_acknowledgement_from_the_version_it_wrote() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let version = version_main(&db).await.unwrap();
+
+    let claimed = {
+        let _lost = catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1);
+        db.claim_branch_writer("main").await
+    };
+    assert_eq!(claimed.unwrap(), 1);
+    assert_eq!(version_main(&db).await.unwrap(), version + 1);
+    insert_person(&db, "main", "after-the-lost-acknowledgement").await;
+}
+
+/// A claim that can read neither its acknowledgement nor the version it
+/// attempted is in doubt and holds nothing; the next claim settles it by
+/// landing above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_in_doubt_is_settled_by_the_next_claim() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    let unsettled = {
+        let _lost = catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1);
+        let _unread = catalog::PUBLISH_READ_BACK.fail_once_at(1);
+        db.claim_branch_writer("main").await
+    }
+    .expect_err("neither the acknowledgement nor the version was read");
+    assert!(unsettled.is_manifest_publish_in_doubt(), "{unsettled}");
+    assert!(
+        unsettled
+            .to_string()
+            .contains("writer epoch claim outcome is in doubt"),
+        "{unsettled}"
+    );
+
+    let refused = try_insert(&db, "main", "unsettled")
+        .await
+        .expect_err("the claim landed and this process does not hold it");
+    assert_eq!(writer_fenced(refused), (None, None, 1));
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 2);
+    insert_person(&db, "main", "settled").await;
+}
+
+/// A merge of a claimed fork into its claimed branch keeps the branch's own
+/// epoch: the owner's claim answers it and writes no version, and a process
+/// that holds nothing is still refused there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_survives_a_merge_of_a_claimed_fork_into_its_branch() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    let people = count_rows(&db, "node:Person").await;
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+    db.branch_create("feature").await.unwrap();
+    assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+    insert_person(&db, "feature", "merged-in").await;
+    db.branch_merge("feature", "main").await.unwrap();
+
+    let version = version_main(&db).await.unwrap();
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+    assert_eq!(version_main(&db).await.unwrap(), version);
+    let refused = second_process(&uri, "load", &person_row("fenced-writer"))
+        .await
+        .expect_err("the branch is claimed and that process holds nothing");
+    assert!(
+        refused.contains("WriterFenced { held: None, read: None, current: 1 }"),
+        "{refused}"
+    );
+    let names = collect_column_strings(&read_table(&db, "node:Person").await, "name");
+    assert_eq!(names.len(), people + 1, "{names:?}");
+    assert!(names.iter().any(|row| row == "merged-in"), "{names:?}");
+}
+
+/// A ref delete asserts no epoch: a process that holds nothing deletes a
+/// branch another process claimed, and the branch created again under its
+/// name is at epoch 0 and takes that process's write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_does_not_refuse_deleting_the_branch() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    let people = count_rows(&db, "node:Person").await;
+    db.branch_create("feature").await.unwrap();
+    second_process(&uri, "branch_claim", "feature=1")
+        .await
+        .unwrap();
+
+    db.branch_delete("feature").await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    insert_person(&db, "feature", "second-life").await;
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        people + 1
+    );
+}
+
+/// A merge publishes on its target: a process that holds nothing is refused
+/// merging its own unclaimed fork into a branch another process claimed, and
+/// that branch keeps the rows it held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_refuses_a_non_holders_merge_into_the_branch() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    second_process(&uri, "branch_claim", "main=1")
+        .await
+        .unwrap();
+    db.branch_create("feature").await.unwrap();
+    insert_person(&db, "feature", "never-merged").await;
+    let held = collect_column_strings(&read_table(&db, "node:Person").await, "name");
+
+    let refused = db
+        .branch_merge("feature", "main")
+        .await
+        .map(|_| ())
+        .expect_err("a process holding nothing merged into a claimed branch");
+    assert_eq!(writer_fenced(refused), (None, None, 1));
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    let names = collect_column_strings(&read_table(&reader, "node:Person").await, "name");
+    assert_eq!(names, held);
+    assert!(!names.iter().any(|row| row == "never-merged"), "{names:?}");
+}
+
+/// Insert `name` on `main` and drop the write's future after its `__manifest`
+/// commit is durable and before the publisher records it: the acknowledgement
+/// is lost and the write is aborted while its read-back is parked.
+async fn insert_dropped_after_its_commit(db: &Arc<Session>, name: &'static str) {
+    let _lost = catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1);
+    let parked = helpers::failpoint::Rendezvous::park_first(&catalog::PUBLISH_READ_BACK);
+    let owner = Arc::clone(db);
+    let write = tokio::spawn(async move { try_insert(&owner, "main", name).await });
+    parked.wait_until_reached().await;
+    write.abort();
+    parked.release();
+    let dropped = write.await.expect_err("the write's future ran to its end");
+    assert!(dropped.is_cancelled(), "{dropped}");
+    assert!(!parked.timed_out(), "released, not timed out");
+}
+
+/// A write whose future is dropped after its commit landed is read by the
+/// handle that wrote it, and that handle's next write lands, whether or not
+/// the process holds the branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_owner_reads_a_write_whose_future_was_dropped_after_its_commit() {
+    for claim in [false, true] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = Arc::new(init_and_load(&dir).await);
+        if claim {
+            assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+        }
+        let people = count_rows(&db, "node:Person").await;
+
+        insert_dropped_after_its_commit(&db, "dropped-after-commit").await;
+        let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        assert_eq!(
+            count_rows(&reader, "node:Person").await,
+            people + 1,
+            "claim={claim}: the dropped write committed"
+        );
+
+        assert_eq!(
+            count_rows(&db, "node:Person").await,
+            people + 1,
+            "claim={claim}: the writing handle reads the write"
+        );
+        insert_person(&db, "main", "after-the-dropped-write").await;
+        assert_eq!(count_rows(&db, "node:Person").await, people + 2);
+    }
+}
+
+/// The handle that wrote a row in a write whose future was dropped after its
+/// commit deletes that row, whether or not the process holds the branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_owner_deletes_a_row_whose_write_future_was_dropped() {
+    for claim in [false, true] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = Arc::new(init_and_load(&dir).await);
+        if claim {
+            assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+        }
+        let people = count_rows(&db, "node:Person").await;
+
+        insert_dropped_after_its_commit(&db, "dropped-after-commit").await;
+        let deleted = db
+            .mutate(
+                "main",
+                MUTATION_QUERIES,
+                "remove_person",
+                &mixed_params(&[("$name", "dropped-after-commit")], &[]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.affected_nodes, 1, "claim={claim}");
+        let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        assert_eq!(
+            count_rows(&reader, "node:Person").await,
+            people,
+            "claim={claim}: the row is gone from the store"
+        );
+    }
+}
+
+/// A second process claims `main` at `epoch` and writes `name` there.
+async fn claim_and_write_in_a_second_process(uri: &str, epoch: u64, name: &str) {
+    second_process(
+        uri,
+        "branch_claim_then_load",
+        &format!("{epoch}={}", person_row(name)),
+    )
+    .await
+    .unwrap();
+}
+
+/// A replaced owner reads from before the claim until a write of its own is
+/// refused. Its delete of a row its successor wrote matches nothing in its
+/// view and is fenced all the same: the row stays and the stale reads end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_replaced_owner_is_refused_a_delete_that_matches_nothing_in_its_view() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+    let people = count_rows(&db, "node:Person").await;
+    claim_and_write_in_a_second_process(&uri, 2, "successor-row").await;
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        people,
+        "a replaced owner reads from before the claim"
+    );
+
+    let refused = db
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "remove_person",
+            &mixed_params(&[("$name", "successor-row")], &[]),
+        )
+        .await
+        .map(|deleted| deleted.affected_nodes)
+        .expect_err("a replaced owner's delete answered from its stale view");
+    assert_eq!(writer_fenced(refused), (Some(1), None, 2));
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        people + 1,
+        "the stale reads end with the refused delete"
+    );
+    let reader = helpers::session(Omnigraph::open(&uri).await.unwrap());
+    assert_eq!(count_rows(&reader, "node:Person").await, people + 1);
+}
+
+/// A replaced owner whose next claim stays in doubt holds no version from
+/// before that claim: its handle probes from then on, and reads what a later
+/// owner writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_in_doubt_withdraws_the_version_a_replaced_owner_held() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = init_and_load(&dir).await;
+    assert_eq!(db.claim_branch_writer("main").await.unwrap(), 1);
+    let people = count_rows(&db, "node:Person").await;
+    claim_and_write_in_a_second_process(&uri, 2, "successor-row").await;
+
+    let unsettled = {
+        let _lost = catalog::PUBLISH_POST_MERGE_PRE_ACK.fail_once_at(1);
+        let _unread = catalog::PUBLISH_READ_BACK.fail_once_at(1);
+        db.claim_branch_writer("main").await
+    }
+    .expect_err("neither the acknowledgement nor the version was read");
+    assert!(unsettled.is_manifest_publish_in_doubt(), "{unsettled}");
+    claim_and_write_in_a_second_process(&uri, 4, "later-row").await;
+    assert_eq!(count_rows(&db, "node:Person").await, people + 2);
+}
+
+/// What a read of `feature` on `db` finds for the `Person` named `name`.
+async fn people_named_on_feature(
+    db: &Session,
+    name: &str,
+) -> std::result::Result<usize, OmniError> {
+    db.query(
+        ReadTarget::branch("feature"),
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", name)]),
+    )
+    .await
+    .map(|rows| rows.num_rows())
+    .map_err(|error| error.into_completion_evidence().0)
+}
+
+/// After a process deletes a branch it holds, a handle bound to the branch
+/// probes again: it reads the branch as gone and then the branch created
+/// again, as it does when the process never claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_ends_when_its_process_deletes_the_branch() {
+    for claim in [false, true] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = init_and_load(&dir).await;
+        db.branch_create("feature").await.unwrap();
+        db.sync_branch("feature").await.unwrap();
+        if claim {
+            assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+        }
+        insert_person(&db, "feature", "first-life").await;
+
+        let sibling = helpers::session(Omnigraph::open(&uri).await.unwrap());
+        sibling.branch_delete("feature").await.unwrap();
+        let gone = people_named_on_feature(&db, "first-life").await;
+        assert!(
+            matches!(gone, Err(OmniError::BranchNotFound { .. })),
+            "claim={claim}: the bound handle read the deleted branch as {gone:?}"
+        );
+        sibling.branch_create("feature").await.unwrap();
+        assert_eq!(
+            people_named_on_feature(&db, "first-life").await.unwrap(),
+            0,
+            "claim={claim}: the branch created again holds no row of the deleted one"
+        );
+    }
+}
+
+/// Another process's delete of a branch asserts no epoch and reaches the owner
+/// by no path but a probe, so a handle bound to the held branch serves the
+/// deleted incarnation until a publish of its own loads the branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn branch_claim_owner_serves_a_bound_branch_deleted_under_it_until_its_next_write() {
+    for recreated in [false, true] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let db = init_and_load(&dir).await;
+        db.branch_create("feature").await.unwrap();
+        db.sync_branch("feature").await.unwrap();
+        assert_eq!(db.claim_branch_writer("feature").await.unwrap(), 1);
+        insert_person(&db, "feature", "first-life").await;
+
+        let action = if recreated {
+            "branch_recreate"
+        } else {
+            "branch_delete"
+        };
+        second_process(&uri, action, "feature").await.unwrap();
+        assert_eq!(
+            people_named_on_feature(&db, "first-life").await.unwrap(),
+            1,
+            "recreated={recreated}: the owner reads the deleted incarnation"
+        );
+
+        let wrote = try_insert(&db, "feature", "next-write").await;
+        let first_life = people_named_on_feature(&db, "first-life").await;
+        if recreated {
+            wrote.expect("the write lands on the branch created again, at epoch 0");
+            assert!(
+                matches!(first_life, Ok(0)),
+                "the handle probes again after its write: {first_life:?}"
+            );
+            assert_eq!(people_named_on_feature(&db, "next-write").await.unwrap(), 1);
+        } else {
+            wrote.expect_err("the write finds the branch gone");
+            assert!(
+                matches!(first_life, Err(OmniError::BranchNotFound { .. })),
+                "the handle probes again after its write: {first_life:?}"
+            );
+        }
     }
 }

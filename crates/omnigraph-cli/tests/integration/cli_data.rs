@@ -1253,10 +1253,11 @@ fn index_build_builds_missing_and_lagging_indexes_on_a_branch_issue_840() {
 
 #[test]
 fn maintenance_refuses_server_targets_before_network() {
+    // `optimize` runs served maintenance on a server target; the rest are
+    // direct-storage commands.
     let server = crate::support::managed_http::IntentApiFixture::graph(Vec::new());
     for command in [
-        &["optimize"][..],
-        &["index", "build"],
+        &["index", "build"][..],
         &["index", "rebuild", "--kind", "full-text"],
         &["rebuild-full-text-indexes"],
         &["repair"],
@@ -1278,6 +1279,49 @@ fn maintenance_refuses_server_targets_before_network() {
         assert!(server.requests().is_empty());
     }
     server.assert_complete();
+}
+
+/// `--timeout` bounds every wait, the submission included: a server that
+/// answers the submission only after the deadline does not hold the CLI,
+/// which names the operation and exits as in doubt.
+#[test]
+fn optimize_timeout_bounds_a_stalled_submission() {
+    use std::io::BufRead;
+    let server = crate::support::managed_http::IntentApiFixture::graph_with_response_delay(
+        vec![crate::support::managed_http::IntentReply::json(
+            202,
+            serde_json::json!({"lookup": "found", "operation": {"state": "accepted"}}),
+        )],
+        std::time::Duration::from_secs(8),
+    );
+    let mut child = crate::support::cli_process()
+        .args(["optimize", "--timeout", "1", "--target"])
+        .fixture_target(&server.origin)
+        .args(["--graph", "knowledge"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Timed from the submission, so the process's own start-up (slow on a
+    // freshly linked binary) does not count against the deadline.
+    let mut submitted = None;
+    let mut stderr = String::new();
+    for line in std::io::BufReader::new(child.stderr.take().unwrap()).lines() {
+        let line = line.unwrap();
+        if line.starts_with("operation id:") {
+            submitted = Some(std::time::Instant::now());
+        }
+        stderr.push_str(&line);
+        stderr.push('\n');
+    }
+    let status = child.wait().unwrap();
+    let waited = submitted.expect("the CLI names the operation").elapsed();
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    assert!(
+        waited < std::time::Duration::from_secs(5),
+        "the deadline bounds the submission: {waited:?}"
+    );
+    assert!(stderr.contains("stopped waiting"), "{stderr}");
 }
 
 #[test]
@@ -1384,7 +1428,8 @@ fn repair_json_reports_noop_on_clean_graph() {
 
     assert!(payload.get("confirm").is_none());
     assert!(payload.get("force").is_none());
-    assert_eq!(payload["graph_manifest_version"], Value::Null);
+    // The report publishes nothing, so it names no graph manifest version.
+    assert!(payload.get("graph_manifest_version").is_none());
     assert!(payload.get("manifest_version").is_none());
     assert!(payload.get("tables").is_none());
     let datasets = payload["datasets"].as_array().unwrap();
@@ -1469,7 +1514,7 @@ fn repair_reports_foreign_drift_and_refuses_removed_flags() {
             .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["graph_manifest_version"], Value::Null);
+    assert!(payload.get("graph_manifest_version").is_none());
     let person = payload["datasets"]
         .as_array()
         .unwrap()

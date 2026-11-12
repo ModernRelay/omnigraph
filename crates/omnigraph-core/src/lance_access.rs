@@ -48,6 +48,9 @@ impl LanceAccessContext {
 
     /// Carry the same immutable destination through native data and control IO.
     pub fn with_storage(storage: &dyn crate::storage::StorageAdapter) -> Self {
+        if let Some(mount) = storage.read_through_mount() {
+            return Self::with_registry(read_through::registry(mount, storage.io_scope()));
+        }
         match storage.binding() {
             Some(binding) => Self::with_registry(bound::registry(binding, storage.io_scope())),
             None => Self::with_io_scope(storage.io_scope()),
@@ -75,6 +78,7 @@ impl LanceAccessContext {
 }
 
 mod bound;
+mod read_through;
 mod scoped;
 
 pub(crate) fn has_captured_provider(session: &Arc<Session>) -> bool {
@@ -171,7 +175,7 @@ pub mod object_store_seam {
         authority: &str,
         frozen: Arc<FrozenDirectory>,
         prefix: Path,
-    ) -> Result<ReadThroughMount, String> {
+    ) -> Result<ReadThroughMountGuard, String> {
         let mut mounts = READ_THROUGH
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -181,14 +185,14 @@ pub mod object_store_seam {
             ));
         }
         mounts.insert(authority.to_string(), (frozen, prefix));
-        Ok(ReadThroughMount(authority.to_string()))
+        Ok(ReadThroughMountGuard(authority.to_string()))
     }
 
     /// The guard of one [`mount_read_through`].
     #[derive(Debug)]
-    pub struct ReadThroughMount(String);
+    pub struct ReadThroughMountGuard(String);
 
-    impl Drop for ReadThroughMount {
+    impl Drop for ReadThroughMountGuard {
         fn drop(&mut self) {
             READ_THROUGH
                 .write()

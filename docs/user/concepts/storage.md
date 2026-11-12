@@ -41,6 +41,12 @@ which can make earlier commits unreadable. Review the retention policy and
 backups before confirming it, and quiesce long-lived historical or Blob readers
 first. An unconfirmed cleanup echoes the policy but does not inspect candidates.
 
+Cleanup reclaims table versions, not the graph's own catalog. Every graph
+commit adds a version of the branch's catalog, and no command removes the
+versions of a live branch, so its storage grows with the number of commits;
+plan storage for it on write-heavy graphs. A deleted branch's catalog can be
+collected by `cleanup` once nothing else depends on it.
+
 ## Local filesystem requirement
 
 Local read-write graphs require filesystem hard-link support. Read-only access
@@ -59,6 +65,14 @@ OmniGraph uses the standard AWS credential chain. Common settings include:
 - `AWS_S3_FORCE_PATH_STYLE=true` when the endpoint requires path-style URLs;
 - `AWS_ALLOW_HTTP=true` only for a trusted local development endpoint.
 
+A graph's commit protocol relies on the store honouring conditional writes
+(`If-None-Match` and `If-Match` on `PUT`), which the server requests on every
+S3 binding. The project's S3 test suites run against RustFS; qualify any other
+S3-compatible service before production. Google Cloud Storage's S3
+interoperability endpoint is untested, and a store that ignores the conditions
+can let two writers publish the same graph version. Native `gs://` URIs are not
+supported.
+
 ## Azure configuration
 
 Azure roots use the strict form `az://<container>/<prefix>`. Credentials never
@@ -76,3 +90,12 @@ identity selection.
 
 For deployment, server boot, and cloud-specific safety requirements, see
 [Deployment](../deployment.md).
+
+## Encryption at rest
+
+The graph's data, history and Blob payloads are ordinary objects in the storage
+root, and nothing encrypts them on the way. Encryption at rest is the storage's:
+enable default bucket encryption (SSE-S3 or SSE-KMS) on S3, the service's
+equivalent on other S3-compatible stores, Azure Storage service encryption, or
+an encrypted volume for a local root. There is no field-level encryption; keep
+secrets out of graph properties, or encrypt them before they are written.
