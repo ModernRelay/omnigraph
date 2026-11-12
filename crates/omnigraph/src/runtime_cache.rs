@@ -745,9 +745,12 @@ query since($n: I64) { match { $c: Chunk  $c.n >= $n } return { $c.slug } }
             .into_iter()
             .filter(|key| key.table_path == main_pin.table_path)
             .collect();
+        // Every session version, main's pin, and the version-1 base main's
+        // first write staged on: a branch create drops only the created
+        // branch's own refs, so that handle outlives it.
         assert_eq!(
             held.len(),
-            COMMITS as usize + 1,
+            COMMITS as usize + 2,
             "under the budget every version stays held: {held:?}"
         );
         assert_eq!(
