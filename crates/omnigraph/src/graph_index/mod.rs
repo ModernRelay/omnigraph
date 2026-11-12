@@ -3,7 +3,7 @@ pub(crate) mod persist;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::builder::LargeStringBuilder;
+use arrow_array::builder::{LargeStringBuilder, StringBuilder};
 use arrow_array::{Array, ArrayRef, LargeStringArray, StringArray, UInt32Array};
 use arrow_schema::DataType;
 use futures::TryStreamExt;
@@ -240,11 +240,34 @@ impl DenseIds<'_> {
         }
     }
 
+    /// The UTF-8 bytes of the ids of `dense`, `None` when one lies outside
+    /// the dictionary: the value buffer [`Self::column`] allocates for them.
+    pub(crate) fn value_bytes(&self, dense: &[u32]) -> Option<usize> {
+        dense.iter().try_fold(0usize, |bytes, &d| {
+            Some(bytes.saturating_add(self.byte_len(d)?))
+        })
+    }
+
+    /// The offset bytes [`Self::column`] allocates for `rows` ids. A graph
+    /// index gathers `i64` offsets and narrows them to `i32`, and both are
+    /// alive during the cast; the interner writes `i32` offsets only. Callers
+    /// charge this with [`Self::value_bytes`] before they call `column`, so
+    /// the cost of each dictionary is stated once, here.
+    pub(crate) fn offset_bytes(&self, rows: usize) -> usize {
+        let per_offset = match self {
+            Self::Index(_) => std::mem::size_of::<i64>() + std::mem::size_of::<i32>(),
+            Self::Interned(_) => std::mem::size_of::<i32>(),
+        };
+        rows.saturating_add(1).saturating_mul(per_offset)
+    }
+
     /// The `Utf8` column of the ids of `dense`, every one inside the
-    /// dictionary (the caller checked); a graph index's ids are gathered
-    /// with Arrow's `take`, then narrowed to `Utf8`: a chunk is bounded by
-    /// the batch bytes, so its offsets fit i32, and the cast rewrites only
-    /// the offsets and keeps the gathered value buffer.
+    /// dictionary (the caller checked). A graph index's ids are gathered with
+    /// Arrow's `take`, then narrowed to `Utf8`; the cast rewrites only the
+    /// offsets and keeps the gathered value buffer. It fails, rather than
+    /// wraps, when a chunk's ids pass `i32::MAX` bytes. The interner's ids are
+    /// copied into buffers sized up front, so neither buffer grows by
+    /// doubling.
     pub(crate) fn column(&self, dense: &UInt32Array) -> Result<ArrayRef> {
         let failed = |error: arrow_schema::ArrowError| {
             OmniError::manifest_internal(format!("gathering destination ids failed: {error}"))
@@ -254,9 +277,15 @@ impl DenseIds<'_> {
                 let gathered = arrow_select::take::take(*ids, dense, None).map_err(failed)?;
                 arrow_cast::cast(&gathered, &DataType::Utf8).map_err(failed)
             }
-            Self::Interned(ids) => Ok(Arc::new(StringArray::from_iter_values(
-                dense.values().iter().map(|&d| ids[d as usize].as_str()),
-            ))),
+            Self::Interned(ids) => {
+                let values = dense.values();
+                let bytes = values.iter().map(|&d| ids[d as usize].len()).sum();
+                let mut column = StringBuilder::with_capacity(values.len(), bytes);
+                for &d in values {
+                    column.append_value(&ids[d as usize]);
+                }
+                Ok(Arc::new(column.finish()))
+            }
         }
     }
 }
@@ -689,7 +718,51 @@ mod tests {
             assert_eq!(ids.byte_len(2), Some(3));
             assert_eq!(ids.byte_len(1), Some(0));
             assert_eq!(ids.byte_len(4), None);
+            assert_eq!(ids.value_bytes(dense.values()), Some(7));
+            assert_eq!(ids.value_bytes(&[1, 4]), None);
             assert_eq!(&ids.column(&dense).unwrap(), &expected);
+        }
+    }
+
+    /// A destination column holds no more than its dictionary says it
+    /// allocates, so the walk that charges `value_bytes` and `offset_bytes`
+    /// first has charged it. Before this was owned here, the single-hop walk
+    /// charged a graph index's column 4 offset bytes per row instead of 12,
+    /// and the interner's column grew its value buffer by doubling.
+    #[test]
+    fn dense_ids_column_holds_what_its_dictionary_charges() {
+        const ROWS: usize = 8192;
+        // The array structs and Arrow's 64-byte buffer rounding.
+        const STRUCTS: usize = 1024;
+        for shape in ["one-byte", "short", "uuid"] {
+            let id = |i: usize| match shape {
+                "one-byte" => (i % 10).to_string(),
+                "short" => format!("n{}", i % 1000),
+                _ => format!("{i:08x}-0000-4000-8000-{i:012x}"),
+            };
+            let mut builder = TypeIndexBuilder::new();
+            let mut interner = IdInterner::new();
+            for i in 0..ROWS {
+                builder.get_or_insert(&id(i)).unwrap();
+                interner.get_or_insert(&id(i));
+            }
+            let index = builder.finish();
+            let distinct = index.len() as u32;
+            let dense = UInt32Array::from_iter_values((0..ROWS as u32).map(|i| i % distinct));
+            for (variant, ids) in [
+                ("index", DenseIds::Index(index.ids())),
+                ("interned", DenseIds::Interned(interner.ids())),
+            ] {
+                let charge =
+                    ids.value_bytes(dense.values()).unwrap() + ids.offset_bytes(dense.len());
+                let (column, peak) = crate::test_alloc::peak_bytes(|| ids.column(&dense));
+                assert_eq!(column.unwrap().len(), ROWS);
+                assert!(
+                    peak <= charge + STRUCTS,
+                    "{variant} column of {ROWS} {shape} ids held {peak} bytes; \
+                     its dictionary charges {charge}"
+                );
+            }
         }
     }
 

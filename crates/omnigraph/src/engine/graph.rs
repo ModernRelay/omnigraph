@@ -492,28 +492,18 @@ fn source_node_key(source: usize, node: u32) -> u64 {
 }
 
 /// The destination column of one chunk: `dense` resolved through `ids`, the
-/// dictionary of the walk's destination space, charged to `memory` first.
+/// dictionary of the walk's destination space, charged to `memory` first
+/// with what `ids` says the column allocates.
 fn destination_column(dense: Vec<u32>, ids: DenseIds<'_>, memory: &WorkMemory) -> Result<ArrayRef> {
-    // One pass checks every id against the dictionary and sums the bytes;
-    // the column is then built straight from the dictionary.
-    let mut bytes = 0usize;
-    for &d in &dense {
-        let len = ids.byte_len(d).ok_or_else(|| {
-            OmniError::manifest_internal(format!(
-                "dense destination id {d} is outside its dictionary of {} ids",
-                ids.len()
-            ))
-        })?;
-        bytes = bytes.saturating_add(len);
-    }
+    let bytes = ids.value_bytes(&dense).ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "a dense destination id is outside its dictionary of {} ids",
+            ids.len()
+        ))
+    })?;
     memory.string(bytes).map_err(|error| memory.error(error))?;
-    // The gathered offsets: a graph index gathers i64 offsets and narrows
-    // them to i32, both alive during the cast.
     memory
-        .grow(
-            (dense.len() + 1)
-                .saturating_mul(std::mem::size_of::<i64>() + std::mem::size_of::<i32>()),
-        )
+        .grow(ids.offset_bytes(dense.len()))
         .map_err(|error| memory.error(error))?;
     ids.column(&UInt32Array::from(dense))
 }

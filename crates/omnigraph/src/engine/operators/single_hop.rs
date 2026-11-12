@@ -508,16 +508,11 @@ impl Walk {
             &mut self.dst,
             Vec::with_capacity(self.capacity),
         ));
-        let bytes = dst
-            .values()
-            .iter()
-            .map(|&dense| {
-                ids.byte_len(dense)
-                    .expect("a destination lies inside its dictionary")
-            })
-            .sum::<usize>();
+        let bytes = ids
+            .value_bytes(dst.values())
+            .expect("a destination lies inside its dictionary");
         work.string(bytes)?;
-        work.grow((rows + 1).saturating_mul(std::mem::size_of::<i32>()))?;
+        work.grow(ids.offset_bytes(rows))?;
         let destination = ids.column(&dst).map_err(external)?;
         let output = align_sources(batch, &ordinals, destination, &[], schema, &work)?;
         sender.send_bounded(output, work).await

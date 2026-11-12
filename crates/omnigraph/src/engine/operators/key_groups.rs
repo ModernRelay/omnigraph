@@ -17,9 +17,14 @@ use crate::error::OmniError;
 
 /// The groups' hash, keyed at random per build: the keys are node ids that
 /// writers choose, and a public fixed key would let ids that share a bucket
-/// make a build and its probes quadratic. Nothing depends on the hash
-/// values: groups are numbered by first appearance and a probe answers in
-/// its own row order, and a build keeps the state its probes hash with.
+/// make a build and its probes quadratic. Only foldhash's per-hasher seed
+/// is random: DataFusion's `RandomState` is foldhash's `FixedState`, which
+/// always hashes with the public `SharedSeed::global_fixed()`, and
+/// `create_hashes` accepts no other state. That still removes the fixed
+/// public key; foldhash does not claim to resist an interactive attacker.
+/// Nothing depends on the hash values: groups are numbered by first
+/// appearance and a probe answers in its own row order, and a build keeps
+/// the state its probes hash with.
 fn key_hash_state() -> RandomState {
     use std::hash::BuildHasher;
     RandomState::with_seed(std::collections::hash_map::RandomState::new().hash_one(0u64))
