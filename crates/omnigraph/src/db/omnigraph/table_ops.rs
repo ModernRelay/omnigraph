@@ -1806,3 +1806,12 @@ async fn demote_superseded_handles(
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {
     db.runtime_cache.invalidate_all().await;
 }
+
+pub(super) async fn invalidate_graph_index_for<'a>(
+    db: &Omnigraph,
+    edge_table_keys: impl IntoIterator<Item = &'a str>,
+) {
+    db.runtime_cache
+        .invalidate_edge_tables(edge_table_keys)
+        .await;
+}

@@ -1861,6 +1861,121 @@ async fn single_edge_query_builds_only_referenced_edge() {
     );
 }
 
+/// A write keeps the cached topology of the edge tables it did not change. The
+/// cache key carries each covered table's stamp, so after a `WorksAt` insert, a
+/// node-only insert and a `WorksAt` merge from a branch, a `Knows` traversal on
+/// the writing handle reuses its CSR (no build), and a `Knows` insert makes the
+/// next one build once and see the new edge.
+#[tokio::test]
+async fn write_keeps_graph_index_of_untouched_edge_tables() {
+    const HIRE: &str = r#"
+query hire($person: String, $company: String) {
+    insert WorksAt { from: $person, to: $company }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(
+            &[("$name", "Walker"), ("$friend", "Alice")],
+            &[("$age", 41)],
+        ),
+    )
+    .await
+    .unwrap();
+    let csr_db = with_traversal(&db, Traversal::Csr);
+    let friends_of_walker = || async {
+        let builds = Arc::new(AtomicU64::new(0));
+        let probes = QueryIoProbes {
+            graph_build_count: Arc::clone(&builds),
+            ..Default::default()
+        };
+        let result = with_query_io_probes(
+            probes,
+            csr_db.query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "Walker")]),
+            ),
+        )
+        .await
+        .unwrap();
+        (first_column_sorted(&result), builds.load(Ordering::Relaxed))
+    };
+
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 1),
+        "test setup: the first traversal builds the Knows topology"
+    );
+
+    mutate_main(
+        &db,
+        HIRE,
+        "hire",
+        &params(&[("$person", "Walker"), ("$company", "Acme")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 0),
+        "a WorksAt insert must keep the cached Knows topology"
+    );
+
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Loner")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 0),
+        "a node-only insert must keep the cached Knows topology"
+    );
+
+    db.branch_create("hiring").await.unwrap();
+    mutate_branch(
+        &db,
+        "hiring",
+        HIRE,
+        "hire",
+        &params(&[("$person", "Walker"), ("$company", "Globex")]),
+    )
+    .await
+    .unwrap();
+    // The branch create cleared the caches (the e_tag-less recreated-branch
+    // fallback); warm main again before the merge.
+    assert_eq!(friends_of_walker().await.1, 1);
+    db.branch_merge("hiring", "main").await.unwrap();
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 0),
+        "a merge that changed only WorksAt must keep the cached Knows topology"
+    );
+
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Walker"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string(), "Bob".to_string()], 1),
+        "a Knows insert must rebuild the Knows topology and show the new edge"
+    );
+}
+
 /// Warm queries over unchanged contract bytes build no catalog and compile each
 /// named query once (the key digests the source); a SchemaApply rewrites the
 /// bytes, so both handles see the added type and the next query rebuilds once.

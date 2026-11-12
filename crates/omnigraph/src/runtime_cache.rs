@@ -115,6 +115,31 @@ impl RuntimeCache {
         cache.artifact_negative.invalidate_all();
     }
 
+    /// A write changed the edge tables `table_keys` (`edge:<Name>`): drop the
+    /// scoped indexes and failed-load verdicts that cover any of them, and keep
+    /// the rest. Every key embeds each covered table's stamp (identity,
+    /// version, pin, e_tag), so an index over untouched tables stays exact
+    /// after the write, and a written table's next read misses on its new
+    /// stamp anyway. The shelf stays: `shelf_serve` verifies each requested
+    /// table's current stamp, so it stops serving a written table and keeps
+    /// serving untouched ones. Lifetime changes (branch create and delete, a
+    /// refresh, schema apply, optimize) still clear everything through
+    /// `invalidate_all`, the e_tag-less fallback for recreated branches.
+    pub async fn invalidate_edge_tables<'a>(&self, table_keys: impl IntoIterator<Item = &'a str>) {
+        let written: std::collections::HashSet<&str> = table_keys.into_iter().collect();
+        if written.is_empty() {
+            return;
+        }
+        let untouched = |key: &GraphIndexCacheKey| {
+            !key.edge_tables
+                .iter()
+                .any(|table| written.contains(table.table_key.as_str()))
+        };
+        let mut cache = self.graph_indices.lock().await;
+        cache.entries.retain(untouched);
+        cache.artifact_negative.retain(untouched);
+    }
+
     /// Build (or fetch) the CSR/CSC graph index scoped to exactly `edge_types` —
     /// the edge types the query actually traverses, not every edge type in the
     /// catalog. Scoping is what keeps a single-edge join (`$x identifiesPerson

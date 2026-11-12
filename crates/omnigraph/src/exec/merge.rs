@@ -6191,7 +6191,7 @@ impl Omnigraph {
                 crate::instrumentation::MergeTimingPhase::PhysicalPublish,
             );
             let mut updates = Vec::new();
-            let mut changed_edge_tables = false;
+            let mut changed_edge_tables: Vec<String> = Vec::new();
             for table_key in &ordered_table_keys {
                 let Some(candidate_state) = candidates.get(table_key) else {
                     continue;
@@ -6281,7 +6281,7 @@ impl Omnigraph {
                     fail(&BRANCH_MERGE_POST_TABLE_EFFECT)?;
                 }
                 if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
+                    changed_edge_tables.push(table_key.clone());
                 }
                 updates.push(update);
             }
@@ -6317,9 +6317,8 @@ impl Omnigraph {
         })
         .await?;
 
-        if changed_edge_tables {
-            self.invalidate_graph_index().await;
-        }
+        self.invalidate_graph_index_for(changed_edge_tables.iter().map(String::as_str))
+            .await;
 
         Ok(MergeResult {
             outcome: if is_fast_forward {

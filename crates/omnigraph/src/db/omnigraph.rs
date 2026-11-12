@@ -4875,14 +4875,15 @@ impl Omnigraph {
             *self.merge_authority_cache.lock().await = Some((target_name, coordinator));
             published
         };
-        if candidate
-            .record
-            .tables
-            .iter()
-            .any(|table| table.registration.table_key.starts_with("edge:"))
-        {
-            self.invalidate_graph_index().await;
-        }
+        self.invalidate_graph_index_for(
+            candidate
+                .record
+                .tables
+                .iter()
+                .map(|table| table.registration.table_key.as_str())
+                .filter(|table_key| table_key.starts_with("edge:")),
+        )
+        .await;
         Ok(published.commit)
     }
 
@@ -5095,9 +5096,19 @@ impl Omnigraph {
         )
     }
 
-    /// Invalidate the cached graph index. Called after edge mutations.
+    /// Invalidate every cached graph index. Called when the schema or the
+    /// physical layout of every edge table may change.
     pub(crate) async fn invalidate_graph_index(&self) {
         table_ops::invalidate_graph_index(self).await
+    }
+
+    /// Invalidate the cached graph indexes that cover a written edge table
+    /// (`edge:<Name>`). Called after edge mutations and merges.
+    pub(crate) async fn invalidate_graph_index_for<'a>(
+        &self,
+        edge_table_keys: impl IntoIterator<Item = &'a str>,
+    ) {
+        table_ops::invalidate_graph_index_for(self, edge_table_keys).await
     }
 }
 
