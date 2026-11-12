@@ -1,1 +1,1 @@
-- An in-memory filter runs the right side of `and`/`or`, and each later filter, only on rows the earlier conditions left undecided. Results are unchanged.
+- An in-memory filter evaluates the right side of `and`/`or`, and each later filter, on the undecided rows alone when they are at most 20% of a batch. Results are unchanged.

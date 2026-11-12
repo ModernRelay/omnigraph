@@ -179,9 +179,22 @@ pub(super) fn kept_rows(mask: &BooleanArray) -> BooleanArray {
 /// `filter` evaluated on the `selected` rows of `batch`: equal to
 /// [`evaluate_filter`] on every selected row and null or that value on every
 /// other row, so a caller combines it only with a mask that decides the
-/// unselected rows. No row is evaluated when none is selected; a small
-/// selection evaluates its rows alone, over just the columns `filter` reads,
-/// so an expensive operand skips the rows a cheaper one already removed.
+/// unselected rows. When no row is selected, no row is evaluated. When at
+/// most [`PRE_SELECTION_SHARE`] of the rows are selected, only those rows are
+/// evaluated, over just the columns `filter` reads, so an expensive operand
+/// skips the rows a cheaper one already removed. Above that share every row
+/// is evaluated, the unselected ones included.
+///
+/// So the result never depends on the unselected rows, but whether they are
+/// evaluated does, through how many rows of the same batch are selected. That
+/// is unobservable only while no operand can fail on a row's value (every
+/// cast a filter records is a lossless widening, and writes refuse
+/// non-finite floats), and so are the type and cast checks `evaluate_expr`
+/// runs on the rows it evaluates. An operand that can fail must not be
+/// evaluated on unselected rows at any share: the rule of
+/// `docs/rfcs/2026-09-24-shared-expression-model.md` that keeps a fallible
+/// conjunct behind the conjuncts guarding it. The change that adds such an
+/// operand takes the gather path for it whatever the share.
 pub(super) fn evaluate_filter_where(
     batch: &RecordBatch,
     filter: &IRExpr,
@@ -217,7 +230,7 @@ fn columns_read(batch: &RecordBatch, filter: &IRExpr) -> Option<RecordBatch> {
         let name = match leaf {
             IRExpr::PropAccess {
                 variable, property, ..
-            } => format!("{variable}.{property}"),
+            } => property_column(variable, property),
             IRExpr::AliasRef(name, _) => name.clone(),
             IRExpr::Param(_, _) | IRExpr::Literal(_, _) => return,
             _ => {
@@ -378,7 +391,7 @@ pub(super) fn evaluate_expr(
         IRExpr::PropAccess {
             variable, property, ..
         } => {
-            let col_name = format!("{variable}.{property}");
+            let col_name = property_column(variable, property);
             Arc::clone(batch.column_by_name(&col_name).ok_or_else(|| {
                 OmniError::manifest(format!("column '{col_name}' not found in wide batch"))
             })?)
@@ -406,6 +419,13 @@ pub(super) fn evaluate_expr(
     };
     check_array_type(&values, expr.ty(), &expr.to_string())?;
     Ok(values)
+}
+
+/// The wide-batch column that holds `variable.property`. Evaluation and
+/// [`columns_read`] both name a property's column through it, so the columns
+/// gathered for a selection are the ones evaluation then looks up.
+fn property_column(variable: &str, property: &str) -> String {
+    format!("{variable}.{property}")
 }
 
 /// A result column of the input: an aggregate leaf or a group key the
@@ -516,7 +536,7 @@ pub(super) fn evaluate_projection(
             property,
             ty,
         } => {
-            let col_name = format!("{}.{}", variable, property);
+            let col_name = property_column(variable, property);
             let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
                 OmniError::manifest(format!("column '{}' not found in wide batch", col_name))
             })?;
@@ -684,11 +704,13 @@ mod pre_selection_tests {
         }
     }
 
-    /// The right operand of `and` runs only on the rows the left one kept:
-    /// a row the left one removed cannot fail the right one. The F32 column
-    /// holds an infinity (which no write stores) only on a removed row, so
-    /// the cast to F64 that the comparison records fails there and only
-    /// there. On main both operands ran over every row and the filter failed.
+    /// When the left operand of `and` keeps 10 of 100 rows (at most
+    /// `PRE_SELECTION_SHARE`), the right one runs only on those rows. The F32
+    /// column holds an infinity (which no write stores) only on a removed
+    /// row, so the cast to F64 that the comparison records fails there and
+    /// only there. Before pre-selection both operands ran over every row and
+    /// the filter failed. Above the share the right operand runs over every
+    /// row again and this batch fails as before; see `evaluate_filter_where`.
     #[test]
     fn and_skips_the_rows_its_left_operand_removed_issue_1336() {
         let rows = 100;
