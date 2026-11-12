@@ -384,26 +384,12 @@ async fn object_storage_offline_deployment(root: &str) {
     let (id, lock) = reported.unwrap();
     assert!(result.converged);
     assert_eq!(result.id, id);
+    // The converged apply released the lock it reported (#1359).
+    assert!(!lock.is_empty());
     let status = deployment_status(root, Some(&id), &caller).await.unwrap();
-    assert_eq!(status.lock_id.as_deref(), Some(lock.as_str()));
+    assert_eq!(status.lock_id, None);
     assert!(
         matches!(status.lookup, Some(DeploymentLookup::Complete { result: observed }) if observed.input_digest == result.input_digest && observed.id == id)
-    );
-    assert_eq!(
-        acquire_cluster_admission(root, ClusterAdmissionPurpose::Serve)
-            .await
-            .unwrap_err()
-            .code,
-        "state_lock_held"
-    );
-    assert!(force_unlock_storage_root(root, "wrong-id").await.is_err());
-    assert_eq!(
-        deployment_status(root, None, &caller)
-            .await
-            .unwrap()
-            .lock_id
-            .as_deref(),
-        Some(lock.as_str())
     );
     assert!(matches!(
         apply_deployment(dir.path(), Some(&id), &caller, |_, _, _| panic!(
@@ -413,7 +399,6 @@ async fn object_storage_offline_deployment(root: &str) {
         .unwrap(),
         DeploymentLookup::Complete { .. }
     ));
-    force_unlock_storage_root(root, &lock).await.unwrap();
     let owner = acquire_cluster_admission(root, ClusterAdmissionPurpose::Serve)
         .await
         .unwrap()

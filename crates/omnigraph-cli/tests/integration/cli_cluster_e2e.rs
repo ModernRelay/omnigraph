@@ -117,7 +117,8 @@ fn cluster_e2e_s3_direct_root_deploys_unlocks_and_maintains_issue_1163() {
         "--json",
     ])));
     assert_eq!(observed["lookup"], deployed);
-    let lock_id = observed["lock_id"].as_str().unwrap().to_owned();
+    // The converged apply released its lock on S3 too (#1359).
+    assert!(observed["lock_id"].is_null(), "{observed}");
     let replayed = parse_stdout_json(&output_success(&mut rooted(&[
         "cluster",
         "apply",
@@ -127,7 +128,7 @@ fn cluster_e2e_s3_direct_root_deploys_unlocks_and_maintains_issue_1163() {
         "--json",
     ])));
     assert_eq!(replayed, deployed, "a terminal ID is lookup only");
-    unlock(&lock_id);
+    assert!(status()["lock_id"].is_null());
 
     let plan = parse_stdout_json(&output_success(
         rooted(&["cluster", "plan", "--json", "--config"]).arg(temp.path()),
