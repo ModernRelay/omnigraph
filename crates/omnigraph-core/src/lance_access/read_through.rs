@@ -15,7 +15,9 @@ use url::Url;
 /// is given it sits above the mount, as it sits above a plain store, so a
 /// scoped clone and a scoped plain root differ in the mount alone. `s3+ddb`
 /// is not wrapped: its root URIs are refused before a mount is built, since
-/// the storage layer admits `s3://` roots alone.
+/// the storage layer admits `s3://` roots alone. The registry carries the
+/// destination marker, so an external source (an external Blob in any
+/// bucket) is opened through the process registry, never through the mount.
 pub(super) fn registry(
     mount: ReadThroughMount,
     scope: Option<StorageIoScope>,
@@ -25,13 +27,12 @@ pub(super) fn registry(
     super::object_store_seam::hook(&registry);
     for scheme in ["file", "file-object-store", "s3"] {
         if let Some(inner) = registry.get_provider(scheme) {
-            registry.insert(
-                scheme,
-                Arc::new(MountedProvider {
-                    inner,
-                    mount: mount.clone(),
-                }),
-            );
+            let provider = Arc::new(MountedProvider {
+                inner,
+                mount: mount.clone(),
+            });
+            registry.insert(scheme, provider.clone());
+            registry.insert(super::bound::MARKER, provider);
         }
     }
     if let Some(scope) = scope {
@@ -246,6 +247,32 @@ mod tests {
             ),
             "a base-only key is not there on the bare root"
         );
+    }
+
+    /// An external source is opened through the process registry, not the
+    /// clone's: a key under the clone root's prefix that the clone root does
+    /// not hold is not found there, where the mount would have read the base.
+    #[tokio::test]
+    async fn an_external_source_is_not_read_through_the_mount() {
+        let directory = tempfile::tempdir().unwrap();
+        let (base_uri, root_uri) = fixture(directory.path());
+        let storage = storage_read_through(&base_uri, &root_uri).await.unwrap();
+        let context = crate::lance_access::LanceAccessContext::with_storage(storage.as_ref());
+        let session = context.data_session();
+        let external = crate::lance_access::external_source_registry(&session);
+        assert!(Arc::ptr_eq(
+            &external,
+            &crate::lance_access::store_registry()
+        ));
+        let table = format!("{root_uri}/table");
+        for (registry, through_the_mount) in [(session.store_registry(), true), (external, false)] {
+            let (lance, table_path) =
+                ObjectStore::from_uri_and_params(registry, &table, &ObjectStoreParams::default())
+                    .await
+                    .unwrap();
+            let read = lance.inner.get(&table_path.clone().join("a")).await;
+            assert_eq!(read.is_ok(), through_the_mount, "{table}/a: {read:?}");
+        }
     }
 
     #[tokio::test]

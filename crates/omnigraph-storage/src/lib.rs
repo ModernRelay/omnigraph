@@ -1625,9 +1625,9 @@ impl ObjectStorageAdapter {
     ) -> Result<Self> {
         let root = parse_s3_uri(root_uri)?;
         let base = parse_s3_uri(base_uri)?;
-        let root_key = root.key.trim_end_matches('/');
-        let base_key = base.key.trim_end_matches('/');
-        if root.bucket == base.bucket && s3_prefixes_overlap(root_key, base_key) {
+        let root_key = ObjectPath::from(root.key.as_str());
+        let base_key = ObjectPath::from(base.key.as_str());
+        if root.bucket == base.bucket && s3_prefixes_overlap(root_key.as_ref(), base_key.as_ref()) {
             return Err(StorageError::backend(
                 StorageFailureKind::Configuration,
                 format!(
@@ -1636,12 +1636,9 @@ impl ObjectStorageAdapter {
             ));
         }
         let base_store = build_s3_store(s3_bucket_builder(&base.bucket), base_uri)?;
-        let frozen = FrozenDirectory::over(Arc::new(PrefixStore::new(
-            base_store,
-            ObjectPath::from(base_key),
-        )))
-        .await
-        .map_err(|err| storage_backend_error("read_through_open", base_uri, err))?;
+        let frozen = FrozenDirectory::over(Arc::new(PrefixStore::new(base_store, base_key)))
+            .await
+            .map_err(|err| storage_backend_error("read_through_open", base_uri, err))?;
         let mut builder = s3_bucket_builder(&root.bucket);
         let retrying = match scope {
             Some(_) => Some(build_s3_store(
@@ -1654,7 +1651,7 @@ impl ObjectStorageAdapter {
             builder = builder.with_retry(single_attempt_retry_config());
         }
         let layer: Arc<DynObjectStore> = Arc::new(build_s3_store(builder, root_uri)?);
-        let mount = ReadThroughMount::open(layer.as_ref(), frozen, ObjectPath::from(root_key))
+        let mount = ReadThroughMount::open(layer.as_ref(), frozen, root_key)
             .await
             .map_err(|err| storage_backend_error("read_through_open", root_uri, err))?;
         let adapter = Self {
@@ -3131,8 +3128,9 @@ fn build_s3_store(builder: AmazonS3Builder, root_uri: &str) -> Result<object_sto
     })
 }
 
-/// Whether two key prefixes of one bucket name one set of objects or one
-/// lies inside the other; the empty prefix is the bucket itself.
+/// Whether two canonical key prefixes of one bucket (object-store paths: no
+/// empty or trailing segment) name one set of objects or one lies inside the
+/// other; the empty prefix is the bucket itself.
 fn s3_prefixes_overlap(a: &str, b: &str) -> bool {
     a == b
         || a.is_empty()
@@ -6601,6 +6599,9 @@ mod tests {
             ("s3://bucket/graph/sub", "s3://bucket/graph"),
             ("s3://bucket", "s3://bucket/clone"),
             ("s3://bucket/graph/", "s3://bucket/graph"),
+            ("s3://bucket/graph//sub", "s3://bucket/graph/sub"),
+            ("s3://bucket/graph/sub", "s3://bucket/graph//sub/"),
+            ("s3://bucket//graph", "s3://bucket/graph/clone"),
         ] {
             let text = ObjectStorageAdapter::durable_read_through(base, root)
                 .await
