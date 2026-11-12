@@ -2915,7 +2915,8 @@ query insert_one() {
     insert Person { slug: "new-0", age: 1 }
 }
 query update_one() {
-    update Person set { age: 2 } where slug = "p0003"
+    match { $x: Person } where $x.slug = "p0003"
+    update $x set { age: 2 }
 }
 "#;
     const SIZES: [(u32, [&str; 4]); 2] = [

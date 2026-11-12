@@ -36,7 +36,10 @@ query failed_write_is_not_read() { match { $p: Person } return { $p.name } }
 p.name: String
 
 --- mutate
-query remove_nobody() { delete Person where name = "nobody" }
+query remove_nobody() {
+    match { $x: Person } where $x.name = "nobody"
+    delete $x
+}
 --- expect affected: nodes=0 edges=0
 
 --- mutate

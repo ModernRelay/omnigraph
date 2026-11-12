@@ -117,11 +117,8 @@ edge Supports: Source -> Claim
 
 ```gq
 query sources_for_claim($claim: String) {
-  match {
-    $source: Source
-    $c: Claim { slug: $claim }
-    $source supports $c
-  }
+  match { $source: Source, $c: Claim, $source supports $c }
+  where $c.slug = $claim
   return { $source.title as source }
   order { source asc }
 }

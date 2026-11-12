@@ -1188,10 +1188,8 @@ edge Knows: Person -> Person {
     .await;
     let source = r#"
 query pairs() {
-    match {
-        $p: Person { name: "a" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a"
     return { max($e.payload) as last }
 }
 "#;
@@ -1253,10 +1251,8 @@ query pairs() {
     // the spill must already be on the row then.
     let limited = r#"
 query first() {
-    match {
-        $p: Person { name: "a" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a"
     return { $e.payload }
     limit 1
 }

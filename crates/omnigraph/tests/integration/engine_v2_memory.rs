@@ -2232,10 +2232,8 @@ async fn a_query_that_fits_a_budget_fits_every_larger_budget_issue_1361() {
     let db = with_setting(&db, "engine", "v2");
     let source = r#"
 query pairs() {
-    match {
-        $p: Person { name: "a" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a"
     return { max($e.payload) as last }
 }
 "#;
