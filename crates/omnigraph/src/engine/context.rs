@@ -445,17 +445,23 @@ impl Refusal {
     }
 }
 
-/// The name DataFusion's `ExternalSorter` gives the reservation its merge of
-/// sorted runs holds (`sorts/sort.rs`). The merge grows it one spill-file
-/// read buffer at a time for as long as the pool admits the growth
-/// (`MultiLevelMergeBuilder::get_sorted_spill_files_to_merge`), and merges
-/// fewer files per pass when it is refused, but registers it as a consumer
-/// that cannot spill.
+/// The name DataFusion's `ExternalSorter` gives the consumer of its merge of
+/// sorted runs (`sorts/sort.rs`). Above the two spill files a merge must read
+/// together, the merge grows its reservation one spill-file read buffer at a
+/// time for as long as the pool admits the growth
+/// (`MultiLevelMergeBuilder::get_sorted_spill_files_to_merge`), but
+/// DataFusion registers the consumer as unable to spill.
+///
+/// Remove this match once DataFusion leaves headroom for the sort's merge
+/// itself (apache/datafusion#19216, apache/datafusion#20715, finding 9 of
+/// apache/datafusion#25804).
 const SORT_MERGE_CONSUMER: &str = "ExternalSorterMerge[";
 
-/// Whether a reservation gives memory back by spilling: a consumer that says
-/// so, or a sort's merge, whose refused growth only narrows its next pass.
-fn yields_under_pressure(consumer: &MemoryConsumer) -> bool {
+/// Whether a reservation is capped like a spilling one: a consumer that can
+/// spill, or a sort's merge. A refused merge growth narrows the next pass only
+/// above the two-file minimum; refused below it, or while the merge builds an
+/// in-memory batch, it fails the query.
+fn capped_like_spilling(consumer: &MemoryConsumer) -> bool {
     consumer.can_spill() || consumer.name().starts_with(SORT_MERGE_CONSUMER)
 }
 
@@ -562,7 +568,7 @@ impl MemoryPool for SpillHeadroomPool {
         }
         let spill_limit = self.limit / 2;
         let size = reservation.size();
-        if yields_under_pressure(reservation.consumer())
+        if capped_like_spilling(reservation.consumer())
             && additional > spill_limit.saturating_sub(size)
         {
             return self.refused(
@@ -734,9 +740,8 @@ mod tests {
         assert_eq!(pool.reserved(), 0);
     }
 
-    /// A sort's merge reservation cannot spill, but a refused growth only
-    /// makes the merge read fewer spill files per pass, so it stops at half
-    /// the budget like a spilling one and leaves the rest to graph work.
+    /// A sort's merge reservation cannot spill, but it stops at half the
+    /// budget like a spilling one and leaves the rest to graph work.
     #[test]
     fn issue_1361_a_sort_merge_stops_at_half_the_budget() {
         let pool: Arc<dyn MemoryPool> = Arc::new(SpillHeadroomPool::new(1_024));

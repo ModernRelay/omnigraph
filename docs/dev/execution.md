@@ -541,13 +541,17 @@ accounting.
 
 Each spill-capable reservation is limited to half the query memory budget.
 This makes an accumulating sort spill before it takes the space needed by its
-batch producer. A sort's merge reservation (`ExternalSorterMerge[n]`) has the
-same limit although DataFusion registers it as unable to spill: the merge
-grows it one spill-file read buffer at a time for as long as the pool admits
-the growth, and reads fewer files per pass when refused, so without the limit
-it could take nearly the whole budget from the graph work consuming its
-output. Small aggregate and sort-merge reservations can still grow
-when combined usage is high. All fallible growth also checks total usage
+batch producer. Each reservation of a sort's merge consumer
+(`ExternalSorterMerge[n]`) has the same limit, although DataFusion registers it
+as unable to spill. Above the two spill files a merge must read together, the
+merge grows its reservation one spill-file read buffer at a time for as long
+as the pool admits the growth, and reads fewer files per pass when refused, so
+without the limit it could take nearly the whole budget from the graph work
+consuming its output. The limit also applies to that two-file minimum and to
+the merge's in-memory batch building, where a refusal fails the query. The
+limit is per reservation, not per consumer. Other reservations that cannot
+spill, such as `SortPreservingMergeExec[n]`, have no half-budget limit and can
+still grow when combined usage is high. All fallible growth also checks total usage
 against the full query cap. Every reservation uses the same tracked pool;
 there is no separate pool or dummy reservation. This policy does not guarantee
 space for arbitrary wide graph allocations, which can still be refused.
