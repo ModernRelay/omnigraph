@@ -1,0 +1,28 @@
+# issue: none
+# notes: Two clones of one base are independent (the graph shallow clone RFC, What a caller observes). Run with --store <a second clone root> --base <base> after the first clone root wrote bob: this root sees the base alone, and its own write stays here.
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine
+    storage: s3-compatible
+
+--- query
+query all() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+--- expect shape
+p.name: String
+
+--- mutate
+query add() { insert Person { name: "carol" } }
+--- expect affected: nodes=1 edges=0
+
+--- query
+query all() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"carol"}
+--- expect shape
+p.name: String

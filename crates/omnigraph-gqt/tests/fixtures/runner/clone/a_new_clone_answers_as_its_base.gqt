@@ -1,0 +1,16 @@
+# issue: none
+# notes: A new clone answers as its base does (the graph shallow clone RFC, What a caller observes). Run with --store <clone root> --base <base>; the base holds alice.
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine
+    storage: s3-compatible
+
+--- query
+query all() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+--- expect shape
+p.name: String

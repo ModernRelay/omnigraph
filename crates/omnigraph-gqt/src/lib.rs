@@ -39,13 +39,33 @@ pub const BLESS_ENV: &str = "OMNIGRAPH_GQ_BLESS";
 pub const ENGINE_ENV: &str = "OMNIGRAPH_GQ_ENGINE";
 pub(crate) const RETIRED_SETTING_ENVIRONMENT: [&str; 1] = ["OMNIGRAPH_TRAVERSAL_MODE"];
 
-struct GqtHost;
+/// The runner's host; with `base`, every reopen of the store root is
+/// `Omnigraph::open_clone` over that base, as the first open was.
+struct GqtHost {
+    base: Option<String>,
+}
+
+const PLAIN_HOST: GqtHost = GqtHost { base: None };
 
 impl ExecutionHost for GqtHost {
     type StepGuard = Vec<dst_runner::seams::ArmedSeam>;
 
     fn admit_case(&self, _case: &Case) -> Result<(), String> {
         Ok(())
+    }
+    fn reopen<'a>(
+        &'a self,
+        uri: &'a str,
+        storage: Option<Arc<dyn StorageAdapter>>,
+    ) -> futures::future::BoxFuture<'a, Result<Omnigraph, omnigraph::error::OmniError>> {
+        async move {
+            match (&self.base, storage) {
+                (_, Some(storage)) => Omnigraph::open_with_storage(uri, storage).await,
+                (Some(base), None) => Omnigraph::open_clone(base, uri).await,
+                (None, None) => Omnigraph::open(uri).await,
+            }
+        }
+        .boxed()
     }
     fn arm_seams(&self, seams: &[SeamDirective], step: &Step) -> Result<Self::StepGuard, String> {
         dst_runner::arm_seams(seams, step)
@@ -161,7 +181,7 @@ fn execute_case<'a>(
     bless: bool,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
     match engine_from_env() {
-        Ok(engine) => execute_case_on_engine(case, path, bless, engine, None),
+        Ok(engine) => execute_case_on_engine(case, path, bless, engine, None, None),
         Err(error) => futures::future::ready(Err(error)).boxed(),
     }
 }
@@ -182,7 +202,7 @@ fn execute_case_on_server<'a>(
     case: &'a Case,
     target: &'a ServerTarget,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    omnigraph_gqt_core::execute_steps_served(case, target, &GqtHost)
+    omnigraph_gqt_core::execute_steps_served(case, target, &PLAIN_HOST)
 }
 
 fn execute_case_on_engine<'a>(
@@ -191,30 +211,39 @@ fn execute_case_on_engine<'a>(
     bless: bool,
     engine: Engine,
     store: Option<&'a str>,
+    base: Option<&'a str>,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    execute_case_inner(case, path, bless, engine, store).boxed()
+    execute_case_inner(case, path, bless, engine, store, base).boxed()
 }
 
+/// With `base`, the `--store` root is opened as a clone read through to that
+/// graph (`Omnigraph::open_clone`); without it, as the graph it holds.
 async fn execute_case_inner(
     case: &Case,
     path: &Path,
     bless: bool,
     engine: Engine,
     store: Option<&str>,
+    base: Option<&str>,
 ) -> Result<(), String> {
     case.admit_store(store)?;
     if let Some(uri) = store {
-        let db = Omnigraph::open(uri)
-            .await
-            .map_err(|e| format!("open failed: {e}"))?;
+        let db = match base {
+            Some(base) => Omnigraph::open_clone(base, uri).await,
+            None => Omnigraph::open(uri).await,
+        }
+        .map_err(|e| format!("open failed: {e}"))?;
         let db = with_case_external_blob_policy(db, case)?;
         let session = case_session(db, case, engine)?;
-        return omnigraph_gqt_core::execute_steps(case, path, bless, session, uri, None, &GqtHost)
+        let host = GqtHost {
+            base: base.map(str::to_owned),
+        };
+        return omnigraph_gqt_core::execute_steps(case, path, bless, session, uri, None, &host)
             .await
             .map(|_| ());
     }
     let (session, uri, _dir) = open_case_store(case, engine).await?;
-    omnigraph_gqt_core::execute_steps(case, path, bless, session, &uri, None, &GqtHost)
+    omnigraph_gqt_core::execute_steps(case, path, bless, session, &uri, None, &PLAIN_HOST)
         .await
         .map(|_| ())
 }
@@ -230,7 +259,7 @@ async fn execute_case_with_storage(
 ) -> Result<(), String> {
     let db = match (prepared, case.fixture.as_ref()) {
         (Some(mounted), _) => {
-            GqtHost.observe(|| mounted.to_string());
+            PLAIN_HOST.observe(|| mounted.to_string());
             Omnigraph::open_with_storage(uri, storage.clone())
                 .await
                 .map_err(|e| format!("open failed: {e}"))?
@@ -247,7 +276,7 @@ async fn execute_case_with_storage(
     if let (None, Some(fixture)) = (prepared, case.fixture.as_ref()) {
         seed_case(&session, &fixture.seed, case.needs_indices).await?;
     }
-    omnigraph_gqt_core::execute_steps(case, path, false, session, uri, Some(storage), &GqtHost)
+    omnigraph_gqt_core::execute_steps(case, path, false, session, uri, Some(storage), &PLAIN_HOST)
         .await
         .map(|_| ())
 }
@@ -276,7 +305,7 @@ async fn run_concurrent_step(
         let run = Arc::clone(&run);
         measure::SESSION.scope(ctx, async move {
             let outcome = match run.start_session(index).await {
-                Ok(()) => run_session(&GqtHost, session, op).await,
+                Ok(()) => run_session(&PLAIN_HOST, session, op).await,
                 Err(aborted) => Err(aborted),
             };
             let script = run.finish_session(index).await;

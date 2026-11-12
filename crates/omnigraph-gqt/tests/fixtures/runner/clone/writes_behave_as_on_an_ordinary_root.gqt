@@ -1,0 +1,21 @@
+# issue: none
+# notes: Writes behave as on an ordinary root (the graph shallow clone RFC, What a caller observes). Run with --store <clone root> --base <base> after a_new_clone_answers_as_its_base; the base holds alice and is never written.
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine
+    storage: s3-compatible
+
+--- mutate
+query add() { insert Person { name: "bob" } }
+--- expect affected: nodes=1 edges=0
+
+--- query
+query all() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"bob"}
+--- expect shape
+p.name: String

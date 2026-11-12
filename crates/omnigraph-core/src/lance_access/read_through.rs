@@ -1,4 +1,5 @@
-//! Lance stores of a local root that is read through a frozen directory.
+//! Lance stores of a root that is read through a frozen directory: a local
+//! directory or an `s3://` prefix.
 
 use std::sync::Arc;
 
@@ -10,9 +11,11 @@ use object_store::path::Path;
 use omnigraph_storage::{ReadThroughMount, StorageIoScope};
 use url::Url;
 
-/// The mount under every local store; when `scope` is given it sits above
-/// the mount, as it sits above a plain local store, so a scoped clone and a
-/// scoped local root differ in the mount alone.
+/// The mount under every local store and under the `s3` store; when `scope`
+/// is given it sits above the mount, as it sits above a plain store, so a
+/// scoped clone and a scoped plain root differ in the mount alone. `s3+ddb`
+/// is not wrapped: its root URIs are refused before a mount is built, since
+/// the storage layer admits `s3://` roots alone.
 pub(super) fn registry(
     mount: ReadThroughMount,
     scope: Option<StorageIoScope>,
@@ -20,7 +23,7 @@ pub(super) fn registry(
     let registry = ObjectStoreRegistry::default();
     #[cfg(feature = "dst")]
     super::object_store_seam::hook(&registry);
-    for scheme in ["file", "file-object-store"] {
+    for scheme in ["file", "file-object-store", "s3"] {
         if let Some(inner) = registry.get_provider(scheme) {
             registry.insert(
                 scheme,
@@ -37,9 +40,9 @@ pub(super) fn registry(
     Arc::new(registry)
 }
 
-/// Builds every local store as `file-object-store`, whose reads and writes
-/// all pass through the object store, with the mount under it: a `file`
-/// store reads data files by direct local path, below any mount.
+/// Builds every local store as `file-object-store` (a `file` store reads data
+/// files by direct local path, below any mount) and every `s3` store as Lance
+/// builds it, each with the mount under it.
 #[derive(Debug)]
 struct MountedProvider {
     inner: Arc<dyn ObjectStoreProvider>,

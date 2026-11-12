@@ -792,6 +792,8 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::{GetRange, UpdateVersion};
 
+    use crate::read_through_contract;
+
     use super::*;
 
     async fn directory(files: &[(&str, &str)]) -> (tempfile::TempDir, Arc<FrozenDirectory>) {
@@ -1288,604 +1290,62 @@ mod tests {
         Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap())
     }
 
-    async fn durable(
-        layer: &Arc<dyn ObjectStore>,
-        base: &Arc<dyn ObjectStore>,
-    ) -> ReadThroughStore {
-        let frozen = FrozenDirectory::over(Arc::clone(base)).await.unwrap();
-        ReadThroughStore::durable(Arc::clone(layer), frozen, Path::from("graph"))
-            .await
-            .unwrap()
+    /// The durable contract's stores on local directories: a base directory
+    /// holding the named files and one fresh directory per clone root.
+    struct LocalFixture {
+        dirs: std::sync::Mutex<Vec<tempfile::TempDir>>,
     }
 
-    #[tokio::test]
-    async fn durable_deletes_survive_a_reopen_and_stay_in_their_own_clone_root() {
-        let (dir, _) = directory(&[("a.txt", "base a"), ("sub/b.txt", "base b")]).await;
-        let base = local(dir.path());
-        let layers = tempfile::tempdir().unwrap();
-        for name in ["one", "two"] {
-            std::fs::create_dir(layers.path().join(name)).unwrap();
-        }
-        let one = local(&layers.path().join("one"));
-        let two = local(&layers.path().join("two"));
-        let first = durable(&one, &base).await;
-        let second = durable(&two, &base).await;
-        first.delete(&Path::from("graph/a.txt")).await.unwrap();
-        first
-            .put(
-                &Path::from("graph/c.txt"),
-                PutPayload::from_static(b"layer c"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(text(&first, "graph/a.txt").await, None);
-        assert_eq!(
-            text(&second, "graph/a.txt").await.as_deref(),
-            Some("base a"),
-            "a delete in one layer leaves the other layer's view alone"
-        );
-        assert_eq!(text(&second, "graph/c.txt").await, None);
-        drop(first);
-        let reopened = durable(&one, &base).await;
-        assert_eq!(text(&reopened, "graph/a.txt").await, None);
-        assert_eq!(
-            keys(&reopened, None).await,
-            vec!["graph/c.txt", "graph/sub/b.txt"]
-        );
-        assert_eq!(
-            keys(&second, None).await,
-            vec!["graph/a.txt", "graph/sub/b.txt"]
-        );
-        assert_eq!(
-            directory_files(&dir),
-            vec![
-                ("a.txt".to_string(), "base a".to_string()),
-                ("sub/b.txt".to_string(), "base b".to_string()),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_durable_store_keeps_its_whiteouts_out_of_sight() {
-        let (dir, _) = directory(&[("a.txt", "base a"), ("b.txt", "base b")]).await;
-        let base = local(dir.path());
-        let layer: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = durable(&layer, &base).await;
-        store.delete(&Path::from("graph/a.txt")).await.unwrap();
-        let marker = Path::from("graph/__clone/deleted/a.txt");
-        assert!(
-            layer.head(&marker).await.is_ok(),
-            "the layer holds the marker"
-        );
-        assert!(matches!(
-            store.head(&marker).await,
-            Err(Error::NotFound { .. })
-        ));
-        assert_eq!(keys(&store, None).await, vec!["graph/b.txt"]);
-        assert_eq!(
-            keys(&store, Some("graph/__clone")).await,
-            Vec::<String>::new()
-        );
-        let graph = store
-            .list_with_delimiter(Some(&Path::from("graph")))
-            .await
-            .unwrap();
-        assert!(graph.common_prefixes.is_empty());
-        assert!(
-            store
-                .put(
-                    &Path::from("graph/__clone/x"),
-                    PutPayload::from_static(b"x")
-                )
-                .await
-                .is_err()
-        );
-        assert!(store.delete(&marker).await.is_err());
-
-        store
-            .put(&Path::from("graph/c.txt"), PutPayload::from_static(b"c"))
-            .await
-            .unwrap();
-        store.delete(&Path::from("graph/c.txt")).await.unwrap();
-        store.delete(&Path::from("graph/a.txt")).await.unwrap();
-        let recorded: Vec<String> = layer
-            .list(Some(&Path::from("graph/__clone")))
-            .map_ok(|meta| meta.location.to_string())
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(
-            recorded,
-            vec!["graph/__clone/created", "graph/__clone/deleted/a.txt"],
-            "the created object and one whiteout per deleted base object, nothing for a clone-root key"
-        );
-    }
-
-    #[tokio::test]
-    async fn durable_refuses_a_base_that_is_itself_a_clone_root() {
-        let (dir, _) = directory(&[("__clone/deleted/a.txt", ""), ("b.txt", "base b")]).await;
-        let frozen = FrozenDirectory::over(local(dir.path())).await.unwrap();
-        let error =
-            ReadThroughStore::durable(Arc::new(InMemory::new()), frozen, Path::from("graph"))
-                .await
-                .err()
-                .unwrap()
-                .to_string();
-        assert!(error.contains("__clone/deleted/a.txt"), "{error}");
-        assert!(error.contains("it is a clone root"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn durable_refuses_a_base_that_holds_an_object_at_the_reserved_name() {
-        let (dir, _) = directory(&[("__clone", "not a directory"), ("b.txt", "base b")]).await;
-        let frozen = FrozenDirectory::over(local(dir.path())).await.unwrap();
-        let error =
-            ReadThroughStore::durable(Arc::new(InMemory::new()), frozen, Path::from("graph"))
-                .await
-                .err()
-                .unwrap()
-                .to_string();
-        assert!(
-            error.contains("the base holds an object named __clone"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_clone_root_carries_the_reserved_directory_from_its_first_build() {
-        let (dir, _) = directory(&[("a.txt", "base a")]).await;
-        let base = local(dir.path());
-        let root = tempfile::tempdir().unwrap();
-        let layer = local(root.path());
-        let store = durable(&layer, &base).await;
-        assert!(root.path().join("graph/__clone/created").is_file());
-        store
-            .put(&Path::from("graph/c.txt"), PutPayload::from_static(b"c"))
-            .await
-            .unwrap();
-        assert_eq!(keys(&store, None).await, vec!["graph/a.txt", "graph/c.txt"]);
-        drop(store);
-        let again = durable(&layer, &base).await;
-        assert_eq!(keys(&again, None).await, vec!["graph/a.txt", "graph/c.txt"]);
-
-        let as_base = FrozenDirectory::over(local(&root.path().join("graph")))
-            .await
-            .unwrap();
-        let error =
-            ReadThroughStore::durable(Arc::new(InMemory::new()), as_base, Path::from("other"))
-                .await
-                .err()
-                .unwrap()
-                .to_string();
-        assert!(
-            error.contains("it is a clone root"),
-            "a clone root that never deleted is refused as a base: {error}"
-        );
-    }
-
-    /// A layer whose delete fails after the whiteout landed, as a process
-    /// stop between the two steps would leave the clone root.
-    #[derive(Debug)]
-    struct DeleteFails(Arc<dyn ObjectStore>);
-
-    impl fmt::Display for DeleteFails {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "DeleteFails({})", self.0)
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for DeleteFails {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> Result<PutResult> {
-            self.0.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> Result<Box<dyn MultipartUpload>> {
-            self.0.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            self.0.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, Result<Path>>,
-        ) -> BoxStream<'static, Result<Path>> {
-            locations
-                .and_then(|location| async move {
-                    Err(Error::Generic {
-                        store: "DeleteFails",
-                        source: format!("the process stopped before {location} was deleted").into(),
-                    })
-                })
-                .boxed()
-        }
-
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-            self.0.list(prefix)
-        }
-
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-            self.0.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-            self.0.copy_opts(from, to, options).await
-        }
-    }
-
-    #[tokio::test]
-    async fn a_stop_between_the_whiteout_and_the_delete_leaves_the_key_deleted_or_untouched() {
-        let (dir, _) = directory(&[("a.txt", "base a"), ("b.txt", "base b")]).await;
-        let base = local(dir.path());
-        let root = tempfile::tempdir().unwrap();
-        let plain = local(root.path());
-        let stopping: Arc<dyn ObjectStore> = Arc::new(DeleteFails(Arc::clone(&plain)));
-
-        let store = durable(&stopping, &base).await;
-        store
-            .put(
-                &Path::from("graph/b.txt"),
-                PutPayload::from_static(b"clone b"),
-            )
-            .await
-            .unwrap();
-        assert!(store.delete(&Path::from("graph/a.txt")).await.is_err());
-        assert!(store.delete(&Path::from("graph/b.txt")).await.is_err());
-        assert_eq!(text(&store, "graph/a.txt").await, None);
-        assert_eq!(
-            text(&store, "graph/b.txt").await.as_deref(),
-            Some("clone b"),
-            "the clone root's own object still answers while its delete has not happened"
-        );
-        drop(store);
-
-        let reopened = durable(&plain, &base).await;
-        assert_eq!(
-            text(&reopened, "graph/a.txt").await,
-            None,
-            "a key only the base held is deleted once its whiteout landed"
-        );
-        assert_eq!(
-            text(&reopened, "graph/b.txt").await.as_deref(),
-            Some("clone b"),
-            "a key the clone root held is untouched until its own object is deleted"
-        );
-        reopened.delete(&Path::from("graph/b.txt")).await.unwrap();
-        assert_eq!(text(&reopened, "graph/b.txt").await, None);
-        let again = durable(&plain, &base).await;
-        assert_eq!(text(&again, "graph/b.txt").await, None);
-        assert_eq!(keys(&again, None).await, Vec::<String>::new());
-    }
-
-    #[tokio::test]
-    async fn racing_updates_of_a_base_object_admit_one_over_a_local_clone_root() {
-        let (dir, _) = directory(&[("a.txt", "base a")]).await;
-        let base = local(dir.path());
-        let root = tempfile::tempdir().unwrap();
-        let store = Arc::new(durable(&local(root.path()), &base).await);
-        let location = Path::from("graph/a.txt");
-        let token = store.head(&location).await.unwrap().e_tag.unwrap();
-        let attempts: Vec<_> = (0..8)
-            .map(|i| {
-                let store = Arc::clone(&store);
-                let location = location.clone();
-                let token = token.clone();
-                tokio::spawn(async move {
-                    store
-                        .put_opts(
-                            &location,
-                            PutPayload::from(format!("w{i}").into_bytes()),
-                            PutOptions::from(PutMode::Update(UpdateVersion {
-                                e_tag: Some(token),
-                                version: None,
-                            })),
-                        )
-                        .await
-                        .is_ok()
-                })
-            })
-            .collect();
-        let mut won = 0;
-        for attempt in attempts {
-            if attempt.await.unwrap() {
-                won += 1;
-            }
-        }
-        assert_eq!(won, 1);
-    }
-
-    /// A layer that parks one call at `key` until the test lets it go, its
-    /// create or its delete, so a second call can start inside the first.
-    #[derive(Debug)]
-    struct Parks {
-        layer: Arc<dyn ObjectStore>,
-        key: Path,
-        the_create: bool,
-        parked: Arc<tokio::sync::Semaphore>,
-        go: Arc<tokio::sync::Semaphore>,
-    }
-
-    impl Parks {
-        fn over(key: &Path, the_create: bool) -> Self {
+    impl LocalFixture {
+        fn new() -> Self {
             Self {
-                layer: Arc::new(InMemory::new()),
-                key: key.clone(),
-                the_create,
-                parked: Arc::new(tokio::sync::Semaphore::new(0)),
-                go: Arc::new(tokio::sync::Semaphore::new(0)),
+                dirs: std::sync::Mutex::new(Vec::new()),
             }
         }
-    }
 
-    impl fmt::Display for Parks {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "Parks({})", self.layer)
+        fn keep(&self, dir: tempfile::TempDir) -> Arc<dyn ObjectStore> {
+            let store = local(dir.path());
+            self.dirs.lock().unwrap().push(dir);
+            store
         }
     }
 
     #[async_trait]
-    impl ObjectStore for Parks {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> Result<PutResult> {
-            if self.the_create && *location == self.key && matches!(opts.mode, PutMode::Create) {
-                self.parked.add_permits(1);
-                self.go.acquire().await.unwrap().forget();
-            }
-            self.layer.put_opts(location, payload, opts).await
+    impl read_through_contract::Fixture for LocalFixture {
+        async fn base(&self, files: &[(&str, &str)]) -> Arc<dyn ObjectStore> {
+            let (dir, _) = directory(files).await;
+            self.keep(dir)
         }
 
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> Result<Box<dyn MultipartUpload>> {
-            self.layer.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            self.layer.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, Result<Path>>,
-        ) -> BoxStream<'static, Result<Path>> {
-            let layer = Arc::clone(&self.layer);
-            let key = (!self.the_create).then(|| self.key.clone());
-            let (parked, go) = (Arc::clone(&self.parked), Arc::clone(&self.go));
-            locations
-                .and_then(move |location| {
-                    let layer = Arc::clone(&layer);
-                    let held = key.as_ref() == Some(&location);
-                    let (parked, go) = (Arc::clone(&parked), Arc::clone(&go));
-                    async move {
-                        if held {
-                            parked.add_permits(1);
-                            go.acquire().await.unwrap().forget();
-                        }
-                        layer.delete(&location).await?;
-                        Ok(location)
-                    }
-                })
-                .boxed()
-        }
-
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-            self.layer.list(prefix)
-        }
-
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-            self.layer.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-            self.layer.copy_opts(from, to, options).await
+        async fn clone_root(&self) -> Arc<dyn ObjectStore> {
+            self.keep(tempfile::tempdir().unwrap())
         }
     }
 
-    async fn base_with_a() -> Arc<dyn ObjectStore> {
-        let base: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        base.put(&Path::from("a.txt"), PutPayload::from_static(b"base a"))
-            .await
-            .unwrap();
-        base
+    macro_rules! local_contract_rows {
+        ($($name:ident),* $(,)?) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    read_through_contract::$name(&LocalFixture::new()).await;
+                }
+            )*
+        };
     }
 
-    #[tokio::test]
-    async fn an_update_and_a_delete_of_one_base_object_take_turns() {
-        let location = Path::from("graph/a.txt");
-        let parks = Parks::over(&location, true);
-        let (parked, go) = (Arc::clone(&parks.parked), Arc::clone(&parks.go));
-        let layer: Arc<dyn ObjectStore> = Arc::new(parks);
-        let store = Arc::new(durable(&layer, &base_with_a().await).await);
-        let token = store.head(&location).await.unwrap().e_tag.unwrap();
-
-        let update = tokio::spawn({
-            let (store, location) = (Arc::clone(&store), location.clone());
-            async move {
-                store
-                    .put_opts(
-                        &location,
-                        PutPayload::from_static(b"updated"),
-                        PutOptions::from(PutMode::Update(UpdateVersion {
-                            e_tag: Some(token),
-                            version: None,
-                        })),
-                    )
-                    .await
-            }
-        });
-        parked.acquire().await.unwrap().forget();
-        let delete = tokio::spawn({
-            let (store, location) = (Arc::clone(&store), location.clone());
-            async move { store.delete(&location).await }
-        });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        go.add_permits(1);
-
-        let updated = update.await.unwrap();
-        delete.await.unwrap().unwrap();
-        assert!(
-            updated.is_ok(),
-            "an update admitted on the base ETag before the delete began lands: {updated:?}"
-        );
-        assert_eq!(
-            text(&store, "graph/a.txt").await,
-            None,
-            "the delete that began after the update ran after it and removed the object"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_create_and_a_delete_of_one_base_object_take_turns() {
-        let location = Path::from("graph/a.txt");
-        let parks = Parks::over(&location, false);
-        let (parked, go) = (Arc::clone(&parks.parked), Arc::clone(&parks.go));
-        let layer: Arc<dyn ObjectStore> = Arc::new(parks);
-        let store = Arc::new(durable(&layer, &base_with_a().await).await);
-
-        let delete = tokio::spawn({
-            let (store, location) = (Arc::clone(&store), location.clone());
-            async move { store.delete(&location).await }
-        });
-        parked.acquire().await.unwrap().forget();
-        let create = tokio::spawn({
-            let (store, location) = (Arc::clone(&store), location.clone());
-            async move {
-                store
-                    .put_opts(
-                        &location,
-                        PutPayload::from_static(b"created"),
-                        PutOptions::from(PutMode::Create),
-                    )
-                    .await
-            }
-        });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        go.add_permits(1);
-
-        delete.await.unwrap().unwrap();
-        let created = create.await.unwrap();
-        let left = text(&store, "graph/a.txt").await;
-        match &created {
-            Ok(_) => assert_eq!(
-                left.as_deref(),
-                Some("created"),
-                "a create the store acknowledged after the delete stands"
-            ),
-            Err(Error::AlreadyExists { .. }) => assert_eq!(
-                left, None,
-                "a create refused before the delete leaves the key deleted"
-            ),
-            Err(error) => panic!("{error}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_rename_of_a_base_object_is_refused_and_one_of_a_clone_object_runs() {
-        let layer: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = durable(&layer, &base_with_a().await).await;
-        let (a, r, c) = (
-            Path::from("graph/a.txt"),
-            Path::from("graph/r.txt"),
-            Path::from("graph/c.txt"),
-        );
-
-        let refused = store.rename(&a, &r).await;
-        assert!(matches!(refused, Err(Error::Generic { .. })), "{refused:?}");
-        assert_eq!(text(&store, "graph/a.txt").await.as_deref(), Some("base a"));
-        assert_eq!(text(&store, "graph/r.txt").await, None);
-        let layer_keys: Vec<String> = layer
-            .list(None)
-            .map_ok(|meta| meta.location.to_string())
-            .try_collect()
-            .await
-            .unwrap();
-        assert!(
-            layer_keys
-                .iter()
-                .all(|key| !key.contains("deleted") && key != "graph/r.txt"),
-            "a refused rename writes nothing: {layer_keys:?}"
-        );
-
-        store
-            .put(&c, PutPayload::from_static(b"clone c"))
-            .await
-            .unwrap();
-        store.rename(&c, &r).await.unwrap();
-        assert_eq!(
-            text(&store, "graph/r.txt").await.as_deref(),
-            Some("clone c")
-        );
-        assert_eq!(text(&store, "graph/c.txt").await, None);
-    }
-
-    #[tokio::test]
-    async fn create_after_a_durable_delete_holds_across_reopens() {
-        let base: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        base.put(&Path::from("a.txt"), PutPayload::from_static(b"base a"))
-            .await
-            .unwrap();
-        let layer: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let location = Path::from("graph/a.txt");
-        let create = PutOptions::from(PutMode::Create);
-
-        let store = durable(&layer, &base).await;
-        assert!(matches!(
-            store
-                .put_opts(&location, PutPayload::from_static(b"x"), create.clone())
-                .await,
-            Err(Error::AlreadyExists { .. })
-        ));
-        store.delete(&location).await.unwrap();
-
-        let store = durable(&layer, &base).await;
-        store
-            .put_opts(&location, PutPayload::from_static(b"x"), create.clone())
-            .await
-            .unwrap();
-
-        let store = durable(&layer, &base).await;
-        assert_eq!(text(&store, "graph/a.txt").await.as_deref(), Some("x"));
-        assert!(matches!(
-            store
-                .put_opts(&location, PutPayload::from_static(b"y"), create)
-                .await,
-            Err(Error::AlreadyExists { .. })
-        ));
-        store.delete(&location).await.unwrap();
-
-        let store = durable(&layer, &base).await;
-        assert_eq!(text(&store, "graph/a.txt").await, None);
-        let kept = base.get(&Path::from("a.txt")).await.unwrap();
-        assert_eq!(kept.bytes().await.unwrap(), Bytes::from_static(b"base a"));
-        let base_keys: Vec<String> = base
-            .list(None)
-            .map_ok(|meta| meta.location.to_string())
-            .try_collect()
-            .await
-            .unwrap();
-        assert_eq!(base_keys, vec!["a.txt"]);
-    }
+    local_contract_rows!(
+        durable_deletes_survive_a_reopen_and_stay_in_their_own_clone_root,
+        a_durable_store_keeps_its_whiteouts_out_of_sight,
+        durable_refuses_a_base_that_is_itself_a_clone_root,
+        durable_refuses_a_base_that_holds_an_object_at_the_reserved_name,
+        a_clone_root_carries_the_reserved_directory_from_its_first_build,
+        a_stop_between_the_whiteout_and_the_delete_leaves_the_key_deleted_or_untouched,
+        an_update_and_a_delete_of_one_base_object_take_turns,
+        a_create_and_a_delete_of_one_base_object_take_turns,
+        a_rename_of_a_base_object_is_refused_and_one_of_a_clone_object_runs,
+        create_after_a_durable_delete_holds_across_reopens,
+        racing_updates_of_a_base_object_over_a_clone_root_admit_one,
+    );
 
     mod differential_probe {
         use std::collections::{BTreeSet, HashMap, HashSet};
