@@ -24,6 +24,10 @@
   <a href="rust-toolchain.toml"><img alt="Rust" src="https://img.shields.io/badge/rust-stable-1b1b1f?style=flat-square&labelColor=1b1b1f"></a>
 </p>
 
+<p align="center">
+  <a href="https://www.producthunt.com/products/omnigraph?launch=omnigraph&utm_source=github&utm_medium=readme&utm_campaign=ph-launch"><img alt="Omnigraph on Product Hunt" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1298575&theme=light" width="250" height="54"></a>
+</p>
+
 <hr>
 
 Omnigraph is engineered for the new workload introduced by long-horizon agents: multiple agents sharing a typed world model to continuously retrieve and update context and coordinate work. Agents and UIs can become thin stateless consumers of durable state.
