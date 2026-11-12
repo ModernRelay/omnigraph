@@ -15,6 +15,7 @@
   <a href="docs/user/index.md">Docs</a> &nbsp;·&nbsp;
   <a href="https://github.com/ModernRelay/omnigraph-cookbooks">Cookbooks</a> &nbsp;·&nbsp;
   <a href="docs/user/cli/reference.md">CLI</a> &nbsp;·&nbsp;
+  <a href="https://www.omnigraph.dev/studio?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=studio">Studio</a> &nbsp;·&nbsp;
   <a href="https://www.omnigraph.dev/llms.txt">llms.txt</a>
 </p>
 
@@ -65,6 +66,23 @@ published release binaries. Or with Homebrew:
 brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
+
+## Studio
+
+[Omnigraph Studio](https://www.omnigraph.dev/studio?utm_source=github&utm_medium=readme&utm_campaign=studio) is the desktop app for your graphs. Browse each type as
+a table, follow relationships on a canvas, write queries with the compiler's
+errors as you type, and review what a branch changes before you merge it. It is
+a native Rust app on GPUI, the framework behind Zed, for macOS, Windows and Linux.
+
+<a href="https://www.omnigraph.dev/studio?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=studio"><img alt="Omnigraph Studio showing what a branch adds, changes and removes, inline in a table" src="https://www.omnigraph.dev/studio/studio-demo-poster.jpg" width="800"></a>
+
+Open a graph on one of your server targets in Studio:
+
+```bash
+omnigraph studio --target <server> --graph <graph>
+```
+
+[Download Studio](https://www.omnigraph.dev/studio?utm_source=github&utm_medium=readme&utm_campaign=studio) or read [its source](https://github.com/ModernRelay/omnigraph-studio).
 
 ## Set it up with an AI agent
 
@@ -167,8 +185,11 @@ everyday commands stay short. Stored queries and mutations run **by name**:
 ```bash
 omnigraph query  search_docs --params '{"q":"AI safety"}'
 omnigraph mutate add_person  --params '{"name":"Mina"}'
+```
 
-# Branch, review, merge across the whole graph; agents write in isolation
+Branch, review and merge across the whole graph, so agents write in isolation:
+
+```bash
 omnigraph branch create --from main agent/ingest-42
 omnigraph branch merge  agent/ingest-42 --into main
 ```
@@ -195,6 +216,7 @@ See the [policy guide](docs/user/operations/policy.md).
 |---|---|---|
 | **TypeScript SDK** | typed access from Node / TS | [`@modernrelay/omnigraph`](https://www.npmjs.com/package/@modernrelay/omnigraph) · [source](https://github.com/ModernRelay/omnigraph-ts) |
 | **Built-in MCP** | connect an agent to the server's `/mcp`, directly or through `omnigraph mcp --target NAME` | [MCP guide](docs/user/operations/mcp.md) |
+| **Omnigraph Studio** | browse, query and review a graph in a desktop app | [download](https://www.omnigraph.dev/studio?utm_source=github&utm_medium=readme&utm_campaign=studio) · [source](https://github.com/ModernRelay/omnigraph-studio) |
 | **HTTP / OpenAPI** | use the wire contract from any language | [HTTP guide](docs/user/operations/server.md) · [OpenAPI](openapi.json) |
 
 Match the client's HTTP contract to the server's. The 0.14 server requires
