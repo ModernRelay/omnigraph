@@ -86,8 +86,8 @@ omnigraph-core = { path = "../omnigraph-core", version = "0.15.1", features = ["
 # tests/integration/s3_storage.rs runs the read-through storage contract's rows against a bucket.
 omnigraph-storage = { path = "../omnigraph-storage", version = "0.15.1", features = ["test-util"] }
 omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.15.1", features = ["test-util"] }
-tokio = { workspace = true }
-lance-namespace-impls = { workspace = true }
+# Paused time for the load deadline test in tests/writes.rs, so the crate's own test build runs it.
+tokio = { workspace = true, features = ["test-util"] }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,
 # so production builds (which exclude dev-deps) never see it.
 lance-io = { version = "13.0.0", features = ["test-util"] }

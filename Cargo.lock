@@ -5582,7 +5582,6 @@ name = "omnigraph-catalog"
 version = "0.15.1"
 dependencies = [
  "arrow-array",
- "arrow-ipc",
  "arrow-schema",
  "async-trait",
  "bytes",
@@ -5625,7 +5624,6 @@ dependencies = [
  "futures",
  "keyring",
  "lance",
- "lance-index",
  "libc",
  "libyaml-rs",
  "omnigraph-api-types",
@@ -5681,12 +5679,9 @@ dependencies = [
 name = "omnigraph-compiler"
 version = "0.15.1"
 dependencies = [
- "ahash",
  "arrow-array",
- "arrow-cast",
  "arrow-ipc",
  "arrow-json",
- "arrow-ord",
  "arrow-schema",
  "arrow-select",
  "pest",
@@ -5725,7 +5720,6 @@ dependencies = [
  "omnigraph-storage",
  "serde",
  "serde_json",
- "serial_test",
  "sha2 0.10.9",
  "stop-words",
  "tempfile",
@@ -5746,7 +5740,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
- "lance-core",
  "lance-io",
  "object_store 0.14.2",
  "omnigraph-cluster",
@@ -5791,7 +5784,6 @@ dependencies = [
  "lance-io",
  "lance-linalg",
  "lance-namespace",
- "lance-namespace-impls",
  "lance-select",
  "lance-table",
  "libc",
@@ -5969,13 +5961,11 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "color-eyre",
- "dashmap",
  "futures",
  "headers",
  "http-body-util",
  "jsonwebtoken",
  "lance",
- "lance-index",
  "libc",
  "object_store 0.14.2",
  "omnigraph-api-types",
@@ -6002,7 +5992,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower",
- "tower-http",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -9011,7 +9000,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 

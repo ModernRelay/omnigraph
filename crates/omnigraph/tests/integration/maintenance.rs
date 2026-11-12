@@ -4041,21 +4041,21 @@ async fn cleanup_age_window_preserves_recent_ref_absent_descendant() {
     );
 }
 
-/// The archive begins a retirement age window, then leaves with its unneeded tree.
-/// Native lifecycle contents and filesystem timestamps require the Rust owner.
-#[tokio::test]
-async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-    db.branch_create("feature").await.unwrap();
-    let manifest_uri = dir.path().join("__manifest");
+/// Backdate the live `__manifest` branch `branch`: its ref's `create_at` to
+/// zero and every file of its ref and tree to the epoch, so `cleanup`'s age
+/// window has passed for them. Returns the ref and tree paths.
+async fn age_manifest_branch(
+    root: &std::path::Path,
+    branch: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let manifest_uri = root.join("__manifest");
     let manifest = Dataset::open(manifest_uri.to_str().unwrap()).await.unwrap();
     let native = manifest
         .list_branches()
         .await
         .unwrap()
         .into_keys()
-        .find(|name| name.starts_with("feature."))
+        .find(|name| name.starts_with(&format!("{branch}.")))
         .unwrap();
     let live_ref = manifest_uri
         .join("_refs/branches")
@@ -4082,6 +4082,19 @@ async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
                 .unwrap();
         }
     }
+    (live_ref, tree)
+}
+
+/// The archive begins a retirement age window, then leaves with its unneeded tree.
+/// Native lifecycle contents and filesystem timestamps require the Rust owner.
+#[tokio::test]
+async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    let manifest_uri = dir.path().join("__manifest");
+    let manifest = Dataset::open(manifest_uri.to_str().unwrap()).await.unwrap();
+    let (live_ref, tree) = age_manifest_branch(dir.path(), "feature").await;
     db.branch_delete("feature").await.unwrap();
     assert!(!live_ref.exists());
     let archive = tree.join("_omnigraph_retired_branch.json");
@@ -4135,6 +4148,60 @@ async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
     assert!(
         !tree.exists(),
         "unneeded native history is reclaimed with its archive"
+    );
+}
+
+/// A handle that found a commit on a branch looks there first for the other
+/// commits of its history block. Once the branch is deleted and `cleanup`
+/// reclaims its tree, that branch has no `_versions` listing: the lookup must
+/// drop the hint and answer from `__history`, where the deletion archived the
+/// branch's commits. A warm handle across `cleanup` is not a `.gqt` step.
+#[tokio::test]
+async fn commit_lookup_past_a_reclaimed_branch_tree_reads_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    for name in ["First", "Second"] {
+        let person = mixed_params(&[("$name", name)], &[("$age", 30)]);
+        helpers::mutate_branch(&db, "feature", MUTATION_QUERIES, "insert_person", &person)
+            .await
+            .unwrap();
+    }
+    let commits = db.list_commits(Some("feature")).await.unwrap();
+    let (second, first) = (commits[0].clone(), commits[1].clone());
+
+    let reader = helpers::session(Omnigraph::open(uri).await.unwrap());
+    assert_eq!(
+        reader.get_commit(&first.graph_commit_id).await.unwrap(),
+        first,
+        "test setup: the scan finds the commit on `feature` and remembers its block there"
+    );
+    let (_, tree) = age_manifest_branch(dir.path(), "feature").await;
+    db.branch_delete("feature").await.unwrap();
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::ZERO),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !tree.exists(),
+        "test setup: cleanup reclaimed the deleted branch's tree"
+    );
+
+    assert_eq!(
+        reader.get_commit(&second.graph_commit_id).await.unwrap(),
+        second,
+        "the hinted branch's tree is gone: the lookup reads `__history`"
+    );
+    assert_eq!(
+        reader.get_commit(&first.graph_commit_id).await.unwrap(),
+        first,
+        "and keeps reading it once the hint is dropped"
     );
 }
 
