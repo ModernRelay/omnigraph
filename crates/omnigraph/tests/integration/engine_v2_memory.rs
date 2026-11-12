@@ -2243,7 +2243,7 @@ query pairs() {
 }
 "#;
     let mut outcomes = Vec::new();
-    for budget in 3..=8 {
+    for budget in 1..=16 {
         let probes = QueryMemoryProbes::default();
         let result = with_query_memory_probes(
             probes.clone(),
