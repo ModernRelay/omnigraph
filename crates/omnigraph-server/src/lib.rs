@@ -1362,6 +1362,32 @@ impl ApiError {
         error
     }
 
+    /// The answer to a cluster diagnostic reporting a failed storage read of
+    /// a control object (the state file, its lock, the operation record), or
+    /// `None` for any other diagnostic. Every caller maps a diagnostic it got
+    /// before the request had effects, so nothing changed; the storage
+    /// crate's class of the failure decides whether the same request can
+    /// succeed later. Only positive transient evidence, or no typed evidence
+    /// either way, answers 503 with `action: retry`; a failure that repeats
+    /// on every read (bytes that are not text, an object over its bound,
+    /// denied access, a broken backend contract) answers 500.
+    pub(crate) fn failed_control_read(error: &omnigraph_cluster::Diagnostic) -> Option<Self> {
+        use omnigraph::error::StorageFailureKind as Kind;
+        let message = format!("[{}] {}", error.code, error.message);
+        let answer = match error.storage_failure? {
+            Kind::Transient | Kind::Unknown => Self::new(
+                ErrorCode::ServiceUnavailable,
+                format!("{message}; nothing changed, retry the same request"),
+            ),
+            Kind::Precondition => Self::conflict(message),
+            Kind::Configuration | Kind::Permanent | Kind::NotFound => Self::internal(format!(
+                "{message}; nothing changed, and the same request fails until the stored object \
+                 or the storage configuration is repaired"
+            )),
+        };
+        Some(answer.applied_nothing())
+    }
+
     /// Refusal before an operation acquires ownership in a closed runtime.
     fn admission_closed() -> Self {
         Self::new(

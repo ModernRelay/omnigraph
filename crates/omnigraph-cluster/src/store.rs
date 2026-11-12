@@ -544,7 +544,10 @@ impl ClusterStore {
 
     /// One bounded GET supplies both the exact bytes and their backend CAS
     /// token. Missing objects are not probed separately.
-    async fn read_versioned_opt(&self, uri: &str) -> Result<Option<(String, String)>, String> {
+    async fn read_versioned_opt(
+        &self,
+        uri: &str,
+    ) -> Result<Option<(String, String)>, omnigraph_storage::StorageError> {
         self.adapter
             .read_text_versioned_if_exists_bounded(
                 uri,
@@ -555,7 +558,6 @@ impl ClusterStore {
                 },
             )
             .await
-            .map_err(|err| err.to_string())
     }
 
     /// Shared list-and-parse for the sidecar/approval directories: id
@@ -996,7 +998,8 @@ impl ClusterStore {
                     "state_read_error",
                     CLUSTER_STATE_FILE,
                     format!("could not read state file: {err}"),
-                ));
+                )
+                .with_storage_failure(&err));
             }
         };
 
@@ -1077,6 +1080,7 @@ impl ClusterStore {
                 CLUSTER_STATE_FILE,
                 format!("could not read state file before write: {err}"),
             )
+            .with_storage_failure(&err)
         })?;
         if let Some((text, _)) = &current {
             let (previous, _) = decode_ledger(text, upgrade)?;
@@ -1148,7 +1152,8 @@ impl ClusterStore {
                 "operation_record_read_error",
                 crate::operations::CLUSTER_OPERATIONS_FILE,
                 format!("could not read the operation record: {error}"),
-            )),
+            )
+            .with_storage_failure(&error)),
         }
     }
 
@@ -1182,7 +1187,9 @@ impl ClusterStore {
             Ok(Some(None)) => match self.read_versioned_opt(&uri).await {
                 Ok(Some((text, version))) if text == payload => OperationWrite::Written { version },
                 Ok(_) => OperationWrite::Conflict,
-                Err(error) => OperationWrite::InDoubt { error },
+                Err(error) => OperationWrite::InDoubt {
+                    error: error.to_string(),
+                },
             },
             Ok(None) => OperationWrite::Conflict,
             Err(error) if error.is_unresolved_conditional() => OperationWrite::InDoubt {
@@ -1331,7 +1338,8 @@ impl ClusterStore {
                     "state_lock_read_error",
                     CLUSTER_LOCK_FILE,
                     format!("could not read state lock: {err}"),
-                ));
+                )
+                .with_storage_failure(&err));
             }
         };
         let lock = parse_lock_file_for_unlock(&text)?;
@@ -1396,11 +1404,14 @@ impl ClusterStore {
                 }
             }
             Ok(None) => {}
-            Err(err) => diagnostics.push(Diagnostic::warning(
-                "state_lock_read_error",
-                CLUSTER_LOCK_FILE,
-                format!("could not read state lock: {err}"),
-            )),
+            Err(err) => diagnostics.push(
+                Diagnostic::warning(
+                    "state_lock_read_error",
+                    CLUSTER_LOCK_FILE,
+                    format!("could not read state lock: {err}"),
+                )
+                .with_storage_failure(&err),
+            ),
         }
     }
 
