@@ -2187,3 +2187,86 @@ async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251
     assert_eq!(rows, expected);
     assert_released(&probes);
 }
+
+/// A run that fits a query memory budget fits every larger budget. The
+/// fixture is the bound-edge sort of #1339: 4,096 `Knows` edges from one
+/// person, each with a 1 KiB pseudo-random payload, aggregated under budgets
+/// around the size of the sort's spill reservation.
+#[tokio::test]
+#[serial]
+async fn a_query_that_fits_a_budget_fits_every_larger_budget_issue_1361() {
+    const EDGES: usize = 4096;
+    const PAYLOAD: usize = 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Person {\n    name: String @key\n}\nedge Knows: Person -> Person {\n    payload: String\n}\n",
+        )
+        .await
+        .unwrap(),
+    );
+    let mut lines = vec![
+        r#"{"type":"Person","data":{"name":"a"}}"#.to_string(),
+        r#"{"type":"Person","data":{"name":"b"}}"#.to_string(),
+    ];
+    lines.extend((0..EDGES).map(|edge| {
+        let payload = (0..PAYLOAD)
+            .map(|position| {
+                let mut z =
+                    ((edge as u64) << 32 | position as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                char::from(b'!' + ((z ^ (z >> 31)) % 90) as u8)
+            })
+            .collect::<String>();
+        serde_json::json!({
+            "edge": "Knows",
+            "id": format!("k{edge:05}"),
+            "from": "a",
+            "to": "b",
+            "data": {"payload": payload},
+        })
+        .to_string()
+    }));
+    db.load_jsonl(&lines.join("\n"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let db = with_setting(&db, "engine", "v2");
+    let source = r#"
+query pairs() {
+    match {
+        $p: Person { name: "a" }
+        $p $e:knows $q
+    }
+    return { max($e.payload) as last }
+}
+"#;
+    let mut outcomes = Vec::new();
+    for budget in 3..=8 {
+        let probes = QueryMemoryProbes::default();
+        let result = with_query_memory_probes(
+            probes.clone(),
+            with_query_memory_limit(budget * MIB, query_main(&db, source, "pairs", &params(&[]))),
+        )
+        .await;
+        assert_released(&probes);
+        outcomes.push((
+            budget,
+            result
+                .map(|batch| batch.num_rows())
+                .map_err(|error| format!("{error:?}")),
+        ));
+    }
+    let first_fit = outcomes
+        .iter()
+        .position(|(_, outcome)| outcome.is_ok())
+        .expect("some budget fits the query");
+    for (budget, outcome) in &outcomes[first_fit..] {
+        assert!(
+            matches!(outcome, Ok(1)),
+            "{budget} MiB is refused although {} MiB fits: {outcomes:#?}",
+            outcomes[first_fit].0
+        );
+    }
+}
