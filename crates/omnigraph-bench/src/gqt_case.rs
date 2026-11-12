@@ -229,6 +229,7 @@ fn validate_recipe(recipe: &DatasetRecipe) -> Result<Case, String> {
         }
     };
     admit_environment(&case)?;
+    case.admit_lasting_store()?;
     Ok(case)
 }
 pub fn dataset_file(
@@ -604,6 +605,7 @@ pub(crate) fn admit_target_queries(
             }
         }
     }
+    case.admit_lasting_store()?;
     if case.fixture.is_some() {
         return Err("queries must omit schema and seed".into());
     }

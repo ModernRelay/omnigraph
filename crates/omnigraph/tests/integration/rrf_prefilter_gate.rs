@@ -265,7 +265,7 @@ async fn init_gate_db(dir: &tempfile::TempDir) -> Session {
     db.load_jsonl(&gate_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db
 }
 
@@ -457,7 +457,7 @@ async fn init_stats_db(dir: &tempfile::TempDir) -> Session {
     db.load_jsonl(&stats_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     db
 }
 
@@ -614,7 +614,7 @@ async fn natural_gate_prefilters_at_ratio_boundary() {
     db.load_jsonl(&rows.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let db = db;
 
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
@@ -767,7 +767,7 @@ async fn empty_eligible_set_falls_back() {
     )
     .await
     .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let db = db;
 
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
@@ -807,7 +807,7 @@ async fn natural_gate_prefilters_selective_fixture() {
     db.load_jsonl(&rows.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let db = db;
 
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
@@ -880,7 +880,7 @@ async fn decoy_flood_winner_holds_under_both_plans() {
     db.load_jsonl(&rows.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let db = db;
 
     let text_params = params(&[("$q1", "alpha"), ("$q2", "beta")]);
@@ -926,7 +926,7 @@ async fn natural_gate_falls_back_on_broad_fixture() {
     db.load_jsonl(&rows.join("\n"), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
+    db.ensure_indices_as(None).await.unwrap();
     let db = db;
 
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);

@@ -558,3 +558,51 @@ async fn bound_pairs_size_a_list_property_by_its_own_elements_issue_1251() {
         [EDGES]
     );
 }
+
+/// A bound frontier holds nodes, whose ids are never null, so a null
+/// source id is an integrity fault: the pairs refuse it instead of dropping
+/// the row, and emit nothing.
+#[tokio::test]
+async fn bound_pairs_refuse_a_null_source_id() {
+    let (_dir, env) = graph_environment_for(
+        "node Person { name: String @key }\nedge Knows: Person -> Person",
+        people(),
+    )
+    .await;
+    let ctx = QueryContext::new(64 * 1024 * 1024).unwrap();
+    let memory = Arc::new(WorkMemory::new(ctx.task_ctx(), "bound pair nulls").unwrap());
+    let member = EdgeMember {
+        edge_type: "Knows".into(),
+        direction: Direction::Out,
+    };
+    let schema =
+        bound_edge_pair_schema(&env.catalog, std::slice::from_ref(&member), false).unwrap();
+    let wide = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "p.__id",
+            DataType::Utf8,
+            true,
+        )])),
+        vec![Arc::new(StringArray::from(vec![Some("a"), None]))],
+    )
+    .unwrap();
+    let mut emitted = 0;
+    let error = produce_bound_edge_pairs(
+        &wide,
+        &env.snapshot,
+        &env.catalog,
+        "p",
+        &member,
+        None,
+        &schema,
+        &memory,
+        |_batch, _lease| {
+            emitted += 1;
+            std::future::ready(Ok(()))
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("null 'p.__id'"), "{error}");
+    assert_eq!(emitted, 0);
+}

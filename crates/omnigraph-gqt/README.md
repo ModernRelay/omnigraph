@@ -94,7 +94,7 @@ runner implements it. The declared `storage` is recorded, not checked: no
 route reports the server's backend. Refused before any request, by name: `--- restart`,
 `--- concurrent`, seam directives, settings steps and settings prefixes on a
 control or `show` step, `--- expect plan`, `--- expect same as v1`, the
-`# traversal:` pin, and queries that need indices (`search`, `fuzzy`,
+`# traversal:` pin, the `# writer:` pin, and queries that need indices (`search`, `fuzzy`,
 `nearest`, `rrf`). The `--- expect shape` section is not judged under a
 server target: it holds the executor's Arrow schema against the compiler's,
 which no wire answer carries. `--server` is exclusive with `--store`, and a
@@ -518,7 +518,7 @@ beside a write is a number. So is its wait: every in-process lock the engine
 takes is a gate whose acquisition crosses the seams `gate.<gate>.acquire`,
 `gate.<gate>.hold` and `gate.<gate>.release`, plus `gate.coordinator_cas.refused`
 for an install that ends without a hold (`table`, `branch`,
-`schema_shared`, `schema_exclusive`, `export`, `coordinator_cas`; the
+`schema_shared`, `schema_exclusive`, `export`, `writer_yield`, `coordinator_cas`; the
 engine's `write_queue` module doc §Gates), and a session's `acquire`-to-`hold`
 spans on the virtual clock are summed per gate into `wait.<gate>` ticks, in
 its row's `waiting` column and in the TSV. The clock rule: the virtual clock
@@ -656,6 +656,19 @@ overwrite chunk holds before a Lance writer takes it, Lance's file target
 (1 Mi rows) without the header, so a case of a few hundred records writes
 fragments before its last record is judged and pins what a late refusal leaves
 behind. An in-process pin: a server target refuses it.
+
+The optional `# writer: held` header makes the case's process the writer of
+`main`: the runner claims the branch's writer epoch through
+`Omnigraph::claim_branch_writer` once the fixture has loaded and before the
+first step, so every step runs on a held branch, and a `--- restart` reopens
+a handle of the process that still holds it. `held` is the only value. The
+claim is one `__manifest` version outside every step: it moves no head and
+no measured step carries its requests; under `--measure` they are the `setup`
+label's. The pin runs on the case's own schema and seed only: `--store`
+refuses it, and so do a bench dataset recipe and a bench workload file,
+because the claim would stay in a store the case does not own and no command
+claims a branch back in this release. An in-process pin: no route claims, so a
+server target refuses it.
 
 An `expand $src <Edge> $dst:` line selects every matching named-edge physical `Expand` between
 those bindings over that edge type and claims `mode csr` or `mode

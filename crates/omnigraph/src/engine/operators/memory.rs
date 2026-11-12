@@ -1039,47 +1039,58 @@ impl WorkMemory {
     /// The bytes `interleave_once` admits for the rows of `batches` at
     /// `picks` (`(batch, row)`) before Arrow builds them: each pick copies its
     /// row once, a row picked twice is copied twice, plus Arrow's scratch. A
-    /// caller sizes a window by it before it interleaves.
+    /// caller sizes a window by it before it interleaves. `row_bytes[batch]`
+    /// holds [`Self::row_bytes`] of each batch, computed once by the caller
+    /// when it holds the rows, since a window is sized again on every halving.
     pub(in crate::engine) fn interleave_bytes(
         &self,
         batches: &[RecordBatch],
+        row_bytes: &[Vec<usize>],
         picks: &[(usize, usize)],
     ) -> DfResult<usize> {
-        let (picked, scratch) = self.interleave_estimate(batches, picks)?;
+        let (picked, scratch) = self.interleave_estimate(batches, row_bytes, picks)?;
         Ok(picked.saturating_add(scratch))
     }
 
-    /// The picked bytes of an interleave and its scratch bytes, column by
-    /// column as `take_estimate` counts a take.
+    /// The picked bytes of an interleave and its scratch bytes, as
+    /// `take_estimate` counts a take: per column, a pick's one-row slice plus
+    /// 16, and 128. A row's slices summed over its columns are its
+    /// `row_bytes`, so the picks sum those once instead of slicing every
+    /// column of every pick.
     fn interleave_estimate(
         &self,
         batches: &[RecordBatch],
+        row_bytes: &[Vec<usize>],
         picks: &[(usize, usize)],
     ) -> DfResult<(usize, usize)> {
         let Some(first) = batches.first() else {
             return Ok((0, 0));
         };
-        let mut bytes = 0usize;
-        let mut scratch_bytes = 0usize;
-        for column in 0..first.num_columns() {
-            let data: Vec<ArrayData> = batches
-                .iter()
-                .map(|batch| batch.column(column).to_data())
-                .collect();
-            scratch_bytes = scratch_bytes.saturating_add(take_scratch_size(&data[0], picks.len()));
-            let mut picked = 0usize;
-            for &(batch, row) in picks {
-                self.check()?;
-                let data = data.get(batch).ok_or_else(|| {
-                    DataFusionError::Internal(format!("interleave pick of absent batch {batch}"))
+        self.check()?;
+        let columns = first.num_columns();
+        let mut picked = 0usize;
+        for &(batch, row) in picks {
+            let bytes = row_bytes
+                .get(batch)
+                .and_then(|rows| rows.get(row))
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "interleave pick ({batch}, {row}) has no row bytes"
+                    ))
                 })?;
-                picked = picked
-                    .saturating_add(slice_memory_size(data, row, 1)?)
-                    .saturating_add(16);
-            }
-            bytes = bytes.saturating_add(picked).saturating_add(128);
+            picked = picked
+                .saturating_add(*bytes)
+                .saturating_add(columns.saturating_mul(16));
         }
-        Ok((bytes, scratch_bytes))
+        let mut scratch_bytes = 0usize;
+        for column in first.columns() {
+            scratch_bytes =
+                scratch_bytes.saturating_add(take_scratch_size(&column.to_data(), picks.len()));
+        }
+        Ok((
+            picked.saturating_add(columns.saturating_mul(128)),
+            scratch_bytes,
+        ))
     }
 
     /// The rows of `batches` at `picks`, in pick order, under `schema`: the
@@ -1089,10 +1100,11 @@ impl WorkMemory {
         &self,
         schema: &SchemaRef,
         batches: &[RecordBatch],
+        row_bytes: &[Vec<usize>],
         picks: &[(usize, usize)],
         name: &str,
     ) -> DfResult<RecordBatch> {
-        let (bytes, scratch_bytes) = self.interleave_estimate(batches, picks)?;
+        let (bytes, scratch_bytes) = self.interleave_estimate(batches, row_bytes, picks)?;
         let admitted = self
             .resources
             .reservation(name, bytes.saturating_add(scratch_bytes))?;
@@ -1651,16 +1663,26 @@ mod tests {
         );
         // An interleave over one-row batches counts each pick the same way.
         let rows = [batch.slice(0, 1), batch.slice(1, 1)];
+        let sizes: Vec<Vec<usize>> = rows
+            .iter()
+            .map(|row| memory.row_bytes(row).unwrap())
+            .collect();
         let picks = [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)];
-        assert!(memory.interleave_bytes(&rows, &picks[..2]).unwrap() < 2 * 1_048_576);
-        assert!(memory.interleave_bytes(&rows, &picks).unwrap() >= 8 * 512 * 1024);
+        assert!(memory.interleave_bytes(&rows, &sizes, &picks[..2]).unwrap() < 2 * 1_048_576);
+        assert!(memory.interleave_bytes(&rows, &sizes, &picks).unwrap() >= 8 * 512 * 1024);
         let two = memory
-            .interleave_once(&batch.schema(), &rows, &picks[..2], "test interleave")
+            .interleave_once(
+                &batch.schema(),
+                &rows,
+                &sizes,
+                &picks[..2],
+                "test interleave",
+            )
             .unwrap();
         assert_eq!(two, batch);
         assert!(
             memory
-                .interleave_once(&batch.schema(), &rows, &picks, "test interleave")
+                .interleave_once(&batch.schema(), &rows, &sizes, &picks, "test interleave")
                 .is_err(),
             "four copies of the wide row in two columns exceed the pool"
         );
@@ -1917,5 +1939,190 @@ mod row_bytes_tests {
             assert_eq!(memory.row_bytes(&batch).unwrap(), expected);
             assert!(expected.iter().all(|bytes| *bytes > 0));
         }
+    }
+
+    /// An interleave's estimate from row bytes taken once equals the one that
+    /// slices every column of every pick (per column: a slice plus 16 per
+    /// pick, and 128), with Arrow's scratch from the first batch: one-row
+    /// batches as hydration fetches them, a multi-row batch, a repeated pick
+    /// and a sliced batch.
+    #[test]
+    fn interleave_estimate_from_row_bytes_equals_the_per_slice_sum_issue_1340() {
+        let limit = 1 << 20;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let resources = Arc::new(QueryResources::new(pool, limit as u64));
+        let ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_extension(resources)),
+        );
+        let memory = WorkMemory::new(ctx, "interleave estimate").unwrap();
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3), Some(4)]));
+        let names: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("a much longer value"),
+            None,
+            Some(""),
+        ]));
+        let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+        for row in 0..4 {
+            vectors.values().append_slice(&[row as f32; 3]);
+            vectors.append(row != 2);
+        }
+        let vectors: ArrayRef = Arc::new(vectors.finish());
+        let batch =
+            RecordBatch::try_from_iter([("ints", ints), ("names", names), ("vectors", vectors)])
+                .unwrap();
+        let batches = vec![
+            batch.slice(1, 1),
+            batch.clone(),
+            batch.slice(2, 2),
+            batch.slice(0, 1),
+        ];
+        let picks = [(0, 0), (1, 3), (1, 1), (2, 1), (3, 0), (0, 0), (2, 0)];
+        let sliced = picks.iter().try_fold(0usize, |bytes, &(batch, row)| {
+            memory
+                .slice_bytes(&batches[batch], row, 1)
+                .map(|row_bytes| bytes + row_bytes + 16 * batches[0].num_columns())
+        });
+        let scratch: usize = batches[0]
+            .columns()
+            .iter()
+            .map(|column| take_scratch_size(&column.to_data(), picks.len()))
+            .sum();
+        let expected = sliced.unwrap() + 128 * batches[0].num_columns() + scratch;
+        let sizes: Vec<Vec<usize>> = batches
+            .iter()
+            .map(|batch| memory.row_bytes(batch).unwrap())
+            .collect();
+        assert_eq!(
+            memory.interleave_bytes(&batches, &sizes, &picks).unwrap(),
+            expected
+        );
+        assert_eq!(memory.interleave_bytes(&batches, &sizes, &[]).unwrap(), {
+            let scratch: usize = batches[0]
+                .columns()
+                .iter()
+                .map(|column| take_scratch_size(&column.to_data(), 0))
+                .sum();
+            128 * batches[0].num_columns() + scratch
+        });
+        assert!(
+            memory
+                .interleave_bytes(&batches, &sizes, &[(4, 0)])
+                .is_err()
+        );
+        assert!(
+            memory
+                .interleave_bytes(&batches, &sizes, &[(0, 1)])
+                .is_err()
+        );
+    }
+
+    /// The estimate the row bytes replaced, kept here only as the
+    /// instrument's baseline: per column, every batch's `to_data()` and a
+    /// one-row slice of every pick.
+    fn per_slice_estimate(batches: &[RecordBatch], picks: &[(usize, usize)]) -> usize {
+        let mut bytes = 0usize;
+        let mut scratch_bytes = 0usize;
+        for column in 0..batches[0].num_columns() {
+            let data: Vec<ArrayData> = batches
+                .iter()
+                .map(|batch| batch.column(column).to_data())
+                .collect();
+            scratch_bytes += take_scratch_size(&data[0], picks.len());
+            let picked: usize = picks
+                .iter()
+                .map(|&(batch, row)| slice_memory_size(&data[batch], row, 1).unwrap() + 16)
+                .sum();
+            bytes += picked + 128;
+        }
+        bytes + scratch_bytes
+    }
+
+    fn best_of(runs: usize, mut run: impl FnMut()) -> std::time::Duration {
+        (0..runs)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                run();
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    /// Decision instrument for the hydration estimate's CPU: the per-slice
+    /// estimate against one `row_bytes` pass per fetched row plus the
+    /// estimate from those sizes, over 1,024 one-row batches (id, integer,
+    /// float, 200-byte text, 128-dimension vector) and 2,048 picks, best of
+    /// 30. A window is estimated once and again on every halving, so the
+    /// per-estimate figure is the one each halving repeats. Run in a
+    /// release build:
+    /// `cargo test --release -p omnigraph-engine --lib interleave_estimate_from_row_bytes_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "instrument: CPU of the hydration estimate from row bytes against the per-slice estimate (run with --release)"]
+    fn interleave_estimate_from_row_bytes_cost() {
+        let limit = 1 << 30;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let resources = Arc::new(QueryResources::new(pool, limit as u64));
+        let ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_extension(resources)),
+        );
+        let memory = WorkMemory::new(ctx, "interleave estimate cost").unwrap();
+        let batches: Vec<RecordBatch> = (0..1024)
+            .map(|row| {
+                let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 128);
+                vectors.values().append_slice(&[row as f32; 128]);
+                vectors.append(true);
+                let columns: [(&str, ArrayRef); 5] = [
+                    (
+                        "id",
+                        Arc::new(StringArray::from(vec![format!("id-{row:06}")])),
+                    ),
+                    ("int", Arc::new(Int64Array::from(vec![row as i64]))),
+                    (
+                        "float",
+                        Arc::new(arrow_array::Float64Array::from(vec![row as f64])),
+                    ),
+                    (
+                        "text",
+                        Arc::new(StringArray::from(vec![format!("{row:0>200}")])),
+                    ),
+                    ("vector", Arc::new(vectors.finish())),
+                ];
+                RecordBatch::try_from_iter(columns).unwrap()
+            })
+            .collect();
+        let picks: Vec<(usize, usize)> = (0..2048).map(|pick| ((pick * 7) % 1024, 0)).collect();
+        let sizes: Vec<Vec<usize>> = batches
+            .iter()
+            .map(|batch| memory.row_bytes(batch).unwrap())
+            .collect();
+        let expected = per_slice_estimate(&batches, &picks);
+        assert_eq!(
+            memory.interleave_bytes(&batches, &sizes, &picks).unwrap(),
+            expected
+        );
+        let per_slice = best_of(30, || {
+            assert_eq!(per_slice_estimate(&batches, &picks), expected);
+        });
+        let sizing = best_of(30, || {
+            for batch in &batches {
+                assert_eq!(memory.row_bytes(batch).unwrap().len(), 1);
+            }
+        });
+        let summed = best_of(30, || {
+            assert_eq!(
+                memory.interleave_bytes(&batches, &sizes, &picks).unwrap(),
+                expected
+            );
+        });
+        println!(
+            "hydration estimate, 1,024 rows, 2,048 picks: per-slice {} µs per estimate; \
+             row bytes {} µs once per window, then {} µs per estimate",
+            per_slice.as_micros(),
+            sizing.as_micros(),
+            summed.as_micros(),
+        );
     }
 }
