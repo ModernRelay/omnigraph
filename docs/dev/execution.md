@@ -83,9 +83,11 @@ every edge table its commit lists, which is every edge type. A branch create
 or delete clears nothing, because it changes no key: graph tables never carry
 a branch's own ref (a branch write stages detached on the inherited ref; see
 "Table forks" in [Lance alignment](lance.md)), so a recreated branch's tables
-share `main`'s ref and can repeat a dead branch's version numbers, and only the
-new random pin keeps them apart. A deleted branch's indexes and held table
-handles stay until the LRUs drop them (8 indexes; 64 handles or 64 MiB). A
+share `main`'s ref and can repeat a dead branch's version numbers. The new
+random pin keeps them apart on every store, by construction. Where the store
+gives an e_tag (S3, and local files on Linux), the e_tag also differs, and a
+write to the edge table also evicts the old index, but neither is needed. A
+deleted branch's indexes and held table handles stay until the LRUs drop them (8 indexes; 64 handles or 64 MiB). A
 refresh, schema apply, optimize and the system-column upgrade clear the whole
 cache.
 

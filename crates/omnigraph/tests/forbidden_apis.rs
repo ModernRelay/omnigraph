@@ -4083,24 +4083,34 @@ fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
         );
     }
 
+    // The helper and the clears it is made of, so a direct call fails too.
+    let cache_clears = [
+        "invalidate_read_caches",
+        "invalidate_all",
+        "invalidate_graph_index",
+    ];
     for function_name in ["branch_create_as", "branch_create_from_impl"] {
         let function = functions
             .get(function_name)
             .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
-        assert_eq!(
-            method_call_count(&function.block, "invalidate_read_caches"),
-            0,
-            "Omnigraph::{function_name} must keep the read caches: a branch create changes no cache key"
-        );
+        for clear in cache_clears {
+            assert_eq!(
+                method_call_count(&function.block, clear),
+                0,
+                "Omnigraph::{function_name} must keep the read caches (no {clear}): a branch create changes no cache key"
+            );
+        }
     }
     let delete_helper = functions
         .get("delete_captured_branch_storage")
         .expect("missing Omnigraph::delete_captured_branch_storage");
-    assert_eq!(
-        method_call_count(&delete_helper.block, "invalidate_read_caches"),
-        0,
-        "captured branch deletion must keep the read caches: a branch delete changes no cache key"
-    );
+    for clear in cache_clears {
+        assert_eq!(
+            method_call_count(&delete_helper.block, clear),
+            0,
+            "captured branch deletion must keep the read caches (no {clear}): a branch delete changes no cache key"
+        );
+    }
 }
 
 fn function_blocks(ast: &syn::File, function_name: &str) -> Vec<syn::Block> {

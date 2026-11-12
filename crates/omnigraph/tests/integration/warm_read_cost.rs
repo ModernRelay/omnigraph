@@ -1442,13 +1442,14 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
 /// A recreated branch reuses the same edge table, native ref (`main`'s) and
 /// version number as the deleted one. The graph-index cache key (A1) carries each
 /// edge table's identity, version, detached pin (`staged_version`), native ref and
-/// e_tag; on local FS the e_tag is `None`, so the recreated branch's new random
-/// detached pin is what keeps its key apart from the dead branch's. This reader is
+/// e_tag; the recreated branch's new random detached pin keeps its key apart from
+/// the dead branch's on every store (the e_tag differs too where the store has
+/// one, Linux local files included). This reader is
 /// a second handle, so it also takes the manifest refresh; this traversal takes
 /// the indexed path (single-source frontier), so it also exercises the table-handle
 /// cache; the assertion is that recreated-branch topology is never stale
-/// regardless of path. `recreated_branch_misses_cached_topology_on_its_new_pin`
-/// pins the same on one handle, with no refresh to clear the cache.
+/// regardless of path. `recreated_branch_misses_cached_topology` checks the same
+/// on one handle, with no refresh to clear the cache.
 #[tokio::test]
 async fn recreated_branch_traversal_uses_graph_index_incarnation() {
     cost_harness(async {
@@ -1989,10 +1990,14 @@ query hire($person: String, $company: String) {
 /// On one handle, with no refresh in between, a branch deleted and recreated
 /// at the same edge-table version misses the dead branch's cached topology. A
 /// branch control clears no cache: both incarnations stage on `main`'s ref at
-/// the same version number, and only the new random detached pin in the key
-/// keeps them apart (docs/dev/execution.md, traversal and joins).
+/// the same version number (docs/dev/execution.md, traversal and joins). This
+/// checks the end result only. Three things keep the keys apart here, and each
+/// is enough alone: the new random detached pin, the e_tag (Linux local files
+/// have one) and the eviction by the second `Knows` write. The pin is the one
+/// that holds on every store; `runtime_cache::tests::
+/// same_counter_different_pin_splits_both_keys_without_etag` owns that rule.
 #[tokio::test]
-async fn recreated_branch_misses_cached_topology_on_its_new_pin() {
+async fn recreated_branch_misses_cached_topology() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     let csr_db = with_traversal(&db, Traversal::Csr);

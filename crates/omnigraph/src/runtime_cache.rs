@@ -40,12 +40,12 @@ struct GraphIndexTableState {
     /// per-lineage counter, so two branches share it with different pins.
     staged_version: Option<u64>,
     table_branch: Option<String>,
-    /// Lance manifest incarnation token for this edge table version. Preserves the
-    /// incarnation distinction the dropped synthetic snapshot id used to carry: a
-    /// branch deleted and recreated at the same version number gets a new e_tag, so
-    /// the cache rebuilds instead of serving stale topology. `None` only on stores
-    /// without e_tags (local FS); there a same-branch manifest refresh clears the
-    /// cache as the fallback (the read-path gap in docs/dev/invariants.md).
+    /// Lance manifest incarnation token for this edge table version, where the
+    /// store gives one (S3 and Linux local files do). A branch deleted and
+    /// recreated at the same version number gets a new e_tag. The key does not
+    /// depend on it: the recreated branch's new random `staged_version` already
+    /// splits the key on every store, e_tag or not
+    /// (`same_counter_different_pin_splits_both_keys_without_etag`).
     e_tag: Option<String>,
     /// The edge's `(from_type, to_type)` endpoint names at build time. `GraphIndex`
     /// keys its `TypeIndex`es by these, and `execute_expand_csr` looks them up by
