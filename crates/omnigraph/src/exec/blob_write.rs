@@ -37,27 +37,6 @@ enum BlobCellValue {
     Null,
 }
 
-/// The authority a write attempt captured that a re-prepared attempt must
-/// still see: the native branch incarnation and the accepted schema.
-#[derive(PartialEq, Eq)]
-struct AttemptIdentity {
-    branch_identifier: lance::dataset::refs::BranchIdentifier,
-    schema_ir_hash: String,
-    schema_identity_domain: String,
-    schema_identity_version: u32,
-}
-
-impl AttemptIdentity {
-    fn of(txn: &crate::db::WriteTxn) -> Self {
-        Self {
-            branch_identifier: txn.authority.branch_identifier.clone(),
-            schema_ir_hash: txn.authority.schema_ir_hash.clone(),
-            schema_identity_domain: txn.authority.schema_identity_domain.clone(),
-            schema_identity_version: txn.authority.schema_identity_version,
-        }
-    }
-}
-
 impl Session {
     /// Replace one Blob cell of an existing node or edge with managed bytes.
     ///
@@ -147,11 +126,9 @@ impl Session {
 }
 
 impl Omnigraph {
-    /// Re-prepare after a pre-effect read-set change, within the bound an
-    /// insert-only mutation uses. Unlike a predicate update, whose
-    /// read-modify-write plan would rebase, the stored value is the caller's,
-    /// so a fresh attempt is the same write. Each attempt re-reads the cell,
-    /// re-evaluates the precondition and re-carries the row's other cells.
+    /// Re-prepare after a pre-effect read-set change, as every writer does
+    /// (`db::reprepare`). Each attempt re-reads the cell, re-evaluates the
+    /// precondition and re-carries the row's other cells.
     #[allow(clippy::too_many_arguments)]
     async fn write_blob_cell(
         &self,
@@ -164,7 +141,6 @@ impl Omnigraph {
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
     ) -> Result<BlobWriteOutcome> {
-        let mut first = None;
         let mut reprepares =
             crate::db::reprepare::PreEffectReprepares::begin(self, requested, "Blob write");
         loop {
@@ -178,12 +154,12 @@ impl Omnigraph {
                     stage_write_concurrency,
                     history_release_bytes,
                     write_budget,
-                    &mut first,
+                    reprepares.is_first(),
                     reprepares.attempt(),
                 )
                 .await;
             match result {
-                Err(error) if reprepares.may_prepare_again(&error, true) => {
+                Err(error) if reprepares.may_prepare_again(&error) => {
                     reprepares.prepare_again().await?;
                 }
                 result => return result,
@@ -202,10 +178,9 @@ impl Omnigraph {
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
-        first: &mut Option<AttemptIdentity>,
+        first_attempt: bool,
         attempt: &mut crate::db::reprepare::WriteAttempt,
     ) -> Result<BlobWriteOutcome> {
-        let first_attempt = first.is_none();
         let txn = self.open_write_txn(requested).await.map_err(|error| {
             if first_attempt {
                 error.before_effect()
@@ -213,18 +188,7 @@ impl Omnigraph {
                 error.without_pre_effect_evidence()
             }
         })?;
-        let identity = AttemptIdentity::of(&txn);
-        match first {
-            None => *first = Some(identity),
-            Some(first) if *first != identity => {
-                return Err(OmniError::manifest_conflict(format!(
-                    "branch '{}' changed incarnation or accepted schema while a Blob write \
-                     re-prepared; the write was not applied",
-                    requested.unwrap_or("main")
-                )));
-            }
-            Some(_) => {}
-        }
+        attempt.admit(&txn, true)?;
 
         let catalog = Arc::clone(&txn.catalog);
         let resolved = resolve_blob_cell(&catalog, cell)?;

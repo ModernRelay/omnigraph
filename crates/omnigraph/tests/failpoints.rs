@@ -1841,7 +1841,11 @@ async fn pinned_fragments_at(db: &Session, table_key: &str, version: u64) -> usi
 
 /// The ages of every `node:Person` row named `name`.
 async fn person_ages(db: &Session, name: &str) -> Vec<i32> {
-    read_table(db, "node:Person")
+    person_ages_on(db, "main", name).await
+}
+
+async fn person_ages_on(db: &Session, branch: &str, name: &str) -> Vec<i32> {
+    helpers::read_table_branch(db, branch, "node:Person")
         .await
         .iter()
         .flat_map(|batch| {
@@ -2342,17 +2346,23 @@ async fn blob_put_reevaluates_its_precondition_and_recarries_the_row_after_a_com
 }
 
 /// A Blob write that re-prepares across an accepted-schema change or a
-/// delete-and-recreate of its branch fails closed, without effect.
+/// delete-and-recreate of its branch fails closed with `ReadSetChanged` for
+/// the member that changed, without effect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn blob_put_fails_closed_when_schema_or_branch_incarnation_changes_between_attempts() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(seed_blob_write_graph(dir.path().to_str().unwrap()).await);
-    let refused = |error: &OmniError| {
+    let refused = |error: &OmniError, member: &str| {
         matches!(error, OmniError::Manifest(manifest)
-            if manifest.kind == ManifestErrorKind::Conflict
-                && manifest.message.contains("changed incarnation or accepted schema"))
+        if matches!(
+            &manifest.details,
+            Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
+                member: changed,
+                ..
+            }) if changed == member
+        ))
     };
     let parked_put = |branch: &'static str| {
         let db = Arc::clone(&db);
@@ -2381,7 +2391,7 @@ async fn blob_put_fails_closed_when_schema_or_branch_incarnation_changes_between
         .await
         .unwrap()
         .expect_err("a schema change refuses the retry");
-    assert!(refused(&error), "{error:?}");
+    assert!(refused(&error, "schema_ir_hash"), "{error:?}");
     assert_eq!(main_commit_count(&db).await, schema_commits);
     assert_eq!(
         read_managed_blob_bytes(&db, ReadTarget::branch("main"), readme("content")).await,
@@ -2401,7 +2411,7 @@ async fn blob_put_fails_closed_when_schema_or_branch_incarnation_changes_between
         .await
         .unwrap()
         .expect_err("a recreated branch refuses the retry");
-    assert!(refused(&error), "{error:?}");
+    assert!(refused(&error, "branch_identifier:feature"), "{error:?}");
     for branch in ["feature", "main"] {
         assert_eq!(
             read_managed_blob_bytes(&db, ReadTarget::branch(branch), readme("content")).await,
@@ -2487,22 +2497,24 @@ async fn a_write_after_publication_cannot_change_a_blob_put_receipt() {
 
 /// The coarse token is branch-wide: a commit to a table that the prepared
 /// mutation does not write can still invalidate schema/cardinality/RI inputs.
-/// A strict update therefore reports `ReadSetChanged` before moving its Person
-/// table HEAD when a disjoint Company commit wins during preparation.
+/// A strict update overtaken by a disjoint Company commit during preparation
+/// is therefore sent back before moving its Person table, and reruns on the
+/// new head under the writer gates instead of returning `ReadSetChanged`, so
+/// strict writes are not starved by writers that prepare again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn strict_mutation_rejects_disjoint_head_change_before_effects() {
+async fn strict_update_overtaken_by_a_disjoint_write_reruns_on_the_new_head_issue_1331() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(helpers::init_and_load(&dir).await);
-    assert_strict_update_refuses_head_change(db, "main").await;
+    assert_strict_update_reruns_over_head_change(db, "main").await;
 }
 
-/// The same refusal on a branch other than the handle's bound one, where
+/// The same rerun on a branch other than the handle's bound one, where
 /// revalidation trusts the captured manifest probe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn named_branch_strict_mutation_rejects_head_change_before_effects() {
+async fn named_branch_strict_update_overtaken_reruns_on_the_new_head_issue_1331() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(helpers::init_and_load(&dir).await);
@@ -2515,46 +2527,53 @@ async fn named_branch_strict_mutation_rejects_head_change_before_effects() {
     )
     .await
     .unwrap();
-    assert_strict_update_refuses_head_change(db, "feature").await;
+    assert_strict_update_reruns_over_head_change(db, "feature").await;
 }
 
 /// Parks a strict Person update on `branch`, commits a disjoint Company insert
-/// on the same branch, and requires the refusal before any table effect.
-async fn assert_strict_update_refuses_head_change(
+/// on the same branch, and requires the update to commit after preparing
+/// again once, over the insert.
+async fn assert_strict_update_reruns_over_head_change(
     db: Arc<omnigraph::Session>,
     branch: &'static str,
 ) {
-    let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
-    let writer_db = Arc::clone(&db);
-    let writer = tokio::spawn(async move {
-        writer_db
-            .mutate(
+    let companies_before = helpers::count_rows_branch(&db, branch, "node:Company").await;
+    let write = {
+        let db = Arc::clone(&db);
+        async move {
+            db.mutate(
                 branch,
                 OCC_DISJOINT_MUTATIONS,
                 "set_age",
                 &helpers::mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
             )
             .await
-    });
-
-    rendezvous.wait_until_reached().await;
-    db.mutate(
-        branch,
-        OCC_DISJOINT_MUTATIONS,
-        "insert_company",
-        &params(&[("$name", "ConcurrentCo")]),
-    )
-    .await
-    .expect("the disjoint Company insert commits while Person update is parked");
-    let _no_table_effect = catalog::MUTATION_POST_TABLE_COMMIT.fire_always();
-    rendezvous.release();
-
-    let err = writer
-        .await
-        .unwrap()
-        .expect_err("strict stale read set must fail rather than auto-reprepare");
-    assert_refused_before_effects(err, &format!("graph_head:{branch}"));
+            .map(|_| ())
+        }
+    };
+    let during = {
+        let db = Arc::clone(&db);
+        async move {
+            db.mutate(
+                branch,
+                OCC_DISJOINT_MUTATIONS,
+                "insert_company",
+                &params(&[("$name", "ConcurrentCo")]),
+            )
+            .await
+            .expect("the disjoint Company insert commits while Person update is parked");
+        }
+    };
+    let (outcome, reprepares, _) = issue_1331_park_write(&db, write, during).await;
+    outcome.expect("the overtaken strict update commits on the new head");
+    assert_eq!(reprepares, 1, "the update prepared again once");
+    assert_eq!(
+        helpers::count_rows_branch(&db, branch, "node:Company").await,
+        companies_before + 1,
+        "the overtaking insert stays"
+    );
+    let ages = person_ages_on(&db, branch, "Alice").await;
+    assert_eq!(ages, vec![99], "the update applied on the new head");
 }
 
 /// With `MUTATION_POST_TABLE_COMMIT` armed, a write that reached a table effect
@@ -2975,22 +2994,22 @@ async fn append_load_revalidates_unique_after_pre_effect_authority_change() {
     assert_eq!(collect_column_strings(&users, "name"), vec!["winner"]);
 }
 
-/// Overwrite is strict because its replacement image was computed from the
-/// captured branch state. Even a disjoint graph commit invalidates that coarse
-/// read token, and rejection must happen before the overwritten table moves.
+/// An overwrite load overtaken by a disjoint graph commit during preparation
+/// is sent back before the overwritten table moves, and reruns on the new
+/// head: the replacement image is the load's input, so the rerun replaces
+/// the table with the same rows, and the overtaking commit stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn overwrite_load_rejects_disjoint_head_change_before_effects() {
+async fn overwrite_load_overtaken_by_a_disjoint_write_reruns_on_the_new_head_issue_1331() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let db = std::sync::Arc::new(helpers::init_and_load(&dir).await);
+    let companies_before = count_rows(&db, "node:Company").await;
 
-    let rendezvous =
-        helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
-    let writer_a_db = std::sync::Arc::clone(&db);
-    let writer_a = tokio::spawn(async move {
-        writer_a_db
-            .load(
+    let write = {
+        let db = std::sync::Arc::clone(&db);
+        async move {
+            db.load(
                 "main",
                 r#"{"type":"Person","data":{"name":"Alice","age":31}}
 {"type":"Person","data":{"name":"Bob","age":25}}
@@ -2999,64 +3018,52 @@ async fn overwrite_load_rejects_disjoint_head_change_before_effects() {
                 LoadMode::Overwrite,
             )
             .await
-    });
-
-    rendezvous.wait_until_reached().await;
-    db.mutate(
-        "main",
-        OCC_DISJOINT_MUTATIONS,
-        "insert_company",
-        &params(&[("$name", "ConcurrentCo")]),
-    )
-    .await
-    .expect("the disjoint Company insert commits while overwrite is parked");
-
-    let winner_person_pin = helpers::snapshot_main(&db)
-        .await
-        .unwrap()
-        .dataset("node:Person")
-        .unwrap()
-        .published_dataset_version;
-    let person_uri = node_table_uri(&db, "Person").await;
-    let winner_person_head = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .latest_version_id()
-        .await
-        .unwrap();
-    rendezvous.release();
-
-    let err = writer_a
-        .await
-        .unwrap()
-        .expect_err("strict overwrite must reject the changed read set");
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected a typed manifest conflict");
+            .map(|_| ())
+        }
     };
-    assert!(matches!(
-        manifest_err.details,
-        Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
-            ref member,
-            ..
-        }) if member == "graph_head:main"
-    ));
-
-    let final_person_pin = helpers::snapshot_main(&db)
+    let winner_pin = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let during = {
+        let db = std::sync::Arc::clone(&db);
+        let winner_pin = std::sync::Arc::clone(&winner_pin);
+        async move {
+            db.mutate(
+                "main",
+                OCC_DISJOINT_MUTATIONS,
+                "insert_company",
+                &params(&[("$name", "ConcurrentCo")]),
+            )
+            .await
+            .expect("the disjoint Company insert commits while overwrite is parked");
+            *winner_pin.lock().unwrap() = Some(
+                helpers::snapshot_main(&db)
+                    .await
+                    .unwrap()
+                    .dataset("node:Person")
+                    .unwrap()
+                    .published_dataset_version,
+            );
+        }
+    };
+    let (outcome, reprepares, _) = issue_1331_park_write(&db, write, during).await;
+    outcome.expect("the overtaken overwrite commits on the new head");
+    assert_eq!(reprepares, 1, "the overwrite prepared again once");
+    assert_eq!(person_ages(&db, "Alice").await, vec![31]);
+    assert_eq!(count_rows(&db, "node:Person").await, 4);
+    assert_eq!(
+        count_rows(&db, "node:Company").await,
+        companies_before + 1,
+        "the overtaking insert stays"
+    );
+    let final_pin = helpers::snapshot_main(&db)
         .await
         .unwrap()
         .dataset("node:Person")
         .unwrap()
         .published_dataset_version;
-    let final_person_head = lance::Dataset::open(&person_uri)
-        .await
-        .unwrap()
-        .latest_version_id()
-        .await
-        .unwrap();
-    assert_eq!(
-        (final_person_pin, final_person_head),
-        (winner_person_pin, winner_person_head),
-        "overwrite rejection must happen before any Person table effect"
+    assert_ne!(
+        Some(final_pin),
+        *winner_pin.lock().unwrap(),
+        "the rerun published the Person table once more"
     );
 }
 
@@ -6203,10 +6210,9 @@ async fn optimize_holds_main_gate_through_disjoint_table_effects() {
 
 /// Same as the insert cell, for a strict delete. The second handle waits for
 /// optimize; Optimize's publication then moved the graph head the delete was
-/// prepared against, so the strict read-modify-write reports the typed
-/// read-set conflict instead of a silent rebase (RFC 0067: Optimize is an
-/// ordinary publication, not a recovery barrier), and the caller's retry
-/// lands on the compacted pins and preserves the deletion.
+/// prepared against (RFC 0067: Optimize is an ordinary publication, not a
+/// recovery barrier), so the delete prepares again and lands on the compacted
+/// pins, preserving the deletion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(optimize)]
 async fn optimize_serializes_concurrent_delete_across_handles() {
@@ -6264,31 +6270,10 @@ async fn optimize_serializes_concurrent_delete_across_handles() {
         .expect("optimize task hung")
         .unwrap();
     result.expect("optimize must finish before the queued delete");
-    let conflict = writer
+    writer
         .await
         .expect("writer task panicked")
-        .expect_err("a strict delete prepared before Optimize published reports the conflict");
-    assert!(
-        matches!(
-            &conflict,
-            OmniError::Manifest(omnigraph::error::ManifestError {
-                details: Some(omnigraph::error::ManifestConflictDetails::ReadSetChanged {
-                    member,
-                    ..
-                }),
-                ..
-            }) if member == "graph_head:main"
-        ),
-        "the queued delete must see Optimize's publication as a read-set change: {conflict}"
-    );
-    db_b.mutate(
-        "main",
-        MUTATION_QUERIES,
-        "remove_person",
-        &mixed_params(&[("$name", "alice")], &[]),
-    )
-    .await
-    .expect("the retried delete lands on the compacted pins");
+        .expect("a delete prepared before Optimize published lands on the compacted pins");
 
     // No lost write: alice's delete persisted (3 rows); graph remains re-optimizable.
     let db = helpers::session(Omnigraph::open(&uri).await.unwrap());
@@ -8380,12 +8365,13 @@ async fn branch_merge_captured_source_survives_concurrent_cleanup() {
     );
 }
 
-/// A delete parked at its primary-delete point loses the manifest CAS to a
-/// concurrent update on the same table: its detached effect is never
-/// published, the linear history never moves, and no sidecar exists.
+/// A delete parked at its primary-delete point is overtaken by a concurrent
+/// update on the same table from another handle: its first attempt's staging
+/// is never published, it reruns on the new head and deletes the row, the
+/// linear history never moves, and no sidecar exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn inline_delete_conflict_rejects_without_effect() {
+async fn inline_delete_overtaken_reruns_without_publishing_its_first_staging_issue_1331() {
     use std::sync::Arc;
 
     let _scenario = FailScenario::setup();
@@ -8416,24 +8402,29 @@ async fn inline_delete_conflict_rejects_without_effect() {
         .await
         .expect("concurrent update must land while the delete is parked");
         rv.release();
-        let err = delete.await.unwrap().unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                OmniError::Manifest(manifest) if manifest.kind == ManifestErrorKind::Conflict
-            ),
-            "unexpected error: {err}"
-        );
+        delete
+            .await
+            .unwrap()
+            .expect("the overtaken delete reruns on the new head");
     }
     assert!(sidecar_operation_ids(dir.path()).is_empty());
     let fresh = helpers::session(Omnigraph::open(&uri).await.unwrap());
     assert_eq!(
         count_rows(&fresh, "node:Person").await,
-        4,
-        "a conflicted delete removes nothing"
+        3,
+        "the rerun removed Alice"
+    );
+    assert_eq!(
+        person_ages(&fresh, "Bob").await,
+        vec![26],
+        "the update stays"
     );
     let (_, pin) = person_head_and_published(&fresh, "main").await;
-    assert_eq!(pin, pin_before + 1, "only the update published a pin");
+    assert_eq!(
+        pin,
+        pin_before + 2,
+        "the update and the rerun each published one pin"
+    );
     assert_person_pin_detached(&fresh, "main", head_before).await;
     assert_eq!(
         helpers::open_dataset_head(&person_uri, None)

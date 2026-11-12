@@ -1305,7 +1305,6 @@ impl StagedMutation {
                         "Lance's conflict rules refuse to carry the staged write over the table's \
                          row-preserving commits"
                     );
-                    attempt.note_carry_refused();
                     return Err(refused);
                 }
             }

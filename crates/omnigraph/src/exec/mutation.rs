@@ -1299,7 +1299,6 @@ impl Omnigraph {
         let mut reprepares =
             crate::db::reprepare::PreEffectReprepares::begin(self, Some(branch), "mutation");
         loop {
-            let mut retryable = false;
             let first_attempt = reprepares.is_first();
             let result = self
                 .mutate_one_attempt(
@@ -1312,14 +1311,13 @@ impl Omnigraph {
                     stage_write_concurrency,
                     history_release_bytes,
                     first_attempt,
-                    &mut retryable,
                     write_budget,
                     route,
                     reprepares.attempt(),
                 )
                 .await;
             match result {
-                Err(err) if reprepares.may_prepare_again(&err, retryable) => {
+                Err(err) if reprepares.may_prepare_again(&err) => {
                     reprepares.prepare_again().await?;
                 }
                 result => return result,
@@ -1338,7 +1336,6 @@ impl Omnigraph {
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         first_attempt: bool,
-        retryable: &mut bool,
         write_budget: WriteBudget,
         route: &WriteRoute,
         attempt: &mut crate::db::reprepare::WriteAttempt,
@@ -1395,7 +1392,18 @@ impl Omnigraph {
         // Lower + validate up front so the touched-dataset set is known before
         // execution. A lowering/validation error returns exactly as it did
         // when this happened inside execute_named_mutation.
-        let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
+        // An update or delete selects existing rows; an insert-only mutation
+        // only adds them (`WriteAttempt::admit`). A query that no longer
+        // lowers is judged as one that selects rows, so a schema changed under
+        // a later attempt is reported as that change.
+        let lowered = self.lower_named_mutation(&txn.catalog, query_source, query_name);
+        let selects_rows = lowered.as_ref().map_or(true, |ir| {
+            !ir.ops
+                .iter()
+                .all(|op| matches!(op, MutationOpIR::Insert { .. }))
+        });
+        attempt.admit(&txn, selects_rows)?;
+        let ir = lowered?;
         debug_assert!(
             route.agrees_with(&ir.write_mode),
             "the lowered write mode {:?} disagrees with the pre-parsed route",
@@ -1403,17 +1411,6 @@ impl Omnigraph {
         );
         fill_declared_params(&mut resolved_params, &ir.params)?;
         validate_params(&resolved_params, &ir.params)?;
-        // Only an insert-only mutation is safe to replay automatically after a
-        // pre-effect authority mismatch. Update/Delete keep strict caller-visible
-        // `ReadSetChanged`; replaying their stale read-modify-write plan would be
-        // a semantic rebase rather than a fresh execution contract. The one
-        // exception is a send-back by publications that changed no row: the
-        // rows the plan read are unchanged, so a fresh execution reads the
-        // same ones (`WriteAttempt::note_carry_refused`).
-        *retryable = ir
-            .ops
-            .iter()
-            .all(|op| matches!(op, MutationOpIR::Insert { .. }));
 
         let exec_result = self
             .execute_named_mutation(
@@ -1429,7 +1426,6 @@ impl Omnigraph {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => {
                 if !self.unpublished_view_is_current(&txn).await? {
-                    *retryable = true;
                     return Err(OmniError::manifest_read_set_changed(
                         format!("manifest_version:{addressed}"),
                         Some(txn.manifest_probe.captured().version.to_string()),

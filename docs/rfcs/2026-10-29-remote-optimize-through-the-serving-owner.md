@@ -258,8 +258,8 @@ back ([carried writes](2026-11-10-writes-carried-over-row-preserving-publication
 A write that is still sent back (an upsert or update of a row in a fragment
 the run rewrote, or a write the run on another handle overtook) prepares again
 with the branch's writer gates held through its publication, so no later run
-can publish under that attempt; even a strict update or delete prepares again
-then, since the run changed no row it read. A run therefore waits for no
+can publish under that attempt, a strict update or delete included, since
+every write sent back reruns its request. A run therefore waits for no
 writer before it takes the gates. The first implementation of this RFC waited
 for such writers (a writer yield, bounded at 10 s, with per-write tickets); the
 gated retry replaced it, and the report and the record carry no yield.

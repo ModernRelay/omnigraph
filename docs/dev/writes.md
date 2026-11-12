@@ -387,11 +387,8 @@ a staged table goes through Lance's `TransactionRebase` over those commits
 version, and commits detached there, so the compaction stays and the table's
 history stays one chain. An insert, an append and an overwrite carry; an
 update, delete or upsert of a row in a fragment a rewrite replaced is a
-conflict Lance reports. Every publication in between still changed no row,
-so the rows the write read hold, and the write prepares again
-(`WriteAttempt::note_carry_refused`), a strict update or delete included.
-Any other publication in between, a row change or a schema change, refuses
-as before. A caller's `--if-commit` head and an unattached base are not
+conflict Lance reports, and the attempt is sent back, as one overtaken by a
+row change is. A caller's `--if-commit` head and an unattached base are not
 carried. On a branch its process does not hold, neither is a publication by
 another handle that lands after the beside-staging probe: the publisher's CAS
 refuses that one, as above. On a branch the process holds, a write takes no
@@ -400,13 +397,22 @@ probe, and a publication by any handle of the process is seen under the gates
 `QueryIoProbes::writes_carried_over_row_preserving` counts the attempts
 carried, each staged table rebased.
 
-A write sent back before its effects prepares again with the branch's writer
-gates held, the shared schema permit and the branch gate, from its next
+A write sent back before its effects prepares again from its request,
+whatever its kind: it reruns its query, or rereads its input, on the current
+head, so an update or delete reads its rows as they are when it publishes,
+the write a caller resubmitting the request would make. A caller whose write
+must apply to the head it read names it (`--if-commit`), and a moved head is
+then a terminal `PreconditionFailed`. An attempt that sees a branch
+incarnation or accepted schema other than its write's first attempt saw
+returns `ReadSetChanged` for that member (`WriteAttempt::admit`): the request
+no longer means what it meant. The next attempt holds the branch's writer
+gates, the shared schema permit and the branch gate, from its
 capture through its publication (`db::reprepare::PreEffectReprepares`, the
 one owner of the mutation, load and Blob write loops). Every publisher on the
 branch in the process, optimize included, takes that branch gate, so nothing
 moves the branch under that attempt: a write finishes in at most two
-attempts, whatever sent it back and however often maintenance runs, and no
+attempts, whatever sent it back and however often other writers or
+maintenance run, and no
 maintenance run waits for writers to get there. Preparation takes no gate
 of its own, which is what lets it run under them; `commit_all` adds the table
 gates. The bound is the process's: another process's publication is refused
@@ -876,9 +882,9 @@ carried stored external reference the policy refuses fails as
 | Observation | Outcome |
 |---|---|
 | Parse, validation, policy, limit, or authority failure before effects | Typed error; no graph movement |
-| Authority movement before effects through publications that changed no row (optimize, index builds) | Carry the attempt over them: re-anchor on the current head, rebase each moved staged table with Lance's resolver; when Lance refuses a table, prepare again under the writer gates, whatever the write's kind |
-| Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and prepare again under the writer gates, boundedly |
-| Strict read-set movement | `ReadSetChanged` |
+| Authority movement before effects through publications that changed no row (optimize, index builds) | Carry the attempt over them: re-anchor on the current head, rebase each moved staged table with Lance's resolver; when Lance refuses a table, send the attempt back |
+| Any other authority movement before effects | Discard the complete attempt and prepare again from the request under the writer gates, whatever the write's kind, boundedly |
+| A later attempt sees another branch incarnation or accepted schema than the first, or the bound is reached | `ReadSetChanged` |
 | A publish or a claim on a branch whose writer epoch is not the one its process asserts | `WriterFenced { held, read, current }` before the manifest put; never retried; the process's holder for the branch is cleared, and a publish's detached staging stays unpublished for the collector |
 | Exact duplicate on strict insert | `KeyConflict` |
 | Mutation, load, Blob write, merge or optimize fails before publication, after detached effects | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob, merge and optimize writers mark the steps between (an optimize table's own failure, `BeforeEffect` in planning and `Unpublished` in staging, fails only that table), so a server does not treat that logical error as uncertain; native storage settlement is checked independently, and a typed refusal keeps its shape |

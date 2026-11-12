@@ -739,7 +739,6 @@ async fn load_jsonl_data(
     // (`load_file_as` reads its file once). Replay that slice directly on a
     // pre-effect retry; copying it into a second raw byte buffer would double
     // peak input memory before the parser's per-type materialization.
-    let retryable = matches!(mode, LoadMode::Append | LoadMode::Merge);
     let memory = crate::engine::LoadMemory::new(query_memory_bytes)?;
     let csv_input;
     let input = match input_shape {
@@ -775,7 +774,7 @@ async fn load_jsonl_data(
         )
         .await;
         match result {
-            Err(err) if reprepares.may_prepare_again(&err, retryable) => {
+            Err(err) if reprepares.may_prepare_again(&err) => {
                 reprepares.prepare_again().await?;
             }
             result => return result,
@@ -820,6 +819,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
             error.without_pre_effect_evidence()
         }
     })?;
+    // An overwrite replaces the rows it finds; an append or a merge only
+    // adds or upserts by key (`WriteAttempt::admit`).
+    attempt.admit(&txn, matches!(mode, LoadMode::Overwrite))?;
     let catalog = Arc::clone(&txn.catalog);
     let snapshot = txn.base.clone();
     let mut planning = snapshot.clone();

@@ -10,24 +10,34 @@
 //! on. Lance's conflict rules still refuse to carry an update of a row in a
 //! fragment a rewrite replaced; that attempt is sent back too.
 //!
-//! A write that was sent back prepares again with the branch's writer gates
-//! held, from its next capture through its publication
-//! ([`WriteAttempt`]). Every publisher on the branch in this process, optimize
-//! included, takes the same branch gate, so nothing can move the branch under
-//! that attempt: a write finishes in at most two attempts, whatever sent it
-//! back and however often maintenance runs. The cost, one preparation under
-//! the gates, is paid only after a send-back. A publication by another
-//! process is outside that bound (one mutation-capable writer process is the
-//! supported topology); the publisher's CAS refuses it, and the write prepares
-//! again within [`MAX_PRE_EFFECT_REPREPARES`].
+//! A write that was sent back prepares again from its request, whatever its
+//! kind: it reruns its query, or rereads its input, on the current head, so
+//! it is the write a caller resubmitting the same request would make, and an
+//! update or delete reads the rows as they are when it publishes. A caller
+//! whose write must apply to the head it read names that head
+//! (`expected_head`), and a moved head is then its terminal precondition
+//! failure. Which rows a write that selects existing rows (an update, a
+//! delete, an overwrite load, a Blob put) touches depends on the branch
+//! incarnation and the accepted schema it was compiled against, so such an
+//! attempt that sees either differ from the first attempt's returns
+//! `ReadSetChanged` instead ([`WriteAttempt::admit`]). A write that only adds
+//! or upserts rows by key goes on, onto a branch created again under its name
+//! or a schema an apply accepted meanwhile.
 //!
-//! A send-back whose publications changed no row is never the caller's: the
-//! write's logical reads still hold, so even a strict update or delete
-//! prepares again instead of returning `ReadSetChanged`. Taking all of this
-//! from [`PreEffectReprepares`] keeps the next writer of this kind from
-//! forgetting any of it.
+//! The next attempt prepares with the branch's writer gates held, from its
+//! capture through its publication ([`WriteAttempt`]). Every publisher on the
+//! branch in this process, optimize included, takes the same branch gate, so
+//! nothing can move the branch under that attempt: a write finishes in at
+//! most two attempts, whatever sent it back and however often other writers
+//! or maintenance run. The cost, one preparation under the gates, is paid only
+//! after a send-back. A publication by another process is outside that bound
+//! (one mutation-capable writer process is the supported topology); the
+//! publisher's CAS refuses it, and the write prepares again within
+//! [`MAX_PRE_EFFECT_REPREPARES`]. Taking all of this from
+//! [`PreEffectReprepares`] keeps the next writer of this kind from forgetting
+//! any of it.
 
-use super::omnigraph::Omnigraph;
+use super::omnigraph::{Omnigraph, WriteTxn};
 use super::write_queue::BranchWriteGates;
 use crate::error::{OmniError, Result};
 
@@ -35,12 +45,73 @@ use crate::error::{OmniError, Result};
 /// caller's.
 const MAX_PRE_EFFECT_REPREPARES: usize = 32;
 
-/// What one attempt of a write carries to its revalidation: the writer gates
-/// it prepared under, if any, and whether a row-preserving carry was refused.
+/// What the first attempt of a write was compiled against, which every later
+/// attempt must still see: the native branch incarnation and the accepted
+/// schema.
+#[derive(PartialEq, Eq)]
+struct AttemptIdentity {
+    branch_identifier: lance::dataset::refs::BranchIdentifier,
+    schema_ir_hash: String,
+    schema_identity_domain: String,
+    schema_identity_version: u32,
+}
+
+impl AttemptIdentity {
+    fn of(txn: &WriteTxn) -> Self {
+        Self {
+            branch_identifier: txn.authority.branch_identifier.clone(),
+            schema_ir_hash: txn.authority.schema_ir_hash.clone(),
+            schema_identity_domain: txn.authority.schema_identity_domain.clone(),
+            schema_identity_version: txn.authority.schema_identity_version,
+        }
+    }
+
+    /// The first member in which `self`, a later attempt's identity, differs
+    /// from `first`, as the `ReadSetChanged` the caller receives.
+    fn changed_since(&self, first: &Self, branch: Option<&str>) -> Option<OmniError> {
+        let identifier = |identifier: &lance::dataset::refs::BranchIdentifier| {
+            serde_json::to_string(identifier).ok()
+        };
+        if self.branch_identifier != first.branch_identifier {
+            return Some(OmniError::manifest_read_set_changed(
+                format!("branch_identifier:{}", branch.unwrap_or("main")),
+                identifier(&first.branch_identifier),
+                identifier(&self.branch_identifier),
+            ));
+        }
+        if self.schema_ir_hash != first.schema_ir_hash {
+            return Some(OmniError::manifest_read_set_changed(
+                "schema_ir_hash",
+                Some(first.schema_ir_hash.clone()),
+                Some(self.schema_ir_hash.clone()),
+            ));
+        }
+        if self.schema_identity_domain != first.schema_identity_domain {
+            return Some(OmniError::manifest_read_set_changed(
+                "schema_identity_domain",
+                Some(first.schema_identity_domain.clone()),
+                Some(self.schema_identity_domain.clone()),
+            ));
+        }
+        if self.schema_identity_version != first.schema_identity_version {
+            return Some(OmniError::manifest_read_set_changed(
+                "schema_identity_version",
+                Some(first.schema_identity_version.to_string()),
+                Some(self.schema_identity_version.to_string()),
+            ));
+        }
+        None
+    }
+}
+
+/// What one attempt of a write carries: the writer gates it prepared under,
+/// if any, the identity of the write's first attempt, and whether this
+/// attempt's admission found that identity changed.
 #[derive(Default)]
 pub(crate) struct WriteAttempt {
     gates: Option<BranchWriteGates>,
-    carry_refused: bool,
+    first: Option<AttemptIdentity>,
+    identity_changed: bool,
 }
 
 impl WriteAttempt {
@@ -51,12 +122,29 @@ impl WriteAttempt {
         self.gates.take()
     }
 
-    /// Revalidation proved that every publication since the capture changed
-    /// no row, and Lance's conflict rules refused to carry a staged table
-    /// over them. The write's logical reads still hold, so it prepares again
-    /// whatever its kind.
-    pub(crate) fn note_carry_refused(&mut self) {
-        self.carry_refused = true;
+    /// Admit the authority this attempt captured. The first attempt records
+    /// its branch incarnation and accepted schema. A later attempt of a write
+    /// that `selects_rows` and sees either differ returns `ReadSetChanged`
+    /// for the member that did: the rows its request selects are no longer
+    /// the rows it was compiled to select.
+    pub(crate) fn admit(&mut self, txn: &WriteTxn, selects_rows: bool) -> Result<()> {
+        let identity = AttemptIdentity::of(txn);
+        match &self.first {
+            None => {
+                self.first = Some(identity);
+                Ok(())
+            }
+            Some(_) if !selects_rows => Ok(()),
+            Some(first) => match identity.changed_since(first, txn.branch.as_deref()) {
+                Some(changed) => {
+                    // An earlier attempt may have staged detached effects,
+                    // so this refusal claims no proof that nothing was.
+                    self.identity_changed = true;
+                    Err(changed.without_pre_effect_evidence())
+                }
+                None => Ok(()),
+            },
+        }
     }
 }
 
@@ -88,18 +176,20 @@ impl<'a> PreEffectReprepares<'a> {
         self.attempt == 0
     }
 
-    /// The attempt about to run, for its writer to pass to `commit_all`.
+    /// The attempt about to run, for its writer to admit its capture with and
+    /// to pass to `commit_all`.
     pub(crate) fn attempt(&mut self) -> &mut WriteAttempt {
         &mut self.current
     }
 
     /// Whether `error` from an attempt sends the write back to prepare
-    /// again: a `ReadSetChanged`, within the bound, that the attempt marked
-    /// `retryable` or that a refused row-preserving carry raised.
-    pub(crate) fn may_prepare_again(&self, error: &OmniError, retryable: bool) -> bool {
-        (retryable || self.current.carry_refused)
-            && error.is_read_set_changed()
+    /// again: a `ReadSetChanged` within the bound. One that
+    /// [`WriteAttempt::admit`] raised is not: the write's identity changed,
+    /// and only the first attempt could have recorded it.
+    pub(crate) fn may_prepare_again(&self, error: &OmniError) -> bool {
+        error.is_read_set_changed()
             && self.attempt < MAX_PRE_EFFECT_REPREPARES
+            && !self.current.identity_changed
     }
 
     /// Go round again: take the branch's writer gates for the next attempt,
@@ -115,13 +205,18 @@ impl<'a> PreEffectReprepares<'a> {
         crate::instrumentation::record_mutation_reprepare();
         // The last attempt's gates, if it never reached `commit_all`, go
         // first: the gates are not reentrant.
+        let first = self.current.first.take();
         self.current = WriteAttempt::default();
         let gates = self
             .db
             .write_queue()
             .acquire_branch_write_gates(self.branch)
             .await;
-        self.current.gates = Some(gates);
+        self.current = WriteAttempt {
+            gates: Some(gates),
+            first,
+            identity_changed: false,
+        };
         self.db.refresh_coordinator_only().await
     }
 }
