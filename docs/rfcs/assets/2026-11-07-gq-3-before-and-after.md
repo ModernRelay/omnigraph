@@ -253,8 +253,8 @@ needs a bound.
 query reachable($from: String) {
   match {
     from union(
-      { match { $p: Person, $p knows $q } where $p.handle = $from return { $q } },
-      { match { from reachable($from), $q knows $r } return { $r as q } }),
+      { match { $p: Person, $q: Person, $p knows $q } where $p.handle = $from return { $q } },
+      { match { from reachable($from), $r: Person, $q knows $r } return { $r as q } }),
   }
   return distinct { $q }
 }
@@ -281,8 +281,9 @@ query in_collection($slug: String) {
 }
 ```
 
-**Written against schema order.** The same meaning in both editions;
-edition 3's `fmt` rewrites it to schema order.
+**Written against schema order.** Edition 2 accepts it and reads the
+schema's direction; edition 3 refuses it (`T82`) and prints the swapped
+triple, so the written order is always the direction.
 
 ```gq
 // edition 2
@@ -295,7 +296,7 @@ query boss($slug: String) {
 ```gq
 // edition 3
 query boss($slug: String) {
-  match { $c: Company, $c worksAt $p }   // fmt: $p worksAt $c
+  match { $c: Company, $p worksAt $c }   // `$c worksAt $p` is T82
   where $c.slug = $slug
   return { $p.name }
 }
@@ -358,15 +359,15 @@ query distinct_cities() {
 
 **Filter on an aggregate.** Edition 2 writes a literal or parameter bound
 with a count block, `$c: Company  count { $p worksAt $c } >= 100`, and
-edition 3 keeps the block as an expression in `where`,
-`where count { $p worksAt $c } >= 100`. New in edition 3 is a threshold
-over a grouped column, which a count block cannot express: no `having`, and
-a filter cannot see a `return` column.
+edition 3 keeps the block as an expression in `where`, `where count { $p:
+Person, $p worksAt $c } >= 100`. New in edition 3 is a threshold over a
+grouped column, which a count block cannot express: no `having`, and a
+filter cannot see a `return` column.
 
 ```gq
 // edition 3
 query big_employers() {
-  match { from { match { $p worksAt $c } return { $c, count($p) as n } } }
+  match { from { match { $p: Person, $c: Company, $p worksAt $c } return { $c, count($p) as n } } }
   where $n >= 100
   return { $c.name, $n }
   order { $n desc }
@@ -381,7 +382,7 @@ different terms, not two spellings of one.
 ```gq
 // edition 3
 query average_headcount() {
-  match { $c: Company, let $n = count { $p worksAt $c } }
+  match { $c: Company, let $n = count { $p: Person, $p worksAt $c } }
   return { avg($n) as mean, max($n) as largest }
 }
 ```
@@ -401,7 +402,7 @@ query well_connected($min: I64) {
 // edition 3
 query well_connected($min: I64) {
   match { $p: Person }
-  where count { $p knows $q } >= $min
+  where count { $q: Person, $p knows $q } >= $min
   return { $p.name }
 }
 ```
@@ -414,7 +415,7 @@ parameter).
 // edition 3
 query full_collections() {
   match { $x: Collection }
-  where count { $d in $x } >= $x.min_docs
+  where count { $d: Doc, $d in $x } >= $x.min_docs
   return { $x.slug }
 }
 ```
@@ -426,7 +427,7 @@ ordered on.
 ```gq
 // edition 3
 query degrees($min: I64) {
-  match { $p: Person, let $degree = count { $p knows $q } }
+  match { $p: Person, let $degree = count { $q: Person, $p knows $q } }
   where $degree >= $min
   return { $p.name, $degree }
   order { $degree desc }
@@ -452,7 +453,8 @@ query authors_without_citations() {
 // edition 3
 query authors_without_citations() {
   match { $p: Person }
-  where exists { $p authored $d } and not exists { $p authored $d2, $other cites $d2 }
+  where exists { $d: Doc, $p authored $d }
+    and not exists { $d2: Doc, $other: Doc, $p authored $d2, $other cites $d2 }
   return { $p.name }
 }
 ```
@@ -465,7 +467,7 @@ is dropped.
 ```gq
 // edition 3
 query people_and_employers() {
-  match { $p: Person, optional { $p worksAt $c } }
+  match { $p: Person, optional { $c: Company, $p worksAt $c } }
   return { $p.name, $c.name }
 }
 ```
@@ -512,7 +514,7 @@ query colleagues_of_colleagues($of: String) {
 query latest_per_author() {
   match {
     $p: Person,
-    from { match { $p authored $d } return { $d } order { $d.year desc } limit 3 },
+    from { match { $d: Doc, $p authored $d } return { $d } order { $d.year desc } limit 3 },
   }
   return { $p.name, $d.title, $d.year }
 }
@@ -549,7 +551,10 @@ query similar($q: Vector(3)) {
 ```gq
 // edition 3
 query similar($q: Vector(3)) {
-  match { from nearest({ match { $d: Doc } where $d.year >= 2025 return { $d } }, $d.embedding, $q, k: 20) }
+  match {
+    let $pop = { match { $d: Doc } where $d.year >= 2025 return { $d } },
+    from nearest($pop, $d.embedding, $q, k: 20) as $distance,
+  }
   return { $d.title }
   order { $distance }
 }
@@ -570,7 +575,10 @@ query similar_scored($q: Vector(3)) {
 ```gq
 // edition 3
 query similar_scored($q: Vector(3)) {
-  match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) }
+  match {
+    let $docs = { match { $d: Doc } return { $d } },
+    from nearest($docs, $d.embedding, $q, k: 20) as $distance,
+  }
   return { $d.title, $distance as s }
   order { $distance }
 }
@@ -585,7 +593,8 @@ documents.
 // edition 3
 query cited_near($coll: String, $q: Vector(3)) {
   match {
-    from nearest({ match { $d in $x, $x: Collection } where $x.slug = $coll return { $d } }, $d.embedding, $q, k: 20),
+    let $pop = { match { $d: Doc, $x: Collection, $d in $x } where $x.slug = $coll return { $d } },
+    from nearest($pop, $d.embedding, $q, k: 20) as $distance,
     $d cites $other,
   }
   return { $d.title, $distance, count($other) as cites }
@@ -600,7 +609,10 @@ form answers a different question.
 ```gq
 // edition 3
 query within_radius($q: Vector(3), $r: F32) {
-  match { from distance({ match { $d: Doc } where $d.year >= 2025 return { $d } }, $d.embedding, $q) }
+  match {
+    let $pop = { match { $d: Doc } where $d.year >= 2025 return { $d } },
+    from distance($pop, $d.embedding, $q) as $distance,
+  }
   where $distance <= $r
   return { $d.title, $distance }
   order { $distance, $d.id }
@@ -623,7 +635,10 @@ query about($q: String) {
 ```gq
 // edition 3
 query about($q: String) {
-  match { from bm25({ match { $d: Doc } return { $d } }, $d.body, $q) }
+  match {
+    let $docs = { match { $d: Doc } return { $d } },
+    from bm25($docs, $d.body, $q) as $score,
+  }
   return { $d.title, $score as s }
   order { $score desc }
   limit 10
@@ -668,7 +683,7 @@ query hybrid($q: String, $v: Vector(3)) {
 query hybrid($q: String, $v: Vector(3)) {
   match {
     let $docs = { match { $d: Doc } return { $d } },
-    from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $q), k: 60),
+    from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $q), k: 60) as $score,
   }
   return { $d.title, $score }
   order { $score desc }
@@ -685,8 +700,8 @@ query weighted($q: String, $v: Vector(3)) {
   match {
     let $docs = { match { $d: Doc } return { $d } },
     let $docs2 = { match { from $docs } return { $d as d2 } },              // the second arm's column renamed before it is ranked (T68)
-    from { match { from distance($docs, $d.embedding, $v) } return { $d, $distance as vec } },
-    from { match { from bm25($docs2, $d2.body, $q) } return { $d2, $score as lex } },
+    from distance($docs, $d.embedding, $v) as $vec,
+    from bm25($docs2, $d2.body, $q) as $lex,
   }
   where $d = $d2
   return { $d.title, 0.7 * (1.0 / (1.0 + $vec)) + 0.3 * $lex as s }
@@ -701,7 +716,10 @@ budget is a session setting.
 ```gq
 // edition 3
 query similar_fast($q: Vector(3)) {
-  match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20, recall: 0.9) }
+  match {
+    let $docs = { match { $d: Doc } return { $d } },
+    from nearest($docs, $d.embedding, $q, k: 20, recall: 0.9) as $distance,
+  }
   return { $d.title, $distance }
 }
 ```
@@ -779,7 +797,10 @@ supported.**
 ```gq
 // edition 3
 query tag_near($q: Vector(3)) {
-  match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) }
+  match {
+    let $docs = { match { $d: Doc } return { $d } },
+    from nearest($docs, $d.embedding, $q, k: 20) as $distance,
+  }
   update $d set { tags: ["near"] }
 }
 ```
@@ -805,8 +826,9 @@ query operators() {
 ```
 
 **Annotations on a declaration.** `@description` and `@instruction` are
-unchanged; edition 3 admits any `@name(args)` and keeps unknown names as
-metadata. The body's filter moves to `where`.
+unchanged; edition 3 admits `@name(args)` for the annotations it reads and
+the metadata allow-list, and refuses any other name (`T80`). The body's
+filter moves to `where`.
 
 ```gq
 // edition 2
