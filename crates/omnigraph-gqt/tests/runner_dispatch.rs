@@ -1123,7 +1123,7 @@ fn prepared_store_under_dst_runs_seams_on_the_view_ignores_foreign_files_and_ref
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!output.status.success());
-    assert!(text.contains("prepared store holds a symlink"), "{text}");
+    assert!(text.contains("the base holds a symlink"), "{text}");
     std::fs::remove_file(root.join("loop")).unwrap();
     runtime.block_on(async {
         let db = omnigraph::db::Omnigraph::open(&uri).await.unwrap();

@@ -1,6 +1,7 @@
 //! The public catalog and the measured adapter share these owning-layer tests.
 use crate::gqt_case::*;
-use crate::gqt_runner::{execute_gqt_rep_signaled, validate_sample};
+use crate::gqt_evidence::{LocalRoute, LocalRouteKind};
+use crate::gqt_runner::{GqtRepObservation, execute_gqt_rep_signaled, validate_sample};
 use crate::runner::{MeasurementSignals, RunnerResult};
 use omnigraph::db::{GraphCommit, GraphCommitKind, Omnigraph};
 use omnigraph_gqt_core::StepKind;
@@ -141,8 +142,16 @@ async fn run_sample_with_logical(
         .bind(&logical.logical_content_sha256, &logical.algorithm)
         .unwrap();
     let mut signals = Signals::default();
-    let sample =
-        execute_gqt_rep_signaled(1, &root, &physical, &metadata, &bound, &mut signals).await?;
+    let sample = execute_gqt_rep_signaled(
+        1,
+        &root,
+        &LocalRoute::Direct,
+        &physical,
+        &metadata,
+        &bound,
+        &mut signals,
+    )
+    .await?;
     validate_sample(
         &sample,
         &bound,
@@ -642,6 +651,154 @@ async fn selected_read_restart_mutation_branch_and_single_load_use_engine_receip
         assert!(sample.merge.is_none());
     }
 }
+/// `repetitions` of `plan` on `kind` as the run loop prepares them: a
+/// restored route gets a verified copy of the frozen template, read-through
+/// an empty `active`. The template's bytes are checked after each one.
+async fn run_on_route(
+    plan: &PlannedGqt,
+    kind: LocalRouteKind,
+    repetitions: u32,
+) -> Vec<GqtRepObservation> {
+    let limits = crate::reset::TraversalLimits::default();
+    let directory = tempfile::tempdir().unwrap();
+    let entry = directory.path().canonicalize().unwrap();
+    let active = entry.join("active");
+    let scratch = entry.join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let (logical, _) = crate::dataset_worker::build_dataset(
+        &plan.dataset_build_plan().unwrap(),
+        active.to_str().unwrap(),
+        &scratch,
+        None,
+    )
+    .await
+    .unwrap();
+    let template =
+        crate::reset::freeze_plain_copy_template(&active, &entry.join("root"), limits).unwrap();
+    std::fs::remove_dir_all(&active).unwrap();
+    let physical = template.physical_digest().clone();
+    let route = kind.over(template.template_root());
+    let bound = plan
+        .bind(&logical.logical_content_sha256, &logical.algorithm)
+        .unwrap();
+    let mut samples = Vec::new();
+    for repetition in 1..=repetitions {
+        let metadata = match kind {
+            LocalRouteKind::ReadThrough => {
+                std::fs::create_dir(&active).unwrap();
+                crate::reset::digest_metadata_tree(&active, limits).unwrap()
+            }
+            LocalRouteKind::Direct | LocalRouteKind::ObjectStore => {
+                template.restore_active().unwrap().metadata_digest().clone()
+            }
+        };
+        let context = format!("{} on {} #{repetition}", plan.definition.id, kind.name());
+        let sample = execute_gqt_rep_signaled(
+            repetition,
+            &active,
+            &route,
+            &physical,
+            &metadata,
+            &bound,
+            &mut Signals::default(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
+        validate_sample(
+            &sample,
+            &bound,
+            repetition,
+            &crate::gqt_protocol::PreparationProofV2::Embedded {
+                physical_digest: physical.clone(),
+                metadata_digest: metadata,
+            },
+            sample.elapsed_us,
+            false,
+        )
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
+        assert_eq!(sample.outcome, "expectations-passed", "{context}");
+        assert!(sample.verification.selected_assertion_passed, "{context}");
+        crate::reset::verify_physical_tree(template.template_root(), &physical, limits)
+            .unwrap_or_else(|error| panic!("{context}: the template's bytes changed: {error}"));
+        std::fs::remove_dir_all(&active).unwrap();
+        samples.push(sample);
+    }
+    samples
+}
+
+/// A scenario answers alike on the three routes to a local root, and the
+/// read-through route asks storage for what the object-store route asks,
+/// repetition after repetition over one template.
+async fn routes_agree(name: &str) {
+    let p = plan(name);
+    let direct = run_on_route(&p, LocalRouteKind::Direct, 1).await;
+    let object_store = run_on_route(&p, LocalRouteKind::ObjectStore, 1).await;
+    let read_through = run_on_route(&p, LocalRouteKind::ReadThrough, 2).await;
+    for (route, sample) in [
+        ("direct", &direct[0]),
+        ("object-store", &object_store[0]),
+        ("read-through", &read_through[0]),
+        ("read-through, second repetition", &read_through[1]),
+    ] {
+        eprintln!(
+            "{name} on {route}: {} us, lance {:?}, control {:?}",
+            sample.elapsed_us, sample.logical_store_calls, sample.control_store_calls
+        );
+        assert_eq!(
+            sample.verification, direct[0].verification,
+            "{name} on {route}"
+        );
+    }
+    assert_eq!(
+        direct[0].control_store_calls, object_store[0].control_store_calls,
+        "{name}: control calls, direct against object-store"
+    );
+    for sample in &read_through {
+        assert_eq!(
+            sample.control_store_calls, object_store[0].control_store_calls,
+            "{name}: control calls, read-through against object-store"
+        );
+        assert_eq!(
+            sample.logical_store_calls, object_store[0].logical_store_calls,
+            "{name}: Lance calls, read-through against object-store"
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_reads_and_reopens() {
+    for name in ["tiny-read", "tiny-restart", "tiny-post-reopen"] {
+        routes_agree(name).await;
+    }
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_published_writes() {
+    for name in ["tiny-mutate", "tiny-branch", "tiny-load"] {
+        routes_agree(name).await;
+    }
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_a_merge() {
+    routes_agree("e2e-merge-all-changed").await;
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_a_branch_delete() {
+    routes_agree("e2e-branch-delete").await;
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_a_write_over_a_long_history() {
+    routes_agree("very-long-history-32-write").await;
+}
+
+#[tokio::test]
+async fn local_routes_agree_on_writes_to_several_branches() {
+    routes_agree("identity-lifecycle").await;
+}
+
 async fn bounded_scenario(name: &str) -> crate::dataset_identity::DatasetLogicalV1 {
     let p = plan(name);
     let (sample, _, logical) = run_sample_with_logical(&p)
@@ -820,6 +977,7 @@ async fn authority_fixture() -> crate::gqt_record::GqtRunRecordV1 {
     let mut sample = execute_gqt_rep_signaled(
         1,
         &active,
+        &LocalRoute::Direct,
         &physical,
         &template_metadata,
         &bound,

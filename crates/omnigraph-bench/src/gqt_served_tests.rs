@@ -1241,6 +1241,7 @@ val: I64
                 state_sha256: "a".repeat(64),
             },
             fixture_manifest_sha256: "b".repeat(64),
+            route: Default::default(),
         };
         assert!(embedded.validate(&bound).is_err());
         assert!(!accepts(&sample, &embedded.proof().unwrap(), false));
