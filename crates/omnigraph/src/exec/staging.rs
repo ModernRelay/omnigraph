@@ -1224,9 +1224,9 @@ impl StagedMutation {
                     held.branch_key().unwrap_or("main"),
                 )));
             }
-            None => db.write_queue().acquire_branch_write_gates(branch).await,
+            None => db.write_queue().acquire_branch_write_gates(branch).await?,
         };
-        let table_guards = db.write_queue().acquire_many(&queue_keys).await;
+        let table_guards = db.write_queue().acquire_many(&queue_keys).await?;
         let gates = branch_gates.with_tables(table_guards);
 
         // Re-capture manifest pins under the queue (PR 2 / MR-686).

@@ -144,20 +144,20 @@ impl Omnigraph {
         let mut reprepares =
             crate::db::reprepare::PreEffectReprepares::begin(self, requested, "Blob write");
         loop {
-            let result = self
-                .write_blob_cell_attempt(
-                    requested,
-                    cell,
-                    value,
-                    precondition,
-                    actor_id,
-                    stage_write_concurrency,
-                    history_release_bytes,
-                    write_budget,
-                    reprepares.is_first(),
-                    reprepares.attempt(),
-                )
-                .await;
+            let first_attempt = reprepares.is_first();
+            let result = crate::db::write_queue::preparing(self.write_blob_cell_attempt(
+                requested,
+                cell,
+                value,
+                precondition,
+                actor_id,
+                stage_write_concurrency,
+                history_release_bytes,
+                write_budget,
+                first_attempt,
+                reprepares.attempt(),
+            ))
+            .await;
             match result {
                 Err(error) if reprepares.may_prepare_again(&error) => {
                     reprepares.prepare_again().await?;

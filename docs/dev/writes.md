@@ -414,8 +414,13 @@ moves the branch under that attempt: a write finishes in at most two
 attempts, whatever sent it back and however often other writers or
 maintenance run, and no
 maintenance run waits for writers to get there. Preparation takes no gate
-of its own, which is what lets it run under them; `commit_all` adds the table
-gates. The bound is the process's: another process's publication is refused
+of its own, which is what lets it run under them, since the gates are not
+reentrant; `commit_all` adds the table gates. The engine checks the rule:
+every attempt runs inside a preparation scope (`db::write_queue::preparing`,
+a task-local) that its commit point ends, and every writer-gate acquisition
+inside it refuses with an internal error instead of waiting on the attempt's
+own gate. `WriteAttempt::admit` refuses an attempt prepared outside the scope.
+The bound is the process's: another process's publication is refused
 by the publisher's CAS and prepares the write again, within
 `MAX_PRE_EFFECT_REPREPARES` (32).
 
