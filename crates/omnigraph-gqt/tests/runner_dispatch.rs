@@ -1697,9 +1697,14 @@ fn listing(runtime: &tokio::runtime::Runtime, uri: &str) -> Vec<(String, u64, Op
     rows
 }
 
-/// The sorted `Person` names a handle over `uri` answers: the graph there,
-/// or with `base` the clone of that base rooted there.
-fn person_names(runtime: &tokio::runtime::Runtime, uri: &str, base: Option<&str>) -> Vec<String> {
+/// The sorted `Person` names a handle over `uri` answers on `branch`: the
+/// graph there, or with `base` the clone of that base rooted there.
+fn person_names(
+    runtime: &tokio::runtime::Runtime,
+    uri: &str,
+    base: Option<&str>,
+    branch: &str,
+) -> Vec<String> {
     runtime.block_on(async {
         let db = match base {
             Some(base) => omnigraph::db::Omnigraph::open_clone(base, uri).await,
@@ -1708,7 +1713,7 @@ fn person_names(runtime: &tokio::runtime::Runtime, uri: &str, base: Option<&str>
         .unwrap();
         let rows = omnigraph::Session::from_defaults(std::sync::Arc::new(db), Default::default())
             .query(
-                omnigraph::db::ReadTarget::branch("main"),
+                omnigraph::db::ReadTarget::branch(branch),
                 "query all() { match { $p: Person } return { $p.name } }",
                 "all",
                 &Default::default(),
@@ -1728,9 +1733,9 @@ fn person_names(runtime: &tokio::runtime::Runtime, uri: &str, base: Option<&str>
     })
 }
 
-/// The four cases under `tests/fixtures/runner/clone/` run with `--store` and
-/// `--base` over a base holding alice, three on one clone root and the fourth
-/// on another; afterwards the base's listing is as it was.
+/// The cases under `tests/fixtures/runner/clone/`: the first, with `--store`
+/// alone, gives the base its branch `feature`; the four observations run with
+/// `--base`, three on one clone root and the fourth on another.
 fn run_clone_cases(
     runtime: &tokio::runtime::Runtime,
     base: &str,
@@ -1751,17 +1756,14 @@ fn run_clone_cases(
             .await
             .unwrap();
     });
-    let before = listing(runtime, base);
     let cases = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runner/clone");
-    for (case, clone) in [
-        ("a_new_clone_answers_as_its_base.gqt", clone_a),
-        ("writes_behave_as_on_an_ordinary_root.gqt", clone_a),
-        ("a_later_open_finds_the_clones_own_state.gqt", clone_a),
-        ("two_clones_of_one_base_are_independent.gqt", clone_b),
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"))
-            .arg(cases.join(case))
-            .args(["--store", clone, "--base", base])
+    let run = |case: &str, store: &str, base: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"));
+        command.arg(cases.join(case)).args(["--store", store]);
+        if let Some(base) = base {
+            command.args(["--base", base]);
+        }
+        let output = command
             .args(["--target", "omnigraph-engine", "--storage", storage])
             .arg("--artifacts")
             .arg(artifacts)
@@ -1769,23 +1771,47 @@ fn run_clone_cases(
             .unwrap();
         assert!(
             output.status.success(),
-            "{case} on {clone}: {}",
+            "{case} on {store}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let (_, summary) = report(&output);
-        assert_eq!(summary["attempts"][0]["input"]["store"], clone);
-        assert_eq!(summary["attempts"][0]["input"]["base"], base);
+        assert_eq!(summary["attempts"][0]["input"]["store"], store);
+        match base {
+            Some(base) => assert_eq!(summary["attempts"][0]["input"]["base"], base),
+            None => assert!(summary["attempts"][0]["input"]["base"].is_null()),
+        }
+    };
+    run("the_base_holds_a_feature_branch.gqt", base, None);
+    let before = listing(runtime, base);
+    for (case, clone) in [
+        ("a_new_clone_answers_as_its_base.gqt", clone_a),
+        ("writes_behave_as_on_an_ordinary_root.gqt", clone_a),
+        ("a_later_open_finds_the_clones_own_state.gqt", clone_a),
+        ("two_clones_of_one_base_are_independent.gqt", clone_b),
+    ] {
+        run(case, clone, Some(base));
     }
     assert_eq!(
         listing(runtime, base),
         before,
         "the base's listing and ETags are as they were"
     );
-    assert_eq!(person_names(runtime, base, None), ["alice"]);
-    assert_eq!(person_names(runtime, clone_a, Some(base)), ["alice", "bob"]);
+    assert_eq!(person_names(runtime, base, None, "main"), ["alice"]);
     assert_eq!(
-        person_names(runtime, clone_b, Some(base)),
+        person_names(runtime, base, None, "feature"),
+        ["alice", "dave"]
+    );
+    assert_eq!(
+        person_names(runtime, clone_a, Some(base), "main"),
+        ["alice", "bob"]
+    );
+    assert_eq!(
+        person_names(runtime, clone_b, Some(base), "main"),
         ["alice", "carol"]
+    );
+    assert_eq!(
+        person_names(runtime, clone_b, Some(base), "feature"),
+        ["alice", "dave"]
     );
 }
 

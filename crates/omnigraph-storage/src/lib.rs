@@ -1381,18 +1381,7 @@ impl ObjectStorageAdapter {
 
     fn s3_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
         let location = parse_s3_uri(root_uri)?;
-        let mut builder = s3_bucket_builder(&location.bucket);
-        let retrying = match scope {
-            Some(_) => Some(build_s3_store(
-                builder.clone().with_retry(scoped_read_retry_config()),
-                root_uri,
-            )?),
-            None => None,
-        };
-        if scope.is_some() {
-            builder = builder.with_retry(single_attempt_retry_config());
-        }
-        let store = build_s3_store(builder, root_uri)?;
+        let (store, retrying) = s3_clients(&location.bucket, root_uri, scope.is_some())?;
 
         let adapter = Self {
             store: Arc::new(store),
@@ -1617,7 +1606,7 @@ impl ObjectStorageAdapter {
 
     /// The S3 instance of [`Self::durable_read_through`]: both clients from the
     /// standard `AWS_*` environment (one endpoint by construction), the base's
-    /// index from one listing of its prefix, a scoped clone root's two clients each over the mount.
+    /// index from one listing, the mount named by the clone root's bucket and prefix.
     async fn s3_read_through(
         base_uri: &str,
         root_uri: &str,
@@ -1639,21 +1628,12 @@ impl ObjectStorageAdapter {
         let frozen = FrozenDirectory::over(Arc::new(PrefixStore::new(base_store, base_key)))
             .await
             .map_err(|err| storage_backend_error("read_through_open", base_uri, err))?;
-        let mut builder = s3_bucket_builder(&root.bucket);
-        let retrying = match scope {
-            Some(_) => Some(build_s3_store(
-                builder.clone().with_retry(scoped_read_retry_config()),
-                root_uri,
-            )?),
-            None => None,
-        };
-        if scope.is_some() {
-            builder = builder.with_retry(single_attempt_retry_config());
-        }
-        let layer: Arc<DynObjectStore> = Arc::new(build_s3_store(builder, root_uri)?);
+        let (layer, retrying) = s3_clients(&root.bucket, root_uri, scope.is_some())?;
+        let layer: Arc<DynObjectStore> = Arc::new(layer);
         let mount = ReadThroughMount::open(layer.as_ref(), frozen, root_key)
             .await
-            .map_err(|err| storage_backend_error("read_through_open", root_uri, err))?;
+            .map_err(|err| storage_backend_error("read_through_open", root_uri, err))?
+            .in_bucket(root.bucket.as_str());
         let adapter = Self {
             store: Arc::new(mount.store(layer)),
             scope: None,
@@ -3126,6 +3106,31 @@ fn build_s3_store(builder: AmazonS3Builder, root_uri: &str) -> Result<object_sto
             format!("failed to initialize s3 storage for '{root_uri}': {err}"),
         )
     })
+}
+
+/// The clients of one `s3://` root: the store its reads and writes go to and,
+/// when `scoped`, a second client with bounded retries for its reads, the
+/// first then single-attempt (`ObjectStorageAdapter::with_scope_and_retrying`).
+fn s3_clients(
+    bucket: &str,
+    root_uri: &str,
+    scoped: bool,
+) -> Result<(
+    object_store::aws::AmazonS3,
+    Option<object_store::aws::AmazonS3>,
+)> {
+    let mut builder = s3_bucket_builder(bucket);
+    let retrying = match scoped {
+        true => Some(build_s3_store(
+            builder.clone().with_retry(scoped_read_retry_config()),
+            root_uri,
+        )?),
+        false => None,
+    };
+    if scoped {
+        builder = builder.with_retry(single_attempt_retry_config());
+    }
+    Ok((build_s3_store(builder, root_uri)?, retrying))
 }
 
 /// Whether two canonical key prefixes of one bucket (object-store paths: no

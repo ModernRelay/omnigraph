@@ -84,9 +84,12 @@ graph, or a clone root built over another base, is not detected (the RFC,
 What a caller observes) and answers from what it holds. It is admitted on the
 direct engine only: `--base` without `--store`,
 beside `--server`, or with a DST environment selected is refused. A
-`--- restart` reopens the root over the same base. The four cases under
+`--- restart` reopens the root over the same base. The cases under
 `tests/fixtures/runner/clone/` are the RFC's first four observations run with
-both options; `runner_dispatch` runs them over a local base and, with
+both options over a base that holds a branch beside `main` (the first case,
+run with `--store` alone, gives it that branch): a clone reads the branch,
+deletes it, and after a restart still lacks it, while the base and a second
+clone keep it; `runner_dispatch` runs them over a local base and, with
 `OMNIGRAPH_S3_TEST_BUCKET`, against a bucket.
 
 With `--server <URL> --graph <ID>` (plus `--token <TOKEN>` on a

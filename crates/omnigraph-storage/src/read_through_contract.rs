@@ -623,7 +623,12 @@ pub async fn create_after_a_durable_delete_holds_across_reopens(fixture: &dyn Fi
 }
 
 /// Of eight racing updates of one base object, each on the ETag the mount
-/// reports, exactly one is admitted: the clone root's own create decides.
+/// reports, exactly one is admitted. The frozen directory's turn puts them in
+/// a sequence: the first finds no copy in the clone root and lands by the
+/// clone root's uncontested put-if-absent, each later one finds that copy and
+/// fails its put-if-match against the copy's ETag. The row holds the mount's
+/// ordering and the layer's put-if-match; the layer's put-if-absent under
+/// contention is `s3_adapter_conditional_writes_contract`'s.
 pub async fn racing_updates_of_a_base_object_over_a_clone_root_admit_one(fixture: &dyn Fixture) {
     let base = fixture.base(&[("a.txt", "base a")]).await;
     let layer = fixture.clone_root().await;

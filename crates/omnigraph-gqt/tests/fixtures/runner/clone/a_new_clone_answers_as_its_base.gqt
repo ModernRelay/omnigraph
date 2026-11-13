@@ -1,5 +1,5 @@
 # issue: none
-# notes: A new clone answers as its base does (the graph shallow clone RFC, What a caller observes). Run with --store <clone root> --base <base>; the base holds alice.
+# notes: A new clone answers as its base does (the graph shallow clone RFC, What a caller observes). Run with --store <clone root> --base <base>; the base holds alice on main and dave on its branch feature.
 --- runner
 timeout_ms: 10000
 environments:
@@ -12,5 +12,21 @@ environments:
 query all() { match { $p: Person } return { $p.name } }
 --- expect unordered
 {"p.name":"alice"}
+--- expect shape
+p.name: String
+
+--- query
+branch list
+--- expect unordered
+{"name":"feature"}
+{"name":"main"}
+--- expect shape
+name: String
+
+--- query branch: feature
+query all() { match { $p: Person } return { $p.name } }
+--- expect unordered
+{"p.name":"alice"}
+{"p.name":"dave"}
 --- expect shape
 p.name: String

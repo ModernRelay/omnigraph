@@ -370,6 +370,7 @@ pub struct ReadThroughMount {
     frozen: Arc<FrozenDirectory>,
     prefix: Path,
     reserved: Path,
+    bucket: Option<String>,
 }
 
 impl ReadThroughMount {
@@ -431,7 +432,22 @@ impl ReadThroughMount {
             frozen: Arc::new(frozen),
             prefix,
             reserved,
+            bucket: None,
         })
+    }
+
+    /// The mount of a clone root that is a key prefix of `bucket`: a local
+    /// clone root's prefix is an absolute path and names one location by
+    /// itself, a key prefix names one only with its bucket.
+    #[must_use]
+    pub fn in_bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.bucket = Some(bucket.into());
+        self
+    }
+
+    /// The bucket the clone root's prefix is in, when it is a key prefix.
+    pub fn bucket(&self) -> Option<&str> {
+        self.bucket.as_deref()
     }
 
     /// A store of this mount over `layer`, which must hold the objects the

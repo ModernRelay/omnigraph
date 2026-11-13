@@ -1,5 +1,5 @@
 # issue: none
-# notes: A later open finds the clone's own state (the graph shallow clone RFC, What a caller observes). Run with --store <clone root> --base <base> on the clone root writes_behave_as_on_an_ordinary_root wrote bob into; the restart reopens that root over the same base.
+# notes: A later open finds the clone's own state (the graph shallow clone RFC, What a caller observes). Run with --store <clone root> --base <base> on the clone root writes_behave_as_on_an_ordinary_root wrote bob into and deleted the base's branch feature from; the restart reopens that root over the same base.
 --- runner
 timeout_ms: 10000
 environments:
@@ -16,6 +16,13 @@ query all() { match { $p: Person } return { $p.name } }
 --- expect shape
 p.name: String
 
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+--- expect shape
+name: String
+
 --- restart
 
 --- query
@@ -25,3 +32,14 @@ query all() { match { $p: Person } return { $p.name } }
 {"p.name":"bob"}
 --- expect shape
 p.name: String
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+--- expect shape
+name: String
+
+--- query branch: feature
+query all() { match { $p: Person } return { $p.name } }
+--- expect error: branch 'feature' not found

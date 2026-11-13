@@ -1,5 +1,5 @@
 # issue: none
-# notes: Writes behave as on an ordinary root (the graph shallow clone RFC, What a caller observes). Run with --store <clone root> --base <base> after a_new_clone_answers_as_its_base; the base holds alice and is never written.
+# notes: Writes behave as on an ordinary root (the graph shallow clone RFC, What a caller observes). Run with --store <clone root> --base <base> after a_new_clone_answers_as_its_base; the base holds alice and its branch feature and is never written: the insert and the branch delete land in the clone root alone.
 --- runner
 timeout_ms: 10000
 environments:
@@ -19,3 +19,18 @@ query all() { match { $p: Person } return { $p.name } }
 {"p.name":"bob"}
 --- expect shape
 p.name: String
+
+--- mutate
+branch delete feature
+--- expect ok
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+--- expect shape
+name: String
+
+--- query branch: feature
+query all() { match { $p: Person } return { $p.name } }
+--- expect error: branch 'feature' not found

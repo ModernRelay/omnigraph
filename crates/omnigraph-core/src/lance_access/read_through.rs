@@ -42,8 +42,8 @@ pub(super) fn registry(
 }
 
 /// Builds every local store as `file-object-store` (a `file` store reads data
-/// files by direct local path, below any mount) and every `s3` store as Lance
-/// builds it, each with the mount under it.
+/// files by direct local path, below any mount) and the `s3` store of the
+/// mount's bucket as Lance builds it, each with the mount under it.
 #[derive(Debug)]
 struct MountedProvider {
     inner: Arc<dyn ObjectStoreProvider>,
@@ -57,6 +57,11 @@ impl ObjectStoreProvider for MountedProvider {
         mut base_path: Url,
         params: &ObjectStoreParams,
     ) -> lance_core::Result<ObjectStore> {
+        if let Some(bucket) = self.mount.bucket()
+            && base_path.host_str() != Some(bucket)
+        {
+            return self.inner.new_store(base_path, params).await;
+        }
         if base_path.scheme() == "file" {
             base_path = Url::parse(
                 &base_path
@@ -272,6 +277,49 @@ mod tests {
                     .unwrap();
             let read = lance.inner.get(&table_path.clone().join("a")).await;
             assert_eq!(read.is_ok(), through_the_mount, "{table}/a: {read:?}");
+        }
+    }
+
+    /// The mount of a clone root in bucket `dst` is under the `s3` store of
+    /// that bucket alone: the store of `src` for the same key prefix is
+    /// Lance's bare store, so nothing it misses is read from the base.
+    #[tokio::test]
+    async fn a_store_of_another_bucket_is_not_mounted() {
+        let directory = tempfile::tempdir().unwrap();
+        let (base_uri, root_uri) = fixture(directory.path());
+        let storage = storage_read_through(&base_uri, &root_uri).await.unwrap();
+        let mount = storage.read_through_mount().unwrap().in_bucket("dst");
+        let registry = registry(mount, None);
+        let options: std::collections::HashMap<String, String> = [
+            ("aws_endpoint", "http://127.0.0.1:1"),
+            ("aws_region", "us-east-1"),
+            ("aws_access_key_id", "unused"),
+            ("aws_secret_access_key", "unused"),
+            ("aws_allow_http", "true"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                lance::io::StorageOptionsAccessor::with_static_options(options),
+            )),
+            ..ObjectStoreParams::default()
+        };
+        for (table, mounted) in [
+            ("s3://dst/clone/table", true),
+            ("s3://src/clone/table", false),
+        ] {
+            let (lance, _) =
+                ObjectStore::from_uri_and_params(Arc::clone(&registry), table, &params)
+                    .await
+                    .unwrap();
+            let store = format!("{:?}", lance.inner);
+            assert_eq!(
+                store.contains("ReadThroughStore"),
+                mounted,
+                "{table}: {store}"
+            );
         }
     }
 
