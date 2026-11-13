@@ -154,9 +154,9 @@ the scopes, the predecessor build and install scripts (compared exactly) and
 the required case names, so removing or altering one fails `Check Workflow Action Pins` and
 this job. The 90-minute budget covers two cold builds into one target
 directory: the predecessor CLI alone (one package, one bin, no test features),
-then the current tree's test targets, whose dev-dependency features (lance-io
-defaults and `test-util`) differ, so only dependency artifacts with matching
-features are reused.
+then the current tree's test targets, whose dev-dependency features
+(`test-util`) differ, so only dependency artifacts with matching features are
+reused.
 
 The released 0.12 cluster-ledger journey is separate
 [manual release qualification](testing.md#manual-012-cluster-upgrade-qualification).
