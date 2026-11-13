@@ -497,7 +497,7 @@ mod tests {
     }
 
     /// Two branches write the same lineage counter to different detached pins
-    /// on one physical table; without e_tags (Windows local files) the pin is
+    /// on one physical table; for a store that reports no e_tag the pin is
     /// the only thing that tells the two datasets apart, in both caches.
     #[test]
     fn same_counter_different_pin_splits_both_keys_without_etag() {
