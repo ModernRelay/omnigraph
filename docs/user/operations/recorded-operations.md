@@ -56,11 +56,12 @@ reason to resubmit the same work under the same id.
 
 | Refusal | Status |
 |---|---|
-| The same id with a different request (message prefix `[operation_request_mismatch]`); an id at or before the record's eviction mark (`[operation_id_expired]`, mint a new one); an outstanding deployment; four unresolved publications; a record from another ledger at this root (`[operation_record_foreign]`) | 409 `conflict` |
+| The same id with a different request (message prefix `[operation_request_mismatch]`); an id at or before the record's eviction mark (`[operation_id_expired]`, mint a new one); an outstanding deployment; four unresolved publications; a record from another ledger at this root (`[operation_record_foreign]`); a cluster state file whose text is not valid cluster state (`[invalid_state_json]`) or an operation record whose text is not a valid record (`[operation_record_invalid]`; restore the object from a trusted copy, while bytes that are not text answer 500) | 409 `conflict` |
 | Another operation is active in the maintenance scope (its id is in the message), or the scope is admitting one | 429 `too_many_requests`, with `Retry-After` |
 | A gate hold above the server's ceiling, an `operation_id` that is not a canonical ULID, or one dated more than a minute ahead of the server's clock | 400 `bad_request` |
-| The routes are off, the server is draining, the graph is closing for a deployment, or the record write was refused and nothing was accepted (`effects: none`). A refusal that names an earlier request of unknown outcome clears once a read sees the record change; for an unconditional write, or a create whose record never appeared, it holds until the server restarts | 503 `service_unavailable` |
+| The routes are off, the server is draining, the graph is closing for a deployment, a storage read of the cluster state file, its lock or the operation record failed temporarily or for an unknown reason (message prefix `[state_read_error]`, `[state_lock_read_error]` or `[operation_record_read_error]`; send the same request again), or the record write was refused and nothing was accepted (`effects: none`). A refusal that names an earlier request of unknown outcome clears once a read sees the record change; for an unconditional write, or a create whose record never appeared, it holds until the server restarts | 503 `service_unavailable` |
 | A record write without a definite answer | 500 `outcome_unknown`; look the id up |
+| A storage read of the cluster state file, its lock or the operation record failed in a way that repeats on every read: bytes that are not text, an object over its size bound, or access the store denies (same message prefixes; `effects: none`, nothing changed). Sending the same request again fails the same way until the object or the storage configuration is repaired | 500 `internal` |
 
 ## From the CLI
 

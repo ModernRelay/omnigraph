@@ -62,11 +62,11 @@ before that commit leaves the graph unchanged and no recovery state; after it
 the published pins are the tables' versions, with nothing left to finish.
 Optimize runs beside live writers: a write that lands on a table while its
 compaction is staged fails the run with a read-set conflict, and the next run
-re-plans from the new state. An update or delete prepared before an optimize
-published reports the same conflict and is retried by its caller. Lance compacts
-neighbouring fragments only when the same indexes cover them, so a table whose
-index coverage was uneven before a run may coalesce fully only on the next run,
-after the rebuilt coverage is in place.
+re-plans from the new state. A write prepared before an optimize published goes
+ahead, or prepares again once, holding writes off, if it changes a row the run
+moved; none reports a conflict for it. Lance compacts neighbouring fragments only when the
+same indexes cover them, so a table whose index coverage was uneven before a run
+may coalesce fully only on the next run, after the rebuilt coverage is in place.
 
 Compacting a table with Blob properties reads each managed Blob value into
 memory. Optimize sizes each compaction batch from its largest row, whatever
@@ -87,8 +87,7 @@ first deferred one, and `--tables` runs only the listed tables, in order. Each
 table's `outcome` is `optimized`, `unchanged`, `deferred`, `skipped` or
 `failed` (with its `error`; the other tables still publish). The report adds
 `input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
-and `artifact` outcomes, which never fail a published run. A run first waits up
-to 10 s for writes in flight when the last run published (`writer_yield_ms`).
+and `artifact` outcomes, which never fail a published run.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of

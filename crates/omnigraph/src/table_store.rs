@@ -194,9 +194,18 @@ pub(crate) fn cap_sort_inputs_and_merge_partitions(
     })
 }
 
-/// DataFusion's sort spill reservation under a pool of `memory_limit` bytes.
+/// DataFusion's sort spill reservation under a pool of `memory_limit` bytes:
+/// what a sort's merge holds from the sort's first input batch on, and the
+/// headroom DataFusion frees for the in-memory sort at every spill. A
+/// sixteenth of the pool, at least a third of it up to 512 KiB, at most
+/// DataFusion's own default of 10 MiB: a third (at most 40 MiB) sat idle
+/// beside the batches' half and left the graph work producing the sort's
+/// input a sixth (#1361), and under 1.5 MiB a sixteenth is less headroom
+/// than a spill's in-memory sort needs beside a second spilling consumer.
 pub(crate) fn sort_spill_reservation_bytes(memory_limit: u64) -> usize {
-    (memory_limit / 3).min(40 * 1024 * 1024) as usize
+    (memory_limit / 16)
+        .max((memory_limit / 3).min(512 * 1024))
+        .min(10 * 1024 * 1024) as usize
 }
 
 /// The codec of every spill file the engine writes, in a query's session and
@@ -765,6 +774,136 @@ fn stamp_no_by_source_delete(transaction: &mut Transaction) {
 pub(crate) fn is_index_only_commit(transaction: &Transaction, expected_read_version: u64) -> bool {
     transaction.read_version == expected_read_version
         && matches!(&transaction.operation, Operation::CreateIndex { .. })
+}
+
+/// Most links [`row_preserving_chain`] follows before it gives up. One
+/// optimize run chains at most a rewrite, an index fold and an index build
+/// per table, each possibly followed by a full-text declaration; the bound
+/// leaves room for several runs between a write's capture and its gates and
+/// keeps the walk's requests bounded. Past it the write starts over, as it
+/// did before the chain was read.
+pub(crate) const ROW_PRESERVING_CHAIN_MAX_LINKS: usize = 32;
+
+/// The commits between a write's captured pin of a table and the table's
+/// current pin, when every one of them leaves the table's rows as they were.
+///
+/// A link qualifies when its operation is a `Rewrite` or a `CreateIndex`.
+/// Lance's transaction specification defines a rewrite as reorganizing data
+/// without changing it (compaction, deletion materialization, dropped-column
+/// erasure all commit one), and a `CreateIndex` applies with every fragment of
+/// the version it read unchanged (`is_index_only_commit`). Those are the
+/// operations optimize and index reconciliation publish; who published a link
+/// is not consulted, only what its transaction records.
+#[derive(Debug, Clone)]
+pub(crate) struct RowPreservingChain {
+    /// `(version, transaction)` of every link, lowest first: the first link
+    /// read the captured pin, the last is the current pin.
+    links: Vec<(u64, Transaction)>,
+}
+
+/// Walk `current`'s chain of commits by `read_version` links down to
+/// `captured_version` and return it when every link preserves rows
+/// ([`RowPreservingChain`]). `None` when a link is any other operation,
+/// records no transaction, or the walk reaches neither the captured version
+/// nor a stop within [`ROW_PRESERVING_CHAIN_MAX_LINKS`]: the write must then
+/// treat the table as changed.
+pub(crate) async fn row_preserving_chain(
+    current: &Dataset,
+    captured_version: u64,
+) -> Result<Option<RowPreservingChain>> {
+    let mut links = Vec::new();
+    let mut dataset = current.clone();
+    for _ in 0..ROW_PRESERVING_CHAIN_MAX_LINKS {
+        let Some(transaction) = dataset
+            .read_transaction()
+            .await
+            .map_err(OmniError::storage)?
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            transaction.operation,
+            Operation::Rewrite { .. } | Operation::CreateIndex { .. }
+        ) {
+            return Ok(None);
+        }
+        let read_version = transaction.read_version;
+        links.push((dataset.version().version, transaction));
+        if read_version == captured_version {
+            links.reverse();
+            return Ok(Some(RowPreservingChain { links }));
+        }
+        if read_version == 0 {
+            return Ok(None);
+        }
+        dataset = dataset
+            .checkout_version(read_version)
+            .await
+            .map_err(OmniError::storage)?;
+    }
+    Ok(None)
+}
+
+/// Carry a staged write prepared on `base` over the row-preserving `chain`
+/// to `current`, the chain's last version, with Lance's own conflict
+/// resolver (`TransactionRebase`, the pass `commit_transaction` runs for a
+/// linear commit): every link is checked as a concurrent transaction, the
+/// resolver finishes against `current`, and the transaction then records
+/// `current` as the version it read, so the detached commit links to the
+/// table's current pin like any other write. Nothing is written for the
+/// operations the chain can hold, so a refusal leaves no effect.
+///
+/// The inner `Ok` is the write, now reading `current`, to commit detached
+/// there; the inner `Err` is Lance's message when its conflict rules refuse
+/// to carry the write over a link (an update or delete of a fragment a
+/// rewrite replaced, for one).
+pub(crate) async fn rebase_staged_write(
+    base: &Dataset,
+    staged: StagedWrite,
+    current: &Dataset,
+    chain: &RowPreservingChain,
+) -> Result<std::result::Result<StagedWrite, String>> {
+    let StagedWrite {
+        transaction,
+        commit_metadata,
+        new_fragments,
+        removed_fragment_ids,
+        deleted_rows,
+    } = staged;
+    let mut rebase = lance::io::commit::conflict_resolver::TransactionRebase::try_new(
+        base,
+        transaction,
+        commit_metadata.affected_rows.as_ref(),
+    )
+    .await
+    .map_err(OmniError::storage)?;
+    for (version, link) in &chain.links {
+        if let Err(error) = rebase.check_txn(link, *version) {
+            return match error {
+                lance::Error::RetryableCommitConflict { .. }
+                | lance::Error::IncompatibleTransaction { .. }
+                | lance::Error::CommitConflict { .. } => Ok(Err(error.to_string())),
+                other => Err(OmniError::storage(other)),
+            };
+        }
+    }
+    let mut transaction = match rebase.finish(current).await {
+        Ok(transaction) => transaction,
+        Err(
+            error @ (lance::Error::RetryableCommitConflict { .. }
+            | lance::Error::IncompatibleTransaction { .. }
+            | lance::Error::CommitConflict { .. }),
+        ) => return Ok(Err(error.to_string())),
+        Err(error) => return Err(OmniError::storage(error)),
+    };
+    transaction.read_version = current.version().version;
+    Ok(Ok(StagedWrite {
+        transaction,
+        commit_metadata,
+        new_fragments,
+        removed_fragment_ids,
+        deleted_rows,
+    }))
 }
 
 /// Verify one persisted link of the insertion-absence proof chain and return

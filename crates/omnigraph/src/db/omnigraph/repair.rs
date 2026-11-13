@@ -134,17 +134,17 @@ pub(super) async fn repair_report(db: &Omnigraph, actor: Option<&str>) -> Result
     // schema apply cannot pair an old dataset path with a replacement's alias,
     // and a cleanup cannot remove a version the report is reading.
     let authority_txn = db.open_write_txn(None).await?;
-    let _schema_permit = db.write_queue().acquire_schema_shared().await;
+    let _schema_permit = db.write_queue().acquire_schema_shared().await?;
     db.refresh_coordinator_only().await?;
     let catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
-    let _main_branch_guard = db.write_queue().acquire_branch(None).await;
+    let _main_branch_guard = db.write_queue().acquire_branch(None).await?;
 
     let table_keys = optimize::all_table_keys(&catalog);
     let queue_keys = table_keys
         .iter()
         .map(|table_key| (table_key.clone(), None))
         .collect::<Vec<_>>();
-    let _table_guards = db.write_queue().acquire_many(&queue_keys).await;
+    let _table_guards = db.write_queue().acquire_many(&queue_keys).await?;
 
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
     let table_tasks = table_keys

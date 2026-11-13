@@ -564,6 +564,61 @@ fn handlers_document_internal_failures() {
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
+/// The routes that read the cluster control objects (the state file, its lock,
+/// the operation record and, for deployments, the catalog payloads). A failed
+/// read answers by its storage class, 503 `service_unavailable` or 500
+/// `internal`, and corrupt stored text answers 409 `conflict` (issue #1356).
+fn control_read_response_errors(doc: &Value) -> Vec<String> {
+    let names = [
+        "deployment status",
+        "deployment apply",
+        "deployment lookup",
+        "deployment plan",
+        "start optimize",
+        "get operation",
+        "cancel operation",
+    ]
+    .map(|name| {
+        omnigraph_api_types::operations::named_operation(name)
+            .expect("the route belongs to the operation inventory")
+            .operation_id()
+    });
+    [
+        ErrorCode::Conflict,
+        ErrorCode::Internal,
+        ErrorCode::ServiceUnavailable,
+    ]
+    .into_iter()
+    .flat_map(|code| required_response_errors(doc, &names, code))
+    .collect()
+}
+
+#[test]
+fn control_read_routes_document_every_answer_issue_1356() {
+    let doc = openapi_json();
+    let errors = control_read_response_errors(&doc);
+    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    let path = "/graphs/{graph_id}/operations/{operation_id}";
+    for remove_response in [true, false] {
+        let mut changed = doc.clone();
+        let responses = changed["paths"][path]["get"]["responses"]
+            .as_object_mut()
+            .unwrap();
+        if remove_response {
+            responses.remove("409");
+        } else {
+            let description = responses["409"]["description"]
+                .as_str()
+                .unwrap()
+                .replace(ErrorCode::Conflict.as_str(), "");
+            responses.get_mut("409").unwrap()["description"] = Value::String(description);
+        }
+        let errors = control_read_response_errors(&changed);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("getOperation "), "{errors:?}");
+    }
+}
+
 #[test]
 fn required_write_coverage_detects_a_missing_response_or_code() {
     let doc = openapi_json();
