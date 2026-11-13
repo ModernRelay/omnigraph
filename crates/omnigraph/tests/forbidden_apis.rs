@@ -4077,24 +4077,32 @@ fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
         );
     }
 
-    for function_name in ["branch_create_as", "branch_create_from_impl"] {
+    // The helpers and the evictions they are made of, so a direct call fails
+    // too. Every eviction is a method call: the `Omnigraph` methods call the
+    // `RuntimeCache` ones directly, with no free function between them.
+    let cache_evictions = [
+        "invalidate_read_caches",
+        "invalidate_all",
+        "invalidate_graph_index_for",
+        "invalidate_edge_tables",
+    ];
+    for function_name in [
+        "branch_create_as",
+        "branch_create_from_impl",
+        "branch_delete_as",
+        "delete_captured_branch_storage",
+    ] {
         let function = functions
             .get(function_name)
             .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
-        assert_eq!(
-            method_call_count(&function.block, "invalidate_read_caches"),
-            1,
-            "Omnigraph::{function_name} must invalidate derived caches after successful ref creation"
-        );
+        for eviction in cache_evictions {
+            assert_eq!(
+                method_call_count(&function.block, eviction),
+                0,
+                "Omnigraph::{function_name} must keep the read caches (no {eviction}): a branch create or delete changes no cache key"
+            );
+        }
     }
-    let delete_helper = functions
-        .get("delete_captured_branch_storage")
-        .expect("missing Omnigraph::delete_captured_branch_storage");
-    assert_eq!(
-        method_call_count(&delete_helper.block, "invalidate_read_caches"),
-        1,
-        "captured branch deletion must invalidate derived caches after successful ref removal"
-    );
 }
 
 fn function_blocks(ast: &syn::File, function_name: &str) -> Vec<syn::Block> {

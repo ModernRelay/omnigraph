@@ -1300,22 +1300,21 @@ impl Omnigraph {
             crate::db::reprepare::PreEffectReprepares::begin(self, Some(branch), "mutation");
         loop {
             let first_attempt = reprepares.is_first();
-            let result = self
-                .mutate_one_attempt(
-                    branch,
-                    query_source,
-                    query_name,
-                    &resolved_params,
-                    actor_id,
-                    expected_head,
-                    stage_write_concurrency,
-                    history_release_bytes,
-                    first_attempt,
-                    write_budget,
-                    route,
-                    reprepares.attempt(),
-                )
-                .await;
+            let result = crate::db::write_queue::preparing(self.mutate_one_attempt(
+                branch,
+                query_source,
+                query_name,
+                &resolved_params,
+                actor_id,
+                expected_head,
+                stage_write_concurrency,
+                history_release_bytes,
+                first_attempt,
+                write_budget,
+                route,
+                reprepares.attempt(),
+            ))
+            .await;
             match result {
                 Err(err) if reprepares.may_prepare_again(&err) => {
                     reprepares.prepare_again().await?;
@@ -1445,7 +1444,7 @@ impl Omnigraph {
                         None => {
                             self.write_queue()
                                 .acquire_branch_write_gates(requested.as_deref())
-                                .await
+                                .await?
                         }
                     };
                     self.revalidate_write_txn(&txn).await?;
@@ -1859,7 +1858,7 @@ impl Omnigraph {
                 };
                 staging.append_batch(&table_key, schema, mode, batch)?;
 
-                self.invalidate_graph_index().await;
+                self.invalidate_graph_index_for([table_key.as_str()]).await;
 
                 Ok(MutationResult {
                     affected_nodes: 0,
@@ -2251,6 +2250,7 @@ impl Omnigraph {
         staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
 
         let mut affected_edges = 0usize;
+        let mut cascaded_edge_tables: Vec<String> = Vec::new();
 
         let edge_info: Vec<(String, String, String)> = txn
             .catalog
@@ -2319,6 +2319,7 @@ impl Omnigraph {
             affected_edges += matched;
 
             if matched > 0 {
+                cascaded_edge_tables.push(edge_table_key.clone());
                 staging.record_deleted_ids(&edge_table_key, matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
                 staging.record_deleted_row_addrs(
@@ -2331,9 +2332,8 @@ impl Omnigraph {
 
         staging.record_deleted_ids(&table_key, deleted_ids);
 
-        if affected_edges > 0 {
-            self.invalidate_graph_index().await;
-        }
+        self.invalidate_graph_index_for(cascaded_edge_tables.iter().map(String::as_str))
+            .await;
 
         Ok(MutationResult {
             affected_nodes,
@@ -2396,7 +2396,7 @@ impl Omnigraph {
             staging.record_deleted_ids(&table_key, deleted_ids);
             staging.record_delete(&table_key, pred_expr.clone());
             staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
-            self.invalidate_graph_index().await;
+            self.invalidate_graph_index_for([table_key.as_str()]).await;
         }
 
         Ok(MutationResult {

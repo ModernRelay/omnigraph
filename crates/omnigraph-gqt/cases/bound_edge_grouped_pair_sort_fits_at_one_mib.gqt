@@ -1,0 +1,71 @@
+# issue: none
+# notes: A grouped return over a bound-edge expansion runs the pair sort beside a second
+# notes: spilling consumer, the aggregate, which halves the sort's fair share of the pool.
+# notes: At every spill DataFusion frees the merge's pre-reservation as the headroom its
+# notes: in-memory sort grows into; a pre-reservation of a sixteenth left too little of it
+# notes: under 2.25 MiB and the query was refused at 1 MiB where it fits at 0.875 and 2 MiB.
+# notes: 16,384 edges with a 256 B payload: every edge counted at 1 MiB and at 2 MiB.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person {
+    payload: String
+}
+
+--- seed
+{"type":"Person","data":{"name":"a0"}}
+{"type":"Person","data":{"name":"b0"}}
+
+--- load generate: v1 seed: 1 mode: append
+tables:
+  - kind: edge
+    name: Knows
+    rows: 16384
+    commits: 4
+    from: {kind: endpoint, prefix: a, width: 1, population: 1, distribution: {kind: ordinal}}
+    to: {kind: endpoint, prefix: b, width: 1, population: 1, distribution: {kind: ordinal}}
+    columns:
+      payload: {kind: repeat, text: x, count: 256}
+--- expect ok
+
+--- query
+set query_memory_bytes = 1048576;
+query one_mib() {
+    match {
+        $p: Person { name: "a0" }
+        $p $e:knows $q
+    }
+    return { $q.name, count($e.payload) as n }
+}
+
+--- expect unordered
+{"q.name": "b0", "n": 16384}
+
+--- expect shape
+q.name: String
+n: I64
+
+--- query
+set query_memory_bytes = 2097152;
+query two_mib() {
+    match {
+        $p: Person { name: "a0" }
+        $p $e:knows $q
+    }
+    return { $q.name, count($e.payload) as n }
+}
+
+--- expect unordered
+{"q.name": "b0", "n": 16384}
+
+--- expect shape
+q.name: String
+n: I64

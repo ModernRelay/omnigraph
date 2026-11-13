@@ -427,7 +427,8 @@ const UNSETTLED_REFUSAL: &str = "; a refusal that names an earlier request of un
      whose record never appeared, when the server restarts";
 
 fn refusal(error: omnigraph_cluster::Diagnostic) -> ApiError {
-    ApiError::conflict(format!("[{}] {}", error.code, error.message))
+    ApiError::failed_control_read(&error)
+        .unwrap_or_else(|| ApiError::conflict(format!("[{}] {}", error.code, error.message)))
 }
 
 fn outcome_unknown(operation_id: &str, error: &str) -> ApiError {
@@ -671,10 +672,10 @@ type Acceptance = Result<Operation, ApiError>;
         (status = 202, description = "Durably accepted, or still running; look it up by its id until it is terminal", body = OperationOutput),
         (status = 400, description = "A non-canonical operation_id, or a max_gate_hold_ms above this server's ceiling", body = crate::api::ErrorOutput),
         (status = 403, body = crate::api::ErrorOutput),
-        (status = 409, description = "The same id with a different request (`[operation_request_mismatch]`), an id at or before the eviction mark (`[operation_id_expired]`), an outstanding deployment, four unresolved publications, or a record from another ledger (`[operation_record_foreign]`)", body = crate::api::ErrorOutput),
+        (status = 409, description = "Conflict (code `conflict`): the same id with a different request (`[operation_request_mismatch]`), an id at or before the eviction mark (`[operation_id_expired]`), an outstanding deployment, four unresolved publications, a record from another ledger (`[operation_record_foreign]`), or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)", body = crate::api::ErrorOutput),
         (status = 429, description = "Another operation is active in the maintenance scope, or that scope's admission gate is held across an acceptance; honor `Retry-After`", body = crate::api::ErrorOutput),
-        (status = 500, description = "Internal failure (code `internal`), or a record write with no definite answer (code `outcome_unknown`); look the operation up by its id", body = crate::api::ErrorOutput),
-        (status = 503, description = "The routes are not enabled, admission is closed, or the operation record write was refused and nothing was accepted (a refusal naming an earlier request of unknown outcome clears once a read sees the record change, or, for an unconditional write or a create whose record never appeared, when the server restarts)", body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing was accepted), or a record write with no definite answer (code `outcome_unknown`); look the operation up by its id", body = crate::api::ErrorOutput),
+        (status = 503, description = "The routes are not enabled, admission is closed, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or the operation record write was refused; nothing was accepted (a refusal naming an earlier request of unknown outcome clears once a read sees the record change, or, for an unconditional write or a create whose record never appeared, when the server restarts)", body = crate::api::ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -874,7 +875,9 @@ pub(crate) async fn start_optimize(
                 Ok(OperationWrite::InDoubt { error }) => {
                     Err(outcome_unknown(&operation_id, &error))
                 }
-                Err(error) => Err(refusal(error)),
+                // The lock check and the record's encoding: both come before
+                // the put, so nothing was accepted.
+                Err(error) => Err(refusal(error).applied_nothing()),
             };
             let cancellation = OptimizeCancellation::new();
             let landed = answer.is_ok();
@@ -1350,9 +1353,9 @@ async fn find_authorized(
     responses(
         (status = 200, description = "The operation's record, or `lookup: unknown`", body = OperationOutput),
         (status = 403, body = crate::api::ErrorOutput),
-        (status = 409, description = "A record from another ledger at this root, or the record changed during resolution", body = crate::api::ErrorOutput),
-        (status = 500, description = "Internal failure (code `internal`), or a resolution write with no definite answer (code `outcome_unknown`); retry the lookup", body = crate::api::ErrorOutput),
-        (status = 503, description = "The routes are not enabled", body = crate::api::ErrorOutput),
+        (status = 409, description = "Conflict (code `conflict`): a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)", body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing changed), or a resolution write with no definite answer (code `outcome_unknown`); retry the lookup", body = crate::api::ErrorOutput),
+        (status = 503, description = "The routes are not enabled, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or a record write was refused; nothing changed, retry", body = crate::api::ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1377,9 +1380,9 @@ pub(crate) async fn get_operation(
         (status = 200, description = "The operation is terminal, unchanged; or `lookup: unknown`", body = OperationOutput),
         (status = 202, description = "Cancellation requested; a `publishing` operation is unchanged", body = OperationOutput),
         (status = 403, body = crate::api::ErrorOutput),
-        (status = 409, description = "A record from another ledger at this root, or the record changed during resolution", body = crate::api::ErrorOutput),
-        (status = 500, description = "Internal failure (code `internal`), or a resolution write with no definite answer (code `outcome_unknown`); look the operation up by its id", body = crate::api::ErrorOutput),
-        (status = 503, description = "The routes are not enabled", body = crate::api::ErrorOutput),
+        (status = 409, description = "Conflict (code `conflict`): a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)", body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing changed), or a resolution write with no definite answer (code `outcome_unknown`); look the operation up by its id", body = crate::api::ErrorOutput),
+        (status = 503, description = "The routes are not enabled, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or a record write was refused; nothing changed, retry", body = crate::api::ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]

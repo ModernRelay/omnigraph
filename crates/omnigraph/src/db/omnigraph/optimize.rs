@@ -864,7 +864,7 @@ pub async fn optimize_all_datasets(
     // Canonical writer order: schema -> branch -> sorted tables. Planning reads
     // catalog index intent, so it must use an operation-local accepted catalog
     // under the same schema gate as schema apply and the exact RFC-022 writers.
-    let schema_permit = db.write_queue().acquire_schema_shared().await;
+    let schema_permit = db.write_queue().acquire_schema_shared().await?;
     db.refresh_coordinator_only()
         .await
         .map_err(OmniError::before_effect)?;
@@ -916,9 +916,9 @@ pub async fn optimize_all_datasets(
         .map(|table_key| (table_key.clone(), None))
         .collect::<Vec<_>>();
     let gates = async {
-        let main_branch_guard = db.write_queue().acquire_branch(None).await;
-        let table_guards = db.write_queue().acquire_many(&queue_keys).await;
-        (main_branch_guard, table_guards)
+        let main_branch_guard = db.write_queue().acquire_branch(None).await?;
+        let table_guards = db.write_queue().acquire_many(&queue_keys).await?;
+        Ok::<_, OmniError>((main_branch_guard, table_guards))
     };
     // A gate wait dropped before it holds leaves the queue as it was.
     let (main_branch_guard, table_guards) = match request.cancellation.as_ref() {
@@ -928,9 +928,9 @@ pub async fn optimize_all_datasets(
                 drop(schema_permit);
                 return Ok(cancelled_before_gates());
             }
-            gates = gates => gates,
+            gates = gates => gates?,
         },
-        None => gates.await,
+        None => gates.await?,
     };
     let gates_acquired = Instant::now();
 
@@ -1060,9 +1060,6 @@ pub async fn optimize_all_datasets(
         .await;
         graph_commit_id = Some(commit?.graph_commit_id);
         db.runtime_cache.invalidate_all().await;
-        if edge_tables_committed {
-            db.invalidate_graph_index().await;
-        }
     }
 
     // The graph commit is durable from here: nothing below fails the run. A
@@ -2021,7 +2018,7 @@ pub async fn cleanup_all_datasets(
     // envelope before deleting any version history.
     let authority_txn = db.open_write_txn(None).await?;
 
-    let _cleanup_schema_permit = db.write_queue().acquire_schema_shared().await;
+    let _cleanup_schema_permit = db.write_queue().acquire_schema_shared().await?;
     db.refresh_coordinator_only().await?;
     let cleanup_catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
@@ -2036,9 +2033,9 @@ pub async fn cleanup_all_datasets(
         .collect();
 
     let graph_branches = cleanup_graph_branches(db).await?;
-    let _cleanup_branch_guards = db.write_queue().acquire_branches(&graph_branches).await;
+    let _cleanup_branch_guards = db.write_queue().acquire_branches(&graph_branches).await?;
     let gc_queue_keys = db.table_queue_keys_for_branches(&graph_branches, &cleanup_catalog);
-    let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await;
+    let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await?;
 
     db.revalidate_write_txn(&authority_txn).await?;
 
@@ -2196,12 +2193,12 @@ pub struct BranchReconcileStats {
 /// Collect unreferenced table forks under cleanup's complete writer gates.
 #[cfg(all(test, feature = "failpoints"))]
 pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconcileStats> {
-    let _schema = db.write_queue().acquire_schema_shared().await;
+    let _schema = db.write_queue().acquire_schema_shared().await?;
     let catalog = db.catalog();
     let graph_branches = cleanup_graph_branches(db).await?;
-    let _branches = db.write_queue().acquire_branches(&graph_branches).await;
+    let _branches = db.write_queue().acquire_branches(&graph_branches).await?;
     let table_keys = db.table_queue_keys_for_branches(&graph_branches, &catalog);
-    let _tables = db.write_queue().acquire_many(&table_keys).await;
+    let _tables = db.write_queue().acquire_many(&table_keys).await?;
     reconcile_orphaned_branches_under_control_gates(db, None).await
 }
 
