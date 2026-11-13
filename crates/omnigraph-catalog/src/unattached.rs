@@ -26,6 +26,7 @@ pub use omnigraph_core::branch_names::{
 };
 use omnigraph_core::graph_commit_id::canonical_ulid;
 
+use crate::branch_control::{list_native_tag_names, read_native_tag};
 use crate::commit_graph::{CommitGraph, GraphCommit, GraphCommitKind, HistoryCache};
 use crate::error::{OmniError, Result};
 use crate::history::HistoryRecord;
@@ -33,7 +34,7 @@ use crate::migrations::{read_stamp, require_unattached_branches};
 use crate::publisher::{
     GraphHeadExpectation, UnattachedIntent, UnattachedOutcome, UnattachedWriteBase,
 };
-use crate::retention::{ManifestTagInventory, list_native_tag_names, read_native_tag};
+use crate::retention::ManifestTagInventory;
 use crate::seams::{decide_seam, fail};
 use crate::state::{GraphLineageRow, read_manifest_rows_projected};
 use crate::unpublished::{
@@ -440,7 +441,9 @@ impl<'a> NativeTags<'a> {
             let tag = if self.sealed {
                 None
             } else {
-                read_native_tag(self.dataset, name).await?
+                read_native_tag(self.dataset, name)
+                    .await
+                    .map_err(OmniError::storage)?
             };
             self.read.insert(name.to_string(), tag);
         }
@@ -646,7 +649,10 @@ impl ManifestCoordinator {
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
         let mut named = Vec::new();
-        for name in list_native_tag_names(&main).await? {
+        for name in list_native_tag_names(&main)
+            .await
+            .map_err(OmniError::storage)?
+        {
             if let Some((_, named_id)) = unattached_tag_parts(&name)?
                 && named_id == graph_commit_id
             {
@@ -774,7 +780,8 @@ impl ManifestCoordinator {
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
         let names: Vec<String> = list_native_tag_names(&main)
-            .await?
+            .await
+            .map_err(OmniError::storage)?
             .into_iter()
             .filter(|name| is_unattached_tag(name))
             .collect();
@@ -821,7 +828,8 @@ impl ManifestCoordinator {
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
         let names: Vec<String> = list_native_tag_names(&main)
-            .await?
+            .await
+            .map_err(OmniError::storage)?
             .into_iter()
             .filter(|name| name.starts_with(&prefix))
             .collect();
@@ -938,7 +946,7 @@ fn descend<'a>(
 /// `graph_commit_id`, confirmed by a read: a tag still listed, or a read that
 /// fails, leaves the release in doubt.
 async fn confirm_tag_released(main: &Dataset, name: &str, graph_commit_id: &str) -> Result<()> {
-    match crate::branch_control::read_native_tag(main, name).await {
+    match read_native_tag(main, name).await {
         Ok(Some(_)) => Err(OmniError::manifest_publish_in_doubt(
             graph_commit_id,
             format!("the candidate tag '{name}' is still listed after its deletion"),

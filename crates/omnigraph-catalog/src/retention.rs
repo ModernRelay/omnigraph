@@ -198,24 +198,6 @@ pub async fn release_merge_input_tags(dataset: &Dataset, names: &[String]) -> Re
     Ok(())
 }
 
-/// The names of main's `__manifest` native tags from one directory listing,
-/// no tag opened. Lance's `tags().list()` reads every tag's contents before
-/// returning, so a reader that needs a few tags selects names here and reads
-/// only those with [`read_native_tag`].
-pub async fn list_native_tag_names(dataset: &Dataset) -> Result<Vec<String>> {
-    crate::branch_control::list_native_tag_names(dataset)
-        .await
-        .map_err(OmniError::storage)
-}
-
-/// One native tag's contents by name in one whole-object GET; `None` when
-/// the tag is gone, since a listing races a release.
-pub async fn read_native_tag(dataset: &Dataset, name: &str) -> Result<Option<TagContents>> {
-    crate::branch_control::read_native_tag(dataset, name)
-        .await
-        .map_err(OmniError::storage)
-}
-
 /// One immutable inventory boundary around all graph snapshots a collector
 /// combines. User tags may be updated, so both names and contents must match.
 pub struct ManifestTagInventory {

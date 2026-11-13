@@ -93,26 +93,43 @@ pub async fn get_branch_contents(dataset: &Dataset, branch: &str) -> lance::Resu
     .await
 }
 
-/// Read one ref object in a single GET. Lance's `BranchContents::from_path`
-/// heads the object for its size and then reads that range, and
-/// `Branches::get` heads it once more for existence: three requests, and the
-/// head/range pair can observe a rewrite between them (the torn read the
-/// retry boundary above absorbs). One GET returns one whole object version.
-/// A ref written before identifiers existed falls back to Lance's reader,
-/// which derives its private synthetic identifier.
+/// One small JSON ref object (a branch ref, a native tag, a retirement
+/// archive) in a single whole-object GET; `None` when it is absent. Lance's
+/// `BranchContents::from_path` and `TagContents::from_path` head the object
+/// for its size and then read that range, and `Branches::get` and
+/// `Tags::get` head it once more for existence: three requests, and a
+/// rewrite landing between the size and the range serves a prefix of the
+/// new object (the torn read). One GET returns one whole object version.
+/// Every exact ref read of this module goes through here; each caller maps
+/// a miss and a decode failure in its own terms. Revisit at the Lance bump
+/// whose `from_path` reads a ref in one `get`.
+async fn get_ref_object(
+    store: &lance::io::ObjectStore,
+    path: &object_store::path::Path,
+) -> lance::Result<Option<bytes::Bytes>> {
+    let bytes = match store.inner.get(path).await {
+        Ok(object) => object.bytes().await,
+        Err(error) => Err(error),
+    };
+    match bytes {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(error) => Err(lance::Error::from(error)),
+    }
+}
+
+/// Read one branch ref object through [`get_ref_object`]; an absent ref is
+/// Lance's `NotFound`, which the retry boundary above treats as a raced
+/// delete. A ref written before identifiers existed falls back to Lance's
+/// reader, which derives its private synthetic identifier.
 pub(crate) async fn read_ref_contents(
     store: &lance::io::ObjectStore,
     path: &object_store::path::Path,
     name: &str,
 ) -> lance::Result<BranchContents> {
-    let bytes = store
-        .inner
-        .get(path)
-        .await
-        .map_err(lance::Error::from)?
-        .bytes()
-        .await
-        .map_err(lance::Error::from)?;
+    let bytes = get_ref_object(store, path)
+        .await?
+        .ok_or_else(|| lance::Error::not_found(path.to_string()))?;
     let contents: BranchContents = serde_json::from_slice(&bytes)
         .map_err(|error| lance::Error::corrupt_file(path.clone(), error.to_string()))?;
     if contents.identifier == BranchIdentifier::missing_identifier_sentinel() {
@@ -139,25 +156,17 @@ pub async fn list_native_tag_names(dataset: &Dataset) -> lance::Result<Vec<Strin
     Ok(names)
 }
 
-/// One native tag of `dataset` by name in a single whole-object GET, as
-/// [`read_ref_contents`] reads a branch ref; `None` when the tag is absent,
-/// since a listing or a create's readback races a release. Lance's
-/// `Tags::get` sends an exists HEAD, a size HEAD and a ranged GET, and a
-/// `Tags::update` landing between the size and the range serves a prefix of
-/// the rewritten object; one GET returns one whole version.
+/// One native tag of `dataset` by name in a single whole-object GET
+/// ([`get_ref_object`]) instead of `Tags::get`'s exists HEAD, size HEAD and
+/// ranged GET; `None` when the tag is absent, since a listing or a create's
+/// readback races a release.
 pub async fn read_native_tag(dataset: &Dataset, name: &str) -> lance::Result<Option<TagContents>> {
     check_valid_tag(name)?;
     let root = dataset.branch_location().find_main()?;
     let store = dataset.object_store(None).await?;
     let path = tag_path(&root.path, name);
-    let bytes = match store.inner.get(&path).await {
-        Ok(result) => result.bytes().await,
-        Err(error) => Err(error),
-    };
-    let bytes = match bytes {
-        Ok(bytes) => bytes,
-        Err(object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(error) => return Err(lance::Error::from(error)),
+    let Some(bytes) = get_ref_object(&store, &path).await? else {
+        return Ok(None);
     };
     serde_json::from_slice(&bytes)
         .map(Some)
@@ -428,13 +437,11 @@ pub async fn archived_manifest_branch(
         .object_store(None)
         .await
         .map_err(OmniError::storage)?;
-    let bytes = match store.inner.get(&path).await {
-        Ok(object) => object
-            .bytes()
-            .await
-            .map_err(|error| OmniError::storage(error.into()))?,
-        Err(object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(error) => return Err(OmniError::storage(error.into())),
+    let Some(bytes) = get_ref_object(&store, &path)
+        .await
+        .map_err(OmniError::storage)?
+    else {
+        return Ok(None);
     };
     let contents: BranchContents = serde_json::from_slice(&bytes).map_err(|error| {
         OmniError::manifest_conflict(format!(

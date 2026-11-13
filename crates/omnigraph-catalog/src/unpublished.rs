@@ -21,6 +21,7 @@ pub use omnigraph_core::branch_names::{
     UNPUBLISHED_TAG_PREFIX, is_unpublished_tag, unpublished_tag_commit_id,
 };
 
+use crate::branch_control::{list_native_tag_names, read_native_tag};
 use crate::commit_graph::{CommitGraph, GraphCommit, HistoryCache};
 use crate::error::{OmniError, Result};
 use crate::history::HistoryRecord;
@@ -28,9 +29,7 @@ use crate::migrations::{read_stamp, require_unpublished_commits};
 use crate::publisher::{
     CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition,
 };
-use crate::retention::{
-    ManifestTagInventory, list_native_tag_names, read_native_tag, release_merge_input_tags,
-};
+use crate::retention::{ManifestTagInventory, release_merge_input_tags};
 use crate::seams::{decide_seam, fail};
 use crate::state::{
     BranchRecords, GraphLineageRow, TablePin, TableRow, TableState, read_manifest_rows_projected,
@@ -624,7 +623,10 @@ impl ManifestCoordinator {
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
         let name = unpublished_tag_name(graph_commit_id);
-        let Some(tag) = read_native_tag(&main, &name).await? else {
+        let Some(tag) = read_native_tag(&main, &name)
+            .await
+            .map_err(OmniError::storage)?
+        else {
             return Ok(None);
         };
         Self::unpublished_from_tag(root_uri, &main, &name, &tag)
@@ -702,13 +704,17 @@ impl ManifestCoordinator {
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
         let names: Vec<String> = list_native_tag_names(&main)
-            .await?
+            .await
+            .map_err(OmniError::storage)?
             .into_iter()
             .filter(|name| is_unpublished_tag(name))
             .collect();
         let mut proposals = Vec::new();
         for name in &names {
-            let Some(tag) = read_native_tag(&main, name).await? else {
+            let Some(tag) = read_native_tag(&main, name)
+                .await
+                .map_err(OmniError::storage)?
+            else {
                 continue;
             };
             let proposal = Self::unpublished_from_tag(root_uri, &main, name, &tag).await?;
@@ -833,7 +839,7 @@ impl ManifestCoordinator {
         fail(&DROP_POST_INPUTS_PRE_TAG)?;
         let name = candidate.tag_name();
         release_unpublished_tag(&main, &name).await?;
-        match crate::branch_control::read_native_tag(&main, &name).await {
+        match read_native_tag(&main, &name).await {
             Ok(Some(_)) => Err(OmniError::manifest_publish_in_doubt(
                 &candidate.property.graph_commit_id,
                 format!(
