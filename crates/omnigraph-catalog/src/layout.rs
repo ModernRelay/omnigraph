@@ -85,6 +85,59 @@ pub async fn open_manifest_dataset_with_session(
     }
 }
 
+/// Open one manifest branch at a `version` the caller already knows,
+/// resolving only that version. Main opens at the version directly; a named
+/// branch is resolved to its native ref from main as
+/// [`open_manifest_dataset_with_session`] does, then checked out at the
+/// version, never at its latest first. Lance's checkout still refuses a
+/// manifest that belongs to another branch.
+pub async fn open_manifest_dataset_at_with_session(
+    root_uri: &str,
+    branch: Option<&str>,
+    version: u64,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
+    let Some(branch) = branch.filter(|branch| *branch != "main") else {
+        return open_main_manifest_at(root_uri, version, control_session).await;
+    };
+    let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
+    let native = resolve_native_manifest_branch(&main, branch).await?;
+    main.checkout_version((native.as_str(), version))
+        .await
+        .map_err(|error| branch_ref_error(error, branch))
+}
+
+/// [`open_manifest_dataset_at_with_session`] for a caller that already holds
+/// the branch's NATIVE ref name, as [`open_manifest_dataset_native_with_session`].
+pub async fn open_manifest_dataset_native_at_with_session(
+    root_uri: &str,
+    native: Option<&str>,
+    version: u64,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
+    let Some(native) = native.filter(|native| *native != "main") else {
+        return open_main_manifest_at(root_uri, version, control_session).await;
+    };
+    let main = open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
+    main.checkout_version((native, version))
+        .await
+        .map_err(|error| branch_ref_error(error, crate::branch_names::logical_branch_name(native)))
+}
+
+async fn open_main_manifest_at(
+    root_uri: &str,
+    version: u64,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
+    crate::instrumentation::open_dataset_at_version(
+        &manifest_uri(root_uri.trim_end_matches('/')),
+        version,
+        Some(control_session),
+        crate::instrumentation::manifest_wrapper(),
+    )
+    .await
+}
+
 /// Open one manifest branch by its NATIVE ref name, skipping resolution.
 /// For callers that already hold a fresh listing (branch-delete's per-branch
 /// dependency probe) and must not pay another per-branch listing.

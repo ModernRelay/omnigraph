@@ -2164,6 +2164,31 @@ pub async fn open_dataset(
     Ok(dataset)
 }
 
+/// [`open_dataset`] at exactly `version`, resolving only that version (no
+/// listing of `_versions/` for the latest), with every Lance failure reported
+/// as the storage error it is. Unlike `open_dataset(.., At(version), ..)`, a
+/// missing version or dataset is not classified as reclaimed history: for a
+/// control dataset such as `__manifest` the caller already holds the version
+/// from a read, so a miss keeps the classification a latest open followed by
+/// `checkout_version` gives it.
+pub async fn open_dataset_at_version(
+    uri: &str,
+    version: u64,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    let builder = dataset_builder(uri, VersionResolution::At(version), session, &wrapper).await?;
+    let dataset = builder.load().await.map_err(OmniError::storage)?;
+    if let Some(wrapper) = &wrapper {
+        let store = dataset
+            .object_store(None)
+            .await
+            .map_err(OmniError::storage)?;
+        record_probed_store(wrapper, store);
+    }
+    Ok(dataset)
+}
+
 /// [`open_dataset`] at the latest version of a dataset that may not exist:
 /// `None` when Lance finds no dataset at `uri`, every other failure as it is.
 pub async fn open_dataset_if_present(
