@@ -797,7 +797,7 @@ mod tests {
     /// retries, as the environment path does; only its conditional and
     /// mutable requests are single-attempt.
     #[tokio::test]
-    async fn scoped_captured_s3_binding_retries_reads() {
+    async fn scoped_captured_s3_binding_retries_reads_issue_1386() {
         const MAX_RETRIES: usize = 1;
         let (endpoint, server) = spawn_counting_status_server(503, MAX_RETRIES + 1);
         let mut binding = CapturedStorageBinding::capture(
