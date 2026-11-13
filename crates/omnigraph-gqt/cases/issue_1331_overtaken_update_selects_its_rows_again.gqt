@@ -20,8 +20,8 @@ node Person {
 {"type":"Person","data":{"name":"bob","age":31}}
 
 --- concurrent
-u1: query bump_thirty() { update Person set { age: 99 } where age = 30 }
-u2: query age_alice() { update Person set { age: 40 } where name = "alice" }
+u1: query bump_thirty() { match { $x: Person } where $x.age = 30  update $x set { age: 99 } }
+u2: query age_alice() { match { $x: Person } where $x.name = "alice"  update $x set { age: 40 } }
 order: u1 park put nodes/, u2, u1 put nodes/, u1
 --- expect
 u1: ok
