@@ -771,6 +771,10 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    static COMPACTION_TASK_PROBES: CompactionTaskProbes;
+}
+
+tokio::task_local! {
     static EXTERNAL_PAYLOAD_READ_STALL: ();
 }
 
@@ -981,6 +985,48 @@ pub async fn enter_stage_write_probe() -> Option<StageWriteProbeGuard> {
         state: state.clone(),
     };
     Some(guard)
+}
+
+/// The same rendezvous probe around each compaction task one table's rewrite
+/// executes (#1384): how many of a table's tasks are inside Lance's
+/// `CompactionTask::execute` at once.
+#[derive(Clone)]
+pub struct CompactionTaskProbes(StageWriteProbes);
+
+impl CompactionTaskProbes {
+    /// Create a probe that releases each group of compaction tasks after
+    /// `release_after` of them have entered.
+    pub fn rendezvous(release_after: usize) -> Self {
+        Self(StageWriteProbes::rendezvous(release_after))
+    }
+
+    /// Number of compaction tasks that entered the probe.
+    pub fn entered(&self) -> u64 {
+        self.0.entered()
+    }
+
+    /// Maximum compaction tasks simultaneously inside the probe.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.0.peak_in_flight()
+    }
+}
+
+/// Run `fut` with the compaction-task probe installed.
+pub async fn with_compaction_task_probes<F>(probes: CompactionTaskProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    COMPACTION_TASK_PROBES.scope(probes, fut).await
+}
+
+pub async fn enter_compaction_task_probe() -> Option<StageWriteProbeGuard> {
+    let probes = COMPACTION_TASK_PROBES.try_with(Clone::clone).ok()?;
+    let state = probes.0.state;
+    state.entered.fetch_add(1, Ordering::Relaxed);
+    state.rendezvous.wait().await;
+    let active = state.active.fetch_add(1, Ordering::Relaxed) + 1;
+    state.peak.fetch_max(active, Ordering::Relaxed);
+    Some(StageWriteProbeGuard { state })
 }
 
 pub fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {

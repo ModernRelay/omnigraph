@@ -4008,3 +4008,60 @@ async fn segments_of_one_btree_cover_together_issue_1298() {
             .unwrap()
     );
 }
+
+/// #1384: a table's compaction tasks run at once, as Lance's own
+/// `compact_files` runs them, instead of one after another. Each task waits
+/// at a two-party rendezvous inside its execution, so tasks that never
+/// overlap time out instead of passing on equal results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
+    use crate::instrumentation::{CompactionTaskProbes, with_compaction_task_probes};
+    use lance::dataset::optimize::CompactionOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let mut ds = TableStore::write_dataset(&uri, person_batch(&[("p0", Some(0))]))
+        .await
+        .unwrap();
+    for id in 1..4 {
+        lance_append_inline_local(&mut ds, person_batch(&[(&format!("p{id}"), Some(id))])).await;
+    }
+    assert_eq!(ds.get_fragments().len(), 4);
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    // Two rows per output fragment: Lance plans two tasks of two fragments.
+    let options = CompactionOptions {
+        target_rows_per_fragment: 2,
+        ..CompactionOptions::default()
+    };
+    let plan = TableStore::plan_table_compaction(&ds, &options)
+        .await
+        .unwrap();
+    assert_eq!(plan.num_tasks(), 2, "the layout plans two tasks");
+
+    let probes = CompactionTaskProbes::rendezvous(2);
+    let staged = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        with_compaction_task_probes(probes.clone(), store.stage_compaction(&ds, &options)),
+    )
+    .await
+    .expect("a table's two compaction tasks never ran at the same time")
+    .unwrap()
+    .expect("the plan has work");
+    assert_eq!(probes.entered(), 2);
+    assert_eq!(probes.peak_in_flight(), 2);
+
+    // Fragment ids follow task order, as when the tasks ran one by one.
+    let Operation::Rewrite { groups, .. } = &staged.staged.transaction.operation else {
+        panic!("compaction stages a Rewrite");
+    };
+    let old = groups
+        .iter()
+        .map(|group| group.old_fragments.iter().map(|f| f.id).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let new = groups
+        .iter()
+        .map(|group| group.new_fragments.iter().map(|f| f.id).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(old, vec![vec![0, 1], vec![2, 3]]);
+    assert_eq!(new, vec![vec![4], vec![5]]);
+}

@@ -5022,6 +5022,7 @@ impl TableStore {
             if let (true, Some(rows)) = (has_blob_columns, task.options.batch_size) {
                 crate::instrumentation::record_compaction_blob_batch(rows);
             }
+            let _probe = crate::instrumentation::enter_compaction_task_probe().await;
             results.push(task.execute(ds).await.map_err(OmniError::storage)?);
         }
         if results.iter().any(|result| result.row_addrs.is_some()) {
