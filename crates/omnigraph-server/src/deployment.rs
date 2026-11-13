@@ -439,7 +439,7 @@ pub(crate) async fn plan(
         (status = 403, body = crate::api::ErrorOutput), (status = 409, description = "Conflict (code `conflict`), including a cluster control object whose stored text is corrupt: a catalog payload that does not match its recorded digest, or a state file that is not valid cluster state; restore the object from a trusted copy. Its bytes failing to decode as text answer 500 instead", body = crate::api::ErrorOutput),
         (status = 413, body = crate::api::ErrorOutput), (status = 415, body = crate::api::ErrorOutput),
         (status = 500, description = "Internal failure (code `internal`), or unsettled deployment completion (code `outcome_unknown`); reconcile the original deployment identity before submitting another deployment. Also, before any effect, a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read, such as bytes that are not text (`effects: none`)", body = crate::api::ErrorOutput),
-        (status = 503, body = crate::api::ErrorOutput)),
+        (status = 503, description = "Nothing changed: before any effect, a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry)", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn apply(

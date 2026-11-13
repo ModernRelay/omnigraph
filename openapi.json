@@ -708,7 +708,7 @@
             }
           },
           "503": {
-            "description": "; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "Nothing changed: before any effect, a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11016,7 +11016,7 @@
             }
           },
           "409": {
-            "description": "The same id with a different request (`[operation_request_mismatch]`), an id at or before the eviction mark (`[operation_id_expired]`), an outstanding deployment, four unresolved publications, or a record from another ledger (`[operation_record_foreign]`)",
+            "description": "Conflict (code `conflict`): the same id with a different request (`[operation_request_mismatch]`), an id at or before the eviction mark (`[operation_id_expired]`), an outstanding deployment, four unresolved publications, a record from another ledger (`[operation_record_foreign]`), or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11349,7 +11349,7 @@
             }
           },
           "409": {
-            "description": "A record from another ledger at this root, or the record changed during resolution",
+            "description": "Conflict (code `conflict`): a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11682,7 +11682,7 @@
             }
           },
           "409": {
-            "description": "A record from another ledger at this root, or the record changed during resolution",
+            "description": "Conflict (code `conflict`): a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
