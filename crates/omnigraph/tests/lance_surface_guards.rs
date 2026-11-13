@@ -2636,8 +2636,13 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
 // qualifies, the join is hash-partitioned and the table is the build side, so
 // every row of it is buffered however small the write. Lance runs the merge in
 // its own context with no memory pool, so `write_max_bytes` does not bound
-// that. Both halves ride on DataFusion's defaults: a bump that moves the
-// threshold or the selection turns this red, which is the point, since the
+// that. A write past DataFusion's 1 MiB collect threshold (a keyed write
+// chunk may hold up to 32 MiB of vectors or text) is not collected: the join is
+// partitioned, and the build side follows `should_swap_join_order`, which
+// compares row counts because Lance reports no byte size for the table, so the
+// write must still build. Both halves ride on DataFusion's defaults: a bump that
+// moves the thresholds or the selection, or a Lance release that starts to
+// report the table's byte size, turns this red, which is the point, since the
 // keyed write's memory follows this plan shape (invariant 11).
 #[tokio::test]
 async fn keyed_write_batch_source_is_the_merge_join_build_side_issue_1379() {
@@ -2722,6 +2727,33 @@ async fn keyed_write_batch_source_is_the_merge_join_build_side_issue_1379() {
         build_input_rows(join),
         "2",
         "the build side must hold the write's 2 rows, not the table:\n{batches}"
+    );
+
+    // A wide write: 200 new rows of about 8 KiB each, past the 1 MiB collect
+    // threshold, so the join is partitioned and the row counts pick the side.
+    const WIDE_ROWS: usize = 200;
+    let wide_ids: Vec<String> = (0..WIDE_ROWS)
+        .map(|i| format!("w{i:03}{}", "x".repeat(8 * 1024)))
+        .collect();
+    let wide = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(wide_ids)),
+            Arc::new(UInt64Array::from_iter_values(0..WIDE_ROWS as u64)),
+        ],
+    )
+    .unwrap();
+    let wide_plan = job().analyze_plan_batches(vec![wide]).await.unwrap();
+    let join = hash_join_line(&wide_plan);
+    assert!(
+        join.contains("mode=Partitioned") && join.contains("join_type=Left"),
+        "a write past the byte threshold is partitioned, and its smaller row count \
+         still makes it the build side:\n{wide_plan}"
+    );
+    assert_eq!(
+        build_input_rows(join),
+        "200",
+        "the build side must hold the wide write's 200 rows, not the table:\n{wide_plan}"
     );
 
     let reader = RecordBatchIterator::new(vec![Ok(source.clone())], schema.clone());
