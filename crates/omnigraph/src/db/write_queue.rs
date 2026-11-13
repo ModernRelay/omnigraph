@@ -1162,6 +1162,20 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
     }
 
+    /// Repro for #1369 on main: a write sent back holds its branch's writer
+    /// gates while it prepares again. A writer gate taken during that
+    /// preparation must answer, not wait on the attempt's own gate forever.
+    #[tokio::test]
+    async fn a_writer_gate_taken_while_preparing_answers_issue_1369() {
+        let qm = WriteQueueManager::new();
+        let _held = qm.acquire_branch_write_gates(None).await;
+        let again = timeout(Duration::from_secs(2), qm.acquire_branch(None)).await;
+        assert!(
+            again.is_ok(),
+            "taking the branch gate while preparing under it waited on its own gate"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn real_and_symlinked_local_roots_share_manager_before_init() {
