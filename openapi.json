@@ -232,6 +232,27 @@
               }
             }
           },
+          "409": {
+            "description": "Conflict (code `conflict`), for example a cluster control object whose stored text is corrupt: an applied policy payload that does not match its recorded digest, or a state file that is not valid cluster state; restore the object from a trusted copy. Its bytes failing to decode as text answer 500 instead",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "412": {
             "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
@@ -281,7 +302,7 @@
             }
           },
           "500": {
-            "description": "Internal failure (code `internal`) while evaluating deployment access",
+            "description": "Internal failure (code `internal`) while evaluating deployment access, or a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read, such as bytes that are not text (`effects: none`)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -302,7 +323,7 @@
             }
           },
           "503": {
-            "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline. Also a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -555,7 +576,7 @@
             }
           },
           "409": {
-            "description": "",
+            "description": "Conflict (code `conflict`), including a cluster control object whose stored text is corrupt: a catalog payload that does not match its recorded digest, or a state file that is not valid cluster state; restore the object from a trusted copy. Its bytes failing to decode as text answer 500 instead",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -666,7 +687,7 @@
             }
           },
           "500": {
-            "description": "Internal failure (code `internal`), or unsettled deployment completion (code `outcome_unknown`); reconcile the original deployment identity before submitting another deployment",
+            "description": "Internal failure (code `internal`), or unsettled deployment completion (code `outcome_unknown`); reconcile the original deployment identity before submitting another deployment. Also, before any effect, a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read, such as bytes that are not text (`effects: none`)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -687,7 +708,7 @@
             }
           },
           "503": {
-            "description": "; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "Nothing changed: before any effect, a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -898,6 +919,27 @@
               }
             }
           },
+          "409": {
+            "description": "Conflict (code `conflict`), for example a cluster control object whose stored text is corrupt: an applied policy payload that does not match its recorded digest, or a state file that is not valid cluster state; restore the object from a trusted copy. Its bytes failing to decode as text answer 500 instead",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "412": {
             "description": "actor_mismatch when Omnigraph-If-Actor names another actor than the credential resolves to",
             "headers": {
@@ -946,8 +988,29 @@
               }
             }
           },
+          "500": {
+            "description": "Internal failure (code `internal`), or a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read, such as bytes that are not text (`effects: none`)",
+            "headers": {
+              "Omnigraph-Http-Api": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "0.14"
+                  ]
+                },
+                "description": "Supported OmniGraph HTTP API contract."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
           "503": {
-            "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline. Also a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1181,7 +1244,7 @@
             }
           },
           "409": {
-            "description": "",
+            "description": "Conflict (code `conflict`), including a cluster control object whose stored text is corrupt: a catalog payload that does not match its recorded digest, or a state file that is not valid cluster state; restore the object from a trusted copy. Its bytes failing to decode as text answer 500 instead",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1292,7 +1355,7 @@
             }
           },
           "500": {
-            "description": "Internal failure (code `internal`) while evaluating deployment access or planning",
+            "description": "Internal failure (code `internal`) while evaluating deployment access or planning, or a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read, such as bytes that are not text (`effects: none`)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -1313,7 +1376,7 @@
             }
           },
           "503": {
-            "description": "graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "Nothing was planned: a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -10953,7 +11016,7 @@
             }
           },
           "409": {
-            "description": "The same id with a different request (`[operation_request_mismatch]`), an id at or before the eviction mark (`[operation_id_expired]`), an outstanding deployment, four unresolved publications, or a record from another ledger (`[operation_record_foreign]`)",
+            "description": "Conflict (code `conflict`): the same id with a different request (`[operation_request_mismatch]`), an id at or before the eviction mark (`[operation_id_expired]`), an outstanding deployment, four unresolved publications, a record from another ledger (`[operation_record_foreign]`), or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11043,7 +11106,7 @@
             }
           },
           "500": {
-            "description": "Internal failure (code `internal`), or a record write with no definite answer (code `outcome_unknown`); look the operation up by its id",
+            "description": "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing was accepted), or a record write with no definite answer (code `outcome_unknown`); look the operation up by its id",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11064,7 +11127,7 @@
             }
           },
           "503": {
-            "description": "The routes are not enabled, admission is closed, or the operation record write was refused and nothing was accepted (a refusal naming an earlier request of unknown outcome clears once a read sees the record change, or, for an unconditional write or a create whose record never appeared, when the server restarts); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "The routes are not enabled, admission is closed, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or the operation record write was refused; nothing was accepted (a refusal naming an earlier request of unknown outcome clears once a read sees the record change, or, for an unconditional write or a create whose record never appeared, when the server restarts); graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11286,7 +11349,7 @@
             }
           },
           "409": {
-            "description": "A record from another ledger at this root, or the record changed during resolution",
+            "description": "Conflict (code `conflict`): a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11355,7 +11418,7 @@
             }
           },
           "500": {
-            "description": "Internal failure (code `internal`), or a resolution write with no definite answer (code `outcome_unknown`); retry the lookup",
+            "description": "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing changed), or a resolution write with no definite answer (code `outcome_unknown`); retry the lookup",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11376,7 +11439,7 @@
             }
           },
           "503": {
-            "description": "The routes are not enabled; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "The routes are not enabled, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or a record write was refused; nothing changed, retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11619,7 +11682,7 @@
             }
           },
           "409": {
-            "description": "A record from another ledger at this root, or the record changed during resolution",
+            "description": "Conflict (code `conflict`): a record from another ledger at this root, the record changed during resolution, or a state file or operation record whose stored text is corrupt (`[invalid_state_json]`, `[operation_record_invalid]`; bytes that are not text answer 500)",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11688,7 +11751,7 @@
             }
           },
           "500": {
-            "description": "Internal failure (code `internal`), or a resolution write with no definite answer (code `outcome_unknown`); look the operation up by its id",
+            "description": "Internal failure (code `internal`), including a storage read of the cluster state, its lock or the operation record that fails the same way on every read (nothing changed), or a resolution write with no definite answer (code `outcome_unknown`); look the operation up by its id",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
@@ -11709,7 +11772,7 @@
             }
           },
           "503": {
-            "description": "The routes are not enabled; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
+            "description": "The routes are not enabled, a storage read of the cluster state, its lock or the operation record failed temporarily or for an unknown reason, or a record write was refused; nothing changed, retry; graph_unavailable for a known graph that is not served, or service_unavailable when server operation admission is closed; honor Retry-After, and reconcile any earlier write before retrying",
             "headers": {
               "Omnigraph-Http-Api": {
                 "schema": {
