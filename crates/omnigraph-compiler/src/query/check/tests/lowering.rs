@@ -38,8 +38,9 @@ struct Row {
 const B_IN_PROGRESS: &[&str] = &[
     "edge binding in a read",
     "a node an optional introduces returned whole",
+    "a union arm returning a value",
+    "a union whose arms read the enclosing scope",
     "a declared read's call",
-    "union",
     "distance",
     "limit over a parameter",
 ];
@@ -121,9 +122,18 @@ const CLOSURE: &[Row] = &[
                  query q() { match { from adults() } return { $p.name } }",
                 Refused("B"),
             ),
-            // "union"
             (
                 "query q() { match { from union({ match { $p: Person } return { $p } }, { match { $q: Person } return { $q as p } }) } return { $p.name } }",
+                Lowers,
+            ),
+            // "a union arm returning a value"
+            (
+                "query q() { match { from union({ match { $p: Person } return { $p, 1 as d } }, { match { $q: Person } return { $q as p, 2 as d } }) } return { $p.name, $d } }",
+                Refused("B"),
+            ),
+            // "a union whose arms read the enclosing scope"
+            (
+                "query q() { match { $c: Company, from union({ match { $p: Person, $p worksAt $c } return { $p } }, { match { $q: Person } return { $q as p } }) } return { $p.name } }",
                 Refused("B"),
             ),
             (

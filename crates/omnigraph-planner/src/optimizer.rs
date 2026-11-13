@@ -332,6 +332,7 @@ pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
                 }
                 // An `optional`'s names are in scope after it.
                 PatternStep::Optional { inner, .. } => bindings(inner, out),
+                PatternStep::Union { arms, .. } => arms.iter().for_each(|arm| bindings(arm, out)),
                 PatternStep::AntiJoin { .. }
                 | PatternStep::Filter(_)
                 | PatternStep::Rank { .. } => {}
@@ -415,6 +416,13 @@ pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
                     let mut inner_types = types.clone();
                     bindings(inner, &mut inner_types);
                     filter_calls(inner, &inner_types, out);
+                }
+                PatternStep::Union { arms, .. } => {
+                    for arm in arms {
+                        let mut arm_types = HashMap::new();
+                        bindings(arm, &mut arm_types);
+                        filter_calls(arm, &arm_types, out);
+                    }
                 }
             }
         }
@@ -810,6 +818,40 @@ fn resolve_pipeline(
                     },
                     schema,
                 )
+            }
+            PatternStep::Union { arms, bindings } => {
+                let mut folded: Option<LogicalId> = None;
+                for arm in arms {
+                    let arm = resolve_pipeline(plan, arm, source, next_binding, None)?;
+                    folded = Some(match folded {
+                        None => arm,
+                        Some(left) => {
+                            let schema = schema_of(plan, left)?;
+                            plan.add(
+                                LogicalNode::Union {
+                                    left,
+                                    right: arm,
+                                    bindings: bindings.clone(),
+                                },
+                                schema,
+                            )
+                        }
+                    });
+                }
+                let union =
+                    folded.ok_or_else(|| PlanError::Internal("a union has no arm".to_string()))?;
+                match current {
+                    None => union,
+                    Some(left) => {
+                        let joined = join_schema(
+                            &schema_of(plan, left)?,
+                            None,
+                            &schema_of(plan, union)?,
+                            None,
+                        );
+                        plan.add(LogicalNode::CrossJoin { left, right: union }, joined)
+                    }
+                }
             }
             PatternStep::Optional { outer_var, inner } => {
                 let input = bound(current, "optional")?;
@@ -2006,6 +2048,13 @@ fn place_query_filters(
                     scopes.push(*inner);
                     stack.push(*input);
                 }
+                // Each arm of a union binds the union's names: a filter
+                // written after it stays above it, and each arm's own
+                // filters are its own scope's.
+                Some(LogicalNode::Union { left, right, .. }) => {
+                    scopes.push(*left);
+                    scopes.push(*right);
+                }
                 // A window is a cut: no filter written after it moves below
                 // it, where it would decide which targets the window selects
                 // (law 2). The window's population is a scope of its own.
@@ -2550,6 +2599,11 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             inner: _,
             outer_var: _,
         }
+        | LogicalNode::Union {
+            left: _,
+            right: _,
+            bindings: _,
+        }
         | LogicalNode::Join {
             left: _,
             right: _,
@@ -2635,10 +2689,17 @@ fn materialize_returns_late(
         return Ok(false);
     };
     let return_exprs = return_exprs.clone();
-    if physical
-        .live()
-        .any(|(_, node)| matches!(node, PhysicalNode::Aggregate { .. }))
-    {
+    // A union's arms bind one name through several scans, and an optional
+    // leaves its names' row addresses null on the rows it kept without a
+    // match: neither hydrates a return column by one binding's address.
+    if physical.live().any(|(_, node)| {
+        matches!(
+            node,
+            PhysicalNode::Aggregate { .. }
+                | PhysicalNode::Union { .. }
+                | PhysicalNode::OptionalJoin { .. }
+        )
+    }) {
         return Ok(false);
     }
     let fused = physical
@@ -3510,6 +3571,19 @@ impl Lowering<'_> {
                     predicate: predicate.clone(),
                     aggregate: crate::plan_block_aggregate(&predicate.left)?,
                     strategy,
+                }))
+            }
+            LogicalNode::Union {
+                left,
+                right,
+                bindings,
+            } => {
+                let left = self.lower(*left)?;
+                let right = self.lower(*right)?;
+                Ok(self.physical.add(PhysicalNode::Union {
+                    left,
+                    right,
+                    bindings: bindings.clone(),
                 }))
             }
             LogicalNode::OptionalJoin {
@@ -4794,7 +4868,8 @@ fn derive_properties(
             PhysicalNode::Filter { input, .. }
             | PhysicalNode::Expand { input, .. }
             | PhysicalNode::AntiJoin { input, .. }
-            | PhysicalNode::OptionalJoin { input, .. } => {
+            | PhysicalNode::OptionalJoin { input, .. }
+            | PhysicalNode::Union { left: input, .. } => {
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),

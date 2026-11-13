@@ -42,7 +42,8 @@ use super::operators::{
     ExpandExec, ExpandExecution, ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec,
     LanceFragmentSink, LimitExec, LookupSpec, MetadataCountExec, OptionalJoinExec,
     OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec,
-    ScanSource, SortExec, SortKey, TargetCutExec, ValidateExec, fresh_tag_column, tagged_schema,
+    ScanSource, SortExec, SortKey, TargetCutExec, UnionExec, ValidateExec, fresh_tag_column,
+    tagged_schema,
 };
 use super::*;
 use crate::loader::LoadMode;
@@ -891,6 +892,11 @@ impl Lower for Walk<'_, '_> {
             Arc::clone(self.lowering.graph_index),
         );
         self.built(id, mask)
+    }
+
+    fn union(&mut self, id: NodeId, bindings: &[String], left: Plan, right: Plan) -> Lowers<Plan> {
+        let union = UnionExec::try_new(left, right, bindings.to_vec())?;
+        self.built(id, union)
     }
 
     fn optional_join(

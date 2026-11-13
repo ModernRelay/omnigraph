@@ -213,6 +213,26 @@ references bind their names and its returned values read by name; a name it
 binds without returning stays its own variable. An inline read with an
 aggregate, `distinct`, `order` or `limit` is refused (`T86`).
 
+`from union(a, b, …)` joins the bag union of its arms, each an inline read:
+every row of every arm, duplicates kept (`return distinct` removes them). The
+arms return the same number of columns, matched by position and named by the
+first arm, so a later arm renames its column with `as`:
+
+```gq
+query older_or_known() {
+  match {
+    from union(
+      { match { $p: Person } where $p.age > 30 return { $p } },
+      { match { $a: Person, $q: Person, $a knows $q } return { $q as p } }),
+  }
+  return { $p.handle }
+}
+```
+
+In this release every column of a union is a node of one type in every
+arm, and no arm reads a name of the enclosing scope; an arm returning a value
+or an edge, or reading an outer name, is refused (`T86`).
+
 Comparison operators are `=`, `!=`, `<`, `<=`, `>`, and `>=`.
 
 See [Query language](index.md) for expressions, projection and ordering.

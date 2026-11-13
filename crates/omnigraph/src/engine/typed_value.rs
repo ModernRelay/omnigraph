@@ -790,7 +790,9 @@ pub(super) fn validate_plan_values(
                     pending.push(conjunct);
                     pending.extend(residual);
                 }
-                PhysicalNode::AntiJoin { .. } | PhysicalNode::OptionalJoin { .. } => {}
+                PhysicalNode::AntiJoin { .. }
+                | PhysicalNode::OptionalJoin { .. }
+                | PhysicalNode::Union { .. } => {}
                 PhysicalNode::RankFuse { k, .. } => pending.extend(k),
                 PhysicalNode::Sort { order_by, .. } => {
                     pending.extend(order_by.iter().map(|ordering| &ordering.expr))

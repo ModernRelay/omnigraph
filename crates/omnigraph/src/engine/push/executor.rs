@@ -169,6 +169,7 @@ fn require_push_node(node: &PhysicalNode) -> Result<()> {
         | PhysicalNode::Expand { .. }
         | PhysicalNode::AntiJoin { .. }
         | PhysicalNode::OptionalJoin { .. }
+        | PhysicalNode::Union { .. }
         | PhysicalNode::OuterReference { .. }
         | PhysicalNode::RankFuse { .. }
         | PhysicalNode::Projection { .. }

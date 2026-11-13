@@ -88,6 +88,11 @@ fn multi_input_samples(plan: &mut PhysicalPlan) -> Vec<PhysicalNode> {
             inner: l,
             outer_var: "o".to_string(),
         },
+        PhysicalNode::Union {
+            left: k,
+            right: l,
+            bindings: vec!["o".to_string()],
+        },
         PhysicalNode::RankFuse {
             arms: [
                 arm(leaf(plan), RankKind::Nearest),

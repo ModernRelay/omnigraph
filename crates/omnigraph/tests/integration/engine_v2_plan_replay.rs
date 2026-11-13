@@ -525,6 +525,14 @@ query sum_ages() {
     match { $p: Person }
     return { sum($p.age) as total }
 }
+query old_or_liking() {
+    match {
+        from union(
+            { match { $p: Person } where $p.age > 40 return { $p } },
+            { match { $q: Person, $d: Doc, $q likes $d } return { $q as p } }),
+    }
+    return { $p.name }
+}
 query liked_d0_or_not() {
     match { $p: Person, optional { $p likes $d where $d.title = "d0" } }
     return { $p.name, $d.title }
@@ -1672,6 +1680,52 @@ async fn an_optional_replays_and_an_edited_one_is_refused() {
     };
     assert!(
         error.to_string().contains("no optional of the plan"),
+        "{error}"
+    );
+}
+
+/// A union replays with every row of both arms, and a saved plan whose
+/// `Union` binds another name is refused at the door.
+#[tokio::test]
+async fn a_union_replays_and_an_edited_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let Replayed {
+        result,
+        rows,
+        plan,
+        envelope,
+        ..
+    } = replayed(&db, PEOPLE_QUERIES, "old_or_liking", &ParamMap::new()).await;
+    let mut names: Vec<String> = result.iter().map(|row| row["p.name"].to_string()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["\"ann\"", "\"ann\"", "\"bob\"", "\"cyd\""],
+        "{result:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["operator"] == "UnionExec" && row["status"] == "executed"),
+        "{rows:#?}"
+    );
+    let mut altered = serde_json::to_value(plan).unwrap();
+    let node = altered["body"]["plan"]["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|node| node["node"] == "Union")
+        .unwrap();
+    node["bindings"] = serde_json::json!(["q"]);
+    let error = match db
+        .replay_bound_plan("main", &with_plan(&envelope, altered))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a union over another binding replayed"),
+    };
+    assert!(
+        error.to_string().contains("no union of the plan"),
         "{error}"
     );
 }

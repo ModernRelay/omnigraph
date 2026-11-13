@@ -331,6 +331,11 @@ pub enum NodeMirror {
         inner: NodeId,
         outer_var: String,
     },
+    Union {
+        left: NodeId,
+        right: NodeId,
+        bindings: Vec<String>,
+    },
     OuterReference {
         outer_var: String,
     },
@@ -561,6 +566,15 @@ impl From<&PhysicalNode> for NodeMirror {
                 input: *input,
                 inner: *inner,
                 outer_var: outer_var.clone(),
+            },
+            PhysicalNode::Union {
+                left,
+                right,
+                bindings,
+            } => Self::Union {
+                left: *left,
+                right: *right,
+                bindings: bindings.clone(),
             },
             PhysicalNode::OuterReference { outer_var } => Self::OuterReference {
                 outer_var: outer_var.clone(),
@@ -815,6 +829,15 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 input,
                 inner,
                 outer_var,
+            },
+            NodeMirror::Union {
+                left,
+                right,
+                bindings,
+            } => Self::Union {
+                left,
+                right,
+                bindings,
             },
             NodeMirror::OuterReference { outer_var } => Self::OuterReference { outer_var },
             NodeMirror::RankFuse {

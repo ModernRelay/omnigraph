@@ -41,6 +41,7 @@ query operators() {
 {"o.name":"Filter","o.inputs":[1]}
 {"o.name":"Expand","o.inputs":[1]}
 {"o.name":"AntiJoin","o.inputs":[2]}
+{"o.name":"Union","o.inputs":[2]}
 {"o.name":"OptionalJoin","o.inputs":[2]}
 {"o.name":"OuterReference","o.inputs":[0]}
 {"o.name":"RankFuse","o.inputs":[2]}
@@ -116,6 +117,7 @@ query logical_kinds() {
 {"k.name":"Sort","k.coverage":"routable"}
 {"k.name":"TableScan","k.coverage":"routable"}
 {"k.name":"TextSearch","k.coverage":"refused_by_name"}
+{"k.name":"Union","k.coverage":"refused_by_name"}
 {"k.name":"TargetCut","k.coverage":"refused_by_name"}
 {"k.name":"Validate","k.coverage":"refused_by_name"}
 

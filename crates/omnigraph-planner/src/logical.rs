@@ -280,6 +280,7 @@ logical_kinds! {
     TableScan => "TableScan", Routable;
     TargetCut => "TargetCut", RefusedByName;
     TextSearch => "TextSearch", RefusedByName;
+    Union => "Union", RefusedByName;
     Validate => "Validate", RefusedByName;
 }
 
@@ -615,6 +616,14 @@ pub enum LogicalNode {
         inner: LogicalId,
         outer_var: String,
     },
+    /// `from union(a, b)`: every row of `left` and every row of `right`, a
+    /// bag; each arm binds the reference columns `bindings`, and only their
+    /// columns leave.
+    Union {
+        left: LogicalId,
+        right: LogicalId,
+        bindings: Vec<String>,
+    },
     /// The leaf of a `not { … }` inner tree: the enclosing pipeline's rows,
     /// correlated on `outer_var`. A node of its own, not the outer node, so
     /// the inner tree stays a tree and no pass folds its filter outward.
@@ -719,6 +728,7 @@ impl LogicalNode {
             Self::Expand { .. } => LogicalKind::Expand,
             Self::AntiJoin { .. } => LogicalKind::AntiJoin,
             Self::OptionalJoin { .. } => LogicalKind::OptionalJoin,
+            Self::Union { .. } => LogicalKind::Union,
             Self::OuterReference { .. } => LogicalKind::OuterReference,
             Self::Nearest { .. } => LogicalKind::Nearest,
             Self::TextSearch { .. } => LogicalKind::TextSearch,
@@ -744,7 +754,9 @@ impl LogicalNode {
             | Self::Aggregate { input, .. }
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![*input],
-            Self::Join { left, right, .. } | Self::CrossJoin { left, right } => vec![*left, *right],
+            Self::Join { left, right, .. }
+            | Self::CrossJoin { left, right }
+            | Self::Union { left, right, .. } => vec![*left, *right],
             Self::AntiJoin { input, inner, .. } | Self::OptionalJoin { input, inner, .. } => {
                 vec![*input, *inner]
             }
@@ -778,7 +790,9 @@ impl LogicalNode {
             | Self::Aggregate { input, .. }
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![input],
-            Self::Join { left, right, .. } | Self::CrossJoin { left, right } => vec![left, right],
+            Self::Join { left, right, .. }
+            | Self::CrossJoin { left, right }
+            | Self::Union { left, right, .. } => vec![left, right],
             Self::AntiJoin { input, inner, .. } | Self::OptionalJoin { input, inner, .. } => {
                 vec![input, inner]
             }
@@ -1083,6 +1097,10 @@ impl LogicalPlan {
                 "predicate": predicate.to_string(),
                 "typed_left": crate::typed::block(&predicate.left),
                 "typed_right": crate::typed::expr(&predicate.right),
+            }),
+            LogicalNode::Union { bindings, .. } => json!({
+                "node": "Union",
+                "bindings": bindings,
             }),
             LogicalNode::OptionalJoin { outer_var, .. } => json!({
                 "node": "OptionalJoin",

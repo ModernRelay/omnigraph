@@ -93,7 +93,10 @@ named relation: `let $cs = { match { $c: Company } return { $c } }, from $cs`.
 elements; a value that can fail (arithmetic) is refused at type check
 (`T86`), so write the arithmetic where the name is read (`where`, `return`).
 `from { match … return { … } }` joins an inline read's rows; one with an
-aggregate, `distinct`, `order` or `limit` is `T86`.
+aggregate, `distinct`, `order` or `limit` is `T86`. `from union({ … }, { … })`
+joins the bag of its arms' rows, columns by position and named by the first
+arm (`return { $q as p }` in a later one); an arm returning a value or an
+edge, or reading an outer name, is `T86`.
 
 ```gq
 query recent_signals() {

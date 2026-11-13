@@ -961,6 +961,16 @@ physical_nodes! {
         strategy: AntiJoinStrategy,
     } => "AntiJoin" [input: NodeId, inner: NodeId]
         shape: PipelineShape::Breaker, sides: vec![*inner], cut: None, order: None;
+    /// `from union(a, b)`: every row of `left` then every row of `right`,
+    /// collected, each under the columns of the reference columns
+    /// `bindings`, which every arm binds; the arms' other columns stay
+    /// behind.
+    Union {
+        left: NodeId,
+        right: NodeId,
+        bindings: Vec<String>,
+    } => "Union" [left: NodeId, right: NodeId]
+        shape: PipelineShape::Breaker, sides: vec![*right], cut: None, order: None;
     /// `optional { … }` over `input`: every input row with each of its
     /// matches in the `inner` tree, whose leaf is an `OuterReference` to the
     /// input rows, and an input row with none once, every column the inner
@@ -1512,6 +1522,10 @@ impl PhysicalPlan {
                 "typed_left": crate::typed::block(&predicate.left),
                 "typed_right": crate::typed::expr(&predicate.right),
             }),
+            PhysicalNode::Union { bindings, .. } => json!({
+                "node": node.name(),
+                "bindings": bindings,
+            }),
             PhysicalNode::OptionalJoin { outer_var, .. } => json!({
                 "node": node.name(),
                 "outer_var": outer_var,
@@ -1823,6 +1837,7 @@ impl PhysicalPlan {
             Some(PhysicalNode::ContainsJoin { .. }) => "ContainsJoin(build)".to_string(),
             Some(PhysicalNode::AntiJoin { .. }) => "AntiJoin(inner)".to_string(),
             Some(PhysicalNode::OptionalJoin { .. }) => "OptionalJoin(inner)".to_string(),
+            Some(PhysicalNode::Union { .. }) => "Union(right)".to_string(),
             Some(PhysicalNode::RankFuse { .. }) => "RankFuse(secondary)".to_string(),
             Some(node) => node.name().to_string(),
             None => "tombstone".to_string(),

@@ -94,6 +94,13 @@ pub enum PatternStep {
         inner: Vec<PatternStep>,
         predicate: SubqueryPredicate,
     },
+    /// `from union(a, b, …)`: the bag union of the arms, each its own
+    /// pipeline from nothing, every arm binding the union's reference
+    /// columns, `bindings`, under the first arm's names.
+    Union {
+        arms: Vec<Vec<PatternStep>>,
+        bindings: Vec<String>,
+    },
     /// `optional { p }`: every outer row with each of its matches in
     /// `inner`, which runs over the outer rows; an outer row with none
     /// stays, the names `inner` introduces null on it.
@@ -124,6 +131,7 @@ impl ReadShape {
                 PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
                     pending.extend(inner)
                 }
+                PatternStep::Union { arms, .. } => pending.extend(arms.iter().flatten()),
                 PatternStep::NodeScan { .. }
                 | PatternStep::Filter(_)
                 | PatternStep::Rank { .. } => {}
@@ -259,6 +267,9 @@ fn physical_names(pipeline: &[PatternStep]) -> HashSet<String> {
                 names.extend(edge_binding.iter().cloned());
             }
             PatternStep::Optional { inner, .. } => names.extend(physical_names(inner)),
+            PatternStep::Union { arms, .. } => arms
+                .iter()
+                .for_each(|arm| names.extend(physical_names(arm))),
             PatternStep::Filter(_) | PatternStep::AntiJoin { .. } | PatternStep::Rank { .. } => {}
         }
     }
@@ -280,6 +291,8 @@ struct Facts {
     blocks: Vec<BlockFact>,
     /// The `optional { }` elements, in written order.
     optionals: Vec<OptionalFact>,
+    /// The `from union(…)` elements, in written order.
+    unions: Vec<UnionFact>,
     /// The names the `optional`s introduce, which an element after them may
     /// not read: the steps place an `optional` after the scope's bindings
     /// and traversals.
@@ -303,6 +316,10 @@ impl Facts {
         }
         for optional in &self.optionals {
             out.extend(optional.inner.names());
+        }
+        for union in &self.unions {
+            out.extend(union.bindings.iter().map(|(name, _)| name.clone()));
+            union.arms.iter().for_each(|arm| out.extend(arm.names()));
         }
         out.retain(|name| name != "_");
         out
@@ -360,6 +377,10 @@ impl Facts {
         for optional in &mut self.optionals {
             optional.inner.rename(renames);
         }
+        for union in &mut self.unions {
+            union.arms.iter_mut().for_each(|arm| arm.rename(renames));
+            union.bindings.iter_mut().for_each(|(name, _)| rename(name));
+        }
         self.optional_names = std::mem::take(&mut self.optional_names)
             .into_iter()
             .map(|mut name| {
@@ -378,6 +399,12 @@ impl Facts {
         }
         for block in &self.blocks {
             block.inner.optional_names_into(out);
+        }
+        for union in &self.unions {
+            union
+                .arms
+                .iter()
+                .for_each(|arm| arm.optional_names_into(out));
         }
     }
 
@@ -398,6 +425,9 @@ impl Facts {
         }
         for optional in &mut self.optionals {
             optional.inner.each_expr(f);
+        }
+        for union in &mut self.unions {
+            union.arms.iter_mut().for_each(|arm| arm.each_expr(f));
         }
     }
 
@@ -441,6 +471,14 @@ struct TraversalFact {
     min_hops: u32,
     max_hops: Option<u32>,
     edge_binding: Option<String>,
+}
+
+/// A `from union(…)`: each arm's facts, every arm binding the union's
+/// reference columns under the first arm's names, with their node types.
+#[derive(Debug)]
+struct UnionFact {
+    arms: Vec<Facts>,
+    bindings: Vec<(String, String)>,
 }
 
 /// An `optional { }`: its pattern's facts.
@@ -515,10 +553,6 @@ impl<'a> Shaper<'a> {
     /// others a `from`.
     fn unlowered_node(&self, node: &Term) -> ShapeError {
         let (what, kinds): (String, &'static [ElementKind]) = match node {
-            Term::Union { .. } => (
-                "a `Union` in a pattern (a `from` over `union`)".into(),
-                FROM,
-            ),
             Term::Call { name, .. } => (
                 format!("a declared read's call in a pattern (`{name}`)"),
                 FROM,
@@ -1356,7 +1390,7 @@ impl<'a> Shaper<'a> {
             }
             Term::Union { left, right } => match optional_parts(left, right) {
                 Some((outer, pattern)) => self.optional(outer, pattern, facts),
-                None => Err(self.unlowered_node(term)),
+                None => self.union(term, facts),
             },
             other => Err(self.unlowered_node(other)),
         }
@@ -1388,6 +1422,99 @@ impl<'a> Shaper<'a> {
                 .filter(|name| !outer_columns.contains(name) && !is_anon(name)),
         );
         facts.optionals.push(OptionalFact { inner });
+        Ok(())
+    }
+
+    /// `from union(a, b, …)`: the arms, folded from the left, each an inline
+    /// read of its own, its returned references renamed to the first arm's
+    /// column names by position and every other name it binds renamed apart.
+    fn union(&self, term: &Term, facts: &mut Facts) -> Result<(), ShapeError> {
+        let at = || Construct::Element(FROM, None);
+        let mut arms = Vec::new();
+        let mut pending = vec![term];
+        while let Some(term) = pending.pop() {
+            match term {
+                Term::Union { left, right } => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+                arm => arms.push(arm),
+            }
+        }
+        let mut columns: Vec<(String, String)> = Vec::new();
+        let mut shaped = Vec::new();
+        for (index, arm) in arms.into_iter().enumerate() {
+            let Term::Project {
+                input,
+                items,
+                keep: false,
+            } = arm
+            else {
+                return Err(self.unlowered_node(arm));
+            };
+            if !env_columns(input).is_empty() {
+                return Err(self.refuse_at("a `union` arm that reads the enclosing scope", at()));
+            }
+            let mut inner = Facts {
+                inlined: facts.inlined,
+                ..Facts::default()
+            };
+            self.facts(input, &mut inner)?;
+            let inner_lets = std::mem::take(&mut inner.lets);
+            inner.substitute(&inner_lets);
+            let mut renames: HashMap<String, String> = HashMap::new();
+            let mut exposed = HashSet::new();
+            for (position, (column, expr)) in items.iter().enumerate() {
+                let mut expr = expr.clone();
+                substitute(&mut expr, &inner_lets);
+                let IRExpr::Variable(variable, ExprType::Node { type_name }) = &expr else {
+                    return Err(self.refuse_at(
+                        "a `union` arm returning a value or an edge, not a node",
+                        at(),
+                    ));
+                };
+                if index == 0 {
+                    columns.push((column.clone(), type_name.clone()));
+                }
+                let Some((name, declared)) = columns.get(position) else {
+                    return Err(ShapeError::Internal(
+                        "a union arm has more columns than the first".to_string(),
+                    ));
+                };
+                if declared != type_name {
+                    return Err(self.refuse_at(
+                        "a `union` whose arms return one column as different node types",
+                        at(),
+                    ));
+                }
+                exposed.insert(variable.clone());
+                if variable != name {
+                    renames.insert(variable.clone(), name.clone());
+                }
+            }
+            let mut hidden: Vec<String> = inner
+                .names()
+                .into_iter()
+                .filter(|name| !exposed.contains(name) && !is_anon(name))
+                .collect();
+            hidden.sort();
+            hidden.dedup();
+            for name in hidden {
+                let fresh = format!("{FRESH_PREFIX}f{}_{name}", inner.inlined);
+                inner.inlined += 1;
+                renames.insert(name, fresh);
+            }
+            inner.rename(&renames);
+            facts.inlined = inner.inlined;
+            shaped.push(inner);
+        }
+        facts
+            .types
+            .extend(columns.iter().map(|(name, ty)| (name.clone(), ty.clone())));
+        facts.unions.push(UnionFact {
+            arms: shaped,
+            bindings: columns,
+        });
         Ok(())
     }
 
@@ -1753,6 +1880,30 @@ impl<'a> Shaper<'a> {
         outer_physical_names: &HashSet<String>,
         fresh: &mut FreshNames,
     ) -> Result<(), ShapeError> {
+        // A union is a source: its arms run from nothing, and the names it
+        // binds are bound for the elements that join it.
+        for union in &facts.unions {
+            let mut arms = Vec::with_capacity(union.arms.len());
+            for arm in &union.arms {
+                let mut steps = Vec::new();
+                self.place(
+                    arm,
+                    &[],
+                    &mut steps,
+                    &mut HashSet::new(),
+                    &HashSet::new(),
+                    fresh,
+                )?;
+                arms.push(steps);
+            }
+            let bindings: Vec<String> = union
+                .bindings
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            bound_vars.extend(bindings.iter().cloned());
+            pipeline.push(PatternStep::Union { arms, bindings });
+        }
         let bindings: Vec<&BindingFact> = facts.bindings.iter().collect();
         let traversals: Vec<&TraversalFact> = facts.traversals.iter().collect();
         let binding_set: HashSet<&str> = bindings.iter().map(|b| b.variable.as_str()).collect();
@@ -1949,6 +2100,9 @@ impl<'a> Shaper<'a> {
                 }
                 PatternStep::Optional { inner, .. } => {
                     physical_names.extend(self::physical_names(inner));
+                }
+                PatternStep::Union { bindings, .. } => {
+                    physical_names.extend(bindings.iter().cloned());
                 }
                 PatternStep::Filter(_)
                 | PatternStep::AntiJoin { .. }
@@ -2272,6 +2426,10 @@ fn rename_inner_bindings(
             PatternStep::Optional { outer_var, inner } => {
                 rename(outer_var);
                 pending.extend(inner);
+            }
+            PatternStep::Union { arms, bindings } => {
+                bindings.iter_mut().for_each(&rename);
+                pending.extend(arms.iter_mut().flatten());
             }
         }
     }

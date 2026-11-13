@@ -856,6 +856,9 @@ pub(super) fn collect_referenced_edge_names(
             PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
                 collect_referenced_edge_names(inner, out)
             }
+            PatternStep::Union { arms, .. } => arms
+                .iter()
+                .for_each(|arm| collect_referenced_edge_names(arm, out)),
             PatternStep::NodeScan { .. } | PatternStep::Filter(_) | PatternStep::Rank { .. } => {}
         }
     }

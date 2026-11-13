@@ -255,6 +255,15 @@ pub trait Lower {
         inner: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
+    /// Called with both arms lowered, the left first.
+    fn union(
+        &mut self,
+        id: NodeId,
+        bindings: &[String],
+        left: Self::Op,
+        right: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
     /// Called with the outer input and the inner tree lowered, after
     /// [`Lower::correlate_outer`].
     fn optional_join(
@@ -569,6 +578,15 @@ impl PhysicalPlan {
                 l.correlate_outer(id, outer_var, &outer)?;
                 let inner = self.lower_node(*inner, l)?;
                 l.anti_join(id, outer_var, outer, inner)
+            }
+            PhysicalNode::Union {
+                left,
+                right,
+                bindings,
+            } => {
+                let left = self.lower_node(*left, l)?;
+                let right = self.lower_node(*right, l)?;
+                l.union(id, bindings, left, right)
             }
             PhysicalNode::OptionalJoin {
                 input,

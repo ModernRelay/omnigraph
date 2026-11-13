@@ -178,6 +178,16 @@ impl Lower for Trace {
         self.call("anti_join", id, &[&outer, &inner])
     }
 
+    fn union(
+        &mut self,
+        id: NodeId,
+        _: &[String],
+        left: String,
+        right: String,
+    ) -> Result<String, PlanError> {
+        self.call("union", id, &[&left, &right])
+    }
+
     fn optional_join(
         &mut self,
         id: NodeId,

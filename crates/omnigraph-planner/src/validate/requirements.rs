@@ -133,9 +133,21 @@ fn flatten<'p>(
     steps: &'p [PatternStep],
     out: &mut Vec<&'p PatternStep>,
     optionals: &mut Vec<OptionalMatch>,
+    unions: &mut Vec<Vec<String>>,
 ) {
     for step in steps {
         match step {
+            // A union's arms each bind its names: their bindings,
+            // traversals, conjuncts and blocks are the scope's, and the plan
+            // folds the arms with one `Union` per arm after the first.
+            PatternStep::Union { arms, bindings } => {
+                for _ in 1..arms.len() {
+                    unions.push(bindings.clone());
+                }
+                for arm in arms {
+                    flatten(arm, out, optionals, unions);
+                }
+            }
             PatternStep::Optional { outer_var, inner } => {
                 let mut eligibility = Vec::new();
                 for own in inner {
@@ -150,14 +162,15 @@ fn flatten<'p>(
                         }
                         PatternStep::Rank { .. }
                         | PatternStep::AntiJoin { .. }
-                        | PatternStep::Optional { .. } => {}
+                        | PatternStep::Optional { .. }
+                        | PatternStep::Union { .. } => {}
                     }
                 }
                 optionals.push(OptionalMatch {
                     outer_var: outer_var.clone(),
                     eligibility,
                 });
-                flatten(inner, out, optionals);
+                flatten(inner, out, optionals, unions);
             }
             other => out.push(other),
         }
@@ -178,6 +191,9 @@ pub struct Requirements {
     pub(crate) blocks: Vec<Block>,
     /// The `optional`s of the top-level scope, nested ones included.
     pub(crate) optionals: Vec<OptionalMatch>,
+    /// The names every `Union` node of the plan binds: one entry per arm
+    /// after the first of each written `union`.
+    pub(crate) unions: Vec<Vec<String>>,
     pub(crate) search: Option<Search>,
     /// Every eligibility conjunct of the top-level scope (inline matches,
     /// `match` filters and the filters of a deferred traversal destination),
@@ -221,7 +237,8 @@ impl Requirements {
         let mut rank_step: Option<(&IRExpr, Option<u64>)> = None;
         let mut steps = Vec::new();
         let mut optionals = Vec::new();
-        flatten(&ir.pipeline, &mut steps, &mut optionals);
+        let mut unions = Vec::new();
+        flatten(&ir.pipeline, &mut steps, &mut optionals, &mut unions);
         for op in steps {
             budget.visit(1)?;
             match op {
@@ -293,8 +310,8 @@ impl Requirements {
                     outer_var: outer_var.clone(),
                     predicate: predicate.clone(),
                 }),
-                PatternStep::Optional { .. } => {
-                    unreachable!("flatten puts an optional's steps in its place")
+                PatternStep::Optional { .. } | PatternStep::Union { .. } => {
+                    unreachable!("flatten puts an optional's and a union's steps in their place")
                 }
             }
         }
@@ -354,6 +371,7 @@ impl Requirements {
             traversals,
             blocks,
             optionals,
+            unions,
             search,
             eligibility,
             returns: ir.return_exprs.clone(),

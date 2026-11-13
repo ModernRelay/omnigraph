@@ -286,6 +286,7 @@ impl Requirements {
         }
         let top = pipeline(plan, plan.root(), budget)?;
         self.check_optionals(plan, &top, budget)?;
+        self.check_unions(plan, &top)?;
         check_full_text_indexes(plan, input, budget)?;
         self.check_search(plan)?;
         self.check_row_cuts(plan, budget)?;
@@ -607,6 +608,42 @@ impl Requirements {
                     "predicate origin",
                     format!("the plan tests the optional's `{leaked}` outside the optional"),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The plan runs one `Union` per arm after the first of each written
+    /// `union`, each over the names the union binds.
+    fn check_unions(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
+        let mut planned: Vec<&Vec<String>> = top
+            .iter()
+            .filter_map(|id| match plan.node(*id) {
+                Some(PhysicalNode::Union { bindings, .. }) => Some(bindings),
+                _ => None,
+            })
+            .collect();
+        if planned.len() != self.unions.len() {
+            return Err(ValidationError::violated(
+                "plan shape",
+                format!(
+                    "the query's unions fold {} arms; the plan runs {} unions",
+                    self.unions.len(),
+                    planned.len()
+                ),
+            ));
+        }
+        for bindings in &self.unions {
+            match planned.iter().position(|planned| *planned == bindings) {
+                Some(index) => {
+                    planned.remove(index);
+                }
+                None => {
+                    return Err(ValidationError::violated(
+                        "binding identity",
+                        format!("no union of the plan binds {bindings:?} as the query's does"),
+                    ));
+                }
             }
         }
         Ok(())

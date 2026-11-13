@@ -1,0 +1,152 @@
+# issue: none
+# notes: `from union(a, b, …)` is the bag union of its arms (`Union`, folded
+# notes: from the left): every row of each arm, duplicates kept, its columns
+# notes: named by the first arm and matched by position. Each arm is its own
+# notes: inline read whose other names stay inside it, a `where` after the
+# notes: union filters the union's rows, and the elements after it join on
+# notes: the names it binds.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+    age: I32?
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"bob","name":"Bob","age":25}}
+{"type":"Person","data":{"handle":"cy","name":"Cy","age":41}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Company","data":{"slug":"bolt","name":"Bolt"}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"WorksAt","from":"bob","to":"bolt"}
+{"edge":"Knows","from":"ada","to":"bob"}
+{"edge":"Knows","from":"cy","to":"bob"}
+
+--- query
+query older_or_known() {
+    match {
+        from union(
+            { match { $p: Person } where $p.age > 30 return { $p } },
+            { match { $a: Person, $q: Person, $a knows $q } return { $q as p } }),
+    }
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"cy"}
+{"p.handle":"bob"}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query names_from_the_first_arm() {
+    match {
+        from union(
+            { match { $p: Person } where $p.handle = "ada" return { $p } },
+            { match { $q: Person } where $q.handle = "cy" return { $q } },
+            { match { $r: Person } where $r.handle = "ada" return { $r } }),
+    }
+    where $p.age > 30
+    return { $p.handle, $p.age }
+}
+
+--- expect unordered
+{"p.age":36,"p.handle":"ada"}
+{"p.age":41,"p.handle":"cy"}
+{"p.age":36,"p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+p.age: I32?
+
+--- query
+query employers_of_the_union() {
+    match {
+        from union(
+            { match { $p: Person } where $p.handle = "ada" return { $p } },
+            { match { $p: Person } where $p.handle = "bob" return { $p } }),
+        $p worksAt $c,
+    }
+    return { $p.handle, $c.slug }
+}
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"bolt","p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+c.slug: String
+
+--- query
+query distinct_union() {
+    match {
+        from union(
+            { match { $p: Person } where $p.age > 30 return { $p } },
+            { match { $a: Person, $q: Person, $a knows $q } return { $q as p } }),
+    }
+    return distinct { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+{"p.handle":"cy"}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query counted() {
+    match {
+        from union(
+            { match { $p: Person } return { $p } },
+            { match { $p: Person } where $p.age > 30 return { $p } }),
+    }
+    return { count($p) as n }
+}
+
+--- expect unordered
+{"n":5}
+
+--- expect shape
+n: I64
+
+--- query
+query first_two() {
+    match {
+        from union(
+            { match { $p: Person } return { $p } },
+            { match { $p: Person } where $p.age > 30 return { $p } }),
+    }
+    return { $p.handle, $p.name }
+    order { $p.handle }
+    limit 2
+}
+
+--- expect ordered
+{"p.handle":"ada","p.name":"Ada"}
+{"p.handle":"ada","p.name":"Ada"}
+
+--- expect shape
+p.handle: String
+p.name: String

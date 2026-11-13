@@ -498,6 +498,10 @@ fn estimate_rows_over(
                 .saturating_mul(estimate_rows(plan, *right, source)?),
         ),
         LogicalNode::OuterReference { .. } => outer_rows,
+        LogicalNode::Union { left, right, .. } => Some(
+            estimate_rows(plan, *left, source)?
+                .saturating_add(estimate_rows(plan, *right, source)?),
+        ),
         LogicalNode::MergeClassify { .. } => None,
         LogicalNode::CsvSource { spec } => Some(spec.estimated_rows),
         LogicalNode::DeltaSource { spec } => Some(spec.rows),
