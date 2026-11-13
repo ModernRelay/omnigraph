@@ -565,6 +565,30 @@ pub(super) fn validate_plan_values(
         /// `(binding, column)`: `F32` from Lance, `F64` for the fused sum.
         scores: HashMap<(&'a str, &'a str), DataType>,
     }
+    // A name an `optional` introduces is null on an outer row with no
+    // match, so its leaves may be typed nullable over a required property.
+    let mut optional_names: HashSet<&str> = HashSet::new();
+    for (_, node) in plan.live() {
+        if let PhysicalNode::OptionalJoin { inner, .. } = node {
+            let mut work = vec![*inner];
+            while let Some(id) = work.pop() {
+                let Some(node) = plan.node(id) else { continue };
+                match node {
+                    PhysicalNode::Scan { spec, .. } => {
+                        optional_names.extend(spec.binding.as_deref());
+                    }
+                    PhysicalNode::Expand {
+                        dst, edge_binding, ..
+                    } => {
+                        optional_names.insert(dst.as_str());
+                        optional_names.extend(edge_binding.as_deref());
+                    }
+                    _ => {}
+                }
+                work.extend(node.inputs());
+            }
+        }
+    }
     let mut pipelines = vec![(plan.root(), Owners::default(), Vec::new())];
     while let Some((root, mut owners, mut pending)) = pipelines.pop() {
         let mut nodes = Vec::new();
@@ -766,7 +790,7 @@ pub(super) fn validate_plan_values(
                     pending.push(conjunct);
                     pending.extend(residual);
                 }
-                PhysicalNode::AntiJoin { .. } => {}
+                PhysicalNode::AntiJoin { .. } | PhysicalNode::OptionalJoin { .. } => {}
                 PhysicalNode::RankFuse { k, .. } => pending.extend(k),
                 PhysicalNode::Sort { order_by, .. } => {
                     pending.extend(order_by.iter().map(|ordering| &ordering.expr))
@@ -809,8 +833,10 @@ pub(super) fn validate_plan_values(
                     ty,
                 } => {
                     let (data_type, nullable) = property_type(variable, property)?;
+                    let optional = optional_names.contains(variable.as_str());
                     if ty.to_arrow().as_ref() != Some(&data_type)
-                        || !matches!(ty, ExprType::Value { nullable: stored, .. } if *stored == nullable)
+                        || !matches!(ty, ExprType::Value { nullable: stored, .. }
+                            if *stored == nullable || optional && *stored)
                     {
                         return Err(OmniError::manifest_internal(format!(
                             "property {variable}.{property} leaf type {} disagrees with its catalog owner ({data_type}, nullable={nullable})",

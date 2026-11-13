@@ -525,6 +525,10 @@ query sum_ages() {
     match { $p: Person }
     return { sum($p.age) as total }
 }
+query liked_d0_or_not() {
+    match { $p: Person, optional { $p likes $d where $d.title = "d0" } }
+    return { $p.name, $d.title }
+}
 "#;
 
 const DOC_SCHEMA: &str = r#"
@@ -1620,6 +1624,56 @@ async fn the_skip_shapes_and_the_aggregate_replay() {
             "{label}: {error}"
         );
     }
+}
+
+/// An `optional` replays with its rows kept without a match, and a saved
+/// plan whose `OptionalJoin` correlates on another binding is refused at the
+/// door: its inner tree no longer tests what the query's optional writes.
+#[tokio::test]
+async fn an_optional_replays_and_an_edited_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let Replayed {
+        result,
+        rows,
+        plan,
+        envelope,
+        ..
+    } = replayed(&db, PEOPLE_QUERIES, "liked_d0_or_not", &ParamMap::new()).await;
+    let mut names: Vec<String> = result
+        .iter()
+        .map(|row| format!("{}:{}", row["p.name"], row["d.title"]))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["\"ann\":\"d0\"", "\"bob\":\"d0\"", "\"cyd\":null"],
+        "{result:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["operator"] == "OptionalJoinExec" && row["status"] == "executed"),
+        "{rows:#?}"
+    );
+    let mut altered = serde_json::to_value(plan).unwrap();
+    let node = altered["body"]["plan"]["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|node| node["node"] == "OptionalJoin")
+        .unwrap();
+    node["outer_var"] = serde_json::json!("d");
+    let error = match db
+        .replay_bound_plan("main", &with_plan(&envelope, altered))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("an optional over another binding replayed"),
+    };
+    assert!(
+        error.to_string().contains("no optional of the plan"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

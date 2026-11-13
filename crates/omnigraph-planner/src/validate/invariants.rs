@@ -285,6 +285,7 @@ impl Requirements {
             }
         }
         let top = pipeline(plan, plan.root(), budget)?;
+        self.check_optionals(plan, &top, budget)?;
         check_full_text_indexes(plan, input, budget)?;
         self.check_search(plan)?;
         self.check_row_cuts(plan, budget)?;
@@ -531,6 +532,103 @@ impl Requirements {
             }
         }
         Ok(())
+    }
+
+    /// Every written `optional` runs as one `OptionalJoin` over its
+    /// correlation binding, the conjuncts of its own pattern tested inside
+    /// its inner tree and nowhere else the query does not require them: a
+    /// conjunct of the optional tested after it would drop the outer rows it
+    /// keeps.
+    fn check_optionals(
+        &self,
+        plan: &PhysicalPlan,
+        top: &[NodeId],
+        budget: &mut Budget,
+    ) -> Result<(), ValidationError> {
+        let mut planned: Vec<(NodeId, &String, Vec<NodeId>)> = Vec::new();
+        for id in top {
+            if let Some(PhysicalNode::OptionalJoin {
+                outer_var, inner, ..
+            }) = plan.node(*id)
+            {
+                planned.push((*id, outer_var, pipeline(plan, *inner, budget)?));
+            }
+        }
+        if planned.len() != self.optionals.len() {
+            return Err(ValidationError::violated(
+                "predicate retention",
+                format!(
+                    "the query writes {} optionals; the plan runs {}",
+                    self.optionals.len(),
+                    planned.len()
+                ),
+            ));
+        }
+        let inside: HashSet<NodeId> = planned
+            .iter()
+            .flat_map(|(_, _, nodes)| nodes.iter().copied())
+            .collect();
+        let outside: Vec<NodeId> = top
+            .iter()
+            .copied()
+            .filter(|id| !inside.contains(id))
+            .collect();
+        let tested_outside: HashSet<IRExpr> = conjuncts(plan, &outside)
+            .into_iter()
+            .map(|(_, conjunct)| conjunct)
+            .collect();
+        let top_level: HashSet<&IRExpr> = self.eligibility.iter().collect();
+        for optional in &self.optionals {
+            let found = planned.iter().position(|(_, outer_var, nodes)| {
+                let tested: HashSet<IRExpr> = conjuncts(plan, nodes)
+                    .into_iter()
+                    .map(|(_, conjunct)| conjunct)
+                    .collect();
+                **outer_var == optional.outer_var
+                    && optional
+                        .eligibility
+                        .iter()
+                        .all(|conjunct| tested.contains(conjunct))
+            });
+            let Some(index) = found else {
+                return Err(ValidationError::violated(
+                    "predicate retention",
+                    format!(
+                        "no optional of the plan over `${}` tests the conjuncts the query's optional writes",
+                        optional.outer_var
+                    ),
+                ));
+            };
+            planned.remove(index);
+            if let Some(leaked) = optional.eligibility.iter().find(|conjunct| {
+                tested_outside.contains(*conjunct) && !self.top_level_conjunct(conjunct, &top_level)
+            }) {
+                return Err(ValidationError::violated(
+                    "predicate origin",
+                    format!("the plan tests the optional's `{leaked}` outside the optional"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `conjunct` is required outside every `optional`: the scope's
+    /// eligibility holds each optional's conjuncts too, so one written in
+    /// `where` as well counts once more than the optionals write it.
+    fn top_level_conjunct(&self, conjunct: &IRExpr, eligibility: &HashSet<&IRExpr>) -> bool {
+        let in_optionals = self
+            .optionals
+            .iter()
+            .flat_map(|optional| optional.eligibility.iter())
+            .filter(|own| *own == conjunct)
+            .count();
+        eligibility.contains(conjunct)
+            && self
+                .eligibility
+                .iter()
+                .filter(|own| *own == conjunct)
+                .count()
+                > in_optionals
     }
 
     /// The plan ranks exactly the retrievals the leading `order` key names,

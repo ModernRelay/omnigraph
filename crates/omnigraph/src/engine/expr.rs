@@ -44,6 +44,7 @@ impl ProjectionContext {
                 | PhysicalNode::ContainsJoin { .. }
                 | PhysicalNode::Filter { .. }
                 | PhysicalNode::AntiJoin { .. }
+                | PhysicalNode::OptionalJoin { .. }
                 | PhysicalNode::OuterReference { .. }
                 | PhysicalNode::RankFuse { .. }
                 | PhysicalNode::Projection { .. }
@@ -135,6 +136,10 @@ pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<
                 outer_var: _,
                 inner,
                 predicate: _,
+            } => collect_node_bindings(inner, out),
+            PatternStep::Optional {
+                outer_var: _,
+                inner,
             } => collect_node_bindings(inner, out),
         }
     }

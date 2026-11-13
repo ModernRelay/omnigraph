@@ -94,6 +94,13 @@ pub enum PatternStep {
         inner: Vec<PatternStep>,
         predicate: SubqueryPredicate,
     },
+    /// `optional { p }`: every outer row with each of its matches in
+    /// `inner`, which runs over the outer rows; an outer row with none
+    /// stays, the names `inner` introduces null on it.
+    Optional {
+        outer_var: String,
+        inner: Vec<PatternStep>,
+    },
 }
 
 impl ReadShape {
@@ -114,7 +121,9 @@ impl ReadShape {
                         return true;
                     }
                 }
-                PatternStep::AntiJoin { inner, .. } => pending.extend(inner),
+                PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
+                    pending.extend(inner)
+                }
                 PatternStep::NodeScan { .. }
                 | PatternStep::Filter(_)
                 | PatternStep::Rank { .. } => {}
@@ -249,6 +258,7 @@ fn physical_names(pipeline: &[PatternStep]) -> HashSet<String> {
                 names.insert(dst_var.clone());
                 names.extend(edge_binding.iter().cloned());
             }
+            PatternStep::Optional { inner, .. } => names.extend(physical_names(inner)),
             PatternStep::Filter(_) | PatternStep::AntiJoin { .. } | PatternStep::Rank { .. } => {}
         }
     }
@@ -268,6 +278,12 @@ struct Facts {
     traversals: Vec<TraversalFact>,
     filters: Vec<IRExpr>,
     blocks: Vec<BlockFact>,
+    /// The `optional { }` elements, in written order.
+    optionals: Vec<OptionalFact>,
+    /// The names the `optional`s introduce, which an element after them may
+    /// not read: the steps place an `optional` after the scope's bindings
+    /// and traversals.
+    optional_names: HashSet<String>,
     /// The type of every node variable the scope binds.
     types: HashMap<String, String>,
     /// Each `let` name and its value, earlier `let`s already read into it.
@@ -284,6 +300,9 @@ impl Facts {
         for t in &self.traversals {
             out.extend([t.src.clone(), t.dst.clone()]);
             out.extend(t.edge_binding.iter().cloned());
+        }
+        for optional in &self.optionals {
+            out.extend(optional.inner.names());
         }
         out.retain(|name| name != "_");
         out
@@ -338,6 +357,48 @@ impl Facts {
             }
             rename_expr(&mut block.right, &rename);
         }
+        for optional in &mut self.optionals {
+            optional.inner.rename(renames);
+        }
+        self.optional_names = std::mem::take(&mut self.optional_names)
+            .into_iter()
+            .map(|mut name| {
+                rename(&mut name);
+                name
+            })
+            .collect();
+    }
+
+    /// Every name an `optional` of the facts introduces, nested ones and
+    /// those of a block's or an optional's own included.
+    fn optional_names_into(&self, out: &mut HashSet<String>) {
+        out.extend(self.optional_names.iter().cloned());
+        for optional in &self.optionals {
+            optional.inner.optional_names_into(out);
+        }
+        for block in &self.blocks {
+            block.inner.optional_names_into(out);
+        }
+    }
+
+    /// `f` over every expression the facts hold, a block's and an
+    /// optional's included.
+    fn each_expr(&mut self, f: &mut dyn FnMut(&mut IRExpr)) {
+        for binding in &mut self.bindings {
+            binding.filters.iter_mut().for_each(&mut *f);
+        }
+        self.filters.iter_mut().for_each(&mut *f);
+        self.lets.values_mut().for_each(&mut *f);
+        for block in &mut self.blocks {
+            block.inner.each_expr(f);
+            if let Some(arg) = block.left.arg_mut() {
+                f(arg);
+            }
+            f(&mut block.right);
+        }
+        for optional in &mut self.optionals {
+            optional.inner.each_expr(f);
+        }
     }
 
     /// Every expression the facts hold, a block's included, with each
@@ -356,6 +417,9 @@ impl Facts {
                 substitute(arg, lets);
             }
             substitute(&mut block.right, lets);
+        }
+        for optional in &mut self.optionals {
+            optional.inner.substitute(lets);
         }
     }
 }
@@ -377,6 +441,12 @@ struct TraversalFact {
     min_hops: u32,
     max_hops: Option<u32>,
     edge_binding: Option<String>,
+}
+
+/// An `optional { }`: its pattern's facts.
+#[derive(Debug)]
+struct OptionalFact {
+    inner: Facts,
 }
 
 #[derive(Debug)]
@@ -446,8 +516,8 @@ impl<'a> Shaper<'a> {
     fn unlowered_node(&self, node: &Term) -> ShapeError {
         let (what, kinds): (String, &'static [ElementKind]) = match node {
             Term::Union { .. } => (
-                "a `Union` in a pattern (an `optional`, or a `from` over `union`)".into(),
-                &[ElementKind::Optional, ElementKind::From],
+                "a `Union` in a pattern (a `from` over `union`)".into(),
+                FROM,
             ),
             Term::Call { name, .. } => (
                 format!("a declared read's call in a pattern (`{name}`)"),
@@ -583,6 +653,21 @@ impl<'a> Shaper<'a> {
                 (key, *descending)
             })
             .collect();
+        // `$x is null` over a reference tests its identity, which an
+        // `optional` leaves null on an outer row with no match.
+        let mut optional_names = HashSet::new();
+        facts.optional_names_into(&mut optional_names);
+        after_facts.optional_names_into(&mut optional_names);
+        let id = self.catalog.system_columns.id;
+        let mut null_tests = |e: &mut IRExpr| reference_null_tests(e, id, &optional_names);
+        facts.each_expr(&mut null_tests);
+        after_facts.each_expr(&mut null_tests);
+        items.values_mut().for_each(&mut null_tests);
+        aggs.values_mut()
+            .filter_map(|agg| agg.arg.as_mut())
+            .for_each(&mut null_tests);
+        let mut order_keys = order_keys;
+        order_keys.iter_mut().for_each(|(key, _)| null_tests(key));
         let order_keys = order_keys.as_slice();
         // Return items.
         let mut return_exprs = Vec::new();
@@ -593,6 +678,16 @@ impl<'a> Shaper<'a> {
                     Construct::ReturnItem(i),
                 ));
             };
+            // A node object has no null in this release's result types, and
+            // an `optional`'s name is null on a row it kept without a match.
+            if let Some(IRExpr::Variable(variable, ExprType::Node { .. })) = items.get(hidden)
+                && optional_names.contains(variable)
+            {
+                return Err(self.refuse_at(
+                    "a node an `optional` introduces returned whole (a nullable node object)",
+                    Construct::ReturnItem(i),
+                ));
+            }
             let item = match (items.get(hidden), aggs.get(hidden)) {
                 (Some(e), _) => self
                     .item(e, &aggs, ranking.as_ref())
@@ -1259,8 +1354,41 @@ impl<'a> Shaper<'a> {
                 });
                 Ok(())
             }
+            Term::Union { left, right } => match optional_parts(left, right) {
+                Some((outer, pattern)) => self.optional(outer, pattern, facts),
+                None => Err(self.unlowered_node(term)),
+            },
             other => Err(self.unlowered_node(other)),
         }
+    }
+
+    /// `optional { p }` over the elements before it (`outer`): their facts,
+    /// then the optional's own, whose new names enter the scope.
+    fn optional(&self, outer: &Term, pattern: &Term, facts: &mut Facts) -> Result<(), ShapeError> {
+        self.facts(outer, facts)?;
+        let at = || Construct::Element(&[ElementKind::Optional], None);
+        let mut inner = Facts {
+            inlined: facts.inlined,
+            ..Facts::default()
+        };
+        self.facts(pattern, &mut inner)?;
+        facts.inlined = inner.inlined;
+        // A `let` inside an `optional` is a column of its matches, null on
+        // an outer row with none; read in place, its value would not be.
+        if !inner.lets.is_empty() {
+            return Err(self.refuse_at("a `let` inside an `optional`", at()));
+        }
+        // The names the scope binds before it are the outer columns; a
+        // rebinding of one inside is `T68`.
+        let outer_columns: HashSet<String> = facts.names().into_iter().collect();
+        facts.optional_names.extend(
+            inner
+                .names()
+                .into_iter()
+                .filter(|name| !outer_columns.contains(name) && !is_anon(name)),
+        );
+        facts.optionals.push(OptionalFact { inner });
+        Ok(())
     }
 
     /// `from { match … return { … } }`: one outer row per inner row, the
@@ -1500,6 +1628,120 @@ impl<'a> Shaper<'a> {
         Ok(())
     }
 
+    /// The scope's traversals as expansions from the names already bound,
+    /// each introducing its other end with that binding's filters; a
+    /// traversal with neither end bound scans its source.
+    fn expand_traversals(
+        &self,
+        traversals: &[&TraversalFact],
+        pipeline: &mut Vec<PatternStep>,
+        bound_vars: &mut HashSet<String>,
+        deferred_filters: &mut HashMap<String, Vec<IRExpr>>,
+        fresh: &mut FreshNames,
+    ) -> Result<(), ShapeError> {
+        let mut remaining: Vec<&TraversalFact> = traversals.to_vec();
+        while !remaining.is_empty() {
+            let mut next_remaining = Vec::new();
+            for traversal in &remaining {
+                let src_bound = traversal.src != "_" && bound_vars.contains(&traversal.src);
+                let dst_bound = traversal.dst != "_" && bound_vars.contains(&traversal.dst);
+                if !src_bound && !dst_bound {
+                    next_remaining.push(*traversal);
+                    continue;
+                }
+                let edge_binding = traversal.edge_binding.clone();
+                if src_bound && dst_bound {
+                    let temp_var = fresh.temp(&traversal.dst);
+                    pipeline.push(PatternStep::Expand {
+                        src_var: traversal.src.clone(),
+                        dst_var: temp_var.clone(),
+                        edges: traversal.edges.clone(),
+                        src_type: traversal.src_type.clone(),
+                        dst_type: traversal.dst_type.clone(),
+                        min_hops: traversal.min_hops,
+                        max_hops: traversal.max_hops,
+                        dst_filters: vec![],
+                        edge_binding,
+                    });
+                    let id = self.catalog.system_columns.id.to_string();
+                    let string = scalar(ScalarType::String);
+                    pipeline.push(PatternStep::Filter(
+                        crate::ir::coerce::binary(
+                            IRExpr::PropAccess {
+                                variable: temp_var,
+                                property: id.clone(),
+                                ty: string.clone(),
+                            },
+                            BinaryOp::Compare(CompOp::Eq),
+                            IRExpr::PropAccess {
+                                variable: traversal.dst.clone(),
+                                property: id,
+                                ty: string,
+                            },
+                        )
+                        .map_err(|e| ShapeError::Internal(e.to_string()))?,
+                    ));
+                } else if !src_bound && dst_bound {
+                    let introduced_filters =
+                        deferred_filters.remove(&traversal.src).unwrap_or_default();
+                    let dst_var = if traversal.src == "_" {
+                        fresh.anon()
+                    } else {
+                        traversal.src.clone()
+                    };
+                    pipeline.push(PatternStep::Expand {
+                        src_var: traversal.dst.clone(),
+                        dst_var,
+                        edges: traversal.edges.reversed(),
+                        src_type: traversal.dst_type.clone(),
+                        dst_type: traversal.src_type.clone(),
+                        min_hops: traversal.min_hops,
+                        max_hops: traversal.max_hops,
+                        dst_filters: introduced_filters,
+                        edge_binding,
+                    });
+                    if traversal.src != "_" {
+                        bound_vars.insert(traversal.src.clone());
+                    }
+                } else {
+                    let introduced_filters =
+                        deferred_filters.remove(&traversal.dst).unwrap_or_default();
+                    let dst_var = if traversal.dst == "_" {
+                        fresh.anon()
+                    } else {
+                        traversal.dst.clone()
+                    };
+                    pipeline.push(PatternStep::Expand {
+                        src_var: traversal.src.clone(),
+                        dst_var,
+                        edges: traversal.edges.clone(),
+                        src_type: traversal.src_type.clone(),
+                        dst_type: traversal.dst_type.clone(),
+                        min_hops: traversal.min_hops,
+                        max_hops: traversal.max_hops,
+                        dst_filters: introduced_filters,
+                        edge_binding,
+                    });
+                    if traversal.dst != "_" {
+                        bound_vars.insert(traversal.dst.clone());
+                    }
+                }
+            }
+            if next_remaining.len() == remaining.len() {
+                // Neither end bound: the source starts its own pattern.
+                let t = next_remaining[0];
+                pipeline.push(PatternStep::NodeScan {
+                    variable: t.src.clone(),
+                    type_name: t.src_type.clone(),
+                    filters: Vec::new(),
+                });
+                bound_vars.insert(t.src.clone());
+            }
+            remaining = next_remaining;
+        }
+        Ok(())
+    }
+
     /// The pattern's steps: the facts placed as the module documentation
     /// describes.
     fn place(
@@ -1641,107 +1883,50 @@ impl<'a> Shaper<'a> {
             });
             bound_vars.insert(variable.to_string());
         }
-        let mut remaining: Vec<&TraversalFact> = traversals.clone();
-        while !remaining.is_empty() {
-            let mut next_remaining = Vec::new();
-            for traversal in &remaining {
-                let src_bound = traversal.src != "_" && bound_vars.contains(&traversal.src);
-                let dst_bound = traversal.dst != "_" && bound_vars.contains(&traversal.dst);
-                if !src_bound && !dst_bound {
-                    next_remaining.push(*traversal);
-                    continue;
-                }
-                let edge_binding = traversal.edge_binding.clone();
-                if src_bound && dst_bound {
-                    let temp_var = fresh.temp(&traversal.dst);
-                    pipeline.push(PatternStep::Expand {
-                        src_var: traversal.src.clone(),
-                        dst_var: temp_var.clone(),
-                        edges: traversal.edges.clone(),
-                        src_type: traversal.src_type.clone(),
-                        dst_type: traversal.dst_type.clone(),
-                        min_hops: traversal.min_hops,
-                        max_hops: traversal.max_hops,
-                        dst_filters: vec![],
-                        edge_binding,
-                    });
-                    let id = self.catalog.system_columns.id.to_string();
-                    let string = scalar(ScalarType::String);
-                    pipeline.push(PatternStep::Filter(
-                        crate::ir::coerce::binary(
-                            IRExpr::PropAccess {
-                                variable: temp_var,
-                                property: id.clone(),
-                                ty: string.clone(),
-                            },
-                            BinaryOp::Compare(CompOp::Eq),
-                            IRExpr::PropAccess {
-                                variable: traversal.dst.clone(),
-                                property: id,
-                                ty: string,
-                            },
-                        )
-                        .map_err(|e| ShapeError::Internal(e.to_string()))?,
-                    ));
-                } else if !src_bound && dst_bound {
-                    let introduced_filters =
-                        deferred_filters.remove(&traversal.src).unwrap_or_default();
-                    let dst_var = if traversal.src == "_" {
-                        fresh.anon()
-                    } else {
-                        traversal.src.clone()
-                    };
-                    pipeline.push(PatternStep::Expand {
-                        src_var: traversal.dst.clone(),
-                        dst_var,
-                        edges: traversal.edges.reversed(),
-                        src_type: traversal.dst_type.clone(),
-                        dst_type: traversal.src_type.clone(),
-                        min_hops: traversal.min_hops,
-                        max_hops: traversal.max_hops,
-                        dst_filters: introduced_filters,
-                        edge_binding,
-                    });
-                    if traversal.src != "_" {
-                        bound_vars.insert(traversal.src.clone());
-                    }
-                } else {
-                    let introduced_filters =
-                        deferred_filters.remove(&traversal.dst).unwrap_or_default();
-                    let dst_var = if traversal.dst == "_" {
-                        fresh.anon()
-                    } else {
-                        traversal.dst.clone()
-                    };
-                    pipeline.push(PatternStep::Expand {
-                        src_var: traversal.src.clone(),
-                        dst_var,
-                        edges: traversal.edges.clone(),
-                        src_type: traversal.src_type.clone(),
-                        dst_type: traversal.dst_type.clone(),
-                        min_hops: traversal.min_hops,
-                        max_hops: traversal.max_hops,
-                        dst_filters: introduced_filters,
-                        edge_binding,
-                    });
-                    if traversal.dst != "_" {
-                        bound_vars.insert(traversal.dst.clone());
-                    }
-                }
-            }
-            if next_remaining.len() == remaining.len() {
-                // Neither end bound: the source starts its own pattern.
-                let t = next_remaining[0];
-                pipeline.push(PatternStep::NodeScan {
-                    variable: t.src.clone(),
-                    type_name: t.src_type.clone(),
-                    filters: Vec::new(),
-                });
-                bound_vars.insert(t.src.clone());
-            }
-            remaining = next_remaining;
-        }
+        // The steps place an `optional` after the scope's other traversals;
+        // a traversal from a name it introduces expands after it.
+        let (after_optional, before_optional): (Vec<&TraversalFact>, Vec<&TraversalFact>) =
+            traversals.iter().partition(|t| {
+                facts.optional_names.contains(&t.src) || facts.optional_names.contains(&t.dst)
+            });
+        self.expand_traversals(
+            &before_optional,
+            pipeline,
+            bound_vars,
+            &mut deferred_filters,
+            fresh,
+        )?;
         pipeline.extend(rebind_filters.into_iter().map(PatternStep::Filter));
+        for optional in &facts.optionals {
+            // The inner tree reads the whole outer row; a name it shares with
+            // the scope is that outer column (a rebinding is `T68`).
+            let mut visible_outer: HashSet<String> = bound_vars.clone();
+            let outer_var = find_outer_var(&optional.inner, &visible_outer);
+            let mut names = outer_physical_names.clone();
+            names.extend(physical_names(pipeline));
+            let mut inner = Vec::new();
+            let before = visible_outer.clone();
+            self.place(
+                &optional.inner,
+                &[],
+                &mut inner,
+                &mut visible_outer,
+                &names,
+                fresh,
+            )?;
+            bound_vars.extend(visible_outer.difference(&before).cloned());
+            pipeline.push(PatternStep::Optional {
+                outer_var: outer_var.unwrap_or_default(),
+                inner,
+            });
+        }
+        self.expand_traversals(
+            &after_optional,
+            pipeline,
+            bound_vars,
+            &mut deferred_filters,
+            fresh,
+        )?;
         for filter in &facts.filters {
             pipeline.push(PatternStep::Filter(filter.clone()));
         }
@@ -1761,6 +1946,9 @@ impl<'a> Shaper<'a> {
                 } => {
                     physical_names.insert(dst_var.clone());
                     physical_names.extend(edge_binding.iter().cloned());
+                }
+                PatternStep::Optional { inner, .. } => {
+                    physical_names.extend(self::physical_names(inner));
                 }
                 PatternStep::Filter(_)
                 | PatternStep::AntiJoin { .. }
@@ -1895,6 +2083,41 @@ fn env_columns(term: &Term) -> Vec<String> {
         pending.extend(term.children());
     }
     Vec::new()
+}
+
+/// The elements before an `optional { p }` and `p`, as the type checker
+/// writes the optional: `Union(Correlate(R, p), Project(Filter(Correlate(R,
+/// Group(p, [], [count])), ¬ exists), nulls))`.
+fn optional_parts<'t>(left: &'t Term, right: &'t Term) -> Option<(&'t Term, &'t Term)> {
+    let Term::Correlate { outer, inner } = left else {
+        return None;
+    };
+    let Term::Project {
+        input, keep: false, ..
+    } = right
+    else {
+        return None;
+    };
+    let Term::Filter { input, .. } = input.as_ref() else {
+        return None;
+    };
+    let Term::Correlate {
+        outer: unmatched,
+        inner: grouped,
+    } = input.as_ref()
+    else {
+        return None;
+    };
+    let Term::Group {
+        input: counted,
+        keys,
+        aggs,
+    } = grouped.as_ref()
+    else {
+        return None;
+    };
+    (unmatched == outer && counted == inner && keys.is_empty() && aggs.len() == 1)
+        .then_some((outer.as_ref(), inner.as_ref()))
 }
 
 /// The `Fuse` a pattern extends from: the leaf its first inputs reach.
@@ -2046,10 +2269,81 @@ fn rename_inner_bindings(
                 expressions.push(&mut predicate.right);
                 pending.extend(inner);
             }
+            PatternStep::Optional { outer_var, inner } => {
+                rename(outer_var);
+                pending.extend(inner);
+            }
         }
     }
     for expr in expressions {
         rename_expr(expr, &rename);
+    }
+}
+
+/// `expr` with every `is null` over a node or edge reference testing the
+/// reference's identity column: nullable where an `optional` introduces the
+/// name, else never null.
+fn reference_null_tests(expr: &mut IRExpr, id: &str, optional: &HashSet<String>) {
+    if let IRExpr::IsNull { expr: inner, .. } = expr
+        && let IRExpr::Variable(variable, ExprType::Node { .. } | ExprType::Edge { .. }) =
+            inner.as_ref()
+    {
+        let nullable = optional.contains(variable);
+        **inner = IRExpr::PropAccess {
+            variable: variable.clone(),
+            property: id.to_string(),
+            ty: ExprType::from_prop(&PropType::scalar(ScalarType::String, nullable)),
+        };
+        return;
+    }
+    let recurse = |e: &mut IRExpr| reference_null_tests(e, id, optional);
+    match expr {
+        IRExpr::Nearest { query, .. } => recurse(query),
+        IRExpr::Search { field, query, .. }
+        | IRExpr::MatchText { field, query, .. }
+        | IRExpr::Bm25 { field, query, .. } => {
+            recurse(field);
+            recurse(query);
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+            ..
+        } => {
+            recurse(field);
+            recurse(query);
+            if let Some(m) = max_edits {
+                recurse(m);
+            }
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+            ..
+        } => {
+            recurse(primary);
+            recurse(secondary);
+            if let Some(k) = k {
+                recurse(k);
+            }
+        }
+        IRExpr::Aggregate { arg, .. }
+        | IRExpr::Not(arg, _)
+        | IRExpr::IsNull { expr: arg, .. }
+        | IRExpr::Neg { expr: arg, .. }
+        | IRExpr::Cast { expr: arg, .. } => recurse(arg),
+        IRExpr::Binary { left, right, .. } => {
+            recurse(left);
+            recurse(right);
+        }
+        IRExpr::Call { args, .. } => args.iter_mut().for_each(recurse),
+        IRExpr::AliasRef(_, _)
+        | IRExpr::Variable(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::Param(_, _)
+        | IRExpr::PropAccess { .. } => {}
     }
 }
 

@@ -237,9 +237,10 @@ pub trait Lower {
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
-    /// Called with the lowered outer input before the walk enters the inner
-    /// tree, whose [`Lower::outer_reference`] leaf reads what this set up.
-    fn anti_join_outer(
+    /// Called with the lowered outer input of an `AntiJoin` or an
+    /// `OptionalJoin` before the walk enters the inner tree, whose
+    /// [`Lower::outer_reference`] leaf reads what this set up.
+    fn correlate_outer(
         &mut self,
         id: NodeId,
         outer_var: &str,
@@ -247,6 +248,16 @@ pub trait Lower {
     ) -> Result<(), Self::Error>;
 
     fn anti_join(
+        &mut self,
+        id: NodeId,
+        outer_var: &str,
+        outer: Self::Op,
+        inner: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
+    /// Called with the outer input and the inner tree lowered, after
+    /// [`Lower::correlate_outer`].
+    fn optional_join(
         &mut self,
         id: NodeId,
         outer_var: &str,
@@ -555,9 +566,19 @@ impl PhysicalPlan {
                 ..
             } => {
                 let outer = self.lower_node(*input, l)?;
-                l.anti_join_outer(id, outer_var, &outer)?;
+                l.correlate_outer(id, outer_var, &outer)?;
                 let inner = self.lower_node(*inner, l)?;
                 l.anti_join(id, outer_var, outer, inner)
+            }
+            PhysicalNode::OptionalJoin {
+                input,
+                inner,
+                outer_var,
+            } => {
+                let outer = self.lower_node(*input, l)?;
+                l.correlate_outer(id, outer_var, &outer)?;
+                let inner = self.lower_node(*inner, l)?;
+                l.optional_join(id, outer_var, outer, inner)
             }
             PhysicalNode::OuterReference { outer_var } => l.outer_reference(id, outer_var),
             PhysicalNode::RankFuse {

@@ -271,6 +271,7 @@ logical_kinds! {
     MergeClassify => "MergeClassify", Routable;
     MetadataCount => "MetadataCount", RefusedByName;
     Nearest => "Nearest", RefusedByName;
+    OptionalJoin => "OptionalJoin", RefusedByName;
     OuterReference => "OuterReference", RefusedByName;
     Projection => "Projection", Routable;
     RankFuse => "RankFuse", RefusedByName;
@@ -606,6 +607,14 @@ pub enum LogicalNode {
         outer_var: String,
         predicate: SubqueryPredicate,
     },
+    /// `optional { … }`: every input row with each of its matches in the
+    /// inner tree, whose leaf is an `OuterReference` to those same rows, and
+    /// an input row with none once, the columns the inner tree adds null.
+    OptionalJoin {
+        input: LogicalId,
+        inner: LogicalId,
+        outer_var: String,
+    },
     /// The leaf of a `not { … }` inner tree: the enclosing pipeline's rows,
     /// correlated on `outer_var`. A node of its own, not the outer node, so
     /// the inner tree stays a tree and no pass folds its filter outward.
@@ -709,6 +718,7 @@ impl LogicalNode {
             Self::MergeClassify { .. } => LogicalKind::MergeClassify,
             Self::Expand { .. } => LogicalKind::Expand,
             Self::AntiJoin { .. } => LogicalKind::AntiJoin,
+            Self::OptionalJoin { .. } => LogicalKind::OptionalJoin,
             Self::OuterReference { .. } => LogicalKind::OuterReference,
             Self::Nearest { .. } => LogicalKind::Nearest,
             Self::TextSearch { .. } => LogicalKind::TextSearch,
@@ -735,7 +745,9 @@ impl LogicalNode {
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![*input],
             Self::Join { left, right, .. } | Self::CrossJoin { left, right } => vec![*left, *right],
-            Self::AntiJoin { input, inner, .. } => vec![*input, *inner],
+            Self::AntiJoin { input, inner, .. } | Self::OptionalJoin { input, inner, .. } => {
+                vec![*input, *inner]
+            }
             Self::MergeClassify {
                 base,
                 source,
@@ -767,7 +779,9 @@ impl LogicalNode {
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![input],
             Self::Join { left, right, .. } | Self::CrossJoin { left, right } => vec![left, right],
-            Self::AntiJoin { input, inner, .. } => vec![input, inner],
+            Self::AntiJoin { input, inner, .. } | Self::OptionalJoin { input, inner, .. } => {
+                vec![input, inner]
+            }
             Self::MergeClassify {
                 base,
                 source,
@@ -1069,6 +1083,10 @@ impl LogicalPlan {
                 "predicate": predicate.to_string(),
                 "typed_left": crate::typed::block(&predicate.left),
                 "typed_right": crate::typed::expr(&predicate.right),
+            }),
+            LogicalNode::OptionalJoin { outer_var, .. } => json!({
+                "node": "OptionalJoin",
+                "outer_var": outer_var,
             }),
             LogicalNode::OuterReference { outer_var } => json!({
                 "node": "OuterReference",

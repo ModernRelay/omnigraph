@@ -326,6 +326,11 @@ pub enum NodeMirror {
         aggregate: Option<AggregateSpec>,
         strategy: AntiJoinStrategy,
     },
+    OptionalJoin {
+        input: NodeId,
+        inner: NodeId,
+        outer_var: String,
+    },
     OuterReference {
         outer_var: String,
     },
@@ -547,6 +552,15 @@ impl From<&PhysicalNode> for NodeMirror {
                 predicate: SubqueryPredicateMirror::from(predicate),
                 aggregate: *aggregate,
                 strategy: *strategy,
+            },
+            PhysicalNode::OptionalJoin {
+                input,
+                inner,
+                outer_var,
+            } => Self::OptionalJoin {
+                input: *input,
+                inner: *inner,
+                outer_var: outer_var.clone(),
             },
             PhysicalNode::OuterReference { outer_var } => Self::OuterReference {
                 outer_var: outer_var.clone(),
@@ -792,6 +806,15 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 predicate: SubqueryPredicate::from(predicate),
                 aggregate,
                 strategy,
+            },
+            NodeMirror::OptionalJoin {
+                input,
+                inner,
+                outer_var,
+            } => Self::OptionalJoin {
+                input,
+                inner,
+                outer_var,
             },
             NodeMirror::OuterReference { outer_var } => Self::OuterReference { outer_var },
             NodeMirror::RankFuse {

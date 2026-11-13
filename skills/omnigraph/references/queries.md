@@ -68,8 +68,10 @@ The compiler typechecks parameter values against declared types.
 ### Match → Where → Return → Order → Limit
 
 `match { … }` holds the elements, the forms that produce rows: bindings
-`$x: Type` (no property braces), triples `$a edge $b`, `optional { … }` (which
-this release's planner does not lower: `T86`), `let` and `from`, separated by
+`$x: Type` (no property braces), triples `$a edge $b`, `optional { … }` (every row
+of the elements before it, with its matches or once with the names it
+introduces null; those names are nullable after it, and returning one of its
+nodes whole is `T86`), `let` and `from`, separated by
 commas (a trailing comma is allowed; a newline is not
 a separator). `where`, after the braces, holds one Boolean expression that sees
 every element and removes rows. A filter or `where` inside the braces is
@@ -414,8 +416,8 @@ traversals, edge bindings, blocks, `let` and `from`, and runs as a read of the
 graph the write started from:
 `match { $c: Company, $p $k:worksAt $c } where $c.slug = $slug  delete $k`.
 Assignments may read the row (`city: $c.city`; an endpoint as `to: $c`), and
-an `insert` runs once per row. `optional`, a `Blob` read from a row, and a
-selection that reads a type an earlier group of the write changes are refused
+an `insert` runs once per row. A `Blob` read from a row and a selection that
+reads a type an earlier group of the write changes are refused
 (`T86`); rows of one statement giving one entity's property two values are
 refused (`E4`).
 

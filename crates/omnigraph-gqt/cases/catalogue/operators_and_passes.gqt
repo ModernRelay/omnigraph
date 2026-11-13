@@ -41,6 +41,7 @@ query operators() {
 {"o.name":"Filter","o.inputs":[1]}
 {"o.name":"Expand","o.inputs":[1]}
 {"o.name":"AntiJoin","o.inputs":[2]}
+{"o.name":"OptionalJoin","o.inputs":[2]}
 {"o.name":"OuterReference","o.inputs":[0]}
 {"o.name":"RankFuse","o.inputs":[2]}
 {"o.name":"Projection","o.inputs":[1]}
@@ -107,6 +108,7 @@ query logical_kinds() {
 {"k.name":"MergeClassify","k.coverage":"routable"}
 {"k.name":"MetadataCount","k.coverage":"refused_by_name"}
 {"k.name":"Nearest","k.coverage":"refused_by_name"}
+{"k.name":"OptionalJoin","k.coverage":"refused_by_name"}
 {"k.name":"OuterReference","k.coverage":"refused_by_name"}
 {"k.name":"Projection","k.coverage":"routable"}
 {"k.name":"RankFuse","k.coverage":"refused_by_name"}

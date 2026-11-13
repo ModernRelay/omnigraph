@@ -294,7 +294,8 @@ that calls itself.
 
 | Refused | Stage | Rewrite this release runs |
 |---|---|---|
-| `optional { … }`, `from union(…)`, a declared read's call, `distance`, an edge-type binding in a read, `limit $param` | B | none |
+| `from union(…)`, a declared read's call, `distance`, an edge-type binding in a read, `limit $param` | B | none |
+| A node an `optional` introduces, returned whole | B | return its properties |
 | A `let` whose value can fail (arithmetic) | B | write the value where the name is read, in `where` or `return` |
 | An order key no return item computes | B | return the key under an alias; the edit inserts it |
 | An inline read with an aggregate, `distinct`, `order` or `limit` | B | none |

@@ -330,6 +330,8 @@ pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
                 } => {
                     out.insert(dst_var.clone(), dst_type.clone());
                 }
+                // An `optional`'s names are in scope after it.
+                PatternStep::Optional { inner, .. } => bindings(inner, out),
                 PatternStep::AntiJoin { .. }
                 | PatternStep::Filter(_)
                 | PatternStep::Rank { .. } => {}
@@ -409,7 +411,7 @@ pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
                 PatternStep::Filter(filter) | PatternStep::Rank { key: filter, .. } => {
                     calls(filter, types, out)
                 }
-                PatternStep::AntiJoin { inner, .. } => {
+                PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
                     let mut inner_types = types.clone();
                     bindings(inner, &mut inner_types);
                     filter_calls(inner, &inner_types, out);
@@ -807,6 +809,26 @@ fn resolve_pipeline(
                         predicate: predicate.clone(),
                     },
                     schema,
+                )
+            }
+            PatternStep::Optional { outer_var, inner } => {
+                let input = bound(current, "optional")?;
+                let schema = schema_of(plan, input)?;
+                let outer = plan.add(
+                    LogicalNode::OuterReference {
+                        outer_var: outer_var.clone(),
+                    },
+                    schema,
+                );
+                let inner = resolve_pipeline(plan, inner, source, next_binding, Some(outer))?;
+                let joined = schema_of(plan, inner)?;
+                plan.add(
+                    LogicalNode::OptionalJoin {
+                        input,
+                        inner,
+                        outer_var: outer_var.clone(),
+                    },
+                    joined,
                 )
             }
         };
@@ -1974,7 +1996,13 @@ fn place_query_filters(
                     }
                     stack.extend(*input);
                 }
-                Some(LogicalNode::AntiJoin { input, inner, .. }) => {
+                // An `optional`'s inner tree is a scope of its own: a filter
+                // written after it never moves into it, where it would keep
+                // the outer row with nulls instead of dropping it.
+                Some(
+                    LogicalNode::AntiJoin { input, inner, .. }
+                    | LogicalNode::OptionalJoin { input, inner, .. },
+                ) => {
                     scopes.push(*inner);
                     stack.push(*input);
                 }
@@ -2517,6 +2545,11 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             edge_binding: _,
         }
         | LogicalNode::OuterReference { outer_var: _ }
+        | LogicalNode::OptionalJoin {
+            input: _,
+            inner: _,
+            outer_var: _,
+        }
         | LogicalNode::Join {
             left: _,
             right: _,
@@ -3477,6 +3510,20 @@ impl Lowering<'_> {
                     predicate: predicate.clone(),
                     aggregate: crate::plan_block_aggregate(&predicate.left)?,
                     strategy,
+                }))
+            }
+            LogicalNode::OptionalJoin {
+                input,
+                inner,
+                outer_var,
+            } => {
+                let lowered = self.lower(*input)?;
+                let inner = self.lower(*inner)?;
+                self.csr_cached = true;
+                Ok(self.physical.add(PhysicalNode::OptionalJoin {
+                    input: lowered,
+                    inner,
+                    outer_var: outer_var.clone(),
                 }))
             }
             LogicalNode::OuterReference { outer_var } => {
@@ -4746,7 +4793,8 @@ fn derive_properties(
             }
             PhysicalNode::Filter { input, .. }
             | PhysicalNode::Expand { input, .. }
-            | PhysicalNode::AntiJoin { input, .. } => {
+            | PhysicalNode::AntiJoin { input, .. }
+            | PhysicalNode::OptionalJoin { input, .. } => {
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),

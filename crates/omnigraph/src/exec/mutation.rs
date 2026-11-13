@@ -795,6 +795,7 @@ fn traverses(step: &omnigraph_planner::PatternStep) -> bool {
         step,
         omnigraph_planner::PatternStep::Expand { .. }
             | omnigraph_planner::PatternStep::AntiJoin { .. }
+            | omnigraph_planner::PatternStep::Optional { .. }
     )
 }
 

@@ -328,6 +328,60 @@ fn a_dropped_conjunct_fails_predicate_retention() {
     assert_eq!(check, "predicate retention", "{detail}");
 }
 
+/// An `optional` runs as one `OptionalJoin` over its correlation binding,
+/// testing its own conjuncts in its inner tree: a join over another binding,
+/// or a plan that tests the optional's conjunct after it, is refused.
+#[test]
+fn an_optional_tests_its_conjuncts_inside_its_inner_tree() {
+    let fixture = Fixture::new(
+        r#"query q() {
+    match { $d: Doc, optional { $d cites $e where $e.year > 2000 } }
+    return { $d.slug, $e.slug }
+}"#,
+        &[],
+    );
+    let plan = fixture.plan();
+    fixture.accept(plan.clone()).expect("the planned optional");
+    let [join] = node_ids(&plan, |node| {
+        matches!(node, PhysicalNode::OptionalJoin { .. })
+    })[..] else {
+        panic!("one optional join");
+    };
+    // The join correlated on another binding.
+    let mut relabelled = plan.clone();
+    if let Some(PhysicalNode::OptionalJoin { outer_var, .. }) = relabelled.node_mut(join) {
+        *outer_var = "e".to_string();
+    }
+    let (check, detail) = fixture.refused(relabelled);
+    assert_eq!(check, "predicate retention", "{detail}");
+    // The optional's conjunct also tested above the join.
+    let mut leaked = plan;
+    let conjunct = fixture.ir.pipeline.iter().find_map(|step| match step {
+        crate::PatternStep::Optional { inner, .. } => inner.iter().find_map(|step| match step {
+            crate::PatternStep::Expand { dst_filters, .. } => dst_filters.first().cloned(),
+            crate::PatternStep::Filter(filter) => Some(filter.clone()),
+            _ => None,
+        }),
+        _ => None,
+    });
+    let conjunct = conjunct.expect("the optional's conjunct");
+    let projection = node_ids(&leaked, |node| {
+        matches!(node, PhysicalNode::Projection { .. })
+    })[0];
+    let Some(PhysicalNode::Projection { input, .. }) = leaked.node(projection).cloned() else {
+        unreachable!()
+    };
+    let filter = leaked.add(PhysicalNode::Filter {
+        input,
+        filters: vec![conjunct],
+    });
+    if let Some(PhysicalNode::Projection { input, .. }) = leaked.node_mut(projection) {
+        *input = filter;
+    }
+    let (check, detail) = fixture.refused(leaked);
+    assert_eq!(check, "predicate origin", "{detail}");
+}
+
 /// The strategy of every block of `plan` set to `strategy`.
 fn relabel_blocks(plan: &mut PhysicalPlan, strategy: crate::AntiJoinStrategy) {
     for id in node_ids(plan, |node| matches!(node, PhysicalNode::AntiJoin { .. })) {

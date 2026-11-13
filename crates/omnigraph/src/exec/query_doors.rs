@@ -243,7 +243,9 @@ impl Session {
         let traverses = ir.pipeline.iter().any(|op| {
             matches!(
                 op,
-                PatternStep::Expand { .. } | PatternStep::AntiJoin { .. }
+                PatternStep::Expand { .. }
+                    | PatternStep::AntiJoin { .. }
+                    | PatternStep::Optional { .. }
             )
         });
         let graph_index = if traverses {
@@ -353,7 +355,9 @@ impl Session {
         let needs_graph = ir.pipeline.iter().any(|op| {
             matches!(
                 op,
-                PatternStep::Expand { .. } | PatternStep::AntiJoin { .. }
+                PatternStep::Expand { .. }
+                    | PatternStep::AntiJoin { .. }
+                    | PatternStep::Optional { .. }
             )
         });
         let graph_index = match (&index_source, needs_graph) {

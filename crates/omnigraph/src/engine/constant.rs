@@ -162,7 +162,9 @@ fn fold_pipeline(pipeline: &mut [PatternStep], params: &ParamMap) -> Result<()> 
                 }
             }
             PatternStep::Filter(filter) => *filter = fold_expr(filter, params)?,
-            PatternStep::AntiJoin { inner, .. } => fold_pipeline(inner, params)?,
+            PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
+                fold_pipeline(inner, params)?
+            }
             // The ranking's query binds at its scan, as a leading key's does.
             PatternStep::Rank { .. } => {}
         }

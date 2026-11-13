@@ -37,7 +37,7 @@ struct Row {
 /// shrink to empty before the release ships B whole.
 const B_IN_PROGRESS: &[&str] = &[
     "edge binding in a read",
-    "optional",
+    "a node an optional introduces returned whole",
     "a declared read's call",
     "union",
     "distance",
@@ -93,10 +93,18 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { $k: Knows } return { $k.@src } }",
                 Refused("B"),
             ),
-            // "optional"
             (
                 "query q() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name } }",
+                Lowers,
+            ),
+            // "a node an optional introduces returned whole"
+            (
+                "query q() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c } }",
                 Refused("B"),
+            ),
+            (
+                "query q() { match { $p: Person, optional { $p knows $f }, $f worksAt $c } where $c.name = \"Acme\" return { $p.name, $f.name } }",
+                Lowers,
             ),
         ],
     },
@@ -311,11 +319,6 @@ fn t86_is_at_the_construct_with_its_repair() {
     let suggestion = d.suggestion.expect("an edit");
     let repaired = apply_edits(text, &suggestion.edits);
     outcome(&repaired).unwrap_or_else(|e| panic!("{repaired}: {e}"));
-    // An `optional` is refused at the element.
-    let d =
-        refused("query q() { match { $p: Person, optional { $p knows $f } } return { $p.name } }");
-    assert_eq!(d.position.map(|p| p.column), Some(33), "{d}");
-    assert!(d.fix.is_none(), "{d}");
     // A block compared with a column is refused at the comparison.
     let d = refused(
         "query q() { match { $p: Person } where count { $f: Person, $p knows $f } >= $p.age return { $p.name } }",

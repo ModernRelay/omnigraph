@@ -174,6 +174,28 @@ text search is the exception: it stands alone as a conjunct (`T38`), so
 one. `match` itself is not an inner scope, and neither is `optional { ... }`:
 a triple there binds its ends.
 
+## Optional elements
+
+`optional { ... }` keeps every row of the elements before it: a row with
+matches once per match, and a row with none once, with every name the
+optional introduces null on it. The names it introduces are in scope after it
+and nullable, so `$c.name` read from `optional { $p worksAt $c }` is
+`String?`, `$c is null` tests whether the row had a match, and `count($c)`
+counts the matches. A `where` inside the braces decides which rows match; a
+`where` after `match` filters the joined rows:
+
+```gq
+query employers() {
+  match { $p: Person, optional { $p worksAt $c where $c.slug = "acme" } }
+  return { $p.handle, $c.name }
+}
+```
+
+A traversal written after the optional may start from a name it introduces;
+a row where that name is null has no match there. Returning a node the
+optional introduces whole, `return { $c }`, is not lowered in this release
+(`T86`): return its properties.
+
 ## Values and inline reads
 
 `let $v = <expression>` names a value computed for every row of the elements

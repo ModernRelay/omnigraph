@@ -124,6 +124,7 @@ binary's rows.
 | HydrateByAddress | [1] |
 | HydrateColumns | [1] |
 | MetadataCount | [0] |
+| OptionalJoin | [2] |
 | OuterReference | [0] |
 | Page | [1] |
 | Projection | [1] |
@@ -186,6 +187,7 @@ binary's rows.
 | MergeClassify | routable |
 | MetadataCount | refused_by_name |
 | Nearest | refused_by_name |
+| OptionalJoin | refused_by_name |
 | OuterReference | refused_by_name |
 | Projection | routable |
 | RankFuse | refused_by_name |

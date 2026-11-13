@@ -961,7 +961,18 @@ physical_nodes! {
         strategy: AntiJoinStrategy,
     } => "AntiJoin" [input: NodeId, inner: NodeId]
         shape: PipelineShape::Breaker, sides: vec![*inner], cut: None, order: None;
-    /// The enclosing rows, the leaf of a correlated `AntiJoin` inner tree.
+    /// `optional { … }` over `input`: every input row with each of its
+    /// matches in the `inner` tree, whose leaf is an `OuterReference` to the
+    /// input rows, and an input row with none once, every column the inner
+    /// tree adds null on it.
+    OptionalJoin {
+        input: NodeId,
+        inner: NodeId,
+        outer_var: String,
+    } => "OptionalJoin" [input: NodeId, inner: NodeId]
+        shape: PipelineShape::Breaker, sides: vec![*inner], cut: None, order: None;
+    /// The enclosing rows, the leaf of a correlated `AntiJoin` or
+    /// `OptionalJoin` inner tree.
     OuterReference {
         outer_var: String,
     } => "OuterReference" []
@@ -1501,6 +1512,10 @@ impl PhysicalPlan {
                 "typed_left": crate::typed::block(&predicate.left),
                 "typed_right": crate::typed::expr(&predicate.right),
             }),
+            PhysicalNode::OptionalJoin { outer_var, .. } => json!({
+                "node": node.name(),
+                "outer_var": outer_var,
+            }),
             PhysicalNode::OuterReference { outer_var } => json!({
                 "node": node.name(),
                 "outer_var": outer_var,
@@ -1807,6 +1822,7 @@ impl PhysicalPlan {
             Some(PhysicalNode::CrossJoin { .. }) => "CrossJoin(build)".to_string(),
             Some(PhysicalNode::ContainsJoin { .. }) => "ContainsJoin(build)".to_string(),
             Some(PhysicalNode::AntiJoin { .. }) => "AntiJoin(inner)".to_string(),
+            Some(PhysicalNode::OptionalJoin { .. }) => "OptionalJoin(inner)".to_string(),
             Some(PhysicalNode::RankFuse { .. }) => "RankFuse(secondary)".to_string(),
             Some(node) => node.name().to_string(),
             None => "tombstone".to_string(),

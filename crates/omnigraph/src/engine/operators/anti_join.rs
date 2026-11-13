@@ -42,7 +42,7 @@ use crate::error::{OmniError, Result};
 pub(crate) struct OuterSlot(Mutex<Option<RecordBatch>>);
 
 impl OuterSlot {
-    fn fill(&self, batch: RecordBatch) {
+    pub(super) fn fill(&self, batch: RecordBatch) {
         *self
             .0
             .lock()
@@ -57,7 +57,7 @@ impl OuterSlot {
     }
 }
 
-struct FilledSlot<'a>(&'a OuterSlot);
+pub(super) struct FilledSlot<'a>(pub(super) &'a OuterSlot);
 
 impl Drop for FilledSlot<'_> {
     fn drop(&mut self) {
@@ -211,7 +211,7 @@ pub(crate) fn tagged_schema(outer: &Schema, tag_column: &str) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-fn tag_batch(wide: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
+pub(super) fn tag_batch(wide: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let num_rows = wide.num_rows();
     let mut columns: Vec<ArrayRef> = wide.columns().to_vec();
     columns.push(Arc::new(UInt32Array::from_iter_values(0..num_rows as u32)));

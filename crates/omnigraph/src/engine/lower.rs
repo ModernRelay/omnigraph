@@ -40,9 +40,9 @@ use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerUdaf};
 use super::operators::{
     AntiJoinMaskExec, ArmOrder, CatalogueExec, ContainsJoinExec, CrossJoinExec, CsvSourceExec,
     ExpandExec, ExpandExecution, ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec,
-    LanceFragmentSink, LimitExec, LookupSpec, MetadataCountExec, OuterReferenceExec, OuterSlot,
-    ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec, ScanSource, SortExec, SortKey,
-    TargetCutExec, ValidateExec, fresh_tag_column, tagged_schema,
+    LanceFragmentSink, LimitExec, LookupSpec, MetadataCountExec, OptionalJoinExec,
+    OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec,
+    ScanSource, SortExec, SortKey, TargetCutExec, ValidateExec, fresh_tag_column, tagged_schema,
 };
 use super::*;
 use crate::loader::LoadMode;
@@ -836,7 +836,7 @@ impl Lower for Walk<'_, '_> {
         self.built(id, expand)
     }
 
-    fn anti_join_outer(&mut self, _id: NodeId, _outer_var: &str, outer: &Plan) -> Lowers<()> {
+    fn correlate_outer(&mut self, _id: NodeId, _outer_var: &str, outer: &Plan) -> Lowers<()> {
         let outer_schema = outer.schema();
         let tag_column = fresh_tag_column(&outer_schema);
         self.outers.push(OuterScope {
@@ -891,6 +891,26 @@ impl Lower for Walk<'_, '_> {
             Arc::clone(self.lowering.graph_index),
         );
         self.built(id, mask)
+    }
+
+    fn optional_join(
+        &mut self,
+        id: NodeId,
+        outer_var: &str,
+        outer: Plan,
+        inner: Plan,
+    ) -> Lowers<Plan> {
+        let scope = self.outers.pop().ok_or_else(|| {
+            OmniError::manifest_internal("OptionalJoin closed with no outer scope open".to_string())
+        })?;
+        let join = OptionalJoinExec::try_new(
+            outer,
+            inner,
+            outer_var.to_string(),
+            scope.tag_column,
+            scope.slot,
+        )?;
+        self.built(id, join)
     }
 
     fn outer_reference(&mut self, id: NodeId, outer_var: &str) -> Lowers<Plan> {

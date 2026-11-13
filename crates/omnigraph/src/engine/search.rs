@@ -853,7 +853,9 @@ pub(super) fn collect_referenced_edge_names(
                         .map(|member| member.edge_type.clone()),
                 );
             }
-            PatternStep::AntiJoin { inner, .. } => collect_referenced_edge_names(inner, out),
+            PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
+                collect_referenced_edge_names(inner, out)
+            }
             PatternStep::NodeScan { .. } | PatternStep::Filter(_) | PatternStep::Rank { .. } => {}
         }
     }

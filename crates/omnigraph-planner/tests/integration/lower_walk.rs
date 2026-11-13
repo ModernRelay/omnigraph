@@ -164,8 +164,8 @@ impl Lower for Trace {
         self.call("expand", id, &[&input])
     }
 
-    fn anti_join_outer(&mut self, id: NodeId, _: &str, outer: &String) -> Result<(), PlanError> {
-        self.call("anti_join_outer", id, &[outer]).map(|_| ())
+    fn correlate_outer(&mut self, id: NodeId, _: &str, outer: &String) -> Result<(), PlanError> {
+        self.call("correlate_outer", id, &[outer]).map(|_| ())
     }
 
     fn anti_join(
@@ -176,6 +176,16 @@ impl Lower for Trace {
         inner: String,
     ) -> Result<String, PlanError> {
         self.call("anti_join", id, &[&outer, &inner])
+    }
+
+    fn optional_join(
+        &mut self,
+        id: NodeId,
+        _: &str,
+        outer: String,
+        inner: String,
+    ) -> Result<String, PlanError> {
+        self.call("optional_join", id, &[&outer, &inner])
     }
 
     fn outer_reference(&mut self, id: NodeId, _: &str) -> Result<String, PlanError> {
@@ -401,7 +411,7 @@ fn an_anti_join_hands_over_its_outer_input_before_the_inner_tree_is_lowered() {
         names,
         [
             "outer_reference#0",
-            "anti_join_outer#3",
+            "correlate_outer#3",
             "outer_reference#1",
             "filter#2",
             "anti_join#3",

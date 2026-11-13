@@ -116,6 +116,54 @@ pub(crate) struct Block {
     pub predicate: SubqueryPredicate,
 }
 
+/// An `optional { }` of the top-level scope: its correlation binding and
+/// the eligibility conjuncts of its own pattern, which the plan tests inside
+/// its inner tree and nowhere after it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OptionalMatch {
+    pub outer_var: String,
+    pub eligibility: Vec<IRExpr>,
+}
+
+/// The steps of `steps` with each `optional`'s own steps in its place: the
+/// names an `optional` introduces are the scope's, so its bindings,
+/// traversals, conjuncts and blocks are the scope's requirements too, and
+/// `optionals` records where its conjuncts must run.
+fn flatten<'p>(
+    steps: &'p [PatternStep],
+    out: &mut Vec<&'p PatternStep>,
+    optionals: &mut Vec<OptionalMatch>,
+) {
+    for step in steps {
+        match step {
+            PatternStep::Optional { outer_var, inner } => {
+                let mut eligibility = Vec::new();
+                for own in inner {
+                    match own {
+                        PatternStep::NodeScan { filters, .. }
+                        | PatternStep::Expand {
+                            dst_filters: filters,
+                            ..
+                        } => push_conjuncts(&mut eligibility, filters),
+                        PatternStep::Filter(filter) => {
+                            push_conjuncts(&mut eligibility, std::slice::from_ref(filter))
+                        }
+                        PatternStep::Rank { .. }
+                        | PatternStep::AntiJoin { .. }
+                        | PatternStep::Optional { .. } => {}
+                    }
+                }
+                optionals.push(OptionalMatch {
+                    outer_var: outer_var.clone(),
+                    eligibility,
+                });
+                flatten(inner, out, optionals);
+            }
+            other => out.push(other),
+        }
+    }
+}
+
 /// What every plan for one checked declaration must preserve.
 #[derive(Debug, Clone)]
 pub struct Requirements {
@@ -128,6 +176,8 @@ pub struct Requirements {
     pub(crate) traversals: Vec<Traversal>,
     /// Correlated blocks of the top-level scope, in written order.
     pub(crate) blocks: Vec<Block>,
+    /// The `optional`s of the top-level scope, nested ones included.
+    pub(crate) optionals: Vec<OptionalMatch>,
     pub(crate) search: Option<Search>,
     /// Every eligibility conjunct of the top-level scope (inline matches,
     /// `match` filters and the filters of a deferred traversal destination),
@@ -169,7 +219,10 @@ impl Requirements {
         let mut bindings: BTreeMap<String, BoundVariable> = BTreeMap::new();
         let mut selected_edges = HashSet::new();
         let mut rank_step: Option<(&IRExpr, Option<u64>)> = None;
-        for op in &ir.pipeline {
+        let mut steps = Vec::new();
+        let mut optionals = Vec::new();
+        flatten(&ir.pipeline, &mut steps, &mut optionals);
+        for op in steps {
             budget.visit(1)?;
             match op {
                 PatternStep::Rank { key, window, .. } => rank_step = Some((key, *window)),
@@ -240,6 +293,9 @@ impl Requirements {
                     outer_var: outer_var.clone(),
                     predicate: predicate.clone(),
                 }),
+                PatternStep::Optional { .. } => {
+                    unreachable!("flatten puts an optional's steps in its place")
+                }
             }
         }
         let mut keys = ir.order_by.as_slice();
@@ -297,6 +353,7 @@ impl Requirements {
             selected_edges,
             traversals,
             blocks,
+            optionals,
             search,
             eligibility,
             returns: ir.return_exprs.clone(),

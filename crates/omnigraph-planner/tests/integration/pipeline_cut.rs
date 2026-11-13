@@ -83,6 +83,11 @@ fn multi_input_samples(plan: &mut PhysicalPlan) -> Vec<PhysicalNode> {
             aggregate: None,
             strategy: AntiJoinStrategy::Correlated,
         },
+        PhysicalNode::OptionalJoin {
+            input: k,
+            inner: l,
+            outer_var: "o".to_string(),
+        },
         PhysicalNode::RankFuse {
             arms: [
                 arm(leaf(plan), RankKind::Nearest),

@@ -483,6 +483,7 @@ fn estimate_rows_over(
         | LogicalNode::TextSearch { input, .. }
         | LogicalNode::RankFuse { input, .. }
         | LogicalNode::AntiJoin { input, .. }
+        | LogicalNode::OptionalJoin { input, .. }
         | LogicalNode::TargetCut { input, .. }
         | LogicalNode::Aggregate { input, .. } => estimate_rows(plan, *input, source),
         LogicalNode::Limit { input, rows, .. } | LogicalNode::Page { input, rows, .. } => {

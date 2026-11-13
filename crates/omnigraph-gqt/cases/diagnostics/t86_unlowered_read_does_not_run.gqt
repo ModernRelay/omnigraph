@@ -1,6 +1,7 @@
 # issue: none
 # notes: A read whose term this release's planner does not lower is refused at type check with `T86`, naming the stage that adds it:
-# notes: an `optional` (stage B) and a read that calls itself (`Fix`, stage Rec); nothing executes.
+# notes: an `optional`'s node returned whole (stage B) and a read that calls itself (`Fix`, stage Rec); nothing executes.
+# notes: The `optional` itself runs.
 
 --- runner
 timeout_ms: 10000
@@ -49,7 +50,19 @@ query q($h: String) { match { $p: Person, optional { $p knows $q } } where $p.ha
 --- params
 {"h": "ada"}
 
---- expect error: type error: T86: `q`: this release's planner does not lower a `Union` in a pattern (an `optional`, or a `from` over `union`); stage B (the break) adds it
+--- expect unordered
+{"p.name":"Ada"}
+
+--- expect shape
+p.name: String
+
+--- query
+query whole($h: String) { match { $p: Person, optional { $p knows $q } } where $p.handle = $h return { $p.name, $q } }
+
+--- params
+{"h": "ada"}
+
+--- expect error: type error: T86: `whole`: this release's planner does not lower a node an `optional` introduces returned whole (a nullable node object); stage B (the break) adds it
 
 --- query
 query reachable($from: String) {
