@@ -46,13 +46,12 @@ it; a second declaration is `T83`, naming both: rename or delete the later one.
 A read is `match { ... }`, an optional `where`, then `return`, `order` and
 `limit`. `match` holds the elements that produce rows (bindings, triples,
 `optional { ... }`, `let` and `from`), separated by commas; `where` holds one
-Boolean expression, evaluated after every element, that removes rows. Every
-list takes commas. Elements that share no variable multiply their rows, which
-is refused (`T81`) unless all but one are pinned to a row by their `@key`. For
-the elements, their refusals and fixes, edge alternatives, wildcard, bounded
-hops, direction, edge identity and products, see [Traversal and match
-patterns](traversal.md). `from` draws the rows of a ranking into the match,
-and `let` names a relation for it; see [Search](../search/index.md).
+Boolean expression, evaluated after every element, that removes rows. Elements
+that share no variable multiply their rows, which is refused (`T81`) unless
+all but one are pinned to a row by their `@key`. For the elements, edges, hops,
+products and inner scopes, with their refusals and fixes, see [Traversal and
+match patterns](traversal.md). `from` draws the rows of a ranking into the
+match, and `let` names a relation for it; see [Search](../search/index.md).
 
 ### Boolean expressions and nulls
 
@@ -104,16 +103,17 @@ wrong side); a [write](../mutations/index.md) selects the same way.
 `exists { ... }`, `not exists { ... }`, `count { ... } op value` and
 `sum(expr) { ... } op value` (also `min`, `max`, `avg`) are operands of
 `where` that match a pattern once per outer row; a block holds elements and
-its own `where`, `count { $p knows $q where $q.age > 30 }`, and must read an
-outer variable (`T39`, `T9` under `not`). The row is kept when the aggregate
-comparison is true: `not exists` means `count = 0`, and `exists` means
-`count > 0`. The right side is a literal, `now()` or typed parameter;
-a column, such as `$p.quota`, is not lowered in this release
-(`T86`). Numeric bounds follow the [comparison rules](#boolean-expressions-and-nulls)
-for the aggregate's result type. Its argument is a scalar expression in the
-block's scope: numeric for `sum` and `avg`; numeric, `String`, `Bool`, `Date`
-or `DateTime` for `min` and `max`, as in `return`. With no matches, `sum`,
-`min`, `max` and `avg` satisfy no comparison; `count` is `0`.
+its own `where`, `count { $q: Person, $p knows $q where $q.age > 30 }`, reads
+an outer variable (`T39`, `T9` under `not`) and binds every name new to it
+(`T84`, [inner scopes](traversal.md#inner-scopes)). The row is kept when the
+aggregate comparison is true: `not exists` means `count = 0`, and `exists`
+means `count > 0`. The right side is a literal, `now()` or typed parameter; a
+column, `$p.quota`, is not lowered yet (`T86`). Numeric bounds follow the
+[comparison rules](#boolean-expressions-and-nulls) for the aggregate's result
+type. Its argument is a scalar expression in the block's scope: numeric for
+`sum` and `avg`; numeric, `String`, `Bool`, `Date` or `DateTime` for `min` and
+`max`, as in `return`. With no matches, `sum`, `min`, `max` and `avg` satisfy
+no comparison; `count` is `0`.
 
 Integer block `sum` accumulates exactly in 128 bits, refuses overflow of that
 range, and rounds the total once to `F64` before comparison: `9007199254740993`

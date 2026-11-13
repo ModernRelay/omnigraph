@@ -364,7 +364,7 @@ needs the same query for conclusions:
 // GraphPolicy pol-assertion-has-span, check_query: assertions_without_span
 query assertions_without_span() {
     match { $a: Assertion }
-    where not exists { $a extractedFrom $s }
+    where not exists { $s: TranscriptSegment, $a extractedFrom $s }
     return { $a.slug }
 }
 ```
@@ -491,7 +491,7 @@ query:
 // GraphPolicy pol-strategic-has-owner, check_query: strategic_without_owner
 query strategic_without_owner() {
     match { $c: Customer }
-    where $c.tier = "strategic" and not exists { $c accountOwner $p }
+    where $c.tier = "strategic" and not exists { $p: Person, $c accountOwner $p }
     return { $c.slug }
 }
 ```

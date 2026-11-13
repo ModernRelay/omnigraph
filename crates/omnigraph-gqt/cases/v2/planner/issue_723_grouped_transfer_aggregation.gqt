@@ -157,7 +157,7 @@ sent: F64?
 --- query
 set engine = v2;
 query repeated_source_rows() {
-    match { $copy: Account, let $srcs = { match { $src: Account, $src $t:accountTransferAccount $dst } return { $src, $dst, $t } }, from $srcs }
+    match { $copy: Account, let $srcs = { match { $src: Account, $dst: Account, $src $t:accountTransferAccount $dst } return { $src, $dst, $t } }, from $srcs }
     where $src.accountId = "a"
     return { $src.accountId, count($t.amount) as transfers, sum($t.amount) as sent }
 }

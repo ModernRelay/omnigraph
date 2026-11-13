@@ -1,0 +1,37 @@
+# issue: none
+# notes: A block or an inline read is an inner scope: a name it reads from the enclosing scope correlates, and a name new to it
+# notes: is introduced by a binding element inside it. A triple naming a name that is neither is `T84`, whose fix inserts the
+# notes: binding with the type the edge declares for that end before the triple; nothing executes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+    age: I32?
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+
+--- query
+query loners() { match { $p: Person } where not exists { $p knows $q } return { $p.name } }
+
+--- expect error: type error: T84: `$q` is named in a triple of this block but bound nowhere
+
+--- query
+query headcounts() { match { from { match { $p worksAt $c } return { $c, count($p) as n } } } return { $c.name, $n } }
+
+--- expect error: type error: T84: `$p`, `$c` are named in a triple of this inline read but bound nowhere

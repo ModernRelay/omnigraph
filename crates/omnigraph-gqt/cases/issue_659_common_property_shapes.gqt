@@ -90,7 +90,7 @@ query incompatible_vector_dimensions() {
 query nullable_block_argument_counts_nonnull_values() {
     match { $a: Person }
     where $a.name = "a"
-      and count(contains($e.state, "open")) { $a $e:(knows | likes) $b } = 2
+      and count(contains($e.state, "open")) { $b: Person, $a $e:(knows | likes) $b } = 2
     return { $a.name as name }
 }
 --- expect unordered
@@ -102,7 +102,7 @@ name: String
 query nullable_block_argument_parameter_counts_nonnull_values($term: String) {
     match { $a: Person }
     where $a.name = "a"
-      and count(contains($e.state, $term)) { $a $e:(knows | likes) $b } = 2
+      and count(contains($e.state, $term)) { $b: Person, $a $e:(knows | likes) $b } = 2
     return { $a.name as name }
 }
 --- params
@@ -115,7 +115,7 @@ name: String
 --- query
 query count_all_includes_null_property_edges() {
     match { $a: Person }
-    where $a.name = "a" and count { $a $e:(knows | likes) $b } = 3
+    where $a.name = "a" and count { $b: Person, $a $e:(knows | likes) $b } = 3
     return { $a.name as name }
 }
 --- expect unordered

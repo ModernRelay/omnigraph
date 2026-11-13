@@ -31,7 +31,7 @@ edge Knows: Person -> Person
 --- query
 query no_two_hop() {
     match { $p: Person }
-    where not exists { $p knows{2,2} $x }
+    where not exists { $x: Person, $p knows{2,2} $x }
     return { $p.name }
 }
 

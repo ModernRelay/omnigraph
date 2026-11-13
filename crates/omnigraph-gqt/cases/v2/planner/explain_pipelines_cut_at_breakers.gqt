@@ -68,7 +68,7 @@ pipeline 2: Expand -> HashJoin(probe) -> Projection => consumer after 0, 1
 set engine = v2;
 query knows_nobody() {
     match { $p: Person }
-    where not exists { $p knows $q }
+    where not exists { $q: Person, $p knows $q }
     return { $p.name }
 }
 --- expect unordered

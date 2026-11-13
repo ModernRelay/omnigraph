@@ -198,6 +198,33 @@ source first: `, $p worksAt $c`. Otherwise the fix lists the triples, if any,
 and the suggestion, which needs review, writes the second component as the
 named relation drawn with `from`.
 
+## Inner scopes
+
+A block and an inline read bind every name new to them and read an outer
+name to correlate on it; see
+[Traversal and match patterns](traversal.md#inner-scopes). A triple naming a
+name that is neither in scope nor bound there is `T84`:
+
+```text
+query loners() { match { $p: Person } where not exists { $p knows $q } return { $p.name } }
+```
+
+```text
+error[T84]: type error: T84: `$q` is named in a triple of this block but bound nowhere: a name new to a block or an inline read is introduced by a binding element inside it, and a name read from the enclosing scope correlates
+  --> line 1, column 58
+  fix: bind it in the block: `$q: Person`
+```
+
+The machine-applicable suggestion inserts `$q: Person, ` before the triple,
+with the type the edge declares for that end, and binds every other name the
+scope's triples introduce in the same edit. A binding inside a block of a name
+the enclosing scope holds is `T68`. Its suggestion drops the binding, so the
+block reads the outer name; a block that only binds the name to filter its
+row, `not exists { $p: Person where $p.name = "Bob" }`, becomes that filter,
+`not ($p.name = "Bob")`, or `not coalesce(…, false)` around a predicate that
+can be null. A binding of another type has no suggestion: name the block's
+own variable differently.
+
 ## Terms this release does not lower
 
 A read or write the type checker accepts, the planner runs. A term that

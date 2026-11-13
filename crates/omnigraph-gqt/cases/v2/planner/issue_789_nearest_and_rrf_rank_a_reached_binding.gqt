@@ -42,7 +42,7 @@ edge Cites: Doc -> Doc
 --- query
 query nearest_on_an_undeclared_destination($q: Vector(2)) {
     match {
-      from nearest({ match { $p: Person, $p knows $d } where $p.name = "p1" return { $p, $d } }, $d.embedding, $q, k: 1),
+      from nearest({ match { $p: Person, $d: Doc, $p knows $d } where $p.name = "p1" return { $p, $d } }, $d.embedding, $q, k: 1),
     }
     return { $d.slug }
     order { $distance }
@@ -96,7 +96,7 @@ d.slug: String
 --- query
 query nearest_from_a_source_with_no_edges($q: Vector(2)) {
     match {
-      from nearest({ match { $p: Person, $p knows $d } where $p.name = "p3" return { $p, $d } }, $d.embedding, $q, k: 2),
+      from nearest({ match { $p: Person, $d: Doc, $p knows $d } where $p.name = "p3" return { $p, $d } }, $d.embedding, $q, k: 2),
     }
     return { $d.slug }
     order { $distance }

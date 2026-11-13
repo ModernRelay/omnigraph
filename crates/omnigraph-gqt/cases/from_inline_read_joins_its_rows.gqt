@@ -45,7 +45,7 @@ edge Knows: Person -> Person
 {"edge":"Knows","from":"ada","to":"di"}
 
 --- query
-query from_vars() { match { from { match { $p: Person, $p worksAt $c } return { $p, $c } } } return { $p.handle, $c.slug } }
+query from_vars() { match { from { match { $p: Person, $c: Company, $p worksAt $c } return { $p, $c } } } return { $p.handle, $c.slug } }
 
 --- expect unordered
 {"c.slug":"acme","p.handle":"ada"}
@@ -67,7 +67,7 @@ p.handle: String
 town: String
 
 --- query
-query from_correlated() { match { $c: Company, from { match { $p worksAt $c } return { $p } } } return { $c.slug, $p.handle } }
+query from_correlated() { match { $c: Company, from { match { $p: Person, $p worksAt $c } return { $p } } } return { $c.slug, $p.handle } }
 
 --- expect unordered
 {"c.slug":"acme","p.handle":"ada"}
@@ -93,7 +93,7 @@ c.slug: String
 --- query
 query from_hides_the_names_it_does_not_return() {
     match {
-        from { match { $p: Person, $p worksAt $c } where $c.slug = "bolt" return { $p } },
+        from { match { $p: Person, $c: Company, $p worksAt $c } where $c.slug = "bolt" return { $p } },
         $c: Company,
     }
     return { $p.handle, $c.slug }
@@ -109,7 +109,7 @@ c.slug: String
 
 --- query
 query from_over_a_grouped_read() {
-    match { from { match { $p worksAt $c } return { $c, count($p) as n } } }
+    match { from { match { $p: Person, $c: Company, $p worksAt $c } return { $c, count($p) as n } } }
     return { $c.slug, $n }
 }
 

@@ -45,7 +45,7 @@ p.slug: String
 set engine = v2;
 query both_in_one_block() {
     match { $p: Person }
-    where not $p.age > 35 and not exists { $p knows $q }
+    where not $p.age > 35 and not exists { $q: Person, $p knows $q }
     return { $p.slug }
 }
 

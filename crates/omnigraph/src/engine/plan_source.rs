@@ -904,7 +904,7 @@ query nobody_older() {
     return { $p.name }
 }
 query likes_nothing() {
-    match { $p: Person } where not exists { $p likes $d }
+    match { $p: Person } where not exists { $d: Doc, $p likes $d }
     return { $p.name }
 }
 query people() { match { $p: Person } return { count($p) as n } }

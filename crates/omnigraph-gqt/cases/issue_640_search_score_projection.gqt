@@ -196,7 +196,7 @@ query alias_projected_again() {
 --- query
 query nearest_projected_through_traversal($v: Vector(2)) {
     match {
-      from nearest({ match { $p: Person, $p knows $f } return { $p, $f } }, $p.embedding, $v, k: 3),
+      from nearest({ match { $p: Person, $f: Person, $p knows $f } return { $p, $f } }, $p.embedding, $v, k: 3),
     }
     return { $f.name, $distance as score }
     order { $distance, $f.name }

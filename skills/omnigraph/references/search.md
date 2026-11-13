@@ -190,7 +190,8 @@ type checking (`T27`); compare enums with `=`. The analyzer folds case and
 stems, so `"deep"` matches `"Deep Learning"`. `search`, `fuzzy` and
 `match_text` must stand alone as a conjunct of `where` or be compared
 `= true`, joined only by `and`; `= false`, `not search(...)` and `or` are
-refused (`T38`). Negate with a block that re-mentions the binding:
+refused (`T38`). Negate with a block that re-mentions the binding, the one
+block that may bind an outer name:
 `not exists { $d: Doc where search($d.title, $q) }`.
 
 ## The Key Pattern: Scope First, Rank Second
@@ -200,7 +201,7 @@ Filter with graph traversal inside the ranking's population. Constrain the ranke
 ```gq
 query related_chunks($artifact_slug: String, $q: Vector(1536)) {
     match {
-      from nearest({ match { $c: Chunk, $c partOfArtifact $a } where $a.slug = $artifact_slug return { $c, $a } }, $c.embedding, $q, k: 10),
+      from nearest({ match { $c: Chunk, $a: InformationArtifact, $c partOfArtifact $a } where $a.slug = $artifact_slug return { $c, $a } }, $c.embedding, $q, k: 10),
     }
     return { $c.text }
     order { $distance }           // rank: vector similarity within scope

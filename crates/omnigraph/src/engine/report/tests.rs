@@ -150,7 +150,7 @@ query older_likers() {
     return { $p.name, $q.name, $d.title }
 }
 query older_than_likers_of_d0_or_bob() {
-    match { $p: Person, let $qs = { match { $q: Person, $q likes $d } return { $q, $d } }, from $qs }
+    match { $p: Person, let $qs = { match { $q: Person, $d: Doc, $q likes $d } return { $q, $d } }, from $qs }
     where $p.age > $q.age and ($d.title = "d0" or $p.name = "bob")
     return { $p.name, $q.name, $d.title }
 }
@@ -159,7 +159,7 @@ query liked() {
     return { $p.name, $d.title }
 }
 query likes_nothing() {
-    match { $p: Person } where not exists { $p likes $d }
+    match { $p: Person } where not exists { $d: Doc, $p likes $d }
     return { $p.name }
 }
 query nobody_older() {
@@ -976,7 +976,7 @@ query fused_then_slug($t: String, $q: Vector(4)) {
 }
 query nearest_with_edge($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
+      from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
     }
     return { $d.slug }
     order { $distance }

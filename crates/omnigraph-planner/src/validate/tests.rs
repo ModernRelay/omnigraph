@@ -1032,7 +1032,7 @@ fn an_exhausted_budget_is_a_resource_outcome() {
 }
 
 const NEAREST: &str = r#"query q($v: Vector(2)) {
-    match { from nearest({ match { $d: Doc, $d cites $e } return { $d, $e } }, $d.embedding, $v, k: 3) }
+    match { from nearest({ match { $d: Doc, $e: Doc, $d cites $e } return { $d, $e } }, $d.embedding, $v, k: 3) }
     return { $d.slug }
     order { $distance }
     limit 3
@@ -1169,7 +1169,7 @@ fn membership_admits_the_fragment_and_nothing_else() {
         "query q() { match { $d: Doc } where \"a\" in $d.tags return { $d.slug } }",
         "query q() { match { $d: Doc, $d cites $e } return { $d.slug } }",
         "query q() { match { $d: Doc, let $es = { match { $e: Doc } return { $e } }, from $es } return { $d.slug } }",
-        "query q() { match { $d: Doc } where not exists { $d cites $e } return { $d.slug } }",
+        "query q() { match { $d: Doc } where not exists { $e: Doc, $d cites $e } return { $d.slug } }",
         "query q() { match { $d: Doc } return { count($d) as n } }",
         "query q() { match { $d: Doc } return { $d } }",
         "query q() { match { $d: Doc } return { $d.@id } }",
@@ -1432,14 +1432,14 @@ fn a_full_text_call_needs_a_recorded_index_segment() {
     return { $d.slug }
 }"#;
     let inherited = r#"query q($q: String) {
-    match { $d: Doc } where not exists { $d cites $x where search($d.title, $q) }
+    match { $d: Doc } where not exists { $x: Doc, $d cites $x where search($d.title, $q) }
     return { $d.slug }
 }"#;
     let nested = r#"query q($q: String) {
     match { $p: Doc }
     where not exists {
-        $p cites $d
-        where not exists { $d cites $x where search($d.title, $q) }
+        $d: Doc, $p cites $d
+        where not exists { $x: Doc, $d cites $x where search($d.title, $q) }
     }
     return { $p.slug }
 }"#;

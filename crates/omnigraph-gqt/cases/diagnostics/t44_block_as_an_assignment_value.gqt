@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- mutate
-query w() { match { $p: Person }  update $p set { age: count { $p knows $q } } }
+query w() { match { $p: Person }  update $p set { age: count { $q: Person, $p knows $q } } }
 
 --- expect error: type error: T44:

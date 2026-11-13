@@ -306,7 +306,7 @@ edge_id: String
 --- query
 query count_distinct_neighbors() {
     match { $from: Person }
-    where $from.name = "a" and count { $from (knows | likes) $to } = 3
+    where $from.name = "a" and count { $to: Person, $from (knows | likes) $to } = 3
     return { $from.name as name }
 }
 
@@ -319,7 +319,7 @@ name: String
 --- query
 query count_physical_edges() {
     match { $from: Person }
-    where $from.name = "a" and count { $from $edge:(knows | likes) $to } = 5
+    where $from.name = "a" and count { $to: Person, $from $edge:(knows | likes) $to } = 5
     return { $from.name as name }
 }
 
@@ -332,7 +332,7 @@ name: String
 --- query
 query exists_mixed_path() {
     match { $from: Person }
-    where $from.name = "a" and exists { $from (knows | likes){3,3} $to }
+    where $from.name = "a" and exists { $to: Person, $from (knows | likes){3,3} $to }
     return { $from.name as name }
 }
 
@@ -345,7 +345,7 @@ name: String
 --- query
 query not_mixed_path() {
     match { $from: Person }
-    where $from.name = "a" and not exists { $from (knows | likes){4,4} $to }
+    where $from.name = "a" and not exists { $to: Person, $from (knows | likes){4,4} $to }
     return { $from.name as name }
 }
 
@@ -409,7 +409,7 @@ total: I64
 
 --- query
 query type_metadata_inside_count_block() {
-    match { $a: Person } where $a.name = "a" and count($e.@type) { $a $e:(knows | likes) $b where $e.@type = "Likes" } = 1
+    match { $a: Person } where $a.name = "a" and count($e.@type) { $b: Person, $a $e:(knows | likes) $b where $e.@type = "Likes" } = 1
     return { $a.name as name }
 }
 --- expect unordered

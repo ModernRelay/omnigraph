@@ -77,15 +77,15 @@ const CLOSURE: &[Row] = &[
                 Lowers,
             ),
             (
-                "query q() { match { $p: Person, from { match { $p worksAt $c } return { $c } } } return { $p.name, $c.name } }",
+                "query q() { match { $p: Person, from { match { $c: Company, $p worksAt $c } return { $c } } } return { $p.name, $c.name } }",
                 Lowers,
             ),
             (
-                "query q() { match { $p: Person } where count { $p knows $q where $q.age > 30 } > 0 return { $p.name } }",
+                "query q() { match { $p: Person } where count { $q: Person, $p knows $q where $q.age > 30 } > 0 return { $p.name } }",
                 Lowers,
             ),
             (
-                "query q() { match { $p: Person } where not exists { $p worksAt $c } return { $p.name } }",
+                "query q() { match { $p: Person } where not exists { $c: Company, $p worksAt $c } return { $p.name } }",
                 Lowers,
             ),
             // "edge binding in a read"
@@ -318,7 +318,7 @@ fn t86_is_at_the_construct_with_its_repair() {
     assert!(d.fix.is_none(), "{d}");
     // A block compared with a column is refused at the comparison.
     let d = refused(
-        "query q() { match { $p: Person } where count { $p knows $f } >= $p.age return { $p.name } }",
+        "query q() { match { $p: Person } where count { $f: Person, $p knows $f } >= $p.age return { $p.name } }",
     );
     assert_eq!(d.position.map(|p| p.column), Some(40), "{d}");
     // A write group whose selection reads a table an earlier group changes

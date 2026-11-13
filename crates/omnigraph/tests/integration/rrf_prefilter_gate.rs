@@ -242,7 +242,7 @@ query antijoin_only($q1: String, $q2: String) {
       from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
       $c: Chunk,
     }
-    where not exists { $c chunkOfArtifact $a }
+    where not exists { $a: Artifact, $c chunkOfArtifact $a }
     return { $c.slug }
     order { $score desc }
     limit 5

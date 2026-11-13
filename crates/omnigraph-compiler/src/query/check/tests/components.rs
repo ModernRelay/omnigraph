@@ -156,7 +156,7 @@ fn without_one_connecting_triple_the_fix_is_the_named_relation() {
 #[test]
 fn every_scope_applies_the_rule() {
     t81(
-        "query q() { match { $p: Person } where exists { $p knows $q, $c: Company } return { $p.name } }",
+        "query q() { match { $p: Person } where exists { $q: Person, $p knows $q, $c: Company } return { $p.name } }",
     );
     t81("query q() { match { $p: Person, optional { $c: Company } } return { $p.name } }");
     t81(
@@ -166,10 +166,10 @@ fn every_scope_applies_the_rule() {
     ok(
         r#"query w() { match { $p: Person, $c: Company } where $c.slug = "acme" update $p set { age: 1 } }"#,
     );
-    // A block re-mentioning the outer variable correlates on the outer row,
-    // which is one row.
+    // A block reading the outer variable correlates on the outer row, which
+    // is one row.
     ok(
-        r#"query q() { match { $p: Person } where exists { $p: Person, $c: Company where $c.slug = "acme" } return { $p.name } }"#,
+        r#"query q() { match { $p: Person } where exists { $c: Company where $p.name = $c.name and $c.slug = "acme" } return { $p.name } }"#,
     );
 }
 

@@ -72,7 +72,7 @@ p.age: I32?
 
 --- mutate
 query unemployed_age() {
-  match { $p: Person } where not exists { $p worksAt $c }
+  match { $p: Person } where not exists { $c: Company, $p worksAt $c }
   update $p set { age: $p.age + 1 }
 }
 
@@ -80,7 +80,7 @@ query unemployed_age() {
 
 --- mutate
 query mentors_move() {
-  match { $p: Person } where count { $p mentors $m } > 1
+  match { $p: Person } where count { $m: Person, $p mentors $m } > 1
   update $p set { city: null }
 }
 
@@ -110,7 +110,7 @@ p.age: I32?
 
 --- mutate
 query mentor_from_a_read() {
-  match { from { match { $p: Person, $p worksAt $c } where $c.slug = "acme" return { $p } }, $x: Person } where $x.name = "di"
+  match { from { match { $p: Person, $c: Company, $p worksAt $c } where $c.slug = "acme" return { $p } }, $x: Person } where $x.name = "di"
   insert Mentors { from: $x, to: $p }
 }
 

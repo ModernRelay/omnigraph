@@ -51,7 +51,7 @@ edge Knows: Doc -> Doc {
 --- query
 query nearest_two_hop_sources($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $d knows $t, $t knows $u } return { $d, $t, $u } }, $d.embedding, $q, k: 2),
+      from nearest({ match { $d: Doc, $t: Doc, $d knows $t, $u: Doc, $t knows $u } return { $d, $t, $u } }, $d.embedding, $q, k: 2),
     }
     return { $d.slug }
     order { $distance }

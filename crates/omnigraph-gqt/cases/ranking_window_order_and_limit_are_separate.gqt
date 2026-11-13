@@ -142,7 +142,7 @@ distance: F32
 --- query
 query a_window_keeps_every_row_of_a_target() {
     match {
-        from nearest({ match { $d: Doc, $d cites $e } return { $d, $e } }, $d.embedding, [0.0, 1.0], k: 1),
+        from nearest({ match { $d: Doc, $e: Doc, $d cites $e } return { $d, $e } }, $d.embedding, [0.0, 1.0], k: 1),
     }
     return { $d.slug, $e.slug }
     order { $e.slug }
@@ -160,7 +160,7 @@ e.slug: String
 query the_ladder_fills_a_window_its_population_thins() {
     match {
         from nearest(
-            { match { $d: Doc } where not exists { $d cites $x } return { $d } },
+            { match { $d: Doc } where not exists { $x: Doc, $d cites $x } return { $d } },
             $d.embedding, [0.0, 1.0], k: 1
         ),
     }

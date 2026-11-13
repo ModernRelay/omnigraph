@@ -1,7 +1,8 @@
 # issue: none
 # red_on: 2026-09-16 working tree: `planner internal error: a GQ filter op has no input`.
-# notes: Count documents whose slug does not start with x. The negated filter
-# notes: uses the outer binding, without introducing another scan.
+# notes: Count documents whose slug does not start with x. The block that
+# notes: re-mentioned the outer binding to filter it is written as the negated
+# notes: filter it meant, which the one scan of the binding carries.
 
 --- runner
 timeout_ms: 10000
@@ -24,7 +25,7 @@ node Doc {
 set engine = v2;
 query count_non_x_docs() {
     match { $d: Doc }
-    where not exists { $d: Doc where starts_with($d.slug, "x") }
+    where not (starts_with($d.slug, "x"))
     return { count($d) as n }
 }
 
@@ -36,6 +37,6 @@ n: I64
 
 --- expect plan
 scan Doc as $d: columns [__id, slug]
-scan Doc as $d: no filter
-filter reads [d.slug]
+scan Doc as $d: filter reads [d.slug]
+pass predicate_pushdown
 pass projection_pushdown

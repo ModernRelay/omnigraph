@@ -226,13 +226,23 @@ fn inline_ret(input: Term, cols: &[(&str, Ty)]) -> Term {
 fn age() -> Ty {
     Ty::Value(PropType::scalar(ScalarType::I32, true))
 }
+/// `$q: Person, $p knows $q` in a block correlated on `$p`: the binding is
+/// a `Scan` beside the outer row, and the triple, both ends bound, expands to
+/// a fresh column that a filter ties to `$q` (section 2's derived forms).
 fn knows_q_from_env() -> Term {
-    expand(
-        env(&[("p", node("Person"))]),
-        "p",
-        "q",
-        "Person",
-        &[("Knows", Direction::Out)],
+    filter(
+        expand(
+            corr(env(&[("p", node("Person"))]), scan("q", "Person")),
+            "p",
+            "__temp_t1",
+            "Person",
+            &[("Knows", Direction::Out)],
+        ),
+        cmp(
+            CompOp::Eq,
+            prop("__temp_t1", "__id", val(ScalarType::String, false)),
+            prop("q", "__id", val(ScalarType::String, false)),
+        ),
     )
 }
 
@@ -261,27 +271,27 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
         ),
         (
             "count { p } as a value: Correlate(R, Group(p, [], [agg])), the aggregate column",
-            "query f() { match { $p: Person, let $n = count { $p knows $q } } return { $n } }",
+            "query f() { match { $p: Person, let $n = count { $q: Person, $p knows $q } } return { $n } }",
             Term::Project {
-                input: block(scan("p", "Person"), knows_q_from_env(), "__temp_b1").boxed(),
-                items: vec![("n".into(), col("__temp_b1", val(ScalarType::I64, false)))],
+                input: block(scan("p", "Person"), knows_q_from_env(), "__temp_b2").boxed(),
+                items: vec![("n".into(), col("__temp_b2", val(ScalarType::I64, false)))],
                 keep: true,
             },
         ),
         (
             "exists { p }: count { p } > 0",
-            "query f() { match { $p: Person } where exists { $p knows $q } return { $p } }",
+            "query f() { match { $p: Person } where exists { $q: Person, $p knows $q } return { $p } }",
             filter(
-                block(scan("p", "Person"), knows_q_from_env(), "__temp_b1"),
-                exists("__temp_b1"),
+                block(scan("p", "Person"), knows_q_from_env(), "__temp_b2"),
+                exists("__temp_b2"),
             ),
         ),
         (
             "not exists { p }: Filter(¬ exists { p })",
-            "query f() { match { $p: Person } where not exists { $p knows $q } return { $p } }",
+            "query f() { match { $p: Person } where not exists { $q: Person, $p knows $q } return { $p } }",
             filter(
-                block(scan("p", "Person"), knows_q_from_env(), "__temp_b1"),
-                not(exists("__temp_b1")),
+                block(scan("p", "Person"), knows_q_from_env(), "__temp_b2"),
+                not(exists("__temp_b2")),
             ),
         ),
         (
@@ -573,23 +583,23 @@ const FORMS: &[(&str, &str)] = &[
     ),
     (
         "exists",
-        "query f() { match { $p: Person } where exists { $p knows $q } return { $p } }",
+        "query f() { match { $p: Person } where exists { $q: Person, $p knows $q } return { $p } }",
     ),
     (
         "count_gt_0",
-        "query f() { match { $p: Person } where count { $p knows $q } > 0 return { $p } }",
+        "query f() { match { $p: Person } where count { $q: Person, $p knows $q } > 0 return { $p } }",
     ),
     (
         "count_ge_1",
-        "query f() { match { $p: Person } where count { $p knows $q } >= 1 return { $p } }",
+        "query f() { match { $p: Person } where count { $q: Person, $p knows $q } >= 1 return { $p } }",
     ),
     (
         "not_exists",
-        "query f() { match { $p: Person } where not exists { $p knows $q } return { $p } }",
+        "query f() { match { $p: Person } where not exists { $q: Person, $p knows $q } return { $p } }",
     ),
     (
         "count_eq_0",
-        "query f() { match { $p: Person } where count { $p knows $q } = 0 return { $p } }",
+        "query f() { match { $p: Person } where count { $q: Person, $p knows $q } = 0 return { $p } }",
     ),
     (
         "union_flat",
@@ -775,7 +785,8 @@ fn two_forms_share_a_term_only_when_the_formatter_names_one() {
 // The closure table (section 2, Closure): one case per row.
 
 /// A grouped relation: a derived relation for every row to consume.
-const GROUPED: &str = "{ match { $p worksAt $c } return { $c, count($p) as n } }";
+const GROUPED: &str =
+    "{ match { $p: Person, $c: Company, $p worksAt $c } return { $c, count($p) as n } }";
 
 #[test]
 fn the_closure_table() {
@@ -826,7 +837,7 @@ fn the_closure_table() {
     );
     rows.insert(
         "Score, ApproxTopK population, ranked column named",
-        accept("query q($v: Vector(3)) { match { from nearest({ match { from { match { $p authored $d } return { $d, count($p) as authors } } } where $authors > 1 return { $d, $authors } }, $d.embedding, $v, k: 5) } return { $d, $authors, $distance } }"),
+        accept("query q($v: Vector(3)) { match { from nearest({ match { from { match { $p: Person, $d: Doc, $p authored $d } return { $d, count($p) as authors } } } where $authors > 1 return { $d, $authors } }, $d.embedding, $v, k: 5) } return { $d, $authors, $distance } }"),
     );
     rows.insert(
         "Score population, ranked column not a node column",
@@ -838,12 +849,12 @@ fn the_closure_table() {
     );
     rows.insert(
         "Fuse arms, scored, over one node column",
-        accept("query q($s: String, $v: Vector(3)) { match { let $docs = { match { from { match { $p authored $d } return { $d, count($p) as a } } } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) } return { $d, $score } }"),
+        accept("query q($s: String, $v: Vector(3)) { match { let $docs = { match { from { match { $p: Person, $d: Doc, $p authored $d } return { $d, count($p) as a } } } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) } return { $d, $score } }"),
     );
     rows.insert(
         "Fuse arms over two node columns",
         refuse(
-            "query q($s: String, $v: Vector(3)) { match { let $docs = { match { $p authored $d } return { $p, $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), { match { from $docs } return { $p } order { $p.age } }) } return { $score } }",
+            "query q($s: String, $v: Vector(3)) { match { let $docs = { match { $p: Person, $d: Doc, $p authored $d } return { $p, $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), { match { from $docs } return { $p } order { $p.age } }) } return { $score } }",
             "T75",
             "the fused target would be a pair",
         ),

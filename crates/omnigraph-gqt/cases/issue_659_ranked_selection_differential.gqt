@@ -135,7 +135,7 @@ expand $d $t: mode indexed_scan ran indexed_scan
 
 --- query
 query nearest_named_chain($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc, $t: Doc, $d knows $t, $t tagged $m } return { $d, $t, $m } }, $d.embedding, $q, k: 3) }
+    match { from nearest({ match { $d: Doc, $t: Doc, $d knows $t, $m: Marker, $t tagged $m } return { $d, $t, $m } }, $d.embedding, $q, k: 3) }
     return { $d.slug as slug }
     order { $distance }
     limit 3
@@ -156,7 +156,7 @@ expand $t $m: mode indexed_scan ran indexed_scan
 
 --- query
 query nearest_selected_chain($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc, $t: Doc, $d knows $t, $t (tagged | tagged) $m } return { $d, $t, $m } }, $d.embedding, $q, k: 3) }
+    match { from nearest({ match { $d: Doc, $t: Doc, $d knows $t, $m: Marker, $t (tagged | tagged) $m } return { $d, $t, $m } }, $d.embedding, $q, k: 3) }
     return { $d.slug as slug }
     order { $distance }
     limit 3

@@ -199,11 +199,13 @@ fn block(depth: u32) -> BoxedStrategy<Block> {
                 func: BlockFunc::Agg(f),
                 arg: arg.map(Box::new),
                 pattern,
+                at: SourceSpan::default(),
             }),
         pattern(depth, 1..3).prop_map(|pattern| Block {
             func: BlockFunc::Exists,
             arg: None,
             pattern,
+            at: SourceSpan::default(),
         }),
     ]
     .boxed()

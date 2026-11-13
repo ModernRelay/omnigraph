@@ -323,6 +323,9 @@ pub struct Block {
     pub arg: Option<Box<Expr>>,
     /// The block's elements and its own `where`, inside its braces.
     pub pattern: Pattern,
+    /// Where the block was written, from its function word to its closing
+    /// brace: where a fix that replaces the whole block writes.
+    pub at: SourceSpan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -71,8 +71,8 @@ impl Parts {
             }
             Element::Let { .. } => {}
             // A binding of a name already in scope produces no row: it
-            // restates a local's type, or correlates a block on the outer
-            // row.
+            // restates a local's type, or re-mentions an outer name in an
+            // `optional` or in a block that negates a text search.
             Element::Binding { variable, .. } if !bound.contains(variable) => {
                 self.restated.push((index, variable.clone()));
             }

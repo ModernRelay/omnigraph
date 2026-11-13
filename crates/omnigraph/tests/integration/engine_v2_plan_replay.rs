@@ -503,7 +503,7 @@ query first_liked() {
     limit 1
 }
 query likes_nothing() {
-    match { $p: Person } where not exists { $p likes $d }
+    match { $p: Person } where not exists { $d: Doc, $p likes $d }
     return { $p.name }
 }
 query none_ordered() {
@@ -539,7 +539,7 @@ edge Knows: Doc -> Doc
 const DOC_QUERIES: &str = r#"
 query nearest_with_edge($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
+      from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
     }
     return { $d.slug }
     order { $distance }
@@ -547,7 +547,7 @@ query nearest_with_edge($q: Vector(4)) {
 }
 query window_then_where($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
+      from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
     }
     where $t.slug != "d01"
     return { $d.slug }
@@ -1811,7 +1811,7 @@ async fn a_plan_refusal_is_a_typed_bad_request_and_a_ranked_destination_replays_
     let db = docs(&dir).await;
     let source = r#"
 query nearest_destination($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $t.embedding, $q, k: 1) }
+    match { from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $t.embedding, $q, k: 1) }
     return { $t.slug }
     order { $distance }
     limit 1

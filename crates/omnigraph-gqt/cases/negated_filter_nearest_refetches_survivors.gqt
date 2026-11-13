@@ -41,7 +41,7 @@ node Doc {
 --- query
 query nearest_after_negation($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc } where not exists { $d: Doc where starts_with($d.name, "doc-00") } return { $d } }, $d.embedding, $q, k: 4),
+      from nearest({ match { $d: Doc } where not (starts_with($d.name, "doc-00")) return { $d } }, $d.embedding, $q, k: 4),
     }
     return { $d.slug }
     order { $distance }

@@ -3641,6 +3641,7 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
     match inner.as_rule() {
         Rule::expr => expr(inner),
         Rule::block_value => {
+            let at = source_span(&inner);
             let mut func = None;
             let mut arg = None;
             let mut pattern = Pattern::default();
@@ -3657,6 +3658,7 @@ fn operand(pair: Pair<Rule>) -> R<Expr> {
                 func: func.unwrap(),
                 arg,
                 pattern,
+                at,
             })))
         }
         Rule::agg_distinct => {

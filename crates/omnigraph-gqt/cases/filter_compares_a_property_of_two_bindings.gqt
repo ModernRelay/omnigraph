@@ -71,7 +71,7 @@ p.name: String
 --- query
 query kept_in_memory_inside_a_negation() {
     match { $p: Person }
-    where not exists { $p: Person where $p.age > 20.5 }
+    where not coalesce($p.age > 20.5, false)
     return { $p.name }
 }
 

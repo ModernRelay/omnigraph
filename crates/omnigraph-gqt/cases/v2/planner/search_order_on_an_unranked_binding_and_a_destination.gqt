@@ -78,7 +78,7 @@ sort tiebreak [$c, $z]
 --- query
 set engine = v2;
 query nearest_on_a_traversal_destination($q: Vector(4)) {
-    match { from nearest({ match { $p: Person, $p knows $d } return { $p, $d } }, $d.embedding, $q, k: 1) }
+    match { from nearest({ match { $p: Person, $d: Doc, $p knows $d } return { $p, $d } }, $d.embedding, $q, k: 1) }
     return { $d.slug }
     order { $distance }
     limit 1

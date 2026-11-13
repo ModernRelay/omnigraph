@@ -97,7 +97,7 @@ codes! {
     // docs/rfcs/2026-11-07-gq-3.md section 5. T60 to T64, T66 and T67 are
     // unallocated.
     T65 = "a ranking is written as a call in order or return; it is a relation function";
-    T68 = "a name drawn into scope, or bound inside an inline read, is already in scope";
+    T68 = "a name drawn into scope, or bound inside an inline read or a block, is already in scope";
     T69 = "a relation where a scalar is read, or a scalar where a relation is read";
     T70 = "a call cycle is not monotone, has no base arm, passes a computed argument, or exceeds the plan budget";
     T71 = "an option is unknown, out of range or written positionally";
@@ -112,6 +112,7 @@ codes! {
     T80 = "an annotation the language does not read";
     T81 = "a pattern whose components share no variable and are not pinned to one row by a `@key` equality";
     T83 = "two declarations of one name in a source unit";
+    T84 = "a name an inner scope, a block or an inline read, uses in a triple without binding it";
     T86 = "a term this release's planner does not lower; the message names the stage that adds it";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at

@@ -475,7 +475,7 @@ async fn string_contains_resolves_inside_negation() {
     let q = r#"
 query not_sal_tagged() {
     match { $m: Metric }
-    where not exists { $m tagged $t where contains($t.tname, "sal") }
+    where not exists { $t: Tag, $m tagged $t where contains($t.tname, "sal") }
     return { $m.name }
 }
 "#;
@@ -578,7 +578,7 @@ query prefix_and_search() {
 }
 query not_alp_tagged() {
     match { $m: Metric }
-    where not exists { $m tagged $t where starts_with($t.tname, "alp") }
+    where not exists { $t: Tag, $m tagged $t where starts_with($t.tname, "alp") }
     return { $m.name }
 }
 "#;

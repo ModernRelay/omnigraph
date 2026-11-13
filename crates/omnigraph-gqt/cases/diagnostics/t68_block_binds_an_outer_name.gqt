@@ -1,0 +1,37 @@
+# issue: none
+# notes: A block correlates on an outer name by reading it, so a binding inside a block of a name the enclosing scope holds is
+# notes: `T68`: beside other elements the fix drops the binding, and a block that only binds the name to filter its row is
+# notes: written as that filter, `not ($p.name = "Bob")`; nothing executes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+    age: I32?
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"bob","name":"Bob"}}
+
+--- query
+query not_bob() { match { $p: Person } where not exists { $p: Person where $p.name = "Bob" } return { $p.name } }
+
+--- expect error: type error: T68: `$p` is bound inside a block, but the scope where the block is written already holds `$p` (node Person)
+
+--- query
+query knows_someone() { match { $p: Person } where exists { $p: Person, $q: Person, $p knows $q } return { $p.name } }
+
+--- expect error: type error: T68: `$p` is bound inside a block, but the scope where the block is written already holds `$p` (node Person)

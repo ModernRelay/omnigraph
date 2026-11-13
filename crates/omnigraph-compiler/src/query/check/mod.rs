@@ -282,7 +282,7 @@ fn ranking_as_scalar(name: &str) -> QueryDiagnostic {
 /// gives every piece the edit needs: the spans the parser recorded, a
 /// `limit` to size a `nearest` window, every occurrence the same call, no
 /// aggregate, and for `rrf` the type of the ranked binding.
-fn ranking_in_order_or_return(body: &ReadBody) -> Option<QueryDiagnostic> {
+fn ranking_in_order_or_return(catalog: &Catalog, body: &ReadBody) -> Option<QueryDiagnostic> {
     let is_ranking = |e: &Expr| matches!(e, Expr::Call(c) if matches!(c.name.as_str(), "nearest" | "bm25" | "rrf" | "distance"));
     let (call, written) = body
         .order
@@ -310,7 +310,7 @@ fn ranking_in_order_or_return(body: &ReadBody) -> Option<QueryDiagnostic> {
     };
     let mut diagnostic = ranking_as_scalar(&call.name);
     diagnostic.position = written.map(|s| s.position);
-    if let Some((edits, fix)) = ranking_edits(body, call) {
+    if let Some((edits, fix)) = ranking_edits(catalog, body, call) {
         diagnostic = diagnostic.with_fix(fix).with_suggestion(Suggestion {
             applicability: Applicability::MachineApplicable,
             edits,
@@ -320,7 +320,11 @@ fn ranking_in_order_or_return(body: &ReadBody) -> Option<QueryDiagnostic> {
 }
 
 /// The edits, and the fix they write: the `match` clause and the `order`.
-fn ranking_edits(body: &ReadBody, call: &Call) -> Option<(Vec<TextEdit>, String)> {
+fn ranking_edits(
+    catalog: &Catalog,
+    body: &ReadBody,
+    call: &Call,
+) -> Option<(Vec<TextEdit>, String)> {
     use crate::query::syntax::print;
     let spans = &body.spans;
     let inner = spans.match_inner.as_ref()?;
@@ -508,11 +512,37 @@ fn ranking_edits(body: &ReadBody, call: &Call) -> Option<(Vec<TextEdit>, String)
             });
         }
     }
+    // The population is an inline read, which binds every name its triples
+    // introduce (`T84`).
+    let fresh = match call.name.as_str() {
+        "rrf" => Vec::new(),
+        _ => end_bindings(catalog, &body.pattern.elements, &HashMap::new()),
+    };
+    let element_spans = &body.pattern.spans.elements;
+    if !fresh.is_empty() && element_spans.len() != body.pattern.elements.len() {
+        return None;
+    }
+    for (i, binds) in &fresh {
+        let at = element_spans[*i].start;
+        edits.push(TextEdit {
+            start: at,
+            end: at,
+            replacement: binds.iter().map(|(n, t)| format!("${n}: {t}, ")).collect(),
+        });
+    }
     let elements = body
         .pattern
         .elements
         .iter()
-        .map(print::element)
+        .enumerate()
+        .flat_map(|(i, c)| {
+            let binds = fresh.iter().find(|(j, _)| *j == i).map(|(_, b)| b.clone());
+            binds
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(n, t)| format!("${n}: {t}"))
+                .chain(std::iter::once(print::element(c)))
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let filter = body
@@ -683,9 +713,14 @@ struct Scope {
     /// True inside an inline read or a called body: a binding reusing an
     /// outer name is `T68`, since it would silently become a filter.
     inner: bool,
-    /// True inside a block or `optional`: a binding that re-mentions an
-    /// outer variable correlates on it.
+    /// True inside `optional`: a binding that re-mentions an outer variable
+    /// correlates on it.
     correlates: bool,
+    /// True inside a block. A block, like an inline read, is an inner scope:
+    /// it correlates on an outer name by reading it, a binding of an outer
+    /// name is `T68`, and a name new to it is introduced by a binding
+    /// element, so a triple naming one it does not bind is `T84`.
+    block: bool,
     /// While a filter written earlier is placed: the names bound before it,
     /// the only outer names a block inside it correlates on.
     block_visible: Option<Vec<String>>,
@@ -721,6 +756,7 @@ impl Scope {
             pending: Vec::new(),
             inner,
             correlates: false,
+            block: false,
             block_visible: None,
             reads: Vec::new(),
         }
@@ -1172,7 +1208,7 @@ impl Ctx<'_> {
     /// A read body in `sc` (top level: no outer columns; inline: the
     /// enclosing scope's visible columns).
     fn read_body(&mut self, body: &ReadBody, mut sc: Scope) -> R<Rel> {
-        if let Some(refusal) = ranking_in_order_or_return(body) {
+        if let Some(refusal) = ranking_in_order_or_return(self.catalog, body) {
             return Err(E::D(refusal));
         }
         self.pattern(&mut sc, &body.pattern)?;
@@ -1632,7 +1668,7 @@ impl Ctx<'_> {
     /// binder it reads. A block in the `where` correlates on every element's
     /// names (section 3).
     fn pattern(&mut self, sc: &mut Scope, pattern: &Pattern) -> R<()> {
-        if let Some(fix) = aggregate_filter_fix(pattern, self.in_write) {
+        if let Some(fix) = aggregate_filter_fix(self.catalog, pattern, self.in_write) {
             return Err(fix);
         }
         if let Some(refusal) = membership_triple(pattern, sc) {
@@ -1640,16 +1676,46 @@ impl Ctx<'_> {
         }
         lookahead(&pattern.elements, sc);
         let mut parts = components::Parts::default();
+        // Each triple of an inner scope and the ends it introduced.
+        let mut introduced: Vec<(usize, Vec<String>)> = Vec::new();
         for (i, c) in pattern.elements.iter().enumerate() {
             if let Some(span) = pattern.spans.elements.get(i) {
                 self.at = Some(span.position);
             }
+            if sc.block
+                && let Element::Binding {
+                    variable,
+                    type_name,
+                } = c
+                && sc.local(variable).is_none()
+                && let Some(outer) = sc.outer_col(variable)
+            {
+                return Err(E::D(block_rebinding(
+                    pattern,
+                    i,
+                    variable,
+                    type_name,
+                    &outer.ty,
+                    self.binding_type(type_name).ok().as_ref(),
+                )));
+            }
             let before = sc.cols.len();
             sc.reads.clear();
             self.element(sc, c)?;
-            let bound = sc.cols[before..].iter().map(|c| c.name.clone()).collect();
+            let bound: Vec<String> = sc.cols[before..].iter().map(|c| c.name.clone()).collect();
+            if let Element::Traversal(t) = c {
+                let ends: Vec<String> = [&t.src, &t.dst]
+                    .into_iter()
+                    .filter(|end| *end != "_" && bound.contains(end))
+                    .cloned()
+                    .collect();
+                introduced.push((i, ends));
+            }
             parts.element(i, c, bound, std::mem::take(&mut sc.reads));
             self.flush(sc, false)?;
+        }
+        if sc.block || sc.inner {
+            unbound_triple_names(pattern, sc, &introduced)?;
         }
         if let Some(predicate) = &pattern.predicate {
             let written = pattern.spans.predicate.as_ref().map(|s| s.position);
@@ -1765,7 +1831,7 @@ impl Ctx<'_> {
         if sc.correlates
             && let Some(outer) = sc.outer_col(var).cloned()
         {
-            // A block re-mentions an outer variable to correlate on it.
+            // `optional` re-mentions an outer variable to correlate on it.
             if !outer.ty.same_base(&ty) {
                 return Err(err(
                     if matches!(outer.ty, Ty::Edge { .. }) || matches!(ty, Ty::Edge { .. }) {
@@ -1774,7 +1840,7 @@ impl Ctx<'_> {
                         T50
                     },
                     format!(
-                        "variable `${var}` is bound to {} outside the block, cannot rebind to `{type_name}`",
+                        "variable `${var}` is bound to {} outside the `optional`, cannot rebind to `{type_name}`",
                         outer.ty.display()
                     ),
                 ));
@@ -1910,10 +1976,12 @@ impl Ctx<'_> {
                 ));
             }
             if sc.is_bound(k) {
-                if sc.inner && sc.outer_col(k).is_some() && sc.local(k).is_none() {
-                    return Err(err(
+                if (sc.inner || sc.block) && sc.outer_col(k).is_some() && sc.local(k).is_none() {
+                    let scope = if sc.block { "a block" } else { "an inner read" };
+                    return Err(err_fix(
                         T68,
-                        format!("edge binding `${k}` inside an inner read reuses an outer name"),
+                        format!("edge binding `${k}` inside {scope} reuses an outer name"),
+                        "bind the edge under another name",
                     ));
                 }
                 return Err(err(
@@ -2164,6 +2232,114 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// `T68` for a block whose only element binds a name the scope where the
+    /// block is written holds, with the same type: a re-mention, which once
+    /// correlated the block on the outer row and so filtered it. An `exists` block of that shape is the
+    /// test that its `where` is true, so the fix writes the predicate in the
+    /// block's place (`not exists { $p: Person where $p.name = "bob" }` is
+    /// `not ($p.name = "bob")`). Where the predicate can be null the block's
+    /// test was false and the conjunct would be null, so `not exists` kept a
+    /// row that `not ( … )` drops; the fix writes `coalesce(…, false)` there,
+    /// which keeps every row. The block is typed with the re-mention
+    /// correlating to learn that; a refusal inside it is returned first,
+    /// since it is the block's own.
+    ///
+    /// A predicate holding a search predicate (`search`, `fuzzy`,
+    /// `match_text`, `match_terms`) has no such conjunct: a search predicate
+    /// stands alone as a conjunct (`T38`), so `not search(…)` is refused, and
+    /// this block is how a search is negated. That block keeps correlating
+    /// by re-mention: `Ok(true)`.
+    fn re_mention_only(&mut self, sc: &Scope, block: &Block, outer: &[Col]) -> R<bool> {
+        let pattern = &block.pattern;
+        let [
+            Element::Binding {
+                variable,
+                type_name,
+            },
+        ] = pattern.elements.as_slice()
+        else {
+            return Ok(false);
+        };
+        let Some(outer_ty) = outer.iter().find(|c| c.name == *variable).map(|c| &c.ty) else {
+            return Ok(false);
+        };
+        match self.binding_type(type_name) {
+            Ok(ty) if outer_ty.same_base(&ty) => {}
+            _ => return Ok(false),
+        }
+        if pattern.predicate.as_ref().is_some_and(has_search_predicate) {
+            return Ok(true);
+        }
+        let at = pattern.spans.elements.first().map(|s| s.position);
+        let mut d = QueryDiagnostic::typecheck(
+            T68,
+            format!(
+                "`${variable}` is bound inside a block, but the scope where the block is written already holds `${variable}` ({}); a block reads an outer name to correlate on it, so a block that only binds one to filter its row is that filter",
+                outer_ty.display()
+            ),
+        );
+        d.position = at;
+        if block.func != BlockFunc::Exists {
+            return Err(E::D(d.with_fix(format!(
+                "read the outer `${variable}` without binding it inside the block, or write the filter as a conjunct of the `where`"
+            ))));
+        }
+        let mut probe = Scope::new(sc.params.clone(), outer.to_vec(), sc.rels.clone());
+        probe.inner = false;
+        probe.correlates = true;
+        self.pattern(&mut probe, pattern)?;
+        self.flush(&mut probe, true)?;
+        let nullable = probe.steps.iter().any(|(_, s)| match s {
+            Step::Filter { pred, .. } => pred.ty.nullable(),
+            _ => false,
+        });
+        self.at = at;
+        let span = &block.at;
+        let (open, close) = if nullable {
+            ("coalesce(", ", false)")
+        } else {
+            ("(", ")")
+        };
+        let (fix, edits) = match (&pattern.predicate, &pattern.spans.predicate) {
+            (Some(p), Some(pspan)) if span.end > span.start => (
+                format!("`{open}{}{close}`", crate::query::syntax::print::expr(p)),
+                vec![
+                    TextEdit {
+                        start: span.start,
+                        end: pspan.start,
+                        replacement: open.to_string(),
+                    },
+                    TextEdit {
+                        start: pspan.end,
+                        end: span.end,
+                        replacement: close.to_string(),
+                    },
+                ],
+            ),
+            (None, _) if span.end > span.start => (
+                "`true`, since the outer row always exists".to_string(),
+                vec![TextEdit {
+                    start: span.start,
+                    end: span.end,
+                    replacement: "true".to_string(),
+                }],
+            ),
+            _ => return Err(E::D(d.with_fix("write the block's `where` in its place"))),
+        };
+        let note = if nullable {
+            ", which keeps the block's answer where the predicate is null"
+        } else {
+            ""
+        };
+        Err(E::D(
+            d.with_fix(format!("write {fix} in the block's place{note}"))
+                .with_suggestion(Suggestion {
+                    applicability: Applicability::MachineApplicable,
+                    edits,
+                }),
+        ))
+    }
+
     /// A block's inner scope: its term (starting from `Env` when it reads an
     /// outer column) and its free variables.
     /// A block's inner scope, with its aggregate argument typed against the
@@ -2171,10 +2347,10 @@ impl Ctx<'_> {
     fn block_scope_arg(
         &mut self,
         sc: &mut Scope,
-        pattern: &Pattern,
-        arg: Option<&Expr>,
+        block: &Block,
     ) -> R<(Term, Vec<String>, Option<SExpr>)> {
-        let outer = match &sc.block_visible {
+        let (pattern, arg) = (&block.pattern, block.arg.as_deref());
+        let outer: Vec<Col> = match &sc.block_visible {
             Some(before) => sc
                 .visible()
                 .into_iter()
@@ -2182,9 +2358,11 @@ impl Ctx<'_> {
                 .collect(),
             None => sc.visible(),
         };
+        let re_mention = self.re_mention_only(sc, block, &outer)?;
         let mut inner = Scope::new(sc.params.clone(), outer, sc.rels.clone());
         inner.inner = false;
-        inner.correlates = true;
+        inner.block = !re_mention;
+        inner.correlates = re_mention;
         self.pattern(&mut inner, pattern)?;
         self.flush(&mut inner, true)?;
         let arg = match arg {
@@ -3580,7 +3758,7 @@ impl Ctx<'_> {
                 ));
             }
             Expr::Block(b) => {
-                let (term, free, arg) = self.block_scope_arg(sc, &b.pattern, b.arg.as_deref())?;
+                let (term, free, arg) = self.block_scope_arg(sc, b)?;
                 if free.is_empty() {
                     return Err(err(
                         T39,
@@ -5199,7 +5377,7 @@ fn contains_agg(e: &Expr) -> bool {
 /// the elements that bind the aggregate's argument move into the block, and
 /// the call becomes the block's value (`match { $p knows $f } where
 /// count($f) > 3` is `where count($f) { $p knows $f } > 3`).
-fn aggregate_filter_fix(pattern: &Pattern, in_write: bool) -> Option<E> {
+fn aggregate_filter_fix(catalog: &Catalog, pattern: &Pattern, in_write: bool) -> Option<E> {
     use crate::query::syntax::print;
     let filter = pattern.predicate.as_ref()?;
     let call = first_aggregate_call(filter)?;
@@ -5249,6 +5427,49 @@ fn aggregate_filter_fix(pattern: &Pattern, in_write: bool) -> Option<E> {
             format!("return {{ {written} as {} }}", alias_for(&written)),
         ));
     }
+    // The block binds every name its triples introduce (`T84`).
+    let mut outer: HashMap<String, BoundVariable> = HashMap::new();
+    for c in pattern.elements.iter().filter(|c| !binds(c)) {
+        if let Element::Binding {
+            variable,
+            type_name,
+        } = c
+        {
+            outer.insert(
+                variable.clone(),
+                BoundVariable::Node {
+                    type_name: type_name.clone(),
+                },
+            );
+        }
+    }
+    let kept_elements: Vec<Element> = pattern
+        .elements
+        .iter()
+        .filter(|c| !binds(c))
+        .cloned()
+        .collect();
+    for (_, introduced) in end_bindings(catalog, &kept_elements, &HashMap::new()) {
+        for (variable, type_name) in introduced {
+            outer.insert(variable, BoundVariable::Node { type_name });
+        }
+    }
+    let fresh = end_bindings(catalog, &moved, &outer);
+    let moved: Vec<Element> = moved
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, c)| {
+            let binds = fresh.iter().find(|(j, _)| *j == i).map(|(_, b)| b.clone());
+            binds
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(variable, type_name)| Element::Binding {
+                    variable,
+                    type_name,
+                })
+                .chain(std::iter::once(c))
+        })
+        .collect();
     let func = agg_func(&call.name);
     let block = Expr::Block(Box::new(Block {
         func: BlockFunc::Agg(func),
@@ -5257,6 +5478,7 @@ fn aggregate_filter_fix(pattern: &Pattern, in_write: bool) -> Option<E> {
             elements: moved,
             ..Pattern::default()
         },
+        at: SourceSpan::default(),
     }));
     let rewritten = replace_call(filter, call, &block);
     let kept: Vec<String> = pattern
@@ -5276,6 +5498,218 @@ fn aggregate_filter_fix(pattern: &Pattern, in_write: bool) -> Option<E> {
             print::expr(&rewritten)
         ),
     ))
+}
+
+/// `T68` for a binding inside a block of a name the scope where the block is
+/// written holds. A block correlates on an outer name by reading it, so the
+/// fix drops the binding when its type is the outer name's; another type
+/// meant a name of the block's own, and the fix is a fresh name.
+fn block_rebinding(
+    pattern: &Pattern,
+    index: usize,
+    var: &str,
+    type_name: &str,
+    outer: &Ty,
+    written: Option<&Ty>,
+) -> QueryDiagnostic {
+    let mut d = QueryDiagnostic::typecheck(
+        T68,
+        format!(
+            "`${var}` is bound inside a block, but the scope where the block is written already holds `${var}` ({}); a block reads an outer name to correlate on it, and binds only a name new to it",
+            outer.display()
+        ),
+    );
+    let spans = &pattern.spans.elements;
+    d.position = spans.get(index).map(|s| s.position);
+    let same = written.is_some_and(|ty| ty.same_base(outer));
+    if !same {
+        return d.with_fix(format!(
+            "bind another name inside the block: `$x: {type_name}`"
+        ));
+    }
+    d = d.with_fix(format!(
+        "read the outer `${var}` without binding it: drop `${var}: {type_name}`"
+    ));
+    let range = match (index, spans.get(index)) {
+        (0, Some(this)) => spans.get(1).map(|next| (this.start, next.start)),
+        (i, Some(this)) => spans.get(i - 1).map(|prev| (prev.end, this.end)),
+        _ => None,
+    };
+    match range {
+        Some((start, end)) => d.with_suggestion(Suggestion {
+            applicability: Applicability::MachineApplicable,
+            edits: vec![TextEdit {
+                start,
+                end,
+                replacement: String::new(),
+            }],
+        }),
+        None => d,
+    }
+}
+
+/// The bindings an inner scope written from `elements` needs (`T84`): for
+/// each triple, the ends it names first that no binding element of
+/// `elements` binds and the enclosing scope (`outer`) does not hold, each
+/// with the type the edge declares for that end, by the triple's resolution
+/// against the bindings before it. A triple that does not resolve
+/// contributes none, and the refusal it meets is the one its text earns.
+fn end_bindings(
+    catalog: &Catalog,
+    elements: &[Element],
+    outer: &HashMap<String, BoundVariable>,
+) -> Vec<(usize, Vec<(String, String)>)> {
+    let mut declared: HashMap<String, BoundVariable> = HashMap::new();
+    for c in elements {
+        if let Element::Binding {
+            variable,
+            type_name,
+        } = c
+            && catalog.query_node_type(type_name).is_some()
+        {
+            declared.insert(
+                variable.clone(),
+                BoundVariable::Node {
+                    type_name: type_name.clone(),
+                },
+            );
+        }
+    }
+    let mut known = declared.clone();
+    known.extend(outer.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let mut out = Vec::new();
+    for (i, c) in elements.iter().enumerate() {
+        let Element::Traversal(t) = c else {
+            continue;
+        };
+        let Ok(resolved) = resolve_traversal(catalog, t, &known, &declared) else {
+            continue;
+        };
+        let mut here = Vec::new();
+        for (end, ty) in [(&t.src, &resolved.src_type), (&t.dst, &resolved.dst_type)] {
+            if end == "_" || known.contains_key(end) {
+                continue;
+            }
+            known.insert(
+                end.clone(),
+                BoundVariable::Node {
+                    type_name: ty.clone(),
+                },
+            );
+            here.push((end.clone(), ty.clone()));
+        }
+        if !here.is_empty() {
+            out.push((i, here));
+        }
+    }
+    out
+}
+
+/// Whether `e` calls a search predicate, which stands alone as a conjunct
+/// (`T38`).
+fn has_search_predicate(e: &Expr) -> bool {
+    match e {
+        Expr::Call(c) => {
+            matches!(
+                c.name.as_str(),
+                "search" | "fuzzy" | "match_text" | "match_terms"
+            ) || c
+                .args
+                .iter()
+                .any(|a| matches!(a, Arg::Expr(x) if has_search_predicate(x)))
+        }
+        Expr::Compare { left, right, .. }
+        | Expr::Arith { left, right, .. }
+        | Expr::InfixString { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::In {
+            needle: left,
+            list: right,
+            ..
+        } => has_search_predicate(left) || has_search_predicate(right),
+        Expr::Not(x) | Expr::Neg(x) => has_search_predicate(x),
+        Expr::IsNull { expr, .. } => has_search_predicate(expr),
+        _ => false,
+    }
+}
+
+/// `T84` for the names an inner scope's triples introduced that no binding
+/// element of the scope binds, at the first triple naming one. A name new
+/// to a block or an inline read is introduced by a binding; the fix inserts
+/// one before each triple that first names such a name, with the type the
+/// edge declares for that end, which is the type the triple gave it.
+fn unbound_triple_names(
+    pattern: &Pattern,
+    sc: &Scope,
+    introduced: &[(usize, Vec<String>)],
+) -> R<()> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut found: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+    for (i, ends) in introduced {
+        let mut here = Vec::new();
+        for end in ends {
+            if sc.declared.contains_key(end) || seen.contains(end) {
+                continue;
+            }
+            let Some(Ty::Node { type_name, .. }) = sc.local(end).map(|c| &c.ty) else {
+                continue;
+            };
+            seen.push(end.clone());
+            here.push((end.clone(), type_name.clone()));
+        }
+        if !here.is_empty() {
+            found.push((*i, here));
+        }
+    }
+    let Some((first, _)) = found.first() else {
+        return Ok(());
+    };
+    let scope = if sc.block { "block" } else { "inline read" };
+    let names = seen
+        .iter()
+        .map(|n| format!("`${n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let bindings = found
+        .iter()
+        .flat_map(|(_, b)| b.iter())
+        .map(|(n, t)| format!("`${n}: {t}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let verb = if seen.len() == 1 { "is" } else { "are" };
+    let spans = &pattern.spans.elements;
+    let mut d = QueryDiagnostic::typecheck(
+        T84,
+        format!(
+            "{names} {verb} named in a triple of this {scope} but bound nowhere: a name new to a block or an inline read is introduced by a binding element inside it, and a name read from the enclosing scope correlates"
+        ),
+    )
+    .with_fix(format!(
+        "bind {} in the {scope}: {bindings}",
+        if seen.len() == 1 { "it" } else { "them" }
+    ));
+    d.position = spans.get(*first).map(|s| s.position);
+    let edits: Option<Vec<TextEdit>> = found
+        .iter()
+        .map(|(i, b)| {
+            spans.get(*i).map(|span| TextEdit {
+                start: span.start,
+                end: span.start,
+                replacement: b
+                    .iter()
+                    .map(|(n, t)| format!("${n}: {t}, "))
+                    .collect::<String>(),
+            })
+        })
+        .collect();
+    if let Some(edits) = edits.filter(|e| !e.is_empty() && spans.len() == pattern.elements.len()) {
+        d = d.with_suggestion(Suggestion {
+            applicability: Applicability::MachineApplicable,
+            edits,
+        });
+    }
+    Err(E::D(d))
 }
 
 /// `T7` for `$d in $list` in `match`: a triple over the edge named `in` whose

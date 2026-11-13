@@ -2630,7 +2630,7 @@ fn expects_expand_ignores_bound_edges_and_plain_bindings() {
     assert!(!expects_expand(bound.single_decl()));
     let plain = parse_query(QUERY.trim_start_matches("--- query\n")).unwrap();
     assert!(!expects_expand(plain.single_decl()));
-    let negated = "query f() {\n    match { $a: Person }\n    where not exists { $a knows $x }\n    \
+    let negated = "query f() {\n    match { $a: Person }\n    where not exists { $x: Person, $a knows $x }\n    \
                    return { $a.name }\n}\n";
     let negated = parse_query(negated).unwrap();
     assert!(!expects_expand(negated.single_decl()));

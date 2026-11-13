@@ -650,7 +650,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query no_friends() { match { $p: Person } where not exists { $p knows $q } return { $p.name } }
+      query no_friends() { match { $p: Person } where not exists { $q: Person, $p knows $q } return { $p.name } }
 - id: e2e-query-count-bare
   fixture: fixtures/e2e_query_issues.gqt
   workload: workloads/e2e_query_count_bare.gqt
@@ -934,7 +934,7 @@ scenarios:
     ordinal: 2
     text: |
       --- query
-      query no_friends() { match { $p: Person } where not exists { $p knows $q } return { $p.name } }
+      query no_friends() { match { $p: Person } where not exists { $q: Person, $p knows $q } return { $p.name } }
   environment:
     target: omnigraph-server
     network_position: same-host

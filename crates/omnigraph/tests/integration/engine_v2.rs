@@ -864,13 +864,13 @@ edge Tags: Source -> Doc
 "#;
     let source = r#"
 query rows($q: Vector(4)) {
-    match { from nearest({ match { $s: Source, $s links $d, $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
+    match { from nearest({ match { $s: Source, $d: Doc, $s links $d, $t: Doc, $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
     return { $s.slug, $d.slug, $t.slug }
     order { $distance }
     limit 10
 }
 query total($q: Vector(4)) {
-    match { from nearest({ match { $s: Source, $s links $d, $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
+    match { from nearest({ match { $s: Source, $d: Doc, $s links $d, $t: Doc, $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
     return { count($d) as n }
     limit 10
 }
@@ -1158,7 +1158,7 @@ edge Likes: Person -> Doc
     order { $p.name }
 }";
     const RANKED_DESTINATION: &str = "query ranked_destination($q: String) {
-    match { from bm25({ match { $p: Person, $p likes $d } return { $p, $d } }, $d.title, $q) }
+    match { from bm25({ match { $p: Person, $d: Doc, $p likes $d } return { $p, $d } }, $d.title, $q) }
     return { $d.slug }
     order { $score desc }
 }";

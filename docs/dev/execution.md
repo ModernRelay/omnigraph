@@ -68,6 +68,25 @@ checker's alone: the shaper flattens a named relation's inline read into the
 enclosing pattern, so the product it plans, a `CrossJoin` or a
 `ContainsJoin`, is the one the two bindings written side by side planned.
 
+A block and an inline read are inner scopes (`check/mod.rs`, `Scope::block`
+and `Scope::inner`): a name read from the enclosing scope correlates, and a
+name new to the scope is introduced by a binding element anywhere in it. After
+a scope's elements are typed, every end a triple introduced that no binding of
+the scope binds is `T84`, at the first triple naming one, with one suggestion
+inserting each binding before the triple that first names it, typed as the
+triple resolved that end (the edge's declared end type). A binding inside a
+block of an outer name is `T68`; its suggestion drops the binding, and a block
+whose only element is such a binding of the same type becomes its predicate in
+the block's place (`coalesce(…, false)` when the predicate can be null, as a
+probe typing the block with the re-mention correlating reports). A block of that shape whose
+predicate holds a search predicate keeps correlating by re-mention, since a
+search predicate stands alone (`T38`). The inserted binding makes the triple's
+ends both bound, so the core term is the derived form's `Scan` and `Expand` to
+a fresh column with the identity `Filter`; the shaper reads that filter as the
+triple between the two bindings and places the binding from the bound end, so
+the plan is the one the unbound triple planned. `optional { }` and a
+declaration's own `match` keep a triple's ends introduced by the triple.
+
 A write body checks to `CoreWrite`: groups of clauses and their sinks. The
 engine's `exec/write_plan.rs` lowers each group in one of two forms. A group
 whose clauses are a scan of its statements' target, filtered by predicates a

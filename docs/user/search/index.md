@@ -197,7 +197,7 @@ declared at all; its `return` lists every binding the rest of the query reads:
 ```gq
 query passages($matter: String, $q: String) {
   match {
-    from bm25({ match { $r: SourceRevision, $r hasPassage $p } where $r.matter_number = $matter return { $r, $p } }, $p.text, $q),
+    from bm25({ match { $r: SourceRevision, $p: Passage, $r hasPassage $p } where $r.matter_number = $matter return { $r, $p } }, $p.text, $q),
   }
   return { $r.path, $p.locator }
   order { $score desc }

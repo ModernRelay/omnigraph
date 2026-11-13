@@ -51,7 +51,7 @@ edge InGroup: Cell -> Group
 --- query
 query cancellation_total_stays_one() {
     match { $g: Group }
-    where $g.name = "cancel" and sum($c.signed) { $c inGroup $g } = 1
+    where $g.name = "cancel" and sum($c.signed) { $c: Cell, $c inGroup $g } = 1
     return { $g.name as group_name }
 }
 --- expect unordered
@@ -66,7 +66,7 @@ cast 1: I64 -> F64
 --- query
 query single_sum_rounds_before_comparison() {
     match { $g: Group }
-    where $g.name = "single" and sum($c.signed) { $c inGroup $g } > 9007199254740992
+    where $g.name = "single" and sum($c.signed) { $c: Cell, $c inGroup $g } > 9007199254740992
     return { $g.name as group_name }
 }
 --- expect unordered
@@ -81,7 +81,7 @@ no cast sum($c.signed)
 query overflow_order_a_rounds_final_total() {
     match { $g: Group }
     where $g.name = "overflow_a"
-      and sum($c.signed) { $c inGroup $g } > 9223372036854775806
+      and sum($c.signed) { $c: Cell, $c inGroup $g } > 9223372036854775806
     return { $g.name as group_name }
 }
 --- expect unordered
@@ -95,7 +95,7 @@ cast 9223372036854775806: I64 -> F64
 query overflow_order_b_rounds_final_total() {
     match { $g: Group }
     where $g.name = "overflow_b"
-      and sum($c.signed) { $c inGroup $g } > 9223372036854775806
+      and sum($c.signed) { $c: Cell, $c inGroup $g } > 9223372036854775806
     return { $g.name as group_name }
 }
 --- expect unordered
@@ -109,7 +109,7 @@ cast 9223372036854775806: I64 -> F64
 query unsigned_sum_rounds_once() {
     match { $g: Group }
     where $g.name = "unsigned_sum"
-      and sum($c.unsigned) { $c inGroup $g } > 9223372036854775807
+      and sum($c.unsigned) { $c: Cell, $c inGroup $g } > 9223372036854775807
     return { $g.name as group_name }
 }
 --- expect unordered
@@ -123,7 +123,7 @@ cast 9223372036854775807: I64 -> F64
 --- query
 query unsigned_min_retains_exact_value($bound: I64) {
     match { $g: Group }
-    where $g.name = "unsigned_boundary" and min($c.unsigned) { $c inGroup $g } > $bound
+    where $g.name = "unsigned_boundary" and min($c.unsigned) { $c: Cell, $c inGroup $g } > $bound
     return { $g.name as group_name }
 }
 --- params
@@ -140,7 +140,7 @@ cast $bound: I64 -> exact_integer
 --- query
 query unsigned_max_retains_exact_value($bound: I64) {
     match { $g: Group }
-    where $g.name = "unsigned_boundary" and max($c.unsigned) { $c inGroup $g } > $bound
+    where $g.name = "unsigned_boundary" and max($c.unsigned) { $c: Cell, $c inGroup $g } > $bound
     return { $g.name as group_name }
 }
 --- params
@@ -157,7 +157,7 @@ cast $bound: I64 -> exact_integer
 --- query
 query integer_max_narrows_exact_literal() {
     match { $g: Group }
-    where $g.name = "single" and max($c.signed) { $c inGroup $g } > 9007199254740992.0
+    where $g.name = "single" and max($c.signed) { $c: Cell, $c inGroup $g } > 9007199254740992.0
     return { $g.name as group_name }
 }
 --- expect unordered
@@ -172,7 +172,7 @@ no cast max($c.signed)
 --- query
 query integer_max_widens_for_declared_float($bound: F64) {
     match { $g: Group }
-    where $g.name = "single" and max($c.signed) { $c inGroup $g } > $bound
+    where $g.name = "single" and max($c.signed) { $c: Cell, $c inGroup $g } > $bound
     return { $g.name as group_name }
 }
 --- params
@@ -189,7 +189,7 @@ no cast $bound
 --- query
 query integer_avg_uses_float_accumulation() {
     match { $g: Group }
-    where $g.name = "cancel" and avg($c.signed) { $c inGroup $g } = 0
+    where $g.name = "cancel" and avg($c.signed) { $c: Cell, $c inGroup $g } = 0
     return { $g.name as group_name }
 }
 --- expect unordered
@@ -204,7 +204,7 @@ cast 0: I64 -> F64
 --- query
 query empty_sum_stays_null() {
     match { $g: Group }
-    where $g.name = "empty" and sum($c.signed) { $c inGroup $g } >= 0
+    where $g.name = "empty" and sum($c.signed) { $c: Cell, $c inGroup $g } >= 0
     return { $g.name as group_name }
 }
 --- expect unordered
@@ -217,7 +217,7 @@ type sum($c.signed): F64?
 --- query
 query integer_max_keeps_declared_float_domain_for_second_value($bound: F64) {
     match { $g: Group }
-    where $g.name = "single" and max($c.signed) { $c inGroup $g } > $bound
+    where $g.name = "single" and max($c.signed) { $c: Cell, $c inGroup $g } > $bound
     return { $g.name as group_name }
 }
 --- params
@@ -234,7 +234,7 @@ no cast $bound
 --- query
 query row_count_f64_bound_0($bound: F64) {
     match { $g: Group }
-    where count { $c inGroup $g } >= $bound
+    where count { $c: Cell, $c inGroup $g } >= $bound
     return { $g.name as group_name }
 }
 --- params
@@ -255,7 +255,7 @@ no cast $bound
 --- query
 query row_count_f64_bound_1($bound: F64) {
     match { $g: Group }
-    where count { $c inGroup $g } >= $bound
+    where count { $c: Cell, $c inGroup $g } >= $bound
     return { $g.name as group_name }
 }
 --- params
@@ -275,7 +275,7 @@ no cast $bound
 --- query
 query row_count_u64_bound_0($bound: U64) {
     match { $g: Group }
-    where count { $c inGroup $g } >= $bound
+    where count { $c: Cell, $c inGroup $g } >= $bound
     return { $g.name as group_name }
 }
 --- params
@@ -296,7 +296,7 @@ cast $bound: U64 -> exact_integer
 --- query
 query row_count_u64_bound_1($bound: U64) {
     match { $g: Group }
-    where count { $c inGroup $g } >= $bound
+    where count { $c: Cell, $c inGroup $g } >= $bound
     return { $g.name as group_name }
 }
 --- params
@@ -316,7 +316,7 @@ cast $bound: U64 -> exact_integer
 --- query
 query null_unsigned_row_count_bound_satisfies_nothing($bound: U64?) {
     match { $g: Group }
-    where count { $c inGroup $g } >= $bound
+    where count { $c: Cell, $c inGroup $g } >= $bound
     return { $g.name as group_name }
 }
 --- params
@@ -332,7 +332,7 @@ cast $bound: U64? -> exact_integer?
 --- query
 query filtered_row_count_uses_the_same_float_comparison($bound: F64) {
     match { $g: Group }
-    where count { $c inGroup $g where $c.signed > 0 } >= $bound
+    where count { $c: Cell, $c inGroup $g where $c.signed > 0 } >= $bound
     return { $g.name as group_name }
 }
 --- params

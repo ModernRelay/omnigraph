@@ -46,7 +46,7 @@ edge WorksAt: Person -> Company
 query not_at_acme() {
     match { $p: Person }
     where not exists {
-        $p worksAt $c
+        $c: Company, $p worksAt $c
         where $c.name = "Acme"
     }
     return { $p.name }
@@ -83,8 +83,8 @@ p.name: String
 query no_nonacme_employer() {
     match { $p: Person }
     where not exists {
-        $p worksAt $c
-        where not exists { $c: Company where $c.name = "Acme" }
+        $c: Company, $p worksAt $c
+        where not ($c.name = "Acme")
     }
     return { $p.name }
 }
@@ -115,7 +115,7 @@ p.name: String
 query unemployed_filtered_inner() {
     match { $p: Person }
     where not exists {
-        $p worksAt $c
+        $c: Company, $p worksAt $c
         where $c.name != ""
     }
     return { $p.name }

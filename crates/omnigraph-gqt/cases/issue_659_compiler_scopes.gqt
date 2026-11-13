@@ -101,7 +101,7 @@ person: String
 
 --- query
 query named_reverse_not() {
-    match { $c: Company } where not exists { $c worksAt $p }
+    match { $c: Company } where not exists { $p: Person, $c worksAt $p }
     return { $c.name as company }
 }
 --- expect unordered
@@ -112,7 +112,7 @@ company: String
 
 --- query
 query named_reverse_exists() {
-    match { $c: Company } where exists { $c worksAt $p }
+    match { $c: Company } where exists { $p: Person, $c worksAt $p }
     return { $c.name as company }
 }
 --- expect unordered
@@ -123,7 +123,7 @@ company: String
 
 --- query
 query named_reverse_count() {
-    match { $c: Company } where count { $c worksAt $p } > 0
+    match { $c: Company } where count { $p: Person, $c worksAt $p } > 0
     return { $c.name as company }
 }
 --- expect unordered
@@ -134,7 +134,7 @@ company: String
 
 --- query
 query named_child_string_argument() {
-    match { $p: Person } where count(contains($f.name, "x")) { $p knows $f } > 0
+    match { $p: Person } where count(contains($f.name, "x")) { $f: Person, $p knows $f } > 0
     return { $p.name as person }
 }
 --- expect unordered
@@ -145,7 +145,7 @@ person: String
 
 --- query
 query named_unanchored() {
-    match { $p: Person, let $xs = { match { $x knows $y } return { $x, $y } }, from $xs }
+    match { $p: Person, let $xs = { match { $x: Person, $y: Person, $x knows $y } return { $x, $y } }, from $xs }
     return { $p.name }
 }
 --- expect unordered
@@ -157,7 +157,7 @@ p.name: String
 
 --- query
 query selected_unanchored() {
-    match { $p: Person, let $xs = { match { $x (knows | likes) $y } return { $x, $y } }, from $xs }
+    match { $p: Person, let $xs = { match { $x: Person, $y: Person, $x (knows | likes) $y } return { $x, $y } }, from $xs }
     return { $p.name }
 }
 --- expect unordered
@@ -169,7 +169,7 @@ p.name: String
 
 --- query
 query nested_unanchored() {
-    match { $p: Person } where not exists { $x knows $y where $p.name = "p" }
+    match { $p: Person } where not exists { $x: Person, $y: Person, $x knows $y where $p.name = "p" }
     return { $p.name }
 }
 --- expect unordered
@@ -237,7 +237,7 @@ query cross_type_same_variable() {
 
 --- query
 query block_local_name_is_not_correlated() {
-    match { $p: Person, $x: Company } where $p.name = "p" and exists { $p knows $k } and $x.name = "idle"
+    match { $p: Person, $x: Company } where $p.name = "p" and exists { $k: Person, $p knows $k } and $x.name = "idle"
     return { $p.name as person, $x.name as company }
 }
 --- expect unordered
@@ -249,7 +249,7 @@ company: String
 
 --- query
 query block_local_name_not_block() {
-    match { $p: Person, $x: Company } where not exists { $p knows $k } and $x.name = "idle"
+    match { $p: Person, $x: Company } where not exists { $k: Person, $p knows $k } and $x.name = "idle"
     return { $p.name as person, $x.name as company }
 }
 --- expect unordered
@@ -283,7 +283,7 @@ query undeclared_mixed_orientation_reverse_member_first() {
 --- query
 query block_local_selected_edge_does_not_capture_the_outer_edge() {
     match { $p: Person, $p $e:(knows | likes) $f }
-    where exists { $p $k:(knows | likes) $x where $k.@type = "Knows" }
+    where exists { $x: Person, $p $k:(knows | likes) $x where $k.@type = "Knows" }
     return { $p.name as person, $e.@type as kind, $e.@id as id }
 }
 --- expect unordered
@@ -297,7 +297,7 @@ id: String
 --- query
 query block_local_named_edge_does_not_capture_the_outer_edge() {
     match { $p: Person, $p $e:knows $f }
-    where exists { $p $k:knows $x }
+    where exists { $x: Person, $p $k:knows $x }
     return { $p.name as person, $e.@id as id }
 }
 --- expect unordered
@@ -309,10 +309,7 @@ id: String
 --- query
 query block_local_node_does_not_capture_the_outer_node() {
     match { $p: Person, $x: Company }
-    where exists {
-        $p: Person
-        where $p.name = "p" and exists { $p knows $k }
-    }
+    where ($p.name = "p" and exists { $k: Person, $p knows $k })
       and $x.name = "idle"
     return { $p.name as person, $x.name as company }
 }
@@ -328,9 +325,9 @@ query nested_local_names_remain_independent() {
     where count($c.name) {
         $c: Company
         where $p.name = "p"
-          and exists { $p knows $k where $k.name = "x" }
+          and exists { $k: Person, $p knows $k where $k.name = "x" }
           and $c.name = "acme"
-          and exists { $c worksAt $q where $q.name = "p" }
+          and exists { $q: Person, $c worksAt $q where $q.name = "p" }
     } = 1
       and $x.name = "idle"
     return { $p.name as person, $x.name as company }
@@ -345,8 +342,8 @@ company: String
 query sibling_inner_names_keep_distinct_types() {
     match { $p: Person }
     where $p.name = "p"
-      and exists { $p knows $x where $x.value is null }
-      and exists { $p worksAt $x where $x.value is null }
+      and exists { $x: Person, $p knows $x where $x.value is null }
+      and exists { $x: Company, $p worksAt $x where $x.value is null }
     return { $p.name as person }
 }
 --- expect unordered

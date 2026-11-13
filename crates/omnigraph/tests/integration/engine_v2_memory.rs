@@ -615,7 +615,7 @@ edge Knows: Doc -> Doc
         "force_postfilter",
     );
     let query = r#"query friends($q: Vector(4)) {
-        match { from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10) }
+        match { from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10) }
         return { $d.slug }
         order { $distance }
         limit 10
@@ -735,7 +735,7 @@ query fused($q: String) {
 }
 query without_matching_friend() {
     match { $p: Person }
-    where not exists { $p knows $friend where $friend.text = "needle" }
+    where not exists { $friend: Person, $p knows $friend where $friend.text = "needle" }
     return { $p.name }
 }
 "#;

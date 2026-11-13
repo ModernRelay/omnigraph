@@ -102,7 +102,7 @@ edge_id: String
 
 --- query
 query correlated_common_string_argument() {
-    match { $p: Person } where count(contains($e.label, "own")) { $p $e:(owns | ownedBy) $d } = 2
+    match { $p: Person } where count(contains($e.label, "own")) { $d: Doc, $p $e:(owns | ownedBy) $d } = 2
     return { $p.name as name }
 }
 

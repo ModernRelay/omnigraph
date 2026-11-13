@@ -99,7 +99,7 @@ label: String
 --- query
 query let_read_inside_a_block() {
     match { $p: Person, let $home = $p.city }
-    where exists { $p knows $q where $q.city = $home }
+    where exists { $q: Person, $p knows $q where $q.city = $home }
     return { $p.handle }
 }
 

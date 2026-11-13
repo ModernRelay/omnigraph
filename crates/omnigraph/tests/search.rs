@@ -108,7 +108,7 @@ const RANKED_EDGE_DATA: &str = r#"{"type":"RankedDoc","data":{"slug":"rank-1","e
 const RANKED_EDGE_QUERIES: &str = r#"
 query nearest_edges($q: Vector(4)) {
     match {
-      from nearest({ match { $d: RankedDoc, $d $w:rankedLink $target } return { $d, $w, $target } }, $d.embedding, $q, k: 4),
+      from nearest({ match { $d: RankedDoc, $target: RankedDoc, $d $w:rankedLink $target } return { $d, $w, $target } }, $d.embedding, $q, k: 4),
     }
     return { $d.slug, $w.label }
     order { $distance }
@@ -129,7 +129,7 @@ query rrf_edges($q1: Vector(4), $q2: Vector(4)) {
 
 query nearest_hops($q: Vector(4)) {
     match {
-      from nearest({ match { $d: RankedDoc, $d rankedLink{1,2} $target } return { $d, $target } }, $d.embedding, $q, k: 2),
+      from nearest({ match { $d: RankedDoc, $target: RankedDoc, $d rankedLink{1,2} $target } return { $d, $target } }, $d.embedding, $q, k: 2),
     }
     return { $d.slug, $target.slug }
     order { $distance }
@@ -464,7 +464,7 @@ query rrf_all($q: Vector(4)) {
 
 query nearest_friends($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10),
+      from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10),
     }
     return { $d.slug }
     order { $distance }
@@ -487,7 +487,7 @@ query rrf_keep($q: Vector(4)) {
 
 query nearest_far_friends($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $d far $t } return { $d, $t } }, $d.embedding, $q, k: 10),
+      from nearest({ match { $d: Doc, $t: Doc, $d far $t } return { $d, $t } }, $d.embedding, $q, k: 10),
     }
     return { $d.slug }
     order { $distance }
@@ -1404,7 +1404,7 @@ edge Knows: Doc -> Doc {
 const ISSUE_567_LINE_QUERIES: &str = r#"
 query nearest_friends($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10),
+      from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10),
     }
     return { $d.slug }
     order { $distance }
@@ -1413,7 +1413,7 @@ query nearest_friends($q: Vector(4)) {
 
 query nearest_friends_count($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10),
+      from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10),
     }
     return { count($d) as total }
     limit 10

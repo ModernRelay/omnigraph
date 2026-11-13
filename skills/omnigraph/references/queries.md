@@ -203,8 +203,14 @@ and keeps the row by a comparison on the aggregate of its matches:
 `not exists { ... }` (no match), `exists { ... }` (at least one),
 `count { ... } > 2`, and `sum($d.size) { ... } > 100` (also `min`, `max`,
 `avg`). A block holds elements and its own `where` inside its braces,
-`count { $s formsPattern $p where $p.kind = "x" }`, and correlates on every
-element of the enclosing `match`; it must read at least one outer variable.
+`count { $p: Pattern, $s formsPattern $p where $p.kind = "x" }`, and
+correlates on every element of the enclosing `match`; it must read at least
+one outer variable.
+A block and an inline read bind every name new to them with a binding
+element (`T84` names the triple and inserts `$p: Pattern`, the edge's end
+type), read an outer name unbound to correlate on it, and refuse a binding of
+an outer name (`T68`): `not exists { $p: Person where $p.name = "bob" }` is
+`not ($p.name = "bob")`. An anonymous end `$_` needs no binding.
 The right side is a literal, `now()` or a parameter. `not { ... }` is refused
 with `not exists { ... }` as the fix (`Q012`).
 
@@ -217,7 +223,7 @@ query orphan_signals() {
 
 query busy_signals($least: I64) {
     match { $s: Signal }
-    where count { $s formsPattern $p } >= $least
+    where count { $p: Pattern, $s formsPattern $p } >= $least
     return { $s.slug }
 }
 ```

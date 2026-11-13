@@ -84,7 +84,7 @@ f.name: String
 --- query
 query no_outgoing() {
     match { $p: Person }
-    where not exists { $p knows $x }
+    where not exists { $x: Person, $p knows $x }
     return { $p.name }
 }
 
@@ -98,7 +98,7 @@ p.name: String
 --- query
 query isolated() {
     match { $p: Person }
-    where not exists { $p <knows> $x }
+    where not exists { $x: Person, $p <knows> $x }
     return { $p.name }
 }
 

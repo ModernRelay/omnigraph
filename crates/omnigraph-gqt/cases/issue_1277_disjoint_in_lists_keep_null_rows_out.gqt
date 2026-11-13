@@ -144,7 +144,7 @@ t.slug: String
 --- query
 query not_block() {
     match { $i: Item }
-    where not exists { $i next $t where (not ($t.s in ["x"]) or not ($t.s in ["y"])) }
+    where not exists { $t: Item, $i next $t where (not ($t.s in ["x"]) or not ($t.s in ["y"])) }
     return { $i.slug }
 }
 
@@ -158,7 +158,7 @@ i.slug: String
 --- query
 query exists_block() {
     match { $i: Item }
-    where exists { $i next $t where (not ($t.s in ["x"]) or not ($t.s in ["y"])) }
+    where exists { $t: Item, $i next $t where (not ($t.s in ["x"]) or not ($t.s in ["y"])) }
     return { $i.slug }
 }
 

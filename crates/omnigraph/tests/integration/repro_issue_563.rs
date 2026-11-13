@@ -51,7 +51,7 @@ edge ChunkOfArtifact: Chunk -> Artifact {
 const RANKED_JOIN_QUERY: &str = r#"
 query recall_join($q: String) {
     match {
-      from bm25({ match { $c: Chunk, $c chunkOfArtifact $a } where search($c.text, $q) return { $c, $a } }, $c.text, $q),
+      from bm25({ match { $c: Chunk, $a: Artifact, $c chunkOfArtifact $a } where search($c.text, $q) return { $c, $a } }, $c.text, $q),
     }
     return { $c.slug, $a.slug, $a.name }
     order { $score desc }

@@ -308,7 +308,7 @@ const KEY_SET_SHAPES: &[(&str, &str)] = &[
     ),
     (
         "$p: Person",
-        "not exists { $p knows $m, $p worksAt $c, $c: Company where $c.name = $nameFORCE }",
+        "not exists { $m: Person, $p knows $m, $p worksAt $c, $c: Company where $c.name = $nameFORCE }",
     ),
     (
         "$p: Person, $p knows $q",

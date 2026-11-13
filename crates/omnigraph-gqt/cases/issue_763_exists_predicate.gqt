@@ -55,7 +55,7 @@ n.slug: String
 query has_any_artifact() {
     match { $n: Actor }
     where exists {
-        $m artifactOwnedByActor $n
+        $m: Artifact, $m artifactOwnedByActor $n
     }
     return { $n.slug }
 }
@@ -69,7 +69,7 @@ n.slug: String
 query has_any_image_filtered_after() {
     match { $n: Actor }
     where exists {
-        $m artifactOwnedByActor $n
+        $m: Artifact, $m artifactOwnedByActor $n
         where $m.kind = "image"
     }
     return { $n.slug }
@@ -81,11 +81,10 @@ n.slug: String
 
 --- query
 set engine = v2;
-query outer_variable_rebound_after_the_inner_binding() {
+query outer_variable_read_after_the_inner_binding() {
     match { $n: Actor }
     where exists {
         $m: Artifact,
-        $n: Actor,
         $m artifactOwnedByActor $n
         where $m.kind = "image"
     }
@@ -100,10 +99,9 @@ scan Actor as $n: columns [__id, slug]
 pass projection_pushdown
 
 --- query
-query search_inside_the_block_runs_after_a_rebinding() {
+query search_inside_the_block_runs_beside_an_outer_read() {
     match { $n: Actor }
     where exists {
-        $n: Actor,
         $m: Artifact,
         $m artifactOwnedByActor $n
         where search($m.text, "photo")

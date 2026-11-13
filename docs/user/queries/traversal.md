@@ -15,10 +15,10 @@ braces, `where` holds one Boolean expression:
 | `$a <knows \| likes> $b` or `$a <*> $b` | Follow the selected edges in either direction. |
 | `$a $e:(knows \| likes) $b` or `$a $e:* $b` | Bind each concrete selected edge. |
 | `where $p.age >= 18` | Apply a filter expression. |
-| `where not exists { $p blocked $other }` | Keep rows for which the inner pattern has no match. |
-| `where exists { $p blocked $other }` | Keep rows for which the inner pattern has at least one match. |
-| `where count { $a authored $p } > 2` | Keep rows whose inner pattern matches more than two times. |
-| `where sum($d.size) { $p owns $d } > 100` | Aggregate a property over the inner matches, then compare. |
+| `where not exists { $o: Person, $p blocked $o }` | Keep rows for which the inner pattern has no match. |
+| `where exists { $o: Person, $p blocked $o }` | Keep rows for which the inner pattern has at least one match. |
+| `where count { $p: Post, $a authored $p } > 2` | Keep rows whose inner pattern matches more than two times. |
+| `where sum($d.size) { $d: File, $p owns $d } > 100` | Aggregate a property over the inner matches, then compare. |
 
 ```gq
 query colleagues($h: String) {
@@ -140,6 +140,27 @@ query every_pair() {
   return { $p.name, $c.name }
 }
 ```
+
+## Inner scopes
+
+A block (`exists`, `not exists`, `count` and the other aggregates) and an
+inline read are inner scopes, and both follow one rule. A name the inner
+scope reads from the scope where it is written correlates: it is the outer
+row's value. A name new to it is introduced by a binding element inside it,
+anywhere in the scope: `not exists { $m: Person, $m manages $p }`. A triple
+naming a name that is neither in scope nor bound there is refused with `T84`;
+the fix inserts the binding before the triple, with the type the edge
+declares for that end. An anonymous end, `$_`, and an edge binding,
+`$k:knows`, need none. A binding of a name already in scope is `T68`: beside
+other elements the fix drops it, so the scope reads the outer name. A block
+that only binds an outer name to filter its row, `not exists { $p: Person
+where $p.name = "bob" }`, is that filter, and the fix writes it in the
+block's place, `not ($p.name = "bob")`, or `not coalesce($p.age > 30, false)`
+where the predicate can be null, which keeps the rows whose test is null. A
+text search is the exception: it stands alone as a conjunct (`T38`), so
+`not exists { $d: Doc where search($d.title, $q) }` stays the way to negate
+one. `match` itself is not an inner scope, and neither is `optional { ... }`:
+a triple there binds its ends.
 
 ## Values and inline reads
 
