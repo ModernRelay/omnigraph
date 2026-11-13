@@ -66,8 +66,8 @@ decide_seam! {
     pub static CLEANUP_SWEEP_PRE_DEAD_MANIFEST_DELETE = ("cleanup.sweep_pre_dead_manifest_delete", Unreachable, [Fail]);
 }
 
-/// Requests the run made, for the two ceilings in `maintenance.rs`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Requests the collector made while planning a cleanup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CollectorCost {
     /// `__manifest` reads: one per live branch at HEAD plus one per retained
     /// version below HEAD.

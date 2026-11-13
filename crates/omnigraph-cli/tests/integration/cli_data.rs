@@ -5113,6 +5113,15 @@ fn cleanup_against_local_scope_executes_with_confirm() {
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(payload.get("tables").is_none());
+    let cost = &payload["planning_cost"];
+    assert!(
+        cost["table_opens"].as_u64().is_some_and(|n| n > 0),
+        "{cost}"
+    );
+    assert_eq!(
+        cost["manifest_time_reads"], 0,
+        "--keep alone needs no cutoff reads"
+    );
     let datasets = payload["datasets"].as_array().unwrap();
     assert_eq!(datasets.len(), 4, "{payload}");
     assert!(

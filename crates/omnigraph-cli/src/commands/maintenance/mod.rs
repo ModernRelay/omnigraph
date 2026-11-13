@@ -267,8 +267,10 @@ pub(crate) async fn run_cleanup(
         omnigraph::storage::storage_for_binding(&binding)?,
     )
     .await?;
-    let stats = db.cleanup_as(options.clone(), actor.as_deref()).await?;
-    write_cleanup(&uri, &options, &policy_desc, &stats, json, stdout)?;
+    let report = db
+        .cleanup_report_as(options.clone(), actor.as_deref())
+        .await?;
+    write_cleanup(&uri, &options, &policy_desc, &report, json, stdout)?;
     Ok(Completion::success())
 }
 

@@ -382,7 +382,8 @@ drops does not stop it; `--older-than` reads every other commit's time and
 stops on one it cannot read. Without `--confirm`, cleanup only echoes the
 policy and exits 0; it lists no candidates. Cleanup also reclaims table forks
 and deleted branches' refs once nothing needs them. Branch
-deletion and `optimize` leave this reclamation to `cleanup`.
+deletion and `optimize` leave this reclamation to `cleanup`. With `--confirm --json`,
+`planning_cost.table_opens` counts the table manifests opened to plan the sweep.
 
 ## Stored Queries
 

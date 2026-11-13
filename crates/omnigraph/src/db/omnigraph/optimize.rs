@@ -790,6 +790,13 @@ impl OptimizeRequest {
     }
 }
 
+/// Outcomes and collector planning cost from one cleanup run.
+#[derive(Debug, Clone, Default)]
+pub struct CleanupReport {
+    pub datasets: Vec<DatasetCleanupStats>,
+    pub planning_cost: CollectorCost,
+}
+
 /// Per-dataset outcome of `cleanup_all_datasets`. `error` is `Some` when this
 /// dataset's version GC failed; cleanup is fault-isolated per dataset, so a
 /// single dataset's failure is recorded here rather than aborting the whole sweep.
@@ -2043,7 +2050,7 @@ pub async fn cleanup_all_datasets(
     db: &Omnigraph,
     options: CleanupPolicyOptions,
     actor: Option<&str>,
-) -> Result<Vec<DatasetCleanupStats>> {
+) -> Result<CleanupReport> {
     db.enforce(
         omnigraph_policy::PolicyAction::Reclaim,
         &omnigraph_policy::ResourceScope::Graph,
@@ -2096,12 +2103,13 @@ async fn cleanup_detached_only(
     options: &CleanupPolicyOptions,
     graph_branches: &[Option<String>],
     table_tasks: &[(String, String)],
-) -> Result<Vec<DatasetCleanupStats>> {
+) -> Result<CleanupReport> {
     let before_timestamp = options
         .older_than
         .map(|duration| crate::dst_clock::now_utc() - duration);
     let native_plan = prepare_native_fork_reconciliation(db, before_timestamp).await?;
-    let plan = super::collector::plan_collection(db, options, graph_branches).await?;
+    let collection = super::collector::plan_collection(db, options, graph_branches).await?;
+    let plan = &collection;
     let mut table_tasks = table_tasks.to_vec();
     let mut scheduled_paths = table_tasks
         .iter()
@@ -2113,7 +2121,6 @@ async fn cleanup_detached_only(
         }
     }
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
-    let plan = &plan;
     let results: Vec<DatasetCleanupStats> = futures::stream::iter(table_tasks)
         .map(|(table_key, full_path)| async move {
             let summary = plan.row_summary(&full_path);
@@ -2223,7 +2230,10 @@ async fn cleanup_detached_only(
             "cleanup could not reconcile some orphaned forks; will retry next cleanup"
         );
     }
-    Ok(results)
+    Ok(CleanupReport {
+        datasets: results,
+        planning_cost: collection.cost,
+    })
 }
 
 /// Outcome of [`reconcile_orphaned_branches`]: the `(owner, branch)` pairs

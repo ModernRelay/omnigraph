@@ -313,10 +313,11 @@ pub(crate) fn write_cleanup(
     uri: &str,
     policy: &omnigraph::db::CleanupPolicyOptions,
     policy_desc: &str,
-    stats: &[omnigraph::db::DatasetCleanupStats],
+    report: &omnigraph::db::CleanupReport,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<()> {
+    let stats = &report.datasets;
     let keep = policy.keep_versions;
     let older_than_dur = policy.older_than;
     if json {
@@ -324,6 +325,7 @@ pub(crate) fn write_cleanup(
             "uri": uri,
             "keep_versions": keep,
             "older_than_secs": older_than_dur.map(|d| d.as_secs()),
+            "planning_cost": report.planning_cost,
             "datasets": stats.iter().map(|s| serde_json::json!({
                 "type_key": s.type_key,
                 "bytes_removed": s.bytes_removed,
@@ -2193,34 +2195,42 @@ mod tests {
 
     #[test]
     fn maintenance_cleanup_reports_preserve_partial_failure_and_policy() {
-        use omnigraph::db::{CleanupPolicyOptions, DatasetCleanupStats};
+        use omnigraph::db::{
+            CleanupPolicyOptions, CleanupReport, CollectorCost, DatasetCleanupStats,
+        };
         use std::time::Duration;
         let policy = CleanupPolicyOptions {
             keep_versions: Some(2),
             older_than: Some(Duration::from_secs(60)),
         };
-        let stats = [
-            DatasetCleanupStats {
-                type_key: "node:Person".into(),
-                bytes_removed: 12,
-                old_versions_removed: 3,
-                error: None,
-                manifests_removed: 4,
-                unpublished_manifests: 5,
-                unpublished_bytes: 6,
-                foreign_versions: vec![7, 8],
+        let report = CleanupReport {
+            planning_cost: CollectorCost {
+                table_opens: 9,
+                ..Default::default()
             },
-            DatasetCleanupStats {
-                type_key: "edge:Knows".into(),
-                bytes_removed: 2,
-                old_versions_removed: 1,
-                error: Some("access denied".into()),
-                manifests_removed: 0,
-                unpublished_manifests: 0,
-                unpublished_bytes: 0,
-                foreign_versions: vec![],
-            },
-        ];
+            datasets: vec![
+                DatasetCleanupStats {
+                    type_key: "node:Person".into(),
+                    bytes_removed: 12,
+                    old_versions_removed: 3,
+                    error: None,
+                    manifests_removed: 4,
+                    unpublished_manifests: 5,
+                    unpublished_bytes: 6,
+                    foreign_versions: vec![7, 8],
+                },
+                DatasetCleanupStats {
+                    type_key: "edge:Knows".into(),
+                    bytes_removed: 2,
+                    old_versions_removed: 1,
+                    error: Some("access denied".into()),
+                    manifests_removed: 0,
+                    unpublished_manifests: 0,
+                    unpublished_bytes: 0,
+                    foreign_versions: vec![],
+                },
+            ],
+        };
         let description = "keep 2 versions, remove anything older than 60s";
         assert_maintenance_report(
             concat!(
@@ -2229,13 +2239,17 @@ mod tests {
             ),
             serde_json::json!({
                 "uri":"graph", "keep_versions":2,"older_than_secs":60,
+                "planning_cost": {
+                    "manifest_snapshots":0,"manifest_time_reads":0,"manifest_rechecks":0,
+                    "listings":0,"table_opens":9,"index_reads":0,"transaction_reads":0
+                },
                 "datasets":[
                     {"type_key":"node:Person","bytes_removed":12,"old_versions_removed":3,"error":null,"manifests_removed":4,"unpublished_manifests":5,"unpublished_bytes":6,"foreign_versions":[7,8]},
                     {"type_key":"edge:Knows","bytes_removed":2,"old_versions_removed":1,"error":"access denied","manifests_removed":0,"unpublished_manifests":0,"unpublished_bytes":0,"foreign_versions":[]},
                 ],
             }),
             |json, writer| {
-                super::write_cleanup("graph", &policy, description, &stats, json, writer)
+                super::write_cleanup("graph", &policy, description, &report, json, writer)
             },
         );
         let policy = CleanupPolicyOptions {
@@ -2244,13 +2258,13 @@ mod tests {
         };
         assert_maintenance_report(
             "cleanup graph (remove anything older than 60s) — removed 0 versions (0 bytes) across 0 datasets\n",
-            serde_json::json!({"uri":"graph","keep_versions":null,"older_than_secs":60,"datasets":[]}),
+            serde_json::json!({"uri":"graph","keep_versions":null,"older_than_secs":60,"planning_cost":CollectorCost::default(),"datasets":[]}),
             |json, writer| {
                 super::write_cleanup(
                     "graph",
                     &policy,
                     "remove anything older than 60s",
-                    &[],
+                    &CleanupReport::default(),
                     json,
                     writer,
                 )
