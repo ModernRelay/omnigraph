@@ -1,0 +1,67 @@
+# issue: none
+# notes: A rows step whose plan holds arithmetic, unary minus and the registry's
+# notes: conditional rows (`if`, `coalesce`, `concat`) returns its rows; the
+# notes: runner's typed-plan check knows every expression node the planner's
+# notes: explain prints.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36,"city":"London"}}
+{"type":"Person","data":{"handle":"bob","name":"Bob","age":25,"city":"Paris"}}
+{"type":"Person","data":{"handle":"cy","name":"Cy","age":41}}
+{"type":"Person","data":{"handle":"di","name":"Di","age":19,"city":"London"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Company","data":{"slug":"bolt","name":"Bolt"}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"WorksAt","from":"bob","to":"acme"}
+{"edge":"WorksAt","from":"cy","to":"bolt"}
+{"edge":"Knows","from":"ada","to":"bob"}
+{"edge":"Knows","from":"ada","to":"cy"}
+{"edge":"Knows","from":"bob","to":"di"}
+
+--- query
+query computed_items() {
+    match { $p: Person } where $p.age * 2 > 40
+    return {
+        $p.handle,
+        $p.age + 1 as next,
+        -$p.age as negated,
+        if($p.age > 30, "older", "younger") as band,
+        coalesce($p.city, "nowhere") as town,
+        concat($p.name, "!") as shout,
+    }
+}
+
+--- expect unordered
+{"band":"older","negated":-36,"next":37,"p.handle":"ada","shout":"Ada!","town":"London"}
+{"band":"older","negated":-41,"next":42,"p.handle":"cy","shout":"Cy!","town":"nowhere"}
+{"band":"younger","negated":-25,"next":26,"p.handle":"bob","shout":"Bob!","town":"Paris"}
+
+--- expect shape
+p.handle: String
+next: I32
+negated: I32
+band: String
+town: String
+shout: String

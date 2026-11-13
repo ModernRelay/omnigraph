@@ -1037,9 +1037,11 @@ fn typed_node(value: &Value) -> Result<TypedNode, String> {
         .ok_or_else(bad)?;
     let valid_arity = match op {
         "property" | "variable" | "param" | "literal" | "alias" | "count_rows" => args.is_empty(),
-        "nearest" | "aggregate" | "not" | "is_null" | "cast" => args.len() == 1,
-        "search" | "match_text" | "bm25" | "and" | "or" | "compare" => args.len() == 2,
+        "nearest" | "aggregate" | "not" | "is_null" | "cast" | "neg" => args.len() == 1,
+        "search" | "match_text" | "bm25" | "and" | "or" | "compare" | "arith" => args.len() == 2,
         "fuzzy" | "rrf" => (2..=3).contains(&args.len()),
+        "if" => args.len() == 3,
+        "coalesce" | "concat" | "match_terms" => !args.is_empty(),
         _ => false,
     };
     if !valid_arity {
