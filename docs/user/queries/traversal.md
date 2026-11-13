@@ -233,6 +233,27 @@ In this release every column of a union is a node of one type in every
 arm, and no arm reads a name of the enclosing scope; an arm returning a value
 or an edge, or reading an outer name, is refused (`T86`).
 
+`from name(args)` calls a read declared in the same source: its body runs as
+an inline read, each parameter bound to its argument evaluated in the
+caller's scope, and its returned columns enter the caller's scope. An argument
+is a binding, not text: `$p.handle` below reads the caller's `$p`, never the
+`$p` the called read binds for itself. The called read's own `order` and
+`limit` belong to it, so they are refused there as an inline read's are
+(`T86`):
+
+```gq
+query colleagues($h: String) {
+  match { $p: Person, $p worksAt $c, $q worksAt $c }
+  where $p.handle = $h
+  return { $q }
+}
+
+query everyones_colleagues() {
+  match { $p: Person, from colleagues($p.handle) }
+  return { $p.handle, $q.handle }
+}
+```
+
 Comparison operators are `=`, `!=`, `<`, `<=`, `>`, and `>=`.
 
 See [Query language](index.md) for expressions, projection and ordering.

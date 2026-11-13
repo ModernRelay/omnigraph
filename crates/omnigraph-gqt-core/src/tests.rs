@@ -554,10 +554,16 @@ fn schema_and_seed_are_optional_together() {
 }
 
 #[test]
-fn refuses_second_declaration_in_one_section() {
-    let two = "--- query\nquery a() {\n    match { $p: Person }\n    return { $p.name }\n}\nquery b() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
-    let text = format!("{HDR}{SCHEMA}{SEED}{two}{EXPECT}");
-    assert!(refusal("x", &text).contains("exactly one declaration"));
+fn a_section_runs_its_last_declaration_after_the_reads_it_calls() {
+    let two = "--- query\nquery a() {\n    match { $p: Person }\n    return { $p }\n}\nquery b() {\n    match { from a() }\n    return { $p.name }\n}\n";
+    let case = parse_case("x", &format!("{HDR}{SCHEMA}{SEED}{two}{EXPECT}")).unwrap();
+    let Some(Item::Step(Step::Query(step))) = case.items.first() else {
+        panic!("one query step");
+    };
+    assert_eq!(step.name, "b");
+    let mutation_first = "--- query\nquery ins($n: String) {\n    insert Person { name: $n }\n}\nquery b() {\n    match { $p: Person }\n    return { $p.name }\n}\n";
+    let text = format!("{HDR}{SCHEMA}{SEED}{mutation_first}{EXPECT}");
+    assert!(refusal("x", &text).contains("a mutation declaration is the last or none"));
 }
 
 #[test]

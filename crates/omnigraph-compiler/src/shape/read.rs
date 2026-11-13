@@ -868,7 +868,7 @@ impl<'a> Shaper<'a> {
                     input,
                     items,
                     keep: false,
-                }) => self.inline_read(input, items, &mut population)?,
+                }) => self.inline_read(input, items, &[], &mut population)?,
                 _ => self.facts(body, &mut population)?,
             }
             let population_lets = std::mem::take(&mut population.lets);
@@ -1351,7 +1351,14 @@ impl<'a> Shaper<'a> {
                 input,
                 items,
                 keep: false,
-            } => self.inline_read(input, items, facts),
+            } => self.inline_read(input, items, &[], facts),
+            // `from name(args)`: the declared read's body, read as an inline
+            // read with its parameters bound to the arguments.
+            Term::Call { .. } => {
+                let (input, items, bindings) =
+                    read_parts(term).ok_or_else(|| self.unlowered_node(term))?;
+                self.inline_read(input, items, bindings, facts)
+            }
             Term::Correlate { outer, inner } => {
                 self.facts(outer, facts)?;
                 if let Term::Group { .. } = inner.as_ref() {
@@ -1360,13 +1367,8 @@ impl<'a> Shaper<'a> {
                         Construct::Block,
                     ));
                 }
-                if let Term::Project {
-                    input,
-                    items,
-                    keep: false,
-                } = inner.as_ref()
-                {
-                    return self.inline_read(input, items, facts);
+                if let Some((input, items, bindings)) = read_parts(inner) {
+                    return self.inline_read(input, items, bindings, facts);
                 }
                 self.facts(inner, facts)
             }
@@ -1444,15 +1446,15 @@ impl<'a> Shaper<'a> {
         let mut columns: Vec<(String, String)> = Vec::new();
         let mut shaped = Vec::new();
         for (index, arm) in arms.into_iter().enumerate() {
-            let Term::Project {
-                input,
-                items,
-                keep: false,
-            } = arm
-            else {
+            let Some((input, items, bindings)) = read_parts(arm) else {
                 return Err(self.unlowered_node(arm));
             };
-            if !env_columns(input).is_empty() {
+            let reads_outer = bindings.iter().any(|(_, arg)| {
+                let mut read = Vec::new();
+                arg.columns(&mut read);
+                !read.is_empty()
+            });
+            if reads_outer || !env_columns(input).is_empty() {
                 return Err(self.refuse_at("a `union` arm that reads the enclosing scope", at()));
             }
             let mut inner = Facts {
@@ -1505,6 +1507,7 @@ impl<'a> Shaper<'a> {
                 renames.insert(name, fresh);
             }
             inner.rename(&renames);
+            bind_arguments(&mut inner, bindings);
             facts.inlined = inner.inlined;
             shaped.push(inner);
         }
@@ -1525,10 +1528,17 @@ impl<'a> Shaper<'a> {
     /// value is a `let` of that name, and every name the inner read binds
     /// without returning it is renamed apart, so a later outer binding of the
     /// same name stays another variable.
+    ///
+    /// A declared read's call is its body read the same way, `bindings`
+    /// giving each parameter its argument. The arguments are bound after
+    /// the body's own names are renamed apart, so a caller's variable an
+    /// argument reads is never one the body binds: binding, not textual
+    /// substitution.
     fn inline_read(
         &self,
         input: &Term,
         items: &[(String, IRExpr)],
+        bindings: &[(String, IRExpr)],
         facts: &mut Facts,
     ) -> Result<(), ShapeError> {
         let outer: HashSet<String> = env_columns(input).into_iter().collect();
@@ -1582,6 +1592,7 @@ impl<'a> Shaper<'a> {
             renames.insert(name, fresh);
         }
         inner.rename(&renames);
+        bind_arguments(&mut inner, bindings);
         let rename = |variable: &mut String| {
             if let Some(name) = renames.get(variable) {
                 *variable = name.clone();
@@ -1589,6 +1600,7 @@ impl<'a> Shaper<'a> {
         };
         for (column, mut value) in values {
             rename_expr(&mut value, &rename);
+            bind_params(&mut value, bindings);
             facts.lets.insert(column, value);
         }
         facts.bindings.extend(inner.bindings);
@@ -2455,6 +2467,130 @@ fn reference_null_tests(expr: &mut IRExpr, id: &str, optional: &HashSet<String>)
         return;
     }
     let recurse = |e: &mut IRExpr| reference_null_tests(e, id, optional);
+    match expr {
+        IRExpr::Nearest { query, .. } => recurse(query),
+        IRExpr::Search { field, query, .. }
+        | IRExpr::MatchText { field, query, .. }
+        | IRExpr::Bm25 { field, query, .. } => {
+            recurse(field);
+            recurse(query);
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+            ..
+        } => {
+            recurse(field);
+            recurse(query);
+            if let Some(m) = max_edits {
+                recurse(m);
+            }
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+            ..
+        } => {
+            recurse(primary);
+            recurse(secondary);
+            if let Some(k) = k {
+                recurse(k);
+            }
+        }
+        IRExpr::Aggregate { arg, .. }
+        | IRExpr::Not(arg, _)
+        | IRExpr::IsNull { expr: arg, .. }
+        | IRExpr::Neg { expr: arg, .. }
+        | IRExpr::Cast { expr: arg, .. } => recurse(arg),
+        IRExpr::Binary { left, right, .. } => {
+            recurse(left);
+            recurse(right);
+        }
+        IRExpr::Call { args, .. } => args.iter_mut().for_each(recurse),
+        IRExpr::AliasRef(_, _)
+        | IRExpr::Variable(_, _)
+        | IRExpr::Literal(_, _)
+        | IRExpr::Param(_, _)
+        | IRExpr::PropAccess { .. } => {}
+    }
+}
+
+/// A named expression: a returned item, or a parameter and its argument.
+type Item = (String, IRExpr);
+
+/// An inline read's parts: its pattern, its returned items and the
+/// arguments its parameters are bound to, none for a read written inline; a
+/// declared read's call is its body's.
+fn read_parts(term: &Term) -> Option<(&Term, &[Item], &[Item])> {
+    match term {
+        Term::Project {
+            input,
+            items,
+            keep: false,
+        } => Some((input, items, &[])),
+        Term::Call { bindings, body, .. } => match body.as_ref() {
+            Term::Project {
+                input,
+                items,
+                keep: false,
+            } => Some((input, items, bindings)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Every expression of a called read's facts with each of its parameters
+/// read as the argument bound to it. A binding's filter whose argument reads
+/// a caller's column is no longer over that binding alone: it joins the
+/// scope's filters, which run once both are bound.
+fn bind_arguments(facts: &mut Facts, bindings: &[(String, IRExpr)]) {
+    if bindings.is_empty() {
+        return;
+    }
+    facts.each_expr(&mut |e| bind_params(e, bindings));
+    rehome_binding_filters(facts);
+}
+
+/// `facts` with every binding filter that reads more than its binding moved
+/// to the scope's filters, nested scopes included.
+fn rehome_binding_filters(facts: &mut Facts) {
+    for binding in &mut facts.bindings {
+        let (own, other): (Vec<IRExpr>, Vec<IRExpr>) = std::mem::take(&mut binding.filters)
+            .into_iter()
+            .partition(|f| {
+                let mut cols = Vec::new();
+                f.columns(&mut cols);
+                cols.iter().all(|c| *c == binding.variable)
+            });
+        binding.filters = own;
+        facts.filters.extend(other);
+    }
+    for block in &mut facts.blocks {
+        rehome_binding_filters(&mut block.inner);
+    }
+    for optional in &mut facts.optionals {
+        rehome_binding_filters(&mut optional.inner);
+    }
+    for union in &mut facts.unions {
+        union.arms.iter_mut().for_each(rehome_binding_filters);
+    }
+}
+
+/// `expr` with every parameter `bindings` names read as its argument.
+fn bind_params(expr: &mut IRExpr, bindings: &[(String, IRExpr)]) {
+    if bindings.is_empty() {
+        return;
+    }
+    if let IRExpr::Param(name, _) = expr {
+        if let Some((_, arg)) = bindings.iter().find(|(param, _)| param == name) {
+            *expr = arg.clone();
+        }
+        return;
+    }
+    let recurse = |e: &mut IRExpr| bind_params(e, bindings);
     match expr {
         IRExpr::Nearest { query, .. } => recurse(query),
         IRExpr::Search { field, query, .. }

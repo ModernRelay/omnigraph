@@ -42,10 +42,15 @@ A query runs against one resolved `ReadTarget`:
    logical and physical `Union` (a new node kind: no existing one emits the
    rows of two pipelines) folded from the left; each arm is a scope of its
    own for filter placement, and the union's columns are its bindings'.
+   A `from name(args)` (`Call`) is its body read as an inline read: the
+   body's own names are renamed apart first and only then each parameter is
+   replaced by its argument, so an argument reading a caller's variable is
+   never captured by a name the body binds; a binding filter that then reads
+   a caller's column joins the scope's filters. A call adds no plan node.
    The shaper is the compiler's
    (`omnigraph_compiler::shape`), and the type checker runs it on every
    declaration it accepts: a term it does not lower (a `union` arm with a
-   value or an outer name, `Fix`, `Call`,
+   value or an outer name, `Fix`,
    a `let` value that can fail, an inline read with a group, order or cut, a
    computed order key no return item computes) is refused at type check with
    `T86`, at the construct and naming the programme stage that adds it, so

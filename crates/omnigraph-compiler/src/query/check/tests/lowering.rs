@@ -40,7 +40,6 @@ const B_IN_PROGRESS: &[&str] = &[
     "a node an optional introduces returned whole",
     "a union arm returning a value",
     "a union whose arms read the enclosing scope",
-    "a declared read's call",
     "distance",
     "limit over a parameter",
 ];
@@ -116,11 +115,15 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { from { match { $p: Person } where $p.age > 30 return { $p } } } return { $p.name } }",
                 Lowers,
             ),
-            // "a declared read's call"
             (
                 "query adults() { match { $p: Person } where $p.age > 30 return { $p } }
                  query q() { match { from adults() } return { $p.name } }",
-                Refused("B"),
+                Lowers,
+            ),
+            (
+                "query colleagues($h: String) { match { $p: Person, $p worksAt $c, $q worksAt $c } where $p.handle = $h return { $q } }
+                 query q() { match { $p: Person, from colleagues($p.handle) } return { $p.name, $q.name } }",
+                Lowers,
             ),
             (
                 "query q() { match { from union({ match { $p: Person } return { $p } }, { match { $q: Person } return { $q as p } }) } return { $p.name } }",

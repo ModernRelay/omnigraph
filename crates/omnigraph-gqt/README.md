@@ -113,6 +113,11 @@ are not written to reports. The engine's existing backend admission rules
 still apply. Keep external queries outside `cases/`: corpus execution has no
 store argument and refuses a file without schema and seed.
 
+A `--- query` or `--- mutate` section runs its last declaration. The
+declarations before it, all reads, are the declared reads it calls, which
+resolve in the same source unit; a mutation declaration before the last
+refuses the case.
+
 One engine instance survives ordinary steps and expected errors. Only
 `--- restart` drops the engine and reopens the same storage. A case owns one
 session ([Session settings](../../docs/rfcs/2026-09-16-session-settings.md)) for

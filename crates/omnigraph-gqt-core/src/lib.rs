@@ -2401,12 +2401,23 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                         ));
                     }
                 };
-                let [decl] = decls.as_slice() else {
+                // The step runs the section's last declaration; the reads
+                // before it are the declared reads it calls, which resolve
+                // in the same source unit.
+                let Some((decl, called)) = decls.split_last() else {
                     return Err(format!(
-                        "a `--- {kind}` section must hold exactly one declaration, got {}",
-                        decls.len()
+                        "a `--- {kind}` section must hold a declaration, got none"
                     ));
                 };
+                if called.iter().any(QueryDecl::is_mutation) {
+                    return Err(format!(
+                        "a `--- {kind}` section holds the declared reads its last declaration \
+                         calls before it; a mutation declaration is the last or none"
+                    ));
+                }
+                for read in called {
+                    inspect_decl(read, &mut needs_indices)?;
+                }
                 let is_mutation = decl.is_mutation();
                 if kind == "query" && is_mutation {
                     return Err(

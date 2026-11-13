@@ -1,0 +1,149 @@
+# issue: none
+# notes: `from name(args)` is a `Call`: the body of a declared read in the
+# notes: same source unit, its parameters bound to the arguments evaluated in
+# notes: the caller's scope, its returned columns entering the caller's scope
+# notes: as an inline read's do. It is binding, not textual substitution: an
+# notes: argument reading a caller variable whose name the body also binds
+# notes: still reads the caller's, and the body's own names stay inside it.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+    age: I32?
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Person","data":{"handle":"bob","name":"Bob","age":25}}
+{"type":"Person","data":{"handle":"cy","name":"Cy","age":41}}
+{"type":"Person","data":{"handle":"dee","name":"Dee"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Company","data":{"slug":"bolt","name":"Bolt"}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"WorksAt","from":"bob","to":"acme"}
+{"edge":"WorksAt","from":"cy","to":"bolt"}
+{"edge":"WorksAt","from":"dee","to":"bolt"}
+
+--- query
+query adults() {
+    match { $p: Person }
+    where $p.age > 30
+    return { $p }
+}
+query adult_names() {
+    match { from adults() }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name":"Ada"}
+{"p.name":"Cy"}
+
+--- expect shape
+p.name: String
+
+--- query
+query colleagues($h: String) {
+    match { $p: Person, $p worksAt $c, $q worksAt $c }
+    where $p.handle = $h
+    return { $q }
+}
+query colleagues_of($of: String) {
+    match { from colleagues($of) }
+    return { $q.handle }
+}
+
+--- params
+{"of": "cy"}
+
+--- expect unordered
+{"q.handle":"cy"}
+{"q.handle":"dee"}
+
+--- expect shape
+q.handle: String
+
+--- query
+query colleagues($h: String) {
+    match { $p: Person, $p worksAt $c, $q worksAt $c }
+    where $p.handle = $h
+    return { $q }
+}
+query everyones_colleagues() {
+    match { $p: Person, from colleagues($p.handle) }
+    return { $p.handle, $q.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada","q.handle":"ada"}
+{"p.handle":"ada","q.handle":"bob"}
+{"p.handle":"bob","q.handle":"ada"}
+{"p.handle":"bob","q.handle":"bob"}
+{"p.handle":"cy","q.handle":"cy"}
+{"p.handle":"cy","q.handle":"dee"}
+{"p.handle":"dee","q.handle":"cy"}
+{"p.handle":"dee","q.handle":"dee"}
+
+--- expect shape
+p.handle: String
+q.handle: String
+
+--- query
+query colleagues($h: String) {
+    match { $p: Person, $p worksAt $c, $q worksAt $c }
+    where $p.handle = $h
+    return { $q }
+}
+query colleagues_of_colleagues($of: String) {
+    match {
+        from { match { from colleagues($of) } return { $q.handle as h } },
+        from colleagues($h),
+    }
+    return { $h, $q.handle }
+}
+
+--- params
+{"of": "ada"}
+
+--- expect unordered
+{"h":"ada","q.handle":"ada"}
+{"h":"ada","q.handle":"bob"}
+{"h":"bob","q.handle":"ada"}
+{"h":"bob","q.handle":"bob"}
+
+--- expect shape
+h: String
+q.handle: String
+
+--- query
+query aged($min: I32) {
+    match { $p: Person }
+    where $p.age >= $min
+    return { $p, $p.age as years }
+}
+query thirty_and_over() {
+    match { from aged(30) }
+    where $years < 40
+    return { $p.handle, $years }
+}
+
+--- expect unordered
+{"p.handle":"ada","years":36}
+
+--- expect shape
+p.handle: String
+years: I32?
