@@ -5420,7 +5420,7 @@ impl Omnigraph {
         let _schema_permit = if dry_run {
             None
         } else {
-            Some(self.write_queue().acquire_schema_shared().await)
+            Some(self.write_queue().acquire_schema_shared().await?)
         };
         // The target gate is held through publication: it keeps a target
         // delete/recreate from reusing the name underneath the plan (ABA) and
@@ -5434,15 +5434,15 @@ impl Omnigraph {
         let (source_gate, _target_gate) = if dry_run {
             (None, None)
         } else if source_branch <= target_branch {
-            let source_gate = queue.acquire_branch(source_branch.as_deref()).await;
+            let source_gate = queue.acquire_branch(source_branch.as_deref()).await?;
             (
                 Some(source_gate),
-                Some(queue.acquire_branch(target_branch.as_deref()).await),
+                Some(queue.acquire_branch(target_branch.as_deref()).await?),
             )
         } else {
-            let target_gate = queue.acquire_branch(target_branch.as_deref()).await;
+            let target_gate = queue.acquire_branch(target_branch.as_deref()).await?;
             (
-                Some(queue.acquire_branch(source_branch.as_deref()).await),
+                Some(queue.acquire_branch(source_branch.as_deref()).await?),
                 Some(target_gate),
             )
         };
@@ -6006,7 +6006,7 @@ impl Omnigraph {
         );
         let merge_branches = [target_branch.map(str::to_string)];
         let merge_queue_keys = self.table_queue_keys_for_branches(&merge_branches, catalog);
-        let _merge_queue_guards = self.write_queue().acquire_many(&merge_queue_keys).await;
+        let _merge_queue_guards = self.write_queue().acquire_many(&merge_queue_keys).await?;
 
         // Re-read both inputs against one accepted schema contract. Target
         // authority remains exact; source head movement is harmless, but its

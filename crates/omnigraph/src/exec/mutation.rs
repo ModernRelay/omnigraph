@@ -1300,22 +1300,21 @@ impl Omnigraph {
             crate::db::reprepare::PreEffectReprepares::begin(self, Some(branch), "mutation");
         loop {
             let first_attempt = reprepares.is_first();
-            let result = self
-                .mutate_one_attempt(
-                    branch,
-                    query_source,
-                    query_name,
-                    &resolved_params,
-                    actor_id,
-                    expected_head,
-                    stage_write_concurrency,
-                    history_release_bytes,
-                    first_attempt,
-                    write_budget,
-                    route,
-                    reprepares.attempt(),
-                )
-                .await;
+            let result = crate::db::write_queue::preparing(self.mutate_one_attempt(
+                branch,
+                query_source,
+                query_name,
+                &resolved_params,
+                actor_id,
+                expected_head,
+                stage_write_concurrency,
+                history_release_bytes,
+                first_attempt,
+                write_budget,
+                route,
+                reprepares.attempt(),
+            ))
+            .await;
             match result {
                 Err(err) if reprepares.may_prepare_again(&err) => {
                     reprepares.prepare_again().await?;
@@ -1445,7 +1444,7 @@ impl Omnigraph {
                         None => {
                             self.write_queue()
                                 .acquire_branch_write_gates(requested.as_deref())
-                                .await
+                                .await?
                         }
                     };
                     self.revalidate_write_txn(&txn).await?;

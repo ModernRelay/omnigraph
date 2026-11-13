@@ -36,9 +36,17 @@
 //! [`MAX_PRE_EFFECT_REPREPARES`]. Taking all of this from
 //! [`PreEffectReprepares`] keeps the next writer of this kind from forgetting
 //! any of it.
+//!
+//! Preparation must take no writer gate of its own: the gates are not
+//! reentrant, so a gated attempt that took one would wait on its own gate
+//! forever. Each attempt therefore runs inside a preparation scope
+//! ([`crate::db::write_queue::preparing`]), where every writer-gate
+//! acquisition refuses with an internal error; [`WriteAttempt::admit`]
+//! refuses an attempt outside one, and [`WriteAttempt::admitted_gates`], the
+//! commit point, ends it.
 
 use super::omnigraph::{Omnigraph, WriteTxn};
-use super::write_queue::BranchWriteGates;
+use super::write_queue::{self, BranchWriteGates};
 use crate::error::{OmniError, Result};
 
 /// How many times a write prepares again before its `ReadSetChanged` is the
@@ -121,12 +129,17 @@ impl WriteAttempt {
     /// attempt, which takes them at its revalidation. An attempt that never
     /// passed [`WriteAttempt::admit`] cannot commit: a writer that forgot to
     /// admit its capture would otherwise rerun across a recreated branch or a
-    /// schema change unchecked.
+    /// schema change unchecked. This is the attempt's commit point: its
+    /// preparation ends here, and the writer gates may be taken from here on.
     pub(crate) fn admitted_gates(&mut self) -> Result<Option<BranchWriteGates>> {
         if !self.admitted {
             return Err(OmniError::manifest_internal(
                 "a write attempt reached its commit without admitting its capture",
             ));
+        }
+        let prepared_in_scope = write_queue::end_preparation();
+        if self.gates.is_some() && prepared_in_scope {
+            crate::instrumentation::record_gated_preparation_checked();
         }
         Ok(self.gates.take())
     }
@@ -136,7 +149,17 @@ impl WriteAttempt {
     /// that `selects_rows` and sees either differ returns `ReadSetChanged`
     /// for the member that did: the rows its request selects are no longer
     /// the rows it was compiled to select.
+    ///
+    /// An attempt must prepare inside a preparation scope
+    /// ([`write_queue::preparing`]), where a writer-gate acquisition refuses
+    /// instead of waiting on the gates a gated attempt holds; one admitted
+    /// outside it is refused, so a writer cannot skip the check.
     pub(crate) fn admit(&mut self, txn: &WriteTxn, selects_rows: bool) -> Result<()> {
+        if !write_queue::is_preparing() {
+            return Err(OmniError::manifest_internal(
+                "a write attempt admitted its capture outside a preparation scope",
+            ));
+        }
         let identity = AttemptIdentity::of(txn);
         match &self.first {
             None => self.first = Some(identity),
@@ -218,7 +241,7 @@ impl<'a> PreEffectReprepares<'a> {
             .db
             .write_queue()
             .acquire_branch_write_gates(self.branch)
-            .await;
+            .await?;
         self.current = WriteAttempt {
             gates: Some(gates),
             first,

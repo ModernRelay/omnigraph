@@ -279,7 +279,7 @@ pub(in crate::db::omnigraph) async fn prepare_schema_apply(
     actor: Option<&str>,
 ) -> Result<(PreparedSchemaApply, SchemaMigrationPlan)> {
     authorize(db, actor)?;
-    let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
+    let _schema_gate = db.write_queue().acquire_schema_exclusive().await?;
     let captured = capture(db, source, None)
         .await
         .map_err(OmniError::before_effect)?;
@@ -295,7 +295,7 @@ pub(in crate::db::omnigraph) async fn reconcile_schema_apply(
     authorize(db, actor)?;
     prepared.validate_envelope(db, actor)?;
     if prepared.is_noop() {
-        let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
+        let _schema_gate = db.write_queue().acquire_schema_exclusive().await?;
         db.refresh_coordinator_only().await?;
         let (snapshot, branch_identifier, graph_head) = {
             let coordinator = db.coordinator.load_full();

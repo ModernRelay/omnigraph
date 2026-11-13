@@ -758,7 +758,7 @@ async fn load_jsonl_data(
     loop {
         let replay = BufReader::new(Cursor::new(data.as_bytes()));
         let first_attempt = reprepares.is_first();
-        let result = load_jsonl_reader_once(
+        let result = crate::db::write_queue::preparing(load_jsonl_reader_once(
             db,
             branch,
             replay,
@@ -771,7 +771,7 @@ async fn load_jsonl_data(
             write_budget,
             &memory,
             reprepares.attempt(),
-        )
+        ))
         .await;
         match result {
             Err(err) if reprepares.may_prepare_again(&err) => {

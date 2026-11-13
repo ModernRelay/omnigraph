@@ -227,7 +227,7 @@ where
 
     let _export_exclusion = db.reserve_export_destructive_control()?;
 
-    let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
+    let _schema_gate = db.write_queue().acquire_schema_exclusive().await?;
     apply_schema_with_lock(db, desired_schema_source, actor, validate_catalog, None).await
 }
 
@@ -239,7 +239,7 @@ pub(super) async fn apply_prepared_schema(
     prepared::authorize(db, actor)?;
     prepared.validate_envelope(db, actor)?;
     let _export_exclusion = db.reserve_export_destructive_control()?;
-    let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
+    let _schema_gate = db.write_queue().acquire_schema_exclusive().await?;
     apply_schema_with_lock(
         db,
         &prepared.desired_source,
@@ -617,11 +617,11 @@ where
         .datasets()
         .map(|entry| (entry.type_key.clone(), entry.native_dataset_branch.clone()))
         .collect();
-    let _main_branch_guard = db.write_queue().acquire_branch(None).await;
+    let _main_branch_guard = db.write_queue().acquire_branch(None).await?;
     let _schema_apply_queue_guards = db
         .write_queue()
         .acquire_many(&schema_apply_queue_keys)
-        .await;
+        .await?;
 
     // The snapshot was captured before the branch/table waits. Revalidate the
     // complete authority token now, while those gates are held, so a stale

@@ -1747,6 +1747,26 @@ where
     D: std::future::Future<Output = ()>,
 {
     let _ = db;
+    let (outcome, probes) = park_write_while(write, during).await;
+    (
+        outcome,
+        probes.mutation_reprepares.load(Ordering::Relaxed),
+        probes
+            .writes_carried_over_row_preserving
+            .load(Ordering::Relaxed),
+    )
+}
+
+/// Park `write` after its staging, before its gates, run `during`, then let
+/// the write finish; returns its outcome and the probes it ran under.
+async fn park_write_while<W, D>(
+    write: W,
+    during: D,
+) -> (omnigraph::error::Result<()>, QueryIoProbes)
+where
+    W: std::future::Future<Output = omnigraph::error::Result<()>> + Send + 'static,
+    D: std::future::Future<Output = ()>,
+{
     let probes = QueryIoProbes::default();
     let rendezvous =
         helpers::failpoint::Rendezvous::park_first(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE);
@@ -1759,13 +1779,7 @@ where
     rendezvous.release();
     let outcome = writer.await.unwrap();
     assert!(!rendezvous.timed_out(), "the write stayed parked");
-    (
-        outcome,
-        probes.mutation_reprepares.load(Ordering::Relaxed),
-        probes
-            .writes_carried_over_row_preserving
-            .load(Ordering::Relaxed),
-    )
+    (outcome, probes)
 }
 
 /// Issue #1331: an insert into the very table an `optimize` publication
@@ -2005,6 +2019,99 @@ async fn upsert_of_a_row_optimize_rewrote_meanwhile_prepares_again_once_issue_13
         assert_eq!(carried, 0, "{kind}");
         assert_eq!(person_ages(&db, "early-0").await, vec![77], "{kind}");
         assert_eq!(count_rows(&db, "node:Person").await, 6, "{kind}");
+    }
+}
+
+/// Issue #1369: a write sent back prepares again holding its branch's writer
+/// gates, which are not reentrant, so its preparation must take no writer
+/// gate. The engine checks that: every attempt prepares inside a preparation
+/// scope, where a writer-gate acquisition refuses instead of waiting on the
+/// attempt's own gates (`write_queue::tests`). Each writer, a mutation, a load
+/// and a Blob write, is sent back once here, and its gated second attempt
+/// prepares inside that scope and commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn each_writers_gated_attempt_prepares_with_the_gate_check_issue_1369() {
+    for kind in ["mutation", "load", "Blob write"] {
+        let _scenario = FailScenario::setup();
+        let dir = tempfile::tempdir().unwrap();
+        let (outcome, probes) = if kind == "Blob write" {
+            // A note update between the put's staging and its gates sends
+            // the put back.
+            let db = Arc::new(seed_blob_write_graph(dir.path().to_str().unwrap()).await);
+            let write = {
+                let db = Arc::clone(&db);
+                async move {
+                    db.put_blob_at_as(
+                        "main",
+                        readme("content"),
+                        Bytes::from_static(b"gated"),
+                        None,
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            };
+            let during = {
+                let db = Arc::clone(&db);
+                async move { set_readme_note(&db, "n1").await }
+            };
+            let parked = park_write_while(write, during).await;
+            assert_eq!(
+                read_managed_blob_bytes(&db, ReadTarget::branch("main"), readme("content")).await,
+                b"gated"
+            );
+            parked
+        } else {
+            // An optimize that rewrites the row's fragment sends the update
+            // or the merge back: Lance refuses to carry it over the rewrite.
+            let db = Arc::new(init_and_load(&dir).await);
+            issue_1331_fragment_person(&db, "early").await;
+            let write = {
+                let db = Arc::clone(&db);
+                async move {
+                    if kind == "mutation" {
+                        mutate_main(
+                            &db,
+                            MUTATION_QUERIES,
+                            "set_age",
+                            &mixed_params(&[("$name", "early-0")], &[("$age", 77)]),
+                        )
+                        .await
+                        .map(|_| ())
+                    } else {
+                        db.load(
+                            "main",
+                            r#"{"type":"Person","data":{"name":"early-0","age":77}}"#,
+                            LoadMode::Merge,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                }
+            };
+            let during = {
+                let db = Arc::clone(&db);
+                async move {
+                    issue_1331_optimize_person_only(&db).await;
+                }
+            };
+            let parked = park_write_while(write, during).await;
+            assert_eq!(person_ages(&db, "early-0").await, vec![77], "{kind}");
+            parked
+        };
+        outcome.unwrap_or_else(|error| panic!("{kind} refused: {error}"));
+        assert_eq!(
+            probes.mutation_reprepares.load(Ordering::Relaxed),
+            1,
+            "{kind}: one send-back, then the gated attempt"
+        );
+        assert_eq!(
+            probes.gated_preparations_checked.load(Ordering::Relaxed),
+            1,
+            "{kind}: the gated attempt prepared inside the preparation scope"
+        );
     }
 }
 
