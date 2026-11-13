@@ -1,43 +1,69 @@
 # Search
 
 OmniGraph combines vector, full-text, and graph patterns in one `.gq` query.
-Search expressions can filter or order a matched node set; a `limit` is required
-for nearest-neighbor ordering.
+Search predicates filter a matched node set; a ranking is a relation that
+`match` draws rows from with `from`, its score a column the `from` names
+with `as`.
 
 ## Functions
 
 | Function | Meaning |
 |---|---|
-| `nearest($d.embedding, $q)` | Rank vectors by L2 distance. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
+| `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by L2 distance, with the distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
+| `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their BM25 relevance as the score. |
+| `rrf(ranking, ranking, k: 60)` | Two rankings of one population fused with Reciprocal Rank Fusion, the fused score as the score. The default `k` is 60. |
 | `search($d.body, $q)` | Full-text token search. |
-| `fuzzy($d.body, $q [, max_edits])` | Full-text search with edit-distance tolerance. |
+| `fuzzy($d.body, $q, max_edits: n)` | Full-text search with edit-distance tolerance. |
 | `match_text($d.body, $q)` | Match a full-text query in a `match` block. |
-| `bm25($d.body, $q)` | BM25 relevance score. |
-| `rrf(rank_a, rank_b [, k])` | Fuse two rankings with Reciprocal Rank Fusion. The default `k` is 60. |
 
-Search arguments use their declared types. `fuzzy` defaults `max_edits` to 2
-when omitted; a supplied value must be an integer from 0 to 4,294,967,295.
-`rrf` defaults `k` to 60 when omitted; a supplied value must be an integer
-from 1 to 4,294,967,295. A supplied null is an error, including a nullable
-parameter that was omitted from the parameter map. Query text and vectors
-must also be non-null; vector elements must convert to finite F32 values.
+The first argument of a ranking is the population it ranks: a relation a
+`let` names before the ranking, `let $pop = { match { ... } return { $d } }`,
+whose `return` names the bindings the rest of the query reads, or the same
+inline read in its place. The second is the ranked property of a node binding
+of that population. `from` adds the population's columns and the score column
+to the query, and `as` names the score: `from nearest($pop, $d.embedding, $q,
+k: 10) as $distance`. A `from` that ranks without `as`, or an `as` on a `from`
+that ranks nothing, is refused (`T85`), so a score enters scope only under the
+name written; inside a relation function's argument, such as an `rrf` arm, a
+score has no name. Return the score (`$distance`, or aliased,
+`$score as score`) and order by it, `order { $distance }` for a distance and
+`order { $score desc }` for a relevance score. The score is an ordinary
+column: it may be any `order` key, in either direction, or none.
+Elements and a `where` written after the `from` run over the rows the ranking
+selected; a row they remove is not replaced by the next candidate. A ranking written as a call in `order` or `return`, such as
+`order { nearest($d.embedding, $q) }`, is refused (`T65`) with the `from` form
+as its fix.
 
-Filters in the `match` block are applied before ranking, so `limit 10` means the
-top ten matches that satisfy the graph and property filters.
+Search arguments use their declared types. `nearest` requires its window
+`k` (`T17`), an integer literal or parameter of at least 1: it selects the `k`
+nearest targets of the population with every row each has, and the read's
+`limit`, which may be larger, smaller or absent, cuts the rows after that. A
+window read from a parameter is not lowered in this release unless it is the
+read's `limit` with the score leading the `order` (`T86`). `fuzzy` defaults `max_edits` to 2 when
+omitted; a literal must be 0 to 2 (`T71`) and a parameter an integer from 0
+to 4,294,967,295. `rrf` takes `k` as an integer literal from 1 to 1,000,000
+or an integer parameter. Options are named: `fuzzy($d.body, $q, 2)` is
+refused (`T71`) with `max_edits: 2` as its fix. A supplied null is an error,
+including a nullable parameter that was omitted from the parameter map. Query
+text and vectors must also be non-null; vector elements must convert to
+finite F32 values.
 
-A `bm25()` ordering reads every matching entity before applying the final
+Filters in the population's `match` are applied before ranking, so `limit 10`
+means the top ten matches that satisfy the graph and property filters.
+
+A `bm25` ranking reads every matching entity before applying the final
 limit. Equal scores are then ordered by entity identity, including when the
 smallest identity lies beyond the first search candidates.
 
-Full-text rankings inside `rrf()` are
+Full-text rankings inside `rrf` are
 never bounded this way: each full-text arm scans every matching entity, and
 fusion ranks the entities that satisfy the graph and property filters, so
 bounding an arm could silently drop an entity's contribution and shift fused
 results. When a traversal constrains the ranked variable and the graph shows
 few entities could satisfy it, the full-text arms instead rank only those
 entities (an unbounded, index-served prefilter — results are identical, the
-scan is just smaller); broad traversals keep the full scan. A `nearest()`
-ranking inside `rrf()` is inherently top-k, as vector
+scan is just smaller); broad traversals keep the full scan. A `nearest`
+ranking inside `rrf` is inherently top-k, as vector
 search always is: an entity outside its window adds no vector contribution
 to its fused score, so a traversal that drops the window's top matches can
 shift fused ranks.
@@ -46,9 +72,9 @@ shift fused ranks.
 
 ```gq
 query similar($q: Vector(4)) {
-  match { $d: Document }
+  match { let $pop = { match { $d: Document } return { $d } }, from nearest($pop, $d.embedding, $q, k: 10) as $distance }
   return { $d.slug, $d.title }
-  order { nearest($d.embedding, $q) }
+  order { $distance }
   limit 10
 }
 ```
@@ -81,10 +107,10 @@ than one in sixteen of the nearest candidates then runs one exact pass over
 the whole type (every row with an embedding ranked, no cap), taken sooner
 once a rung would cover the whole type anyway, so `limit` is
 filled whenever that many survivors exist; a query whose survivors are permanently fewer than
-`limit` pays that whole-type pass on every execution. A `nearest` ordering constrained by a traversal is first restricted
+`limit` pays that whole-type pass on every execution. A `nearest` ranking constrained by a traversal is first restricted
 to the entities that can satisfy the traversal's first hop when few entities
-can (the same gate `rrf()` uses), and ranks only those. A `nearest()` arm
-inside `rrf()` is a top-k window: the arm's scan widens its own cap, but a
+can (the same gate `rrf` uses), and ranks only those. A `nearest` arm
+inside `rrf` is a top-k window: the arm's scan widens its own cap, but a
 traversal that drops the arm's rows shortens the fused answer. As with every
 IVF search, a full candidate count does not make the ANN ranking exact; the
 cap remains a recall/latency tradeoff.
@@ -92,15 +118,15 @@ cap remains a recall/latency tradeoff.
 | Setting or variable | Meaning |
 |---|---|
 | `ann_nprobes` ([session setting](../queries/index.md#session-settings), `request` scope; process default `OMNIGRAPH_ANN_NPROBES`) | Partition cap per index delta of a `nearest` scan; default 20, `0` removes the cap, an invalid value refuses startup |
-| `OMNIGRAPH_RRF_GATE_RATIO` | Fraction of the ranked type below which a traversal-constrained `nearest` or `rrf()` prefilters its scan; default 0.10, `0` turns the gate off, an invalid value is the default |
+| `OMNIGRAPH_RRF_GATE_RATIO` | Fraction of the ranked type below which a traversal-constrained `nearest` or `rrf` prefilters its scan; default 0.10, `0` turns the gate off, an invalid value is the default |
 | `OMNIGRAPH_RRF_GATE_MAX_IDS` | Largest eligible set the gate pushes into the scan; default 100000, `0` turns the gate off, an invalid value is the default |
 | `rrf_plan` ([session setting](../queries/index.md#session-settings), `process` scope; process default `OMNIGRAPH_RRF_PLAN`) | `auto` (default), `force_prefilter`, or `force_postfilter`, for diagnosis. On a traversal-constrained `nearest`, `force_postfilter` can leave `limit` unfilled and `force_prefilter` ranks the eligible entities regardless of the size threshold |
 
 ## Full-text search
 
 Use full-text functions for token search, fuzzy terms, and relevance. Use the
-query language's exact `contains` and `starts_with` predicates for literal,
-case-sensitive substring and prefix matching.
+query language's exact `contains(...)` and `starts_with(...)` functions for
+literal, case-sensitive substring and prefix matching.
 
 A full-text function needs a full-text index on its property: a one-column
 `@index` or `@key` on a free-text String property of a node. The index's
@@ -119,64 +145,71 @@ within its own block.
 
 ```gq
 query relevant($q: String) {
-  match { $d: Document }
-  return { $d.slug, bm25($d.body, $q) as score }
-  order { bm25($d.body, $q) desc }
+  match { let $pop = { match { $d: Document } return { $d } }, from bm25($pop, $d.body, $q) as $score }
+  return { $d.slug, $score as score }
+  order { $score desc }
   limit 10
 }
 ```
 
-`score` is the relevance the ordering used, one computation observed twice:
-the projected `bm25(...)` must repeat the leading `order` key (`T33`), and
-`nearest(...)` projects its distance the same way; that distance is the
-squared L2 distance Lance ranks by. Without an alias the column is
-`d._score` or `d._distance`. `rrf(...)` projects the fused score under the
-same rule, an `F64` named `d._rrf` after its first arm's binding without an
-alias. A `nearest(...)` or `bm25(...)` that appears only as an `rrf` arm is
-refused (`T33`), and so are the predicates `search(...)`, `fuzzy(...)` and
-`match_text(...)` (`T35`). A relevance ranking orders most relevant first:
-`asc` on a `bm25(...)` or `rrf(...)` order key is refused (`T54`), as any
-modifier on `nearest(...)` is at parse time.
+`score` is the relevance the ranking used, the one value the `$score` column
+holds. `nearest` gives its distance the same way, the squared L2 distance
+Lance ranks by, and `rrf` gives the fused score as an `F64`. Without an alias
+the result column takes the score's name, `$score` giving `score` and
+`$distance` giving `distance`; write `$score as _score` or
+`$distance as _distance` for those names. A search
+predicate, `search(...)`, `fuzzy(...)` or `match_text(...)`, stands alone as a
+filter and is not a return item (`T38`). An aggregate over the score, such
+as `max($score)`, is not lowered in this release (`T86`).
 
 Exact String predicates remain correct without an index. A free-text index does
-not accelerate equality, `starts_with`, or literal substring `contains`.
+not accelerate equality, `starts_with(...)`, or literal substring `contains(...)`.
 
 ## Hybrid ranking
 
 Reciprocal Rank Fusion combines rankings without assuming their raw scores use
-the same scale:
+the same scale. Name the population once with `let` and rank it in both arms;
+`from rrf(...) as $score` draws one row per target with the fused score as
+`$score`:
 
 ```gq
 query hybrid($vector: Vector(4), $text: String) {
-  match { $d: Document }
+  match {
+    let $all = { match { $d: Document } return { $d } },
+    from rrf(nearest($all, $d.embedding, $vector, k: 10), bm25($all, $d.body, $text), k: 60) as $score,
+  }
   return { $d.slug, $d.title }
-  order { rrf(nearest($d.embedding, $vector), bm25($d.body, $text)) }
+  order { $score desc }
   limit 10
 }
 ```
+
+An `rrf` takes two arms. Two arms that rank the same population, property
+and query are refused (`T75`), and so are arms that rank two different
+bindings: the fused target would be a pair.
 
 Ranking order is a contract, not a side effect: search-ordered results are
 sorted on the search score itself, including through multi-hop traversals, with
 secondary keys and the entity-id tie-break applied after the score. A fused
 order sorts every row by the fused score, then the keys written after
-`rrf(...)`, then every binding's id, and `limit` counts rows after that order;
+`$score`, then every binding's id, and `limit` counts rows after that order;
 an entity that fans out to several rows contributes each of them. The full
 ordering contract lives on the [queries page](../queries/index.md).
 
 ## Ranking a traversal-reached binding
 
-A search order may rank any binding of the pattern, whichever binding the
-`match` block declares first, and whether or not the ranked binding is
-declared at all:
+A ranking may rank any node binding of its population, whichever binding the
+population's `match` declares first, and whether or not the ranked binding is
+declared at all; its `return` lists every binding the rest of the query reads:
 
 ```gq
 query passages($matter: String, $q: String) {
   match {
-    $r: SourceRevision { matter_number: $matter }
-    $r hasPassage $p
+    let $pop = { match { $r: SourceRevision, $p: Passage, $r hasPassage $p } where $r.matter_number = $matter return { $r, $p } },
+    from bm25($pop, $p.text, $q) as $score,
   }
   return { $r.path, $p.locator }
-  order { bm25($p.text, $q) }
+  order { $score desc }
   limit 5
 }
 ```
@@ -184,20 +217,15 @@ query passages($matter: String, $q: String) {
 The ranking starts the traversal: the query scans every `Passage`, ranks it
 and keeps the passages the traversal reaches from the selected revision, in
 score order. Ranking a destination therefore costs a scan of the ranked type,
-however few entities the other end reaches. A `nearest()` ranking ranks the
+however few entities the other end reaches. A `nearest` ranking ranks the
 reached entities, never a global top list that the traversal later cuts.
-
-An `rrf()` whose two arms rank two different bindings one traversal connects,
-directly or over several hops, is refused at type checking (`T59`): a ranking
-starts the traversal at the binding it ranks, and one traversal cannot start
-at both. Rank one binding in both arms, or bindings no traversal joins.
 
 ## What a ranked read reports
 
-A read whose order is a search carries a `ranking` object in its JSON
+A read that draws from a ranking carries a `ranking` object in its JSON
 envelope (`POST /query`, a stored-query call, `omnigraph query --json`, and
 the metadata line of `--format jsonl`). For `hybrid` above, with
-`rrf(...) as score` in `return`:
+`$score as score` in `return`:
 
 ```json
 "ranking": {
@@ -208,7 +236,7 @@ the metadata line of `--format jsonl`). For `hybrid` above, with
 }
 ```
 
-`by` is the search function the order names: `nearest`, `bm25` or `rrf`.
+`by` is the ranking the read draws from: `nearest`, `bm25` or `rrf`.
 `order` says which way the score ranks: `ascending` for a `nearest` distance,
 where smaller is nearer, and `descending` for a `bm25` or fused score, where
 larger is more relevant.
@@ -219,13 +247,13 @@ match, so it is always exhaustive. A `nearest` search is exhaustive when it
 searched every partition of the vector index, scored every row without one,
 or returned every row it admitted. It is `false` when the `ann_nprobes` cap
 left partitions unsearched, so a nearer row may exist; raising the cap
-searches more. An `rrf(...)` is exhaustive when its `nearest` arm is.
+searches more. An `rrf` is exhaustive when its `nearest` arm is.
 
 `score_columns` lists the returned columns that hold the ranking's own
 score, in return order. Two columns that return one score both appear; a
-column computed from the score, such as `bm25(...) > 0.0 as hit`, does not.
+column computed from the score, such as `$score > 0.0 as hit`, does not.
 It is empty when the read returns no score. The object never carries a query
-text, vector or other parameter value, and a read whose order is no search
+text, vector or other parameter value, and a read that draws from no ranking
 has no `ranking`.
 
 ## Indexes

@@ -1,0 +1,207 @@
+# issue: none
+# notes: A write group whose `match … where` is more than a filtered scan of its target runs its selection as a read
+# notes: against the write's snapshot: a traversal deleting an edge binding, an update over a traversal, a `not exists`
+# notes: and a `count {…} > n` block, a `let` and a `from`, assignments that read the row, an insert per selected row
+# notes: with bound endpoint references, and a selection that matches nothing. Two values one statement's rows give one
+# notes: entity's property are `E4`; a group whose selection reads a table an earlier group changes is not lowered in this release (`T86`).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    city: String?
+    age: I32?
+}
+node Company {
+    slug: String @key
+    city: String?
+}
+node Badge {
+    owner: String @key
+    label: String?
+}
+edge WorksAt: Person -> Company {
+    role: String?
+}
+edge Mentors: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"ada","city":"paris","age":30}}
+{"type":"Person","data":{"name":"bob","city":"rome","age":40}}
+{"type":"Person","data":{"name":"cy","city":"oslo","age":50}}
+{"type":"Person","data":{"name":"di","city":"kyiv","age":20}}
+{"type":"Company","data":{"slug":"acme","city":"berlin"}}
+{"type":"Company","data":{"slug":"init","city":"lima"}}
+{"edge":"WorksAt","from":"ada","to":"acme","data":{"role":"eng"}}
+{"edge":"WorksAt","from":"bob","to":"acme","data":{"role":"ops"}}
+{"edge":"WorksAt","from":"cy","to":"init","data":{"role":"eng"}}
+{"edge":"Mentors","from":"ada","to":"bob"}
+{"edge":"Mentors","from":"ada","to":"cy"}
+
+--- mutate
+query relocate_staff($slug: String) {
+  match { $c: Company, $p worksAt $c } where $c.slug = $slug
+  update $p set { city: $c.city }
+}
+
+--- params
+{"slug": "acme"}
+
+--- expect affected: nodes=2 edges=0
+
+--- query
+query people() { match { $p: Person } return { $p.name, $p.city, $p.age } }
+
+--- expect unordered
+{"p.name": "ada", "p.city": "berlin", "p.age": 30}
+{"p.name": "bob", "p.city": "berlin", "p.age": 40}
+{"p.name": "cy", "p.city": "oslo", "p.age": 50}
+{"p.name": "di", "p.city": "kyiv", "p.age": 20}
+
+--- expect shape
+p.name: String
+p.city: String?
+p.age: I32?
+
+--- mutate
+query unemployed_age() {
+  match { $p: Person } where not exists { $c: Company, $p worksAt $c }
+  update $p set { age: $p.age + 1 }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query mentors_move() {
+  match { $p: Person } where count { $m: Person, $p mentors $m } > 1
+  update $p set { city: null }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query note_from_let() {
+  match { $p: Person, let $town = concat($p.name, "-town") } where $p.age >= 50
+  update $p set { city: $town }
+}
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query people() { match { $p: Person } return { $p.name, $p.city, $p.age } }
+
+--- expect unordered
+{"p.name": "ada", "p.age": 30}
+{"p.name": "bob", "p.city": "berlin", "p.age": 40}
+{"p.name": "cy", "p.city": "cy-town", "p.age": 50}
+{"p.name": "di", "p.city": "kyiv", "p.age": 21}
+
+--- expect shape
+p.name: String
+p.city: String?
+p.age: I32?
+
+--- mutate
+query mentor_from_a_read() {
+  match { from { match { $p: Person, $c: Company, $p worksAt $c } where $c.slug = "acme" return { $p } }, $x: Person } where $x.name = "di"
+  insert Mentors { from: $x, to: $p }
+}
+
+--- expect affected: nodes=0 edges=2
+
+--- mutate
+query badge_per_row() {
+  match { $p: Person, $p worksAt $c } where $c.slug = "acme"
+  insert Badge { owner: $p.name, label: concat($p.name, "@", $c.slug) }
+  insert Badge { owner: $c.slug, label: $c.city }
+}
+
+--- expect affected: nodes=3 edges=0
+
+--- query
+query badges() { match { $b: Badge } return { $b.owner, $b.label } }
+
+--- expect unordered
+{"b.owner": "ada", "b.label": "ada@acme"}
+{"b.owner": "bob", "b.label": "bob@acme"}
+{"b.owner": "acme", "b.label": "berlin"}
+
+--- expect shape
+b.owner: String
+b.label: String?
+
+--- query
+query mentored() { match { $m: Person, $m mentors $p } return { $m.name, $p.name } }
+
+--- expect unordered
+{"m.name": "ada", "p.name": "bob"}
+{"m.name": "ada", "p.name": "cy"}
+{"m.name": "di", "p.name": "ada"}
+{"m.name": "di", "p.name": "bob"}
+
+--- expect shape
+m.name: String
+p.name: String
+
+--- mutate
+query badge_per_company() {
+  match { $p: Person, $p worksAt $c } where $c.slug = "acme"
+  insert Badge { owner: $c.slug, label: $p.name }
+}
+
+--- expect error: E4: `badge_per_company`: the rows of statement 1 of group 1 give Badge ("acme") two values for `label`, "ada" and "bob"
+
+--- mutate
+query company_city_from_staff() {
+  match { $p: Person, $p worksAt $c }
+  update $c set { city: $p.city }
+}
+
+--- expect error: E4: `company_city_from_staff`: the rows of statement 1 of group 1 give Company `acme` two values for `city`, "berlin" and null
+
+--- mutate
+query second_group_reads_the_first() {
+  match { $p: Person } where $p.name = "ada"
+  update $p set { city: "x" }
+  match { $q: Person, $q worksAt $c }
+  update $c set { city: $q.name }
+}
+
+--- expect error: T86: `second_group_reads_the_first`: this release's planner does not lower a write group whose selection reads a table an earlier group of the write changes (`node:Person`)
+
+--- mutate
+query close_nothing() {
+  match { $c: Company, $p $k:worksAt $c } where $c.slug = "none"
+  delete $k
+}
+
+--- expect affected: nodes=0 edges=0
+
+--- mutate
+query close_company($slug: String) {
+  match { $c: Company, $p $k:worksAt $c } where $c.slug = $slug
+  delete $k
+}
+
+--- params
+{"slug": "acme"}
+
+--- expect affected: nodes=0 edges=2
+
+--- query
+query staff() { match { $p: Person, $p $k:worksAt $c } return { $p.name, $c.slug, $k.role } }
+
+--- expect unordered
+{"p.name": "cy", "c.slug": "init", "k.role": "eng"}
+
+--- expect shape
+p.name: String
+c.slug: String
+k.role: String?

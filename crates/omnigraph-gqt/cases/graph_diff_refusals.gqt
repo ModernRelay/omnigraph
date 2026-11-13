@@ -40,14 +40,16 @@ branch create feature
 
 --- mutate branch: feature
 query feature_bob() {
-    update Person set { age: 41 } where name = "bob"
+    match { $x: Person } where $x.name = "bob"
+    update $x set { age: 41 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query main_bob() {
-    update Person set { age: 42 } where name = "bob"
+    match { $x: Person } where $x.name = "bob"
+    update $x set { age: 42 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -59,7 +61,7 @@ branch merge feature dry run
 
 --- query
 query bob_on_main() {
-    match { $p: Person { name: "bob" } }
+    match { $p: Person } where $p.name = "bob"
     return { $p.age }
 }
 

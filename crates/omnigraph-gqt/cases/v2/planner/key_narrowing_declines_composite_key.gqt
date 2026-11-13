@@ -23,9 +23,8 @@ node Pair {
 --- query
 set engine = v2;
 query exact() {
-    match {
-        $p: Pair { first: "ada", last: "lovelace" }
-    }
+    match { $p: Pair }
+    where $p.first = "ada" and $p.last = "lovelace"
     return { $p.last }
 }
 --- expect unordered
@@ -39,10 +38,8 @@ not pass key_to_id
 --- query
 set engine = v2;
 query first_only() {
-    match {
-        $p: Pair
-        $p.first = "ada"
-    }
+    match { $p: Pair }
+    where $p.first = "ada"
     return { $p.last }
 }
 --- expect unordered

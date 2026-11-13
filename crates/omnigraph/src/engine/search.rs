@@ -771,6 +771,8 @@ pub(super) fn search_call(filter: &IRExpr) -> Option<&IRExpr> {
         | IRExpr::Binary { .. }
         | IRExpr::Not(_, _)
         | IRExpr::Cast { .. }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. }
         | IRExpr::IsNull { .. } => None,
     }
 }
@@ -821,7 +823,7 @@ pub(super) struct NeededColumns(pub(super) HashSet<String>);
 /// Map traversed edge types, including AntiJoin inner pipelines, to endpoints.
 /// Scoping the graph-index build to these types avoids scanning unrelated edges.
 pub(crate) fn referenced_edge_types(
-    pipeline: &[IROp],
+    pipeline: &[PatternStep],
     catalog: &Catalog,
 ) -> HashMap<String, (String, String)> {
     let mut names = std::collections::BTreeSet::new();
@@ -838,12 +840,12 @@ pub(crate) fn referenced_edge_types(
 }
 
 pub(super) fn collect_referenced_edge_names(
-    pipeline: &[IROp],
+    pipeline: &[PatternStep],
     out: &mut std::collections::BTreeSet<String>,
 ) {
     for op in pipeline {
         match op {
-            IROp::Expand { edges, .. } => {
+            PatternStep::Expand { edges, .. } => {
                 out.extend(
                     edges
                         .members()
@@ -851,8 +853,8 @@ pub(super) fn collect_referenced_edge_names(
                         .map(|member| member.edge_type.clone()),
                 );
             }
-            IROp::AntiJoin { inner, .. } => collect_referenced_edge_names(inner, out),
-            IROp::NodeScan { .. } | IROp::Filter(_) => {}
+            PatternStep::AntiJoin { inner, .. } => collect_referenced_edge_names(inner, out),
+            PatternStep::NodeScan { .. } | PatternStep::Filter(_) | PatternStep::Rank { .. } => {}
         }
     }
 }
@@ -1401,7 +1403,7 @@ mod typed_search_value_tests {
     use lance_index::scalar::inverted::query::FtsQuery;
     use omnigraph_compiler::catalog::build_catalog;
     use omnigraph_compiler::ir::{IRExpr, ParamMap};
-    use omnigraph_compiler::query::ast::{CompOp, Literal};
+    use omnigraph_compiler::query::value::{CompOp, Literal};
     use omnigraph_compiler::schema::parser::parse_schema;
     use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 

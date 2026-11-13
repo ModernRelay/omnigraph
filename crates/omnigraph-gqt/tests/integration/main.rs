@@ -2,6 +2,8 @@
 //! so the crate links once instead of once per file; the binaries the CI selects by name stay in tests/.
 
 mod effective_settings;
+mod fix_convergence;
+mod query_corpus;
 mod replay_coverage;
 mod result_evidence;
 mod review_regressions;

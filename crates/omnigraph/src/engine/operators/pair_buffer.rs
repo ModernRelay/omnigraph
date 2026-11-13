@@ -273,7 +273,7 @@ mod tests {
     use std::time::Duration;
 
     use datafusion::execution::memory_pool::MemoryPool;
-    use omnigraph_compiler::query::ast::{CompOp, Literal};
+    use omnigraph_compiler::query::value::{CompOp, Literal};
 
     use datafusion::physical_plan::SendableRecordBatchStream;
     use futures::StreamExt;

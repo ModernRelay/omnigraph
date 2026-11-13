@@ -49,7 +49,7 @@ query markers() { match { $m: Marker } return { $m.name } }
 m.name: String
 
 --- query branch: main
-query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query edges() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"alice"}
 --- expect shape
@@ -74,7 +74,7 @@ query markers() { match { $m: Marker } return { $m.name } }
 m.name: String
 
 --- query branch: main
-query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query edges() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"alice"}
 --- expect shape
@@ -109,7 +109,7 @@ query markers() { match { $m: Marker } return { $m.name } }
 m.name: String
 
 --- query branch: main
-query edges() { match { $p: Person $p $e:knows $q } return { $p.name, $q.name } }
+query edges() { match { $p: Person, $p $e:knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"alice","q.name":"alice"}
 {"p.name":"alice","q.name":"eve"}

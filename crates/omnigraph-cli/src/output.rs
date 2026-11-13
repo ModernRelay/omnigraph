@@ -436,6 +436,23 @@ pub(crate) fn write_query_lint_human(
                     query_kind_label(result.kind)
                 )?;
             }
+            QueryLintStatus::Error if !result.diagnostics.is_empty() => {
+                // Every refusal of the query's compile pass, each where it
+                // stands.
+                for diagnostic in &result.diagnostics {
+                    match diagnostic.position {
+                        Some(at) => writeln!(
+                            writer,
+                            "ERROR query `{}`: line {}, column {}: {diagnostic}",
+                            result.name, at.line, at.column
+                        )?,
+                        None => writeln!(writer, "ERROR query `{}`: {diagnostic}", result.name)?,
+                    }
+                    if let Some(fix) = &diagnostic.fix {
+                        writeln!(writer, "  fix: {fix}")?;
+                    }
+                }
+            }
             QueryLintStatus::Error => {
                 writeln!(
                     writer,
@@ -644,6 +661,19 @@ pub(crate) fn diagnostic_detail_lines(
     lines
 }
 
+/// The further refusals of the same compile pass, after the first one's
+/// lines: each one's code and expectation, then its detail lines.
+pub(crate) fn further_diagnostic_lines(
+    diagnostic: &omnigraph_api_types::DiagnosticOutput,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for further in &diagnostic.further {
+        lines.push(format!("error[{}]: {}", further.code, further.expected));
+        lines.extend(diagnostic_detail_lines(further));
+    }
+    lines
+}
+
 pub(crate) fn write_cluster_diagnostics(
     diagnostics: &[omnigraph_cluster::Diagnostic],
     stdout: &mut dyn Write,
@@ -660,7 +690,10 @@ pub(crate) fn write_cluster_diagnostics(
         )?;
         if let Some(detail) = &diagnostic.detail {
             let detail = omnigraph_api_types::DiagnosticOutput::from(detail.as_ref());
-            for line in diagnostic_detail_lines(&detail) {
+            for line in diagnostic_detail_lines(&detail)
+                .into_iter()
+                .chain(further_diagnostic_lines(&detail))
+            {
                 writeln!(stdout, "{line}")?;
             }
         }
@@ -1877,6 +1910,33 @@ mod tests {
         render_annotations,
     };
 
+    /// Every refusal of one compile pass is printed: the further ones after
+    /// the first, each with its code, expectation, position and fix.
+    #[test]
+    fn further_refusals_print_after_the_first() {
+        let catalog = omnigraph_compiler::build_catalog(
+            &parse_schema("node Company { slug: String @key  name: String }").unwrap(),
+        )
+        .unwrap();
+        let refusals = omnigraph_compiler::query::check::check_source_all(
+            &catalog,
+            r#"query q() { match { $c: Company } where $c.names = "x" and $c.slug = 3 return { $c } }"#,
+        );
+        let first = omnigraph_compiler::QueryDiagnostic::first_of(refusals).unwrap();
+        let output = omnigraph_api_types::DiagnosticOutput::from(&first);
+        assert_eq!(
+            super::diagnostic_detail_lines(&output)
+                .into_iter()
+                .chain(super::further_diagnostic_lines(&output))
+                .collect::<Vec<_>>(),
+            [
+                "  --> line 1, column 41",
+                "error[T7]: cannot compare String with I64",
+                "  --> line 1, column 60",
+            ]
+        );
+    }
+
     #[test]
     fn graph_type_subject_hides_type_key_syntax() {
         assert_eq!(graph_type_subject("node:Person"), "node type 'Person'");
@@ -2456,6 +2516,7 @@ mod tests {
                     status: QueryLintStatus::Ok,
                     warnings: vec!["unused parameter".to_string()],
                     error: None,
+                    diagnostics: Vec::new(),
                     operation: None,
                 },
                 QueryLintQueryResult {
@@ -2464,6 +2525,7 @@ mod tests {
                     status: QueryLintStatus::Ok,
                     warnings: Vec::new(),
                     error: None,
+                    diagnostics: Vec::new(),
                     operation: None,
                 },
                 QueryLintQueryResult {
@@ -2472,6 +2534,7 @@ mod tests {
                     status: QueryLintStatus::Error,
                     warnings: Vec::new(),
                     error: None,
+                    diagnostics: Vec::new(),
                     operation: None,
                 },
             ],

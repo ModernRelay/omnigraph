@@ -125,7 +125,7 @@ load csv "padded_large.csv" into edge:LargeLink mode overwrite header
 --- expect error: '01' not found in Large
 
 --- query
-query small_rows() { match { $a: Small $a smallLink $b } return { $a.id, $b.id } }
+query small_rows() { match { $a: Small, $a smallLink $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": 0, "b.id": 1}
 {"a.id": 7, "b.id": 6}
@@ -134,7 +134,7 @@ a.id: I64
 b.id: I64
 
 --- query
-query large_rows() { match { $a: Large $a largeLink $b } return { $a.id, $b.id } }
+query large_rows() { match { $a: Large, $a largeLink $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": 0, "b.id": 63}
 {"a.id": 63, "b.id": 32}
@@ -160,7 +160,7 @@ load validate edge_ri edge:LargeLink to Large: access probe
 load executed: partitions 1 rows 1
 
 --- query
-query across_fragments() { match { $a: Large $a largeLink $b } return { $a.id, $b.id } }
+query across_fragments() { match { $a: Large, $a largeLink $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": 63, "b.id": 64}
 --- expect shape

@@ -33,7 +33,8 @@ node Attachment {
 
 --- mutate
 query null_comparison_on_non_nullable($slug: String, $age: I64?) {
-    update Person set { adult: $age > 30 } where slug = $slug
+    match { $x: Person } where $x.slug = $slug
+    update $x set { adult: $age > 30 }
 }
 
 --- params
@@ -43,7 +44,8 @@ query null_comparison_on_non_nullable($slug: String, $age: I64?) {
 
 --- mutate
 query null_on_non_nullable_blob_matching_no_row($slug: String, $body: Blob?) {
-    update Attachment set { body: $body } where slug = $slug
+    match { $x: Attachment } where $x.slug = $slug
+    update $x set { body: $body }
 }
 
 --- params
@@ -53,7 +55,8 @@ query null_on_non_nullable_blob_matching_no_row($slug: String, $body: Blob?) {
 
 --- mutate
 query comparison_on_nullable($slug: String, $age: I64?) {
-    update Person set { maybe: $age > 30 } where slug = $slug
+    match { $x: Person } where $x.slug = $slug
+    update $x set { maybe: $age > 30 }
 }
 
 --- params
@@ -63,7 +66,7 @@ query comparison_on_nullable($slug: String, $age: I64?) {
 
 --- query
 query maybe_of_a() {
-    match { $p: Person { slug: "a" } }
+    match { $p: Person } where $p.slug = "a"
     return { $p.slug, $p.maybe }
 }
 
@@ -76,7 +79,8 @@ p.maybe: Bool?
 
 --- mutate
 query null_comparison_on_nullable($slug: String, $age: I64?) {
-    update Person set { maybe: $age > 30 } where slug = $slug
+    match { $x: Person } where $x.slug = $slug
+    update $x set { maybe: $age > 30 }
 }
 
 --- params
@@ -102,7 +106,7 @@ p.maybe: Bool?
 --- query
 set engine = v2;
 query inline_match_null_selects_no_row($age: I64?) {
-    match { $p: Person { adult: $age > 30 } }
+    match { $p: Person } where $p.adult = ($age > 30)
     return { $p.slug }
 }
 

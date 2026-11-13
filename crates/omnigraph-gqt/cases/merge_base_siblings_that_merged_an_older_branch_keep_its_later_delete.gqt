@@ -36,14 +36,16 @@ branch create b;
 
 --- mutate branch: a
 query touch_p_once() {
-    update Person set { age: 0 } where name = "p"
+    match { $x: Person } where $x.name = "p"
+    update $x set { age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: a
 query touch_p_twice() {
-    update Person set { age: 0 } where name = "p"
+    match { $x: Person } where $x.name = "p"
+    update $x set { age: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -67,14 +69,16 @@ branch create right from a;
 
 --- mutate branch: left
 query set_l() {
-    update Person set { age: 1 } where name = "l"
+    match { $x: Person } where $x.name = "l"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: right
 query set_r() {
-    update Person set { age: 1 } where name = "r"
+    match { $x: Person } where $x.name = "r"
+    update $x set { age: 1 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -91,7 +95,8 @@ branch merge b into right;
 
 --- mutate branch: right
 query delete_w() {
-    delete Person where name = "w"
+    match { $x: Person } where $x.name = "w"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0

@@ -30,7 +30,8 @@ query seed_doc() {
 --- mutate
 set write_max_bytes = 4093;
 query assign_missing($payload: Blob) {
-    update Doc set { content: $payload } where slug = "missing"
+    match { $x: Doc } where $x.slug = "missing"
+    update $x set { content: $payload }
 }
 
 --- params

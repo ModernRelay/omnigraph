@@ -194,8 +194,10 @@ mod tests {
         measure(source, usize::MAX, usize::MAX).expect("no limit")
     }
 
+    /// `expr` as a `where`, in parentheses so that it, not the `match`
+    /// braces, is the deepest point of the base source.
     fn filter(expr: &str) -> String {
-        format!("query q() {{ match {{ $p: Person\n {expr} }} return {{ $p.name }} }}")
+        format!("query q() {{ match {{ $p: Person }} where ({expr}) return {{ $p.name }} }}")
     }
 
     type Shape = (&'static str, fn(usize) -> String);
@@ -214,7 +216,11 @@ mod tests {
                 format!("{}$p.age > 1{}", "not (".repeat(n), ")".repeat(n))
             }),
             ("negation blocks", |n| {
-                format!("{}$p.age > 1{}", "not { ".repeat(n), " }".repeat(n))
+                format!(
+                    "{}$p.age > 1{}",
+                    "not exists { $p: Person where ".repeat(n),
+                    " }".repeat(n)
+                )
             }),
             ("list literals", |n| {
                 format!("$p.age in {}1{}", "[".repeat(n), "]".repeat(n))

@@ -20,73 +20,73 @@ node Doc {
 --- query
 set engine = v2;
 query refused_0() {
-    match { $d: Doc search($d.text, "needle") = false }
+    match { $d: Doc } where search($d.text, "needle") = false
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
 
 --- query
 set engine = v2;
 query refused_1() {
-    match { $d: Doc search($d.text, "needle") != true }
+    match { $d: Doc } where search($d.text, "needle") != true
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
 
 --- query
 set engine = v2;
 query refused_2() {
-    match { $d: Doc search($d.text, "needle") < true }
+    match { $d: Doc } where search($d.text, "needle") < true
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
 
 --- query
 set engine = v2;
 query refused_3($enabled: Bool) {
-    match { $d: Doc search($d.text, "needle") = $enabled }
+    match { $d: Doc } where search($d.text, "needle") = $enabled
     return { $d.slug }
 }
 
 --- params
 {"enabled":true}
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
 
 --- query
 set engine = v2;
 query refused_4() {
-    match { $d: Doc true = search($d.text, "needle") }
+    match { $d: Doc } where true = search($d.text, "needle")
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
 
 --- query
 set engine = v2;
 query refused_5() {
-    match { $d: Doc match_text($d.text, "needle") = false }
+    match { $d: Doc } where match_text($d.text, "needle") = false
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `match_text` is a search predicate; it must stand alone as a conjunct of `where`
 
 --- query
 set engine = v2;
 query refused_6() {
-    match { $d: Doc fuzzy($d.text, "needle") = false }
+    match { $d: Doc } where fuzzy($d.text, "needle") = false
     return { $d.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `fuzzy` is a search predicate; it must stand alone as a conjunct of `where`
 
 --- query
 set engine = v2;
 query accepted_joined_by_and() {
-    match { $d: Doc  search($d.text, "needle") and $d.slug = "d" }
+    match { $d: Doc } where search($d.text, "needle") and $d.slug = "d"
     return { $d.slug }
 }
 

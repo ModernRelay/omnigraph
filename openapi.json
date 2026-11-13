@@ -15230,6 +15230,17 @@
           "code": {
             "type": "string"
           },
+          "end": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PositionOutput",
+                "description": "Where the refused construct ends (exclusive): with `position`, its\nspan."
+              }
+            ]
+          },
           "expected": {
             "type": "string"
           },
@@ -15245,15 +15256,30 @@
               "null"
             ]
           },
+          "further": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiagnosticOutput"
+            },
+            "description": "The independent refusals the same compile pass found after this one,\nin source order, each with its span and fix; each carries no further\nlist of its own. Applying every machine-applicable suggestion of this\ndiagnostic and its further ones at once is one repair pass."
+          },
           "position": {
             "oneOf": [
               {
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/PositionOutput"
+                "$ref": "#/components/schemas/PositionOutput",
+                "description": "Where the refused construct starts."
               }
             ]
+          },
+          "related": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RelatedSpanOutput"
+            },
+            "description": "Other source spans the refusal names: the first declaration of a\nname a later one repeats."
           },
           "stage": {
             "type": [
@@ -16619,7 +16645,7 @@
           "query": {
             "type": "string",
             "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` instead. May be the branch\nstatement `branch list` or a branch control read (`branch diff …`,\n`branch merge-base …`, `branch merge … dry run`), sent with no `name`,\n`params`, `branch`, or `snapshot`; or one `explain` statement (`explain query …`), which\nanswers the v2 plan instead of\nrunning it, as one result per plan node (fields `tree`, `depth`, `node`,\n`detail`: the logical, physical and available DataFusion trees, then `plan` entries for\nthe passes and the document's other fields), under the same `params`,\n`branch`, or `snapshot` as the query itself. `explain load csv …` answers the accepted\nload plan as the same results (`logical_initial`, `logical`, `physical`, then `plan`\nentries), under `branch` alone: `snapshot`, `name` and `params` are refused.\nIt requires the load's `change` permission before probing source metadata,\nreads no payload byte, and publishes nothing.",
-            "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+            "example": "query get_person($name: String) {\n    match { $p: Person }\n    where $p.name = $name\n    return { $p.name, $p.age }\n}"
           },
           "settings": {
             "oneOf": [
@@ -16888,6 +16914,27 @@
         "properties": {
           "operation_id": {
             "type": "string"
+          }
+        }
+      },
+      "RelatedSpanOutput": {
+        "type": "object",
+        "description": "Another source span a refusal names.",
+        "required": [
+          "position",
+          "end",
+          "message"
+        ],
+        "properties": {
+          "end": {
+            "$ref": "#/components/schemas/PositionOutput"
+          },
+          "message": {
+            "type": "string",
+            "description": "What stands there."
+          },
+          "position": {
+            "$ref": "#/components/schemas/PositionOutput"
           }
         }
       },

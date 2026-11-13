@@ -2,7 +2,7 @@
 //! types are declarations carried by the IR, including explicit conversions.
 
 use omnigraph_compiler::ir::{BlockAggregateExpr, IRExpr, IRProjection};
-use omnigraph_compiler::query::ast::BinaryOp;
+use omnigraph_compiler::query::value::BinaryOp;
 use serde_json::{Value, json};
 
 use crate::logical::Predicate;
@@ -55,12 +55,15 @@ pub(crate) fn expr(root: &IRExpr) -> Value {
                             BinaryOp::And => "and",
                             BinaryOp::Or => "or",
                             BinaryOp::Compare(_) => "compare",
+                            BinaryOp::Arith(_) => "arith",
                         },
                         vec![left, right],
                     ),
                     IRExpr::Not(inner, _) => ("not", vec![inner]),
                     IRExpr::IsNull { expr, .. } => ("is_null", vec![expr]),
                     IRExpr::Cast { expr, .. } => ("cast", vec![expr]),
+                    IRExpr::Neg { expr, .. } => ("neg", vec![expr]),
+                    IRExpr::Call { func, args, .. } => (func.name(), args.iter().collect()),
                 };
 
                 pending.push(Step::Finish(expr, op, children.len()));
@@ -157,7 +160,7 @@ pub(crate) fn block_aggregate(
 mod tests {
     use super::*;
     use crate::logical::GqFilter;
-    use omnigraph_compiler::query::ast::{CompOp, Literal};
+    use omnigraph_compiler::query::value::{CompOp, Literal};
     use omnigraph_compiler::{ExprType, PropType, ScalarType};
 
     fn ty(scalar: ScalarType, nullable: bool) -> ExprType {

@@ -1,0 +1,39 @@
+# issue: none
+# notes: Two patterns that share no variable multiply their rows by a product, which the compiler refuses with `T81` at the second
+# notes: unless every component but one is pinned to one row by a `@key` equality in `where`: the fix joins them through the triple
+# notes: one edge type writes between them, or writes the intended product as a named relation; nothing executes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+node Collection {
+    slug: String @key
+}
+edge WorksAt: Person -> Company @card(0..1)
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Collection","data":{"slug":"papers"}}
+
+--- query
+query staff() { match { $c: Company, $p: Person } return { $p.name, $c.name } }
+
+--- expect error: type error: T81: `$p: Person` shares no variable with `$c: Company`, so the pattern multiplies their rows by a product; a product is written only when every component but one is pinned to one row by a `@key` equality in `where`
+
+--- query
+query shelved() { match { $p: Person, $s: Collection } where $p.name = "Ada" return { $p.name, $s.slug } }
+
+--- expect error: type error: T81: `$s: Collection` shares no variable with `$p: Person`, so the pattern multiplies their rows by a product; a product is written only when every component but one is pinned to one row by a `@key` equality in `where`

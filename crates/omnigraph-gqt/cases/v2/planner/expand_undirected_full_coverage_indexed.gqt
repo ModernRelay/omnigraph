@@ -24,10 +24,8 @@ edge Knows: Person -> Person
 --- query
 set engine = v2;
 query around() {
-    match {
-        $a: Person { name: "middle" }
-        $a <knows> $b
-    }
+    match { $a: Person, $a <knows> $b }
+    where $a.name = "middle"
     return { $b.name }
 }
 --- expect unordered

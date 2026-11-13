@@ -25,9 +25,9 @@ node Doc {
 
 --- query
 query covered() {
-    match { $d: Doc $d.year >= 2020 }
-    return { $d.slug, bm25($d.text, "graph") as score }
-    order { bm25($d.text, "graph") }
+    match { let $pop = { match { $d: Doc } where $d.year >= 2020 return { $d } }, from bm25($pop, $d.text, "graph") as $score }
+    return { $d.slug, $score as score }
+    order { $score desc }
 }
 
 --- expect ordered
@@ -51,9 +51,9 @@ query tail() {
 
 --- query
 query unfiltered() {
-    match { $d: Doc }
-    return { $d.slug, bm25($d.text, "graph") as score }
-    order { bm25($d.text, "graph") }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, "graph") as $score }
+    return { $d.slug, $score as score }
+    order { $score desc }
 }
 
 --- expect ordered
@@ -68,9 +68,9 @@ score: F32
 
 --- query
 query filtered() {
-    match { $d: Doc $d.year >= 2000 }
-    return { $d.slug, bm25($d.text, "graph") as score }
-    order { bm25($d.text, "graph") }
+    match { let $pop = { match { $d: Doc } where $d.year >= 2000 return { $d } }, from bm25($pop, $d.text, "graph") as $score }
+    return { $d.slug, $score as score }
+    order { $score desc }
 }
 
 --- expect ordered

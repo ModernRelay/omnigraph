@@ -25,7 +25,7 @@ edge In: Person -> Person { label: String }
 
 --- query
 query concrete_orientations() {
-    match { $p: Person { name: "p" } $p $e:(owns | ownedBy) $d }
+    match { $p: Person, $p $e:(owns | ownedBy) $d } where $p.name = "p"
     return { $d.name as destination, $e.@type as edge_type, $e.@id as edge_id, $e.@src as source, $e.@dst as target, $e.label as label }
 }
 
@@ -46,7 +46,7 @@ expand $p $d: selection alternation [OwnedBy in, Owns out]
 
 --- query
 query cross_type_wildcard() {
-    match { $p: Person { name: "p" } $d: Doc $p $e:* $d }
+    match { $p: Person, $d: Doc, $p $e:* $d } where $p.name = "p"
     return { $d.name as destination, $e.@type as edge_type }
 }
 
@@ -60,7 +60,7 @@ edge_type: String
 
 --- query
 query distinct_cross_type_destination() {
-    match { $p: Person { name: "p" } $p (owns | ownedBy) $d }
+    match { $p: Person, $p (owns | ownedBy) $d } where $p.name = "p"
     return { $d.name as destination }
 }
 
@@ -72,7 +72,7 @@ destination: String
 
 --- query
 query incompatible_common_property() {
-    match { $p: Person $p $e:(owns | ownedBy) $d }
+    match { $p: Person, $p $e:(owns | ownedBy) $d }
     return { $e.weight }
 }
 
@@ -80,7 +80,7 @@ query incompatible_common_property() {
 
 --- query
 query asymmetric_recursion() {
-    match { $p: Person $p (owns | ownedBy){1,2} $d }
+    match { $p: Person, $p (owns | ownedBy){1,2} $d }
     return { $d.name }
 }
 
@@ -88,7 +88,7 @@ query asymmetric_recursion() {
 
 --- query
 query quoted_repeated_member() {
-    match { $p: Person { name: "p" } $p $e:("in" | "in") $q }
+    match { $p: Person, $p $e:(in | in) $q } where $p.name = "p"
     return { $q.name as destination, $e.@type as edge_type, $e.@id as edge_id }
 }
 
@@ -102,7 +102,7 @@ edge_id: String
 
 --- query
 query correlated_common_string_argument() {
-    match { $p: Person count($e.label contains "own") { $p $e:(owns | ownedBy) $d } = 2 }
+    match { $p: Person } where count(contains($e.label, "own")) { $d: Doc, $p $e:(owns | ownedBy) $d } = 2
     return { $p.name as name }
 }
 

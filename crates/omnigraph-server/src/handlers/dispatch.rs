@@ -6,7 +6,7 @@
 use super::*;
 use crate::api::branch_statement_refusals as refusals;
 use omnigraph::loader::CsvLoadRequest;
-use omnigraph_compiler::query::ast::{
+use omnigraph_compiler::query::file::{
     BranchCreateFrom, BranchDiffSides, BranchRead, BranchStmt, BranchWrite, CommitWrite,
     EXPLAIN_STATEMENT_NAME, LoadStmt, SettingStmt, show_statement_name,
 };

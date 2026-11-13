@@ -51,6 +51,7 @@ mod shape;
 mod single_hop;
 mod sort;
 mod subquery_aggregate;
+mod target_cut;
 mod text_match;
 mod validate;
 
@@ -77,6 +78,7 @@ use scan::{Filled, Needles};
 pub(super) use scan::{RuntimeFilterSlot, ScanExec, ScanSource};
 pub(super) use sort::{SortExec, SortKey};
 pub(crate) use subquery_aggregate::RowCountPredicate;
+pub(super) use target_cut::{SELECTED_TARGETS, TargetCutExec};
 pub(super) use validate::ValidateExec;
 
 /// The `switch` gauge: the slot of the [`Switch`] side an operator with a

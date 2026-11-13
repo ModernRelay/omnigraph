@@ -60,7 +60,7 @@ x: I64
 
 --- query
 query by_single_edge_type() {
-    match { $from: Person $from $edge: knows $to }
+    match { $from: Person, $from $edge: knows $to }
     return { $edge.@type as edge_type, count($to) as n }
     order { $edge.@type }
 }

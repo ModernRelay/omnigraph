@@ -2825,7 +2825,7 @@ fn cluster_plan_json_reads_inferred_local_state() {
     write_cluster_config_fixture(temp.path());
     apply_cluster_fixture(temp.path());
     fs::write(temp.path().join("people.gq"),
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }").unwrap();
+        "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }").unwrap();
     let json = cluster_json(temp.path(), "plan");
     assert_eq!(json["ok"], true);
     assert_eq!(json["state_observations"]["state_found"], true);

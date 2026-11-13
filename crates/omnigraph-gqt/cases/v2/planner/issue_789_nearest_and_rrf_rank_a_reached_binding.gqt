@@ -42,11 +42,11 @@ edge Cites: Doc -> Doc
 --- query
 query nearest_on_an_undeclared_destination($q: Vector(2)) {
     match {
-        $p: Person { name: "p1" }
-        $p knows $d
+      let $pop = { match { $p: Person, $d: Doc, $p knows $d } where $p.name = "p1" return { $p, $d } },
+      from nearest($pop, $d.embedding, $q, k: 1) as $distance,
     }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 1
 }
 --- params
@@ -57,17 +57,14 @@ query nearest_on_an_undeclared_destination($q: Vector(2)) {
 d.slug: String
 --- expect plan
 scan Doc as $d: ranked nearest fetch 1
---- expect same as v1
-
 --- query
 query nearest_on_a_destination_declared_second($q: Vector(2)) {
     match {
-        $p: Person { name: "p1" }
-        $d: Doc
-        $p knows $d
+      let $pop = { match { $p: Person, $d: Doc, $p knows $d } where $p.name = "p1" return { $p, $d } },
+      from nearest($pop, $d.embedding, $q, k: 2) as $distance,
     }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 2
 }
 --- params
@@ -79,16 +76,17 @@ query nearest_on_a_destination_declared_second($q: Vector(2)) {
 d.slug: String
 --- expect plan
 scan Doc as $d: ranked nearest fetch 2
---- expect same as v1
-
 --- query
 query rrf_over_one_destination($q: Vector(2)) {
     match {
-        $p: Person { name: "p1" }
-        $p knows $d
+      let $all = { match { $d: Doc } return { $d } },
+      from rrf(nearest($all, $d.embedding, $q, k: 2), bm25($all, $d.body, "needle"), k: 60) as $score,
+      $p: Person,
+      $p knows $d,
     }
+    where $p.name = "p1"
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), bm25($d.body, "needle")) }
+    order { $score desc }
     limit 2
 }
 --- params
@@ -97,16 +95,14 @@ query rrf_over_one_destination($q: Vector(2)) {
 {"d.slug":"d1"}
 --- expect shape
 d.slug: String
---- expect same as v1
-
 --- query
 query nearest_from_a_source_with_no_edges($q: Vector(2)) {
     match {
-        $p: Person { name: "p3" }
-        $p knows $d
+      let $pop = { match { $p: Person, $d: Doc, $p knows $d } where $p.name = "p3" return { $p, $d } },
+      from nearest($pop, $d.embedding, $q, k: 2) as $distance,
     }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 2
 }
 --- params
@@ -115,4 +111,3 @@ query nearest_from_a_source_with_no_edges($q: Vector(2)) {
 
 --- expect shape
 d.slug: String
---- expect same as v1

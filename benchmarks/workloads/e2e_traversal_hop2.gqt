@@ -9,13 +9,7 @@ environments:
 
 --- query
 query hop2() {
-    match {
-        $a: Person
-        $b: Person
-        $c: Person
-        $a knows $b
-        $b knows $c
-    }
+    match { $a: Person, $b: Person, $c: Person, $a knows $b, $b knows $c }
     return { $a.name, $c.name }
 }
 --- expect unordered
@@ -89,13 +83,7 @@ c.name: String
 
 --- query
 query hop2() {
-    match {
-        $a: Person
-        $b: Person
-        $c: Person
-        $a knows $b
-        $b knows $c
-    }
+    match { $a: Person, $b: Person, $c: Person, $a knows $b, $b knows $c }
     return { $a.name, $c.name }
 }
 --- expect unordered
@@ -171,13 +159,7 @@ c.name: String
 
 --- query
 query hop2() {
-    match {
-        $a: Person
-        $b: Person
-        $c: Person
-        $a knows $b
-        $b knows $c
-    }
+    match { $a: Person, $b: Person, $c: Person, $a knows $b, $b knows $c }
     return { $a.name, $c.name }
 }
 --- expect unordered

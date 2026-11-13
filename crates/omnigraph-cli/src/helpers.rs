@@ -2,7 +2,7 @@
 //! Backend selection belongs to the typed target resolver.
 
 use omnigraph_api_types::{ChangeRequest, QueryRequest, query_file_refusals};
-use omnigraph_compiler::query::ast::QueryFile;
+use omnigraph_compiler::query::file::QueryFile;
 
 use super::*;
 use crate::operator::{InvocationConfig, OperatorConfig};
@@ -571,7 +571,7 @@ pub(crate) fn resolve_query_path(
 pub(crate) fn select_named_query(
     query_file: QueryFile,
     requested_name: Option<&str>,
-) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
+) -> Result<(String, Vec<omnigraph_compiler::query::file::Param>)> {
     let queries = match query_file.body.into_read_declarations() {
         Ok(queries) => queries,
         Err(message) => bail!("{message}"),
@@ -593,7 +593,7 @@ pub(crate) fn select_named_query(
 }
 
 pub(crate) fn query_params_from_json(
-    query_params: &[omnigraph_compiler::query::ast::Param],
+    query_params: &[omnigraph_compiler::query::file::Param],
     params_json: Option<&Value>,
 ) -> Result<ParamMap> {
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)

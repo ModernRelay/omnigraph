@@ -8,7 +8,7 @@ environments:
     storage: local-filesystem
 
 --- query
-query friends() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+query friends() { match { $p: Person, $p knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"p000500","q.name":"p000501"}
 {"p.name":"p000502","q.name":"p000503"}
@@ -65,7 +65,7 @@ p.name: String
 q.name: String
 
 --- query
-query friends() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+query friends() { match { $p: Person, $p knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"p000500","q.name":"p000501"}
 {"p.name":"p000502","q.name":"p000503"}
@@ -124,7 +124,7 @@ q.name: String
 --- restart
 
 --- query
-query friends() { match { $p: Person $p knows $q } return { $p.name, $q.name } }
+query friends() { match { $p: Person, $p knows $q } return { $p.name, $q.name } }
 --- expect unordered
 {"p.name":"p000500","q.name":"p000501"}
 {"p.name":"p000502","q.name":"p000503"}

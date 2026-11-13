@@ -28,9 +28,9 @@ pub use replay::{
 pub use requirements::{KeyIds, Requirements};
 pub use subset::{ChainNode, ChainRanking, Derivation, Rule, Step};
 
-use omnigraph_compiler::CheckedRead;
+use crate::read_shape::ReadShape;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{ParamMap, QueryIR};
+use omnigraph_compiler::ir::ParamMap;
 use serde::{Deserialize, Serialize};
 
 use crate::bound::{BoundPlan, ValueTable};
@@ -106,16 +106,14 @@ impl std::fmt::Display for ValidationError {
     }
 }
 
-/// Everything acceptance reads beside the plan source: the checked
-/// declaration the requirements come from, the catalog it was checked
-/// against, the typed IR the planner plans (constants of filter positions
-/// already folded to their bound values), the bound parameter values
-/// (`now()` among them), the derivation of a key's canonical id, and the
-/// limits.
+/// Everything acceptance reads beside the plan source: the catalog the read
+/// was checked against, the shape of its core term the planner plans and
+/// the requirements come from (constants of filter positions already folded
+/// to their bound values), the bound parameter values (`now()` among them),
+/// the derivation of a key's canonical id, and the limits.
 pub struct AcceptInput<'a> {
-    pub checked: &'a CheckedRead,
     pub catalog: &'a Catalog,
-    pub ir: &'a QueryIR,
+    pub ir: &'a ReadShape,
     pub params: &'a ParamMap,
     pub keys: &'a dyn KeyIds,
     pub limits: ValidationLimits,

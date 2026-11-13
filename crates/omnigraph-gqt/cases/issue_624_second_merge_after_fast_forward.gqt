@@ -102,10 +102,8 @@ branch merge b into tgt
 
 --- query branch: tgt
 query scalar_read() {
-    match {
-        $p: Person
-        $p.value = 0
-    }
+    match { $p: Person }
+    where $p.value = 0
     return { $p.name }
 }
 
@@ -117,10 +115,8 @@ p.name: String
 
 --- query branch: tgt
 query key_read() {
-    match {
-        $p: Person
-        $p.name = "p001"
-    }
+    match { $p: Person }
+    where $p.name = "p001"
     return { $p.value }
 }
 
@@ -132,10 +128,8 @@ p.value: I64
 
 --- query branch: tgt
 query text_read() {
-    match {
-        $p: Person
-        search($p.text, "needle")
-    }
+    match { $p: Person }
+    where search($p.text, "needle")
     return { count($p) as n }
 }
 
@@ -147,9 +141,9 @@ n: I64
 
 --- query branch: tgt
 query vector_read_indexed_row($q: Vector(4)) {
-    match { $p: Person }
+    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.embedding, $q, k: 1) as $distance }
     return { $p.name }
-    order { nearest($p.embedding, $q) }
+    order { $distance }
     limit 1
 }
 
@@ -164,9 +158,9 @@ p.name: String
 
 --- query branch: tgt
 query vector_read_new_row($q: Vector(4)) {
-    match { $p: Person }
+    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.embedding, $q, k: 1) as $distance }
     return { $p.name }
-    order { nearest($p.embedding, $q) }
+    order { $distance }
     limit 1
 }
 

@@ -14,7 +14,7 @@ Graph-scoped actions:
 |---|---|
 | `read` | Queries, snapshots, branches, and commits |
 | `export` | Snapshot export |
-| `change` | Mutations, loads, and source metadata probes for `explain load csv` |
+| `change` | Mutations, the read of their `match` selection on the same branch included, loads, and source metadata probes for `explain load csv` |
 | `schema_apply` | Schema changes |
 | `branch_create` | Branch creation |
 | `branch_delete` | Branch deletion |

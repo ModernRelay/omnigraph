@@ -110,6 +110,16 @@ impl Lower for Trace {
         self.call("limit", id, &[&input])
     }
 
+    fn target_cut(
+        &mut self,
+        id: NodeId,
+        _: &str,
+        _: usize,
+        input: String,
+    ) -> Result<String, PlanError> {
+        self.call("target_cut", id, &[&input])
+    }
+
     fn page(
         &mut self,
         id: NodeId,

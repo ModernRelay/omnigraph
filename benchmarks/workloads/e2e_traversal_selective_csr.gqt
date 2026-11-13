@@ -10,10 +10,8 @@ environments:
 
 --- query
 query sel($name: String) {
-    match {
-        $a: Person { name: $name }
-        $a knows{1,2} $b
-    }
+    match { $a: Person, $a knows{1,2} $b }
+    where $a.name = $name
     return { $b.name }
 }
 --- params
@@ -31,10 +29,8 @@ b.name: String
 
 --- query
 query sel($name: String) {
-    match {
-        $a: Person { name: $name }
-        $a knows{1,2} $b
-    }
+    match { $a: Person, $a knows{1,2} $b }
+    where $a.name = $name
     return { $b.name }
 }
 --- params

@@ -41,11 +41,10 @@ node Chunk {
 --- query
 query recall_count($q: String) {
     match {
-        $c: Chunk
-        search($c.text, $q)
+      let $pop = { match { $c: Chunk } where search($c.text, $q) return { $c } },
+      from bm25($pop, $c.text, $q) as $score,
     }
     return { count($c) as total }
-    order { bm25($c.text, $q) }
     limit 2
 }
 

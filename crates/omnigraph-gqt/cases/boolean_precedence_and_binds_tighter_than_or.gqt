@@ -27,7 +27,7 @@ node Row {
 --- query
 set engine = v2;
 query bare_or_and() {
-    match { $r: Row  $r.a or $r.b and $r.c }
+    match { $r: Row } where ($r.a or $r.b and $r.c)
     return { $r.slug }
 }
 
@@ -42,7 +42,7 @@ r.slug: String
 --- query
 set engine = v2;
 query explicit_or_over_and() {
-    match { $r: Row  $r.a or ($r.b and $r.c) }
+    match { $r: Row } where ($r.a or ($r.b and $r.c))
     return { $r.slug }
 }
 
@@ -57,7 +57,7 @@ r.slug: String
 --- query
 set engine = v2;
 query parenthesized_or_under_and() {
-    match { $r: Row  ($r.a or $r.b) and $r.c }
+    match { $r: Row } where ($r.a or $r.b) and $r.c
     return { $r.slug }
 }
 
@@ -71,7 +71,7 @@ r.slug: String
 --- query
 set engine = v2;
 query bare_not_and() {
-    match { $r: Row  not $r.a and $r.c }
+    match { $r: Row } where not $r.a and $r.c
     return { $r.slug }
 }
 
@@ -84,7 +84,7 @@ r.slug: String
 --- query
 set engine = v2;
 query parenthesized_and_under_not() {
-    match { $r: Row  not ($r.a and $r.c) }
+    match { $r: Row } where not ($r.a and $r.c)
     return { $r.slug }
 }
 
@@ -98,7 +98,8 @@ r.slug: String
 
 --- mutate
 query delete_bare_or_and() {
-    delete Row where a or b and c
+    match { $x: Row } where ($x.a or $x.b and $x.c)
+    delete $x
 }
 
 --- expect affected: nodes=3 edges=0

@@ -6,9 +6,10 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::Write;
 
+use crate::read_shape::ReadShape;
 use arrow_schema::SchemaRef;
-use omnigraph_compiler::ir::{IRExpr, QueryIR};
-use omnigraph_compiler::query::ast::LoadStmtMode;
+use omnigraph_compiler::ir::IRExpr;
+use omnigraph_compiler::query::file::LoadStmtMode;
 use omnigraph_compiler::settings::{SettingId, Traversal};
 use omnigraph_compiler::types::Direction;
 use serde_json::{Value, json};
@@ -267,7 +268,13 @@ fn params_of_expr(expr: &IRExpr, out: &mut BTreeSet<String>) {
         }
         IRExpr::Not(inner, _)
         | IRExpr::IsNull { expr: inner, .. }
+        | IRExpr::Neg { expr: inner, .. }
         | IRExpr::Cast { expr: inner, .. } => params_of_expr(inner, out),
+        IRExpr::Call { args, .. } => {
+            for arg in args {
+                params_of_expr(arg, out);
+            }
+        }
         IRExpr::PropAccess { .. }
         | IRExpr::Variable(_, _)
         | IRExpr::Literal(_, _)
@@ -475,7 +482,7 @@ pub struct PreparedQuery {
 
 /// Build an executable read plan without rendering explain diagnostics.
 pub async fn plan_query(
-    query: &QueryIR,
+    query: &ReadShape,
     source: &(dyn PlanSource + Sync),
     bounds: &Bounds,
 ) -> Result<PhysicalPlan, Unrouted> {
@@ -542,7 +549,7 @@ impl Traced {
 }
 
 pub(crate) fn plan_traced(
-    query: &QueryIR,
+    query: &ReadShape,
     source: &dyn PlanSource,
     bounds: &Bounds,
     explain: bool,
@@ -1000,10 +1007,11 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::read_shape::PatternStep;
     use crate::{MemorySource, NodeTypeSpec, TableRef};
     use arrow_schema::{DataType, Field, Schema};
     use omnigraph_compiler::SYSTEM_COLUMNS_V3;
-    use omnigraph_compiler::ir::{IRExpr, IROp, IRProjection};
+    use omnigraph_compiler::ir::{IRExpr, IRProjection};
     use std::sync::Arc;
 
     use crate::fixture_bounds::BOUNDS;
@@ -1025,10 +1033,10 @@ mod tests {
                 row_count: None,
             },
         );
-        let query = QueryIR {
+        let query = ReadShape {
             name: "documents".into(),
             params: vec![],
-            pipeline: vec![IROp::NodeScan {
+            pipeline: vec![PatternStep::NodeScan {
                 variable: "d".into(),
                 type_name: "Doc".into(),
                 filters: vec![],

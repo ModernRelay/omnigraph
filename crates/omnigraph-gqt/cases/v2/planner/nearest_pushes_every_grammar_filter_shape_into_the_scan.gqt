@@ -74,9 +74,11 @@ node Doc {
 
 --- query
 query f_eq($q: Vector(4)) {
-    match { $d: Doc
-        $d.n = 7 }
-    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+    match {
+      let $pop = { match { $d: Doc } where $d.n = 7 return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
+    }
+    return { $d.slug } order { $distance } limit 3
 }
 
 --- params
@@ -94,9 +96,11 @@ scan Doc as $d: filter reads [d.n]
 
 --- query
 query f_ne($q: Vector(4)) {
-    match { $d: Doc
-        $d.n != 0 }
-    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+    match {
+      let $pop = { match { $d: Doc } where $d.n != 0 return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
+    }
+    return { $d.slug } order { $distance } limit 3
 }
 
 --- params
@@ -116,9 +120,11 @@ scan Doc as $d: filter reads [d.n]
 
 --- query
 query f_gt($q: Vector(4)) {
-    match { $d: Doc
-        $d.n > 10 }
-    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+    match {
+      let $pop = { match { $d: Doc } where $d.n > 10 return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
+    }
+    return { $d.slug } order { $distance } limit 3
 }
 
 --- params
@@ -138,9 +144,11 @@ scan Doc as $d: filter reads [d.n]
 
 --- query
 query f_lt($q: Vector(4)) {
-    match { $d: Doc
-        $d.n < 3 }
-    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+    match {
+      let $pop = { match { $d: Doc } where $d.n < 3 return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
+    }
+    return { $d.slug } order { $distance } limit 3
 }
 
 --- params
@@ -160,9 +168,11 @@ scan Doc as $d: filter reads [d.n]
 
 --- query
 query f_ge($q: Vector(4)) {
-    match { $d: Doc
-        $d.n >= 10 }
-    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+    match {
+      let $pop = { match { $d: Doc } where $d.n >= 10 return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
+    }
+    return { $d.slug } order { $distance } limit 3
 }
 
 --- params
@@ -182,9 +192,11 @@ scan Doc as $d: filter reads [d.n]
 
 --- query
 query f_le($q: Vector(4)) {
-    match { $d: Doc
-        $d.n <= 2 }
-    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+    match {
+      let $pop = { match { $d: Doc } where $d.n <= 2 return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
+    }
+    return { $d.slug } order { $distance } limit 3
 }
 
 --- params
@@ -204,9 +216,11 @@ scan Doc as $d: filter reads [d.n]
 
 --- query
 query f_starts_with($q: Vector(4)) {
-    match { $d: Doc
-        $d.name starts_with "doc-2" }
-    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+    match {
+      let $pop = { match { $d: Doc } where starts_with($d.name, "doc-2") return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
+    }
+    return { $d.slug } order { $distance } limit 3
 }
 
 --- params
@@ -226,9 +240,11 @@ scan Doc as $d: filter reads [d.name]
 
 --- query
 query f_contains($q: Vector(4)) {
-    match { $d: Doc
-        $d.name contains "-3" }
-    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+    match {
+      let $pop = { match { $d: Doc } where contains($d.name, "-3") return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
+    }
+    return { $d.slug } order { $distance } limit 3
 }
 
 --- params
@@ -248,9 +264,11 @@ scan Doc as $d: filter reads [d.name]
 
 --- query
 query f_param($q: Vector(4), $n: I64) {
-    match { $d: Doc
-        $d.n = $n }
-    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+    match {
+      let $pop = { match { $d: Doc } where $d.n = $n return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
+    }
+    return { $d.slug } order { $distance } limit 3
 }
 
 --- params
@@ -268,9 +286,11 @@ scan Doc as $d: filter reads [d.n]
 
 --- query
 query f_flipped($q: Vector(4)) {
-    match { $d: Doc
-        10 < $d.n }
-    return { $d.slug } order { nearest($d.embedding, $q) } limit 3
+    match {
+      let $pop = { match { $d: Doc } where 10 < $d.n return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
+    }
+    return { $d.slug } order { $distance } limit 3
 }
 
 --- params

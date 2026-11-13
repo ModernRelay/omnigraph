@@ -19,7 +19,7 @@ use datafusion::arrow::csv::ReaderBuilder;
 use datafusion::arrow::csv::reader::Format;
 use omnigraph_compiler::SystemColumns;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
-use omnigraph_compiler::query::ast::{LoadStmt, LoadStmtMode, LoadTarget};
+use omnigraph_compiler::query::file::{LoadStmt, LoadStmtMode, LoadTarget};
 use omnigraph_compiler::types::{PropType, ScalarType};
 
 use super::{

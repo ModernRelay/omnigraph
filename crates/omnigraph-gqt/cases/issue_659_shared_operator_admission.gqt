@@ -22,7 +22,7 @@ edge Likes: Person -> Person
 --- query
 set traversal_work_limit = 6;
 query selected_then_named_refuses_one_below_total() {
-    match { $a: Person { name: "a" } $a (knows | likes) $b $b likes $c }
+    match { $a: Person, $a (knows | likes) $b, $b likes $c } where $a.name = "a"
     return { $c.name as name }
 }
 --- expect error: traversal_work_limit
@@ -30,7 +30,7 @@ query selected_then_named_refuses_one_below_total() {
 --- query
 set traversal_work_limit = 7;
 query selected_then_named_accepts_exact_total() {
-    match { $a: Person { name: "a" } $a (knows | likes) $b $b likes $c }
+    match { $a: Person, $a (knows | likes) $b, $b likes $c } where $a.name = "a"
     return { $c.name as name }
 }
 --- expect unordered
@@ -41,7 +41,7 @@ name: String
 --- query
 set traversal_work_limit = 6;
 query selected_then_selected_refuses_one_below_total() {
-    match { $a: Person { name: "a" } $a (knows | likes) $b $b (likes | likes) $c }
+    match { $a: Person, $a (knows | likes) $b, $b (likes | likes) $c } where $a.name = "a"
     return { $c.name as name }
 }
 --- expect error: traversal_work_limit
@@ -49,7 +49,7 @@ query selected_then_selected_refuses_one_below_total() {
 --- query
 set traversal_work_limit = 7;
 query selected_then_selected_accepts_exact_total() {
-    match { $a: Person { name: "a" } $a (knows | likes) $b $b (likes | likes) $c }
+    match { $a: Person, $a (knows | likes) $b, $b (likes | likes) $c } where $a.name = "a"
     return { $c.name as name }
 }
 --- expect unordered

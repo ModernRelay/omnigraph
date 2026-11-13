@@ -25,19 +25,22 @@ node Number {
 
 --- mutate
 query literal_does_not_narrow_lossily() {
-    update Number set { marked: true } where f = 0.1
+    match { $x: Number } where $x.f = 0.1
+    update $x set { marked: true }
 }
 --- expect affected: nodes=0 edges=0
 
 --- mutate
 query omitted_nullable_bound($bound: F64?) {
-    update Number set { marked: true } where f = $bound
+    match { $x: Number } where $x.f = $bound
+    update $x set { marked: true }
 }
 --- expect affected: nodes=0 edges=0
 
 --- mutate
 query declared_parameter($bound: F32) {
-    update Number set { marked: true } where f = $bound
+    match { $x: Number } where $x.f = $bound
+    update $x set { marked: true }
 }
 --- params
 {"bound":0.1}
@@ -45,7 +48,8 @@ query declared_parameter($bound: F32) {
 
 --- mutate
 query fractional_bound() {
-    update Number set { marked: true } where small > 2.5
+    match { $x: Number } where $x.small > 2.5
+    update $x set { marked: true }
 }
 --- expect affected: nodes=1 edges=0
 
@@ -64,7 +68,8 @@ x.marked: Bool
 
 --- mutate
 query parameter_assignment_rounding($small: F32, $wide: F64) {
-    update Number set { rounded: $small = $wide } where key = "a"
+    match { $x: Number } where $x.key = "a"
+    update $x set { rounded: $small = $wide }
 }
 --- params
 {"small":16777217.0,"wide":16777216.0}

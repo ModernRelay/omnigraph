@@ -1427,7 +1427,7 @@ pub(crate) fn validate_query_source(
 
 fn stored_declarations(
     file: QueryFile,
-) -> Result<Vec<omnigraph_compiler::query::ast::QueryDecl>, String> {
+) -> Result<Vec<omnigraph_compiler::query::file::QueryDecl>, String> {
     if !file.settings.is_empty() {
         return Err(omnigraph_compiler::settings::STORED_QUERY_CARRIES_NO_SETTINGS.to_string());
     }

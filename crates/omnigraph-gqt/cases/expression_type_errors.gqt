@@ -1,6 +1,7 @@
 # issue: none
 # notes: The context rules of the shared expression model as typed errors: a non-Boolean operand of `and`/`or`/`not`, a non-Boolean filter or
-# notes: mutation `where` (T41), an aggregate in a filter (T7), a Boolean item in an aggregate return (T9), a search call under `or` (T38), an unaliased comparison in return (T43), an aggregate or search call in a mutation `where` or an assignment (T44), a property leaf in an assignment or inline match (T45).
+# notes: mutation `where` (T41), an aggregate in a filter (T7), a Boolean item in an aggregate return (T9), a search call under `or` (T38), an unaliased comparison in return (T43), an aggregate or search call in an assignment (T44), and a bare property name in an assignment or a `where` (Q018);
+# notes: a search predicate in a write's `where` is no error: the group's selection runs it as a read does.
 
 --- runner
 timeout_ms: 10000
@@ -23,38 +24,38 @@ node Person {
 --- query
 set engine = v2;
 query and_over_non_boolean() {
-    match { $p: Person  $p.age and $p.name }
+    match { $p: Person } where $p.age and $p.name
     return { $p.slug }
 }
 
---- expect error: T41: `and` needs Bool operands, got I64 and String
+--- expect error: T41: a filter needs a Bool, got I64
 
 --- query
 set engine = v2;
 query not_over_non_boolean() {
-    match { $p: Person  not $p.age }
+    match { $p: Person } where not $p.age
     return { $p.slug }
 }
 
---- expect error: T41: `not` needs a Bool operand, got I64
+--- expect error: T41: `not` needs a Bool, got I64
 
 --- query
 set engine = v2;
 query aggregate_in_a_filter() {
-    match { $p: Person  count($p) > 1 }
+    match { $p: Person } where count($p) > 1
     return { $p.slug }
 }
 
---- expect error: T7: filter comparisons require scalar operands, got aggregate and I64
+--- expect error: T8: `count($p)` is an aggregate over the read's own rows; it belongs in `return`
 
 --- query
 set engine = v2;
 query search_under_or() {
-    match { $p: Person  search($p.text, "hello") or $p.age > 30 }
+    match { $p: Person } where (search($p.text, "hello") or $p.age > 30)
     return { $p.slug }
 }
 
---- expect error: T38: search predicates require a standalone call or `= true`, alone or joined by and
+--- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
 
 --- query
 set engine = v2;
@@ -67,65 +68,69 @@ query unaliased_comparison_in_return() {
 
 --- mutate
 query count_in_a_mutation_where() {
-    update Person set { adult: true } where count(age) > 1
+    match { $x: Person } where count($x.age) > 1
+    update $x set { adult: true }
 }
 
---- expect error: T44: `count` cannot appear in a mutation where; a where compares the row's own properties, parameters and now()
+--- expect error: T8: `count(…)` is an aggregate; it belongs in `return`, or as a block `count($x.p) { … }`
 
 --- mutate
 query property_leaf_in_an_assignment() {
-    update Person set { adult: age > 30 } where slug = "a"
+    match { $x: Person } where $x.slug = "a"
+    update $x set { adult: age > 30 }
 }
 
---- expect error: T45: `age` cannot appear in an assignment value; assignments and binding matches are constants per invocation
+--- expect error: Q018: `age` is a bare name, which is not a value in a read: a property is `$x.age`, a parameter `$age`, a string `"age"`; a bare name is a return alias in `order` only
 
 --- query
 set engine = v2;
-query property_leaf_in_an_inline_match() {
-    match { $p: Person { adult: age > 30 } }
+query property_leaf_in_a_where() {
+    match { $p: Person } where $p.adult = (age > 30)
     return { $p.slug }
 }
 
---- expect error: T45: `age` cannot appear in an assignment value; assignments and binding matches are constants per invocation
+--- expect error: Q018: `age` is a bare name, which is not a value in a read: a property is `$x.age`, a parameter `$age`, a string `"age"`; a bare name is a return alias in `order` only
 
 --- mutate
 query search_in_a_mutation_where() {
-    delete Person where search(text, "hello")
+    match { $x: Person } where search($x.text, "hello")
+    update $x set { adult: true }
 }
 
---- expect error: T44: `search` cannot appear in a mutation where; a where compares the row's own properties, parameters and now()
+--- expect affected: nodes=1 edges=0
 
 --- mutate
 query count_in_an_assignment() {
     insert Person { slug: "b", name: "b", age: 1, text: "t", adult: count(1) > 3 }
 }
 
---- expect error: T44: `count` cannot appear in an assignment value; assignments and binding matches are constants per invocation
+--- expect error: T8: `count(…)` is an aggregate; it belongs in `return`, or as a block `count($x.p) { … }`
 
 --- query
 set engine = v2;
 query or_over_non_boolean() {
-    match { $p: Person  $p.adult or $p.name }
+    match { $p: Person } where ($p.adult or $p.name)
     return { $p.slug }
 }
 
---- expect error: T41: `or` needs Bool operands, got Bool and String
+--- expect error: T41: `or` needs a Bool, got String
 
 --- query
 set engine = v2;
 query string_as_a_filter() {
-    match { $p: Person  $p.name }
+    match { $p: Person } where $p.name
     return { $p.slug }
 }
 
---- expect error: T41: a filter must be Boolean, got String
+--- expect error: T41: a filter needs a Bool, got String
 
 --- mutate
 query string_as_a_mutation_where() {
-    delete Person where name
+    match { $x: Person } where $x.name
+    delete $x
 }
 
---- expect error: T41: a mutation `where` must be Boolean, got String
+--- expect error: T41: a filter needs a Bool, got String
 
 --- query
 set engine = v2;
@@ -134,4 +139,10 @@ query boolean_item_in_an_aggregate_return() {
     return { $p.name, count($p) as n, $p.age > 30 as adult }
 }
 
---- expect error: T9: non-aggregate expressions in an aggregate query must be property accesses or variables
+--- expect unordered
+{"p.name": "alice", "n": 1, "adult": true}
+
+--- expect shape
+p.name: String
+n: I64
+adult: Bool

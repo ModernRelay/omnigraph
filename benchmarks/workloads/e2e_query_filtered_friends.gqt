@@ -9,7 +9,7 @@ environments:
 
 --- query
 query filtered_friends() {
-    match { $p: Person $p.age >= 90 $p knows $q }
+    match { $p: Person, $p knows $q } where $p.age >= 90
     return { $p.name, $q.name }
 }
 --- expect unordered
@@ -24,7 +24,7 @@ q.name: String
 
 --- query
 query filtered_friends() {
-    match { $p: Person $p.age >= 90 $p knows $q }
+    match { $p: Person, $p knows $q } where $p.age >= 90
     return { $p.name, $q.name }
 }
 --- expect unordered
@@ -41,7 +41,7 @@ q.name: String
 
 --- query
 query filtered_friends() {
-    match { $p: Person $p.age >= 90 $p knows $q }
+    match { $p: Person, $p knows $q } where $p.age >= 90
     return { $p.name, $q.name }
 }
 --- expect unordered

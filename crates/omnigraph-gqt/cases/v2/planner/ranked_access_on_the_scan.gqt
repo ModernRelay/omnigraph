@@ -25,9 +25,9 @@ node Doc {
 --- query
 set engine = v2;
 query by_text($t: String) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $t) as $score }
     return { $d.slug }
-    order { bm25($d.text, $t) }
+    order { $score desc }
     limit 2
 }
 --- params
@@ -43,9 +43,9 @@ scan Doc as $d: ranked bm25
 --- query
 set engine = v2;
 query by_vector($q: Vector(4)) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $distance }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 2
 }
 --- params
@@ -61,9 +61,9 @@ scan Doc as $d: ranked nearest fetch 2 diagnostics present
 --- query
 set engine = v2;
 query by_vector_among_members($q: Vector(4), $members: [String]) {
-    match { $d: Doc $d.slug in $members }
+    match { let $pop = { match { $d: Doc } where $d.slug in $members return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 1
 }
 --- params
@@ -79,9 +79,9 @@ scan Doc as $d: filter reads [d.slug]
 --- query
 set engine = v2;
 query fused($q: Vector(4), $t: String) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    order { $score desc }
     limit 3
 }
 --- params

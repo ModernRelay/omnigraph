@@ -58,11 +58,8 @@ edge Links: Source -> Doc
 --- query
 set engine = v2;
 query one_destination_search() {
-    match {
-        $s: Source
-        $s links $d
-        search($d.body, "needle")
-    }
+    match { $s: Source, $s links $d }
+    where search($d.body, "needle")
     return { $d.slug }
 }
 --- expect unordered
@@ -77,12 +74,8 @@ scan Doc as $d: filter reads [d.body]
 --- query
 set engine = v2;
 query two_destination_searches() {
-    match {
-        $s: Source
-        $s links $d
-        search($d.body, "needle")
-        match_text($d.summary, "beacon")
-    }
+    match { $s: Source, $s links $d }
+    where search($d.body, "needle") and match_text($d.summary, "beacon")
     return { $d.slug }
 }
 --- expect unordered

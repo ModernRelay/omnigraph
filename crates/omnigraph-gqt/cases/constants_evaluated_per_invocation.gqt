@@ -23,7 +23,7 @@ node Person {
 --- query
 set engine = v2;
 query inline_match_with_twenty($age: I64) {
-    match { $p: Person { adult: $age > 30 } }
+    match { $p: Person } where $p.adult = ($age > 30)
     return { $p.slug }
 }
 
@@ -39,7 +39,7 @@ p.slug: String
 --- query
 set engine = v2;
 query inline_match_with_forty($age: I64) {
-    match { $p: Person { adult: $age > 30 } }
+    match { $p: Person } where $p.adult = ($age > 30)
     return { $p.slug }
 }
 
@@ -54,7 +54,8 @@ p.slug: String
 
 --- mutate
 query assign_with_forty($slug: String, $age: I64) {
-    update Person set { adult: $age > 30 } where slug = $slug
+    match { $x: Person } where $x.slug = $slug
+    update $x set { adult: $age > 30 }
 }
 
 --- params
@@ -64,7 +65,8 @@ query assign_with_forty($slug: String, $age: I64) {
 
 --- mutate
 query assign_with_twenty($slug: String, $age: I64) {
-    update Person set { adult: $age > 30 } where slug = $slug
+    match { $x: Person } where $x.slug = $slug
+    update $x set { adult: $age > 30 }
 }
 
 --- params
@@ -88,7 +90,8 @@ p.adult: Bool
 
 --- mutate
 query or_absorbs_null($slug: String, $flag: Bool?) {
-    update Person set { adult: true or $flag } where slug = $slug
+    match { $x: Person } where $x.slug = $slug
+    update $x set { adult: true or $flag }
 }
 
 --- params
@@ -98,7 +101,8 @@ query or_absorbs_null($slug: String, $flag: Bool?) {
 
 --- mutate
 query and_absorbs_null($slug: String, $flag: Bool?) {
-    update Person set { adult: false and $flag } where slug = $slug
+    match { $x: Person } where $x.slug = $slug
+    update $x set { adult: false and $flag }
 }
 
 --- params
@@ -123,7 +127,7 @@ p.adult: Bool
 --- query
 set engine = v2;
 query inline_match_or_absorbs_null($flag: Bool?) {
-    match { $p: Person { adult: true or $flag } }
+    match { $p: Person } where $p.adult = (true or $flag)
     return { $p.slug }
 }
 
@@ -139,7 +143,7 @@ p.slug: String
 --- query
 set engine = v2;
 query inline_match_and_absorbs_null($flag: Bool?) {
-    match { $p: Person { adult: false and $flag } }
+    match { $p: Person } where $p.adult = (false and $flag)
     return { $p.slug }
 }
 

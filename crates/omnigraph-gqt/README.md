@@ -93,7 +93,7 @@ the served and skipped cases and refuses an empty served set. A declared
 runner implements it. The declared `storage` is recorded, not checked: no
 route reports the server's backend. Refused before any request, by name: `--- restart`,
 `--- concurrent`, seam directives, settings steps and settings prefixes on a
-control or `show` step, `--- expect plan`, `--- expect same as v1`, the
+control or `show` step, `--- expect plan`, the
 `# traversal:` pin, the `# writer:` pin, and queries that need indices (`search`, `fuzzy`,
 `nearest`, `rrf`). The `--- expect shape` section is not judged under a
 server target: it holds the executor's Arrow schema against the compiler's,
@@ -125,6 +125,21 @@ order, and that shape is derived, so a `show` step writes no `--- expect shape`
 section; a `process` setting in a case body refuses the case at parse time. GQ operations
 and GQT rows, shape, affected counts, errors and loop semantics are shared by
 both paths. Unordered row comparison preserves duplicate counts.
+
+An `expect error: <needle>` holds when the step fails and its error contains
+the needle; a compiler diagnostic renders with its code, `parse error: Q018: …`
+as `type error: T7: …` and `plan error: P002: …` do, so a case can name the
+code it expects. A compile that refuses a source for several independent
+reasons renders its first refusal; the needle matches that one, and the
+others ride the diagnostic's `further` list. Every expect-error step the
+compiler refuses is also held to fix convergence
+(`tests/integration/fix_convergence.rs`): applying every machine-applicable
+suggestion of one pass at once shrinks the refusals and reaches a fixed point
+within three passes. A `--- query` or `--- mutate` section the compiler refuses at
+parse is a step only under `expect error:` (any other expectation refuses the
+case with the parse error); it runs through the engine's door like any query
+and fails there with the same refusal. The cases under `cases/diagnostics/` use this:
+one per code the parser and type checker raise.
 
 A write's commit id can be bound for the rest of the case (RFC "Unpublished
 graph commits"): `--- bind commit $name`, an empty section directly after the
@@ -807,31 +822,6 @@ load write: overwrite fragments
 load executed: partitions 1 rows 2
 ```
 
-## Reference comparison
-
-A query step may end with `--- expect same as v1`, directly after its
-`--- expect shape` or `--- expect plan`; the section has no body. The runner
-runs the step's query again on a copy of the case session carrying the frozen
-engine v1 (`omnigraph_reference_engine::ReferenceEngine`, the crate
-`omnigraph-reference-engine`, installed through `Session::with_read_executor`)
-and compares its rows with v2's, ordered or unordered as the step's
-`--- expect` says. The step's own rows expect still applies; the comparison is
-added to it.
-
-```text
---- expect unordered
---- expect shape
-p.name: String
---- expect same as v1
-```
-
-A v1 error, a v1 gate refusal included, or a row difference fails the step.
-The section is refused on a mutate step, an error expect, `show` and
-`branch list`. The DST runner skips the comparison. The reference answers
-`not { ... }` blocks only among the correlated blocks, and refuses count
-predicates and a string `nearest` argument, so a step using those carries no
-`expect same as v1`.
-
 ## Run and reproduce
 
 Run the complete package (the workspace Cargo configuration enables seeded
@@ -1103,9 +1093,7 @@ Replay ignores this variable and refuses saved blessing invocations.
 
 `OMNIGRAPH_GQ_ENGINE` names the initial `engine` setting for direct and
 DST case sessions, the baseline `reset engine` restores. It accepts only `v2`,
-empty or unset, all three meaning engine v2, the setting's one value; engine
-v1 is reached only through `--- expect same as v1`, never through this
-variable.
+empty or unset, all three meaning engine v2, the setting's one value.
 
 Invocation reports freeze the engine in the worker input before clearing the
 worker environment, and replay uses the recorded value. An input without the

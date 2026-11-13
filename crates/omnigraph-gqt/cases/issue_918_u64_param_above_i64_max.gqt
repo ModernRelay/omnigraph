@@ -20,7 +20,7 @@ node Item {
 
 --- query
 query item_above_the_signed_range($v: U64) {
-    match { $i: Item $i.size = $v }
+    match { $i: Item } where $i.size = $v
     return { $i.key }
 }
 
@@ -35,7 +35,7 @@ i.key: String
 
 --- query
 query item_above_the_signed_range_as_text($v: U64) {
-    match { $i: Item $i.size = $v }
+    match { $i: Item } where $i.size = $v
     return { $i.key }
 }
 
@@ -60,7 +60,7 @@ query insert_item_above_the_signed_range($v: U64) {
 
 --- query
 query inserted_item_keeps_the_whole_value($v: U64) {
-    match { $i: Item $i.size = $v }
+    match { $i: Item } where $i.size = $v
     return { $i.key }
 }
 

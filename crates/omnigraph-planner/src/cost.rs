@@ -5,7 +5,7 @@
 //! frontier and warm CSR; only legacy plans probe index coverage again.
 
 use omnigraph_compiler::ir::{IRExpr, ValidateCheck};
-use omnigraph_compiler::query::ast::{CompOp, Literal};
+use omnigraph_compiler::query::value::{CompOp, Literal};
 use omnigraph_compiler::types::Direction;
 use serde::{Deserialize, Serialize};
 
@@ -483,6 +483,7 @@ fn estimate_rows_over(
         | LogicalNode::TextSearch { input, .. }
         | LogicalNode::RankFuse { input, .. }
         | LogicalNode::AntiJoin { input, .. }
+        | LogicalNode::TargetCut { input, .. }
         | LogicalNode::Aggregate { input, .. } => estimate_rows(plan, *input, source),
         LogicalNode::Limit { input, rows, .. } | LogicalNode::Page { input, rows, .. } => {
             Some(estimate_rows(plan, *input, source)?.min(*rows as u64))

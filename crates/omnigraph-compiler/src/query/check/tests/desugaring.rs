@@ -1,0 +1,921 @@
+//! The desugaring-uniqueness test and the closure table as a test
+//! (docs/rfcs/2026-11-07-gq-3.md, section 10).
+//!
+//! The first lowers every surface form of section 3 through the checker and compares its core term with the term the derived-forms table
+//! of section 2 names, built here directly; then it lowers every form and
+//! fails on two forms that share a term unless the formatter list of section
+//! 6 writes both one way, or A6's one exception (a literal and a reference to
+//! the same value) covers them. The second is one case per
+//! row of section 2's closure table: a derived relation in that input
+//! position, accepted or refused with the stated reason.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::catalog::{Catalog, build_catalog};
+use crate::ir::core::*;
+use crate::ir::expr::IRExpr;
+use crate::query::check::{SExpr, SKind, type_source};
+use crate::query::value::{AggFunc, CompOp, Literal};
+use crate::schema::parser::parse_schema;
+use crate::types::{Direction, PropType, ScalarType};
+
+/// The checker tests' schema plus a second Person → Person edge, so that an
+/// alternation has two members of one orientation.
+fn catalog() -> Catalog {
+    let schema = format!("{}\nedge Likes: Person -> Person\n", super::SCHEMA);
+    build_catalog(&parse_schema(&schema).unwrap()).unwrap()
+}
+
+#[track_caller]
+fn lower(src: &str) -> CoreDecl {
+    let out = type_source(&catalog(), src).unwrap_or_else(|e| panic!("{e}\n{src}"));
+    out.into_iter()
+        .last()
+        .unwrap()
+        .1
+        .unwrap_or_else(|e| panic!("{e}\n{src}"))
+        .core
+}
+
+#[track_caller]
+fn refusal(src: &str) -> crate::query::diagnostic::QueryDiagnostic {
+    match type_source(&catalog(), src) {
+        Err(e) => e,
+        Ok(out) => out
+            .into_iter()
+            .find_map(|(_, r)| r.err())
+            .unwrap_or_else(|| panic!("accepted:\n{src}")),
+    }
+}
+
+fn term(c: &CoreDecl) -> &Term {
+    match c {
+        CoreDecl::Read(r) => &r.term,
+        CoreDecl::Write(w) => &w.groups[0].input,
+    }
+}
+
+/// The match term under a read's return desugaring:
+/// `Project(Cut?(Order?(Extend(R, items))), items)`.
+fn match_term(c: &CoreDecl) -> &Term {
+    let mut t = term(c);
+    if let Term::Project {
+        input, keep: false, ..
+    } = t
+    {
+        t = input;
+    }
+    if let Term::Cut { input, .. } = t {
+        t = input;
+    }
+    if let Term::Order { input, .. } = t {
+        t = input;
+    }
+    match t {
+        Term::Project {
+            input, keep: true, ..
+        }
+        | Term::Group { input, .. } => input,
+        other => other,
+    }
+}
+
+// Constructors for the expected terms.
+
+fn node(t: &str) -> Ty {
+    Ty::Node {
+        type_name: t.into(),
+        nullable: false,
+    }
+}
+fn val(s: ScalarType, nullable: bool) -> Ty {
+    Ty::scalar(s, nullable)
+}
+fn boolean(nullable: bool) -> Ty {
+    val(ScalarType::Bool, nullable)
+}
+fn scan(v: &str, t: &str) -> Term {
+    Term::Scan {
+        var: v.into(),
+        ty: node(t),
+    }
+}
+fn expand(input: Term, src: &str, dst: &str, dst_type: &str, sel: &[(&str, Direction)]) -> Term {
+    Term::Expand {
+        input: input.boxed(),
+        src: src.into(),
+        dst: dst.into(),
+        src_type: "Person".into(),
+        dst_type: dst_type.into(),
+        edges: {
+            let members: Vec<crate::traversal::EdgeMember> = sel
+                .iter()
+                .map(|(e, d)| crate::traversal::EdgeMember {
+                    edge_type: e.to_string(),
+                    direction: *d,
+                })
+                .collect();
+            if let [one] = members.as_slice() {
+                crate::traversal::EdgeSelection::Named(one.clone())
+            } else {
+                crate::traversal::EdgeSelection::Alternation(members)
+            }
+        },
+        min_hops: 1,
+        max_hops: Some(1),
+        edge_var: None,
+    }
+}
+fn env(cols: &[(&str, Ty)]) -> Term {
+    Term::Env(
+        cols.iter()
+            .map(|(n, t)| Col {
+                name: n.to_string(),
+                ty: t.clone(),
+            })
+            .collect(),
+    )
+}
+fn filter(input: Term, pred: IRExpr) -> Term {
+    Term::Filter {
+        input: input.boxed(),
+        pred,
+    }
+}
+fn corr(outer: Term, inner: Term) -> Term {
+    Term::Correlate {
+        outer: outer.boxed(),
+        inner: inner.boxed(),
+    }
+}
+fn col(n: &str, ty: Ty) -> IRExpr {
+    SExpr::new(SKind::Col(n.into()), ty).to_ir()
+}
+fn prop(c: &str, p: &str, ty: Ty) -> IRExpr {
+    SExpr::new(
+        SKind::Prop {
+            col: c.into(),
+            prop: p.into(),
+        },
+        ty,
+    )
+    .to_ir()
+}
+fn int(n: i128, s: ScalarType) -> IRExpr {
+    SExpr::new(SKind::Lit(Literal::Integer(n)), val(s, false)).to_ir()
+}
+/// A comparison in the bound form the checker stores: each numeric literal at
+/// its own type, the casts [`coerce`](crate::ir::coerce)'s.
+fn cmp(op: CompOp, l: IRExpr, r: IRExpr) -> IRExpr {
+    let own = |e: IRExpr| match e {
+        IRExpr::Literal(lit @ (Literal::Integer(_) | Literal::Float(_)), _) => {
+            let ty = crate::query::check::literal::literal_type(&lit).unwrap();
+            IRExpr::Literal(lit, crate::types::ExprType::from_prop(&ty))
+        }
+        other => other,
+    };
+    crate::ir::coerce::binary(own(l), crate::query::value::BinaryOp::Compare(op), own(r)).unwrap()
+}
+fn not(e: IRExpr) -> IRExpr {
+    IRExpr::Not(Box::new(e), boolean(false).expr_type())
+}
+fn count_rows() -> Agg {
+    Agg {
+        func: AggFunc::Count,
+        distinct: false,
+        arg: None,
+        ty: val(ScalarType::I64, false),
+    }
+}
+fn block(r: Term, inner: Term, c: &str) -> Term {
+    corr(
+        r,
+        Term::Group {
+            input: inner.boxed(),
+            keys: Vec::new(),
+            aggs: vec![(c.into(), count_rows())],
+        },
+    )
+}
+fn exists(c: &str) -> IRExpr {
+    cmp(
+        CompOp::Gt,
+        col(c, val(ScalarType::I64, false)),
+        int(0, ScalarType::I64),
+    )
+}
+fn inline_ret(input: Term, cols: &[(&str, Ty)]) -> Term {
+    Term::Project {
+        input: Term::Project {
+            input: input.boxed(),
+            items: cols
+                .iter()
+                .map(|(n, t)| (format!("^{n}"), col(n, t.clone())))
+                .collect(),
+            keep: true,
+        }
+        .boxed(),
+        items: cols
+            .iter()
+            .map(|(n, t)| (n.to_string(), col(&format!("^{n}"), t.clone())))
+            .collect(),
+        keep: false,
+    }
+}
+
+fn age() -> Ty {
+    Ty::Value(PropType::scalar(ScalarType::I32, true))
+}
+/// `$q: Person, $p knows $q` in a block correlated on `$p`: the binding is
+/// a `Scan` beside the outer row, and the triple, both ends bound, expands to
+/// a fresh column that a filter ties to `$q` (section 2's derived forms).
+fn knows_q_from_env() -> Term {
+    filter(
+        expand(
+            corr(env(&[("p", node("Person"))]), scan("q", "Person")),
+            "p",
+            "__temp_t1",
+            "Person",
+            &[("Knows", Direction::Out)],
+        ),
+        cmp(
+            CompOp::Eq,
+            prop("__temp_t1", "__id", val(ScalarType::String, false)),
+            prop("q", "__id", val(ScalarType::String, false)),
+        ),
+    )
+}
+
+/// Section 2's derived-forms table, row by row: each surface form lowers to
+/// the core term the table names.
+#[test]
+fn every_surface_form_lowers_to_the_term_the_table_names() {
+    use CompOp::*;
+    let p_knows_q = || {
+        expand(
+            scan("p", "Person"),
+            "p",
+            "q",
+            "Person",
+            &[("Knows", Direction::Out)],
+        )
+    };
+    let rows: Vec<(&str, &str, Term)> = vec![
+        (
+            "match { … }: binders in written order, a filter after the last variable it names",
+            "query f() { match { $p: Person, $p knows $q } where $q.age > 3 return { $q } }",
+            filter(
+                p_knows_q(),
+                cmp(Gt, prop("q", "age", age()), int(3, ScalarType::I32)),
+            ),
+        ),
+        (
+            "count { p } as a value: Correlate(R, Group(p, [], [agg])), the aggregate column",
+            "query f() { match { $p: Person, let $n = count { $q: Person, $p knows $q } } return { $n } }",
+            Term::Project {
+                input: block(scan("p", "Person"), knows_q_from_env(), "__temp_b2").boxed(),
+                items: vec![("n".into(), col("__temp_b2", val(ScalarType::I64, false)))],
+                keep: true,
+            },
+        ),
+        (
+            "exists { p }: count { p } > 0",
+            "query f() { match { $p: Person } where exists { $q: Person, $p knows $q } return { $p } }",
+            filter(
+                block(scan("p", "Person"), knows_q_from_env(), "__temp_b2"),
+                exists("__temp_b2"),
+            ),
+        ),
+        (
+            "not exists { p }: Filter(¬ exists { p })",
+            "query f() { match { $p: Person } where not exists { $q: Person, $p knows $q } return { $p } }",
+            filter(
+                block(scan("p", "Person"), knows_q_from_env(), "__temp_b2"),
+                not(exists("__temp_b2")),
+            ),
+        ),
+        (
+            "optional { p }: Union(Correlate(R, p), Project(Filter(R, ¬ exists p), nulls))",
+            "query f() { match { $p: Person, optional { $p worksAt $c } } return { $p, $c } }",
+            {
+                let works = || {
+                    expand(
+                        env(&[("p", node("Person"))]),
+                        "p",
+                        "c",
+                        "Company",
+                        &[("WorksAt", Direction::Out)],
+                    )
+                };
+                Term::Union {
+                    left: corr(scan("p", "Person"), works()).boxed(),
+                    right: Term::Project {
+                        input: filter(
+                            block(scan("p", "Person"), works(), "_opt"),
+                            not(exists("_opt")),
+                        )
+                        .boxed(),
+                        items: vec![
+                            ("p".into(), col("p", node("Person"))),
+                            (
+                                "c".into(),
+                                SExpr::new(
+                                    SKind::Null,
+                                    Ty::Node {
+                                        type_name: "Company".into(),
+                                        nullable: true,
+                                    },
+                                )
+                                .to_ir(),
+                            ),
+                        ],
+                        keep: false,
+                    }
+                    .boxed(),
+                }
+            },
+        ),
+        (
+            "two patterns sharing no variable, all but one pinned to a row by its key: Correlate with an inner term that has no free variables",
+            "query f() { match { $p: Person, $c: Company } where $c.slug = \"acme\" return { $p, $c } }",
+            filter(
+                corr(scan("p", "Person"), scan("c", "Company")),
+                cmp(
+                    CompOp::Eq,
+                    prop("c", "slug", val(ScalarType::String, false)),
+                    SExpr::new(
+                        SKind::Lit(Literal::String("acme".into())),
+                        val(ScalarType::String, false),
+                    )
+                    .to_ir(),
+                ),
+            ),
+        ),
+        (
+            "$a (e1 | e2) $b: one Expand whose selector holds every member",
+            "query f() { match { $p: Person, $p (knows | likes) $q } return { $q } }",
+            expand(
+                scan("p", "Person"),
+                "p",
+                "q",
+                "Person",
+                &[("Knows", Direction::Out), ("Likes", Direction::Out)],
+            ),
+        ),
+        (
+            "$a <e> $b: one Expand whose selector holds both orientations",
+            "query f() { match { $p: Person, $p <knows> $q } return { $q } }",
+            expand(
+                scan("p", "Person"),
+                "p",
+                "q",
+                "Person",
+                &[("Knows", Direction::Both)],
+            ),
+        ),
+        (
+            "$k: E: Scan over the edge type",
+            "query f() { match { $k: WorksAt } return { $k } }",
+            Term::Scan {
+                var: "k".into(),
+                ty: Ty::Edge {
+                    type_name: "WorksAt".into(),
+                    nullable: false,
+                },
+            },
+        ),
+        (
+            "let $v = expr: Project adding one named column",
+            "query f() { match { $p: Person, let $a = $p.age } return { $a } }",
+            Term::Project {
+                input: scan("p", "Person").boxed(),
+                items: vec![("a".into(), prop("p", "age", age()))],
+                keep: true,
+            },
+        ),
+        (
+            "from rel: Correlate",
+            "query f() { match { $p: Person, from { match { $c: Company } return { $c } } } return { $p, $c } }",
+            corr(
+                scan("p", "Person"),
+                inline_ret(scan("c", "Company"), &[("c", node("Company"))]),
+            ),
+        ),
+        (
+            "union(rel, rel, …): Union, folded from the left",
+            "query f() { match { from union({ match { $c: Company } return { $c } }, { match { $d: Company } return { $d as c } }, { match { $e: Company } return { $e as c } }) } return { $c } }",
+            {
+                let arm = |v: &str| Term::Project {
+                    input: Term::Project {
+                        input: scan(v, "Company").boxed(),
+                        items: vec![("^c".into(), col(v, node("Company")))],
+                        keep: true,
+                    }
+                    .boxed(),
+                    items: vec![("c".into(), col("^c", node("Company")))],
+                    keep: false,
+                };
+                Term::Union {
+                    left: Term::Union {
+                        left: inline_ret(scan("c", "Company"), &[("c", node("Company"))]).boxed(),
+                        right: arm("d").boxed(),
+                    }
+                    .boxed(),
+                    right: arm("e").boxed(),
+                }
+            },
+        ),
+        (
+            "distance(rel, $x.f, $q): Score",
+            "query f($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, $v) as $distance } return { $d } }",
+            Term::Score {
+                input: inline_ret(scan("d", "Doc"), &[("d", node("Doc"))]).boxed(),
+                column: "d".into(),
+                property: "embedding".into(),
+                kind: ScoreKind::Distance,
+                query: ScoreQuery::Vector(
+                    SExpr::new(
+                        SKind::Param("v".into()),
+                        Ty::Value(PropType::scalar(ScalarType::Vector(3), false)),
+                    )
+                    .to_ir(),
+                ),
+                out: "distance".into(),
+            },
+        ),
+        (
+            "bm25(rel, $x.f, q): Score, a String meaning terms(q, mode: any)",
+            "query f($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } return { $d } }",
+            Term::Score {
+                input: inline_ret(scan("d", "Doc"), &[("d", node("Doc"))]).boxed(),
+                column: "d".into(),
+                property: "body".into(),
+                kind: ScoreKind::Bm25,
+                query: ScoreQuery::Lexical(LexicalQuery {
+                    text: SExpr::new(SKind::Param("s".into()), val(ScalarType::String, false))
+                        .to_ir(),
+                    mode_all: false,
+                    max_edits: int(0, ScalarType::I64),
+                }),
+                out: "score".into(),
+            },
+        ),
+        (
+            "nearest(rel, $x.f, $q, k: n): ApproxTopK",
+            "query f($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 5) as $distance } return { $d } }",
+            Term::ApproxTopK {
+                input: inline_ret(scan("d", "Doc"), &[("d", node("Doc"))]).boxed(),
+                column: "d".into(),
+                property: "embedding".into(),
+                query: SExpr::new(
+                    SKind::Param("v".into()),
+                    Ty::Value(PropType::scalar(ScalarType::Vector(3), false)),
+                )
+                .to_ir(),
+                k: Count::Literal(5),
+                recall: None,
+                out: "distance".into(),
+            },
+        ),
+    ];
+    for (row, src, want) in rows {
+        let got = lower(src);
+        assert_eq!(match_term(&got), &want, "row: {row}\n{src}");
+    }
+
+    // `return { … }`, `order`, `limit`:
+    // Project(Cut(Order(Extend(R, items), keys), k), items).
+    let got = lower(
+        "query f() { match { $p: Person } return { $p.name } order { $p.age desc } limit 3 }",
+    );
+    let name = val(ScalarType::String, false);
+    let want = Term::Project {
+        input: Term::Cut {
+            input: Term::Order {
+                input: Term::Project {
+                    input: scan("p", "Person").boxed(),
+                    items: vec![("^p.name".into(), prop("p", "name", name.clone()))],
+                    keep: true,
+                }
+                .boxed(),
+                keys: vec![(prop("p", "age", age()), true)],
+            }
+            .boxed(),
+            k: Count::Literal(3),
+        }
+        .boxed(),
+        items: vec![("p.name".into(), col("^p.name", name))],
+        keep: false,
+    };
+    assert_eq!(term(&got), &want);
+    // `return distinct { … }`: Group with no aggregates.
+    let got = lower("query f() { match { $p: Person } return distinct { $p.city } }");
+    let city = Ty::Value(PropType::scalar(ScalarType::String, true));
+    assert!(matches!(term(&got), Term::Project { input, .. }
+        if matches!(input.as_ref(), Term::Group { keys, aggs, .. }
+            if aggs.is_empty() && keys == &vec![("^p.city".to_string(), prop("p", "city", city.clone()))])));
+    // `rrf(rel, …)`: Fuse; a named read: Call; a self-calling read: Fix.
+    let got = lower(
+        "query f($s: String, $v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) as $score } return { $d } }",
+    );
+    assert!(
+        matches!(match_term(&got), Term::Fuse { arms, k: Count::Literal(60), weights, .. } if arms.len() == 2 && weights == &vec![1.0, 1.0])
+    );
+    let got = lower(
+        "query g($h: String) { match { $p: Person } where $p.handle = $h return { $p } }\nquery f() { match { from g(\"a\") } return { $p } }",
+    );
+    assert!(matches!(match_term(&got), Term::Call { name, .. } if name == "g"));
+    let got = lower(super::REACHABLE);
+    assert!(matches!(term(&got), Term::Fix { .. }));
+    // A write body: one group per run of clauses and statements, the clauses'
+    // term then one sink per statement.
+    let got = lower(
+        "query w($h: String) { match { $p: Person } where $p.handle = $h  update $p set { city: null }  match { $c: Company } where $c.slug = $h  update $c set { name: $h } }",
+    );
+    let CoreDecl::Write(w) = &got else { panic!() };
+    assert_eq!(w.groups.len(), 2);
+    assert_eq!(
+        w.groups[0].input,
+        filter(
+            scan("p", "Person"),
+            cmp(
+                Eq,
+                prop("p", "handle", name_ty()),
+                SExpr::new(SKind::Param("h".into()), name_ty()).to_ir()
+            )
+        )
+    );
+    // The old `delete T where φ`, as the rewriter writes it:
+    // Delete(Filter(Scan(T), φ), $x).
+    let got = lower("query w() { match { $x: Person } where $x.age > 3  delete $x }");
+    let CoreDecl::Write(w) = &got else { panic!() };
+    assert_eq!(
+        w.groups[0].input,
+        filter(
+            scan("x", "Person"),
+            cmp(Gt, prop("x", "age", age()), int(3, ScalarType::I32))
+        )
+    );
+    assert!(matches!(&w.groups[0].sinks[0], Sink::Delete { var, .. } if var == "x"));
+}
+
+fn name_ty() -> Ty {
+    val(ScalarType::String, false)
+}
+
+/// The forms of section 3, each a declaration; `meaning` groups the forms a
+/// reader would call one query.
+const FORMS: &[(&str, &str)] = &[
+    (
+        "property_equality",
+        "query f($h: String) { match { $p: Person } where $p.handle = $h return { $p } }",
+    ),
+    // A triple is written in its edge's declared order, source first; the
+    // reversed triple is `T82`, so the formatter has no order to restore.
+    (
+        "triple_schema_order",
+        "query f() { match { $c: Company, $p worksAt $c } return { $p, $c } }",
+    ),
+    (
+        "exists",
+        "query f() { match { $p: Person } where exists { $q: Person, $p knows $q } return { $p } }",
+    ),
+    (
+        "count_gt_0",
+        "query f() { match { $p: Person } where count { $q: Person, $p knows $q } > 0 return { $p } }",
+    ),
+    (
+        "count_ge_1",
+        "query f() { match { $p: Person } where count { $q: Person, $p knows $q } >= 1 return { $p } }",
+    ),
+    (
+        "not_exists",
+        "query f() { match { $p: Person } where not exists { $q: Person, $p knows $q } return { $p } }",
+    ),
+    (
+        "count_eq_0",
+        "query f() { match { $p: Person } where count { $q: Person, $p knows $q } = 0 return { $p } }",
+    ),
+    (
+        "union_flat",
+        "query f() { match { from union({ match { $c: Company } return { $c } }, { match { $d: Company } return { $d as c } }, { match { $e: Company } return { $e as c } }) } return { $c } }",
+    ),
+    (
+        "union_nested",
+        "query f() { match { from union(union({ match { $c: Company } return { $c } }, { match { $d: Company } return { $d as c } }), { match { $e: Company } return { $e as c } }) } return { $c } }",
+    ),
+    (
+        "alternation",
+        "query f() { match { $p: Person, $p (knows | likes) $q } return { $q } }",
+    ),
+    (
+        "alternation_reordered",
+        "query f() { match { $p: Person, $p (likes | knows) $q } return { $q } }",
+    ),
+    (
+        "undirected",
+        "query f() { match { $p: Person, $p <knows> $q } return { $q } }",
+    ),
+    (
+        "undirected_ends_swapped",
+        "query f() { match { $p: Person, $q <knows> $p } return { $q } }",
+    ),
+    (
+        "order_asc",
+        "query f() { match { $p: Person } return { $p } order { $p.age asc } }",
+    ),
+    (
+        "order_default",
+        "query f() { match { $p: Person } return { $p } order { $p.age } }",
+    ),
+    (
+        "alias_same_name",
+        "query f() { match { $p: Person } return { $p as p } }",
+    ),
+    (
+        "no_alias",
+        "query f() { match { $p: Person } return { $p } }",
+    ),
+    (
+        "conjunction",
+        "query f() { match { $p: Person } where $p.age > 3 and $p.city = \"x\" return { $p } }",
+    ),
+    (
+        "bm25_string",
+        "query f($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } return { $d } }",
+    ),
+    (
+        "bm25_terms_any",
+        "query f($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s, mode: any)) as $score } return { $d } }",
+    ),
+    (
+        "bm25_terms_all",
+        "query f($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s)) as $score } return { $d } }",
+    ),
+    (
+        "rrf_default_k",
+        "query f($s: String, $v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) as $score } return { $d } }",
+    ),
+    (
+        "rrf_k_60",
+        "query f($s: String, $v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s), k: 60) as $score } return { $d } }",
+    ),
+    (
+        "let_rel_then_from",
+        "query f() { match { let $r = { match { $c: Company } return { $c } }, from $r } return { $c } }",
+    ),
+    (
+        "from_inline",
+        "query f() { match { from { match { $c: Company } return { $c } } } return { $c } }",
+    ),
+    (
+        "filter",
+        "query f() { match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs } where $p.age > 3 return { $p, $q } }",
+    ),
+    (
+        "two_bindings",
+        "query f() { match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs } return { $p, $q } }",
+    ),
+    (
+        "two_bindings_swapped",
+        "query f() { match { $q: Person, let $ps = { match { $p: Person } return { $p } }, from $ps } return { $p, $q } }",
+    ),
+    (
+        "let_value",
+        "query f() { match { $p: Person, let $a = $p.age } return { $a } }",
+    ),
+    (
+        "return_expression",
+        "query f() { match { $p: Person } return { $p.age as a } }",
+    ),
+    (
+        "fuzzy_default",
+        "query f($s: String) { match { $d: Doc } where fuzzy($d.body, $s) return { $d } }",
+    ),
+    (
+        "fuzzy_two_edits",
+        "query f($s: String) { match { $d: Doc } where fuzzy($d.body, $s, max_edits: 2) return { $d } }",
+    ),
+];
+
+/// The formatter's list (section 6): each pair is (non-canonical form,
+/// canonical form), the rewrite `queries fmt` performs without changing the
+/// typed IR. The five collisions of the clause-list surface (a property map
+/// beside its equality, `not { }` beside `not exists { }`, a top-level `and`
+/// beside two filter clauses, a filter's position among the clauses, and
+/// `return` items with and without commas) are spellings the grammar no
+/// longer has.
+const FORMATTER: &[(&str, &str)] = &[
+    ("count_gt_0", "exists"),
+    ("union_nested", "union_flat"),
+    ("alternation_reordered", "alternation"),
+    ("undirected_ends_swapped", "undirected"),
+    ("order_asc", "order_default"),
+    ("alias_same_name", "no_alias"),
+    ("bm25_terms_any", "bm25_string"),
+    ("rrf_k_60", "rrf_default_k"),
+    ("fuzzy_two_edits", "fuzzy_default"),
+];
+
+/// Lint's rows-equal rewrites (section 5): equal rows, because a count is a
+/// non-negative integer, but a different typed IR, so `fmt` does not apply
+/// them.
+const LINT_ONLY: &[(&str, &str)] = &[("count_ge_1", "exists"), ("count_eq_0", "not_exists")];
+
+/// A6's one standing exception: a literal and a reference to the same value.
+const LITERAL_AND_REFERENCE: &[(&str, &str)] = &[("let_rel_then_from", "from_inline")];
+
+/// The canonical form `fmt` writes for `id`.
+fn canonical(id: &str) -> &str {
+    let mut id = id;
+    while let Some((_, to)) = FORMATTER
+        .iter()
+        .chain(LITERAL_AND_REFERENCE)
+        .find(|(from, _)| *from == id)
+    {
+        id = to;
+    }
+    id
+}
+
+#[test]
+fn two_forms_share_a_term_only_when_the_formatter_names_one() {
+    let lowered: Vec<(&str, CoreDecl)> = FORMS.iter().map(|(id, src)| (*id, lower(src))).collect();
+    let term = |id: &str| &lowered.iter().find(|(i, _)| *i == id).unwrap().1;
+    // Every collision is two spellings the formatter writes one way (or A6's
+    // literal and reference); a new one fails here.
+    let mut unlisted = BTreeSet::new();
+    for (i, (a, ta)) in lowered.iter().enumerate() {
+        for (b, tb) in &lowered[..i] {
+            if ta == tb && canonical(a) != canonical(b) {
+                unlisted.insert((b.to_string(), a.to_string()));
+            }
+        }
+    }
+    assert_eq!(unlisted, BTreeSet::new(), "collisions no list names");
+    // Every formatter row is a collision: the formatter never changes the
+    // typed IR.
+    for (from, to) in FORMATTER.iter().chain(LITERAL_AND_REFERENCE) {
+        assert_eq!(term(from), term(to), "{from} -> {to}");
+    }
+    // Lint's rows are not: they change the IR, which is why they are lint's.
+    for (from, to) in LINT_ONLY {
+        assert_ne!(term(from), term(to), "{from} -> {to}");
+    }
+    // Forms a reader might call one query that are different terms: kept
+    // apart, no A6 question (clause order of binders, `let` against a return
+    // expression).
+    for (a, b) in [
+        ("two_bindings", "two_bindings_swapped"),
+        ("let_value", "return_expression"),
+    ] {
+        let ta = &lowered.iter().find(|(i, _)| *i == a).unwrap().1;
+        let tb = &lowered.iter().find(|(i, _)| *i == b).unwrap().1;
+        assert_ne!(ta, tb, "{a} / {b}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The closure table (section 2, Closure): one case per row.
+
+/// A grouped relation: a derived relation for every row to consume.
+const GROUPED: &str =
+    "{ match { $p: Person, $c: Company, $p worksAt $c } return { $c, count($p) as n } }";
+
+#[test]
+fn the_closure_table() {
+    let mut rows: BTreeMap<&str, String> = BTreeMap::new();
+    let accept = |src: &str| -> String {
+        let _ = lower(src);
+        "accepted".into()
+    };
+    let refuse = |src: &str, code: &str, reason: &str| -> String {
+        let e = refusal(src);
+        assert_eq!(e.code.as_str(), code, "{e}\n{src}");
+        assert!(e.message.contains(reason), "`{reason}` not in: {e}");
+        format!("refused {code}")
+    };
+    rows.insert(
+        "Correlate inner term",
+        accept(&format!("query q() {{ match {{ $x: Company, from {{ match {{ from {GROUPED} }} where $c = $x return {{ $n }} }} }} return {{ $x, $n }} }}")),
+    );
+    rows.insert(
+        "Union arms",
+        accept(&format!("query q() {{ match {{ from union({{ match {{ from {GROUPED} }} return {{ $c, $n }} }}, {{ match {{ from {GROUPED} }} return {{ $c, $n }} }}) }} return {{ $c, $n }} }}")),
+    );
+    rows.insert(
+        "Union arms, types disagree",
+        refuse(
+            &format!("query q() {{ match {{ from union({{ match {{ from {GROUPED} }} return {{ $c, $n }} }}, {{ match {{ $x: Company }} return {{ $x as c, $x.name as n }} }}) }} return {{ $c }} }}"),
+            "T73",
+            "arm 2 column 2",
+        ),
+    );
+    rows.insert(
+        "Group, Project, Filter, Order, Cut input",
+        accept(&format!("query q() {{ match {{ from {GROUPED} }} where $n > 1 return {{ avg($n) as mean, max($n) as largest, count($c) as k }} order {{ mean desc }} limit 1 }}")),
+    );
+    rows.insert(
+        "Expand source, a node column",
+        accept(&format!(
+            "query q() {{ match {{ from {GROUPED}, $x worksAt $c }} return {{ $x, $n }} }}"
+        )),
+    );
+    rows.insert(
+        "Expand source, no node column",
+        refuse(
+            "query q() { match { from { match { $p: Person } return { $p.handle as h } }, $h knows $x } return { $x } }",
+            "T23",
+            "nothing to traverse from",
+        ),
+    );
+    rows.insert(
+        "Score, ApproxTopK population, ranked column named",
+        accept("query q($v: Vector(3)) { match { let $pop = { match { from { match { $p: Person, $d: Doc, $p authored $d } return { $d, count($p) as authors } } } where $authors > 1 return { $d, $authors } }, from nearest($pop, $d.embedding, $v, k: 5) as $distance } return { $d, $authors, $distance } }"),
+    );
+    rows.insert(
+        "Score population, ranked column not a node column",
+        refuse(
+            &format!("query q($v: Vector(3)) {{ match {{ let $pop = {GROUPED}, from distance($pop, $n.embedding, $v) as $distance }} return {{ $c }} }}"),
+            "T79",
+            "a ranking ranks a node column",
+        ),
+    );
+    rows.insert(
+        "Fuse arms, scored, over one node column",
+        accept("query q($s: String, $v: Vector(3)) { match { let $docs = { match { from { match { $p: Person, $d: Doc, $p authored $d } return { $d, count($p) as a } } } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) as $score } return { $d, $score } }"),
+    );
+    rows.insert(
+        "Fuse arms over two node columns",
+        refuse(
+            "query q($s: String, $v: Vector(3)) { match { let $docs = { match { $p: Person, $d: Doc, $p authored $d } return { $p, $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), { match { from $docs } return { $p } order { $p.age } }) as $score } return { $score } }",
+            "T75",
+            "the fused target would be a pair",
+        ),
+    );
+    rows.insert(
+        "Call argument, a relation",
+        refuse(
+            &format!("query g($c: String) {{ match {{ $x: Company }} where $x.slug = $c return {{ $x }} }}\nquery q() {{ match {{ from g({GROUPED}) }} return {{ $x }} }}"),
+            "T69",
+            "an inline read is a relation",
+        ),
+    );
+    rows.insert(
+        "Call argument, a scalar",
+        accept("query g($c: String) { match { $x: Company } where $x.slug = $c return { $x } }\nquery q() { match { $p: Person, from g($p.handle) } return { $x } }"),
+    );
+    rows.insert("Fix body, monotone", accept(super::REACHABLE));
+    rows.insert(
+        "Fix body, a negation over it",
+        refuse(
+            "query bad($from: String) { match { from union({ match { $p: Person } where $p.handle = $from return { $p as m } }, { match { $q: Person } where not exists { from bad($from), $m knows $q } return { $q as m } }) } return distinct { $m } }",
+            "T70",
+            "not monotone",
+        ),
+    );
+    rows.insert(
+        "a column of a relation, a relation",
+        refuse(
+            &format!(
+                "query q() {{ match {{ let $r = {GROUPED}, $x: Company }} return {{ $x, $r }} }}"
+            ),
+            "T69",
+            "is a relation",
+        ),
+    );
+    rows.insert(
+        "a sink's input",
+        accept(&format!(
+            "query w() {{ match {{ from {GROUPED} }} where $n > 100  update $c set {{ name: \"big\" }} }}"
+        )),
+    );
+    rows.insert(
+        "a sink's input, a ranked relation",
+        accept("query w($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 20) as $distance }  update $d set { tags: [\"near\"] } }"),
+    );
+    // A sink inside a read: never (A7). The grammar has no statement in a
+    // read body, and a read cannot draw rows from a write.
+    // A bare word is an operand nowhere in a `match`, so a statement there
+    // fails at its word.
+    rows.insert(
+        "a sink inside a read, in the body",
+        refuse(
+            "query q() { match { $p: Person, delete $p } return { $p } }",
+            "Q018",
+            "`delete` is a bare name",
+        ),
+    );
+    rows.insert(
+        "a sink inside a read, through a call",
+        refuse(
+            "query w($h: String) { insert Person { handle: $h, name: $h } }\nquery q() { match { from w(\"a\") } return { 1 as one } }",
+            "T74",
+            "A7",
+        ),
+    );
+    for (k, v) in &rows {
+        eprintln!("{k:52} {v}");
+    }
+    assert_eq!(rows.len(), 19);
+}

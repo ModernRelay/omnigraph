@@ -8,10 +8,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
 use omnigraph_compiler::ir::{
     BlockAggregateExpr, IRExpr, IROrdering, IRProjection, SubqueryPredicate,
 };
-use omnigraph_compiler::query::ast::{AggFunc, BinaryOp, CompOp, Literal};
+use omnigraph_compiler::query::syntax::ArithOp;
+use omnigraph_compiler::query::value::{AggFunc, BinaryOp, CompOp, Literal};
 use omnigraph_compiler::traversal::{EdgeMember, EdgeSelection};
 use omnigraph_compiler::types::Direction;
 use omnigraph_compiler::{
@@ -267,6 +269,11 @@ pub enum NodeMirror {
         input: NodeId,
         rows: usize,
     },
+    TargetCut {
+        input: NodeId,
+        binding: String,
+        targets: usize,
+    },
     Page {
         input: NodeId,
         rows: usize,
@@ -440,6 +447,15 @@ impl From<&PhysicalNode> for NodeMirror {
             PhysicalNode::Limit { input, rows } => Self::Limit {
                 input: *input,
                 rows: *rows,
+            },
+            PhysicalNode::TargetCut {
+                input,
+                binding,
+                targets,
+            } => Self::TargetCut {
+                input: *input,
+                binding: binding.clone(),
+                targets: *targets,
             },
             PhysicalNode::Page {
                 input,
@@ -680,6 +696,15 @@ impl TryFrom<NodeMirror> for PhysicalNode {
             NodeMirror::RowCompare { input } => Self::RowCompare { input },
             NodeMirror::ClassifyThreeWay { input } => Self::ClassifyThreeWay { input },
             NodeMirror::Limit { input, rows } => Self::Limit { input, rows },
+            NodeMirror::TargetCut {
+                input,
+                binding,
+                targets,
+            } => Self::TargetCut {
+                input,
+                binding,
+                targets,
+            },
             NodeMirror::Page {
                 input,
                 rows,
@@ -1148,6 +1173,76 @@ pub enum BinaryOpMirror {
     Compare(CompOpMirror),
     And,
     Or,
+    Arith(ArithOpMirror),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArithOpMirror {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
+
+impl From<ArithOp> for ArithOpMirror {
+    fn from(op: ArithOp) -> Self {
+        match op {
+            ArithOp::Add => Self::Add,
+            ArithOp::Sub => Self::Sub,
+            ArithOp::Mul => Self::Mul,
+            ArithOp::Div => Self::Div,
+            ArithOp::Rem => Self::Rem,
+        }
+    }
+}
+
+impl From<ArithOpMirror> for ArithOp {
+    fn from(mirror: ArithOpMirror) -> Self {
+        match mirror {
+            ArithOpMirror::Add => Self::Add,
+            ArithOpMirror::Sub => Self::Sub,
+            ArithOpMirror::Mul => Self::Mul,
+            ArithOpMirror::Div => Self::Div,
+            ArithOpMirror::Rem => Self::Rem,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "func", rename_all = "snake_case")]
+pub enum ScalarFuncMirror {
+    If,
+    Coalesce,
+    Concat,
+    MatchTerms { all: bool },
+}
+
+impl From<ScalarFunc> for ScalarFuncMirror {
+    fn from(func: ScalarFunc) -> Self {
+        match func {
+            ScalarFunc::If => Self::If,
+            ScalarFunc::Coalesce => Self::Coalesce,
+            ScalarFunc::Concat => Self::Concat,
+            ScalarFunc::MatchTerms { mode } => Self::MatchTerms {
+                all: mode == TermsMode::All,
+            },
+        }
+    }
+}
+
+impl From<ScalarFuncMirror> for ScalarFunc {
+    fn from(mirror: ScalarFuncMirror) -> Self {
+        match mirror {
+            ScalarFuncMirror::If => Self::If,
+            ScalarFuncMirror::Coalesce => Self::Coalesce,
+            ScalarFuncMirror::Concat => Self::Concat,
+            ScalarFuncMirror::MatchTerms { all } => Self::MatchTerms {
+                mode: if all { TermsMode::All } else { TermsMode::Any },
+            },
+        }
+    }
 }
 
 impl From<BinaryOp> for BinaryOpMirror {
@@ -1156,6 +1251,7 @@ impl From<BinaryOp> for BinaryOpMirror {
             BinaryOp::Compare(op) => Self::Compare(CompOpMirror::from(op)),
             BinaryOp::And => Self::And,
             BinaryOp::Or => Self::Or,
+            BinaryOp::Arith(op) => Self::Arith(ArithOpMirror::from(op)),
         }
     }
 }
@@ -1166,6 +1262,7 @@ impl From<BinaryOpMirror> for BinaryOp {
             BinaryOpMirror::Compare(op) => Self::Compare(CompOp::from(op)),
             BinaryOpMirror::And => Self::And,
             BinaryOpMirror::Or => Self::Or,
+            BinaryOpMirror::Arith(op) => Self::Arith(ArithOp::from(op)),
         }
     }
 }
@@ -1544,6 +1641,15 @@ pub enum ExprMirror {
         operand: Box<ExprMirror>,
         ty: ExprType,
     },
+    Neg {
+        operand: Box<ExprMirror>,
+        ty: ExprType,
+    },
+    Call {
+        func: ScalarFuncMirror,
+        args: Vec<ExprMirror>,
+        ty: ExprType,
+    },
 }
 
 fn boxed(expr: &IRExpr) -> Box<ExprMirror> {
@@ -1664,6 +1770,15 @@ impl From<&IRExpr> for ExprMirror {
                 operand: boxed(expr),
                 ty: ty.clone(),
             },
+            IRExpr::Neg { expr, ty } => Self::Neg {
+                operand: boxed(expr),
+                ty: ty.clone(),
+            },
+            IRExpr::Call { func, args, ty } => Self::Call {
+                func: ScalarFuncMirror::from(*func),
+                args: args.iter().map(ExprMirror::from).collect(),
+                ty: ty.clone(),
+            },
         }
     }
 }
@@ -1766,6 +1881,15 @@ impl From<ExprMirror> for IRExpr {
             },
             ExprMirror::Cast { operand, ty } => Self::Cast {
                 expr: unboxed(*operand),
+                ty,
+            },
+            ExprMirror::Neg { operand, ty } => Self::Neg {
+                expr: unboxed(*operand),
+                ty,
+            },
+            ExprMirror::Call { func, args, ty } => Self::Call {
+                func: ScalarFunc::from(func),
+                args: args.into_iter().map(IRExpr::from).collect(),
                 ty,
             },
         }

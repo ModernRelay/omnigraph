@@ -28,6 +28,36 @@ fn parse_failure_returns_structured_error_output() {
     assert_eq!(output.findings[0].code, PARSE_ERROR_CODE);
 }
 
+/// A file declaring one name twice is refused whole, and the finding keeps
+/// the code `T83` at the later declaration rather than the parse family's
+/// `Q000`, one finding for each later declaration.
+#[test]
+fn a_repeated_declaration_name_is_a_t83_finding() {
+    let output = lint_query_file(
+        &catalog("node Person { name: String }"),
+        "query q() { match { $p: Person } return { $p.name } }\nquery q() { match { $p: Person } return { $p } }\nquery q() { match { $p: Person } return { $p } }\n",
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+    assert_eq!(output.status, QueryLintStatus::Error);
+    assert_eq!(output.queries_processed, 0);
+    assert_eq!(output.findings.len(), 2);
+    assert_eq!(output.errors, 2);
+    assert!(
+        output.findings[1].message.starts_with("line 3, column 7: "),
+        "{}",
+        output.findings[1].message
+    );
+    assert_eq!(output.findings[0].code, "T83");
+    assert!(
+        output.findings[0]
+            .message
+            .starts_with("line 2, column 7: type error: T83: `q` is declared twice"),
+        "{}",
+        output.findings[0].message
+    );
+}
+
 #[test]
 fn branch_statement_is_refused_as_a_parse_family_finding() {
     let output = lint_query_file(
@@ -106,12 +136,14 @@ name: String?
         ),
         r#"
 query list_people($slug: String) {
-match { $p: Person { slug: $slug } }
+match { $p: Person } where $p.slug = $slug
 return { $p.name }
 }
 
 query bad_update($slug: String) {
-update Person set { missing: "nope" } where slug = $slug
+match { $x: Person } where $x.slug = $slug
+update $x set { missing: "nope" }
+update $x set { nmae: "x" }
 }
 "#,
         "/tmp/queries.gq",
@@ -125,7 +157,7 @@ update Person set { missing: "nope" } where slug = $slug
     assert_eq!(
         operation.result,
         vec![QueryResultFieldDescriptor {
-            name: "name".to_string(),
+            name: "p.name".to_string(),
             kind: QueryValueKind::String,
             item_kind: None,
             vector_dim: None,
@@ -150,7 +182,18 @@ update Person set { missing: "nope" } where slug = $slug
             .unwrap_or_default()
             .contains("has no property")
     );
+    // Every refusal of the query's pass, each where it stands.
+    let refusals = &output.results[1].diagnostics;
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    assert!(
+        refusals[1]
+            .message
+            .contains("`nmae`; nearest: name (String?)")
+    );
+    assert_eq!(refusals[1].position.map(|at| at.line), Some(10));
     let serialized = serde_json::to_value(&output).unwrap();
+    assert!(serialized["results"][0].get("diagnostics").is_none());
+    assert_eq!(serialized["results"][1]["diagnostics"][1]["code"], "T11");
     assert!(
         serialized["results"][1].get("operation").is_none(),
         "failed queries must omit the descriptor rather than serialize a partial value"
@@ -246,7 +289,8 @@ effectiveTo: DateTime?
         ),
         r#"
 query update_policy($slug: String, $name: String) {
-update Policy set { name: $name } where slug = $slug
+match { $x: Policy } where $x.slug = $slug
+update $x set { name: $name }
 }
 "#,
         "/tmp/queries.gq",
@@ -300,7 +344,8 @@ embedding: Vector(3)? @embed(body)
         ),
         r#"
 query update_doc($slug: String, $body: String) {
-update Doc set { body: $body } where slug = $slug
+match { $x: Doc } where $x.slug = $slug
+update $x set { body: $body }
 }
 "#,
         "/tmp/queries.gq",
@@ -334,7 +379,8 @@ name: String?
         &catalog,
         r#"
 query update_policy($slug: String, $name: String) {
-update Policy set { name: $name } where slug = $slug
+match { $x: Policy } where $x.slug = $slug
+update $x set { name: $name }
 }
 "#,
         "/tmp/queries.gq",
@@ -364,11 +410,13 @@ a_field: String?
         ),
         r#"
 query update_b($slug: String) {
-update Policy set { a_field: "x" } where slug = $slug
+match { $x: Policy } where $x.slug = $slug
+update $x set { a_field: "x" }
 }
 
 query update_a($slug: String) {
-update Policy set { a_field: "x" } where slug = $slug
+match { $x: Policy } where $x.slug = $slug
+update $x set { a_field: "x" }
 }
 "#,
         "/tmp/queries.gq",
@@ -394,10 +442,8 @@ edge WorksAt: Person -> Company
         ),
         r#"
 query unemployed() {
-match {
-    $p: Person
-    not { $p worksAt $_ }
-}
+match { $p: Person }
+where not exists { $p worksAt $_ }
 return { $p.name }
 }
 
@@ -443,7 +489,8 @@ edge Partners: Company -> Company
         ),
         r#"
 query delete_person($slug: String) {
-delete Person where slug = $slug
+match { $x: Person } where $x.slug = $slug
+delete $x
 }
 "#,
         "/tmp/queries.gq",
@@ -516,13 +563,13 @@ createdAt: DateTime?
 query describe_doc() {
 match { $d: Doc }
 return {
-    $d.slug
-    $d.count
-    $d.total
-    $d.score
-    $d.tags
-    $d.embedding
-    $d.createdAt
+    $d.slug,
+    $d.count,
+    $d.total,
+    $d.score,
+    $d.tags,
+    $d.embedding,
+    $d.createdAt,
     $d
 }
 }
@@ -547,19 +594,19 @@ return {
     assert_eq!(
         shapes,
         vec![
-            ("slug", QueryValueKind::String, None, None, false),
-            ("count", QueryValueKind::Int, None, None, false),
-            ("total", QueryValueKind::BigInt, None, None, false),
-            ("score", QueryValueKind::Float, None, None, false),
+            ("d.slug", QueryValueKind::String, None, None, false),
+            ("d.count", QueryValueKind::Int, None, None, false),
+            ("d.total", QueryValueKind::BigInt, None, None, false),
+            ("d.score", QueryValueKind::Float, None, None, false),
             (
-                "tags",
+                "d.tags",
                 QueryValueKind::List,
                 Some(QueryValueKind::Date),
                 None,
                 true,
             ),
-            ("embedding", QueryValueKind::Vector, None, Some(3), false,),
-            ("createdAt", QueryValueKind::DateTime, None, None, true,),
+            ("d.embedding", QueryValueKind::Vector, None, Some(3), false,),
+            ("d.createdAt", QueryValueKind::DateTime, None, None, true,),
             ("d", QueryValueKind::Object, None, None, false),
         ]
     );
@@ -568,7 +615,7 @@ return {
     assert_eq!(
         serialized["results"][0]["operation"]["result"][4],
         serde_json::json!({
-            "name": "tags",
+            "name": "d.tags",
             "kind": "list",
             "item_kind": "date",
             "nullable": true
@@ -577,7 +624,7 @@ return {
     assert_eq!(
         serialized["results"][0]["operation"]["result"][5],
         serde_json::json!({
-            "name": "embedding",
+            "name": "d.embedding",
             "kind": "vector",
             "vector_dim": 3,
             "nullable": false
@@ -594,7 +641,7 @@ fn selected_scopes_contribute_every_read_fact_issue_659() {
         let output = lint_query_file(
             &schema,
             &format!(
-                "query q() {{ match {{ $p: Person not {{ $p {selector} $c $c: Company }} }} return {{ $p.name }} }}"
+                "query q() {{ match {{ $p: Person }} where not exists {{ $p {selector} $c, $c: Company }} return {{ $p.name }} }}"
             ),
             "/tmp/queries.gq",
             QueryLintSchemaSource::file("/tmp/schema.pg"),

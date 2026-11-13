@@ -27,7 +27,8 @@ node Doc {
 
 --- mutate
 query delete_doc($s: String) {
-    delete Doc where slug = $s
+    match { $x: Doc } where $x.slug = $s
+    delete $x
 }
 
 --- params
@@ -37,7 +38,8 @@ query delete_doc($s: String) {
 
 --- mutate
 query delete_doc($s: String) {
-    delete Doc where slug = $s
+    match { $x: Doc } where $x.slug = $s
+    delete $x
 }
 
 --- params
@@ -47,7 +49,8 @@ query delete_doc($s: String) {
 
 --- mutate
 query delete_doc($s: String) {
-    delete Doc where slug = $s
+    match { $x: Doc } where $x.slug = $s
+    delete $x
 }
 
 --- params
@@ -57,9 +60,9 @@ query delete_doc($s: String) {
 
 --- query
 query nearest_after_delete($q: Vector(4)) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 

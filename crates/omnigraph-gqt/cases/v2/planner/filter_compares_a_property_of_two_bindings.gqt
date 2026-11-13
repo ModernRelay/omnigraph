@@ -23,11 +23,8 @@ node Person {
 --- query
 set engine = v2;
 query older_pairs() {
-    match {
-        $a: Person
-        $b: Person
-        $a.age > $b.age
-    }
+    match { $a: Person, let $bs = { match { $b: Person } return { $b } }, from $bs }
+    where $a.age > $b.age
     return { $a.name, $b.name }
 }
 
@@ -48,12 +45,10 @@ not pass predicate_pushdown
 --- query
 set engine = v2;
 query nobody_older() {
-    match {
-        $p: Person
-        not {
-            $q: Person
-            $q.age > $p.age
-        }
+    match { $p: Person }
+    where not exists {
+        $q: Person
+        where $q.age > $p.age
     }
     return { $p.name }
 }
@@ -73,10 +68,8 @@ scan Person as $q: no filter
 --- query
 set engine = v2;
 query pushed_into_the_scan() {
-    match {
-        $p: Person
-        $p.age > 20.5
-    }
+    match { $p: Person }
+    where $p.age > 20.5
     return { $p.name }
 }
 
@@ -93,10 +86,8 @@ pass predicate_pushdown
 --- query
 set engine = v2;
 query kept_in_memory_inside_a_negation() {
-    match {
-        $p: Person
-        not { $p.age > 20.5 }
-    }
+    match { $p: Person }
+    where not coalesce($p.age > 20.5, false)
     return { $p.name }
 }
 

@@ -24,10 +24,7 @@ edge Links: Person -> Person
 --- query
 set engine = v2;
 query linked_either_way() {
-    match {
-        $s: Person
-        $s <links> $d
-    }
+    match { $s: Person, $s <links> $d }
     return { $s.name, $d.name }
 }
 

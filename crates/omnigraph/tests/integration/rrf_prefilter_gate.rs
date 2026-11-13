@@ -127,134 +127,147 @@ fn gate_seed_data() -> String {
 const GATE_QUERIES: &str = r#"
 query single_hop_both_bm25($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $c chunkOfArtifact $a
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $c chunkOfArtifact $a,
     }
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 5
 }
 
 query search_filter_single_hop($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $c chunkOfArtifact $a
-        search($c.text, $q1)
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $c chunkOfArtifact $a,
     }
+    where search($c.text, $q1)
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 5
 }
 
 query bm25_secondary_position($v: Vector(4), $q: String) {
     match {
-        $c: Chunk
-        $c chunkOfArtifact $a
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(nearest($all, $c.embedding, $v, k: 5), bm25($all, $c.text, $q), k: 60) as $score,
+      $c: Chunk,
+      $c chunkOfArtifact $a,
     }
     return { $c.slug }
-    order { rrf(nearest($c.embedding, $v), bm25($c.text, $q)) }
+    order { $score desc }
     limit 5
 }
 
 query multi_hop($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $c chunkCites{1,2} $d
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $c chunkCites{1,2} $d,
     }
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 5
 }
 
 query multi_hop_min_two($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $c chunkCites{2,2} $d
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $c chunkCites{2,2} $d,
     }
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 5
 }
 
 query dst_filtered($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $c chunkOfArtifact $a
-        $a.slug = "art-0"
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $c chunkOfArtifact $a,
     }
+    where $a.slug = "art-0"
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 5
 }
 
 query direction_both($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $c <chunkCites> $d
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $c <chunkCites> $d,
     }
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 5
 }
 
 query direction_in($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $d chunkCites $c
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $d chunkCites $c,
     }
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 5
 }
 
 query several_expands($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        $c chunkOfArtifact $a
-        $c chunkCites $d
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
+      $c chunkOfArtifact $a,
+      $c chunkCites $d,
     }
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 5
 }
 
 query antijoin_only($q1: String, $q2: String) {
     match {
-        $c: Chunk
-        not { $c chunkOfArtifact $a }
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
     }
+    where not exists { $a: Artifact, $c chunkOfArtifact $a }
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
-    limit 5
-}
-
-query different_var_arms($q1: String, $q2: String) {
-    match {
-        $c: Chunk
-        $d: Chunk
-        $c chunkOfArtifact $a
-    }
-    return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($d.text, $q2)) }
+    order { $score desc }
     limit 5
 }
 
 query undeclared_ranked_destination($q1: String, $q2: String) {
     match {
-        $d: Chunk
-        $d chunkCites $c
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $d: Chunk,
+      $d chunkCites $c,
     }
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 5
 }
 
 query no_traversal($q1: String, $q2: String) {
     match {
-        $c: Chunk
+      let $all = { match { $c: Chunk } return { $c } },
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
+      $c: Chunk,
     }
     return { $c.slug }
-    order { rrf(bm25($c.text, $q1), bm25($c.text, $q2)) }
+    order { $score desc }
     limit 5
 }
 "#;
@@ -568,9 +581,10 @@ async fn antijoin_only_shape_falls_back() {
     );
 }
 
-/// The Shape fence's remaining rows: arms on different variables and a
-/// traversal-free rrf scan record the Shape reason under force_prefilter. A
-/// ranked traversal destination is no longer one: it roots its component.
+/// The Shape fence's remaining row: a traversal-free rrf scan records the
+/// Shape reason under force_prefilter. A ranked traversal destination is no
+/// longer one: it roots its component, and arms over different variables are
+/// refused at type check.
 #[tokio::test]
 #[serial]
 async fn shape_fence_covers_all_fallback_rows() {
@@ -578,7 +592,7 @@ async fn shape_fence_covers_all_fallback_rows() {
     let db = init_gate_db(&dir).await;
     let text_params = params(&[("$q1", "needle"), ("$q2", "sharp")]);
 
-    for query_name in ["different_var_arms", "no_traversal"] {
+    for query_name in ["no_traversal"] {
         let (_, verdicts, _) = run_forced(&db, "force_prefilter", query_name, &text_params).await;
         assert_eq!(verdicts.len(), 1, "{query_name}: one verdict per rrf run");
         assert_eq!(

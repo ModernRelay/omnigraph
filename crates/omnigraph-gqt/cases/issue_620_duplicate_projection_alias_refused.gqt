@@ -20,103 +20,82 @@ node Pair {
 
 --- query
 query same_alias_twice() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.name as value, $a.num as value }
 }
 
---- expect error: result column `value` is produced by more than one projection
+--- expect error: T25: two return items produce the column `value`; alias one
 
 --- query
 query same_property_twice() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.num, $a.num }
 }
 
---- expect error: result column `a.num` is produced by more than one projection
+--- expect error: T25: two return items produce the column `a.num`; alias one
 
 --- query
 query two_literals() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { 1, 2 }
 }
 
---- expect error: result column `literal` is produced by more than one projection
+--- expect error: T25: two return items produce the column `literal`; alias one
 
 --- query
 query alias_named_like_a_literal() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.num as literal, 2 }
 }
 
---- expect error: result column `literal` is produced by more than one projection
+--- expect error: T25: two return items produce the column `literal`; alias one
 
 --- query
 query property_and_aggregate_over_it() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.name, count($a.name) }
 }
 
---- expect error: result column `a.name` is produced by more than one projection
+--- expect error: T25: two return items produce the column `a.name`; alias one
 
 --- query
 query variable_and_alias_named_like_it() {
-    match {
-        $a: Pair
-        $b: Pair
-    }
+    match { $a: Pair, let $bs = { match { $b: Pair } return { $b } }, from $bs }
     return { $a, $b.name as a }
 }
 
---- expect error: result column `a` is produced by more than one projection
+--- expect error: T25: two return items produce the column `a`; alias one
 
 --- query
 query parameter_and_alias_named_like_it($x: I64) {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $x, $a.name as x }
 }
 
 --- params
 {"x": 1}
 
---- expect error: result column `x` is produced by more than one projection
+--- expect error: T25: two return items produce the column `x`; alias one
 
 --- query
 query two_aggregates_one_alias() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { count($a) as n, sum($a.num) as n }
 }
 
---- expect error: result column `n` is produced by more than one projection
+--- expect error: T25: two return items produce the column `n`; alias one
 
 --- query
 query third_occurrence() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.name as v, $a.num as w, $a.name as v }
 }
 
---- expect error: result column `v` is produced by more than one projection
+--- expect error: T25: two return items produce the column `v`; alias one
 
 --- query
 query distinct_aliases() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.name as who, $a.num as how_many }
 }
 
@@ -129,9 +108,7 @@ how_many: I64
 
 --- query
 query property_and_aliased_aggregate() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { $a.name, count($a.num) as n }
 }
 
@@ -144,9 +121,7 @@ n: I64
 
 --- query
 query two_aliased_literals() {
-    match {
-        $a: Pair
-    }
+    match { $a: Pair }
     return { 1 as one, 2 as two }
 }
 

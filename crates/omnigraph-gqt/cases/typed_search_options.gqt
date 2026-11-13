@@ -1,6 +1,7 @@
 # issue: none
 # notes: Supplied search options must fit their API range; only absent options use defaults.
 # notes: Nullable query and option parameters refuse null before search execution.
+# notes: The `rrf` arms differ only in repeating the term, since identical arms are a type error; both select the one Doc.
 
 --- runner
 timeout_ms: 10000
@@ -21,7 +22,7 @@ node Doc {
 --- query
 set engine = v2;
 query omitted_nullable_fuzzy_option($edits: I64?) {
-    match { $d: Doc fuzzy($d.text, "needle", $edits) }
+    match { $d: Doc } where fuzzy($d.text, "needle", max_edits: $edits)
     return { $d.key }
 }
 --- params
@@ -31,7 +32,7 @@ query omitted_nullable_fuzzy_option($edits: I64?) {
 --- query
 set engine = v2;
 query negative_fuzzy_option($edits: I64) {
-    match { $d: Doc fuzzy($d.text, "needle", $edits) }
+    match { $d: Doc } where fuzzy($d.text, "needle", max_edits: $edits)
     return { $d.key }
 }
 --- params
@@ -41,7 +42,7 @@ query negative_fuzzy_option($edits: I64) {
 --- query
 set engine = v2;
 query oversized_fuzzy_option($edits: U64) {
-    match { $d: Doc fuzzy($d.text, "needle", $edits) }
+    match { $d: Doc } where fuzzy($d.text, "needle", max_edits: $edits)
     return { $d.key }
 }
 --- params
@@ -51,9 +52,9 @@ query oversized_fuzzy_option($edits: U64) {
 --- query
 set engine = v2;
 query null_rrf_option($k: I64?) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
-    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    order { $score desc }
     limit 1
 }
 --- params
@@ -63,9 +64,9 @@ query null_rrf_option($k: I64?) {
 --- query
 set engine = v2;
 query zero_rrf_option($k: I64) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
-    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    order { $score desc }
     limit 1
 }
 --- params
@@ -75,9 +76,9 @@ query zero_rrf_option($k: I64) {
 --- query
 set engine = v2;
 query oversized_rrf_option($k: U64) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
-    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    order { $score desc }
     limit 1
 }
 --- params
@@ -87,9 +88,9 @@ query oversized_rrf_option($k: U64) {
 --- query
 set engine = v2;
 query typed_rrf_option($k: U32) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
-    order { rrf(bm25($d.text, "needle"), bm25($d.text, "needle"), $k) }
+    order { $score desc }
     limit 1
 }
 --- params
@@ -102,7 +103,7 @@ d.key: String
 --- query
 set engine = v2;
 query null_search_query($q: String?) {
-    match { $d: Doc search($d.text, $q) }
+    match { $d: Doc } where search($d.text, $q)
     return { $d.key }
 }
 --- params
@@ -112,9 +113,9 @@ query null_search_query($q: String?) {
 --- query
 set engine = v2;
 query null_bm25_query($q: String?) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $q) as $score }
     return { $d.key }
-    order { bm25($d.text, $q) }
+    order { $score desc }
     limit 1
 }
 --- params
@@ -124,9 +125,9 @@ query null_bm25_query($q: String?) {
 --- query
 set engine = v2;
 query null_nearest_query($q: Vector(2)?) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
     return { $d.key }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 1
 }
 --- params

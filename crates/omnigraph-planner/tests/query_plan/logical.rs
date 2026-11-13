@@ -222,7 +222,7 @@ fn dependent_scan_pushes_exact_search_membership_but_keeps_fuzzy_and_correlation
                 ),
             ];
             if !embedded {
-                pipeline.push(IROp::Filter(filter));
+                pipeline.push(PatternStep::Filter(filter));
             }
             let (plan, _) = planned(&ir(pipeline, vec![prop("b", "slug")], vec![]));
             let destination = plan
@@ -252,12 +252,12 @@ fn dependent_scan_pushes_exact_search_membership_but_keeps_fuzzy_and_correlation
 
 #[test]
 fn sibling_negations_keep_destination_scan_filters_in_their_scopes() {
-    let negation = |value: &str| IROp::AntiJoin {
+    let negation = |value: &str| PatternStep::AntiJoin {
         outer_var: "a".to_string(),
         predicate: omnigraph_compiler::ir::SubqueryPredicate::not_exists(),
         inner: vec![
             expand("a", "x", vec![]),
-            IROp::Filter(IRExpr::comparison(
+            PatternStep::Filter(IRExpr::comparison(
                 prop("x", "state"),
                 CompOp::Eq,
                 IRExpr::Literal(
@@ -307,7 +307,7 @@ fn a_search_filter_reading_a_second_binding_is_not_placed_on_a_root_scan() {
         vec![
             scan("a"),
             scan("b"),
-            IROp::Filter(IRExpr::comparison(
+            PatternStep::Filter(IRExpr::comparison(
                 IRExpr::Search {
                     field: Box::new(prop("b", "text")),
                     query: Box::new(prop("a", "probe")),
@@ -383,7 +383,7 @@ fn rejected_scalar_filters_stay_above_root_and_dependent_scans() {
                     ),
                 ]
             } else {
-                vec![IROp::NodeScan {
+                vec![PatternStep::NodeScan {
                     variable: "a".into(),
                     type_name: "T".into(),
                     filters: if embedded {
@@ -394,7 +394,7 @@ fn rejected_scalar_filters_stay_above_root_and_dependent_scans() {
                 }]
             };
             if !embedded {
-                pipeline.push(IROp::Filter(filter));
+                pipeline.push(PatternStep::Filter(filter));
             }
             let op = ir(pipeline, vec![prop(binding, "slug")], vec![]);
             let source = RefusingSource(source());

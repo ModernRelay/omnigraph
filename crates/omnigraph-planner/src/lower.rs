@@ -186,6 +186,16 @@ pub trait Lower {
 
     fn limit(&mut self, id: NodeId, rows: usize, input: Self::Op) -> Result<Self::Op, Self::Error>;
 
+    /// The rows of the first `targets` distinct `binding` identities of an
+    /// input sorted by score then identity.
+    fn target_cut(
+        &mut self,
+        id: NodeId,
+        binding: &str,
+        targets: usize,
+        input: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
     fn page(
         &mut self,
         id: NodeId,
@@ -458,6 +468,14 @@ impl PhysicalPlan {
             PhysicalNode::Limit { input, rows } => {
                 let input = self.lower_node(*input, l)?;
                 l.limit(id, *rows, input)
+            }
+            PhysicalNode::TargetCut {
+                input,
+                binding,
+                targets,
+            } => {
+                let input = self.lower_node(*input, l)?;
+                l.target_cut(id, binding, *targets, input)
             }
             PhysicalNode::Page {
                 input,

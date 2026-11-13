@@ -32,7 +32,7 @@ edge Link: Number -> Number {
 --- query
 set engine = v2;
 query integer_node_literal() {
-    match { $x: Number $x.n > 9007199254740992.0 }
+    match { $x: Number } where $x.n > 9007199254740992.0
     return { $x.key }
 }
 --- expect unordered
@@ -48,7 +48,7 @@ type $x.n: I64
 --- query
 set engine = v2;
 query integer_edge_literal() {
-    match { $x: Number $x $e:link $y $e.n > 9007199254740992.0 }
+    match { $x: Number, $x $e:link $y } where $e.n > 9007199254740992.0
     return { $x.key }
 }
 --- expect unordered
@@ -79,7 +79,7 @@ no cast $x.n
 --- query
 set engine = v2;
 query f32_node_nonrepresentable_literal() {
-    match { $x: Number $x.f = 0.1 }
+    match { $x: Number } where $x.f = 0.1
     return { $x.key }
 }
 --- expect unordered
@@ -92,7 +92,7 @@ type 0.1: F64
 --- query
 set engine = v2;
 query f32_edge_nonrepresentable_literal() {
-    match { $x: Number $x $e:link $y $e.f = 0.1 }
+    match { $x: Number, $x $e:link $y } where $e.f = 0.1
     return { $x.key }
 }
 --- expect unordered
@@ -105,7 +105,7 @@ type 0.1: F64
 --- query
 set engine = v2;
 query f32_exact_literal() {
-    match { $x: Number $x.f = 0.10000000149011612 }
+    match { $x: Number } where $x.f = 0.10000000149011612
     return { $x.key }
 }
 --- expect unordered
@@ -119,7 +119,7 @@ no cast $x.f
 --- query
 set engine = v2;
 query declared_f64_parameter($bound: F64) {
-    match { $x: Number $x.f = $bound }
+    match { $x: Number } where $x.f = $bound
     return { $x.key }
 }
 --- params
@@ -134,7 +134,7 @@ type $bound: F64
 --- query
 set engine = v2;
 query declared_f64_parameter($bound: F64) {
-    match { $x: Number $x.f = $bound }
+    match { $x: Number } where $x.f = $bound
     return { $x.key }
 }
 --- params
@@ -150,7 +150,7 @@ type $bound: F64
 --- query
 set engine = v2;
 query declared_f32_parameter($bound: F32) {
-    match { $x: Number $x.f = $bound }
+    match { $x: Number } where $x.f = $bound
     return { $x.key }
 }
 --- params
@@ -167,7 +167,7 @@ type $bound: F32
 --- query
 set engine = v2;
 query integer_fractional_literal() {
-    match { $x: Number $x.small > 2.5 }
+    match { $x: Number } where $x.small > 2.5
     return { $x.key }
 }
 --- expect unordered
@@ -181,7 +181,7 @@ type 2.5: F64
 --- query
 set engine = v2;
 query unsigned_negative_parameter($bound: I64) {
-    match { $x: Number $x.u > $bound }
+    match { $x: Number } where $x.u > $bound
     return { $x.key }
 }
 --- params
@@ -199,7 +199,7 @@ cast $bound: I64 -> exact_integer
 set engine = v2;
 query signed_list_exact_literal() {
     match { $x: Number }
-    return { $x.key, $x.ns contains 9007199254740992.0 as member }
+    return { $x.key, 9007199254740992.0 in $x.ns as member }
 }
 --- expect unordered
 {"x.key":"a","member":false}
@@ -247,7 +247,7 @@ type [9007199254740992.0, 1.5]: [F64]
 set engine = v2;
 query unsigned_list_negative_needle($needle: I64) {
     match { $x: Number }
-    return { $x.key, $x.us contains $needle as member }
+    return { $x.key, $needle in $x.us as member }
 }
 --- params
 {"needle":-1}
@@ -264,7 +264,7 @@ cast $needle: I64 -> exact_integer
 --- query
 set engine = v2;
 query f32_list_nonrepresentable_needle() {
-    match { $x: Number $x.fs contains 0.1 }
+    match { $x: Number } where 0.1 in $x.fs
     return { $x.key }
 }
 --- expect unordered

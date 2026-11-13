@@ -24,7 +24,7 @@ node Person {
 --- query
 set engine = v2;
 query trailing($s: String) {
-    match { $p: Person $p.slug = $s }
+    match { $p: Person } where $p.slug = $s
     return { $p.age }
 }
 --- params
@@ -40,7 +40,7 @@ pass key_to_id
 --- query
 set engine = v2;
 query slashed($s: String) {
-    match { $p: Person $p.slug = $s }
+    match { $p: Person } where $p.slug = $s
     return { $p.age }
 }
 --- params
@@ -56,7 +56,7 @@ pass key_to_id
 --- query
 set engine = v2;
 query long_key($s: String) {
-    match { $p: Person $p.slug = $s }
+    match { $p: Person } where $p.slug = $s
     return { $p.age }
 }
 --- params

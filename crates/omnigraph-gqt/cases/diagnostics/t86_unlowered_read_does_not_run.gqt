@@ -1,0 +1,67 @@
+# issue: none
+# notes: A read whose term this release's planner does not lower is refused at type check with `T86`, naming the stage that adds it:
+# notes: an `optional` (stage B) and a read that calls itself (`Fix`, stage Rec); nothing executes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+interface Named { name: String }
+node Person implements Named {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company implements Named {
+    slug: String @key
+    name: String
+}
+node Doc {
+    id: String @key
+    title: String
+    body: String @index
+    year: I32
+    tags: [String]
+    embedding: Vector(3)?
+    payload: Blob?
+}
+node Collection {
+    slug: String @key
+    min_docs: I32
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Knows: Person -> Person
+edge Authored: Person -> Doc
+edge Cites: Doc -> Doc
+edge In: Doc -> Collection
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+
+--- query
+query q($h: String) { match { $p: Person, optional { $p knows $q } } where $p.handle = $h return { $p.name } }
+
+--- params
+{"h": "ada"}
+
+--- expect error: type error: T86: `q`: this release's planner does not lower a `Union` in a pattern (an `optional`, or a `from` over `union`); stage B (the break) adds it
+
+--- query
+query reachable($from: String) {
+    match {
+        from union(
+            { match { $p: Person } where $p.handle = $from return { $p as q } },
+            { match { from reachable($from), $r: Person, $q knows $r } return { $r as q } }),
+    }
+    return distinct { $q }
+}
+
+--- params
+{"from": "ada"}
+
+--- expect error: type error: T86: `reachable`: this release's planner does not lower a read that calls itself (`Fix`); stage Rec (recursion, the `Fix` evaluator) adds it

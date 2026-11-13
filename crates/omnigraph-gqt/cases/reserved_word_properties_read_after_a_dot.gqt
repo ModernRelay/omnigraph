@@ -23,7 +23,7 @@ node Person {
 
 --- query
 query read_and_after_a_dot() {
-    match { $p: Person  $p.and = 1 }
+    match { $p: Person } where $p.and = 1
     return { $p.slug, $p.and }
 }
 
@@ -36,7 +36,7 @@ p.and: I64
 
 --- query
 query read_is_after_a_dot() {
-    match { $p: Person  $p.is = 1 }
+    match { $p: Person } where $p.is = 1
     return { $p.slug, $p.is }
 }
 
@@ -50,7 +50,7 @@ p.is: I64
 --- query
 set engine = v2;
 query both_in_one_expression() {
-    match { $p: Person  $p.and = 1 or $p.is = 1 }
+    match { $p: Person } where ($p.and = 1 or $p.is = 1)
     return { $p.slug }
 }
 
@@ -70,7 +70,7 @@ query assign_bare() {
 
 --- query
 query inline_match_bare() {
-    match { $p: Person { and: 1 } }
+    match { $p: Person } where $p.and = 1
     return { $p.slug }
 }
 
@@ -84,7 +84,7 @@ p.slug: String
 --- query
 set engine = v2;
 query is_property_before_is_null() {
-    match { $p: Person  $p.is is not null }
+    match { $p: Person } where $p.is is not null
     return { $p.slug }
 }
 

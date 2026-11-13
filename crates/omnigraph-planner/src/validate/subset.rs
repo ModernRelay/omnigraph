@@ -19,9 +19,11 @@
 
 use std::collections::BTreeSet;
 
+use crate::read_shape::{PatternStep, ReadShape};
 use omnigraph_compiler::catalog::NodeType;
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR};
-use omnigraph_compiler::query::ast::{BinaryOp, CompOp, Literal};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
+use omnigraph_compiler::query::value::SCORE_COLUMN;
+use omnigraph_compiler::query::value::{BinaryOp, CompOp, Literal};
 use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 use serde::{Deserialize, Serialize};
 
@@ -197,7 +199,7 @@ pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
         return None;
     }
     let mut pipeline = ir.pipeline.iter();
-    let Some(IROp::NodeScan {
+    let Some(PatternStep::NodeScan {
         variable,
         type_name,
         filters,
@@ -215,7 +217,7 @@ pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
     }
     for op in pipeline {
         match op {
-            IROp::Filter(filter) if fragment.predicate(filter) => {}
+            PatternStep::Filter(filter) if fragment.predicate(filter) => {}
             _ => return None,
         }
     }
@@ -234,22 +236,16 @@ pub(crate) fn membership(input: &AcceptInput<'_>) -> Option<Member> {
         };
         fragment.property(variable, property)?;
     }
-    // The lowering makes a projected `bm25()` its score column; the
-    // declaration says which call it was.
-    let decl = input.checked.decl();
-    let written_lead = decl.order_clause.first().map(|key| &key.expr);
-    for (index, projection) in ir.return_exprs.iter().enumerate() {
+    // A projected `bm25()` reads its score column under the ranked binding.
+    for projection in &ir.return_exprs {
         let direct = match &projection.expr {
             IRExpr::PropAccess {
                 variable, property, ..
             } if fragment.property(variable, property).is_some() => true,
-            _ => {
-                ranked
-                    && decl
-                        .return_clause
-                        .get(index)
-                        .is_some_and(|written| Some(&written.expr) == written_lead)
-            }
+            IRExpr::PropAccess {
+                variable, property, ..
+            } => ranked && variable == fragment.binding && property == SCORE_COLUMN,
+            _ => false,
         };
         if !direct {
             return None;
@@ -686,7 +682,7 @@ pub(crate) fn check(
 /// leading `bm25()`, the projection, the sort of the remaining keys with the
 /// identity tie-break the comparator requires, and the limit.
 fn canonical(
-    ir: &QueryIR,
+    ir: &ReadShape,
     plan: &PhysicalPlan,
     member: &Member,
     input: &AcceptInput<'_>,
@@ -697,8 +693,8 @@ fn canonical(
     let mut conjuncts: Vec<IRExpr> = Vec::new();
     for op in &ir.pipeline {
         let filters: Vec<IRExpr> = match op {
-            IROp::NodeScan { filters, .. } => filters.clone(),
-            IROp::Filter(filter) => vec![filter.clone()],
+            PatternStep::NodeScan { filters, .. } => filters.clone(),
+            PatternStep::Filter(filter) => vec![filter.clone()],
             _ => Vec::new(),
         };
         for conjunct in filters.into_iter().flat_map(IRExpr::into_conjuncts) {
@@ -776,7 +772,7 @@ fn canonical(
 /// The identity tie-break of the canonical sort: the binding's id unless
 /// every returned expression is an order key (rows that tie are then
 /// indistinguishable) or the id is a key itself.
-fn canonical_tiebreak(ir: &QueryIR, member: &Member, input: &AcceptInput<'_>) -> Vec<ColumnRef> {
+fn canonical_tiebreak(ir: &ReadShape, member: &Member, input: &AcceptInput<'_>) -> Vec<ColumnRef> {
     let keys: Vec<String> = ir.order_by.iter().map(|key| key.expr.to_string()).collect();
     let covered = ir
         .return_exprs

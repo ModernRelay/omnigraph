@@ -23,7 +23,7 @@ use omnigraph_api_types::{
     schema_apply_output, show_read_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::query::ast::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
+use omnigraph_compiler::query::file::{BranchCreateFrom, BranchRead, BranchWrite, CommitWrite};
 use omnigraph_compiler::query::parser::parse_query;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::{Method, StatusCode};
@@ -1657,7 +1657,7 @@ impl GraphClient {
         &self,
         branch: Option<&str>,
         query_source: &str,
-        stmt: omnigraph_compiler::query::ast::LoadStmt,
+        stmt: omnigraph_compiler::query::file::LoadStmt,
         external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
         settings: &[(SettingId, SettingValue)],
         stderr: &mut dyn Write,
@@ -2011,7 +2011,7 @@ impl GraphClient {
         &self,
         target: ReadTarget,
         query_source: &str,
-        stmt: omnigraph_compiler::query::ast::LoadStmt,
+        stmt: omnigraph_compiler::query::file::LoadStmt,
         external_blob_policy: Option<omnigraph::ExternalBlobPolicy>,
         settings: &[(SettingId, SettingValue)],
     ) -> Result<ReadOutput> {

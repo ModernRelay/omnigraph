@@ -23,7 +23,7 @@ node Job {
 --- query
 set engine = v2;
 query jobs_with_a_real_operator() {
-    match { $j: Job $o: @Operator $j.uses = $o.name }
+    match { $j: Job, let $os = { match { $o: @Operator } return { $o } }, from $os } where $j.uses = $o.name
     return { $j.name, $o.inputs }
     order { $j.name }
 }
@@ -39,10 +39,8 @@ o.inputs: [I64]
 --- query
 set engine = v2;
 query jobs_naming_no_operator() {
-    match {
-        $j: Job
-        not { $o: @Operator $o.name = $j.uses }
-    }
+    match { $j: Job }
+    where not exists { $o: @Operator where $o.name = $j.uses }
     return { $j.name }
 }
 
@@ -54,7 +52,8 @@ j.name: String
 
 --- mutate
 query rename_scan() {
-    update @Operator set { name: "Read" } where name = "Scan"
+    match { $x: @Operator } where $x.name = "Scan"
+    update $x set { name: "Read" }
 }
 
 --- expect error: catalogue type `@Operator` is read-only
@@ -69,11 +68,11 @@ query add_operator() {
 --- query
 set engine = v2;
 query search_operators($q: String) {
-    match { $o: @Operator match_text($o.name, $q) }
+    match { $o: @Operator } where match_text($o.name, $q)
     return { $o.name }
 }
 
 --- params
 {"q":"scan"}
 
---- expect error: match_text cannot target catalogue binding `$o: @Operator`
+--- expect error: T27: `match_text` needs a full-text index on `@Operator.name`

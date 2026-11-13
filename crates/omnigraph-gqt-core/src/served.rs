@@ -11,7 +11,7 @@ use omnigraph_api_types::{
     BranchMergeOutcome, BranchOutcomeOutput, ChangeOutput, ChangeRequest, HTTP_API_CONTRACT,
     HTTP_API_CONTRACT_HEADER, IngestRequest, QueryRequest, ReadOutput, SchemaOutput,
 };
-use omnigraph_compiler::query::ast::{BranchCreateFrom, show_statement_name};
+use omnigraph_compiler::query::file::{BranchCreateFrom, show_statement_name};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -91,9 +91,6 @@ pub fn admit_served(case: &Case) -> Result<(), String> {
             Step::Query(query) => {
                 if query.plan.is_some() {
                     refused.push(format!("step {ordinal} (expect plan)"));
-                }
-                if query.same_as_v1 {
-                    refused.push(format!("step {ordinal} (expect same as v1)"));
                 }
             }
             Step::Control(control) => {

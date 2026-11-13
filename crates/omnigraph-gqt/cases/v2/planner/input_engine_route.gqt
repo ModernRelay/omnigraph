@@ -1,6 +1,6 @@
 # issue: none
-# notes: inventory sweep, input class `engine`: the same query on the v2 plan runner
-# notes: and on the reference engine returns the same rows.
+# notes: inventory sweep, input class `engine`: the query's rows and its plan line
+# notes: under `set engine = v2`.
 
 --- runner
 timeout_ms: 10000
@@ -25,11 +25,8 @@ edge Knows: Person -> Person
 --- query
 set engine = v2;
 query older_friends($min: I64) {
-    match {
-        $p: Person
-        $p knows $q
-        $q.age > $min
-    }
+    match { $p: Person, $p knows $q }
+    where $q.age > $min
     return { $p.name, $q.name }
     order { $p.name }
 }
@@ -43,4 +40,3 @@ p.name: String
 q.name: String
 --- expect plan
 expand $p Knows $q: mode indexed_scan ran indexed_scan
---- expect same as v1

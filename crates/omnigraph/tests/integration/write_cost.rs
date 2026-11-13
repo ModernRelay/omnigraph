@@ -908,7 +908,7 @@ async fn load_csv_reuses_endpoint_reads_and_falls_back_under_a_small_pool() {
     use omnigraph::loader::{CsvLoadRequest, LoadMode};
     use omnigraph::settings::{SettingId, SettingValue, Source};
     use omnigraph::{ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
 
     const SCHEMA: &str = "node Person { name: String @key }\nedge Knows: Person -> Person\n";
     const PEOPLE: &str = r#"{"type":"Person","data":{"name":"Alice"}}

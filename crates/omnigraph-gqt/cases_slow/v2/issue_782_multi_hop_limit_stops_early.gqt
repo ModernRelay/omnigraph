@@ -1,5 +1,5 @@
 # issue: 782
-# red_on: 3cdf10ef; step 1 (query) fails with `resource limit exceeded for query_memory_bytes: actual 157286414, limit 157286400`, while engine v1 returns the row.
+# red_on: 3cdf10ef; step 1 (query) fails with `resource limit exceeded for query_memory_bytes: actual 157286414, limit 157286400`.
 # notes: 1024 sources know one hub and the hub knows 1024 targets: 1,050,624
 # notes: one-or-two-hop pairs, more than the default 150 MiB query budget admits when
 # notes: the expand keeps every pair (about 214 bytes each on the red commit, 225 MB
@@ -4125,10 +4125,7 @@ edge Knows: Person -> Person
 --- query
 set engine = v2;
 query any_reached() {
-    match {
-        $p: Person
-        $p knows{1,2} $f
-    }
+    match { $p: Person, $p knows{1,2} $f }
     return { $f.role }
     limit 1
 }
@@ -4141,10 +4138,7 @@ f.role: String
 --- query
 set engine = v2;
 query pair_count() {
-    match {
-        $p: Person
-        $p knows{1,2} $f
-    }
+    match { $p: Person, $p knows{1,2} $f }
     return { count($f) as n }
 }
 

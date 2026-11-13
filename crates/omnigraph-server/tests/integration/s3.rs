@@ -166,7 +166,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
         .unwrap();
         fs::write(
             dir.path().join("people.gq"),
-            "query find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+            "query find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
         )
         .unwrap();
         fs::write(
@@ -361,7 +361,7 @@ async fn server_boots_azure_cluster_from_bare_storage_uri_and_serves_query() {
         .unwrap();
         fs::write(
             dir.path().join("people.gq"),
-            "query find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+            "query find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
         )
         .unwrap();
         fs::write(

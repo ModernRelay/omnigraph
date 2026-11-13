@@ -43,7 +43,7 @@ query add_bob() {
 
 --- query
 query bob_by_key() {
-    match { $p: Person { name: "bob" } }
+    match { $p: Person } where $p.name = "bob"
     return { $p.name, $p.age }
 }
 

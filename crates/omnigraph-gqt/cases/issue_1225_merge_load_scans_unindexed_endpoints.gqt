@@ -56,7 +56,7 @@ load validate edge_ri edge:Knows to Person: access scan
 load executed: partitions 1 rows 2
 
 --- query
-query loaded() { match { $a: Person $a knows $b } return { count($b) as n } }
+query loaded() { match { $a: Person, $a knows $b } return { count($b) as n } }
 --- expect unordered
 {"n": 6}
 --- expect shape

@@ -26,7 +26,8 @@ branch create parent
 
 --- mutate branch: parent
 query parent_writes() {
-    update Person set { age: 31 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 31 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -112,7 +113,8 @@ branch delete child
 
 --- mutate branch: parent
 query recreated_parent_writes() {
-    update Person set { age: 90 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 90 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -140,7 +142,8 @@ p.age: I32
 
 --- mutate branch: grandchild
 query grandchild_writes_after_both_ancestor_names_are_reused() {
-    update Person set { age: 32 } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: 32 }
 }
 
 --- expect affected: nodes=1 edges=0

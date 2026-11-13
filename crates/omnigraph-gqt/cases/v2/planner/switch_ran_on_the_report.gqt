@@ -47,11 +47,8 @@ edge Links: Source -> Doc
 --- query
 set engine = v2;
 query open_links() {
-    match {
-        $s: Source
-        $s links $d
-        $d: Doc { state: "open" }
-    }
+    match { $s: Source, $s links $d, $d: Doc }
+    where $d.state = "open"
     return { $s.slug, $d.slug }
     order { $s.slug, $d.slug }
 }

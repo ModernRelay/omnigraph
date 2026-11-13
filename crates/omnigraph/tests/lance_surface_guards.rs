@@ -9278,7 +9278,7 @@ async fn row_identity_discovery_stamps_row_ids_and_rewrites_lance_13() {
 
     db.mutate(
         "main",
-        "query d() { delete Person where name = \"p003\" }",
+        "query d() { match { $x: Person } where $x.name = \"p003\"  delete $x }",
         "d",
         &omnigraph_compiler::ir::ParamMap::new(),
     )

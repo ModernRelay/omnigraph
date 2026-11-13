@@ -130,10 +130,8 @@ async fn ordering_parallel_edge_tie_breaks_by_physical_edge_id() {
 
     let q = r#"
 query q() {
-    match {
-        $p: Person { name: "Alice" }
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
+    where $p.name = "Alice"
     return { $w.label }
     order { $p.age asc }
 }

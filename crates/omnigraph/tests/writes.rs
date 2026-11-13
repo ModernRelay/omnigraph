@@ -125,6 +125,48 @@ async fn mutation_does_not_create_run_branch() {
     );
 }
 
+/// A write group whose selection is a traversal runs it against the write's
+/// snapshot: when it selects no row the write stages nothing and publishes no
+/// commit, and when it selects rows it publishes exactly one.
+#[tokio::test]
+async fn traversal_selection_publishes_once_or_not_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    let query = "query age_friends($name: String) { \
+                 match { $p: Person, $p knows $f } where $p.name = $name \
+                 update $f set { age: 1 } }";
+    let head = head_commit_id(uri).await;
+
+    let none = db
+        .mutate_with_receipt(
+            "main",
+            query,
+            "age_friends",
+            &params(&[("$name", "Nobody")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (none.result.affected_nodes, none.result.affected_edges),
+        (0, 0)
+    );
+    assert!(
+        none.commit.is_none(),
+        "an empty selection publishes nothing"
+    );
+    assert_eq!(head_commit_id(uri).await, head);
+
+    let some = db
+        .mutate_with_receipt("main", query, "age_friends", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(some.result.affected_nodes, 2, "Alice knows Bob and Charlie");
+    let commit = some.commit.expect("an effectful selection publishes once");
+    assert_eq!(commit.parent_commit_id.as_deref(), Some(head.as_str()));
+    assert_eq!(head_commit_id(uri).await, commit.graph_commit_id);
+}
+
 /// A failed mutation (validation error mid-query) leaves the target branch's
 /// observable state unchanged. There is nothing for cleanup to delete.
 #[tokio::test]
@@ -631,7 +673,8 @@ query insert_then_update_same_person(
     $name: String, $insert_age: I32, $update_age: I32
 ) {
     insert Person { name: $name, age: $insert_age }
-    update Person set { age: $update_age } where name = $name
+    match { $x: Person } where $x.name = $name
+    update $x set { age: $update_age }
 }
 
 query insert_two_friends($from: String, $a: String, $b: String) {
@@ -647,29 +690,37 @@ query person_with_two_friends($name: String, $age: I32, $a: String, $b: String) 
 
 query mixed_insert_and_delete($name: String, $age: I32, $victim: String) {
     insert Person { name: $name, age: $age }
-    delete Person where name = $victim
+    match { $x: Person } where $x.name = $victim
+    delete $x
 }
 
 query update_then_filter_by_old_value(
     $first_name: String, $first_new_age: I32,
     $second_threshold: I32, $second_new_age: I32
 ) {
-    update Person set { age: $first_new_age } where name = $first_name
-    update Person set { age: $second_new_age } where age > $second_threshold
+    match { $x: Person } where $x.name = $first_name
+    update $x set { age: $first_new_age }
+    match { $x: Person } where $x.age > $second_threshold
+    update $x set { age: $second_new_age }
 }
 
 query delete_two_persons($first: String, $second: String) {
-    delete Person where name = $first
-    delete Person where name = $second
+    match { $x: Person } where $x.name = $first
+    delete $x
+    match { $x: Person } where $x.name = $second
+    delete $x
 }
 
 query delete_overlapping_persons($name: String, $threshold: I32) {
-    delete Person where name = $name
-    delete Person where age > $threshold
+    match { $x: Person } where $x.name = $name
+    delete $x
+    match { $x: Person } where $x.age > $threshold
+    delete $x
 }
 
 query update_age_by_name($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
+    match { $x: Person } where $x.name = $name
+    update $x set { age: $age }
 }
 "#;
 
@@ -1105,7 +1156,7 @@ async fn write_max_bytes_checks_inline_and_repeated_external_payloads_before_rea
 #[tokio::test(start_paused = true)]
 async fn load_csv_source_read_is_bounded_by_the_deadline() {
     use omnigraph::loader::{CSV_SOURCE_READ_DEADLINE, CsvLoadRequest, LoadMode};
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     const SCHEMA: &str = "node Person { id: I64 @key name: String }";
     let dir = tempfile::tempdir().unwrap();
     let csv_path = dir.path().join("people.csv");
@@ -1183,7 +1234,7 @@ async fn load_csv_source_read_is_bounded_by_the_deadline() {
 async fn load_csv_refuses_a_source_replaced_between_probe_and_read() {
     use omnigraph::instrumentation::{ExternalPayloadReadHold, with_external_payload_read_held};
     use omnigraph::loader::{CsvLoadRequest, LoadMode};
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     const SCHEMA: &str = "node Person { id: I64 @key name: String }";
     let dir = tempfile::tempdir().unwrap();
     let csv_path = dir.path().join("people.csv");
@@ -1263,7 +1314,7 @@ async fn load_csv_refuses_a_source_replaced_between_probe_and_read() {
 async fn explain_load_answers_the_plan_without_reading_the_source() {
     use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
     use omnigraph::settings::{SettingId, SettingValue, Source};
-    use omnigraph_compiler::query::ast::{FileBody, LoadStmt};
+    use omnigraph_compiler::query::file::{FileBody, LoadStmt};
     use omnigraph_compiler::query::parser::parse_query;
     const SCHEMA: &str = "node Person { id: I64 @key name: String }";
     let dir = tempfile::tempdir().unwrap();
@@ -1394,7 +1445,7 @@ async fn explain_load_answers_the_plan_without_reading_the_source() {
 async fn load_csv_statement_probes_and_reads_its_source_once() {
     use omnigraph::instrumentation::{MergeWriteProbes, with_merge_write_probes};
     use omnigraph::loader::{CsvLoadRequest, LoadMode};
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     const SCHEMA: &str = "node Person { id: I64 @key name: String }";
     let dir = tempfile::tempdir().unwrap();
     let csv_path = dir.path().join("people.csv");
@@ -1461,7 +1512,7 @@ async fn load_csv_statement_probes_and_reads_its_source_once() {
 #[tokio::test]
 async fn load_csv_overwrite_admits_compact_keys_under_default_memory() {
     use omnigraph::loader::CsvLoadRequest;
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     use std::io::Write;
 
     const ROWS: usize = 400_000;
@@ -1525,7 +1576,7 @@ async fn load_csv_overwrite_admits_compact_keys_under_default_memory() {
 async fn load_csv_overwrite_from_many_slices_keeps_source_order() {
     use omnigraph::instrumentation::with_csv_slice_bytes;
     use omnigraph::loader::CsvLoadRequest;
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
     use std::io::Write;
 
     const ROWS: usize = 2_000;
@@ -1622,7 +1673,7 @@ async fn load_csv_overwrite_from_many_slices_keeps_source_order() {
 async fn load_csv_overwrite_refuses_a_first_record_longer_than_the_head_range() {
     use omnigraph::instrumentation::with_csv_slice_bytes;
     use omnigraph::loader::CsvLoadRequest;
-    use omnigraph_compiler::query::ast::LoadTarget;
+    use omnigraph_compiler::query::file::LoadTarget;
 
     const HEAD_RANGE: usize = 64 * 1024;
     let source_dir = tempfile::tempdir().unwrap();
@@ -1684,7 +1735,8 @@ async fn mutation_update_row_cap_accepts_limit_and_rejects_one_over_pre_effect()
     const SCHEMA: &str = "node Thing { key: String @key marked: Bool? }\n";
     const UPDATE_ALL: &str = r#"
 query update_all() {
-    update Thing set { marked: true } where key != ""
+    match { $x: Thing } where $x.key != ""
+    update $x set { marked: true }
 }
 "#;
 
@@ -1781,12 +1833,15 @@ node Document {
 "#;
     const UPDATE: &str = r#"
 query update_note($note: String) {
-    update Document set { note: $note } where title = "wide"
-    update Document set { note: $note } where title = "nobody"
+    match { $x: Document } where $x.title = "wide"
+    update $x set { note: $note }
+    match { $x: Document } where $x.title = "nobody"
+    update $x set { note: $note }
 }
 
 query patch_note($note: String) {
-    update Document set { note: $note } where title = "wide"
+    match { $x: Document } where $x.title = "wide"
+    update $x set { note: $note }
 }
 "#;
 
@@ -1918,7 +1973,8 @@ query patch_note($note: String) {
 
     const REPLACE: &str = r#"
 query replace_content($c: Blob) {
-    update Document set { content: $c } where title = "wide"
+    match { $x: Document } where $x.title = "wide"
+    update $x set { content: $c }
 }
 "#;
     let probes = omnigraph::instrumentation::MergeWriteProbes::default();
@@ -1971,12 +2027,15 @@ node Document {
 "#;
     const UPDATE: &str = r#"
 query update_shelf($note: String) {
-    update Document set { note: $note } where shelf = "a"
-    update Document set { note: $note } where title = "nobody"
+    match { $x: Document } where $x.shelf = "a"
+    update $x set { note: $note }
+    match { $x: Document } where $x.title = "nobody"
+    update $x set { note: $note }
 }
 
 query patch_shelf($note: String) {
-    update Document set { note: $note } where shelf = "a"
+    match { $x: Document } where $x.shelf = "a"
+    update $x set { note: $note }
 }
 "#;
 
@@ -2375,7 +2434,8 @@ edge Attachment: Document -> Document {
 "#;
     const CLEAR_BOTH: &str = r#"
 query clear_both($content: Blob?, $preview: Blob?) {
-    update Document set { content: $content, preview: $preview } where title = "by-update"
+    match { $x: Document } where $x.title = "by-update"
+    update $x set { content: $content, preview: $preview }
 }
 "#;
 
@@ -2484,7 +2544,7 @@ query clear_both($content: Blob?, $preview: Blob?) {
     for name in ["content", "preview"] {
         nulls.insert(
             name.to_string(),
-            omnigraph_compiler::query::ast::Literal::Null,
+            omnigraph_compiler::query::value::Literal::Null,
         );
     }
     db.mutate("main", CLEAR_BOTH, "clear_both", &nulls)
@@ -2509,16 +2569,20 @@ node Document {
 "#;
     const MUTATIONS: &str = r#"
 query update_note($note: String) {
-    update Document set { note: $note } where title = "doc"
+    match { $x: Document } where $x.title = "doc"
+    update $x set { note: $note }
 }
 
 query update_note_beside_another($note: String) {
-    update Document set { note: $note } where title = "doc"
-    update Document set { note: $note } where title = "nobody"
+    match { $x: Document } where $x.title = "doc"
+    update $x set { note: $note }
+    match { $x: Document } where $x.title = "nobody"
+    update $x set { note: $note }
 }
 
 query set_content($c: Blob?) {
-    update Document set { content: $c } where title = "doc"
+    match { $x: Document } where $x.title = "doc"
+    update $x set { content: $c }
 }
 "#;
 
@@ -2669,7 +2733,7 @@ query set_content($c: Blob?) {
     let mut null_params = omnigraph_compiler::ir::ParamMap::new();
     null_params.insert(
         "c".to_string(),
-        omnigraph_compiler::query::ast::Literal::Null,
+        omnigraph_compiler::query::value::Literal::Null,
     );
     let result = db
         .mutate("main", MUTATIONS, "set_content", &null_params)
@@ -2717,20 +2781,13 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
         )
         .await
         .expect_err("D₂ must reject mixed insert+delete");
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected Manifest error, got {err:?}");
-    };
     assert!(
-        manifest_err.message.contains("inserts/updates and deletes"),
-        "unexpected error message: {}",
-        manifest_err.message,
+        err.to_string().contains("T76"),
+        "the type checker refuses the mixed write: {err}"
     );
     assert!(
-        manifest_err
-            .message
-            .contains("split into separate mutations"),
-        "error message should direct user to split: {}",
-        manifest_err.message,
+        err.to_string().contains("split it into separate mutations"),
+        "error message should direct user to split: {err}"
     );
 
     // No I/O — counts unchanged, branches unchanged.
@@ -2805,8 +2862,10 @@ async fn removed_ids_summed_across_types_refuse_delete_and_overwrite_before_stag
     const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\nedge WorksAt: Person -> Company\n";
     const TABLES: [&str; 2] = ["node:Person", "node:Company"];
     const CLEAR: &str = r#"query clear() {
-        delete Person where name != ""
-        delete Company where name != ""
+        match { $x: Person } where $x.name != ""
+        delete $x
+        match { $x: Company } where $x.name != ""
+        delete $x
     }"#;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2897,7 +2956,7 @@ async fn removed_ids_summed_across_types_refuse_delete_and_overwrite_before_stag
     let removed = db
         .mutate(
             "main",
-            r#"query one() { delete Person where name = "small" }"#,
+            r#"query one() { match { $x: Person } where $x.name = "small"  delete $x }"#,
             "one",
             &params(&[]),
         )
@@ -2944,7 +3003,7 @@ edge Right: Hub -> Leaf
     let error = db
         .mutate(
             "main",
-            r#"query drop_hub() { delete Hub where name = "hub" }"#,
+            r#"query drop_hub() { match { $x: Hub } where $x.name = "hub"  delete $x }"#,
             "drop_hub",
             &params(&[]),
         )
@@ -3016,8 +3075,10 @@ edge Knows: Person -> Person
 
     let q = r#"
 query del_age_then_name($threshold: I32, $name: String) {
-    delete Person where age > $threshold
-    delete Person where name = $name
+    match { $x: Person } where $x.age > $threshold
+    delete $x
+    match { $x: Person } where $x.name = $name
+    delete $x
 }
 "#;
     let r = db
@@ -3573,8 +3634,10 @@ async fn multi_statement_delete_on_same_node_table() {
 async fn cascade_delete_node_then_explicit_delete_edge_on_same_table() {
     const QUERY: &str = r#"
 query cascade_then_explicit($name: String, $other: String) {
-    delete Person where name = $name
-    delete Knows where from = $other
+    match { $x: Person } where $x.name = $name
+    delete $x
+    match { $x: Knows } where $x.@src = $other
+    delete $x
 }
 "#;
 
@@ -3788,14 +3851,16 @@ query insert_then_update_note(
     $title: String, $blob: String, $note: String
 ) {
     insert Document { title: $title, content: $blob }
-    update Document set { note: $note } where title = $title
+    match { $x: Document } where $x.title = $title
+    update $x set { note: $note }
 }
 
 query insert_then_replace_blob(
     $title: String, $first: String, $second: String
 ) {
     insert Document { title: $title, content: $first }
-    update Document set { content: $second } where title = $title
+    match { $x: Document } where $x.title = $title
+    update $x set { content: $second }
 }
 "#;
 
@@ -3864,7 +3929,7 @@ query insert_then_replace_blob(
         .query(
             ReadTarget::branch("main"),
             r#"query get_doc($title: String) {
-                match { $d: Document { title: $title } }
+                match { $d: Document } where $d.title = $title
                 return { $d.title, $d.note }
             }"#,
             "get_doc",
@@ -3933,11 +3998,13 @@ query insert_then_set_first(
     $slug: String, $a: Blob, $title: String, $b: Blob, $rank: I64, $first: Blob
 ) {
     insert Doc { slug: $slug, first: $a, title: $title, second: $b, rank: $rank }
-    update Doc set { first: $first } where rank > 0
+    match { $x: Doc } where $x.rank > 0
+    update $x set { first: $first }
 }
 
 query clear_second($second: Blob?) {
-    update Doc set { second: $second } where rank > 0
+    match { $x: Doc } where $x.rank > 0
+    update $x set { second: $second }
 }
 "#;
     const SCALARS: &str = r#"
@@ -4013,7 +4080,7 @@ query scalars() {
     let mut null_second = omnigraph_compiler::ir::ParamMap::new();
     null_second.insert(
         "second".to_string(),
-        omnigraph_compiler::query::ast::Literal::Null,
+        omnigraph_compiler::query::value::Literal::Null,
     );
     let result = db
         .mutate("main", MUTATIONS, "clear_second", &null_second)
@@ -4246,8 +4313,8 @@ async fn camelcase_mutation_predicate_updates_and_deletes() {
     db.load_jsonl(CC_DATA, LoadMode::Overwrite).await.unwrap();
 
     let m = r#"
-query set_status($repo: String, $st: String) { update Doc set { status: $st } where repoName = $repo }
-query del($repo: String) { delete Doc where repoName = $repo }
+query set_status($repo: String, $st: String) { match { $x: Doc } where $x.repoName = $repo  update $x set { status: $st } }
+query del($repo: String) { match { $x: Doc } where $x.repoName = $repo  delete $x }
 "#;
 
     let upd = db
@@ -4292,8 +4359,10 @@ async fn camelcase_chained_mutation_reads_pending_by_camelcase() {
     // camelCase column, so it must match op-1's pending row.
     let m = r#"
 query chain($repo: String) {
-    update Doc set { status: "stage1" } where repoName = $repo
-    update Doc set { status: "stage2" } where repoName = $repo
+    match { $x: Doc } where $x.repoName = $repo
+    update $x set { status: "stage1" }
+    match { $x: Doc } where $x.repoName = $repo
+    update $x set { status: "stage2" }
 }
 "#;
     let r = db
@@ -4430,7 +4499,7 @@ async fn post_publish_fold_matches_fresh_reopen() {
 
 const FIND_PERSON_QUERY: &str = r#"
 query find_person($name: String) {
-    match { $p: Person { name: $name } }
+    match { $p: Person } where $p.name = $name
     return { $p.name }
 }
 "#;
@@ -4974,12 +5043,14 @@ query seed_knows() {
 }
 
 query replace_knows() {
-    delete Knows where from = "Alice"
+    match { $x: Knows } where $x.@src = "Alice"
+    delete $x
     insert Knows { from: "Alice", to: "Bob", since: "2021" }
 }
 
 query drop_knows() {
-    delete Knows where from = "Alice"
+    match { $x: Knows } where $x.@src = "Alice"
+    delete $x
 }
 "#;
     mutate_main(&db, MUTATIONS, "seed_knows", &params(&[]))
@@ -4989,11 +5060,7 @@ query drop_knows() {
     let err = mutate_main(&db, MUTATIONS, "replace_knows", &params(&[]))
         .await
         .expect_err("a mutation mixing a delete and an insert must be refused");
-    assert!(
-        err.to_string().contains("constructive or destructive"),
-        "got: {}",
-        err
-    );
+    assert!(err.to_string().contains("T76"), "got: {}", err);
 
     mutate_main(&db, MUTATIONS, "drop_knows", &params(&[]))
         .await
@@ -5021,7 +5088,8 @@ async fn update_refuses_edge_types_pinning_key_immutability() {
 
     const MUTATIONS: &str = r#"
 query set_since() {
-    update Knows set { since: "2021" } where from = "Alice"
+    match { $x: Knows } where $x.@src = "Alice"
+    update $x set { since: "2021" }
 }
 "#;
     let err = mutate_main(&db, MUTATIONS, "set_since", &params(&[]))
@@ -5062,10 +5130,12 @@ node Doc {
 "#;
     const UPDATE: &str = r#"
 query bump($slug: String) {
-    update Doc set { score: 1 } where slug = $slug
+    match { $x: Doc } where $x.slug = $slug
+    update $x set { score: 1 }
 }
 query bump_all() {
-    update Doc set { score: 2 } where age >= 0
+    match { $x: Doc } where $x.age >= 0
+    update $x set { score: 2 }
 }
 "#;
 

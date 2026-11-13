@@ -168,7 +168,8 @@ tables:
 --- mutate
 set write_max_bytes = 2048;
 query retitle_apart() {
-    update Apart set { title: "new" } where slug = "row000"
+    match { $x: Apart } where $x.slug = "row000"
+    update $x set { title: "new" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -176,7 +177,8 @@ query retitle_apart() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_shared() {
-    update Shared set { title: "new" } where slug = "row000"
+    match { $x: Shared } where $x.slug = "row000"
+    update $x set { title: "new" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -184,7 +186,8 @@ query retitle_shared() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_apart_doc_carrying_its_blob() {
-    update ApartDoc set { title: "new" } where slug = "row000"
+    match { $x: ApartDoc } where $x.slug = "row000"
+    update $x set { title: "new" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -192,7 +195,8 @@ query retitle_apart_doc_carrying_its_blob() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_shared_doc_carrying_its_blob() {
-    update SharedDoc set { title: "new" } where slug = "row000"
+    match { $x: SharedDoc } where $x.slug = "row000"
+    update $x set { title: "new" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -200,7 +204,8 @@ query retitle_shared_doc_carrying_its_blob() {
 --- mutate
 set write_max_bytes = 2048;
 query clear_apart_doc($c: Blob?) {
-    update ApartDocCleared set { content: $c, title: "cleared" } where slug = "row000"
+    match { $x: ApartDocCleared } where $x.slug = "row000"
+    update $x set { content: $c, title: "cleared" }
 }
 
 --- params
@@ -211,7 +216,8 @@ query clear_apart_doc($c: Blob?) {
 --- mutate
 set write_max_bytes = 2048;
 query clear_shared_doc($c: Blob?) {
-    update SharedDocCleared set { content: $c, title: "cleared" } where slug = "row000"
+    match { $x: SharedDocCleared } where $x.slug = "row000"
+    update $x set { content: $c, title: "cleared" }
 }
 
 --- params
@@ -222,8 +228,10 @@ query clear_shared_doc($c: Blob?) {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_apart_doc_in_two_statements() {
-    update ApartDocTwice set { title: "twice" } where slug = "row000"
-    update ApartDocTwice set { title: "twice" } where slug = "nobody"
+    match { $x: ApartDocTwice } where $x.slug = "row000"
+    update $x set { title: "twice" }
+    match { $x: ApartDocTwice } where $x.slug = "nobody"
+    update $x set { title: "twice" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -231,18 +239,18 @@ query retitle_apart_doc_in_two_statements() {
 --- mutate
 set write_max_bytes = 2048;
 query retitle_shared_doc_in_two_statements() {
-    update SharedDocTwice set { title: "twice" } where slug = "row000"
-    update SharedDocTwice set { title: "twice" } where slug = "nobody"
+    match { $x: SharedDocTwice } where $x.slug = "row000"
+    update $x set { title: "twice" }
+    match { $x: SharedDocTwice } where $x.slug = "nobody"
+    update $x set { title: "twice" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- query
 query titles_after_updates() {
-    match {
-        $s: Shared { slug: "row000" }
-        $a: Apart { slug: "row000" }
-    }
+    match { $s: Shared, $a: Apart }
+    where $s.slug = "row000" and $a.slug = "row000"
     return { $s.title, $a.title }
 }
 
@@ -256,13 +264,19 @@ a.title: String
 --- query
 query doc_titles_after_updates() {
     match {
-        $s: SharedDoc { slug: "row000" }
-        $a: ApartDoc { slug: "row000" }
-        $sc: SharedDocCleared { slug: "row000" }
-        $ac: ApartDocCleared { slug: "row000" }
-        $st: SharedDocTwice { slug: "row000" }
-        $at: ApartDocTwice { slug: "row000" }
+        $s: SharedDoc,
+        $a: ApartDoc,
+        $sc: SharedDocCleared,
+        $ac: ApartDocCleared,
+        $st: SharedDocTwice,
+        $at: ApartDocTwice,
     }
+    where $s.slug = "row000"
+      and $a.slug = "row000"
+      and $sc.slug = "row000"
+      and $ac.slug = "row000"
+      and $st.slug = "row000"
+      and $at.slug = "row000"
     return { $s.title, $a.title, $sc.title, $ac.title, $st.title, $at.title }
 }
 

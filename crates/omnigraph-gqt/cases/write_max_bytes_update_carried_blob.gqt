@@ -407,8 +407,10 @@ node Apart {
 --- mutate
 set write_max_bytes = 2047;
 query retitle_one_byte_short() {
-    update Doc set { title: "new" } where slug = "big"
-    update Doc set { title: "none" } where slug = "nobody"
+    match { $x: Doc } where $x.slug = "big"
+    update $x set { title: "new" }
+    match { $x: Doc } where $x.slug = "nobody"
+    update $x set { title: "none" }
 }
 
 --- expect error: materialized blob payload bytes
@@ -429,8 +431,10 @@ d.title: String
 --- mutate
 set write_max_bytes = 2048;
 query retitle_exact() {
-    update Doc set { title: "new" } where slug = "big"
-    update Doc set { title: "none" } where slug = "nobody"
+    match { $x: Doc } where $x.slug = "big"
+    update $x set { title: "new" }
+    match { $x: Doc } where $x.slug = "nobody"
+    update $x set { title: "none" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -451,7 +455,8 @@ d.title: String
 --- mutate
 set write_max_bytes = 2047;
 query retitle_alone() {
-    update Doc set { title: "patched" } where slug = "big"
+    match { $x: Doc } where $x.slug = "big"
+    update $x set { title: "patched" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -472,8 +477,10 @@ d.title: String
 --- mutate
 set write_max_bytes = 2047;
 query carry_after_patch_still_counts_the_payload() {
-    update Doc set { title: "new" } where slug = "big"
-    update Doc set { title: "none" } where slug = "nobody"
+    match { $x: Doc } where $x.slug = "big"
+    update $x set { title: "new" }
+    match { $x: Doc } where $x.slug = "nobody"
+    update $x set { title: "none" }
 }
 
 --- expect error: materialized blob payload bytes
@@ -481,7 +488,8 @@ query carry_after_patch_still_counts_the_payload() {
 --- mutate
 set write_max_bytes = 2047;
 query clear_and_retitle($c: Blob?) {
-    update Doc set { content: $c, title: "cleared" } where slug = "big"
+    match { $x: Doc } where $x.slug = "big"
+    update $x set { content: $c, title: "cleared" }
 }
 
 --- params
@@ -505,7 +513,8 @@ d.title: String
 --- mutate
 set write_max_bytes = 2047;
 query retitle_indexed_alone() {
-    update Indexed set { title: "patched" } where slug = "big"
+    match { $x: Indexed } where $x.slug = "big"
+    update $x set { title: "patched" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -513,7 +522,8 @@ query retitle_indexed_alone() {
 --- mutate
 set write_max_bytes = 8191;
 query retitle_packed_alone() {
-    update Packed set { title: "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt" } where slug = "big"
+    match { $x: Packed } where $x.slug = "big"
+    update $x set { title: "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -533,7 +543,7 @@ d.title: String
 
 --- query
 query packed_title_after_patch() {
-    match { $d: Packed { slug: "big" } }
+    match { $d: Packed } where $d.slug = "big"
     return { $d.slug, $d.title }
 }
 
@@ -559,7 +569,8 @@ tables:
 --- mutate
 set write_max_bytes = 4096;
 query retitle_shared_fragment() {
-    update Shared set { title: "patched" } where slug = "big"
+    match { $x: Shared } where $x.slug = "big"
+    update $x set { title: "patched" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -567,17 +578,16 @@ query retitle_shared_fragment() {
 --- mutate
 set write_max_bytes = 4096;
 query retitle_apart_fragment() {
-    update Apart set { title: "patched" } where slug = "big"
+    match { $x: Apart } where $x.slug = "big"
+    update $x set { title: "patched" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- query
 query titles_after_fragment_independent_updates() {
-    match {
-        $s: Shared { slug: "big" }
-        $a: Apart { slug: "big" }
-    }
+    match { $s: Shared, $a: Apart }
+    where $s.slug = "big" and $a.slug = "big"
     return { $s.title, $a.title }
 }
 

@@ -1,5 +1,5 @@
 # issue: none
-# notes: A one-hop traversal's hash join drains its build side at the first non-empty probe batch. A build side that holds no row ends the probe with no output; an empty probe never drains the build; a build holding some of the probed ids joins exactly those; a source with no out-edge contributes nothing. Every step matches the reference engine.
+# notes: A one-hop traversal's hash join drains its build side at the first non-empty probe batch. A build side that holds no row ends the probe with no output; an empty probe never drains the build; a build holding some of the probed ids joins exactly those; a source with no out-edge contributes nothing.
 
 --- runner
 timeout_ms: 10000
@@ -26,41 +26,29 @@ edge Knows: Person -> Person
 --- query
 set engine = v2;
 query empty_build() {
-    match {
-        $p: Person
-        $p knows $q
-        $q.name = "nobody"
-    }
+    match { $p: Person, $p knows $q }
+    where $q.name = "nobody"
     return { $p.name, $q.name }
 }
 --- expect unordered
 --- expect shape
 p.name: String
 q.name: String
---- expect same as v1
-
 --- query
 set engine = v2;
 query empty_probe() {
-    match {
-        $p: Person { name: "nobody" }
-        $p knows $q
-    }
+    match { $p: Person, $p knows $q }
+    where $p.name = "nobody"
     return { $q.name }
 }
 --- expect unordered
 --- expect shape
 q.name: String
---- expect same as v1
-
 --- query
 set engine = v2;
 query partial_build() {
-    match {
-        $p: Person
-        $p knows $q
-        $q.name = "bob"
-    }
+    match { $p: Person, $p knows $q }
+    where $q.name = "bob"
     return { $p.name, $q.name }
 }
 --- expect unordered
@@ -69,15 +57,10 @@ query partial_build() {
 --- expect shape
 p.name: String
 q.name: String
---- expect same as v1
-
 --- query
 set engine = v2;
 query every_hop() {
-    match {
-        $p: Person
-        $p knows $q
-    }
+    match { $p: Person, $p knows $q }
     return { $p.name, $q.name }
 }
 --- expect unordered
@@ -87,4 +70,3 @@ query every_hop() {
 --- expect shape
 p.name: String
 q.name: String
---- expect same as v1

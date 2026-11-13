@@ -114,11 +114,11 @@ tables:
 
 --- loop $cycle 0 32
 --- mutate
-query age_set_one() { update BenchN000 set { val: 1 } where name = "n000_r0000000" }
+query age_set_one() { match { $x: BenchN000 } where $x.name = "n000_r0000000"  update $x set { val: 1 } }
 --- expect affected: nodes=1 edges=0
 
 --- mutate
-query age_restore_zero() { update BenchN000 set { val: 0 } where name = "n000_r0000000" }
+query age_restore_zero() { match { $x: BenchN000 } where $x.name = "n000_r0000000"  update $x set { val: 0 } }
 --- expect affected: nodes=1 edges=0
 
 --- endloop
@@ -149,7 +149,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_0($c: String) { delete BenchE000 where cohort = $c }
+query delete_src_0($c: String) { match { $x: BenchE000 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -172,7 +172,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_1($c: String) { delete BenchE001 where cohort = $c }
+query delete_src_1($c: String) { match { $x: BenchE001 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -195,7 +195,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_2($c: String) { delete BenchE002 where cohort = $c }
+query delete_src_2($c: String) { match { $x: BenchE002 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -218,7 +218,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_3($c: String) { delete BenchE003 where cohort = $c }
+query delete_src_3($c: String) { match { $x: BenchE003 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_src_del"}
 --- expect ok
@@ -309,7 +309,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_0($c: String) { delete BenchE000 where cohort = $c }
+query delete_tgt_0($c: String) { match { $x: BenchE000 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok
@@ -332,7 +332,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_1($c: String) { delete BenchE001 where cohort = $c }
+query delete_tgt_1($c: String) { match { $x: BenchE001 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok
@@ -355,7 +355,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_2($c: String) { delete BenchE002 where cohort = $c }
+query delete_tgt_2($c: String) { match { $x: BenchE002 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok
@@ -378,7 +378,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_3($c: String) { delete BenchE003 where cohort = $c }
+query delete_tgt_3($c: String) { match { $x: BenchE003 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d50_tgt_del"}
 --- expect ok
@@ -467,8 +467,7 @@ hi: I32?
 
 --- query branch: main
 query edge_0_main() {
-    match { $a: BenchN000
-        $a $e:benche000 $b }
+    match { $a: BenchN000, $a $e:benche000 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered
@@ -500,8 +499,7 @@ hi: I32?
 
 --- query branch: main
 query edge_1_main() {
-    match { $a: BenchN001
-        $a $e:benche001 $b }
+    match { $a: BenchN001, $a $e:benche001 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered
@@ -533,8 +531,7 @@ hi: I32?
 
 --- query branch: main
 query edge_2_main() {
-    match { $a: BenchN002
-        $a $e:benche002 $b }
+    match { $a: BenchN002, $a $e:benche002 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered
@@ -566,8 +563,7 @@ hi: I32?
 
 --- query branch: main
 query edge_3_main() {
-    match { $a: BenchN003
-        $a $e:benche003 $b }
+    match { $a: BenchN003, $a $e:benche003 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered
@@ -599,8 +595,7 @@ hi: I32?
 
 --- query branch: bench-source
 query edge_0_bench_source() {
-    match { $a: BenchN000
-        $a $e:benche000 $b }
+    match { $a: BenchN000, $a $e:benche000 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered
@@ -632,8 +627,7 @@ hi: I32?
 
 --- query branch: bench-source
 query edge_1_bench_source() {
-    match { $a: BenchN001
-        $a $e:benche001 $b }
+    match { $a: BenchN001, $a $e:benche001 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered
@@ -665,8 +659,7 @@ hi: I32?
 
 --- query branch: bench-source
 query edge_2_bench_source() {
-    match { $a: BenchN002
-        $a $e:benche002 $b }
+    match { $a: BenchN002, $a $e:benche002 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered
@@ -698,8 +691,7 @@ hi: I32?
 
 --- query branch: bench-source
 query edge_3_bench_source() {
-    match { $a: BenchN003
-        $a $e:benche003 $b }
+    match { $a: BenchN003, $a $e:benche003 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered
@@ -731,8 +723,7 @@ hi: I32?
 
 --- query branch: bench-target
 query edge_0_bench_target() {
-    match { $a: BenchN000
-        $a $e:benche000 $b }
+    match { $a: BenchN000, $a $e:benche000 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered
@@ -764,8 +755,7 @@ hi: I32?
 
 --- query branch: bench-target
 query edge_1_bench_target() {
-    match { $a: BenchN001
-        $a $e:benche001 $b }
+    match { $a: BenchN001, $a $e:benche001 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered
@@ -797,8 +787,7 @@ hi: I32?
 
 --- query branch: bench-target
 query edge_2_bench_target() {
-    match { $a: BenchN002
-        $a $e:benche002 $b }
+    match { $a: BenchN002, $a $e:benche002 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered
@@ -830,8 +819,7 @@ hi: I32?
 
 --- query branch: bench-target
 query edge_3_bench_target() {
-    match { $a: BenchN003
-        $a $e:benche003 $b }
+    match { $a: BenchN003, $a $e:benche003 $b }
     return { $e.cohort as cohort, count($e.val) as n, count($e.payload) as payloads, min($e.val) as lo, max($e.val) as hi }
 }
 --- expect unordered

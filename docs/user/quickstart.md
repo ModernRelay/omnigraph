@@ -68,11 +68,8 @@ Write a query (`.gq`) — save as `queries.gq`:
 
 ```gq
 query sources_for_claim($claim: String) {
-  match {
-    $source: Source
-    $claim_node: Claim { slug: $claim }
-    $source supports $claim_node
-  }
+  match { $source: Source, $claim_node: Claim, $source supports $claim_node }
+  where $claim_node.slug = $claim
   return { $source.title as source }
   order { source asc }
 }

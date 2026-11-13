@@ -109,7 +109,7 @@ not pass aggregate_pushdown
 --- query
 set engine = v2;
 query count_filtered() {
-    match { $d: Doc $d.score > 0 } return { count($d) as n }
+    match { $d: Doc } where $d.score > 0 return { count($d) as n }
 }
 
 --- expect unordered
@@ -143,7 +143,7 @@ validation scope invariants_only
 --- query
 set engine = v2;
 query count_traversal() {
-    match { $d: Doc $d knows $t } return { count($d) as n }
+    match { $d: Doc, $d knows $t } return { count($d) as n }
 }
 
 --- expect unordered
@@ -158,7 +158,7 @@ not pass aggregate_pushdown
 --- query
 set engine = v2;
 query count_pairs() {
-    match { $d: Doc $e: Doc } return { count($d) as n }
+    match { $d: Doc, let $es = { match { $e: Doc } return { $e } }, from $es } return { count($d) as n }
 }
 
 --- expect unordered

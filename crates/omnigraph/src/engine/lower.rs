@@ -23,7 +23,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion::physical_plan::execution_plan::EmissionType;
 use omnigraph_compiler::ir::{DeltaClass, SubqueryPredicate};
-use omnigraph_compiler::query::ast::LoadStmtMode;
+use omnigraph_compiler::query::file::LoadStmtMode;
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 use omnigraph_planner::logical::{EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use omnigraph_planner::{
@@ -42,7 +42,7 @@ use super::operators::{
     ExpandExec, ExpandExecution, ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec,
     LanceFragmentSink, LimitExec, LookupSpec, MetadataCountExec, OuterReferenceExec, OuterSlot,
     ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec, ScanSource, SortExec, SortKey,
-    ValidateExec, fresh_tag_column, tagged_schema,
+    TargetCutExec, ValidateExec, fresh_tag_column, tagged_schema,
 };
 use super::*;
 use crate::loader::LoadMode;
@@ -718,6 +718,29 @@ impl Lower for Walk<'_, '_> {
         self.built(id, LimitExec::new(input, rows))
     }
 
+    fn target_cut(
+        &mut self,
+        id: NodeId,
+        binding: &str,
+        targets: usize,
+        input: Plan,
+    ) -> Lowers<Plan> {
+        let name = format!("{binding}.{}", self.lowering.catalog.system_columns.id);
+        let schema = input.schema();
+        let hidden = format!("{HIDDEN}{name}");
+        let column = if schema.column_with_name(&hidden).is_some() {
+            hidden
+        } else if schema.column_with_name(&name).is_some() {
+            name
+        } else {
+            return Err(OmniError::manifest_internal(format!(
+                "the window's target identity '{name}' is not in its input"
+            ))
+            .into());
+        };
+        self.built(id, TargetCutExec::new(input, column, targets))
+    }
+
     fn page(
         &mut self,
         _id: NodeId,
@@ -905,7 +928,7 @@ impl Lower for Walk<'_, '_> {
         let fused_score = format!(
             "{}.{}",
             arms[0].binding,
-            omnigraph_compiler::query::ast::RRF_COLUMN
+            omnigraph_compiler::query::value::RRF_COLUMN
         );
         let order = |arm: &RankArm| {
             let (property, descending) = arm.kind.score();
@@ -1111,6 +1134,8 @@ impl Lower for Walk<'_, '_> {
                     | IRExpr::Binary { .. }
                     | IRExpr::Not(_, _)
                     | IRExpr::Cast { .. }
+                    | IRExpr::Neg { .. }
+                    | IRExpr::Call { .. }
                     | IRExpr::IsNull { .. },
                     Some(_),
                 ) => {
@@ -1134,6 +1159,8 @@ impl Lower for Walk<'_, '_> {
                     | IRExpr::Binary { .. }
                     | IRExpr::Not(_, _)
                     | IRExpr::Cast { .. }
+                    | IRExpr::Neg { .. }
+                    | IRExpr::Call { .. }
                     | IRExpr::IsNull { .. },
                     None,
                 ) => {
@@ -1213,6 +1240,8 @@ impl Lower for Walk<'_, '_> {
                 | IRExpr::Binary { .. }
                 | IRExpr::Not(_, _)
                 | IRExpr::Cast { .. }
+                | IRExpr::Neg { .. }
+                | IRExpr::Call { .. }
                 | IRExpr::IsNull { .. } => {
                     return Err(OmniError::manifest_internal(
                         "the planned sort key is not a property or an alias".to_string(),
@@ -1408,6 +1437,8 @@ fn aggregate_argument(
         | IRExpr::Binary { .. }
         | IRExpr::Not(_, _)
         | IRExpr::Cast { .. }
+        | IRExpr::Neg { .. }
+        | IRExpr::Call { .. }
         | IRExpr::IsNull { .. } => Projected::Expression(arg.clone(), ty.clone()),
     }
 }
@@ -1458,6 +1489,8 @@ fn hidden_columns(
             | IRExpr::Binary { .. }
             | IRExpr::Not(_, _)
             | IRExpr::Cast { .. }
+            | IRExpr::Neg { .. }
+            | IRExpr::Call { .. }
             | IRExpr::IsNull { .. } => {
                 return Err(OmniError::manifest_internal(
                     "the planned sort key is not a property or an alias".to_string(),

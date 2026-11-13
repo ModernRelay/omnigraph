@@ -2,7 +2,7 @@
 //! Cast nodes; execution never chooses a domain from bound parameter values.
 
 use crate::error::{CompilerError, Result};
-use crate::query::ast::{BinaryOp, CompOp, Literal};
+use crate::query::value::{BinaryOp, CompOp, Literal};
 use crate::types::{ExprType, ScalarType};
 
 use super::{BlockAggregateExpr, IRExpr, SubqueryPredicate, fold};
@@ -37,7 +37,7 @@ fn domain(ty: &ExprType) -> Option<Domain> {
     match ty {
         ExprType::Value { scalar, .. } => Some(Domain::Scalar(*scalar)),
         ExprType::ExactInteger { .. } => Some(Domain::Exact),
-        ExprType::Node { .. } => None,
+        ExprType::Node { .. } | ExprType::Edge { .. } => None,
     }
 }
 
@@ -265,6 +265,8 @@ pub(super) fn boolean(expr: IRExpr) -> IRExpr {
 pub fn binary(left: IRExpr, op: BinaryOp, right: IRExpr) -> Result<IRExpr> {
     let (left, op, right) = match op {
         BinaryOp::And | BinaryOp::Or => (boolean(left), op, boolean(right)),
+        // The checker widens arithmetic operands with explicit casts.
+        BinaryOp::Arith(_) => (left, op, right),
         BinaryOp::Compare(op) => {
             let op = resolved_operator(op, left.ty(), literal(&left), right.ty());
             let (lt, rt) =
@@ -369,7 +371,7 @@ fn float_round_trips(value: f64, target: Domain) -> bool {
 }
 
 /// `in` fixes the list role before overloaded `contains` dispatch sees a null.
-pub(super) fn in_list(list: IRExpr, needle: IRExpr) -> Result<IRExpr> {
+pub(crate) fn in_list(list: IRExpr, needle: IRExpr) -> Result<IRExpr> {
     let list = match list {
         IRExpr::Literal(Literal::Null, _) => {
             let domain =

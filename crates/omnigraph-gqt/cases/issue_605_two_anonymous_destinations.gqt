@@ -1,7 +1,7 @@
 # issue: 605
 # red_on: 2026-09-03, pre-fix build: panicked at hconcat_batches `duplicate column`, '_.id' (step 1), 'p.id' (steps 2, 3), '__temp_p.id' (step 4); step 5 returned no rows.
 # notes: Repeated anonymous destinations, bindings and self-loops must not
-# notes: duplicate batch columns. A rebound variable inside negation keeps its filter.
+# notes: duplicate batch columns. A negated filter on an outer variable, and a negation that reads one, keep their filters.
 
 --- runner
 timeout_ms: 10000
@@ -26,11 +26,7 @@ edge Knows: Person -> Person
 
 --- query
 query knows_anyone_twice() {
-    match {
-        $p: Person
-        $p knows $_
-        $p knows $_
-    }
+    match { $p: Person, $p knows $_, $p knows $_ }
     return { $p.name }
 }
 
@@ -43,10 +39,8 @@ p.name: String
 
 --- query
 query bound_twice() {
-    match {
-        $p: Person
-        $p: Person { name: "bob" }
-    }
+    match { $p: Person, $p: Person }
+    where $p.name = "bob"
     return { $p.name }
 }
 
@@ -58,10 +52,8 @@ p.name: String
 
 --- query
 query bound_twice_in_negation() {
-    match {
-        $p: Person
-        not { $p: Person { name: "bob" } }
-    }
+    match { $p: Person }
+    where not ($p.name = "bob")
     return { $p.name }
 }
 
@@ -73,11 +65,7 @@ p.name: String
 
 --- query
 query self_loop_twice() {
-    match {
-        $p: Person
-        $p knows $p
-        $p knows $p
-    }
+    match { $p: Person, $p knows $p, $p knows $p }
     return { $p.name }
 }
 
@@ -88,15 +76,12 @@ query self_loop_twice() {
 p.name: String
 
 --- query
-query rebind_inside_negation_non_root() {
-    match {
-        $p: Person
-        $p knows $q
-        not {
-            $r: Person
-            $r knows $q
-            $q: Person { name: "zzz" }
-        }
+query outer_name_read_inside_negation_non_root() {
+    match { $p: Person, $p knows $q }
+    where not exists {
+        $r: Person,
+        $r knows $q
+        where $q.name = "zzz"
     }
     return { $p.name }
 }

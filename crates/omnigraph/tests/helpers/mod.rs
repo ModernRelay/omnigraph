@@ -23,7 +23,7 @@ use omnigraph::settings::SessionSettings;
 pub use omnigraph::settings::Traversal;
 use omnigraph::{BLOB_READ_RANGE_MAX_BYTES, BlobCell, BlobContent, EntityKind};
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::result::{MutationResult, QueryResult};
 
 pub const TEST_SCHEMA: &str = include_str!("../fixtures/test.pg");
@@ -40,15 +40,18 @@ query add_friend($from: String, $to: String) {
 }
 
 query set_age($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
+    match { $x: Person } where $x.name = $name
+    update $x set { age: $age }
 }
 
 query remove_person($name: String) {
-    delete Person where name = $name
+    match { $x: Person } where $x.name = $name
+    delete $x
 }
 
 query remove_friendship($from: String) {
-    delete Knows where from = $from
+    match { $x: Knows } where $x.@src = $from
+    delete $x
 }
 
 query insert_person_and_friend($name: String, $age: I32, $friend: String) {

@@ -5,10 +5,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::read_shape::{PatternStep, ReadShape};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use omnigraph_compiler::ir::{IRExpr, IROp, IROrdering, IRProjection, QueryIR, is_fresh_variable};
-use omnigraph_compiler::query::ast::{AggFunc, LoadStmtMode};
+use omnigraph_compiler::ir::expr::ScalarFunc;
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, is_fresh_variable};
 use omnigraph_compiler::query::codes::{P002, P004};
+use omnigraph_compiler::query::file::LoadStmtMode;
+use omnigraph_compiler::query::value::AggFunc;
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 use omnigraph_compiler::types::Direction;
@@ -301,7 +304,7 @@ pub fn write_count_schema() -> SchemaRef {
     )]))
 }
 
-/// Stage 1, pass 1 for a GQ query: the flat `IROp` pipeline folded into a
+/// Stage 1, pass 1 for a GQ query: the flat `PatternStep` pipeline folded into a
 /// tree, then a leading search function, the `return`, the remaining
 /// `order` keys and the `limit` above it.
 /// The node properties the query's full-text calls read the index of, as
@@ -311,23 +314,25 @@ pub fn write_count_schema() -> SchemaRef {
 /// one's coverage (`require_full_text_indexes`) and acceptance requires the
 /// plan to record it. Block-local bindings stay within their lexical scope;
 /// nested blocks inherit their parent's bindings, never a sibling's locals.
-pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
-    fn bindings(ops: &[IROp], out: &mut HashMap<String, String>) {
+pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
+    fn bindings(ops: &[PatternStep], out: &mut HashMap<String, String>) {
         for op in ops {
             match op {
-                IROp::NodeScan {
+                PatternStep::NodeScan {
                     variable,
                     type_name,
                     filters: _,
                 } => {
                     out.insert(variable.clone(), type_name.clone());
                 }
-                IROp::Expand {
+                PatternStep::Expand {
                     dst_var, dst_type, ..
                 } => {
                     out.insert(dst_var.clone(), dst_type.clone());
                 }
-                IROp::AntiJoin { .. } | IROp::Filter(_) => {}
+                PatternStep::AntiJoin { .. }
+                | PatternStep::Filter(_)
+                | PatternStep::Rank { .. } => {}
             }
         }
     }
@@ -359,8 +364,26 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
                 calls(left, types, out);
                 calls(right, types, out);
             }
+            IRExpr::Call {
+                func: ScalarFunc::MatchTerms { .. },
+                args,
+                ..
+            } => {
+                if let Some(IRExpr::PropAccess {
+                    variable, property, ..
+                }) = args.first()
+                    && let Some(type_name) = types.get(variable)
+                {
+                    let target = (type_name.clone(), property.clone());
+                    if !out.contains(&target) {
+                        out.push(target);
+                    }
+                }
+            }
+            IRExpr::Call { args, .. } => args.iter().for_each(|arg| calls(arg, types, out)),
             IRExpr::Not(inner, _)
             | IRExpr::Cast { expr: inner, .. }
+            | IRExpr::Neg { expr: inner, .. }
             | IRExpr::IsNull { expr: inner, .. } => calls(inner, types, out),
             IRExpr::PropAccess { .. }
             | IRExpr::Nearest { .. }
@@ -372,19 +395,21 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
         }
     }
     fn filter_calls(
-        ops: &[IROp],
+        ops: &[PatternStep],
         types: &HashMap<String, String>,
         out: &mut Vec<(String, String)>,
     ) {
         for op in ops {
             match op {
-                IROp::NodeScan { filters, .. }
-                | IROp::Expand {
+                PatternStep::NodeScan { filters, .. }
+                | PatternStep::Expand {
                     dst_filters: filters,
                     ..
                 } => filters.iter().for_each(|filter| calls(filter, types, out)),
-                IROp::Filter(filter) => calls(filter, types, out),
-                IROp::AntiJoin { inner, .. } => {
+                PatternStep::Filter(filter) | PatternStep::Rank { key: filter, .. } => {
+                    calls(filter, types, out)
+                }
+                PatternStep::AntiJoin { inner, .. } => {
                     let mut inner_types = types.clone();
                     bindings(inner, &mut inner_types);
                     filter_calls(inner, &inner_types, out);
@@ -410,7 +435,7 @@ pub fn full_text_targets(ir: &QueryIR) -> Vec<(String, String)> {
 /// Lance would fall back to a bare, case-sensitive tokenizer, so the call is
 /// refused rather than answered differently. The type checker (`T27`)
 /// already required the declaration.
-fn require_full_text_indexes(ir: &QueryIR, source: &dyn PlanSource) -> Result<(), PlanError> {
+fn require_full_text_indexes(ir: &ReadShape, source: &dyn PlanSource) -> Result<(), PlanError> {
     for (type_name, property) in full_text_targets(ir) {
         let type_key = format!("node:{type_name}");
         if source.full_text_coverage(&type_key, &property) == FullTextCoverage::Absent {
@@ -424,7 +449,7 @@ fn require_full_text_indexes(ir: &QueryIR, source: &dyn PlanSource) -> Result<()
 
 fn resolve_query(
     plan: &mut LogicalPlan,
-    ir: &QueryIR,
+    ir: &ReadShape,
     source: &dyn PlanSource,
 ) -> Result<(), PlanError> {
     require_full_text_indexes(ir, source)?;
@@ -450,7 +475,7 @@ fn resolve_query(
             ));
         }
     }
-    let QueryIR {
+    let ReadShape {
         name: _,
         params: _,
         pipeline,
@@ -463,13 +488,18 @@ fn resolve_query(
     let mut current = resolve_pipeline(plan, pipeline, source, &mut next_binding, None)?;
     let schema = schema_of(plan, current)?;
     let mut orderings: &[IROrdering] = order_by;
-    let mut ranked = false;
+    // A ranking drawn as a pattern step leads no sort; a `limit` over its
+    // rows still cuts a total order, the identities' when nothing is written.
+    let windowed = pipeline
+        .iter()
+        .any(|step| matches!(step, PatternStep::Rank { .. }));
     let has_aggregates = return_exprs
         .iter()
         .any(|projection| contains_aggregate(&projection.expr));
     let grouped = has_aggregates || *distinct;
-    if let Some(leading) = orderings.first() {
-        if let Some(mut node) = search_node(current, &leading.expr, *limit) {
+    let mut ranked = windowed && limit.is_some() && !grouped;
+    if let Some(leading) = orderings.first().filter(|_| !windowed) {
+        if let Some(mut node) = search_node(current, &leading.expr, *limit, true) {
             if let LogicalNode::RankFuse {
                 arms, row_tiebreak, ..
             } = &mut node
@@ -575,7 +605,7 @@ fn resolve_query(
 /// starts from the `OuterReference`, so its first op may filter or expand.
 fn resolve_pipeline(
     plan: &mut LogicalPlan,
-    ops: &[IROp],
+    ops: &[PatternStep],
     source: &dyn PlanSource,
     next_binding: &mut u16,
     seed: Option<LogicalId>,
@@ -583,7 +613,7 @@ fn resolve_pipeline(
     let mut current: Option<LogicalId> = seed;
     for op in ops {
         let node = match op {
-            IROp::NodeScan {
+            PatternStep::NodeScan {
                 variable,
                 type_name,
                 filters,
@@ -635,12 +665,12 @@ fn resolve_pipeline(
                     }
                 }
             }
-            IROp::Filter(filter) => {
+            PatternStep::Filter(filter) => {
                 let input = bound(current, "filter")?;
                 let schema = schema_of(plan, input)?;
                 filter_over(plan, input, std::slice::from_ref(filter), schema)
             }
-            IROp::Expand {
+            PatternStep::Expand {
                 src_var,
                 dst_var,
                 edges,
@@ -695,7 +725,67 @@ fn resolve_pipeline(
                 );
                 filter_over(plan, destination, dst_filters, schema)
             }
-            IROp::AntiJoin {
+            PatternStep::Rank {
+                key,
+                binding,
+                window,
+            } => {
+                let input = bound(current, "ranking")?;
+                let schema = schema_of(plan, input)?;
+                let mut node = search_node(input, key, *window, false).ok_or_else(|| {
+                    PlanError::Internal(format!("the ranking step `{key}` is not a search"))
+                })?;
+                if let LogicalNode::RankFuse {
+                    arms, row_tiebreak, ..
+                } = &mut node
+                {
+                    *row_tiebreak = scope_tiebreaks(plan, input, source)?
+                        .into_iter()
+                        .map(|(column, _)| column)
+                        .filter(|column| column.binding != arms[0].binding)
+                        .collect();
+                }
+                let ranked = plan.add(node, schema.clone());
+                if let IRExpr::Nearest { .. } = key {
+                    // The window: the rows of the `k` nearest targets, in
+                    // distance order with ties to the smaller identity.
+                    let targets = window.ok_or_else(|| {
+                        PlanError::Internal("a `nearest` ranking step has no window".to_string())
+                    })?;
+                    let score = rank_score(binding, RankKind::Nearest);
+                    let mut keys = Vec::new();
+                    order_keys(&score, &mut keys);
+                    let tiebreak = scope_tiebreaks(plan, ranked, source)?
+                        .into_iter()
+                        .map(|(column, _)| column)
+                        .filter(|column| column.binding == *binding)
+                        .collect();
+                    let sorted = plan.add(
+                        LogicalNode::Sort {
+                            input: ranked,
+                            keys,
+                            order_by: vec![IROrdering {
+                                expr: score,
+                                descending: false,
+                            }],
+                            fetch: None,
+                            tiebreak,
+                        },
+                        schema.clone(),
+                    );
+                    plan.add(
+                        LogicalNode::TargetCut {
+                            input: sorted,
+                            binding: binding.clone(),
+                            targets,
+                        },
+                        schema,
+                    )
+                } else {
+                    ranked
+                }
+            }
+            PatternStep::AntiJoin {
                 outer_var,
                 inner,
                 predicate,
@@ -780,7 +870,12 @@ pub(crate) fn gq_conjunct(conjunct: &IRExpr) -> Predicate {
 
 /// The node a leading `order` search function becomes; `None` leaves the
 /// expression to `Sort`, which then reads its columns like any other.
-fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<LogicalNode> {
+fn search_node(
+    input: LogicalId,
+    expr: &IRExpr,
+    limit: Option<u64>,
+    leads: bool,
+) -> Option<LogicalNode> {
     match expr {
         IRExpr::Nearest {
             variable,
@@ -797,6 +892,7 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
                 query: query.as_ref().clone(),
                 k: limit,
                 reads,
+                leads,
             })
         }
         IRExpr::Bm25 { field, query, .. } => {
@@ -816,6 +912,7 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
                 property: property.clone(),
                 query: query.as_ref().clone(),
                 reads,
+                leads,
             })
         }
         IRExpr::Rrf {
@@ -839,6 +936,7 @@ fn search_node(input: LogicalId, expr: &IRExpr, limit: Option<u64>) -> Option<Lo
                 limit,
                 reads,
                 row_tiebreak: Vec::new(),
+                leads,
             })
         }
         _ => None,
@@ -902,7 +1000,7 @@ pub(crate) fn rank_score(binding: &str, kind: RankKind) -> IRExpr {
 fn fused_score(binding: &str) -> IRExpr {
     IRExpr::PropAccess {
         variable: binding.to_string(),
-        property: omnigraph_compiler::query::ast::RRF_COLUMN.to_string(),
+        property: omnigraph_compiler::query::value::RRF_COLUMN.to_string(),
         ty: omnigraph_compiler::types::ExprType::from_prop(
             &omnigraph_compiler::types::PropType::scalar(
                 omnigraph_compiler::types::ScalarType::F64,
@@ -1214,7 +1312,9 @@ pub(crate) fn reads_of_expr(expr: &IRExpr, out: &mut Vec<ColumnRef>) {
         }
         IRExpr::Not(inner, _)
         | IRExpr::IsNull { expr: inner, .. }
+        | IRExpr::Neg { expr: inner, .. }
         | IRExpr::Cast { expr: inner, .. } => reads_of_expr(inner, out),
+        IRExpr::Call { args, .. } => args.iter().for_each(|arg| reads_of_expr(arg, out)),
         IRExpr::PropAccess {
             variable,
             property,
@@ -1878,6 +1978,10 @@ fn place_query_filters(
                     scopes.push(*inner);
                     stack.push(*input);
                 }
+                // A window is a cut: no filter written after it moves below
+                // it, where it would decide which targets the window selects
+                // (law 2). The window's population is a scope of its own.
+                Some(LogicalNode::TargetCut { input, .. }) => scopes.push(*input),
                 Some(node) => stack.extend(node.inputs()),
                 None => {}
             }
@@ -2353,6 +2457,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             query: _,
             k: _,
             reads,
+            leads: _,
         }
         | LogicalNode::TextSearch {
             input: _,
@@ -2360,6 +2465,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             property: _,
             query: _,
             reads,
+            leads: _,
         }
         | LogicalNode::Aggregate {
             input: _,
@@ -2373,6 +2479,7 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             limit: _,
             reads,
             row_tiebreak,
+            leads: _,
         } => {
             out.extend(arms.iter().map(|arm| ColumnRef::entity(&arm.binding)));
             out.extend(reads.iter().cloned());
@@ -2389,6 +2496,11 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             }
             reads_of_expr(&predicate.right, &mut out);
         }
+        LogicalNode::TargetCut {
+            input: _,
+            binding,
+            targets: _,
+        } => out.push(ColumnRef::property(binding, IDENTITY_MEMBER)),
         LogicalNode::MetadataCount {
             spec: _,
             return_exprs: _,
@@ -3378,6 +3490,7 @@ impl Lowering<'_> {
                 property,
                 query,
                 k,
+                leads,
                 ..
             } => {
                 let lowered = self.lower(*input)?;
@@ -3389,7 +3502,11 @@ impl Lowering<'_> {
                     query: query.clone(),
                     fetch,
                     nprobes: self.source.ann_nprobes(),
-                    scope: RankScope::Order,
+                    scope: if *leads {
+                        RankScope::Order
+                    } else {
+                        RankScope::Window
+                    },
                     overfetch: fetch.map(OverfetchRung::ladder).unwrap_or_default(),
                     prefilter: None,
                     eligibility: Eligibility::BeforeScoring,
@@ -3416,7 +3533,9 @@ impl Lowering<'_> {
                         ranked.prefilter = Some(prefilter);
                     }
                 }
-                self.ranking = Some(Ranking::Scores(vec![score]));
+                if *leads {
+                    self.ranking = Some(Ranking::Scores(vec![score]));
+                }
                 Ok(lowered)
             }
             LogicalNode::TextSearch {
@@ -3424,6 +3543,7 @@ impl Lowering<'_> {
                 binding,
                 property,
                 query,
+                leads,
                 ..
             } => {
                 let lowered = self.lower(*input)?;
@@ -3453,7 +3573,9 @@ impl Lowering<'_> {
                         &[Role::Search],
                     );
                 }
-                self.ranking = Some(Ranking::Scores(vec![score]));
+                if *leads {
+                    self.ranking = Some(Ranking::Scores(vec![score]));
+                }
                 Ok(lowered)
             }
             LogicalNode::RankFuse {
@@ -3462,6 +3584,7 @@ impl Lowering<'_> {
                 k,
                 limit,
                 row_tiebreak,
+                leads,
                 ..
             } => {
                 let primary = self.lower(*input)?;
@@ -3541,10 +3664,12 @@ impl Lowering<'_> {
                 )?;
                 let [primary_arm, secondary_arm] = <[RankArm; 2]>::try_from(lowered_arms)
                     .map_err(|_| PlanError::Internal("an rrf has two arms".to_string()))?;
-                self.ranking = Some(Ranking::Fused(IROrdering {
-                    expr: fused_score(&primary_arm.binding),
-                    descending: true,
-                }));
+                if *leads {
+                    self.ranking = Some(Ranking::Fused(IROrdering {
+                        expr: fused_score(&primary_arm.binding),
+                        descending: true,
+                    }));
+                }
                 Ok(self.physical.add(PhysicalNode::RankFuse {
                     arms: [primary_arm, secondary_arm],
                     k: k.clone(),
@@ -3564,6 +3689,19 @@ impl Lowering<'_> {
                         "no operator sorts by {keys:?}; the input declares {declared:?}"
                     )))
                 }
+            }
+            LogicalNode::TargetCut {
+                input,
+                binding,
+                targets,
+            } => {
+                let lowered = self.lower(*input)?;
+                self.tracer.record(&[Role::Limit], Rule::Lower, &[]);
+                Ok(self.physical.add(PhysicalNode::TargetCut {
+                    input: lowered,
+                    binding: binding.clone(),
+                    targets: usize::try_from(*targets).unwrap_or(usize::MAX),
+                }))
             }
             LogicalNode::Limit { input, rows } => {
                 self.limit = Some(*rows);
@@ -4509,6 +4647,17 @@ fn derive_properties(
                 let input = props(plan, *input)?;
                 Properties {
                     schema: classify_schema(&source.schema(SideId::Base)?),
+                    ordering: ordering.clone(),
+                    rows: input.rows,
+                    work_bytes: input.work_bytes,
+                    retained_limit: None,
+                    sources: Vec::new(),
+                }
+            }
+            PhysicalNode::TargetCut { input, .. } => {
+                let input = props(plan, *input)?;
+                Properties {
+                    schema: input.schema.clone(),
                     ordering: ordering.clone(),
                     rows: input.rows,
                     work_bytes: input.work_bytes,

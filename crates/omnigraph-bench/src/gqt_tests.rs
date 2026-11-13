@@ -1367,7 +1367,7 @@ fn nested_and_relocated_catalogs_keep_content_identity_and_refuse_aliases() {
 #[tokio::test]
 async fn expected_parameter_error_does_not_claim_a_warming_engine_read() {
     let mut p = plan("tiny-read");
-    let prefix = "--- query\nquery invalid($key: String) { match { $i: Item { key: $key } } return { $i.val } }\n--- params\n{\"key\":42}\n--- expect error: params rejected\n\n";
+    let prefix = "--- query\nquery invalid($key: String) { match { $i: Item } where $i.key = $key return { $i.val } }\n--- params\n{\"key\":42}\n--- expect error: params rejected\n\n";
     let at = p.queries.text.find("--- query").unwrap();
     p.queries.text.insert_str(at, prefix);
     p.queries.sha256 = sha256_bytes(p.queries.text.as_bytes());

@@ -42,7 +42,7 @@ pass projection_pushdown
 --- query
 set engine = v2;
 query contribute() {
-    match { $c: T $c.state = "open" }
+    match { $c: T } where $c.state = "open"
     return { $c.rank, count($c.slug) as n }
     order { $c.rank }
 }
@@ -72,9 +72,9 @@ scan T as $c: columns [__id, slug, state, rank, kind, kind_ref]
 --- query
 set engine = v2;
 query leading_nearest() {
-    match { $c: T }
+    match { let $pop = { match { $c: T } return { $c } }, from nearest($pop, $c.embedding, [1.0, 0.0], k: 1) as $distance }
     return { $c.slug }
-    order { nearest($c.embedding, [1.0, 0.0]) }
+    order { $distance }
     limit 1
 }
 --- expect ordered
@@ -87,7 +87,7 @@ scan T as $c: columns [__id, slug]
 --- query
 set engine = v2;
 query negated() {
-    match { $c: T not { $x: T $x.kind = $c.kind_ref } }
+    match { $c: T } where not exists { $x: T where $x.kind = $c.kind_ref }
     return { $c.slug }
 }
 --- expect unordered
@@ -100,7 +100,7 @@ scan T as $x: columns [slug, kind]
 --- query
 set engine = v2;
 query destination() {
-    match { $a: T $a knows $b $a.state = "open" $b.kind = $a.kind_ref }
+    match { $a: T, $a knows $b } where $a.state = "open" and $b.kind = $a.kind_ref
     return { $b.slug }
 }
 --- expect unordered
@@ -116,7 +116,7 @@ filter reads [b.kind, a.kind_ref]
 --- query
 set engine = v2;
 query unused_binding() {
-    match { $c: T $d: T }
+    match { $c: T, let $ds = { match { $d: T } return { $d } }, from $ds }
     return { $c.slug }
 }
 --- expect unordered

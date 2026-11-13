@@ -95,7 +95,7 @@ async fn selected_traversal_owned_state_refuses_a_realistic_pool_and_releases_is
     let dir = tempfile::tempdir().unwrap();
     let db = graph_fixture(&dir, 16_384, 0).await;
     let query = r#"query friends() {
-        match { $a: Person { name: "hub" } $a (knows | knows){1,3} $b }
+        match { $a: Person, $a (knows | knows){1,3} $b } where $a.name = "hub"
         return { $b.@id }
     }"#;
     let limit = MIB;
@@ -311,7 +311,7 @@ node Person {
 edge Knows: Person -> Person
 "#;
 const EXPAND: &str = r#"query friends() {
-    match { $a: Person { name: "hub" } $a knows $b }
+    match { $a: Person, $a knows $b } where $a.name = "hub"
     return { $b.name, $b.payload }
 }"#;
 
@@ -353,7 +353,7 @@ async fn cancellation_during_charged_expand_releases_pool_and_worker() {
     for source in [
         EXPAND.to_string(),
         EXPAND.replace("knows", "(knows | knows){1,3}"),
-        r#"query friends() { match { $a: Person { name: "hub" } $b: Person $a $e:* $b } return { $e.@id } }"#.to_string(),
+        r#"query friends() { match { $a: Person, $b: Person, $a $e:* $b } where $a.name = "hub" return { $e.@id } }"#.to_string(),
     ] {
         let v2 = v2.clone();
     let probes = QueryMemoryProbes::default();
@@ -523,9 +523,9 @@ node Doc {
     db.ensure_indices_as(None).await.unwrap();
     let v2 = with_setting(&db, "engine", "v2");
     let source = r#"query fused($q: String) {
-        match { $d: Doc }
+        match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $q), bm25($all, $d.text, "needle needle"), k: 60) as $score, $d: Doc }
         return { $d.slug }
-        order { rrf(bm25($d.text, $q), bm25($d.text, $q)) }
+        order { $score desc }
         limit 5000
     }"#;
     let values = params(&[("q", "needle")]);
@@ -615,9 +615,9 @@ edge Knows: Doc -> Doc
         "force_postfilter",
     );
     let query = r#"query friends($q: Vector(4)) {
-        match { $d: Doc $d knows $t }
+        match { let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, from nearest($pop, $d.embedding, $q, k: 10) as $distance }
         return { $d.slug }
-        order { nearest($d.embedding, $q) }
+        order { $distance }
         limit 10
     }"#;
     let probes = QueryMemoryProbes::default();
@@ -728,16 +728,14 @@ edge Knows: Person -> Person
         let v2 = with_setting(&db, "engine", "v2");
         let queries = r#"
 query fused($q: String) {
-    match { $p: Person $p knows $friend }
+    match { let $all = { match { $p: Person } return { $p } }, from rrf(bm25($all, $p.text, $q), bm25($all, $p.text, "needle needle"), k: 60) as $score, $p: Person, $p knows $friend }
     return { $p.name }
-    order { rrf(bm25($p.text, $q), bm25($p.text, $q)) }
+    order { $score desc }
     limit 2
 }
 query without_matching_friend() {
-    match {
-        $p: Person
-        not { $p knows $friend $friend.text = "needle" }
-    }
+    match { $p: Person }
+    where not exists { $friend: Person, $p knows $friend where $friend.text = "needle" }
     return { $p.name }
 }
 "#;
@@ -811,7 +809,7 @@ edge Likes: Person -> Doc
 "#;
 
 const JOIN_OUTPUT_QUERY: &str = r#"query joined_payloads() {
-    match { $p: Person  $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, $d.payload }
 }"#;
 
@@ -1043,7 +1041,7 @@ async fn wide_source_fanout_stays_within_the_query_pool() {
     .await
     .unwrap();
     let query = r#"query count_payloads() {
-        match { $a: Person { name: "hub" } $a knows $b }
+        match { $a: Person, $a knows $b } where $a.name = "hub"
         return { count($a.payload) as n }
     }"#;
     let probes = QueryMemoryProbes::default();
@@ -1099,11 +1097,11 @@ async fn csr_single_hop_materializes_only_emitted_destination_ids() {
     let v2 = with_traversal(&with_setting(&db, "engine", "v2"), Traversal::Csr);
     let queries = r#"
 query two_hops() {
-    match { $a: Person { name: "hub" } $a knows{1,2} $b }
+    match { $a: Person, $a knows{1,2} $b } where $a.name = "hub"
     return { $b.name }
 }
 query one_hop() {
-    match { $a: Person { name: "hub" } $a knows $b }
+    match { $a: Person, $a knows $b } where $a.name = "hub"
     return { $b.name }
 }"#;
     let expected: Vec<_> = (0..3).map(name).collect();
@@ -1162,21 +1160,15 @@ node Passage {
 "#;
 
 const CITED: &str = r#"query cited() {
-    match {
-        $m: Matter
-        $p: Passage
-        $p.text contains $m.number
-    }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
+    where contains($p.text, $m.number)
     return { $m.mid, $p.pid }
 }"#;
 
 /// The same pairs through a conjunct the join derives no needles from.
 const CITED_WITHOUT_NEEDLES: &str = r#"query cited() {
-    match {
-        $m: Matter
-        $p: Passage
-        $p.text contains $m.number or $p.text = $m.number
-    }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
+    where (contains($p.text, $m.number) or $p.text = $m.number)
     return { $m.mid, $p.pid }
 }"#;
 
@@ -1377,7 +1369,7 @@ async fn hydrated_copies_of_a_joined_row_stay_within_the_chunk_bound() {
         .unwrap();
     let v2 = with_setting(&db, "engine", "v2");
     let fanout = r#"query fanout() {
-        match { $a: Person $a knows $b }
+        match { $a: Person, $a knows $b }
         return { $a.name, $a.payload }
         limit 108
     }"#;
@@ -1856,8 +1848,13 @@ node Passage {
 
 /// `conjunct` and `extra` over one Matter and one Passage.
 fn cited_by(conjunct: &str, extra: &str) -> String {
+    let filter = if extra.is_empty() {
+        format!("({conjunct})")
+    } else {
+        format!("({conjunct}) and {extra}")
+    };
     format!(
-        "query cited() {{\n    match {{\n        $m: Matter\n        $p: Passage\n        {conjunct}\n        {extra}\n    }}\n    return {{ $m.mid, $p.pid }}\n}}"
+        "query cited() {{\n    match {{ $m: Matter, let $ps = {{ match {{ $p: Passage }} return {{ $p }} }}, from $ps }}\n    where {filter}\n    return {{ $m.mid, $p.pid }}\n}}"
     )
 }
 
@@ -1975,7 +1972,7 @@ async fn a_contains_join_and_its_cross_join_agree_on_generated_texts_over_severa
             probes.clone(),
             query_main(
                 &v2,
-                &cited_by("$p.text contains $m.number", extra),
+                &cited_by("contains($p.text, $m.number)", extra),
                 "cited",
                 &params(&[]),
             ),
@@ -2001,7 +1998,7 @@ async fn a_contains_join_and_its_cross_join_agree_on_generated_texts_over_severa
             probes.clone(),
             query_main(
                 &v2,
-                &cited_by("($p.text contains $m.number) or false", extra),
+                &cited_by("contains($p.text, $m.number) or false", extra),
                 "cited",
                 &params(&[]),
             ),
@@ -2059,12 +2056,12 @@ async fn multi_hop_expand_stops_at_the_limit_it_feeds() {
     let v2 = with_setting(&db, "engine", "v2");
     let queries = r#"
 query first() {
-    match { $p: Person $p knows{1,2} $f }
+    match { $p: Person, $p knows{1,2} $f }
     return { $f.name }
     limit 1
 }
 query all() {
-    match { $p: Person $p knows{1,2} $f }
+    match { $p: Person, $p knows{1,2} $f }
     return { count($f) as n }
 }"#;
     let pairs = width * (width + 1) + width;
@@ -2146,7 +2143,7 @@ async fn bound_expand_returns_list_edge_properties_under_a_fixed_pool_issue_1251
         .unwrap();
     let v2 = with_setting(&db, "engine", "v2");
     let query = r#"query tagged() {
-        match { $a: Person { name: "hub" } $a $t:knows $b }
+        match { $a: Person, $a $t:knows $b } where $a.name = "hub"
         return { $b.name, $t.labels }
     }"#;
     let limit = 8 * MIB;
@@ -2235,10 +2232,8 @@ async fn a_query_that_fits_a_budget_fits_every_larger_budget_issue_1361() {
     let db = with_setting(&db, "engine", "v2");
     let source = r#"
 query pairs() {
-    match {
-        $p: Person { name: "a" }
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
+    where $p.name = "a"
     return { max($e.payload) as last }
 }
 "#;

@@ -25,7 +25,8 @@ node Doc {
 
 --- mutate
 query move_embedding($s: String, $e: Vector(4)) {
-    update Doc set { embedding: $e } where slug = $s
+    match { $x: Doc } where $x.slug = $s
+    update $x set { embedding: $e }
 }
 
 --- params
@@ -35,9 +36,9 @@ query move_embedding($s: String, $e: Vector(4)) {
 
 --- query
 query nearest_after_update($q: Vector(4)) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 6) as $distance }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 6
 }
 

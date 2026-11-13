@@ -15,7 +15,7 @@ use crate::support::*;
 #[tokio::test(flavor = "multi_thread")]
 async fn stored_wildcard_keeps_both_authorization_gates_issue_659() {
     let source = r#"query neighbors() {
-        match { $p: Person { name: "Alice" } $f: Person $p * $f }
+        match { $p: Person, $f: Person, $p * $f } where $p.name = "Alice"
         return { $f.name }
     }"#;
     let (_temp, app) = app_with_stored_queries(
@@ -150,7 +150,7 @@ async fn server_boots_with_a_valid_stored_query_registry() {
     let graph = graph_path(temp.path());
     let registry = stored_query_registry(&[(
         "find_person",
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+        "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.age } }",
         false,
     )]);
     let state = AppState::open_single_with_queries(
@@ -443,7 +443,7 @@ async fn server_refuses_boot_on_type_broken_stored_query() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invoke_stored_read_returns_rows() {
-    const RANKED_PEOPLE_GQ: &str = "query ranked_people($q: String) { match { $p: Person } return { $p.name, bm25($p.name, $q) as relevance } order { bm25($p.name, $q) } limit 2 }";
+    const RANKED_PEOPLE_GQ: &str = "query ranked_people($q: String) { match { let $pop = { match { $p: Person } return { $p } }, from bm25($pop, $p.name, $q) as $score } return { $p.name, $score as relevance } order { $score desc } limit 2 }";
     let (_temp, app) = app_with_stored_queries(
         &[
             ("find_person", FIND_PERSON_GQ, false),
@@ -984,7 +984,7 @@ async fn list_queries_surfaces_query_description_and_instruction() {
     let described = "query described($name: String) \
         @description(\"Find a person by exact name.\") \
         @instruction(\"Use for exact lookups; prefer search for fuzzy matches.\") \
-        { match { $p: Person { name: $name } } return { $p.age } }";
+        { match { $p: Person } where $p.name = $name return { $p.age } }";
     let (_temp, app) = app_with_stored_queries(
         &[
             ("described", described, true),
@@ -1151,7 +1151,7 @@ async fn invoke_stored_mutation_graph_commit_precondition_issue_365() {
     assert_receipt_commit_matches_get(&app, &body, "t-full").await;
 }
 
-const OLDER_OR_NAMED_GQ: &str = "query older_or_named($name: String) { match { $p: Person  $p.age > 30 or $p.name = $name } return { $p.name } }";
+const OLDER_OR_NAMED_GQ: &str = "query older_or_named($name: String) { match { $p: Person } where ($p.age > 30 or $p.name = $name) return { $p.name } }";
 
 /// [`app_with_stored_queries`] with the process defaults every invocation's
 /// session starts from, seeded here instead of the process environment.
@@ -1230,7 +1230,7 @@ fn cluster_invoke(graph_id: &str, name: &str, body: Value) -> axum::http::Reques
         .unwrap()
 }
 
-/// A stored `where and = 1` or `as and` no longer parses, the registry refusal the cluster
+/// A stored `… where and = 1` statement or `as and` no longer parses, the registry refusal the cluster
 /// boot quarantines on and the import refuses; rewritten to `conj`, the registry imports,
 /// applies, boots under strict `require_all_graphs` with no quarantine, and serves.
 #[tokio::test(flavor = "multi_thread")]
@@ -1247,15 +1247,13 @@ async fn registry_rewritten_away_from_reserved_words_reloads_without_quarantine(
     let details: Vec<String> = errors.iter().map(ToString::to_string).collect();
     assert!(
         details.iter().any(|detail| {
-            detail.contains("stored query 'clear_flag'")
-                && detail.contains("`and` is a reserved word; a property of that name is written `$p.and` in a read and cannot be named bare in a mutation `where`")
+            detail.contains("stored query 'clear_flag'") && detail.contains("is not a statement")
         }),
         "{details:?}"
     );
     assert!(
         details.iter().any(|detail| {
-            detail.contains("stored query 'by_and'")
-                && detail.contains("`and` is a reserved word and cannot be a return alias")
+            detail.contains("stored query 'by_and'") && detail.contains("cannot be a return alias")
         }),
         "{details:?}"
     );
@@ -1304,7 +1302,7 @@ graphs:
     assert!(
         parse_errors
             .iter()
-            .any(|message| message.contains("cannot be named bare in a mutation `where`"))
+            .any(|message| message.contains("is not a statement"))
             && parse_errors
                 .iter()
                 .any(|message| message.contains("cannot be a return alias")),
@@ -1320,7 +1318,7 @@ graphs:
     .unwrap();
     std::fs::write(
         rewritten.path().join("mutations.gq"),
-        "query add_person($slug: String, $n: I64) { insert Person { slug: $slug, conj: $n } }\nquery clear_flag() { update Person set { conj: 0 } where conj = 1 }\n",
+        "query add_person($slug: String, $n: I64) { insert Person { slug: $slug, conj: $n } }\nquery clear_flag() { match { $x: Person } where $x.conj = 1  update $x set { conj: 0 } }\n",
     )
     .unwrap();
     std::fs::write(

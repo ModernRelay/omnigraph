@@ -23,7 +23,7 @@ node Person {
 --- query
 set engine = v2;
 query plain($s: String) {
-    match { $p: Person $p.slug = $s }
+    match { $p: Person } where $p.slug = $s
     return { $p.age }
 }
 --- params
@@ -40,7 +40,7 @@ pass scan_access
 --- query
 set engine = v2;
 query escaped($s: String) {
-    match { $p: Person $p.slug = $s }
+    match { $p: Person } where $p.slug = $s
     return { $p.age }
 }
 --- params
@@ -57,7 +57,7 @@ pass scan_access
 --- query
 set engine = v2;
 query empty($s: String) {
-    match { $p: Person $s = $p.slug }
+    match { $p: Person } where $s = $p.slug
     return { $p.age }
 }
 --- params

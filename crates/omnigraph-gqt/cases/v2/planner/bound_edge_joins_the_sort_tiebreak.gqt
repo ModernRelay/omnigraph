@@ -27,7 +27,7 @@ edge Knows: Person -> Doc {
 --- query
 set engine = v2;
 query weights_by_name() {
-    match { $p: Person $p $e:knows $d }
+    match { $p: Person, $p $e:knows $d }
     return { $p.name, $e.weight }
     order { $p.name }
 }

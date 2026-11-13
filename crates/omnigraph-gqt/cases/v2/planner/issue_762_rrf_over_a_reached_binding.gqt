@@ -28,13 +28,12 @@ edge About: Doc -> Topic
 
 --- query
 query ranked_destination() {
-    match { $t: Topic { name: "storage" } $d about $t }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, [1.0, 0.0], k: 1), bm25($all, $d.body, "needle"), k: 60) as $score, $t: Topic, $d about $t } where $t.name = "storage"
     return { $d.slug }
-    order { rrf(nearest($d.embedding, [1.0, 0.0]), bm25($d.body, "needle")) }
+    order { $score desc }
     limit 1
 }
 --- expect ordered
 {"d.slug":"d1"}
 --- expect shape
 d.slug: String
---- expect same as v1

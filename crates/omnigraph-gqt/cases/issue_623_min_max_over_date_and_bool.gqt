@@ -27,9 +27,7 @@ node Person {
 
 --- query
 query min_max_over_date_and_bool() {
-    match {
-        $p: Person
-    }
+    match { $p: Person }
     return { min($p.birthdate) as min_birthdate, max($p.birthdate) as max_birthdate, min($p.isStudent) as min_is_student, max($p.isStudent) as max_is_student, min($p.registered) as first_registered, max($p.registered) as last_registered }
 }
 
@@ -46,10 +44,8 @@ last_registered: DateTime
 
 --- query
 query zero_rows_one_null_row() {
-    match {
-        $p: Person
-        $p.name = "nobody"
-    }
+    match { $p: Person }
+    where $p.name = "nobody"
     return { count($p) as n, min($p.birthdate) as min_birthdate, max($p.isStudent) as max_is_student, min($p.registered) as first_registered }
 }
 
@@ -64,10 +60,8 @@ first_registered: DateTime?
 
 --- query
 query null_only_group_yields_null() {
-    match {
-        $p: Person
-        $p.name = "carol"
-    }
+    match { $p: Person }
+    where $p.name = "carol"
     return { count($p) as n, max($p.isStudent) as max_is_student, min($p.birthdate) as min_birthdate }
 }
 
@@ -81,29 +75,23 @@ min_birthdate: Date?
 
 --- query
 query min_over_list_refused() {
-    match {
-        $p: Person
-    }
+    match { $p: Person }
     return { min($p.tags) as t }
 }
 
---- expect error: T8: min requires a numeric, String, Bool, Date, or DateTime scalar, got [I32]
+--- expect error: T8: min requires an orderable scalar, got [I32]?
 
 --- query
 query max_over_vector_refused() {
-    match {
-        $p: Person
-    }
+    match { $p: Person }
     return { max($p.emb) as e }
 }
 
---- expect error: T8: max requires a numeric, String, Bool, Date, or DateTime scalar, got Vector(2)
+--- expect error: T8: max requires an orderable scalar, got Vector(2)?
 
 --- query
 query sum_over_date_refused() {
-    match {
-        $p: Person
-    }
+    match { $p: Person }
     return { sum($p.birthdate) as s }
 }
 
@@ -111,10 +99,8 @@ query sum_over_date_refused() {
 
 --- query
 query min_over_blob_refused() {
-    match {
-        $p: Person
-    }
+    match { $p: Person }
     return { min($p.doc) as d }
 }
 
---- expect error: T24: Blob property `$p.doc` is not available as a .gq read value
+--- expect error: T24: a Blob is not a read value, so min cannot take it

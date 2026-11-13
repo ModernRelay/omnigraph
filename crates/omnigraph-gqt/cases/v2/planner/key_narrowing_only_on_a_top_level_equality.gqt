@@ -22,7 +22,7 @@ node Person {
 --- query
 set engine = v2;
 query either() {
-    match { $p: Person $p.slug = "alpha" or $p.slug = "beta" }
+    match { $p: Person } where ($p.slug = "alpha" or $p.slug = "beta")
     return { $p.age }
 }
 --- expect unordered
@@ -36,7 +36,7 @@ not pass key_to_id
 --- query
 set engine = v2;
 query nested() {
-    match { $p: Person ($p.slug = "alpha" and $p.age = 11) or $p.slug = "gamma" }
+    match { $p: Person } where (($p.slug = "alpha" and $p.age = 11) or $p.slug = "gamma")
     return { $p.age }
 }
 --- expect unordered
@@ -50,7 +50,7 @@ not pass key_to_id
 --- query
 set engine = v2;
 query negated() {
-    match { $p: Person not $p.slug = "alpha" }
+    match { $p: Person } where not $p.slug = "alpha"
     return { $p.age }
 }
 --- expect unordered
@@ -64,7 +64,7 @@ not pass key_to_id
 --- query
 set engine = v2;
 query unequal() {
-    match { $p: Person $p.slug != "alpha" }
+    match { $p: Person } where $p.slug != "alpha"
     return { $p.age }
 }
 --- expect unordered
@@ -78,7 +78,7 @@ not pass key_to_id
 --- query
 set engine = v2;
 query contradictory() {
-    match { $p: Person $p.slug = "alpha" and $p.slug = "beta" }
+    match { $p: Person } where $p.slug = "alpha" and $p.slug = "beta"
     return { $p.age }
 }
 --- expect unordered
@@ -89,7 +89,7 @@ p.age: I32
 --- query
 set engine = v2;
 query contradictory_reversed() {
-    match { $p: Person $p.slug = "beta" and $p.slug = "alpha" }
+    match { $p: Person } where $p.slug = "beta" and $p.slug = "alpha"
     return { $p.age }
 }
 --- expect unordered
@@ -100,7 +100,7 @@ p.age: I32
 --- query
 set engine = v2;
 query repeated() {
-    match { $p: Person $p.slug = "alpha" and $p.slug = "alpha" }
+    match { $p: Person } where $p.slug = "alpha" and $p.slug = "alpha"
     return { $p.age }
 }
 --- expect unordered

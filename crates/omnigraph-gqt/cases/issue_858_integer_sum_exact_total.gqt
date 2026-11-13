@@ -23,7 +23,7 @@ node Person {
 
 --- query
 query exact_total() {
-    match { $p: Person $p.team = "cancel" }
+    match { $p: Person } where $p.team = "cancel"
     return { sum($p.amount) as total }
 }
 --- expect unordered
@@ -55,7 +55,7 @@ result columns [total: F64?, p.team: String]
 
 --- query
 query unchanged_average() {
-    match { $p: Person $p.team = "cancel" }
+    match { $p: Person } where $p.team = "cancel"
     return { avg($p.amount) as mean }
 }
 --- expect unordered

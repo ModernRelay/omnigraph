@@ -1,7 +1,6 @@
 # Mutations and Loads
 
-Mutation statements live inside a named `.gq` query. Run them with
-`omnigraph mutate`.
+Mutation statements live inside a named `.gq` query; run it with `omnigraph mutate`.
 
 ```gq
 query hire($person_id: String, $company_id: String, $role: String) {
@@ -13,70 +12,71 @@ query hire($person_id: String, $company_id: String, $role: String) {
 }
 ```
 
-Edge endpoints use the reserved assignments `from` and `to`; their values are
-the logical ids of existing endpoint nodes.
+An edge insert assigns its endpoints as `from` and `to`, the logical ids of existing nodes.
 
 ## Statements
 
-```gq
+```gq fragment
 insert Person { email: $email, display_name: $name }
-update Person set { display_name: $name } where email = $email
-delete Person where email = $email
+
+match { $x: Person } where $x.email = $email
+update $x set { display_name: $name }
+
+match { $x: Person } where $x.email = $email
+delete $x
 ```
 
-A `where` on `update` or `delete` takes the same expressions as a read filter
-(see [Boolean expressions and nulls](../queries/index.md#boolean-expressions-and-nulls)):
-`and`, `or`, `not`, parentheses, the six comparisons, `starts_with`,
-`contains`, `in`, `is null` and `is not null`. Its operands are the target type's
-properties, named bare, the system fields `@id`, `@src` and `@dst`, literals,
-parameters, and `now()`; `from` and `to` stay accepted for `@src` and `@dst`.
-It keeps only the rows whose expression is true. On four `Knows` edges, `ab1`
-and `ab2` from `a` to `b`, `ac`, and `db`:
+A write body is one or more groups. A group selects its rows with a read's
+`match { ... }` and `where`, and its statements run once per row:
+`update $x set { ... }` and `delete $x` name a bound node or edge variable
+(another is `T77`), and `insert T { ... }` writes one entity per row, once
+with no `match`. A later group opens with its own `match` and sees the effects
+of the groups before it. A statement takes no `where`: `delete T where ...`
+is refused (`Q008`) with the group form as the fix, and elements written
+without `match { }` are refused (`Q013`).
 
 ```gq
-query exact() { delete Knows where @src = "a" and @dst = "b" }
+query relocate_staff($slug: String) {
+  match { $c: Company, $p worksAt $c } where $c.slug = $slug
+  update $p set { city: null }
+}
 ```
 
-removes `ab1` and `ab2` and nothing else: `affected: nodes=0 edges=2`. A binding
-variable in a `where` is refused at compile time (`T14`); an aggregate, search,
-or ranking call is `T44`, for example ``T44: `count` cannot appear in a mutation
-where; a where compares the row's own properties, parameters and now()``. A
-compound `where` runs under either `engine` setting. A `where` that tests over
-four properties twice each with `=`, `!=` or `in` is refused.
+The selection takes everything a [read's match](../queries/index.md#match-patterns)
+does: traversals and edge bindings (`$p $k:worksAt $c` then `delete $k`),
+`exists`, `not exists` and `count { ... }` blocks, `let` and `from`. One
+binding of the written type with a filter over it is evaluated together with
+the statements before it; any other selection runs once as a read of the
+graph the write started from. Such a selection may not read a type an earlier
+group of the same write changes, and `optional` is not supported yet (both
+`T86`). An unbound variable is `T6` and an aggregate `T8`; a filter on one
+binding testing over four properties twice each with `=`, `!=` or `in` fails.
 
-Assignment values are constants: literals, parameters, `now()`, and comparisons
-or Boolean operators over them, such as `adult: true or $flag`. A constant's
-value is fixed per invocation: parameters and `now()` are bound once before any
-retry, so a retried mutation computes the same value. It follows the read rules
-for null: with `$flag` null, `true or $flag` is `true` and `false and $flag` is
-`false`, and `$age > 30` with `$age` null is null. A null result assigned to a
-nullable property writes null; on a `Blob` property it clears the cell. `null`
-is a reserved word, so clear a Blob through a nullable parameter such as
-`$content: Blob?`. Assigned to a non-nullable property a null result is refused
-with a typed error that names the property, never written as a default. A
-property or system field in a value is refused, for example ``T45: `age` cannot
-appear in an assignment value; assignments and binding matches are constants per
-invocation``.
+Assignment values are literals, parameters, `now()`, expressions over them,
+and values read from the row (`city: $c.city`, `to: $c` for an endpoint);
+constants are bound once before any retry. They follow the read rules for
+null: a null result, or `null` written as the value, clears a nullable
+property, and on a non-nullable property is refused with a typed error naming
+it. A value read from the row may not be a `Blob` (`T86`). Rows of one
+statement that give one entity's property two values are refused (`E4`); a
+keyed insert whose rows repeat a key with equal values writes it once. A
+write whose selection matches nothing publishes no commit.
 
 A mutation query may contain several inserts and updates, or several deletes,
-but it cannot mix inserts or updates with deletes. Split that workflow into two
-queries, or run the queries on a branch and merge when the combined result is
-ready.
+but not both (`T76`). Split that workflow into two queries, or run them on a
+branch and merge when the combined result is ready.
 
 ## Atomicity
 
-An effectful mutation query publishes one graph commit. All of its statements
+An effectful mutation query publishes one graph commit: all of its statements
 become visible together, or none do. Separate mutation commands are separate
-commits, even when they run consecutively.
+commits. With `--json`, a successful effectful mutation returns `commit` with
+the exact `graph_commit_id` and commit metadata published by that attempt; one
+that matches no entities publishes no commit and returns `"commit": null`.
+Load JSON responses use the same exact receipt.
 
-With `--json`, a successful effectful mutation returns `commit` with the
-exact `graph_commit_id` and commit metadata published by that attempt. A
-successful mutation that matches no entities publishes no commit and returns
-`"commit": null`. Load JSON responses use the same exact receipt.
-
-For a multi-command workflow, use a branch as isolated staging. Earlier changes
-remain committed on that branch; merging makes the resulting branch state
-visible on the target in one atomic step. See
+For a multi-command workflow, stage the commits on a branch; merging makes
+them visible on the target in one atomic step. See
 [Branches, Commits, and History](../branching/index.md).
 
 ## Insert and update identity
@@ -105,22 +105,19 @@ edges of several types:
 {"edge":"WorksAt","from":"ada@example.com","to":"acme","data":{"role":"Engineer"}}
 ```
 
-Here, `Person.email` and `Company.slug` are single-property String keys, so their
-derived ids are exactly `ada@example.com` and `acme`. The edge uses those ids in
-`from` and `to`.
+`Person.email` and `Company.slug` are single-property String keys, so their
+derived ids, which the edge's `from` and `to` use, are exactly
+`ada@example.com` and `acme`.
 
 A `Date` value is an integer day count since 1970-01-01 or a `YYYY-MM-DD`
 string; a `DateTime` value is an integer millisecond count since the Unix epoch
 or an ISO 8601 string. Any other JSON type (a float such as `19723.0`, a
 boolean, an object) fails the load with `invalid Date value` or `invalid
-DateTime value` naming the property. A `Date` string carries no time of day:
-`"2024-01-01T02:00:00+05:00"` fails the load with `invalid Date literal`, as it
-does in a mutation param, a `date(...)` literal, or a read filter; an instant
-belongs in a `DateTime` property. A `DateTime` holds milliseconds: a string with
-a non-zero digit past the third fractional digit, such as
-`"2024-01-01T00:00:00.123456Z"`, fails the load with `invalid DateTime literal`,
-as it does in a mutation param, a `datetime(...)` literal, or a read filter.
-Trailing zeros, as in `.123000`, are accepted.
+DateTime value` naming the property. A `Date` string carries no time of day
+(`"2024-01-01T02:00:00+05:00"` fails with `invalid Date literal`), and a
+`DateTime` holds milliseconds (`"2024-01-01T00:00:00.123456Z"` fails with
+`invalid DateTime literal`; trailing zeros, as in `.123000`, are accepted), as
+in a mutation param, a `date(...)`/`datetime(...)` literal, or a read filter.
 
 Choose the mode explicitly:
 
@@ -155,6 +152,9 @@ when omitted). It is the one CSV surface: `omnigraph load` reads JSONL only.
 
 ```gq
 load csv "s3://imports/person.csv" into node:Person mode append delimiter "|" header
+```
+
+```gq
 load csv "s3://imports/knows.csv" into edge:Knows mode append delimiter "|" header columns (from, to, creationDate)
 ```
 
@@ -346,5 +346,5 @@ loading them, and its [limits](../blobs.md#limits) for the bounds that apply.
 
 ## Conditional mutations
 
-A mutation can be made to apply only to the graph state the caller read, with
-`--if-commit`; see [conditional mutations](conditional.md).
+`--if-commit` applies a mutation only to the graph state the caller read; see
+[conditional mutations](conditional.md).

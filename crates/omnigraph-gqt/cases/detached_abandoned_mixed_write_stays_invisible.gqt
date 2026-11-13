@@ -27,7 +27,7 @@ action: fail
 scope: next_step
 
 --- mutate branch: work
-query mixed_write() { update Person set { age: 31 } where name = "alice" update Person set { age: 41 } where name = "bob" insert Person { name: "carol", age: 20 } }
+query mixed_write() { match { $x: Person } where $x.name = "alice"  update $x set { age: 31 } match { $x: Person } where $x.name = "bob"  update $x set { age: 41 } insert Person { name: "carol", age: 20 } }
 --- expect error: injected failpoint triggered: mutation.post_finalize_pre_publisher
 
 --- query branch: work
@@ -72,7 +72,7 @@ p.age: I64
 p.note: String?
 
 --- mutate branch: work
-query mixed_write() { update Person set { age: 31 } where name = "alice" update Person set { age: 41 } where name = "bob" insert Person { name: "carol", age: 20 } }
+query mixed_write() { match { $x: Person } where $x.name = "alice"  update $x set { age: 31 } match { $x: Person } where $x.name = "bob"  update $x set { age: 41 } insert Person { name: "carol", age: 20 } }
 --- expect affected: nodes=3 edges=0
 
 --- query branch: work

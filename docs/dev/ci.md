@@ -181,9 +181,8 @@ The dispatch owner also checks external-store admission and persistence.
 Automatic corpus runs supply no `--store`, so schema-less query files are
 refused there; schema-and-seed datasets with zero steps are admitted.
 `--measure` refuses a selection with no DST environment.
-`GQT (dst)` runs the whole package, on engine v2, the one engine; a step's
-`--- expect same as v1` comparison runs inside it, so no job selects an
-engine. `GQT (dst-clippy)` checks all package targets with Clippy.
+`GQT (dst)` runs the whole package on engine v2, the one engine, so no job
+selects an engine. `GQT (dst-clippy)` checks all package targets with Clippy.
 `GQT (served)` runs `crates/omnigraph-gqt-served/tests/gqt_served_conformance.rs`:
 every corpus case that declares the `omnigraph-server` target runs again
 through an in-process server, its in-process verdict must be green and its

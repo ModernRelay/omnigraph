@@ -60,7 +60,7 @@ sort tiebreak [$p]
 --- query
 set engine = v2;
 query traversed() {
-    match { $p: Person $p knows $q }
+    match { $p: Person, $p knows $q }
     return { $q.name }
     order { $q.name }
 }

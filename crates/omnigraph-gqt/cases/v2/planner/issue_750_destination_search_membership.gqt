@@ -46,11 +46,8 @@ edge Hops: Doc -> Doc
 --- query
 set engine = v2;
 query destination_search() {
-    match {
-        $s: Source
-        $s links $d
-        search($d.body, "needle")
-    }
+    match { $s: Source, $s links $d }
+    where search($d.body, "needle")
     return { $d.slug }
     order { $d.slug }
 }
@@ -68,11 +65,8 @@ scan Doc as $d: filter reads [d.body]
 --- query
 set engine = v2;
 query destination_match_text() {
-    match {
-        $s: Source
-        $s links $d
-        match_text($d.body, "needle")
-    }
+    match { $s: Source, $s links $d }
+    where match_text($d.body, "needle")
     return { $d.slug }
     order { $d.slug }
 }
@@ -90,13 +84,10 @@ scan Doc as $d: filter reads [d.body]
 --- query
 set engine = v2;
 query scalar_and_two_destination_searches() {
-    match {
-        $s: Source
-        $s links $d
-        $d: Doc { state: "open" }
-        search($d.body, "needle")
-        match_text($d.summary, "beacon")
-    }
+    match { $s: Source, $s links $d, $d: Doc }
+    where $d.state = "open"
+      and search($d.body, "needle")
+      and match_text($d.summary, "beacon")
     return { $d.slug }
 }
 --- expect unordered
@@ -111,13 +102,8 @@ scan Doc as $d: filter reads [d.state, d.body, d.summary]
 --- query
 set engine = v2;
 query two_searches_on_one_property() {
-    match {
-        $s: Source
-        $s links $d
-        $d: Doc { state: "open" }
-        search($d.body, "needle")
-        match_text($d.body, "zeta")
-    }
+    match { $s: Source, $s links $d, $d: Doc }
+    where $d.state = "open" and search($d.body, "needle") and match_text($d.body, "zeta")
     return { $d.slug }
 }
 --- expect unordered
@@ -132,13 +118,8 @@ scan Doc as $d: filter reads [d.state, d.body]
 --- query
 set engine = v2;
 query multihop_endpoint_membership() {
-    match {
-        $s: Source
-        $s links $d
-        $d: Doc { state: "open" }
-        $d hops $e
-        search($e.body, "endpoint")
-    }
+    match { $s: Source, $s links $d, $d: Doc, $d hops $e }
+    where $d.state = "open" and search($e.body, "endpoint")
     return { $e.slug }
 }
 --- expect unordered
@@ -154,13 +135,10 @@ scan Doc as $e: filter reads [e.body]
 --- query
 set engine = v2;
 query limit_counts_surviving_paths() {
-    match {
-        $s: Source
-        $s links $d
-        $d: Doc { state: "open" }
-        search($d.body, "needle")
-        match_text($d.summary, "beacon")
-    }
+    match { $s: Source, $s links $d, $d: Doc }
+    where $d.state = "open"
+      and search($d.body, "needle")
+      and match_text($d.summary, "beacon")
     return { $d.slug }
     limit 2
 }
@@ -176,11 +154,8 @@ scan Doc as $d: filter reads [d.state, d.body, d.summary]
 --- query
 set engine = v2;
 query empty_source_destination_search() {
-    match {
-        $s: Source { slug: "orphan" }
-        $s links $d
-        search($d.body, "needle")
-    }
+    match { $s: Source, $s links $d }
+    where $s.slug = "orphan" and search($d.body, "needle")
     return { $d.slug }
 }
 --- expect unordered
@@ -193,11 +168,8 @@ scan Doc as $d: filter reads [d.body]
 --- query
 set engine = v2;
 query destination_search_has_no_matches() {
-    match {
-        $s: Source
-        $s links $d
-        match_text($d.body, "absenttoken")
-    }
+    match { $s: Source, $s links $d }
+    where match_text($d.body, "absenttoken")
     return { $d.slug }
 }
 --- expect unordered

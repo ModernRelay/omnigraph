@@ -8,7 +8,7 @@ environments:
     storage: local-filesystem
 
 --- mutate
-query hot_write() { update Hot set { value: 1 } where key = "hot" }
+query hot_write() { match { $x: Hot } where $x.key = "hot"  update $x set { value: 1 } }
 --- expect affected: nodes=1 edges=0
 
 --- query branch: main

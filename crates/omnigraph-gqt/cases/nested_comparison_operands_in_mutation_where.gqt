@@ -24,21 +24,24 @@ node Person {
 
 --- mutate
 query nested_comparison() {
-    update Person set { adult: true } where (age > 30) = true
+    match { $x: Person } where ($x.age > 30) = true
+    update $x set { adult: true }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query nested_null_test() {
-    update Person set { nick: "bee" } where (nick is null) = true
+    match { $x: Person } where ($x.nick is null) = true
+    update $x set { nick: "bee" }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query nested_not() {
-    delete Person where (not (age > 30)) = true
+    match { $x: Person } where (not ($x.age > 30)) = true
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0

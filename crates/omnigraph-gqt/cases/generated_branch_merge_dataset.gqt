@@ -65,7 +65,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-source
-query delete_src_0($c: String) { delete BenchE000 where cohort = $c }
+query delete_src_0($c: String) { match { $x: BenchE000 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d3_src_del"}
 --- expect ok
@@ -105,7 +105,7 @@ tables:
 --- expect ok
 
 --- mutate branch: bench-target
-query delete_tgt_0($c: String) { delete BenchE000 where cohort = $c }
+query delete_tgt_0($c: String) { match { $x: BenchE000 } where $x.cohort = $c  delete $x }
 --- params
 {"c": "d3_tgt_del"}
 --- expect ok

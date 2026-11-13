@@ -5,7 +5,7 @@
 //! the ranking its own run establishes; nothing is kept beside the plan.
 
 use omnigraph_compiler::ir::{IRExpr, IRProjection};
-use omnigraph_compiler::query::ast::RRF_COLUMN;
+use omnigraph_compiler::query::value::RRF_COLUMN;
 use omnigraph_compiler::result::{Ranking, SearchFunction};
 
 use crate::error::PlanError;
@@ -69,7 +69,7 @@ pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, Pl
             } => {
                 let scan = (id, ranked.kind, spec.binding.as_deref());
                 match ranked.scope {
-                    RankScope::Order => ordered.push(scan),
+                    RankScope::Order | RankScope::Window => ordered.push(scan),
                     RankScope::Primary | RankScope::Secondary => arms.push(scan),
                 }
             }
@@ -164,9 +164,10 @@ fn return_list(plan: &PhysicalPlan, id: NodeId) -> Result<Option<&[IRProjection]
 mod tests {
     use std::sync::Arc;
 
+    use crate::read_shape::{PatternStep, ReadShape};
     use arrow_schema::{DataType, Field, Schema};
-    use omnigraph_compiler::ir::{IROp, IROrdering, QueryIR};
-    use omnigraph_compiler::query::ast::{DISTANCE_COLUMN, Literal, SCORE_COLUMN};
+    use omnigraph_compiler::ir::IROrdering;
+    use omnigraph_compiler::query::value::{DISTANCE_COLUMN, Literal, SCORE_COLUMN};
     use omnigraph_compiler::{ExprType, PropType, SYSTEM_COLUMNS_V3, ScalarType};
 
     use super::*;
@@ -219,10 +220,10 @@ mod tests {
             column: format!("d.{property}"),
             ty: typed(ScalarType::F32, nullable),
         };
-        let query = QueryIR {
+        let query = ReadShape {
             name: "q".to_string(),
             params: vec![],
-            pipeline: vec![IROp::NodeScan {
+            pipeline: vec![PatternStep::NodeScan {
                 variable: "d".to_string(),
                 type_name: "Doc".to_string(),
                 filters: vec![],

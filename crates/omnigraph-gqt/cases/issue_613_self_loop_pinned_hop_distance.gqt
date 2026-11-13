@@ -24,10 +24,7 @@ edge Knows: Person -> Person
 
 --- query
 query exactly_two_hops() {
-    match {
-        $p: Person
-        $p knows{2,2} $f
-    }
+    match { $p: Person, $p knows{2,2} $f }
     return { $p.name, $f.name }
 }
 
@@ -39,10 +36,7 @@ f.name: String
 
 --- query
 query one_to_two_hops() {
-    match {
-        $p: Person
-        $p knows{1,2} $f
-    }
+    match { $p: Person, $p knows{1,2} $f }
     return { $p.name, $f.name }
 }
 

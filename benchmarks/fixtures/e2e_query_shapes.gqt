@@ -155,7 +155,7 @@ query fixture_people() { match { $p: Person } return { count($p) as n } }
 n: I64
 
 --- query
-query fixture_edges() { match { $p: Person $p knows $q } return { count($q) as n } }
+query fixture_edges() { match { $p: Person, $p knows $q } return { count($q) as n } }
 --- expect unordered
 {"n":50}
 --- expect shape

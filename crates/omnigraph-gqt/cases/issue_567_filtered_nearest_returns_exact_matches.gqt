@@ -28,9 +28,9 @@ node Doc {
 
 --- query
 query kept_nearest($q: Vector(4)) {
-    match { $d: Doc { keep: true } }
+    match { let $pop = { match { $d: Doc } where $d.keep = true return { $d } }, from nearest($pop, $d.embedding, $q, k: 5) as $distance }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 5
 }
 

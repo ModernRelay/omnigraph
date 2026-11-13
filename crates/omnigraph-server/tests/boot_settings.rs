@@ -2650,7 +2650,7 @@ async fn live_deployment_fixture(mode: &str) {
         "node Peer { name: String @key }\n",
     )
     .unwrap();
-    fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }\n").unwrap();
+    fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }\n").unwrap();
     fs::write(temp.path().join("policy.yaml"), "version: 1\ngroups:\n  admins: [operator]\n  readers: [reader]\nrules:\n  - id: admins\n    allow:\n      actors: { group: admins }\n      actions: [schema_apply, read, invoke_query]\n  - id: readers\n    allow:\n      actors: { group: readers }\n      actions: [read]\n").unwrap();
     fs::write(temp.path().join("cluster-policy.yaml"), "version: 1\ngroups:\n  admins: [operator]\nrules:\n  - id: manage\n    allow:\n      actors: { group: admins }\n      actions: [config_manage]\n").unwrap();
     fs::write(temp.path().join("cluster.yaml"), "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries:\n      find_person:\n        file: ./people.gq\n  peer:\n    schema: ./peer.pg\npolicies:\n  access:\n    file: ./policy.yaml\n    applies_to: [knowledge, peer]\n  management:\n    file: ./cluster-policy.yaml\n    applies_to: [cluster]\n").unwrap();
@@ -2989,7 +2989,7 @@ async fn live_deployment_fixture(mode: &str) {
         .expect("graph reads stay admitted during planning and the held merge");
         assert_eq!(code, StatusCode::OK);
         fs::write(&schema_path, original_source).unwrap();
-        fs::write(temp.path().join("people.gq"), "// query-only deployment\nquery find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }\n").unwrap();
+        fs::write(temp.path().join("people.gq"), "// query-only deployment\nquery find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }\n").unwrap();
         let deployment = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
         let deploy_app = app.clone();
         let request = submit(&id, &deployment, "operator-token");
@@ -3062,7 +3062,7 @@ async fn live_deployment_fixture(mode: &str) {
         "node Person { name: String @key bio: String? }\n",
     )
     .unwrap();
-    fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.bio } }\n").unwrap();
+    fs::write(temp.path().join("people.gq"), "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.bio } }\n").unwrap();
     let deployment = omnigraph_cluster::capture_deployment(temp.path()).unwrap();
     if mode == "acceptance" {
         use omnigraph_cluster::seams::catalog::{

@@ -36,9 +36,9 @@ node Doc {
 --- query
 set engine = v2;
 query fused_top_two($q: Vector(2), $t: String) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 2), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
     return { $d.slug, $d.body, $d.title }
-    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    order { $score desc }
     limit 2
 }
 
@@ -63,9 +63,9 @@ scan Doc as $d: ranked bm25
 --- query
 set engine = v2;
 query ranked_top_two($t: String) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $t) as $score }
     return { $d.slug, $d.body, $d.title }
-    order { bm25($d.text, $t) }
+    order { $score desc }
     limit 2
 }
 

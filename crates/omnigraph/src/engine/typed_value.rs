@@ -621,7 +621,7 @@ pub(super) fn validate_plan_values(
                     owners.scores.insert(
                         (
                             arms[0].binding.as_str(),
-                            omnigraph_compiler::query::ast::RRF_COLUMN,
+                            omnigraph_compiler::query::value::RRF_COLUMN,
                         ),
                         DataType::Float64,
                     );
@@ -778,6 +778,7 @@ pub(super) fn validate_plan_values(
                 | PhysicalNode::RowCompare { .. }
                 | PhysicalNode::ClassifyThreeWay { .. }
                 | PhysicalNode::Limit { .. }
+                | PhysicalNode::TargetCut { .. }
                 | PhysicalNode::Page { .. }
                 | PhysicalNode::Expand { .. }
                 | PhysicalNode::OuterReference { .. }
@@ -884,11 +885,17 @@ pub(super) fn validate_plan_values(
                 }
                 | IRExpr::Not(arg, _)
                 | IRExpr::Cast { expr: arg, ty: _ }
+                | IRExpr::Neg { expr: arg, ty: _ }
                 | IRExpr::IsNull {
                     expr: arg,
                     negated: _,
                     ty: _,
                 } => pending.push(arg),
+                IRExpr::Call {
+                    func: _,
+                    args,
+                    ty: _,
+                } => pending.extend(args),
                 IRExpr::Binary {
                     left,
                     op: _,
@@ -914,7 +921,7 @@ pub(super) fn validate_plan_values(
 mod tests {
     use super::*;
     use crate::error::ManifestErrorKind;
-    use omnigraph_compiler::query::ast::Param;
+    use omnigraph_compiler::query::file::Param;
     use omnigraph_compiler::types::PropType;
 
     fn scalar(scalar: ScalarType, nullable: bool) -> ExprType {

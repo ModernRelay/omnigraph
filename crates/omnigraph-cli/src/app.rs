@@ -405,13 +405,15 @@ pub(crate) fn error_output_of(error: &color_eyre::Report) -> Option<ErrorOutput>
 }
 
 /// The human rendering of the diagnostics contract: the code and the
-/// expectation, where it is, and the one fix.
+/// expectation, where it is, and the one fix; then each further refusal of
+/// the same compile pass the same way.
 fn render_diagnostic(
     output: &ErrorOutput,
     diagnostic: &omnigraph_api_types::DiagnosticOutput,
 ) -> String {
     let mut lines = vec![format!("error[{}]: {}", diagnostic.code, output.error)];
     lines.extend(output::diagnostic_detail_lines(diagnostic));
+    lines.extend(output::further_diagnostic_lines(diagnostic));
     lines.join("\n")
 }
 

@@ -55,11 +55,7 @@ load csv "knows_admitted.csv" into edge:Knows mode append delimiter "|" header
 
 --- query
 query loaded() {
-    match {
-        $a: Person
-        $b: Person
-        $a knows $b
-    }
+    match { $a: Person, $b: Person, $a knows $b }
     return { $a.id, $b.id }
 }
 
@@ -79,7 +75,7 @@ load csv "knows_uncached.csv" into edge:Knows mode overwrite delimiter "|" heade
 --- expect ok
 
 --- query
-query replaced_uncached() { match { $a: Person $a knows $b } return { count($b) as n } }
+query replaced_uncached() { match { $a: Person, $a knows $b } return { count($b) as n } }
 --- expect unordered
 {"n":2}
 --- expect shape
@@ -90,7 +86,7 @@ load csv "knows_admitted.csv" into edge:Knows mode overwrite delimiter "|" heade
 --- expect ok
 
 --- query
-query replaced_admitted() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+query replaced_admitted() { match { $a: Person, $a knows $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": "person-0002", "b.id": "person-0003"}
 {"a.id": "person-0003", "b.id": "person-0004"}

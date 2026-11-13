@@ -8,7 +8,7 @@ environments:
     storage: local-filesystem
 
 --- query
-query filter() { match { $p: Person $p.age >= 90 } return { $p.name, $p.age } }
+query filter() { match { $p: Person } where $p.age >= 90 return { $p.name, $p.age } }
 --- expect unordered
 {"p.name":"p000590","p.age":90}
 {"p.name":"p000591","p.age":91}
@@ -25,7 +25,7 @@ p.name: String
 p.age: I64
 
 --- query
-query filter() { match { $p: Person $p.age >= 90 } return { $p.name, $p.age } }
+query filter() { match { $p: Person } where $p.age >= 90 return { $p.name, $p.age } }
 --- expect unordered
 {"p.name":"p000590","p.age":90}
 {"p.name":"p000591","p.age":91}
@@ -44,7 +44,7 @@ p.age: I64
 --- restart
 
 --- query
-query filter() { match { $p: Person $p.age >= 90 } return { $p.name, $p.age } }
+query filter() { match { $p: Person } where $p.age >= 90 return { $p.name, $p.age } }
 --- expect unordered
 {"p.name":"p000590","p.age":90}
 {"p.name":"p000591","p.age":91}

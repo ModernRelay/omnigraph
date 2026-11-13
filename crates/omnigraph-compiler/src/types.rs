@@ -39,6 +39,71 @@ pub fn check_datetime_literal(value: &str) -> Result<(), String> {
     ))
 }
 
+/// The day a `Date` literal names, as days since the Unix epoch: the one
+/// parse the type checker and every writer and reader of a `Date` literal
+/// share, [`check_date_literal`] in front of Arrow's `Utf8 -> Date32` cast.
+///
+/// # Errors
+///
+/// The refusal message naming `value`.
+pub fn date_literal_days(value: &str) -> Result<i32, String> {
+    check_date_literal(value)?;
+    cast_date_literal_days(value)
+}
+
+/// The bare Arrow `Utf8 -> Date32` cast, a time-bearing string read as its
+/// UTC day. [`date_literal_days`] fronts it with the check; a reader of ids
+/// that old writers derived through this very cast calls it bare.
+///
+/// # Errors
+///
+/// The refusal message naming `value`.
+pub fn cast_date_literal_days(value: &str) -> Result<i32, String> {
+    use arrow_array::{Array, Date32Array, StringArray};
+    let raw = StringArray::from(vec![Some(value)]);
+    let casted = arrow_cast::cast::cast(&raw, &DataType::Date32)
+        .map_err(|e| format!("invalid Date literal '{value}': {e}"))?;
+    let out = casted
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .ok_or_else(|| "Date32 cast produced unexpected array".to_string())?;
+    if out.is_null(0) {
+        return Err(format!("invalid Date literal '{value}'"));
+    }
+    Ok(out.value(0))
+}
+
+/// The instant a `DateTime` literal names, as milliseconds since the Unix
+/// epoch: the one parse the type checker and every writer and reader of a
+/// `DateTime` literal share. A signed extended year is parsed as an ISO
+/// local date-time in UTC; every other string goes through Arrow's
+/// `Utf8 -> Date64` cast.
+///
+/// # Errors
+///
+/// The refusal message naming `value`.
+pub fn datetime_literal_millis(value: &str) -> Result<i64, String> {
+    use arrow_array::{Array, Date64Array, StringArray};
+    if value.starts_with(['+', '-']) {
+        return ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"]
+            .iter()
+            .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
+            .map(|datetime| datetime.and_utc().timestamp_millis())
+            .ok_or_else(|| format!("invalid DateTime literal '{value}'"));
+    }
+    let raw = StringArray::from(vec![Some(value)]);
+    let casted = arrow_cast::cast::cast(&raw, &DataType::Date64)
+        .map_err(|e| format!("invalid DateTime literal '{value}': {e}"))?;
+    let out = casted
+        .as_any()
+        .downcast_ref::<Date64Array>()
+        .ok_or_else(|| "Date64 cast produced unexpected array".to_string())?;
+    if out.is_null(0) {
+        return Err(format!("invalid DateTime literal '{value}'"));
+    }
+    Ok(out.value(0))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScalarType {
     String,
@@ -317,6 +382,11 @@ pub enum ExprType {
     Node {
         type_name: String,
     },
+    /// An edge reference column of the core IR; `type_name` may hold the
+    /// alternatives of an edge selector, joined by `|`.
+    Edge {
+        type_name: String,
+    },
     /// Internal exact comparison carrier, never a declared parameter or result.
     ExactInteger {
         list: bool,
@@ -336,14 +406,14 @@ impl ExprType {
     pub fn nullable(&self) -> bool {
         match self {
             Self::Value { nullable, .. } | Self::ExactInteger { nullable, .. } => *nullable,
-            Self::Node { .. } => false,
+            Self::Node { .. } | Self::Edge { .. } => false,
         }
     }
 
     pub fn is_list(&self) -> bool {
         match self {
             Self::Value { list, .. } | Self::ExactInteger { list, .. } => *list,
-            Self::Node { .. } => false,
+            Self::Node { .. } | Self::Edge { .. } => false,
         }
     }
 
@@ -365,7 +435,8 @@ impl ExprType {
             (Self::ExactInteger { list: left, .. }, Self::ExactInteger { list: right, .. }) => {
                 left == right
             }
-            (Self::Node { type_name: left }, Self::Node { type_name: right }) => left == right,
+            (Self::Node { type_name: left }, Self::Node { type_name: right })
+            | (Self::Edge { type_name: left }, Self::Edge { type_name: right }) => left == right,
             _ => false,
         }
     }
@@ -389,6 +460,7 @@ impl ExprType {
             }
             .display_name(),
             Self::Node { type_name } => type_name.clone(),
+            Self::Edge { type_name } => format!("edge {type_name}"),
             Self::ExactInteger { list, nullable } => format!(
                 "{}{}",
                 if *list {
@@ -417,7 +489,7 @@ impl ExprType {
                 }
                 .to_arrow(),
             ),
-            Self::Node { type_name: _ } => None,
+            Self::Node { type_name: _ } | Self::Edge { type_name: _ } => None,
             Self::ExactInteger { list, .. } => Some(if *list {
                 DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
                     "item",

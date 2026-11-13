@@ -32,7 +32,8 @@ branch create b
 --- loop $i 1 4
 --- mutate branch: b
 query bump_alice($n: I32) {
-    update Person set { age: $n } where name = "alice"
+    match { $x: Person } where $x.name = "alice"
+    update $x set { age: $n }
 }
 --- params
 {"n": ${i}}

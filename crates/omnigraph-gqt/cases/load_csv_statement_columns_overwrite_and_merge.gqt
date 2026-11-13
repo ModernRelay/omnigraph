@@ -16527,7 +16527,7 @@ load csv "cross_batch_edge_duplicate.csv" into edge:Link mode overwrite header
 
 --- query
 query unchanged_after_cross_batch_edge_duplicate() {
-    match { $a: Person $a $e:link $b }
+    match { $a: Person, $a $e:link $b }
     return { count($e.key) as n }
 }
 

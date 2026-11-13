@@ -31,12 +31,11 @@ edge Knows: Person -> Person
 
 --- query
 query no_two_hops_to_e() {
-    match {
-        $p: Person
-        not {
-            $p knows{2,2} $x
-            $x: Person { name: "e" }
-        }
+    match { $p: Person }
+    where not exists {
+        $p knows{2,2} $x,
+        $x: Person
+        where $x.name = "e"
     }
     return { $p.name }
 }
@@ -53,16 +52,13 @@ p.name: String
 --- expect plan
 anti join $p: key_set
 
---- expect same as v1
-
 --- query
 query not_within_two_of_e() {
-    match {
-        $p: Person
-        not {
-            $p knows{1,2} $x
-            $x: Person { name: "e" }
-        }
+    match { $p: Person }
+    where not exists {
+        $p knows{1,2} $x,
+        $x: Person
+        where $x.name = "e"
     }
     return { $p.name }
 }
@@ -78,16 +74,13 @@ p.name: String
 --- expect plan
 anti join $p: key_set
 
---- expect same as v1
-
 --- query
 query not_known_by_c() {
-    match {
-        $p: Person
-        not {
-            $x knows $p
-            $x: Person { name: "c" }
-        }
+    match { $p: Person }
+    where not exists {
+        $x knows $p,
+        $x: Person
+        where $x.name = "c"
     }
     return { $p.name }
 }
@@ -104,17 +97,14 @@ p.name: String
 --- expect plan
 anti join $p: key_set
 
---- expect same as v1
-
 --- query
 query one_neighbour_e() {
-    match {
-        $p: Person
-        count {
-            $p knows $x
-            $x: Person { name: "e" }
-        } = 1
-    }
+    match { $p: Person }
+    where count {
+        $p knows $x,
+        $x: Person
+        where $x.name = "e"
+    } = 1
     return { $p.name }
 }
 
@@ -129,13 +119,12 @@ anti join $p: key_set
 
 --- query
 query one_edge_row_to_e() {
-    match {
-        $p: Person
-        count {
-            $p $k:knows $x
-            $x: Person { name: "e" }
-        } = 1
-    }
+    match { $p: Person }
+    where count {
+        $p $k:knows $x,
+        $x: Person
+        where $x.name = "e"
+    } = 1
     return { $p.name }
 }
 
@@ -149,13 +138,12 @@ anti join $p: key_set
 
 --- query
 query two_edge_rows_to_e() {
-    match {
-        $p: Person
-        count {
-            $p $k:knows $x
-            $x: Person { name: "e" }
-        } = 2
-    }
+    match { $p: Person }
+    where count {
+        $p $k:knows $x,
+        $x: Person
+        where $x.name = "e"
+    } = 2
     return { $p.name }
 }
 

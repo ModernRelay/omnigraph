@@ -59,7 +59,7 @@ const COMPANY_QUERY: &str =
     "query company_identity() { match { $c: Company } return { $c.@id, $c.name } }";
 const OLD_PEOPLE_QUERY: &str =
     "query old_people() { match { $p: Person } return { $p.@id, $p.name } order { $p.@id asc } }";
-const OLD_COWORKERS_QUERY: &str = "query old_coworkers() { match { $p: Person\n $p worksat $c } return { $p.@id, $c.name } order { $p.@id asc } }";
+const OLD_COWORKERS_QUERY: &str = "query old_coworkers() { match { $p: Person, $p worksat $c } return { $p.@id, $c.name } order { $p.@id asc } }";
 
 async fn legacy_graph_with_data(dir: &tempfile::TempDir) -> Session {
     let uri = dir.path().to_str().unwrap();

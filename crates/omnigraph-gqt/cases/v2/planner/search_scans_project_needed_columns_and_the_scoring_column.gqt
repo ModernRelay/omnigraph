@@ -87,9 +87,9 @@ node Doc {
 
 --- query
 query nearest_slug($q: Vector(4)) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 10) as $distance }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 10
 }
 
@@ -117,9 +117,9 @@ scan Doc as $d: columns [__id, slug]
 
 --- query
 query bm25_slug($q: String) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $q) as $score }
     return { $d.slug }
-    order { bm25($d.title, $q) }
+    order { $score desc }
     limit 10
 }
 
@@ -147,9 +147,9 @@ scan Doc as $d: columns [__id, slug]
 
 --- query
 query nearest_whole($q: Vector(4)) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 10) as $distance }
     return { $d }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 10
 }
 

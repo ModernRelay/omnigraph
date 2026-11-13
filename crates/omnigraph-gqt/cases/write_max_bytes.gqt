@@ -98,7 +98,8 @@ query wide_scalar($note: String) {
 --- mutate
 set write_max_bytes = 4093;
 query carry_payload() {
-    update Doc set { note: "updated" } where slug = "accepted"
+    match { $x: Doc } where $x.slug = "accepted"
+    update $x set { note: "updated" }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -106,7 +107,8 @@ query carry_payload() {
 --- mutate
 set write_max_bytes = 1;
 query removed_ids() {
-    delete Doc where slug = "accepted"
+    match { $x: Doc } where $x.slug = "accepted"
+    delete $x
 }
 
 --- expect error: retained removed-id bytes per operation

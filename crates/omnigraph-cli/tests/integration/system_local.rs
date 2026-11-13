@@ -281,7 +281,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
             .arg("--target")
             .arg(graph.path())
             .arg("--query-string")
-            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
+            .arg("query find($name: String) { match { $p: Person } where $p.name = $name return { $p.name, $p.age } }")
             .arg("--params")
             .arg(r#"{"name":"Inline"}"#)
             .arg("--json"),
@@ -850,9 +850,8 @@ fn local_cli_resolves_relative_query_cwd_relative() {
         &cwd_dir.join("local.gq"),
         r#"
 query get_person($name: String) {
-    match {
-        $p: Person { name: $name }
-    }
+    match { $p: Person }
+    where $p.name = $name
     return { $p.age, $p.name }
 }
 "#,
@@ -863,9 +862,8 @@ query get_person($name: String) {
         &other_dir.join("local.gq"),
         r#"
 query get_person($name: String) {
-    match {
-        $p: Person { name: $name }
-    }
+    match { $p: Person }
+    where $p.name = $name
     return { $p.name }
 }
 "#,
@@ -925,11 +923,8 @@ node Task {
         &queries,
         r#"
 query due_with_tag($deadline: DateTime, $tag: String) {
-    match {
-        $t: Task
-        $t.due_at <= $deadline
-        $t.tags contains $tag
-    }
+    match { $t: Task }
+    where $t.due_at <= $deadline and $tag in $t.tags
     return { $t.slug, $t.due_at, $t.tags, $t.scores, $t.active_days }
 }
 
@@ -958,16 +953,17 @@ query update_task(
     $scores: [I32],
     $active_days: [Date]
 ) {
-    update Task set {
+    match { $x: Task } where $x.slug = $slug
+    update $x set {
         due_at: $due_at,
         tags: $tags,
         scores: $scores,
         active_days: $active_days
-    } where slug = $slug
+    }
 }
 
 query get_task($slug: String) {
-    match { $t: Task { slug: $slug } }
+    match { $t: Task } where $t.slug = $slug
     return { $t.slug, $t.due_at, $t.tags, $t.scores, $t.active_days }
 }
 "#,
@@ -1104,9 +1100,9 @@ node Doc {
         &queries,
         r#"
 query vector_search($q: String) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug, $d.title }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 "#,
@@ -1860,7 +1856,7 @@ fn local_cluster_apply_then_server_boots_from_cluster_state() {
     .unwrap();
     std::fs::write(
         temp.path().join("people.gq"),
-        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+        "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
     )
     .unwrap();
     std::fs::write(
@@ -2081,12 +2077,12 @@ fn write_two_graph_cluster(dir: &std::path::Path) {
     .unwrap();
     std::fs::write(
         dir.join("people.gq"),
-        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+        "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
     )
     .unwrap();
     std::fs::write(
         dir.join("services.gq"),
-        "\nquery find_service($name: String) {\n  match { $s: Service { name: $name } }\n  return { $s.name }\n}\n",
+        "\nquery find_service($name: String) {\n  match { $s: Service } where $s.name = $name\n  return { $s.name }\n}\n",
     )
     .unwrap();
     std::fs::write(
@@ -2224,7 +2220,7 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     .unwrap();
     std::fs::write(
         dir.join("people.gq"),
-        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name, $p.bio }\n}\n",
+        "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name, $p.bio }\n}\n",
     )
     .unwrap();
     let plan = cluster_cli(dir, &["plan"]);
@@ -2355,7 +2351,7 @@ fn local_cluster_serving_enforces_applied_policy_bindings() {
     .unwrap();
     std::fs::write(
         dir.join("people.gq"),
-        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+        "\nquery find_person($name: String) {\n  match { $p: Person } where $p.name = $name\n  return { $p.name }\n}\n",
     )
     .unwrap();
     std::fs::write(
@@ -2669,7 +2665,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     fs::copy(fixture("test.pg"), cluster.path().join("local.pg")).unwrap();
     fs::write(
         cluster.path().join("find-person.gq"),
-        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
+        "query find_person($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }",
     )
     .unwrap();
     fs::write(
@@ -2793,7 +2789,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .arg("--graph")
         .arg("local")
         .arg("--query-string")
-        .arg("query q($name: String) { match { $p: Person { name: $name } } return { $p.name } }")
+        .arg("query q($name: String) { match { $p: Person } where $p.name = $name return { $p.name } }")
         .arg("--params")
         .arg(r#"{"name":"Alice"}"#)
         .arg("--json")

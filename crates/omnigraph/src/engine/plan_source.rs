@@ -12,10 +12,9 @@ use arrow_schema::SchemaRef;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::datatypes::Field;
 use lance_file::version::ConcreteFileVersion;
-use omnigraph_compiler::CheckedRead;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{IRExpr, IROp, ParamMap, QueryIR};
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::ir::{IRExpr, ParamMap};
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_compiler::settings::{RrfPlan, SessionSettings, Traversal};
 use omnigraph_compiler::types::Direction;
 use omnigraph_planner::{
@@ -25,6 +24,7 @@ use omnigraph_planner::{
     PlanError, PlanSource, PrefilterMode, ReplayEnvelope, ReplayRefusal, SideId, TableRef,
     Unrouted, ValidationLimits,
 };
+use omnigraph_planner::{PatternStep, ReadShape};
 
 use super::ResolvedParams;
 use super::scan::ir_expr_to_df_expr;
@@ -112,10 +112,7 @@ fn gate_policy(settings: &SessionSettings) -> GatePolicy {
 pub(crate) struct QuerySource<'a> {
     /// The compiled query with every constant of a filter position folded to
     /// its bound value (`engine::constant`); the planner reads no other form.
-    pub ir: QueryIR,
-    /// The declaration `ir` was lowered from, as the type checker accepted
-    /// it: acceptance derives the query's requirements from it.
-    pub checked: CheckedRead,
+    pub ir: ReadShape,
     pub catalog: &'a Arc<Catalog>,
     /// The pinned snapshot of the user graph; `None` under the
     /// catalogue-only scope, where every table the planner asks for is a
@@ -152,7 +149,21 @@ impl<'a> QuerySource<'a> {
         params: &ParamMap,
         settings: &'a SessionSettings,
     ) -> Result<QuerySource<'a>> {
-        let params = resolve_params(&query.ir, params)?;
+        Self::gather_at(query, catalog, snapshot, params, None, settings).await
+    }
+
+    /// [`Self::gather`] with `now()` bound to `now` instead of the clock
+    /// when one is given: a write's selection reads the instant the write
+    /// bound once for every attempt and every assignment.
+    pub(crate) async fn gather_at(
+        query: &CompiledQuery,
+        catalog: &'a Arc<Catalog>,
+        snapshot: Option<&'a Snapshot>,
+        params: &ParamMap,
+        now: Option<&Literal>,
+        settings: &'a SessionSettings,
+    ) -> Result<QuerySource<'a>> {
+        let params = resolve_params(&query.ir, params, now)?;
         let ir = super::constant::fold_query_constants(&query.ir, params.shared())?;
         let table_stats = match snapshot {
             Some(snapshot) => query_table_statistics(&ir, snapshot).await?,
@@ -160,7 +171,6 @@ impl<'a> QuerySource<'a> {
         };
         let mut source = QuerySource {
             ir,
-            checked: query.checked.clone(),
             catalog,
             snapshot,
             params,
@@ -529,22 +539,31 @@ fn no_plan(reason: impl std::fmt::Display) -> OmniError {
 }
 
 /// The query's parameters with every omitted nullable one bound to null and
-/// `now()` bound to the clock; an omitted required one is the error the query
-/// answers.
-fn resolve_params(ir: &QueryIR, params: &ParamMap) -> Result<ResolvedParams> {
+/// `now()` bound to `now`, or to the clock when none is given; an omitted
+/// required one is the error the query answers.
+fn resolve_params(
+    ir: &ReadShape,
+    params: &ParamMap,
+    now: Option<&Literal>,
+) -> Result<ResolvedParams> {
     let mut resolved = params.clone();
     fill_declared_params(&mut resolved, &ir.params)?;
-    let now_name = omnigraph_compiler::query::ast::NOW_PARAM_NAME;
+    let now_name = omnigraph_compiler::query::value::NOW_PARAM_NAME;
     if resolved.contains_key(now_name) {
         return Err(OmniError::manifest(format!(
             "param '{now_name}': reserved for now() and cannot be bound"
         )));
     }
-    let now = time::OffsetDateTime::from(crate::dst_clock::system_time_now())
-        .truncate_to_millisecond()
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|error| OmniError::manifest(format!("failed to format now(): {error}")))?;
-    resolved.insert(now_name.to_string(), Literal::DateTime(now));
+    let now = match now {
+        Some(now) => now.clone(),
+        None => Literal::DateTime(
+            time::OffsetDateTime::from(crate::dst_clock::system_time_now())
+                .truncate_to_millisecond()
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|error| OmniError::manifest(format!("failed to format now(): {error}")))?,
+        ),
+    };
+    resolved.insert(now_name.to_string(), now);
     validate_params(&resolved, &ir.params)?;
     Ok(ResolvedParams(Arc::new(resolved)))
 }
@@ -634,7 +653,6 @@ impl QuerySource<'_> {
 
     fn accept_input<'s>(&'s self, keys: &'s CatalogKeys<'s>) -> AcceptInput<'s> {
         AcceptInput {
-            checked: &self.checked,
             catalog: self.catalog,
             ir: &self.ir,
             params: self.params.shared(),
@@ -664,7 +682,6 @@ pub(crate) fn accept_replay(
     let ir = super::constant::fold_query_constants(&query.ir, &params)?;
     let keys = CatalogKeys(catalog);
     let input = AcceptInput {
-        checked: &query.checked,
         catalog,
         ir: &ir,
         params: &params,
@@ -768,7 +785,7 @@ pub(crate) async fn load_index_facts(
 }
 
 async fn query_table_statistics(
-    ir: &QueryIR,
+    ir: &ReadShape,
     snapshot: &Snapshot,
 ) -> Result<HashMap<String, TableStatistics>> {
     let mut types = BTreeMap::new();
@@ -776,14 +793,14 @@ async fn query_table_statistics(
     while let Some(ops) = pending.pop() {
         for op in ops {
             match op {
-                IROp::NodeScan {
+                PatternStep::NodeScan {
                     type_name,
                     variable: _,
                     filters: _,
                 } => {
                     types.entry(format!("node:{type_name}")).or_insert(false);
                 }
-                IROp::Expand {
+                PatternStep::Expand {
                     edges,
                     src_type,
                     dst_type,
@@ -802,12 +819,12 @@ async fn query_table_statistics(
                             .or_insert(false);
                     }
                 }
-                IROp::AntiJoin {
+                PatternStep::AntiJoin {
                     inner,
                     outer_var: _,
                     predicate: _,
                 } => pending.push(inner),
-                IROp::Filter(_) => {}
+                PatternStep::Filter(_) | PatternStep::Rank { .. } => {}
             }
         }
     }
@@ -875,21 +892,19 @@ edge Likes: Person -> Doc
 
     const QUERIES: &str = r#"
 query liked() {
-    match { $p: Person $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, $d.title }
 }
 query nobody_older() {
-    match {
-        $p: Person
-        not {
-            $q: Person
-            $q.age > $p.age
-        }
+    match { $p: Person }
+    where not exists {
+        $q: Person
+        where $q.age > $p.age
     }
     return { $p.name }
 }
 query likes_nothing() {
-    match { $p: Person not { $p likes $d } }
+    match { $p: Person } where not exists { $d: Doc, $p likes $d }
     return { $p.name }
 }
 query people() { match { $p: Person } return { count($p) as n } }
@@ -897,12 +912,7 @@ query people() { match { $p: Person } return { count($p) as n } }
 
     fn compile(catalog: &Catalog, name: &str) -> CompiledQuery {
         let statement = omnigraph_compiler::find_read_statement(QUERIES, name).unwrap();
-        let checked = CheckedRead::check(catalog, statement.decl()).unwrap();
-        let ir = omnigraph_compiler::lower_query(catalog, checked.query()).unwrap();
-        CompiledQuery {
-            ir: Arc::new(ir),
-            checked,
-        }
+        CompiledQuery::compile(catalog, statement.decl()).unwrap()
     }
 
     /// GQT cannot inspect gathered facts or the catalog's version origin.

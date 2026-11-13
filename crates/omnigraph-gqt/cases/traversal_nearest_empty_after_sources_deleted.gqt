@@ -28,7 +28,8 @@ edge Knows: Doc -> Doc {
 
 --- mutate
 query delete_doc($s: String) {
-    delete Doc where slug = $s
+    match { $x: Doc } where $x.slug = $s
+    delete $x
 }
 
 --- params
@@ -39,11 +40,11 @@ query delete_doc($s: String) {
 --- query
 query nearest_after_source_delete($q: Vector(4)) {
     match {
-        $d: Doc
-        $d knows $t
+      let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } },
+      from nearest($pop, $d.embedding, $q, k: 2) as $distance,
     }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 2
 }
 

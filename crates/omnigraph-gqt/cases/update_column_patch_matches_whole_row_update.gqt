@@ -64,15 +64,18 @@ branch create rows
 
 --- mutate
 query patch_scores() {
-    update Doc set { score: 5 } where age >= 2
+    match { $x: Doc } where $x.age >= 2
+    update $x set { score: 5 }
 }
 
 --- expect affected: nodes=4 edges=0
 
 --- mutate branch: rows
 query rewrite_scores() {
-    update Doc set { score: 5 } where age >= 2
-    update Doc set { score: 0 } where slug = "nobody"
+    match { $x: Doc } where $x.age >= 2
+    update $x set { score: 5 }
+    match { $x: Doc } where $x.slug = "nobody"
+    update $x set { score: 0 }
 }
 
 --- expect affected: nodes=4 edges=0
@@ -157,9 +160,9 @@ d.emb: Vector(4)?
 
 --- query
 query nearest_first($q: Vector(4)) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.emb, $q, k: 6) as $distance }
     return { $d.slug }
-    order { nearest($d.emb, $q) }
+    order { $distance }
     limit 6
 }
 
@@ -179,9 +182,9 @@ d.slug: String
 
 --- query branch: rows
 query nearest_first($q: Vector(4)) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.emb, $q, k: 6) as $distance }
     return { $d.slug }
-    order { nearest($d.emb, $q) }
+    order { $distance }
     limit 6
 }
 
@@ -219,59 +222,70 @@ branch diff "${seeded}" to rows
 
 --- mutate
 query patch_out_of_range() {
-    update Doc set { score: 500 } where age = 0
+    match { $x: Doc } where $x.age = 0
+    update $x set { score: 500 }
 }
 
 --- expect error: @range violation on Doc.score
 
 --- mutate branch: rows
 query rewrite_out_of_range() {
-    update Doc set { score: 500 } where age = 0
-    update Doc set { score: 0 } where slug = "nobody"
+    match { $x: Doc } where $x.age = 0
+    update $x set { score: 500 }
+    match { $x: Doc } where $x.slug = "nobody"
+    update $x set { score: 0 }
 }
 
 --- expect error: @range violation on Doc.score
 
 --- mutate
 query patch_duplicate_code() {
-    update Doc set { code: "c-03" } where age = 0
+    match { $x: Doc } where $x.age = 0
+    update $x set { code: "c-03" }
 }
 
 --- expect error: @unique violation on Doc.code
 
 --- mutate branch: rows
 query rewrite_duplicate_code() {
-    update Doc set { code: "c-03" } where age = 0
-    update Doc set { score: 0 } where slug = "nobody"
+    match { $x: Doc } where $x.age = 0
+    update $x set { code: "c-03" }
+    match { $x: Doc } where $x.slug = "nobody"
+    update $x set { score: 0 }
 }
 
 --- expect error: @unique violation on Doc.code
 
 --- mutate
 query delete_one() {
-    delete Doc where slug = "d-01"
+    match { $x: Doc } where $x.slug = "d-01"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: rows
 query delete_one() {
-    delete Doc where slug = "d-01"
+    match { $x: Doc } where $x.slug = "d-01"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query patch_again() {
-    update Doc set { score: 7 } where age < 4
+    match { $x: Doc } where $x.age < 4
+    update $x set { score: 7 }
 }
 
 --- expect affected: nodes=3 edges=0
 
 --- mutate branch: rows
 query rewrite_again() {
-    update Doc set { score: 7 } where age < 4
-    update Doc set { score: 0 } where slug = "nobody"
+    match { $x: Doc } where $x.age < 4
+    update $x set { score: 7 }
+    match { $x: Doc } where $x.slug = "nobody"
+    update $x set { score: 0 }
 }
 
 --- expect affected: nodes=3 edges=0
@@ -319,14 +333,16 @@ branch create feature from main
 
 --- mutate branch: feature
 query patch_on_feature() {
-    update Doc set { score: 9 } where age = 5
+    match { $x: Doc } where $x.age = 5
+    update $x set { score: 9 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate
 query patch_on_main() {
-    update Doc set { score: 8 } where age = 0
+    match { $x: Doc } where $x.age = 0
+    update $x set { score: 8 }
 }
 
 --- expect affected: nodes=1 edges=0
@@ -343,16 +359,20 @@ branch create feature_rows from rows
 
 --- mutate branch: feature_rows
 query rewrite_on_feature() {
-    update Doc set { score: 9 } where age = 5
-    update Doc set { score: 0 } where slug = "nobody"
+    match { $x: Doc } where $x.age = 5
+    update $x set { score: 9 }
+    match { $x: Doc } where $x.slug = "nobody"
+    update $x set { score: 0 }
 }
 
 --- expect affected: nodes=1 edges=0
 
 --- mutate branch: rows
 query rewrite_on_rows() {
-    update Doc set { score: 8 } where age = 0
-    update Doc set { score: 0 } where slug = "nobody"
+    match { $x: Doc } where $x.age = 0
+    update $x set { score: 8 }
+    match { $x: Doc } where $x.slug = "nobody"
+    update $x set { score: 0 }
 }
 
 --- expect affected: nodes=1 edges=0

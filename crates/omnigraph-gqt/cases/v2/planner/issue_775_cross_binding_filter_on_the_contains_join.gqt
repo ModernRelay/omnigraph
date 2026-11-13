@@ -47,13 +47,10 @@ edge PassageOfRevision: Passage -> SourceRevision
 set engine = v2;
 query cross_binding_filter_stays_below_traversal() {
     match {
-        $m: Matter
-        $p: Passage
-        $p.text contains $m.number
-        $p passageOfRevision $r
-        $r: SourceRevision
-        $r.matter_number != $m.number
+        $m: Matter,
+        let $ps = { match { $p: Passage, $p passageOfRevision $r, $r: SourceRevision } return { $p, $r } }, from $ps,
     }
+    where contains($p.text, $m.number) and $r.matter_number != $m.number
     return { $r.matter_number, $m.number as cited, count($p) as n }
     order { $r.matter_number asc }
     limit 30
@@ -81,13 +78,8 @@ pass join_algorithm
 --- query
 set engine = v2;
 query passage_reached_by_the_traversal() {
-    match {
-        $m: Matter
-        $r: SourceRevision
-        $p passageOfRevision $r
-        $p.text contains $m.number
-        $r.matter_number != $m.number
-    }
+    match { $m: Matter, let $rs = { match { $r: SourceRevision, $p: Passage, $p passageOfRevision $r } return { $r, $p } }, from $rs }
+    where contains($p.text, $m.number) and $r.matter_number != $m.number
     return { $r.matter_number, $m.number as cited, count($p) as n }
     order { $r.matter_number asc }
     limit 30

@@ -71,11 +71,11 @@ edge Knows: Doc -> Doc {
 --- query
 query nearest_counts_rows($q: Vector(4)) {
     match {
-        $d: Doc
-        $d knows $t
+      let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
     }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
 
@@ -93,11 +93,11 @@ d.slug: String
 --- query
 query nearest_returns_pairs($q: Vector(4)) {
     match {
-        $d: Doc
-        $d knows $t
+      let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } },
+      from nearest($pop, $d.embedding, $q, k: 4) as $distance,
     }
     return { $d.slug, $t.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 4
 }
 

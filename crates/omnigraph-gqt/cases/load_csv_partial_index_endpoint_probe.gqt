@@ -64,7 +64,7 @@ load validate edge_ri edge:Knows to Person: access probe
 load executed: partitions 1 rows 1
 
 --- query
-query across_fragments() { match { $a: Person $a knows $b } return { $a.id, $b.id } }
+query across_fragments() { match { $a: Person, $a knows $b } return { $a.id, $b.id } }
 --- expect unordered
 {"a.id": "p000063", "b.id": "extra000000"}
 --- expect shape

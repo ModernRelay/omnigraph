@@ -175,6 +175,7 @@ fn require_push_node(node: &PhysicalNode) -> Result<()> {
         | PhysicalNode::Sort { .. }
         | PhysicalNode::HydrateColumns { .. }
         | PhysicalNode::Limit { .. }
+        | PhysicalNode::TargetCut { .. }
         | PhysicalNode::CsvSource { .. }
         | PhysicalNode::DeltaSource { .. }
         | PhysicalNode::Validate { .. }

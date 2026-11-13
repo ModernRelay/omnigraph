@@ -148,7 +148,7 @@ async fn pushed_limit_skips_deleted_rows_and_spans_fragments_issue_1335() {
     let found = db
         .query(
             ReadTarget::branch("main"),
-            "query late($name: String) { match { $p: Person { name: $name } } return { $p.name } limit 1 }",
+            "query late($name: String) { match { $p: Person } where $p.name = $name return { $p.name } limit 1 }",
             "late",
             &params(&[("$name", &last)]),
         )

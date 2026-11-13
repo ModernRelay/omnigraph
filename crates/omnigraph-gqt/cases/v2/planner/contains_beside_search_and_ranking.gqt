@@ -29,13 +29,11 @@ node Passage {
 set engine = v2;
 query bm25_order() {
     match {
-        $m: Matter
-        $p: Passage
-        $p.text contains $m.number
-        $m.number != $p.pid
+      let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },
+      from bm25($pop, $p.text, "law") as $score,
     }
     return { $p.pid }
-    order { bm25($p.text, "law") }
+    order { $score desc }
     limit 10
 }
 
@@ -54,13 +52,11 @@ scan Passage as $p: ranked bm25
 set engine = v2;
 query nearest_order() {
     match {
-        $m: Matter
-        $p: Passage
-        $p.text contains $m.number
-        $m.number != $p.pid
+      let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },
+      from nearest($pop, $p.embedding, [1.0, 0.0], k: 10) as $distance,
     }
     return { $p.pid }
-    order { nearest($p.embedding, [1.0, 0.0]) }
+    order { $distance }
     limit 10
 }
 
@@ -79,13 +75,14 @@ scan Passage as $p: ranked nearest fetch 10
 set engine = v2;
 query rrf_order() {
     match {
-        $m: Matter
-        $p: Passage
-        $p.text contains $m.number
-        $m.number != $p.pid
+      let $all = { match { $p: Passage } return { $p } },
+      from rrf(nearest($all, $p.embedding, [1.0, 0.0], k: 10), bm25($all, $p.text, "law"), k: 60) as $score,
+      $m: Matter,
+      $p: Passage,
     }
+    where contains($p.text, $m.number) and $m.number != $p.pid
     return { $p.pid }
-    order { rrf(nearest($p.embedding, [1.0, 0.0]), bm25($p.text, "law")) }
+    order { $score desc }
     limit 10
 }
 
@@ -104,13 +101,8 @@ scan Passage as $p: ranked bm25
 --- query
 set engine = v2;
 query search_filter_unranked() {
-    match {
-        $m: Matter
-        $p: Passage
-        $p.text contains $m.number
-        search($p.text, "law")
-        $m.number != $p.pid
-    }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
+    where contains($p.text, $m.number) and search($p.text, "law") and $m.number != $p.pid
     return { $p.pid }
 }
 
@@ -129,13 +121,11 @@ pass join_algorithm
 set engine = v2;
 query bm25_order_on_the_needles() {
     match {
-        $m: Matter
-        $p: Passage
-        $p.text contains $m.number
-        $m.number != $p.pid
+      let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },
+      from bm25($pop, $m.number, "case") as $score,
     }
     return { $p.pid }
-    order { bm25($m.number, "case") }
+    order { $score desc }
     limit 10
 }
 

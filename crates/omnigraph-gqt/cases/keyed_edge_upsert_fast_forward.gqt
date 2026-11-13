@@ -37,10 +37,7 @@ query upsert_inherited_edge() { insert Knows { from: "Bob", to: "Diana" } }
 
 --- query branch: b0
 query edges() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 
@@ -60,10 +57,7 @@ branch merge b0
 
 --- query branch: main
 query edge_count() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { count($q.name) as n }
 }
 
@@ -77,10 +71,7 @@ n: I64
 
 --- query branch: main
 query edges() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 

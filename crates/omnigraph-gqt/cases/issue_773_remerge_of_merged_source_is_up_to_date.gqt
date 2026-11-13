@@ -43,7 +43,8 @@ branch merge s
 
 --- mutate
 query delete_z() {
-    delete Person where name = "z"
+    match { $x: Person } where $x.name = "z"
+    delete $x
 }
 
 --- expect affected: nodes=1 edges=0

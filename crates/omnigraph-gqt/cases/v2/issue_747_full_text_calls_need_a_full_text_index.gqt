@@ -38,45 +38,45 @@ edge Has: Person -> Note
 
 --- query
 query searched($q: String) {
-    match { $d: Doc search($d.notes, $q) }
+    match { $d: Doc } where search($d.notes, $q)
     return { $d.slug }
 }
 --- params
 {"q": "deep"}
---- expect error: T27: `search` over `$d.notes` needs a full-text index
+--- expect error: T27: `search` needs a full-text index on `Doc.notes`
 
 --- query
 query fuzzed($q: String) {
-    match { $d: Doc fuzzy($d.notes, $q) }
+    match { $d: Doc } where fuzzy($d.notes, $q)
     return { $d.slug }
 }
 --- params
 {"q": "deep"}
---- expect error: T27: `fuzzy` over `$d.notes` needs a full-text index
+--- expect error: T27: `fuzzy` needs a full-text index on `Doc.notes`
 
 --- query
 query matched($q: String) {
-    match { $d: Doc match_text($d.notes, $q) }
+    match { $d: Doc } where match_text($d.notes, $q)
     return { $d.slug }
 }
 --- params
 {"q": "deep"}
---- expect error: T27: `match_text` over `$d.notes` needs a full-text index
+--- expect error: T27: `match_text` needs a full-text index on `Doc.notes`
 
 --- query
 query ranked($q: String) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.notes, $q) as $score }
     return { $d.slug }
-    order { bm25($d.notes, $q) }
+    order { $score desc }
     limit 2
 }
 --- params
 {"q": "deep"}
---- expect error: T27: `bm25` over `$d.notes` needs a full-text index
+--- expect error: T27: `bm25` needs a full-text index on `Doc.notes`
 
 --- query
 query lower($q: String) {
-    match { $d: Doc search($d.title, $q) }
+    match { $d: Doc } where search($d.title, $q)
     return { $d.slug }
 }
 --- params
@@ -89,7 +89,7 @@ d.slug: String
 
 --- query
 query upper($q: String) {
-    match { $d: Doc search($d.title, $q) }
+    match { $d: Doc } where search($d.title, $q)
     return { $d.slug }
 }
 --- params
@@ -102,11 +102,9 @@ d.slug: String
 
 --- query
 query sibling_names_reused($q: String) {
-    match {
-        $p: Person
-        not { $d: Doc $p reads $d search($d.title, $q) }
-        not { $d: Note $p has $d }
-    }
+    match { $p: Person }
+    where not exists { $d: Doc, $p reads $d where search($d.title, $q) }
+      and not exists { $d: Note, $p has $d }
     return { $p.slug }
 }
 --- params
@@ -119,11 +117,9 @@ p.slug: String
 
 --- query
 query sibling_names_distinct($q: String) {
-    match {
-        $p: Person
-        not { $d: Doc $p reads $d search($d.title, $q) }
-        not { $n: Note $p has $n }
-    }
+    match { $p: Person }
+    where not exists { $d: Doc, $p reads $d where search($d.title, $q) }
+      and not exists { $n: Note, $p has $n }
     return { $p.slug }
 }
 --- params

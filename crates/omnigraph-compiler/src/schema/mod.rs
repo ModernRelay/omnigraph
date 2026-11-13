@@ -36,7 +36,7 @@ pub(crate) fn is_reserved_storage_system_column(name: &str) -> bool {
 /// they are enforced only where a NEW declaration enters (`.pg` parse), never
 /// against a stored catalog — an existing graph keeps opening.
 pub(crate) fn is_reserved_search_output_column(name: &str) -> bool {
-    name == crate::query::ast::DISTANCE_COLUMN
-        || name == crate::query::ast::SCORE_COLUMN
-        || name == crate::query::ast::RRF_COLUMN
+    name == crate::query::value::DISTANCE_COLUMN
+        || name == crate::query::value::SCORE_COLUMN
+        || name == crate::query::value::RRF_COLUMN
 }

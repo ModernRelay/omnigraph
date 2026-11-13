@@ -36,7 +36,8 @@ query add_b_c() {
 
 --- mutate branch: b0
 query drop_b_c() {
-    delete Knows where from = "b"
+    match { $x: Knows } where $x.@src = "b"
+    delete $x
 }
 
 --- expect affected: nodes=0 edges=1
@@ -50,10 +51,7 @@ branch merge b0
 
 --- query
 query edges_on_main() {
-    match {
-        $x: Person
-        $x knows $y
-    }
+    match { $x: Person, $x knows $y }
     return { $x.name, $y.name }
 }
 

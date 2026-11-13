@@ -124,10 +124,8 @@ async fn indexed_matches_csr_undirected_one_hop() {
     let db = init_and_load(&dir).await;
     let queries = r#"
 query connected($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p <knows> $f
-    }
+    match { $p: Person, $p <knows> $f }
+    where $p.name = $name
     return { $f.name }
 }
 "#;
@@ -160,10 +158,8 @@ async fn indexed_matches_csr_undirected_under_degraded_coverage() {
 
     let queries = r#"
 query connected($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p <knows> $f
-    }
+    match { $p: Person, $p <knows> $f }
+    where $p.name = $name
     return { $f.name }
 }
 "#;
@@ -178,10 +174,8 @@ async fn indexed_matches_csr_multi_hop_same_type() {
     let db = init_and_load(&dir).await;
     let queries = r#"
 query reach($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows{1,2} $f
-    }
+    match { $p: Person, $p knows{1,2} $f }
+    where $p.name = $name
     return { $f.name }
 }
 "#;
@@ -196,10 +190,8 @@ async fn indexed_matches_csr_cross_type() {
     let db = init_and_load(&dir).await;
     let queries = r#"
 query employer($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p worksAt $c
-    }
+    match { $p: Person, $p worksAt $c }
+    where $p.name = $name
     return { $c.name }
 }
 "#;
@@ -289,18 +281,14 @@ edge WorksAt: Person -> Company
 {"edge":"WorksAt","from":"shared","to":"other"}"#;
     const QUERY: &str = r#"
 query reach($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p worksAt $c
-    }
+    match { $p: Person, $p worksAt $c }
+    where $p.name = $name
     return { $c.name }
 }
 
 query reach_two($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p worksAt{1,2} $c
-    }
+    match { $p: Person, $p worksAt{1,2} $c }
+    where $p.name = $name
     return { $c.name }
 }
 "#;
@@ -330,10 +318,8 @@ query reach_two($name: String) {
 
 const REACH_5: &str = r#"
 query reach($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows{1,5} $f
-    }
+    match { $p: Person, $p knows{1,5} $f }
+    where $p.name = $name
     return { $f.name }
 }
 "#;
@@ -390,10 +376,8 @@ async fn variable_hops_handle_self_loop() {
 async fn pinned_range_does_not_re_reach_a_self_looped_node() {
     const EXACTLY_2: &str = r#"
 query reach2($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows{2,2} $f
-    }
+    match { $p: Person, $p knows{2,2} $f }
+    where $p.name = $name
     return { $f.name }
 }
 "#;
@@ -426,24 +410,18 @@ query reach2($name: String) {
 async fn single_hop_self_loop_is_emitted_by_all_spellings() {
     const QUERIES: &str = r#"
 query friends($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $f
-    }
+    match { $p: Person, $p knows $f }
+    where $p.name = $name
     return { $f.name }
 }
 query friends_undirected($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p <knows> $f
-    }
+    match { $p: Person, $p <knows> $f }
+    where $p.name = $name
     return { $f.name }
 }
 query friends_bound($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
+    where $p.name = $name
     return { $f.name }
 }
 "#;

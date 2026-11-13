@@ -32,10 +32,8 @@ edge Knows: Person -> Person {
 
 --- query
 query all_edges() {
-    match {
-        $p: Person { name: "alice" }
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
+    where $p.name = "alice"
     return { $w.label }
     order { $p.rank }
 }
@@ -51,10 +49,8 @@ w.label: String
 
 --- query
 query first_page() {
-    match {
-        $p: Person { name: "alice" }
-        $p $w:knows $f
-    }
+    match { $p: Person, $p $w:knows $f }
+    where $p.name = "alice"
     return { $w.label }
     order { $p.rank }
     limit 2
@@ -69,11 +65,8 @@ w.label: String
 
 --- query
 query next_page() {
-    match {
-        $p: Person { name: "alice" }
-        $p $w:knows $f
-        $w.@id > "edge-b"
-    }
+    match { $p: Person, $p $w:knows $f }
+    where $p.name = "alice" and $w.@id > "edge-b"
     return { $w.label }
     order { $p.rank }
     limit 2

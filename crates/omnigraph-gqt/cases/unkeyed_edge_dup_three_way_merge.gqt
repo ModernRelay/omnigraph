@@ -57,10 +57,7 @@ query add_person_on_main() { insert Person { name: "Eve" } }
 
 --- query branch: b0
 query edges() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 
@@ -83,10 +80,7 @@ branch merge b0
 
 --- query branch: main
 query edges() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { $p.name, $q.name }
 }
 
@@ -128,10 +122,7 @@ branch delete b0
 
 --- query branch: main
 query edge_count() {
-    match {
-        $p: Person
-        $p $e:knows $q
-    }
+    match { $p: Person, $p $e:knows $q }
     return { count($q.name) as n }
 }
 

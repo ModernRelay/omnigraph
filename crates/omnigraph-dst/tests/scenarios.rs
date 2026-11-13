@@ -2758,14 +2758,18 @@ fn update_patch_cost_rows(replay: &str) -> String {
     const WIDE_SCHEMA: &str = "node Doc {\n    slug: String @key\n    age: I32\n    title: String?\n    content: Blob?\n    emb: Vector(2048)?\n}\n";
     const UPDATES: &str = r#"
 query patch() {
-    update Doc set { score: 1 } where slug = "d1"
+    match { $x: Doc } where $x.slug = "d1"
+    update $x set { score: 1 }
 }
 query rewrite() {
-    update Doc set { score: 2 } where slug = "d1"
-    update Doc set { score: 2 } where slug = "nobody"
+    match { $x: Doc } where $x.slug = "d1"
+    update $x set { score: 2 }
+    match { $x: Doc } where $x.slug = "nobody"
+    update $x set { score: 2 }
 }
 query widen($title: String) {
-    update Doc set { title: $title } where slug = "d1"
+    match { $x: Doc } where $x.slug = "d1"
+    update $x set { title: $title }
 }
 "#;
 
@@ -2911,7 +2915,8 @@ query insert_one() {
     insert Person { slug: "new-0", age: 1 }
 }
 query update_one() {
-    update Person set { age: 2 } where slug = "p0003"
+    match { $x: Person } where $x.slug = "p0003"
+    update $x set { age: 2 }
 }
 "#;
     const SIZES: [(u32, [&str; 4]); 2] = [
@@ -3024,15 +3029,13 @@ query update_one() {
 /// graph carries `commits` small update commits on main before the reopen.
 const WARM_READ_QUERIES: &str = r#"
 query get_person($name: String) {
-    match { $p: Person { name: $name } }
+    match { $p: Person } where $p.name = $name
     return { $p.name, $p.age }
 }
 
 query friends_of($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $q
-    }
+    match { $p: Person, $p knows $q }
+    where $p.name = $name
     return { $q.name }
 }
 "#;
@@ -3316,9 +3319,9 @@ node Doc {
 "#;
     const QUERIES: &str = r#"
 query nearest_docs($q: Vector(2)) {
-    match { $d: Doc }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 4) as $distance }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 4
 }
 "#;
@@ -3328,7 +3331,7 @@ query nearest_docs($q: Vector(2)) {
 
     impl NearestCost {
         async fn nearest(db: &Session) -> serde_json::Value {
-            use omnigraph_compiler::query::ast::Literal;
+            use omnigraph_compiler::query::value::Literal;
             let mut params = omnigraph_compiler::ir::ParamMap::new();
             params.insert(
                 "q".to_string(),
@@ -4187,7 +4190,7 @@ fn overwrite_removal_cost_rows(replay: &str) -> String {
             _workload_seed: u64,
         ) {
             use omnigraph::loader::CsvLoadRequest;
-            use omnigraph_compiler::query::ast::LoadTarget;
+            use omnigraph_compiler::query::file::LoadTarget;
 
             omnigraph_dst::cost::set_label("_overwrite_removal_setup");
             let schema = "node Person { id: String @key } \
@@ -4322,7 +4325,7 @@ fn endpoint_probe_cost_rows(replay: &str) -> String {
             _workload_seed: u64,
         ) {
             use omnigraph::loader::CsvLoadRequest;
-            use omnigraph_compiler::query::ast::LoadTarget;
+            use omnigraph_compiler::query::file::LoadTarget;
 
             omnigraph_dst::cost::set_label("_endpoint_probe_setup");
             let schema = "node Account { id: I64 @key } \

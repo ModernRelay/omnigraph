@@ -41,7 +41,7 @@ edge SegmentOf: Segment -> Artifact
 --- query
 set engine = v2;
 query grouped_fanout() {
-    match { $s: Segment $s segmentOf $t }
+    match { $s: Segment, $s segmentOf $t }
     return { $t.slug, count($s) as segments }
     order { segments desc, $t.slug }
     limit 2
@@ -59,7 +59,7 @@ pass projection_pushdown
 --- query
 set engine = v2;
 query destination_count() {
-    match { $s: Segment $s segmentOf $t }
+    match { $s: Segment, $s segmentOf $t }
     return { count($t) as targets }
 }
 --- expect unordered
@@ -72,11 +72,8 @@ scan Artifact as $t: columns [__id, slug]
 --- query
 set engine = v2;
 query hidden_dependencies() {
-    match {
-        $s: Segment
-        $s segmentOf $t
-        $t: Artifact { state: "open" }
-    }
+    match { $s: Segment, $s segmentOf $t, $t: Artifact }
+    where $t.state = "open"
     return { $t.slug }
     order { $t.rank, $t.slug }
 }
@@ -92,7 +89,7 @@ scan Artifact as $t: columns [__id, slug, state, rank]
 --- query
 set engine = v2;
 query bare_destination() {
-    match { $s: Segment { slug: "s1" } $s segmentOf $t }
+    match { $s: Segment, $s segmentOf $t } where $s.slug = "s1"
     return { $t }
     order { $t.slug }
 }
@@ -107,7 +104,7 @@ scan Artifact as $t: columns [__id, slug, content, state, rank]
 --- query
 set engine = v2;
 query empty_expansion() {
-    match { $s: Segment { slug: "orphan" } $s segmentOf $t }
+    match { $s: Segment, $s segmentOf $t } where $s.slug = "orphan"
     return { $t.slug }
 }
 --- expect unordered
@@ -119,11 +116,8 @@ scan Artifact as $t: columns [__id, slug]
 --- query
 set engine = v2;
 query filtered_destinations_are_empty() {
-    match {
-        $s: Segment
-        $s segmentOf $t
-        $t: Artifact { state: "absent" }
-    }
+    match { $s: Segment, $s segmentOf $t, $t: Artifact }
+    where $t.state = "absent"
     return { $t.slug }
 }
 --- expect unordered
@@ -135,7 +129,7 @@ scan Artifact as $t: columns [__id, slug, state]
 --- query
 set engine = v2;
 query empty_source() {
-    match { $s: Segment { slug: "absent" } $s segmentOf $t }
+    match { $s: Segment, $s segmentOf $t } where $s.slug = "absent"
     return { $t.slug }
 }
 --- expect unordered
@@ -147,7 +141,7 @@ scan Artifact as $t: columns [__id, slug]
 --- query
 set engine = v2;
 query unused_destination() {
-    match { $s: Segment $s segmentOf $t }
+    match { $s: Segment, $s segmentOf $t }
     return { count($s) as segments }
 }
 --- expect unordered

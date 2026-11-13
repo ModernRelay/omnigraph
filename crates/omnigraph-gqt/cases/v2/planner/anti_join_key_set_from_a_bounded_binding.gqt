@@ -75,19 +75,22 @@ edge TouchpointByIdentity: Touchpoint -> ExternalID
 --- query
 query lookalikes($channel: String, $exclude: String) {
     match {
-        $c: Channel { slug: $channel }
-        $s: Source
-        $c channelWatchesSource $s
-        $t: Touchpoint { action: "star" }
-        $t touchpointOnSource $s
-        $x: ExternalID
-        $t touchpointByIdentity $x
-        not {
-            $s0: Source { slug: $exclude }
-            $t0: Touchpoint
-            $t0 touchpointOnSource $s0
-            $t0 touchpointByIdentity $x
-        }
+        $c: Channel,
+        $s: Source,
+        $c channelWatchesSource $s,
+        $t: Touchpoint,
+        $t touchpointOnSource $s,
+        $x: ExternalID,
+        $t touchpointByIdentity $x,
+    }
+    where $c.slug = $channel
+      and $t.action = "star"
+      and not exists {
+        $s0: Source,
+        $t0: Touchpoint,
+        $t0 touchpointOnSource $s0,
+        $t0 touchpointByIdentity $x
+        where $s0.slug = $exclude
     }
     return { $x.slug, count($t) as repos }
 }
@@ -107,25 +110,26 @@ repos: I64
 anti join $x: key_set
 pass anti_join_strategy
 
---- expect same as v1
-
 --- query
 query twice_on_excluded($channel: String, $exclude: String) {
     match {
-        $c: Channel { slug: $channel }
-        $s: Source
-        $c channelWatchesSource $s
-        $t: Touchpoint { action: "star" }
-        $t touchpointOnSource $s
-        $x: ExternalID
-        $t touchpointByIdentity $x
-        count {
-            $s0: Source { slug: $exclude }
-            $t0: Touchpoint
-            $t0 touchpointOnSource $s0
-            $t0 touchpointByIdentity $x
-        } >= 2
+        $c: Channel,
+        $s: Source,
+        $c channelWatchesSource $s,
+        $t: Touchpoint,
+        $t touchpointOnSource $s,
+        $x: ExternalID,
+        $t touchpointByIdentity $x,
     }
+    where $c.slug = $channel
+      and $t.action = "star"
+      and count {
+        $s0: Source,
+        $t0: Touchpoint,
+        $t0 touchpointOnSource $s0,
+        $t0 touchpointByIdentity $x
+        where $s0.slug = $exclude
+    } >= 2
     return { $x.slug, count($t) as repos }
 }
 
@@ -145,20 +149,23 @@ anti join $x: key_set
 --- query
 query heavy_on_excluded($channel: String, $exclude: String) {
     match {
-        $c: Channel { slug: $channel }
-        $s: Source
-        $c channelWatchesSource $s
-        $t: Touchpoint { action: "star" }
-        $t touchpointOnSource $s
-        $x: ExternalID
-        $t touchpointByIdentity $x
-        sum($t0.weight) {
-            $s0: Source { slug: $exclude }
-            $t0: Touchpoint
-            $t0 touchpointOnSource $s0
-            $t0 touchpointByIdentity $x
-        } > 3
+        $c: Channel,
+        $s: Source,
+        $c channelWatchesSource $s,
+        $t: Touchpoint,
+        $t touchpointOnSource $s,
+        $x: ExternalID,
+        $t touchpointByIdentity $x,
     }
+    where $c.slug = $channel
+      and $t.action = "star"
+      and sum($t0.weight) {
+        $s0: Source,
+        $t0: Touchpoint,
+        $t0 touchpointOnSource $s0,
+        $t0 touchpointByIdentity $x
+        where $s0.slug = $exclude
+    } > 3
     return { $x.slug, count($t) as repos }
 }
 
@@ -179,20 +186,22 @@ anti join $x: key_set
 --- query
 query not_through_the_web($channel: String, $exclude: String) {
     match {
-        $c: Channel { slug: $channel }
-        $s: Source
-        $c channelWatchesSource $s
-        $t: Touchpoint { action: "star" }
-        $t touchpointOnSource $s
-        $x: ExternalID
-        $t touchpointByIdentity $x
-        not {
-            $s0: Source { slug: $exclude }
-            $t0: Touchpoint
-            $t0 $e:touchpointOnSource $s0
-            $e.via = "web"
-            $t0 touchpointByIdentity $x
-        }
+        $c: Channel,
+        $s: Source,
+        $c channelWatchesSource $s,
+        $t: Touchpoint,
+        $t touchpointOnSource $s,
+        $x: ExternalID,
+        $t touchpointByIdentity $x,
+    }
+    where $c.slug = $channel
+      and $t.action = "star"
+      and not exists {
+        $s0: Source,
+        $t0: Touchpoint,
+        $t0 $e:touchpointOnSource $s0,
+        $t0 touchpointByIdentity $x
+        where $s0.slug = $exclude and $e.via = "web"
     }
     return { $x.slug, count($t) as repos }
 }
@@ -212,22 +221,23 @@ repos: I64
 --- expect plan
 anti join $x: key_set
 
---- expect same as v1
-
 --- query
 query never_forked($channel: String) {
     match {
-        $c: Channel { slug: $channel }
-        $s: Source
-        $c channelWatchesSource $s
-        $t: Touchpoint { action: "star" }
-        $t touchpointOnSource $s
-        $x: ExternalID
-        $t touchpointByIdentity $x
-        not {
-            $t0: Touchpoint { action: "fork" }
-            $t0 touchpointByIdentity $x
-        }
+        $c: Channel,
+        $s: Source,
+        $c channelWatchesSource $s,
+        $t: Touchpoint,
+        $t touchpointOnSource $s,
+        $x: ExternalID,
+        $t touchpointByIdentity $x,
+    }
+    where $c.slug = $channel
+      and $t.action = "star"
+      and not exists {
+        $t0: Touchpoint,
+        $t0 touchpointByIdentity $x
+        where $t0.action = "fork"
     }
     return { $x.slug, count($t) as repos }
 }
@@ -247,25 +257,25 @@ repos: I64
 anti join $x: correlated
 not pass anti_join_strategy
 
---- expect same as v1
-
 --- query
 query no_heavier_on_excluded($channel: String, $exclude: String) {
     match {
-        $c: Channel { slug: $channel }
-        $s: Source
-        $c channelWatchesSource $s
-        $t: Touchpoint { action: "star" }
-        $t touchpointOnSource $s
-        $x: ExternalID
-        $t touchpointByIdentity $x
-        not {
-            $s0: Source { slug: $exclude }
-            $t0: Touchpoint
-            $t0 touchpointOnSource $s0
-            $t0 touchpointByIdentity $x
-            $t0.weight > $t.weight
-        }
+        $c: Channel,
+        $s: Source,
+        $c channelWatchesSource $s,
+        $t: Touchpoint,
+        $t touchpointOnSource $s,
+        $x: ExternalID,
+        $t touchpointByIdentity $x,
+    }
+    where $c.slug = $channel
+      and $t.action = "star"
+      and not exists {
+        $s0: Source,
+        $t0: Touchpoint,
+        $t0 touchpointOnSource $s0,
+        $t0 touchpointByIdentity $x
+        where $s0.slug = $exclude and $t0.weight > $t.weight
     }
     return { $x.slug, count($t) as repos }
 }
@@ -285,5 +295,3 @@ repos: I64
 --- expect plan
 anti join $x: correlated
 not pass anti_join_strategy
-
---- expect same as v1

@@ -97,11 +97,7 @@ load csv "bob_only.csv" into edge:WorksAt mode overwrite header
 
 --- query
 query employment() {
-    match {
-        $p: Person
-        $c: Company
-        $p worksAt $c
-    }
+    match { $p: Person, $c: Company, $p worksAt $c }
     return { $p.name, $p.title, $c.name }
 }
 

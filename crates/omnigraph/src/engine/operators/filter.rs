@@ -145,7 +145,7 @@ mod tests {
 
     use arrow_array::{Array, ArrayRef, Float32Array, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use omnigraph_compiler::query::ast::{CompOp, Literal};
+    use omnigraph_compiler::query::value::{CompOp, Literal};
     use omnigraph_compiler::types::{ExprType, PropType, ScalarType};
 
     use super::*;

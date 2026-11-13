@@ -8,14 +8,14 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::ir::ParamMap;
-use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::query::value::Literal;
 use omnigraph_planner::PhysicalNode;
 use serde_json::Value;
 
 use crate::helpers::*;
 
 const WILDCARD_LIKES_QUERY: &str = r#"query selected() {
-    match { $p: Person $d: Doc $p $e:* $d }
+    match { $p: Person, $d: Doc, $p $e:* $d }
     return { $p.name as person, $d.title as title, $e.@type as edge_type }
     order { $p.name, $d.title, $e.@type }
 }"#;
@@ -43,7 +43,7 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
     let destinations = query_main(
         &db,
         r#"query destinations() {
-            match { $p: Person $p.name != "hub" }
+            match { $p: Person } where $p.name != "hub"
             return { $p.name as name, $p.@id as id }
         }"#,
         "destinations",
@@ -67,9 +67,9 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
     db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
     db.ensure_indices_as(None).await.unwrap();
     let query = r#"query selected_page() {
-        match { $p: Person $p $e:(knows | likes) $q }
+        match { let $all = { match { $p: Person } return { $p } }, from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "needle needle"), k: 60) as $score, $p: Person, $p $e:(knows | likes) $q }
         return { $e.@type as edge_type, $e.@id as edge_id, $q.name as target }
-        order { rrf(bm25($p.text, "needle"), bm25($p.text, "needle")) }
+        order { $score desc }
         limit 1
     }"#;
     let first = db
@@ -327,7 +327,7 @@ async fn selected_cold_indexed_route_uses_persisted_members_without_building_csr
     let csr = probes.expand_csr_runs.clone();
     let switches = probes.traversal_mid_switches.clone();
     let builds = probes.graph_build_count.clone();
-    let query = r#"query selected() { match { $p: Person $p (bookmarks | likes) $d } return { $p.name, $d.title } }"#;
+    let query = r#"query selected() { match { $p: Person, $p (bookmarks | likes) $d } return { $p.name, $d.title } }"#;
     let run = with_query_io_probes(
         probes,
         db.query_inspected("main", query, "selected", &ParamMap::new()),
@@ -368,7 +368,7 @@ async fn limit_stops_selected_traversal_before_admitting_later_source_windows_is
         .unwrap();
     let cap = 8_192 + sources + 8_192;
     let query = format!(
-        "set traversal_work_limit = {cap}; query selected() {{ match {{ $p: Person $p (knows | knows) $q }} return {{ $q.@id }} limit 1 }}"
+        "set traversal_work_limit = {cap}; query selected() {{ match {{ $p: Person, $p (knows | knows) $q }} return {{ $q.@id }} limit 1 }}"
     );
     let probes = QueryMemoryProbes::default();
     let limited = with_query_memory_probes(
@@ -493,17 +493,17 @@ const PEOPLE_SEED: &[&str] = &[
 
 const PEOPLE_QUERIES: &str = r#"
 query liked() {
-    match { $p: Person $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, $d.title }
     order { $p.name, $d.title }
 }
 query first_liked() {
-    match { $p: Person $p likes $d }
+    match { $p: Person, $p likes $d }
     return { $p.name, $d.title }
     limit 1
 }
 query likes_nothing() {
-    match { $p: Person not { $p likes $d } }
+    match { $p: Person } where not exists { $d: Doc, $p likes $d }
     return { $p.name }
 }
 query none_ordered() {
@@ -539,23 +539,32 @@ edge Knows: Doc -> Doc
 const DOC_QUERIES: &str = r#"
 query nearest_with_edge($q: Vector(4)) {
     match {
-        $d: Doc
-        $d knows $t
+      let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
     }
     return { $d.slug }
-    order { nearest($d.embedding, $q) }
+    order { $distance }
     limit 3
 }
-query fused($t: String, $q: Vector(4)) {
-    match { $d: Doc }
+query window_then_where($q: Vector(4)) {
+    match {
+      let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
+    }
+    where $t.slug != "d01"
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), bm25($d.text, $t)) }
+    order { $d.slug }
+}
+query fused($t: String, $q: Vector(4)) {
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
+    return { $d.slug }
+    order { $score desc }
     limit 3
 }
 query fused_vectors($q: Vector(4), $r: Vector(4)) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $r, k: 3), k: 60) as $score, $d: Doc }
     return { $d.slug }
-    order { rrf(nearest($d.embedding, $q), nearest($d.embedding, $r)) }
+    order { $score desc }
     limit 3
 }
 "#;
@@ -584,12 +593,8 @@ const CITATION_SEED: &[&str] = &[
 
 const CITATION_QUERIES: &str = r#"
 query cited() {
-    match {
-        $m: Matter
-        $p: Passage
-        $p.text contains $m.number
-        $m.mid != $p.pid
-    }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
+    where contains($p.text, $m.number) and $m.mid != $p.pid
     return { $m.mid, $p.pid }
     order { $m.mid, $p.pid }
 }
@@ -785,7 +790,7 @@ async fn legacy_two_hop_plan_corrects_assumed_coverage_before_execution() {
     let dir = tempfile::tempdir().unwrap();
     let db = docs(&dir).await;
     let query = r#"query two_hops() {
-        match { $a: Doc { slug: "d00" } $a knows{1,2} $b }
+        match { $a: Doc, $a knows{1,2} $b } where $a.slug = "d00"
         return { $b.slug }
     }"#;
     let run = db
@@ -989,7 +994,7 @@ async fn a_marker_with_no_contains_join_refuses_the_replay() {
 #[tokio::test]
 async fn saved_contains_conjunct_refuses_pairing_and_leaf_type_drift() {
     use omnigraph_compiler::ir::IRExpr;
-    use omnigraph_compiler::query::ast::CompOp;
+    use omnigraph_compiler::query::value::CompOp;
     use omnigraph_compiler::{ExprType, PropType, ScalarType};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1263,6 +1268,38 @@ async fn a_nearest_ladder_replays_the_same_rungs() {
     assert_eq!(rungs, [0, ladder]);
 }
 
+/// A window drawn as a pattern step fills its own `k` targets, not the
+/// `limit`: the population (a document with a `knows` edge) thins the first
+/// candidates, so the ladder reruns until the window holds three targets,
+/// and the `where` after the window then removes one of them without a
+/// refill. The replay repeats the rungs and the rows.
+#[tokio::test]
+async fn a_window_ladder_replays_the_same_rungs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = docs(&dir).await;
+    let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
+    let Replayed {
+        result, plan, rows, ..
+    } = replayed(&db, DOC_QUERIES, "window_then_where", &params).await;
+    assert_eq!(
+        result,
+        vec![
+            serde_json::json!({"d.slug": "d04"}),
+            serde_json::json!({"d.slug": "d08"})
+        ],
+        "the window holds d00, d04 and d08; the `where` removes d00 and nothing refills it"
+    );
+    assert!(
+        plan.plan.live().any(|(_, node)| matches!(
+            node,
+            omnigraph_planner::PhysicalNode::TargetCut { targets: 3, .. }
+        )),
+        "the window is a cut of three targets"
+    );
+    let rungs = rows[0]["attempts"].as_array().unwrap().len();
+    assert!(rungs >= 2, "the thinned window reruns its scan: {rows:#?}");
+}
+
 #[tokio::test]
 async fn a_fusion_replays() {
     let dir = tempfile::tempdir().unwrap();
@@ -1374,31 +1411,30 @@ async fn a_read_reports_its_ranking() {
 
     const RANKED: &str = r#"
 query two_texts($a: String, $b: String) {
-    match { $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $a), bm25($all, $d.text, $b), k: 60) as $score, $d: Doc }
     return {
         $d.slug,
-        rrf(bm25($d.text, $a), bm25($d.text, $b)) as fused,
-        rrf(bm25($d.text, $a), bm25($d.text, $b)) as again
+        $score as fused,
+        $score as again
     }
-    order { rrf(bm25($d.text, $a), bm25($d.text, $b)) }
+    order { $score desc }
     limit 3
 }
 query closest($q: Vector(4)) {
-    match { $d: Doc }
-    return { $d.slug, nearest($d.embedding, $q) }
-    order { nearest($d.embedding, $q) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $distance }
+    return { $d.slug, $distance as _distance }
+    order { $distance }
     limit 2
 }
 query distinct_scores($a: String) {
-    match { $d: Doc }
-    return distinct { $d.slug, bm25($d.text, $a) as relevance }
-    order { bm25($d.text, $a) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $a) as $score }
+    return distinct { $d.slug, $score as relevance }
     limit 3
 }
 query computed_score($a: String) {
-    match { $d: Doc }
-    return { $d.slug, bm25($d.text, $a) as relevance, bm25($d.text, $a) > 0.0 as hit }
-    order { bm25($d.text, $a) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $a) as $score }
+    return { $d.slug, $score as relevance, $score > 0.0 as hit }
+    order { $score desc }
     limit 3
 }
 query unranked() {
@@ -1440,7 +1476,7 @@ query unranked() {
             RANKED,
             "closest",
             &closest,
-            ranking(SearchFunction::Nearest, &["d._distance"]),
+            ranking(SearchFunction::Nearest, &["_distance"]),
         ),
         (
             DOC_QUERIES,
@@ -1777,9 +1813,9 @@ async fn a_plan_refusal_is_a_typed_bad_request_and_a_ranked_destination_replays_
     let db = docs(&dir).await;
     let source = r#"
 query nearest_destination($q: Vector(4)) {
-    match { $d: Doc $d knows $t }
+    match { let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, from nearest($pop, $t.embedding, $q, k: 1) as $distance }
     return { $t.slug }
-    order { nearest($t.embedding, $q) }
+    order { $distance }
     limit 1
 }
 "#;
@@ -1815,12 +1851,12 @@ query nearest_destination($q: Vector(4)) {
         .expect("the ranked-root plan replays");
     assert_eq!(rows_of(&replay.result), expected);
 
-    // An `rrf()` whose arms rank two bindings one traversal connects is
-    // refused at type checking whichever binding is declared first, with no
-    // fix to follow: each arm would root the traversal at its own binding.
+    // An `rrf` whose arms rank two bindings one traversal connects is
+    // refused at type checking whichever binding is declared first: the fused
+    // target would be a pair.
     for (name, first, second) in [("d_first", "$d", "$t"), ("t_first", "$t", "$d")] {
         let source = format!(
-            "query {name}() {{\n    match {{ {first}: Doc {second}: Doc $d knows $t }}\n    return {{ $d.slug, $t.slug }}\n    order {{ rrf(bm25($d.text, \"needle\"), bm25($t.text, \"needle\")) }}\n    limit 1\n}}\n"
+            "query {name}() {{\n    match {{ let $pop = {{ match {{ $d: Doc }} return {{ $d }} }}, let $pop2 = {{ match {{ $t: Doc }} return {{ $t }} }}, from rrf(bm25($pop, $d.text, \"needle\"), bm25($pop2, $t.text, \"needle\")) as $score, {first}: Doc, {second}: Doc, $d knows $t }}\n    return {{ $d.slug, $t.slug }}\n    order {{ $score desc }}\n    limit 1\n}}\n"
         );
         let refused = db
             .query(ReadTarget::branch("main"), &source, name, &ParamMap::new())
@@ -1829,18 +1865,10 @@ query nearest_destination($q: Vector(4)) {
         let diagnostic = refused.diagnostic().unwrap_or_else(|| {
             panic!("{name}: a type refusal carries its diagnostic: {refused:?}")
         });
-        assert_eq!(diagnostic.code.as_str(), "T59", "{name}: {refused}");
+        assert_eq!(diagnostic.code.as_str(), "T75", "{name}: {refused}");
         assert_eq!(
             diagnostic.fix, None,
             "{name}: no declaration order serves both arms"
-        );
-        assert_eq!(
-            diagnostic
-                .stage
-                .as_ref()
-                .and_then(|stage| stage.expression.as_deref()),
-            Some(r#"rrf(bm25($d.text, "needle"), bm25($t.text, "needle"))"#),
-            "{name}"
         );
     }
 
@@ -1851,7 +1879,7 @@ query nearest_destination($q: Vector(4)) {
     let csr = with_traversal(&db, omnigraph_compiler::settings::Traversal::Csr);
     let wildcard = r#"
 query wildcard() {
-    match { $a: Doc $b: Doc $a * $b }
+    match { $a: Doc, $b: Doc, $a * $b }
     return { $b.slug }
 }
 "#;
@@ -2133,7 +2161,7 @@ async fn sibling_detached_edge_pins_refuse_traversal_plan_replay() {
 #[tokio::test]
 async fn an_exact_subset_member_replays_only_with_its_derivation() {
     const SOURCE: &str = r#"query elders($min: I64) {
-    match { $p: Person $p.age >= $min }
+    match { $p: Person } where $p.age >= $min
     return { $p.name, $p.age as age }
     order { $p.age desc }
     limit 2
@@ -2231,9 +2259,9 @@ async fn an_envelope_of_another_version_asks_for_the_query_again() {
 #[tokio::test]
 async fn a_replay_rechecks_recorded_full_text_coverage() {
     const SOURCE: &str = r#"query recent($t: String) {
-    match { $d: Doc $d.year >= 2000 }
-    return { $d.slug, bm25($d.text, $t) as score }
-    order { bm25($d.text, $t) }
+    match { let $pop = { match { $d: Doc } where $d.year >= 2000 return { $d } }, from bm25($pop, $d.text, $t) as $score }
+    return { $d.slug, $score as score }
+    order { $score desc }
 }"#;
     let dir = tempfile::tempdir().unwrap();
     let db = session(
@@ -2448,15 +2476,15 @@ async fn saved_property_leaf_types_refuse_drift_before_pushdown_or_empty_input()
     let db = people(&dir).await;
     let queries = r#"
 query pushed() {
-    match { $p: Person $p.age > 35 }
+    match { $p: Person } where $p.age > 35
     return { $p.name }
 }
 query no_matches() {
-    match { $p: Person $p.age > 100 }
+    match { $p: Person } where $p.age > 100
     return { $p.name }
 }
 query skipped() {
-    match { $p: Person $p.age > 35 }
+    match { $p: Person } where $p.age > 35
     return { $p.name }
     limit 0
 }
@@ -2562,7 +2590,7 @@ async fn saved_count_variable_types_refuse_drift_with_metadata_or_empty_aggregat
     let dir = tempfile::tempdir().unwrap();
     let db = people(&dir).await;
     let empty = r#"query empty_count() {
-        match { $p: Person $p.age > 100 }
+        match { $p: Person } where $p.age > 100
         return { count($p) as n }
     }"#;
     for (source, name, kind) in [
@@ -2689,7 +2717,7 @@ async fn saved_temporal_params_keep_fresh_shape_refusals_on_empty_input() {
     ] {
         for predicate in ["$p.age > 0", "$p.age > 100"] {
             let source = format!(
-                "query temporal($values: {type_name}) {{ match {{ $p: Person {predicate} }} return {{ $values as values }} }}"
+                "query temporal($values: {type_name}) {{ match {{ $p: Person }} where {predicate} return {{ $values as values }} }}"
             );
             let params = ParamMap::from([("values".into(), Literal::List(vec![valid.clone()]))]);
             let run = db

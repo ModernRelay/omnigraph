@@ -46,10 +46,8 @@ query joins them:
 
 ```gq
 query jobs_naming_no_operator() {
-  match {
-    $j: Job
-    not { $o: @Operator $o.name = $j.uses }
-  }
+  match { $j: Job }
+  where not exists { $o: @Operator where $o.name = $j.uses }
   return { $j.name }
 }
 ```
@@ -134,6 +132,7 @@ binary's rows.
 | Scan | [0, 1] |
 | Sort | [1] |
 | SortMergeJoin | [2] |
+| TargetCut | [1] |
 | Validate | [1] |
 <!-- /catalogue:operators -->
 
@@ -193,6 +192,7 @@ binary's rows.
 | RowDiff | routable |
 | Sort | routable |
 | TableScan | routable |
+| TargetCut | refused_by_name |
 | TextSearch | refused_by_name |
 | Validate | refused_by_name |
 <!-- /catalogue:logical_kinds -->

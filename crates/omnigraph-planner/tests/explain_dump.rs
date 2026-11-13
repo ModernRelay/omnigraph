@@ -6,7 +6,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 
-use omnigraph_compiler::ir::QueryIR;
+use omnigraph_planner::read_shape::ReadShape;
 use omnigraph_planner::{Bounds, MemorySource, Operation, RouteOverride, route};
 
 #[path = "support/bounds.rs"]
@@ -48,7 +48,7 @@ fn dump_failure_child() {
     let Some(dir) = std::env::var_os(CHILD_DIR) else {
         return;
     };
-    let query = Operation::Query(Box::new(QueryIR {
+    let query = Operation::Query(Box::new(ReadShape {
         name: "unresolved".into(),
         params: vec![],
         pipeline: vec![],

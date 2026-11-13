@@ -9,9 +9,32 @@
 A query runs against one resolved `ReadTarget`:
 
 1. Resolve the branch or graph snapshot once.
-2. Parse and type-check `.gq` source against that snapshot's accepted catalog.
-3. Lower the checked query to typed IR, keeping the declaration and its
-   checked query beside it (`CheckedRead`).
+2. Parse and type-check `.gq` source against that snapshot's accepted catalog
+   into the typed core IR (`ir::core`).
+3. Shape the core read for the planner (`omnigraph_planner::read_shape`): the
+   pattern of scans, expansions, filters and correlated blocks, its return
+   items, order, limit and the ranking a `from nearest/bm25/rrf` draws. A
+   `let` value that cannot fail is read wherever its name is; a `from` over an
+   inline read with no group, order or cut adds the inner pattern's facts,
+   its unreturned names renamed apart. A ranking that is the read's only
+   element, its score leading the `order` in its direction and its `nearest`
+   window the `limit`, stays the leading key today's ranked scan runs. Any
+   other ranking is a `PatternStep::Rank` over its population: `nearest`
+   lowers to its ranked scan with `RankScope::Window`, a `Sort` by distance
+   then the target's identity, and a `TargetCut` that keeps every row of the
+   first `k` targets; the elements and `where` after it are steps above the
+   cut, and filter placement treats the cut as a scope boundary, so no
+   filter moves below it (law 2). The overfetch ladder fills the cut's `k`
+   targets, read from its `selected_targets` counter, instead of the read's
+   `limit`. `bm25` has no window, and an `rrf` windows its `nearest` arm at
+   the arm's own `k`. The shaper is the compiler's
+   (`omnigraph_compiler::shape`), and the type checker runs it on every
+   declaration it accepts: a term it does not lower (`Union`, `Fix`, `Call`,
+   a `let` value that can fail, an inline read with a group, order or cut, a
+   computed order key no return item computes) is refused at type check with
+   `T86`, at the construct and naming the programme stage that adds it, so
+   the planner never refuses a checked read. A term that still arrives
+   unlowered is the planner's `P006`, an internal error and a defect.
 4. Gather the planning inputs once: bound parameters (`now()` among them),
    constants folded to their values, statistics, settings and the index
    facts the full-text coverage of every ranked property is derived from.
@@ -19,19 +42,95 @@ A query runs against one resolved `ReadTarget`:
 6. Bind the accepted plan's values and execute it against the same snapshot.
 7. Serialize result batches at the calling boundary.
 
-Type checking constructs a complete `CheckedReadQuery` or
-`CheckedMutationQuery`. Its private fields retain typed expressions, scopes,
-parameter declarations and operation metadata. Each input expression and
-literal payload is resolved once per successful checking invocation, including
-null members of literal lists. Equal expressions at different source locations
-are separate occurrences.
+Every caller parses through one front door, `parse_query`: the nesting bound,
+then the one grammar (`query/syntax/grammar.pest`). The type checker
+(`query/check/`) types each declaration into one core term, places every
+filter after the last binder of a variable it names, and binds every
+expression (`check/bind.rs`): system columns to their physical names,
+comparisons and membership through `ir::coerce`, which stores the explicit
+casts of invariant 9, literal-only nodes folded. The planner, the engine,
+result-schema inference (`check::result::result_schema`) and every header
+consumer (server, CLI, cluster, MCP, lint, the operation descriptor) read that
+core term; nothing re-derives types from the text.
 
-Lowering and result-schema inference consume the checked value and read its
-retained types. Callers use the same accepted catalog for checking, lowering
-and schema inference. Lowering still inserts comparison casts, folds constants
-and substitutes search scores; validation of the resulting IR remains fallible.
-The compiler's occurrence tests check resolution counts independently and
-assert that lowering and schema inference perform no further resolution.
+Each scope's elements form components (`check/components.rs`): a binding, a
+triple, an `optional` or a `from` joins the components of every variable it
+binds or reads; a `let` value stands for the variables it reads, and the
+`where` with its blocks joins nothing. Two components multiply their rows by
+the `Correlate` of an inner term with no free variables, a product, which the
+type checker admits only when every component but one is a single node
+binding whose `@key` columns a top-level `where` conjunct equates with a
+literal or a parameter; otherwise it refuses with `T81`, whose suggestion is
+the triple when exactly one edge type joins the two, or the second component
+as a named relation drawn with `from`. A `from` that reads nothing of its
+scope is that product written out and admitted. The rule is the type
+checker's alone: the shaper flattens a named relation's inline read into the
+enclosing pattern, so the product it plans, a `CrossJoin` or a
+`ContainsJoin`, is the one the two bindings written side by side planned.
+
+A block and an inline read are inner scopes (`check/mod.rs`, `Scope::block`
+and `Scope::inner`): a name read from the enclosing scope correlates, and a
+name new to the scope is introduced by a binding element anywhere in it. After
+a scope's elements are typed, every end a triple introduced that no binding of
+the scope binds is `T84`, at the first triple naming one, with one suggestion
+inserting each binding before the triple that first names it, typed as the
+triple resolved that end (the edge's declared end type). A binding inside a
+block of an outer name is `T68`; its suggestion drops the binding, and a block
+whose only element is such a binding of the same type becomes its predicate in
+the block's place (`coalesce(…, false)` when the predicate can be null, as a
+probe typing the block with the re-mention correlating reports). A block of that shape whose
+predicate holds a search predicate keeps correlating by re-mention, since a
+search predicate stands alone (`T38`). The inserted binding makes the triple's
+ends both bound, so the core term is the derived form's `Scan` and `Expand` to
+a fresh column with the identity `Filter`; the shaper reads that filter as the
+triple between the two bindings and places the binding from the bound end, so
+the plan is the one the unbound triple planned. `optional { }` and a
+declaration's own `match` keep a triple's ends introduced by the triple.
+
+A triple's written order is its direction (`check/mod.rs`, `reversed_triple`).
+`resolve_traversal` still resolves each member's `Direction` from the end
+types; when every member of a named edge or an alternation resolves to `In`,
+the triple is `T82` at its element span, whose two end ranges the parser
+records (`element_span`), and the suggestion swaps them. The swapped triple
+types to the same edge selection from the same bound end, except where both
+ends are bound: the semi-join `Expand` then starts at the written source, so
+the core term's orientation flips while the shaper's plan stays the same. An
+undirected triple, a wildcard and an alternation whose members resolve both
+ways are not refused.
+
+A ranked `from` names its score with `as` (`check/mod.rs`, `drawn_rel`). The
+ranking's term carries the written name as its `out` (`Score`, `ApproxTopK`,
+and `Fuse`, whose `out` the core added for it), and the shaper reads the score
+through that name, so a renamed score plans as `$distance` did. A `from` ranks
+when its relation's term is one of the three, written as a ranking function or
+drawn from a `let` bound to one; without `as` it is `T85`, the suggestion
+inserting `as $distance` or `as $score` after the relation, whose byte range
+the parser records on the `from`'s element span, and an `as` on a `from` that
+ranks nothing is `T85` with the `as` removed. A ranking in a `union` arm or a
+ranking's population is projected to its population's columns, since a score
+there has no name; an `rrf` arm is read whole, as fusion keeps only the target
+and the fused score.
+
+A write body checks to `CoreWrite`: groups of clauses and their sinks. The
+engine's `exec/write_plan.rs` lowers each group in one of two forms. A group
+whose clauses are a scan of its statements' target, filtered by predicates a
+staged scan evaluates (no search predicate, arithmetic or registry call), and
+whose assignments read no row lowers to staged statements: an `update` or
+`delete` takes the predicate and reads it together with the statements staged
+before it, an `insert` after one runs once per matched row, and an `insert`
+with no clauses runs once. Every other group lowers its selection to a read
+shaped by `read_shape` and run by the engine (`engine::execute_selection`)
+against the write's captured snapshot and catalog, with the `now()` the write
+bound: it returns per row the `@id` of each `update` or `delete` variable and
+each assignment value that reads the row. The statement then stages the
+typed membership `id in [ids]` with those values per entity, and an `insert`
+runs once per row; two values for one entity and property through one
+statement's rows are `E4`. Because that read sees the snapshot, not the
+staged statements, a group whose selection reads a table an earlier group
+writes is not lowered, nor are a selection the read shaper refuses and a
+`Blob` read from a row; the write shaper is the compiler's too, so the type
+checker refuses each with `T86`. Such a write publishes once, through the
+same staging.
 
 The executor never refreshes a mutable branch head midway through a query.
 Historical reads build from the requested immutable table versions; current
@@ -53,11 +152,11 @@ Stable code owners:
 
 | Concern | Owner |
 |---|---|
-| Parser, type checker, lowering | `crates/omnigraph-compiler/src/query/`, `src/ir/` |
+| Parser, type checker, core IR | `crates/omnigraph-compiler/src/query/`, `src/ir/` |
+| Read shape (the core read as the planner reads it) | `crates/omnigraph-planner/src/read_shape.rs` |
 | Read doors | `crates/omnigraph/src/exec/query_doors.rs` |
 | Plan acceptance | `crates/omnigraph-planner/src/validate/` |
 | Plan lowering, operators and context (engine v2) | `crates/omnigraph/src/engine/` |
-| Frozen engine v1, the GQT test reference | `crates/omnigraph-reference-engine/` |
 | Lance scan boundary | `crates/omnigraph/src/table_store.rs` |
 | Topology build/cache | `crates/omnigraph/src/graph_index/`, `runtime_cache.rs` |
 | Mutation orchestration | `crates/omnigraph/src/exec/mutation.rs` |
@@ -107,7 +206,7 @@ for every fragment it reads (it builds the physical expression once per
 distinct expression), so that scan reads unfiltered and the engine keeps the
 rows whose key is in one set of the keys (one more column read per fragment
 no key is in, which only a long list pays for). It preserves incoming row/rank order and carries a
-deterministic edge tie-break. A correlated block (`not { ... }`,
+deterministic edge tie-break. A correlated block (`not exists { ... }`,
 `exists { ... }`, `count { ... } > 2`, `sum($d.size) { ... } > 100`) is one
 anti-join over its typed inner pipeline, keeping each outer row by a
 `SubqueryPredicate` on the aggregate of its matches.
@@ -117,9 +216,9 @@ are flat Arrow batches, not a factorized representation: an `Expand` copies
 an input row's columns into every output row that row produces. What bounds
 multi-hop fan-out is:
 
-- deferred bindings: the compiler's IR lowering gives at most one binding of
-  each connected pattern a `NodeScan`: the binding the leading search order
-  ranks, else the first declared (`scan_root`). `Expand` introduces the rest,
+- deferred bindings: the read shape gives at most one binding of each
+  connected pattern a `NodeScan`: the binding the ranking ranks, else the
+  first bound (`read_shape.rs`, `place`). `Expand` introduces the rest,
   in either direction, so connected bindings never become a cross join closed
   by a filter;
 - bounded streaming: every `Expand` emits chunks of at most
@@ -285,22 +384,6 @@ value, `v2`, and refuses `v1` as an unknown value. The doors
 query shape the planner refuses (`UnsupportedQuery`) is a `BadRequest` user
 error on execute, the error `explain_query` gives for it.
 
-Engine v1, the executor v2 replaced, is the crate
-`omnigraph-reference-engine` (`publish = false`). Its source and the compiler's
-`ir::untyped` read IR are frozen and pinned by the crate's `tests/frozen.rs`;
-it depends on `omnigraph-compiler`, `omnigraph-core`, `omnigraph-catalog` and
-third-party crates only, so it is
-independent of the production engine and planner in either direction; the
-compiler, core and catalog crates are shared. `omnigraph-gqt` is its one dependent: it
-installs `ReferenceEngine` on a session copy through
-`Session::with_read_executor` (the `ReadExecutor` trait in
-`omnigraph_catalog::read_executor`, both under the `test-util` feature) to run
-a step's `--- expect same as v1` comparison. Only this reference door converts
-the compiled query with `QueryIR::erase` into `ir::untyped`; erasure is one-way,
-and engine v2 keeps the compiler's normal IR. It answers `not { ... }` blocks
-only among the correlated blocks, and refuses count predicates and a string
-`nearest` argument. A defect is fixed on v2, never in the reference.
-
 Filter placement is a planner decision, the `predicate_pushdown` pass
 on a query plan (`place_query_filters`, per scope: the top-level tree and
 each correlated block's inner tree on its own): a search filter moves to the scan of
@@ -326,8 +409,8 @@ Column projection is the second pushdown dimension, the
 `projection_pushdown` pass described below.
 
 Before a query runs, `plan_query`
-(`engine/plan_source.rs`) hands the compiled `QueryIR` to the planner as
-`Operation::Query`: `resolve_query` folds the `IROp` pipeline into a logical
+(`engine/plan_source.rs`) hands the compiled read shape (`ReadShape`) to the
+planner as `Operation::Query`: `resolve_query` folds its pattern steps into a logical
 tree (one `TableScan` per `match` binding, `Join { kind: Cross }` for a
 second binding with no edge, `Expand`, `Filter`, `AntiJoin` with its inner
 tree over an `OuterReference` leaf standing for the enclosing rows, a leading
@@ -709,9 +792,9 @@ is how a `nearest()` over a string query reads `unavailable`. A bound plan
 serializes through planner-owned mirror types (`mirror.rs`) and reads back
 equal (`omnigraph-planner/tests/integration/bound_plan.rs`); the `SearchMode` of a
 ranked scan is built from the plan node, the value table and the pass, never
-from the `QueryIR`.
+from the read shape.
 
-Nothing reads the `QueryIR` after `plan_query` returns, and the types say so:
+Nothing reads the read shape after `plan_query` returns, and the types say so:
 `execute(bound: BoundPlan, context: &EngineContext)` (`engine/mod.rs`) is the
 run, and `EngineContext` holds the snapshot, the catalog and the graph-index
 handle, each data and not a decision: no session setting and no environment
@@ -902,8 +985,8 @@ no RFC accompanies it.
 ## Plan acceptance
 
 Every read reaches execution through one door: `accept_query` plans the query
-and the planner's validator checks the plan against what the checked
-declaration requires; only that check constructs an `AcceptedPlan`, whose
+and the planner's validator checks the plan against what the read shape of
+the checked declaration requires; only that check constructs an `AcceptedPlan`, whose
 fields are private, and `bind` and `execute` take nothing else. The ordinary
 run, `Session::explain_query`, the `explain` statement and the inspected run
 share the path, so explain validates exactly what a run validates and reports
@@ -917,17 +1000,17 @@ row keys (`optimizer::validate_rank_fuse_row_tiebreaks`). Execution keeps
 only the checks that need the snapshot or the bound values
 (`validate_traversal_admission`, `typed_value::validate_plan_values`).
 
-The requirements come from the compiler's typed lowering of the checked
-declaration (`AcceptInput.ir`), checked first against the declaration's
-counts of traversals, blocks, return items, order keys and limit. Every
-`QueryIR` expression carries its type and every conversion is an explicit
+The requirements come from the read shape of the checked core term
+(`AcceptInput.ir`): its bindings, traversals, blocks, return items, order
+keys and limit. Every
+read-shape expression carries its type and every conversion is an explicit
 `Cast`, so acceptance compares expressions with their types. For a split
 aggregate return, `validate/returns.rs` checks a `Projection` directly above
 `Aggregate` or `MetadataCount`: group keys, return-item names, order and
 types, and each aggregate operand reached through an `AliasRef` must match
-the typed lowering. Ambiguous or unused intermediate columns are refused.
-The declaration supplies only which return items and order key are the
-written score calls. The checks: binding identity and traversal
+the read shape. Ambiguous or unused intermediate columns are refused.
+The read shape supplies which return items and order keys read the score
+column. The checks: binding identity and traversal
 identity (endpoints, edge selection, direction, endpoint types, hop bounds),
 search identity and its declared approximation, eligibility in both
 directions (every lowered conjunct is tested, checked per `rrf` arm since
@@ -941,9 +1024,11 @@ every variant: a `Limit`'s or `Page`'s rows, a `Sort`'s `fetch`, a ranked
 scan's candidate cap; a fusion and a hydration cut nothing), and the
 validator justifies each one by its position: the root `Limit` and the final
 `Sort` (below the root `Limit`, its projections and a hydration) at the
-query's `limit`, and a ranked scan's cap as its declared policy sets it. Any
-other cut, a capped sort below the final one or a cut in a correlated
-block's tree, is refused as `row cut`. The order check recomputes the root's
+query's `limit`, and a ranked scan's cap as its declared policy sets it (a
+window's scan at its `k`). A `TargetCut` counts targets, not rows, and must
+keep exactly the query's window `k`; its own uncapped `Sort` orders no row
+the query returns. Any other cut, a capped sort below the final one or a cut
+in a correlated block's tree, is refused as `row cut`. The order check recomputes the root's
 order from the operators (`optimizer::derived_order`, typed `OrderKey`s):
 a fusion's sort leads with `<binding>._rrf` descending, a search-ordered
 aggregate's or a `return distinct`'s with its remaining keys and then every

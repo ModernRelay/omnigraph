@@ -1,0 +1,36 @@
+# issue: none
+# notes: A triple is written in its edge's declared order, source first, so its written order is its direction. A triple
+# notes: written against it is `T82`, whatever the end types, whose fix swaps the two ends and keeps the edge binding and
+# notes: the alternation; the swapped triple reads the edge in its declared orientation. Nothing executes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company @card(0..1)
+edge Founded: Person -> Company
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+
+--- query
+query staff($slug: String) { match { $c: Company, $c worksAt $p } where $c.slug = $slug return { $p.name } }
+
+--- expect error: type error: T82: `$c worksAt $p` is written against the declared direction of `WorksAt: Person -> Company`
+
+--- query
+query ties() { match { $c: Company } where exists { $p: Person, $c $k:(worksAt | founded) $p } return { $c.name } }
+
+--- expect error: type error: T82: `$c $k:(worksAt | founded) $p` is written against the declared direction of `Founded: Person -> Company`, `WorksAt: Person -> Company`

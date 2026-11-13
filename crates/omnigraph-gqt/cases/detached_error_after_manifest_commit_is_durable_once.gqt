@@ -53,7 +53,7 @@ p.name: String
 p.age: I64
 
 --- mutate
-query older() { update Person set { age: 51 } where name = "carol" }
+query older() { match { $x: Person } where $x.name = "carol"  update $x set { age: 51 } }
 --- expect affected: nodes=1 edges=0
 
 --- restart

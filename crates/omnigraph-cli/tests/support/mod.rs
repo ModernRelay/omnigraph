@@ -1008,7 +1008,7 @@ node Person {
         root.join("people.gq"),
         r#"
 query find_person($name: String) {
-  match { $p: Person { name: $name } }
+  match { $p: Person } where $p.name = $name
   return { $p.name, $p.age }
 }
 "#,
@@ -1128,7 +1128,7 @@ node Service {
         root.join("services.gq"),
         r#"
 query find_service($name: String) {
-  match { $s: Service { name: $name } }
+  match { $s: Service } where $s.name = $name
   return { $s.name }
 }
 "#,
