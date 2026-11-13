@@ -278,7 +278,7 @@ pub(in crate::db::omnigraph) async fn settle_prepared_schema(
     prepared::authorize(db, actor)?;
     original.validate_structure(db)?;
     settlement.validate(original)?;
-    let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
+    let _schema_gate = db.write_queue().acquire_schema_exclusive().await?;
     if original.is_noop() {
         return Ok(if live_base(db, original).await?.is_some() {
             SchemaApplySettlement::NoOp {
@@ -321,8 +321,8 @@ pub(in crate::db::omnigraph) async fn settle_prepared_schema(
         .datasets()
         .map(|entry| (entry.type_key.clone(), entry.native_dataset_branch.clone()))
         .collect::<Vec<_>>();
-    let _branch_gate = db.write_queue().acquire_branch(None).await;
-    let _table_gates = db.write_queue().acquire_many(&keys).await;
+    let _branch_gate = db.write_queue().acquire_branch(None).await?;
+    let _table_gates = db.write_queue().acquire_many(&keys).await?;
     if live_base(db, original).await?.is_none() {
         return retained_outcome(db, original, settlement).await;
     }

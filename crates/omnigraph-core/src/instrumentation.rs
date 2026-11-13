@@ -199,11 +199,17 @@ pub struct QueryIoProbes {
     /// This must equal the newly deleted offset count; a fragment scan would
     /// make it grow with the compacted catalog's history instead.
     pub projection_identity_rows: Arc<AtomicU64>,
-    /// Pre-effect reprepares a mutation or a load took after a `ReadSetChanged`
-    /// (bounded by `MAX_PRE_EFFECT_REPREPARES`). The caller sees only the
-    /// exhaustion of that loop, so this is the one view of the attempts behind
-    /// an acknowledged write.
+    /// Pre-effect reprepares a mutation, a load or a Blob write took after a
+    /// `ReadSetChanged` (bounded by `MAX_PRE_EFFECT_REPREPARES`); each such
+    /// attempt prepares under the branch's writer gates. The caller sees only
+    /// the exhaustion of that loop, so this is the one view of the attempts
+    /// behind an acknowledged write.
     pub mutation_reprepares: Arc<AtomicU64>,
+    /// Attempts carried, under the writer gates, over publications that
+    /// changed no row (an optimize compaction or an index build), every staged
+    /// table rebased, instead of preparing again. An attempt whose carry Lance
+    /// refused is not counted; it prepares again.
+    pub writes_carried_over_row_preserving: Arc<AtomicU64>,
     /// The Lance `ObjectStore`s behind the opens that carried
     /// `manifest_wrapper` / `history_wrapper` / `table_wrapper`. A store's own
     /// `io_tracker` also sees Lance's direct local reader and writer, which on
@@ -1062,6 +1068,15 @@ pub fn record_probed_store(
 pub fn record_mutation_reprepare() {
     let _ = current(|p| {
         p.mutation_reprepares.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one write carried over row-preserving publications. No-op unless a
+/// cost probe is active.
+pub fn record_write_carried_over_row_preserving() {
+    let _ = current(|p| {
+        p.writes_carried_over_row_preserving
+            .fetch_add(1, Ordering::Relaxed);
     });
 }
 

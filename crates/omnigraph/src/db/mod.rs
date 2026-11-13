@@ -34,7 +34,7 @@ pub use omnigraph::{
     SystemColumnUpgradeReport, TableCeilings, TableCollectionPlan, TableOptimizeOutcome,
     UnattachedTagRecord, UnpublishedManifest, unattached_release_order,
 };
-pub(crate) use omnigraph::{EarlyRevalidation, WriteAuthorityToken, WriteTxn};
+pub(crate) use omnigraph::{EarlyRevalidation, WriteAuthorityToken, WriteRevalidation, WriteTxn};
 pub(crate) use omnigraph::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };

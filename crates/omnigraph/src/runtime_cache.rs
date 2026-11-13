@@ -40,12 +40,12 @@ struct GraphIndexTableState {
     /// per-lineage counter, so two branches share it with different pins.
     staged_version: Option<u64>,
     table_branch: Option<String>,
-    /// Lance manifest incarnation token for this edge table version. Preserves the
-    /// incarnation distinction the dropped synthetic snapshot id used to carry: a
-    /// branch deleted and recreated at the same version number gets a new e_tag, so
-    /// the cache rebuilds instead of serving stale topology. `None` only on stores
-    /// without e_tags (local FS); there a same-branch manifest refresh clears the
-    /// cache as the fallback (the read-path gap in docs/dev/invariants.md).
+    /// Lance manifest incarnation token for this edge table version, where the
+    /// store gives one (S3 and Linux local files do). A branch deleted and
+    /// recreated at the same version number gets a new e_tag. The key does not
+    /// depend on it: the recreated branch's new random `staged_version` already
+    /// splits the key on every store, e_tag or not
+    /// (`same_counter_different_pin_splits_both_keys_without_etag`).
     e_tag: Option<String>,
     /// The edge's `(from_type, to_type)` endpoint names at build time. `GraphIndex`
     /// keys its `TypeIndex`es by these, and `execute_expand_csr` looks them up by
@@ -113,6 +113,31 @@ impl RuntimeCache {
         cache.entries.invalidate_all();
         cache.shelf = None;
         cache.artifact_negative.invalidate_all();
+    }
+
+    /// A write changed the edge tables `table_keys` (`edge:<Name>`): drop the
+    /// scoped indexes and failed-load verdicts that cover any of them, and keep
+    /// the rest. Every key embeds each covered table's stamp (identity,
+    /// version, pin, e_tag), so an index over untouched tables stays exact
+    /// after the write, and a written table's next read misses on its new
+    /// stamp anyway. The shelf stays: `shelf_serve` verifies each requested
+    /// table's current stamp, so it stops serving a written table and keeps
+    /// serving untouched ones. A branch create or delete clears nothing (it
+    /// changes no key); a refresh, schema apply and optimize still clear
+    /// everything through `invalidate_all`.
+    pub async fn invalidate_edge_tables<'a>(&self, table_keys: impl IntoIterator<Item = &'a str>) {
+        let written: std::collections::HashSet<&str> = table_keys.into_iter().collect();
+        if written.is_empty() {
+            return;
+        }
+        let untouched = |key: &GraphIndexCacheKey| {
+            !key.edge_tables
+                .iter()
+                .any(|table| written.contains(table.table_key.as_str()))
+        };
+        let mut cache = self.graph_indices.lock().await;
+        cache.entries.retain(untouched);
+        cache.artifact_negative.retain(untouched);
     }
 
     /// Build (or fetch) the CSR/CSC graph index scoped to exactly `edge_types` —
@@ -472,7 +497,7 @@ mod tests {
     }
 
     /// Two branches write the same lineage counter to different detached pins
-    /// on one physical table; without e_tags (Windows local files) the pin is
+    /// on one physical table; for a store that reports no e_tag the pin is
     /// the only thing that tells the two datasets apart, in both caches.
     #[test]
     fn same_counter_different_pin_splits_both_keys_without_etag() {
@@ -694,9 +719,12 @@ query since($n: I64) { match { $c: Chunk  $c.n >= $n } return { $c.slug } }
             .into_iter()
             .filter(|key| key.table_path == main_pin.table_path)
             .collect();
+        // Every session version, main's pin, and the version-1 base main's
+        // first write staged on: a branch create drops only the created
+        // branch's own refs, so that handle outlives it.
         assert_eq!(
             held.len(),
-            COMMITS as usize + 1,
+            COMMITS as usize + 2,
             "under the budget every version stays held: {held:?}"
         );
         assert_eq!(

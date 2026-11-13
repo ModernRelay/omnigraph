@@ -305,6 +305,21 @@ impl StorageError {
         matches!(self, Self::Unresolved(_))
     }
 
+    /// The class of evidence this error carries, for a caller that must
+    /// answer its own client by it. A resource limit is an operator-actionable
+    /// capacity constraint (`Configuration`), and an internal error a broken
+    /// contract of the backend or this adapter (`Permanent`). Like the kind
+    /// itself, this is not a replay decision.
+    pub fn failure_kind(&self) -> StorageFailureKind {
+        match self {
+            Self::Backend(failure) | Self::Unresolved(failure) | Self::Io { failure, .. } => {
+                failure.kind
+            }
+            Self::ResourceLimit { .. } => StorageFailureKind::Configuration,
+            Self::Internal(_) => StorageFailureKind::Permanent,
+        }
+    }
+
     /// The failure this error carries, when it carries one.
     fn failure(&self) -> Option<&StorageFailure> {
         match self {
@@ -6476,6 +6491,49 @@ mod tests {
                 .is_none()
         );
         assert_eq!(adapter.read_text(uri).await.unwrap(), "new");
+    }
+
+    /// A caller answering its own client by the failure's class (the served
+    /// cluster's control-object reads) gets it from the error, never from its
+    /// text: bytes that are not UTF-8 and an object over the bound fail the
+    /// same way on every read, while an I/O error with no typed kind is
+    /// `Unknown`.
+    #[tokio::test]
+    async fn a_failed_bounded_versioned_read_carries_its_failure_kind_issue_1356() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ObjectStorageAdapter::local();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_owned();
+
+        std::fs::write(dir.path().join("bytes.json"), [0xff, 0xfe, 0xfd]).unwrap();
+        let not_text = adapter
+            .read_text_versioned_if_exists_bounded(&path("bytes.json"), 16)
+            .await
+            .expect_err("bytes that are not UTF-8 are not text");
+        assert_eq!(not_text.failure_kind(), StorageFailureKind::Permanent);
+
+        std::fs::write(dir.path().join("large.json"), "0123456789").unwrap();
+        let over_bound = adapter
+            .read_text_versioned_if_exists_bounded(&path("large.json"), 4)
+            .await
+            .expect_err("an object over the bound is refused");
+        assert!(matches!(over_bound, StorageError::ResourceLimit { .. }));
+        assert_eq!(over_bound.failure_kind(), StorageFailureKind::Configuration);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("loop.json"), dir.path().join("loop.json"))
+                .unwrap();
+            let untyped = adapter
+                .read_text_versioned_if_exists_bounded(&path("loop.json"), 16)
+                .await
+                .expect_err("a self-symlink cannot be read");
+            assert_eq!(untyped.failure_kind(), StorageFailureKind::Unknown);
+        }
+
+        assert_eq!(
+            StorageError::internal("broken contract").failure_kind(),
+            StorageFailureKind::Permanent
+        );
     }
 
     /// Where hard links work the probe is negative and cleans up after

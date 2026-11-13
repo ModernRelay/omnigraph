@@ -371,9 +371,67 @@ rebuilt whole as a detached commit chained on the rewrite under its name
 partition count; the batch publishes once with an exact CAS on every planned
 pin, and a pin a concurrent writer moved fails the run with a read-set
 conflict so the next run re-plans. A failure before publication leaves
-unpublished staging the collector reclaims once it is dead. A strict mutation
-prepared before Optimize's publication reports the same read-set conflict as
-it would after any other writer.
+unpublished staging the collector reclaims once it is dead.
+
+A mutation, load or Blob write prepared before such a publication is carried
+over it ([RFC](../rfcs/2026-11-10-writes-carried-over-row-preserving-publications.md)).
+Under its gates, when the head moved, `revalidate_write_txn_carrying` checks
+that the schema contract, the table set and every registration's identity,
+location, native ref and row count are unchanged, and that every moved pin
+reaches the captured one through `Rewrite` and `CreateIndex` commits alone
+(`table_store::row_preserving_chain`, at most
+`ROW_PRESERVING_CHAIN_MAX_LINKS` per table). The write is then re-anchored on
+the current head before any effect. A table it only read keeps its moved pin;
+a staged table goes through Lance's `TransactionRebase` over those commits
+(`table_store::rebase_staged_write`), records the current pin as its read
+version, and commits detached there, so the compaction stays and the table's
+history stays one chain. An insert, an append and an overwrite carry; an
+update, delete or upsert of a row in a fragment a rewrite replaced is a
+conflict Lance reports, and the attempt is sent back, as one overtaken by a
+row change is. A caller's `--if-commit` head and an unattached base are not
+carried. On a branch its process does not hold, neither is a publication by
+another handle that lands after the beside-staging probe: the publisher's CAS
+refuses that one, as above. On a branch the process holds, a write takes no
+probe, and a publication by any handle of the process is seen under the gates
+([writer epoch](#writer-epoch)), so it is carried.
+`QueryIoProbes::writes_carried_over_row_preserving` counts the attempts
+carried, each staged table rebased.
+
+A write sent back before its effects prepares again from its request,
+whatever its kind: it reruns its query, or rereads its input, on the current
+head, so an update or delete reads its rows as they are when it publishes,
+the write a caller resubmitting the request would make. A caller whose write
+must apply to the head it read names it (`--if-commit`), and a moved head is
+then a terminal `PreconditionFailed`. An attempt that sees a branch
+incarnation or accepted schema other than its write's first attempt saw
+returns `ReadSetChanged` for that member (`WriteAttempt::admit`): the request
+no longer means what it meant. The next attempt holds the branch's writer
+gates, the shared schema permit and the branch gate, from its
+capture through its publication (`db::reprepare::PreEffectReprepares`, the
+one owner of the mutation, load and Blob write loops). Every publisher on the
+branch in the process, optimize included, takes that branch gate, so nothing
+moves the branch under that attempt: a write finishes in at most two
+attempts, whatever sent it back and however often other writers or
+maintenance run, and no
+maintenance run waits for writers to get there. Preparation takes no gate
+of its own, which is what lets it run under them, since the gates are not
+reentrant; `commit_all` adds the table gates. The engine checks the rule:
+every attempt runs inside a preparation scope (`db::write_queue::preparing`,
+a task-local) that its commit point ends, and every writer-gate acquisition
+inside it refuses with an internal error instead of waiting on the attempt's
+own gate. `WriteAttempt::admit` refuses an attempt prepared outside the scope.
+The bound is the process's: another process's publication is refused
+by the publisher's CAS and prepares the write again, within
+`MAX_PRE_EFFECT_REPREPARES` (32).
+
+The gated attempt costs other writers more than its own branch. Writers on the
+branch wait for its one preparation. The shared schema permit it holds also
+makes a branch create, a schema apply or a system-column upgrade wait, since
+each takes the permit exclusively, and the schema gate is fair: while such a
+request waits, new shared requests wait behind it, so writers on every branch
+wait too. Each wait lasts one preparation, as a branch merge's planning under
+the same permit already does. For a large merge load on object storage that
+can be seconds.
 
 Optimize captures its write authority before it takes the shared schema,
 main-branch and table gates, and rechecks it under them. On the direct path
@@ -605,7 +663,22 @@ sealed, exact-`id`, filter-bearing MergeInsert adapter:
 
 - strict insert probes the pinned parent and returns `KeyConflict` for an
   existing ID;
-- upsert updates or inserts without changing modes on retry;
+- upsert updates or inserts without changing modes on retry. With an id
+  BTREE it first runs the strict insert's exact-id probe, while the fragments
+  the BTREE leaves uncovered times the source ids stay within one keyed batch
+  (8,192), since Lance plans the probe's `IN` list once per uncovered
+  fragment. Rows all new stage through the absence-proven insert writer; rows
+  all present stage as a known-present update only while the BTREE covers
+  more fragments than it leaves and those uncovered fragments' recorded
+  data-file sizes are known and total at most 1 MiB
+  (`KNOWN_PRESENT_TAIL_MAX_BYTES`): that indexed merge scans each uncovered
+  fragment for every source column (Lance 13), so the fragment rule bounds
+  its requests and the byte budget bounds its bytes whatever the row width.
+  Otherwise the upsert takes Lance's full-table merge join
+  (`use_index(false)`), which builds the inserted-row key filter;
+- an `update` whose predicate has `<key> = v` on a single String `@key` adds
+  the derived `id = v` conjunct to its match scan when the table has an id
+  BTREE, as a node delete does, so the scan reads the index;
 - a bare Lance Append is not a production graph-table write;
 - one table's keyed input is bounded to 8,192 rows and the effective
   `write_max_bytes` (default 32 MiB) before its data is staged.
@@ -829,8 +902,9 @@ carried stored external reference the policy refuses fails as
 | Observation | Outcome |
 |---|---|
 | Parse, validation, policy, limit, or authority failure before effects | Typed error; no graph movement |
-| Retryable authority movement before effects on a replay-safe adapter | Discard the complete attempt and reprepare boundedly |
-| Strict read-set movement | `ReadSetChanged` |
+| Authority movement before effects through publications that changed no row (optimize, index builds) | Carry the attempt over them: re-anchor on the current head, rebase each moved staged table with Lance's resolver; when Lance refuses a table, send the attempt back |
+| Any other authority movement before effects | Discard the complete attempt and prepare again from the request under the writer gates, whatever the write's kind, boundedly |
+| A later attempt sees another branch incarnation or accepted schema than the first, or the bound is reached | `ReadSetChanged` |
 | A publish or a claim on a branch whose writer epoch is not the one its process asserts | `WriterFenced { held, read, current }` before the manifest put; never retried; the process's holder for the branch is cleared, and a publish's detached staging stays unpublished for the collector |
 | Exact duplicate on strict insert | `KeyConflict` |
 | Mutation, load, Blob write, merge or optimize fails before publication, after detached effects | Typed error; no graph movement; the detached staging is unpublished and the collector reclaims it once its recorded authority is gone. The table store marks an opaque error (storage, I/O, internal) of a staged write or a detached commit `CompletionEvidence::Unpublished` at the source, and the mutation, load, Blob, merge and optimize writers mark the steps between (an optimize table's own failure, `BeforeEffect` in planning and `Unpublished` in staging, fails only that table), so a server does not treat that logical error as uncertain; native storage settlement is checked independently, and a typed refusal keeps its shape |

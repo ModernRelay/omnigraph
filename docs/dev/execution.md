@@ -74,6 +74,29 @@ covered edge table's physical identity and version, so unrelated edge types do
 not force a graph-wide scan and a lazy branch may reuse an identical inherited
 table view.
 
+The key also carries each table's detached pin (`staged_version`), native ref
+and e_tag. Every write makes a new version or a new random detached pin, so a
+later snapshot never matches a stale key, and eviction only frees memory. A
+write (mutation, merge) evicts the cached indexes that cover an edge table it
+changed, on any branch; a publish of an unpublished commit evicts those of
+every edge table its commit lists, which is every edge type. A branch create
+or delete clears nothing, because it changes no key: graph tables never carry
+a branch's own ref (a branch write stages detached on the inherited ref; see
+"Table forks" in [Lance alignment](lance.md)), so a recreated branch's tables
+share `main`'s ref and can repeat a dead branch's version numbers. The new
+random pin keeps them apart on every store, by construction. Where the store
+gives an e_tag (S3, and local files on Linux), the e_tag also differs, and a
+write to the edge table also evicts the old index, but neither is needed. A
+deleted branch's indexes and held table handles stay until the LRUs drop them (8 indexes; 64 handles or 64 MiB). A
+refresh, schema apply, optimize and the system-column upgrade clear the whole
+cache.
+
+The shelf, the last full-catalog decode of the persisted artifact, is cleared
+only by those four and replaced only by a newer decode. It checks each
+requested table's stamp on every serve, so it stops serving a written edge
+table, but on a handle that writes edges after one artifact load it keeps that
+stale full-catalog topology for the handle's life (at most one).
+
 An explicitly bound edge must scan its edge table because topology alone does
 not contain edge properties. Every edge probe (`graph.rs::scan_edges_stream`:
 the bound-edge producer, an indexed hop) pushes its `key IN (keys)` list into
@@ -543,21 +566,34 @@ Each spill-capable reservation is limited to half the query memory budget.
 This makes an accumulating sort spill before it takes the space needed by its
 batch producer. Each reservation of a sort's merge consumer
 (`ExternalSorterMerge[n]`) has the same limit, although DataFusion registers it
-as unable to spill. Above the two spill files a merge must read together, the
-merge grows its reservation one spill-file read buffer at a time for as long
-as the pool admits the growth, and reads fewer files per pass when refused, so
-without the limit it could take nearly the whole budget from the graph work
-consuming its output. The limit also applies to that two-file minimum and to
-the merge's in-memory batch building, where a refusal fails the query. The
-limit is per reservation, not per consumer. Other reservations that cannot
-spill, such as `SortPreservingMergeExec[n]`, have no half-budget limit and can
-still grow when combined usage is high. All fallible growth also checks total usage
-against the full query cap. Every reservation uses the same tracked pool;
+as unable to spill. The merge holds `sort_spill_reservation_bytes` from the
+sort's first input batch on, idle until the merge runs, and DataFusion frees
+it at every spill as the headroom its in-memory sort grows into: a sixteenth
+of the budget, at least a third of the budget up to 512 KiB, at most
+DataFusion's default of 10 MiB, so from 8 MiB up the sort holds at most nine
+sixteenths while its batches accumulate and the producer of its input has the
+rest at every budget. At a third of the budget the two held five sixths and
+the producer raced the sorter's spill cycle for the sixth, winning or losing
+it by the interleaving; under 1.5 MiB a sixteenth left the in-memory sort
+too little headroom at spill time beside a second spilling consumer (a
+grouped return's aggregate), so the third stays there. Above the two spill files a merge
+must read together, the merge grows its reservation one spill-file read
+buffer at a time for as long as the pool admits the growth, and reads fewer
+files per pass when refused, so without the limit it could take nearly the
+whole budget from the graph work consuming its output. The limit also applies
+to that two-file minimum and to the merge's in-memory batch building, where a
+refusal fails the query. The limit is per reservation, not per consumer.
+Other reservations that cannot spill, such as `SortPreservingMergeExec[n]`,
+have no half-budget limit and can still grow when combined usage is high. All
+fallible growth also checks total usage against the full query cap. Every reservation uses the same tracked pool;
 there is no separate pool or dummy reservation. This policy does not guarantee
 space for arbitrary wide graph allocations, which can still be refused.
 
 DataFusion operators that support spilling, including sorts, may use the
-query's scratch directory under its 100 GiB quota. The custom graph breakers
+query's scratch directory under its 100 GiB quota. Spill files are
+zstd-compressed Arrow IPC (`SPILL_COMPRESSION` in `table_store.rs`, which
+ordered scans use as well), and the quota counts them at their compressed
+size. The custom graph breakers
 do not spill: a refused reservation returns `OmniError::ResourceLimitExceeded`
 with `query_memory_bytes`. Exhausted DataFusion memory and scratch quotas are
 classified as `query_memory_bytes` and `query_scratch_bytes`, respectively.
@@ -838,6 +874,21 @@ plan's, and writes one report row per node from the node's operator's own
 | `status` | `executed` | A stream of the operator was polled. |
 | `status` | `skipped` | The operator is in the tree and no stream of it was polled: the build scan of a hash join behind an empty probe, the right subtree of a cross join behind an empty left, everything under a `Limit` of zero rows or a `Sort` with a fetch of zero, an `AntiJoin` inner tree the bulk check answered without. |
 | `attempts` | `rung`, `ran`, `actual_rows`, `drained` | One entry per pass: `rung` 0 is the first pass and each rerun of the overfetch ladder appends one whose `rung` names the declared rung it took (`RankedAccess.overfetch[rung - 1]`); `ran` is `true` / `false` (polled or not), or on the operator of a declared switch the side that ran (`hash_join`, `id_lookup`, `csr`, `indexed_scan`); `actual_rows` is the operator's `output_rows` metric; `drained` is `true` or `false` for an omnigraph operator (its stream reached its end or not) and `null` for a DataFusion operator (`AggregateExec`), whose end no counter observes; `actual_rows` is complete only when `drained` is `true`, a lower bound otherwise. |
+
+An operator pass that spilled also adds one entry to the report's `spill`
+list, kept apart from the rows so that replays, which compare the rows, do
+not depend on the memory a run had: the node's `id`, the pass's `rung`, and
+the operator's `spill_count`, `spilled_bytes` (bytes written, after
+compression) and `spilled_rows`. A DataFusion plan an operator runs itself,
+outside the tree, reaches it through that operator: `WorkMemory::stream`,
+which executes every such plan, registers the plan's own spill counters on the
+operator's metrics. The counters are shared, not copied, so the row reads what
+the plan has spilled whenever the report is built, including when a `Limit`
+cut the run short and the operator's cancelled worker has not yet wound down.
+DataFusion's spilling operators create these counters in `execute`, before
+they are polled, so only operators that the plan's own `execute` reaches at
+once are seen: a spilling operator below a multi-partition
+`CoalescePartitionsExec`, whose spawned tasks execute its input later, is not.
 
 Polled is read off the operator's metrics: omnigraph's operators count a
 `polls` metric on every poll of the streams they hand out (`operators::polled`),

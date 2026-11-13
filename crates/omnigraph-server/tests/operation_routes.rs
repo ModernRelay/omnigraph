@@ -475,3 +475,93 @@ async fn a_known_ending_survives_a_failed_final_write_and_a_repeat_answers_the_r
     assert_eq!(found["in_progress"], false, "{found}");
     drop(child);
 }
+
+/// How a test breaks the reads of one control object.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum ReadFault {
+    /// A symbolic link to itself: every open fails with ELOOP, an I/O error
+    /// with no typed kind, so the storage crate classifies it `Unknown`.
+    SelfLink,
+    /// Bytes that are not UTF-8: every read fails the same way (`Permanent`).
+    NotText,
+}
+
+/// Break the reads of one control object. Returns the restore.
+#[cfg(unix)]
+fn break_reads(path: &Path, fault: ReadFault) -> impl FnOnce() + use<> {
+    let aside = path.with_extension("json.intact");
+    let existed = path.exists();
+    if existed {
+        fs::rename(path, &aside).unwrap();
+    }
+    match fault {
+        ReadFault::SelfLink => std::os::unix::fs::symlink(path.file_name().unwrap(), path).unwrap(),
+        ReadFault::NotText => fs::write(path, [0xff, 0xfe, 0xfd]).unwrap(),
+    }
+    let path = path.to_path_buf();
+    move || {
+        fs::remove_file(&path).unwrap();
+        if existed {
+            fs::rename(&aside, &path).unwrap();
+        }
+    }
+}
+
+/// A failed storage read of the cluster state file or of the operation record
+/// comes before any record write, so submit, lookup and cancel answer it with
+/// `effects: none`, never the 409 a request change needs. The storage crate's
+/// class of the failure decides the rest: a failure with no typed evidence
+/// (here ELOOP) may pass, so it is 503 `action: retry`; bytes that are not
+/// text fail every read the same way, so they are 500, which does not tell
+/// the caller to send the same request again. The same submission is accepted
+/// once the store reads again.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_control_read_answers_by_its_storage_class_issue_1356() {
+    let temp = applied_cluster();
+    apply_cluster_fixture(temp.path()).await;
+    let (mut child, address) = spawn_server(temp.path(), None);
+    let client = Client {
+        http: reqwest::Client::new(),
+        base: format!("http://{address}"),
+    };
+    client.wait_ready(&mut child.0).await;
+    let body = json!({ "operation_id": OPERATION_ID });
+
+    for (fault, status, code, action) in [
+        (ReadFault::SelfLink, 503, "service_unavailable", "retry"),
+        (ReadFault::NotText, 500, "internal", "refresh"),
+    ] {
+        for object in ["__cluster/state.json", "__cluster/operations.json"] {
+            let restore = break_reads(&temp.path().join(object), fault);
+            for (route, (answered, refused)) in [
+                ("submit", client.submit("op-secret", body.clone()).await),
+                (
+                    "submit again",
+                    client.submit("op-secret", body.clone()).await,
+                ),
+                ("lookup", client.lookup(OPERATION_ID).await),
+                ("cancel", client.cancel(OPERATION_ID).await),
+            ] {
+                let case = format!("{route} with {object} {fault:?}: {refused}");
+                assert_eq!(answered, status, "{case}");
+                assert_eq!(refused["code"], code, "{case}");
+                assert_eq!(refused["disposition"]["effects"], "none", "{case}");
+                assert_eq!(refused["disposition"]["action"], action, "{case}");
+            }
+            restore();
+        }
+    }
+
+    let (status, unknown) = client.lookup(OPERATION_ID).await;
+    assert_eq!(status, 200, "{unknown}");
+    assert_eq!(
+        unknown["lookup"], "unknown",
+        "nothing was accepted: {unknown}"
+    );
+    let (status, accepted) = client.submit("op-secret", body).await;
+    assert!(matches!(status, 200 | 202), "{status}: {accepted}");
+    assert_eq!(accepted["lookup"], "found", "{accepted}");
+    drop(child);
+}

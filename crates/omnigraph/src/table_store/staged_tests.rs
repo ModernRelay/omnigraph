@@ -856,6 +856,264 @@ async fn keyed_upsert_stamps_no_by_source_delete_marker_and_persists_it() {
     );
 }
 
+/// Issue #1248: with an id BTREE, an upsert whose rows are all new stages the
+/// join-free absence-proven insert and one whose rows are all present stages a
+/// known-present update; neither pays Lance's full-table merge join. A mixed
+/// batch, or a table without the BTREE, keeps the join.
+#[tokio::test]
+async fn upsert_skips_the_merge_join_when_the_id_btree_decides_its_rows_issue_1248() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let mut ds = TableStore::write_dataset(
+        &uri,
+        person_pk_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+    )
+    .await
+    .unwrap();
+
+    let upsert = |ds: Dataset, rows: &'static [(&'static str, Option<i32>)]| {
+        let probes = MergeWriteProbes::default();
+        let staged = with_merge_write_probes(
+            probes.clone(),
+            store.stage_keyed_write(
+                ds,
+                "Person",
+                person_pk_batch(rows),
+                KeyedWriteSemantics::Upsert,
+                SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
+            ),
+        );
+        async move { (staged.await.unwrap(), probes) }
+    };
+    let routes = |probes: &MergeWriteProbes| {
+        (
+            probes.stage_merge_insert_calls(),
+            probes.stage_fenced_insert_calls(),
+            probes.stage_known_present_update_calls(),
+        )
+    };
+
+    let (_, unindexed) = upsert(ds.clone(), &[("carol", Some(40))]).await;
+    assert_eq!(
+        routes(&unindexed),
+        (1, 0, 0),
+        "without the BTREE the probe would read every id, so the join stays"
+    );
+
+    ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("id_idx".to_string())
+        .await
+        .unwrap();
+
+    let (staged, all_new) = upsert(ds.clone(), &[("carol", Some(40))]).await;
+    assert_eq!(routes(&all_new), (0, 1, 0), "all new: the fenced insert");
+    assert!(
+        super::has_insert_absence_certificate(&staged.transaction),
+        "the all-new upsert carries the absence certificate"
+    );
+
+    let (_, all_present) = upsert(ds.clone(), &[("alice", Some(31)), ("bob", Some(26))]).await;
+    assert_eq!(
+        routes(&all_present),
+        (0, 0, 1),
+        "all present: the known-present update"
+    );
+
+    let (_, mixed) = upsert(ds.clone(), &[("alice", Some(32)), ("dave", Some(50))]).await;
+    assert_eq!(routes(&mixed), (1, 0, 0), "a mixed batch keeps the join");
+}
+
+/// Issue #1248: Lance's indexed merge route scans each fragment the id BTREE
+/// leaves uncovered for every source column, so an all-present upsert takes
+/// it only while that tail's recorded data files fit
+/// `KNOWN_PRESENT_TAIL_MAX_BYTES`. A wide tail keeps the id join, whose read
+/// does not grow with the row width; a narrow tail of the same fragment count
+/// still switches.
+#[tokio::test]
+async fn all_present_upsert_keeps_the_join_over_a_wide_uncovered_tail_issue_1248() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    // Two covered fragments, then one uncovered fragment of `tail` rows.
+    let table = |name: &'static str, tail: Vec<String>| {
+        let uri = format!("{}/{name}.lance", dir.path().to_str().unwrap());
+        async move {
+            let ds = TableStore::write_dataset(
+                &uri,
+                person_pk_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+            )
+            .await
+            .unwrap();
+            let mut ds = TableStore::append_or_create_batch(
+                &uri,
+                Some(ds),
+                person_pk_batch(&[("erin", Some(20))]),
+            )
+            .await
+            .unwrap();
+            ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+                .name("id_idx".to_string())
+                .await
+                .unwrap();
+            let ds = Dataset::open(&uri).await.unwrap();
+            let rows: Vec<(&str, Option<i32>)> =
+                tail.iter().map(|id| (id.as_str(), Some(1))).collect();
+            TableStore::append_or_create_batch(&uri, Some(ds), person_pk_batch(&rows))
+                .await
+                .unwrap()
+        }
+    };
+    let route = |ds: Dataset| {
+        let probes = MergeWriteProbes::default();
+        let staged = with_merge_write_probes(
+            probes.clone(),
+            store.stage_keyed_write(
+                ds,
+                "Person",
+                person_pk_batch(&[("alice", Some(31))]),
+                KeyedWriteSemantics::Upsert,
+                SYSTEM_COLUMNS_LEGACY,
+                WriteBudget::default(),
+            ),
+        );
+        async move {
+            staged.await.unwrap();
+            (
+                probes.stage_merge_insert_calls(),
+                probes.stage_fenced_insert_calls(),
+                probes.stage_known_present_update_calls(),
+            )
+        }
+    };
+    // Ids of pseudo-random hex, so the data files stay above the budget
+    // after Lance compresses them.
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let wide: Vec<String> = (0..3_000)
+        .map(|row| {
+            let mut id = format!("wide-{row}-");
+            while id.len() < 1_024 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                id.push_str(&format!("{seed:016x}"));
+            }
+            id
+        })
+        .collect();
+
+    let narrow = table("narrow", vec!["frank".to_string()]).await;
+    let tail = crate::dataset_index::key_column_uncovered_tail(&narrow, "id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.fragments, 1);
+    assert!(tail.data_file_bytes.unwrap() <= super::KNOWN_PRESENT_TAIL_MAX_BYTES);
+    assert_eq!(
+        route(narrow).await,
+        (0, 0, 1),
+        "a narrow tail: the known-present update"
+    );
+
+    let wide = table("wide", wide).await;
+    let tail = crate::dataset_index::key_column_uncovered_tail(&wide, "id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.fragments, 1);
+    assert!(
+        tail.data_file_bytes.unwrap() > super::KNOWN_PRESENT_TAIL_MAX_BYTES,
+        "the wide tail holds {:?} bytes",
+        tail.data_file_bytes
+    );
+    assert_eq!(
+        route(wide).await,
+        (1, 0, 0),
+        "a tail above the byte budget keeps the join"
+    );
+}
+
+/// Issue #1225: Lance plans the upsert probe's `IN` list once per fragment
+/// the id BTREE leaves uncovered, so the probe runs only while those copies
+/// hold at most one keyed batch of ids. One id past that edge keeps the join.
+#[tokio::test]
+async fn upsert_probe_runs_only_while_its_in_list_copies_fit_one_keyed_batch_issue_1225() {
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let mut ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("id_idx".to_string())
+        .await
+        .unwrap();
+    let ds = Dataset::open(&uri).await.unwrap();
+    let ds = TableStore::append_or_create_batch(&uri, Some(ds), person_pk_batch(&[("x1", None)]))
+        .await
+        .unwrap();
+    let ds = TableStore::append_or_create_batch(&uri, Some(ds), person_pk_batch(&[("x2", None)]))
+        .await
+        .unwrap();
+    let uncovered = crate::dataset_index::key_column_uncovered_tail(&ds, "id")
+        .await
+        .unwrap()
+        .unwrap()
+        .fragments;
+    assert_eq!(uncovered, 2);
+
+    let route = |count: usize| {
+        let ids: Vec<String> = (0..count).map(|row| format!("new-{row}")).collect();
+        let probes = MergeWriteProbes::default();
+        let ds = ds.clone();
+        let store = &store;
+        async move {
+            let rows: Vec<(&str, Option<i32>)> = ids.iter().map(|id| (id.as_str(), None)).collect();
+            with_merge_write_probes(
+                probes.clone(),
+                store.stage_keyed_write(
+                    ds,
+                    "Person",
+                    person_pk_batch(&rows),
+                    KeyedWriteSemantics::Upsert,
+                    SYSTEM_COLUMNS_LEGACY,
+                    WriteBudget::default(),
+                ),
+            )
+            .await
+            .unwrap();
+            (
+                probes.stage_merge_insert_calls(),
+                probes.stage_fenced_insert_calls(),
+                probes.stage_known_present_update_calls(),
+            )
+        }
+    };
+    let edge = KEYED_WRITE_MAX_ROWS / uncovered;
+    assert_eq!(
+        route(edge).await,
+        (0, 1, 0),
+        "at the edge the probe runs and the new rows take the fenced insert"
+    );
+    assert_eq!(
+        route(edge + 1).await,
+        (1, 0, 0),
+        "one id past the edge skips the probe and keeps the join"
+    );
+}
+
 #[tokio::test]
 async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode_issue_1261() {
     let dir = tempfile::tempdir().unwrap();

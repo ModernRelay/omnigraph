@@ -442,7 +442,12 @@ timings, not asserted here. nextest runs no doctest, so the step keeps a
 `scripts/check-workspace-test-owners.py` reads that report for the owners
 the job requires by name (the two upgrade journeys and the CLI/server/proxy
 journeys listed in the step) and for the upgrade journeys' captured notices,
-in place of grepping a `--nocapture` log. The local command in
+in place of grepping a `--nocapture` log. The same profile prints no line for
+a passing test (`status-level = "slow"`): the run's log holds the start line,
+the `SLOW` line of a test still running after a minute, each failure with its
+captured output as it happens and once more in the final summary, and the
+summary line, so a log of the workspace's tests opens in GitHub's viewer and
+reads as its failures. The local command in
 [testing.md](testing.md) stays `cargo test`; the two run the same binaries.
 
 Every run, red or green, uploads that report as `test-workspace-junit` and
