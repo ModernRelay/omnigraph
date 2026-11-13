@@ -513,28 +513,21 @@ pub(crate) fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
     if s.is_empty() {
         bail!("duration is empty");
     }
-    let (num_part, unit) = match s
-        .char_indices()
-        .rev()
-        .find(|(_, c)| c.is_ascii_alphabetic())
-    {
-        Some((i, _)) => (
-            &s[..i + 1 - s[i..].chars().next().unwrap().len_utf8()],
-            &s[i..],
-        ),
-        None => (s, ""),
-    };
+    let (num_part, unit) = s.split_at(s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len()));
     let n: u64 = num_part
         .parse()
         .map_err(|e| color_eyre::eyre::eyre!("invalid duration '{}': {}", s, e))?;
-    let secs = match unit {
-        "" | "s" => n,
-        "m" => n * 60,
-        "h" => n * 60 * 60,
-        "d" => n * 60 * 60 * 24,
-        "w" => n * 60 * 60 * 24 * 7,
+    let seconds_per_unit = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        "w" => 7 * 24 * 60 * 60,
         _ => bail!("unknown duration unit '{}'. Supported: s, m, h, d, w", unit),
     };
+    let secs = n
+        .checked_mul(seconds_per_unit)
+        .ok_or_else(|| color_eyre::eyre::eyre!("invalid duration '{s}': exceeds u64 seconds"))?;
     Ok(std::time::Duration::from_secs(secs))
 }
 
@@ -629,6 +622,29 @@ pub(crate) fn branch_statement_change_request(query_source: &str) -> ChangeReque
 mod tests {
     use super::*;
     use omnigraph_compiler::query::parser::parse_query;
+
+    #[test]
+    fn duration_units_preserve_the_largest_representable_value() {
+        for (unit, seconds) in [
+            ("", 1),
+            ("s", 1),
+            ("m", 60),
+            ("h", 3600),
+            ("d", 86400),
+            ("w", 604800),
+        ] {
+            let limit = u64::MAX / seconds;
+            assert_eq!(
+                parse_duration_arg(&format!("{limit}{unit}"))
+                    .unwrap()
+                    .as_secs(),
+                limit * seconds
+            );
+            if let Some(overflow) = limit.checked_add(1) {
+                assert!(parse_duration_arg(&format!("{overflow}{unit}")).is_err());
+            }
+        }
+    }
 
     #[test]
     fn graph_resource_id_for_selection_uses_name_or_anonymous_uri() {

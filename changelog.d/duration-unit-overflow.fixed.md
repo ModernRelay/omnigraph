@@ -1,0 +1,1 @@
+- Cleanup and optimize reject duration arguments whose unit conversion would overflow seconds.
