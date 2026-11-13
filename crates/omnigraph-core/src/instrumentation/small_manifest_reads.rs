@@ -27,6 +27,12 @@ type KeptScanStores = Vec<(Weak<lance::io::ObjectStore>, Arc<lance::io::ObjectSt
 /// keys, their own credential fetch on S3 and Azure. Held here, a later scan
 /// with the same parameters is a registry hit. A Weak keeps its allocation, so
 /// a dead entry's address cannot be reused before it is pruned.
+///
+/// The dataset store is the registry's store for the dataset's key, which
+/// every dataset with that key shares: every local dataset in one registry, or
+/// every S3 dataset in one bucket with the same parameters. A kept store
+/// therefore lives until all of those datasets are gone, and then until the
+/// next scan anywhere in the process prunes it.
 static KEPT_SCAN_STORES: LazyLock<Mutex<KeptScanStores>> = LazyLock::new(Default::default);
 
 fn keep_scan_store(original: &Arc<lance::io::ObjectStore>, store: &Arc<lance::io::ObjectStore>) {
@@ -473,6 +479,17 @@ mod tests {
     /// chain) on S3 and Azure.
     #[tokio::test]
     async fn manifest_scans_reuse_one_scan_store_issue_1381() {
+        // Registries of the test's own: the process-wide one is shared with
+        // every other test in this process, which can move its miss count and
+        // keep its shared local store alive.
+        let fresh_session = || {
+            Arc::new(lance::session::Session::new(
+                0,
+                0,
+                Arc::new(lance::io::ObjectStoreRegistry::default()),
+            ))
+        };
+        let session = fresh_session();
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().join("table.lance");
         let uri = uri.to_str().unwrap();
@@ -480,7 +497,7 @@ mod tests {
         let dataset = crate::instrumentation::open_dataset(
             uri,
             crate::instrumentation::VersionResolution::Latest,
-            None,
+            Some(&session),
             None,
         )
         .await
@@ -507,16 +524,28 @@ mod tests {
             "each scan built a new object store"
         );
 
-        // The kept store lives only as long as its dataset's store: once that
-        // is gone, the next scan of any dataset releases it.
+        // The kept store is the registry's scan store, not the bounded
+        // wrapper a scan dataset holds. It lives only as long as its dataset's
+        // store: once that is gone, the next scan of a dataset with another
+        // key releases it.
+        let mut params = dataset.store_params().cloned().unwrap();
+        params.block_size = Some(MAX_SCAN_FILE_BYTES as usize);
         let kept = Arc::downgrade(
-            &manifest_scan_dataset(&dataset)
-                .await
-                .unwrap()
-                .object_store(None)
-                .await
-                .unwrap(),
+            &lance::io::ObjectStore::from_uri_and_params(
+                Arc::clone(&registry),
+                dataset.uri(),
+                &params,
+            )
+            .await
+            .unwrap()
+            .0,
         );
+        assert_eq!(
+            registry.stats().misses,
+            misses,
+            "the scan store was not kept"
+        );
+        assert!(kept.upgrade().is_some());
         drop(dataset);
         let other = dir.path().join("other.lance");
         let other = other.to_str().unwrap();
@@ -524,7 +553,7 @@ mod tests {
         let other = crate::instrumentation::open_dataset(
             other,
             crate::instrumentation::VersionResolution::Latest,
-            None,
+            Some(&fresh_session()),
             None,
         )
         .await
