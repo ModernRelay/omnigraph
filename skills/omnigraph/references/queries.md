@@ -76,6 +76,12 @@ every element and removes rows. A filter or `where` inside the braces is
 comma is `Q016`; each prints the corrected text. Every list takes commas:
 return items, order keys, call arguments and assignments.
 
+`let $v = expr` names a value for `where`, `return`, `order` and later
+elements; a value that can fail (arithmetic) is refused by the planner
+(`P006`), so put arithmetic in `return` or guard it with `if`.
+`from { match … return { … } }` joins an inline read's rows; one with an
+aggregate, `distinct`, `order` or `limit` is `P006`.
+
 ```gq
 query recent_signals() {
     match { $s: Signal }

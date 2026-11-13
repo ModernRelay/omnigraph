@@ -173,6 +173,94 @@ struct Facts {
     blocks: Vec<BlockFact>,
     /// The type of every node variable the scope binds.
     types: HashMap<String, String>,
+    /// Each `let` name and its value, earlier `let`s already read into it.
+    lets: HashMap<String, IRExpr>,
+    /// How many inline reads' hidden names were renamed apart so far.
+    inlined: usize,
+}
+
+impl Facts {
+    /// Every name the facts bind or read as a node or edge variable.
+    fn names(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.types.keys().cloned().collect();
+        out.extend(self.bindings.iter().map(|b| b.variable.clone()));
+        for t in &self.traversals {
+            out.extend([t.src.clone(), t.dst.clone()]);
+            out.extend(t.edge_binding.iter().cloned());
+        }
+        out.retain(|name| name != "_");
+        out
+    }
+
+    /// The facts with every variable `renames` names renamed, a block's
+    /// included.
+    fn rename(&mut self, renames: &HashMap<String, String>) {
+        if renames.is_empty() {
+            return;
+        }
+        let rename = |variable: &mut String| {
+            if let Some(name) = renames.get(variable) {
+                *variable = name.clone();
+            }
+        };
+        for binding in &mut self.bindings {
+            rename(&mut binding.variable);
+            binding
+                .filters
+                .iter_mut()
+                .for_each(|f| rename_expr(f, &rename));
+        }
+        for t in &mut self.traversals {
+            rename(&mut t.src);
+            rename(&mut t.dst);
+            if let Some(edge) = &mut t.edge_binding {
+                rename(edge);
+            }
+        }
+        self.filters
+            .iter_mut()
+            .for_each(|f| rename_expr(f, &rename));
+        self.types = std::mem::take(&mut self.types)
+            .into_iter()
+            .map(|(mut name, ty)| {
+                rename(&mut name);
+                (name, ty)
+            })
+            .collect();
+        for block in &mut self.blocks {
+            block.inner.rename(renames);
+            block.outer = std::mem::take(&mut block.outer)
+                .into_iter()
+                .map(|mut name| {
+                    rename(&mut name);
+                    name
+                })
+                .collect();
+            if let Some(arg) = block.left.arg_mut() {
+                rename_expr(arg, &rename);
+            }
+            rename_expr(&mut block.right, &rename);
+        }
+    }
+
+    /// Every expression the facts hold, a block's included, with each
+    /// `let` name read as its value.
+    fn substitute(&mut self, lets: &HashMap<String, IRExpr>) {
+        if lets.is_empty() {
+            return;
+        }
+        for binding in &mut self.bindings {
+            binding.filters.iter_mut().for_each(|f| substitute(f, lets));
+        }
+        self.filters.iter_mut().for_each(|f| substitute(f, lets));
+        for block in &mut self.blocks {
+            block.inner.substitute(lets);
+            if let Some(arg) = block.left.arg_mut() {
+                substitute(arg, lets);
+            }
+            substitute(&mut block.right, lets);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -310,6 +398,28 @@ impl<'a> Shaper<'a> {
             _ => return Err(self.refuse("a read whose returns are not a projection")),
         };
         let (body, ranking) = self.ranking(body)?;
+        // The pattern, with every `let` value read where its name is.
+        let mut facts = Facts::default();
+        self.facts(body, &mut facts)?;
+        let lets = std::mem::take(&mut facts.lets);
+        facts.substitute(&lets);
+        for e in items.values_mut() {
+            substitute(e, &lets);
+        }
+        for agg in aggs.values_mut() {
+            if let Some(arg) = &mut agg.arg {
+                substitute(arg, &lets);
+            }
+        }
+        let order_keys: Vec<(IRExpr, bool)> = order_keys
+            .iter()
+            .map(|(key, descending)| {
+                let mut key = key.clone();
+                substitute(&mut key, &lets);
+                (key, *descending)
+            })
+            .collect();
+        let order_keys = order_keys.as_slice();
         // Return items.
         let mut return_exprs = Vec::new();
         for (column, expr) in finals {
@@ -418,9 +528,6 @@ impl<'a> Shaper<'a> {
             });
         }
         let _ = grouped;
-        // The pattern.
-        let mut facts = Facts::default();
-        self.facts(body, &mut facts)?;
         let ranked: Vec<String> = ranking
             .as_ref()
             .map(|r| vec![r.column.clone()])
@@ -770,10 +877,50 @@ impl<'a> Shaper<'a> {
                 Ok(())
             }
             Term::Filter { input, pred } => self.filter(input, pred, facts),
+            // `let $v = e`: a value column, read wherever its name is. The
+            // core evaluates it for every row before `where` (A3), which a
+            // value that cannot fail makes the same rows as reading it in
+            // place; a value that can fail needs a column computed before the
+            // filter, which no operator adds inside a pattern.
+            Term::Project {
+                input,
+                items,
+                keep: true,
+            } => {
+                self.facts(input, facts)?;
+                for (name, value) in items {
+                    if value.can_fail() {
+                        return Err(self.refuse("a `let` whose value can fail"));
+                    }
+                    let mut cols = Vec::new();
+                    value.columns(&mut cols);
+                    if cols.iter().any(|c| is_block_column(c)) {
+                        return Err(self.refuse("a `let` over a block value"));
+                    }
+                    let mut value = value.clone();
+                    substitute(&mut value, &facts.lets);
+                    facts.lets.insert(name.clone(), value);
+                }
+                Ok(())
+            }
+            // A `from` that opens the pattern: the inline read alone.
+            Term::Project {
+                input,
+                items,
+                keep: false,
+            } => self.inline_read(input, items, facts),
             Term::Correlate { outer, inner } => {
                 self.facts(outer, facts)?;
                 if let Term::Group { .. } = inner.as_ref() {
                     return Err(self.refuse("a correlated block read without its filter"));
+                }
+                if let Term::Project {
+                    input,
+                    items,
+                    keep: false,
+                } = inner.as_ref()
+                {
+                    return self.inline_read(input, items, facts);
                 }
                 self.facts(inner, facts)
             }
@@ -794,6 +941,86 @@ impl<'a> Shaper<'a> {
             }
             other => Err(self.refuse(format!("a `{}` node in a pattern", other.operator()))),
         }
+    }
+
+    /// `from { match … return { … } }`: one outer row per inner row, the
+    /// inner pattern joined on the outer variables it reads. With no group,
+    /// order or cut in it, that is the inner pattern's facts added to the
+    /// outer ones: a returned reference column binds its name, a returned
+    /// value is a `let` of that name, and every name the inner read binds
+    /// without returning it is renamed apart, so a later outer binding of the
+    /// same name stays another variable.
+    fn inline_read(
+        &self,
+        input: &Term,
+        items: &[(String, IRExpr)],
+        facts: &mut Facts,
+    ) -> Result<(), PlanError> {
+        let outer: HashSet<String> = env_columns(input).into_iter().collect();
+        let mut inner = Facts::default();
+        self.facts(input, &mut inner)?;
+        let inner_lets = std::mem::take(&mut inner.lets);
+        inner.substitute(&inner_lets);
+        let items: Vec<(String, IRExpr)> = items
+            .iter()
+            .map(|(column, expr)| {
+                let mut expr = expr.clone();
+                substitute(&mut expr, &inner_lets);
+                (column.clone(), expr)
+            })
+            .collect();
+        let mut renames: HashMap<String, String> = HashMap::new();
+        let mut values: Vec<(String, IRExpr)> = Vec::new();
+        for (column, expr) in &items {
+            match expr {
+                IRExpr::Variable(variable, ExprType::Node { .. } | ExprType::Edge { .. }) => {
+                    if variable != column {
+                        if outer.contains(variable) {
+                            return Err(self.refuse(
+                                "a `from` returning an outer variable under another name",
+                            ));
+                        }
+                        renames.insert(variable.clone(), column.clone());
+                    }
+                }
+                _ => values.push((column.clone(), expr.clone())),
+            }
+        }
+        let exposed: HashSet<&String> = items
+            .iter()
+            .filter_map(|(_, e)| match e {
+                IRExpr::Variable(v, _) => Some(v),
+                _ => None,
+            })
+            .collect();
+        let mut hidden: Vec<String> = inner
+            .names()
+            .into_iter()
+            .filter(|name| !outer.contains(name) && !exposed.contains(name) && !is_anon(name))
+            .collect();
+        hidden.sort();
+        hidden.dedup();
+        for name in hidden {
+            let fresh = format!("{FRESH_PREFIX}f{}_{name}", facts.inlined);
+            facts.inlined += 1;
+            renames.insert(name, fresh);
+        }
+        inner.rename(&renames);
+        let rename = |variable: &mut String| {
+            if let Some(name) = renames.get(variable) {
+                *variable = name.clone();
+            }
+        };
+        for (column, mut value) in values {
+            rename_expr(&mut value, &rename);
+            facts.lets.insert(column, value);
+        }
+        facts.bindings.extend(inner.bindings);
+        facts.traversals.extend(inner.traversals);
+        facts.filters.extend(inner.filters);
+        facts.blocks.extend(inner.blocks);
+        facts.types.extend(inner.types);
+        Ok(())
     }
 
     fn traversal(&self, facts: &mut Facts, mut t: TraversalFact) {
@@ -915,6 +1142,13 @@ impl<'a> Shaper<'a> {
             }
             let mut inner_facts = Facts::default();
             self.facts(inner, &mut inner_facts)?;
+            let inner_lets = std::mem::take(&mut inner_facts.lets);
+            inner_facts.substitute(&inner_lets);
+            let mut agg = agg.clone();
+            if let Some(arg) = &mut agg.arg {
+                substitute(arg, &inner_lets);
+            }
+            let agg = &agg;
             let left = match &agg.arg {
                 // Counting a node binding counts its rows.
                 None => BlockAggregateExpr::count_rows(),
@@ -1324,6 +1558,18 @@ fn scan_root(
     }
 }
 
+/// The outer columns a correlated term reads: its `Env` leaf's.
+fn env_columns(term: &Term) -> Vec<String> {
+    let mut pending = vec![term];
+    while let Some(term) = pending.pop() {
+        if let Term::Env(cols) = term {
+            return cols.iter().map(|c| c.name.clone()).collect();
+        }
+        pending.extend(term.children());
+    }
+    Vec::new()
+}
+
 /// The `Fuse` a pattern extends from: the leaf its first inputs reach.
 fn fuse_leaf(term: &Term) -> Option<&Term> {
     match term {
@@ -1473,6 +1719,62 @@ fn rename_inner_bindings(
     }
     for expr in expressions {
         rename_expr(expr, &rename);
+    }
+}
+
+/// `expr` with every value column a `let` names read as the `let`'s value.
+fn substitute(expr: &mut IRExpr, lets: &HashMap<String, IRExpr>) {
+    if lets.is_empty() {
+        return;
+    }
+    match expr {
+        IRExpr::AliasRef(name, _) | IRExpr::Variable(name, _) => {
+            if let Some(value) = lets.get(name.as_str()) {
+                *expr = value.clone();
+            }
+        }
+        IRExpr::Nearest { query, .. } => substitute(query, lets),
+        IRExpr::Search { field, query, .. }
+        | IRExpr::MatchText { field, query, .. }
+        | IRExpr::Bm25 { field, query, .. } => {
+            substitute(field, lets);
+            substitute(query, lets);
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+            ..
+        } => {
+            substitute(field, lets);
+            substitute(query, lets);
+            if let Some(m) = max_edits {
+                substitute(m, lets);
+            }
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+            ..
+        } => {
+            substitute(primary, lets);
+            substitute(secondary, lets);
+            if let Some(k) = k {
+                substitute(k, lets);
+            }
+        }
+        IRExpr::Aggregate { arg, .. }
+        | IRExpr::Not(arg, _)
+        | IRExpr::IsNull { expr: arg, .. }
+        | IRExpr::Neg { expr: arg, .. }
+        | IRExpr::Cast { expr: arg, .. } => substitute(arg, lets),
+        IRExpr::Binary { left, right, .. } => {
+            substitute(left, lets);
+            substitute(right, lets);
+        }
+        IRExpr::Call { args, .. } => args.iter_mut().for_each(|a| substitute(a, lets)),
+        IRExpr::Literal(_, _) | IRExpr::Param(_, _) | IRExpr::PropAccess { .. } => {}
     }
 }
 

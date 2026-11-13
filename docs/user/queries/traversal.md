@@ -106,6 +106,22 @@ edge `WorksAt`); edge lookup itself is case-insensitive. Any word is an edge
 name inside `match`, keywords included (`$d in $c` follows an edge `In`), and a
 quoted name is accepted too.
 
+## Values and inline reads
+
+`let $v = <expression>` names a value computed for every row of the elements
+before it; `where`, later elements, the blocks of `where`, `return` and
+`order` read it as `$v`. A value whose expression cannot fail is read where
+its name is. One that can fail (arithmetic: overflow, a zero divisor) runs for
+every row before `where`, as the core states; the planner has no operator for
+that yet and refuses it (`P006`), so write the expression in `return` or guard
+it with `if`.
+
+`from { match … return { … } }` joins the rows of an inline read, one outer
+row per inner row, correlated on the outer variables it reads. Its returned
+references bind their names and its returned values read by name; a name it
+binds without returning stays its own variable. An inline read with an
+aggregate, `distinct`, `order` or `limit` is refused (`P006`).
+
 Comparison operators are `=`, `!=`, `<`, `<=`, `>`, and `>=`.
 
 See [Query language](index.md) for expressions, projection and ordering.

@@ -13,9 +13,13 @@ A query runs against one resolved `ReadTarget`:
    into the typed core IR (`ir::core`).
 3. Shape the core read for the planner (`omnigraph_planner::read_shape`): the
    pattern of scans, expansions, filters and correlated blocks, its return
-   items, order, limit and the ranking a `from nearest/bm25/rrf` draws. A core
-   node the planner does not lower (`Union`, `Fix`, `Call`, a computed order
-   key no return item computes) is refused with `P006`.
+   items, order, limit and the ranking a `from nearest/bm25/rrf` draws. A
+   `let` value that cannot fail is read wherever its name is; a `from` over an
+   inline read with no group, order or cut adds the inner pattern's facts,
+   its unreturned names renamed apart. A core node the planner does not lower
+   (`Union`, `Fix`, `Call`, a `let` value that can fail, an inline read with a
+   group, order or cut, a computed order key no return item computes) is
+   refused with `P006`.
 4. Gather the planning inputs once: bound parameters (`now()` among them),
    constants folded to their values, statistics, settings and the index
    facts the full-text coverage of every ranked property is derived from.

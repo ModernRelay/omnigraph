@@ -1,0 +1,116 @@
+# issue: none
+# notes: `from { match … return { … } }` joins one outer row per row of the
+# notes: inline read (`Correlate` over its `Project`). With no group, order or
+# notes: cut inside, that is the inner pattern joined on the outer variables it
+# notes: reads: a returned reference binds its name, a returned value is read
+# notes: by name, and a name the inner read binds without returning stays its
+# notes: own variable, so an outer binding of the same name is another one. An
+# notes: inline read with an aggregate stays `P006`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36,"city":"London"}}
+{"type":"Person","data":{"handle":"bob","name":"Bob","age":25,"city":"Paris"}}
+{"type":"Person","data":{"handle":"cy","name":"Cy","age":41}}
+{"type":"Person","data":{"handle":"di","name":"Di","age":19,"city":"London"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Company","data":{"slug":"bolt","name":"Bolt"}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"WorksAt","from":"bob","to":"acme"}
+{"edge":"WorksAt","from":"cy","to":"bolt"}
+{"edge":"Knows","from":"ada","to":"bob"}
+{"edge":"Knows","from":"ada","to":"cy"}
+{"edge":"Knows","from":"bob","to":"di"}
+{"edge":"Knows","from":"ada","to":"di"}
+
+--- query
+query from_vars() { match { from { match { $p: Person, $p worksAt $c } return { $p, $c } } } return { $p.handle, $c.slug } }
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"bob"}
+{"c.slug":"bolt","p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+c.slug: String
+
+--- query
+query from_alias() { match { from { match { $p: Person } where $p.age > 20 return { $p, $p.city as town } } } where $town = "London" return { $p.handle, $town } }
+
+--- expect unordered
+{"p.handle":"ada","town":"London"}
+
+--- expect shape
+p.handle: String
+town: String
+
+--- query
+query from_correlated() { match { $c: Company, from { match { $p worksAt $c } return { $p } } } return { $c.slug, $p.handle } }
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"bob"}
+{"c.slug":"bolt","p.handle":"cy"}
+
+--- expect shape
+c.slug: String
+p.handle: String
+
+--- query
+query from_then_traversal() { match { from { match { $p: Person } where $p.age > 20 return { $p } }, $p worksAt $c } return { $p.handle, $c.slug } }
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"bob"}
+{"c.slug":"bolt","p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+c.slug: String
+
+--- query
+query from_hides_the_names_it_does_not_return() {
+    match {
+        from { match { $p: Person, $p worksAt $c } where $c.slug = "bolt" return { $p } },
+        $c: Company,
+    }
+    return { $p.handle, $c.slug }
+}
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"cy"}
+{"c.slug":"bolt","p.handle":"cy"}
+
+--- expect shape
+p.handle: String
+c.slug: String
+
+--- query
+query from_over_a_grouped_read() {
+    match { from { match { $p worksAt $c } return { $c, count($p) as n } } }
+    return { $c.slug, $n }
+}
+
+--- expect error: P006: `from_over_a_grouped_read`: the planner does not lower a `Group` node in a pattern

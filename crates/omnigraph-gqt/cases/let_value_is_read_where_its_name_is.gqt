@@ -1,0 +1,134 @@
+# issue: none
+# notes: `let $v = e` adds a value column to every row of the pattern before it
+# notes: (`Project`); `where`, the `return` items, the `order` keys, later
+# notes: elements and the blocks of `where` read it by name. A value that
+# notes: cannot fail is the same column wherever it is read, so the planner
+# notes: reads the value in place. A value that can fail (arithmetic) must run
+# notes: for every row before `where`, and stays `P006` until an operator adds
+# notes: a column inside a pattern.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+    age: I32?
+    city: String?
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada","age":36,"city":"London"}}
+{"type":"Person","data":{"handle":"bob","name":"Bob","age":25,"city":"Paris"}}
+{"type":"Person","data":{"handle":"cy","name":"Cy","age":41}}
+{"type":"Person","data":{"handle":"di","name":"Di","age":19,"city":"London"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Company","data":{"slug":"bolt","name":"Bolt"}}
+{"edge":"WorksAt","from":"ada","to":"acme"}
+{"edge":"WorksAt","from":"bob","to":"acme"}
+{"edge":"WorksAt","from":"cy","to":"bolt"}
+{"edge":"Knows","from":"ada","to":"bob"}
+{"edge":"Knows","from":"ada","to":"cy"}
+{"edge":"Knows","from":"bob","to":"di"}
+{"edge":"Knows","from":"ada","to":"di"}
+
+--- query
+query let_in_where_and_return() {
+    match { $p: Person, let $town = $p.city }
+    where $town = "London"
+    return { $p.handle, $town }
+    order { $p.handle }
+}
+
+--- expect ordered
+{"p.handle":"ada","town":"London"}
+{"p.handle":"di","town":"London"}
+
+--- expect shape
+p.handle: String
+town: String
+
+--- query
+query let_over_a_function_in_order() {
+    match { $p: Person, let $town = coalesce($p.city, "nowhere") }
+    return { $p.handle, $town }
+    order { $town desc, $p.handle }
+}
+
+--- expect ordered
+{"p.handle":"cy","town":"nowhere"}
+{"p.handle":"bob","town":"Paris"}
+{"p.handle":"ada","town":"London"}
+{"p.handle":"di","town":"London"}
+
+--- expect shape
+p.handle: String
+town: String
+
+--- query
+query let_after_a_traversal() {
+    match {
+        $p: Person,
+        $p worksAt $c,
+        let $label = concat($c.name, "/", $p.handle),
+    }
+    where $c.slug = "acme"
+    return { $label }
+    order { $label }
+}
+
+--- expect ordered
+{"label":"Acme/ada"}
+{"label":"Acme/bob"}
+
+--- expect shape
+label: String
+
+--- query
+query let_read_inside_a_block() {
+    match { $p: Person, let $home = $p.city }
+    where exists { $p knows $q where $q.city = $home }
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query let_in_an_aggregate() {
+    match { $p: Person, $p worksAt $c, let $firm = $c.name }
+    return { $firm, count($p) as n }
+    order { $firm }
+}
+
+--- expect unordered
+{"firm":"Acme","n":2}
+{"firm":"Bolt","n":1}
+
+--- expect shape
+firm: String
+n: I64
+
+--- query
+query let_whose_value_can_fail() {
+    match { $p: Person, let $next = $p.age + 1 }
+    where $next > 30
+    return { $p.handle }
+}
+
+--- expect error: P006: `let_whose_value_can_fail`: the planner does not lower a `let` whose value can fail
