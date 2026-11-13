@@ -1,0 +1,45 @@
+# issue: 919
+# red_on: main @ 9fb5b48e: inserting [] into an [I64] property failed with T3, expected [I64] but got [String].
+
+--- runner
+timeout_ms: 60000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Sample {
+    key: String @key
+    xs: [I64]
+}
+
+--- seed
+{"type":"Sample","data":{"key":"existing","xs":[42]}}
+
+--- mutate
+query add() { insert Sample { key: "new", xs: [] } }
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query clear() { update Sample set { xs: [] } where key = "existing" }
+
+--- expect affected: nodes=1 edges=0
+
+--- mutate
+query wrong_element() { update Sample set { xs: ["text"] } where key = "existing" }
+
+--- expect error: property `xs` has type [I64] but got [String]
+
+--- query
+query values() { match { $s: Sample } return { $s.key as key, $s.xs as xs } }
+
+--- expect unordered
+{"key":"existing","xs":[]}
+{"key":"new","xs":[]}
+
+--- expect shape
+key: String
+xs: [I64]

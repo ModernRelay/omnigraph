@@ -44,9 +44,9 @@ where; a where compares the row's own properties, parameters and now()``. A
 compound `where` runs under either `engine` setting. A `where` that tests over
 four properties twice each with `=`, `!=` or `in` is refused.
 
-Assignment values are constants: literals, parameters, `now()`, and comparisons
-or Boolean operators over them, such as `adult: true or $flag`. A constant's
-value is fixed per invocation: parameters and `now()` are bound once before any
+Assignments take literals, parameters, `now()`, and comparisons or Boolean operators
+over them, such as `adult: true or $flag`. In a list assignment, `[]` takes the
+property's element type. Parameters and `now()` are bound once before any
 retry, so a retried mutation computes the same value. It follows the read rules
 for null: with `$flag` null, `true or $flag` is `true` and `false and $flag` is
 `false`, and `$age > 30` with `$age` null is null. A null result assigned to a
