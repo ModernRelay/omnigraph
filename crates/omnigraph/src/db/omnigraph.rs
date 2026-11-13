@@ -38,7 +38,6 @@ mod export;
 pub(crate) mod optimize;
 mod prepared_create;
 pub(crate) mod promotion;
-mod repair;
 mod resolution;
 pub(crate) mod schema_apply;
 pub(crate) mod system_column_upgrade;
@@ -58,12 +57,11 @@ pub use optimize::{
     ArtifactRefresh, ArtifactSkip, AuthorityCapture, CleanupPolicyOptions, ConfigurationClear,
     DatasetCleanupStats, DatasetOptimizeStats, DeferReason, OptimizeBeforePublish,
     OptimizeCancellation, OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport,
-    OptimizeRequest, ResourceExceeded, ResourceMeasure, RunCancellation, SkipReason, TableCeilings,
+    OptimizeRequest, ResourceExceeded, ResourceMeasure, RunCancellation, TableCeilings,
     TableOptimizeOutcome,
 };
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
-pub use repair::{DatasetRepairStats, RepairAction, RepairClassification, RepairStats};
 pub use resolution::PublicationLookup;
 pub use schema_apply::{
     PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplyReconciliation,
@@ -4035,14 +4033,6 @@ impl Omnigraph {
         request: optimize::OptimizeRequest,
     ) -> Result<optimize::OptimizeReport> {
         optimize::optimize_all_datasets(self, actor, request).await
-    }
-
-    /// Report, per table on `main`, how its Lance linear history stands
-    /// against its registration. See [`repair`] for the classifications. The
-    /// report publishes nothing and adopts no drift. Requires `maintain` on
-    /// `main`.
-    pub async fn repair_report_as(&self, actor: Option<&str>) -> Result<repair::RepairStats> {
-        repair::repair_report(self, actor).await
     }
 
     /// Remove Lance manifests (and the fragments they uniquely own) per the

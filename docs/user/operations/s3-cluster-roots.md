@@ -2,9 +2,9 @@
 
 A cluster whose server is stopped has no served route for deployment, recovery
 or maintenance. For that case `cluster plan`, `cluster apply`, `cluster status`,
-`cluster force-unlock`, `cluster upgrade-ledger` and the five
-[maintenance commands](maintenance.md) (`optimize`, `index build`, `index rebuild`,
-`repair` and `cleanup`, and the deprecated `rebuild-full-text-indexes`) accept an
+`cluster force-unlock`, `cluster upgrade-ledger` and the four
+[maintenance commands](maintenance.md) (`optimize`, `index build`, `index rebuild`
+and `cleanup`, and the deprecated `rebuild-full-text-indexes`) accept an
 inline `s3://` cluster root. Maintenance selects its graph with `--graph`; a graph
 URI is refused. Every other command, and any `az://`
 address, refuses an inline cloud target.
