@@ -538,8 +538,10 @@ impl OptimizeConcurrency {
 pub struct OptimizeLimits {
     /// Stop starting tables once the run has held main's writer gates this
     /// long. The first table always starts, so every run makes progress; the
-    /// wait of a writer that queued for the gates is at most this, plus that
-    /// table, the publication and the configuration clear.
+    /// wait of a writer that queued for the gates is at most this, plus the
+    /// tables already started, the publication and the configuration clear.
+    /// Those tables share the run's index build budget, so their full-text
+    /// and vector builds run one at a time.
     pub max_gate_hold: Option<Duration>,
     /// Ceilings on one table's plan, checked before its first write.
     pub table: TableCeilings,

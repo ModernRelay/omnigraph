@@ -82,12 +82,13 @@ that many at once, so budget for that many Blob tables compacting together.
 Writes to `main` wait while optimize holds its writer gates. A run given
 `--max-gate-hold 30s` starts no table after that long except the first: the
 rest are `deferred`, finished tables publish, and a writer waits at most the
-bound plus one rewrite. Tables run in type-key order; `resume_at` names the
-first deferred one, and `--tables` runs only the listed tables, in order. Each
-table's `outcome` is `optimized`, `unchanged`, `deferred`, `skipped` or
-`failed` (with its `error`; the other tables still publish). The report adds
-`input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
-and `artifact` outcomes, which never fail a published run.
+bound plus the tables already rewriting (on the direct path their full-text
+and vector builds run one at a time). Tables run in type-key order; `resume_at`
+names the first deferred one, and `--tables` runs only the listed tables, in
+order. Each table's `outcome` is `optimized`, `unchanged`, `deferred`,
+`skipped` or `failed` (with its `error`; the other tables still publish). The
+report adds `input_commit`, `graph_commit_id`, `gate_hold_ms` and the
+`configuration_clear` and `artifact` outcomes, which never fail a published run.
 
 Optimize also persists the traversal-adjacency artifact
 (`__graph_index/csr-current.bin`), which cold traversal builds load instead of
