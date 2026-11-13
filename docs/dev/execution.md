@@ -74,6 +74,29 @@ covered edge table's physical identity and version, so unrelated edge types do
 not force a graph-wide scan and a lazy branch may reuse an identical inherited
 table view.
 
+The key also carries each table's detached pin (`staged_version`), native ref
+and e_tag. Every write makes a new version or a new random detached pin, so a
+later snapshot never matches a stale key, and eviction only frees memory. A
+write (mutation, merge) evicts the cached indexes that cover an edge table it
+changed, on any branch; a publish of an unpublished commit evicts those of
+every edge table its commit lists, which is every edge type. A branch create
+or delete clears nothing, because it changes no key: graph tables never carry
+a branch's own ref (a branch write stages detached on the inherited ref; see
+"Table forks" in [Lance alignment](lance.md)), so a recreated branch's tables
+share `main`'s ref and can repeat a dead branch's version numbers. The new
+random pin keeps them apart on every store, by construction. Where the store
+gives an e_tag (S3, and local files on Linux), the e_tag also differs, and a
+write to the edge table also evicts the old index, but neither is needed. A
+deleted branch's indexes and held table handles stay until the LRUs drop them (8 indexes; 64 handles or 64 MiB). A
+refresh, schema apply, optimize and the system-column upgrade clear the whole
+cache.
+
+The shelf, the last full-catalog decode of the persisted artifact, is cleared
+only by those four and replaced only by a newer decode. It checks each
+requested table's stamp on every serve, so it stops serving a written edge
+table, but on a handle that writes edges after one artifact load it keeps that
+stale full-catalog topology for the handle's life (at most one).
+
 An explicitly bound edge must scan its edge table because topology alone does
 not contain edge properties. Every edge probe (`graph.rs::scan_edges_stream`:
 the bound-edge producer, an indexed hop) pushes its `key IN (keys)` list into

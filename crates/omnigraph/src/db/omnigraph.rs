@@ -4147,11 +4147,11 @@ impl Omnigraph {
         target
             .branch_delete_captured(branch, &expected_identifier)
             .await?;
-        // The removed coordinator refreshes used to invalidate these caches
-        // before the authority change. Do it explicitly after success instead:
-        // old branch-incarnation handles/topology can never leak into a later
-        // recreation, while a failed control leaves warm state untouched.
-        self.invalidate_read_caches().await;
+        // No read cache is cleared: a branch control changes no cache key.
+        // Graph tables never carry a branch's own ref, and a recreated
+        // branch's writes get new random detached pins, so a dead branch's
+        // handles and topology never match a later key; the LRUs drop them
+        // (docs/dev/execution.md, "Graph index cache").
         Ok(())
     }
 
@@ -4229,8 +4229,8 @@ impl Omnigraph {
             )
             .await
             .map_err(OmniError::before_effect)?;
+        // A create changes no read-cache key; see `delete_captured_branch_storage`.
         source_coord.branch_create(&target).await?;
-        self.invalidate_read_caches().await;
         Ok(())
     }
 
@@ -4398,7 +4398,7 @@ impl Omnigraph {
                 unreachable!("a commit start captures the commit's record with its source")
             }
         };
-        self.invalidate_read_caches().await;
+        // A create changes no read-cache key; see `delete_captured_branch_storage`.
         Ok(created)
     }
 
@@ -5030,14 +5030,15 @@ impl Omnigraph {
             *self.merge_authority_cache.lock().await = Some((target_name, coordinator));
             published
         };
-        if candidate
-            .record
-            .tables
-            .iter()
-            .any(|table| table.registration.table_key.starts_with("edge:"))
-        {
-            self.invalidate_graph_index().await;
-        }
+        self.invalidate_graph_index_for(
+            candidate
+                .record
+                .tables
+                .iter()
+                .map(|table| table.registration.table_key.as_str())
+                .filter(|table_key| table_key.starts_with("edge:")),
+        )
+        .await;
         Ok(published.commit)
     }
 
@@ -5250,9 +5251,15 @@ impl Omnigraph {
         )
     }
 
-    /// Invalidate the cached graph index. Called after edge mutations.
-    pub(crate) async fn invalidate_graph_index(&self) {
-        table_ops::invalidate_graph_index(self).await
+    /// Invalidate the cached graph indexes that cover a written edge table
+    /// (`edge:<Name>`). Called after edge mutations and merges.
+    pub(crate) async fn invalidate_graph_index_for<'a>(
+        &self,
+        edge_table_keys: impl IntoIterator<Item = &'a str>,
+    ) {
+        self.runtime_cache
+            .invalidate_edge_tables(edge_table_keys)
+            .await;
     }
 }
 

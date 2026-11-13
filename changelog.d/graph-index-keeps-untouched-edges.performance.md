@@ -1,0 +1,1 @@
+- A write or a branch create or delete no longer clears the cached graph topology and table handles it did not change, so the next traversal skips rebuilding them. Results are unchanged.

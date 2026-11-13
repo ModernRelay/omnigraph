@@ -1802,7 +1802,3 @@ async fn demote_superseded_handles(
         }
     }
 }
-
-pub(super) async fn invalidate_graph_index(db: &Omnigraph) {
-    db.runtime_cache.invalidate_all().await;
-}

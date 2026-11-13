@@ -1858,7 +1858,7 @@ impl Omnigraph {
                 };
                 staging.append_batch(&table_key, schema, mode, batch)?;
 
-                self.invalidate_graph_index().await;
+                self.invalidate_graph_index_for([table_key.as_str()]).await;
 
                 Ok(MutationResult {
                     affected_nodes: 0,
@@ -2250,6 +2250,7 @@ impl Omnigraph {
         staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
 
         let mut affected_edges = 0usize;
+        let mut cascaded_edge_tables: Vec<String> = Vec::new();
 
         let edge_info: Vec<(String, String, String)> = txn
             .catalog
@@ -2318,6 +2319,7 @@ impl Omnigraph {
             affected_edges += matched;
 
             if matched > 0 {
+                cascaded_edge_tables.push(edge_table_key.clone());
                 staging.record_deleted_ids(&edge_table_key, matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
                 staging.record_deleted_row_addrs(
@@ -2330,9 +2332,8 @@ impl Omnigraph {
 
         staging.record_deleted_ids(&table_key, deleted_ids);
 
-        if affected_edges > 0 {
-            self.invalidate_graph_index().await;
-        }
+        self.invalidate_graph_index_for(cascaded_edge_tables.iter().map(String::as_str))
+            .await;
 
         Ok(MutationResult {
             affected_nodes,
@@ -2395,7 +2396,7 @@ impl Omnigraph {
             staging.record_deleted_ids(&table_key, deleted_ids);
             staging.record_delete(&table_key, pred_expr.clone());
             staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
-            self.invalidate_graph_index().await;
+            self.invalidate_graph_index_for([table_key.as_str()]).await;
         }
 
         Ok(MutationResult {
