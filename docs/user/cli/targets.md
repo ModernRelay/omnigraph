@@ -165,12 +165,12 @@ omnigraph target refresh production
 `login --create-profile NAME` authenticates and verifies the organization before
 creating a profile. Existing names refuse; routing defaults stay unchanged.
 Only creation accepts `--api URL` (default `https://platform.omnigraph.dev`)
-and `--organization ID`.
+and `--organization ID`; without it, a person in several organizations [chooses one](login.md#choose-the-organization).
 `login --profile NAME` signs in to an existing profile. Bare `login` uses
 `defaults.profile`; without a selection it explains how to select or create one.
 Neither form implicitly creates a profile or selects the only configured entry.
 Login/logout require `provider: omnigraph`, directly or via a managed target's pinned
-profile. Static tokens use `credentials`.
+profile. Static tokens use `credentials`. A refused sign-in [names the check that failed](login.md#when-a-sign-in-is-refused).
 
 Target registration uses authenticated discovery to save exact cluster identity
 and its service-attested endpoint, if available. It creates no remote cluster.

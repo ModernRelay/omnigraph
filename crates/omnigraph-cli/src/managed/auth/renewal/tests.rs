@@ -441,7 +441,7 @@ async fn renewed_credential_write_failure_propagates_and_keeps_pending_without_r
         assert_eq!(store.writes.borrow()[&key(&pending).unwrap()], 2);
         pending.access_token = jwt(-1, "user_one");
         pending.expires_at = OffsetDateTime::from_unix_timestamp(
-            claims(&pending.access_token, &pending.config, true)
+            claims(&pending.access_token, &pending.config, true, Source::Saved)
                 .unwrap()
                 .exp,
         )

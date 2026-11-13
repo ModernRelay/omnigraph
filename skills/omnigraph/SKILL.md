@@ -223,7 +223,7 @@ destination line.
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
 | Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |
-| Managed account | `cluster create/list`, `organization members/invitations`; `--profile NAME` |
+| Managed account | `cluster create/list`, `organization list`, `organization members/invitations`; `--profile NAME` |
 | Managed cluster | `cluster members/pull/push/plan/apply/status/operation/history/cancel/token/delete/undo-delete`; complete cluster target |
 | Local configuration | `config validate/rename-profile/rename-target/recover-rename/recover-operations`, `target list/inspect/add/refresh/remove`, `skill export/show`, `version`, `embed`; `alias NAME` owns its target and graph |
 | Authentication | `login --create-profile NAME`, `login --profile NAME`, or `logout --profile NAME` for platform sessions; `credentials set/status/remove/export` requires explicit profile or standalone target |
@@ -381,7 +381,10 @@ Changing a profile's principal requires `login --profile NAME
 invalidating old derived credentials. See the primary operator reference.
 
 `login --create-profile NAME` explicitly creates a new profile, defaulting its API
-to `https://platform.omnigraph.dev`. Bare login uses `defaults.profile`; it never
+to `https://platform.omnigraph.dev`. Pass `--organization ID` when the person
+belongs to several organizations: without it they are asked at a terminal and
+refused with `organization_required` anywhere else. `organization list --profile
+NAME` shows the IDs. Bare login uses `defaults.profile`; it never
 creates a missing profile. Neither form changes routing defaults. Operator YAML
 may be read-only; credential metadata stays in writable `OMNIGRAPH_HOME`.
 Credentials retain their expiry through discovery and are checked before dispatch.

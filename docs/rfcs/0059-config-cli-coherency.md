@@ -7,7 +7,7 @@ implementation: complete
 authors:
   - andrew
 created: 2026-09-06
-updated: 2026-10-29
+updated: 2026-11-10
 discussion: https://github.com/ModernRelay/omnigraph/pull/675
 supersedes: []
 superseded_by: []
@@ -108,6 +108,45 @@ This amendment is accepted. Implementation completion requires parser/help,
 bounded selector resolution, durable same-key retry tests, validated receipts
 and the linked user workflow to agree. The earlier completed implementation
 status does not qualify this new behavior.
+
+## Accepted amendment: organization choice at login (2026-11-10)
+
+This amendment replaces one rule of the first-login paragraph under
+[Design](#design): a profile created without an organization no longer takes
+the organization of the fresh hosted sign-in. That sign-in carries whichever
+organization the browser session last selected, so a person in several
+organizations could create a profile in one they did not mean, and neither the
+command nor its output said that a choice had been made.
+
+`login --create-profile NAME` without `--organization` asks the API for the
+person's active memberships, with the fresh sign-in as the credential:
+
+| Memberships | Result |
+|---|---|
+| One | The profile is created in it. |
+| Several, standard input a terminal | List them on stderr and read a number or an organization ID from stdin. Three answers that name none end the sign-in. |
+| Several, anywhere else | Refuse with `organization_required` and the list. Automation never prompts and never infers. |
+
+The sign-in is then exchanged for the chosen organization, as it already is
+for `--organization ID`, and every existing check of the exchanged session
+still applies. A sign-in that selected no organization, or an API that cannot
+list memberships, also refuses with `organization_required`: the CLI cannot
+make an organization the right one by default. A fresh sign-in that is not
+kept is revoked, best effort. `--organization ID` and login to an existing
+profile are unchanged, and a profile still belongs to exactly one
+organization and owns its own sign-in.
+
+`organization list --profile NAME [--json]` reports the same memberships for
+an existing profile and marks the profile's own. It answers from the person's
+sign-in and needs no service permission; a workload profile refuses. `--json`
+emits the API envelope unchanged.
+
+A refused sign-in names the one check that failed, as a fixed sentence that
+includes no token. Fresh provider tokens that do not fit the sign-in
+configuration the API publishes refuse with `provider_response_invalid`.
+`credential_invalid` remains for a session this machine saved, its index, or
+the API's verification of it, so the code says whether signing in again can
+help.
 
 ## Summary
 

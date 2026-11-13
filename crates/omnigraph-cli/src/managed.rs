@@ -19,7 +19,7 @@ mod deployment;
 mod lifecycle;
 mod members;
 mod organization;
-pub(crate) use auth::VerifiedIdentity;
+pub(crate) use auth::{OrganizationChoice, VerifiedIdentity};
 
 pub(crate) fn import_custody(
     source: &Path,
@@ -412,9 +412,10 @@ pub(crate) async fn credential_lock() -> color_eyre::Result<auth::LockGuard> {
 pub(crate) async fn register_login(
     api: String,
     organization: Option<&str>,
+    choice: OrganizationChoice<'_>,
     stderr: &mut dyn Write,
 ) -> color_eyre::Result<Value> {
-    auth::login(api, organization, stderr)
+    auth::login(api, organization, choice, stderr)
         .await
         .map_err(|failure| color_eyre::eyre::eyre!("{}", failure.body))
 }

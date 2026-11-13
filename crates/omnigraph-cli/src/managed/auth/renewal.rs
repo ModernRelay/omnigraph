@@ -11,6 +11,9 @@ const REFRESH_ATTEMPT: Duration = Duration::from_secs(6);
 const VERIFY_BUDGET: Duration = Duration::from_secs(15);
 const VERIFY_ATTEMPT: Duration = Duration::from_secs(4);
 const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
+/// The seconds a fresh device token must still have for its verification:
+/// [`VERIFY_BUDGET`] and the 30 seconds a saved token is renewed ahead of.
+const VERIFY_MARGIN: i64 = 45;
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -64,53 +67,131 @@ pub(super) struct Claims {
     exp: i64,
 }
 
-fn invalid() -> Failure {
+impl Claims {
+    /// The organization the token names, if the sign-in selected one.
+    pub(super) fn organization(&self) -> Option<&str> {
+        self.org_id.as_deref()
+    }
+}
+
+/// A session, its index or its metadata, as this machine saved it, fails a
+/// local check. `detail` names the check; it is a fixed text, never derived
+/// from the saved material.
+fn invalid(detail: &'static str) -> Failure {
+    Failure::refused("credential_invalid", detail)
+}
+
+/// What the identity provider just returned does not fit the sign-in
+/// configuration the API publishes, or is malformed. Nothing saved is at
+/// fault, and signing in again does not help while the two disagree.
+fn provider_invalid(detail: &'static str) -> Failure {
+    Failure::refused("provider_response_invalid", detail)
+}
+
+/// A sign-in that selected no organization cannot become a session: every
+/// session, saved or verified, belongs to one.
+pub(super) fn organization_required() -> Failure {
     Failure::refused(
-        "credential_invalid",
-        "the saved AuthKit credential profile or identity is invalid",
+        "organization_required",
+        "this sign-in selected no organization; run login again with --organization ORG_ID",
     )
 }
 
-pub(super) fn timestamp(value: &str) -> Result<OffsetDateTime> {
-    OffsetDateTime::parse(value, &Rfc3339).map_err(|_| invalid())
+/// Where a token under check came from, which decides its refusal's code.
+#[derive(Clone, Copy)]
+pub(super) enum Source {
+    /// Read from this machine's secure store.
+    Saved,
+    /// Just returned by the identity provider.
+    Provider,
 }
 
-fn claims(token: &str, config: &provider::Config, allow_expired: bool) -> Result<Claims> {
-    let claims = provider_claims(token, config, allow_expired)?;
-    claims.org_id.as_ref().ok_or_else(invalid)?;
+impl Source {
+    fn refuse(self, detail: &'static str) -> Failure {
+        match self {
+            Self::Saved => invalid(detail),
+            Self::Provider => provider_invalid(detail),
+        }
+    }
+}
+
+pub(super) fn timestamp(value: &str) -> Result<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| invalid("a session time is not an RFC 3339 timestamp"))
+}
+
+fn claims(
+    token: &str,
+    config: &provider::Config,
+    allow_expired: bool,
+    source: Source,
+) -> Result<Claims> {
+    let claims = provider_claims(token, config, allow_expired, source)?;
+    if claims.org_id.is_none() {
+        return Err(source.refuse("the access token names no organization"));
+    }
     Ok(claims)
 }
 
 // A fresh device session can be organizationless. Saved credentials and resource
 // verification still use claims(), which requires an organization.
-fn provider_claims(token: &str, config: &provider::Config, allow_expired: bool) -> Result<Claims> {
-    validate_token(token)?;
+fn provider_claims(
+    token: &str,
+    config: &provider::Config,
+    allow_expired: bool,
+    source: Source,
+) -> Result<Claims> {
+    validate_token(token)
+        .map_err(|_| source.refuse("the access token is empty, too long or not printable ASCII"))?;
     let parts: Vec<_> = token.split('.').collect();
     if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
-        return Err(invalid());
+        return Err(source.refuse("the access token is not a three-part JWT"));
     }
     // Metadata checks do not authenticate a JWT. The resource server verifies it.
+    let unreadable = || source.refuse("the access token's claims cannot be read");
     let claims: Claims =
-        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).map_err(|_| invalid())?)
-            .map_err(|_| invalid())?;
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).map_err(|_| unreadable())?)
+            .map_err(|_| unreadable())?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    if claims.iss != config.issuer
-        || claims.client_id != config.client_id
-        || claims.org_id.as_ref().is_some_and(|org| {
-            !org.starts_with("org_") || super::super::organization_id(org).is_err()
-        })
-        || [&claims.sub, &claims.sid].iter().any(|s| {
-            s.is_empty() || s.len() > 1024 || s.chars().any(|c| c.is_control() || c.is_whitespace())
-        })
-        || claims.iat > now + 60
-        || claims.exp <= claims.iat
+    if claims.iss != config.issuer {
+        return Err(source.refuse(
+            "the access token's issuer is not the issuer the API's sign-in configuration names",
+        ));
+    }
+    if claims.client_id != config.client_id {
+        return Err(source.refuse(
+            "the access token was issued to another client than the API's sign-in configuration names",
+        ));
+    }
+    if claims
+        .org_id
+        .as_ref()
+        .is_some_and(|org| !org.starts_with("org_") || super::super::organization_id(org).is_err())
+    {
+        return Err(source.refuse("the access token's organization ID is malformed"));
+    }
+    if [&claims.sub, &claims.sid].iter().any(|s| {
+        s.is_empty() || s.len() > 1024 || s.chars().any(|c| c.is_control() || c.is_whitespace())
+    }) {
+        return Err(source.refuse(
+            "the access token's subject or session ID is empty, too long or contains whitespace",
+        ));
+    }
+    if claims.iat > now + 60 {
+        return Err(source.refuse(
+            "the access token was issued more than 60 seconds in the future; check this machine's clock",
+        ));
+    }
+    if claims.exp <= claims.iat
         || claims
             .exp
             .checked_sub(claims.iat)
             .is_none_or(|lifetime| lifetime > 900)
-        || (!allow_expired && claims.exp <= now)
     {
-        return Err(invalid());
+        return Err(source.refuse("the access token's lifetime is not between 1 and 900 seconds"));
+    }
+    if !allow_expired && claims.exp <= now {
+        return Err(source.refuse("the access token has expired"));
     }
     Ok(claims)
 }
@@ -126,41 +207,78 @@ fn key(saved: &Session) -> Result<String> {
         &saved.identity.subject,
         &saved.identity.session_id,
     );
-    let bytes = serde_json::to_vec(&tuple).map_err(|_| invalid())?;
+    let bytes = serde_json::to_vec(&tuple)
+        .map_err(|_| invalid("a session's storage key cannot be derived"))?;
     Ok(format!("credential:{:x}", Sha256::digest(bytes)))
 }
 
 fn parse(raw: &str, origin: &str) -> Result<Session> {
     if raw.len() > MAX_CACHE {
-        return Err(invalid());
+        return Err(invalid("a saved session is larger than 64 KiB"));
     }
-    let saved: Session = serde_json::from_str(raw).map_err(|_| invalid())?;
+    let saved: Session = serde_json::from_str(raw)
+        .map_err(|_| invalid("a saved session is not in the format this CLI reads"))?;
     saved.config.validate()?;
-    let decoded = claims(&saved.access_token, &saved.config, true)?;
-    validate_token(&saved.refresh_token)?;
+    let decoded = claims(&saved.access_token, &saved.config, true, Source::Saved)?;
+    validate_token(&saved.refresh_token)
+        .map_err(|_| invalid("a saved refresh token is empty, too long or not printable ASCII"))?;
     let expiry = timestamp(&saved.expires_at)?;
     let refresh_expiry = timestamp(&saved.refresh_expires_at)?;
     let now = OffsetDateTime::now_utc();
-    if saved.version != 2
-        || saved.origin != origin
-        || canonical_origin(origin)? != origin
-        || Some(saved.identity.account_id.as_str()) != decoded.org_id.as_deref()
-        || saved.identity.subject != decoded.sub
-        || saved.identity.session_id != decoded.sid
-        || saved.identity.principal_id.is_empty()
+    if saved.version != 2 {
+        return Err(invalid("a saved session has another format version"));
+    }
+    if saved.origin != origin || canonical_origin(origin)? != origin {
+        return Err(invalid("a saved session belongs to another API origin"));
+    }
+    if Some(saved.identity.account_id.as_str()) != decoded.org_id.as_deref() {
+        return Err(invalid(
+            "a saved session's organization differs from its access token's",
+        ));
+    }
+    if saved.identity.subject != decoded.sub || saved.identity.session_id != decoded.sid {
+        return Err(invalid(
+            "a saved session's subject or session ID differs from its access token's",
+        ));
+    }
+    if saved.identity.principal_id.is_empty()
         || saved.identity.principal_id.len() > 1024
         || saved
             .identity
             .principal_id
             .chars()
             .any(|c| c.is_control() || c.is_whitespace())
-        || expiry > OffsetDateTime::from_unix_timestamp(decoded.exp).map_err(|_| invalid())?
-        || expiry > refresh_expiry
-        || refresh_expiry > now + HUMAN_SESSION_LIFETIME + MAX_METADATA_CLOCK_SKEW
     {
-        return Err(invalid());
+        return Err(invalid(
+            "a saved session's principal ID is empty, too long or contains whitespace",
+        ));
+    }
+    if expiry > token_expiry(&decoded)? || expiry > refresh_expiry {
+        return Err(invalid(
+            "a saved session expires later than its access token or its sign-in deadline",
+        ));
+    }
+    if refresh_expiry > now + HUMAN_SESSION_LIFETIME + MAX_METADATA_CLOCK_SKEW {
+        return Err(invalid(
+            "a saved session's sign-in deadline is more than 30 days away; check this machine's clock",
+        ));
     }
     Ok(saved)
+}
+
+fn token_expiry(claims: &Claims) -> Result<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp(claims.exp)
+        .map_err(|_| invalid("an access token's expiry is not a representable time"))
+}
+
+/// The saved index names a session the store does not hold.
+fn missing() -> Failure {
+    invalid("the saved session index names a session the secure store does not hold")
+}
+
+/// A saved session is not the one its index entry describes.
+fn misfiled() -> Failure {
+    invalid("a saved session is filed under another identity's key or organization")
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -178,9 +296,10 @@ fn index(store: &dyn Store, origin: &str) -> Result<Index> {
         });
     };
     if raw.len() > MAX_CACHE {
-        return Err(invalid());
+        return Err(invalid("the saved session index is larger than 64 KiB"));
     }
-    let index: Index = serde_json::from_str(&raw).map_err(|_| invalid())?;
+    let index: Index = serde_json::from_str(&raw)
+        .map_err(|_| invalid("the saved session index is not in the format this CLI reads"))?;
     if index.version != 2
         || index.sessions.len() > 128
         || index.sessions.iter().any(|(org, key)| {
@@ -190,7 +309,9 @@ fn index(store: &dyn Store, origin: &str) -> Result<Index> {
                 || !key[11..].bytes().all(|b| b.is_ascii_hexdigit())
         })
     {
-        return Err(invalid());
+        return Err(invalid(
+            "the saved session index has another version or a malformed entry",
+        ));
     }
     Ok(index)
 }
@@ -200,10 +321,10 @@ pub(super) fn validate_custody(store: &dyn Store, origin: &str) -> Result<Vec<Se
     let index = index(store, origin)?;
     let mut sessions = Vec::new();
     for (organization, reference) in index.sessions {
-        let raw = store.get(&reference)?.ok_or_else(invalid)?;
+        let raw = store.get(&reference)?.ok_or_else(missing)?;
         let saved = parse(&raw, origin)?;
         if key(&saved)? != reference || saved.identity.account_id != organization {
-            return Err(invalid());
+            return Err(misfiled());
         }
         sessions.push(saved);
     }
@@ -236,10 +357,10 @@ pub(super) fn load_selected(
     let Some((org, selected)) = selected else {
         return Ok(None);
     };
-    let raw = store.get(selected)?.ok_or_else(invalid)?;
+    let raw = store.get(selected)?.ok_or_else(missing)?;
     let saved = parse(&raw, origin)?;
     if key(&saved)? != *selected || saved.identity.account_id != org {
-        return Err(invalid());
+        return Err(misfiled());
     }
     Ok(Some(saved))
 }
@@ -250,7 +371,8 @@ pub(super) fn load(store: &dyn Store, origin: &str) -> Result<Option<Session>> {
 }
 
 pub(super) fn save(store: &dyn Store, saved: &Session) -> Result<()> {
-    let value = serde_json::to_string(saved).map_err(|_| invalid())?;
+    let value = serde_json::to_string(saved)
+        .map_err(|_| invalid("the session cannot be written in the saved format"))?;
     parse(&value, &saved.origin)?;
     let claim = session_claim(&saved.config, &saved.identity.session_id)?;
     let owner = crate::operator_routing::journal_owner().unwrap_or_else(|| "test-unbound".into());
@@ -270,13 +392,15 @@ pub(super) fn save(store: &dyn Store, saved: &Session) -> Result<()> {
         .sessions
         .insert(saved.identity.account_id.clone(), selected.clone());
     if index.sessions.len() > 128 {
-        return Err(invalid());
+        return Err(invalid(
+            "this profile already holds sessions for 128 organizations",
+        ));
     }
     // Rotation and its pending marker remain one atomic credential value. The
     // index never chooses a most-recent identity, nor copies refresh secrets.
     store.put(&selected, &value)?;
     if previous.as_ref() != Some(&selected) {
-        let encoded = serde_json::to_string(&index).map_err(|_| invalid())?;
+        let encoded = serde_json::to_string(&index).map_err(|_| unwritable_index())?;
         if let Err(error) = store.put(&saved.origin, &encoded) {
             let _ = store.remove(&selected);
             return Err(error);
@@ -288,24 +412,44 @@ pub(super) fn save(store: &dyn Store, saved: &Session) -> Result<()> {
     Ok(())
 }
 
+/// The claims of a device sign-in's fresh tokens, checked against the
+/// sign-in configuration and the provider's own response. Reads no saved
+/// state, so it says nothing yet about whether the session is new.
+pub(super) fn device_claims(
+    config: &provider::Config,
+    tokens: &workos::AuthenticateResponse,
+) -> Result<Claims> {
+    let initial = provider_claims(
+        tokens.access_token.as_ref(),
+        config,
+        false,
+        Source::Provider,
+    )?;
+    validate_token(tokens.refresh_token.as_ref()).map_err(|_| {
+        provider_invalid("the provider's refresh token is empty, too long or not printable ASCII")
+    })?;
+    if tokens.user.id != initial.sub || tokens.organization_id != initial.org_id {
+        return Err(provider_invalid(
+            "the provider's response names another user or organization than its access token",
+        ));
+    }
+    Ok(initial)
+}
+
 pub(super) fn check_device_session(
     store: &dyn Store,
     origin: &str,
     config: &provider::Config,
     tokens: &workos::AuthenticateResponse,
 ) -> Result<Claims> {
-    let initial = provider_claims(tokens.access_token.as_ref(), config, false)?;
-    validate_token(tokens.refresh_token.as_ref())?;
-    if tokens.user.id != initial.sub || tokens.organization_id != initial.org_id {
-        return Err(invalid());
-    }
+    let initial = device_claims(config, tokens)?;
     // A provider response must be a new session before it can be selected or
     // revoked. Existing token pairs stay untouched under the caller's origin lock.
     for (org, selected) in index(store, origin)?.sessions {
-        let raw = store.get(&selected)?.ok_or_else(invalid)?;
+        let raw = store.get(&selected)?.ok_or_else(missing)?;
         let cached = parse(&raw, origin)?;
         if key(&cached)? != selected || cached.identity.account_id != org {
-            return Err(invalid());
+            return Err(misfiled());
         }
         if cached.config.issuer == config.issuer
             && cached.config.client_id == config.client_id
@@ -330,8 +474,8 @@ pub(super) fn check_device_session(
 }
 
 fn session_claim(config: &provider::Config, sid: &str) -> Result<String> {
-    let bytes =
-        serde_json::to_vec(&(&config.issuer, &config.client_id, sid)).map_err(|_| invalid())?;
+    let bytes = serde_json::to_vec(&(&config.issuer, &config.client_id, sid))
+        .map_err(|_| invalid("a provider session's claim key cannot be derived"))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -370,14 +514,24 @@ pub(super) async fn select_device_organization(
         return Ok(tokens);
     };
     super::super::organization_id(organization)?;
-    if initial.org_id.as_deref() == Some(organization) {
+    // A token about to expire cannot outlast its verification, which happens
+    // when a person took their time choosing: it is renewed for the same
+    // organization, as one for another organization is exchanged.
+    if initial.org_id.as_deref() == Some(organization)
+        && initial.exp > OffsetDateTime::now_utc().unix_timestamp() + VERIFY_MARGIN
+    {
         return Ok(tokens);
     }
     let selected = provider
         .refresh(tokens.refresh_token.as_ref(), organization)
         .await
         .map_err(|error| provider::failure(&error))?;
-    let claims = claims(selected.access_token.as_ref(), config, false)?;
+    let claims = claims(
+        selected.access_token.as_ref(),
+        config,
+        false,
+        Source::Provider,
+    )?;
     if selected.user.id != initial.sub
         || claims.sub != initial.sub
         || claims.sid != initial.sid
@@ -397,10 +551,13 @@ pub(super) async fn verify(
     config: &provider::Config,
     token: &str,
     expected_user: Option<&str>,
+    source: Source,
 ) -> Result<(Identity, String, Value)> {
-    let decoded = claims(token, config, false)?;
+    let decoded = claims(token, config, false, source)?;
     if expected_user.is_some_and(|id| id != decoded.sub) {
-        return Err(invalid());
+        return Err(
+            source.refuse("the access token names another user than the provider's response")
+        );
     }
     let body = verify_session_response(&Api::new(origin.into(), Some(token.into()))?)
         .await
@@ -410,15 +567,26 @@ pub(super) async fn verify(
     let principal = bounded_string(data, "principal_id", 1024)?;
     let expires = bounded_string(data, "expires_at", 128)?;
     let expiry = timestamp(expires)?;
+    // What the API verified must be the session the token describes: a
+    // person's, in the token's organization, for no longer than the token.
+    let unlisted = || invalid("the API's verified session does not list valid service permissions");
     let permissions: Vec<String> =
-        serde_json::from_value(data["service_permissions"].clone()).map_err(|_| invalid())?;
-    super::super::validate_service_permissions(&permissions).map_err(|_| invalid())?;
-    if Some(account) != decoded.org_id.as_deref()
-        || data["kind"] != "human"
-        || expiry <= OffsetDateTime::now_utc()
-        || expiry > OffsetDateTime::from_unix_timestamp(decoded.exp).map_err(|_| invalid())?
-    {
-        return Err(invalid());
+        serde_json::from_value(data["service_permissions"].clone()).map_err(|_| unlisted())?;
+    super::super::validate_service_permissions(&permissions).map_err(|_| unlisted())?;
+    if Some(account) != decoded.org_id.as_deref() {
+        return Err(invalid(
+            "the API verified the session in another organization than its access token names",
+        ));
+    }
+    if data["kind"] != "human" {
+        return Err(invalid(
+            "the API verified the session as another kind than a person's sign-in",
+        ));
+    }
+    if expiry <= OffsetDateTime::now_utc() || expiry > token_expiry(&decoded)? {
+        return Err(invalid(
+            "the API's verified session has expired or outlasts its access token",
+        ));
     }
     let identity = Identity {
         principal_id: principal.into(),
@@ -438,16 +606,30 @@ pub(super) async fn accept(
     tokens: workos::AuthenticateResponse,
     previous: Option<&Session>,
 ) -> Result<(Session, Value)> {
-    let organization = tokens.organization_id.clone().ok_or_else(invalid)?;
+    // The provider's tokens are fresh here, from a device sign-in or a
+    // renewal: a defect in them is the provider's, not a saved session's.
+    let organization = tokens
+        .organization_id
+        .clone()
+        .ok_or_else(organization_required)?;
     let access = tokens.access_token.into_inner();
     let refresh = tokens.refresh_token.into_inner();
-    validate_token(&refresh)?;
-    let (identity, mut expires_at, mut output) =
-        verify(origin, &config, &access, Some(&tokens.user.id))
-            .await
-            .map_err(|error| scrub(scrub(error, &access), &refresh))?;
+    validate_token(&refresh).map_err(|_| {
+        provider_invalid("the provider's refresh token is empty, too long or not printable ASCII")
+    })?;
+    let (identity, mut expires_at, mut output) = verify(
+        origin,
+        &config,
+        &access,
+        Some(&tokens.user.id),
+        Source::Provider,
+    )
+    .await
+    .map_err(|error| scrub(scrub(error, &access), &refresh))?;
     if identity.account_id != organization {
-        return Err(invalid());
+        return Err(provider_invalid(
+            "the provider's response names another organization than its access token",
+        ));
     }
     let refresh_expires_at = match previous {
         Some(previous) => {
@@ -464,7 +646,7 @@ pub(super) async fn accept(
         }
         None => (OffsetDateTime::now_utc() + HUMAN_SESSION_LIFETIME)
             .format(&Rfc3339)
-            .map_err(|_| invalid())?,
+            .map_err(|_| invalid("the sign-in deadline is not a representable time"))?,
     };
     if timestamp(&expires_at)? > timestamp(&refresh_expires_at)? {
         expires_at = refresh_expires_at.clone();
@@ -747,7 +929,12 @@ pub(super) async fn credential_loaded(
     }
 }
 
-async fn revoke(origin: &str, token: String) -> bool {
+/// The saved index, changed in memory, cannot be written back.
+fn unwritable_index() -> Failure {
+    invalid("the session index cannot be written in the saved format")
+}
+
+pub(super) async fn revoke(origin: &str, token: String) -> bool {
     let Ok(api) = Api::new(origin.into(), Some(token)) else {
         return false;
     };
@@ -774,7 +961,7 @@ pub(super) async fn logout(
             } else {
                 store.put(
                     origin,
-                    &serde_json::to_string(&index).map_err(|_| invalid())?,
+                    &serde_json::to_string(&index).map_err(|_| unwritable_index())?,
                 )?;
             }
             store.remove(&selected)?;

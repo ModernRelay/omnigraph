@@ -26,6 +26,30 @@ These commands never use folder context or change the selected target. A
 cluster target cannot administer its organization implicitly. `--json` emits
 the validated API envelope.
 
+## Find your organizations
+
+```sh
+omnigraph organization list --profile work
+omnigraph organization list --profile work --json
+```
+
+This lists the organizations you are an active member of, with their names
+and IDs, and marks the one `work` signs in to. It answers from your own
+sign-in and needs no service permission; a workload profile is refused, since
+only a person has memberships. The API returns at most your first 100.
+
+A profile belongs to one organization. To work in another, create a profile
+for it with its ID:
+
+```sh
+omnigraph login --create-profile research --organization org_example
+```
+
+`--json` emits the validated API envelope, `data.organizations`, each with
+`organization_id` and a `name` that is null when the identity provider holds
+none. It does not mark the profile's own; read that from
+`credentials status --profile work --json`.
+
 ## Invite and find people
 
 ```sh

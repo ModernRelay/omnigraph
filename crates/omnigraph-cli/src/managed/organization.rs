@@ -216,6 +216,103 @@ struct InvitationPage {
     after: Option<String>,
 }
 
+/// One organization the signed-in person is an active member of. The
+/// control plane reads the name from the identity provider, which may hold
+/// none.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub(super) struct Membership {
+    pub(super) organization_id: String,
+    pub(super) name: Option<String>,
+}
+
+impl Membership {
+    /// `ID (Name)`, or the ID alone when the provider holds no name.
+    pub(super) fn label(&self) -> String {
+        match &self.name {
+            Some(name) => format!("{} ({name})", self.organization_id),
+            None => self.organization_id.clone(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct Memberships {
+    organizations: Vec<Membership>,
+}
+
+/// The control plane lists at most the first 100 active memberships.
+const MEMBERSHIPS_MAX: usize = 100;
+
+fn memberships(data: &Value) -> Result<Vec<Membership>> {
+    let listed: Memberships = parse(data)?;
+    let mut seen = BTreeSet::new();
+    if listed.organizations.len() > MEMBERSHIPS_MAX
+        || listed.organizations.iter().any(|organization| {
+            organization_id(&organization.organization_id).is_err()
+                || !optional_text(&organization.name, 256)
+                || !seen.insert(&organization.organization_id)
+        })
+    {
+        return Err(Failure::protocol());
+    }
+    Ok(listed.organizations)
+}
+
+/// The active memberships of the person `api`'s credential belongs to:
+/// `GET /v1/organizations`, validated. The answer describes the person, not
+/// the credential's organization, so unlike the team responses it names no
+/// organization of its own to check against the selected one.
+pub(super) async fn list_memberships(
+    api: &Api,
+    timeout: Duration,
+) -> Result<(Value, Vec<Membership>)> {
+    let body = api
+        .request_with_timeout(Method::GET, "/v1/organizations", None, None, timeout)
+        .await?;
+    let listed = memberships(&body["data"])?;
+    Ok((body, listed))
+}
+
+fn memberships_human(listed: &[Membership], selected: &str) -> String {
+    let mut human = String::from("Organizations you are an active member of\n");
+    for organization in listed {
+        writeln!(
+            human,
+            "{} {}  {}{}",
+            if organization.organization_id == selected {
+                "*"
+            } else {
+                " "
+            },
+            organization.organization_id,
+            organization.name.as_deref().unwrap_or("(no name)"),
+            if organization.organization_id == selected {
+                "  · this profile"
+            } else {
+                ""
+            },
+        )
+        .unwrap();
+    }
+    if listed.is_empty() {
+        human.push_str("No active organization memberships.\n");
+    }
+    if !listed
+        .iter()
+        .any(|organization| organization.organization_id == selected)
+    {
+        writeln!(
+            human,
+            "This profile's organization, {selected}, is not among them."
+        )
+        .unwrap();
+    }
+    human.push_str(
+        "\nA profile signs in to one organization. For another, create a profile with `omnigraph login --create-profile NAME --organization ORG_ID`.\n",
+    );
+    human
+}
+
 fn plain(value: &str, max: usize) -> bool {
     !value.is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
@@ -808,6 +905,10 @@ pub(super) async fn dispatch(
         binding.organization()?;
         let api = binding.client().await?;
         let organization = api.account_id()?;
+        if matches!(command, OrganizationCommand::List) {
+            let (body, listed) = list_memberships(&api, TEAM_TIMEOUT).await?;
+            return Ok((body, memberships_human(&listed, organization), 0));
+        }
         if let Some((operation, key)) = &operation {
             let mut journal = custody::Journal::open(input, binding, &api)?;
             // Look up original custody before any selector read, even after a failed write.
