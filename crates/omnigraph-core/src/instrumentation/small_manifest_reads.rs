@@ -526,8 +526,11 @@ mod tests {
 
         // The kept store is the registry's scan store, not the bounded
         // wrapper a scan dataset holds. It lives only as long as its dataset's
-        // store: once that is gone, the next scan of a dataset with another
-        // key releases it.
+        // store. Once that is gone, the next scan that keeps a store releases
+        // it, except a scan on the same registry with the same store key: that
+        // scan gets the same store back and keeps it, which is correct reuse.
+        // Every local dataset has the store key `file`, so the releasing scan
+        // here runs on another registry.
         let mut params = dataset.store_params().cloned().unwrap();
         params.block_size = Some(MAX_SCAN_FILE_BYTES as usize);
         let kept = Arc::downgrade(
