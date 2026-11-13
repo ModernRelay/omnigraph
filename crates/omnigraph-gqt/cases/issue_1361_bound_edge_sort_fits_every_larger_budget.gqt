@@ -1,0 +1,118 @@
+# issue: 1361
+# red_on: 2026-11-12, main b1d569bc on GitHub's runners (merge-queue run 43319210672 of #1368, and run 43301358856 of #1367 on 568180af): the integration test `a_query_that_fits_a_budget_fits_every_larger_budget_issue_1361` over this fixture refuses 5 MiB while 4 and 6 to 16 MiB fit, `graph take output cannot reserve 358966 bytes: 4932873 bytes are reserved, query limit is 5242880 bytes`; step `five_mib` is that budget. The refusal depends on the interleaving of the pair producer and the sort's spill cycle: on a macOS development host the same main never refused above 2 MiB in a 128 KiB sweep from 1 to 8 MiB.
+# notes: A bound-edge expansion sorts its pairs under the query pool; 4,096 edges with a 1 KiB
+# notes: payload from one source spill at every budget below 17 MiB. A budget that fits must fit
+# notes: at every larger budget: while the sort accumulates it holds at most half of
+# notes: `query_memory_bytes` in batches plus its merge's pre-reservation (a sixteenth, at
+# notes: least a third up to 512 KiB), so the pair producer has the rest whatever its
+# notes: interleaving with the sort's spill cycle.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person {
+    payload: String
+}
+
+--- seed
+{"type":"Person","data":{"name":"a0"}}
+{"type":"Person","data":{"name":"b0"}}
+
+--- load generate: v1 seed: 1 mode: append
+tables:
+  - kind: edge
+    name: Knows
+    rows: 4096
+    commits: 4
+    from: {kind: endpoint, prefix: a, width: 1, population: 1, distribution: {kind: ordinal}}
+    to: {kind: endpoint, prefix: b, width: 1, population: 1, distribution: {kind: ordinal}}
+    columns:
+      payload: {kind: repeat, text: x, count: 1024}
+--- expect ok
+
+--- query
+set query_memory_bytes = 4194304;
+query four_mib() {
+    match {
+        $p: Person { name: "a0" }
+        $p $e:knows $q
+    }
+    return { count($e.payload) as n }
+}
+
+--- expect unordered
+{"n": 4096}
+
+--- expect shape
+n: I64
+
+--- query
+set query_memory_bytes = 5242880;
+query five_mib() {
+    match {
+        $p: Person { name: "a0" }
+        $p $e:knows $q
+    }
+    return { count($e.payload) as n }
+}
+
+--- expect unordered
+{"n": 4096}
+
+--- expect shape
+n: I64
+
+--- query
+set query_memory_bytes = 6291456;
+query six_mib() {
+    match {
+        $p: Person { name: "a0" }
+        $p $e:knows $q
+    }
+    return { count($e.payload) as n }
+}
+
+--- expect unordered
+{"n": 4096}
+
+--- expect shape
+n: I64
+
+--- query
+set query_memory_bytes = 8388608;
+query eight_mib() {
+    match {
+        $p: Person { name: "a0" }
+        $p $e:knows $q
+    }
+    return { count($e.payload) as n }
+}
+
+--- expect unordered
+{"n": 4096}
+
+--- expect shape
+n: I64
+
+--- query
+set query_memory_bytes = 16777216;
+query sixteen_mib() {
+    match {
+        $p: Person { name: "a0" }
+        $p $e:knows $q
+    }
+    return { count($e.payload) as n }
+}
+
+--- expect unordered
+{"n": 4096}
+
+--- expect shape
+n: I64
