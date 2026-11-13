@@ -132,6 +132,7 @@ binary's rows.
 | Scan | [0, 1] |
 | Sort | [1] |
 | SortMergeJoin | [2] |
+| TargetCut | [1] |
 | Validate | [1] |
 <!-- /catalogue:operators -->
 
@@ -191,6 +192,7 @@ binary's rows.
 | RowDiff | routable |
 | Sort | routable |
 | TableScan | routable |
+| TargetCut | refused_by_name |
 | TextSearch | refused_by_name |
 | Validate | refused_by_name |
 <!-- /catalogue:logical_kinds -->
