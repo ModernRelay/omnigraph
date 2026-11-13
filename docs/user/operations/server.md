@@ -105,13 +105,17 @@ the server refused the token sent; a valid OIDC token it does not admit gets 403
 
 A server with neither static tokens, signed-token trust, nor policy refuses to start unless you explicitly
 pass `--unauthenticated` (or set `OMNIGRAPH_UNAUTHENTICATED=1`). Use that only
-on a trusted development network. A graph without an applied policy refuses
-every action to every token, reads included: bearer tokens are not scoped to
-graphs, so a permit there would reach every graph that lacks a policy. Apply a
-[graph policy](policy.md) to each graph a token should reach. Setting
-`OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` in the server's environment restores
-the earlier behaviour, in which every static token may `read` every graph
-without a policy; the server logs a warning at startup when it is set.
+on a trusted development network. An unauthenticated server binds only a
+loopback address (`127.0.0.1`, `::1` or `localhost`); on any other `--bind`,
+including the container's `0.0.0.0:8080`, it refuses to start unless
+`OMNIGRAPH_UNAUTHENTICATED_ALLOW_REMOTE=1` is also set. A graph without an
+applied policy refuses every action to every token, reads included: bearer
+tokens are not scoped to graphs, so a permit there would reach every graph that
+lacks a policy. Apply a [graph policy](policy.md) to each graph a token should
+reach. Setting `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` in the server's
+environment restores the earlier behaviour, in which every static token may
+`read` every graph without a policy; the server logs a warning at startup when
+it is set.
 
 ### Assert the actor
 
