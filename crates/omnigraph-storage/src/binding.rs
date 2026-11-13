@@ -383,15 +383,27 @@ impl CapturedStorageBinding {
                         builder = builder.with_config(key, value);
                     }
                 }
+                let captured_retry = captured_retry_config(
+                    self.options.get("client_max_retries").map(String::as_str),
+                    self.options.get("client_retry_timeout").map(String::as_str),
+                )?;
+                let build = |builder: AmazonS3Builder| {
+                    builder.build().map_err(|_| binding_error("failed to initialize the captured S3 destination; verify its native credentials and transport options"))
+                };
+                // A scope routes reads and fresh immutable writes to a
+                // retrying client and everything else to a single-attempt
+                // one, as the environment path does. The retrying client
+                // keeps this binding's captured retry bounds.
+                let retrying = match scope {
+                    Some(_) => Some(build(builder.clone().with_retry(captured_retry.clone()))?),
+                    None => None,
+                };
                 builder = builder.with_retry(if scope.is_some() {
                     single_attempt_retry_config()
                 } else {
-                    captured_retry_config(
-                        self.options.get("client_max_retries").map(String::as_str),
-                        self.options.get("client_retry_timeout").map(String::as_str),
-                    )?
+                    captured_retry
                 });
-                let store = builder.build().map_err(|_| binding_error("failed to initialize the captured S3 destination; verify its native credentials and transport options"))?;
+                let store = build(builder)?;
                 let adapter = ObjectStorageAdapter {
                     store: Arc::new(store),
                     scope: None,
@@ -405,9 +417,11 @@ impl CapturedStorageBinding {
                     omit_write_etag: false,
                     read_through: None,
                 };
-                Ok(match scope {
-                    Some(scope) => adapter.with_scope(scope),
-                    None => adapter,
+                Ok(match (scope, retrying) {
+                    (Some(scope), Some(retrying)) => {
+                        adapter.with_scope_and_retrying(scope, Arc::new(retrying))
+                    }
+                    _ => adapter,
                 })
             }
         }
@@ -719,6 +733,100 @@ mod tests {
         assert_eq!(
             bound.uri(),
             write_queue_root_identity(real.join("new").to_str().unwrap()).unwrap()
+        );
+    }
+
+    /// Serves `status` to every request until `limit` requests or the
+    /// deadline, and returns how many requests arrived.
+    fn spawn_counting_status_server(
+        status: u16,
+        limit: usize,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local status server");
+        listener
+            .set_nonblocking(true)
+            .expect("configure local status server");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("local server address")
+        );
+        let server = tokio::task::spawn_blocking(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut served = 0;
+            while served < limit && Instant::now() < deadline {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("status server accept failed: {error}"),
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("configure blocking status connection");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("configure status server read timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).expect("read local status request");
+                    assert!(read != 0, "status request ended before its headers");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                assert!(request.starts_with(b"GET "), "expected an object-store GET");
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write local status response");
+                stream.flush().expect("flush local status response");
+                served += 1;
+            }
+            served
+        });
+        (endpoint, server)
+    }
+
+    /// Issue #1386: a scoped captured S3 binding keeps the binding's read
+    /// retries, as the environment path does; only its conditional and
+    /// mutable requests are single-attempt.
+    #[tokio::test]
+    async fn scoped_captured_s3_binding_retries_reads() {
+        const MAX_RETRIES: usize = 1;
+        let (endpoint, server) = spawn_counting_status_server(503, MAX_RETRIES + 1);
+        let mut binding = CapturedStorageBinding::capture(
+            "s3://bucket/cluster",
+            &StorageDestination::S3 {
+                region: "us-east-1".into(),
+                endpoint: Some(endpoint),
+                virtual_hosted_style: false,
+            },
+        )
+        .unwrap();
+        for (key, value) in [
+            ("aws_access_key_id", "test-access-key"),
+            ("aws_secret_access_key", "test-secret-key"),
+            ("allow_http", "true"),
+            ("client_max_retries", "1"),
+            ("client_retry_timeout", "5"),
+        ] {
+            binding.options.insert(key.into(), value.into());
+        }
+        let adapter = binding.adapter(Some(StorageIoScope::new())).unwrap();
+        adapter
+            .read_text("s3://bucket/cluster/key")
+            .await
+            .expect_err("a 503 must fail the read");
+        assert_eq!(
+            server.await.expect("join local status server"),
+            MAX_RETRIES + 1,
+            "a scoped binding's read must retry up to the captured client_max_retries"
         );
     }
 }

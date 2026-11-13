@@ -243,6 +243,16 @@ async fn branch_ref_names(dataset: &Dataset) -> Result<Vec<String>> {
     list_branch_ref_names(&store, &root.path).await
 }
 
+/// Whether a native ref named `native` is listed under `_refs/branches/`.
+/// Only the ref names are listed; no ref is read, so a listing failure
+/// surfaces as itself.
+pub async fn branch_ref_is_listed(dataset: &Dataset, native: &str) -> Result<bool> {
+    Ok(branch_ref_names(dataset)
+        .await?
+        .iter()
+        .any(|name| name == native))
+}
+
 async fn branch_tree_exists(dataset: &Dataset, branch: &str) -> Result<bool> {
     let target = dataset
         .branch_location()

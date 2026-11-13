@@ -1241,18 +1241,13 @@ impl StagedCommitMetadata {
 }
 
 /// One Lance detached commit of `transaction` on `ds`: no conflict pass, no
-/// HEAD movement, no auto-cleanup.
-async fn commit_detached(
-    ds: Arc<Dataset>,
-    transaction: Transaction,
-    affected_rows: Option<RowAddrTreeMap>,
-) -> Result<Dataset> {
-    let mut builder = crate::lance_commit::commit_builder(ds)
+/// HEAD movement, no auto-cleanup. It takes no `affected_rows`: Lance passes
+/// them only to an attached commit's conflict pass, which a detached commit
+/// skips. A staged write's `affected_rows` serve the rebase check instead.
+async fn commit_detached(ds: Arc<Dataset>, transaction: Transaction) -> Result<Dataset> {
+    let builder = crate::lance_commit::commit_builder(ds)
         .with_skip_auto_cleanup(true)
         .with_detached(true);
-    if let Some(affected_rows) = affected_rows {
-        builder = builder.with_affected_rows(affected_rows);
-    }
     // A detached commit is unreachable until a manifest names it, so its
     // failure is definite for the graph whatever its storage cause.
     builder
@@ -2325,16 +2320,15 @@ impl TableStore {
 
     /// Whether a named fork the accepted snapshot places on `entry` no longer
     /// exists as a ref on its table dataset. Absence is proven from the ref
-    /// listing so a transient or permission failure surfaces as itself rather
-    /// than as a branch-lifecycle conclusion.
+    /// name listing (no ref is read) so a transient or permission failure
+    /// surfaces as itself rather than as a branch-lifecycle conclusion.
     pub(crate) async fn named_fork_is_absent(&self, entry: &DatasetEntry) -> Result<bool> {
         let Some(native) = entry.native_dataset_branch.as_deref() else {
             return Ok(false);
         };
         let uri = self.dataset_uri(&entry.dataset_path);
         let root = self.open_dataset_head(&uri, None).await?;
-        let refs = crate::branch_control::list_branch_contents(&root).await?;
-        Ok(!refs.contains_key(native))
+        Ok(!crate::branch_control::branch_ref_is_listed(&root, native).await?)
     }
 
     pub async fn open_dataset_head(
@@ -4683,14 +4677,13 @@ impl TableStore {
             declared_full_text,
         )
         .await?;
-        let mut dataset =
-            commit_detached(ds, staged.transaction, staged.commit_metadata.affected_rows).await?;
+        let mut dataset = commit_detached(ds, staged.transaction).await?;
         if let Some(mut declaration) = self
             .stage_full_text_declarations(&dataset, &undeclared)
             .await?
         {
             witness.stamp(&mut declaration);
-            dataset = commit_detached(Arc::new(dataset), declaration, None).await?;
+            dataset = commit_detached(Arc::new(dataset), declaration).await?;
         }
         let identity = self.transaction_identity(&dataset)?;
         Ok((dataset, identity))
@@ -4713,7 +4706,7 @@ impl TableStore {
             return Ok(None);
         };
         witness.stamp(&mut declaration);
-        let dataset = commit_detached(ds, declaration, None).await?;
+        let dataset = commit_detached(ds, declaration).await?;
         let identity = self.transaction_identity(&dataset)?;
         Ok(Some((dataset, identity)))
     }

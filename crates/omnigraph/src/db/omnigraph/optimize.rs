@@ -1735,40 +1735,61 @@ async fn measure_plan(
 /// The bytes of `source`'s data, overlay and deletion files: a data file's
 /// recorded size, or a HEAD of the file when none is recorded, and a HEAD of
 /// each deletion file, which records no size in Lance 13. Each file resolves
-/// through the collector's base rule. Counting stops once it passes
-/// `ceiling`. `None` when a size cannot be read.
+/// through the collector's base rule. The HEADs run up to the store's I/O
+/// parallelism at a time, issued and summed in file order. Counting stops once
+/// it passes `ceiling`. `None` when a size cannot be read.
 async fn source_file_bytes(
     ds: &lance::Dataset,
     source: &[lance_table::format::Fragment],
     ceiling: u64,
 ) -> Option<u64> {
-    let mut total = 0_u64;
+    let mut probes = Vec::new();
     for fragment in source {
         for file in fragment.referenced_lance_files() {
-            let size = match file.file_size_bytes.get() {
-                Some(size) => size.get(),
-                None => {
-                    let (store, path) =
-                        super::collector::data_file_location(ds, file).await.ok()?;
-                    store.size(&path).await.ok()?
-                }
-            };
-            total = total.saturating_add(size);
-            if total > ceiling {
-                return Some(total);
-            }
+            probes.push(match file.file_size_bytes.get() {
+                Some(size) => SizeProbe::Recorded(size.get()),
+                None => SizeProbe::Data(file.clone()),
+            });
         }
         if let Some(deletion) = &fragment.deletion_file {
-            let (store, path) = super::collector::deletion_file_location(ds, fragment.id, deletion)
-                .await
-                .ok()?;
-            total = total.saturating_add(store.size(&path).await.ok()?);
-            if total > ceiling {
-                return Some(total);
-            }
+            probes.push(SizeProbe::Deletion(fragment.id, deletion.clone()));
+        }
+    }
+    let parallelism = ds
+        .object_store(None)
+        .await
+        .map_or(1, |store| store.io_parallelism());
+    let mut sizes =
+        futures::stream::iter(probes.into_iter().map(|probe| probe.size(ds))).buffered(parallelism);
+    let mut total = 0_u64;
+    while let Some(size) = sizes.next().await {
+        total = total.saturating_add(size?);
+        if total > ceiling {
+            return Some(total);
         }
     }
     Some(total)
+}
+
+/// One file of `source_file_bytes`: a recorded size, or a file to HEAD.
+enum SizeProbe {
+    Recorded(u64),
+    Data(lance_table::format::DataFile),
+    Deletion(u64, lance_table::format::DeletionFile),
+}
+
+impl SizeProbe {
+    async fn size(self, ds: &lance::Dataset) -> Option<u64> {
+        let (store, path) = match self {
+            Self::Recorded(size) => return Some(size),
+            Self::Data(file) => super::collector::data_file_location(ds, &file).await,
+            Self::Deletion(fragment_id, deletion) => {
+                super::collector::deletion_file_location(ds, fragment_id, &deletion).await
+            }
+        }
+        .ok()?;
+        store.size(&path).await.ok()
+    }
 }
 
 decide_seam! {

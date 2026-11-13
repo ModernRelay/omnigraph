@@ -67,11 +67,14 @@ absent, or still at the expected version, once no re-issue settles the request
 leaves the write failed with its outcome unknown.
 
 A command that writes storage directly, without a server, uses a client that
-retries a request itself before any re-issue: up to its `max_retries` (10 by
-default), and on S3 an if-match that meets a conflicting write in flight too.
-Those attempts are not logged. Because one of them may have applied, that
-client's permission or authentication error is re-issued like a lost answer,
-and its first conflict is read back.
+retries a request itself before any re-issue, and on S3 an if-match that meets
+a conflicting write in flight too. A CLI target captures its retry bounds once:
+3 retries and 180 seconds by default. `OBJECT_STORE_CLIENT_MAX_RETRIES` and
+`OBJECT_STORE_CLIENT_RETRY_TIMEOUT` can lower them but not raise them. An
+application that opens a graph from the `AWS_*` environment keeps object_store's
+own default of 10 retries. These client retries are not logged. Because one of
+them may have applied, that client's permission or authentication error is
+re-issued like a lost answer, and its first conflict is read back.
 
 A write to a reused key whose outcome is unknown refuses later writes to that
 key only, until a clean shutdown; a clean shutdown with such a key retains

@@ -1,0 +1,1 @@
+- `optimize` planning under a source byte ceiling reads file sizes concurrently, and a deleted fork check lists ref names instead of reading every ref.
