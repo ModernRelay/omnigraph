@@ -363,7 +363,7 @@
     "bound_point_id": "09fb205c377c6d161449ebdc29dd123c7dc16d3855f39142aa52ad2666f33b63"
   },
   "nearest-ranks-updated-embedding": {
-    "planned_sha256": "9722df5f27c7cb0ffa53b720bb5e7d8c96f99e853deffe2a857b8a532fedf40b",
+    "planned_sha256": "e022a537307fcf252d71da0cb45aa86cb20e501d14c6755e77bab517d8209e29",
     "recipe_sha256": "84b7e8bb5cb9161c03d33e5f798712c62cd185c3ea171e3eb56e6756ea836c6e",
     "needs_indices": true,
     "cache_condition": {
@@ -373,10 +373,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "f4d866a7ecea1f18e613b9b164110415a2940305f45bb86336c72b24cf47b72b",
+    "workload_sha256": "aa1241b282621229b00226c8273b5728c59f763365a7d14fbe7d7e9c0f7a8783",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- query\nquery nearest_after_update($q: Vector(4)) {\n    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 6) }\n    return { $d.slug }\n    order { $distance }\n    limit 6\n}\n"
+      "text": "--- query\nquery nearest_after_update($q: Vector(4)) {\n    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 6) as $distance }\n    return { $d.slug }\n    order { $distance }\n    limit 6\n}\n"
     },
     "environment": {
       "backend": {
@@ -393,10 +393,10 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "c0ab22b12989093e453ade99c6de46b84123d0953fcd04ba4fbdd40173df6eed"
+    "bound_point_id": "d9a248d49ee16e4af6efa47c05ed4c0b06282a39bb6bd948c194be60727d9db3"
   },
   "nearest-skips-deleted-rows-and-fills-limit": {
-    "planned_sha256": "13458016a8003fb785d2b07f50682ff2cecca4d7482bc91821b4b20796750e75",
+    "planned_sha256": "ee34c885cca22d499f32c04beeabe855c2e80ada2801a5daef0bef465d8fbd47",
     "recipe_sha256": "d891c3d4d3a3e7fbe741d806c1205a72d59ee2505e689ccf6552a140045d3920",
     "needs_indices": true,
     "cache_condition": {
@@ -406,10 +406,10 @@
       "program": "none",
       "iterations": 0
     },
-    "workload_sha256": "d6d27db65699dd00d77c842da2c856af3a140d192622f76e8cd8f0780de40d39",
+    "workload_sha256": "cf62225baecc88b08290ee4eb8a36902d0b3fc9af6cc2eca9cf7d9b2a68d9f5f",
     "measured_step": {
       "ordinal": 1,
-      "text": "--- query\nquery nearest_after_delete($q: Vector(4)) {\n    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 3) }\n    return { $d.slug }\n    order { $distance }\n    limit 3\n}\n"
+      "text": "--- query\nquery nearest_after_delete($q: Vector(4)) {\n    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }\n    return { $d.slug }\n    order { $distance }\n    limit 3\n}\n"
     },
     "environment": {
       "backend": {
@@ -426,7 +426,7 @@
       "timer": "monotonic"
     },
     "repetitions": 1,
-    "bound_point_id": "83dfa5c68aa06ba0cf18fa7c619a9def921584faabe44e8f67c61a8f2e01471a"
+    "bound_point_id": "528168b841b10ba97efc9707f2c9c16a6d169b5988d3c79cd9461f6c2bbd068f"
   },
   "parallel-tables-1": {
     "planned_sha256": "b8247db3462e0e124ef441e9fe83bd80440dbc053edc576ac21df1aa3012a35e",

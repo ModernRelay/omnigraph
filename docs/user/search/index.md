@@ -2,27 +2,33 @@
 
 OmniGraph combines vector, full-text, and graph patterns in one `.gq` query.
 Search predicates filter a matched node set; a ranking is a relation that
-`match` draws rows from with `from`, its score arriving as a column.
+`match` draws rows from with `from`, its score a column the `from` names
+with `as`.
 
 ## Functions
 
 | Function | Meaning |
 |---|---|
-| `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by L2 distance, with the distance as `$distance`. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
-| `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their BM25 relevance as `$score`. |
-| `rrf(ranking, ranking, k: 60)` | Two rankings of one population fused with Reciprocal Rank Fusion, the fused score as `$score`. The default `k` is 60. |
+| `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by L2 distance, with the distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
+| `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their BM25 relevance as the score. |
+| `rrf(ranking, ranking, k: 60)` | Two rankings of one population fused with Reciprocal Rank Fusion, the fused score as the score. The default `k` is 60. |
 | `search($d.body, $q)` | Full-text token search. |
 | `fuzzy($d.body, $q, max_edits: n)` | Full-text search with edit-distance tolerance. |
 | `match_text($d.body, $q)` | Match a full-text query in a `match` block. |
 
-The first argument of a ranking is the population it ranks: an inline read,
-`{ match { ... } return { $d } }`, whose `return` names the bindings the rest
-of the query reads, or a relation a `let` names. The second is the ranked
-property of a node binding of that population. `from` adds the population's
-columns and the score column to the query; return the score as `$distance` or
-`$score`, alias it (`$score as score`), and order by it, `order { $distance }`
-for a distance and `order { $score desc }` for a relevance score. The score is
-an ordinary column: it may be any `order` key, in either direction, or none.
+The first argument of a ranking is the population it ranks: a relation a
+`let` names before the ranking, `let $pop = { match { ... } return { $d } }`,
+whose `return` names the bindings the rest of the query reads, or the same
+inline read in its place. The second is the ranked property of a node binding
+of that population. `from` adds the population's columns and the score column
+to the query, and `as` names the score: `from nearest($pop, $d.embedding, $q,
+k: 10) as $distance`. A `from` that ranks without `as`, or an `as` on a `from`
+that ranks nothing, is refused (`T85`), so a score enters scope only under the
+name written; inside a relation function's argument, such as an `rrf` arm, a
+score has no name. Return the score (`$distance`, or aliased,
+`$score as score`) and order by it, `order { $distance }` for a distance and
+`order { $score desc }` for a relevance score. The score is an ordinary
+column: it may be any `order` key, in either direction, or none.
 Elements and a `where` written after the `from` run over the rows the ranking
 selected; a row they remove is not replaced by the next candidate. A ranking written as a call in `order` or `return`, such as
 `order { nearest($d.embedding, $q) }`, is refused (`T65`) with the `from` form
@@ -66,7 +72,7 @@ shift fused ranks.
 
 ```gq
 query similar($q: Vector(4)) {
-  match { from nearest({ match { $d: Document } return { $d } }, $d.embedding, $q, k: 10) }
+  match { let $pop = { match { $d: Document } return { $d } }, from nearest($pop, $d.embedding, $q, k: 10) as $distance }
   return { $d.slug, $d.title }
   order { $distance }
   limit 10
@@ -139,7 +145,7 @@ within its own block.
 
 ```gq
 query relevant($q: String) {
-  match { from bm25({ match { $d: Document } return { $d } }, $d.body, $q) }
+  match { let $pop = { match { $d: Document } return { $d } }, from bm25($pop, $d.body, $q) as $score }
   return { $d.slug, $score as score }
   order { $score desc }
   limit 10
@@ -147,10 +153,11 @@ query relevant($q: String) {
 ```
 
 `score` is the relevance the ranking used, the one value the `$score` column
-holds. `nearest` gives its distance the same way as `$distance`, the squared L2
-distance Lance ranks by, and `rrf` gives the fused score as an `F64` `$score`.
-Without an alias the column is `score` or `distance`; write
-`$score as _score` or `$distance as _distance` for those names. A search
+holds. `nearest` gives its distance the same way, the squared L2 distance
+Lance ranks by, and `rrf` gives the fused score as an `F64`. Without an alias
+the result column takes the score's name, `$score` giving `score` and
+`$distance` giving `distance`; write `$score as _score` or
+`$distance as _distance` for those names. A search
 predicate, `search(...)`, `fuzzy(...)` or `match_text(...)`, stands alone as a
 filter and is not a return item (`T38`). An aggregate over the score, such
 as `max($score)`, is not lowered in this release (`T86`).
@@ -162,13 +169,14 @@ not accelerate equality, `starts_with(...)`, or literal substring `contains(...)
 
 Reciprocal Rank Fusion combines rankings without assuming their raw scores use
 the same scale. Name the population once with `let` and rank it in both arms;
-`from rrf(...)` draws one row per target with the fused `$score`:
+`from rrf(...) as $score` draws one row per target with the fused score as
+`$score`:
 
 ```gq
 query hybrid($vector: Vector(4), $text: String) {
   match {
     let $all = { match { $d: Document } return { $d } },
-    from rrf(nearest($all, $d.embedding, $vector, k: 10), bm25($all, $d.body, $text), k: 60),
+    from rrf(nearest($all, $d.embedding, $vector, k: 10), bm25($all, $d.body, $text), k: 60) as $score,
   }
   return { $d.slug, $d.title }
   order { $score desc }
@@ -197,7 +205,8 @@ declared at all; its `return` lists every binding the rest of the query reads:
 ```gq
 query passages($matter: String, $q: String) {
   match {
-    from bm25({ match { $r: SourceRevision, $p: Passage, $r hasPassage $p } where $r.matter_number = $matter return { $r, $p } }, $p.text, $q),
+    let $pop = { match { $r: SourceRevision, $p: Passage, $r hasPassage $p } where $r.matter_number = $matter return { $r, $p } },
+    from bm25($pop, $p.text, $q) as $score,
   }
   return { $r.path, $p.locator }
   order { $score desc }

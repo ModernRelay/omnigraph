@@ -23,7 +23,7 @@ node Doc {
 
 --- query
 query bm25_bare() {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, "needle") }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, "needle") as $score }
     return { $d.slug }
     order { $score desc }
     limit 2
@@ -61,7 +61,7 @@ query rrf_asc($v: Vector(2)) {
 
 --- query
 query rrf_desc($v: Vector(2)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, "needle"), k: 60), $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, "needle"), k: 60) as $score, $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 2

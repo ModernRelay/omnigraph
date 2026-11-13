@@ -1363,7 +1363,7 @@ fn walk_pattern(
                 LetValue::Relation(body) => walk_read(body, params, needs_indices)?,
                 LetValue::Expr(e) => walk_expr(e, params, needs_indices)?,
             },
-            Element::From(rel) => match rel {
+            Element::From { rel, .. } => match rel {
                 RelExpr::Inline(body) => walk_read(body, params, needs_indices)?,
                 RelExpr::Call(call) => walk_expr(&Expr::Call(call.clone()), params, needs_indices)?,
                 RelExpr::Variable(_) => {}
@@ -1405,7 +1405,10 @@ fn read_body(decl: &QueryDecl) -> Option<&ReadBody> {
 /// Whether a read draws a ranking with `from` (`nearest`, `bm25`, `rrf`).
 fn ranks(body: &ReadBody) -> bool {
     body.pattern.elements.iter().any(|element| match element {
-        Element::From(RelExpr::Call(call)) => {
+        Element::From {
+            rel: RelExpr::Call(call),
+            ..
+        } => {
             matches!(call.name.as_str(), "nearest" | "bm25" | "rrf")
         }
         _ => false,

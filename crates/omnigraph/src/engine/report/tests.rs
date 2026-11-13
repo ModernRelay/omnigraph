@@ -957,26 +957,27 @@ fn doc_seed() -> Vec<String> {
 
 const DOC_QUERIES: &str = r#"
 query by_text($t: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $t) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $t) as $score }
     return { $d.slug }
     order { $score desc }
     limit 3
 }
 query fused($t: String, $q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60), $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 3
 }
 query fused_then_slug($t: String, $q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60), $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
     return { $d.slug }
     order { $score desc, $d.slug }
     limit 3
 }
 query nearest_with_edge($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
+      let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
     }
     return { $d.slug }
     order { $distance }

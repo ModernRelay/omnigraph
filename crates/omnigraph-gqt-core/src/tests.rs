@@ -1361,14 +1361,14 @@ fn refuses_embed_schema() {
 
 #[test]
 fn refuses_nearest_over_a_string_literal() {
-    let query = "--- query\nquery q() {\n    match { from nearest({ match { $p: Person } return { $p } }, $p.name, \"alpha\", k: 3) }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
+    let query = "--- query\nquery q() {\n    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.name, \"alpha\", k: 3) as $distance }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
     assert!(refusal("x", &text).contains("string argument"));
 }
 
 #[test]
 fn refuses_nearest_over_a_string_param() {
-    let query = "--- query\nquery q($q: String) {\n    match { from nearest({ match { $p: Person } return { $p } }, $p.name, $q, k: 3) }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
+    let query = "--- query\nquery q($q: String) {\n    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.name, $q, k: 3) as $distance }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
     let text = format!(
         "{HDR}{SCHEMA}{SEED}{query}--- params\n{{\"q\": \"alpha\"}}\n--- expect unordered\n"
     );
@@ -2501,7 +2501,7 @@ fn refuses_loop_headers_with_a_body() {
 
 #[test]
 fn refuses_nearest_over_a_string_property() {
-    let query = "--- query\nquery q() {\n    match { from nearest({ match { $p: Person } return { $p } }, $p.name, $p.name, k: 3) }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
+    let query = "--- query\nquery q() {\n    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.name, $p.name, k: 3) as $distance }\n    return { $p.name }\n    order { $distance }\n    limit 3\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n");
     assert!(refusal("x", &text).contains("vector parameter"));
 }
@@ -2791,7 +2791,7 @@ async fn assert_csr_pin_runs(session: &Session, step: &QueryStep, stage: &str) {
 
 #[test]
 fn refuses_ordered_expect_with_an_aggregate_in_return() {
-    let query = "--- query\nquery q($t: String) {\n    match { from bm25({ match { $p: Person }\n        where search($p.name, $t) return { $p } }, $p.name, $t) }\n    \
+    let query = "--- query\nquery q($t: String) {\n    match { let $pop = { match { $p: Person }\n        where search($p.name, $t) return { $p } }, from bm25($pop, $p.name, $t) as $score }\n    \
                  return { count($p) as total }\n}\n";
     let text = format!("{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n");
     assert!(refusal("x", &text).contains("order` clause"));
@@ -2802,7 +2802,7 @@ fn refuses_ordered_expect_with_an_aggregate_in_return() {
     let text =
         format!("{HDR}{SCHEMA}{SEED}{query}--- expect unordered\n--- expect shape\ntotal: I64?\n");
     parse_case("x", &text).unwrap();
-    let query = "--- query\nquery q($t: String) {\n    match { from bm25({ match { $p: Person } return { $p } }, $p.name, $t) }\n    \
+    let query = "--- query\nquery q($t: String) {\n    match { let $pop = { match { $p: Person } return { $p } }, from bm25($pop, $p.name, $t) as $score }\n    \
                  return { $p.name, count($p) as total }\n    order { total desc }\n    limit 3\n}\n";
     let text = format!(
         "{HDR}{SCHEMA}{SEED}{query}--- expect ordered\n--- expect shape\np.name: String\ntotal: I64?\n"
@@ -2814,15 +2814,15 @@ fn refuses_ordered_expect_with_an_aggregate_in_return() {
 fn refuses_ordered_expect_with_rank_only_distinct_issue_953() {
     for (ranking, score) in [
         (
-            "from nearest({ match { $p: Person } return { $p } }, $p.vec, $v, k: 3)",
+            "let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.vec, $v, k: 3) as $distance",
             "$distance",
         ),
         (
-            "from bm25({ match { $p: Person } return { $p } }, $p.name, $t)",
+            "let $pop = { match { $p: Person } return { $p } }, from bm25($pop, $p.name, $t) as $score",
             "$score desc",
         ),
         (
-            "let $all = { match { $p: Person } return { $p } }, from rrf(nearest($all, $p.vec, $v, k: 3), bm25($all, $p.name, $t), k: 60)",
+            "let $all = { match { $p: Person } return { $p } }, from rrf(nearest($all, $p.vec, $v, k: 3), bm25($all, $p.name, $t), k: 60) as $score",
             "$score desc",
         ),
     ] {

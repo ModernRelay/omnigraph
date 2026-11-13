@@ -41,7 +41,8 @@ node Chunk {
 --- query
 query recall_count($q: String) {
     match {
-      from bm25({ match { $c: Chunk } where search($c.text, $q) return { $c } }, $c.text, $q),
+      let $pop = { match { $c: Chunk } where search($c.text, $q) return { $c } },
+      from bm25($pop, $c.text, $q) as $score,
     }
     return { count($c) as total }
     limit 2

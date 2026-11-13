@@ -8221,7 +8221,7 @@ node Probe {
 query fused($t: String) {
     match {
       let $all = { match { $d: Doc } return { $d } },
-      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60),
+      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "needle needle"), k: 60) as $score,
       $d: Doc,
       $p: Probe,
     }

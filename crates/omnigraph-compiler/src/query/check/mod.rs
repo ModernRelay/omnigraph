@@ -258,16 +258,154 @@ fn infix_string(op: InfixStringOp, at: &SourceSpan, list: bool) -> QueryDiagnost
     diagnostic
 }
 
+/// The score column a ranking term appends: the term is a ranking, drawn
+/// directly or through a named relation.
+fn score_column(term: &Term) -> Option<&str> {
+    match term {
+        Term::Score { out, .. } | Term::ApproxTopK { out, .. } | Term::Fuse { out, .. } => {
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// A ranking drawn by a `from` whose `as` names its score: the score column
+/// takes the written name.
+fn rename_score(r: &mut Rel, name: &str) -> R<()> {
+    let at = match &r.term {
+        Term::Fuse { .. } => 1,
+        _ => r.ty.cols.len() - 1,
+    };
+    if r.ty.cols[at].name == name {
+        return Ok(());
+    }
+    if r.ty.cols.iter().any(|c| c.name == name) {
+        return Err(err_fix(
+            T68,
+            format!("the ranking already has a `{name}` column"),
+            "name the score another way: `as $<name>`",
+        ));
+    }
+    r.ty.cols[at].name = name.to_string();
+    match &mut r.term {
+        Term::Score { out, .. } | Term::ApproxTopK { out, .. } | Term::Fuse { out, .. } => {
+            *out = name.to_string()
+        }
+        _ => unreachable!("score_column holds"),
+    }
+    Ok(())
+}
+
+/// A ranking in a relation function's argument: its score has no name, so
+/// the relation keeps only its population's columns (an `rrf` arm is read
+/// whole, since fusion keeps only the target and the fused score).
+fn unnamed_score(r: Rel) -> Rel {
+    if score_column(&r.term).is_none() {
+        return r;
+    }
+    let at = match &r.term {
+        Term::Fuse { .. } => 1,
+        _ => r.ty.cols.len() - 1,
+    };
+    let mut cols = r.ty.cols;
+    cols.remove(at);
+    let mut shaped = r.shaped;
+    shaped.remove(at);
+    Rel {
+        term: Term::Project {
+            input: r.term.boxed(),
+            items: cols
+                .iter()
+                .map(|c| {
+                    (
+                        c.name.clone(),
+                        SExpr::new(SKind::Col(c.name.clone()), c.ty.clone()).to_ir(),
+                    )
+                })
+                .collect(),
+            keep: false,
+        },
+        ty: RelTy { cols },
+        shaped,
+        ranked: None,
+        free: r.free,
+    }
+}
+
+/// The relation a `from` draws, as a fix names it.
+fn relation_text(rel: &RelExpr) -> String {
+    match rel {
+        RelExpr::Call(c) => format!("{}(…)", c.name),
+        RelExpr::Variable(v) => format!("${v}"),
+        RelExpr::Inline(_) => "{ … }".to_string(),
+    }
+}
+
+/// `T85` for a ranked `from` without `as`; the fix names the score as the
+/// column it was before names were written (`distance`, `score`), or a fresh
+/// variant of it.
+fn unnamed_ranking(rel: &RelExpr, name: &str, span: Option<&SourceSpan>) -> QueryDiagnostic {
+    let mut d = QueryDiagnostic::typecheck(
+        T85,
+        format!(
+            "`from {}` ranks without naming its score: a ranked `from` names its score with `as`, and the score enters scope only under that name",
+            relation_text(rel)
+        ),
+    )
+    .with_fix(format!("from {} as ${name}", relation_text(rel)));
+    if let Some(span) = span {
+        d.position = Some(span.position);
+        if let [(_, end)] = span.ranges.as_slice() {
+            d = d.with_suggestion(Suggestion {
+                applicability: Applicability::MachineApplicable,
+                edits: vec![TextEdit {
+                    start: *end,
+                    end: *end,
+                    replacement: format!(" as ${name}"),
+                }],
+            });
+        }
+    }
+    d
+}
+
+/// `T85` for an `as` on a `from` that ranks nothing: its columns are named
+/// by its relation, so the fix removes the `as`.
+fn named_non_ranking(rel: &RelExpr, name: &str, span: Option<&SourceSpan>) -> QueryDiagnostic {
+    let mut d = QueryDiagnostic::typecheck(
+        T85,
+        format!(
+            "`from {} as ${name}`: `as` names a ranking's score, and this `from` ranks nothing; its columns are named by its relation",
+            relation_text(rel)
+        ),
+    )
+    .with_fix(format!("from {}", relation_text(rel)));
+    if let Some(span) = span {
+        d.position = Some(span.position);
+        if let [(_, end)] = span.ranges.as_slice() {
+            d = d.with_suggestion(Suggestion {
+                applicability: Applicability::MachineApplicable,
+                edits: vec![TextEdit {
+                    start: *end,
+                    end: span.end,
+                    replacement: String::new(),
+                }],
+            });
+        }
+    }
+    d
+}
+
 /// `T65`: a ranking written as a scalar call, in `order`, `return` or a
 /// filter; the fix draws it with `from` and reads its score column.
 fn ranking_as_scalar(name: &str) -> QueryDiagnostic {
     let fix = match name {
         "nearest" => {
-            "from nearest(<population>, $x.field, $q, k: <limit>)  and  order { $distance }"
+            "from nearest(<population>, $x.field, $q, k: <limit>) as $distance  and  order { $distance }"
         }
-        "bm25" => "from bm25(<population>, $x.field, $q)  and  order { $score desc }",
-        "rrf" => "from rrf(<arm>, <arm>, k: 60)  and  order { $score desc }",
-        _ => "from distance(<population>, $x.field, $q)  and  order { $distance }",
+        "bm25" => "from bm25(<population>, $x.field, $q) as $score  and  order { $score desc }",
+        "rrf" => "from rrf(<arm>, <arm>, k: 60) as $score  and  order { $score desc }",
+        _ => "from distance(<population>, $x.field, $q) as $distance  and  order { $distance }",
     };
     QueryDiagnostic::typecheck(
         T65,
@@ -283,7 +421,11 @@ fn ranking_as_scalar(name: &str) -> QueryDiagnostic {
 /// gives every piece the edit needs: the spans the parser recorded, a
 /// `limit` to size a `nearest` window, every occurrence the same call, no
 /// aggregate, and for `rrf` the type of the ranked binding.
-fn ranking_in_order_or_return(catalog: &Catalog, body: &ReadBody) -> Option<QueryDiagnostic> {
+fn ranking_in_order_or_return(
+    catalog: &Catalog,
+    body: &ReadBody,
+    sc: &Scope,
+) -> Option<QueryDiagnostic> {
     let is_ranking = |e: &Expr| matches!(e, Expr::Call(c) if matches!(c.name.as_str(), "nearest" | "bm25" | "rrf" | "distance"));
     let (call, written) = body
         .order
@@ -311,7 +453,7 @@ fn ranking_in_order_or_return(catalog: &Catalog, body: &ReadBody) -> Option<Quer
     };
     let mut diagnostic = ranking_as_scalar(&call.name);
     diagnostic.position = written.map(|s| s.position);
-    if let Some((edits, fix)) = ranking_edits(catalog, body, call) {
+    if let Some((edits, fix)) = ranking_edits(catalog, body, call, sc) {
         diagnostic = diagnostic.with_fix(fix).with_suggestion(Suggestion {
             applicability: Applicability::MachineApplicable,
             edits,
@@ -321,10 +463,15 @@ fn ranking_in_order_or_return(catalog: &Catalog, body: &ReadBody) -> Option<Quer
 }
 
 /// The edits, and the fix they write: the `match` clause and the `order`.
+/// The canonical ranked read names its population with `let` before the
+/// ranking, `$pop` (`$all` for an `rrf`'s type population) or a fresh
+/// variant, and names the score with `as` as the column it was, `$distance`
+/// or `$score`, or a fresh variant.
 fn ranking_edits(
     catalog: &Catalog,
     body: &ReadBody,
     call: &Call,
+    sc: &Scope,
 ) -> Option<(Vec<TextEdit>, String)> {
     use crate::query::syntax::print;
     let spans = &body.spans;
@@ -368,6 +515,27 @@ fn ranking_edits(
             _ => {}
         }
     }
+    // Every name the read mentions or its scope holds; the names the fix
+    // introduces are fresh against them.
+    let mut taken = Vec::new();
+    pattern_vars(&body.pattern, &mut taken);
+    for e in body
+        .projections
+        .iter()
+        .map(|p| &p.expr)
+        .chain(body.order.iter().map(|o| &o.expr))
+    {
+        expr_vars(e, &mut taken);
+    }
+    let fresh = |base: &str| {
+        let mut name = base.to_string();
+        let mut n = 2;
+        while taken.contains(&name) || sc.in_scope(&name) {
+            name = format!("{base}{n}");
+            n += 1;
+        }
+        format!("${name}")
+    };
     let args: Vec<String> = call
         .args
         .iter()
@@ -396,15 +564,25 @@ fn ranking_edits(
                 _ => String::new(),
             };
             let (score, ordered) = match call.name.as_str() {
-                "bm25" => ("$score", "$score desc"),
-                _ => ("$distance", "$distance"),
+                "bm25" => {
+                    let s = fresh("score");
+                    (s.clone(), format!("{s} desc"))
+                }
+                _ => {
+                    let s = fresh("distance");
+                    (s.clone(), s)
+                }
             };
-            // The population is the whole `match` and its `where`; with a
-            // `where` the window closes after it, and the outer `match`
-            // closes there too.
-            let tail = format!(" return {{ {returned} }} }}, {field}, {query}{window})");
+            // The population is the whole `match` and its `where`, named
+            // before the ranking; with a `where` the population closes after
+            // it, and the outer `match` closes there too.
+            let pop = fresh("pop");
+            let tail = format!(
+                " return {{ {returned} }} }}, from {}({pop}, {field}, {query}{window}) as {score}",
+                call.name
+            );
             (
-                format!(" from {}({{ match {{", call.name),
+                format!(" let {pop} = {{ match {{"),
                 match predicate_end {
                     Some(_) => format!("{tail} }}"),
                     None => format!("}}{tail} "),
@@ -416,6 +594,7 @@ fn ranking_edits(
         "rrf" => {
             // The arms rank the type of the ranked binding; the pattern
             // follows, correlated on it.
+            let all = fresh("all");
             let mut arms = Vec::new();
             let mut ranked: Option<String> = None;
             for a in &call.args {
@@ -438,7 +617,7 @@ fn ranking_edits(
                     _ => return None,
                 };
                 arms.push(format!(
-                    "{}($all, {}, {}{window})",
+                    "{}({all}, {}, {}{window})",
                     arm.name,
                     print::expr(field),
                     print::expr(query)
@@ -452,23 +631,21 @@ fn ranking_edits(
                 } if *variable == ranked => Some(type_name.clone()),
                 _ => None,
             })?;
-            if vars.contains(&"all".to_string()) {
-                return None;
-            }
             let k = call
                 .options
                 .iter()
                 .find(|(o, _)| o == "k")
                 .map(|(_, v)| print::expr(v))
                 .unwrap_or_else(|| "60".into());
+            let score = fresh("score");
             (
                 format!(
-                    " let $all = {{ match {{ ${ranked}: {type_name} }} return {{ ${ranked} }} }}, from rrf({}, k: {k}), ",
+                    " let {all} = {{ match {{ ${ranked}: {type_name} }} return {{ ${ranked} }} }}, from rrf({}, k: {k}) as {score}, ",
                     arms.join(", ")
                 ),
                 String::new(),
-                "$score",
-                "$score desc",
+                score.clone(),
+                format!("{score} desc"),
             )
         }
         _ => return None,
@@ -492,7 +669,7 @@ fn ranking_edits(
             edits.push(TextEdit {
                 start: span.start,
                 end: span.end,
-                replacement: ordered.to_string(),
+                replacement: ordered.clone(),
             });
         }
     }
@@ -501,8 +678,8 @@ fn ranking_edits(
     }
     for (p, span) in body.projections.iter().zip(&spans.items) {
         if p.expr == this {
-            let alias = match (p.alias.is_none(), score) {
-                (true, "$distance") => " as _distance",
+            let alias = match (p.alias.is_none(), call.name.as_str()) {
+                (true, "nearest" | "distance") => " as _distance",
                 (true, _) => " as _score",
                 _ => "",
             };
@@ -1212,7 +1389,7 @@ impl Ctx<'_> {
     /// A read body in `sc` (top level: no outer columns; inline: the
     /// enclosing scope's visible columns).
     fn read_body(&mut self, body: &ReadBody, mut sc: Scope) -> R<Rel> {
-        if let Some(refusal) = ranking_in_order_or_return(self.catalog, body) {
+        if let Some(refusal) = ranking_in_order_or_return(self.catalog, body, &sc) {
             return Err(E::D(refusal));
         }
         self.pattern(&mut sc, &body.pattern)?;
@@ -1808,9 +1985,9 @@ impl Ctx<'_> {
             Element::Traversal(t) => self.traversal(sc, t),
             Element::Optional(pattern) => self.optional(sc, pattern),
             Element::Let { name, value } => self.let_clause(sc, name, value),
-            Element::From(rel) => {
+            Element::From { rel, score } => {
                 self.flush(sc, false)?;
-                let r = self.rel_expr(sc, &RelArg::Rel(rel))?;
+                let r = self.drawn_rel(sc, rel, score.as_deref())?;
                 self.draw(sc, r)
             }
         }
@@ -2421,6 +2598,44 @@ impl Ctx<'_> {
         }
     }
 
+    /// The relation a `from` draws. A ranking's score enters scope under the
+    /// name its `as` writes, and only there: `as` is required on a `from`
+    /// whose relation ranks, a ranking function or a named relation bound to
+    /// one, and refused on any other (`T85`).
+    fn drawn_rel(&mut self, sc: &mut Scope, rel: &RelExpr, score: Option<&str>) -> R<Rel> {
+        // Typing the relation checks its own elements, so the `from`'s span
+        // is taken first.
+        let span = self.element_span.clone();
+        let mut r = match rel {
+            RelExpr::Call(c) if matches!(c.name.as_str(), "distance" | "bm25" | "nearest") => {
+                self.ranking(sc, c, score)?
+            }
+            RelExpr::Call(c) if c.name == "rrf" => self.rrf(sc, c, score)?,
+            _ => self.rel_expr(sc, &RelArg::Rel(rel))?,
+        };
+        let span = span.as_ref();
+        match (score_column(&r.term), score) {
+            (None, None) => {}
+            (Some(_), Some(name)) => rename_score(&mut r, name)?,
+            (Some(column), None) => {
+                let base = column.to_string();
+                let mut name = base.clone();
+                let mut n = 2;
+                while sc.in_scope(&name)
+                    || sc.future.contains(&name)
+                    || r.ty.cols.iter().filter(|c| c.name == name).count()
+                        > usize::from(name == base)
+                {
+                    name = format!("{base}{n}");
+                    n += 1;
+                }
+                return Err(E::D(unnamed_ranking(rel, &name, span)));
+            }
+            (None, Some(name)) => return Err(E::D(named_non_ranking(rel, name, span))),
+        }
+        Ok(r)
+    }
+
     fn rel_var(&mut self, sc: &mut Scope, v: &str) -> R<Rel> {
         if let Some(r) = sc.rels.get(v).cloned() {
             for f in &r.free {
@@ -2441,8 +2656,8 @@ impl Ctx<'_> {
     fn rel_call(&mut self, sc: &mut Scope, c: &Call) -> R<Rel> {
         match c.name.as_str() {
             "union" => self.union(sc, c),
-            "distance" | "bm25" | "nearest" => self.ranking(sc, c),
-            "rrf" => self.rrf(sc, c),
+            "distance" | "bm25" | "nearest" => self.ranking(sc, c, None),
+            "rrf" => self.rrf(sc, c, None),
             name if self.unit.contains_key(name) => self.call(sc, c),
             name if is_registry_name(name) => Err(err_fix(
                 T69,
@@ -2476,7 +2691,7 @@ impl Ctx<'_> {
         let mut pending = None;
         for a in &c.args {
             match self.arg_rel(sc, a) {
-                Ok(r) => arms.push(r),
+                Ok(r) => arms.push(unnamed_score(r)),
                 Err(E::Pending(n)) => pending = Some(n),
                 Err(e) => return Err(e),
             }
@@ -2539,8 +2754,9 @@ impl Ctx<'_> {
         Ok(acc)
     }
 
-    /// `distance`, `bm25` and `nearest`.
-    fn ranking(&mut self, sc: &mut Scope, c: &Call) -> R<Rel> {
+    /// `distance`, `bm25` and `nearest`; `named` is the score's name when
+    /// a `from` draws the ranking, `None` in a relation function's argument.
+    fn ranking(&mut self, sc: &mut Scope, c: &Call, named: Option<&str>) -> R<Rel> {
         let name = c.name.as_str();
         let (positional, admitted): (usize, &[&str]) = match name {
             "nearest" => (3, &["k", "recall"]),
@@ -2576,7 +2792,7 @@ impl Ctx<'_> {
                 fix,
             ));
         }
-        let pop = self.arg_rel(sc, &c.args[0])?;
+        let pop = unnamed_score(self.arg_rel(sc, &c.args[0])?);
         let (column, property) = match &c.args[1] {
             Arg::Expr(Expr::Prop { variable, property }) => (variable.clone(), property.clone()),
             Arg::Expr(Expr::Ident(field)) => {
@@ -2653,14 +2869,22 @@ impl Ctx<'_> {
             }
         };
         let (kind, out) = match name {
-            "bm25" => (ScoreKind::Bm25, "score"),
-            _ => (ScoreKind::Distance, "distance"),
+            "bm25" => (ScoreKind::Bm25, named.unwrap_or("score")),
+            _ => (ScoreKind::Distance, named.unwrap_or("distance")),
         };
         if pop.ty.get(out).is_some() {
             return Err(err_fix(
                 T68,
-                format!("`{name}`'s population already has a `{out}` column"),
-                format!("alias it on the population's `return`: `${out} as {out}0`"),
+                match named {
+                    Some(_) => format!(
+                        "`as ${out}` names the score after a column `{name}`'s population already has"
+                    ),
+                    None => format!("`{name}`'s population already has a `{out}` column"),
+                },
+                match named {
+                    Some(_) => "name the score another way: `as $<name>`".to_string(),
+                    None => format!("alias it on the population's `return`: `${out} as {out}0`"),
+                },
             ));
         }
         let query = if name == "bm25" {
@@ -2887,7 +3111,8 @@ impl Ctx<'_> {
         })
     }
 
-    fn rrf(&mut self, sc: &mut Scope, c: &Call) -> R<Rel> {
+    /// `rrf`; `named` is the fused score's name when a `from` draws it.
+    fn rrf(&mut self, sc: &mut Scope, c: &Call, named: Option<&str>) -> R<Rel> {
         let n = c.args.len();
         if !(RRF_MIN_ARMS..=RRF_MAX_ARMS).contains(&n) {
             return Err(err(T75, format!("`rrf` takes 2 to 16 arms, got {n}")));
@@ -2989,6 +3214,14 @@ impl Ctx<'_> {
             }
         }
         let target = first_ranked.column.clone();
+        let out = named.unwrap_or("score").to_string();
+        if out == target {
+            return Err(err_fix(
+                T68,
+                format!("`rrf`'s score is named `${out}`, its target column's name"),
+                "name the score another way: `as $<name>`",
+            ));
+        }
         let mut free = Vec::new();
         for (r, _) in &arms {
             for f in &r.free {
@@ -3003,6 +3236,7 @@ impl Ctx<'_> {
                 target: target.clone(),
                 k,
                 weights,
+                out: out.clone(),
             },
             ty: RelTy {
                 cols: vec![
@@ -3011,7 +3245,7 @@ impl Ctx<'_> {
                         ty: target_ty.with_nullable(false),
                     },
                     Col {
-                        name: "score".into(),
+                        name: out,
                         ty: Ty::scalar(ScalarType::F64, false),
                     },
                 ],
@@ -4496,7 +4730,7 @@ fn output_columns(t: &Term) -> Vec<String> {
             v.push(out.clone());
             v
         }
-        Term::Fuse { target, .. } => vec![target.clone(), "score".into()],
+        Term::Fuse { target, out, .. } => vec![target.clone(), out.clone()],
         Term::Fix { body, .. } | Term::Call { body, .. } => output_columns(body),
         Term::RecRef { ty, .. } => ty.names(),
     }
@@ -5984,7 +6218,10 @@ fn lookahead(elements: &[Element], sc: &mut Scope) {
             Element::Let { name, .. } => {
                 sc.future.insert(name.clone());
             }
-            Element::From(RelExpr::Inline(body)) => {
+            Element::From {
+                rel: RelExpr::Inline(body),
+                ..
+            } => {
                 for p in &body.projections {
                     match (&p.alias, &p.expr) {
                         (Some(a), _) => {
@@ -6002,7 +6239,7 @@ fn lookahead(elements: &[Element], sc: &mut Scope) {
                 lookahead(&inner.elements, &mut tmp);
                 sc.future.extend(tmp.future);
             }
-            Element::From(_) => {}
+            Element::From { .. } => {}
         }
     }
 }
@@ -6111,7 +6348,7 @@ fn pattern_vars(pattern: &Pattern, out: &mut Vec<String>) {
                     expr_vars(e, out)
                 }
             }
-            Element::From(_) => {}
+            Element::From { score, .. } => out.extend(score.iter().cloned()),
         }
     }
     if let Some(p) = &pattern.predicate {

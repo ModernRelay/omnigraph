@@ -70,14 +70,18 @@ replacement vectors; neither `merge` nor `overwrite` does that automatically.
 
 ## Search Functions in Queries
 
-A ranking is a relation drawn into `match` with `from`:
-`from nearest(rel, $c.embedding, $q, k: n)`, `from bm25(rel, $d.title, $q)`,
-`from rrf(arm, arm, k: 60)`. `rel` is the population, an inline read
-`{ match { … } where … return { $c } }` whose `return` lists every binding the rest of
-the query reads, or a relation named with `let`. `from` adds the score column:
-`$distance` for `nearest`, `$score` for `bm25` and `rrf`. A ranking written as a
-call in `order` or `return` (`order { nearest($c.embedding, $q) }`) is refused
-(`T65`), and the diagnostic prints the `from` form as a machine-applicable fix.
+A ranking is a relation drawn into `match` with `from`, which names its score
+with `as`: `from nearest(rel, $c.embedding, $q, k: n) as $distance`,
+`from bm25(rel, $d.title, $q) as $score`,
+`from rrf(arm, arm, k: 60) as $score`. `rel` is the population, a relation
+named with `let` before the ranking, `let $pop = { match { … } where … return { $c } }`,
+whose `return` lists every binding the rest of the query reads (an inline read
+in its place also works). `from` adds the population's columns and the score
+under the name `as` writes; a ranked `from` without `as`, or an `as` on a
+`from` that ranks nothing, is refused (`T85`) with the fix printed. Inside an
+`rrf` arm a score has no name. A ranking written as a call in `order` or
+`return` (`order { nearest($c.embedding, $q) }`) is refused (`T65`), and the
+diagnostic prints the let-first `from` form as a machine-applicable fix.
 
 Order by the score: `order { $distance }` (ascending distance) or
 `order { $score desc }` (descending relevance), or put another key first;
@@ -93,7 +97,7 @@ entity ID, not by scan order.
 
 ```gq
 query nearest_chunks($q: Vector(1536)) {
-    match { from nearest({ match { $c: Chunk } return { $c } }, $c.embedding, $q, k: 10) }
+    match { let $pop = { match { $c: Chunk } return { $c } }, from nearest($pop, $c.embedding, $q, k: 10) as $distance }
     return { $c.text }
     order { $distance }
     limit 10
@@ -108,7 +112,7 @@ model, the resolved provider model must match it exactly.
 
 ```gq
 query top_titles($q: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $q) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $q) as $score }
     return { $d.slug, $d.title }
     order { $score desc }
     limit 10
@@ -124,7 +128,7 @@ identical arms, or arms that rank two different bindings, are refused (`T75`):
 query hybrid($vq: Vector(1536), $tq: String) {
     match {
         let $all = { match { $d: Doc } return { $d } },
-        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60),
+        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60) as $score,
     }
     return { $d.slug, $d.title }
     order { $score desc }
@@ -138,7 +142,7 @@ Return the score column, aliased or not:
 
 ```gq
 query scored_titles($q: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $q) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $q) as $score }
     return { $d.slug, $score as score }
     order { $score desc }
     limit 10
@@ -146,9 +150,10 @@ query scored_titles($q: String) {
 ```
 
 `$distance as distance` works the same way and returns squared L2
-distance, and an `rrf` `$score` is the fused score as `F64`. Without an alias,
-the result column is `score` or `distance`; `$score as _score` and
-`$distance as _distance` give those names. Full-text predicates are not return
+distance, and an `rrf` score is the fused score as `F64`. Without an alias,
+the result column is the score's name (`$score` gives `score`, `$distance`
+gives `distance`); `$score as _score` and `$distance as _distance` give those
+names. Full-text predicates are not return
 items (`T38`).
 
 A ranking may feed aggregates, but it only selects the rows that are
@@ -201,7 +206,8 @@ Filter with graph traversal inside the ranking's population. Constrain the ranke
 ```gq
 query related_chunks($artifact_slug: String, $q: Vector(1536)) {
     match {
-      from nearest({ match { $c: Chunk, $a: InformationArtifact, $c partOfArtifact $a } where $a.slug = $artifact_slug return { $c, $a } }, $c.embedding, $q, k: 10),
+      let $pop = { match { $c: Chunk, $a: InformationArtifact, $c partOfArtifact $a } where $a.slug = $artifact_slug return { $c, $a } },
+      from nearest($pop, $c.embedding, $q, k: 10) as $distance,
     }
     return { $c.text }
     order { $distance }           // rank: vector similarity within scope

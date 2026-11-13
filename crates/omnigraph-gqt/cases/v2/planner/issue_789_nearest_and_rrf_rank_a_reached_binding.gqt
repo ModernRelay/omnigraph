@@ -42,7 +42,8 @@ edge Cites: Doc -> Doc
 --- query
 query nearest_on_an_undeclared_destination($q: Vector(2)) {
     match {
-      from nearest({ match { $p: Person, $d: Doc, $p knows $d } where $p.name = "p1" return { $p, $d } }, $d.embedding, $q, k: 1),
+      let $pop = { match { $p: Person, $d: Doc, $p knows $d } where $p.name = "p1" return { $p, $d } },
+      from nearest($pop, $d.embedding, $q, k: 1) as $distance,
     }
     return { $d.slug }
     order { $distance }
@@ -59,7 +60,8 @@ scan Doc as $d: ranked nearest fetch 1
 --- query
 query nearest_on_a_destination_declared_second($q: Vector(2)) {
     match {
-      from nearest({ match { $p: Person, $d: Doc, $p knows $d } where $p.name = "p1" return { $p, $d } }, $d.embedding, $q, k: 2),
+      let $pop = { match { $p: Person, $d: Doc, $p knows $d } where $p.name = "p1" return { $p, $d } },
+      from nearest($pop, $d.embedding, $q, k: 2) as $distance,
     }
     return { $d.slug }
     order { $distance }
@@ -78,7 +80,7 @@ scan Doc as $d: ranked nearest fetch 2
 query rrf_over_one_destination($q: Vector(2)) {
     match {
       let $all = { match { $d: Doc } return { $d } },
-      from rrf(nearest($all, $d.embedding, $q, k: 2), bm25($all, $d.body, "needle"), k: 60),
+      from rrf(nearest($all, $d.embedding, $q, k: 2), bm25($all, $d.body, "needle"), k: 60) as $score,
       $p: Person,
       $p knows $d,
     }
@@ -96,7 +98,8 @@ d.slug: String
 --- query
 query nearest_from_a_source_with_no_edges($q: Vector(2)) {
     match {
-      from nearest({ match { $p: Person, $d: Doc, $p knows $d } where $p.name = "p3" return { $p, $d } }, $d.embedding, $q, k: 2),
+      let $pop = { match { $p: Person, $d: Doc, $p knows $d } where $p.name = "p3" return { $p, $d } },
+      from nearest($pop, $d.embedding, $q, k: 2) as $distance,
     }
     return { $d.slug }
     order { $distance }

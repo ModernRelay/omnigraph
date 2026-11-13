@@ -523,7 +523,7 @@ node Doc {
     db.ensure_indices_as(None).await.unwrap();
     let v2 = with_setting(&db, "engine", "v2");
     let source = r#"query fused($q: String) {
-        match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $q), bm25($all, $d.text, "needle needle"), k: 60), $d: Doc }
+        match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $q), bm25($all, $d.text, "needle needle"), k: 60) as $score, $d: Doc }
         return { $d.slug }
         order { $score desc }
         limit 5000
@@ -615,7 +615,7 @@ edge Knows: Doc -> Doc
         "force_postfilter",
     );
     let query = r#"query friends($q: Vector(4)) {
-        match { from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 10) }
+        match { let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, from nearest($pop, $d.embedding, $q, k: 10) as $distance }
         return { $d.slug }
         order { $distance }
         limit 10
@@ -728,7 +728,7 @@ edge Knows: Person -> Person
         let v2 = with_setting(&db, "engine", "v2");
         let queries = r#"
 query fused($q: String) {
-    match { let $all = { match { $p: Person } return { $p } }, from rrf(bm25($all, $p.text, $q), bm25($all, $p.text, "needle needle"), k: 60), $p: Person, $p knows $friend }
+    match { let $all = { match { $p: Person } return { $p } }, from rrf(bm25($all, $p.text, $q), bm25($all, $p.text, "needle needle"), k: 60) as $score, $p: Person, $p knows $friend }
     return { $p.name }
     order { $score desc }
     limit 2

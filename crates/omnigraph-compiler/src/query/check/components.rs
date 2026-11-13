@@ -93,7 +93,7 @@ impl Parts {
                 self.push(index, vars, bound, None, false);
             }
             Element::Optional(_) => self.push(index, read, bound, None, false),
-            Element::From(_) => {
+            Element::From { .. } => {
                 let uncorrelated = read.is_empty();
                 self.push(index, read, bound, None, uncorrelated);
             }

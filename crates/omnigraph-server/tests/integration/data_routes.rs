@@ -6464,7 +6464,7 @@ node Doc {
 "#;
     const EMBED_QUERY: &str = r#"
 query vector_search_string($q: String) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 3) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug, $d.title }
     order { $distance }
     limit 3
@@ -6543,7 +6543,7 @@ async fn query_envelope_reports_its_ranking() {
     const SCHEMA: &str = "node Doc {\n    slug: String @key\n    title: String @index\n}\n";
     const QUERIES: &str = r#"
 query fused($a: String, $b: String) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $a), bm25($all, $d.title, $b), k: 60), $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $a), bm25($all, $d.title, $b), k: 60) as $score, $d: Doc }
     return {
         $d.slug,
         $score as fused,

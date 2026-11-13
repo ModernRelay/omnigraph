@@ -163,7 +163,7 @@ const FILTERED: &str = r#"query q($min: I64) {
 }"#;
 
 const RANKED: &str = r#"query q($q: String) {
-    match { from bm25({ match { $d: Doc } where $d.year > 2000 return { $d } }, $d.title, $q) }
+    match { let $pop = { match { $d: Doc } where $d.year > 2000 return { $d } }, from bm25($pop, $d.title, $q) as $score }
     return { $d.slug, $score as score }
     order { $score desc, $d.year }
     limit 3
@@ -572,11 +572,11 @@ fn drop_first_sort_key(plan: &mut PhysicalPlan) {
 fn fused_and_grouped_searches_sort_as_the_query_requires() {
     let q = [("q", Literal::String("graph".into()))];
     let fused = Fixture::new(
-        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60), $d: Doc } return { $d.slug } order { $score desc, $d.slug desc } limit 2 }",
+        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60) as $score, $d: Doc } return { $d.slug } order { $score desc, $d.slug desc } limit 2 }",
         &q,
     );
     let grouped = Fixture::new(
-        "query q($q: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $q) } return { $d.open, count($d) as n } order { n desc } }",
+        "query q($q: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $q) as $score } return { $d.open, count($d) as n } order { n desc } }",
         &q,
     );
     for fixture in [fused, grouped] {
@@ -676,7 +676,7 @@ fn a_capped_bm25_scan_fails_the_row_cut() {
 #[test]
 fn a_window_cut_of_another_k_fails_the_row_cut() {
     let windowed = Fixture::new(
-        "query q() { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 2) } where $d.year > 2000 return { $d.slug } }",
+        "query q() { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 2) as $distance } where $d.year > 2000 return { $d.slug } }",
         &[],
     );
     windowed
@@ -1032,7 +1032,7 @@ fn an_exhausted_budget_is_a_resource_outcome() {
 }
 
 const NEAREST: &str = r#"query q($v: Vector(2)) {
-    match { from nearest({ match { $d: Doc, $e: Doc, $d cites $e } return { $d, $e } }, $d.embedding, $v, k: 3) }
+    match { let $pop = { match { $d: Doc, $e: Doc, $d cites $e } return { $d, $e } }, from nearest($pop, $d.embedding, $v, k: 3) as $distance }
     return { $d.slug }
     order { $distance }
     limit 3
@@ -1143,7 +1143,7 @@ fn membership_admits_the_fragment_and_nothing_else() {
         "query q() { match { $d: Doc } where ($d.rank is null or $d.rank > 2) return { $d.slug, $d.rank } }",
         "query q() { match { $d: Doc } where $d.open return { $d.title as t } order { $d.year desc, $d.title } limit 4 }",
         "query q($t: String) { match { $d: Doc } where $d.title = $t return { $d.slug } limit 0 }",
-        "query q($q: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $q) } return { $score as s, $d.slug } order { $score desc, $d.slug desc } limit 2 }",
+        "query q($q: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $q) as $score } return { $score as s, $d.slug } order { $score desc, $d.slug desc } limit 2 }",
     ];
     for query in members {
         let params = [
@@ -1175,8 +1175,8 @@ fn membership_admits_the_fragment_and_nothing_else() {
         "query q() { match { $d: Doc } return { $d.@id } }",
         "query q() { match { $d: Doc } return { $d.slug } order { $d.score } }",
         "query q() { match { $d: Doc } where search($d.title, \"g\") return { $d.slug } }",
-        "query q($v: Vector(2)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2) } return { $d.slug } order { $distance } limit 2 }",
-        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60), $d: Doc } return { $d.slug } order { $score desc } limit 2 }",
+        "query q($v: Vector(2)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 2) as $distance } return { $d.slug } order { $distance } limit 2 }",
+        "query q($q: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.title, $q), bm25($all, $d.title, \"needle needle\"), k: 60) as $score, $d: Doc } return { $d.slug } order { $score desc } limit 2 }",
     ];
     for query in outside {
         let params = [

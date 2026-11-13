@@ -20,7 +20,7 @@ node Doc { slug: String @key embedding: Vector(4) @index }
 
 --- query branch: main
 query nearest_docs($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 4) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 4) as $distance }
     return { $d.slug }
     order { $distance }
     limit 4
@@ -46,7 +46,7 @@ query move_a($e: Vector(4)) { match { $x: Doc } where $x.slug = "a"  update $x s
 
 --- query branch: work
 query nearest_docs($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 4) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 4) as $distance }
     return { $d.slug }
     order { $distance }
     limit 4
@@ -62,7 +62,7 @@ d.slug: String
 
 --- query branch: main
 query nearest_docs($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 4) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 4) as $distance }
     return { $d.slug }
     order { $distance }
     limit 4
@@ -84,7 +84,7 @@ query delete_b() { match { $x: Doc } where $x.slug = "b"  delete $x }
 
 --- query branch: work
 query nearest_docs($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 4) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 4) as $distance }
     return { $d.slug }
     order { $distance }
     limit 4
@@ -99,7 +99,7 @@ d.slug: String
 
 --- query branch: main
 query nearest_docs($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 4) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 4) as $distance }
     return { $d.slug }
     order { $distance }
     limit 4
@@ -121,7 +121,7 @@ query replace_b($e: Vector(4)) { insert Doc { slug: "b", embedding: $e } }
 
 --- query branch: work
 query nearest_docs($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 4) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 4) as $distance }
     return { $d.slug }
     order { $distance }
     limit 4
@@ -139,7 +139,7 @@ d.slug: String
 
 --- query branch: main
 query nearest_docs($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 4) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 4) as $distance }
     return { $d.slug }
     order { $distance }
     limit 4
@@ -155,7 +155,7 @@ d.slug: String
 
 --- query branch: work
 query nearest_docs($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 4) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 4) as $distance }
     return { $d.slug }
     order { $distance }
     limit 4

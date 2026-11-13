@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q($v: Vector(3)) { match { from rrf(nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 5)) } return { $d.title } }
+query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from rrf(nearest($pop, $d.embedding, $v, k: 5)) as $score } return { $d.title } }
 
 --- expect error: type error: T75:

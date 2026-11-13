@@ -427,7 +427,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
         ),
         (
             "distance(rel, $x.f, $q): Score",
-            "query f($v: Vector(3)) { match { from distance({ match { $d: Doc } return { $d } }, $d.embedding, $v) } return { $d } }",
+            "query f($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, $v) as $distance } return { $d } }",
             Term::Score {
                 input: inline_ret(scan("d", "Doc"), &[("d", node("Doc"))]).boxed(),
                 column: "d".into(),
@@ -445,7 +445,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
         ),
         (
             "bm25(rel, $x.f, q): Score, a String meaning terms(q, mode: any)",
-            "query f($s: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.body, $s) } return { $d } }",
+            "query f($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } return { $d } }",
             Term::Score {
                 input: inline_ret(scan("d", "Doc"), &[("d", node("Doc"))]).boxed(),
                 column: "d".into(),
@@ -462,7 +462,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
         ),
         (
             "nearest(rel, $x.f, $q, k: n): ApproxTopK",
-            "query f($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 5) } return { $d } }",
+            "query f($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 5) as $distance } return { $d } }",
             Term::ApproxTopK {
                 input: inline_ret(scan("d", "Doc"), &[("d", node("Doc"))]).boxed(),
                 column: "d".into(),
@@ -516,7 +516,7 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             if aggs.is_empty() && keys == &vec![("^p.city".to_string(), prop("p", "city", city.clone()))])));
     // `rrf(rel, …)`: Fuse; a named read: Call; a self-calling read: Fix.
     let got = lower(
-        "query f($s: String, $v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) } return { $d } }",
+        "query f($s: String, $v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) as $score } return { $d } }",
     );
     assert!(
         matches!(match_term(&got), Term::Fuse { arms, k: Count::Literal(60), weights, .. } if arms.len() == 2 && weights == &vec![1.0, 1.0])
@@ -642,23 +642,23 @@ const FORMS: &[(&str, &str)] = &[
     ),
     (
         "bm25_string",
-        "query f($s: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.body, $s) } return { $d } }",
+        "query f($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } return { $d } }",
     ),
     (
         "bm25_terms_any",
-        "query f($s: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.body, terms($s, mode: any)) } return { $d } }",
+        "query f($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s, mode: any)) as $score } return { $d } }",
     ),
     (
         "bm25_terms_all",
-        "query f($s: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.body, terms($s)) } return { $d } }",
+        "query f($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s)) as $score } return { $d } }",
     ),
     (
         "rrf_default_k",
-        "query f($s: String, $v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) } return { $d } }",
+        "query f($s: String, $v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) as $score } return { $d } }",
     ),
     (
         "rrf_k_60",
-        "query f($s: String, $v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s), k: 60) } return { $d } }",
+        "query f($s: String, $v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s), k: 60) as $score } return { $d } }",
     ),
     (
         "let_rel_then_from",
@@ -831,24 +831,24 @@ fn the_closure_table() {
     );
     rows.insert(
         "Score, ApproxTopK population, ranked column named",
-        accept("query q($v: Vector(3)) { match { from nearest({ match { from { match { $p: Person, $d: Doc, $p authored $d } return { $d, count($p) as authors } } } where $authors > 1 return { $d, $authors } }, $d.embedding, $v, k: 5) } return { $d, $authors, $distance } }"),
+        accept("query q($v: Vector(3)) { match { let $pop = { match { from { match { $p: Person, $d: Doc, $p authored $d } return { $d, count($p) as authors } } } where $authors > 1 return { $d, $authors } }, from nearest($pop, $d.embedding, $v, k: 5) as $distance } return { $d, $authors, $distance } }"),
     );
     rows.insert(
         "Score population, ranked column not a node column",
         refuse(
-            &format!("query q($v: Vector(3)) {{ match {{ from distance({GROUPED}, $n.embedding, $v) }} return {{ $c }} }}"),
+            &format!("query q($v: Vector(3)) {{ match {{ let $pop = {GROUPED}, from distance($pop, $n.embedding, $v) as $distance }} return {{ $c }} }}"),
             "T79",
             "a ranking ranks a node column",
         ),
     );
     rows.insert(
         "Fuse arms, scored, over one node column",
-        accept("query q($s: String, $v: Vector(3)) { match { let $docs = { match { from { match { $p: Person, $d: Doc, $p authored $d } return { $d, count($p) as a } } } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) } return { $d, $score } }"),
+        accept("query q($s: String, $v: Vector(3)) { match { let $docs = { match { from { match { $p: Person, $d: Doc, $p authored $d } return { $d, count($p) as a } } } return { $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s)) as $score } return { $d, $score } }"),
     );
     rows.insert(
         "Fuse arms over two node columns",
         refuse(
-            "query q($s: String, $v: Vector(3)) { match { let $docs = { match { $p: Person, $d: Doc, $p authored $d } return { $p, $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), { match { from $docs } return { $p } order { $p.age } }) } return { $score } }",
+            "query q($s: String, $v: Vector(3)) { match { let $docs = { match { $p: Person, $d: Doc, $p authored $d } return { $p, $d } }, from rrf(nearest($docs, $d.embedding, $v, k: 5), { match { from $docs } return { $p } order { $p.age } }) as $score } return { $score } }",
             "T75",
             "the fused target would be a pair",
         ),
@@ -892,7 +892,7 @@ fn the_closure_table() {
     );
     rows.insert(
         "a sink's input, a ranked relation",
-        accept("query w($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 20) }  update $d set { tags: [\"near\"] } }"),
+        accept("query w($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 20) as $distance }  update $d set { tags: [\"near\"] } }"),
     );
     // A sink inside a read: never (A7). The grammar has no statement in a
     // read body, and a read cannot draw rows from a write.

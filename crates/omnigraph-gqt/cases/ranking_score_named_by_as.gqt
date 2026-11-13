@@ -1,0 +1,112 @@
+# issue: none
+# notes: A ranked `from` names its score with `as`, and the score is the column of that name and no other (`T85`
+# notes: refuses the `from` without it). A renamed score is read like any column: in `where`, `return` and `order`,
+# notes: by the ranked scan when the score leads the `order` and the window is the `limit`, and by the ranking step
+# notes: otherwise; `bm25` and `rrf` alike, and through a named relation bound to the ranking.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+    embedding: Vector(2) @index
+}
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"a","text":"needle","embedding":[0.0,1.0]}}
+{"type":"Doc","data":{"slug":"b","text":"needle hay","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","text":"hay","embedding":[1.0,1.0]}}
+{"edge":"Cites","from":"a","to":"b"}
+{"edge":"Cites","from":"a","to":"c"}
+{"edge":"Cites","from":"c","to":"a"}
+
+--- query
+query named_in_the_ranked_scan() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 2) as $dist }
+    return { $d.slug, $dist }
+    order { $dist }
+    limit 2
+}
+
+--- expect ordered
+{"d.slug":"a","dist":0}
+{"d.slug":"c","dist":1}
+
+--- expect shape
+d.slug: String
+dist: F32
+
+--- expect plan
+scan Doc as $d: ranked nearest fetch 2
+
+--- query
+query named_in_the_ranking_step() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 3) as $dist, $x: Doc, $d cites $x }
+    where $dist > 0.5
+    return { $d.slug, $x.slug, $dist }
+    order { $d.slug, $x.slug }
+}
+
+--- expect ordered
+{"d.slug":"c","x.slug":"a","dist":1}
+
+--- expect shape
+d.slug: String
+x.slug: String
+dist: F32
+
+--- query
+query bm25_named() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, "needle") as $relevance }
+    return { $d.slug }
+    order { $relevance desc }
+    limit 2
+}
+
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"b"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query rrf_named() {
+    match {
+        let $all = { match { $d: Doc } return { $d } },
+        from rrf(nearest($all, $d.embedding, [0.0, 1.0], k: 3), bm25($all, $d.text, "needle"), k: 60) as $fused,
+    }
+    return { $d.slug }
+    order { $fused desc }
+    limit 3
+}
+
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"b"}
+{"d.slug":"c"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query named_relation_bound_to_a_ranking() {
+    match { let $pop = { match { $d: Doc } return { $d } }, let $near = nearest($pop, $d.embedding, [0.0, 1.0], k: 2), from $near as $dist }
+    return { $d.slug, $dist }
+    order { $dist }
+    limit 2
+}
+
+--- expect ordered
+{"d.slug":"a","dist":0}
+{"d.slug":"c","dist":1}
+
+--- expect shape
+d.slug: String
+dist: F32

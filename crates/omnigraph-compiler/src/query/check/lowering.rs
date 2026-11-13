@@ -120,12 +120,18 @@ fn statement_span(decl: &Decl, group: usize, statement: usize) -> Option<&Source
 fn nested(element: &Element) -> Vec<&Pattern> {
     let bodies: Vec<&ReadBody> = match element {
         Element::Optional(p) => return vec![p],
-        Element::From(RelExpr::Inline(body))
+        Element::From {
+            rel: RelExpr::Inline(body),
+            ..
+        }
         | Element::Let {
             value: LetValue::Relation(body),
             ..
         } => vec![body],
-        Element::From(RelExpr::Call(call)) => call
+        Element::From {
+            rel: RelExpr::Call(call),
+            ..
+        } => call
             .args
             .iter()
             .filter_map(|a| match a {
@@ -141,7 +147,7 @@ fn nested(element: &Element) -> Vec<&Pattern> {
 fn element_matches(element: &Element, kinds: &[ElementKind], name: Option<&str>) -> bool {
     let (kind, binds) = match element {
         Element::Let { name, .. } => (ElementKind::Let, Some(name.as_str())),
-        Element::From(_) => (ElementKind::From, None),
+        Element::From { .. } => (ElementKind::From, None),
         Element::Optional(_) => (ElementKind::Optional, None),
         Element::Binding { variable, .. } => (ElementKind::Binding, Some(variable.as_str())),
         Element::Traversal(_) => return false,

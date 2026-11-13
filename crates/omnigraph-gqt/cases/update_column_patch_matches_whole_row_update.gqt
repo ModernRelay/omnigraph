@@ -160,7 +160,7 @@ d.emb: Vector(4)?
 
 --- query
 query nearest_first($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.emb, $q, k: 6) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.emb, $q, k: 6) as $distance }
     return { $d.slug }
     order { $distance }
     limit 6
@@ -182,7 +182,7 @@ d.slug: String
 
 --- query branch: rows
 query nearest_first($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.emb, $q, k: 6) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.emb, $q, k: 6) as $distance }
     return { $d.slug }
     order { $distance }
     limit 6

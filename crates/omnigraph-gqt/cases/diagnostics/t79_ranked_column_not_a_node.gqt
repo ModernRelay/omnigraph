@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d.embedding as e } }, $e.x, $v, k: 3) } return { $e } }
+query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d.embedding as e } }, from nearest($pop, $e.x, $v, k: 3) as $distance } return { $e } }
 
 --- expect error: type error: T79:

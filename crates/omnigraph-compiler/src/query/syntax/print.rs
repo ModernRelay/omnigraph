@@ -215,7 +215,10 @@ pub fn element(c: &Element) -> String {
             LetValue::Relation(body) => format!("let ${name} = {}", inline(body)),
             LetValue::Expr(e) => format!("let ${name} = {}", expr(e)),
         },
-        Element::From(rel) => format!("from {}", relation(rel)),
+        Element::From { rel, score } => match score {
+            Some(s) => format!("from {} as ${s}", relation(rel)),
+            None => format!("from {}", relation(rel)),
+        },
         Element::Optional(p) => format!("optional {}", braced(p)),
         Element::Binding {
             variable,

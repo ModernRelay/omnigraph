@@ -2666,7 +2666,7 @@ fn ranked_read_reports_its_ranking_in_json_and_jsonl() {
         &queries,
         r#"
 query scored($q: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $q) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $q) as $score }
     return { $d.slug, $score as relevance }
     order { $score desc }
     limit 2

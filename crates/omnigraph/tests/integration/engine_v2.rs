@@ -687,28 +687,28 @@ async fn explain_search_uses_vector_params_without_initializing_embeddings() {
     let v2 = with_setting(&vector_doc_graph(&dir).await, "engine", "v2");
     for (ranking, ordering, parameter_type, values, available) in [
         (
-            "from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1)",
+            "let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance",
             "$distance",
             "Vector(4)",
             vector_param("q", &[0.0; 4]),
             true,
         ),
         (
-            "let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60)",
+            "let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60) as $score",
             "$score desc",
             "Vector(4)",
             vector_param("q", &[0.0; 4]),
             true,
         ),
         (
-            "from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1)",
+            "let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance",
             "$distance",
             "String",
             params(&[("q", "a")]),
             false,
         ),
         (
-            "let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60)",
+            "let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 1), bm25($all, $d.title, \"a\"), k: 60) as $score",
             "$score desc",
             "String",
             params(&[("q", "a")]),
@@ -780,7 +780,7 @@ async fn rrf_order_runs_a_cross_join_over_multiple_probe_batches() {
     );
     db.load_jsonl(&seed, LoadMode::Overwrite).await.unwrap();
     let db = with_setting(&db, "engine", "v2");
-    let source = "query fused($t: String) {\n    match {\n      let $all = { match { $d: Doc } return { $d } },\n      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, \"needle needle\"), k: 60),\n      $d: Doc,\n      $p: Probe,\n    }\n    where $d.n = $p.n\n    return { $d.slug }\n    order { $score desc }\n    limit 1\n}";
+    let source = "query fused($t: String) {\n    match {\n      let $all = { match { $d: Doc } return { $d } },\n      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, \"needle needle\"), k: 60) as $score,\n      $d: Doc,\n      $p: Probe,\n    }\n    where $d.n = $p.n\n    return { $d.slug }\n    order { $score desc }\n    limit 1\n}";
     let result = query_main(
         &db,
         &format!("explain {source}"),
@@ -864,13 +864,13 @@ edge Tags: Source -> Doc
 "#;
     let source = r#"
 query rows($q: Vector(4)) {
-    match { from nearest({ match { $s: Source, $d: Doc, $s links $d, $t: Doc, $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
+    match { let $pop = { match { $s: Source, $d: Doc, $s links $d, $t: Doc, $s tags $t } return { $s, $d, $t } }, from nearest($pop, $s.embedding, $q, k: 10) as $distance }
     return { $s.slug, $d.slug, $t.slug }
     order { $distance }
     limit 10
 }
 query total($q: Vector(4)) {
-    match { from nearest({ match { $s: Source, $d: Doc, $s links $d, $t: Doc, $s tags $t } return { $s, $d, $t } }, $s.embedding, $q, k: 10) }
+    match { let $pop = { match { $s: Source, $d: Doc, $s links $d, $t: Doc, $s tags $t } return { $s, $d, $t } }, from nearest($pop, $s.embedding, $q, k: 10) as $distance }
     return { count($d) as n }
     limit 10
 }
@@ -1147,7 +1147,7 @@ edge Likes: Person -> Doc
     limit 2
 }";
     const RANKED: &str = "query ranked($q: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $q) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $q) as $score }
     return { $d.slug, $score as score }
     order { $score desc }
     limit 2
@@ -1158,7 +1158,7 @@ edge Likes: Person -> Doc
     order { $p.name }
 }";
     const RANKED_DESTINATION: &str = "query ranked_destination($q: String) {
-    match { from bm25({ match { $p: Person, $d: Doc, $p likes $d } return { $p, $d } }, $d.title, $q) }
+    match { let $pop = { match { $p: Person, $d: Doc, $p likes $d } return { $p, $d } }, from bm25($pop, $d.title, $q) as $score }
     return { $d.slug }
     order { $score desc }
 }";

@@ -23,7 +23,7 @@ node Doc {
 --- query
 set engine = v2;
 query bm25_threshold($q: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $q) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $q) as $score }
     return { $d.slug, $score > 0.0 as hit }
     order { $score desc }
     limit 2
@@ -43,7 +43,7 @@ hit: Bool
 --- query
 set engine = v2;
 query nearest_threshold($v: Vector(2)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 2) as $distance }
     return { $d.slug, $distance < 1.0 as close }
     order { $distance }
     limit 2
@@ -63,7 +63,7 @@ close: Bool
 --- query
 set engine = v2;
 query nearest_threshold_expression($v: Vector(2)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 2) as $distance }
     return { $d.slug, $distance < 1.0 as close }
     order { $distance, ($distance < 1.0) asc }
     limit 2
@@ -83,7 +83,7 @@ close: Bool
 --- query
 set engine = v2;
 query nearest_threshold_alias($v: Vector(2)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 2) as $distance }
     return { $d.slug, $distance < 1.0 as close }
     order { $distance, close asc }
     limit 2
@@ -103,7 +103,7 @@ close: Bool
 --- query
 set engine = v2;
 query bm25_threshold_expression($q: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $q) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $q) as $score }
     return { $d.slug, $score > 0.18 as hit }
     order { $score desc, ($score > 0.18) asc }
     limit 2
@@ -123,7 +123,7 @@ hit: Bool
 --- query
 set engine = v2;
 query bm25_threshold_alias($q: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $q) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $q) as $score }
     return { $d.slug, $score > 0.18 as hit }
     order { $score desc, hit asc }
     limit 2
@@ -143,7 +143,7 @@ hit: Bool
 --- query
 set engine = v2;
 query rrf_threshold_expression($v: Vector(2), $q: String) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, $q), k: 60), $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, $q), k: 60) as $score, $d: Doc }
     return { $d.slug, $score > 0.0325 as high }
     order { $score desc, ($score > 0.0325) asc }
     limit 2
@@ -163,7 +163,7 @@ high: Bool
 --- query
 set engine = v2;
 query rrf_threshold_alias($v: Vector(2), $q: String) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, $q), k: 60), $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 2), bm25($all, $d.text, $q), k: 60) as $score, $d: Doc }
     return { $d.slug, $score > 0.0325 as high }
     order { $score desc, high asc }
     limit 2
@@ -183,7 +183,7 @@ high: Bool
 --- query
 set engine = v2;
 query recursive_rank_keys($v: Vector(2)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 2) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 2) as $distance }
     return {
         $d.slug,
         not ($distance < 1.0) as far,

@@ -94,7 +94,7 @@ set engine = v2;
 query fused_v2($t: String) {
     match {
       let $all = { match { $d: Doc } return { $d } },
-      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60),
+      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60) as $score,
       $d: Doc,
       $p: Probe,
     }
@@ -122,7 +122,7 @@ set engine = v2;
 query fused_explicit_id($t: String) {
     match {
       let $all = { match { $d: Doc } return { $d } },
-      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60),
+      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60) as $score,
       $d: Doc,
       $p: Probe,
     }
@@ -149,7 +149,7 @@ set engine = v2;
 query fused_covered_return($t: String) {
     match {
       let $all = { match { $d: Doc } return { $d } },
-      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60),
+      from rrf(bm25($all, $d.text, $t), bm25($all, $d.text, "hay"), k: 60) as $score,
       $d: Doc,
       $p: Probe,
     }

@@ -29,7 +29,8 @@ node Passage {
 set engine = v2;
 query bm25_order() {
     match {
-      from bm25({ match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } }, $p.text, "law"),
+      let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },
+      from bm25($pop, $p.text, "law") as $score,
     }
     return { $p.pid }
     order { $score desc }
@@ -51,7 +52,8 @@ scan Passage as $p: ranked bm25
 set engine = v2;
 query nearest_order() {
     match {
-      from nearest({ match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } }, $p.embedding, [1.0, 0.0], k: 10),
+      let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },
+      from nearest($pop, $p.embedding, [1.0, 0.0], k: 10) as $distance,
     }
     return { $p.pid }
     order { $distance }
@@ -74,7 +76,7 @@ set engine = v2;
 query rrf_order() {
     match {
       let $all = { match { $p: Passage } return { $p } },
-      from rrf(nearest($all, $p.embedding, [1.0, 0.0], k: 10), bm25($all, $p.text, "law"), k: 60),
+      from rrf(nearest($all, $p.embedding, [1.0, 0.0], k: 10), bm25($all, $p.text, "law"), k: 60) as $score,
       $m: Matter,
       $p: Passage,
     }
@@ -119,7 +121,8 @@ pass join_algorithm
 set engine = v2;
 query bm25_order_on_the_needles() {
     match {
-      from bm25({ match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } }, $m.number, "case"),
+      let $pop = { match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps } where contains($p.text, $m.number) and $m.number != $p.pid return { $m, $p } },
+      from bm25($pop, $m.number, "case") as $score,
     }
     return { $p.pid }
     order { $score desc }

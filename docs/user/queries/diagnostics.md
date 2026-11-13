@@ -245,6 +245,28 @@ row, `not exists { $p: Person where $p.name = "Bob" }`, becomes that filter,
 can be null. A binding of another type has no suggestion: name the block's
 own variable differently.
 
+## A ranked `from` names its score
+
+A `from` whose relation is a ranking, a ranking function or a `let` bound to
+one, names the score with `as`; see [Search](../search/index.md). Without it
+the `from` is `T85`:
+
+```text
+query near($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) } return { $d.slug, $distance } }
+```
+
+```text
+error[T85]: type error: T85: `from nearest(…)` ranks without naming its score: a ranked `from` names its score with `as`, and the score enters scope only under that name
+  --> line 1, column 85
+  fix: from nearest(…) as $distance
+```
+
+The machine-applicable suggestion writes `as $distance` after the ranking
+(`as $score` for `bm25` and `rrf`), the name the score column had before it
+was written, or a fresh variant when that name is taken. An `as` on a `from`
+that ranks nothing, `from $docs as $s`, is `T85` too, and the suggestion
+removes it: the relation names its own columns.
+
 ## Terms this release does not lower
 
 A read or write the type checker accepts, the planner runs. A term that

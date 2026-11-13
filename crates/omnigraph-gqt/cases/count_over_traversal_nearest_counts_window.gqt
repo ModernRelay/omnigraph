@@ -68,7 +68,8 @@ edge Knows: Doc -> Doc {
 --- query
 query count_nearest_with_edges($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 2),
+      let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } },
+      from nearest($pop, $d.embedding, $q, k: 2) as $distance,
     }
     return { count($d) as total }
     limit 2

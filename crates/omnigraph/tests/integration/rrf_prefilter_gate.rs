@@ -128,7 +128,7 @@ const GATE_QUERIES: &str = r#"
 query single_hop_both_bm25($q1: String, $q2: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
       $c: Chunk,
       $c chunkOfArtifact $a,
     }
@@ -140,7 +140,7 @@ query single_hop_both_bm25($q1: String, $q2: String) {
 query search_filter_single_hop($q1: String, $q2: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
       $c: Chunk,
       $c chunkOfArtifact $a,
     }
@@ -153,7 +153,7 @@ query search_filter_single_hop($q1: String, $q2: String) {
 query bm25_secondary_position($v: Vector(4), $q: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(nearest($all, $c.embedding, $v, k: 5), bm25($all, $c.text, $q), k: 60),
+      from rrf(nearest($all, $c.embedding, $v, k: 5), bm25($all, $c.text, $q), k: 60) as $score,
       $c: Chunk,
       $c chunkOfArtifact $a,
     }
@@ -165,7 +165,7 @@ query bm25_secondary_position($v: Vector(4), $q: String) {
 query multi_hop($q1: String, $q2: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
       $c: Chunk,
       $c chunkCites{1,2} $d,
     }
@@ -177,7 +177,7 @@ query multi_hop($q1: String, $q2: String) {
 query multi_hop_min_two($q1: String, $q2: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
       $c: Chunk,
       $c chunkCites{2,2} $d,
     }
@@ -189,7 +189,7 @@ query multi_hop_min_two($q1: String, $q2: String) {
 query dst_filtered($q1: String, $q2: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
       $c: Chunk,
       $c chunkOfArtifact $a,
     }
@@ -202,7 +202,7 @@ query dst_filtered($q1: String, $q2: String) {
 query direction_both($q1: String, $q2: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
       $c: Chunk,
       $c <chunkCites> $d,
     }
@@ -214,7 +214,7 @@ query direction_both($q1: String, $q2: String) {
 query direction_in($q1: String, $q2: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
       $c: Chunk,
       $d chunkCites $c,
     }
@@ -226,7 +226,7 @@ query direction_in($q1: String, $q2: String) {
 query several_expands($q1: String, $q2: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
       $c: Chunk,
       $c chunkOfArtifact $a,
       $c chunkCites $d,
@@ -239,7 +239,7 @@ query several_expands($q1: String, $q2: String) {
 query antijoin_only($q1: String, $q2: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
       $c: Chunk,
     }
     where not exists { $a: Artifact, $c chunkOfArtifact $a }
@@ -251,7 +251,7 @@ query antijoin_only($q1: String, $q2: String) {
 query undeclared_ranked_destination($q1: String, $q2: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
       $d: Chunk,
       $d chunkCites $c,
     }
@@ -263,7 +263,7 @@ query undeclared_ranked_destination($q1: String, $q2: String) {
 query no_traversal($q1: String, $q2: String) {
     match {
       let $all = { match { $c: Chunk } return { $c } },
-      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+      from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
       $c: Chunk,
     }
     return { $c.slug }

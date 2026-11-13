@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q() { match { from bm25({ match { $d: Doc } return { $d } }, $d.body, "") } return { $d.title } }
+query q() { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, "") as $score } return { $d.title } }
 
 --- expect error: type error: T20:

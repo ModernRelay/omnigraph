@@ -1,0 +1,31 @@
+# issue: none
+# notes: A ranked `from` names its score with `as`, and the score enters scope only under that name: `as` is required on a
+# notes: `from` whose relation is a ranking function, and refused on any other, whose columns its relation names. Both are
+# notes: `T85` at the `from`, the fix writing `as $distance` (the column the score was) or removing the `as`. Nothing
+# notes: executes.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String
+    embedding: Vector(3)
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","title":"A","embedding":[1.0,0.0,0.0]}}
+
+--- query
+query near($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) } return { $d.slug, $distance } order { $distance } }
+
+--- expect error: type error: T85: `from nearest(…)` ranks without naming its score
+
+--- query
+query docs() { match { let $docs = { match { $d: Doc } return { $d } }, from $docs as $s } return { $d.slug } }
+
+--- expect error: type error: T85: `from $docs as $s`: `as` names a ranking's score, and this `from` ranks nothing

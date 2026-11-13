@@ -43,6 +43,6 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.title, $v, k: 3) } return { $d.title } }
+query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.title, $v, k: 3) as $distance } return { $d.title } }
 
 --- expect error: type error: T15:

@@ -23,7 +23,8 @@ node Doc {
 set engine = v2;
 query filtered_rank($t: String, $q: String) {
     match {
-      from bm25({ match { $d: Doc } where search($d.title, $t) return { $d } }, $d.body, $q),
+      let $pop = { match { $d: Doc } where search($d.title, $t) return { $d } },
+      from bm25($pop, $d.body, $q) as $score,
     }
     return { $d.slug }
     order { $score desc }

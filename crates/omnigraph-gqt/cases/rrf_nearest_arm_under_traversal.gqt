@@ -39,7 +39,7 @@ edge Knows: Doc -> Doc {
 query nearest_and_text_with_edges($q: Vector(4), $text: String) {
     match {
       let $all = { match { $d: Doc } return { $d } },
-      from rrf(nearest($all, $d.embedding, $q, k: 2), bm25($all, $d.text, $text), k: 60),
+      from rrf(nearest($all, $d.embedding, $q, k: 2), bm25($all, $d.text, $text), k: 60) as $score,
       $d: Doc,
       $d knows $t,
     }

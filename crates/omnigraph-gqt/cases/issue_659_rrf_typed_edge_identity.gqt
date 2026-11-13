@@ -27,7 +27,7 @@ edge Likes: Person -> Person
 query fused_types() {
     match {
       let $all = { match { $p: Person } return { $p } },
-      from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60),
+      from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60) as $score,
       $p: Person,
       $p $e:(likes | knows) $q,
     }
@@ -52,7 +52,7 @@ rank fuse row tiebreak [$e.@type, $e.@id, $q.@id]
 query fused_type_page() {
     match {
       let $all = { match { $p: Person } return { $p } },
-      from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60),
+      from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60) as $score,
       $p: Person,
       $p $e:(likes | knows) $q,
     }
@@ -72,7 +72,7 @@ edge_id: String
 query fused_wildcard_type_page() {
     match {
       let $all = { match { $p: Person } return { $p } },
-      from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60),
+      from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "hay"), k: 60) as $score,
       $p: Person,
       $q: Person,
       $p $e:* $q,

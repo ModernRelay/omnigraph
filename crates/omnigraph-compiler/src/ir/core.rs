@@ -255,7 +255,8 @@ pub enum Term {
         property: String,
         kind: ScoreKind,
         query: ScoreQuery,
-        /// `distance` or `score`.
+        /// The score's column, named by the `from`'s `as`; `distance` or
+        /// `score` in a relation function's argument, where it has no name.
         out: String,
     },
     ApproxTopK {
@@ -274,6 +275,8 @@ pub enum Term {
         /// The fusion constant, `RRF_DEFAULT_K` when unwritten.
         k: Count,
         weights: Vec<f64>,
+        /// The fused score's column, named by the `from`'s `as`.
+        out: String,
     },
     /// The least fixpoint of a declared read over itself; `body` reads the
     /// recursive relation through [`Term::RecRef`].

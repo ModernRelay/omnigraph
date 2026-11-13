@@ -29,7 +29,7 @@ edge Knows: Person -> Person {
 
 --- query
 query nearest_projected($v: Vector(2)) {
-    match { from nearest({ match { $p: Person } return { $p } }, $p.embedding, $v, k: 2) }
+    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.embedding, $v, k: 2) as $distance }
     return { $p.name, $distance as score }
     order { $distance, $distance }
     limit 2
@@ -48,7 +48,7 @@ score: F32
 
 --- query
 query nearest_projected_default_name($v: Vector(2)) {
-    match { from nearest({ match { $p: Person } return { $p } }, $p.embedding, $v, k: 1) }
+    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.embedding, $v, k: 1) as $distance }
     return { $p.name, $distance as _distance }
     order { $distance, $distance }
     limit 1
@@ -66,7 +66,7 @@ _distance: F32
 
 --- query
 query bm25_projected($q: String) {
-    match { from bm25({ match { $p: Person } return { $p } }, $p.bio, $q) }
+    match { let $pop = { match { $p: Person } return { $p } }, from bm25($pop, $p.bio, $q) as $score }
     return { $p.name, $score as _score }
     order { $score desc, $score desc }
     limit 3
@@ -85,7 +85,7 @@ _score: F32
 
 --- query
 query nearest_projected_no_match($v: Vector(2)) {
-    match { from nearest({ match { $p: Person } where $p.name = "absent" return { $p } }, $p.embedding, $v, k: 2) }
+    match { let $pop = { match { $p: Person } where $p.name = "absent" return { $p } }, from nearest($pop, $p.embedding, $v, k: 2) as $distance }
     return { $p.name, $distance as score }
     order { $distance }
     limit 2
@@ -102,7 +102,7 @@ score: F32
 
 --- query
 query bm25_projected_no_match($q: String) {
-    match { from bm25({ match { $p: Person } where $p.name = "absent" return { $p } }, $p.bio, $q) }
+    match { let $pop = { match { $p: Person } where $p.name = "absent" return { $p } }, from bm25($pop, $p.bio, $q) as $score }
     return { $p.name, $score as score }
     order { $score desc }
     limit 3
@@ -156,7 +156,7 @@ query nearest_projected_under_aggregate($v: Vector(2)) {
 
 --- query
 query rrf_projected($q: String, $v: Vector(2)) {
-    match { let $all = { match { $p: Person } return { $p } }, from rrf(nearest($all, $p.embedding, $v, k: 3), bm25($all, $p.bio, $q), k: 60), $p: Person }
+    match { let $all = { match { $p: Person } return { $p } }, from rrf(nearest($all, $p.embedding, $v, k: 3), bm25($all, $p.bio, $q), k: 60) as $score, $p: Person }
     return { $p.name, $score as fused }
     order { $score desc, $score }
     limit 3
@@ -196,7 +196,8 @@ query alias_projected_again() {
 --- query
 query nearest_projected_through_traversal($v: Vector(2)) {
     match {
-      from nearest({ match { $p: Person, $f: Person, $p knows $f } return { $p, $f } }, $p.embedding, $v, k: 3),
+      let $pop = { match { $p: Person, $f: Person, $p knows $f } return { $p, $f } },
+      from nearest($pop, $p.embedding, $v, k: 3) as $distance,
     }
     return { $f.name, $distance as score }
     order { $distance, $f.name }
@@ -216,7 +217,7 @@ score: F32
 
 --- query
 query nearest_ordered_plain_projection($v: Vector(2)) {
-    match { from nearest({ match { $p: Person } return { $p } }, $p.embedding, $v, k: 2) }
+    match { let $pop = { match { $p: Person } return { $p } }, from nearest($pop, $p.embedding, $v, k: 2) as $distance }
     return { $p.name }
     order { $distance }
     limit 2

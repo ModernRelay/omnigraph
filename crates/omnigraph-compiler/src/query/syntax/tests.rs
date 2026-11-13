@@ -290,7 +290,7 @@ const FROM: &str = "from { match { $p knows $q } return { $q } }";
 #[test]
 fn let_and_from_in_every_element_position() {
     for text in [LET, FROM] {
-        let probe = |c: &Element| matches!(c, Element::Let { .. } | Element::From(_));
+        let probe = |c: &Element| matches!(c, Element::Let { .. } | Element::From { .. });
         // First, middle and last of a `match`.
         for elements in [
             format!("{text}, $p: Person"),
@@ -325,7 +325,11 @@ fn let_and_from_in_every_element_position() {
         let c = one_element(&format!(
             "from {{ match {{ $p: Person, {text} }} return {{ $p }} }}"
         ));
-        let Element::From(RelExpr::Inline(body)) = c else {
+        let Element::From {
+            rel: RelExpr::Inline(body),
+            ..
+        } = c
+        else {
             panic!()
         };
         assert!(body.pattern.elements.iter().any(probe));
@@ -345,28 +349,53 @@ fn let_and_from_in_every_element_position() {
 fn from_takes_an_inline_read_a_variable_and_a_call() {
     assert!(matches!(
         one_element("from { match { $p: Person } return { $p } }"),
-        Element::From(RelExpr::Inline(_))
+        Element::From {
+            rel: RelExpr::Inline(_),
+            score: None
+        }
     ));
     assert!(matches!(
         one_element("from $docs"),
-        Element::From(RelExpr::Variable(v)) if v == "docs"
+        Element::From { rel: RelExpr::Variable(v), score: None } if v == "docs"
     ));
-    let Element::From(RelExpr::Call(c)) = one_element("from colleagues($x.handle)") else {
+    let Element::From {
+        rel: RelExpr::Call(c),
+        ..
+    } = one_element("from colleagues($x.handle)")
+    else {
         panic!()
     };
     assert_eq!(c.name, "colleagues");
     // A call's name need not touch its parenthesis.
-    let Element::From(RelExpr::Call(c)) = one_element("from colleagues ($x.handle)") else {
+    let Element::From {
+        rel: RelExpr::Call(c),
+        ..
+    } = one_element("from colleagues ($x.handle)")
+    else {
         panic!()
     };
     assert_eq!(c.name, "colleagues");
-    let Element::From(RelExpr::Call(c)) = one_element(
-        "from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20, recall: 0.9)",
-    ) else {
+    // A ranking's population may be written inline; `as` names its score.
+    let Element::From {
+        rel: RelExpr::Call(c),
+        score,
+    } = one_element(
+        "from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20, recall: 0.9) as $distance",
+    )
+    else {
         panic!()
     };
     assert_eq!((c.args.len(), c.options.len()), (3, 2));
     assert!(matches!(c.args[0], Arg::Inline(_)));
+    assert_eq!(score.as_deref(), Some("distance"));
+    let Element::From {
+        rel: RelExpr::Variable(v),
+        score,
+    } = one_element("from $r as $s")
+    else {
+        panic!()
+    };
+    assert_eq!((v.as_str(), score.as_deref()), ("r", Some("s")));
     // `from` followed by anything else is a parse error at the word, and so
     // is a bare name anywhere in a `match`.
     for text in ["from = 1", "from", "from (1) = 1"] {
@@ -946,9 +975,9 @@ fn one_keyword_and_the_body_shape_is_the_kind() {
     ));
     // A write whose selection comes from a ranked read.
     let w = write(
-        "query tag_near($q: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) } update $d set { tags: [\"near\"] } }",
+        "query tag_near($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 20) as $distance } update $d set { tags: [\"near\"] } }",
     );
-    assert_eq!((w.all_elements().len(), w.all_statements().len()), (1, 1));
+    assert_eq!((w.all_elements().len(), w.all_statements().len()), (2, 1));
     // A statement keyword stays a property name, after a dot and as a key.
     write("query w() { match { $p: P } where $p.insert = 1 and $p.update = 2 delete $p }");
     // Parameters with defaults, `limit $k`, generic annotations.
@@ -999,7 +1028,7 @@ fn calls_take_positionals_then_options_and_one_distinct_form() {
     ));
     // Nested relation functions.
     one_element(
-        "from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $q), k: 60, weights: [0.7, 0.3])",
+        "from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $q), k: 60, weights: [0.7, 0.3]) as $score",
     );
     // A block value as an operand, compared with another binding's value.
     let e = where_expr("count { $d in $x } + 1 >= $x.min_docs");
@@ -1519,10 +1548,10 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"an option before a positional argument"#,
         "Q005",
         r#"query q($q: Vector(3)) {
-  match { from nearest({ match { $d: Doc } return { $d } }, k: 20, $d.embedding, $q) }
+  match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, k: 20, $d.embedding, $q) as $distance }
   return { $d.title }
 }"#,
-        r#"query q($q: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) } return { $d.title } }"#,
+        r#"query q($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 20) as $distance } return { $d.title } }"#,
     ),
     (
         r#"an endpoint written as a meta-field"#,

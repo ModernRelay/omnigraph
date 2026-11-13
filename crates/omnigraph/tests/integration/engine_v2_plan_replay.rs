@@ -67,7 +67,7 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
     db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
     db.ensure_indices_as(None).await.unwrap();
     let query = r#"query selected_page() {
-        match { let $all = { match { $p: Person } return { $p } }, from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "needle needle"), k: 60), $p: Person, $p $e:(knows | likes) $q }
+        match { let $all = { match { $p: Person } return { $p } }, from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "needle needle"), k: 60) as $score, $p: Person, $p $e:(knows | likes) $q }
         return { $e.@type as edge_type, $e.@id as edge_id, $q.name as target }
         order { $score desc }
         limit 1
@@ -539,7 +539,8 @@ edge Knows: Doc -> Doc
 const DOC_QUERIES: &str = r#"
 query nearest_with_edge($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
+      let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
     }
     return { $d.slug }
     order { $distance }
@@ -547,20 +548,21 @@ query nearest_with_edge($q: Vector(4)) {
 }
 query window_then_where($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
+      let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
     }
     where $t.slug != "d01"
     return { $d.slug }
     order { $d.slug }
 }
 query fused($t: String, $q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60), $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60) as $score, $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 3
 }
 query fused_vectors($q: Vector(4), $r: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $r, k: 3), k: 60), $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $r, k: 3), k: 60) as $score, $d: Doc }
     return { $d.slug }
     order { $score desc }
     limit 3
@@ -1409,7 +1411,7 @@ async fn a_read_reports_its_ranking() {
 
     const RANKED: &str = r#"
 query two_texts($a: String, $b: String) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $a), bm25($all, $d.text, $b), k: 60), $d: Doc }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, $a), bm25($all, $d.text, $b), k: 60) as $score, $d: Doc }
     return {
         $d.slug,
         $score as fused,
@@ -1419,18 +1421,18 @@ query two_texts($a: String, $b: String) {
     limit 3
 }
 query closest($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 2) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $distance }
     return { $d.slug, $distance as _distance }
     order { $distance }
     limit 2
 }
 query distinct_scores($a: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $a) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $a) as $score }
     return distinct { $d.slug, $score as relevance }
     limit 3
 }
 query computed_score($a: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $a) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $a) as $score }
     return { $d.slug, $score as relevance, $score > 0.0 as hit }
     order { $score desc }
     limit 3
@@ -1811,7 +1813,7 @@ async fn a_plan_refusal_is_a_typed_bad_request_and_a_ranked_destination_replays_
     let db = docs(&dir).await;
     let source = r#"
 query nearest_destination($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $t.embedding, $q, k: 1) }
+    match { let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, from nearest($pop, $t.embedding, $q, k: 1) as $distance }
     return { $t.slug }
     order { $distance }
     limit 1
@@ -1854,7 +1856,7 @@ query nearest_destination($q: Vector(4)) {
     // target would be a pair.
     for (name, first, second) in [("d_first", "$d", "$t"), ("t_first", "$t", "$d")] {
         let source = format!(
-            "query {name}() {{\n    match {{ from rrf(bm25({{ match {{ $d: Doc }} return {{ $d }} }}, $d.text, \"needle\"), bm25({{ match {{ $t: Doc }} return {{ $t }} }}, $t.text, \"needle\")), {first}: Doc, {second}: Doc, $d knows $t }}\n    return {{ $d.slug, $t.slug }}\n    order {{ $score desc }}\n    limit 1\n}}\n"
+            "query {name}() {{\n    match {{ let $pop = {{ match {{ $d: Doc }} return {{ $d }} }}, let $pop2 = {{ match {{ $t: Doc }} return {{ $t }} }}, from rrf(bm25($pop, $d.text, \"needle\"), bm25($pop2, $t.text, \"needle\")) as $score, {first}: Doc, {second}: Doc, $d knows $t }}\n    return {{ $d.slug, $t.slug }}\n    order {{ $score desc }}\n    limit 1\n}}\n"
         );
         let refused = db
             .query(ReadTarget::branch("main"), &source, name, &ParamMap::new())
@@ -2257,7 +2259,7 @@ async fn an_envelope_of_another_version_asks_for_the_query_again() {
 #[tokio::test]
 async fn a_replay_rechecks_recorded_full_text_coverage() {
     const SOURCE: &str = r#"query recent($t: String) {
-    match { from bm25({ match { $d: Doc } where $d.year >= 2000 return { $d } }, $d.text, $t) }
+    match { let $pop = { match { $d: Doc } where $d.year >= 2000 return { $d } }, from bm25($pop, $d.text, $t) as $score }
     return { $d.slug, $score as score }
     order { $score desc }
 }"#;

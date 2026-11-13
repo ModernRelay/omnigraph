@@ -31,7 +31,8 @@ node Doc {
 --- query
 query nearest_matching_rows($q: Vector(4)) {
     match {
-      from nearest({ match { $d: Doc } where $d.n > 3 return { $d } }, $d.embedding, $q, k: 3),
+      let $pop = { match { $d: Doc } where $d.n > 3 return { $d } },
+      from nearest($pop, $d.embedding, $q, k: 3) as $distance,
     }
     return { $d.slug }
     order { $distance }

@@ -52,7 +52,7 @@ query oversized_fuzzy_option($edits: U64) {
 --- query
 set engine = v2;
 query null_rrf_option($k: I64?) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
     order { $score desc }
     limit 1
@@ -64,7 +64,7 @@ query null_rrf_option($k: I64?) {
 --- query
 set engine = v2;
 query zero_rrf_option($k: I64) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
     order { $score desc }
     limit 1
@@ -76,7 +76,7 @@ query zero_rrf_option($k: I64) {
 --- query
 set engine = v2;
 query oversized_rrf_option($k: U64) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
     order { $score desc }
     limit 1
@@ -88,7 +88,7 @@ query oversized_rrf_option($k: U64) {
 --- query
 set engine = v2;
 query typed_rrf_option($k: U32) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.text, "needle"), bm25($all, $d.text, "needle needle"), k: $k) as $score }
     return { $d.key }
     order { $score desc }
     limit 1
@@ -113,7 +113,7 @@ query null_search_query($q: String?) {
 --- query
 set engine = v2;
 query null_bm25_query($q: String?) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, $q) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.text, $q) as $score }
     return { $d.key }
     order { $score desc }
     limit 1
@@ -125,7 +125,7 @@ query null_bm25_query($q: String?) {
 --- query
 set engine = v2;
 query null_nearest_query($q: Vector(2)?) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
     return { $d.key }
     order { $distance }
     limit 1

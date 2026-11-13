@@ -583,7 +583,8 @@ unit you want back, not on a whole document.
 ```gq
 query customer_evidence($slug: String, $q: String) {
     match {
-      from nearest({ match { $c: Customer, $a: Assertion, $a about $c } where $c.slug = $slug return { $c, $a } }, $a.embedding, $q, k: 10),
+      let $pop = { match { $c: Customer, $a: Assertion, $a about $c } where $c.slug = $slug return { $c, $a } },
+      from nearest($pop, $a.embedding, $q, k: 10) as $distance,
     }
     return { $a.statement }
     order { $distance }

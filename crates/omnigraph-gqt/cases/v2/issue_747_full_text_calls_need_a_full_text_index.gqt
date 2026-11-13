@@ -65,7 +65,7 @@ query matched($q: String) {
 
 --- query
 query ranked($q: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.notes, $q) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.notes, $q) as $score }
     return { $d.slug }
     order { $score desc }
     limit 2

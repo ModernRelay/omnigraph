@@ -743,7 +743,7 @@ node Doc {
 "#;
     const EMBED_QUERY: &str = r#"
 query vector_search_string($q: String) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 3) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug, $d.title }
     order { $distance }
     limit 3

@@ -78,7 +78,7 @@ edge Tagged: Doc -> Marker
 
 --- query
 query nearest_named($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3) }
+    match { let $pop = { match { $d: Doc, $t: Doc, $d knows $t } return { $d, $t } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug as slug }
     order { $distance }
     limit 3
@@ -97,7 +97,7 @@ expand $d $t: mode indexed_scan ran indexed_scan
 
 --- query
 query nearest_alternative($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc, $t: Doc, $d (knows | knows) $t } return { $d, $t } }, $d.embedding, $q, k: 3) }
+    match { let $pop = { match { $d: Doc, $t: Doc, $d (knows | knows) $t } return { $d, $t } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug as slug }
     order { $distance }
     limit 3
@@ -116,7 +116,7 @@ expand $d $t: mode indexed_scan ran indexed_scan
 
 --- query
 query nearest_wildcard($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc, $t: Doc, $d * $t } return { $d, $t } }, $d.embedding, $q, k: 3) }
+    match { let $pop = { match { $d: Doc, $t: Doc, $d * $t } return { $d, $t } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug as slug }
     order { $distance }
     limit 3
@@ -135,7 +135,7 @@ expand $d $t: mode indexed_scan ran indexed_scan
 
 --- query
 query nearest_named_chain($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc, $t: Doc, $d knows $t, $m: Marker, $t tagged $m } return { $d, $t, $m } }, $d.embedding, $q, k: 3) }
+    match { let $pop = { match { $d: Doc, $t: Doc, $d knows $t, $m: Marker, $t tagged $m } return { $d, $t, $m } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug as slug }
     order { $distance }
     limit 3
@@ -156,7 +156,7 @@ expand $t $m: mode indexed_scan ran indexed_scan
 
 --- query
 query nearest_selected_chain($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc, $t: Doc, $d knows $t, $m: Marker, $t (tagged | tagged) $m } return { $d, $t, $m } }, $d.embedding, $q, k: 3) }
+    match { let $pop = { match { $d: Doc, $t: Doc, $d knows $t, $m: Marker, $t (tagged | tagged) $m } return { $d, $t, $m } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug as slug }
     order { $distance }
     limit 3
@@ -177,7 +177,7 @@ expand $t $m: mode indexed_scan ran indexed_scan
 
 --- query
 query fused_sparse_named($q: Vector(4), $other: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $other, k: 3), k: 60), $d: Doc, $t: Doc, $d knows $t }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $other, k: 3), k: 60) as $score, $d: Doc, $t: Doc, $d knows $t }
     return { $d.slug as slug }
     order { $score desc }
     limit 3
@@ -196,7 +196,7 @@ scan Doc as $d: ranked nearest diagnostics present
 
 --- query
 query fused_sparse_wildcard($q: Vector(4), $other: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $other, k: 3), k: 60), $d: Doc, $t: Doc, $d * $t }
+    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $other, k: 3), k: 60) as $score, $d: Doc, $t: Doc, $d * $t }
     return { $d.slug as slug }
     order { $score desc }
     limit 3

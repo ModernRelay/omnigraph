@@ -288,7 +288,7 @@ where match_text($d.body, $q)  // regular full-text match (not phrase search)
 
 ```gq
 query vector_search($q: Vector(3072)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 10) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 10) as $distance }
     return { $d.slug, $d.title }
     order { $distance }
     limit 10
@@ -296,9 +296,11 @@ query vector_search($q: Vector(3072)) {
 ```
 
 `nearest`, `bm25`, and `rrf` are relations drawn into `match` with `from`: the
-first argument is the population (an inline read whose `return` lists the
-bindings the query reads on), the second the ranked property, and `from` adds
-the score column, `$distance` for `nearest` and `$score` for `bm25` and `rrf`.
+first argument is the population (named with `let` before the ranking, its
+`return` listing the bindings the query reads on), the second the ranked
+property, and `from` adds the score column under the name its `as` writes,
+`as $distance` for `nearest` and `as $score` for `bm25` and `rrf`; a ranked
+`from` without `as` is `T85`, and so is an `as` on a `from` that ranks nothing.
 Order by it (`order { $distance }`, `order { $score desc }`), at any position
 of `order`; elements and `where` after the `from` run over the selected rows,
 which nothing refills; a ranking written as a call in `order` or `return` is `T65`, with the `from`
@@ -308,7 +310,7 @@ of its arms' candidates. `nearest` requires its window `k` (`T17`), the number
 of nearest targets it keeps with all their rows; the `limit` is a separate cut.
 BM25 needs neither, though a limit is recommended for bounded output.
 
-Return the score as `$distance`/`$score` (column `distance`/`score`) or alias
+Return the score by its name, `$distance`/`$score` (column `distance`/`score`), or alias
 it; see [`search.md`](search.md#projecting-scores). Search predicates
 (`search`, `fuzzy`, `match_text`) stand alone as filters and are not return
 items (`T38`). A ranked read's JSON carries a `ranking` object; see
@@ -323,7 +325,7 @@ differ and rank one binding (`T75`):
 query hybrid_search($vq: Vector(3072), $tq: String) {
     match {
         let $all = { match { $d: Doc } return { $d } },
-        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60),
+        from rrf(nearest($all, $d.embedding, $vq, k: 10), bm25($all, $d.title, $tq), k: 60) as $score,
     }
     return { $d.slug, $d.title }
     order { $score desc }

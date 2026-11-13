@@ -1082,7 +1082,11 @@ impl<'a> Shaper<'a> {
     /// pattern, which the rest of the pattern extends from its target.
     fn fused(&self, fuse: &Term) -> Result<Ranking, ShapeError> {
         let Term::Fuse {
-            arms, target, k, ..
+            arms,
+            target,
+            k,
+            out,
+            ..
         } = fuse
         else {
             unreachable!("fuse_leaf returns a Fuse")
@@ -1117,7 +1121,7 @@ impl<'a> Shaper<'a> {
                 k,
                 ty: scalar(ScalarType::F64),
             },
-            out: "score".to_string(),
+            out: out.clone(),
             column: target.clone(),
             score: (RRF_COLUMN, scalar(ScalarType::F64)),
             descending: true,

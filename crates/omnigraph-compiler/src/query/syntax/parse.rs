@@ -910,7 +910,7 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
                     Q020,
                     "`retrieve` was withdrawn: a ranking is a relation function drawn with `from`",
                     span_of(&section),
-                    "match { from nearest({ match { … } return { $d } }, $d.embedding, $q, k: 10) }",
+                    "match { let $pop = { match { … } return { $d } }, from nearest($pop, $d.embedding, $q, k: 10) as $distance }",
                 ));
             }
             Rule::return_clause => {
@@ -2384,7 +2384,9 @@ fn build_elements(
 }
 
 /// An element's [`SourceSpan`]; a triple's carries the byte ranges of its
-/// two ends, source then destination, where its `T82` fix swaps them.
+/// two ends, source then destination, where its `T82` fix swaps them, and a
+/// `from`'s the byte range of its relation, after which its `T85` fix writes
+/// or removes `as`.
 fn element_span(p: &Pair<Rule>) -> SourceSpan {
     let mut span = source_span(p);
     let c = kind(p);
@@ -2396,6 +2398,10 @@ fn element_span(p: &Pair<Rule>) -> SourceSpan {
         if let [src, dst] = ends.as_slice() {
             span.ranges = vec![written_range(src), written_range(dst)];
         }
+    } else if c.as_rule() == Rule::from_clause
+        && let Some(rel) = c.into_inner().find(|e| e.as_rule() == Rule::relation_expr)
+    {
+        span.ranges = vec![written_range(&rel)];
     }
     span
 }
@@ -2603,11 +2609,15 @@ fn element(pair: Pair<Rule>, before: &[Pair<Rule>]) -> R<Element> {
             Ok(Element::Let { name, value })
         }
         Rule::from_clause => {
-            let rel = c
-                .into_inner()
-                .find(|p| p.as_rule() == Rule::relation_expr)
-                .unwrap();
-            Ok(Element::From(relation(rel)?))
+            let mut inner = c.into_inner();
+            let rel = inner.find(|p| p.as_rule() == Rule::relation_expr).unwrap();
+            let score = inner
+                .find(|p| p.as_rule() == Rule::variable)
+                .map(|v| v.as_str()[1..].to_string());
+            Ok(Element::From {
+                rel: relation(rel)?,
+                score,
+            })
         }
         Rule::from_paren_rec => {
             let rel = c

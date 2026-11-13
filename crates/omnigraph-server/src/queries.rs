@@ -615,8 +615,9 @@ embedding: Vector(4)
     fn vector_param_on_exposed_query_warns() {
         let reg = QueryRegistry::from_specs(vec![spec(
             "vec_search",
-            "query vec_search($q: Vector(4)) { match { from nearest({ match { $u: User } return { $u } }, \
-             $u.embedding, $q, k: 3) } return { $u.name } order { $distance } limit 3 }",
+            "query vec_search($q: Vector(4)) { match { let $pop = { match { $u: User } return { $u } }, \
+             from nearest($pop, $u.embedding, $q, k: 3) as $distance } return { $u.name } \
+             order { $distance } limit 3 }",
             true, // mcp.expose
         )])
         .unwrap();
@@ -630,8 +631,9 @@ embedding: Vector(4)
     fn vector_param_on_unexposed_query_is_silent() {
         let reg = QueryRegistry::from_specs(vec![spec(
             "vec_search",
-            "query vec_search($q: Vector(4)) { match { from nearest({ match { $u: User } return { $u } }, \
-             $u.embedding, $q, k: 3) } return { $u.name } order { $distance } limit 3 }",
+            "query vec_search($q: Vector(4)) { match { let $pop = { match { $u: User } return { $u } }, \
+             from nearest($pop, $u.embedding, $q, k: 3) as $distance } return { $u.name } \
+             order { $distance } limit 3 }",
             false, // not exposed — vector param is fine for service-to-service callers
         )])
         .unwrap();

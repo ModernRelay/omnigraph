@@ -38,7 +38,7 @@ p.slug: String
 
 --- query
 query leading_nearest_runs($q: Vector(2)) {
-    match { from nearest({ match { $p: Person } where $p.enabled = true return { $p } }, $p.embedding, $q, k: 1) }
+    match { let $pop = { match { $p: Person } where $p.enabled = true return { $p } }, from nearest($pop, $p.embedding, $q, k: 1) as $distance }
     return { $p.slug }
     order { $distance }
     limit 1

@@ -194,11 +194,11 @@ order { companies desc, $person.name asc }
 limit 20
 ```
 
-Return expressions include variables, properties, literals, `now()`, the
-aggregates `count`, `sum`, `avg`, `min`, and `max`, and the score column a
-[ranking](../search/index.md) adds (`$distance` or `$score`). Each gives one
-column named by its alias or expression (`$p.name` gives `p.name`, `$score`
-gives `score`); duplicates are refused (`T25`).
+Return expressions include variables, properties, literals, `now()`, `count`,
+`sum`, `avg`, `min`, `max`, and a [ranking](../search/index.md)'s score, named
+by its `from`'s `as` (`T85`). Each gives one column named by its alias or
+expression (`$p.name` gives `p.name`, `$score` gives `score`); duplicates are
+refused (`T25`).
 
 Integer `sum` accumulates exactly in 128 bits and rounds once to `F64`; `avg`
 uses a floating-point accumulator. `min` and `max` accept numeric, `String`,

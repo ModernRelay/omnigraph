@@ -245,8 +245,9 @@ having_rec = { fw_having ~ ("{" ~ brace_body ~ "}" | expr) }
 // foreign forms are recognised here only to be refused with a fix.
 element = { arrow_traversal | cypher_pattern | list_to_rows | prefix_rec | with_rec | call_block_rec | match_prefix_rec | let_clause | from_clause | from_paren_rec | negation_rec | optional_block | optional_rec | blockless_rec | binding_brace_filter | binding_braces_rec | binding_paren_rec | binding | binding_lower_rec | traversal | filter_rec | stray_braces_rec }
 let_clause     = { kw_let ~ variable ~ "=" ~ (inline_read | expr) }
-// `from` is the element when the next token is `{`, `$` or a call.
-from_clause    = { kw_from ~ &("{" | "$" | call_name ~ "(") ~ relation_expr }
+// `from` is the element when the next token is `{`, `$` or a call; `as`
+// names a ranking's score.
+from_clause    = { kw_from ~ &("{" | "$" | call_name ~ "(") ~ relation_expr ~ (kw_as ~ variable)? }
 relation_expr  = { inline_read | call | variable }
 from_paren_rec = { kw_from ~ "(" ~ relation_expr ~ ")" }
 inline_read    = { "{" ~ (read_body ~ &"}" | matchless_read_rec) ~ "}" }

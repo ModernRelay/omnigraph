@@ -1508,13 +1508,13 @@ query title_search($term: String) {
     order { $d.slug }
 }
 query ranked($term: String) {
-    match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $term) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $term) as $score }
     return { $d.slug }
     order { $score desc }
     limit 10
 }
 query vectors($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
     return { $d.slug }
     order { $distance }
     limit 1
@@ -2047,7 +2047,7 @@ query retitle($title: String) { match { $x: Doc } where $x.slug = "ml-intro"  up
 query remove() { match { $x: Doc } where $x.slug = "rl-intro"  delete $x }
 query revise() { match { $x: Doc } where $x.slug = "dl-basics"  update $x set { body: "written after storage upgrade" } }
 query vectors($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 1) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 1) as $distance }
     return { $d.slug }
     order { $distance }
     limit 1

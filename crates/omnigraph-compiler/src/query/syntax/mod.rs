@@ -269,8 +269,12 @@ pub enum Element {
         name: String,
         value: LetValue,
     },
-    /// `from rel`: rows drawn from a relation.
-    From(RelExpr),
+    /// `from rel`, or `from rel as $s` over a ranking: rows drawn from a
+    /// relation; `score` names the score column a ranking adds.
+    From {
+        rel: RelExpr,
+        score: Option<String>,
+    },
     Optional(Pattern),
     /// `$x: T`, a node or an edge type.
     Binding {
@@ -445,8 +449,9 @@ pub struct SourceSpan {
     /// `operands` order, then, for an `in` over a written list, of each of
     /// its elements: where a refused literal operand is replaced. A
     /// triple's element span holds its two ends, source then destination,
-    /// which its `T82` fix swaps. Empty for a node built rather than parsed
-    /// and for the other nodes.
+    /// which its `T82` fix swaps; a `from`'s holds its relation, after which
+    /// its `T85` fix writes or removes `as`. Empty for a node built rather
+    /// than parsed and for the other nodes.
     pub ranges: Vec<(usize, usize)>,
 }
 

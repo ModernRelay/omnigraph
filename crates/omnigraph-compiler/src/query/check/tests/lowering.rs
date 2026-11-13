@@ -119,7 +119,7 @@ const CLOSURE: &[Row] = &[
                 Refused("B"),
             ),
             (
-                "query q($s: String) { match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.body, $s) } return { $d.title, $score } order { $score desc } limit 3 }",
+                "query q($s: String) { match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.body, $s) as $score } return { $d.title, $score } order { $score desc } limit 3 }",
                 Lowers,
             ),
             // A monotone self-call types to `Fix`, which stage Rec evaluates.
@@ -130,20 +130,20 @@ const CLOSURE: &[Row] = &[
         surface: "Ranking",
         texts: &[
             (
-                "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 3) } return { $d.title, $distance } order { $distance } limit 3 }",
+                "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 3) as $distance } return { $d.title, $distance } order { $distance } limit 3 }",
                 Lowers,
             ),
             (
-                "query q($s: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.body, terms($s)) } return { $d.title } order { $score desc } limit 3 }",
+                "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s)) as $score } return { $d.title } order { $score desc } limit 3 }",
                 Lowers,
             ),
             (
-                "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) } return { $d.title } order { $score desc } limit 3 }",
+                "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",
                 Lowers,
             ),
             // "distance"
             (
-                "query q($v: Vector(3)) { match { from distance({ match { $d: Doc } return { $d } }, $d.embedding, $v) } return { $d.title, $distance } }",
+                "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, $v) as $distance } return { $d.title, $distance } }",
                 Refused("B"),
             ),
         ],

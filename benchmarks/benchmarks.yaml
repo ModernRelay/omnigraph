@@ -137,7 +137,7 @@ scenarios:
     text: |
       --- query
       query nearest_after_update($q: Vector(4)) {
-          match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 6) }
+          match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 6) as $distance }
           return { $d.slug }
           order { $distance }
           limit 6
@@ -150,7 +150,7 @@ scenarios:
     text: |
       --- query
       query nearest_after_delete($q: Vector(4)) {
-          match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 3) }
+          match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
           return { $d.slug }
           order { $distance }
           limit 3
@@ -521,7 +521,7 @@ scenarios:
     text: |
       --- query
       query filtered_nearest($q: Vector(4)) {
-          match { from nearest({ match { $d: Doc } where $d.status = "hit" return { $d } }, $d.embedding, $q, k: 3) }
+          match { let $pop = { match { $d: Doc } where $d.status = "hit" return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
           return { $d.slug }
           order { $distance }
           limit 3
@@ -535,7 +535,7 @@ scenarios:
       --- query
       set ann_nprobes = 1;
       query nearest_matching_rows($q: Vector(4)) {
-          match { from nearest({ match { $d: Doc } where $d.n > 3 return { $d } }, $d.embedding, $q, k: 3) }
+          match { let $pop = { match { $d: Doc } where $d.n > 3 return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
           return { $d.slug }
           order { $distance }
           limit 3
@@ -550,7 +550,7 @@ scenarios:
       query recall_two_terms($q1: String, $q2: String) {
           match {
             let $all = { match { $c: Chunk } return { $c } },
-            from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60),
+            from rrf(bm25($all, $c.text, $q1), bm25($all, $c.text, $q2), k: 60) as $score,
             $c: Chunk,
             $a: Artifact,
             $c chunkOfArtifact $a,

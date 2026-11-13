@@ -276,7 +276,7 @@ fn parity_ranked_query_ranking() {
     let queries = p._temp.path().join("ranked.gq");
     std::fs::write(
         &queries,
-        "query ranked($q: String) {\n    match { from bm25({ match { $p: Person } return { $p } }, $p.name, $q) }\n    return { $p.name, $score as relevance }\n    order { $score desc }\n    limit 2\n}\n",
+        "query ranked($q: String) {\n    match { let $pop = { match { $p: Person } return { $p } }, from bm25($pop, $p.name, $q) as $score }\n    return { $p.name, $score as relevance }\n    order { $score desc }\n    limit 2\n}\n",
     )
     .unwrap();
     let (l, r) = p.run(&[

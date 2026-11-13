@@ -36,7 +36,8 @@ edge RankedLink: RankedDoc -> RankedDoc {
 --- query
 query nearest_edges($q: Vector(4)) {
     match {
-      from nearest({ match { $d: RankedDoc, $target: RankedDoc, $d $w:rankedLink $target } return { $d, $w, $target } }, $d.embedding, $q, k: 4),
+      let $pop = { match { $d: RankedDoc, $target: RankedDoc, $d $w:rankedLink $target } return { $d, $w, $target } },
+      from nearest($pop, $d.embedding, $q, k: 4) as $distance,
     }
     return { $d.slug, $w.label }
     order { $distance }
@@ -59,7 +60,8 @@ w.label: String
 --- query
 query nearest_hops($q: Vector(4)) {
     match {
-      from nearest({ match { $d: RankedDoc, $target: RankedDoc, $d rankedLink{1,2} $target } return { $d, $target } }, $d.embedding, $q, k: 2),
+      let $pop = { match { $d: RankedDoc, $target: RankedDoc, $d rankedLink{1,2} $target } return { $d, $target } },
+      from nearest($pop, $d.embedding, $q, k: 2) as $distance,
     }
     return { $d.slug, $target.slug }
     order { $distance }

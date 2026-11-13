@@ -22,7 +22,7 @@ node Doc {
 
 --- query
 query nearest_small_corpus($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 10) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 10) as $distance }
     return { $d.slug }
     order { $distance }
     limit 10

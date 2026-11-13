@@ -36,7 +36,7 @@ query move_embedding($s: String, $e: Vector(4)) {
 
 --- query
 query nearest_after_update($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 6) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 6) as $distance }
     return { $d.slug }
     order { $distance }
     limit 6

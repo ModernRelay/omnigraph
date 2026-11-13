@@ -114,6 +114,7 @@ codes! {
     T82 = "a triple written against its edge's declared direction; the fix swaps its ends, source first";
     T83 = "two declarations of one name in a source unit";
     T84 = "a name an inner scope, a block or an inline read, uses in a triple without binding it";
+    T85 = "a ranked `from` without `as`, or an `as` on a `from` that ranks nothing";
     T86 = "a term this release's planner does not lower; the message names the stage that adds it";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at

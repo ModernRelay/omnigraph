@@ -119,10 +119,10 @@ query relocate_staff($slug: String) {
 }",
         "query passages($matter: String, $q: String, $k: I64 = 5) {
   match {
-    from bm25(
-      { match { $r: SourceRevision, $p: Passage, $r hasPassage $p } where $r.matter_number = $matter and contains($p.text, \"tariff\")
-        return { $r, $p } },
-      $p.text, $q),
+    let $pop = { match { $r: SourceRevision, $p: Passage, $r hasPassage $p }
+                 where $r.matter_number = $matter and contains($p.text, \"tariff\")
+                 return { $r, $p } },
+    from bm25($pop, $p.text, $q) as $score,
   }
   return { $r.path, $p.locator, $score }
   order { $score desc }
@@ -138,10 +138,8 @@ query relocate_staff($slug: String) {
 }",
         "query cited_near($coll: String, $q: Vector(3)) {
   match {
-    from nearest(
-      { match { $d: Doc, $d in $x, $x: Collection } where $x.slug = $coll return { $d } },
-      $d.embedding, $q, k: 20
-    ),
+    let $pop = { match { $d: Doc, $d in $x, $x: Collection } where $x.slug = $coll return { $d } },
+    from nearest($pop, $d.embedding, $q, k: 20) as $distance,
     $d cites $other,
   }
   return { $d.title, $distance, count($other) as cites }
@@ -345,7 +343,7 @@ fn t68_on_a_collision_with_each_kind_of_name_in_scope() {
         ),
         (
             "ranking output",
-            "query q($v: Vector(3)) { match { from distance({ match { $d: Doc } return { $d, $d.year as distance } }, $d.embedding, $v) } return { $d } }",
+            "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d, $d.year as distance } }, from distance($pop, $d.embedding, $v) as $distance } return { $d } }",
         ),
         (
             "let reusing a column",
@@ -364,7 +362,7 @@ fn t68_on_a_collision_with_each_kind_of_name_in_scope() {
     assert!(m.contains("silently become a filter"), "{m}");
     // A `from` inside an inner read drawing a name the enclosing scope holds.
     refused(
-        "query q($v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, $d: Doc, from { match { from distance($docs, $d.embedding, $v) } return { $d as e } } } return { $e } }",
+        "query q($v: Vector(3)) { match { let $docs = { match { $d: Doc } return { $d } }, $d: Doc, from { match { from distance($docs, $d.embedding, $v) as $distance } return { $d as e } } } return { $e } }",
         "T68",
     );
     // The fix the code prints, an alias on the inner return, is accepted.
@@ -518,19 +516,19 @@ fn t70_for_a_non_monotone_cycle_and_a_budget_overrun() {
 fn a_relation_function_over_zero_and_two_node_columns() {
     // Zero node columns: the ranked column is not one.
     let m = refused(
-        "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d.title as t } }, $d.embedding, $v, k: 3) } return { $t } }",
+        "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d.title as t } }, from nearest($pop, $d.embedding, $v, k: 3) as $distance } return { $t } }",
         "T79",
     );
     assert!(m.contains("none"), "{m}");
     // A scalar column named as the ranked one.
     refused(
-        "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d.title as d } }, $d.embedding, $v, k: 3) } return { $d } }",
+        "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d.title as d } }, from nearest($pop, $d.embedding, $v, k: 3) as $distance } return { $d } }",
         "T79",
     );
     // Two node columns: the call names which (the RFC's `passages` shape);
     // the other rides as payload.
     let c = ok(
-        "query q($s: String) { match { from bm25({ match { $p: Person, $d: Doc, $p authored $d } return { $p, $d } }, $d.body, $s) } return { $p.name, $d.title, $score } }",
+        "query q($s: String) { match { let $pop = { match { $p: Person, $d: Doc, $p authored $d } return { $p, $d } }, from bm25($pop, $d.body, $s) as $score } return { $p.name, $d.title, $score } }",
     );
     assert_eq!(
         cols(&c),
@@ -543,7 +541,7 @@ fn a_relation_function_over_zero_and_two_node_columns() {
     // A bare field name is refused at its word, and the suggestion names the
     // one binding in scope.
     let e = parse_source(
-        "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, embedding, $v, k: 3) } return { $d } }",
+        "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, embedding, $v, k: 3) as $distance } return { $d } }",
     )
     .unwrap_err();
     assert_eq!(e.code.as_str(), "Q018", "{e}");
@@ -553,21 +551,21 @@ fn a_relation_function_over_zero_and_two_node_columns() {
 #[test]
 fn a_ranked_column_whose_property_is_not_declared() {
     refused(
-        "query q($s: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.abstract, $s) } return { $d } }",
+        "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.abstract, $s) as $score } return { $d } }",
         "T27",
     );
     refused(
-        "query q($v: Vector(3)) { match { from distance({ match { $d: Doc } return { $d } }, $d.vec, $v) } return { $d } }",
+        "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.vec, $v) as $distance } return { $d } }",
         "T15",
     );
     // A declared property without a full-text index.
     refused(
-        "query q($s: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.title, $s) } return { $d } }",
+        "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.title, $s) as $score } return { $d } }",
         "T27",
     );
     // A query vector of the wrong dimension.
     refused(
-        "query q() { match { from distance({ match { $d: Doc } return { $d } }, $d.embedding, [1.0, 2.0]) } return { $d } }",
+        "query q() { match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, [1.0, 2.0]) as $distance } return { $d } }",
         "T15",
     );
 }
@@ -575,25 +573,25 @@ fn a_ranked_column_whose_property_is_not_declared() {
 #[test]
 fn nearest_without_k() {
     let m = refused(
-        "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v) } return { $d } }",
+        "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v) as $distance } return { $d } }",
         "T17",
     );
     assert!(m.contains("law 3"), "{m}");
     refused(
-        "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 0) } return { $d } }",
+        "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 0) as $distance } return { $d } }",
         "T71",
     );
     refused(
-        "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 5, recall: 1.5) } return { $d } }",
+        "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 5, recall: 1.5) as $distance } return { $d } }",
         "T71",
     );
     refused(
-        "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 5, candidates: 50) } return { $d } }",
+        "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 5, candidates: 50) as $distance } return { $d } }",
         "T71",
     );
     // `k` from a parameter is a window, never `limit`'s value.
     ok(
-        "query q($v: Vector(3), $k: I64) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: $k) } return { $d.title, $distance } limit 3 }",
+        "query q($v: Vector(3), $k: I64) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: $k) as $distance } return { $d.title, $distance } limit 3 }",
     );
 }
 
@@ -771,22 +769,22 @@ fn the_edge_binding_scans_an_edge_type() {
 #[test]
 fn the_ranking_functions_type_their_result_columns() {
     let c = ok(
-        "query q($v: Vector(3)) { match { from distance({ match { $d: Doc } return { $d } }, $d.embedding, $v) } return { $d, $distance } }",
+        "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, $v) as $distance } return { $d, $distance } }",
     );
     assert_eq!(cols(&c)[1], ("distance".into(), "F32".into()));
     let c = ok(
-        "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 5, recall: 0.9) } return { $distance } }",
+        "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 5, recall: 0.9) as $distance } return { $distance } }",
     );
     assert_eq!(cols(&c)[0], ("distance".into(), "F32".into()));
     assert!(format!("{:?}", read_of(&c).term).contains("recall: Some(0.9)"));
     let c = ok(
-        "query q($s: String) { match { from bm25({ match { $d: Doc } return { $d } }, $d.body, terms($s, mode: all, max_edits: 1)) } return { $score } }",
+        "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s, mode: all, max_edits: 1)) as $score } return { $score } }",
     );
     assert_eq!(cols(&c)[0], ("score".into(), "F32".into()));
     // `rrf` yields the target and `score` only: the population's other
     // columns are gone after fusion.
     let fused = "let $docs = { match { $p: Person, $d: Doc, $p authored $d } return { $p, $d } },
-                 from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $s), k: 60, weights: [2.0, 1.0])";
+                 from rrf(nearest($docs, $d.embedding, $v, k: 50), bm25($docs, $d.body, $s), k: 60, weights: [2.0, 1.0]) as $score";
     let c = ok(&format!(
         "query q($s: String, $v: Vector(3)) {{ match {{ {fused} }} return {{ $d.title, $score }} }}"
     ));
@@ -833,7 +831,7 @@ fn rrf_refusals() {
     ] {
         refused(
             &format!(
-                "query q($s: String, $v: Vector(3)) {{ match {{ {pop}, from rrf({arms}{opts}) }} return {{ $d }} }}"
+                "query q($s: String, $v: Vector(3)) {{ match {{ {pop}, from rrf({arms}{opts}) as $score }} return {{ $d }} }}"
             ),
             "T75",
         );
@@ -841,7 +839,7 @@ fn rrf_refusals() {
     for opts in [", k: 0", ", weights: [1.0, 0.0]", ", depth: 2"] {
         refused(
             &format!(
-                "query q($s: String, $v: Vector(3)) {{ match {{ {pop}, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s){opts}) }} return {{ $d }} }}"
+                "query q($s: String, $v: Vector(3)) {{ match {{ {pop}, from rrf(nearest($docs, $d.embedding, $v, k: 5), bm25($docs, $d.body, $s){opts}) as $score }} return {{ $d }} }}"
             ),
             "T71",
         );
@@ -849,7 +847,7 @@ fn rrf_refusals() {
     // Two arms over one population with different queries are distinct arms;
     // an ordered inline read is an arm.
     ok(&format!(
-        "query q($s: String, $t: String, $v: Vector(3)) {{ match {{ {pop}, from rrf(bm25($docs, $d.body, $s), bm25($docs, $d.body, $t), {{ match {{ $d: Doc }} return {{ $d }} order {{ $d.year desc }} limit 10 }}) }} return {{ $d, $score }} }}"
+        "query q($s: String, $t: String, $v: Vector(3)) {{ match {{ {pop}, from rrf(bm25($docs, $d.body, $s), bm25($docs, $d.body, $t), {{ match {{ $d: Doc }} return {{ $d }} order {{ $d.year desc }} limit 10 }}) as $score }} return {{ $d, $score }} }}"
     ));
 }
 
@@ -1049,7 +1047,7 @@ fn write_groups_type_their_sinks() {
     );
     // A write fed by a ranked read, a `let` and an `optional`.
     ok(
-        "query tag_near($q: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 20) }  update $d set { tags: [\"near\"] } }",
+        "query tag_near($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 20) as $distance }  update $d set { tags: [\"near\"] } }",
     );
     ok(
         "query w($h: String) { match { $p: Person, let $n = count { $q: Person, $p knows $q }, optional { $p worksAt $c } } where $p.handle = $h and $n > 1  update $p set { city: \"busy\" } }",
@@ -1194,8 +1192,21 @@ fn weighted_type_checks_with_the_population_renamed_before_d_is_bound() {
   match {
     let $docs = { match { $d: Doc } return { $d } },
     let $docs2 = { match { from $docs } return { $d as d2 } },
-    from { match { from distance($docs, $d.embedding, $v) } return { $d, $distance as vec } },
-    from { match { from bm25($docs2, $d2.body, $q) } return { $d2, $score as lex } },
+    from { match { from distance($docs, $d.embedding, $v) as $distance } return { $d, $distance as vec } },
+    from { match { from bm25($docs2, $d2.body, $q) as $score } return { $d2, $score as lex } },
+  }
+  where $d = $d2
+  return { $d.title, 0.7 * (1.0 / (1.0 + $vec)) + 0.3 * $lex as s }
+  order { s desc }
+  limit 10
+}");
+    // The section 8 form: each `from` names its own score with `as`.
+    ok("query weighted($q: String, $v: Vector(3)) {
+  match {
+    let $docs = { match { $d: Doc } return { $d } },
+    let $docs2 = { match { from $docs } return { $d as d2 } },
+    from distance($docs, $d.embedding, $v) as $vec,
+    from bm25($docs2, $d2.body, $q) as $lex,
   }
   where $d = $d2
   return { $d.title, 0.7 * (1.0 / (1.0 + $vec)) + 0.3 * $lex as s }
@@ -1297,6 +1308,19 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query staff($slug: String) { match { $c: Company, $c worksAt $p } where $c.slug = $slug return { $p.name } }"#,
         r#"query staff($slug: String) { match { $c: Company, $p worksAt $c } where $c.slug = $slug return { $p.name } }"#,
     ),
+    // The two queries of `diagnostics/t85_ranked_from_names_its_score.gqt`.
+    (
+        r#"a ranked from without as"#,
+        "T85",
+        r#"query near($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) } return { $d.id, $distance } order { $distance } }"#,
+        r#"query near($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $distance } return { $d.id, $distance } order { $distance } }"#,
+    ),
+    (
+        r#"an as on a from that ranks nothing"#,
+        "T85",
+        r#"query docs() { match { let $docs = { match { $d: Doc } return { $d } }, from $docs as $s } return { $d.id } }"#,
+        r#"query docs() { match { let $docs = { match { $d: Doc } return { $d } }, from $docs } return { $d.id } }"#,
+    ),
     // The two queries of `diagnostics/t68_block_binds_an_outer_name.gqt`.
     (
         r#"a block that only binds an outer name to filter its row"#,
@@ -1386,6 +1410,90 @@ fn t8_prints_the_block_an_aggregate_filter_means() {
     assert_eq!(d.fix.as_deref(), Some("return { count($p) as count_p }"));
 }
 
+/// A ranked `from` names its score with `as` (`T85`): the score enters
+/// scope under the written name and no other, through a ranking function
+/// or a named relation bound to one; a `from` that ranks nothing takes no
+/// `as`, and in a relation function's argument a score has no name.
+#[test]
+fn a_ranked_from_names_its_score() {
+    let pop = "let $pop = { match { $d: Doc } return { $d } }";
+    // The written name is the column, and the old implicit name is not in
+    // scope beside it.
+    let c = ok(&format!(
+        "query q($v: Vector(3)) {{ match {{ {pop}, from nearest($pop, $d.embedding, $v, k: 3) as $dist }} where $dist < 1.0 return {{ $d.title, $dist }} order {{ $dist }} }}"
+    ));
+    assert_eq!(cols(&c)[1], ("dist".into(), "F32".into()));
+    assert!(format!("{:?}", read_of(&c).term).contains(r#"out: "dist""#));
+    assert_eq!(
+        code(&format!(
+            "query q($v: Vector(3)) {{ match {{ {pop}, from nearest($pop, $d.embedding, $v, k: 3) as $dist }} return {{ $distance }} }}"
+        )),
+        "T6"
+    );
+    // `bm25`, `distance` and `rrf` alike; the fused score keeps its type.
+    let c = ok(&format!(
+        "query q($s: String) {{ match {{ {pop}, from bm25($pop, $d.body, $s) as $relevance }} return {{ $relevance }} }}"
+    ));
+    assert_eq!(cols(&c)[0], ("relevance".into(), "F32".into()));
+    let c = ok(&format!(
+        "query q($v: Vector(3)) {{ match {{ {pop}, from distance($pop, $d.embedding, $v) as $exact }} return {{ $exact }} }}"
+    ));
+    assert_eq!(cols(&c)[0], ("exact".into(), "F32".into()));
+    let c = ok(&format!(
+        "query q($s: String, $v: Vector(3)) {{ match {{ {pop}, from rrf(nearest($pop, $d.embedding, $v, k: 5), bm25($pop, $d.body, $s)) as $fused }} return {{ $d.title, $fused }} order {{ $fused desc }} }}"
+    ));
+    assert_eq!(cols(&c)[1], ("fused".into(), "F64".into()));
+    assert!(format!("{:?}", read_of(&c).term).contains(r#"out: "fused""#));
+    // A named relation bound to a ranking ranks: its `from` takes `as`.
+    let c = ok(&format!(
+        "query q($v: Vector(3)) {{ match {{ {pop}, let $near = nearest($pop, $d.embedding, $v, k: 3), from $near as $d2 }} return {{ $d.title, $d2 }} }}"
+    ));
+    assert_eq!(cols(&c)[1], ("d2".into(), "F32".into()));
+    let d = refused_with(
+        &format!(
+            "query q($v: Vector(3)) {{ match {{ {pop}, let $near = nearest($pop, $d.embedding, $v, k: 3), from $near }} return {{ $d.title }} }}"
+        ),
+        "T85",
+    );
+    assert_eq!(d.fix.as_deref(), Some("from $near as $distance"));
+    // The fix's name is fresh against the scope.
+    let d = refused_with(
+        &format!(
+            "query q($v: Vector(3), $distance: F32) {{ match {{ {pop}, from nearest($pop, $d.embedding, $v, k: 3) }} return {{ $d.title }} }}"
+        ),
+        "T85",
+    );
+    assert_eq!(d.suggestion.unwrap().edits[0].replacement, " as $distance2");
+    // An `as` on an inline read, a declared read's call or a `union`.
+    for rel in [
+        "{ match { $d: Doc } return { $d } }",
+        "union({ match { $d: Doc } return { $d } }, { match { $d: Doc } return { $d } })",
+    ] {
+        refused_with(
+            &format!("query q() {{ match {{ from {rel} as $s }} return {{ $d.title }} }}"),
+            "T85",
+        );
+    }
+    // The written name may not repeat a column of the population.
+    refused_with(
+        &format!(
+            "query q($v: Vector(3)) {{ match {{ {pop}, from nearest($pop, $d.embedding, $v, k: 3) as $d }} return {{ $d.title }} }}"
+        ),
+        "T68",
+    );
+    // A ranking in a relation function's argument has no score name: a
+    // `union` arm and a ranking's population keep their own columns only.
+    ok(&format!(
+        "query q($v: Vector(3)) {{ match {{ {pop}, from union(nearest($pop, $d.embedding, $v, k: 3), {{ match {{ $d: Doc }} return {{ $d }} }}) }} return {{ $d.title }} }}"
+    ));
+    assert_eq!(
+        code(&format!(
+            "query q($v: Vector(3), $s: String) {{ match {{ {pop}, from bm25(nearest($pop, $d.embedding, $v, k: 3), $d.body, $s) as $score }} return {{ $distance }} }}"
+        )),
+        "T6"
+    );
+}
+
 /// `T65`'s suggestion draws the ranking with `from` over the read's own
 /// pattern; applied, the text type-checks to the form the rewriter writes.
 #[test]
@@ -1394,19 +1502,19 @@ fn t65_suggests_an_applicable_edit() {
     for (written, intended) in [
         (
             "query q($v: Vector(3)) { match { $d: Doc } return { $d.title } order { nearest($d.embedding, $v) } limit 3 }",
-            "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $v, k: 3) } return { $d.title } order { $distance } limit 3 }",
+            "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: 3) as $distance } return { $d.title } order { $distance } limit 3 }",
         ),
         (
             "query q($v: Vector(3)) { match { $d: Doc } where $d.year > 2000 return { $d.title } order { nearest($d.embedding, $v) } limit 3 }",
-            "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } where $d.year > 2000 return { $d } }, $d.embedding, $v, k: 3) } return { $d.title } order { $distance } limit 3 }",
+            "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } where $d.year > 2000 return { $d } }, from nearest($pop, $d.embedding, $v, k: 3) as $distance } return { $d.title } order { $distance } limit 3 }",
         ),
         (
             "query q($s: String) { match { $p: Person, $p authored $d } return { $d.title, bm25($d.body, $s) } order { bm25($d.body, $s) } limit 3 }",
-            "query q($s: String) { match { from bm25({ match { $p: Person, $d: Doc, $p authored $d } return { $p, $d } }, $d.body, $s) } return { $d.title, $score as _score } order { $score desc } limit 3 }",
+            "query q($s: String) { match { let $pop = { match { $p: Person, $d: Doc, $p authored $d } return { $p, $d } }, from bm25($pop, $d.body, $s) as $score } return { $d.title, $score as _score } order { $score desc } limit 3 }",
         ),
         (
             "query q($s: String, $v: Vector(3)) { match { $d: Doc } return { $d.title } order { rrf(nearest($d.embedding, $v), bm25($d.body, $s)) } limit 3 }",
-            "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60), $d: Doc } return { $d.title } order { $score desc } limit 3 }",
+            "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) as $score, $d: Doc } return { $d.title } order { $score desc } limit 3 }",
         ),
     ] {
         let d = refused_with(written, "T65");

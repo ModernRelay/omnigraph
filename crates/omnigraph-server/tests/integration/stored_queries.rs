@@ -443,7 +443,7 @@ async fn server_refuses_boot_on_type_broken_stored_query() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invoke_stored_read_returns_rows() {
-    const RANKED_PEOPLE_GQ: &str = "query ranked_people($q: String) { match { from bm25({ match { $p: Person } return { $p } }, $p.name, $q) } return { $p.name, $score as relevance } order { $score desc } limit 2 }";
+    const RANKED_PEOPLE_GQ: &str = "query ranked_people($q: String) { match { let $pop = { match { $p: Person } return { $p } }, from bm25($pop, $p.name, $q) as $score } return { $p.name, $score as relevance } order { $score desc } limit 2 }";
     let (_temp, app) = app_with_stored_queries(
         &[
             ("find_person", FIND_PERSON_GQ, false),

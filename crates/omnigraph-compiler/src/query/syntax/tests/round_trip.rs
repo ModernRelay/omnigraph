@@ -269,7 +269,7 @@ fn element(depth: u32) -> BoxedStrategy<Element> {
         6 => base,
         2 => (pick(VARS), expr(d)).prop_map(|(name, e)| Element::Let { name, value: LetValue::Expr(e) }),
         1 => (pick(VARS), read_body(d)).prop_map(|(name, b)| Element::Let { name, value: LetValue::Relation(Box::new(b)) }),
-        2 => relation(d).prop_map(Element::From),
+        2 => (relation(d), proptest::option::of(pick(VARS))).prop_map(|(rel, score)| Element::From { rel, score }),
         1 => pattern(d, 1..3).prop_map(Element::Optional),
     ]
     .boxed()

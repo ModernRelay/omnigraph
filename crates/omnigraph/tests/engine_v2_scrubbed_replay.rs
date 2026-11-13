@@ -252,7 +252,7 @@ node Doc {
 "#;
 
 const NEAREST: &str = r#"query by_vector($q: Vector(4)) {
-    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, $q, k: 3) }
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 3) as $distance }
     return { $d.slug }
     order { $distance }
     limit 3
