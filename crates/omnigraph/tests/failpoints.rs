@@ -4923,7 +4923,13 @@ async fn schema_apply_retry_preserves_the_original_empty_create() {
         assert_eq!(entry.published_dataset_version, if changed { 2 } else { 1 });
         assert_eq!(entry.version_metadata.staged_version().is_some(), changed);
         assert_eq!(entry.version_metadata.last_linear_version(), Some(1));
-        recovered.repair_report_as(None).await.unwrap();
+        let plan = recovered.cleanup_plan(keep_one()).await.unwrap();
+        let company_plan = main_plan(&plan, "node:Company");
+        assert!(company_plan.errors.is_empty(), "{company_plan:?}");
+        assert!(
+            company_plan.foreign_versions.is_empty(),
+            "the qualified original version is no foreign commit: {company_plan:?}"
+        );
         recovered.ensure_indices_as(None).await.unwrap();
         let cleaned = recovered.cleanup_as(keep_one(), None).await.unwrap();
         assert!(cleaned.iter().all(|row| row.error.is_none()), "{cleaned:?}");
@@ -6034,7 +6040,7 @@ async fn optimize_plans_the_whole_catalog_when_no_op_turns_drain_beside_a_rewrit
 ///
 /// The token carried in `admission_txn` is the authority proof and the source
 /// of the recovery sidecar's `RecoveryAuthorityToken`. Removing it would
-/// silently downgrade optimize/cleanup/repair from
+/// silently downgrade optimize and cleanup from
 /// reject-on-authority-drift to read-whatever-is-fresh.
 async fn seed_optimize_race_graph(dir: &tempfile::TempDir) {
     let seed = helpers::init_and_load(dir).await;
@@ -9831,7 +9837,7 @@ async fn branch_merge_pointer_adoption_carries_the_source_pin() {
 
 /// RFC 0067: a handle whose snapshot predates another handle's write holds
 /// a stale read set: its write reprepares from the current manifest instead
-/// of being refused with a repair conflict.
+/// of being refused as a conflict.
 #[tokio::test]
 #[serial]
 async fn rfc_0067_stale_handle_write_after_another_write_reprepares() {

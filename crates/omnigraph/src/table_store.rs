@@ -518,7 +518,7 @@ pub(crate) fn has_insert_absence_certificate(transaction: &Transaction) -> bool 
 /// instead, which consumers accept as the same no-delete proof. It is
 /// read-advisory: a missing marker only forces a fall-back, never a
 /// correctness change. A persisted `Update` from an external Lance merge
-/// (e.g. adopted via `repair --force`) carries no marker and cannot be pruned.
+/// carries no marker and cannot be pruned.
 pub(crate) const NO_BY_SOURCE_DELETE_PROPERTY: &str = "omnigraph.no_by_source_delete";
 pub(crate) const NO_BY_SOURCE_DELETE_V1: &str = "v1";
 
@@ -8920,7 +8920,7 @@ fn staged_keyed_merge_result(
     // insert), none of which use a by-source-delete arm. Stamp the durable
     // no-by-source-delete marker before the transaction is committed, so the CDC
     // candidate-pruning classifier can trust this persisted `Update` removed no
-    // rows (an external merge adopted via `repair --force` carries no marker).
+    // rows (an external Lance merge carries no marker).
     stamp_no_by_source_delete(&mut uncommitted.transaction);
     Ok(StagedWrite::with_commit_metadata(
         uncommitted.transaction,

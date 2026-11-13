@@ -643,7 +643,6 @@ defaults: {target: local, profile: work}
                 "1",
                 "--confirm",
             ],
-            vec!["repair", "--graph", "knowledge"],
             vec!["rebuild-full-text-indexes", "--graph", "knowledge"],
         ] {
             let mut args = args;

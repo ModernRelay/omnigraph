@@ -1191,7 +1191,6 @@ async fn run(
 fn table_outcome(stat: &omnigraph::db::DatasetOptimizeStats) -> TableOutcome {
     let (reason, detail) = match stat.outcome {
         TableOptimizeOutcome::Deferred(reason) => (Some(reason.as_str()), Some(reason.to_string())),
-        TableOptimizeOutcome::Skipped(reason) => (Some(reason.as_str()), Some(reason.to_string())),
         TableOptimizeOutcome::Failed => {
             (None, stat.failure.as_ref().map(|error| error.to_string()))
         }
