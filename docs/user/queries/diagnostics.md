@@ -69,6 +69,43 @@ without another missing-parameter recovery. Incomplete or ambiguous input can
 still receive textual guidance while omitting `suggestion`. Missing suggestions
 do not mean there is no possible fix.
 
+## Checked literals
+
+A literal compared with a property, or listed in an `in` against one, is
+checked against the property's type wherever it is written: a `where`, a
+block's or an `optional`'s `where`, a write group's `where` and a `let`, in
+either operand order. An enum value outside the declared set, an integer
+outside the property's range, a float outside the `F32` range and a `date(…)`
+or `datetime(…)` that does not parse are `T3`, so a misspelled enum value is
+refused instead of matching no rows. A float against an integer property is
+admitted: it compares through a cast and keeps its fraction. `contains(…)` and
+`starts_with(…)` over an enum property refuse a literal that no declared value
+passes. A parameter keeps its declared type and is not checked against the
+property's domain.
+
+The fix names the nearest allowed value: the closest enum value by edit
+distance, the range bound or the nearest calendar day. Where the literal was
+written in a comparison or an `in`, `suggestion` writes that value in its place
+as `needs_review`, since the intended value is a guess. This source:
+
+```text
+query open_prs() { match { $pr: PullRequest } where $pr.status = "Closed" return { $pr.title } }
+```
+
+against `status: enum(closed, open)` is refused with `T3`, the expectation
+``property `status` expects one of [closed, open], got 'Closed'``, the fix
+`"closed"` and this suggestion:
+
+```json
+{
+  "applicability": "needs_review",
+  "edits": [{ "start": 65, "end": 73, "replacement": "\"closed\"" }]
+}
+```
+
+A date with no nearest calendar day and a malformed `datetime(…)` print the
+expected format instead, without an edit.
+
 ## Where the fields appear
 
 - **CLI, human formats** (`table`, `kv`, `csv`): the form above on stderr,

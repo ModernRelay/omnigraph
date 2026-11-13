@@ -366,7 +366,9 @@ pub fn expr(e: &Expr) -> String {
             };
             format!("{} {} {}", at(left, own), op.symbol(), at(right, right_min))
         }
-        Expr::Compare { op, left, right } => format!(
+        Expr::Compare {
+            op, left, right, ..
+        } => format!(
             "{} {} {}",
             at(left, Prec::Sum),
             comp(*op),

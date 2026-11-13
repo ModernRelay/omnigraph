@@ -74,7 +74,8 @@ regardless of the supplied value. An `F32` property storing `0.1` therefore
 differs from the `F64` literal `0.1`, while `0.5` compares exactly. These rules
 also apply to list membership and the filters of a write, whether a filter runs
 in a scan or in memory. Mixed signed and `U64` values compare without losing
-integer precision.
+integer precision. A literal outside its property's type, such as a misspelled
+enum value, is `T3` ([checked literals](diagnostics.md#checked-literals)).
 
 | `x` | `y` | `x and y` | `x or y` |
 |---|---|---|---|
@@ -84,10 +85,9 @@ integer precision.
 | `true` | `false` | `false` | `true` |
 
 `x is null` and `x is not null` are always `Bool` and are the only null tests:
-GQ has no `null` literal, so `$p.x = null` is a parse error.
-`not ($p.age > 30) or $p.age is null` selects every row the comparison did
-not. A parameter bound to `null` makes every comparison on it null. `is null`
-refuses a `Blob`.
+GQ has no `null` literal, so `$p.x = null` is a parse error. A parameter bound
+to `null` makes every comparison on it null, and `is null` refuses a `Blob`.
+`not ($p.age > 30) or $p.age is null` selects every row the comparison did not.
 
 `and`, `or`, `not`, `is`, `null` and `in` are reserved words: none is a bare operand
 or a return alias. `$p.and` after a dot and `and: 1` in an assignment stay

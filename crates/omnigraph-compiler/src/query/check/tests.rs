@@ -1293,6 +1293,198 @@ fn t65_suggests_an_applicable_edit() {
     }
 }
 
+/// A literal compared with a property is checked against the property's
+/// type in every scope that compares, either operand order, and in an `in`
+/// list: `T3`, its edit writing the nearest allowed value where the literal
+/// was, and the repaired text type-checks.
+#[test]
+fn t3_refuses_a_literal_outside_its_property_with_the_nearest_value() {
+    use crate::query::diagnostic::Applicability;
+    use crate::query::syntax::parse::apply_edits;
+    const LITERAL_SCHEMA: &str = r#"
+node Person { slug: String @key  status: enum(active, retired)  former: enum(active, retired)?  tags: [String]  age: I32  rank: U32  weight: F32  score: F64?  born: Date  seen: DateTime }
+edge Knows: Person -> Person
+"#;
+    let catalog = build_catalog(&parse_schema(LITERAL_SCHEMA).unwrap()).unwrap();
+    let outcome = |src: &str| {
+        check_source(&catalog, src)
+            .unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
+            .remove(0)
+            .1
+    };
+    let read = |predicate: &str| {
+        format!("query q() {{ match {{ $p: Person }} where {predicate} return {{ $p.slug }} }}")
+    };
+    let mut cases: Vec<(String, String, &str)> = [
+        (
+            "$p.status = \"Active\"",
+            "$p.status = \"active\"",
+            "expects one of [active, retired], got 'Active'",
+        ),
+        (
+            "\"retird\" != $p.status",
+            "\"retired\" != $p.status",
+            "got 'retird'",
+        ),
+        (
+            "$p.former = \"retird\"",
+            "$p.former = \"retired\"",
+            "got 'retird'",
+        ),
+        (
+            "$p.status in [\"active\", \"retird\"]",
+            "$p.status in [\"active\", \"retired\"]",
+            "got 'retird'",
+        ),
+        (
+            "$p.age < 3000000000",
+            "$p.age < 2147483647",
+            "has type I32 but got 3000000000, outside its range -2147483648 to 2147483647",
+        ),
+        (
+            "$p.rank > -1",
+            "$p.rank > 0",
+            "has type U32 but got -1, outside its range 0 to 4294967295",
+        ),
+        (
+            "$p.weight < 1.0e39",
+            "$p.weight < 340282346638528860000000000000000000000.0",
+            "has type F32 but got",
+        ),
+        (
+            "$p.born > date(\"1970-13-32\")",
+            "$p.born > date(\"1970-12-31\")",
+            "has type Date but got the malformed date \"1970-13-32\"",
+        ),
+        (
+            "$p.born = date(\"2023-02-30\")",
+            "$p.born = date(\"2023-02-28\")",
+            "malformed date",
+        ),
+    ]
+    .into_iter()
+    .map(|(written, intended, message)| (read(written), read(intended), message))
+    .collect();
+    // The same check in a block's, an `optional`'s and a write group's
+    // `where` and in a `let`.
+    for (written, intended) in [
+        (
+            "query q() { match { $p: Person } where exists { $p knows $q where $q.status = \"retird\" } return { $p.slug } }",
+            "query q() { match { $p: Person } where exists { $p knows $q where $q.status = \"retired\" } return { $p.slug } }",
+        ),
+        (
+            "query q() { match { $p: Person, optional { $p knows $q where $q.status = \"retird\" } } return { $p.slug } }",
+            "query q() { match { $p: Person, optional { $p knows $q where $q.status = \"retired\" } } return { $p.slug } }",
+        ),
+        (
+            "query q() { match { $p: Person, let $gone = $p.status = \"retird\" } return { $p.slug, $gone } }",
+            "query q() { match { $p: Person, let $gone = $p.status = \"retired\" } return { $p.slug, $gone } }",
+        ),
+        (
+            "query q() { match { $p: Person } where $p.status = \"retird\" update $p set { age: 1 } }",
+            "query q() { match { $p: Person } where $p.status = \"retired\" update $p set { age: 1 } }",
+        ),
+    ] {
+        cases.push((written.to_string(), intended.to_string(), "got 'retird'"));
+    }
+    for (written, intended, message) in &cases {
+        let d = outcome(written).expect_err(written);
+        assert_eq!(d.code.as_str(), "T3", "{written}: {d}");
+        assert!(d.message.contains(message), "{written}: {d}");
+        assert!(d.position.is_some(), "{written}");
+        let suggestion = d.suggestion.unwrap_or_else(|| panic!("{written}: no edit"));
+        assert_eq!(suggestion.applicability, Applicability::NeedsReview);
+        let [edit] = suggestion.edits.as_slice() else {
+            panic!("{written}: one edit")
+        };
+        assert_eq!(
+            d.fix.as_deref(),
+            Some(edit.replacement.as_str()),
+            "{written}"
+        );
+        let repaired = apply_edits(written, &suggestion.edits);
+        assert_eq!(&repaired, intended);
+        outcome(&repaired).unwrap_or_else(|e| panic!("{repaired}: {e}"));
+    }
+    // A date with no nearest day, a malformed datetime and a string test no
+    // enum value passes print the fix without an edit.
+    for (written, fix) in [
+        (
+            read("$p.born < date(\"yesterday\")"),
+            "date(\"YYYY-MM-DD\")",
+        ),
+        (
+            read("$p.seen > datetime(\"2024-01-01T25:00:00Z\")"),
+            "datetime(\"YYYY-MM-DDTHH:MM:SSZ\")",
+        ),
+        (read("starts_with($p.status, \"ret_\")"), "\"retired\""),
+        (read("contains($p.status, \"xyz\")"), "\"active\""),
+    ] {
+        let d = outcome(&written).expect_err(&written);
+        assert_eq!(
+            (d.code.as_str(), d.fix.as_deref(), d.suggestion.is_none()),
+            ("T3", Some(fix), true),
+            "{written}: {d}"
+        );
+    }
+    // Valid literals, an integer against a float and a float against an
+    // integer (compared through a cast, which keeps the fraction), a
+    // parameter (its declared type), and a string test some value passes
+    // are admitted as before.
+    for predicate in [
+        "$p.status = \"active\" and \"retired\" != $p.status and $p.former = \"retired\"",
+        "$p.status in [\"active\", \"retired\"] and \"anything\" in $p.tags",
+        "$p.age > -2147483648 and $p.age < 2147483647 and $p.rank >= 0",
+        "$p.weight > 1 and $p.score > 2 and $p.score < 2.5 and $p.weight < 0.5",
+        "$p.age > 2.5 and $p.rank in [1, 2.5] and 9007199254740992.0 = $p.age",
+        "$p.born > date(\"1970-01-01\") and $p.seen < datetime(\"2024-01-01T00:00:00Z\")",
+        "starts_with($p.status, \"ret\") and contains($p.status, \"tiv\")",
+    ] {
+        let src = read(predicate);
+        outcome(&src).unwrap_or_else(|e| panic!("{src}: {e}"));
+    }
+    outcome(
+        "query q($s: String, $n: I64) { match { $p: Person } where $p.status = $s and $p.age < $n return { $p.slug } }",
+    )
+    .expect("a parameter keeps its declared type");
+}
+
+/// The checked-literal example of the diagnostics guide
+/// (docs/user/queries/diagnostics.md), byte for byte.
+#[test]
+fn t3_checked_literal_matches_the_diagnostics_guide() {
+    use crate::query::diagnostic::{Applicability, TextEdit};
+    let catalog = build_catalog(
+        &parse_schema("node PullRequest { title: String @key  status: enum(closed, open) }")
+            .unwrap(),
+    )
+    .unwrap();
+    let src = "query open_prs() { match { $pr: PullRequest } where $pr.status = \"Closed\" return { $pr.title } }";
+    let d = check_source(&catalog, src)
+        .unwrap()
+        .remove(0)
+        .1
+        .unwrap_err();
+    assert_eq!(
+        (d.code.as_str(), d.message.as_str(), d.fix.as_deref()),
+        (
+            "T3",
+            "property `status` expects one of [closed, open], got 'Closed'",
+            Some("\"closed\"")
+        )
+    );
+    let suggestion = d.suggestion.expect("an edit");
+    assert_eq!(suggestion.applicability, Applicability::NeedsReview);
+    assert_eq!(
+        suggestion.edits,
+        vec![TextEdit {
+            start: 65,
+            end: 73,
+            replacement: "\"closed\"".into()
+        }]
+    );
+}
+
 /// A type error points at the clause, return item or order key it was
 /// found in.
 #[test]

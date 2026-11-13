@@ -177,7 +177,14 @@ fn source_span(p: &Pair<Rule>) -> SourceSpan {
         end: start + input[start..end].trim_end().len(),
         position: Position::at(input, start),
         operands: Vec::new(),
+        ranges: Vec::new(),
     }
+}
+
+/// A pair's byte range, its trailing whitespace left out.
+fn written_range(p: &Pair<Rule>) -> (usize, usize) {
+    let start = p.as_span().start();
+    (start, start + p.as_str().trim_end().len())
 }
 
 /// The end of a pair's last token: a pest span can end after the implicit
@@ -843,6 +850,7 @@ fn annotation(pair: Pair<Rule>) -> R<Annotation> {
             end,
             position: Position::at(input, whole.0),
             operands: Vec::new(),
+            ranges: Vec::new(),
         },
     })
 }
@@ -890,6 +898,7 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
                     end: close,
                     position: Position::at(input, open),
                     operands: Vec::new(),
+                    ranges: Vec::new(),
                 });
                 body.pattern = Box::new(match_pattern(&section, where_pair.as_ref())?);
             }
@@ -3328,10 +3337,19 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                     MACHINE,
                 );
             }
+            let right_source = right_pair.as_str().trim().to_string();
+            let ranges = vec![written_range(&left_pair), written_range(&right_pair)];
             Ok(Expr::Compare {
                 op: comp_op(op.as_str()),
                 left: Box::new(expr(left_pair)?),
                 right: Box::new(expr(right_pair)?),
+                at: SourceSpan {
+                    start: span.0,
+                    end: span.1,
+                    position: Position::at(input, span.0),
+                    operands: vec![left_source.clone(), right_source],
+                    ranges,
+                },
             })
         }
         Rule::kw_in => {
@@ -3353,6 +3371,17 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                 ));
             }
             let list_source = list.as_str().trim().to_string();
+            let mut ranges = vec![written_range(&left_pair), written_range(&list)];
+            // A written list's elements, each a range of its own; the checker
+            // reads them only when the list operand is that literal.
+            if let Some(items) = list
+                .clone()
+                .into_inner()
+                .flatten()
+                .find(|p| p.as_rule() == Rule::list_lit)
+            {
+                ranges.extend(items.into_inner().map(|item| written_range(&item)));
+            }
             Ok(Expr::In {
                 needle: Box::new(expr(left_pair)?),
                 list: Box::new(expr(list)?),
@@ -3361,6 +3390,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                     end: span.0 + input[span.0..span.1].trim_end().len(),
                     position: Position::at(input, span.0),
                     operands: vec![left_source.clone(), list_source],
+                    ranges,
                 },
             })
         }
@@ -3463,6 +3493,7 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                     left_source.to_string(),
                     parts[2].as_str().trim().to_string(),
                 ],
+                ranges: Vec::new(),
             },
         }),
         _ => Ok(Expr::IsNull {

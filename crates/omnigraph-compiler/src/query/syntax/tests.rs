@@ -111,6 +111,7 @@ fn cmp(op: CompOp, l: Expr, r: Expr) -> Expr {
         op,
         left: Box::new(l),
         right: Box::new(r),
+        at: SourceSpan::default(),
     }
 }
 

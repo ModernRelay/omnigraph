@@ -3746,52 +3746,18 @@ fn generate_id() -> String {
 }
 
 pub(crate) fn parse_date32_literal(value: &str) -> Result<i32> {
-    omnigraph_compiler::check_date_literal(value).map_err(OmniError::manifest)?;
-    cast_date32_literal(value)
+    omnigraph_compiler::date_literal_days(value).map_err(OmniError::manifest)
 }
 
 /// The bare arrow `Utf8 -> Date32` cast, time-bearing strings read as their UTC day.
 /// `parse_date32_literal` fronts it with the check; the legacy explicit-id compare
 /// calls it bare, since old writers derived those ids through this very cast.
 fn cast_date32_literal(value: &str) -> Result<i32> {
-    let raw: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some(value)]));
-    let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date32)
-        .map_err(|e| OmniError::manifest(format!("invalid Date literal '{}': {}", value, e)))?;
-    let out = casted
-        .as_any()
-        .downcast_ref::<Date32Array>()
-        .ok_or_else(|| OmniError::manifest("Date32 cast produced unexpected array"))?;
-    if out.is_null(0) {
-        return Err(OmniError::manifest(format!(
-            "invalid Date literal '{}'",
-            value
-        )));
-    }
-    Ok(out.value(0))
+    omnigraph_compiler::cast_date_literal_days(value).map_err(OmniError::manifest)
 }
 
 pub(crate) fn parse_date64_literal(value: &str) -> Result<i64> {
-    if value.starts_with(['+', '-']) {
-        return ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"]
-            .iter()
-            .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
-            .map(|datetime| datetime.and_utc().timestamp_millis())
-            .ok_or_else(|| OmniError::manifest(format!("invalid DateTime literal '{value}'")));
-    }
-    let raw: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some(value)]));
-    let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date64)
-        .map_err(|e| OmniError::manifest(format!("invalid DateTime literal '{}': {}", value, e)))?;
-    let out = casted
-        .as_any()
-        .downcast_ref::<Date64Array>()
-        .ok_or_else(|| OmniError::manifest("Date64 cast produced unexpected array"))?;
-    if out.is_null(0) {
-        return Err(OmniError::manifest(format!(
-            "invalid DateTime literal '{}'",
-            value
-        )));
-    }
-    Ok(out.value(0))
+    omnigraph_compiler::datetime_literal_millis(value).map_err(OmniError::manifest)
 }
 
 // ─── Value constraint validation ─────────────────────────────────────────────

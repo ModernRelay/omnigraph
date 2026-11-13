@@ -69,6 +69,6 @@ pub use query_input::{
 };
 pub use result::{MutationExecResult, MutationResult, QueryResult, RunResult};
 pub use types::{
-    AggSignature, Direction, ExprType, PropType, ScalarType, check_date_literal,
-    check_datetime_literal,
+    AggSignature, Direction, ExprType, PropType, ScalarType, cast_date_literal_days,
+    check_date_literal, check_datetime_literal, date_literal_days, datetime_literal_millis,
 };

@@ -1,0 +1,121 @@
+# issue: none
+# red_on: 29f95230
+# notes: A literal compared with a property, or listed in an `in` against one, is checked against the property's type wherever it is written: a
+# notes: read's `where` (either operand order), an `in` list, a block's `where`, an `optional`'s `where`, a write group's `where` and a `let`. An
+# notes: enum value outside the declared set (also as a `starts_with` argument), an integer outside an I32's range and a malformed date
+# notes: are `T3`, where they used to type-check and return no rows (or fail at execution); valid literals of each kind still run, a
+# notes: fractional float against an integer property among them (it compares through a cast and keeps the fraction).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    slug: String @key
+    status: enum(active, retired)
+    age: I32
+    born: Date
+    score: F64?
+}
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"slug":"a","status":"active","age":40,"born":"1985-02-03","score":1.5}}
+{"type":"Person","data":{"slug":"b","status":"retired","age":70,"born":"1955-07-08"}}
+{"edge":"Knows","from":"a","to":"b"}
+
+--- query
+query enum_in_where() {
+    match { $p: Person } where $p.status = "Active"
+    return { $p.slug }
+}
+--- expect error: T3: property `status` expects one of [active, retired], got 'Active'
+
+--- query
+query enum_on_the_left() {
+    match { $p: Person } where "retird" != $p.status
+    return { $p.slug }
+}
+--- expect error: T3: property `status` expects one of [active, retired], got 'retird'
+
+--- query
+query enum_in_an_in_list() {
+    match { $p: Person } where $p.status in ["active", "retird"]
+    return { $p.slug }
+}
+--- expect error: T3: property `status` expects one of [active, retired], got 'retird'
+
+--- query
+query enum_in_a_block_where() {
+    match { $p: Person } where exists { $p knows $q where $q.status = "retird" }
+    return { $p.slug }
+}
+--- expect error: T3: property `status` expects one of [active, retired], got 'retird'
+
+--- query
+query enum_in_an_optional_where() {
+    match { $p: Person, optional { $p knows $q where $q.status = "retird" } }
+    return { $p.slug }
+}
+--- expect error: T3: property `status` expects one of [active, retired], got 'retird'
+
+--- query
+query enum_in_a_let() {
+    match { $p: Person, let $gone = $p.status = "Retired" }
+    return { $p.slug, $gone }
+}
+--- expect error: T3: property `status` expects one of [active, retired], got 'Retired'
+
+--- mutate
+query enum_in_a_write_where() {
+    match { $p: Person } where $p.status = "retird"
+    update $p set { age: 71 }
+}
+--- expect error: T3: property `status` expects one of [active, retired], got 'retird'
+
+--- query
+query integer_outside_i32() {
+    match { $p: Person } where $p.age < 3000000000
+    return { $p.slug }
+}
+--- expect error: T3: property `age` has type I32 but got 3000000000, outside its range -2147483648 to 2147483647
+
+--- query
+query enum_in_a_string_test() {
+    match { $p: Person } where starts_with($p.status, "Ret")
+    return { $p.slug }
+}
+--- expect error: T3: property `status` expects one of [active, retired], and none passes `starts_with` with 'Ret'
+
+--- query
+query malformed_date() {
+    match { $p: Person } where $p.born > date("1970-13-01")
+    return { $p.slug }
+}
+--- expect error: T3: property `born` has type Date but got the malformed date "1970-13-01"
+
+--- query
+query valid_literals_still_run() {
+    match { $p: Person }
+    where $p.status in ["active", "retired"] and "retired" != $p.status and $p.age < 2147483647
+        and $p.age > 39.5 and $p.born > date("1970-01-01") and $p.score > 1
+    return { $p.slug }
+}
+--- expect unordered
+{"p.slug":"a"}
+--- expect shape
+p.slug: String
+
+--- query
+query valid_literal_in_a_block() {
+    match { $p: Person }
+    where exists { $p knows $q where $q.status = "retired" and $q.age >= 65 }
+    return { $p.slug }
+}
+--- expect unordered
+{"p.slug":"a"}
+--- expect shape
+p.slug: String

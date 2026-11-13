@@ -5680,10 +5680,12 @@ name = "omnigraph-compiler"
 version = "0.15.1"
 dependencies = [
  "arrow-array",
+ "arrow-cast",
  "arrow-ipc",
  "arrow-json",
  "arrow-schema",
  "arrow-select",
+ "chrono",
  "pest",
  "pest_derive",
  "proptest",

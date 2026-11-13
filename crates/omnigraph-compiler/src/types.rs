@@ -39,6 +39,71 @@ pub fn check_datetime_literal(value: &str) -> Result<(), String> {
     ))
 }
 
+/// The day a `Date` literal names, as days since the Unix epoch: the one
+/// parse the type checker and every writer and reader of a `Date` literal
+/// share, [`check_date_literal`] in front of Arrow's `Utf8 -> Date32` cast.
+///
+/// # Errors
+///
+/// The refusal message naming `value`.
+pub fn date_literal_days(value: &str) -> Result<i32, String> {
+    check_date_literal(value)?;
+    cast_date_literal_days(value)
+}
+
+/// The bare Arrow `Utf8 -> Date32` cast, a time-bearing string read as its
+/// UTC day. [`date_literal_days`] fronts it with the check; a reader of ids
+/// that old writers derived through this very cast calls it bare.
+///
+/// # Errors
+///
+/// The refusal message naming `value`.
+pub fn cast_date_literal_days(value: &str) -> Result<i32, String> {
+    use arrow_array::{Array, Date32Array, StringArray};
+    let raw = StringArray::from(vec![Some(value)]);
+    let casted = arrow_cast::cast::cast(&raw, &DataType::Date32)
+        .map_err(|e| format!("invalid Date literal '{value}': {e}"))?;
+    let out = casted
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .ok_or_else(|| "Date32 cast produced unexpected array".to_string())?;
+    if out.is_null(0) {
+        return Err(format!("invalid Date literal '{value}'"));
+    }
+    Ok(out.value(0))
+}
+
+/// The instant a `DateTime` literal names, as milliseconds since the Unix
+/// epoch: the one parse the type checker and every writer and reader of a
+/// `DateTime` literal share. A signed extended year is parsed as an ISO
+/// local date-time in UTC; every other string goes through Arrow's
+/// `Utf8 -> Date64` cast.
+///
+/// # Errors
+///
+/// The refusal message naming `value`.
+pub fn datetime_literal_millis(value: &str) -> Result<i64, String> {
+    use arrow_array::{Array, Date64Array, StringArray};
+    if value.starts_with(['+', '-']) {
+        return ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"]
+            .iter()
+            .find_map(|format| chrono::NaiveDateTime::parse_from_str(value, format).ok())
+            .map(|datetime| datetime.and_utc().timestamp_millis())
+            .ok_or_else(|| format!("invalid DateTime literal '{value}'"));
+    }
+    let raw = StringArray::from(vec![Some(value)]);
+    let casted = arrow_cast::cast::cast(&raw, &DataType::Date64)
+        .map_err(|e| format!("invalid DateTime literal '{value}': {e}"))?;
+    let out = casted
+        .as_any()
+        .downcast_ref::<Date64Array>()
+        .ok_or_else(|| "Date64 cast produced unexpected array".to_string())?;
+    if out.is_null(0) {
+        return Err(format!("invalid DateTime literal '{value}'"));
+    }
+    Ok(out.value(0))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScalarType {
     String,

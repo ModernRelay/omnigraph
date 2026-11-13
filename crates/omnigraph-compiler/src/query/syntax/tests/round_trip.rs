@@ -151,7 +151,7 @@ fn expr(depth: u32) -> BoxedStrategy<Expr> {
         4 => leaf(),
         2 => (arith_op(), sub(), sub()).prop_map(|(op, l, r)| Expr::Arith { op, left: Box::new(l), right: Box::new(r) }),
         1 => sub().prop_map(|e| Expr::Neg(Box::new(e))),
-        2 => (comp_op(), sub(), sub()).prop_map(|(op, l, r)| Expr::Compare { op, left: Box::new(l), right: Box::new(r) }),
+        2 => (comp_op(), sub(), sub()).prop_map(|(op, l, r)| Expr::Compare { op, left: Box::new(l), right: Box::new(r), at: SourceSpan::default() }),
         1 => (sub(), sub()).prop_map(|(n, l)| Expr::In { needle: Box::new(n), list: Box::new(l), at: SourceSpan::default() }),
         1 => (sub(), any::<bool>()).prop_map(|(e, negated)| Expr::IsNull { expr: Box::new(e), negated }),
         1 => sub().prop_map(|e| Expr::Not(Box::new(e))),

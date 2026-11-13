@@ -1465,10 +1465,16 @@ impl Ctx<'_> {
                  h: &mut Vec<(String, Agg)>|
          -> R<Box<Expr>> { Ok(Box::new(this.extract_aggs(sc, x, h)?)) };
         Ok(match e {
-            Expr::Compare { op, left, right } => Expr::Compare {
+            Expr::Compare {
+                op,
+                left,
+                right,
+                at,
+            } => Expr::Compare {
                 op: *op,
                 left: b(left, self, sc, hidden)?,
                 right: b(right, self, sc, hidden)?,
+                at: at.clone(),
             },
             Expr::Arith { op, left, right } => Expr::Arith {
                 op: *op,
@@ -3565,9 +3571,16 @@ impl Ctx<'_> {
                 let r = self.expr(sc, right, sub)?;
                 arith(*op, l, r)?
             }
-            Expr::Compare { op, left, right } => {
+            Expr::Compare {
+                op,
+                left,
+                right,
+                at: written,
+            } => {
                 let l = self.expr(sc, left, sub)?;
                 let r = self.expr(sc, right, sub)?;
+                literal_against_property(&l, &r, written, 1)?;
+                literal_against_property(&r, &l, written, 0)?;
                 compare(*op, l, r)?
             }
             Expr::In {
@@ -3605,6 +3618,7 @@ impl Ctx<'_> {
                 }
                 let n = self.expr(sc, needle, sub)?;
                 let l = self.expr(sc, list, sub)?;
+                literal_in_against_property(&n, &l, written)?;
                 let l = match &n.ty {
                     Ty::Value(t) if !t.list => {
                         adapt(l, &Ty::Value(PropType::list_of(t.scalar, false)))
@@ -3810,6 +3824,16 @@ impl Ctx<'_> {
                             b.ty.display()
                         ),
                     ));
+                }
+                if let (
+                    SKind::Prop { prop, .. },
+                    Ty::Value(expected),
+                    SKind::Lit(Literal::String(value)),
+                ) = (&a.kind, &a.ty, &b.kind)
+                    && let Some(mismatch) =
+                        literal::tested_enum_literal(name, value, expected, prop)
+                {
+                    return Err(literal_refusal(mismatch, None, None));
                 }
                 let ty = bool_ty(a.ty.nullable() || b.ty.nullable());
                 SExpr::new(
@@ -4938,6 +4962,106 @@ fn compare(op: CompOp, l: SExpr, r: SExpr) -> R<SExpr> {
     ))
 }
 
+/// A literal compared with a property is checked against the property's
+/// type wherever it is written (a read's `where`, a block's or an
+/// `optional`'s `where`, a write group's `where`, a `let`), since every one
+/// types its comparisons here: `lit` set against `prop`, its byte range the
+/// `index`th of the comparison's operands. A parameter keeps its declared
+/// type, and an operand that is not a property read is left as it is.
+fn literal_against_property(
+    prop: &SExpr,
+    lit: &SExpr,
+    written: &SourceSpan,
+    index: usize,
+) -> R<()> {
+    let (SKind::Prop { prop: name, .. }, Ty::Value(expected)) = (&prop.kind, &prop.ty) else {
+        return Ok(());
+    };
+    let Some(value) = written_literal(lit) else {
+        return Ok(());
+    };
+    match literal::compared_literal(&value, expected, name) {
+        Some(mismatch) => Err(literal_refusal(
+            mismatch,
+            written.ranges.get(index),
+            Some(written.position),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The same check for `in`: a literal needle against a list property's
+/// element type, and each element of a written list against a property
+/// needle.
+fn literal_in_against_property(needle: &SExpr, list: &SExpr, written: &SourceSpan) -> R<()> {
+    if let Ty::Value(t) = &list.ty
+        && t.list
+        && matches!(list.kind, SKind::Prop { .. })
+    {
+        let mut element_type = t.clone();
+        element_type.list = false;
+        let element = SExpr::new(list.kind.clone(), Ty::Value(element_type));
+        return literal_against_property(&element, needle, written, 0);
+    }
+    let (SKind::Prop { prop: name, .. }, Ty::Value(expected), SKind::Lit(Literal::List(items))) =
+        (&needle.kind, &needle.ty, &list.kind)
+    else {
+        return Ok(());
+    };
+    for (i, item) in items.iter().enumerate() {
+        if let Some(mismatch) = literal::compared_literal(item, expected, name) {
+            return Err(literal_refusal(
+                mismatch,
+                written.ranges.get(2 + i),
+                Some(written.position),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The literal an operand was written as, a negated number included.
+fn written_literal(e: &SExpr) -> Option<Literal> {
+    match &e.kind {
+        SKind::Lit(l) => Some(l.clone()),
+        SKind::Neg(inner) => match &inner.kind {
+            SKind::Lit(Literal::Integer(n)) => Some(Literal::Integer(-n)),
+            SKind::Lit(Literal::Float(f)) => Some(Literal::Float(-f)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `T3` for a literal outside its property's domain, the nearest allowed
+/// value printed as the fix and, where the literal's range was recorded,
+/// as the edit that writes it in place.
+fn literal_refusal(
+    mismatch: literal::LiteralMismatch,
+    range: Option<&(usize, usize)>,
+    position: Option<Position>,
+) -> E {
+    let mut d = QueryDiagnostic::typecheck(T3, mismatch.message).with_fix(mismatch.fix);
+    if let (Some(replacement), Some(&(start, end))) = (mismatch.replacement, range)
+        && start < end
+    {
+        d = d.with_suggestion(Suggestion {
+            applicability: Applicability::NeedsReview,
+            edits: vec![TextEdit {
+                start,
+                end,
+                replacement,
+            }],
+        });
+    }
+    // A parsed comparison records its operands' ranges; a built one has no
+    // position of its own, and the clause's is filled in instead.
+    if range.is_some() {
+        d.position = position;
+    }
+    E::D(d)
+}
+
 /// The common type of two branches (`if`, `coalesce`).
 fn common(a: &SExpr, b: &SExpr, what: &str) -> R<Ty> {
     let a2 = adapt(a.clone(), &b.ty);
@@ -5185,10 +5309,16 @@ fn replace_call(e: &Expr, call: &Call, with: &Expr) -> Expr {
     let r = |x: &Expr| Box::new(replace_call(x, call, with));
     match e {
         Expr::Call(c) if c == call => with.clone(),
-        Expr::Compare { op, left, right } => Expr::Compare {
+        Expr::Compare {
+            op,
+            left,
+            right,
+            at,
+        } => Expr::Compare {
             op: *op,
             left: r(left),
             right: r(right),
+            at: at.clone(),
         },
         Expr::Arith { op, left, right } => Expr::Arith {
             op: *op,

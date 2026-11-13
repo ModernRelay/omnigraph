@@ -384,6 +384,9 @@ pub enum Expr {
         op: CompOp,
         left: Box<Expr>,
         right: Box<Expr>,
+        /// Where it was written: a literal operand the type checker refuses
+        /// against the other operand's property is replaced at its range.
+        at: SourceSpan,
     },
     In {
         needle: Box<Expr>,
@@ -435,6 +438,11 @@ pub struct SourceSpan {
     pub end: usize,
     pub position: Position,
     pub operands: Vec<String>,
+    /// The byte range of each operand of a comparison or an `in`, in
+    /// `operands` order, then, for an `in` over a written list, of each of
+    /// its elements: where a refused literal operand is replaced. Empty
+    /// for a node built rather than parsed and for the other nodes.
+    pub ranges: Vec<(usize, usize)>,
 }
 
 impl Default for SourceSpan {
@@ -449,6 +457,7 @@ impl Default for SourceSpan {
                 byte: 0,
             },
             operands: Vec::new(),
+            ranges: Vec::new(),
         }
     }
 }
