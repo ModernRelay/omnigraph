@@ -681,12 +681,12 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// RFC 0067: stage one detached-ready compaction rewrite of the pinned
     /// base, or `None` when there is nothing to compact. Its tasks run within
-    /// `limit`, the run's shared task budget.
+    /// `limit`, the run's shared budget of heavy steps.
     async fn stage_compaction(
         &self,
         snapshot: &SnapshotHandle,
         options: &lance::dataset::optimize::CompactionOptions,
-        limit: &crate::table_store::CompactionTaskLimit,
+        limit: &crate::table_store::OptimizeStepLimit,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>>;
 
     /// #721: stage one detached-ready rewrite of exactly the named
@@ -1293,7 +1293,7 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         options: &lance::dataset::optimize::CompactionOptions,
-        limit: &crate::table_store::CompactionTaskLimit,
+        limit: &crate::table_store::OptimizeStepLimit,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>> {
         Ok(
             TableStore::stage_compaction(self, snapshot.dataset(), options, limit)

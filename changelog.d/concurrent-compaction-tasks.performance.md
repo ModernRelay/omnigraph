@@ -1,1 +1,1 @@
-- `optimize` runs one table's compaction tasks at the same time, sharing the run's rewrite concurrency, instead of one after another. Blob tables and served runs keep one task at a time.
+- `optimize` runs one table's compaction tasks at the same time. The run's rewrite concurrency bounds its compaction tasks, index folds and index builds together.

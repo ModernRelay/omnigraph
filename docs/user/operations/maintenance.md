@@ -75,8 +75,8 @@ Blob payload; a larger row is read whole, external references are not read,
 and the writer's own copies come on top. A Blob descriptor the decoder rejects
 refuses the compaction before that table is rewritten. Optimize plans up to
 `OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables ahead (default 8) and rewrites up to
-that many at once (that many compaction tasks in all, a Blob table's one at a
-time), so budget for that many Blob tables compacting together.
+that many at once, with that many compaction tasks, index folds and builds in
+all (a Blob table's tasks one at a time): budget for that many Blob tables.
 
 ### Bounding a run
 
