@@ -544,7 +544,19 @@ impl Requirements {
         });
         let expected: Vec<(RankScope, &Retrieval)> = match &self.search {
             None => Vec::new(),
-            Some(Search::Rank(retrieval)) => vec![(RankScope::Order, retrieval)],
+            Some(Search::Rank(retrieval)) => {
+                // A windowed `nearest` fills its own window; every other
+                // ranking of the read is its ordering ranking.
+                let windowed = self.window.is_some() && retrieval.kind == RankKind::Nearest;
+                vec![(
+                    if windowed {
+                        RankScope::Window
+                    } else {
+                        RankScope::Order
+                    },
+                    retrieval,
+                )]
+            }
             Some(Search::Fuse { arms, .. }) => vec![
                 (RankScope::Primary, &arms[0]),
                 (RankScope::Secondary, &arms[1]),
@@ -667,6 +679,17 @@ impl Requirements {
         }
         let final_sort = matches!(plan.node(id), Some(PhysicalNode::Sort { .. })).then_some(id);
         for (id, node) in plan.live() {
+            if let PhysicalNode::TargetCut { targets, .. } = node {
+                let window = self.window.flatten();
+                if window != u64::try_from(*targets).ok() {
+                    return Err(ValidationError::violated(
+                        "row cut",
+                        format!(
+                            "node {id} (TargetCut) keeps {targets} targets; the query's window is {window:?}"
+                        ),
+                    ));
+                }
+            }
             let Some(cut) = node.row_cut() else {
                 continue;
             };
@@ -727,13 +750,20 @@ impl Requirements {
             _ => {}
         }
         let limit = self.limit.and_then(|limit| usize::try_from(limit).ok());
+        // A ranking drawn as a pattern step declares its own window; today's
+        // ordering ranking takes the read's `limit`.
+        let window = match self.window {
+            Some(window) => window.and_then(|k| usize::try_from(k).ok()),
+            None => limit,
+        };
         let (fetch, overfetch) = match (access.kind, access.scope) {
             (RankKind::Bm25, _) => (None, Vec::new()),
-            (RankKind::Nearest, RankScope::Order) => {
-                (limit, limit.map(OverfetchRung::ladder).unwrap_or_default())
-            }
+            (RankKind::Nearest, RankScope::Order | RankScope::Window) => (
+                window,
+                window.map(OverfetchRung::ladder).unwrap_or_default(),
+            ),
             (RankKind::Nearest, RankScope::Primary | RankScope::Secondary) => {
-                (Some(limit.unwrap_or(RRF_NEAREST_ARM_K)), Vec::new())
+                (Some(window.unwrap_or(RRF_NEAREST_ARM_K)), Vec::new())
             }
         };
         if access.fetch != fetch || access.overfetch != overfetch {
@@ -926,6 +956,44 @@ impl Requirements {
     /// search-led aggregate or a `return distinct` the written keys then every
     /// group key not written, ascending; no sort where the query orders nothing.
     fn required_keys(&self) -> Option<Vec<IROrdering>> {
+        if self.window.is_some() {
+            // A ranking drawn as a pattern step leads nothing: the written
+            // keys order the rows (group keys made total for `distinct` as
+            // for any read), and a `limit` over ungrouped rows with none
+            // written cuts the identities' order.
+            if self.aggregate {
+                if !self.ordered {
+                    return None;
+                }
+                let distinct = !self
+                    .returns
+                    .iter()
+                    .any(|projection| contains_aggregate(&projection.expr));
+                let mut keys = self.order.clone();
+                if distinct {
+                    for projection in &self.returns {
+                        let written = keys.iter().any(|key| match &key.expr {
+                            IRExpr::AliasRef(alias, _) => *alias == projection.column,
+                            expr => *expr == projection.expr,
+                        });
+                        if !written {
+                            keys.push(IROrdering {
+                                expr: IRExpr::AliasRef(
+                                    projection.column.clone(),
+                                    projection.ty.clone(),
+                                ),
+                                descending: false,
+                            });
+                        }
+                    }
+                }
+                return Some(keys);
+            }
+            if !self.ordered && self.limit.is_none() {
+                return None;
+            }
+            return Some(self.order.clone());
+        }
         if self.aggregate {
             // Under a search, groups have no order unless a key remains
             // after the score; otherwise any written clause sorts them.
@@ -1014,9 +1082,16 @@ impl Requirements {
             }
         }
         let Some(required) = self.required_keys() else {
-            let sorted = top
-                .iter()
-                .any(|id| matches!(plan.node(*id), Some(PhysicalNode::Sort { .. })));
+            // A window's own sort orders its candidates for its `TargetCut`;
+            // it orders no row the query returns.
+            let window_sort = |sort: NodeId| {
+                top.iter().any(|id| {
+                    matches!(plan.node(*id), Some(PhysicalNode::TargetCut { input, .. }) if *input == sort)
+                })
+            };
+            let sorted = top.iter().any(|id| {
+                matches!(plan.node(*id), Some(PhysicalNode::Sort { .. })) && !window_sort(*id)
+            });
             if sorted {
                 return Err(ValidationError::violated(
                     "order",
@@ -1228,7 +1303,7 @@ fn check_policies(plan: &PhysicalPlan, budget: &mut Budget) -> Result<(), Valida
                 }
                 if let Some(prefilter) = &access.prefilter {
                     if access.kind != RankKind::Nearest
-                        || access.scope != RankScope::Order
+                        || !matches!(access.scope, RankScope::Order | RankScope::Window)
                         || prefilter.feeds != [id]
                         || prefilter.on_empty != EmptyEligible::ProvenEmpty
                     {

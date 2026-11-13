@@ -801,7 +801,7 @@ async fn query_table_statistics(
                     outer_var: _,
                     predicate: _,
                 } => pending.push(inner),
-                PatternStep::Filter(_) => {}
+                PatternStep::Filter(_) | PatternStep::Rank { .. } => {}
             }
         }
     }

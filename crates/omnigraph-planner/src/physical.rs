@@ -59,6 +59,10 @@ pub enum RankScope {
     Order,
     Primary,
     Secondary,
+    /// A ranking drawn as a pattern step: the scan's candidates feed a
+    /// `TargetCut` of the window `k` (its `fetch`), whose selected targets
+    /// the overfetch ladder fills, not the read's `limit`.
+    Window,
 }
 
 /// How the prefilter gates decide, as the session and the environment set it
@@ -872,6 +876,17 @@ physical_nodes! {
         rows: usize,
     } => "Page" [input: NodeId]
         shape: PipelineShape::Streaming, sides: vec![], cut: Some(*rows), order: order_of(*input);
+    /// The rows of the first `targets` distinct identities of `binding` in
+    /// its input, which a `Sort` below orders by the window's score then that
+    /// identity: a `nearest` window's selection, each selected target with
+    /// every row it has. Its cut counts targets, not rows, so it declares no
+    /// row cut; plan acceptance holds `targets` to the window `k`.
+    TargetCut {
+        input: NodeId,
+        binding: String,
+        targets: usize,
+    } => "TargetCut" [input: NodeId]
+        shape: PipelineShape::Streaming, sides: vec![], cut: None, order: order_of(*input);
     Page {
         input: NodeId,
         rows: usize,
@@ -1420,6 +1435,11 @@ impl PhysicalPlan {
             }),
             PhysicalNode::Limit { rows, .. } => json!({
                 "node": "Page", "rows": rows, "bytes": 0, "resume": null,
+            }),
+            PhysicalNode::TargetCut {
+                binding, targets, ..
+            } => json!({
+                "node": "TargetCut", "binding": binding, "targets": targets,
             }),
             PhysicalNode::Page {
                 rows,

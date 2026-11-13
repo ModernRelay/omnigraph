@@ -69,7 +69,7 @@ pub fn planned_ranking(plan: &PhysicalPlan) -> Result<Option<PlannedRanking>, Pl
             } => {
                 let scan = (id, ranked.kind, spec.binding.as_deref());
                 match ranked.scope {
-                    RankScope::Order => ordered.push(scan),
+                    RankScope::Order | RankScope::Window => ordered.push(scan),
                     RankScope::Primary | RankScope::Secondary => arms.push(scan),
                 }
             }

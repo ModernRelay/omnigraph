@@ -21,14 +21,19 @@ of the query reads, or a relation a `let` names. The second is the ranked
 property of a node binding of that population. `from` adds the population's
 columns and the score column to the query; return the score as `$distance` or
 `$score`, alias it (`$score as score`), and order by it, `order { $distance }`
-for a distance and `order { $score desc }` for a relevance score, as the leading
-key. A ranking written as a call in `order` or `return`, such as
+for a distance and `order { $score desc }` for a relevance score. The score is
+an ordinary column: it may be any `order` key, in either direction, or none.
+Elements and a `where` written after the `from` run over the rows the ranking
+selected; a row they remove is not replaced by the next candidate. A ranking written as a call in `order` or `return`, such as
 `order { nearest($d.embedding, $q) }`, is refused (`T65`) with the `from` form
 as its fix.
 
 Search arguments use their declared types. `nearest` requires its window
-`k` (`T17`), an integer literal or parameter of at least 1, and a `limit`;
-give the `limit` the same value. `fuzzy` defaults `max_edits` to 2 when
+`k` (`T17`), an integer literal or parameter of at least 1: it selects the `k`
+nearest targets of the population with every row each has, and the read's
+`limit`, which may be larger, smaller or absent, cuts the rows after that. A
+window read from a parameter is not lowered yet unless it is the read's
+`limit` with the score leading the `order` (`P006`). `fuzzy` defaults `max_edits` to 2 when
 omitted; a literal must be 0 to 2 (`T71`) and a parameter an integer from 0
 to 4,294,967,295. `rrf` takes `k` as an integer literal from 1 to 1,000,000
 or an integer parameter. Options are named: `fuzzy($d.body, $q, 2)` is
@@ -147,8 +152,8 @@ distance Lance ranks by, and `rrf` gives the fused score as an `F64` `$score`.
 Without an alias the column is `score` or `distance`; write
 `$score as _score` or `$distance as _distance` for those names. A search
 predicate, `search(...)`, `fuzzy(...)` or `match_text(...)`, stands alone as a
-filter and is not a return item (`T38`). Write the score as the leading
-`order` key in its ranking's direction: `$distance` ascending, `$score desc`.
+filter and is not a return item (`T38`). An aggregate over the score, such
+as `max($score)`, is not lowered yet (`P006`).
 
 Exact String predicates remain correct without an index. A free-text index does
 not accelerate equality, `starts_with(...)`, or literal substring `contains(...)`.

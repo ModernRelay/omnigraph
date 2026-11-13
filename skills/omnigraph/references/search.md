@@ -79,11 +79,12 @@ the query reads, or a relation named with `let`. `from` adds the score column:
 call in `order` or `return` (`order { nearest($c.embedding, $q) }`) is refused
 (`T65`), and the diagnostic prints the `from` form as a machine-applicable fix.
 
-Order by the score as the leading key: `order { $distance }` (ascending
-distance) or `order { $score desc }` (descending relevance); secondary keys
-follow the score, then entity IDs break ties. This order also holds through
-traversals. `nearest` requires its window `k` (`T17`) and a `limit N`; give
-them the same value. BM25 alone needs neither, though a limit keeps output
+Order by the score: `order { $distance }` (ascending distance) or
+`order { $score desc }` (descending relevance), or put another key first;
+entity IDs break the remaining ties. This order also holds through
+traversals. `nearest` requires its window `k` (`T17`): the `k` nearest
+targets, every row of each; `limit` is a separate cut, and elements or a
+`where` after the `from` remove rows without a refill. BM25 alone needs neither, though a limit keeps output
 bounded. A `bm25` ranking reads every text match before the final sort, so
 equal-score rows at a `limit` cutoff are chosen by the secondary keys and then
 entity ID, not by scan order.
@@ -151,7 +152,7 @@ the result column is `score` or `distance`; `$score as _score` and
 items (`T38`).
 
 A ranking may feed aggregates, but it only selects the rows that are
-aggregated: the top-`limit` window under `nearest`, every text match under
+aggregated: the `k` window under `nearest`, every text match under
 `bm25`. Groups are not score-ranked, and the score is not an order key over
 groups (`T42`): the written keys order the groups (or `return distinct` rows),
 then every group key ascending; with none, output is unordered.

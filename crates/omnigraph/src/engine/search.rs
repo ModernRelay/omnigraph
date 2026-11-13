@@ -854,7 +854,7 @@ pub(super) fn collect_referenced_edge_names(
                 );
             }
             PatternStep::AntiJoin { inner, .. } => collect_referenced_edge_names(inner, out),
-            PatternStep::NodeScan { .. } | PatternStep::Filter(_) => {}
+            PatternStep::NodeScan { .. } | PatternStep::Filter(_) | PatternStep::Rank { .. } => {}
         }
     }
 }

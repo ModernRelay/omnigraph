@@ -253,7 +253,7 @@ async fn run_once(
     ctx: &QueryContext,
     pass: &Pass,
     rung: usize,
-) -> Result<(RecordBatch, ScanReports, Vec<ReportRow>)> {
+) -> Result<(RecordBatch, ScanReports, Vec<ReportRow>, Option<usize>)> {
     let lowered = lowering.lower_query(pass)?;
     lowered.record_in_memory_filters();
     let batch = run_plan(&lowered, lowering.plan, ctx).await?;
@@ -263,7 +263,16 @@ async fn run_once(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let rows = pass_rows(&lowered, lowering.plan, rung)?;
-    Ok((batch, report, rows))
+    // The targets a window's cut kept this pass, which the ladder fills.
+    let selected = lowering
+        .plan
+        .live()
+        .find_map(|(id, node)| matches!(node, PhysicalNode::TargetCut { .. }).then_some(id))
+        .and_then(|id| lowered.operators.get(&id))
+        .and_then(|op| op.metrics())
+        .and_then(|metrics| metrics.sum_by_name(operators::SELECTED_TARGETS))
+        .map(|value| value.as_usize());
+    Ok((batch, report, rows, selected))
 }
 
 /// The standalone `nearest` scan of a search order: what the plan declares
@@ -272,6 +281,9 @@ struct NearestScan<'p> {
     id: NodeId,
     prefilter: Option<&'p Prefilter>,
     overfetch: &'p [OverfetchRung],
+    /// A window drawn as a pattern step: the targets its `TargetCut` keeps,
+    /// which the ladder fills instead of the read's `limit`.
+    window: Option<usize>,
 }
 
 /// An `rrf()` with both its arms: the `RankFuse` node and the pre-pass it
@@ -304,12 +316,15 @@ fn ranked_scans(plan: &PhysicalPlan) -> RankedScans<'_> {
             continue;
         };
         match ranked.scope {
-            RankScope::Order => {
+            RankScope::Order | RankScope::Window => {
                 if ranked.kind == RankKind::Nearest && ranked.fetch.is_some() {
                     nearest = Some(NearestScan {
                         id,
                         prefilter: ranked.prefilter.as_ref(),
                         overfetch: &ranked.overfetch,
+                        window: (ranked.scope == RankScope::Window)
+                            .then_some(ranked.fetch)
+                            .flatten(),
                     });
                 }
             }
@@ -610,7 +625,8 @@ async fn execute_with_context(
         pass = next;
     }
 
-    let (result_batch, reports, rows) = Box::pin(run_once(&lowering, ctx, &pass, 0)).await?;
+    let (result_batch, reports, rows, mut selected) =
+        Box::pin(run_once(&lowering, ctx, &pass, 0)).await?;
     executed.record(rows);
     let nearest_report = |reports: &ScanReports| {
         nearest
@@ -630,12 +646,25 @@ async fn execute_with_context(
         .plan
         .live()
         .any(|(_, node)| matches!(node, PhysicalNode::Aggregate { .. }));
-    if let (Some(NearestScan { id, overfetch, .. }), Some(limit)) =
-        (&nearest, declared_limit(&bound.plan))
-    {
+    // A window drawn as a pattern step fills its own `k` targets, grouped or
+    // not; today's ordering ranking fills the read's `limit` rows.
+    let goal = match &nearest {
+        Some(NearestScan {
+            window: Some(k), ..
+        }) => Some((*k, true)),
+        Some(_) if !aggregate => declared_limit(&bound.plan).map(|limit| (limit, false)),
+        _ => None,
+    };
+    if let (Some(NearestScan { id, overfetch, .. }), Some((limit, windowed))) = (&nearest, goal) {
         let id = *id;
-        if !aggregate && !pass.answer_proven_empty() {
-            let short = |batch: &RecordBatch| batch.num_rows() < limit;
+        if !pass.answer_proven_empty() {
+            let short = |batch: &RecordBatch, selected: Option<usize>| {
+                if windowed {
+                    selected.unwrap_or(0) < limit
+                } else {
+                    batch.num_rows() < limit
+                }
+            };
             let full_scan = |report: &ScanReport| {
                 report
                     .nearest_scan
@@ -653,7 +682,7 @@ async fn execute_with_context(
                     .filter(|scan| scan.rows >= scan.k && !scan.exhausted)
             };
             let mut taken = 0usize;
-            while short(&result_batch) {
+            while short(&result_batch, selected) {
                 let Some(scan) = full_scan(&report) else {
                     break;
                 };
@@ -686,8 +715,9 @@ async fn execute_with_context(
                         pass.with_exact_nearest(id, k)
                     }
                 };
-                let (retried, retried_reports, rows) =
+                let (retried, retried_reports, rows, retried_selected) =
                     Box::pin(run_once(&lowering, ctx, &wider, rung)).await?;
+                selected = retried_selected;
                 executed.record(rows);
                 let retried_report = nearest_report(&retried_reports);
                 executed.record_probes(id, rung, &retried_report);

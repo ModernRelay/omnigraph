@@ -545,6 +545,14 @@ query nearest_with_edge($q: Vector(4)) {
     order { $distance }
     limit 3
 }
+query window_then_where($q: Vector(4)) {
+    match {
+      from nearest({ match { $d: Doc, $d knows $t } return { $d, $t } }, $d.embedding, $q, k: 3),
+    }
+    where $t.slug != "d01"
+    return { $d.slug }
+    order { $d.slug }
+}
 query fused($t: String, $q: Vector(4)) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), bm25($all, $d.text, $t), k: 60), $d: Doc }
     return { $d.slug }
@@ -1256,6 +1264,38 @@ async fn a_nearest_ladder_replays_the_same_rungs() {
         .max()
         .unwrap();
     assert_eq!(rungs, [0, ladder]);
+}
+
+/// A window drawn as a pattern step fills its own `k` targets, not the
+/// `limit`: the population (a document with a `knows` edge) thins the first
+/// candidates, so the ladder reruns until the window holds three targets,
+/// and the `where` after the window then removes one of them without a
+/// refill. The replay repeats the rungs and the rows.
+#[tokio::test]
+async fn a_window_ladder_replays_the_same_rungs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = docs(&dir).await;
+    let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(0.0); 4]))]);
+    let Replayed {
+        result, plan, rows, ..
+    } = replayed(&db, DOC_QUERIES, "window_then_where", &params).await;
+    assert_eq!(
+        result,
+        vec![
+            serde_json::json!({"d.slug": "d04"}),
+            serde_json::json!({"d.slug": "d08"})
+        ],
+        "the window holds d00, d04 and d08; the `where` removes d00 and nothing refills it"
+    );
+    assert!(
+        plan.plan.live().any(|(_, node)| matches!(
+            node,
+            omnigraph_planner::PhysicalNode::TargetCut { targets: 3, .. }
+        )),
+        "the window is a cut of three targets"
+    );
+    let rungs = rows[0]["attempts"].as_array().unwrap().len();
+    assert!(rungs >= 2, "the thinned window reruns its scan: {rows:#?}");
 }
 
 #[tokio::test]

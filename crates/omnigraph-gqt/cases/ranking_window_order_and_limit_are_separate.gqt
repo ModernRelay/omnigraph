@@ -1,0 +1,263 @@
+# issue: none
+# notes: A ranking's window `k`, the read's `order` and its `limit` are three values (law 3). Today's ranked
+# notes: scan runs the one combination where they coincide: the score leads the `order` in its ranking's
+# notes: direction and the `nearest` window is the `limit`. Every other combination draws the ranking as a
+# notes: step over its population: `nearest` keeps every row of its `k` nearest targets (a cut by target,
+# notes: not by row), the elements and `where` after it run over the selected rows and nothing refills a
+# notes: target they remove (law 2), and the `order` is a plain sort that may read the score anywhere.
+# notes: `bm25` has no window; `rrf` windows each `nearest` arm at its own `k`. An aggregate over the
+# notes: score is not lowered yet (`P006`).
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-server
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+    embedding: Vector(2) @index
+}
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"a","text":"needle","embedding":[0.0,1.0]}}
+{"type":"Doc","data":{"slug":"b","text":"needle hay","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","text":"hay","embedding":[1.0,1.0]}}
+{"edge":"Cites","from":"a","to":"b"}
+{"edge":"Cites","from":"a","to":"c"}
+{"edge":"Cites","from":"c","to":"a"}
+
+--- query
+query the_lowered_shape() {
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 2) }
+    return { $d.slug }
+    order { $distance }
+    limit 2
+}
+
+--- expect ordered
+{"d.slug": "a"}
+{"d.slug": "c"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query window_smaller_than_the_limit() {
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 2) }
+    return { $d.slug }
+    order { $distance }
+    limit 3
+}
+
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"c"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query window_without_a_limit() {
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 2) }
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"a"}
+{"d.slug":"c"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query distance_descending() {
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 2) }
+    return { $d.slug }
+    order { $distance desc }
+    limit 2
+}
+
+--- expect ordered
+{"d.slug":"c"}
+{"d.slug":"a"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query score_after_another_key() {
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 2) }
+    return { $d.slug, $distance }
+    order { $d.slug desc, $distance }
+}
+
+--- expect ordered
+{"d.slug":"c","distance":1}
+{"d.slug":"a","distance":0}
+
+--- expect shape
+d.slug: String
+distance: F32
+
+--- query
+query a_where_after_the_window_is_not_refilled() {
+    match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 2) }
+    where $d.slug != "a"
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"c"}
+
+--- expect shape
+d.slug: String
+
+--- expect plan
+pipeline 0: Scan => Sort
+pipeline 1: Sort -> TargetCut -> Filter -> Projection => consumer after 0
+
+--- query
+query a_traversal_after_the_window() {
+    match {
+        from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 1),
+        $d cites $e,
+    }
+    return { $d.slug, $e.slug, $distance }
+    order { $e.slug }
+}
+
+--- expect ordered
+{"d.slug":"a","distance":0,"e.slug":"b"}
+{"d.slug":"a","distance":0,"e.slug":"c"}
+
+--- expect shape
+d.slug: String
+e.slug: String
+distance: F32
+
+--- query
+query a_window_keeps_every_row_of_a_target() {
+    match {
+        from nearest({ match { $d: Doc, $d cites $e } return { $d, $e } }, $d.embedding, [0.0, 1.0], k: 1),
+    }
+    return { $d.slug, $e.slug }
+    order { $e.slug }
+}
+
+--- expect ordered
+{"d.slug":"a","e.slug":"b"}
+{"d.slug":"a","e.slug":"c"}
+
+--- expect shape
+d.slug: String
+e.slug: String
+
+--- query
+query the_ladder_fills_a_window_its_population_thins() {
+    match {
+        from nearest(
+            { match { $d: Doc } where not exists { $d cites $x } return { $d } },
+            $d.embedding, [0.0, 1.0], k: 1
+        ),
+    }
+    return { $d.slug, $distance }
+    order { $d.slug }
+}
+
+--- expect ordered
+{"d.slug":"b","distance":2}
+
+--- expect shape
+d.slug: String
+distance: F32
+
+--- query
+query bm25_score_after_another_key() {
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, "needle") }
+    return { $d.slug }
+    order { $d.slug desc, $score desc }
+}
+
+--- expect ordered
+{"d.slug":"b"}
+{"d.slug":"a"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query bm25_limit_without_an_order() {
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, "needle") }
+    return { $d.slug }
+    limit 1
+}
+
+--- expect unordered
+{"d.slug":"a"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query bm25_where_on_the_score() {
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, "needle") }
+    where $d.slug != "a"
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug":"b"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query rrf_arm_window_other_than_the_limit() {
+    match {
+        let $all = { match { $d: Doc } return { $d } },
+        from rrf(nearest($all, $d.embedding, [0.0, 1.0], k: 1), bm25($all, $d.text, "needle")),
+    }
+    return { $d.slug }
+    order { $score desc }
+    limit 3
+}
+
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"b"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query rrf_ordered_by_another_key() {
+    match {
+        let $all = { match { $d: Doc } return { $d } },
+        from rrf(nearest($all, $d.embedding, [0.0, 1.0], k: 2), bm25($all, $d.text, "needle")),
+    }
+    return { $d.slug, $score }
+    order { $d.slug }
+    limit 2
+}
+
+--- expect ordered
+{"d.slug":"a","score":0.032786885246}
+{"d.slug":"b","score":0.016129032258}
+
+--- expect shape
+d.slug: String
+score: F64
+
+--- query
+query aggregate_over_the_score() {
+    match { from bm25({ match { $d: Doc } return { $d } }, $d.text, "needle") }
+    return { max($score) as best }
+}
+
+--- expect error: P006:

@@ -278,13 +278,14 @@ query vector_search($q: Vector(3072)) {
 first argument is the population (an inline read whose `return` lists the
 bindings the query reads on), the second the ranked property, and `from` adds
 the score column, `$distance` for `nearest` and `$score` for `bm25` and `rrf`.
-Order by it as the leading key (`order { $distance }`, `order { $score desc }`);
-a ranking written as a call in `order` or `return` is `T65`, with the `from`
+Order by it (`order { $distance }`, `order { $score desc }`), at any position
+of `order`; elements and `where` after the `from` run over the selected rows,
+which nothing refills; a ranking written as a call in `order` or `return` is `T65`, with the `from`
 form printed as the fix. Rankings restrict rows: `bm25` returns only text
 matches, `nearest` skips rows whose vector is null, and `rrf` returns the union
-of its arms' candidates. `nearest` requires its window `k` (`T17`) and a
-`limit N` of the same value; BM25 alone needs neither, though a limit is
-recommended for bounded output.
+of its arms' candidates. `nearest` requires its window `k` (`T17`), the number
+of nearest targets it keeps with all their rows; the `limit` is a separate cut.
+BM25 needs neither, though a limit is recommended for bounded output.
 
 Return the score as `$distance`/`$score` (column `distance`/`score`) or alias
 it; see [`search.md`](search.md#projecting-scores). Search predicates

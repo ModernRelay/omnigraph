@@ -778,6 +778,7 @@ pub(super) fn validate_plan_values(
                 | PhysicalNode::RowCompare { .. }
                 | PhysicalNode::ClassifyThreeWay { .. }
                 | PhysicalNode::Limit { .. }
+                | PhysicalNode::TargetCut { .. }
                 | PhysicalNode::Page { .. }
                 | PhysicalNode::Expand { .. }
                 | PhysicalNode::OuterReference { .. }

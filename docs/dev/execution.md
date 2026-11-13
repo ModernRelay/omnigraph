@@ -16,7 +16,18 @@ A query runs against one resolved `ReadTarget`:
    items, order, limit and the ranking a `from nearest/bm25/rrf` draws. A
    `let` value that cannot fail is read wherever its name is; a `from` over an
    inline read with no group, order or cut adds the inner pattern's facts,
-   its unreturned names renamed apart. A core node the planner does not lower
+   its unreturned names renamed apart. A ranking that is the read's only
+   element, its score leading the `order` in its direction and its `nearest`
+   window the `limit`, stays the leading key today's ranked scan runs. Any
+   other ranking is a `PatternStep::Rank` over its population: `nearest`
+   lowers to its ranked scan with `RankScope::Window`, a `Sort` by distance
+   then the target's identity, and a `TargetCut` that keeps every row of the
+   first `k` targets; the elements and `where` after it are steps above the
+   cut, and filter placement treats the cut as a scope boundary, so no
+   filter moves below it (law 2). The overfetch ladder fills the cut's `k`
+   targets, read from its `selected_targets` counter, instead of the read's
+   `limit`. `bm25` has no window, and an `rrf` windows its `nearest` arm at
+   the arm's own `k`. A core node the planner does not lower
    (`Union`, `Fix`, `Call`, a `let` value that can fail, an inline read with a
    group, order or cut, a computed order key no return item computes) is
    refused with `P006`.
@@ -914,9 +925,11 @@ every variant: a `Limit`'s or `Page`'s rows, a `Sort`'s `fetch`, a ranked
 scan's candidate cap; a fusion and a hydration cut nothing), and the
 validator justifies each one by its position: the root `Limit` and the final
 `Sort` (below the root `Limit`, its projections and a hydration) at the
-query's `limit`, and a ranked scan's cap as its declared policy sets it. Any
-other cut, a capped sort below the final one or a cut in a correlated
-block's tree, is refused as `row cut`. The order check recomputes the root's
+query's `limit`, and a ranked scan's cap as its declared policy sets it (a
+window's scan at its `k`). A `TargetCut` counts targets, not rows, and must
+keep exactly the query's window `k`; its own uncapped `Sort` orders no row
+the query returns. Any other cut, a capped sort below the final one or a cut
+in a correlated block's tree, is refused as `row cut`. The order check recomputes the root's
 order from the operators (`optimizer::derived_order`, typed `OrderKey`s):
 a fusion's sort leads with `<binding>._rrf` descending, a search-ordered
 aggregate's or a `return distinct`'s with its remaining keys and then every

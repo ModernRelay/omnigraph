@@ -277,6 +277,7 @@ logical_kinds! {
     RowDiff => "RowDiff", Routable;
     Sort => "Sort", Routable;
     TableScan => "TableScan", Routable;
+    TargetCut => "TargetCut", RefusedByName;
     TextSearch => "TextSearch", RefusedByName;
     Validate => "Validate", RefusedByName;
 }
@@ -621,6 +622,9 @@ pub enum LogicalNode {
         query: IRExpr,
         k: Option<u64>,
         reads: Vec<ColumnRef>,
+        /// The score leads the read's final sort (today's ranked read); a
+        /// ranking drawn as a pattern step orders nothing by itself.
+        leads: bool,
     },
     /// A leading `order { bm25($v.prop, q) }`: the full-text ranking, `_score`.
     TextSearch {
@@ -629,6 +633,7 @@ pub enum LogicalNode {
         property: String,
         query: IRExpr,
         reads: Vec<ColumnRef>,
+        leads: bool,
     },
     /// A leading `order { rrf(a, b) }`: both arms run the input tree, ranked
     /// on their targets, and fuse. `k` is the rank constant as written;
@@ -640,6 +645,16 @@ pub enum LogicalNode {
         limit: Option<u64>,
         reads: Vec<ColumnRef>,
         row_tiebreak: Vec<ColumnRef>,
+        leads: bool,
+    },
+    /// The rows of the first `targets` distinct `binding` identities of its
+    /// input, which arrives sorted by the ranking's score then that identity:
+    /// a `nearest` window's selection, every row of each selected target
+    /// kept (fan-out carries the score and adds no vote).
+    TargetCut {
+        input: LogicalId,
+        binding: String,
+        targets: u64,
     },
     /// A `return` with an aggregate: the group keys and aggregate arguments
     /// it reads; `count($v)` reads the identity alone.
@@ -688,6 +703,7 @@ impl LogicalNode {
             Self::Projection { .. } => LogicalKind::Projection,
             Self::Sort { .. } | Self::Ordered { .. } => LogicalKind::Sort,
             Self::Limit { .. } | Self::Page { .. } => LogicalKind::Limit,
+            Self::TargetCut { .. } => LogicalKind::TargetCut,
             Self::Join { .. } | Self::CrossJoin { .. } => LogicalKind::Join,
             Self::RowDiff { .. } => LogicalKind::RowDiff,
             Self::MergeClassify { .. } => LogicalKind::MergeClassify,
@@ -714,6 +730,7 @@ impl LogicalNode {
             | Self::Nearest { input, .. }
             | Self::TextSearch { input, .. }
             | Self::RankFuse { input, .. }
+            | Self::TargetCut { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![*input],
@@ -745,6 +762,7 @@ impl LogicalNode {
             | Self::Nearest { input, .. }
             | Self::TextSearch { input, .. }
             | Self::RankFuse { input, .. }
+            | Self::TargetCut { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![input],
@@ -987,6 +1005,11 @@ impl LogicalPlan {
             }),
             LogicalNode::Limit { rows, .. } => json!({
                 "node": "Limit", "rows": rows, "bytes": 0, "resume": null,
+            }),
+            LogicalNode::TargetCut {
+                binding, targets, ..
+            } => json!({
+                "node": "TargetCut", "binding": binding, "targets": targets,
             }),
             LogicalNode::Page {
                 rows,

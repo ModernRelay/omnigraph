@@ -670,6 +670,40 @@ fn a_capped_bm25_scan_fails_the_row_cut() {
     assert_eq!(check, "row cut", "{detail}");
 }
 
+/// A `nearest` window drawn as a pattern step is a cut of its `k` targets:
+/// the planned plan is accepted, and a `TargetCut` keeping another number of
+/// targets, or a window scan fetching another `k`, fails the row cut.
+#[test]
+fn a_window_cut_of_another_k_fails_the_row_cut() {
+    let windowed = Fixture::new(
+        "query q() { match { from nearest({ match { $d: Doc } return { $d } }, $d.embedding, [0.0, 1.0], k: 2) } where $d.year > 2000 return { $d.slug } }",
+        &[],
+    );
+    windowed
+        .accept(windowed.plan())
+        .expect("the planned window is the cut the query requires");
+    let mut plan = windowed.plan();
+    for id in node_ids(&plan, |node| matches!(node, PhysicalNode::TargetCut { .. })) {
+        if let Some(PhysicalNode::TargetCut { targets, .. }) = plan.node_mut(id) {
+            *targets = 3;
+        }
+    }
+    let (check, detail) = windowed.refused(plan);
+    assert_eq!(check, "row cut", "{detail}");
+    let mut plan = windowed.plan();
+    for id in node_ids(&plan, |node| node.ranked().is_some()) {
+        if let Some(PhysicalNode::Scan {
+            ranked: Some(ranked),
+            ..
+        }) = plan.node_mut(id)
+        {
+            ranked.fetch = Some(3);
+        }
+    }
+    let (check, detail) = windowed.refused(plan);
+    assert_eq!(check, "row cut", "{detail}");
+}
+
 #[test]
 fn another_limit_fails_the_row_cut() {
     let fixture = filtered();

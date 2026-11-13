@@ -150,6 +150,11 @@ pub struct Requirements {
     pub(crate) limit: Option<u64>,
     /// Whether the rows are groups: an aggregate return or `return distinct`.
     pub(crate) aggregate: bool,
+    /// A ranking drawn as a pattern step (`PatternStep::Rank`) rather than
+    /// led by the `order`: its `nearest` window `k` in targets, `None` for
+    /// one with no window (`bm25`). Its score leads no sort, and the
+    /// eligibility conjuncts after it run over the selected rows.
+    pub(crate) window: Option<Option<u64>>,
 }
 
 impl Requirements {
@@ -163,9 +168,11 @@ impl Requirements {
         let mut blocks = Vec::new();
         let mut bindings: BTreeMap<String, BoundVariable> = BTreeMap::new();
         let mut selected_edges = HashSet::new();
+        let mut rank_step: Option<(&IRExpr, Option<u64>)> = None;
         for op in &ir.pipeline {
             budget.visit(1)?;
             match op {
+                PatternStep::Rank { key, window, .. } => rank_step = Some((key, *window)),
                 PatternStep::NodeScan {
                     variable,
                     type_name,
@@ -236,7 +243,11 @@ impl Requirements {
             }
         }
         let mut keys = ir.order_by.as_slice();
-        let search = match keys.first().map(|key| &key.expr) {
+        let leading = match rank_step {
+            Some((key, _)) => Some(key),
+            None => keys.first().map(|key| &key.expr),
+        };
+        let search = match leading {
             Some(IRExpr::Rrf {
                 primary,
                 secondary,
@@ -252,7 +263,7 @@ impl Requirements {
             Some(expr) => Retrieval::of(expr).map(Search::Rank),
             None => None,
         };
-        if search.is_some() {
+        if search.is_some() && rank_step.is_none() {
             keys = &keys[1..];
         }
         // Group rows (aggregates or `return distinct`) bind every key to the
@@ -270,10 +281,7 @@ impl Requirements {
             })
             .filter(|key| !matches!(key.expr, IRExpr::Literal(_, _)))
             .collect();
-        let written_search = search
-            .as_ref()
-            .and(ir.order_by.first())
-            .map(|key| key.expr.clone());
+        let written_search = search.as_ref().and(leading).cloned();
         let projected_ranks = match &written_search {
             Some(lead) => ir
                 .return_exprs
@@ -298,6 +306,7 @@ impl Requirements {
             ordered: !ir.order_by.is_empty(),
             limit: ir.limit,
             aggregate: grouped,
+            window: rank_step.map(|(_, window)| window),
         })
     }
 }

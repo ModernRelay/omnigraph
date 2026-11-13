@@ -238,13 +238,13 @@ return, an order key must be a return item or its alias (`T42`), like
 `count($d)` after `return { count($d) as deals }`.
 
 A read that draws from a [ranking](../search/index.md) orders by its score
-column, written as the leading key: `order { $distance }` for `nearest`, by
-ascending distance, and `order { $score desc }` for `bm25` and `rrf`, by
-descending score, including through traversals, ranking the binding the
-ranking names whichever binding its population declares first
-([details](../search/index.md#ranking-a-traversal-reached-binding)).
-Subsequent keys precede the identity tiebreak. `nearest` requires a limit. A
-ranking written as a call in `order` or `return` is refused (`T65`), and so is
+column like any other: `order { $distance }` for `nearest`, by ascending
+distance, and `order { $score desc }` for `bm25` and `rrf`, by descending
+score, including through traversals, ranking the binding the ranking names
+whichever binding its population declares first
+([details](../search/index.md#ranking-a-traversal-reached-binding)). Later
+keys precede the identity tiebreak. A `nearest` window `k` and the `limit` are
+separate values. A ranking written as a call in `order` or `return` is refused (`T65`), and so is
 a search predicate in return (`T38`).
 
 For aggregate or DISTINCT returns, the ranking selects the input population;

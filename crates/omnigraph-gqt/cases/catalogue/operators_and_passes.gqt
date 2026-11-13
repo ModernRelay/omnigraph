@@ -35,6 +35,7 @@ query operators() {
 {"o.name":"RowCompare","o.inputs":[1]}
 {"o.name":"ClassifyThreeWay","o.inputs":[1]}
 {"o.name":"Page","o.inputs":[1]}
+{"o.name":"TargetCut","o.inputs":[1]}
 {"o.name":"CrossJoin","o.inputs":[2]}
 {"o.name":"ContainsJoin","o.inputs":[2]}
 {"o.name":"Filter","o.inputs":[1]}
@@ -113,6 +114,7 @@ query logical_kinds() {
 {"k.name":"Sort","k.coverage":"routable"}
 {"k.name":"TableScan","k.coverage":"routable"}
 {"k.name":"TextSearch","k.coverage":"refused_by_name"}
+{"k.name":"TargetCut","k.coverage":"refused_by_name"}
 {"k.name":"Validate","k.coverage":"refused_by_name"}
 
 --- expect shape

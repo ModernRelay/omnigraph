@@ -42,7 +42,7 @@ use super::operators::{
     ExpandExec, ExpandExecution, ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec,
     LanceFragmentSink, LimitExec, LookupSpec, MetadataCountExec, OuterReferenceExec, OuterSlot,
     ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec, ScanSource, SortExec, SortKey,
-    ValidateExec, fresh_tag_column, tagged_schema,
+    TargetCutExec, ValidateExec, fresh_tag_column, tagged_schema,
 };
 use super::*;
 use crate::loader::LoadMode;
@@ -716,6 +716,29 @@ impl Lower for Walk<'_, '_> {
 
     fn limit(&mut self, id: NodeId, rows: usize, input: Plan) -> Lowers<Plan> {
         self.built(id, LimitExec::new(input, rows))
+    }
+
+    fn target_cut(
+        &mut self,
+        id: NodeId,
+        binding: &str,
+        targets: usize,
+        input: Plan,
+    ) -> Lowers<Plan> {
+        let name = format!("{binding}.{}", self.lowering.catalog.system_columns.id);
+        let schema = input.schema();
+        let hidden = format!("{HIDDEN}{name}");
+        let column = if schema.column_with_name(&hidden).is_some() {
+            hidden
+        } else if schema.column_with_name(&name).is_some() {
+            name
+        } else {
+            return Err(OmniError::manifest_internal(format!(
+                "the window's target identity '{name}' is not in its input"
+            ))
+            .into());
+        };
+        self.built(id, TargetCutExec::new(input, column, targets))
     }
 
     fn page(

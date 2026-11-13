@@ -77,6 +77,18 @@ pub enum PatternStep {
         edge_binding: Option<String>,
     },
     Filter(IRExpr),
+    /// A ranking drawn over the rows of the steps before it, its
+    /// population, when it is not the read's leading `order` key cut by the
+    /// read's `limit` (that ranking is `order_by`'s first key): `key` is the
+    /// ranking as a leading key holds it (`nearest`, `bm25`, `rrf`),
+    /// `binding` the ranked node column, and `window` the `nearest` window
+    /// `k` in targets (an `rrf`'s `nearest` arm's), `None` for `bm25`. The
+    /// steps after it run over the selected rows, which nothing refills.
+    Rank {
+        key: IRExpr,
+        binding: String,
+        window: Option<u64>,
+    },
     /// A correlated block: `inner` runs over the outer rows and `predicate`
     /// decides per outer row on the aggregate of its matches.
     AntiJoin {
@@ -105,7 +117,9 @@ impl ReadShape {
                     }
                 }
                 PatternStep::AntiJoin { inner, .. } => pending.extend(inner),
-                PatternStep::NodeScan { .. } | PatternStep::Filter(_) => {}
+                PatternStep::NodeScan { .. }
+                | PatternStep::Filter(_)
+                | PatternStep::Rank { .. } => {}
             }
         }
         false
@@ -156,6 +170,94 @@ struct Ranking {
     /// The `k` of each `nearest` window the ranking draws (its own, or its
     /// `rrf` arms'); `None` for a window read from a parameter.
     windows: Vec<Option<u64>>,
+}
+
+/// A body split at the ranking it draws.
+struct Split<'t> {
+    /// The pattern the ranking ranks (the whole body when it draws none).
+    population: &'t Term,
+    ranking: Option<Ranking>,
+    /// The ranking's own node (`ApproxTopK`, a `bm25` `Score`); `None` for a
+    /// fusion, whose population is the type.
+    node: Option<&'t Term>,
+    /// The elements and `where` after the ranking, over an empty leaf.
+    after: Option<Term>,
+}
+
+/// The population term a ranking node ranks.
+fn ranked_input(node: &Term) -> &Term {
+    match node {
+        Term::ApproxTopK { input, .. } | Term::Score { input, .. } => input,
+        other => other,
+    }
+}
+
+/// `term` with the node `leaf` (found by identity on its input chain)
+/// replaced by an empty leaf.
+fn without_leaf(term: &Term, leaf: &Term) -> Term {
+    if std::ptr::eq(term, leaf) {
+        return Term::Env(Vec::new());
+    }
+    match term {
+        Term::Filter { input, pred } => Term::Filter {
+            input: without_leaf(input, leaf).boxed(),
+            pred: pred.clone(),
+        },
+        Term::Expand {
+            input,
+            src,
+            dst,
+            src_type,
+            dst_type,
+            edges,
+            min_hops,
+            max_hops,
+            edge_var,
+        } => Term::Expand {
+            input: without_leaf(input, leaf).boxed(),
+            src: src.clone(),
+            dst: dst.clone(),
+            src_type: src_type.clone(),
+            dst_type: dst_type.clone(),
+            edges: edges.clone(),
+            min_hops: *min_hops,
+            max_hops: *max_hops,
+            edge_var: edge_var.clone(),
+        },
+        Term::Project { input, items, keep } => Term::Project {
+            input: without_leaf(input, leaf).boxed(),
+            items: items.clone(),
+            keep: *keep,
+        },
+        Term::Correlate { outer, inner } => Term::Correlate {
+            outer: without_leaf(outer, leaf).boxed(),
+            inner: inner.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
+/// The names a placed pipeline binds physically: its scans, expansion
+/// destinations and edge bindings.
+fn physical_names(pipeline: &[PatternStep]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for step in pipeline {
+        match step {
+            PatternStep::NodeScan { variable, .. } => {
+                names.insert(variable.clone());
+            }
+            PatternStep::Expand {
+                dst_var,
+                edge_binding,
+                ..
+            } => {
+                names.insert(dst_var.clone());
+                names.extend(edge_binding.iter().cloned());
+            }
+            PatternStep::Filter(_) | PatternStep::AntiJoin { .. } | PatternStep::Rank { .. } => {}
+        }
+    }
+    names
 }
 
 struct Shaper<'a> {
@@ -397,11 +499,21 @@ impl<'a> Shaper<'a> {
             }
             _ => return Err(self.refuse("a read whose returns are not a projection")),
         };
-        let (body, ranking) = self.ranking(body)?;
+        let Split {
+            population: body,
+            ranking,
+            node: ranked_node,
+            after,
+        } = self.split_ranking(body)?;
         // The pattern, with every `let` value read where its name is.
         let mut facts = Facts::default();
         self.facts(body, &mut facts)?;
-        let lets = std::mem::take(&mut facts.lets);
+        let mut after_facts = Facts::default();
+        if let Some(after) = &after {
+            self.facts(after, &mut after_facts)?;
+        }
+        let mut lets = std::mem::take(&mut facts.lets);
+        lets.extend(std::mem::take(&mut after_facts.lets));
         facts.substitute(&lets);
         for e in items.values_mut() {
             substitute(e, &lets);
@@ -450,12 +562,19 @@ impl<'a> Shaper<'a> {
         // Order keys: the rank key leads (left out under an aggregate or
         // `distinct`), the others read return items or the pattern.
         let grouped = !aggs.is_empty() || distinct;
-        if let Some(ranking) = &ranking {
-            self.check_ranking(ranking, order_keys, limit, grouped)?;
-        }
+        // Today's ranked scan runs a ranking that is the read's only element,
+        // its score leading the `order` in its direction and its window the
+        // read's `limit`; any other ranking is a `Rank` step over its
+        // population, cut to its own window, the `order` a plain sort.
+        let windowed = ranking.as_ref().is_some_and(|ranking| {
+            after.is_some()
+                || self
+                    .check_ranking(ranking, order_keys, limit, grouped)
+                    .is_err()
+        });
         let mut order_by = Vec::new();
         let mut keys = order_keys.iter().peekable();
-        if let Some(ranking) = &ranking {
+        if let Some(ranking) = ranking.as_ref().filter(|_| !windowed) {
             let leads =
                 matches!(keys.peek(), Some((IRExpr::AliasRef(name, _), _)) if *name == ranking.out);
             let descending = match keys.peek() {
@@ -527,21 +646,80 @@ impl<'a> Shaper<'a> {
                 descending: *descending,
             });
         }
-        let _ = grouped;
         let ranked: Vec<String> = ranking
             .as_ref()
             .map(|r| vec![r.column.clone()])
             .unwrap_or_default();
         let mut pipeline = Vec::new();
         let mut fresh = FreshNames::default();
-        self.place(
-            &facts,
-            &ranked,
-            &mut pipeline,
-            &mut HashSet::new(),
-            &HashSet::new(),
-            &mut fresh,
-        )?;
+        let mut bound = HashSet::new();
+        if let Some(ranking) = ranking.as_ref().filter(|_| windowed) {
+            // The population as its inline read states it, the names it
+            // binds without returning renamed apart from the later elements.
+            let mut population = Facts::default();
+            match ranked_node.map(ranked_input) {
+                Some(Term::Project {
+                    input,
+                    items,
+                    keep: false,
+                }) => self.inline_read(input, items, &mut population)?,
+                _ => self.facts(body, &mut population)?,
+            }
+            let population_lets = std::mem::take(&mut population.lets);
+            population.substitute(&population_lets);
+            self.place(
+                &population,
+                &ranked,
+                &mut pipeline,
+                &mut bound,
+                &HashSet::new(),
+                &mut fresh,
+            )?;
+            let window = match ranking.windows.as_slice() {
+                [] => None,
+                [Some(k)] => Some(*k),
+                [Some(k), rest @ ..] if rest.iter().all(|w| *w == Some(*k)) => Some(*k),
+                _ => {
+                    return Err(self.refuse(
+                        "a `nearest` window read from a parameter, or two `rrf` arm windows that differ",
+                    ));
+                }
+            };
+            pipeline.push(PatternStep::Rank {
+                key: ranking.key.clone(),
+                binding: ranking.column.clone(),
+                window,
+            });
+            // The later elements and `where` read the score by its name.
+            let mut score = HashMap::new();
+            score.insert(
+                ranking.out.clone(),
+                IRExpr::PropAccess {
+                    variable: ranking.column.clone(),
+                    property: ranking.score.0.to_string(),
+                    ty: ranking.score.1.clone(),
+                },
+            );
+            after_facts.substitute(&score);
+            let physical = physical_names(&pipeline);
+            self.place(
+                &after_facts,
+                &[],
+                &mut pipeline,
+                &mut bound,
+                &physical,
+                &mut fresh,
+            )?;
+        } else {
+            self.place(
+                &facts,
+                &ranked,
+                &mut pipeline,
+                &mut bound,
+                &HashSet::new(),
+                &mut fresh,
+            )?;
+        }
         Ok(ReadShape {
             name: read.name.clone(),
             params: read
@@ -707,6 +885,53 @@ impl<'a> Shaper<'a> {
                 arg: arg.ty().clone(),
                 result,
             },
+        })
+    }
+
+    /// The ranking a body draws and where: at its root (the pattern under
+    /// it), or under later elements and a `where`, which `after` holds with
+    /// the ranking replaced by an empty leaf.
+    fn split_ranking<'t>(&self, body: &'t Term) -> Result<Split<'t>, PlanError> {
+        let (population, ranking) = self.ranking(body)?;
+        if ranking.is_some() {
+            return Ok(Split {
+                population,
+                ranking,
+                node: Some(body)
+                    .filter(|b| !matches!(b, Term::Fuse { .. }) && fuse_leaf(b).is_none()),
+                after: None,
+            });
+        }
+        let mut node = body;
+        loop {
+            node = match node {
+                Term::ApproxTopK { .. }
+                | Term::Score {
+                    kind: ScoreKind::Bm25,
+                    ..
+                } => break,
+                Term::Filter { input, .. }
+                | Term::Expand { input, .. }
+                | Term::Project {
+                    input, keep: true, ..
+                } => input,
+                Term::Correlate { outer, .. } => outer,
+                _ => {
+                    return Ok(Split {
+                        population,
+                        ranking: None,
+                        node: None,
+                        after: None,
+                    });
+                }
+            };
+        }
+        let (population, ranking) = self.ranking(node)?;
+        Ok(Split {
+            population,
+            ranking,
+            node: Some(node),
+            after: Some(without_leaf(body, node)),
         })
     }
 
@@ -1436,7 +1661,9 @@ impl<'a> Shaper<'a> {
                     physical_names.insert(dst_var.clone());
                     physical_names.extend(edge_binding.iter().cloned());
                 }
-                PatternStep::Filter(_) | PatternStep::AntiJoin { .. } => {}
+                PatternStep::Filter(_)
+                | PatternStep::AntiJoin { .. }
+                | PatternStep::Rank { .. } => {}
             }
         }
         for block in &facts.blocks {
@@ -1705,6 +1932,10 @@ fn rename_inner_bindings(
                 expressions.extend(dst_filters);
             }
             PatternStep::Filter(expr) => expressions.push(expr),
+            PatternStep::Rank { binding, key, .. } => {
+                rename(binding);
+                expressions.push(key);
+            }
             PatternStep::AntiJoin {
                 outer_var,
                 inner,

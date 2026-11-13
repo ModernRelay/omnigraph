@@ -269,6 +269,11 @@ pub enum NodeMirror {
         input: NodeId,
         rows: usize,
     },
+    TargetCut {
+        input: NodeId,
+        binding: String,
+        targets: usize,
+    },
     Page {
         input: NodeId,
         rows: usize,
@@ -442,6 +447,15 @@ impl From<&PhysicalNode> for NodeMirror {
             PhysicalNode::Limit { input, rows } => Self::Limit {
                 input: *input,
                 rows: *rows,
+            },
+            PhysicalNode::TargetCut {
+                input,
+                binding,
+                targets,
+            } => Self::TargetCut {
+                input: *input,
+                binding: binding.clone(),
+                targets: *targets,
             },
             PhysicalNode::Page {
                 input,
@@ -682,6 +696,15 @@ impl TryFrom<NodeMirror> for PhysicalNode {
             NodeMirror::RowCompare { input } => Self::RowCompare { input },
             NodeMirror::ClassifyThreeWay { input } => Self::ClassifyThreeWay { input },
             NodeMirror::Limit { input, rows } => Self::Limit { input, rows },
+            NodeMirror::TargetCut {
+                input,
+                binding,
+                targets,
+            } => Self::TargetCut {
+                input,
+                binding,
+                targets,
+            },
             NodeMirror::Page {
                 input,
                 rows,
