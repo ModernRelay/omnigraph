@@ -1041,6 +1041,58 @@ struct IndexLag {
     vector: bool,
 }
 
+/// How many BTREE index builds may run at once in one index pass (#1385).
+/// BTREE training spills under Lance's per-partition memory pool, so a few
+/// concurrent builds stay bounded; full-text and vector builds have no such
+/// bound yet (#1296) and run alone.
+pub const INDEX_BUILD_CONCURRENCY: usize = 4;
+
+/// The shared budget of one index pass: a BTREE build holds one permit, a
+/// full-text or vector build holds all of them, so it never overlaps another
+/// build. Permits are granted in request order, so a waiting full-text build
+/// is not starved by later BTREEs.
+#[derive(Debug, Clone)]
+pub struct IndexBuildLimit {
+    permits: Arc<tokio::sync::Semaphore>,
+    width: u32,
+}
+
+impl IndexBuildLimit {
+    /// A budget of `width` concurrent BTREE builds; `1` builds serially.
+    pub fn new(width: usize) -> Self {
+        let width = width.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(width)),
+            width: u32::try_from(width).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The number of builds the pass may have in flight.
+    pub fn width(&self) -> usize {
+        self.width as usize
+    }
+
+    async fn together(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        self.permits
+            .acquire()
+            .await
+            .map_err(|_| OmniError::manifest_internal("index build budget closed"))
+    }
+
+    async fn alone(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        self.permits
+            .acquire_many(self.width)
+            .await
+            .map_err(|_| OmniError::manifest_internal("index build budget closed"))
+    }
+}
+
+impl Default for IndexBuildLimit {
+    fn default() -> Self {
+        Self::new(INDEX_BUILD_CONCURRENCY)
+    }
+}
+
 /// A staged index fold: the `CreateIndex` to commit detached, if any index
 /// lagged and could be folded, and the columns whose vector delta could not
 /// be trained.
@@ -3300,7 +3352,7 @@ impl TableStore {
     /// Lance's merge would. A vector index the builder cannot train (a column
     /// with no non-null rows) is skipped and reported by column.
     pub async fn stage_index_fold(&self, ds: &Dataset) -> Result<StagedIndexFold> {
-        let (batch, _, skipped) = Self::index_fold_batch(ds).await?;
+        let (batch, _, skipped) = Self::index_fold_batch(ds, &IndexBuildLimit::default()).await?;
         Ok(StagedIndexFold {
             staged: batch.stage(ds.manifest.version),
             skipped,
@@ -3313,15 +3365,18 @@ impl TableStore {
     /// [`Self::stage_index_fold`] builds it): one detached commit leaves every
     /// buildable declared index present and covering every current fragment.
     /// Full-text coverage is not folded (`can_fold_index`).
+    /// The builds count against `limit`, which a caller staging several
+    /// tables shares across them.
     pub async fn stage_index_reconciliation(
         &self,
         ds: &Dataset,
         specs: &[IndexBuildSpec],
+        limit: &IndexBuildLimit,
     ) -> Result<StagedIndexReconciliation> {
-        let (mut batch, refreshed, skipped) = Self::index_fold_batch(ds).await?;
+        let (mut batch, refreshed, skipped) = Self::index_fold_batch(ds, limit).await?;
         let mut vector_builds = 0;
         if !specs.is_empty() {
-            let (created, builds) = Self::create_index_batch(ds, specs).await?;
+            let (created, builds) = Self::create_index_batch(ds, specs, limit).await?;
             batch.extend(created)?;
             vector_builds = builds;
         }
@@ -3340,8 +3395,11 @@ impl TableStore {
 
     /// The fold batch: every lagging foldable index rebuilt whole under its
     /// name, the columns rebuilt, and the vector columns that could not train.
+    /// The rebuilds run under `limit`, BTREEs together and vectors alone, and
+    /// join the batch in lag order.
     async fn index_fold_batch(
         ds: &Dataset,
+        limit: &IndexBuildLimit,
     ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
         let lag = Self::foldable_index_lag(ds).await?;
         if lag.is_empty() {
@@ -3349,45 +3407,59 @@ impl TableStore {
         }
         let existing = ds.load_indices().await.map_err(OmniError::storage)?;
         let read_version = ds.manifest.version;
-        let mut new_indices = Vec::new();
-        let mut removed_indices = Vec::new();
-        let mut refreshed = Vec::new();
-        let mut skipped = Vec::new();
-        for item in lag {
-            let Some(column) = item
-                .fields
-                .first()
-                .and_then(|id| ds.schema().field_by_id(*id))
-                .map(|field| field.name.clone())
-            else {
-                continue;
-            };
+        let items: Vec<_> = lag
+            .into_iter()
+            .filter_map(|item| {
+                let column = item
+                    .fields
+                    .first()
+                    .and_then(|id| ds.schema().field_by_id(*id))
+                    .map(|field| field.name.clone())?;
+                Some((item, column))
+            })
+            .collect();
+        let builds = items.iter().map(|(item, column)| async move {
             let mut ds_clone = ds.clone();
             let columns = [column.as_str()];
-            let built = if item.vector {
+            if item.vector {
+                let _permit = limit.alone().await?;
                 // Keep the index's partition count: the engine builds one
                 // partition, but a partitioned index (Lance's split, or an
                 // explicit build) keeps its shape across folds.
                 let partitions = Self::vector_partition_count(ds, &item.name).await?;
                 let params =
                     lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
-                ds_clone
-                    .create_index_builder(&columns, IndexType::Vector, &params)
-                    .name(item.name.clone())
-                    .replace(true)
-                    .execute_uncommitted()
-                    .await
+                Ok::<_, OmniError>(
+                    ds_clone
+                        .create_index_builder(&columns, IndexType::Vector, &params)
+                        .name(item.name.clone())
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await,
+                )
             } else {
+                let _permit = limit.together().await?;
                 let params = ScalarIndexParams::default();
                 let _probe = crate::instrumentation::enter_index_build_probe().await;
-                ds_clone
+                Ok(ds_clone
                     .create_index_builder(&columns, IndexType::BTree, &params)
                     .name(item.name.clone())
                     .replace(true)
                     .execute_uncommitted()
-                    .await
-            };
-            let new_idx = match built {
+                    .await)
+            }
+        });
+        let built: Vec<_> = futures::stream::iter(builds.collect::<Vec<_>>())
+            .buffered(limit.width())
+            .collect()
+            .await;
+
+        let mut new_indices = Vec::new();
+        let mut removed_indices = Vec::new();
+        let mut refreshed = Vec::new();
+        let mut skipped = Vec::new();
+        for ((item, column), built) in items.into_iter().zip(built) {
+            let new_idx = match built? {
                 Ok(index) => index,
                 Err(error) if item.vector => {
                     tracing::warn!(
@@ -5885,12 +5957,24 @@ impl TableStore {
         ds: &Dataset,
         specs: &[IndexBuildSpec],
     ) -> Result<StagedWrite> {
+        self.stage_create_indices_within(ds, specs, &IndexBuildLimit::default())
+            .await
+    }
+
+    /// [`Self::stage_create_indices`] with its builds counted against
+    /// `limit`, which a caller staging several tables shares across them.
+    pub async fn stage_create_indices_within(
+        &self,
+        ds: &Dataset,
+        specs: &[IndexBuildSpec],
+        limit: &IndexBuildLimit,
+    ) -> Result<StagedWrite> {
         if specs.is_empty() {
             return Err(OmniError::manifest_internal(
                 "stage_create_indices requires at least one index specification",
             ));
         }
-        let (batch, vector_builds) = Self::create_index_batch(ds, specs).await?;
+        let (batch, vector_builds) = Self::create_index_batch(ds, specs, limit).await?;
         let staged = batch.stage(ds.manifest.version).ok_or_else(|| {
             OmniError::manifest_internal(
                 "stage_create_indices built no index for its specifications",
@@ -5911,32 +5995,31 @@ impl TableStore {
     async fn create_index_batch(
         ds: &Dataset,
         specs: &[IndexBuildSpec],
+        limit: &IndexBuildLimit,
     ) -> Result<(IndexBatch, usize)> {
         let read_version = ds.manifest.version;
         let existing_indices = ds
             .load_indices()
             .await
             .map_err(|error| OmniError::storage_context("stage_create_indices", error))?;
-        let mut new_indices = Vec::with_capacity(specs.len());
-        let mut new_names = std::collections::HashSet::with_capacity(specs.len());
-        let mut vector_builds = 0usize;
-        let mut full_text_fields = HashSet::new();
-
         for spec in specs {
-            let (column, index_type) = match spec {
-                IndexBuildSpec::BTree { column, .. } => (column, "BTREE"),
-                IndexBuildSpec::FullText { column } => (column, "FTS"),
-                IndexBuildSpec::Vector { column } => (column, "Vector"),
-            };
+            let (column, index_type) = spec.column_and_kind();
             if column.is_empty() {
                 return Err(OmniError::manifest_internal(format!(
                     "stage_create_indices received an empty {index_type} column name"
                 )));
             }
+        }
 
+        // #1385: independent BTREE builds overlap under `limit`; a full-text
+        // or vector build runs alone. Each builds from the same snapshot and
+        // the results join the batch in specification order, so the batch is
+        // the one a serial loop builds.
+        let builds = specs.iter().map(|spec| async move {
             let mut ds_clone = ds.clone();
-            let mut new_idx = match spec {
+            let built = match spec {
                 IndexBuildSpec::BTree { column, name } => {
+                    let _permit = limit.together().await?;
                     let params = ScalarIndexParams::default();
                     let columns = [column.as_str()];
                     let mut builder =
@@ -5951,6 +6034,7 @@ impl TableStore {
                     builder.replace(true).execute_uncommitted().await
                 }
                 IndexBuildSpec::FullText { column } => {
+                    let _permit = limit.alone().await?;
                     let params = InvertedIndexParams::default();
                     ds_clone
                         .create_index_builder(&[column.as_str()], IndexType::Inverted, &params)
@@ -5959,25 +6043,38 @@ impl TableStore {
                         .await
                 }
                 IndexBuildSpec::Vector { column } => {
+                    let _permit = limit.alone().await?;
                     let params =
                         lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
-                    let new_idx = ds_clone
+                    ds_clone
                         .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
                         .replace(true)
                         .execute_uncommitted()
-                        .await;
-                    if new_idx.is_ok() {
-                        vector_builds += 1;
-                    }
-                    new_idx
+                        .await
                 }
-            }
-            .map_err(|error| {
+            };
+            Ok::<_, OmniError>(built)
+        });
+        let built: Vec<_> = futures::stream::iter(builds.collect::<Vec<_>>())
+            .buffered(limit.width())
+            .collect()
+            .await;
+
+        let mut new_indices = Vec::with_capacity(specs.len());
+        let mut new_names = std::collections::HashSet::with_capacity(specs.len());
+        let mut vector_builds = 0usize;
+        let mut full_text_fields = HashSet::new();
+        for (spec, built) in specs.iter().zip(built) {
+            let (column, index_type) = spec.column_and_kind();
+            let mut new_idx = built?.map_err(|error| {
                 OmniError::storage_context(
                     format!("stage_create_indices: build {index_type} index on '{column}'"),
                     error,
                 )
             })?;
+            if matches!(spec, IndexBuildSpec::Vector { .. }) {
+                vector_builds += 1;
+            }
 
             if new_idx.dataset_version != read_version {
                 return Err(OmniError::manifest_internal(format!(

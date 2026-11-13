@@ -492,7 +492,11 @@ and publishes the pins once. For `ensure_indices` one table's batch holds the
 declared indexes the table lacks and a whole rebuild of each BTREE or vector
 index whose coverage lags (`TableStore::stage_index_reconciliation`), the two
 index links optimize chains after its compaction; full-text coverage stays
-with the explicit rebuild. A failure before
+with the explicit rebuild. The tables stage concurrently and share one
+build budget (`IndexBuildLimit`, `INDEX_BUILD_CONCURRENCY` = 4): a BTREE build
+holds one permit, a full-text or vector build holds all of them and runs
+alone, and the batches join in table and specification order, so the
+publication is the one a serial pass makes. A failure before
 publication leaves no graph-visible residue; after publication reads,
 including full-text search through the batch's certificate, serve from the
 staged version.

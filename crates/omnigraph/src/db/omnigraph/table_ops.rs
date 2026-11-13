@@ -3,6 +3,7 @@ use crate::dataset_index::is_full_text_index;
 use crate::error::{ManifestConflictDetails, ManifestError, missing_graph_type_at_snapshot};
 use crate::seams::{decide_seam, fail};
 use crate::table_store::{RefreshedIndex, TableStore};
+use futures::StreamExt;
 use lance::index::DatasetIndexExt;
 use omnigraph_compiler::types::PropIndexKind;
 
@@ -297,6 +298,12 @@ struct IndexTarget {
     table_branch: Option<String>,
 }
 
+/// One table's staged index work, before it is sorted into the pass.
+enum StagedTarget {
+    Ensure(crate::storage_layer::IndexReconciliation),
+    Rebuilt(crate::storage_layer::StagedHandle),
+}
+
 async fn maintain_indices_for_branch(
     db: &Omnigraph,
     branch: Option<&str>,
@@ -426,24 +433,51 @@ async fn maintain_indices_for_branch(
     // it never becomes a publication target beside productive siblings.
     let mut refreshed_by_table = HashMap::<String, Vec<RefreshedIndex>>::new();
     let mut staged_targets = Vec::with_capacity(targets.len());
-    for target in targets {
-        let Some(ds) = existing_targets.get(&target.table_key) else {
-            continue;
-        };
+    // #1385: tables stage concurrently and share one build budget, so at most
+    // `INDEX_BUILD_CONCURRENCY` BTREE builds run across the whole pass and a
+    // full-text or vector build runs alone. Results are taken in target order,
+    // so pending reports, the failpoint and the publication match a serial
+    // pass.
+    let limit = crate::table_store::IndexBuildLimit::default();
+    let staging = targets.iter().map(|target| {
+        let ds = existing_targets.get(&target.table_key);
         let work = &work_by_table[&target.table_key];
-        let context = |error: OmniError| {
-            error.with_context(format!(
-                "stage index batch on {} ({:?})",
-                target.table_key, work.specs
-            ))
-        };
-        let staged = match mode {
-            IndexMaintenanceMode::Ensure => {
-                let reconciliation = db
+        let limit = &limit;
+        async move {
+            let Some(ds) = ds else {
+                return Ok(None);
+            };
+            let context = |error: OmniError| {
+                error.with_context(format!(
+                    "stage index batch on {} ({:?})",
+                    target.table_key, work.specs
+                ))
+            };
+            match mode {
+                IndexMaintenanceMode::Ensure => db
                     .storage()
-                    .stage_index_reconciliation(ds, &work.specs)
+                    .stage_index_reconciliation(ds, &work.specs, limit)
                     .await
-                    .map_err(context)?;
+                    .map(|reconciliation| Some(StagedTarget::Ensure(reconciliation)))
+                    .map_err(context),
+                IndexMaintenanceMode::RebuildFullText => db
+                    .storage()
+                    .stage_create_indices_within(ds, &work.specs, limit)
+                    .await
+                    .map(|staged| Some(StagedTarget::Rebuilt(staged)))
+                    .map_err(context),
+            }
+        }
+    });
+    let staged_by_target: Vec<Result<Option<StagedTarget>>> =
+        futures::stream::iter(staging.collect::<Vec<_>>())
+            .buffered(limit.width())
+            .collect()
+            .await;
+    for (target, staged) in targets.into_iter().zip(staged_by_target) {
+        let staged = match staged? {
+            None => continue,
+            Some(StagedTarget::Ensure(reconciliation)) => {
                 for (column, reason) in reconciliation.skipped {
                     pending_by_table
                         .entry(target.table_key.clone())
@@ -459,12 +493,7 @@ async fn maintain_indices_for_branch(
                 refreshed_by_table.insert(target.table_key.clone(), reconciliation.refreshed);
                 reconciliation.staged
             }
-            IndexMaintenanceMode::RebuildFullText => Some(
-                db.storage()
-                    .stage_create_indices(ds, &work.specs)
-                    .await
-                    .map_err(context)?,
-            ),
+            Some(StagedTarget::Rebuilt(staged)) => Some(staged),
         };
         let Some(staged) = staged else {
             existing_targets.remove(&target.table_key);

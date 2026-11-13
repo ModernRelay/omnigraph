@@ -1,0 +1,1 @@
+- `index build` builds up to four BTREE indexes at once, within a table and across tables, instead of one after another. Full-text and vector builds still run one at a time.

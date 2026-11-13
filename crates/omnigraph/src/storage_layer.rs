@@ -56,9 +56,9 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, OverwriteChunk, RefreshedIndex,
-    StagedTransactionIdentity, StagedWrite, TableState, TableStore, UpdateMatchRequest,
-    UpdateMatches,
+    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, IndexBuildLimit,
+    OverwriteChunk, RefreshedIndex, StagedTransactionIdentity, StagedWrite, TableState, TableStore,
+    UpdateMatchRequest, UpdateMatches,
 };
 
 /// One fenced merge chunk is bounded in both rows and materialized Arrow
@@ -245,6 +245,17 @@ pub enum IndexBuildSpec {
     Vector {
         column: String,
     },
+}
+
+impl IndexBuildSpec {
+    /// The column the index covers and the kind's display name.
+    pub(crate) fn column_and_kind(&self) -> (&str, &'static str) {
+        match self {
+            Self::BTree { column, .. } => (column, "BTREE"),
+            Self::FullText { column } => (column, "FTS"),
+            Self::Vector { column } => (column, "Vector"),
+        }
+    }
 }
 
 /// A staged index reconciliation
@@ -712,6 +723,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        limit: &IndexBuildLimit,
     ) -> Result<IndexReconciliation>;
 
     /// Atomically create version 1 from a staged read-version-0 transaction.
@@ -979,6 +991,15 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+    ) -> Result<StagedHandle>;
+
+    /// [`Self::stage_create_indices`] with its builds counted against
+    /// `limit`, shared by a caller that stages several tables at once.
+    async fn stage_create_indices_within(
+        &self,
+        snapshot: &SnapshotHandle,
+        specs: &[IndexBuildSpec],
+        limit: &IndexBuildLimit,
     ) -> Result<StagedHandle>;
 
     // ── Index presence (reads, no HEAD advance) ──────────────────────
@@ -1323,8 +1344,10 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        limit: &IndexBuildLimit,
     ) -> Result<IndexReconciliation> {
-        let work = TableStore::stage_index_reconciliation(self, snapshot.dataset(), specs).await?;
+        let work =
+            TableStore::stage_index_reconciliation(self, snapshot.dataset(), specs, limit).await?;
         Ok(IndexReconciliation {
             staged: work.staged.map(StagedHandle::new),
             refreshed: work.refreshed,
@@ -1684,6 +1707,17 @@ impl TableStorage for TableStore {
         specs: &[IndexBuildSpec],
     ) -> Result<StagedHandle> {
         TableStore::stage_create_indices(self, snapshot.dataset(), specs)
+            .await
+            .map(StagedHandle::new)
+    }
+
+    async fn stage_create_indices_within(
+        &self,
+        snapshot: &SnapshotHandle,
+        specs: &[IndexBuildSpec],
+        limit: &IndexBuildLimit,
+    ) -> Result<StagedHandle> {
+        TableStore::stage_create_indices_within(self, snapshot.dataset(), specs, limit)
             .await
             .map(StagedHandle::new)
     }

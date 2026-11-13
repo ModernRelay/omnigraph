@@ -4008,3 +4008,40 @@ async fn segments_of_one_btree_cover_together_issue_1298() {
             .unwrap()
     );
 }
+
+/// #1385: a full-text or vector build (`alone`) waits until every BTREE build
+/// (`together`) has released its permit, and a BTREE requested after it waits
+/// behind it instead of overtaking it.
+#[tokio::test]
+async fn index_build_limit_runs_a_lone_build_after_every_shared_one_issue_1385() {
+    use futures::FutureExt;
+
+    let limit = crate::table_store::IndexBuildLimit::new(2);
+    assert_eq!(limit.width(), 2);
+    let first = limit.together().await.unwrap();
+    let second = limit.together().await.unwrap();
+
+    let mut alone = Box::pin(limit.alone());
+    assert!(
+        (&mut alone).now_or_never().is_none(),
+        "a lone build waits for both BTREEs"
+    );
+    let mut later = Box::pin(limit.together());
+    drop(first);
+    assert!(
+        (&mut alone).now_or_never().is_none(),
+        "one BTREE is still running"
+    );
+    assert!(
+        (&mut later).now_or_never().is_none(),
+        "a later BTREE does not overtake the waiting lone build"
+    );
+    drop(second);
+    let held = alone.await.unwrap();
+    assert!(
+        (&mut later).now_or_never().is_none(),
+        "no BTREE runs beside a lone build"
+    );
+    drop(held);
+    let _permit = later.await.unwrap();
+}
