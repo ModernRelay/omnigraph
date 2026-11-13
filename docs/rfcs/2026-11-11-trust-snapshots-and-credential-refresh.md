@@ -7,7 +7,7 @@ implementation: not-started
 authors:
   - ragnorc
 created: 2026-11-11
-updated: 2026-11-11
+updated: 2026-11-13
 discussion: https://github.com/ModernRelay/omnigraph/issues/434
 supersedes: []
 superseded_by: []
@@ -107,12 +107,17 @@ omnigraph-server --cluster s3://customer/root
 
 `OMNIGRAPH_SERVER_BEARER_TOKENS_REFRESH_SECONDS` enables refresh of the
 static source and sets its interval. Unset or `0` keeps today's boot-only
-contract. The accepted range for a file is 1 to 3600. A value with no
-`OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` configured refuses startup, in the
-same way an AWS secret id refuses a binary built without `--features aws`:
-process environment cannot change in a running process, so there is nothing
-to refresh. When refresh is on, startup logs
-`static credential refresh enabled` with the source name and interval.
+contract. The accepted range for a file is 1 to 3600. A value is accepted
+only when the source the server *selects* can be polled. `resolve_token_source`
+selects Secrets Manager whenever `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET`
+is set and otherwise the environment-or-file source (`auth.rs`), so in phase 1
+an interval refuses startup unless `_AWS_SECRET` is unset and `_FILE` is set:
+with `_AWS_SECRET` the selected source is not yet pollable, and without `_FILE`
+the selected source is process environment, which cannot change in a running
+process. The refusal names the selected source, in the same way an AWS secret
+id refuses a binary built without `--features aws`. When refresh is on,
+startup logs `static credential refresh enabled` with the name of the source
+that is polled and the interval.
 Older binaries ignore the variable silently, so that line is how an operator
 confirms a binary refreshes before relying on it.
 
@@ -130,25 +135,30 @@ of the change becoming visible at the path it reads:
   addition of the new one.
 
 A file that fails to read or validate never changes the installed snapshot.
-That covers a missing or unreadable file, a non-regular file, a file over the
-size bound, invalid JSON, a blank actor or token, and a duplicate actor or
-token value. The last good snapshot stays in force until a valid file is
+That covers a missing or unreadable file, a non-regular file, a file another
+account can write (the rule #1324 applies at boot, applied at every poll), a
+file over the size bound, invalid JSON, a blank actor or token, a reserved
+`principal:` actor, and a duplicate actor or token value. The last good snapshot stays in force until a valid file is
 read. There is no expiry on it: a token file is state, not a time-limited
 assertion. The consequence is stated plainly to operators: **while the file
 is invalid, revocation stops.** The server logs one warning per distinct
-invalid content, naming the source and the error class and never token text,
-instead of one per tick.
+refused content and, for a failure that yields no content (a missing file, a
+permission refusal, a throttled request), one warning per error class until
+the next successful read. Each names the source and the error class and never
+token text. Nothing is logged once per tick.
 
 A valid file holding no entries is a valid state. It is installed, refuses
-every static token, and is audited as a change that removed every actor,
-with a warning that the static principal set is empty. Authentication is
+every static token, and is logged as a change that removed every actor, with
+a warning that the static principal set is empty. Authentication is
 not turned off by it (next section).
 
 Every applied change is logged once at `info`: the new generation, the first
 eight hexadecimal digits of the snapshot digest, the actor count, and the
 actor ids added and removed. Actor ids are not secrets; tokens never appear.
+This is a log line, not an audit record: the server has no audit sink, and
+the log is the operator's own.
 
-Confirmation needs no new API. An operator's hook calls `GET /access` with
+Confirmation needs no new API. An operator's hook calls `GET /graphs/{graph_id}/access` with
 the newly added token and expects 200, or with the removed token and expects
 401; both are decided by the installed snapshot at admission.
 
@@ -173,22 +183,47 @@ The documentation gains three facts an operator must know:
   plus cache propagation), which adds to the one-interval bound above;
 - write a complete file and swap it atomically; the kubelet's projected
   volume already does this through a `..data` symlink swap. A partial write
-  reads as invalid content and is refused, which keeps the last good set.
+  reads as invalid content and is refused, which keeps the last good set;
+- set the volume's `defaultMode: 0400`. Since #1324 the server refuses a token
+  file another account can write and warns when another account can read it,
+  reading the mode after following the mount's symlink; the poll applies the
+  same check, so a file that becomes writable later is refused and keeps the
+  last good set.
 
 ### Authentication mode
 
-The server decides at boot whether it requires bearer authentication, from
-what was configured: a credential source, an applied policy, or neither with
-`--unauthenticated` (`classify_server_runtime_state`, `settings.rs`). That
-decision does not move. A refreshed snapshot can change *which* tokens are
-admitted; it can never change *whether* a token is required. Today
-`requires_bearer_auth` re-derives the answer per request from the live set
-(`lib.rs`), which is correct only because the set is immutable. Under this
-RFC it consults the boot classification together with live policy presence,
-which is the ledger's door and can only add a requirement. No existing
-deployment observes a difference: the server already refuses to boot with a
-configured source that yields no tokens, so the live set is non-empty
-whenever the boot classification says a source exists.
+The server decides at boot whether it requires bearer authentication. Today
+four places derive that from token *content*: the first input of
+`classify_server_runtime_state` is `!tokens.is_empty() || …` (`lib.rs`),
+`requires_bearer_auth` and `has_credential_source` read the live set on each
+request, and the `/mcp` router is mounted only when `has_credential_source()`
+holds. That is correct only because the set never changes after boot.
+
+Under this RFC the input is **configuration**. A static source is configured
+when `OMNIGRAPH_SERVER_BEARER_TOKEN`, `_JSON`, `_FILE` or `_AWS_SECRET` is
+set, whatever the source holds. The classifier takes that value, its result is
+one immutable mode on `AppState`, and `requires_bearer_auth`,
+`has_credential_source` and the `/mcp` mount read the mode. `requires_bearer_auth`
+also stays true while any policy is applied, which is the ledger's door and can
+only add a requirement. A refreshed snapshot can change *which* tokens are
+admitted; it can never change *whether* one is required.
+
+Two boot states change, both a configured static source that holds no tokens
+(a file holding `{}`). Today, with no policy and no `--unauthenticated`, that
+boot is refused as "no bearer tokens", and the refused start leaves the
+serving lock behind (#983); with `--unauthenticated` it boots `Open` and
+serves every request with no credential. Under this RFC both boot in the
+source's mode, `DefaultDeny` (or `PolicyEnabled` with a policy), with an empty
+set: every static token is refused until the file names one, and the first
+refresh that installs a token admits it. This is one rule for one state:
+offboarding the last user and then restarting the pod no longer crash-loops,
+and a refresh that empties the set agrees with a boot that reads one. The
+refusal "policy but no tokens" becomes "policy but no source configured". The
+one deployment that loses something ran a configured-but-empty source *with*
+`--unauthenticated` to get an open server; it now gets `DefaultDeny`, and the
+fix is to unset the source variable, since `--unauthenticated` already means
+"no credential source". That is recorded under compatibility. #1322, which
+binds `Open` to loopback, narrows the same case independently.
 
 ### Other credential surfaces
 
@@ -196,7 +231,9 @@ OIDC identity trust keeps its contract from the
 [identity RFC](2026-09-09-identity-credentials-and-applied-policy.md): a
 5 s poll, a monotonic `revision`, a fixed binding, and a last good snapshot
 usable only until its own `expires_at`, after which OIDC requests get 503.
-Only its mechanism moves onto the shared holder. Data-token trust stays
+Only its mechanism moves onto the shared holder, and a snapshot refused for
+its timestamps is tried again at the next tick, as `refresh_at` does today
+(step 2 of the installation protocol). Data-token trust stays
 boot-only until the phase that gives it a polled policy; that phase amends
 the RFC 0053 sentence that retiring a key requires a restart.
 
@@ -214,10 +251,12 @@ binary; the documentation says so.
 
 ```text
 TrustHolder<S: TrustSet>
-  installed: ArcSwap<Installed<S>>
-  source:    Box<dyn TrustSource<S>>         // load() -> raw bytes
+  installed: ArcSwap<Installed<S>>            // what requests read
+  install:   Mutex<()>                        // one installer at a time
+  source:    Box<dyn TrustSource>             // load() -> raw bytes
   policy:    Freshness                        // BootOnly | Polled { interval }
-  refused:   Option<Digest>                   // raw digest of the last refused content
+  warned:    Option<Warned>                   // the refusal already logged:
+                                              //   Content(raw digest) | NoContent(error class)
 
 Installed<S>
   set:        S                               // hashed entries, no plaintext
@@ -226,6 +265,13 @@ Installed<S>
   raw_digest: Digest                          // digest of the bytes it was parsed from
   applied_at: SystemTime
 ```
+
+`TrustSet` has one request-side method, `admit(token, now)`. Per-request
+validity that depends on time lives there: OIDC's `check_at` refuses an
+otherwise valid token once the snapshot's `expires_at` has passed, and data
+tokens check `exp` and `iat`. The request supplies its own `now`. `Installed`
+and the holder carry no clock, so the holder need not know that one of its
+instances expires, and OIDC keeps no check outside its set.
 
 Each credential surface on `AppState` becomes a `TrustHolder` over its own
 set type: `StaticTokens` (actor → token hash), `DataTokenTrust` and
@@ -243,19 +289,28 @@ from `classify_server_runtime_state` at boot. `requires_bearer_auth` is
 
 Every refresh, on every surface, runs the same steps in `TrustHolder::refresh`:
 
-1. **Read.** Open the configured path again (so a symlink swap is seen), require
-   a regular file, read at most `MAX_BYTES + 1` bytes. The static source
-   adopts the OIDC reader's bounds (`oidc_identity::read_bytes`); its file
-   reader today has neither bound (`settings::read_bearer_tokens_file`).
+1. **Read.** One reader serves boot and every poll. It opens the configured
+   path again (so a symlink swap is seen), applies #1324's check (a regular
+   file, refused when another account can write it, warned when another can
+   read it, the mode read after following symlinks) and reads at most
+   `MAX_BYTES + 1` bytes, the bound the OIDC reader already has
+   (`oidc_identity::read_bytes`). Today `settings::read_bearer_tokens_file`
+   has the permission check and no size bound; the poller gets no second
+   reader, so the two cannot drift.
 2. **Raw short-circuit.** SHA-256 the bytes. If it equals the installed
-   snapshot's `raw_digest` or the `refused` digest, stop. Same bytes imply
-   the same validated set, so this is a sound short-circuit, and it is the
-   common case: one small read and one hash per tick, no parse, no log line.
+   snapshot's `raw_digest`, stop: bytes equal to what is installed cannot
+   install anything else, and this is the common case, one small read and one
+   hash per tick, no parse, no log line. The digest of *refused* content is
+   not a skip. Validation of two surfaces depends on the clock: `Snapshot::parse`
+   refuses a `generated_at` more than 30 s ahead and an `expires_at` in the
+   past, and data-token claims check `exp` and `iat`, so bytes refused at one
+   tick can be valid at the next, and today `refresh_at` installs such a
+   snapshot when the clock reaches it. Refused bytes are therefore validated
+   again on every tick, and their digest only deduplicates the warning.
 3. **Validate.** Parse and run the surface's validator. Static tokens use
-   `validate_bearer_tokens` for every source, which closes the gap that the
-   AWS payload parser skips the duplicate-token check that the env/file path
-   performs (`auth::parse_json_secret_payload` against
-   `settings::validate_bearer_tokens`).
+   `validate_bearer_tokens` for every source, as #1323 already does for the
+   Secrets Manager payload (which also reserves the `principal:` actor
+   prefix).
 4. **Hash and digest.** Hash each token; discard the plaintext. The canonical
    digest is the SHA-256 of the sorted `(actor, token_hash)` pairs.
 5. **Policy gate.** The surface's freshness policy may refuse the candidate:
@@ -263,23 +318,25 @@ Every refresh, on every surface, runs the same steps in `TrustHolder::refresh`:
    tokens have no gate beyond validation.
 6. **Install.** If the canonical digest equals the installed one, record the
    new `raw_digest` and stop: a cosmetic rewrite (whitespace, key order)
-   bumps nothing and logs nothing. Otherwise compare-and-swap a new
-   `Installed` with `generation + 1`, clear `refused`, and log the audit
-   line. A failed compare-and-swap (a concurrent installer won) is retried
-   from step 1 once and then refused.
+   bumps nothing and logs nothing. Otherwise store a new `Installed` with
+   `generation + 1`, clear `warned`, and log the change line.
 
-A failure at any step before 6 leaves `installed` untouched, records the
-raw digest in `refused`, and logs the warning once for that digest. There is
-one place where a trust set changes, and it is this function. Triggers, now
-the interval timer and later a signal or an endpoint, call it and nothing
-else.
+The whole function runs under the holder's `install` mutex, so there is one
+installer at a time, the store in step 6 is plain, and there is no
+compare-and-swap retry whose loss could mark valid bytes as refused.
+`ArcSwap` serves readers only. A failure at any step before 6 leaves
+`installed` untouched and logs the warning once per distinct refused content
+or, when the failure yields no content, once per error class until the next
+successful read. There is one place where a trust set changes, and it is this
+function. Triggers, now the interval timer and later a signal, an endpoint or
+an embedder's call, run it and nothing else.
 
 ### Why two digests
 
-The raw digest is the cheap path and is sound: equal bytes cannot validate to
-different sets. The canonical digest is the identity: it decides whether a
-change is a change, so that a rewrite that moves no token produces no
-generation and no audit noise. Neither is `stat`. A token rotated to another
+The raw digest is the cheap path and is sound against the installed content:
+bytes equal to what is installed cannot install anything else. The canonical
+digest is the identity: it decides whether a change is a change, so that a
+rewrite that moves no token produces no generation and no log line. Neither is `stat`. A token rotated to another
 value of the same length gives a file of the same size, and a copy that
 preserves mtime makes it invisible to a stat-based detector; the issue's
 triage measured that case. A stat pre-check would save reading a few
@@ -346,8 +403,13 @@ binary without this RFC returns silently to boot-only behaviour; the
 documentation names the startup log line as the check, and operators who
 depend on refresh should gate rollout on it.
 
-The mode change has no observable effect on existing deployments because the
-boot classifier already refuses a configured source that yields no tokens.
+The mode change alters two boot states, both a configured static source that
+holds no tokens: the boot with no flag that was refused now starts in
+`DefaultDeny` (or `PolicyEnabled`) with an empty set, and the boot with
+`--unauthenticated` that ran `Open` now runs `DefaultDeny`. The second is the
+only loss, and the remedy is to unset the source variable. Phase 1 records it
+in a `changelog.d` breaking note beside the added one. #1322 narrows the
+`Open` case to loopback binds independently of this.
 
 Reverting is cheap: delete the holder and the timer, restore the immutable
 field. There is no persisted state to migrate either way.
@@ -379,13 +441,20 @@ Extend existing owners; add no fixture. The `Fix Regression Gate` keys on
   keep the installed snapshot and record `refused`; unchanged bytes do
   nothing; a cosmetic rewrite bumps no generation; a rewrite with the same
   size and mtime is installed; a `..data` swap is installed; a valid empty
-  object is installed and audited; the AWS payload goes through
+  object is installed and logged as a change; the AWS payload goes through
   `validate_bearer_tokens`; an interval on an env source does not construct;
-  intervals outside each source's range do not construct.
-- **`crates/omnigraph-server/src/settings.rs` tests.** The mode is fixed
-  from the classifier and `requires_bearer_auth` does not read the live set:
-  install an empty snapshot on a `DefaultDeny` server and assert that an
-  actor-less request is still refused.
+  intervals outside each source's range do not construct; an interval with
+  `_AWS_SECRET` set, or with no `_FILE`, refuses startup naming the selected
+  source; a refusal that yields no content warns once per error class and
+  again after a successful read; a file refused by #1324's check at a poll
+  keeps the installed set.
+- **`crates/omnigraph-server/src/settings.rs` tests.** The classifier takes
+  configuration: a configured `_FILE` holding `{}` boots `DefaultDeny` with
+  and without `--unauthenticated`, and `PolicyEnabled` with a policy; no
+  source and no policy still needs `--unauthenticated`. `requires_bearer_auth`
+  does not read the live set: install an empty snapshot on a `DefaultDeny`
+  server and assert that an actor-less request is still refused and that
+  `/mcp` is still mounted.
 - **`crates/omnigraph-server/tests/boot_settings.rs`, `owned_shutdown`
   module.** One process test, `static_token_file_refresh_issue_434`, which
   runs the real binary with a 1 s interval and a `..data` swap and probes
@@ -397,7 +466,9 @@ Extend existing owners; add no fixture. The `Fix Regression Gate` keys on
   any of it.
 - **`oidc_identity_tests.rs`**, at the phase that moves OIDC onto the
   holder: its existing cases pass unchanged, which is the proof that the
-  policy is preserved.
+  policy is preserved, plus one case that a snapshot refused for a
+  `generated_at` ahead of the clock installs on the first tick after the
+  clock reaches it.
 - **Docs.** `scripts/check-docs.py` for the RFC and registry; the
   `omnigraph skill export` byte-identity owner in `cli_schema_config` for
   the skill line.
@@ -406,13 +477,15 @@ Extend existing owners; add no fixture. The `Fix Regression Gate` keys on
 
 1. **Holder, mode, static file refresh.** `TrustHolder`, the installation
    function, the boot-fixed mode, `FileSource` with `Polled`, the variable,
-   the audit line, the tests above, and the documentation: per-source reload
+   the change log line, the tests above, and the documentation: per-source reload
    behaviour in `docs/user/operations/server.md` (which also stops saying
    "Choose one static token source", since `_TOKEN` and `_FILE` combine),
    the Kubernetes notes in `docs/user/deployment.md`, the sentence in
    `docs/user/clusters/index.md` that credential configuration stays fixed,
-   and one line in `skills/omnigraph/references/server-policy.md`. A
-   `changelog.d/<slug>.added.md` note. `implementation: in-progress`.
+   and one line in `skills/omnigraph/references/server-policy.md`, and `defaultMode: 0400` in
+   the Kubernetes notes. A `changelog.d/<slug>.added.md` note for refresh and
+   a `.breaking.md` note for the two boot states the mode change alters.
+   `implementation: in-progress`.
 2. **AWS Secrets Manager on the holder.** `SecretsManagerSource` with
    `Polled` at a 60 s floor, throttle handling as refusal.
 3. **OIDC onto the holder.** Mechanism only; `revision`, binding and expiry
@@ -437,3 +510,17 @@ available today.
 
 - 2026-11-11: drafted from the issue #434 triage of 2026-10-17 and its
   follow-up of 2026-11-10, verified against main `b125d97a`.
+- 2026-11-13: revised for the review of `5a4bdcbc` on PR #1354. B1: the mode
+  input is configuration, not content; the classifier, `requires_bearer_auth`,
+  `has_credential_source` and the `/mcp` mount read one mode value, and the two
+  boot states of a configured empty source that change are recorded under
+  compatibility (the earlier text claimed no deployment observes a
+  difference, which a `{}` file with `--unauthenticated` disproved). B2: a
+  refused digest no longer skips validation, because OIDC and data-token
+  validation depend on the clock; it deduplicates the warning. B3: the phase-1
+  interval refusal is stated against the selected source. O1: installation is
+  serialized by a mutex and the compare-and-swap retry is gone. O2: one reader
+  with #1324's check at boot and at every poll; step 3 cites #1323 instead of
+  presenting the shared validator as new. O3: per-request validity is a method
+  of the set. O4: `/graphs/{graph_id}/access`. O5: "logged", not "audited".
+  O6: content-less failures warn once per error class.
