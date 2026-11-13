@@ -256,6 +256,7 @@ impl Parts {
         let at = self.producers[second[0]].element;
         if let Some(span) = spans.get(at) {
             d.position = Some(span.position);
+            d.end = Some(span.end_position);
         }
         let triples = self.triples(first, second, catalog, sc);
         let named = self.named_relation(second, sc, pattern);

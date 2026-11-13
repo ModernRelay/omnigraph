@@ -56,6 +56,9 @@ impl PartialEq for StatementBody {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decl {
     pub name: String,
+    /// Where the name was written: the position of a refusal of the whole
+    /// declaration.
+    pub at: SourceSpan,
     pub params: Vec<Param>,
     pub annotations: Vec<Annotation>,
     pub write_mode: MutationWriteMode,
@@ -444,6 +447,8 @@ pub struct SourceSpan {
     pub start: usize,
     pub end: usize,
     pub position: Position,
+    /// The position of `end`: with `position`, the span a refusal reports.
+    pub end_position: Position,
     pub operands: Vec<String>,
     /// The byte range of each operand of a comparison or an `in`, in
     /// `operands` order, then, for an `in` over a written list, of each of
@@ -466,6 +471,25 @@ impl Default for SourceSpan {
                 column: 1,
                 byte: 0,
             },
+            end_position: Position {
+                line: 1,
+                column: 1,
+                byte: 0,
+            },
+            operands: Vec::new(),
+            ranges: Vec::new(),
+        }
+    }
+}
+
+impl SourceSpan {
+    /// The span `start..end` of `input`, with no operands.
+    pub fn of(input: &str, start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end,
+            position: Position::at(input, start),
+            end_position: Position::at(input, end),
             operands: Vec::new(),
             ranges: Vec::new(),
         }

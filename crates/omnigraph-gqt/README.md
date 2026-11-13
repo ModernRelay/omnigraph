@@ -129,7 +129,13 @@ both paths. Unordered row comparison preserves duplicate counts.
 An `expect error: <needle>` holds when the step fails and its error contains
 the needle; a compiler diagnostic renders with its code, `parse error: Q018: …`
 as `type error: T7: …` and `plan error: P002: …` do, so a case can name the
-code it expects. A `--- query` or `--- mutate` section the compiler refuses at
+code it expects. A compile that refuses a source for several independent
+reasons renders its first refusal; the needle matches that one, and the
+others ride the diagnostic's `further` list. Every expect-error step the
+compiler refuses is also held to fix convergence
+(`tests/integration/fix_convergence.rs`): applying every machine-applicable
+suggestion of one pass at once shrinks the refusals and reaches a fixed point
+within three passes. A `--- query` or `--- mutate` section the compiler refuses at
 parse is a step only under `expect error:` (any other expectation refuses the
 case with the parse error); it runs through the engine's door like any query
 and fails there with the same refusal. The cases under `cases/diagnostics/` use this:

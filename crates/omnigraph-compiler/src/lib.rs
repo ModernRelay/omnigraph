@@ -55,8 +55,8 @@ pub use query::descriptor::{
     QueryValueKind, describe_query_operation,
 };
 pub use query::diagnostic::{
-    Applicability, Position, QueryCode, QueryDiagnostic, QueryDiagnosticKind, Stage, Suggestion,
-    TextEdit,
+    Applicability, Extra, Position, QueryCode, QueryDiagnostic, QueryDiagnosticKind, RelatedSpan,
+    Stage, Suggestion, TextEdit,
 };
 pub use query::lint::{
     QueryLintFinding, QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult,

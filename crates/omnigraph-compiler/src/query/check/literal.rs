@@ -236,7 +236,7 @@ pub(crate) fn compared_literal(
             Some(LiteralMismatch {
                 message: format!(
                     "property `{prop}` expects one of [{}], got '{value}'",
-                    allowed.join(", ")
+                    listed_values(value, allowed)
                 ),
                 fix: nearest.clone(),
                 replacement: Some(nearest),
@@ -322,7 +322,7 @@ pub(crate) fn tested_enum_literal(
     Some(LiteralMismatch {
         message: format!(
             "property `{prop}` expects one of [{}], and none passes `{func}` with '{value}'",
-            allowed.join(", ")
+            listed_values(value, allowed)
         ),
         fix: nearest.clone(),
         replacement: Some(nearest),
@@ -338,6 +338,32 @@ fn integer_range(scalar: ScalarType) -> Option<(i128, i128)> {
         ScalarType::U64 => (0, u64::MAX.into()),
         _ => return None,
     })
+}
+
+/// The values a refusal lists: every declared value when there are at most
+/// five, otherwise the five nearest `written`, nearest first, and how many
+/// the enum declares.
+fn listed_values(written: &str, allowed: &[String]) -> String {
+    const LISTED: usize = 5;
+    if allowed.len() <= LISTED {
+        return allowed.join(", ");
+    }
+    let mut ranked: Vec<(usize, usize, &String)> = allowed
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (edit_distance(written, v), i, v))
+        .collect();
+    ranked.sort();
+    let near: Vec<&str> = ranked
+        .iter()
+        .take(LISTED)
+        .map(|(_, _, v)| v.as_str())
+        .collect();
+    format!(
+        "{}, … ({} values; the five nearest shown)",
+        near.join(", "),
+        allowed.len()
+    )
 }
 
 /// The allowed value nearest to `written` by edit distance, the first in

@@ -9,22 +9,61 @@ fix names the decision instead.
 | Field | Meaning |
 |---|---|
 | `code` | Stable identifier: `Q…` from the parser, `T…` from the type checker, `P…` from the planner, `E…` from execution. A code's meaning is frozen; its message text may improve. |
-| `position` | For a parse refusal: `line` and `column` (1-based, in characters) and the `byte` offset. |
+| `position` | Where the refused construct starts: `line` and `column` (1-based, in characters) and the `byte` offset. A parse refusal has one, and so does a type refusal of written text. |
+| `end` | Where the refused construct ends, exclusive, in the same form: `position` to `end` is its span. |
 | `stage` and `expression` | For a refusal after parsing: the stage (`typecheck` or `plan`) and, when the site can render it, the expression it refused. |
 | `expected` | What was expected or violated, one line, without a position. |
 | `fix` | One concrete fix, absent when `expected` names the decision. |
 | `suggestion` | Optional source edits with `applicability`, plus `start`, `end` and `replacement` for each edit. |
+| `related` | Other spans the refusal names, each a `position`, an `end` and a `message`: `T83` names the first declaration of the repeated name. |
+| `further` | The other refusals of the same compile pass, in source order, each in this shape. |
 
 The one-line `error` text is the code and the expectation in the legacy form
 (`parse error: …`, `type error: T33: …`, `plan error: P002: …`); the other
 fields travel beside it.
 
-## The measured case
+## Every refusal in one pass
+
+A compile returns every independent refusal in one pass, in source order,
+each with its span; the first is the diagnostic and the `error` line, the
+others its `further` list. A grammar refusal stops the pass, since the text
+after it has no tree. Otherwise the pass holds a `T83` at each later
+declaration of a repeated name and every declaration's own refusals: each
+element of `match`, top-level conjunct of `where`, return item, order key and
+write statement is checked by itself. A construct naming a variable that a
+refused one would bind is skipped, and so are the order keys after a refused
+return item; a block, an `optional` or an inline read stops at its first
+refusal. `T81` and `T86` are checked only when nothing else in the
+declaration was refused.
+
+```text
+query q() { match { $c: Company } where $c.names = "x" and $c.slug = 3 return { $c } }
+```
+
+```text
+error[T6]: type error: T6: type `Company` has no property `names`; nearest: name (String), slug (String)
+  --> line 1, column 41
+error[T7]: cannot compare String with I64
+  --> line 1, column 60
+```
+
+An unknown type, property, edge, variable, return alias, option or parameter
+type lists up to five names of its kind after `nearest:`, nearest first, each
+with its type. An enum value outside its set lists the declared values, the
+five nearest when there are more.
+
+Applying every `machine_applicable` suggestion of one pass at once (they never
+overlap) gives a source that parses, holds fewer refusals and undoes no
+earlier edit; repairing the grammar can reveal type refusals, and those
+`T86`. Every expect-error case of the logic tests reaches a source with no such
+suggestion left within three passes.
+
+## Typed suggestions
 
 A declaration without its parameter list:
 
 ```text
-query name {
+query name { match { $p: Person } return { $p.name } }
 ```
 
 ```text
@@ -33,19 +72,8 @@ error[Q002]: parse error: expected `(`: a query declares its parameters even whe
   fix: query name()
 ```
 
-Earlier releases reported this at the file's first position as `expected
-query_file`.
-
-## Typed suggestions
-
-The `fix` remains human-readable guidance. When the compiler can propose a
-specific edit, `suggestion` carries it as data. For example, this source:
-
-```text
-query name { match { $p: Person } return { $p.name } }
-```
-
-receives this suggestion alongside Q002:
+The `fix` is human-readable guidance. When the compiler can propose a specific
+edit, `suggestion` carries it as data:
 
 ```json
 {
@@ -64,10 +92,8 @@ correction. `needs_review` means the caller must review the proposed change.
 Neither value guarantees that the corrected query will pass every check;
 validate it again. The compiler does not apply suggestions automatically.
 
-Q002 offers the `()` insertion only when the edited file matches the grammar
-without another missing-parameter recovery. Incomplete or ambiguous input can
-still receive textual guidance while omitting `suggestion`. Missing suggestions
-do not mean there is no possible fix.
+Incomplete or ambiguous input can receive textual guidance without
+`suggestion`; a missing suggestion does not mean there is no fix.
 
 ## Checked literals
 
@@ -120,9 +146,10 @@ expected format instead, without an edit.
   object in its error body. See
   [HTTP errors](../operations/troubleshooting.md#http-errors).
 - **`omnigraph lint`**: a `Q000` finding whose message is the expectation at
-  `line <n>, column <c>`; type errors report their `T…` code, and `T83` (two
-  declarations of one name) is reported for the whole file at the later
-  declaration's `line <n>, column <c>`. See
+  `line <n>, column <c>`; `T83` (two declarations of one name) is a finding
+  for the whole file at each later declaration's `line <n>, column <c>`. A
+  refused query prints every refusal of its pass, each at its position with
+  its fix, and `--json` lists them in its `diagnostics`. See
   [Linting](index.md#linting).
 - **`queries validate --json` and `cluster plan --json`**: each breakage or
   query parse/typecheck failure carries the same diagnostic information as
@@ -175,10 +202,8 @@ Type codes are listed where the construct they guard is described, in
 
 ## Patterns that share no variable
 
-Two components of a pattern that share no variable multiply their rows. The
-type checker refuses that product with `T81` at the second component unless
-every component but one is pinned to one row by an equality of its `@key` with
-a literal or a parameter in `where`; see
+Two components of a pattern that share no variable are `T81` at the second
+component unless every component but one is pinned by a `@key` equality; see
 [Traversal and match patterns](traversal.md#patterns-that-share-no-variable).
 
 ```text
@@ -191,12 +216,9 @@ error[T81]: type error: T81: `$p: Person` shares no variable with `$c: Company`,
   fix: join them through the edge, `$p worksAt $c`, or write the intended product as a named relation, `let $ps = { match { $p: Person } return { $p } }, from $ps`
 ```
 
-When exactly one edge type connects a variable of one component with a
-variable of the other, as `WorksAt: Person -> Company` does here, the
-suggestion is machine-applicable and appends the triple to the elements,
-source first: `, $p worksAt $c`. Otherwise the fix lists the triples, if any,
-and the suggestion, which needs review, writes the second component as the
-named relation drawn with `from`.
+The suggestion appends the triple, machine-applicable, when exactly one edge
+type joins the components; otherwise it writes the named relation and needs
+review.
 
 ## Triples against their edge's direction
 
@@ -214,16 +236,14 @@ error[T82]: type error: T82: `$c worksAt $p` is written against the declared dir
   fix: write the source first: `$p worksAt $c`
 ```
 
-The machine-applicable suggestion swaps the two ends and leaves the edge, its
-binding, bounds and alternation as written. The swapped triple reads the same
-edges from the same bound end.
+The machine-applicable suggestion swaps the two ends and leaves the rest as
+written.
 
 ## Inner scopes
 
-A block and an inline read bind every name new to them and read an outer
-name to correlate on it; see
-[Traversal and match patterns](traversal.md#inner-scopes). A triple naming a
-name that is neither in scope nor bound there is `T84`:
+A triple in a block or an inline read naming a name that is neither in scope
+nor bound there is `T84`; see
+[Traversal and match patterns](traversal.md#inner-scopes).
 
 ```text
 query loners() { match { $p: Person } where not exists { $p knows $q } return { $p.name } }
@@ -235,15 +255,10 @@ error[T84]: type error: T84: `$q` is named in a triple of this block but bound n
   fix: bind it in the block: `$q: Person`
 ```
 
-The machine-applicable suggestion inserts `$q: Person, ` before the triple,
-with the type the edge declares for that end, and binds every other name the
-scope's triples introduce in the same edit. A binding inside a block of a name
-the enclosing scope holds is `T68`. Its suggestion drops the binding, so the
-block reads the outer name; a block that only binds the name to filter its
-row, `not exists { $p: Person where $p.name = "Bob" }`, becomes that filter,
-`not ($p.name = "Bob")`, or `not coalesce(…, false)` around a predicate that
-can be null. A binding of another type has no suggestion: name the block's
-own variable differently.
+The machine-applicable suggestion inserts `$q: Person, ` before the triple and
+binds every other name the scope's triples introduce in the same edit. The
+fixes of `T68`, a binding of a name the enclosing scope holds, are described
+there too.
 
 ## A ranked `from` names its score
 
@@ -262,10 +277,9 @@ error[T85]: type error: T85: `from nearest(…)` ranks without naming its score:
 ```
 
 The machine-applicable suggestion writes `as $distance` after the ranking
-(`as $score` for `bm25` and `rrf`), the name the score column had before it
-was written, or a fresh variant when that name is taken. An `as` on a `from`
-that ranks nothing, `from $docs as $s`, is `T85` too, and the suggestion
-removes it: the relation names its own columns.
+(`as $score` for `bm25` and `rrf`), or a fresh variant when the name is taken.
+An `as` on a `from` that ranks nothing is `T85` too, and the suggestion
+removes it.
 
 ## Terms this release does not lower
 

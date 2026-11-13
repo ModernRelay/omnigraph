@@ -953,6 +953,15 @@ fn t83_names_both_declarations_and_renames_the_later() {
     let at = d.position.expect("the later declaration's position");
     assert_eq!((at.line, at.column), (3, 7));
     assert_eq!(&written[at.byte as usize..at.byte as usize + 1], "f");
+    // Both spans travel as data: the later name is the refusal's span, the
+    // first its related span.
+    assert_eq!(d.end.map(|end| end.byte), Some(at.byte + 1));
+    let [first] = d.related() else {
+        panic!("one related span: {:?}", d.related());
+    };
+    assert_eq!((first.position.line, first.position.column), (1, 7));
+    assert_eq!(first.end.byte - first.position.byte, 1);
+    assert_eq!(first.message, "the first declaration of `f`");
     assert_eq!(
         d.fix.as_deref(),
         Some("rename the later `f` (line 3, column 7) to `f_2`, or delete that declaration")
@@ -980,6 +989,18 @@ fn t83_names_both_declarations_and_renames_the_later() {
     )
     .expect_err("refused");
     assert_eq!(d.position.map(|at| at.line), Some(3), "{d}");
+    // The fourth is refused in the same pass, renamed to another fresh name,
+    // so applying both renames at once leaves one `g`.
+    let [fourth] = d.further() else {
+        panic!("one further refusal: {:?}", d.further());
+    };
+    assert_eq!(fourth.code.as_str(), "T83");
+    assert_eq!(fourth.position.map(|at| at.line), Some(4));
+    assert_eq!(fourth.related()[0].position.line, 1);
+    assert_eq!(
+        fourth.suggestion.as_ref().unwrap().edits[0].replacement,
+        "g_4"
+    );
     assert_eq!(d.suggestion.unwrap().edits[0].replacement, "g_3");
 
     // Names compare case-sensitively, as a call resolves them.
@@ -1745,6 +1766,7 @@ fn a_type_error_carries_the_position_of_its_clause() {
 
 mod components;
 mod desugaring;
+mod diagnostics;
 mod lowering;
 
 /// A triple is written in its edge's declared order, source first: its

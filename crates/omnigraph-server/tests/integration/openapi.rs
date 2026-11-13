@@ -1068,6 +1068,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "FullTextIndexRebuildRequiredOutput",
     "DiagnosticOutput",
     "PositionOutput",
+    "RelatedSpanOutput",
     "SuggestionOutput",
     "Applicability",
     "TextEditOutput",
@@ -1562,12 +1563,26 @@ fn error_output_schema_has_expected_fields() {
         .map(|field| field.as_str().unwrap())
         .collect();
     assert_eq!(required, HashSet::from(["code", "expected"]));
-    for field in ["position", "stage", "expression", "fix", "suggestion"] {
+    for field in [
+        "position",
+        "end",
+        "stage",
+        "expression",
+        "fix",
+        "suggestion",
+        "related",
+        "further",
+    ] {
         assert!(details["properties"].get(field).is_some(), "{field}");
     }
+    assert_eq!(
+        details["properties"]["further"]["items"]["$ref"], "#/components/schemas/DiagnosticOutput",
+        "every further refusal has the diagnostic's own shape"
+    );
     for (name, fields) in [
         ("SuggestionOutput", vec!["applicability", "edits"]),
         ("TextEditOutput", vec!["start", "end", "replacement"]),
+        ("RelatedSpanOutput", vec!["position", "end", "message"]),
     ] {
         let required: HashSet<&str> = doc["components"]["schemas"][name]["required"]
             .as_array()

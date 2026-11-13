@@ -44,14 +44,15 @@ use crate::query::value::{AggFunc, CompOp, Literal};
 /// points at (the span the derived `fix` text replaces).
 #[derive(Debug, Clone)]
 pub struct Refusal {
-    pub diagnostic: QueryDiagnostic,
+    /// Boxed, so a refusal stays small enough to travel in a `Result`.
+    pub diagnostic: Box<QueryDiagnostic>,
     pub span: Option<(usize, usize)>,
 }
 
 impl From<QueryDiagnostic> for Refusal {
     fn from(diagnostic: QueryDiagnostic) -> Self {
         Self {
-            diagnostic,
+            diagnostic: Box::new(diagnostic),
             span: None,
         }
     }
@@ -100,7 +101,7 @@ pub(crate) fn refusal(
             });
     }
     Refusal {
-        diagnostic: d,
+        diagnostic: Box::new(d),
         span: Some(span),
     }
 }
@@ -114,8 +115,9 @@ pub(crate) fn refusal_note(
     note: impl Into<String>,
 ) -> Refusal {
     Refusal {
-        diagnostic: QueryDiagnostic::parse(code, message, Some(Position::at(input, span.0)))
-            .with_fix(note),
+        diagnostic: Box::new(
+            QueryDiagnostic::parse(code, message, Some(Position::at(input, span.0))).with_fix(note),
+        ),
         span: Some(span),
     }
 }
@@ -172,13 +174,7 @@ fn span_of(p: &Pair<Rule>) -> (usize, usize) {
 fn source_span(p: &Pair<Rule>) -> SourceSpan {
     let input = input_of(p);
     let (start, end) = span_of(p);
-    SourceSpan {
-        start,
-        end: start + input[start..end].trim_end().len(),
-        position: Position::at(input, start),
-        operands: Vec::new(),
-        ranges: Vec::new(),
-    }
+    SourceSpan::of(input, start, start + input[start..end].trim_end().len())
 }
 
 /// A pair's byte range, its trailing whitespace left out.
@@ -305,18 +301,67 @@ pub(crate) fn into_query_file(file: SourceFile) -> QueryFile {
 }
 
 pub fn parse_source(input: &str) -> std::result::Result<SourceFile, QueryDiagnostic> {
-    parse_source_detailed(input).map_err(|r| r.diagnostic)
+    match parse_source_all(input) {
+        (Some(file), refusals) if refusals.is_empty() => Ok(file),
+        (_, refusals) => {
+            Err(QueryDiagnostic::first_of(refusals).expect("a refused parse holds one"))
+        }
+    }
 }
 
 /// [`parse_source`] keeping the construct span of a refusal.
 pub fn parse_source_detailed(input: &str) -> R<SourceFile> {
     match structural(input) {
-        Ok((file, names)) => match duplicate_declaration(input, &names) {
-            Some(refused) => Err(refused),
-            None => Ok(file),
-        },
+        Ok((file, names)) => {
+            let mut duplicates = duplicate_declarations(input, &names);
+            if duplicates.is_empty() {
+                return Ok(file);
+            }
+            let mut first = duplicates.remove(0);
+            if !duplicates.is_empty() {
+                first.diagnostic.extra.get_or_insert_default().further =
+                    duplicates.into_iter().map(|r| *r.diagnostic).collect();
+            }
+            Err(first)
+        }
         Err(first) => Err(foreign::with_habits(input, first, structural_refusal)),
     }
+}
+
+/// Every refusal of the parse in source order, and the tree when the
+/// grammar accepted the source: a grammar refusal stops the parse, so it is
+/// the one refusal; a source the grammar accepts is refused only for
+/// repeating a declaration name (`T83`, one per later declaration), and its
+/// tree is still returned so that the type checker can report the
+/// declarations' own refusals beside them.
+pub fn parse_source_all(input: &str) -> (Option<SourceFile>, Vec<QueryDiagnostic>) {
+    match structural(input) {
+        Ok((file, names)) => {
+            let duplicates = duplicate_declarations(input, &names)
+                .into_iter()
+                .map(|r| spanned(input, r))
+                .collect();
+            (Some(file), duplicates)
+        }
+        Err(first) => (
+            None,
+            vec![spanned(
+                input,
+                foreign::with_habits(input, first, structural_refusal),
+            )],
+        ),
+    }
+}
+
+/// A refusal's diagnostic with the end of its construct's span.
+fn spanned(input: &str, refused: Refusal) -> QueryDiagnostic {
+    let mut d = *refused.diagnostic;
+    if d.end.is_none()
+        && let (Some(at), Some((_, end))) = (d.position, refused.span)
+    {
+        d.end = Some(Position::at(input, end.max(at.byte as usize)));
+    }
+    d
 }
 
 /// The structural parse alone, for the habit pass to reparse a candidate.
@@ -327,15 +372,18 @@ fn structural_refusal(input: &str) -> Option<Refusal> {
 /// A declaration's name as written and the byte range of the name.
 type DeclName = (String, (usize, usize));
 
-/// `T83`: the first name a later declaration repeats. A `Call` and every
-/// door that selects a declaration by name resolve it among the source
-/// unit's declarations, comparing bytes (case-sensitively, as `Call`
-/// resolution does), and need exactly one. The refusal points at the later
-/// declaration, names the line and column of both, and suggests renaming the
-/// later one to a name no declaration of the source uses; deleting it is the
-/// other fix, which the text names.
-fn duplicate_declaration(input: &str, names: &[DeclName]) -> Option<Refusal> {
+/// `T83`, once for each later declaration that repeats an earlier one's
+/// name. A `Call` and every door that selects a declaration by name resolve
+/// it among the source unit's declarations, comparing bytes
+/// (case-sensitively, as `Call` resolution does), and need exactly one. The
+/// refusal points at the later declaration's name, carries the first
+/// declaration's name as its related span, names the line and column of
+/// both, and suggests renaming the later one to a name no declaration of the
+/// source uses; deleting it is the other fix, which the text names.
+fn duplicate_declarations(input: &str, names: &[DeclName]) -> Vec<Refusal> {
     let mut first: HashMap<&str, (usize, usize)> = HashMap::new();
+    let mut taken: Vec<String> = names.iter().map(|(name, _)| name.clone()).collect();
+    let mut out = Vec::new();
     for (name, span) in names {
         let Some(earlier) = first.get(name.as_str()) else {
             first.insert(name, *span);
@@ -344,8 +392,10 @@ fn duplicate_declaration(input: &str, names: &[DeclName]) -> Option<Refusal> {
         let (was, at) = (Position::at(input, earlier.0), Position::at(input, span.0));
         let fresh = (2..)
             .map(|n| format!("{name}_{n}"))
-            .find(|candidate| names.iter().all(|(taken, _)| taken != candidate))
+            .find(|candidate| taken.iter().all(|used| used != candidate))
             .expect("an unbounded range holds a name no declaration uses");
+        // Two renames of one pass never pick the same name.
+        taken.push(fresh.clone());
         let mut diagnostic = QueryDiagnostic::typecheck(
             T83,
             format!(
@@ -360,14 +410,20 @@ fn duplicate_declaration(input: &str, names: &[DeclName]) -> Option<Refusal> {
         .with_suggestion(Suggestion {
             applicability: REVIEW,
             edits: vec![edit(span.0, span.1, fresh)],
+        })
+        .with_related(crate::query::diagnostic::RelatedSpan {
+            position: was,
+            end: Position::at(input, earlier.1),
+            message: format!("the first declaration of `{name}`"),
         });
         diagnostic.position = Some(at);
-        return Some(Refusal {
-            diagnostic,
+        diagnostic.end = Some(Position::at(input, span.1));
+        out.push(Refusal {
+            diagnostic: Box::new(diagnostic),
             span: Some(*span),
         });
     }
-    None
+    out
 }
 
 /// The file and each declaration's name span, in source order.
@@ -479,9 +535,7 @@ fn construct_name(rule: Rule) -> Option<&'static str> {
         X::declaration | X::query_decl | X::kw_query => "a declaration `query name(…) { … }`",
         X::param_list => "a parameter list `($name: Type, …)`",
         X::param | X::variable => "a variable `$name`",
-        X::type_ref | X::base_type | X::list_type | X::vector_type => {
-            "a parameter type (`String`, `I64`, `[String]`, `Vector(3)`, …)"
-        }
+        X::type_ref | X::base_type | X::list_type | X::vector_type => PARAM_TYPE,
         X::annotation | X::annotation_name => "an annotation `@name(…)`",
         X::read_body | X::match_clause | X::kw_match => "`match { … }`",
         X::where_clause | X::kw_where => "`where <expression>`",
@@ -579,14 +633,31 @@ fn grammar_error(input: &str, err: pest::error::Error<Rule>) -> Refusal {
             format!("expected {} or {}", rest.join(", "), last)
         }
     };
-    let message = match (expected.is_empty(), found) {
+    let mut message = match (expected.is_empty(), found) {
         (true, Some(t)) => format!("`{t}` is not GQ here"),
         (true, None) => "the source ends early".to_string(),
         (false, Some(t)) => format!("{expected}; found `{t}`"),
         (false, None) => format!("{expected}; the source ends here"),
     };
-    QueryDiagnostic::parse(Q001, message, Some(Position::at(input, byte))).into()
+    // An unknown parameter type is an unknown name: the scalar types
+    // nearest it.
+    if names == [PARAM_TYPE]
+        && let Some(t) = found.filter(|t| t.starts_with(|c: char| c.is_ascii_alphabetic()))
+    {
+        message.push_str(&crate::query::check::nearest::listing(
+            t,
+            crate::query::check::nearest::scalar_types(),
+        ));
+    }
+    let mut d = QueryDiagnostic::parse(Q001, message, Some(Position::at(input, byte)));
+    if let Some(t) = found {
+        d.end = Some(Position::at(input, byte + t.len()));
+    }
+    d.into()
 }
+
+/// The construct a parameter's type stands for.
+const PARAM_TYPE: &str = "a parameter type (`String`, `I64`, `[String]`, `Vector(3)`, …)";
 
 /// The token at `byte`, for a message.
 fn token_at(input: &str, byte: usize) -> Option<&str> {
@@ -672,6 +743,7 @@ fn decl(pair: Pair<Rule>) -> R<Decl> {
     let ctx = collect_ctx(&pair);
     with_ctx(|c| *c = ctx);
     let mut name = None;
+    let mut name_at = None;
     let mut params = Vec::new();
     let mut annotations = Vec::new();
     let mut write_clause = None;
@@ -679,7 +751,10 @@ fn decl(pair: Pair<Rule>) -> R<Decl> {
     for item in pair.into_inner() {
         match item.as_rule() {
             Rule::kw_query => {}
-            Rule::ident => name = Some(item.as_str().to_string()),
+            Rule::ident => {
+                name_at = Some(source_span(&item));
+                name = Some(item.as_str().to_string())
+            }
             Rule::param_list => {
                 for p in item.into_inner() {
                     params.push(param(p)?);
@@ -746,6 +821,7 @@ fn decl(pair: Pair<Rule>) -> R<Decl> {
     };
     Ok(Decl {
         name,
+        at: name_at.unwrap_or_default(),
         params,
         annotations,
         write_mode,
@@ -846,11 +922,8 @@ fn annotation(pair: Pair<Rule>) -> R<Annotation> {
         name,
         args: text.contains('(').then_some(args),
         at: SourceSpan {
-            start,
-            end,
             position: Position::at(input, whole.0),
-            operands: Vec::new(),
-            ranges: Vec::new(),
+            ..SourceSpan::of(input, start, end)
         },
     })
 }
@@ -893,13 +966,7 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
                 let (s, e) = span_of(&section);
                 let open = s + input[s..e].find('{').unwrap_or(0) + 1;
                 let close = s + input[s..e].rfind('}').unwrap_or(e - s);
-                body.spans.match_inner = Some(SourceSpan {
-                    start: open,
-                    end: close,
-                    position: Position::at(input, open),
-                    operands: Vec::new(),
-                    ranges: Vec::new(),
-                });
+                body.spans.match_inner = Some(SourceSpan::of(input, open, close));
                 body.pattern = Box::new(match_pattern(&section, where_pair.as_ref())?);
             }
             Rule::where_clause => {}
@@ -3371,11 +3438,9 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                 left: Box::new(expr(left_pair)?),
                 right: Box::new(expr(right_pair)?),
                 at: SourceSpan {
-                    start: span.0,
-                    end: span.1,
-                    position: Position::at(input, span.0),
                     operands: vec![left_source.clone(), right_source],
                     ranges,
+                    ..SourceSpan::of(input, span.0, span.1)
                 },
             })
         }
@@ -3413,11 +3478,13 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
                 needle: Box::new(expr(left_pair)?),
                 list: Box::new(expr(list)?),
                 at: SourceSpan {
-                    start: span.0,
-                    end: span.0 + input[span.0..span.1].trim_end().len(),
-                    position: Position::at(input, span.0),
                     operands: vec![left_source.clone(), list_source],
                     ranges,
+                    ..SourceSpan::of(
+                        input,
+                        span.0,
+                        span.0 + input[span.0..span.1].trim_end().len(),
+                    )
                 },
             })
         }
@@ -3513,14 +3580,15 @@ fn comparison(pair: Pair<Rule>) -> R<Expr> {
             left: Box::new(expr(left_pair)?),
             right: Box::new(expr(parts[2].clone())?),
             at: SourceSpan {
-                start: span.0,
-                end: span.0 + input[span.0..span.1].trim_end().len(),
-                position: Position::at(input, span.0),
                 operands: vec![
                     left_source.to_string(),
                     parts[2].as_str().trim().to_string(),
                 ],
-                ranges: Vec::new(),
+                ..SourceSpan::of(
+                    input,
+                    span.0,
+                    span.0 + input[span.0..span.1].trim_end().len(),
+                )
             },
         }),
         _ => Ok(Expr::IsNull {

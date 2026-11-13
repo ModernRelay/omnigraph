@@ -409,6 +409,8 @@ A per-project `CLAUDE.md` tells coding agents where files live and what conventi
 
 These are the traps most likely to bite. Scan this table before debugging any parse or runtime error.
 
+**Read the whole refusal, then repair in passes.** A compile reports every independent refusal of the source in one pass, in source order: one `error[CODE]` block each, with its `-->` position and `fix`; in JSON the error's `diagnostic` is the first and its `further` list the rest, each with `position`, `end` and a `suggestion` of byte edits. Apply every `machine_applicable` edit of the pass at once (they never overlap; apply from the highest offset down), compile again, and repeat; three passes reach a source with no such edit left. A `needs_review` edit is a guess (a rename, the nearest enum value) to check first. A grammar refusal hides the rest, so fixing it can reveal type refusals. An unknown type, property, edge, variable, alias, option or parameter type lists `nearest:` names of its kind with their types: pick from that list rather than guessing.
+
 | Trap | Symptom | Fix |
 |------|---------|-----|
 | `#` comments in `.pg` | `parse error: expected schema_file` | Use `//` |

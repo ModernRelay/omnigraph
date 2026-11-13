@@ -40,6 +40,7 @@ fn refusal(decl: &Decl, u: &Unlowered) -> QueryDiagnostic {
     let mut d = QueryDiagnostic::typecheck(T86, u.message());
     let span = construct_span(decl, u);
     d.position = span.map(|s| s.position);
+    d.end = span.map(|s| s.end_position);
     match &u.repair {
         Some(Repair::ReturnTheOrderKey) => {
             if let Some((fix, suggestion)) = return_the_order_key(decl, &u.construct) {

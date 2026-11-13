@@ -79,6 +79,10 @@ pub struct QueryLintQueryResult {
     pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Every refusal of the query's compile pass, in source order, each
+    /// with its span, fix and suggestion; the first is `error`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diagnostics: Vec<QueryDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<QueryOperationDescriptor>,
 }
@@ -126,8 +130,12 @@ pub fn lint_query_file(
         Ok(file) => file
             .body
             .into_read_declarations()
-            .map_err(|message| (PARSE_ERROR_CODE.to_string(), message)),
-        Err(diagnostic) => Err(front_door_finding(diagnostic)),
+            .map_err(|message| vec![(PARSE_ERROR_CODE.to_string(), message)]),
+        Err(diagnostic) => Err(diagnostic
+            .all()
+            .into_iter()
+            .map(front_door_finding)
+            .collect()),
     };
     match parsed {
         Ok(queries) => {
@@ -147,6 +155,7 @@ pub fn lint_query_file(
                             status: QueryLintStatus::Ok,
                             warnings,
                             error: None,
+                            diagnostics: Vec::new(),
                             operation: Some(operation),
                         });
                     }
@@ -157,6 +166,10 @@ pub fn lint_query_file(
                             status: QueryLintStatus::Error,
                             warnings,
                             error: Some(err.to_string()),
+                            diagnostics: err
+                                .diagnostic()
+                                .map(QueryDiagnostic::all)
+                                .unwrap_or_default(),
                             operation: None,
                         });
                     }
@@ -203,32 +216,36 @@ pub fn lint_query_file(
                 findings,
             }
         }
-        Err((code, message)) => QueryLintOutput {
+        Err(refusals) => QueryLintOutput {
             status: QueryLintStatus::Error,
             schema_source,
             query_path,
             queries_processed: 0,
-            errors: 1,
+            errors: refusals.len(),
             warnings: 0,
             infos: 0,
             results: Vec::new(),
-            findings: vec![QueryLintFinding {
-                severity: QueryLintSeverity::Error,
-                code,
-                message,
-                type_name: None,
-                property: None,
-                query_names: Vec::new(),
-            }],
+            findings: refusals
+                .into_iter()
+                .map(|(code, message)| QueryLintFinding {
+                    severity: QueryLintSeverity::Error,
+                    code,
+                    message,
+                    type_name: None,
+                    property: None,
+                    query_names: Vec::new(),
+                })
+                .collect(),
         },
     }
 }
 
-/// The finding of a file the front door refused: its code and its message
+/// The finding of a refusal of the front door: its code and its message
 /// with the position, `line <n>, column <c>: <message>`, so a refused `set`
 /// line is reported where it stands; a spanless diagnostic keeps its
 /// message. A parse refusal is `Q000`; a refusal the front door raises for
-/// the whole source unit (`T83`) keeps its code and its rendered form.
+/// the whole source unit (`T83`, one per repeated name) keeps its code and
+/// its rendered form.
 fn front_door_finding(diagnostic: QueryDiagnostic) -> (String, String) {
     let (code, message) = match diagnostic.kind {
         QueryDiagnosticKind::Parse => (PARSE_ERROR_CODE.to_string(), diagnostic.message.clone()),

@@ -480,6 +480,7 @@ impl QueryDecl {
             settings: Vec::new(),
             body: Body::Decls(vec![Decl {
                 name: String::new(),
+                at: Default::default(),
                 params: Vec::new(),
                 annotations: Vec::new(),
                 write_mode: MutationWriteMode::Publish,

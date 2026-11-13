@@ -326,8 +326,8 @@ omnigraph lint --query queries.gq --schema schema.pg --json
 and a [settings line](#session-settings) naming an unknown setting or a value
 outside its row report the same way; `T83` reports there with its code.
 `L201` warns when a nullable property is never set by any update query in the
-inspected set. Type errors report the affected query and their `T…` code. The
-command exits nonzero when the overall status is an error.
+inspected set. A refused query reports every refusal of its pass with its code
+and line; the command exits nonzero when the overall status is an error.
 
 For every query that compiles successfully, JSON output includes an
 `operation` descriptor:

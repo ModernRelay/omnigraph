@@ -236,9 +236,15 @@ pub(crate) fn resolve_traversal(
 }
 
 fn lookup_traversal_edge<'a>(catalog: &'a Catalog, name: &str) -> Result<&'a EdgeType> {
-    catalog
-        .lookup_edge_by_name(name)
-        .ok_or_else(|| CompilerError::typed(T4, format!("unknown edge type `{name}`")))
+    catalog.lookup_edge_by_name(name).ok_or_else(|| {
+        CompilerError::typed(
+            T4,
+            format!(
+                "unknown edge type `{name}`{}",
+                super::nearest::listing(name, super::nearest::edges(catalog))
+            ),
+        )
+    })
 }
 
 fn resolve_member(

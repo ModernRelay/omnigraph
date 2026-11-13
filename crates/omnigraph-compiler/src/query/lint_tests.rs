@@ -30,18 +30,24 @@ fn parse_failure_returns_structured_error_output() {
 
 /// A file declaring one name twice is refused whole, and the finding keeps
 /// the code `T83` at the later declaration rather than the parse family's
-/// `Q000`.
+/// `Q000`, one finding for each later declaration.
 #[test]
 fn a_repeated_declaration_name_is_a_t83_finding() {
     let output = lint_query_file(
         &catalog("node Person { name: String }"),
-        "query q() { match { $p: Person } return { $p.name } }\nquery q() { match { $p: Person } return { $p } }\n",
+        "query q() { match { $p: Person } return { $p.name } }\nquery q() { match { $p: Person } return { $p } }\nquery q() { match { $p: Person } return { $p } }\n",
         "/tmp/queries.gq",
         QueryLintSchemaSource::file("/tmp/schema.pg"),
     );
     assert_eq!(output.status, QueryLintStatus::Error);
     assert_eq!(output.queries_processed, 0);
-    assert_eq!(output.findings.len(), 1);
+    assert_eq!(output.findings.len(), 2);
+    assert_eq!(output.errors, 2);
+    assert!(
+        output.findings[1].message.starts_with("line 3, column 7: "),
+        "{}",
+        output.findings[1].message
+    );
     assert_eq!(output.findings[0].code, "T83");
     assert!(
         output.findings[0]
@@ -137,6 +143,7 @@ return { $p.name }
 query bad_update($slug: String) {
 match { $x: Person } where $x.slug = $slug
 update $x set { missing: "nope" }
+update $x set { nmae: "x" }
 }
 "#,
         "/tmp/queries.gq",
@@ -175,7 +182,18 @@ update $x set { missing: "nope" }
             .unwrap_or_default()
             .contains("has no property")
     );
+    // Every refusal of the query's pass, each where it stands.
+    let refusals = &output.results[1].diagnostics;
+    assert_eq!(refusals.len(), 2, "{refusals:?}");
+    assert!(
+        refusals[1]
+            .message
+            .contains("`nmae`; nearest: name (String?)")
+    );
+    assert_eq!(refusals[1].position.map(|at| at.line), Some(10));
     let serialized = serde_json::to_value(&output).unwrap();
+    assert!(serialized["results"][0].get("diagnostics").is_none());
+    assert_eq!(serialized["results"][1]["diagnostics"][1]["code"], "T11");
     assert!(
         serialized["results"][1].get("operation").is_none(),
         "failed queries must omit the descriptor rather than serialize a partial value"

@@ -100,7 +100,10 @@ pub(super) fn write_queries_validate(
         for issue in &output.breakages {
             writeln!(stdout, "ERROR  query '{}': {}", issue.query, issue.message)?;
             if let Some(diagnostic) = &issue.diagnostic {
-                for line in crate::output::diagnostic_detail_lines(diagnostic) {
+                for line in crate::output::diagnostic_detail_lines(diagnostic)
+                    .into_iter()
+                    .chain(crate::output::further_diagnostic_lines(diagnostic))
+                {
                     writeln!(stdout, "{line}")?;
                 }
             }

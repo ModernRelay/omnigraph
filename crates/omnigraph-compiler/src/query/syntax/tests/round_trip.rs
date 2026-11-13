@@ -339,6 +339,7 @@ fn decl() -> impl Strategy<Value = Decl> {
     (proptest::collection::vec(param, 0..3), body, any::<bool>()).prop_map(
         |(params, body, commit)| Decl {
             name: "q".into(),
+            at: Default::default(),
             params,
             annotations: Vec::new(),
             write_mode: if commit && matches!(body, DeclBody::Write(_)) {

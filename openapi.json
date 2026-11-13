@@ -15230,6 +15230,17 @@
           "code": {
             "type": "string"
           },
+          "end": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PositionOutput",
+                "description": "Where the refused construct ends (exclusive): with `position`, its\nspan."
+              }
+            ]
+          },
           "expected": {
             "type": "string"
           },
@@ -15245,15 +15256,30 @@
               "null"
             ]
           },
+          "further": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiagnosticOutput"
+            },
+            "description": "The independent refusals the same compile pass found after this one,\nin source order, each with its span and fix; each carries no further\nlist of its own. Applying every machine-applicable suggestion of this\ndiagnostic and its further ones at once is one repair pass."
+          },
           "position": {
             "oneOf": [
               {
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/PositionOutput"
+                "$ref": "#/components/schemas/PositionOutput",
+                "description": "Where the refused construct starts."
               }
             ]
+          },
+          "related": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RelatedSpanOutput"
+            },
+            "description": "Other source spans the refusal names: the first declaration of a\nname a later one repeats."
           },
           "stage": {
             "type": [
@@ -16888,6 +16914,27 @@
         "properties": {
           "operation_id": {
             "type": "string"
+          }
+        }
+      },
+      "RelatedSpanOutput": {
+        "type": "object",
+        "description": "Another source span a refusal names.",
+        "required": [
+          "position",
+          "end",
+          "message"
+        ],
+        "properties": {
+          "end": {
+            "$ref": "#/components/schemas/PositionOutput"
+          },
+          "message": {
+            "type": "string",
+            "description": "What stands there."
+          },
+          "position": {
+            "$ref": "#/components/schemas/PositionOutput"
           }
         }
       },

@@ -2829,8 +2829,13 @@ pub struct SuggestionOutput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DiagnosticOutput {
     pub code: String,
+    /// Where the refused construct starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<PositionOutput>,
+    /// Where the refused construct ends (exclusive): with `position`, its
+    /// span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<PositionOutput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2840,17 +2845,42 @@ pub struct DiagnosticOutput {
     pub fix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<SuggestionOutput>,
+    /// Other source spans the refusal names: the first declaration of a
+    /// name a later one repeats.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RelatedSpanOutput>,
+    /// The independent refusals the same compile pass found after this one,
+    /// in source order, each with its span and fix; each carries no further
+    /// list of its own. Applying every machine-applicable suggestion of this
+    /// diagnostic and its further ones at once is one repair pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(no_recursion)]
+    pub further: Vec<DiagnosticOutput>,
+}
+
+/// Another source span a refusal names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RelatedSpanOutput {
+    pub position: PositionOutput,
+    pub end: PositionOutput,
+    /// What stands there.
+    pub message: String,
+}
+
+fn position_output(at: omnigraph_compiler::Position) -> PositionOutput {
+    PositionOutput {
+        line: at.line,
+        column: at.column,
+        byte: at.byte,
+    }
 }
 
 impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
     fn from(diagnostic: &omnigraph_compiler::QueryDiagnostic) -> Self {
         Self {
             code: diagnostic.code.as_str().to_string(),
-            position: diagnostic.position.map(|at| PositionOutput {
-                line: at.line,
-                column: at.column,
-                byte: at.byte,
-            }),
+            position: diagnostic.position.map(position_output),
+            end: diagnostic.end.map(position_output),
             stage: diagnostic
                 .stage
                 .as_ref()
@@ -2883,6 +2913,16 @@ impl From<&omnigraph_compiler::QueryDiagnostic> for DiagnosticOutput {
                         })
                         .collect(),
                 }),
+            related: diagnostic
+                .related()
+                .iter()
+                .map(|r| RelatedSpanOutput {
+                    position: position_output(r.position),
+                    end: position_output(r.end),
+                    message: r.message.clone(),
+                })
+                .collect(),
+            further: diagnostic.further().iter().map(Self::from).collect(),
         }
     }
 }

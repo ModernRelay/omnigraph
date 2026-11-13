@@ -38,12 +38,15 @@ use crate::types::{Direction, PropType, ScalarType};
 use literal::{assignment_compatible, check_literal_type, literal_type, types_compatible};
 use traversal::{BoundVariable, resolve_traversal};
 
-/// The internal error: a refusal, or the signal that a recursive read's type
-/// is not yet known (the base pass of [`Ctx::read_decl`]).
+/// The internal error: a refusal, the signal that a recursive read's type
+/// is not yet known (the base pass of [`Ctx::read_decl`]), or the signal
+/// that the construct was abandoned after its refusals were recorded on the
+/// context (the recovery of [`Ctx::recover`]).
 #[derive(Debug, Clone)]
 enum E {
     D(QueryDiagnostic),
     Pending(String),
+    Recorded,
 }
 
 impl From<QueryDiagnostic> for E {
@@ -89,7 +92,7 @@ pub fn check_file(
         Body::Explain(d) => vec![d.as_ref()],
         Body::Statement(_) => Vec::new(),
     };
-    let unit: HashMap<String, &Decl> = decls.iter().map(|d| (d.name.clone(), *d)).collect();
+    let unit = source_unit(&decls);
     decls
         .iter()
         .map(|d| (d.name.clone(), check_decl(catalog, &unit, d)))
@@ -108,7 +111,7 @@ pub fn check_syntax_decl(
         Body::Explain(d) => vec![d.as_ref()],
         Body::Statement(_) => Vec::new(),
     };
-    let unit: HashMap<String, &Decl> = decls.iter().map(|d| (d.name.clone(), *d)).collect();
+    let unit = source_unit(&decls);
     check_decl(catalog, &unit, syntax.decl()).map(|checked| checked.core)
 }
 
@@ -123,6 +126,43 @@ pub fn check_query_decl(
 
 /// Each declaration's name and its checked form or refusal.
 pub type CheckedDecls = Vec<(String, Result<CheckedDecl, QueryDiagnostic>)>;
+
+/// The declarations of a source unit by name, the first of a repeated name
+/// kept: the later one is refused (`T83`), and renaming it is the fix.
+fn source_unit<'d>(decls: &[&'d Decl]) -> HashMap<String, &'d Decl> {
+    let mut unit = HashMap::new();
+    for d in decls {
+        unit.entry(d.name.clone()).or_insert(*d);
+    }
+    unit
+}
+
+/// Every refusal of a source in one pass, in source order, each with its
+/// span; empty when the source compiles. A grammar refusal stops the pass
+/// (the tree past it is unknown), so it is the one refusal. Otherwise the
+/// pass holds each repeated declaration name (`T83`) and every
+/// declaration's independent refusals: a declaration is checked on its own,
+/// and in its top scope a refusal in one element, `where` conjunct, return
+/// item, order key or write statement is recorded and the next is checked,
+/// unless it names what a refused construct would have bound. A
+/// declaration's later stages (the product rule, the lowering check) run
+/// only when nothing earlier in it was refused.
+pub fn check_source_all(catalog: &Catalog, source: &str) -> Vec<QueryDiagnostic> {
+    if let Err(refused) = crate::query::depth::check_query_nesting(source) {
+        return vec![refused];
+    }
+    let (file, mut refusals) = crate::query::syntax::parse::parse_source_all(source);
+    let Some(file) = file else {
+        return refusals;
+    };
+    for (_, checked) in check_file(catalog, &file) {
+        if let Err(refused) = checked {
+            refusals.extend(refused.all());
+        }
+    }
+    refusals.sort_by_key(|d| d.position.map_or(0, |at| at.byte));
+    refusals
+}
 
 /// Parse a source and type-check it.
 pub fn check_source(catalog: &Catalog, source: &str) -> Result<CheckedDecls, QueryDiagnostic> {
@@ -143,7 +183,7 @@ pub(crate) fn type_source(
         Body::Explain(d) => vec![d.as_ref()],
         Body::Statement(_) => Vec::new(),
     };
-    let unit: HashMap<String, &Decl> = decls.iter().map(|d| (d.name.clone(), *d)).collect();
+    let unit = source_unit(&decls);
     Ok(decls
         .iter()
         .map(|d| (d.name.clone(), type_decl(catalog, &unit, d)))
@@ -181,11 +221,12 @@ pub(crate) fn type_decl(
         in_write: false,
         at: None,
         element_span: None,
+        refusals: Vec::new(),
     };
     let params = match param_types(&decl.params) {
         Ok(p) => p,
-        Err(E::D(d)) => return Err(d),
-        Err(E::Pending(_)) => unreachable!(),
+        Err(E::D(d)) => return Err(d.at_span_of(&decl.at)),
+        Err(E::Pending(_) | E::Recorded) => unreachable!(),
     };
     ctx.frames.push(Frame {
         decl: decl.name.clone(),
@@ -208,26 +249,64 @@ pub(crate) fn type_decl(
         }),
         DeclBody::Write(w) => ctx.write_decl(decl, w).map(CoreDecl::Write),
     };
+    // Every refusal recorded by a recovery point, then the one that ended
+    // the pass, each at its span or at the declaration's name.
+    let mut refusals = std::mem::take(&mut ctx.refusals);
     match out {
+        Ok(_) | Err(E::Recorded) if !refusals.is_empty() => {}
         Ok(mut core) => {
-            bind::bind_decl(catalog, &mut core).map_err(|e| match e {
-                CompilerError::Query(d) => *d,
-                other => QueryDiagnostic::typecheck(T7, other.to_string()),
+            bind::bind_decl(catalog, &mut core).map_err(|e| {
+                match e {
+                    CompilerError::Query(d) => *d,
+                    other => QueryDiagnostic::typecheck(T7, other.to_string()),
+                }
+                .at_span_of(&decl.at)
             })?;
-            Ok(CheckedDecl { core })
+            return Ok(CheckedDecl { core });
         }
-        Err(E::D(mut d)) => {
-            if d.position.is_none() {
-                d.position = ctx.at;
-            }
-            Err(d)
+        Err(E::D(d)) => {
+            let d = ctx.placed(d);
+            refusals.push(d);
         }
-        Err(E::Pending(name)) => Err(QueryDiagnostic::typecheck(
+        Err(E::Pending(name)) => refusals.push(QueryDiagnostic::typecheck(
             T70,
             format!(
                 "`{name}` calls itself on every branch; a recursion needs a base case, a `union` arm that does not call it"
             ),
         )),
+        Err(E::Recorded) => unreachable!("a recorded refusal is on the context"),
+    }
+    Err(in_source_order(refusals, &decl.at).expect("a refused declaration holds a refusal"))
+}
+
+/// The refusals of one declaration in source order, each without a position
+/// placed at the declaration's name, one of each repeated refusal kept; the
+/// first carries the others.
+fn in_source_order(refusals: Vec<QueryDiagnostic>, decl: &SourceSpan) -> Option<QueryDiagnostic> {
+    let mut refusals: Vec<QueryDiagnostic> =
+        refusals.into_iter().map(|d| d.at_span_of(decl)).collect();
+    refusals.sort_by_key(|d| d.position.map_or(0, |at| at.byte));
+    let mut kept: Vec<QueryDiagnostic> = Vec::new();
+    for d in refusals {
+        if !kept.contains(&d) {
+            kept.push(d);
+        }
+    }
+    QueryDiagnostic::first_of(kept)
+}
+
+/// A diagnostic without a position, placed at `span`.
+trait AtSpan {
+    fn at_span_of(self, span: &SourceSpan) -> Self;
+}
+
+impl AtSpan for QueryDiagnostic {
+    fn at_span_of(mut self, span: &SourceSpan) -> Self {
+        if self.position.is_none() && span.end > span.start {
+            self.position = Some(span.position);
+            self.end = Some(span.end_position);
+        }
+        self
     }
 }
 
@@ -255,6 +334,7 @@ fn infix_string(op: InfixStringOp, at: &SourceSpan, list: bool) -> QueryDiagnost
         }],
     });
     diagnostic.position = Some(at.position);
+    diagnostic.end = Some(at.end_position);
     diagnostic
 }
 
@@ -355,6 +435,7 @@ fn unnamed_ranking(rel: &RelExpr, name: &str, span: Option<&SourceSpan>) -> Quer
     .with_fix(format!("from {} as ${name}", relation_text(rel)));
     if let Some(span) = span {
         d.position = Some(span.position);
+        d.end = Some(span.end_position);
         if let [(_, end)] = span.ranges.as_slice() {
             d = d.with_suggestion(Suggestion {
                 applicability: Applicability::MachineApplicable,
@@ -382,6 +463,7 @@ fn named_non_ranking(rel: &RelExpr, name: &str, span: Option<&SourceSpan>) -> Qu
     .with_fix(format!("from {}", relation_text(rel)));
     if let Some(span) = span {
         d.position = Some(span.position);
+        d.end = Some(span.end_position);
         if let [(_, end)] = span.ranges.as_slice() {
             d = d.with_suggestion(Suggestion {
                 applicability: Applicability::MachineApplicable,
@@ -787,11 +869,15 @@ struct Ctx<'a> {
     /// stage W2.
     in_write: bool,
     /// Where the element, `where`, return item, order key or statement being checked
-    /// was written: the position of a refusal that names none of its own.
-    at: Option<Position>,
+    /// was written, start and end: the span of a refusal that names none of
+    /// its own.
+    at: Option<(Position, Position)>,
     /// The span of the element being checked, when the parser recorded one
     /// per element: where a triple's `T82` fix swaps its two ends.
     element_span: Option<SourceSpan>,
+    /// The refusals the recovery points of the declaration's top scope
+    /// recorded ([`Ctx::recover`]).
+    refusals: Vec<QueryDiagnostic>,
 }
 
 struct Frame {
@@ -908,14 +994,27 @@ struct Scope {
     /// Every column read since an element began, local or outer: what the
     /// element's inner term reads, for the product rule (`components`).
     reads: Vec<String>,
+    /// The declaration's top scope (a read's `match`, return and order, a
+    /// write group): a refusal in one element, conjunct, return item, order
+    /// key or statement is recorded and the next one is checked
+    /// ([`Ctx::recover`]). Inner scopes stop at their first refusal, which
+    /// the top scope records for the construct holding them.
+    recover: bool,
+    /// The names a refused or skipped construct of this scope would have
+    /// bound: a later construct naming one is skipped, since its refusal
+    /// would depend on the one recorded.
+    poisoned: HashSet<String>,
+    /// A refused `from` drew columns no one knows: a later construct naming
+    /// a name the scope cannot resolve is skipped too.
+    opaque: bool,
 }
 
 #[derive(Clone)]
 enum Pending {
     /// A conjunct of `where` and the names bound before it: a block inside it
     /// correlates on those alone.
-    /// And where it was written.
-    Filter(Expr, Vec<String>, Option<Position>),
+    /// And where the `where` was written, start and end.
+    Filter(Expr, Vec<String>, Option<(Position, Position)>),
 }
 
 impl Scope {
@@ -940,7 +1039,55 @@ impl Scope {
             block: false,
             block_visible: None,
             reads: Vec::new(),
+            recover: false,
+            poisoned: HashSet::new(),
+            opaque: false,
         }
+    }
+
+    /// Whether a construct naming `names` depends on a refused one.
+    fn depends_on_refused<'n>(&self, names: impl IntoIterator<Item = &'n String>) -> bool {
+        names.into_iter().any(|n| {
+            self.poisoned.contains(n)
+                || (self.opaque && !self.in_scope(n) && !self.future.contains(n))
+        })
+    }
+
+    /// Record that a refused construct would have bound `names`: those the
+    /// scope does not already hold.
+    fn poison<'n>(&mut self, names: impl IntoIterator<Item = &'n String>) {
+        for n in names {
+            if !self.is_bound(n) {
+                self.poisoned.insert(n.clone());
+            }
+        }
+    }
+
+    /// Every name in scope with its type, as a refusal of an unknown one
+    /// lists them: the columns, the parameters and the named relations.
+    fn names_in_scope(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .visible()
+            .into_iter()
+            .filter(|c| !c.name.starts_with("__"))
+            .map(|c| (format!("${}", c.name), c.ty.display()))
+            .collect();
+        out.extend(
+            self.params
+                .iter()
+                .map(|(p, t)| (format!("${p}"), t.display_name())),
+        );
+        out.extend(
+            self.rels
+                .keys()
+                .map(|r| (format!("${r}"), "relation".into())),
+        );
+        out
+    }
+
+    /// Whether this scope refused or skipped a construct.
+    fn refused_any(&self) -> bool {
+        !self.poisoned.is_empty() || self.opaque
     }
 
     /// Every column visible here, local first then outer, for an inner
@@ -1081,9 +1228,15 @@ fn param_types(params: &[Param]) -> R<Vec<(String, PropType)>> {
             ));
         }
         let Some(ty) = PropType::from_param_type_name(&p.type_name, p.nullable) else {
+            let written = p.type_name.trim_start_matches('[').trim_end_matches(']');
             return Err(err(
                 T48,
-                format!("unknown parameter type `{}` for `${}`", p.type_name, p.name),
+                format!(
+                    "unknown parameter type `{}` for `${}`{}",
+                    p.type_name,
+                    p.name,
+                    nearest::listing(written, nearest::scalar_types())
+                ),
             ));
         };
         if let Some(default) = &p.default {
@@ -1123,29 +1276,41 @@ struct Budget {
 /// retained unread, `@budget(plan = n, rounds = n)` is typed, and every other
 /// name is refused, naming the stage that types it where one does.
 fn annotations(decl: &Decl) -> R<Budget> {
-    let mut budget = Budget {
-        plan: DEFAULT_PLAN_BUDGET,
-        rounds: None,
-    };
+    let mut budget = Budget::default();
     for a in &decl.annotations {
-        annotation(a, &mut budget).map_err(|e| match e {
-            // The suggestion removes the annotation; whether the text still
-            // means what its author wanted is theirs to judge.
-            E::D(mut d) => {
-                d.position = Some(a.at.position);
-                E::D(d.with_suggestion(Suggestion {
-                    applicability: Applicability::NeedsReview,
-                    edits: vec![TextEdit {
-                        start: a.at.start,
-                        end: a.at.end,
-                        replacement: String::new(),
-                    }],
-                }))
-            }
-            other => other,
-        })?;
+        placed_annotation(a, &mut budget)?;
     }
     Ok(budget)
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            plan: DEFAULT_PLAN_BUDGET,
+            rounds: None,
+        }
+    }
+}
+
+/// [`annotation`], a refusal placed at the annotation.
+fn placed_annotation(a: &Annotation, budget: &mut Budget) -> R<()> {
+    annotation(a, budget).map_err(|e| match e {
+        // The suggestion removes the annotation; whether the text still
+        // means what its author wanted is theirs to judge.
+        E::D(mut d) => {
+            d.position = Some(a.at.position);
+            d.end = Some(a.at.end_position);
+            E::D(d.with_suggestion(Suggestion {
+                applicability: Applicability::NeedsReview,
+                edits: vec![TextEdit {
+                    start: a.at.start,
+                    end: a.at.end,
+                    replacement: String::new(),
+                }],
+            }))
+        }
+        other => other,
+    })
 }
 
 fn annotation(a: &Annotation, budget: &mut Budget) -> R<()> {
@@ -1232,18 +1397,82 @@ impl Ctx<'_> {
         }
     }
 
+    /// A recovery point of the top scope: a refusal is recorded at its span
+    /// (the construct's, when it names none of its own) and `None` returned,
+    /// so the caller checks the next construct; a construct abandoned after
+    /// recording is `None` too. A recursive read's pending type is not a
+    /// refusal and propagates.
+    fn recover<T>(&mut self, result: R<T>) -> R<Option<T>> {
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(E::D(d)) => {
+                let d = self.placed(d);
+                self.refusals.push(d);
+                Ok(None)
+            }
+            Err(E::Recorded) => Ok(None),
+            Err(E::Pending(name)) => Err(E::Pending(name)),
+        }
+    }
+
+    /// The annotations of the top declaration, each refusal recorded.
+    fn recorded_annotations(&mut self, decl: &Decl) -> R<Budget> {
+        let mut budget = Budget::default();
+        for a in &decl.annotations {
+            let typed = placed_annotation(a, &mut budget);
+            self.recover(typed)?;
+        }
+        Ok(budget)
+    }
+
+    /// [`Self::recover`] in the top scope; elsewhere the refusal propagates.
+    fn guard<T>(&mut self, top: bool, result: R<T>) -> R<Option<T>> {
+        if top {
+            self.recover(result)
+        } else {
+            result.map(Some)
+        }
+    }
+
+    /// `d` placed at the construct being checked when it names no position
+    /// of its own, or given that construct's end when it starts there.
+    fn placed(&self, mut d: QueryDiagnostic) -> QueryDiagnostic {
+        if let Some((start, end)) = self.at {
+            if d.position.is_none() {
+                d.position = Some(start);
+                d.end = Some(end);
+            } else if d.end.is_none() && d.position == Some(start) {
+                d.end = Some(end);
+            }
+        }
+        d
+    }
+
+    /// The construct being checked was written at `span`.
+    fn set_at(&mut self, span: &SourceSpan) {
+        self.at = Some((span.position, span.end_position));
+    }
+
     // -----------------------------------------------------------------------
     // Declarations.
 
     fn read_decl(&mut self, decl: &Decl) -> R<ReadOut> {
+        // The top scope records an independent refusal and checks on; a
+        // refusal of the name or the annotations is independent of the body.
+        let top = self.frames.len() == 1 && self.refusals.is_empty();
         if is_registry_name(&decl.name) || CLAUSE_KEYWORDS.contains(&decl.name.as_str()) {
-            return Err(err(
+            let refused = err(
                 T74,
                 format!(
                     "a declared read may not be named `{}`, which is a registry row or an element keyword",
                     decl.name
                 ),
-            ));
+            );
+            if !top {
+                return Err(refused);
+            }
+            self.set_at(&decl.at);
+            self.recover::<()>(Err(refused))?;
         }
         let DeclBody::Read(body) = &decl.body else {
             return Err(err(
@@ -1255,12 +1484,21 @@ impl Ctx<'_> {
             ));
         };
         let params = param_types(&decl.params)?;
-        let budget = annotations(decl)?;
+        let budget = if top {
+            self.recorded_annotations(decl)?
+        } else {
+            annotations(decl)?
+        };
         let name = decl.name.clone();
         self.rec_hits.remove(&name);
         self.assume.remove(&name);
         let pmap: HashMap<String, PropType> = params.iter().cloned().collect();
-        let mut rel = self.read_body(body, Scope::new(pmap.clone(), Vec::new(), HashMap::new()))?;
+        let mut sc = Scope::new(pmap.clone(), Vec::new(), HashMap::new());
+        sc.recover = top;
+        let mut rel = self.read_body(body, sc)?;
+        if !self.refusals.is_empty() {
+            return Err(E::Recorded);
+        }
         if self.rec_hits.contains(&name) {
             // The fixpoint of the read's type: start from the base arms'
             // type, retype under it until it is stable.
@@ -1316,56 +1554,78 @@ impl Ctx<'_> {
             base: Some(UnattachedBase::Param(name)),
         } = &decl.write_mode
         {
-            match params.iter().find(|(n, _)| n == name) {
-                Some((_, ty)) if ty.scalar == ScalarType::String && !ty.nullable && !ty.list => {}
-                Some((_, ty)) => {
-                    return Err(err(
-                        T55,
-                        format!(
-                            "`on $base` needs a declared `String` parameter; `${name}` is `{}`",
-                            ty.display_name()
-                        ),
-                    ));
+            let refused = match params.iter().find(|(n, _)| n == name) {
+                Some((_, ty)) if ty.scalar == ScalarType::String && !ty.nullable && !ty.list => {
+                    None
                 }
-                None => {
-                    return Err(err(
-                        T55,
-                        format!(
-                            "`on $base` needs a declared `String` parameter; `${name}` is not declared"
-                        ),
-                    ));
-                }
+                Some((_, ty)) => Some(err(
+                    T55,
+                    format!(
+                        "`on $base` needs a declared `String` parameter; `${name}` is `{}`",
+                        ty.display_name()
+                    ),
+                )),
+                None => Some(err(
+                    T55,
+                    format!(
+                        "`on $base` needs a declared `String` parameter; `${name}` is not declared"
+                    ),
+                )),
+            };
+            if let Some(refused) = refused {
+                self.set_at(&decl.at);
+                self.recover::<()>(Err(refused))?;
             }
         }
-        annotations(decl)?;
+        self.recorded_annotations(decl)?;
         let pmap: HashMap<String, PropType> = params.iter().cloned().collect();
         let mut groups = Vec::new();
         let mut class: Option<(WriteClass, String)> = None;
         // A group's statements run in order, each keyed effect seeing the
         // ones before it, and across statements the later effect wins; two
         // values for one entity reached through the rows of one statement
-        // are found only by running it, so no conflict is refused here.
+        // are found only by running it, so no conflict is refused here. Each
+        // group is a top scope: a refusal in one element, conjunct or
+        // statement is recorded and the next is checked.
         for (g, group) in body.groups.iter().enumerate() {
             let mut sc = Scope::new(pmap.clone(), Vec::new(), HashMap::new());
-            self.pattern(&mut sc, &group.pattern)?;
-            let input = self.finish(&mut sc)?.unwrap_or(Term::Unit);
+            sc.recover = true;
+            let typed = self.pattern(&mut sc, &group.pattern);
+            if self.recover(typed)?.is_none() {
+                continue;
+            }
+            let input = if sc.refused_any() || !self.refusals.is_empty() {
+                Term::Unit
+            } else {
+                let finished = self.finish(&mut sc);
+                match self.recover(finished)? {
+                    Some(term) => term.unwrap_or(Term::Unit),
+                    None => continue,
+                }
+            };
             let mut sinks = Vec::new();
             for (i, s) in group.statements.iter().enumerate() {
                 if let Some(span) = group.spans.statements.get(i) {
-                    self.at = Some(span.position);
+                    self.set_at(span);
                 }
-                let (sink, this) = self.statement(&mut sc, s)?;
+                if sc.depends_on_refused(&statement_names(s)) {
+                    continue;
+                }
+                let typed = self.statement(&mut sc, s);
+                let Some((sink, this)) = self.recover(typed)? else {
+                    continue;
+                };
                 let label = format!("statement {} of group {}", i + 1, g + 1);
                 match &class {
                     Some((c, first)) if *c != this => {
-                        return Err(err(
+                        self.recover::<()>(Err(err(
                             T76,
                             format!(
                                 "{label} is {} but {first} is {}; a write mixes no `delete` with an `insert` or `update`: split it into separate mutations",
                                 class_word(this),
                                 class_word(*c)
                             ),
-                        ));
+                        )))?;
                     }
                     Some(_) => {}
                     None => class = Some((this, label.clone())),
@@ -1373,6 +1633,9 @@ impl Ctx<'_> {
                 sinks.push(sink);
             }
             groups.push(WriteGroup { input, sinks });
+        }
+        if !self.refusals.is_empty() {
+            return Err(E::Recorded);
         }
         Ok(CoreWrite {
             name: decl.name.clone(),
@@ -1389,75 +1652,62 @@ impl Ctx<'_> {
     /// A read body in `sc` (top level: no outer columns; inline: the
     /// enclosing scope's visible columns).
     fn read_body(&mut self, body: &ReadBody, mut sc: Scope) -> R<Rel> {
+        let top = sc.recover;
         if let Some(refusal) = ranking_in_order_or_return(self.catalog, body, &sc) {
-            return Err(E::D(refusal));
+            if !top {
+                return Err(E::D(refusal));
+            }
+            // The return or order holds the ranking: the `match` is checked
+            // alone.
+            self.recover::<()>(Err(E::D(refusal)))?;
+            let typed = self.pattern(&mut sc, &body.pattern);
+            self.recover(typed)?;
+            return Err(E::Recorded);
         }
-        self.pattern(&mut sc, &body.pattern)?;
+        let typed = self.pattern(&mut sc, &body.pattern);
+        if self.guard(top, typed)?.is_none() {
+            // A refusal of the whole pattern: nothing it binds is known.
+            return Err(E::Recorded);
+        }
         // Return items, typed beside every match column.
         let mut items = Vec::new();
         let mut aggs = Vec::new();
         let mut post: Vec<(String, SExpr)> = Vec::new();
         let mut shaped = Vec::new();
         let mut names: Vec<String> = Vec::new();
+        // An item refused or skipped: an order key, which reads the items,
+        // is then not checked.
+        let mut item_refused = false;
         for (i, p) in body.projections.iter().enumerate() {
             if let Some(span) = body.spans.items.get(i) {
-                self.at = Some(span.position);
+                self.set_at(span);
             }
             let name = item_name(&p.expr, p.alias.as_deref());
             if names.contains(&name) {
-                return Err(err(
+                let refused = Err(err(
                     T25,
                     format!("two return items produce the column `{name}`; alias one"),
                 ));
+                self.guard::<()>(top, refused)?;
+                item_refused = true;
+                continue;
             }
             names.push(name.clone());
             shaped.push(
                 (p.alias.is_none() && !matches!(p.expr, Expr::Variable(_)))
                     .then(|| crate::query::syntax::print::expr(&p.expr)),
             );
-            if let Some(agg) = self.aggregate(&mut sc, &p.expr)? {
-                aggs.push((format!("^{name}"), agg));
-                items.push(None);
-            } else if contains_agg(&p.expr) {
-                // An expression over aggregates (`count($p) > 3 as big`): the
-                // aggregates are hidden `Group` columns, the expression a
-                // projection after the group.
-                let mut hidden = Vec::new();
-                let rewritten = self.extract_aggs(&mut sc, &p.expr, &mut hidden)?;
-                for (n, a) in &hidden {
-                    sc.cols.push(Col {
-                        name: n.clone(),
-                        ty: a.ty.clone(),
-                    });
-                }
-                let e = self.expr(&mut sc, &rewritten, At::Value)?;
-                if p.alias.is_none() {
-                    return Err(err(
-                        T43,
-                        "an expression over aggregates in return needs an alias",
-                    ));
-                }
-                aggs.extend(hidden);
-                post.push((format!("^{name}"), e));
-                items.push(None);
-            } else {
-                let e = self.expr(&mut sc, &p.expr, At::Value)?;
-                if matches!(e.ty, Ty::Value(ref t) if t.scalar == ScalarType::Blob) {
-                    return Err(err(T24, format!("a Blob is not a read value (`{name}`)")));
-                }
-                if matches!(e.ty, Ty::Value(ref t) if t.scalar == ScalarType::Bool)
-                    && p.alias.is_none()
-                    && !e.is_reference_read()
-                    && !matches!(e.kind, SKind::Col(_) | SKind::Lit(_))
-                {
-                    return Err(err(
-                        T43,
-                        "a comparison in return needs an alias; write `… as <name>`",
-                    ));
-                }
-                items.push(Some((format!("^{name}"), e)));
+            if top && sc.depends_on_refused(&expr_names(&p.expr)) {
+                item_refused = true;
+                continue;
+            }
+            let typed = self.return_item(&mut sc, p, &name, &mut items, &mut aggs, &mut post);
+            if self.guard(top, typed)?.is_none() {
+                sc.block_buf.clear();
+                item_refused = true;
             }
         }
+        let refused = top && (item_refused || sc.refused_any() || !self.refusals.is_empty());
         // Blocks in return items come before the extension.
         let blocks = std::mem::take(&mut sc.block_buf);
         let at = sc.binders;
@@ -1473,17 +1723,27 @@ impl Ctx<'_> {
                 },
             );
         }
-        let mut term = self.finish(&mut sc)?.unwrap_or(Term::Unit);
+        let mut term = if refused {
+            Term::Unit
+        } else {
+            self.finish(&mut sc)?.unwrap_or(Term::Unit)
+        };
         let grouped = !aggs.is_empty() || !post.is_empty() || body.distinct;
         if body.distinct && !aggs.is_empty() {
-            return Err(err(
-                T56,
-                "`return distinct` does not apply to an aggregated return",
-            ));
+            self.guard::<()>(
+                top,
+                Err(err(
+                    T56,
+                    "`return distinct` does not apply to an aggregated return",
+                )),
+            )?;
         }
         let mut out_cols: Vec<Col> = Vec::new();
         let ext_names: Vec<String>;
-        if grouped {
+        if item_refused {
+            // The order keys read the items; the `limit` reads neither.
+            ext_names = Vec::new();
+        } else if grouped {
             let keys: Vec<(String, SExpr)> = items.iter().flatten().cloned().collect();
             for (i, it) in items.iter().enumerate() {
                 let ty = match it {
@@ -1507,48 +1767,14 @@ impl Ctx<'_> {
             let mut order = Vec::new();
             for (k, o) in body.order.iter().enumerate() {
                 if let Some(span) = body.spans.order.get(k) {
-                    self.at = Some(span.position);
+                    self.set_at(span);
                 }
-                let same_item = body.projections.iter().position(|p| p.expr == o.expr);
-                let k = match &o.expr {
-                    Expr::Ident(alias) if names.contains(alias) => {
-                        let i = names.iter().position(|n| n == alias).unwrap();
-                        SExpr::new(SKind::Col(format!("^{alias}")), out_cols[i].ty.clone())
-                    }
-                    _ if same_item.is_some() => {
-                        let i = same_item.unwrap();
-                        SExpr::new(SKind::Col(format!("^{}", names[i])), out_cols[i].ty.clone())
-                    }
-                    e if self.aggregate(&mut sc, e).is_ok_and(|a| a.is_some()) => {
-                        let a = self.aggregate(&mut sc, e)?.unwrap();
-                        match aggs.iter().find(|(_, x)| *x == a) {
-                            Some((n, x)) => SExpr::new(SKind::Col(n.clone()), x.ty.clone()),
-                            None => {
-                                return Err(err(
-                                    T42,
-                                    "an aggregate order key must repeat a return item; order by its alias",
-                                ));
-                            }
-                        }
-                    }
-                    e if contains_agg(e) => {
-                        return Err(err(
-                            T42,
-                            "an aggregate order key must repeat a return item; order by its alias",
-                        ));
-                    }
-                    e => {
-                        let typed = self.order_key(&mut sc, e)?;
-                        match keys.iter().find(|(_, k)| *k == typed) {
-                            Some((n, k)) => SExpr::new(SKind::Col(n.clone()), k.ty.clone()),
-                            None => {
-                                return Err(err(
-                                    T42,
-                                    "an order key over grouped rows must be a return item or name its alias",
-                                ));
-                            }
-                        }
-                    }
+                if top && sc.depends_on_refused(&expr_names(&o.expr)) {
+                    continue;
+                }
+                let key = self.grouped_order_key(&mut sc, body, o, &names, &out_cols, &aggs, &keys);
+                let Some(k) = self.guard(top, key)? else {
+                    continue;
                 };
                 order.push((k, o.descending.unwrap_or(false)));
             }
@@ -1566,13 +1792,15 @@ impl Ctx<'_> {
                     .iter()
                     .find(|c| !c.starts_with('^') && !keys.iter().any(|(k, _)| k == *c))
                 {
-                    return Err(err(
+                    let refused = Err(err(
                         T9,
                         format!(
                             "`{}` reads `${c}` beside an aggregate, and no return item groups by it; return the column as an item, or aggregate it",
                             n.trim_start_matches('^')
                         ),
                     ));
+                    self.guard::<()>(top, refused)?;
+                    continue;
                 }
                 post_items.push((n, e));
             }
@@ -1606,19 +1834,31 @@ impl Ctx<'_> {
             let mut order = Vec::new();
             for (k, o) in body.order.iter().enumerate() {
                 if let Some(span) = body.spans.order.get(k) {
-                    self.at = Some(span.position);
+                    self.set_at(span);
                 }
-                let k = match &o.expr {
+                if top && sc.depends_on_refused(&expr_names(&o.expr)) {
+                    continue;
+                }
+                let key = match &o.expr {
                     Expr::Ident(alias) => match ext.iter().find(|(n, _)| n[1..] == **alias) {
-                        Some((n, e)) => SExpr::new(SKind::Col(n.clone()), e.ty.clone()),
-                        None => {
-                            return Err(err(
-                                T42,
-                                format!("`{alias}` in `order` names no return alias"),
-                            ));
-                        }
+                        Some((n, e)) => Ok(SExpr::new(SKind::Col(n.clone()), e.ty.clone())),
+                        None => Err(err(
+                            T42,
+                            format!(
+                                "`{alias}` in `order` names no return alias{}",
+                                nearest::listing(
+                                    alias,
+                                    ext.iter()
+                                        .map(|(n, e)| (n[1..].to_string(), e.ty.display()))
+                                        .collect()
+                                )
+                            ),
+                        )),
                     },
-                    e => self.order_key(&mut sc, e)?,
+                    e => self.order_key(&mut sc, e),
+                };
+                let Some(k) = self.guard(top, key)? else {
+                    continue;
                 };
                 order.push((k, o.descending.unwrap_or(false)));
             }
@@ -1635,28 +1875,32 @@ impl Ctx<'_> {
             }
         }
         if let Some(limit) = &body.limit {
+            if let Some(span) = &body.spans.limit {
+                self.set_at(span);
+            }
             let k = match limit {
-                Limit::Literal(n) => Count::Literal(*n),
-                Limit::Param(p) => {
-                    let Some(t) = sc.params.get(p) else {
-                        return Err(err(T6, format!("`limit ${p}` names no parameter")));
-                    };
-                    if t.list || !is_integer(t.scalar) {
-                        return Err(err(
-                            T7,
-                            format!(
-                                "`limit ${p}` needs an integer parameter, got {}",
-                                t.display_name()
-                            ),
-                        ));
-                    }
-                    Count::Param(p.clone())
-                }
+                Limit::Literal(n) => Ok(Count::Literal(*n)),
+                Limit::Param(p) => match sc.params.get(p) {
+                    None => Err(err(T6, format!("`limit ${p}` names no parameter"))),
+                    Some(t) if t.list || !is_integer(t.scalar) => Err(err(
+                        T7,
+                        format!(
+                            "`limit ${p}` needs an integer parameter, got {}",
+                            t.display_name()
+                        ),
+                    )),
+                    Some(_) => Ok(Count::Param(p.clone())),
+                },
             };
-            term = Term::Cut {
-                input: term.boxed(),
-                k,
-            };
+            if let Some(k) = self.guard(top, k)? {
+                term = Term::Cut {
+                    input: term.boxed(),
+                    k,
+                };
+            }
+        }
+        if top && !self.refusals.is_empty() {
+            return Err(E::Recorded);
         }
         term = Term::Project {
             input: term.boxed(),
@@ -1693,6 +1937,119 @@ impl Ctx<'_> {
             shaped,
             ranked: ordered_ranked,
             free: sc.free.clone(),
+        })
+    }
+
+    /// One return item: an aggregate, an expression over aggregates, or a
+    /// value, pushed where [`Ctx::read_body`] reads it.
+    #[allow(clippy::too_many_arguments)]
+    fn return_item(
+        &mut self,
+        sc: &mut Scope,
+        p: &Projection,
+        name: &str,
+        items: &mut Vec<Option<(String, SExpr)>>,
+        aggs: &mut Vec<(String, Agg)>,
+        post: &mut Vec<(String, SExpr)>,
+    ) -> R<()> {
+        if let Some(agg) = self.aggregate(sc, &p.expr)? {
+            aggs.push((format!("^{name}"), agg));
+            items.push(None);
+        } else if contains_agg(&p.expr) {
+            // An expression over aggregates (`count($p) > 3 as big`): the
+            // aggregates are hidden `Group` columns, the expression a
+            // projection after the group.
+            let mut hidden = Vec::new();
+            let rewritten = self.extract_aggs(sc, &p.expr, &mut hidden)?;
+            for (n, a) in &hidden {
+                sc.cols.push(Col {
+                    name: n.clone(),
+                    ty: a.ty.clone(),
+                });
+            }
+            let e = self.expr(sc, &rewritten, At::Value)?;
+            if p.alias.is_none() {
+                return Err(err(
+                    T43,
+                    "an expression over aggregates in return needs an alias",
+                ));
+            }
+            aggs.extend(hidden);
+            post.push((format!("^{name}"), e));
+            items.push(None);
+        } else {
+            let e = self.expr(sc, &p.expr, At::Value)?;
+            if matches!(e.ty, Ty::Value(ref t) if t.scalar == ScalarType::Blob) {
+                return Err(err(T24, format!("a Blob is not a read value (`{name}`)")));
+            }
+            if matches!(e.ty, Ty::Value(ref t) if t.scalar == ScalarType::Bool)
+                && p.alias.is_none()
+                && !e.is_reference_read()
+                && !matches!(e.kind, SKind::Col(_) | SKind::Lit(_))
+            {
+                return Err(err(
+                    T43,
+                    "a comparison in return needs an alias; write `… as <name>`",
+                ));
+            }
+            items.push(Some((format!("^{name}"), e)));
+        }
+        Ok(())
+    }
+
+    /// An order key over grouped rows: a return item's alias, a return item's
+    /// expression, or an aggregate one repeats.
+    #[allow(clippy::too_many_arguments)]
+    fn grouped_order_key(
+        &mut self,
+        sc: &mut Scope,
+        body: &ReadBody,
+        o: &Ordering,
+        names: &[String],
+        out_cols: &[Col],
+        aggs: &[(String, Agg)],
+        keys: &[(String, SExpr)],
+    ) -> R<SExpr> {
+        let same_item = body.projections.iter().position(|p| p.expr == o.expr);
+        Ok(match &o.expr {
+            Expr::Ident(alias) if names.contains(alias) => {
+                let i = names.iter().position(|n| n == alias).unwrap();
+                SExpr::new(SKind::Col(format!("^{alias}")), out_cols[i].ty.clone())
+            }
+            _ if same_item.is_some() => {
+                let i = same_item.unwrap();
+                SExpr::new(SKind::Col(format!("^{}", names[i])), out_cols[i].ty.clone())
+            }
+            e if self.aggregate(sc, e).is_ok_and(|a| a.is_some()) => {
+                let a = self.aggregate(sc, e)?.unwrap();
+                match aggs.iter().find(|(_, x)| *x == a) {
+                    Some((n, x)) => SExpr::new(SKind::Col(n.clone()), x.ty.clone()),
+                    None => {
+                        return Err(err(
+                            T42,
+                            "an aggregate order key must repeat a return item; order by its alias",
+                        ));
+                    }
+                }
+            }
+            e if contains_agg(e) => {
+                return Err(err(
+                    T42,
+                    "an aggregate order key must repeat a return item; order by its alias",
+                ));
+            }
+            e => {
+                let typed = self.order_key(sc, e)?;
+                match keys.iter().find(|(_, k)| *k == typed) {
+                    Some((n, k)) => SExpr::new(SKind::Col(n.clone()), k.ty.clone()),
+                    None => {
+                        return Err(err(
+                            T42,
+                            "an order key over grouped rows must be a return item or name its alias",
+                        ));
+                    }
+                }
+            }
         })
     }
 
@@ -1856,12 +2213,19 @@ impl Ctx<'_> {
             return Err(E::D(refusal));
         }
         lookahead(&pattern.elements, sc);
+        let recorded = self.refusals.len();
         let mut parts = components::Parts::default();
         // Each triple of an inner scope and the ends it introduced.
         let mut introduced: Vec<(usize, Vec<String>)> = Vec::new();
         for (i, c) in pattern.elements.iter().enumerate() {
             if let Some(span) = pattern.spans.elements.get(i) {
-                self.at = Some(span.position);
+                self.set_at(span);
+            }
+            if sc.recover && sc.depends_on_refused(&element_names(c)) {
+                // It names what a refused element would have bound.
+                let binds = element_binds(c);
+                sc.poison(&binds);
+                continue;
             }
             self.element_span = (pattern.spans.elements.len() == pattern.elements.len())
                 .then(|| pattern.spans.elements.get(i).cloned())
@@ -1885,7 +2249,17 @@ impl Ctx<'_> {
             }
             let before = sc.cols.len();
             sc.reads.clear();
-            self.element(sc, c)?;
+            let typed = self.element(sc, c);
+            if self.guard(sc.recover, typed)?.is_none() {
+                sc.block_buf.clear();
+                sc.cols.truncate(before);
+                let binds = element_binds(c);
+                sc.poison(&binds);
+                if matches!(c, Element::From { .. }) {
+                    sc.opaque = true;
+                }
+                continue;
+            }
             let bound: Vec<String> = sc.cols[before..].iter().map(|c| c.name.clone()).collect();
             if let Element::Traversal(t) = c {
                 let ends: Vec<String> = [&t.src, &t.dst]
@@ -1898,11 +2272,15 @@ impl Ctx<'_> {
             parts.element(i, c, bound, std::mem::take(&mut sc.reads));
             self.flush(sc, false)?;
         }
-        if sc.block || sc.inner {
+        if (sc.block || sc.inner) && !sc.refused_any() {
             unbound_triple_names(pattern, sc, &introduced)?;
         }
         if let Some(predicate) = &pattern.predicate {
-            let written = pattern.spans.predicate.as_ref().map(|s| s.position);
+            let written = pattern
+                .spans
+                .predicate
+                .as_ref()
+                .map(|s| (s.position, s.end_position));
             if written.is_some() {
                 self.at = written;
             }
@@ -1913,8 +2291,13 @@ impl Ctx<'_> {
             }
             self.flush(sc, false)?;
         }
-        if let Some(refusal) = parts.refusal(self.catalog, sc, pattern) {
-            return Err(E::D(refusal));
+        // The product rule reads every element: a refused one leaves it
+        // unknown, and a refused conjunct's fix can move it into `match`.
+        if !sc.refused_any()
+            && self.refusals.len() == recorded
+            && let Some(refusal) = parts.refusal(self.catalog, sc, pattern)
+        {
+            self.guard::<()>(sc.recover, Err(E::D(refusal)))?;
         }
         Ok(())
     }
@@ -1938,15 +2321,27 @@ impl Ctx<'_> {
             let at = sc.position(&vars);
             match p {
                 Pending::Filter(e, before, written) => {
-                    if written.is_some() {
-                        self.at = written;
-                    }
-                    // An error abandons the scope, so the restriction needs
-                    // no reset on that path.
+                    // An error outside the top scope abandons the scope, so
+                    // the restriction needs no reset on that path.
                     sc.block_visible = Some(before);
                     for conj in conjuncts(&e) {
-                        let pred = self.expr(sc, conj, At::Filter { top: true })?;
-                        require_bool(&pred, "a filter")?;
+                        // A conjunct is placed at its own first span, the
+                        // `where` when it has none.
+                        match first_span(conj) {
+                            Some(span) => self.set_at(&span),
+                            None if written.is_some() => self.at = written,
+                            None => {}
+                        }
+                        if sc.recover && sc.depends_on_refused(&expr_names(conj)) {
+                            continue;
+                        }
+                        let typed = self
+                            .expr(sc, conj, At::Filter { top: true })
+                            .and_then(|pred| require_bool(&pred, "a filter").map(|()| pred));
+                        let Some(pred) = self.guard(sc.recover, typed)? else {
+                            sc.block_buf.clear();
+                            continue;
+                        };
                         let blocks = std::mem::take(&mut sc.block_buf);
                         sc.push_filter(at, Step::Filter { blocks, pred });
                     }
@@ -2083,7 +2478,13 @@ impl Ctx<'_> {
                 nullable: false,
             });
         }
-        Err(err(T1, format!("unknown node type `{type_name}`")))
+        Err(err(
+            T1,
+            format!(
+                "unknown node type `{type_name}`{}",
+                nearest::listing(type_name, nearest::binding_types(self.catalog))
+            ),
+        ))
     }
 
     fn traversal(&mut self, sc: &mut Scope, t: &Traversal) -> R<()> {
@@ -2460,7 +2861,9 @@ impl Ctx<'_> {
         if pattern.predicate.as_ref().is_some_and(has_search_predicate) {
             return Ok(true);
         }
-        let at = pattern.spans.elements.first().map(|s| s.position);
+        let first = pattern.spans.elements.first();
+        let at = first.map(|s| s.position);
+        let at_end = first.map(|s| s.end_position);
         let mut d = QueryDiagnostic::typecheck(
             T68,
             format!(
@@ -2469,6 +2872,7 @@ impl Ctx<'_> {
             ),
         );
         d.position = at;
+        d.end = at_end;
         if block.func != BlockFunc::Exists {
             return Err(E::D(d.with_fix(format!(
                 "read the outer `${variable}` without binding it inside the block, or write the filter as a conjunct of the `where`"
@@ -2483,7 +2887,7 @@ impl Ctx<'_> {
             Step::Filter { pred, .. } => pred.ty.nullable(),
             _ => false,
         });
-        self.at = at;
+        self.at = at.zip(at_end);
         let span = &block.at;
         let (open, close) = if nullable {
             ("coalesce(", ", false)")
@@ -2650,7 +3054,19 @@ impl Ctx<'_> {
                 format!("bind a relation: `let ${v}s = {{ match {{ … }} return {{ … }} }}`"),
             ));
         }
-        Err(err(T6, format!("`${v}` names no relation in scope")))
+        Err(err(
+            T6,
+            format!(
+                "`${v}` names no relation in scope{}",
+                nearest::listing(
+                    &format!("${v}"),
+                    sc.rels
+                        .keys()
+                        .map(|r| (format!("${r}"), "relation".into()))
+                        .collect()
+                )
+            ),
+        ))
     }
 
     fn rel_call(&mut self, sc: &mut Scope, c: &Call) -> R<Rel> {
@@ -2759,11 +3175,15 @@ impl Ctx<'_> {
     fn ranking(&mut self, sc: &mut Scope, c: &Call, named: Option<&str>) -> R<Rel> {
         let name = c.name.as_str();
         let (positional, admitted): (usize, &[&str]) = match name {
-            "nearest" => (3, &["k", "recall"]),
+            "nearest" => (3, &["k (integer)", "recall (F64 in (0, 1])"]),
             _ => (3, &[]),
         };
+        let admitted_names: Vec<&str> = admitted
+            .iter()
+            .map(|a| a.split(' ').next().unwrap_or(a))
+            .collect();
         for (o, _) in &c.options {
-            if !admitted.contains(&o.as_str()) {
+            if !admitted_names.contains(&o.as_str()) {
                 return Err(err(
                     T71,
                     format!(
@@ -2855,7 +3275,12 @@ impl Ctx<'_> {
             None => {
                 return Err(err(
                     if name == "bm25" { T27 } else { T15 },
-                    format!("type `{type_name}` has no property `{property}` for `{name}` to rank"),
+                    format!(
+                        "type `{type_name}` has no property `{property}` for `{name}` to rank{}",
+                        self.node_props(&type_name)
+                            .map(|p| nearest::listing(&property, nearest::properties(p)))
+                            .unwrap_or_default()
+                    ),
                 ));
             }
         };
@@ -3099,7 +3524,9 @@ impl Ctx<'_> {
                 (other, _) => {
                     return Err(err(
                         T71,
-                        format!("`terms` has no option `{other}`; it admits mode, max_edits"),
+                        format!(
+                            "`terms` has no option `{other}`; it admits mode (`all` or `any`), max_edits (integer)"
+                        ),
                     ));
                 }
             }
@@ -3208,7 +3635,9 @@ impl Ctx<'_> {
                 (other, _) => {
                     return Err(err(
                         T71,
-                        format!("`rrf` has no option `{other}`; it admits k, weights"),
+                        format!(
+                            "`rrf` has no option `{other}`; it admits k (integer), weights (a list of numbers)"
+                        ),
                     ));
                 }
             }
@@ -3491,9 +3920,13 @@ impl Ctx<'_> {
                             return Err(err(
                                 T11,
                                 format!(
-                                    "type `{type_name}` has no property `{}`{}",
+                                    "type `{type_name}` has no property `{}`{}{}",
                                     a.property,
-                                    system_assignment_hint(&a.property)
+                                    system_assignment_hint(&a.property),
+                                    nearest::listing(
+                                        &a.property,
+                                        nearest::properties(&node.properties)
+                                    )
                                 ),
                             ));
                         };
@@ -3550,11 +3983,15 @@ impl Ctx<'_> {
                             }
                             p => {
                                 let Some(pt) = edge.properties.get(p).cloned() else {
+                                    let mut names = nearest::properties(&edge.properties);
+                                    names.push(("from".into(), edge.from_type.clone()));
+                                    names.push(("to".into(), edge.to_type.clone()));
                                     return Err(err(
                                         T11,
                                         format!(
-                                            "type `{type_name}` has no property `{p}`{}",
-                                            system_assignment_hint(p)
+                                            "type `{type_name}` has no property `{p}`{}{}",
+                                            system_assignment_hint(p),
+                                            nearest::listing(p, names)
                                         ),
                                     ));
                                 };
@@ -3592,7 +4029,13 @@ impl Ctx<'_> {
                         WriteClass::Constructive,
                     ));
                 }
-                Err(err(T10, format!("unknown node/edge type `{type_name}`")))
+                Err(err(
+                    T10,
+                    format!(
+                        "unknown node/edge type `{type_name}`{}",
+                        nearest::listing(type_name, nearest::binding_types(self.catalog))
+                    ),
+                ))
             }
             Stmt::Update {
                 variable,
@@ -3621,9 +4064,10 @@ impl Ctx<'_> {
                         return Err(err(
                             T11,
                             format!(
-                                "type `{type_name}` has no property `{}`{}",
+                                "type `{type_name}` has no property `{}`{}{}",
                                 a.property,
-                                system_assignment_hint(&a.property)
+                                system_assignment_hint(&a.property),
+                                nearest::listing(&a.property, nearest::properties(&props))
                             ),
                         ));
                     };
@@ -3836,7 +4280,10 @@ impl Ctx<'_> {
                     };
                     return Err(err(
                         T6,
-                        format!("type `{type_name}` has no property `{prop}`{hint}"),
+                        format!(
+                            "type `{type_name}` has no property `{prop}`{hint}{}",
+                            nearest::listing(prop, nearest::properties(props))
+                        ),
                     ));
                 };
                 let mut p = p.clone();
@@ -3865,7 +4312,12 @@ impl Ctx<'_> {
                             "src" | "dst" => format!("; the system endpoint is `${var}.@{prop}`"),
                             _ => String::new(),
                         };
-                        format!("edge `{type_name}` has no property `{prop}`{hint}")
+                        let near = self
+                            .catalog
+                            .lookup_edge_by_name(type_name)
+                            .map(|e| nearest::listing(prop, nearest::properties(&e.properties)))
+                            .unwrap_or_default();
+                        format!("edge `{type_name}` has no property `{prop}`{hint}{near}")
                     };
                     return Err(err(T6, what));
                 };
@@ -3927,7 +4379,13 @@ impl Ctx<'_> {
                         ),
                     ));
                 } else {
-                    return Err(err(T6, format!("variable `${v}` is not bound")));
+                    return Err(err(
+                        T6,
+                        format!(
+                            "variable `${v}` is not bound{}",
+                            nearest::listing(&format!("${v}"), sc.names_in_scope())
+                        ),
+                    ));
                 }
             }
             Expr::Prop { variable, property } => {
@@ -3938,7 +4396,13 @@ impl Ctx<'_> {
                             format!("`${variable}` is a parameter and has no properties"),
                         ));
                     }
-                    return Err(err(T6, format!("variable `${variable}` is not bound")));
+                    return Err(err(
+                        T6,
+                        format!(
+                            "variable `${variable}` is not bound{}",
+                            nearest::listing(&format!("${variable}"), sc.names_in_scope())
+                        ),
+                    ));
                 };
                 if let Some(field) = property.strip_prefix('@') {
                     let admitted = match &ty {
@@ -4095,6 +4559,7 @@ impl Ctx<'_> {
                         )
                         .with_fix(format!("match {{ …, ${a} in ${b} }}"));
                         d.position = Some(written.position);
+                        d.end = Some(written.end_position);
                         return Err(E::D(d));
                     }
                 }
@@ -4245,7 +4710,10 @@ impl Ctx<'_> {
             |t: &Ty| matches!(t, Ty::Value(p) if p.scalar == ScalarType::String && !p.list);
         let no_options = |c: &Call| -> R<()> {
             match c.options.first() {
-                Some((o, _)) => Err(err(T71, format!("`{}` has no option `{o}`", c.name))),
+                Some((o, _)) => Err(err(
+                    T71,
+                    format!("`{}` has no option `{o}`; it admits none", c.name),
+                )),
                 None => Ok(()),
             }
         };
@@ -4358,7 +4826,15 @@ impl Ctx<'_> {
                         }
                         options.push((o.clone(), self.expr(sc, v, At::Value)?));
                     } else {
-                        return Err(err(T71, format!("`{name}` has no option `{o}`")));
+                        let admits = if name == "fuzzy" {
+                            "max_edits (integer)"
+                        } else {
+                            "none"
+                        };
+                        return Err(err(
+                            T71,
+                            format!("`{name}` has no option `{o}`; it admits {admits}"),
+                        ));
                     }
                 }
                 if name == "fuzzy" && options.is_empty() {
@@ -5937,6 +6413,7 @@ fn reversed_triple(
     ));
     if let Some(span) = span {
         d.position = Some(span.position);
+        d.end = Some(span.end_position);
         if let [(ss, se), (ds, de)] = span.ranges.as_slice() {
             d = d.with_suggestion(Suggestion {
                 applicability: Applicability::MachineApplicable,
@@ -6068,6 +6545,7 @@ fn membership_triple(pattern: &Pattern, sc: &Scope) -> Option<QueryDiagnostic> {
     let spans = &pattern.spans.elements;
     if let Some(span) = spans.get(i) {
         d.position = Some(span.position);
+        d.end = Some(span.end_position);
     }
     // Remove the element with one separator, then add the test to the
     // `where` (or open one after the braces).
@@ -6334,6 +6812,106 @@ fn for_each_child(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
+/// The variables a write statement names.
+fn statement_names(s: &Stmt) -> Vec<String> {
+    let mut out = Vec::new();
+    let assignments = match s {
+        Stmt::Insert { assignments, .. } => assignments.as_slice(),
+        Stmt::Update {
+            variable,
+            assignments,
+        } => {
+            out.push(variable.clone());
+            assignments.as_slice()
+        }
+        Stmt::Delete { variable } => {
+            out.push(variable.clone());
+            &[]
+        }
+    };
+    for a in assignments {
+        expr_vars(&a.value, &mut out);
+    }
+    out
+}
+
+/// The variables an element names, bound or read, a `from`'s relation and
+/// a `let`'s value included: what a refused element's dependents name.
+fn element_names(c: &Element) -> Vec<String> {
+    let mut out = element_binds(c);
+    match c {
+        Element::Let { value, .. } => match value {
+            LetValue::Expr(e) => expr_vars(e, &mut out),
+            LetValue::Relation(body) => body_vars(body, &mut out),
+        },
+        Element::From { rel, .. } => match rel {
+            RelExpr::Variable(v) => out.push(v.clone()),
+            RelExpr::Call(c) => call_vars(c, &mut out),
+            RelExpr::Inline(body) => body_vars(body, &mut out),
+        },
+        Element::Optional(p) => pattern_vars(p, &mut out),
+        Element::Binding { .. } | Element::Traversal(_) => {}
+    }
+    out
+}
+
+/// The names an element would bind.
+fn element_binds(c: &Element) -> Vec<String> {
+    match c {
+        Element::Let { name, .. } => vec![name.clone()],
+        Element::Binding { variable, .. } => vec![variable.clone()],
+        Element::Traversal(t) => [Some(&t.src), Some(&t.dst), t.edge_binding.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|n| *n != "_")
+            .cloned()
+            .collect(),
+        Element::Optional(p) => {
+            let mut out = Vec::new();
+            pattern_vars(p, &mut out);
+            out
+        }
+        Element::From { rel, score } => {
+            let mut out: Vec<String> = score.iter().cloned().collect();
+            if let RelExpr::Inline(body) = rel {
+                for p in &body.projections {
+                    match (&p.alias, &p.expr) {
+                        (Some(a), _) => out.push(a.clone()),
+                        (None, Expr::Variable(v)) => out.push(v.clone()),
+                        _ => {}
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Every variable a relation call names in its arguments and options.
+fn call_vars(c: &Call, out: &mut Vec<String>) {
+    for a in &c.args {
+        match a {
+            Arg::Expr(e) => expr_vars(e, out),
+            Arg::Inline(body) => body_vars(body, out),
+        }
+    }
+    for (_, e) in &c.options {
+        expr_vars(e, out);
+    }
+}
+
+/// Every variable a read body names: its pattern, return items and order
+/// keys.
+fn body_vars(body: &ReadBody, out: &mut Vec<String>) {
+    pattern_vars(&body.pattern, out);
+    for p in &body.projections {
+        expr_vars(&p.expr, out);
+    }
+    for o in &body.order {
+        expr_vars(&o.expr, out);
+    }
+}
+
 fn pattern_vars(pattern: &Pattern, out: &mut Vec<String>) {
     for c in &pattern.elements {
         match c {
@@ -6354,6 +6932,32 @@ fn pattern_vars(pattern: &Pattern, out: &mut Vec<String>) {
     if let Some(p) = &pattern.predicate {
         expr_vars(p, out);
     }
+}
+
+/// The first span written inside `e`, in source order: where a conjunct of
+/// a `where` is placed.
+fn first_span(e: &Expr) -> Option<SourceSpan> {
+    let own = match e {
+        Expr::Compare { at, .. } | Expr::In { at, .. } | Expr::InfixString { at, .. } => Some(at),
+        Expr::Block(b) => Some(&b.at),
+        _ => None,
+    };
+    let mut found = own.filter(|at| at.end > at.start).cloned();
+    for_each_child(e, &mut |child| {
+        if let Some(span) = first_span(child)
+            && found.as_ref().is_none_or(|f| span.start < f.start)
+        {
+            found = Some(span);
+        }
+    });
+    found
+}
+
+/// Every variable `e` names, inside its blocks too.
+fn expr_names(e: &Expr) -> Vec<String> {
+    let mut out = Vec::new();
+    expr_vars(e, &mut out);
+    out
 }
 
 fn expr_vars(e: &Expr, out: &mut Vec<String>) {
@@ -6397,6 +7001,7 @@ mod bind;
 mod components;
 mod literal;
 mod lowering;
+pub(crate) mod nearest;
 mod result;
 pub use result::{projection_field, result_schema};
 mod scalar;
