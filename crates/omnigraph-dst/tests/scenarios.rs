@@ -3783,6 +3783,89 @@ fn branch_write_cost_rows(replay: &str) -> String {
     )
 }
 
+/// Issue #1382: deleting a branch on a reopened handle, with one and with
+/// eight proposals (`as commit`) on it. Each proposal holds a reserved
+/// `unpublished_<id>` tag on `__manifest`; branch delete lists tag names and
+/// reads only user tags, so its rows are equal at both sizes. Before the fix
+/// it read every tag, two more requests per proposal.
+fn branch_delete_tag_cost_rows(replay: &str) -> String {
+    const PROPOSE: &str = r#"
+query propose($name: String, $age: I32) as commit {
+    insert Person { name: $name, age: $age }
+}
+"#;
+
+    struct BranchDeleteTagCost {
+        proposals: i64,
+        label: &'static str,
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for BranchDeleteTagCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_branch_delete_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            db.branch_create("feature").await.unwrap();
+            for proposal in 0..self.proposals {
+                db.mutate(
+                    "feature",
+                    PROPOSE,
+                    "propose",
+                    &mixed_params(
+                        &[("$name", &format!("p{proposal:02}"))],
+                        &[("$age", proposal)],
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                db.list_unpublished_commits(Some("feature"))
+                    .await
+                    .unwrap()
+                    .len(),
+                usize::try_from(self.proposals).unwrap()
+            );
+            let detached = db.detach();
+            let db = detached.attach(Arc::new(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            ));
+            omnigraph_dst::cost::set_label(self.label);
+            let deleted = db.branch_delete("feature").await;
+            omnigraph_dst::cost::set_label("_branch_delete_verify");
+            deleted.unwrap();
+            assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+        }
+    }
+
+    let mut rows = String::new();
+    for (proposals, label) in [(1, "BranchDeleteProposals1"), (8, "BranchDeleteProposals8")] {
+        rows.push_str(&labeled_cost_rows(
+            format!("shared-memory://dst-branch-delete-cost-{replay}-{label}"),
+            &BranchDeleteTagCost { proposals, label },
+            label,
+        ));
+    }
+    rows
+}
+
 /// The first claim of `main` on a reopened handle: one `__manifest` version
 /// and no data-table call.
 fn writer_claim_cost_rows(replay: &str) -> String {
@@ -4459,6 +4542,7 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&nearest_cost_rows("a"));
     table.push_str(&carried_write_cost_rows("a"));
     table.push_str(&writer_claim_cost_rows("a"));
+    table.push_str(&branch_delete_tag_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
     let mut table2 = ledger2.render_calls();
@@ -4477,6 +4561,7 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&nearest_cost_rows("b"));
     table2.push_str(&carried_write_cost_rows("b"));
     table2.push_str(&writer_claim_cost_rows("b"));
+    table2.push_str(&branch_delete_tag_cost_rows("b"));
     assert_eq!(
         table, table2,
         "the counting pass must replay identically before any golden claim"
