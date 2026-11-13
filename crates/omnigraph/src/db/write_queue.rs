@@ -105,8 +105,16 @@ tokio::task_local! {
 /// Run `attempt`, one attempt of a write, as a preparation: until the
 /// attempt reaches its commit point ([`end_preparation`]), every writer-gate
 /// acquisition in this task refuses.
-pub(crate) async fn preparing<F: Future>(attempt: F) -> F::Output {
-    PREPARING.scope(Cell::new(true), attempt).await
+///
+/// The attempt is boxed before the scope wraps it. A write attempt is a large
+/// future, and debug builds copy a future by value through each wrapper on
+/// the stack; boxing it once keeps the writer's own future, and its stack
+/// depth, the size it was before the scope existed.
+pub(crate) fn preparing<'a, F>(attempt: F) -> impl Future<Output = F::Output> + 'a
+where
+    F: Future + 'a,
+{
+    PREPARING.scope(Cell::new(true), Box::pin(attempt))
 }
 
 /// The attempt reached its commit point: it takes the writer gates from here
