@@ -24,7 +24,7 @@ node Person {
 --- query
 set engine = v2;
 query joined_with_and() {
-    match { $p: Person, $q: Person }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
     where $p.age > 30 and $p.age > $q.age
     return { $p.slug, $q.slug }
 }
@@ -46,7 +46,7 @@ filter reads [p.age, q.age]
 --- query
 set engine = v2;
 query two_clauses() {
-    match { $p: Person, $q: Person }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
     where $p.age > 30 and $p.age > $q.age
     return { $p.slug, $q.slug }
 }

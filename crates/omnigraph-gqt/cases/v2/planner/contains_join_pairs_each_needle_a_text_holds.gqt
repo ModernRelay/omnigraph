@@ -43,7 +43,7 @@ node Passage {
 --- query
 set engine = v2;
 query found_numbers() {
-    match { $m: Matter, $p: Passage }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number) and $m.mid != "m-empty"
     return { $m.mid, $p.pid }
 }
@@ -75,7 +75,7 @@ pass join_algorithm
 --- query
 set engine = v2;
 query found_numbers_and_the_empty_one() {
-    match { $m: Matter, $p: Passage }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number)
     return { $m.mid, $p.pid }
 }
@@ -108,7 +108,7 @@ p.pid: String
 --- query
 set engine = v2;
 query found_numbers_by_every_pair() {
-    match { $m: Matter, $p: Passage }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where ((contains($p.text, $m.number)) or false)
     return { $m.mid, $p.pid }
 }
@@ -146,7 +146,7 @@ not pass join_algorithm
 --- query
 set engine = v2;
 query found_numbers_under_a_second_filter() {
-    match { $m: Matter, $p: Passage }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number)
       and $m.number != $p.text and ($m.mid != "m-16" or $p.pid != "p-overlap")
     return { $m.mid, $p.pid }
@@ -184,7 +184,7 @@ pass join_algorithm
 --- query
 set engine = v2;
 query passage_written_first() {
-    match { $p: Passage, $m: Matter }
+    match { $p: Passage, let $ms = { match { $m: Matter } return { $m } }, from $ms }
     where contains($p.text, $m.number) and $m.mid != "m-empty"
     return { $m.mid, $p.pid }
 }

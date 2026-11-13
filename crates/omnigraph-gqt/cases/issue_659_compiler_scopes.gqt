@@ -145,7 +145,7 @@ person: String
 
 --- query
 query named_unanchored() {
-    match { $p: Person, $x knows $y }
+    match { $p: Person, let $xs = { match { $x knows $y } return { $x, $y } }, from $xs }
     return { $p.name }
 }
 --- expect unordered
@@ -157,7 +157,7 @@ p.name: String
 
 --- query
 query selected_unanchored() {
-    match { $p: Person, $x (knows | likes) $y }
+    match { $p: Person, let $xs = { match { $x (knows | likes) $y } return { $x, $y } }, from $xs }
     return { $p.name }
 }
 --- expect unordered

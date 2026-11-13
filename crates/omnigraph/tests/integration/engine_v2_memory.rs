@@ -1160,14 +1160,14 @@ node Passage {
 "#;
 
 const CITED: &str = r#"query cited() {
-    match { $m: Matter, $p: Passage }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number)
     return { $m.mid, $p.pid }
 }"#;
 
 /// The same pairs through a conjunct the join derives no needles from.
 const CITED_WITHOUT_NEEDLES: &str = r#"query cited() {
-    match { $m: Matter, $p: Passage }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where (contains($p.text, $m.number) or $p.text = $m.number)
     return { $m.mid, $p.pid }
 }"#;
@@ -1854,7 +1854,7 @@ fn cited_by(conjunct: &str, extra: &str) -> String {
         format!("({conjunct}) and {extra}")
     };
     format!(
-        "query cited() {{\n    match {{ $m: Matter, $p: Passage }}\n    where {filter}\n    return {{ $m.mid, $p.pid }}\n}}"
+        "query cited() {{\n    match {{ $m: Matter, let $ps = {{ match {{ $p: Passage }} return {{ $p }} }}, from $ps }}\n    where {filter}\n    return {{ $m.mid, $p.pid }}\n}}"
     )
 }
 

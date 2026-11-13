@@ -233,7 +233,7 @@ query comparison_order_key_not_returned() {
 
 --- query
 query composed_distinct_counts() {
-    match { $f: Forum, $f hasMember $p, $copy: Person }
+    match { $f: Forum, $f hasMember $p, let $copies = { match { $copy: Person } return { $copy } }, from $copies }
     where $f.slug = "f1"
     return {
         count(distinct $p) > 0 as has_member,
@@ -254,7 +254,7 @@ repeated_ages: Bool?
 
 --- query
 query distinct_comparison_order_expression() {
-    match { $f: Forum, $f hasMember $p, $copy: Person }
+    match { $f: Forum, $f hasMember $p, let $copies = { match { $copy: Person } return { $copy } }, from $copies }
     return {
         $f.title as title,
         count(distinct $p) > 1 as popular,

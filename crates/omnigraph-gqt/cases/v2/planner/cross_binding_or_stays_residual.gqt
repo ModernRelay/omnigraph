@@ -24,7 +24,7 @@ node Person {
 --- query
 set engine = v2;
 query cross_binding_or() {
-    match { $p: Person, $q: Person }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
     where ($p.x = 1 or $q.y = 2)
     return { $p.slug, $q.slug }
 }

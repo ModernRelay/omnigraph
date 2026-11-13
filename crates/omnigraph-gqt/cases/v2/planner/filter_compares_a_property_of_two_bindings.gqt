@@ -23,7 +23,7 @@ node Person {
 --- query
 set engine = v2;
 query older_pairs() {
-    match { $a: Person, $b: Person }
+    match { $a: Person, let $bs = { match { $b: Person } return { $b } }, from $bs }
     where $a.age > $b.age
     return { $a.name, $b.name }
 }

@@ -140,17 +140,17 @@ const PEOPLE_SEED: &[&str] = &[
 
 const PEOPLE_QUERIES: &str = r#"
 query older_pairs() {
-    match { $p: Person, $q: Person }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
     where $p.age > $q.age
     return { $p.name, $q.name }
 }
 query older_likers() {
-    match { $p: Person, $q: Person, $p likes $d }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs, $p likes $d }
     where $p.age > $q.age
     return { $p.name, $q.name, $d.title }
 }
 query older_than_likers_of_d0_or_bob() {
-    match { $p: Person, $q: Person, $q likes $d }
+    match { $p: Person, let $qs = { match { $q: Person, $q likes $d } return { $q, $d } }, from $qs }
     where $p.age > $q.age and ($d.title = "d0" or $p.name = "bob")
     return { $p.name, $q.name, $d.title }
 }
@@ -358,19 +358,19 @@ const CITATION_SEED: &[&str] = &[
 ];
 
 const CITED: &str = r#"query cited() {
-    match { $m: Matter, $p: Passage }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number)
     return { $m.mid, $p.pid }
 }"#;
 
 const CITED_PASSAGE_FIRST: &str = r#"query cited() {
-    match { $p: Passage, $m: Matter }
+    match { $p: Passage, let $ms = { match { $m: Matter } return { $m } }, from $ms }
     where contains($p.text, $m.number)
     return { $m.mid, $p.pid }
 }"#;
 
 const OLDER_PAIRS: &str = r#"query older_pairs() {
-    match { $p: Person, $q: Person }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
     where $p.age > $q.age
     return { $p.name, $q.name }
 }"#;
@@ -592,7 +592,7 @@ async fn a_text_contains_join_filters_its_right_scan_and_pairs_only_the_found_pa
 
 /// `m2`'s pair fails the second filter, which only `m1` and `p9` can pass.
 const CITED_BY_M1: &str = r#"query cited() {
-    match { $m: Matter, $p: Passage }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number) and ($m.mid = "m1" or $p.pid = "p9")
     return { $m.mid, $p.pid }
 }"#;

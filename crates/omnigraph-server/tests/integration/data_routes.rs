@@ -4959,7 +4959,7 @@ async fn query_endpoint_answers_an_explain_statement_as_rows() {
 
 const EXPLAIN_INSERT_PERSON: &str = "explain query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}\n";
 
-const EXPLAIN_OLDER_PAIRS: &str = "explain query older_pairs() {\n    match { $a: Person, $b: Person }\n    where $a.age > $b.age\n    return { $a.name, $b.name }\n}\n";
+const EXPLAIN_OLDER_PAIRS: &str = "explain query older_pairs() {\n    match { $a: Person, let $bs = { match { $b: Person } return { $b } }, from $bs }\n    where $a.age > $b.age\n    return { $a.name, $b.name }\n}\n";
 
 /// The `explain` answer lists the lowered DataFusion tree after the physical
 /// tree: a filter over two bindings, which no scan can take, runs in the

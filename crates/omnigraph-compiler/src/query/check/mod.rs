@@ -10,7 +10,10 @@
 //! `let` on the elements before it. The steps fold into one term.
 //!
 //! Traversal resolution (`traversal`), literal typing and type
-//! compatibility (`literal`) are the one implementation of those rules. A
+//! compatibility (`literal`) are the one implementation of those rules. Each
+//! scope's elements form components, and two that share no variable are a
+//! product the scope admits only when every one but one is pinned to a row
+//! by its `@key` (`components`, `T81`). A
 //! last pass (`bind`) puts every expression in its bound form: physical
 //! columns, and the casts [`crate::ir::coerce`] chooses.
 
@@ -686,6 +689,9 @@ struct Scope {
     /// While a filter written earlier is placed: the names bound before it,
     /// the only outer names a block inside it correlates on.
     block_visible: Option<Vec<String>>,
+    /// Every column read since an element began, local or outer: what the
+    /// element's inner term reads, for the product rule (`components`).
+    reads: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -716,6 +722,7 @@ impl Scope {
             inner,
             correlates: false,
             block_visible: None,
+            reads: Vec::new(),
         }
     }
 
@@ -742,9 +749,12 @@ impl Scope {
     /// The type of a column visible here, marking an outer one free.
     fn col(&mut self, name: &str) -> Option<Ty> {
         if let Some(c) = self.local(name) {
-            return Some(c.ty.clone());
+            let ty = c.ty.clone();
+            self.reads.push(name.to_string());
+            return Some(ty);
         }
         let ty = self.outer_col(name)?.ty.clone();
+        self.reads.push(name.to_string());
         if !self.free.iter().any(|f| f == name) {
             self.free.push(name.to_string());
         }
@@ -1629,11 +1639,16 @@ impl Ctx<'_> {
             return Err(E::D(refusal));
         }
         lookahead(&pattern.elements, sc);
+        let mut parts = components::Parts::default();
         for (i, c) in pattern.elements.iter().enumerate() {
             if let Some(span) = pattern.spans.elements.get(i) {
                 self.at = Some(span.position);
             }
+            let before = sc.cols.len();
+            sc.reads.clear();
             self.element(sc, c)?;
+            let bound = sc.cols[before..].iter().map(|c| c.name.clone()).collect();
+            parts.element(i, c, bound, std::mem::take(&mut sc.reads));
             self.flush(sc, false)?;
         }
         if let Some(predicate) = &pattern.predicate {
@@ -1648,12 +1663,18 @@ impl Ctx<'_> {
             }
             self.flush(sc, false)?;
         }
+        if let Some(refusal) = parts.refusal(self.catalog, sc, pattern) {
+            return Err(E::D(refusal));
+        }
         Ok(())
     }
 
     /// Place every pending filter whose variables are bound (all of them at
     /// the end of a scope).
     fn flush(&mut self, sc: &mut Scope, all: bool) -> R<()> {
+        // A filter's reads belong to no element: `where` connects no
+        // component.
+        let reads = std::mem::take(&mut sc.reads);
         let pending = std::mem::take(&mut sc.pending);
         for p in pending {
             let vars = pending_vars(&p, sc);
@@ -1683,6 +1704,7 @@ impl Ctx<'_> {
                 }
             }
         }
+        sc.reads = reads;
         Ok(())
     }
 
@@ -5611,6 +5633,7 @@ fn expr_vars(e: &Expr, out: &mut Vec<String>) {
 }
 
 mod bind;
+mod components;
 mod literal;
 mod lowering;
 mod result;

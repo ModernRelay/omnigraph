@@ -1,0 +1,99 @@
+# issue: none
+# notes: Two patterns that share no variable run as a product when every component but one is pinned to one row by an equality of its
+# notes: `@key` with a literal or a parameter: the pinned binding contributes one row, or none. A write selects a pair of pinned nodes the
+# notes: same way. An unpinned product is written as a named relation, `let $r = { match { … } return { … } }, from $r`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    handle: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company @card(0..1)
+
+--- seed
+{"type":"Person","data":{"handle":"ada","name":"Ada"}}
+{"type":"Person","data":{"handle":"bob","name":"Bob"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"type":"Company","data":{"slug":"initech","name":"Initech"}}
+
+--- query
+query beside_acme() {
+    match { $p: Person, $c: Company }
+    where $c.slug = "acme"
+    return { $p.name, $c.name }
+}
+
+--- expect unordered
+{"p.name":"Ada","c.name":"Acme"}
+{"p.name":"Bob","c.name":"Acme"}
+
+--- expect shape
+p.name: String
+c.name: String
+
+--- query
+query beside($slug: String) {
+    match { $p: Person, $c: Company }
+    where $c.slug = $slug
+    return { $p.name, $c.name }
+}
+
+--- params
+{"slug": "nowhere"}
+
+--- expect unordered
+
+--- expect shape
+p.name: String
+c.name: String
+
+--- mutate
+query hire($h: String, $s: String) {
+    match { $p: Person, $c: Company }
+    where $p.handle = $h and $c.slug = $s
+    insert WorksAt { from: $p, to: $c }
+}
+
+--- params
+{"h": "bob", "s": "initech"}
+
+--- expect ok
+
+--- query
+query employers() {
+    match { $p: Person, $p worksAt $c }
+    return { $p.name, $c.name }
+}
+
+--- expect unordered
+{"p.name":"Bob","c.name":"Initech"}
+
+--- expect shape
+p.name: String
+c.name: String
+
+--- query
+query every_pair() {
+    match { $p: Person, let $cs = { match { $c: Company } return { $c } }, from $cs }
+    return { $p.name, $c.name }
+}
+
+--- expect unordered
+{"p.name":"Ada","c.name":"Acme"}
+{"p.name":"Ada","c.name":"Initech"}
+{"p.name":"Bob","c.name":"Acme"}
+{"p.name":"Bob","c.name":"Initech"}
+
+--- expect shape
+p.name: String
+c.name: String

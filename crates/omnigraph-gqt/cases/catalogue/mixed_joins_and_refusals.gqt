@@ -23,7 +23,7 @@ node Job {
 --- query
 set engine = v2;
 query jobs_with_a_real_operator() {
-    match { $j: Job, $o: @Operator } where $j.uses = $o.name
+    match { $j: Job, let $os = { match { $o: @Operator } return { $o } }, from $os } where $j.uses = $o.name
     return { $j.name, $o.inputs }
     order { $j.name }
 }

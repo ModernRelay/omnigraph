@@ -106,6 +106,41 @@ edge `WorksAt`); edge lookup itself is case-insensitive. Any word is an edge
 name inside `match`, keywords included (`$d in $c` follows an edge `In`), and a
 quoted name is accepted too.
 
+## Patterns that share no variable
+
+The elements form components: a binding, a triple, an `optional` or a `from`
+joins the component of every variable it binds or reads, and a `let` value
+counts as the variables it reads. Two components that share no variable
+multiply their rows, every row of one with every row of the other. A pattern
+holds such a product only when every component but one is pinned to at most
+one row: a single binding whose `@key` (every column of a composite key) a
+top-level conjunct of `where` equates with a literal or a parameter.
+Otherwise the type checker refuses it with `T81` at the second component. The
+`where` and its blocks do not join components, so `where $p.name = $c.name`
+is a filtered product and is refused too. The rule holds in every scope: a
+read's or a write group's `match`, an inline read, a block and an `optional`.
+
+```gq
+query staff_beside($slug: String) {
+  match { $p: Person, $c: Company }
+  where $c.slug = $slug
+  return { $p.name, $c.name }
+}
+```
+
+The fix joins the components through a triple; when exactly one edge type
+connects a variable of one with a variable of the other, the diagnostic's
+suggestion inserts it, source first (`$p worksAt $c`). An intended product is
+written as a named relation drawn with `from`, which reads nothing of the
+scope; that is the form the suggestion writes otherwise:
+
+```gq
+query every_pair() {
+  match { $p: Person, let $cs = { match { $c: Company } return { $c } }, from $cs }
+  return { $p.name, $c.name }
+}
+```
+
 ## Values and inline reads
 
 `let $v = <expression>` names a value computed for every row of the elements

@@ -110,6 +110,7 @@ codes! {
     T78 = "an endpoint assignment is neither a key of the endpoint type nor a bound reference of it";
     T79 = "a ranked column is not a node column of its population";
     T80 = "an annotation the language does not read";
+    T81 = "a pattern whose components share no variable and are not pinned to one row by a `@key` equality";
     T83 = "two declarations of one name in a source unit";
     T86 = "a term this release's planner does not lower; the message names the stage that adds it";
 

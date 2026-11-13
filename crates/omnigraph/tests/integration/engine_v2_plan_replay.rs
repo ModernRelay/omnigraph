@@ -591,7 +591,7 @@ const CITATION_SEED: &[&str] = &[
 
 const CITATION_QUERIES: &str = r#"
 query cited() {
-    match { $m: Matter, $p: Passage }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where contains($p.text, $m.number) and $m.mid != $p.pid
     return { $m.mid, $p.pid }
     order { $m.mid, $p.pid }

@@ -47,12 +47,12 @@ A read is `match { ... }`, an optional `where`, then `return`, `order` and
 `limit`. `match` holds the elements that produce rows (bindings, triples,
 `optional { ... }`, `let` and `from`), separated by commas; `where` holds one
 Boolean expression, evaluated after every element, that removes rows. Every
-list takes commas. For the elements, the refusals that print their fix, edge
-alternatives, wildcard, bounded hops, direction and edge identity, see
-[Traversal and match patterns](traversal.md). Omitted bounds always mean
-exactly `{1,1}`; multiple hops require an explicit finite range. `from` draws
-the rows of a ranking into the match, and `let` names a relation for it; see
-[Search](../search/index.md).
+list takes commas. Elements that share no variable multiply their rows, which
+is refused (`T81`) unless all but one are pinned to a row by their `@key`. For
+the elements, their refusals and fixes, edge alternatives, wildcard, bounded
+hops, direction, edge identity and products, see [Traversal and match
+patterns](traversal.md). `from` draws the rows of a ranking into the match,
+and `let` names a relation for it; see [Search](../search/index.md).
 
 ### Boolean expressions and nulls
 

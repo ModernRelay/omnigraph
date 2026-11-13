@@ -60,7 +60,7 @@ query property_and_aggregate_over_it() {
 
 --- query
 query variable_and_alias_named_like_it() {
-    match { $a: Pair, $b: Pair }
+    match { $a: Pair, let $bs = { match { $b: Pair } return { $b } }, from $bs }
     return { $a, $b.name as a }
 }
 

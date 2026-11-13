@@ -448,7 +448,7 @@ async fn cross_variable_string_predicate_is_not_hoisted() {
     let db = metric_db(&dir).await;
     let q = r#"
 query cross() {
-    match { $a: Metric, $b: Metric }
+    match { $a: Metric, let $bs = { match { $b: Metric } return { $b } }, from $bs }
     where starts_with($b.label, $a.label)
     return { $a.name, $b.name }
 }

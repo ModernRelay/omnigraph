@@ -53,6 +53,21 @@ result-schema inference (`check::result::result_schema`) and every header
 consumer (server, CLI, cluster, MCP, lint, the operation descriptor) read that
 core term; nothing re-derives types from the text.
 
+Each scope's elements form components (`check/components.rs`): a binding, a
+triple, an `optional` or a `from` joins the components of every variable it
+binds or reads; a `let` value stands for the variables it reads, and the
+`where` with its blocks joins nothing. Two components multiply their rows by
+the `Correlate` of an inner term with no free variables, a product, which the
+type checker admits only when every component but one is a single node
+binding whose `@key` columns a top-level `where` conjunct equates with a
+literal or a parameter; otherwise it refuses with `T81`, whose suggestion is
+the triple when exactly one edge type joins the two, or the second component
+as a named relation drawn with `from`. A `from` that reads nothing of its
+scope is that product written out and admitted. The rule is the type
+checker's alone: the shaper flattens a named relation's inline read into the
+enclosing pattern, so the product it plans, a `CrossJoin` or a
+`ContainsJoin`, is the one the two bindings written side by side planned.
+
 A write body checks to `CoreWrite`: groups of clauses and their sinks. The
 engine's `exec/write_plan.rs` lowers each group in one of two forms. A group
 whose clauses are a scan of its statements' target, filtered by predicates a

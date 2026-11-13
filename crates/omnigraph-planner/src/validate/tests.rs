@@ -1168,7 +1168,7 @@ fn membership_admits_the_fragment_and_nothing_else() {
         "query q() { match { $d: Doc } where $d.born > date(\"2020-01-01\") return { $d.slug } }",
         "query q() { match { $d: Doc } where \"a\" in $d.tags return { $d.slug } }",
         "query q() { match { $d: Doc, $d cites $e } return { $d.slug } }",
-        "query q() { match { $d: Doc, $e: Doc } return { $d.slug } }",
+        "query q() { match { $d: Doc, let $es = { match { $e: Doc } return { $e } }, from $es } return { $d.slug } }",
         "query q() { match { $d: Doc } where not exists { $d cites $e } return { $d.slug } }",
         "query q() { match { $d: Doc } return { count($d) as n } }",
         "query q() { match { $d: Doc } return { $d } }",

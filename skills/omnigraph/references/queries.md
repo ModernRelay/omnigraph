@@ -77,6 +77,16 @@ every element and removes rows. A filter or `where` inside the braces is
 comma is `Q016`; each prints the corrected text. Every list takes commas:
 return items, order keys, call arguments and assignments.
 
+Elements that share no variable multiply their rows. A binding, triple,
+`optional` or `from` joins the variables it binds or reads; `where` joins
+nothing. Such a product is refused (`T81`, at the second component) unless
+every component but one is a single binding whose `@key` a top-level `where`
+conjunct equates with a literal or parameter, as in a write that links two
+nodes (`match { $p: Person, $c: Company } where $p.handle = $h and $c.slug = $s`).
+Otherwise join the components with a triple, which the diagnostic inserts
+when exactly one edge type connects them, or write the intended product as a
+named relation: `let $cs = { match { $c: Company } return { $c } }, from $cs`.
+
 `let $v = expr` names a value for `where`, `return`, `order` and later
 elements; a value that can fail (arithmetic) is refused at type check
 (`T86`), so write the arithmetic where the name is read (`where`, `return`).

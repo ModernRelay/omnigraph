@@ -173,6 +173,31 @@ expected format instead, without an edit.
 Type codes are listed where the construct they guard is described, in
 [Query language](index.md).
 
+## Patterns that share no variable
+
+Two components of a pattern that share no variable multiply their rows. The
+type checker refuses that product with `T81` at the second component unless
+every component but one is pinned to one row by an equality of its `@key` with
+a literal or a parameter in `where`; see
+[Traversal and match patterns](traversal.md#patterns-that-share-no-variable).
+
+```text
+query staff() { match { $c: Company, $p: Person } return { $p.name, $c.name } }
+```
+
+```text
+error[T81]: type error: T81: `$p: Person` shares no variable with `$c: Company`, so the pattern multiplies their rows by a product; a product is written only when every component but one is pinned to one row by a `@key` equality in `where`
+  --> line 1, column 38
+  fix: join them through the edge, `$p worksAt $c`, or write the intended product as a named relation, `let $ps = { match { $p: Person } return { $p } }, from $ps`
+```
+
+When exactly one edge type connects a variable of one component with a
+variable of the other, as `WorksAt: Person -> Company` does here, the
+suggestion is machine-applicable and appends the triple to the elements,
+source first: `, $p worksAt $c`. Otherwise the fix lists the triples, if any,
+and the suggestion, which needs review, writes the second component as the
+named relation drawn with `from`.
+
 ## Terms this release does not lower
 
 A read or write the type checker accepts, the planner runs. A term that

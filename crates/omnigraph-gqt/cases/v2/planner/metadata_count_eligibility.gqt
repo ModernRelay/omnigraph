@@ -158,7 +158,7 @@ not pass aggregate_pushdown
 --- query
 set engine = v2;
 query count_pairs() {
-    match { $d: Doc, $e: Doc } return { count($d) as n }
+    match { $d: Doc, let $es = { match { $e: Doc } return { $e } }, from $es } return { count($d) as n }
 }
 
 --- expect unordered

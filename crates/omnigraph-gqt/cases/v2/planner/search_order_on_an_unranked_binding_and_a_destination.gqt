@@ -58,7 +58,7 @@ query connected_rrf_t_first($q: Vector(4)) {
 --- query
 set engine = v2;
 query search_only_order_with_an_unranked_binding($q: Vector(4)) {
-    match { from nearest({ match { $c: Doc, $z: Zone } return { $c, $z } }, $c.embedding, $q, k: 3) }
+    match { from nearest({ match { $c: Doc, let $zs = { match { $z: Zone } return { $z } }, from $zs } return { $c, $z } }, $c.embedding, $q, k: 3) }
     return { $c.slug, $z.name }
     order { $distance }
     limit 3

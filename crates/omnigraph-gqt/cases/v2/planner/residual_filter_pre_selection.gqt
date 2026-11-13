@@ -36,7 +36,7 @@ node Person {
 --- query
 set engine = v2;
 query none_survive() {
-    match { $p: Person, $q: Person }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
     where $p.rank > $q.age and $p.score > $q.score
     return { $p.slug, $q.slug }
 }
@@ -50,7 +50,7 @@ q.slug: String
 --- query
 set engine = v2;
 query few_survive() {
-    match { $p: Person, $q: Person }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
     where $p.age > $q.age
       and $p.level > $q.level
       and ($p.score < $q.score or $p.level = $q.level)
@@ -70,7 +70,7 @@ q.slug: String
 --- query
 set engine = v2;
 query nulls_reach_or() {
-    match { $p: Person, $q: Person }
+    match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs }
     where ($p.score = $q.score or ($p.level < $q.level and $p.age > $q.age))
     return { $p.slug, $q.slug }
 }

@@ -326,9 +326,20 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
             },
         ),
         (
-            "two patterns sharing no variable: Correlate with an inner term that has no free variables",
-            "query f() { match { $p: Person, $c: Company } return { $p, $c } }",
-            corr(scan("p", "Person"), scan("c", "Company")),
+            "two patterns sharing no variable, all but one pinned to a row by its key: Correlate with an inner term that has no free variables",
+            "query f() { match { $p: Person, $c: Company } where $c.slug = \"acme\" return { $p, $c } }",
+            filter(
+                corr(scan("p", "Person"), scan("c", "Company")),
+                cmp(
+                    CompOp::Eq,
+                    prop("c", "slug", val(ScalarType::String, false)),
+                    SExpr::new(
+                        SKind::Lit(Literal::String("acme".into())),
+                        val(ScalarType::String, false),
+                    )
+                    .to_ir(),
+                ),
+            ),
         ),
         (
             "$a (e1 | e2) $b: one Expand whose selector holds every member",
@@ -654,15 +665,15 @@ const FORMS: &[(&str, &str)] = &[
     ),
     (
         "filter",
-        "query f() { match { $p: Person, $q: Person } where $p.age > 3 return { $p, $q } }",
+        "query f() { match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs } where $p.age > 3 return { $p, $q } }",
     ),
     (
         "two_bindings",
-        "query f() { match { $p: Person, $q: Person } return { $p, $q } }",
+        "query f() { match { $p: Person, let $qs = { match { $q: Person } return { $q } }, from $qs } return { $p, $q } }",
     ),
     (
         "two_bindings_swapped",
-        "query f() { match { $q: Person, $p: Person } return { $p, $q } }",
+        "query f() { match { $q: Person, let $ps = { match { $p: Person } return { $p } }, from $ps } return { $p, $q } }",
     ),
     (
         "let_value",

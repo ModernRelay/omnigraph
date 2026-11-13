@@ -189,7 +189,7 @@ fn a_block_correlates_on_the_names_in_scope_where_it_is_written() {
     // A block value compared with a later element's property correlates on
     // the names the block reads.
     let waiting = ok(
-        "query q() { match { $p: Person, $c: Collection } where count { $p knows $x } >= $c.min_docs return { $p } }",
+        "query q() { match { $p: Person, let $cs = { match { $c: Collection } return { $c } }, from $cs } where count { $p knows $x } >= $c.min_docs return { $p } }",
     );
     let text = format!("{:?}", read_of(&waiting).term);
     assert!(
@@ -1188,6 +1188,19 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
 }"#,
         r#"query q() { match { $p: Person } return { $p.age > 30 as key, $p.handle } order { $p.age > 30 desc } }"#,
     ),
+    // The two queries of `diagnostics/t81_pattern_components_share_no_variable.gqt`.
+    (
+        r#"two components one edge type joins"#,
+        "T81",
+        r#"query staff() { match { $c: Company, $p: Person } return { $p.name, $c.name } }"#,
+        r#"query staff() { match { $c: Company, $p: Person, $p worksAt $c } return { $p.name, $c.name } }"#,
+    ),
+    (
+        r#"two components no edge type joins"#,
+        "T81",
+        r#"query shelved() { match { $p: Person, $s: Collection } where $p.name = "Ada" return { $p.name, $s.slug } }"#,
+        r#"query shelved() { match { $p: Person, let $ss = { match { $s: Collection } return { $s } }, from $ss } where $p.name = "Ada" return { $p.name, $s.slug } }"#,
+    ),
 ];
 
 #[test]
@@ -1513,5 +1526,6 @@ fn a_type_error_carries_the_position_of_its_clause() {
     assert_eq!(d.position.map(|p| p.column), Some(61));
 }
 
+mod components;
 mod desugaring;
 mod lowering;

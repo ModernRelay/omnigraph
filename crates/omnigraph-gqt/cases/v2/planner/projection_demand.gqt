@@ -116,7 +116,7 @@ filter reads [b.kind, a.kind_ref]
 --- query
 set engine = v2;
 query unused_binding() {
-    match { $c: T, $d: T }
+    match { $c: T, let $ds = { match { $d: T } return { $d } }, from $ds }
     return { $c.slug }
 }
 --- expect unordered

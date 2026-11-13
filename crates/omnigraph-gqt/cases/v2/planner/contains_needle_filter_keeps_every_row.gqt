@@ -36,7 +36,7 @@ node Passage {
 --- query
 set engine = v2;
 query literal_needles_with_passage_written_first() {
-    match { $p: Passage, $m: Matter }
+    match { $p: Passage, let $ms = { match { $m: Matter } return { $m } }, from $ms }
     where contains($p.text, $m.number) and $m.mid != "m-empty"
     return { $m.mid, $p.pid }
 }
@@ -93,7 +93,7 @@ p.pid: String
 --- query
 set engine = v2;
 query contains_inside_an_or() {
-    match { $m: Matter, $p: Passage }
+    match { $m: Matter, let $ps = { match { $p: Passage } return { $p } }, from $ps }
     where (contains($p.text, $m.number) or $p.pid = "p-digit")
       and $m.mid != "m-empty"
       and $m.mid != "m-null"
