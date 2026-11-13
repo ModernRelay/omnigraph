@@ -50,11 +50,23 @@ consumer (server, CLI, cluster, MCP, lint, the operation descriptor) read that
 core term; nothing re-derives types from the text.
 
 A write body checks to `CoreWrite`: groups of clauses and their sinks. The
-engine's `exec/write_plan.rs` lowers each group to today's staged writes: a
-group's clauses must be a scan of the statement's target filtered by
-predicates over that variable alone, an `update` or `delete` takes them as its
-selection, an `insert` with no clauses runs once and one after a matching
-statement once per matched row. Any other group is `P006`.
+engine's `exec/write_plan.rs` lowers each group in one of two forms. A group
+whose clauses are a scan of its statements' target, filtered by predicates a
+staged scan evaluates (no search predicate, arithmetic or registry call), and
+whose assignments read no row lowers to staged statements: an `update` or
+`delete` takes the predicate and reads it together with the statements staged
+before it, an `insert` after one runs once per matched row, and an `insert`
+with no clauses runs once. Every other group lowers its selection to a read
+shaped by `read_shape` and run by the engine (`engine::execute_selection`)
+against the write's captured snapshot and catalog, with the `now()` the write
+bound: it returns per row the `@id` of each `update` or `delete` variable and
+each assignment value that reads the row. The statement then stages the
+typed membership `id in [ids]` with those values per entity, and an `insert`
+runs once per row; two values for one entity and property through one
+statement's rows are `E4`. Because that read sees the snapshot, not the
+staged statements, a group whose selection reads a table an earlier group
+writes is `P006`, as are a selection the read planner refuses and a `Blob`
+read from a row. Such a write publishes once, through the same staging.
 
 The executor never refreshes a mutable branch head midway through a query.
 Historical reads build from the requested immutable table versions; current

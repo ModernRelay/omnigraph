@@ -386,10 +386,15 @@ with its own `match` and sees the groups before it. The `where` always names
 properties through the binding (`$x.slug`, `$x.@src`). A statement takes no
 `where`: `update T set { … } where …` and `delete T where …` are refused
 (`Q008`), and a write's elements written without `match { }` are refused
-(`Q013`); each diagnostic prints the group form. The planner runs one binding
-of the written type plus a `where` over it; a traversal, block or search
-predicate in a write's selection, or an assignment that reads the row
-(`age: $x.age`), is refused (`P006`).
+(`Q013`); each diagnostic prints the group form. The selection takes a read's
+traversals, edge bindings, blocks, `let` and `from`, and runs as a read of the
+graph the write started from:
+`match { $c: Company, $p $k:worksAt $c } where $c.slug = $slug  delete $k`.
+Assignments may read the row (`city: $c.city`; an endpoint as `to: $c`), and
+an `insert` runs once per row. `optional`, a `Blob` read from a row, and a
+selection that reads a type an earlier group of the write changes are refused
+(`P006`); rows of one statement giving one entity's property two values are
+refused (`E4`).
 
 ### Insert
 

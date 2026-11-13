@@ -126,6 +126,48 @@ async fn mutation_does_not_create_run_branch() {
     );
 }
 
+/// A write group whose selection is a traversal runs it against the write's
+/// snapshot: when it selects no row the write stages nothing and publishes no
+/// commit, and when it selects rows it publishes exactly one.
+#[tokio::test]
+async fn traversal_selection_publishes_once_or_not_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    let query = "query age_friends($name: String) { \
+                 match { $p: Person, $p knows $f } where $p.name = $name \
+                 update $f set { age: 1 } }";
+    let head = head_commit_id(uri).await;
+
+    let none = db
+        .mutate_with_receipt(
+            "main",
+            query,
+            "age_friends",
+            &params(&[("$name", "Nobody")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (none.result.affected_nodes, none.result.affected_edges),
+        (0, 0)
+    );
+    assert!(
+        none.commit.is_none(),
+        "an empty selection publishes nothing"
+    );
+    assert_eq!(head_commit_id(uri).await, head);
+
+    let some = db
+        .mutate_with_receipt("main", query, "age_friends", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(some.result.affected_nodes, 2, "Alice knows Bob and Charlie");
+    let commit = some.commit.expect("an effectful selection publishes once");
+    assert_eq!(commit.parent_commit_id.as_deref(), Some(head.as_str()));
+    assert_eq!(head_commit_id(uri).await, commit.graph_commit_id);
+}
+
 /// A failed mutation (validation error mid-query) leaves the target branch's
 /// observable state unchanged. There is nothing for cleanup to delete.
 #[tokio::test]

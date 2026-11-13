@@ -8,7 +8,7 @@ fix names the decision instead.
 
 | Field | Meaning |
 |---|---|
-| `code` | Stable identifier: `Q…` from the parser, `T…` from the type checker, `P…` from the planner. A code's meaning is frozen; its message text may improve. |
+| `code` | Stable identifier: `Q…` from the parser, `T…` from the type checker, `P…` from the planner, `E…` from execution. A code's meaning is frozen; its message text may improve. |
 | `position` | For a parse refusal: `line` and `column` (1-based, in characters) and the `byte` offset. |
 | `stage` and `expression` | For a refusal after parsing: the stage (`typecheck` or `plan`) and, when the site can render it, the expression it refused. |
 | `expected` | What was expected or violated, one line, without a position. |
@@ -184,9 +184,21 @@ an internal error.
 | `P002` | An edge alternation or wildcard traversal has no finite traversal work limit. The fix sets `traversal_work_limit` before the query. |
 | `P003` | The traversal work limit is outside `1..=9223372036854775807`, or a plan records it twice. |
 | `P004` | An edge alternation or wildcard traversal was asked to run in CSR traversal mode; it runs in `auto` or `indexed` mode. |
-| `P006` | A type-checked shape the planner does not run, such as a block compared with a column, or a write group whose selection is more than one filtered binding of its target; `expected` names it. |
+| `P006` | A type-checked shape the planner does not run, such as a block compared with a column, `optional`, or a write group whose selection reads a type an earlier group of the write changes; `expected` names it. |
 
 `P001` and `P005` are withdrawn. A ranking ranks the binding it names
 whatever its population declares first
 ([Search](../search/index.md#ranking-a-traversal-reached-binding)), and an
 `rrf` whose arms rank two bindings is the type error `T75`.
+
+## Execution codes
+
+An execution code refuses a row while the query or write runs
+(`execution error: E2: …`). A refused write publishes nothing.
+
+| Code | Meaning |
+|---|---|
+| `E1` | Integer arithmetic overflowed its type. |
+| `E2` | A divisor is zero. |
+| `E3` | A float result is not finite. |
+| `E4` | The rows of one write statement give one entity's property two values, which row order would otherwise decide; make the selection reach each entity once, or agree on the value. |

@@ -83,6 +83,13 @@ pub(crate) fn evaluate_constant(expr: &IRExpr, params: &ParamMap) -> Result<Lite
     )
 }
 
+/// The value at `row` of a result column as the Literal a write assigns.
+pub(crate) fn literal_at(values: &ArrayRef, row: usize) -> Result<Literal> {
+    literal_from_scalar(
+        ScalarValue::try_from_array(values.as_ref(), row).map_err(OmniError::datafusion)?,
+    )
+}
+
 fn literal_from_scalar(value: ScalarValue) -> Result<Literal> {
     if value.is_null() {
         return Ok(Literal::Null);

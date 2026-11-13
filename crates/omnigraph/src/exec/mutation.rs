@@ -3,8 +3,9 @@ use super::*;
 use crate::db::manifest::HistoryReleaseBytes;
 use crate::engine::{
     MAX_NULL_SPLIT_COLUMNS, evaluate_constant, exceeds_null_split_columns, fill_declared_params,
-    id_in_list_expr, ir_expr_to_df_expr, validate_params,
+    id_in_list_expr, ir_expr_to_df_expr, literal_at, validate_params,
 };
+use crate::exec::write_plan::{InsertRows, SelectedRows, Selection};
 use crate::instrumentation::record_mutation_table_open;
 use crate::loader::append_blob_value;
 use crate::seams::{decide_seam, fail};
@@ -13,6 +14,10 @@ use crate::storage_layer::{DeletedIdBudget, PendingScanBudget, SnapshotHandle, W
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
 use lance_select::mask::RowAddrTreeMap;
+use omnigraph_compiler::query::value::{BinaryOp, CompOp};
+use omnigraph_compiler::result::QueryResult;
+use omnigraph_compiler::settings::SessionSettings;
+use omnigraph_compiler::types::{ExprType, ScalarType};
 
 // ─── Mutation helpers ────────────────────────────────────────────────────────
 
@@ -28,18 +33,54 @@ fn resolve_assignments(
     let mut resolved = HashMap::with_capacity(assignments.len());
     for assignment in assignments {
         let value = evaluate_constant(&assignment.value, params)?;
-        let non_nullable = schema
-            .field_with_name(&assignment.property)
-            .is_ok_and(|field| !field.is_nullable());
-        if non_nullable && matches!(value, Literal::Null) {
-            return Err(OmniError::manifest(format!(
-                "cannot assign null to non-nullable property '{}' of {type_name}",
-                assignment.property
-            )));
-        }
+        refuse_null(type_name, schema, &assignment.property, &value)?;
         resolved.insert(assignment.property.clone(), value);
     }
     Ok(resolved)
+}
+
+/// The constant assignments evaluated over the invocation's parameters.
+fn evaluate_assignments(
+    assignments: &[Assignment],
+    params: &ParamMap,
+) -> Result<HashMap<String, Literal>> {
+    assignments
+        .iter()
+        .map(|assignment| {
+            Ok((
+                assignment.property.clone(),
+                evaluate_constant(&assignment.value, params)?,
+            ))
+        })
+        .collect()
+}
+
+/// Refuse a null value for a non-nullable property of `type_name`, a `Blob`
+/// included.
+fn refuse_null(type_name: &str, schema: &Schema, property: &str, value: &Literal) -> Result<()> {
+    let non_nullable = schema
+        .field_with_name(property)
+        .is_ok_and(|field| !field.is_nullable());
+    if non_nullable && matches!(value, Literal::Null) {
+        return Err(OmniError::manifest(format!(
+            "cannot assign null to non-nullable property '{property}' of {type_name}"
+        )));
+    }
+    Ok(())
+}
+
+/// [`refuse_null`] over every value, in the schema's column order.
+fn refuse_null_on_required(
+    type_name: &str,
+    schema: &Schema,
+    values: &HashMap<String, Literal>,
+) -> Result<()> {
+    for field in schema.fields() {
+        if let Some(value) = values.get(field.name()) {
+            refuse_null(type_name, schema, field.name(), value)?;
+        }
+    }
+    Ok(())
 }
 
 /// Create a single-element or N-element array from a Literal, matching the target DataType.
@@ -674,6 +715,414 @@ fn apply_assignments(
     RecordBatch::try_new(full_schema.clone(), columns).map_err(OmniError::arrow_internal)
 }
 
+// ─── Selection reads ─────────────────────────────────────────────────────────
+
+/// What a write's selection reads run with beside the write's transaction:
+/// the handle whose runtime cache serves the traversal index, and the
+/// session settings a read of the same source plans under.
+pub(crate) struct SelectionReader<'a> {
+    pub(crate) handle: &'a Arc<Omnigraph>,
+    pub(crate) settings: &'a SessionSettings,
+}
+
+/// The rows of selection read `read`, run on first use against the
+/// snapshot and catalog the write captured (invariant 3: one accepted view
+/// per attempt) and kept for the group's later statements, so a group's
+/// selection is evaluated once.
+async fn selection_rows<'s>(
+    ir: &super::write_plan::WritePlan,
+    read: usize,
+    selected: &'s mut [Option<QueryResult>],
+    params: &ParamMap,
+    txn: &crate::db::WriteTxn,
+    reader: &SelectionReader<'_>,
+) -> Result<&'s QueryResult> {
+    let slot = selected.get_mut(read).ok_or_else(|| {
+        OmniError::manifest_internal(format!("write '{}' has no selection {read}", ir.name))
+    })?;
+    if slot.is_none() {
+        let query = &ir.selections[read];
+        // The write bound `now()` once before its first attempt; the
+        // selection reads that instant through the read's own binding.
+        let now = params.get(NOW_PARAM_NAME).cloned().ok_or_else(|| {
+            OmniError::manifest_internal("a write's parameters carry no bound now()")
+        })?;
+        let mut read_params = params.clone();
+        read_params.remove(NOW_PARAM_NAME);
+        let graph_index = if query.ir.pipeline.iter().any(traverses) {
+            let addressed = txn.branch.as_deref().unwrap_or("main");
+            let probe = txn.manifest_probe.captured();
+            crate::engine::GraphIndexHandle::cached(
+                Arc::clone(reader.handle),
+                crate::db::ResolvedTarget {
+                    requested: crate::db::ReadTarget::branch(addressed),
+                    branch: txn.branch.clone(),
+                    snapshot_id: crate::db::SnapshotId::synthetic(
+                        txn.branch.as_deref(),
+                        probe.version,
+                        probe.e_tag.as_deref(),
+                    ),
+                    graph_commit_id: txn.effective_graph_head.clone(),
+                    snapshot: txn.base.clone(),
+                },
+                crate::engine::referenced_edge_types(&query.ir.pipeline, &txn.catalog),
+                txn.catalog.system_columns,
+            )
+        } else {
+            crate::engine::GraphIndexHandle::none()
+        };
+        let result = crate::engine::execute_selection(
+            query,
+            &read_params,
+            &now,
+            &txn.base,
+            graph_index,
+            &txn.catalog,
+            &crate::engine::EmbeddingResolver::new(
+                reader.handle.embedding_cell(),
+                reader.handle.embedding_config_ref(),
+            ),
+            reader.settings,
+        )
+        .await?;
+        *slot = Some(result);
+    }
+    Ok(slot.as_ref().expect("the selection was just read"))
+}
+
+fn traverses(step: &omnigraph_planner::PatternStep) -> bool {
+    matches!(
+        step,
+        omnigraph_planner::PatternStep::Expand { .. }
+            | omnigraph_planner::PatternStep::AntiJoin { .. }
+    )
+}
+
+/// The values the assignments of an `update` that read the row give each
+/// selected entity: `properties` in assignment order, and per entity id one
+/// value for each.
+pub(super) struct RowValues {
+    properties: Vec<String>,
+    by_id: HashMap<String, Vec<Literal>>,
+}
+
+impl RowValues {
+    fn assigns(&self, property: &str) -> bool {
+        self.properties.iter().any(|p| p == property)
+    }
+
+    /// Refuse a null value for a non-nullable property, as for a constant.
+    fn refuse_null_on_required(&self, type_name: &str, schema: &Schema) -> Result<()> {
+        let mut ids: Vec<&String> = self.by_id.keys().collect();
+        ids.sort();
+        for (p, property) in self.properties.iter().enumerate() {
+            for id in &ids {
+                refuse_null(type_name, schema, property, &self.by_id[*id][p])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `constants` with each per-row property at the value whose one-row
+    /// array is widest: what a column patch plans its bytes from.
+    fn widest(
+        &self,
+        schema: &Schema,
+        constants: &HashMap<String, Literal>,
+    ) -> Result<HashMap<String, Literal>> {
+        let mut planned = constants.clone();
+        for (p, property) in self.properties.iter().enumerate() {
+            let field = schema.field_with_name(property).map_err(|_| {
+                OmniError::manifest_internal(format!("update assigns unknown column '{property}'"))
+            })?;
+            let mut widest: Option<(usize, &Literal)> = None;
+            for values in self.by_id.values() {
+                let value = &values[p];
+                let bytes = literal_to_typed_array(value, field.data_type(), 1)?
+                    .to_data()
+                    .get_slice_memory_size()
+                    .unwrap_or(0);
+                if widest.is_none_or(|(most, _)| bytes > most) {
+                    widest = Some((bytes, value));
+                }
+            }
+            if let Some((_, value)) = widest {
+                planned.insert(property.clone(), value.clone());
+            }
+        }
+        Ok(planned)
+    }
+}
+
+/// `batch` with each per-row property of `values` set, row by row, to the
+/// value its entity takes; `batch` itself when the update has none.
+fn apply_row_values(
+    batch: RecordBatch,
+    values: Option<&RowValues>,
+    id_column: &str,
+) -> Result<RecordBatch> {
+    let Some(values) = values else {
+        return Ok(batch);
+    };
+    let ids = batch
+        .column_by_name(id_column)
+        .and_then(|ids| ids.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("update batch lacks its '{id_column}' column"))
+        })?;
+    let schema = batch.schema();
+    let mut columns = batch.columns().to_vec();
+    for (p, property) in values.properties.iter().enumerate() {
+        let (index, field) = schema.column_with_name(property).ok_or_else(|| {
+            OmniError::manifest_internal(format!("update batch lacks column '{property}'"))
+        })?;
+        let rows = (0..batch.num_rows())
+            .map(|row| {
+                let value = values
+                    .by_id
+                    .get(ids.value(row))
+                    .map(|entity| &entity[p])
+                    .ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "update matched '{}', which its selection did not select",
+                            ids.value(row)
+                        ))
+                    })?;
+                literal_to_typed_array(value, field.data_type(), 1)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rows: Vec<&dyn Array> = rows.iter().map(|row| row.as_ref()).collect();
+        columns[index] = if rows.is_empty() {
+            arrow_array::new_empty_array(field.data_type())
+        } else {
+            arrow_select::concat::concat(&rows).map_err(OmniError::arrow_internal)?
+        };
+    }
+    RecordBatch::try_new(schema, columns).map_err(OmniError::arrow_internal)
+}
+
+/// The entities an `update` or `delete` reaches through its group's rows:
+/// the distinct identities in first-row order, and the values the row-read
+/// assignments give each.
+struct SelectedEntities {
+    ids: Vec<String>,
+    values: RowValues,
+}
+
+impl SelectedEntities {
+    /// `id in [ids]` as the typed membership expression the staged
+    /// statement evaluates; `None` when the rows select no entity.
+    fn membership(&self, id_column: &str) -> Option<IRExpr> {
+        if self.ids.is_empty() {
+            return None;
+        }
+        let string = |list: bool| ExprType::Value {
+            scalar: ScalarType::String,
+            list,
+            nullable: false,
+        };
+        Some(IRExpr::Binary {
+            left: Box::new(IRExpr::Literal(
+                Literal::List(self.ids.iter().cloned().map(Literal::String).collect()),
+                string(true),
+            )),
+            op: BinaryOp::Compare(CompOp::Contains),
+            right: Box::new(IRExpr::PropAccess {
+                variable: String::new(),
+                property: id_column.to_string(),
+                ty: string(false),
+            }),
+            ty: ExprType::Value {
+                scalar: ScalarType::Bool,
+                list: false,
+                nullable: false,
+            },
+        })
+    }
+}
+
+/// The value at `row` of each row-read assignment of `rows`.
+fn row_literals(batch: &RecordBatch, rows: &SelectedRows, row: usize) -> Result<Vec<Literal>> {
+    rows.values
+        .iter()
+        .map(|value| literal_at(batch.column(value.column), row))
+        .collect()
+}
+
+/// Two values one statement's rows give one entity's property: `E4`, since
+/// physical row order would otherwise decide which one lands. The message
+/// names the two in text order, which row order does not decide either.
+fn two_values(
+    name: &str,
+    rows: &SelectedRows,
+    entity: &str,
+    property: &str,
+    one: &Literal,
+    other: &Literal,
+) -> OmniError {
+    let (one, other) = (one.to_string(), other.to_string());
+    let (first, second) = if one <= other {
+        (one, other)
+    } else {
+        (other, one)
+    };
+    OmniError::Compiler(omnigraph_compiler::error::CompilerError::query(
+        omnigraph_compiler::query::diagnostic::QueryDiagnostic::execution(
+            omnigraph_compiler::query::codes::E4,
+            format!(
+                "`{name}`: the rows of {} give {entity} two values for `{property}`, {first} \
+                 and {second}; the rows of one statement must agree on each entity's value",
+                rows.statement
+            ),
+        ),
+    ))
+}
+
+fn selected_entities(
+    name: &str,
+    target: &MutationTarget,
+    rows: &SelectedRows,
+    read: &QueryResult,
+) -> Result<SelectedEntities> {
+    let identity = rows.identity.ok_or_else(|| {
+        OmniError::manifest_internal("an update or delete selection names no identity column")
+    })?;
+    let mut ids = Vec::new();
+    let mut by_id: HashMap<String, Vec<Literal>> = HashMap::new();
+    for batch in read.batches() {
+        let column = batch.column(identity);
+        let id_values = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "a selection's identity column is {}, not Utf8",
+                    column.data_type()
+                ))
+            })?;
+        for row in 0..batch.num_rows() {
+            // A row whose variable is unbound names no entity.
+            if id_values.is_null(row) {
+                continue;
+            }
+            let id = id_values.value(row);
+            let values = row_literals(batch, rows, row)?;
+            match by_id.get(id) {
+                None => {
+                    ids.push(id.to_string());
+                    by_id.insert(id.to_string(), values);
+                }
+                Some(earlier) => {
+                    if let Some(p) = (0..values.len()).find(|&p| earlier[p] != values[p]) {
+                        return Err(two_values(
+                            name,
+                            rows,
+                            &format!("{} `{id}`", target.type_name()),
+                            &rows.values[p].property,
+                            &earlier[p],
+                            &values[p],
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(SelectedEntities {
+        ids,
+        values: RowValues {
+            properties: rows.values.iter().map(|v| v.property.clone()).collect(),
+            by_id,
+        },
+    })
+}
+
+/// The value maps an `insert` stages, one per row of its group: the
+/// constant assignments, evaluated once, with each row-read value beside
+/// them. A keyed insert writes the entity its key names, so rows that name
+/// one key with equal values write it once, and with different values are
+/// `E4`; an unkeyed insert writes one entity per row.
+fn inserted_entities(
+    name: &str,
+    catalog: &Catalog,
+    target: &MutationTarget,
+    assignments: &[Assignment],
+    rows: &SelectedRows,
+    read: &QueryResult,
+    params: &ParamMap,
+) -> Result<Vec<HashMap<String, Literal>>> {
+    if read.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+    let constants = evaluate_assignments(assignments, params)?;
+    let system = catalog.system_columns;
+    let key: Option<Vec<String>> = match target {
+        MutationTarget::Node { type_name } => catalog
+            .node_types
+            .get(type_name)
+            .and_then(|node| node.key.clone()),
+        MutationTarget::Edge { type_name } => catalog.edge_types.get(type_name).and_then(|edge| {
+            edge.key.as_ref().map(|columns| {
+                columns
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        c if c == system.src => "from".to_string(),
+                        c if c == system.dst => "to".to_string(),
+                        other => other.to_string(),
+                    })
+                    .collect()
+            })
+        }),
+    };
+    let mut out: Vec<HashMap<String, Literal>> = Vec::new();
+    let mut keyed: HashMap<Vec<Literal>, usize> = HashMap::new();
+    for batch in read.batches() {
+        for row in 0..batch.num_rows() {
+            let mut values = constants.clone();
+            for (value, literal) in rows.values.iter().zip(row_literals(batch, rows, row)?) {
+                values.insert(value.property.clone(), literal);
+            }
+            let Some(key) = &key else {
+                out.push(values);
+                continue;
+            };
+            let tuple: Vec<Literal> = key
+                .iter()
+                .map(|p| values.get(p).cloned().unwrap_or(Literal::Null))
+                .collect();
+            match keyed.get(&tuple) {
+                None => {
+                    keyed.insert(tuple, out.len());
+                    out.push(values);
+                }
+                Some(&earlier) => {
+                    let earlier = &out[earlier];
+                    let mut properties: Vec<&String> = values.keys().collect();
+                    properties.sort();
+                    if let Some(property) = properties
+                        .into_iter()
+                        .find(|p| earlier.get(*p) != values.get(*p))
+                    {
+                        let entity = tuple
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(two_values(
+                            name,
+                            rows,
+                            &format!("{} ({entity})", target.type_name()),
+                            property,
+                            earlier.get(property).unwrap_or(&Literal::Null),
+                            &values[property],
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ─── Mutation execution ──────────────────────────────────────────────────────
 
 use super::staging::{MutationStaging, PendingMode};
@@ -1092,6 +1541,10 @@ impl Session {
             .resolve_write_route(&decl.write_mode, branch, params, actor_id)
             .await?;
         let settings = self.effective(query_source)?;
+        let reader = SelectionReader {
+            handle: self,
+            settings: &settings,
+        };
         self.mutate_with_current_actor(
             &branch,
             query_source,
@@ -1103,6 +1556,7 @@ impl Session {
             HistoryReleaseBytes(settings.history_release_bytes()),
             WriteBudget::from_settings(&settings),
             &route,
+            &reader,
         )
         .await
     }
@@ -1291,6 +1745,7 @@ impl Omnigraph {
         history_release_bytes: HistoryReleaseBytes,
         write_budget: WriteBudget,
         route: &WriteRoute,
+        reader: &SelectionReader<'_>,
     ) -> Result<crate::MutationReceipt> {
         // Resolve request-scoped values such as now() once so a safe
         // pre-effect retry does not change the logical input.
@@ -1313,6 +1768,7 @@ impl Omnigraph {
                     &mut retryable,
                     write_budget,
                     route,
+                    reader,
                 )
                 .await
             {
@@ -1338,6 +1794,7 @@ impl Omnigraph {
         retryable: &mut bool,
         write_budget: WriteBudget,
         route: &WriteRoute,
+        reader: &SelectionReader<'_>,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
         let addressed = requested.as_deref().unwrap_or("main").to_string();
@@ -1399,11 +1856,16 @@ impl Omnigraph {
         );
         fill_declared_params(&mut resolved_params, &ir.params)?;
         validate_params(&resolved_params, &ir.params)?;
-        // Only an insert-only mutation is safe to replay automatically after a
-        // pre-effect authority mismatch. Update/Delete keep strict caller-visible
-        // `ReadSetChanged`; replaying their stale read-modify-write plan would be
-        // a semantic rebase rather than a fresh execution contract.
-        *retryable = ir.ops.iter().all(|op| matches!(op, WriteOp::Insert { .. }));
+        // Only an insert-only mutation that reads no selection is safe to
+        // replay automatically after a pre-effect authority mismatch.
+        // Update/Delete, and an insert per selected row, keep strict
+        // caller-visible `ReadSetChanged`; replaying their stale
+        // read-modify-write plan would be a semantic rebase rather than a
+        // fresh execution contract.
+        *retryable = ir
+            .ops
+            .iter()
+            .all(|op| matches!(op, WriteOp::Insert { .. }) && !op.reads_a_selection());
 
         let exec_result = self
             .execute_named_mutation(
@@ -1412,6 +1874,7 @@ impl Omnigraph {
                 requested.as_deref(),
                 &mut staging,
                 &txn,
+                reader,
             )
             .await;
 
@@ -1580,7 +2043,7 @@ impl Omnigraph {
 
         let ir = match omnigraph_compiler::query::check::check_query_decl(catalog, &query_decl)? {
             omnigraph_compiler::ir::core::CoreDecl::Write(write) => {
-                super::write_plan::WritePlan::of(&write)?
+                super::write_plan::WritePlan::of(&write, catalog)?
             }
             omnigraph_compiler::ir::core::CoreDecl::Read(_) => {
                 return Err(OmniError::manifest(
@@ -1600,6 +2063,7 @@ impl Omnigraph {
         branch: Option<&str>,
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
+        reader: &SelectionReader<'_>,
     ) -> Result<MutationResult> {
         let mut total = MutationResult::default();
         // The node tables exactly one statement of this mutation writes. Only
@@ -1625,30 +2089,65 @@ impl Omnigraph {
             }
         }
         // The rows the group's last `update` or `delete` matched: an insert
-        // in a group with clauses runs once per row.
+        // in a staged group with clauses runs once per row.
         let mut matched = 0u64;
+        // Each group's selection read, run once, at its first statement:
+        // it reads only the captured snapshot, so where among the group's
+        // statements it runs changes nothing.
+        let mut selected: Vec<Option<QueryResult>> = vec![None; ir.selections.len()];
         for op in &ir.ops {
             let result = match op {
                 WriteOp::Insert {
                     target,
                     assignments,
-                    per_row,
-                } => {
-                    let times = if *per_row { matched } else { 1 };
-                    let mut result = MutationResult::default();
-                    for _ in 0..times {
-                        let one = self
-                            .execute_insert(target, assignments, params, branch, staging, txn)
-                            .await?;
-                        result.affected_nodes += one.affected_nodes;
-                        result.affected_edges += one.affected_edges;
+                    rows,
+                } => match rows {
+                    InsertRows::Once => {
+                        let values = evaluate_assignments(assignments, params)?;
+                        self.execute_insert(target, values, branch, staging, txn)
+                            .await?
                     }
-                    result
-                }
+                    InsertRows::Matched => {
+                        let mut result = MutationResult::default();
+                        if matched > 0 {
+                            let values = evaluate_assignments(assignments, params)?;
+                            for _ in 0..matched {
+                                let one = self
+                                    .execute_insert(target, values.clone(), branch, staging, txn)
+                                    .await?;
+                                result.affected_nodes += one.affected_nodes;
+                                result.affected_edges += one.affected_edges;
+                            }
+                        }
+                        result
+                    }
+                    InsertRows::Selected(rows) => {
+                        let read =
+                            selection_rows(ir, rows.read, &mut selected, params, txn, reader)
+                                .await?;
+                        let mut result = MutationResult::default();
+                        for values in inserted_entities(
+                            &ir.name,
+                            &txn.catalog,
+                            target,
+                            assignments,
+                            rows,
+                            read,
+                            params,
+                        )? {
+                            let one = self
+                                .execute_insert(target, values, branch, staging, txn)
+                                .await?;
+                            result.affected_nodes += one.affected_nodes;
+                            result.affected_edges += one.affected_edges;
+                        }
+                        result
+                    }
+                },
                 WriteOp::Update {
                     target,
                     assignments,
-                    predicate,
+                    selection,
                 } => {
                     let sole_write = matches!(
                         target,
@@ -1659,23 +2158,69 @@ impl Omnigraph {
                     // the update's own write budget not shared, so only there
                     // may a cheaper row rewrite carry payload a patch would not.
                     let only_write = ir.ops.len() == 1;
-                    self.execute_update(
-                        target,
-                        assignments,
-                        predicate,
-                        params,
-                        branch,
-                        staging,
-                        txn,
-                        sole_write,
-                        only_write,
-                    )
-                    .await?
+                    match selection {
+                        Selection::Predicate(predicate) => {
+                            self.execute_update(
+                                target,
+                                assignments,
+                                predicate,
+                                None,
+                                params,
+                                branch,
+                                staging,
+                                txn,
+                                sole_write,
+                                only_write,
+                            )
+                            .await?
+                        }
+                        Selection::Rows(rows) => {
+                            let read =
+                                selection_rows(ir, rows.read, &mut selected, params, txn, reader)
+                                    .await?;
+                            let entities = selected_entities(&ir.name, target, rows, read)?;
+                            match entities.membership(txn.catalog.system_columns.id) {
+                                None => MutationResult::default(),
+                                Some(predicate) => {
+                                    self.execute_update(
+                                        target,
+                                        assignments,
+                                        &predicate,
+                                        Some(&entities.values),
+                                        params,
+                                        branch,
+                                        staging,
+                                        txn,
+                                        sole_write,
+                                        only_write,
+                                    )
+                                    .await?
+                                }
+                            }
+                        }
+                    }
                 }
-                WriteOp::Delete { target, predicate } => {
-                    self.execute_delete(target, predicate, params, branch, staging, txn)
-                        .await?
-                }
+                WriteOp::Delete { target, selection } => match selection {
+                    Selection::Predicate(predicate) => {
+                        self.execute_delete(target, predicate, params, branch, staging, txn)
+                            .await?
+                    }
+                    Selection::Rows(rows) => {
+                        let read =
+                            selection_rows(ir, rows.read, &mut selected, params, txn, reader)
+                                .await?;
+                        let entities = selected_entities(&ir.name, target, rows, read)?;
+                        match entities.membership(txn.catalog.system_columns.id) {
+                            None => MutationResult::default(),
+                            Some(predicate) => {
+                                self.execute_delete(
+                                    target, &predicate, params, branch, staging, txn,
+                                )
+                                .await?
+                            }
+                        }
+                    }
+                },
             };
             if !matches!(op, WriteOp::Insert { .. }) {
                 matched = (result.affected_nodes + result.affected_edges) as u64;
@@ -1689,8 +2234,7 @@ impl Omnigraph {
     async fn execute_insert(
         &self,
         target: &MutationTarget,
-        assignments: &[Assignment],
-        params: &ParamMap,
+        resolved: HashMap<String, Literal>,
         branch: Option<&str>,
         staging: &mut MutationStaging,
         txn: &crate::db::WriteTxn,
@@ -1704,7 +2248,7 @@ impl Omnigraph {
                     ))
                 })?;
                 let schema = node_type.arrow_schema.clone();
-                let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
+                refuse_null_on_required(type_name, &schema, &resolved)?;
                 let blob_props = node_type.blob_properties.clone();
                 let id = if let Some(key_properties) = node_type.key.as_ref() {
                     let mut typed_keys = Vec::with_capacity(key_properties.len());
@@ -1781,7 +2325,7 @@ impl Omnigraph {
                     ))
                 })?;
                 let schema = edge_type.arrow_schema.clone();
-                let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
+                refuse_null_on_required(type_name, &schema, &resolved)?;
                 let blob_props = edge_type.blob_properties.clone();
                 let id = if let Some(key_columns) = edge_type.key.as_ref() {
                     let system_columns = catalog.system_columns;
@@ -1873,6 +2417,7 @@ impl Omnigraph {
         target: &MutationTarget,
         assignments: &[Assignment],
         predicate: &IRExpr,
+        row_values: Option<&RowValues>,
         params: &ParamMap,
         branch: Option<&str>,
         staging: &mut MutationStaging,
@@ -1900,10 +2445,10 @@ impl Omnigraph {
         // canonical typed tuple, so changing even a non-leading component
         // without changing `id` would make the row unreachable by its key.
         if let Some(key_properties) = node_type.key.as_ref() {
-            if let Some(key_prop) = key_properties
-                .iter()
-                .find(|key_prop| assignments.iter().any(|a| a.property == key_prop.as_str()))
-            {
+            if let Some(key_prop) = key_properties.iter().find(|key_prop| {
+                assignments.iter().any(|a| a.property == key_prop.as_str())
+                    || row_values.is_some_and(|values| values.assigns(key_prop))
+            }) {
                 return Err(OmniError::manifest(format!(
                     "cannot update @key property '{}' — delete and re-insert instead",
                     key_prop
@@ -1916,6 +2461,9 @@ impl Omnigraph {
         // Resolved before the table is opened, so a null on a non-nullable
         // property is refused even when the predicate matches no row.
         let resolved = resolve_assignments(type_name, &schema, assignments, params)?;
+        if let Some(values) = row_values {
+            values.refuse_null_on_required(type_name, &schema)?;
+        }
         let blob_props = node_type.blob_properties.clone();
         preflight_blob_assignments(&resolved, &blob_props, 1, staging.write_budget())?;
         // Catalog order is kept: `concat_match_batches_to_schema` binds by position.
@@ -1965,16 +2513,15 @@ impl Omnigraph {
             None => pred_expr,
         };
 
+        // The plan reads the assigned columns and the widest value each one
+        // takes, a per-row value at its widest.
+        let planned = match row_values {
+            Some(values) => values.widest(&schema, &resolved)?,
+            None => resolved.clone(),
+        };
+        let id_column = catalog.system_columns.id;
         if let Some(plan) = sole_write
-            .then(|| {
-                column_patch_plan(
-                    node_type,
-                    &schema,
-                    &resolved,
-                    catalog.system_columns.id,
-                    only_write,
-                )
-            })
+            .then(|| column_patch_plan(node_type, &schema, &planned, id_column, only_write))
             .transpose()?
             .flatten()
         {
@@ -2026,6 +2573,7 @@ impl Omnigraph {
                         &blob_props,
                         staging.write_budget(),
                     )?;
+                    let updated = apply_row_values(updated, row_values, id_column)?;
                     staging.append_column_patch(&table_key, updated, plan.patch_columns.clone())
                 };
             match matches.mode {
@@ -2044,6 +2592,7 @@ impl Omnigraph {
                         &blob_props,
                         staging.write_budget(),
                     )?;
+                    let updated = apply_row_values(updated, row_values, id_column)?;
                     let updated_schema = updated.schema();
                     // A refused row rewrite takes the patch, so admission
                     // never depends on the mode (`append_batch` refuses before
@@ -2141,6 +2690,7 @@ impl Omnigraph {
             &blob_props,
             staging.write_budget(),
         )?;
+        let updated = apply_row_values(updated, row_values, id_column)?;
         // Validation (value/enum/unique) runs end-of-query via the evaluator.
 
         // Accumulate the updated batch into the Merge-mode pending stream.
@@ -2685,6 +3235,12 @@ edge Shared: Endpoint -> Endpoint { label: String }
             params: Vec::new(),
             ops: vec![op],
             write_mode: omnigraph_compiler::query::file::MutationWriteMode::Publish,
+            selections: Vec::new(),
+        };
+        let settings = SessionSettings::default();
+        let reader = SelectionReader {
+            handle: &db,
+            settings: &settings,
         };
         for (ir, is_insert) in [
             (
@@ -2695,14 +3251,14 @@ edge Shared: Endpoint -> Endpoint { label: String }
                         assignment("to", "b"),
                         assignment("label", "new"),
                     ],
-                    per_row: false,
+                    rows: InsertRows::Once,
                 }),
                 true,
             ),
             (
                 mutation(WriteOp::Delete {
                     target: target.clone(),
-                    predicate: label_is("existing"),
+                    selection: Selection::Predicate(label_is("existing")),
                 }),
                 false,
             ),
@@ -2714,7 +3270,7 @@ edge Shared: Endpoint -> Endpoint { label: String }
             assert_eq!(retained, &target);
             let mut staging = MutationStaging::default();
             let result = db
-                .execute_named_mutation(&ir, &ParamMap::new(), None, &mut staging, &txn)
+                .execute_named_mutation(&ir, &ParamMap::new(), None, &mut staging, &txn, &reader)
                 .await
                 .unwrap();
             assert_eq!((result.affected_nodes, result.affected_edges), (0, 1));
@@ -2741,7 +3297,7 @@ edge Shared: Endpoint -> Endpoint { label: String }
         let ir = mutation(WriteOp::Update {
             target: target.clone(),
             assignments: vec![assignment("label", "changed")],
-            predicate: label_is("existing"),
+            selection: Selection::Predicate(label_is("existing")),
         });
         let WriteOp::Update {
             target: retained, ..
@@ -2752,7 +3308,7 @@ edge Shared: Endpoint -> Endpoint { label: String }
         assert_eq!(retained, &target);
         let mut staging = MutationStaging::default();
         let error = db
-            .execute_named_mutation(&ir, &ParamMap::new(), None, &mut staging, &txn)
+            .execute_named_mutation(&ir, &ParamMap::new(), None, &mut staging, &txn, &reader)
             .await
             .unwrap_err();
         assert!(

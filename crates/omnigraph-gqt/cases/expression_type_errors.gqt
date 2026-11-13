@@ -1,6 +1,7 @@
 # issue: none
 # notes: The context rules of the shared expression model as typed errors: a non-Boolean operand of `and`/`or`/`not`, a non-Boolean filter or
-# notes: mutation `where` (T41), an aggregate in a filter (T7), a Boolean item in an aggregate return (T9), a search call under `or` (T38), an unaliased comparison in return (T43), an aggregate or search call in a mutation `where` or an assignment (T44), and a bare property name in an assignment or a `where` (Q018).
+# notes: mutation `where` (T41), an aggregate in a filter (T7), a Boolean item in an aggregate return (T9), a search call under `or` (T38), an unaliased comparison in return (T43), an aggregate or search call in an assignment (T44), and a bare property name in an assignment or a `where` (Q018);
+# notes: a search predicate in a write's `where` is no error: the group's selection runs it as a read does.
 
 --- runner
 timeout_ms: 10000
@@ -93,10 +94,10 @@ query property_leaf_in_a_where() {
 --- mutate
 query search_in_a_mutation_where() {
     match { $x: Person } where search($x.text, "hello")
-    delete $x
+    update $x set { adult: true }
 }
 
---- expect error: P006: `search_in_a_mutation_where`: the planner does not lower a search predicate in a write group's filters
+--- expect affected: nodes=1 edges=0
 
 --- mutate
 query count_in_an_assignment() {

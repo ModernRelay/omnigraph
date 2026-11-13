@@ -149,7 +149,21 @@ impl<'a> QuerySource<'a> {
         params: &ParamMap,
         settings: &'a SessionSettings,
     ) -> Result<QuerySource<'a>> {
-        let params = resolve_params(&query.ir, params)?;
+        Self::gather_at(query, catalog, snapshot, params, None, settings).await
+    }
+
+    /// [`Self::gather`] with `now()` bound to `now` instead of the clock
+    /// when one is given: a write's selection reads the instant the write
+    /// bound once for every attempt and every assignment.
+    pub(crate) async fn gather_at(
+        query: &CompiledQuery,
+        catalog: &'a Arc<Catalog>,
+        snapshot: Option<&'a Snapshot>,
+        params: &ParamMap,
+        now: Option<&Literal>,
+        settings: &'a SessionSettings,
+    ) -> Result<QuerySource<'a>> {
+        let params = resolve_params(&query.ir, params, now)?;
         let ir = super::constant::fold_query_constants(&query.ir, params.shared())?;
         let table_stats = match snapshot {
             Some(snapshot) => query_table_statistics(&ir, snapshot).await?,
@@ -525,9 +539,13 @@ fn no_plan(reason: impl std::fmt::Display) -> OmniError {
 }
 
 /// The query's parameters with every omitted nullable one bound to null and
-/// `now()` bound to the clock; an omitted required one is the error the query
-/// answers.
-fn resolve_params(ir: &ReadShape, params: &ParamMap) -> Result<ResolvedParams> {
+/// `now()` bound to `now`, or to the clock when none is given; an omitted
+/// required one is the error the query answers.
+fn resolve_params(
+    ir: &ReadShape,
+    params: &ParamMap,
+    now: Option<&Literal>,
+) -> Result<ResolvedParams> {
     let mut resolved = params.clone();
     fill_declared_params(&mut resolved, &ir.params)?;
     let now_name = omnigraph_compiler::query::value::NOW_PARAM_NAME;
@@ -536,11 +554,16 @@ fn resolve_params(ir: &ReadShape, params: &ParamMap) -> Result<ResolvedParams> {
             "param '{now_name}': reserved for now() and cannot be bound"
         )));
     }
-    let now = time::OffsetDateTime::from(crate::dst_clock::system_time_now())
-        .truncate_to_millisecond()
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|error| OmniError::manifest(format!("failed to format now(): {error}")))?;
-    resolved.insert(now_name.to_string(), Literal::DateTime(now));
+    let now = match now {
+        Some(now) => now.clone(),
+        None => Literal::DateTime(
+            time::OffsetDateTime::from(crate::dst_clock::system_time_now())
+                .truncate_to_millisecond()
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|error| OmniError::manifest(format!("failed to format now(): {error}")))?,
+        ),
+    };
+    resolved.insert(now_name.to_string(), now);
     validate_params(&resolved, &ir.params)?;
     Ok(ResolvedParams(Arc::new(resolved)))
 }

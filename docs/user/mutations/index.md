@@ -27,39 +27,40 @@ delete $x
 ```
 
 A write body is one or more groups. A group selects its rows with a read's
-`match { ... }` and `where`, a binding of the type to write and a predicate
-over it, and its statements run once per row: `update $x set { ... }` and
-`delete $x` name the bound variable (another is `T77`). An `insert T { ... }`
-with no `match` runs once. A later group opens with its own `match` and sees
-the effects of the groups before it. A statement takes no `where`:
-`delete T where ...` is refused (`Q008`) with the group form as the fix, and
-elements written without `match { }` are refused (`Q013`).
-
-A filter takes the expressions of a
-[read filter](../queries/index.md#boolean-expressions-and-nulls) over the
-bound variable's properties, always written `$x.prop`, the system fields
-`$x.@id`, `$x.@src` and `$x.@dst`, literals, parameters, and `now()`. It keeps
-only the rows whose expression is true. On four `Knows` edges, `ab1` and `ab2`
-from `a` to `b`, `ac`, and `db`:
+`match { ... }` and `where`, and its statements run once per row:
+`update $x set { ... }` and `delete $x` name a bound node or edge variable
+(another is `T77`), and `insert T { ... }` writes one entity per row, once
+with no `match`. A later group opens with its own `match` and sees the effects
+of the groups before it. A statement takes no `where`: `delete T where ...`
+is refused (`Q008`) with the group form as the fix, and elements written
+without `match { }` are refused (`Q013`).
 
 ```gq
-query exact() { match { $x: Knows } where $x.@src = "a" and $x.@dst = "b"  delete $x }
+query relocate_staff($slug: String) {
+  match { $c: Company, $p worksAt $c } where $c.slug = $slug
+  update $p set { city: null }
+}
 ```
 
-removes `ab1` and `ab2` and nothing else: `affected: nodes=0 edges=2`. An
-unbound variable is `T6` and an aggregate `T8`. The planner takes one binding
-of the written type and filters over it; a traversal, block or search
-predicate in a write's selection is refused (`P006`). A filter that tests
-over four properties twice each with `=`, `!=` or `in` is refused.
+The selection takes everything a [read's match](../queries/index.md#match-patterns)
+does: traversals and edge bindings (`$p $k:worksAt $c` then `delete $k`),
+`exists`, `not exists` and `count { ... }` blocks, `let` and `from`. One
+binding of the written type with a filter over it is evaluated together with
+the statements before it; any other selection runs once as a read of the
+graph the write started from. Such a selection may not read a type an earlier
+group of the same write changes, and `optional` is not supported yet (both
+`P006`). An unbound variable is `T6` and an aggregate `T8`; a filter on one
+binding testing over four properties twice each with `=`, `!=` or `in` fails.
 
-Assignment values are constants: literals, parameters, `now()`, and comparisons
-or Boolean operators over them, such as `adult: true or $flag`, bound once
-before any retry, so a retried mutation computes the same value. They follow
-the read rules for null: with `$flag` null, `true or $flag` is `true` and
-`$age > 30` with `$age` null is null. A null result, or `null` written as the
-value, clears a nullable property, a `Blob` included; on a non-nullable
-property it is refused with a typed error that names the property. A value
-that reads the row, such as `age: $x.age`, is refused (`P006`).
+Assignment values are literals, parameters, `now()`, expressions over them,
+and values read from the row (`city: $c.city`, `to: $c` for an endpoint);
+constants are bound once before any retry. They follow the read rules for
+null: a null result, or `null` written as the value, clears a nullable
+property, and on a non-nullable property is refused with a typed error naming
+it. A value read from the row may not be a `Blob` (`P006`). Rows of one
+statement that give one entity's property two values are refused (`E4`); a
+keyed insert whose rows repeat a key with equal values writes it once. A
+write whose selection matches nothing publishes no commit.
 
 A mutation query may contain several inserts and updates, or several deletes,
 but not both (`T76`). Split that workflow into two queries, or run them on a

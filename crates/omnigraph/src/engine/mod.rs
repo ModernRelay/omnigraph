@@ -69,7 +69,7 @@ use typed_value::{check_array_type, typed_literal_to_array};
 pub(crate) use typed_value::{fill_declared_params, validate_params};
 
 use bind::bind;
-pub(crate) use constant::evaluate_constant;
+pub(crate) use constant::{evaluate_constant, literal_at};
 use context::QueryContext;
 pub(crate) use context::{LoadCharge, LoadMemory, LoadReuseReservation};
 pub(crate) use explain::{explain_document, explain_load_rows, explain_rows};
@@ -384,6 +384,33 @@ pub(crate) async fn execute_query(
     let run = Box::pin(execute(bound, &context)).await?;
     #[cfg(test)]
     report::tests::capture(&run.plan.plan, &run.report);
+    Ok(run.result)
+}
+
+/// A write group's selection: [`execute_query`] against the snapshot and
+/// catalog the write captured, with `now()` the instant the write bound for
+/// every attempt, so the selection and the assignments read one clock.
+pub(crate) async fn execute_selection(
+    query: &CompiledQuery,
+    params: &ParamMap,
+    now: &Literal,
+    snapshot: &Snapshot,
+    graph_index: GraphIndexHandle,
+    catalog: &Arc<Catalog>,
+    embedding: &EmbeddingResolver<'_>,
+    settings: &SessionSettings,
+) -> Result<QueryResult> {
+    let source =
+        QuerySource::gather_at(query, catalog, Some(snapshot), params, Some(now), settings).await?;
+    let accepted = accept_query(&source).await?;
+    let bound = bind(accepted, &source, embedding).await?;
+    let context = EngineContext {
+        snapshot: Some(snapshot),
+        catalog,
+        graph_index: Arc::new(graph_index),
+        load: None,
+    };
+    let run = Box::pin(execute(bound, &context)).await?;
     Ok(run.result)
 }
 

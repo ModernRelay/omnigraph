@@ -124,6 +124,9 @@ codes! {
     E1 = "integer arithmetic overflowed its type";
     E2 = "a divisor is zero";
     E3 = "a float result is not finite";
+    // A write statement's rows give one entity's property two values
+    // (docs/rfcs/2026-11-07-gq-3.md section 2, the sinks).
+    E4 = "one statement's rows give one entity's property two values";
 }
 
 #[cfg(test)]

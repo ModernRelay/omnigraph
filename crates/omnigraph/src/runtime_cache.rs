@@ -348,7 +348,7 @@ pub(crate) struct CompiledQueryKey {
 
 /// A compiled read declaration: the shape of its checked core term that the
 /// planner plans and acceptance derives the query's requirements from.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct CompiledQuery {
     pub(crate) ir: Arc<ReadShape>,
 }
