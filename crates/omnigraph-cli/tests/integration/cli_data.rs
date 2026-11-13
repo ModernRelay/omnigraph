@@ -1461,8 +1461,9 @@ fn index_rebuild_json_noops_without_full_text_properties_issue_840() {
 }
 
 /// A linear commit a foreign Lance writer put above a table's last linear
-/// version is listed by `cleanup` under `foreign_versions`, never deleted and
-/// never adopted; the removed `repair` command is refused as a usage error.
+/// version is listed by a confirmed `cleanup` (under `foreign_versions` in
+/// JSON, by name in the human report), never deleted and never adopted; the
+/// removed `repair` command is refused as a usage error.
 #[test]
 fn cleanup_lists_a_foreign_commit_without_deleting_or_adopting_it() {
     let temp = tempdir().unwrap();
@@ -1504,6 +1505,17 @@ fn cleanup_lists_a_foreign_commit_without_deleting_or_adopting_it() {
             "every run lists the foreign commit and none deletes it: {person}"
         );
     }
+    let human = stdout_string(&output_success(
+        cli()
+            .args(["cleanup", "--keep", "1", "--confirm", "--target"])
+            .arg(&graph),
+    ));
+    assert!(
+        human.contains(&format!(
+            "node type 'Person': foreign Lance versions {foreign_head} kept, never read or adopted"
+        )),
+        "the human report names the foreign commit: {human}"
+    );
     assert_eq!(
         people(),
         rows_before,

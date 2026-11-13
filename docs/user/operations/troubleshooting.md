@@ -320,8 +320,10 @@ table.
 - Queries, mutations, loads, merges, index builds, schema apply, optimize
   and cleanup are unaffected: none of them resolves the linear HEAD, and no
   command adopts a foreign commit.
-- `cleanup --confirm --json` lists them in the table's result row under
-  `foreign_versions` and never deletes a foreign version or its files.
+- A confirmed `cleanup --keep N --confirm` run lists them per table, under
+  `foreign_versions` with `--json` and by name in the human report, and never
+  deletes a foreign version or its files. The preview without `--confirm`
+  lists nothing.
 - The `repair` command that reported them as `foreign_drift` was removed; read
   `foreign_versions` from cleanup instead.
 

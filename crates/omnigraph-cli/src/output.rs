@@ -303,6 +303,19 @@ pub(crate) fn write_cleanup(
                 failed.join(", ")
             )?;
         }
+        for s in stats.iter().filter(|s| !s.foreign_versions.is_empty()) {
+            let versions = s
+                .foreign_versions
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(
+                stdout,
+                "  {}: foreign Lance versions {versions} kept, never read or adopted",
+                graph_type_subject(&s.type_key)
+            )?;
+        }
     }
     Ok(())
 }
@@ -2124,6 +2137,7 @@ mod tests {
             concat!(
                 "cleanup graph (keep 2 versions, remove anything older than 60s) — removed 4 versions (14 bytes) across 1 datasets\n",
                 "  1 dataset(s) failed and will be retried on the next cleanup: edge type 'Knows'\n",
+                "  node type 'Person': foreign Lance versions 7, 8 kept, never read or adopted\n",
             ),
             serde_json::json!({
                 "uri":"graph", "keep_versions":2,"older_than_secs":60,
