@@ -1117,6 +1117,41 @@ impl IndexBatch {
     }
 }
 
+/// The compaction tasks one optimize run may execute at once, shared by every
+/// table it rewrites (#1384). A table runs its tasks side by side, as Lance's
+/// `compact_files` does, each holding one permit, so a run with one large
+/// table uses the slots its idle tables would have, and the run never has
+/// more tasks in flight than its rewrite concurrency. A Blob table still runs
+/// its tasks one at a time: its batch bound holds per task, not across tasks.
+#[derive(Debug, Clone)]
+pub struct CompactionTaskLimit {
+    permits: Arc<tokio::sync::Semaphore>,
+    width: usize,
+}
+
+impl CompactionTaskLimit {
+    /// A budget of `width` concurrent tasks; `1` runs them one after another.
+    pub fn new(width: usize) -> Self {
+        let width = width.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(width)),
+            width,
+        }
+    }
+
+    /// The number of tasks that may be in flight.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        self.permits
+            .acquire()
+            .await
+            .map_err(|_| OmniError::manifest_internal("compaction task budget closed"))
+    }
+}
+
 /// A staged compaction: the `Rewrite` to commit detached and the metrics its
 /// tasks reported.
 pub struct StagedCompaction {
@@ -4942,14 +4977,16 @@ impl TableStore {
     /// index's coverage over to the new fragments when Lance applies it.
     /// `None` when the plan has no task. Every task of a Blob table is sized
     /// before any executes, so a sizing refusal leaves no rewritten file
-    /// behind.
+    /// behind. The tasks run side by side within `limit`
+    /// ([`CompactionTaskLimit`]).
     pub async fn stage_compaction(
         &self,
         ds: &Dataset,
         options: &CompactionOptions,
+        limit: &CompactionTaskLimit,
     ) -> Result<Option<StagedCompaction>> {
         let plan = Self::plan_table_compaction(ds, options).await?;
-        Self::stage_compaction_plan(ds, plan).await
+        Self::stage_compaction_plan(ds, plan, limit).await
     }
 
     /// #721: rewrite exactly the fragments `fragment_ids` names, one
@@ -4989,7 +5026,7 @@ impl TableStore {
             read_version: ds.manifest.version,
             options: CompactionOptions::default(),
         };
-        Self::stage_compaction_plan(ds, plan).await
+        Self::stage_compaction_plan(ds, plan, &CompactionTaskLimit::new(1)).await
     }
 
     /// Execute a compaction plan against `ds` and stage its result as one
@@ -4997,6 +5034,7 @@ impl TableStore {
     async fn stage_compaction_plan(
         ds: &Dataset,
         plan: CompactionPlan,
+        limit: &CompactionTaskLimit,
     ) -> Result<Option<StagedCompaction>> {
         if plan.num_tasks() == 0 {
             return Ok(None);
@@ -5017,14 +5055,21 @@ impl TableStore {
                 task.options.batch_size = Some(rows);
             }
         }
-        let mut results = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            if let (true, Some(rows)) = (has_blob_columns, task.options.batch_size) {
-                crate::instrumentation::record_compaction_blob_batch(rows);
-            }
-            let _probe = crate::instrumentation::enter_compaction_task_probe().await;
-            results.push(task.execute(ds).await.map_err(OmniError::storage)?);
-        }
+        // Ordered, so results, and the fragment ids assigned from them below,
+        // come back in task order however the tasks interleave.
+        let width = if has_blob_columns { 1 } else { limit.width() };
+        let results = futures::stream::iter(tasks)
+            .map(|task| async move {
+                let _permit = limit.acquire().await?;
+                if let (true, Some(rows)) = (has_blob_columns, task.options.batch_size) {
+                    crate::instrumentation::record_compaction_blob_batch(rows);
+                }
+                let _probe = crate::instrumentation::enter_compaction_task_probe().await;
+                task.execute(ds).await.map_err(OmniError::storage)
+            })
+            .buffered(width)
+            .try_collect::<Vec<_>>()
+            .await?;
         if results.iter().any(|result| result.row_addrs.is_some()) {
             return Err(OmniError::manifest_internal(format!(
                 "compaction of {} produced an address-style rewrite; graph tables use stable row ids",

@@ -4016,6 +4016,7 @@ async fn segments_of_one_btree_cover_together_issue_1298() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
     use crate::instrumentation::{CompactionTaskProbes, with_compaction_task_probes};
+    use crate::table_store::CompactionTaskLimit;
     use lance::dataset::optimize::CompactionOptions;
 
     let dir = tempfile::tempdir().unwrap();
@@ -4041,7 +4042,10 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
     let probes = CompactionTaskProbes::rendezvous(2);
     let staged = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        with_compaction_task_probes(probes.clone(), store.stage_compaction(&ds, &options)),
+        with_compaction_task_probes(
+            probes.clone(),
+            store.stage_compaction(&ds, &options, &CompactionTaskLimit::new(2)),
+        ),
     )
     .await
     .expect("a table's two compaction tasks never ran at the same time")
@@ -4064,4 +4068,16 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
         .collect::<Vec<_>>();
     assert_eq!(old, vec![vec![0, 1], vec![2, 3]]);
     assert_eq!(new, vec![vec![4], vec![5]]);
+
+    // A budget of one, the served path's, still runs them one at a time.
+    let probes = CompactionTaskProbes::rendezvous(1);
+    with_compaction_task_probes(
+        probes.clone(),
+        store.stage_compaction(&ds, &options, &CompactionTaskLimit::new(1)),
+    )
+    .await
+    .unwrap()
+    .expect("the plan has work");
+    assert_eq!(probes.entered(), 2);
+    assert_eq!(probes.peak_in_flight(), 1);
 }

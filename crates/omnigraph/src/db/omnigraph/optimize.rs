@@ -512,7 +512,9 @@ impl OptimizeCancellation {
 }
 
 /// How many tables a run plans ahead of the ones it rewrites, and how many it
-/// rewrites at once. Planning only reads.
+/// rewrites at once. Planning only reads. `rewrite` also bounds the
+/// compaction tasks in flight across those tables, so a lone table may run
+/// that many of its tasks at once (#1384).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OptimizeConcurrency {
     pub planning: usize,
@@ -1219,10 +1221,16 @@ async fn run_table_pipeline(
             (index, started, result)
         }
     };
+    // #1384: the tables being rewritten share one compaction-task budget of
+    // the rewrite concurrency, so a run never has more tasks in flight than
+    // tables it may rewrite, and a lone large table uses the idle slots.
+    let task_limit = crate::table_store::CompactionTaskLimit::new(concurrency.rewrite);
     let stage = |index: usize, started: Instant, work: PreparedOptimizeTable| {
         let catalog = std::sync::Arc::clone(catalog);
+        let task_limit = task_limit.clone();
         async move {
-            let result = apply_optimize_table_effects(db, catalog.as_ref(), work).await;
+            let result =
+                apply_optimize_table_effects(db, catalog.as_ref(), work, &task_limit).await;
             (index, started, result)
         }
     };
@@ -1791,6 +1799,7 @@ async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
+    task_limit: &crate::table_store::CompactionTaskLimit,
 ) -> Result<OptimizeEffectOutcome> {
     let table_key = work.table_key;
     let full_path = work.full_path;
@@ -1804,8 +1813,10 @@ async fn apply_optimize_table_effects(
     let mut tip = base.clone();
     let mut tip_identity = None;
     let mut metrics = CompactionMetrics::default();
-    if let Some((staged, compaction_metrics)) =
-        db.storage().stage_compaction(&base, &options).await?
+    if let Some((staged, compaction_metrics)) = db
+        .storage()
+        .stage_compaction(&base, &options, task_limit)
+        .await?
     {
         let (rewrite, identity) = db
             .storage()
