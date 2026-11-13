@@ -1,0 +1,1 @@
+- The graph index keeps each node id once, in one Arrow array, so building or loading it holds less memory. Results are unchanged.

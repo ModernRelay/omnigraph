@@ -15,9 +15,20 @@ use hashbrown::HashTable;
 use super::memory::WorkMemory;
 use crate::error::OmniError;
 
-/// The seed of the groups' hash function: fixed, so a build hashes the same
-/// way on every run.
-const HASH_SEED: u64 = 0x6f6d_6e69_6a6f_696e;
+/// The groups' hash, keyed at random per build: the keys are node ids that
+/// writers choose, and a public fixed key would let ids that share a bucket
+/// make a build and its probes quadratic. Only foldhash's per-hasher seed
+/// is random: DataFusion's `RandomState` is foldhash's `FixedState`, which
+/// always hashes with the public `SharedSeed::global_fixed()`, and
+/// `create_hashes` accepts no other state. That still removes the fixed
+/// public key; foldhash does not claim to resist an interactive attacker.
+/// Nothing depends on the hash values: groups are numbered by first
+/// appearance and a probe answers in its own row order, and a build keeps
+/// the state its probes hash with.
+fn key_hash_state() -> RandomState {
+    use std::hash::BuildHasher;
+    RandomState::with_seed(std::collections::hash_map::RandomState::new().hash_one(0u64))
+}
 
 /// The groups of one Utf8 key array: `(hash, group)` entries, and per group
 /// the row of `keys` where it first appears. `keys` is an `Arc`-backed clone
@@ -71,7 +82,7 @@ impl KeyGroups {
                 "key groups exceed the UInt32 row range",
             ))
         })?;
-        let state = RandomState::with_seed(HASH_SEED);
+        let state = key_hash_state();
         let mut hashes = vec![0u64; keys.len()];
         create_hashes([keys as &dyn Array], &state, &mut hashes)?;
         Ok(Self::from_hashes(keys, state, &hashes, on_row))
@@ -249,10 +260,9 @@ mod tests {
         // `a` and `b` collide; the null shares `c`'s hash and must stay out.
         let hashes = [7, 7, 7, 9, 9];
         let mut row_groups = Vec::new();
-        let groups =
-            KeyGroups::from_hashes(&keys, RandomState::with_seed(HASH_SEED), &hashes, |group| {
-                row_groups.push(group)
-            });
+        let groups = KeyGroups::from_hashes(&keys, key_hash_state(), &hashes, |group| {
+            row_groups.push(group)
+        });
         assert_eq!(groups.len(), 3);
         assert_eq!(row_groups, [Some(0), Some(1), Some(0), None, Some(2)]);
         let first = |hash, key| groups.group_of(hash, key).map(|g| groups.first_row(g));

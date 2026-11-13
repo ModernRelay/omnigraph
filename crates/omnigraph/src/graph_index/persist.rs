@@ -57,6 +57,7 @@
 
 use std::collections::HashMap;
 
+use arrow_array::Array as _;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
@@ -65,7 +66,7 @@ use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
 
-use super::{CsrIndex, GraphIndex, TypeIndex};
+use super::{CsrIndex, GraphIndex, TypeIndex, TypeIndexBuilder};
 
 const MAGIC: &[u8; 8] = b"OGCSRIDX";
 
@@ -276,7 +277,8 @@ fn serialize(index: &GraphIndex, tables: Vec<TableStamp>) -> Result<Vec<u8>> {
         push_prelude(&mut payload, SECTION_DICT, name, None);
         let ids = types[*name].ids();
         let before = payload.len();
-        for id in ids {
+        for dense in 0..ids.len() {
+            let id = ids.value(dense);
             payload.extend_from_slice(&(id.len() as u32).to_le_bytes());
             payload.extend_from_slice(id.as_bytes());
         }
@@ -468,12 +470,16 @@ fn decode_body(header: &Header, payload: &[u8]) -> Result<GraphIndex> {
         }
         let section = take(payload, &mut cursor, dict.len)?;
         // Every id costs at least its 4-byte length prefix, so the section
-        // bounds the possible id count regardless of what `count` claims.
+        // bounds the possible id count regardless of what `count` claims,
+        // and the id bytes regardless of how they split.
         let capacity_ceiling = section.len() / 4;
-        let mut ids = Vec::with_capacity(
-            usize::try_from(dict.count)
-                .unwrap_or(0)
-                .min(capacity_ceiling),
+        let capacity = usize::try_from(dict.count)
+            .unwrap_or(0)
+            .min(capacity_ceiling);
+        // The id bytes are the section less one length prefix per id.
+        let mut ids = TypeIndexBuilder::with_capacity(
+            capacity,
+            section.len().saturating_sub(capacity.saturating_mul(4)),
         );
         let mut d = 0usize;
         while d < section.len() {
@@ -494,7 +500,7 @@ fn decode_body(header: &Header, payload: &[u8]) -> Result<GraphIndex> {
             let id = std::str::from_utf8(&section[d..id_end]).map_err(|_| {
                 OmniError::manifest("graph index artifact dictionary id is not UTF-8".to_string())
             })?;
-            ids.push(id.to_string());
+            ids.push_unique(id)?;
             d = id_end;
         }
         if ids.len() as u64 != dict.count {
@@ -503,7 +509,7 @@ fn decode_body(header: &Header, payload: &[u8]) -> Result<GraphIndex> {
                 dict.type_name
             )));
         }
-        type_indices.insert(dict.type_name.clone(), TypeIndex::from_ids(ids)?);
+        type_indices.insert(dict.type_name.clone(), ids.finish());
     }
 
     let dict_len = |type_name: &str| -> Result<usize> {
@@ -779,11 +785,14 @@ impl ArtifactCount {
         }
     }
 
-    pub(crate) fn add_ids(&mut self, type_name: &str, ids: &[String]) {
+    /// Counts `ids` new ids of `type_name` holding `bytes` UTF-8 bytes in
+    /// all: each a 4-byte length prefix, its bytes and its widening.
+    pub(crate) fn add_ids(&mut self, type_name: &str, ids: usize, bytes: usize) {
         let widen = self.per_id.get(type_name).copied().unwrap_or(0);
-        for id in ids {
-            self.counted = self.counted.saturating_add(4 + id.len() as u64 + widen);
-        }
+        self.counted = self
+            .counted
+            .saturating_add((ids as u64).saturating_mul(4 + widen))
+            .saturating_add(bytes as u64);
     }
 
     pub(crate) fn add_edges(&mut self, edges: u64) {
@@ -868,7 +877,8 @@ mod tests {
             ("Person".to_string(), "Person".to_string()),
         );
         let mut count = ArtifactCount::new(widest, u64::MAX, &edge_types);
-        count.add_ids("Person", index.parts().0["Person"].ids());
+        let ids = index.parts().0["Person"].ids();
+        count.add_ids("Person", ids.len(), ids.value_data().len());
         count.add_edges(edges);
         assert!(actual <= count.counted(), "{actual} vs {}", count.counted());
         // Exact apart from the header's count and length digits.
@@ -951,6 +961,45 @@ mod tests {
         let header_len = u64::from_le_bytes(bytes[12..20].try_into().unwrap()) as usize;
         let header: Header = serde_json::from_slice(&bytes[fixed..fixed + header_len]).unwrap();
         (header, bytes[fixed + header_len..].to_vec())
+    }
+
+    /// Issue 1337: a loaded dictionary holds each id once, in one buffer.
+    /// Decoding 100,000 uuid-shaped ids (a 4 MB section: 36 bytes and a
+    /// 4-byte length prefix each) holds at most the section's size plus 16
+    /// bytes per id at its peak; an owned `String` per id, cloned into a
+    /// `HashMap<String, u32>` key, holds about 140 bytes per id.
+    #[test]
+    fn loading_a_dictionary_holds_each_id_once_issue_1337() {
+        const IDS: usize = 100_000;
+        let ids: Vec<String> = (0..IDS)
+            .map(|n| format!("{n:08x}-0000-4000-8000-{:012x}", n * 7919))
+            .collect();
+        let mut types = HashMap::new();
+        types.insert("Person".to_string(), TypeIndex::from_ids(ids).unwrap());
+        let index = GraphIndex::from_parts(types, HashMap::new(), HashMap::new()).unwrap();
+        let bytes = serialize(&index, Vec::new()).unwrap();
+        let (header, payload) = split(&bytes);
+        let section = header.dicts[0].len as usize;
+        assert_eq!(section, IDS * 40);
+
+        let (decoded, peak) = crate::test_alloc::peak_bytes(|| decode_body(&header, &payload));
+        let decoded = decoded.unwrap();
+        let person = decoded.type_index("Person").unwrap();
+        assert_eq!(person.len(), IDS);
+        assert_eq!(
+            person.to_dense("00000007-0000-4000-8000-00000000d889"),
+            Some(7)
+        );
+        assert_eq!(
+            person.to_id(99_999),
+            Some("0001869f-0000-4000-8000-00002f335071")
+        );
+        let ceiling = section + 16 * IDS;
+        assert!(
+            peak <= ceiling,
+            "decoding {IDS} ids held {peak} bytes ({} per id); the ceiling is {ceiling}",
+            peak / IDS
+        );
     }
 
     // A lying header `count` must not drive the allocation — the clamp bounds
