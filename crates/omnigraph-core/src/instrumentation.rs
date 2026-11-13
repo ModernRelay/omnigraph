@@ -2126,42 +2126,35 @@ pub async fn open_dataset(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    let builder = dataset_builder(uri, version, session, &wrapper).await?;
-    let dataset = builder.load().await.map_err(|error| match error {
-        // Only the two shapes cleanup/drop legitimately leaves behind for a
-        // pinned historical read count as reclaimed history:
-        //   - VersionNotFound: the dataset exists, that version was GC'd.
-        //   - DatasetNotFound: the whole dataset directory is gone (a dropped
-        //     table's history fully GC'd).
-        // A bare NotFound is NOT a cleanup shape: it is a live manifest
-        // referencing a missing object — corruption or an object-store
-        // inconsistency — so it must stay loud rather than be masked as a benign
-        // retention gap (which the change feed would surface as a 410 "reset via
-        // baseline"). Residual: this cannot tell a corrupt CURRENT table's
-        // DatasetNotFound from a legitimately dropped historical table's; that
-        // needs caller context (whether the version is the table's current one),
-        // and the baseline handshake the gap points to still fails loudly on
-        // genuine current-state loss.
-        lance::Error::VersionNotFound { .. } | lance::Error::DatasetNotFound { .. }
-            if matches!(version, VersionResolution::At(_)) =>
-        {
-            OmniError::HistoricalVersionReclaimed {
-                published_dataset_version: match version {
-                    VersionResolution::At(version) => version,
-                    VersionResolution::Latest => 0,
-                },
+    load_recorded(uri, version, session, wrapper)
+        .await?
+        .map_err(|error| match error {
+            // Only the two shapes cleanup/drop legitimately leaves behind for a
+            // pinned historical read count as reclaimed history:
+            //   - VersionNotFound: the dataset exists, that version was GC'd.
+            //   - DatasetNotFound: the whole dataset directory is gone (a dropped
+            //     table's history fully GC'd).
+            // A bare NotFound is NOT a cleanup shape: it is a live manifest
+            // referencing a missing object — corruption or an object-store
+            // inconsistency — so it must stay loud rather than be masked as a benign
+            // retention gap (which the change feed would surface as a 410 "reset via
+            // baseline"). Residual: this cannot tell a corrupt CURRENT table's
+            // DatasetNotFound from a legitimately dropped historical table's; that
+            // needs caller context (whether the version is the table's current one),
+            // and the baseline handshake the gap points to still fails loudly on
+            // genuine current-state loss.
+            lance::Error::VersionNotFound { .. } | lance::Error::DatasetNotFound { .. }
+                if matches!(version, VersionResolution::At(_)) =>
+            {
+                OmniError::HistoricalVersionReclaimed {
+                    published_dataset_version: match version {
+                        VersionResolution::At(version) => version,
+                        VersionResolution::Latest => 0,
+                    },
+                }
             }
-        }
-        error => OmniError::storage(error),
-    })?;
-    if let Some(wrapper) = &wrapper {
-        let store = dataset
-            .object_store(None)
-            .await
-            .map_err(OmniError::storage)?;
-        record_probed_store(wrapper, store);
-    }
-    Ok(dataset)
+            error => OmniError::storage(error),
+        })
 }
 
 /// [`open_dataset`] at exactly `version`, resolving only that version (no
@@ -2177,16 +2170,9 @@ pub async fn open_dataset_at_version(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    let builder = dataset_builder(uri, VersionResolution::At(version), session, &wrapper).await?;
-    let dataset = builder.load().await.map_err(OmniError::storage)?;
-    if let Some(wrapper) = &wrapper {
-        let store = dataset
-            .object_store(None)
-            .await
-            .map_err(OmniError::storage)?;
-        record_probed_store(wrapper, store);
-    }
-    Ok(dataset)
+    load_recorded(uri, VersionResolution::At(version), session, wrapper)
+        .await?
+        .map_err(OmniError::storage)
 }
 
 /// [`open_dataset`] at the latest version of a dataset that may not exist:
@@ -2196,11 +2182,27 @@ pub async fn open_dataset_if_present(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Option<Dataset>> {
-    let builder = dataset_builder(uri, VersionResolution::Latest, session, &wrapper).await?;
+    match load_recorded(uri, VersionResolution::Latest, session, wrapper).await? {
+        Ok(dataset) => Ok(Some(dataset)),
+        Err(lance::Error::DatasetNotFound { .. }) => Ok(None),
+        Err(error) => Err(OmniError::storage(error)),
+    }
+}
+
+/// The one body of every open above: the recorded, wrapped builder, its load,
+/// and the probed store of a loaded dataset. The inner result is Lance's own
+/// load failure, which each caller reports in its own terms; the outer one is
+/// a failure to build the open or to probe the loaded store.
+async fn load_recorded(
+    uri: &str,
+    version: VersionResolution,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<std::result::Result<Dataset, lance::Error>> {
+    let builder = dataset_builder(uri, version, session, &wrapper).await?;
     let dataset = match builder.load().await {
         Ok(dataset) => dataset,
-        Err(lance::Error::DatasetNotFound { .. }) => return Ok(None),
-        Err(error) => return Err(OmniError::storage(error)),
+        Err(error) => return Ok(Err(error)),
     };
     if let Some(wrapper) = &wrapper {
         let store = dataset
@@ -2209,7 +2211,7 @@ pub async fn open_dataset_if_present(
             .map_err(OmniError::storage)?;
         record_probed_store(wrapper, store);
     }
-    Ok(Some(dataset))
+    Ok(Ok(dataset))
 }
 
 /// The builder of [`open_dataset`]: the open is recorded, and the session, the

@@ -6,6 +6,7 @@ use lance::dataset::refs::BranchIdentifier;
 use lance_namespace::Error as LanceNamespaceError;
 
 use crate::error::{OmniError, Result};
+use crate::instrumentation::VersionResolution;
 use crate::storage::{StorageKind, join_uri, storage_kind_for_uri};
 
 use super::TableIdentity;
@@ -65,24 +66,7 @@ pub async fn open_manifest_dataset_with_session(
     branch: Option<&str>,
     control_session: &Arc<lance::session::Session>,
 ) -> Result<Dataset> {
-    let uri = manifest_uri(root_uri.trim_end_matches('/'));
-    let dataset = crate::instrumentation::open_dataset(
-        &uri,
-        crate::instrumentation::VersionResolution::Latest,
-        Some(control_session),
-        crate::instrumentation::manifest_wrapper(),
-    )
-    .await?;
-    match branch {
-        Some(branch) if branch != "main" => {
-            let native = resolve_native_manifest_branch(&dataset, branch).await?;
-            dataset
-                .checkout_branch(&native)
-                .await
-                .map_err(|error| branch_ref_error(error, branch))
-        }
-        _ => Ok(dataset),
-    }
+    open_manifest_branch(root_uri, branch, VersionResolution::Latest, control_session).await
 }
 
 /// Open one manifest branch at a `version` the caller already knows,
@@ -97,43 +81,11 @@ pub async fn open_manifest_dataset_at_with_session(
     version: u64,
     control_session: &Arc<lance::session::Session>,
 ) -> Result<Dataset> {
-    let Some(branch) = branch.filter(|branch| *branch != "main") else {
-        return open_main_manifest_at(root_uri, version, control_session).await;
-    };
-    let main = open_manifest_dataset_with_session(root_uri, None, control_session).await?;
-    let native = resolve_native_manifest_branch(&main, branch).await?;
-    main.checkout_version((native.as_str(), version))
-        .await
-        .map_err(|error| branch_ref_error(error, branch))
-}
-
-/// [`open_manifest_dataset_at_with_session`] for a caller that already holds
-/// the branch's NATIVE ref name, as [`open_manifest_dataset_native_with_session`].
-pub async fn open_manifest_dataset_native_at_with_session(
-    root_uri: &str,
-    native: Option<&str>,
-    version: u64,
-    control_session: &Arc<lance::session::Session>,
-) -> Result<Dataset> {
-    let Some(native) = native.filter(|native| *native != "main") else {
-        return open_main_manifest_at(root_uri, version, control_session).await;
-    };
-    let main = open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
-    main.checkout_version((native, version))
-        .await
-        .map_err(|error| branch_ref_error(error, crate::branch_names::logical_branch_name(native)))
-}
-
-async fn open_main_manifest_at(
-    root_uri: &str,
-    version: u64,
-    control_session: &Arc<lance::session::Session>,
-) -> Result<Dataset> {
-    crate::instrumentation::open_dataset_at_version(
-        &manifest_uri(root_uri.trim_end_matches('/')),
-        version,
-        Some(control_session),
-        crate::instrumentation::manifest_wrapper(),
+    open_manifest_branch(
+        root_uri,
+        branch,
+        VersionResolution::At(version),
+        control_session,
     )
     .await
 }
@@ -146,21 +98,98 @@ pub async fn open_manifest_dataset_native_with_session(
     native: Option<&str>,
     control_session: &Arc<lance::session::Session>,
 ) -> Result<Dataset> {
-    let uri = manifest_uri(root_uri.trim_end_matches('/'));
-    let dataset = crate::instrumentation::open_dataset(
-        &uri,
-        crate::instrumentation::VersionResolution::Latest,
-        Some(control_session),
-        crate::instrumentation::manifest_wrapper(),
+    open_manifest_native(root_uri, native, VersionResolution::Latest, control_session).await
+}
+
+/// [`open_manifest_dataset_at_with_session`] for a caller that already holds
+/// the branch's NATIVE ref name, as [`open_manifest_dataset_native_with_session`].
+pub async fn open_manifest_dataset_native_at_with_session(
+    root_uri: &str,
+    native: Option<&str>,
+    version: u64,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
+    open_manifest_native(
+        root_uri,
+        native,
+        VersionResolution::At(version),
+        control_session,
     )
-    .await?;
-    match native {
-        Some(native) if native != "main" => {
-            dataset.checkout_branch(native).await.map_err(|error| {
-                branch_ref_error(error, crate::branch_names::logical_branch_name(native))
-            })
+    .await
+}
+
+/// The one body of the logical-name opens: main at `resolution`, or the named
+/// branch's native ref, resolved from main's latest, checked out at
+/// `resolution`.
+async fn open_manifest_branch(
+    root_uri: &str,
+    branch: Option<&str>,
+    resolution: VersionResolution,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
+    let Some(branch) = branch.filter(|branch| *branch != "main") else {
+        return open_main_manifest(root_uri, resolution, control_session).await;
+    };
+    let main = open_main_manifest(root_uri, VersionResolution::Latest, control_session).await?;
+    let native = resolve_native_manifest_branch(&main, branch).await?;
+    checkout_manifest_branch(&main, &native, resolution)
+        .await
+        .map_err(|error| branch_ref_error(error, branch))
+}
+
+/// The one body of the native-name opens: [`open_manifest_branch`] without
+/// resolving the native ref.
+async fn open_manifest_native(
+    root_uri: &str,
+    native: Option<&str>,
+    resolution: VersionResolution,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
+    let Some(native) = native.filter(|native| *native != "main") else {
+        return open_main_manifest(root_uri, resolution, control_session).await;
+    };
+    let main = open_main_manifest(root_uri, VersionResolution::Latest, control_session).await?;
+    checkout_manifest_branch(&main, native, resolution)
+        .await
+        .map_err(|error| branch_ref_error(error, crate::branch_names::logical_branch_name(native)))
+}
+
+/// Main's `__manifest` at `resolution`. A version the caller already holds
+/// opens through [`crate::instrumentation::open_dataset_at_version`], so a
+/// miss stays the storage error it is rather than reclaimed table history.
+async fn open_main_manifest(
+    root_uri: &str,
+    resolution: VersionResolution,
+    control_session: &Arc<lance::session::Session>,
+) -> Result<Dataset> {
+    let uri = manifest_uri(root_uri.trim_end_matches('/'));
+    let wrapper = crate::instrumentation::manifest_wrapper();
+    match resolution {
+        VersionResolution::Latest => {
+            crate::instrumentation::open_dataset(&uri, resolution, Some(control_session), wrapper)
+                .await
         }
-        _ => Ok(dataset),
+        VersionResolution::At(version) => {
+            crate::instrumentation::open_dataset_at_version(
+                &uri,
+                version,
+                Some(control_session),
+                wrapper,
+            )
+            .await
+        }
+    }
+}
+
+/// A native branch of the opened `main`, at its latest or at a known version.
+async fn checkout_manifest_branch(
+    main: &Dataset,
+    native: &str,
+    resolution: VersionResolution,
+) -> lance::Result<Dataset> {
+    match resolution {
+        VersionResolution::Latest => main.checkout_branch(native).await,
+        VersionResolution::At(version) => main.checkout_version((native, version)).await,
     }
 }
 
