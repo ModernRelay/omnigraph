@@ -463,6 +463,23 @@ mod tests {
     }
 
     #[test]
+    fn a_name_declared_twice_is_refused_per_entry() {
+        let source = "query twice() { match { $u: User } return { $u.name } }\n\
+                      query twice() { match { $u: User } return { $u } }";
+        let errors = QueryRegistry::from_specs(vec![spec("twice", source, false)]).unwrap_err();
+        assert_eq!(errors[0].query.as_deref(), Some("twice"));
+        let diagnostic = errors[0].diagnostic.as_deref().unwrap();
+        assert_eq!(diagnostic.code.as_str(), "T83");
+        assert!(
+            errors[0]
+                .message
+                .starts_with("type error: T83: `twice` is declared twice"),
+            "{}",
+            errors[0].message
+        );
+    }
+
+    #[test]
     fn branch_statement_is_refused_per_entry() {
         let errors =
             QueryRegistry::from_specs(vec![spec("b0", "branch create b0", false)]).unwrap_err();

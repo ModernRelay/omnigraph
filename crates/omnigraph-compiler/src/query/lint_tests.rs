@@ -28,6 +28,30 @@ fn parse_failure_returns_structured_error_output() {
     assert_eq!(output.findings[0].code, PARSE_ERROR_CODE);
 }
 
+/// A file declaring one name twice is refused whole, and the finding keeps
+/// the code `T83` at the later declaration rather than the parse family's
+/// `Q000`.
+#[test]
+fn a_repeated_declaration_name_is_a_t83_finding() {
+    let output = lint_query_file(
+        &catalog("node Person { name: String }"),
+        "query q() { match { $p: Person } return { $p.name } }\nquery q() { match { $p: Person } return { $p } }\n",
+        "/tmp/queries.gq",
+        QueryLintSchemaSource::file("/tmp/schema.pg"),
+    );
+    assert_eq!(output.status, QueryLintStatus::Error);
+    assert_eq!(output.queries_processed, 0);
+    assert_eq!(output.findings.len(), 1);
+    assert_eq!(output.findings[0].code, "T83");
+    assert!(
+        output.findings[0]
+            .message
+            .starts_with("line 2, column 7: type error: T83: `q` is declared twice"),
+        "{}",
+        output.findings[0].message
+    );
+}
+
 #[test]
 fn branch_statement_is_refused_as_a_parse_family_finding() {
     let output = lint_query_file(

@@ -426,6 +426,7 @@ These are the traps most likely to bite. Scan this table before debugging any pa
 | Non-parameterized query values | typecheck surprise, injection risk | Declare `$param: Type` and pass via `--params` |
 | Missing required field in `insert` | ``T12: insert for `X` must provide non-nullable property `Y` `` | Accept the param in the mutation signature |
 | Mixing `delete` with `insert`/`update` in one query | `T76` | Split into two mutations |
+| Two `query` declarations of one name in one source (file, `-e` text or stored-query file) | `T83`, naming the line and column of both | Rename or delete the later one; names compare case-sensitively |
 | `update T set { … } where …`, `delete T where …` | `Q008` | `match { $x: T } where $x.prop = $v  update $x set { … }` / `delete $x`; the diagnostic prints it |
 | `$p.id`, `id: $v` for identity | ``T6``/``T11``: ``type `Person` has no property `id`; the system identity is `$p.@id` `` (a failing stored-query registry quarantines its graph) | Use `$p.@id`, `$e.@src`/`@dst`, `$x.@id = $v`; `id` means a declared user property |
 | Long-lived feature branches | merge conflicts, schema apply blocked | Merge promptly; delete when done |

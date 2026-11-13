@@ -110,6 +110,7 @@ codes! {
     T78 = "an endpoint assignment is neither a key of the endpoint type nor a bound reference of it";
     T79 = "a ranked column is not a node column of its population";
     T80 = "an annotation the language does not read";
+    T83 = "two declarations of one name in a source unit";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
     // the binding it ranks, and `rrf()` arms one traversal connects are T59.

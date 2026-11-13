@@ -83,7 +83,9 @@ do not mean there is no possible fix.
   object in its error body. See
   [HTTP errors](../operations/troubleshooting.md#http-errors).
 - **`omnigraph lint`**: a `Q000` finding whose message is the expectation at
-  `line <n>, column <c>`; type errors report their `T…` code. See
+  `line <n>, column <c>`; type errors report their `T…` code, and `T83` (two
+  declarations of one name) is reported for the whole file at the later
+  declaration's `line <n>, column <c>`. See
   [Linting](index.md#linting).
 - **`queries validate --json` and `cluster plan --json`**: each breakage or
   query parse/typecheck failure carries the same diagnostic information as

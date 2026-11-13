@@ -5,11 +5,10 @@ and return columns; mutation queries use the same declaration form and are
 covered in [Mutations](../mutations/index.md). A file may instead hold exactly
 one statement, never beside a query declaration: a branch statement (`branch
 create`, `delete`, `merge`, `list`, `diff`, or `merge-base`; see [Branches,
-Commits, and History](../branching/index.md)), a `show` statement (see
-[session settings](#session-settings)), or an `explain` statement, which
-answers the plan a read query would run under instead of its rows (see
-[Explain](explain.md)). Any of them may open with
-[session settings](#session-settings) lines.
+Commits, and History](../branching/index.md)), a `show` statement, or an
+`explain` statement, which answers the plan a read query would run under
+instead of its rows (see [Explain](explain.md)). Any of them may open with
+[session settings](#session-settings) lines, the settings `show` prints.
 
 ```gq
 query engineers($title: String) @description("People with a title") {
@@ -39,6 +38,8 @@ parameter must be supplied; omission fails before query execution. A trailing
 `?` accepts `null` or an omitted value. `@description("...")` and
 `@instruction("...")` attach metadata for tool clients. An integer parameter
 carries its type's whole range: a `U64` takes `0` to `18446744073709551615`.
+A source declares each name once, compared case-sensitively as a call resolves
+it; a second declaration is `T83`, naming both: rename or delete the later one.
 
 ## Match patterns
 
@@ -256,10 +257,9 @@ than the limit. BM25 reads every matching entity before the final limit.
 
 ## Blobs
 
-Blob properties are not ordinary read-query values. They cannot be projected,
-filtered, ordered, or passed to an aggregate. Read one logical Blob cell with
-the CLI or HTTP Blob endpoint described in [Blobs](../blobs.md). Blob parameters
-remain valid for mutation assignment.
+A Blob property is not a read value: it cannot be projected, filtered, ordered
+or aggregated (`T24`). Read one Blob cell with the CLI or HTTP Blob endpoint in
+[Blobs](../blobs.md); a Blob parameter remains valid in a mutation assignment.
 
 ## Branches and historical reads
 
@@ -324,10 +324,10 @@ omnigraph lint --query queries.gq --schema schema.pg --json
 `Q000` identifies a file the parser refused, at `line <n>, column <c>`; a
 [branch statement](../branching/index.md) where declarations were expected
 and a [settings line](#session-settings) naming an unknown setting or a value
-outside its row report the same way. `L201` warns when a nullable property is
-never set by any update query in the inspected set. Type errors report the
-affected query and their `T…` code. The command exits nonzero when the overall
-status is an error.
+outside its row report the same way; `T83` reports there with its code.
+`L201` warns when a nullable property is never set by any update query in the
+inspected set. Type errors report the affected query and their `T…` code. The
+command exits nonzero when the overall status is an error.
 
 For every query that compiles successfully, JSON output includes an
 `operation` descriptor:

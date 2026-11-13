@@ -3270,6 +3270,26 @@ async fn parse_error_precedes_policy_denial_on_every_door() {
             "{path}"
         );
 
+        // A source declaring the requested name twice is refused before the
+        // name selects either declaration.
+        let twice = json!({
+            field: "query find_person() { match { $p: Person } return { $p.name } }\nquery find_person() { match { $p: Person } return { $p.age } }",
+            "name": "find_person",
+            "branch": "main"
+        });
+        let (status, out) = json_response(&app, send(path, token, twice, expected_head)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {out}");
+        let error: ErrorOutput = serde_json::from_value(out).unwrap();
+        let diagnostic = error
+            .diagnostic
+            .expect("a refused query carries its diagnostic");
+        assert_eq!(diagnostic.code, "T83", "{path}");
+        assert_eq!(
+            diagnostic.position.map(|at| (at.line, at.column)),
+            Some((2, 7)),
+            "{path}"
+        );
+
         // A source nested past the bound is refused before the grammar
         // recurses over it; parsed, it would exhaust the worker's stack and
         // abort the server for every caller.

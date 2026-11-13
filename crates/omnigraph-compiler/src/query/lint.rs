@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::catalog::Catalog;
 use crate::ir::core::{CoreDecl, MutationTarget, Sink};
 use crate::query::descriptor::{QueryOperationDescriptor, describe_query_operation};
-use crate::query::diagnostic::QueryDiagnostic;
+use crate::query::diagnostic::{QueryDiagnostic, QueryDiagnosticKind};
 use crate::query::file::QueryDecl;
 use crate::query::parser::parse_query_diagnostic;
 
@@ -123,8 +123,11 @@ pub fn lint_query_file(
 ) -> QueryLintOutput {
     let query_path = query_path.into();
     let parsed = match parse_query_diagnostic(query_source) {
-        Ok(file) => file.body.into_read_declarations(),
-        Err(diagnostic) => Err(parse_error_message(diagnostic)),
+        Ok(file) => file
+            .body
+            .into_read_declarations()
+            .map_err(|message| (PARSE_ERROR_CODE.to_string(), message)),
+        Err(diagnostic) => Err(front_door_finding(diagnostic)),
     };
     match parsed {
         Ok(queries) => {
@@ -200,7 +203,7 @@ pub fn lint_query_file(
                 findings,
             }
         }
-        Err(message) => QueryLintOutput {
+        Err((code, message)) => QueryLintOutput {
             status: QueryLintStatus::Error,
             schema_source,
             query_path,
@@ -211,7 +214,7 @@ pub fn lint_query_file(
             results: Vec::new(),
             findings: vec![QueryLintFinding {
                 severity: QueryLintSeverity::Error,
-                code: PARSE_ERROR_CODE.to_string(),
+                code,
                 message,
                 type_name: None,
                 property: None,
@@ -221,17 +224,21 @@ pub fn lint_query_file(
     }
 }
 
-/// The parse message with its position, `line <n>, column <c>: <message>`,
-/// so a refused `set` line is reported where it stands; a spanless
-/// diagnostic keeps its message.
-fn parse_error_message(diagnostic: QueryDiagnostic) -> String {
-    let QueryDiagnostic {
-        message, position, ..
-    } = diagnostic;
-    match position {
+/// The finding of a file the front door refused: its code and its message
+/// with the position, `line <n>, column <c>: <message>`, so a refused `set`
+/// line is reported where it stands; a spanless diagnostic keeps its
+/// message. A parse refusal is `Q000`; a refusal the front door raises for
+/// the whole source unit (`T83`) keeps its code and its rendered form.
+fn front_door_finding(diagnostic: QueryDiagnostic) -> (String, String) {
+    let (code, message) = match diagnostic.kind {
+        QueryDiagnosticKind::Parse => (PARSE_ERROR_CODE.to_string(), diagnostic.message.clone()),
+        _ => (diagnostic.code.as_str().to_string(), diagnostic.to_string()),
+    };
+    let message = match diagnostic.position {
         Some(at) => format!("line {}, column {}: {message}", at.line, at.column),
         None => message,
-    }
+    };
+    (code, message)
 }
 
 fn query_kind(query: &QueryDecl) -> QueryLintQueryKind {

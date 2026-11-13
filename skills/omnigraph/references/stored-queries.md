@@ -17,7 +17,7 @@ graphs:
     queries: queries/            # discover every `query <name>` in queries/*.gq
 ```
 
-`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq`, a query that does not type-check against the graph's desired schema, or a duplicate query name across files fails `cluster validate`. A relative `queries` path must stay inside the config
+`queries` also accepts an explicit file list (`[a.gq, b.gq]`) or a fine-grained `name: { file: … }` map; an unparseable `.gq`, a query that does not type-check against the graph's desired schema, or a duplicate query name fails `cluster validate` (`T83` within one file, `duplicate_query_name` across files). A relative `queries` path must stay inside the config
 directory: a `..` segment fails with `config_path_escape`, and a symbolic link
 on the path (or a symlinked discovered `.gq` file) fails with
 `config_path_symlink`. `cluster apply` publishes them to the content-addressed catalog, and the `--target` server type-checks and serves every applied query. Every applied query is listed.

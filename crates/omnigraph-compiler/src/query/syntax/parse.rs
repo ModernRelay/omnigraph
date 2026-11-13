@@ -12,7 +12,7 @@
 //! refusal of the source they produce.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use pest::Parser;
@@ -31,7 +31,7 @@ use super::*;
 use super::{QueryParser, Rule};
 use crate::query::codes::{
     Q001, Q002, Q004, Q005, Q007, Q008, Q009, Q010, Q011, Q012, Q013, Q014, Q015, Q016, Q017, Q018,
-    Q019, Q020, Q021,
+    Q019, Q020, Q021, T83,
 };
 use crate::query::diagnostic::{
     Applicability, Position, QueryCode, QueryDiagnostic, Suggestion, TextEdit,
@@ -304,7 +304,10 @@ pub fn parse_source(input: &str) -> std::result::Result<SourceFile, QueryDiagnos
 /// [`parse_source`] keeping the construct span of a refusal.
 pub fn parse_source_detailed(input: &str) -> R<SourceFile> {
     match structural(input) {
-        Ok(file) => Ok(file),
+        Ok((file, names)) => match duplicate_declaration(input, &names) {
+            Some(refused) => Err(refused),
+            None => Ok(file),
+        },
         Err(first) => Err(foreign::with_habits(input, first, structural_refusal)),
     }
 }
@@ -314,12 +317,60 @@ fn structural_refusal(input: &str) -> Option<Refusal> {
     structural(input).err()
 }
 
-fn structural(input: &str) -> R<SourceFile> {
+/// A declaration's name as written and the byte range of the name.
+type DeclName = (String, (usize, usize));
+
+/// `T83`: the first name a later declaration repeats. A `Call` and every
+/// door that selects a declaration by name resolve it among the source
+/// unit's declarations, comparing bytes (case-sensitively, as `Call`
+/// resolution does), and need exactly one. The refusal points at the later
+/// declaration, names the line and column of both, and suggests renaming the
+/// later one to a name no declaration of the source uses; deleting it is the
+/// other fix, which the text names.
+fn duplicate_declaration(input: &str, names: &[DeclName]) -> Option<Refusal> {
+    let mut first: HashMap<&str, (usize, usize)> = HashMap::new();
+    for (name, span) in names {
+        let Some(earlier) = first.get(name.as_str()) else {
+            first.insert(name, *span);
+            continue;
+        };
+        let (was, at) = (Position::at(input, earlier.0), Position::at(input, span.0));
+        let fresh = (2..)
+            .map(|n| format!("{name}_{n}"))
+            .find(|candidate| names.iter().all(|(taken, _)| taken != candidate))
+            .expect("an unbounded range holds a name no declaration uses");
+        let mut diagnostic = QueryDiagnostic::typecheck(
+            T83,
+            format!(
+                "`{name}` is declared twice in one source, at line {}, column {} and at line {}, column {}; a call or a request resolves a name to exactly one declaration",
+                was.line, was.column, at.line, at.column
+            ),
+        )
+        .with_fix(format!(
+            "rename the later `{name}` (line {}, column {}) to `{fresh}`, or delete that declaration",
+            at.line, at.column
+        ))
+        .with_suggestion(Suggestion {
+            applicability: REVIEW,
+            edits: vec![edit(span.0, span.1, fresh)],
+        });
+        diagnostic.position = Some(at);
+        return Some(Refusal {
+            diagnostic,
+            span: Some(*span),
+        });
+    }
+    None
+}
+
+/// The file and each declaration's name span, in source order.
+fn structural(input: &str) -> R<(SourceFile, Vec<DeclName>)> {
     let pairs =
         QueryParser::parse(Rule::query_file, input).map_err(|error| grammar_error(input, error))?;
     let file = pairs.into_iter().next().expect("grammar: one query_file");
     let mut settings = Vec::new();
     let mut decls = Vec::new();
+    let mut names = Vec::new();
     let mut statement: Option<Body> = None;
     for inner in file.into_inner() {
         match inner.as_rule() {
@@ -383,7 +434,15 @@ fn structural(input: &str) -> R<SourceFile> {
             Rule::declaration => {
                 let d = inner.into_inner().next().expect("grammar: one declaration");
                 match d.as_rule() {
-                    Rule::query_decl => decls.push(decl(d)?),
+                    Rule::query_decl => {
+                        let name = d
+                            .clone()
+                            .into_inner()
+                            .find(|p| p.as_rule() == Rule::ident)
+                            .expect("grammar: query_decl names itself");
+                        names.push((name.as_str().to_string(), span_of(&name)));
+                        decls.push(decl(d)?)
+                    }
                     Rule::mutation_decl => return Err(declaration_keyword(input, d, "mutation")),
                     Rule::view_decl => return Err(declaration_keyword(input, d, "view")),
                     other => unreachable!("grammar: declaration holds no {other:?}"),
@@ -392,10 +451,13 @@ fn structural(input: &str) -> R<SourceFile> {
             _ => {}
         }
     }
-    Ok(SourceFile {
-        settings,
-        body: statement.unwrap_or(Body::Decls(decls)),
-    })
+    Ok((
+        SourceFile {
+            settings,
+            body: statement.unwrap_or(Body::Decls(decls)),
+        },
+        names,
+    ))
 }
 
 /// The constructs an element of `match { … }` may be.

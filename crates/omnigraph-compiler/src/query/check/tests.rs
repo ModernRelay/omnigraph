@@ -860,6 +860,61 @@ fn a_call_binds_its_arguments_and_never_substitutes() {
     );
 }
 
+/// A call resolves against the declarations of its source unit,
+/// case-sensitively, exactly one: two declarations of one name are `T83`,
+/// refused before any declaration is checked, naming both and renaming the
+/// later one.
+#[test]
+fn t83_names_both_declarations_and_renames_the_later() {
+    use crate::query::diagnostic::Applicability;
+    use crate::query::syntax::parse::apply_edits;
+    let written = "query f($h: String) { match { $p: Person } where $p.handle = $h return { $p } }\n\
+                   query q() { match { from f(\"a\") } return { $p.name } }\n\
+                   query f($h: String) { match { $p: Person } where $p.name = $h return { $p } }";
+    let d = check_source(&catalog(), written).expect_err("refused at the front door");
+    assert_eq!(d.code.as_str(), "T83", "{d}");
+    assert_eq!(
+        d.to_string(),
+        "type error: T83: `f` is declared twice in one source, at line 1, column 7 and at line 3, column 7; a call or a request resolves a name to exactly one declaration"
+    );
+    let at = d.position.expect("the later declaration's position");
+    assert_eq!((at.line, at.column), (3, 7));
+    assert_eq!(&written[at.byte as usize..at.byte as usize + 1], "f");
+    assert_eq!(
+        d.fix.as_deref(),
+        Some("rename the later `f` (line 3, column 7) to `f_2`, or delete that declaration")
+    );
+    let suggestion = d.suggestion.expect("the rename");
+    assert_eq!(suggestion.applicability, Applicability::NeedsReview);
+    let repaired = apply_edits(written, &suggestion.edits);
+    assert!(
+        repaired.ends_with(
+            "query f_2($h: String) { match { $p: Person } where $p.name = $h return { $p } }"
+        ),
+        "{repaired}"
+    );
+    // Renamed, the call resolves to the one `f` left.
+    assert!(
+        check(&repaired).iter().all(|(_, r)| r.is_ok()),
+        "{repaired}"
+    );
+
+    // The fresh name is one no declaration of the source uses, and a third
+    // declaration is refused at the first repeat.
+    let d = check_source(
+        &catalog(),
+        "query g() { match { $p: Person } return { $p } }\nquery g_2() { match { $p: Person } return { $p } }\nquery g() { match { $p: Person } return { $p } }\nquery g() { match { $p: Person } return { $p } }",
+    )
+    .expect_err("refused");
+    assert_eq!(d.position.map(|at| at.line), Some(3), "{d}");
+    assert_eq!(d.suggestion.unwrap().edits[0].replacement, "g_3");
+
+    // Names compare case-sensitively, as a call resolves them.
+    ok(
+        "query byName() { match { $p: Person } return { $p } }\nquery byname() { match { $p: Person } return { $p } }",
+    );
+}
+
 #[test]
 fn a_column_drawn_from_must_be_variable_shaped() {
     let e = check(

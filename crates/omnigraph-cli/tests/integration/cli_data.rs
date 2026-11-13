@@ -1946,6 +1946,26 @@ query bad_update($slug: String) {
     assert!(stdout.contains(
         "INFO  Lint complete: 1 queries processed (1 error(s), 0 warning(s), 0 info item(s))"
     ));
+
+    // A file declaring one name twice is refused whole, with the code.
+    write_query_file(
+        &query_path,
+        "query twice() { match { $x: Policy } return { $x.slug } }\n\
+         query twice() { match { $x: Policy } return { $x.name } }\n",
+    );
+    let output = output_failure(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("ERROR line 2, column 7: type error: T83: `twice` is declared twice"),
+        "{stdout}"
+    );
 }
 
 #[test]

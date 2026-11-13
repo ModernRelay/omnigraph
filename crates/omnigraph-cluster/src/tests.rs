@@ -3845,6 +3845,22 @@ fn query_discovery_rejects_duplicates_and_parse_errors() {
         out.diagnostics
     );
 
+    // One name declared twice in one file is the compiler's `T83`.
+    fs::write(dir.path().join("twice.gq"), format!("{decl}{decl}")).unwrap();
+    fs::write(
+        dir.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n    queries: ./twice.gq\n",
+    )
+    .unwrap();
+    let out = validate_config_dir(dir.path());
+    assert!(!out.ok);
+    let diagnostic = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "query_parse_error")
+        .unwrap_or_else(|| panic!("{:?}", out.diagnostics));
+    assert_eq!(diagnostic.detail.as_ref().unwrap().code.as_str(), "T83");
+
     fs::write(
         dir.path().join("broken.gq"),
         "query broken { match { $p: Person } return { $p.name } }",
