@@ -66,7 +66,7 @@ mod fts_compat_tests {
                 &[IndexBuildSpec::FullText {
                     column: "body".into(),
                 }],
-                &crate::table_store::IndexBuildLimit::default(),
+                &crate::table_store::MaintenanceBudget::default(),
             )
             .await
             .unwrap();

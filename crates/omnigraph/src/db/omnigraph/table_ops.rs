@@ -438,7 +438,7 @@ async fn maintain_indices_for_branch(
     // full-text or vector build runs alone. Results are taken in target order,
     // so pending reports, the failpoint and the publication match a serial
     // pass.
-    let limit = crate::table_store::IndexBuildLimit::default();
+    let limit = crate::table_store::MaintenanceBudget::default();
     let staging = targets.iter().map(|target| {
         let ds = existing_targets.get(&target.table_key);
         let work = &work_by_table[&target.table_key];
@@ -1347,7 +1347,7 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
         .stage_create_indices(
             ds,
             &work.specs,
-            &crate::table_store::IndexBuildLimit::default(),
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .map_err(|error| {

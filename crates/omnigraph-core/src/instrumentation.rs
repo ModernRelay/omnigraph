@@ -772,6 +772,7 @@ tokio::task_local! {
 
 tokio::task_local! {
     static INDEX_BUILD_PROBES: IndexBuildProbes;
+    static OPTIMIZE_STEP_PROBES: OptimizeStepProbes;
 }
 
 tokio::task_local! {
@@ -1032,6 +1033,46 @@ async fn enter_probe(state: Arc<StageWriteProbeState>) -> StageWriteProbeGuard {
     let active = state.active.fetch_add(1, Ordering::Relaxed) + 1;
     state.peak.fetch_max(active, Ordering::Relaxed);
     StageWriteProbeGuard { state }
+}
+
+/// The same rendezvous probe around each heavy step that holds permits of a
+/// `MaintenanceBudget` (#1384, #1385): a compaction task or one index build.
+/// It counts how many of the run's steps are executing at once, across every
+/// table the run stages.
+#[derive(Clone)]
+pub struct OptimizeStepProbes(StageWriteProbes);
+
+impl OptimizeStepProbes {
+    /// Create a probe whose first `release_after` steps wait until that many
+    /// have entered.
+    pub fn rendezvous(release_after: usize) -> Self {
+        Self(StageWriteProbes::rendezvous(release_after))
+    }
+
+    /// Number of steps that entered the probe.
+    pub fn entered(&self) -> u64 {
+        self.0.entered()
+    }
+
+    /// Maximum steps simultaneously inside the probe.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.0.peak_in_flight()
+    }
+}
+
+/// Run `fut` with the optimize-step probe installed.
+pub async fn with_optimize_step_probes<F>(probes: OptimizeStepProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    OPTIMIZE_STEP_PROBES.scope(probes, fut).await
+}
+
+pub async fn enter_optimize_step_probe() -> Option<StageWriteProbeGuard> {
+    let state = OPTIMIZE_STEP_PROBES
+        .try_with(|probes| probes.0.state.clone())
+        .ok()?;
+    Some(enter_probe(state).await)
 }
 
 pub fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {

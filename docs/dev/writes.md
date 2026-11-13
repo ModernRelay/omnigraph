@@ -493,18 +493,21 @@ declared indexes the table lacks and a whole rebuild of each BTREE or vector
 index whose coverage lags (`TableStore::stage_index_reconciliation`), the two
 index links optimize chains after its compaction; full-text coverage stays
 with the explicit rebuild. The tables stage concurrently and share one
-build budget (`IndexBuildLimit`, `INDEX_BUILD_CONCURRENCY` = 4): a BTREE build
-holds one permit, a full-text or vector build holds all of them and runs
-alone, and the batches join in table and specification order, so the
-publication is the one a serial pass makes. The pass owns the budget: one
-`ensure_indices` or full-text rebuild pass, or one optimize run across the
-tables it stages at once, never one budget per table. In optimize, a
-full-text or vector build therefore runs one at a time across the whole run;
-every BTREE build waits while one runs, and a table waiting for its permit
-keeps its rewrite slot, so later tables' compaction waits too. The first
-failed build in that order ends that pass's staging (in optimize, that table's
-staging: the table is reported failed and the others keep staging), and the
-builds still in flight are dropped.
+budget (`MaintenanceBudget`): a BTREE build holds enough permits that at most
+`INDEX_BUILD_CONCURRENCY` (4) run at once, a full-text or vector build holds
+all of them and runs alone, and the batches join in table and specification
+order, so the publication is the one a serial pass makes. The pass owns the
+budget: one `ensure_indices` or full-text rebuild pass (width 4), or one
+optimize run across the tables it stages at once (width its rewrite
+concurrency, shared with every compaction task, which holds one permit),
+never one budget per table. In optimize, a full-text or vector build
+therefore runs one at a time across the whole run, and no compaction task or
+other build runs beside it; a table waiting for its permit keeps its rewrite
+slot, so later tables wait too. No step waits for a permit while it holds
+one, so the budget cannot deadlock. The first failed build in that order ends
+that pass's staging (in optimize, that table's staging: the table is reported
+failed and the others keep staging), and the builds still in flight are
+dropped.
 Each spilling BTREE training gets its own Lance memory pool of 150 MiB per
 core (`available_parallelism()`; `LANCE_MEM_POOL_SIZE` sets the pool size
 instead), so a pass can hold up to four such pools before Lance spills. A

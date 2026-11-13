@@ -1048,20 +1048,31 @@ struct IndexLag {
 /// full-text and vector builds have no such bound yet (#1296) and run alone.
 pub const INDEX_BUILD_CONCURRENCY: usize = 4;
 
-/// The shared budget of one maintenance pass. The pass that owns it (an
-/// `ensure_indices` or full-text rebuild pass, one `optimize` run) makes one
-/// and passes it to every build, so the bound holds across its tables. A
-/// BTREE build holds one permit, a full-text or vector build holds all of
-/// them, so it never overlaps another build. Permits are granted in request
-/// order, so a waiting full-text build is not starved by later BTREEs.
+/// The heavy steps one maintenance pass may execute at once, shared by every
+/// table it stages (#1384, #1385). The pass that owns it (an `ensure_indices`
+/// or full-text rebuild pass, one `optimize` run) makes one and passes it to
+/// every step, so the bound holds across its tables. Each step takes its
+/// permits through [`Self::run`] (a compaction task: one permit) or
+/// [`Self::permit_for`] (one index build), never while it holds others, so
+/// permits cannot deadlock. A BTREE build takes enough permits that at most
+/// [`INDEX_BUILD_CONCURRENCY`] run at once; a full-text or vector build takes
+/// all of them, so it never overlaps another step. Permits are granted in
+/// request order, so a waiting full-text build is not starved by later steps.
+/// The pass never has more steps in flight than its width.
 #[derive(Debug, Clone)]
-pub struct IndexBuildLimit {
+pub struct MaintenanceBudget {
     permits: Arc<tokio::sync::Semaphore>,
     width: u32,
 }
 
-impl IndexBuildLimit {
-    /// A budget of `width` concurrent BTREE builds; `1` builds serially.
+/// The permits one index build holds while it runs.
+pub(crate) struct BuildPermit<'a> {
+    _permit: tokio::sync::SemaphorePermit<'a>,
+    _probe: Option<crate::instrumentation::StageWriteProbeGuard>,
+}
+
+impl MaintenanceBudget {
+    /// A budget of `width` concurrent steps; `1` runs them one after another.
     pub fn new(width: usize) -> Self {
         let width = width.clamp(
             1,
@@ -1073,31 +1084,46 @@ impl IndexBuildLimit {
         }
     }
 
-    /// The number of builds the pass may have in flight.
+    /// The number of steps that may be in flight.
     pub fn width(&self) -> usize {
         self.width as usize
     }
 
-    /// The permit one build of `kind` holds while it runs: one for a BTREE,
-    /// the whole budget for any other kind, so a kind without a memory bound
-    /// never overlaps another build. Every build acquires through here.
-    pub(crate) async fn permit_for(
-        &self,
-        kind: IndexType,
-    ) -> Result<tokio::sync::SemaphorePermit<'_>> {
+    /// Run one compaction task holding one permit.
+    pub async fn run<T>(&self, step: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| OmniError::manifest_internal("maintenance budget closed"))?;
+        let _probe = crate::instrumentation::enter_optimize_step_probe().await;
+        step.await
+    }
+
+    /// The permits one build of `kind` holds while it runs: a share of the
+    /// width for a BTREE, so at most `INDEX_BUILD_CONCURRENCY` run at once,
+    /// and the whole width for any other kind, so a kind without a memory
+    /// bound never overlaps another step. Every build acquires through here.
+    pub(crate) async fn permit_for(&self, kind: IndexType) -> Result<BuildPermit<'_>> {
         let permits = if kind == IndexType::BTree {
-            1
+            self.width.div_ceil(INDEX_BUILD_CONCURRENCY as u32)
         } else {
             self.width
         };
-        self.permits
+        let permit = self
+            .permits
             .acquire_many(permits)
             .await
-            .map_err(|_| OmniError::manifest_internal("index build budget closed"))
+            .map_err(|_| OmniError::manifest_internal("maintenance budget closed"))?;
+        Ok(BuildPermit {
+            _permit: permit,
+            _probe: crate::instrumentation::enter_optimize_step_probe().await,
+        })
     }
 }
 
-impl Default for IndexBuildLimit {
+impl Default for MaintenanceBudget {
+    /// An index pass's budget: `INDEX_BUILD_CONCURRENCY` BTREE builds at once.
     fn default() -> Self {
         Self::new(INDEX_BUILD_CONCURRENCY)
     }
@@ -3365,7 +3391,7 @@ impl TableStore {
     pub async fn stage_index_fold(
         &self,
         ds: &Dataset,
-        limit: &IndexBuildLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<StagedIndexFold> {
         let (batch, _, skipped) = Self::index_fold_batch(ds, limit).await?;
         Ok(StagedIndexFold {
@@ -3386,7 +3412,7 @@ impl TableStore {
         &self,
         ds: &Dataset,
         specs: &[IndexBuildSpec],
-        limit: &IndexBuildLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<StagedIndexReconciliation> {
         let (mut batch, refreshed, skipped) = Self::index_fold_batch(ds, limit).await?;
         let mut vector_builds = 0;
@@ -3414,7 +3440,7 @@ impl TableStore {
     /// join the batch in lag order.
     async fn index_fold_batch(
         ds: &Dataset,
-        limit: &IndexBuildLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
         let lag = Self::foldable_index_lag(ds).await?;
         if lag.is_empty() {
@@ -5034,14 +5060,16 @@ impl TableStore {
     /// index's coverage over to the new fragments when Lance applies it.
     /// `None` when the plan has no task. Every task of a Blob table is sized
     /// before any executes, so a sizing refusal leaves no rewritten file
-    /// behind.
+    /// behind. The tasks run side by side, each holding one permit of `limit`
+    /// ([`MaintenanceBudget`]), the run's budget of heavy steps.
     pub async fn stage_compaction(
         &self,
         ds: &Dataset,
         options: &CompactionOptions,
+        limit: &MaintenanceBudget,
     ) -> Result<Option<StagedCompaction>> {
         let plan = Self::plan_table_compaction(ds, options).await?;
-        Self::stage_compaction_plan(ds, plan).await
+        Self::stage_compaction_plan(ds, plan, limit).await
     }
 
     /// #721: rewrite exactly the fragments `fragment_ids` names, one
@@ -5081,7 +5109,7 @@ impl TableStore {
             read_version: ds.manifest.version,
             options: CompactionOptions::default(),
         };
-        Self::stage_compaction_plan(ds, plan).await
+        Self::stage_compaction_plan(ds, plan, &MaintenanceBudget::new(1)).await
     }
 
     /// Execute a compaction plan against `ds` and stage its result as one
@@ -5089,6 +5117,7 @@ impl TableStore {
     async fn stage_compaction_plan(
         ds: &Dataset,
         plan: CompactionPlan,
+        limit: &MaintenanceBudget,
     ) -> Result<Option<StagedCompaction>> {
         if plan.num_tasks() == 0 {
             return Ok(None);
@@ -5109,13 +5138,29 @@ impl TableStore {
                 task.options.batch_size = Some(rows);
             }
         }
-        let mut results = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            if let (true, Some(rows)) = (has_blob_columns, task.options.batch_size) {
-                crate::instrumentation::record_compaction_blob_batch(rows);
-            }
-            results.push(task.execute(ds).await.map_err(OmniError::storage)?);
-        }
+        // Unordered, as Lance's `compact_files` runs them, so a slow task
+        // does not keep finished slots empty; sorting by task index puts the
+        // results, and the fragment ids assigned from them below, back in
+        // task order however the tasks interleave.
+        let width = if has_blob_columns { 1 } else { limit.width() };
+        let mut results = futures::stream::iter(tasks.into_iter().enumerate())
+            .map(|(index, task)| {
+                limit.run(async move {
+                    if let (true, Some(rows)) = (has_blob_columns, task.options.batch_size) {
+                        crate::instrumentation::record_compaction_blob_batch(rows);
+                    }
+                    let result = task.execute(ds).await.map_err(OmniError::storage)?;
+                    Ok((index, result))
+                })
+            })
+            .buffer_unordered(width)
+            .try_collect::<Vec<_>>()
+            .await?;
+        results.sort_unstable_by_key(|(index, _)| *index);
+        let results = results
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<Vec<_>>();
         if results.iter().any(|result| result.row_addrs.is_some()) {
             return Err(OmniError::manifest_internal(format!(
                 "compaction of {} produced an address-style rewrite; graph tables use stable row ids",
@@ -5978,7 +6023,7 @@ impl TableStore {
         &self,
         ds: &Dataset,
         specs: &[IndexBuildSpec],
-        limit: &IndexBuildLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<StagedWrite> {
         if specs.is_empty() {
             return Err(OmniError::manifest_internal(
@@ -6006,7 +6051,7 @@ impl TableStore {
     async fn create_index_batch(
         ds: &Dataset,
         specs: &[IndexBuildSpec],
-        limit: &IndexBuildLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<(IndexBatch, usize)> {
         let read_version = ds.manifest.version;
         let existing_indices = ds

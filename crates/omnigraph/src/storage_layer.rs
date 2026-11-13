@@ -56,7 +56,7 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, IndexBuildLimit,
+    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, MaintenanceBudget,
     OverwriteChunk, RefreshedIndex, StagedTransactionIdentity, StagedWrite, TableState, TableStore,
     UpdateMatchRequest, UpdateMatches,
 };
@@ -700,11 +700,13 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedHandle>;
 
     /// RFC 0067: stage one detached-ready compaction rewrite of the pinned
-    /// base, or `None` when there is nothing to compact.
+    /// base, or `None` when there is nothing to compact. Its tasks run within
+    /// `limit`, the run's shared budget of heavy steps.
     async fn stage_compaction(
         &self,
         snapshot: &SnapshotHandle,
         options: &lance::dataset::optimize::CompactionOptions,
+        limit: &crate::table_store::MaintenanceBudget,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>>;
 
     /// #721: stage one detached-ready rewrite of exactly the named
@@ -724,7 +726,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn stage_index_fold(
         &self,
         snapshot: &SnapshotHandle,
-        limit: &IndexBuildLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)>;
 
     /// Stage, as one detached-ready `CreateIndex`, the declared indexes the
@@ -734,7 +736,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
-        limit: &IndexBuildLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<IndexReconciliation>;
 
     /// Atomically create version 1 from a staged read-version-0 transaction.
@@ -1004,7 +1006,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
-        limit: &IndexBuildLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<StagedHandle>;
 
     // ── Index presence (reads, no HEAD advance) ──────────────────────
@@ -1317,9 +1319,10 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         options: &lance::dataset::optimize::CompactionOptions,
+        limit: &crate::table_store::MaintenanceBudget,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>> {
         Ok(
-            TableStore::stage_compaction(self, snapshot.dataset(), options)
+            TableStore::stage_compaction(self, snapshot.dataset(), options, limit)
                 .await?
                 .map(|compaction| (StagedHandle::new(compaction.staged), compaction.metrics)),
         )
@@ -1340,7 +1343,7 @@ impl TableStorage for TableStore {
     async fn stage_index_fold(
         &self,
         snapshot: &SnapshotHandle,
-        limit: &IndexBuildLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)> {
         let fold = TableStore::stage_index_fold(self, snapshot.dataset(), limit).await?;
         Ok((fold.staged.map(StagedHandle::new), fold.skipped))
@@ -1350,7 +1353,7 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
-        limit: &IndexBuildLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<IndexReconciliation> {
         let work =
             TableStore::stage_index_reconciliation(self, snapshot.dataset(), specs, limit).await?;
@@ -1711,7 +1714,7 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
-        limit: &IndexBuildLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<StagedHandle> {
         TableStore::stage_create_indices(self, snapshot.dataset(), specs, limit)
             .await
