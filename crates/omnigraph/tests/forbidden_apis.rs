@@ -4089,7 +4089,6 @@ fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
     let cache_evictions = [
         "invalidate_read_caches",
         "invalidate_all",
-        "invalidate_graph_index",
         "invalidate_graph_index_for",
         "invalidate_edge_tables",
     ];

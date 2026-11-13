@@ -1152,9 +1152,6 @@ pub async fn optimize_all_datasets(
         db.write_queue().optimize_published(None);
         graph_commit_id = Some(commit?.graph_commit_id);
         db.runtime_cache.invalidate_all().await;
-        if edge_tables_committed {
-            db.invalidate_graph_index().await;
-        }
     }
 
     // The graph commit is durable from here: nothing below fails the run. A

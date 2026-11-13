@@ -5096,12 +5096,6 @@ impl Omnigraph {
         )
     }
 
-    /// Invalidate every cached graph index. Called when the schema or the
-    /// physical layout of every edge table may change.
-    pub(crate) async fn invalidate_graph_index(&self) {
-        self.runtime_cache.invalidate_all().await;
-    }
-
     /// Invalidate the cached graph indexes that cover a written edge table
     /// (`edge:<Name>`). Called after edge mutations and merges.
     pub(crate) async fn invalidate_graph_index_for<'a>(

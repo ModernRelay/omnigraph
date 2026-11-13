@@ -457,7 +457,6 @@ async fn execute_with_lock(
 
         db.store_schema_view(desired_catalog, desired_source, &desired_ir)?;
         db.runtime_cache.invalidate_all().await;
-        db.invalidate_graph_index().await;
         fail(&catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
         Ok::<u64, OmniError>(graph_manifest_version)
     }
