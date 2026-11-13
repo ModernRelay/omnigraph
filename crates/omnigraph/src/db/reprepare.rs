@@ -137,10 +137,7 @@ impl WriteAttempt {
                 "a write attempt reached its commit without admitting its capture",
             ));
         }
-        let prepared_in_scope = write_queue::end_preparation();
-        if self.gates.is_some() && prepared_in_scope {
-            crate::instrumentation::record_gated_preparation_checked();
-        }
+        write_queue::end_preparation();
         Ok(self.gates.take())
     }
 

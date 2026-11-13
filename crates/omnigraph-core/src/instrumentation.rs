@@ -210,11 +210,6 @@ pub struct QueryIoProbes {
     /// table rebased, instead of preparing again. An attempt whose carry Lance
     /// refused is not counted; it prepares again.
     pub writes_carried_over_row_preserving: Arc<AtomicU64>,
-    /// Attempts that prepared again under the branch's writer gates and
-    /// reached their commit point inside the preparation scope, where every
-    /// writer-gate acquisition refuses instead of waiting on the attempt's own
-    /// gates. A test reads it to prove a gated attempt ran with that check.
-    pub gated_preparations_checked: Arc<AtomicU64>,
     /// The Lance `ObjectStore`s behind the opens that carried
     /// `manifest_wrapper` / `history_wrapper` / `table_wrapper`. A store's own
     /// `io_tracker` also sees Lance's direct local reader and writer, which on
@@ -1073,14 +1068,6 @@ pub fn record_probed_store(
 pub fn record_mutation_reprepare() {
     let _ = current(|p| {
         p.mutation_reprepares.fetch_add(1, Ordering::Relaxed);
-    });
-}
-
-/// Record one gated attempt that reached its commit point inside the
-/// preparation scope. No-op unless a cost probe is active.
-pub fn record_gated_preparation_checked() {
-    let _ = current(|p| {
-        p.gated_preparations_checked.fetch_add(1, Ordering::Relaxed);
     });
 }
 

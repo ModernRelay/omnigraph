@@ -419,9 +419,8 @@ reentrant; `commit_all` adds the table gates. The engine checks the rule:
 every attempt runs inside a preparation scope (`db::write_queue::preparing`,
 a task-local) that its commit point ends, and every writer-gate acquisition
 inside it refuses with an internal error instead of waiting on the attempt's
-own gate. `WriteAttempt::admit` refuses an attempt prepared outside the scope,
-and `QueryIoProbes::gated_preparations_checked` counts the gated attempts that
-reached their commit point inside it. The bound is the process's: another process's publication is refused
+own gate. `WriteAttempt::admit` refuses an attempt prepared outside the scope.
+The bound is the process's: another process's publication is refused
 by the publisher's CAS and prepares the write again, within
 `MAX_PRE_EFFECT_REPREPARES` (32).
 

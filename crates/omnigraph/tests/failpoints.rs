@@ -2028,7 +2028,8 @@ async fn upsert_of_a_row_optimize_rewrote_meanwhile_prepares_again_once_issue_13
 /// scope, where a writer-gate acquisition refuses instead of waiting on the
 /// attempt's own gates (`write_queue::tests`). Each writer, a mutation, a load
 /// and a Blob write, is sent back once here, and its gated second attempt
-/// prepares inside that scope and commits.
+/// prepares inside that scope and commits. That it committed is the proof:
+/// `WriteAttempt::admit` refuses an attempt prepared outside the scope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn each_writers_gated_attempt_prepares_with_the_gate_check_issue_1369() {
@@ -2106,11 +2107,6 @@ async fn each_writers_gated_attempt_prepares_with_the_gate_check_issue_1369() {
             probes.mutation_reprepares.load(Ordering::Relaxed),
             1,
             "{kind}: one send-back, then the gated attempt"
-        );
-        assert_eq!(
-            probes.gated_preparations_checked.load(Ordering::Relaxed),
-            1,
-            "{kind}: the gated attempt prepared inside the preparation scope"
         );
     }
 }
