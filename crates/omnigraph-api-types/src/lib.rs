@@ -1882,6 +1882,9 @@ pub struct QueryCatalogEntry {
     /// `true` for a stored mutation → an MCP read-only hint of `false`.
     pub mutation: bool,
     pub params: Vec<ParamDescriptor>,
+    /// Compiled result fields and graph types read or written, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<omnigraph_compiler::QueryOperationDescriptor>,
 }
 
 /// Response for `GET /queries`: every stored query in a graph's

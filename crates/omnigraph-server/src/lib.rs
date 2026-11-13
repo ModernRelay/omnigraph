@@ -45,7 +45,7 @@ pub use registry::{
     RegistryLookup, RegistrySnapshot, StartupFailure,
 };
 
-use crate::queries::{QueryRegistry, check, format_check_breakages};
+use crate::queries::{QueryRegistry, format_check_breakages};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -3969,12 +3969,10 @@ fn log_registry_warnings(label: &str, report: &queries::CheckReport) {
     }
 }
 
-fn validate_registry_against_catalog(
-    registry: &QueryRegistry,
-    catalog: &Catalog,
+fn validate_registry_report(
+    report: queries::CheckReport,
     label: &str,
 ) -> omnigraph::error::Result<()> {
-    let report = check(registry, catalog);
     if report.has_breakages() {
         return Err(OmniError::manifest(format_check_breakages(label, &report)));
     }
@@ -3990,11 +3988,11 @@ fn validate_registry_against_catalog(
 /// attach a registry that has not been schema-checked. `label` names the
 /// graph in messages.
 fn validate_and_attach(
-    queries: QueryRegistry,
+    mut queries: QueryRegistry,
     catalog: &Catalog,
     label: &str,
 ) -> Result<Option<Arc<QueryRegistry>>> {
-    validate_registry_against_catalog(&queries, catalog, label)
+    validate_registry_report(queries.check_and_describe(catalog), label)
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
     Ok(if queries.is_empty() {
         None

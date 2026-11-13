@@ -328,8 +328,8 @@ never set by any update query in the inspected set. Type errors report the
 affected query and their `T…` code. The command exits nonzero when the overall
 status is an error.
 
-For every query that compiles successfully, JSON output includes an
-`operation` descriptor:
+Lint JSON and the served query catalog use the same `operation` descriptor.
+If a server omits it, the result and access sets are unknown. When present:
 
 - `result` lists projected fields in return order. Each field has `name`,
   `kind`, and `nullable`; list fields also have `item_kind`, and vectors

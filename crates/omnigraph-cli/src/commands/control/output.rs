@@ -359,6 +359,7 @@ mod tests {
         let catalog = QueriesCatalogOutput {
             queries: vec![
                 omnigraph_api_types::QueryCatalogEntry {
+                    operation: None,
                     name: "people".into(),
                     tool_name: "people".into(),
                     description: Some("Find people\nby name".into()),
@@ -378,6 +379,7 @@ mod tests {
                     ],
                 },
                 omnigraph_api_types::QueryCatalogEntry {
+                    operation: None,
                     name: "retag".into(),
                     tool_name: "retag_people".into(),
                     description: None,
