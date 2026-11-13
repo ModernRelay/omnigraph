@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -15,6 +15,30 @@ use object_store::{
 use crate::error::{OmniError, Result};
 
 const MAX_SCAN_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Each scan store, with the dataset store it was derived from.
+type KeptScanStores = Vec<(Weak<lance::io::ObjectStore>, Arc<lance::io::ObjectStore>)>;
+
+/// Scan stores kept alive while the dataset store they were derived from lives.
+/// A session's store registry holds stores weakly and keys them by their
+/// parameters, block size included, so a scan store that nothing held was
+/// dropped after its scan and every later scan built a new one: new
+/// object-store clients, with their own connection pool and, without static
+/// keys, their own credential fetch on S3 and Azure. Held here, a later scan
+/// with the same parameters is a registry hit. A Weak keeps its allocation, so
+/// a dead entry's address cannot be reused before it is pruned.
+static KEPT_SCAN_STORES: LazyLock<Mutex<KeptScanStores>> = LazyLock::new(Default::default);
+
+fn keep_scan_store(original: &Arc<lance::io::ObjectStore>, store: &Arc<lance::io::ObjectStore>) {
+    let mut kept = KEPT_SCAN_STORES.lock().unwrap();
+    kept.retain(|(owner, _)| owner.strong_count() > 0);
+    if !kept
+        .iter()
+        .any(|(owner, held)| owner.as_ptr() == Arc::as_ptr(original) && Arc::ptr_eq(held, store))
+    {
+        kept.push((Arc::downgrade(original), Arc::clone(store)));
+    }
+}
 
 /// A scan-local store for small manifest data files; larger or indirect layouts retain their reader.
 pub async fn manifest_scan_dataset(dataset: &Dataset) -> Result<Dataset> {
@@ -39,6 +63,7 @@ pub async fn manifest_scan_dataset(dataset: &Dataset) -> Result<Dataset> {
     )
     .await
     .map_err(OmniError::storage)?;
+    keep_scan_store(&original, &store);
     if let Some(wrapper) = &params.object_store_wrapper {
         super::record_probed_store(wrapper, Arc::clone(&store));
     }
@@ -440,5 +465,74 @@ mod tests {
             );
             assert_eq!(requests.load(Ordering::SeqCst), 1, "case={case:?}");
         }
+    }
+
+    /// A scan store is built once per dataset store, not once per scan: the
+    /// registry holds scan stores weakly, so a store nobody kept was rebuilt by
+    /// every scan, with new object-store clients (connection pool, credential
+    /// chain) on S3 and Azure.
+    #[tokio::test]
+    async fn manifest_scans_reuse_one_scan_store_issue_1381() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("table.lance");
+        let uri = uri.to_str().unwrap();
+        crate::lance_clone::fresh_dataset(uri).await;
+        let dataset = crate::instrumentation::open_dataset(
+            uri,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(small_files(&dataset).is_some());
+        let registry = dataset.session().store_registry();
+
+        let first = manifest_scan_dataset(&dataset).await.unwrap();
+        let first_store = first.object_store(None).await.unwrap();
+        assert_eq!(first_store.block_size(), MAX_SCAN_FILE_BYTES as usize);
+        drop((first, first_store));
+        let misses = registry.stats().misses;
+
+        for _ in 0..3 {
+            let scan = manifest_scan_dataset(&dataset).await.unwrap();
+            assert_eq!(
+                scan.object_store(None).await.unwrap().block_size(),
+                MAX_SCAN_FILE_BYTES as usize
+            );
+        }
+        assert_eq!(
+            registry.stats().misses,
+            misses,
+            "each scan built a new object store"
+        );
+
+        // The kept store lives only as long as its dataset's store: once that
+        // is gone, the next scan of any dataset releases it.
+        let kept = Arc::downgrade(
+            &manifest_scan_dataset(&dataset)
+                .await
+                .unwrap()
+                .object_store(None)
+                .await
+                .unwrap(),
+        );
+        drop(dataset);
+        let other = dir.path().join("other.lance");
+        let other = other.to_str().unwrap();
+        crate::lance_clone::fresh_dataset(other).await;
+        let other = crate::instrumentation::open_dataset(
+            other,
+            crate::instrumentation::VersionResolution::Latest,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        manifest_scan_dataset(&other).await.unwrap();
+        assert!(
+            kept.upgrade().is_none(),
+            "a dropped dataset's scan store stayed"
+        );
     }
 }

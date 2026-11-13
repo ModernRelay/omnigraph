@@ -1,0 +1,1 @@
+- A cold catalog read on S3 or Azure reuses the object-store client an earlier read of the same `__manifest` built, so it no longer pays a new TLS handshake and credential fetch each time.
