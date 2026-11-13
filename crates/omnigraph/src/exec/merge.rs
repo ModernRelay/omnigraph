@@ -5420,7 +5420,7 @@ impl Omnigraph {
         let _schema_permit = if dry_run {
             None
         } else {
-            Some(self.write_queue().acquire_schema_shared().await)
+            Some(self.write_queue().acquire_schema_shared().await?)
         };
         // The target gate is held through publication: it keeps a target
         // delete/recreate from reusing the name underneath the plan (ABA) and
@@ -5434,15 +5434,15 @@ impl Omnigraph {
         let (source_gate, _target_gate) = if dry_run {
             (None, None)
         } else if source_branch <= target_branch {
-            let source_gate = queue.acquire_branch(source_branch.as_deref()).await;
+            let source_gate = queue.acquire_branch(source_branch.as_deref()).await?;
             (
                 Some(source_gate),
-                Some(queue.acquire_branch(target_branch.as_deref()).await),
+                Some(queue.acquire_branch(target_branch.as_deref()).await?),
             )
         } else {
-            let target_gate = queue.acquire_branch(target_branch.as_deref()).await;
+            let target_gate = queue.acquire_branch(target_branch.as_deref()).await?;
             (
-                Some(queue.acquire_branch(source_branch.as_deref()).await),
+                Some(queue.acquire_branch(source_branch.as_deref()).await?),
                 Some(target_gate),
             )
         };
@@ -6006,7 +6006,7 @@ impl Omnigraph {
         );
         let merge_branches = [target_branch.map(str::to_string)];
         let merge_queue_keys = self.table_queue_keys_for_branches(&merge_branches, catalog);
-        let _merge_queue_guards = self.write_queue().acquire_many(&merge_queue_keys).await;
+        let _merge_queue_guards = self.write_queue().acquire_many(&merge_queue_keys).await?;
 
         // Re-read both inputs against one accepted schema contract. Target
         // authority remains exact; source head movement is harmless, but its
@@ -6191,7 +6191,7 @@ impl Omnigraph {
                 crate::instrumentation::MergeTimingPhase::PhysicalPublish,
             );
             let mut updates = Vec::new();
-            let mut changed_edge_tables = false;
+            let mut changed_edge_tables: Vec<String> = Vec::new();
             for table_key in &ordered_table_keys {
                 let Some(candidate_state) = candidates.get(table_key) else {
                     continue;
@@ -6281,7 +6281,7 @@ impl Omnigraph {
                     fail(&BRANCH_MERGE_POST_TABLE_EFFECT)?;
                 }
                 if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
+                    changed_edge_tables.push(table_key.clone());
                 }
                 updates.push(update);
             }
@@ -6317,9 +6317,8 @@ impl Omnigraph {
         })
         .await?;
 
-        if changed_edge_tables {
-            self.invalidate_graph_index().await;
-        }
+        self.invalidate_graph_index_for(changed_edge_tables.iter().map(String::as_str))
+            .await;
 
         Ok(MergeResult {
             outcome: if is_fast_forward {

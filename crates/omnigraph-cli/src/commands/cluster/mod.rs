@@ -399,6 +399,7 @@ mod tests {
             path: "cluster".to_owned(),
             message: "admission original-lock remains held pending settlement".to_owned(),
             detail: None,
+            storage_failure: None,
         };
         let expected = "deployment_outcome_unknown cluster: admission original-lock remains held pending settlement";
         for json in [false, true] {

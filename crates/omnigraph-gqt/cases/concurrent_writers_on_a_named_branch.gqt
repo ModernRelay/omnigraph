@@ -1,6 +1,6 @@
 # issue: none
 # red_on: none; guard case
-# notes: An overtaken insert succeeds; overtaken updates and deletes are refused. Branch results stay isolated and survive reopen.
+# notes: Overtaken inserts, updates and deletes rerun on the new head and succeed. Branch results stay isolated and survive reopen.
 
 --- runner
 timeout_ms: 10000
@@ -19,6 +19,7 @@ node Company { name: String @key }
 --- seed
 {"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":31}}
+{"type":"Person","data":{"name":"dan","age":33}}
 
 --- mutate
 branch create feature
@@ -37,23 +38,23 @@ u1 on feature: query age_alice() { match { $x: Person } where $x.name = "alice" 
 i1 on feature: query add_globex() { insert Company { name: "globex" } }
 order: u1 park put nodes/, i1, u1 put nodes/, u1
 --- expect
-u1: error: graph_head:feature
+u1: ok
 i1: ok
 
 --- concurrent
-d1 on feature: query delete_alice() { match { $x: Person } where $x.name = "alice"  delete $x }
+d1 on feature: query delete_bob() { match { $x: Person } where $x.name = "bob"  delete $x }
 i2 on feature: query add_initech() { insert Company { name: "initech" } }
 order: d1 park put _deletions/, i2, d1 put _deletions/, d1
 --- expect
-d1: error: graph_head:feature
+d1: ok
 i2: ok
 
 --- query branch: feature
 query people_on_feature() { match { $p: Person } return { $p.name, $p.age } }
 --- expect unordered
-{"p.name":"alice","p.age":30}
-{"p.name":"bob","p.age":31}
+{"p.name":"alice","p.age":99}
 {"p.name":"carol","p.age":32}
+{"p.name":"dan","p.age":33}
 --- expect shape
 p.name: String
 p.age: I32
@@ -63,6 +64,7 @@ query people_on_main() { match { $p: Person } return { $p.name, $p.age } }
 --- expect unordered
 {"p.name":"alice","p.age":30}
 {"p.name":"bob","p.age":31}
+{"p.name":"dan","p.age":33}
 --- expect shape
 p.name: String
 p.age: I32
@@ -78,9 +80,9 @@ c.name: String
 --- query branch: feature
 query people_on_feature_after_reopen() { match { $p: Person } return { $p.name, $p.age } }
 --- expect unordered
-{"p.name":"alice","p.age":30}
-{"p.name":"bob","p.age":31}
+{"p.name":"alice","p.age":99}
 {"p.name":"carol","p.age":32}
+{"p.name":"dan","p.age":33}
 --- expect shape
 p.name: String
 p.age: I32

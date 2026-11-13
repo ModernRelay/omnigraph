@@ -717,7 +717,10 @@ async fn verify_catalog_payloads(
             }
             Ok(None) => findings.push((address.clone(), PayloadFinding::Missing)),
             Err(err) => {
-                findings.push((address.clone(), PayloadFinding::ReadError(err)));
+                findings.push((
+                    address.clone(),
+                    PayloadFinding::ReadError(format!("could not read catalog payload: {err}")),
+                ));
             }
         }
     }

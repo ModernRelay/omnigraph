@@ -527,7 +527,7 @@ beside a write is a number. So is its wait: every in-process lock the engine
 takes is a gate whose acquisition crosses the seams `gate.<gate>.acquire`,
 `gate.<gate>.hold` and `gate.<gate>.release`, plus `gate.coordinator_cas.refused`
 for an install that ends without a hold (`table`, `branch`,
-`schema_shared`, `schema_exclusive`, `export`, `writer_yield`, `coordinator_cas`; the
+`schema_shared`, `schema_exclusive`, `export`, `coordinator_cas`; the
 engine's `write_queue` module doc §Gates), and a session's `acquire`-to-`hold`
 spans on the virtual clock are summed per gate into `wait.<gate>` ticks, in
 its row's `waiting` column and in the TSV. The clock rule: the virtual clock

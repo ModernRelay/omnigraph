@@ -739,7 +739,6 @@ async fn load_jsonl_data(
     // (`load_file_as` reads its file once). Replay that slice directly on a
     // pre-effect retry; copying it into a second raw byte buffer would double
     // peak input memory before the parser's per-type materialization.
-    let retryable = matches!(mode, LoadMode::Append | LoadMode::Merge);
     let memory = crate::engine::LoadMemory::new(query_memory_bytes)?;
     let csv_input;
     let input = match input_shape {
@@ -758,7 +757,8 @@ async fn load_jsonl_data(
     let mut reprepares = crate::db::reprepare::PreEffectReprepares::begin(db, branch, "load");
     loop {
         let replay = BufReader::new(Cursor::new(data.as_bytes()));
-        match load_jsonl_reader_once(
+        let first_attempt = reprepares.is_first();
+        let result = crate::db::write_queue::preparing(load_jsonl_reader_once(
             db,
             branch,
             replay,
@@ -767,13 +767,14 @@ async fn load_jsonl_data(
             input,
             stage_write_concurrency,
             history_release_bytes,
-            reprepares.is_first(),
+            first_attempt,
             write_budget,
             &memory,
-        )
-        .await
-        {
-            Err(err) if reprepares.may_prepare_again(&err, retryable) => {
+            reprepares.attempt(),
+        ))
+        .await;
+        match result {
+            Err(err) if reprepares.may_prepare_again(&err) => {
                 reprepares.prepare_again().await?;
             }
             result => return result,
@@ -805,6 +806,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
     first_attempt: bool,
     write_budget: WriteBudget,
     memory: &crate::engine::LoadMemory,
+    attempt: &mut crate::db::reprepare::WriteAttempt,
 ) -> Result<LoadReceipt> {
     // Capture the manifest/schema authority before interpreting any input. The
     // catalog rides the WriteTxn and was built from the exact accepted IR named
@@ -817,6 +819,9 @@ async fn load_jsonl_reader_once<R: BufRead>(
             error.without_pre_effect_evidence()
         }
     })?;
+    // An overwrite replaces the rows it finds; an append or a merge only
+    // adds or upserts by key (`WriteAttempt::admit`).
+    attempt.admit(&txn, matches!(mode, LoadMode::Overwrite))?;
     let catalog = Arc::clone(&txn.catalog);
     let snapshot = txn.base.clone();
     let mut planning = snapshot.clone();
@@ -873,6 +878,7 @@ async fn load_jsonl_reader_once<R: BufRead>(
                 stage_write_concurrency,
                 memory,
                 executed,
+                attempt,
             ))
             .await;
         }
@@ -1343,8 +1349,16 @@ async fn load_jsonl_reader_once<R: BufRead>(
         .stage_all_with_concurrency(db, branch, stage_write_concurrency)
         .await
         .map_err(OmniError::unpublished)?;
-    let commit =
-        publish_staged_load(db, staged, &txn, branch, actor_id, history_release_bytes).await?;
+    let commit = publish_staged_load(
+        db,
+        staged,
+        &txn,
+        branch,
+        actor_id,
+        history_release_bytes,
+        attempt,
+    )
+    .await?;
 
     Ok(LoadReceipt {
         result,
@@ -1373,6 +1387,7 @@ async fn load_csv_overwrite_plan(
     stage_write_concurrency: usize,
     memory: &crate::engine::LoadMemory,
     mut executed: LoadExecuted,
+    attempt: &mut crate::db::reprepare::WriteAttempt,
 ) -> Result<LoadReceipt> {
     let catalog = Arc::clone(&txn.catalog);
     let table_key = request.target.table_key();
@@ -1453,8 +1468,16 @@ async fn load_csv_overwrite_plan(
                 "load csv overwrite into {table_key}: the plan ran without staging a write"
             ))
         })?;
-    let commit =
-        publish_staged_load(db, staged, &txn, branch, actor_id, history_release_bytes).await?;
+    let commit = publish_staged_load(
+        db,
+        staged,
+        &txn,
+        branch,
+        actor_id,
+        history_release_bytes,
+        attempt,
+    )
+    .await?;
     executed.rows = rows;
     let loaded = usize::try_from(rows)
         .map_err(|_| OmniError::manifest("load csv: row count exceeds usize".to_string()))?;
@@ -1483,6 +1506,7 @@ async fn publish_staged_load(
     branch: Option<&str>,
     actor_id: Option<&str>,
     history_release_bytes: HistoryReleaseBytes,
+    attempt: &mut crate::db::reprepare::WriteAttempt,
 ) -> Result<crate::db::GraphCommit> {
     fail(&catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
     let lineage_intent = db
@@ -1494,10 +1518,14 @@ async fn publish_staged_load(
         expected_versions,
         detached: _,
         gates: _held_gates,
+        carried_txn,
     } = staged
-        .commit_all(db, branch, txn, None)
+        .commit_all(db, branch, txn, None, attempt)
         .await
         .map_err(OmniError::unpublished)?;
+    // A load carried over row-preserving publications publishes on the head
+    // it was re-anchored on.
+    let txn = carried_txn.as_ref().unwrap_or(txn);
     fail(&catalog::MUTATION_POST_FINALIZE_PRE_PUBLISHER).map_err(OmniError::unpublished)?;
     // The publisher alone decides between a definite loss and an outcome it
     // could not read back.
