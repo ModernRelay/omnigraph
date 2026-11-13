@@ -198,6 +198,26 @@ source first: `, $p worksAt $c`. Otherwise the fix lists the triples, if any,
 and the suggestion, which needs review, writes the second component as the
 named relation drawn with `from`.
 
+## Triples against their edge's direction
+
+A triple is written in its edge's declared order, source first; see
+[Traversal and match patterns](traversal.md). A triple written against it is
+`T82`, at the triple:
+
+```text
+query staff() { match { $c: Company, $c worksAt $p } return { $p.name } }
+```
+
+```text
+error[T82]: type error: T82: `$c worksAt $p` is written against the declared direction of `WorksAt: Person -> Company`: a triple is written in its edge's declared order, source first, so its written order is its direction
+  --> line 1, column 38
+  fix: write the source first: `$p worksAt $c`
+```
+
+The machine-applicable suggestion swaps the two ends and leaves the edge, its
+binding, bounds and alternation as written. The swapped triple reads the same
+edges from the same bound end.
+
 ## Inner scopes
 
 A block and an inline read bind every name new to them and read an outer

@@ -114,6 +114,10 @@ match {
 where $s.slug = $slug
 ```
 
+A triple is written in the edge's declared order, source first, whichever end
+is bound: `$p formsPattern $s` with `$p: Pattern` is `T82`, and the fix swaps
+the ends to `$s formsPattern $p`. `<e>` reads either direction.
+
 Inside `match` any word is an edge name, keywords included (`$d in $c` follows
 an edge `In`); a quoted name is accepted too.
 

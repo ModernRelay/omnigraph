@@ -101,7 +101,7 @@ person: String
 
 --- query
 query named_reverse_not() {
-    match { $c: Company } where not exists { $p: Person, $c worksAt $p }
+    match { $c: Company } where not exists { $p: Person, $p worksAt $c }
     return { $c.name as company }
 }
 --- expect unordered
@@ -112,7 +112,7 @@ company: String
 
 --- query
 query named_reverse_exists() {
-    match { $c: Company } where exists { $p: Person, $c worksAt $p }
+    match { $c: Company } where exists { $p: Person, $p worksAt $c }
     return { $c.name as company }
 }
 --- expect unordered
@@ -123,7 +123,7 @@ company: String
 
 --- query
 query named_reverse_count() {
-    match { $c: Company } where count { $p: Person, $c worksAt $p } > 0
+    match { $c: Company } where count { $p: Person, $p worksAt $c } > 0
     return { $c.name as company }
 }
 --- expect unordered
@@ -327,7 +327,7 @@ query nested_local_names_remain_independent() {
         where $p.name = "p"
           and exists { $k: Person, $p knows $k where $k.name = "x" }
           and $c.name = "acme"
-          and exists { $q: Person, $c worksAt $q where $q.name = "p" }
+          and exists { $q: Person, $q worksAt $c where $q.name = "p" }
     } = 1
       and $x.name = "idle"
     return { $p.name as person, $x.name as company }

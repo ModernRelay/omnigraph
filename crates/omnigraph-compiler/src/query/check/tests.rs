@@ -1288,6 +1288,15 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query headcounts() { match { from { match { $p worksAt $c } return { $c, count($p) as n } } } return { $c.name, $n } }"#,
         r#"query headcounts() { match { from { match { $p: Person, $c: Company, $p worksAt $c } return { $c, count($p) as n } } } return { $c.name, $n } }"#,
     ),
+    // The two queries of `diagnostics/t82_triple_written_against_its_edge_direction.gqt`
+    // (its schema adds `Founded: Person -> Company`; the second is checked in
+    // `a_triple_is_written_in_its_edges_declared_order`).
+    (
+        r#"a triple written against its edge's declared direction"#,
+        "T82",
+        r#"query staff($slug: String) { match { $c: Company, $c worksAt $p } where $c.slug = $slug return { $p.name } }"#,
+        r#"query staff($slug: String) { match { $c: Company, $p worksAt $c } where $c.slug = $slug return { $p.name } }"#,
+    ),
     // The two queries of `diagnostics/t68_block_binds_an_outer_name.gqt`.
     (
         r#"a block that only binds an outer name to filter its row"#,
@@ -1629,3 +1638,100 @@ fn a_type_error_carries_the_position_of_its_clause() {
 mod components;
 mod desugaring;
 mod lowering;
+
+/// A triple is written in its edge's declared order, source first: its
+/// written order is its direction (section 3, `T82`). The fix swaps the two
+/// ends and keeps the edge binding, the bounds and the alternation; applied,
+/// it reparses to the intended text and types to the declared orientation.
+#[test]
+fn a_triple_is_written_in_its_edges_declared_order() {
+    use crate::query::diagnostic::Applicability;
+    use crate::query::syntax::parse::apply_edits;
+    let schema =
+        format!("{SCHEMA}\nedge Founded: Person -> Company\nedge Employs: Company -> Person\n");
+    let catalog = build_catalog(&parse_schema(&schema).unwrap()).unwrap();
+    let outcome = |src: &str| {
+        type_source(&catalog, src)
+            .unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
+            .remove(0)
+            .1
+    };
+    let repaired = |written: &str, intended: &str| {
+        let d = outcome(written).expect_err("refused");
+        assert_eq!(d.code.as_str(), "T82", "{d}");
+        assert!(d.position.is_some(), "{written}");
+        let suggestion = d.suggestion.expect("an edit");
+        assert_eq!(suggestion.applicability, Applicability::MachineApplicable);
+        let text = apply_edits(written, &suggestion.edits);
+        assert_eq!(
+            parse_source(&text).unwrap(),
+            parse_source(intended).unwrap(),
+            "{text}"
+        );
+        outcome(&text).unwrap_or_else(|d| panic!("{d}\n{text}"));
+    };
+    // In `match`, from the bound end or the typed one.
+    repaired(
+        "query q() { match { $c: Company, $c worksAt $p } return { $p } }",
+        "query q() { match { $c: Company, $p worksAt $c } return { $p } }",
+    );
+    repaired(
+        "query q() { match { $c worksAt $p, $c: Company } return { $p } }",
+        "query q() { match { $p worksAt $c, $c: Company } return { $p } }",
+    );
+    // The edge binding and the alternation stay as written.
+    repaired(
+        "query q() { match { $c: Company, $c $k:worksAt $p } return { $p, $k } }",
+        "query q() { match { $c: Company, $p $k:worksAt $c } return { $p, $k } }",
+    );
+    repaired(
+        "query q() { match { $c: Company } where exists { $p: Person, $c $k:(worksAt | founded) $p } return { $c } }",
+        "query q() { match { $c: Company } where exists { $p: Person, $p $k:(worksAt | founded) $c } return { $c } }",
+    );
+    // A block, an inline read, `optional` and a write group's `match`.
+    repaired(
+        "query q() { match { $c: Company } where count { $p: Person, $c worksAt $p } > 1 return { $c } }",
+        "query q() { match { $c: Company } where count { $p: Person, $p worksAt $c } > 1 return { $c } }",
+    );
+    repaired(
+        "query q() { match { from { match { $c: Company, $p: Person, $c worksAt $p } return { $p } } } return { $p } }",
+        "query q() { match { from { match { $c: Company, $p: Person, $p worksAt $c } return { $p } } } return { $p } }",
+    );
+    repaired(
+        "query q() { match { $c: Company, optional { $c worksAt $p } } return { $c, $p } }",
+        "query q() { match { $c: Company, optional { $p worksAt $c } } return { $c, $p } }",
+    );
+    repaired(
+        "query w() { match { $c: Company, $c worksAt $p } where $c.slug = \"acme\"  delete $p }",
+        "query w() { match { $c: Company, $p worksAt $c } where $c.slug = \"acme\"  delete $p }",
+    );
+    // An anonymous end swaps like any other.
+    repaired(
+        "query q() { match { $c: Company, $c worksAt $_ } return { $c } }",
+        "query q() { match { $c: Company, $_ worksAt $c } return { $c } }",
+    );
+    // The swapped triple types to the reversed triple's terms: the same
+    // edge, read in its declared orientation from the same bound end.
+    let d = outcome("query q() { match { $c: Company, $c worksAt $p } return { $p } }")
+        .expect_err("refused");
+    assert!(d.message.contains("`WorksAt: Person -> Company`"), "{d}");
+    assert_eq!(
+        d.fix.as_deref(),
+        Some("write the source first: `$p worksAt $c`")
+    );
+    // Between ends of one type the written order already is the direction.
+    assert!(outcome("query q() { match { $p: Person, $q knows $p } return { $q } }").is_ok());
+    // `<e>` reads either direction, and a wildcard selects by the end types.
+    assert!(outcome("query q() { match { $p: Person, $q <knows> $p } return { $q } }").is_ok());
+    assert!(
+        outcome("query q() { match { $c: Company, $p: Person, $c * $p } return { $p } }").is_ok()
+    );
+    // An alternation whose members run both ways relative to the written
+    // ends has no swap that orients every member: it is not refused.
+    assert!(
+        outcome("query q() { match { $c: Company, $c (worksAt | employs) $p } return { $p } }")
+            .is_ok()
+    );
+    let d = outcome("query q() { match { $c: Company, $p (worksAt | employs) $c } return { $p } }");
+    assert!(d.is_ok(), "{d:?}");
+}

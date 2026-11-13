@@ -6,7 +6,7 @@ braces, `where` holds one Boolean expression:
 | Pattern | Meaning |
 |---|---|
 | `$p: Person` | Bind nodes of a type. |
-| `$person worksAt $company` | Follow a directed edge. |
+| `$person worksAt $company` | Follow a directed edge, written in its declared order, source first. |
 | `$a knows{1,3} $b` | Follow a path from one to three hops. |
 | `$a <related> $b` | Match the edge in either direction. The edge must connect the same node type at both ends. |
 | `$a $rel:related $b` | Bind a single-hop edge instance so its properties can be used. |
@@ -55,6 +55,18 @@ next one must start on the source type, so `$p worksAt{1,2} $c` over
 A traversal on a named edge needs no bound end: `$a knows $b` alone matches
 every `Knows` edge. Mixed-orientation alternatives
 need a declared endpoint type when their orientation would otherwise be ambiguous.
+
+A triple is written in its edge's declared order, source first, so the written
+order is the direction whatever the end types. Over `WorksAt: Person ->
+Company`, `$c: Company, $c worksAt $p` is refused with `T82`, in every scope,
+and its fix swaps the ends, `$p worksAt $c`, keeping an edge binding, bounds
+and an alternation as written; the swapped triple reads the same edges from the
+same bound end. Between ends of one type, `Knows: Person -> Person`, the written
+order decides which end is the source. `<e>` reads either direction. A wildcard
+selects its edges by the end types, and an alternation whose members run in
+opposite directions between the written ends (`$c (worksAt | employs) $p` with
+`Employs: Company -> Person`) resolves each member's direction from the end
+types; neither is refused.
 
 Hop counts are shortest-path distances from the start node: `{2,2}` returns the
 nodes exactly two hops away. A node is never re-reached through its own

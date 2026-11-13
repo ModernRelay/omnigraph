@@ -87,6 +87,17 @@ triple between the two bindings and places the binding from the bound end, so
 the plan is the one the unbound triple planned. `optional { }` and a
 declaration's own `match` keep a triple's ends introduced by the triple.
 
+A triple's written order is its direction (`check/mod.rs`, `reversed_triple`).
+`resolve_traversal` still resolves each member's `Direction` from the end
+types; when every member of a named edge or an alternation resolves to `In`,
+the triple is `T82` at its element span, whose two end ranges the parser
+records (`element_span`), and the suggestion swaps them. The swapped triple
+types to the same edge selection from the same bound end, except where both
+ends are bound: the semi-join `Expand` then starts at the written source, so
+the core term's orientation flips while the shaper's plan stays the same. An
+undirected triple, a wildcard and an alternation whose members resolve both
+ways are not refused.
+
 A write body checks to `CoreWrite`: groups of clauses and their sinks. The
 engine's `exec/write_plan.rs` lowers each group in one of two forms. A group
 whose clauses are a scan of its statements' target, filtered by predicates a

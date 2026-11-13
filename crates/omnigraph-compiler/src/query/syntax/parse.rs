@@ -2375,12 +2375,29 @@ fn build_elements(
         refused.diagnostic.position = Some(Position::at(input, at));
         return Err(refused);
     }
-    let spans = pairs.iter().map(source_span).collect();
+    let spans = pairs.iter().map(element_span).collect();
     let mut elements = Vec::new();
     for (i, p) in pairs.iter().enumerate() {
         elements.push(element(p.clone(), &pairs[..i])?);
     }
     Ok((elements, spans))
+}
+
+/// An element's [`SourceSpan`]; a triple's carries the byte ranges of its
+/// two ends, source then destination, where its `T82` fix swaps them.
+fn element_span(p: &Pair<Rule>) -> SourceSpan {
+    let mut span = source_span(p);
+    let c = kind(p);
+    if c.as_rule() == Rule::traversal {
+        let ends: Vec<Pair<Rule>> = c
+            .into_inner()
+            .filter(|e| e.as_rule() == Rule::variable)
+            .collect();
+        if let [src, dst] = ends.as_slice() {
+            span.ranges = vec![written_range(src), written_range(dst)];
+        }
+    }
+    span
 }
 
 /// A `match { … }` (a read's or a write group's) and the `where` after it.

@@ -111,6 +111,7 @@ codes! {
     T79 = "a ranked column is not a node column of its population";
     T80 = "an annotation the language does not read";
     T81 = "a pattern whose components share no variable and are not pinned to one row by a `@key` equality";
+    T82 = "a triple written against its edge's declared direction; the fix swaps its ends, source first";
     T83 = "two declarations of one name in a source unit";
     T84 = "a name an inner scope, a block or an inline read, uses in a triple without binding it";
     T86 = "a term this release's planner does not lower; the message names the stage that adds it";

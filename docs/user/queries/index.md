@@ -46,12 +46,12 @@ it; a second declaration is `T83`, naming both: rename or delete the later one.
 A read is `match { ... }`, an optional `where`, then `return`, `order` and
 `limit`. `match` holds the elements that produce rows (bindings, triples,
 `optional { ... }`, `let` and `from`), separated by commas; `where` holds one
-Boolean expression, evaluated after every element, that removes rows. Elements
-that share no variable multiply their rows, which is refused (`T81`) unless
-all but one are pinned to a row by their `@key`. For the elements, edges, hops,
-products and inner scopes, with their refusals and fixes, see [Traversal and
-match patterns](traversal.md). `from` draws the rows of a ranking into the
-match, and `let` names a relation for it; see [Search](../search/index.md).
+Boolean expression, evaluated after every element, that removes rows. A triple
+is written source first (`T82`). Elements that share no variable are a
+product, refused (`T81`) unless all but one are pinned to a row by their
+`@key`. For the elements, edges, hops, products and inner scopes, with their
+refusals and fixes, see [Traversal and match patterns](traversal.md). `from`
+draws a ranking's rows in, and `let` names a relation; see [Search](../search/index.md).
 
 ### Boolean expressions and nulls
 

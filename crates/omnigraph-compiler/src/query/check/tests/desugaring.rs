@@ -570,16 +570,11 @@ const FORMS: &[(&str, &str)] = &[
         "property_equality",
         "query f($h: String) { match { $p: Person } where $p.handle = $h return { $p } }",
     ),
-    // With neither end typed, the written order is the schema order (as
-    // today): `$c worksAt $p` alone makes `$c` the Person. The reversal the
-    // formatter rewrites is of a triple whose ends are typed.
+    // A triple is written in its edge's declared order, source first; the
+    // reversed triple is `T82`, so the formatter has no order to restore.
     (
         "triple_schema_order",
         "query f() { match { $c: Company, $p worksAt $c } return { $p, $c } }",
-    ),
-    (
-        "triple_reversed",
-        "query f() { match { $c: Company, $c worksAt $p } return { $p, $c } }",
     ),
     (
         "exists",
@@ -711,7 +706,6 @@ const FORMS: &[(&str, &str)] = &[
 /// `return` items with and without commas) are spellings the grammar no
 /// longer has.
 const FORMATTER: &[(&str, &str)] = &[
-    ("triple_reversed", "triple_schema_order"),
     ("count_gt_0", "exists"),
     ("union_nested", "union_flat"),
     ("alternation_reordered", "alternation"),

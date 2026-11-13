@@ -443,8 +443,10 @@ pub struct SourceSpan {
     pub operands: Vec<String>,
     /// The byte range of each operand of a comparison or an `in`, in
     /// `operands` order, then, for an `in` over a written list, of each of
-    /// its elements: where a refused literal operand is replaced. Empty
-    /// for a node built rather than parsed and for the other nodes.
+    /// its elements: where a refused literal operand is replaced. A
+    /// triple's element span holds its two ends, source then destination,
+    /// which its `T82` fix swaps. Empty for a node built rather than parsed
+    /// and for the other nodes.
     pub ranges: Vec<(usize, usize)>,
 }
 

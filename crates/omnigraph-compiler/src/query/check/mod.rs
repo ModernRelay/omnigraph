@@ -180,6 +180,7 @@ pub(crate) fn type_decl(
         rec_hits: HashSet::new(),
         in_write: false,
         at: None,
+        element_span: None,
     };
     let params = match param_types(&decl.params) {
         Ok(p) => p,
@@ -611,6 +612,9 @@ struct Ctx<'a> {
     /// Where the element, `where`, return item, order key or statement being checked
     /// was written: the position of a refusal that names none of its own.
     at: Option<Position>,
+    /// The span of the element being checked, when the parser recorded one
+    /// per element: where a triple's `T82` fix swaps its two ends.
+    element_span: Option<SourceSpan>,
 }
 
 struct Frame {
@@ -1682,6 +1686,9 @@ impl Ctx<'_> {
             if let Some(span) = pattern.spans.elements.get(i) {
                 self.at = Some(span.position);
             }
+            self.element_span = (pattern.spans.elements.len() == pattern.elements.len())
+                .then(|| pattern.spans.elements.get(i).cloned())
+                .flatten();
             if sc.block
                 && let Element::Binding {
                     variable,
@@ -1903,6 +1910,7 @@ impl Ctx<'_> {
     }
 
     fn traversal(&mut self, sc: &mut Scope, t: &Traversal) -> R<()> {
+        let written = t;
         // Anonymous endpoints get fresh names.
         let mut t = t.clone();
         for end in [&mut t.src, &mut t.dst] {
@@ -1966,6 +1974,11 @@ impl Ctx<'_> {
             ));
         }
         let resolved = resolve_traversal(self.catalog, &t, &bindings, &sc.declared)?;
+        if let Some(d) =
+            reversed_triple(self.catalog, written, &resolved, self.element_span.as_ref())
+        {
+            return Err(E::D(d));
+        }
         if let Some(k) = &resolved.edge_binding {
             if *k == t.src || *k == t.dst {
                 return Err(err(
@@ -5632,6 +5645,83 @@ fn has_search_predicate(e: &Expr) -> bool {
         Expr::IsNull { expr, .. } => has_search_predicate(expr),
         _ => false,
     }
+}
+
+/// `T82` for a triple written against its edge's declared direction: every
+/// edge it selects resolved from the written ends to the reverse of its
+/// declared `from -> to`. The written order of a triple is its direction, so
+/// the fix swaps the two ends, keeping the edge binding, the hop bounds and
+/// the alternation, which reads the edge in its declared orientation as the
+/// end types did. `<e>` reads either direction, a wildcard selects by the end
+/// types, and an alternation whose members run both ways relative to the
+/// written ends has no swap that orients every member, so none of the three
+/// is refused here.
+fn reversed_triple(
+    catalog: &Catalog,
+    written: &Traversal,
+    resolved: &traversal::ResolvedTraversal,
+    span: Option<&SourceSpan>,
+) -> Option<QueryDiagnostic> {
+    if written.undirected || matches!(written.selector, EdgeSelector::Wildcard) {
+        return None;
+    }
+    let members = resolved.edges.members();
+    if members.is_empty() || members.iter().any(|m| m.direction != Direction::In) {
+        return None;
+    }
+    let declared = members
+        .iter()
+        .filter_map(|m| catalog.lookup_edge_by_name(&m.edge_type))
+        .map(|e| format!("`{}: {} -> {}`", e.name, e.from_type, e.to_type))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let selector = match &written.selector {
+        EdgeSelector::Named(name) => name.clone(),
+        EdgeSelector::Alternation(names) => format!("({})", names.join(" | ")),
+        EdgeSelector::Wildcard => "*".to_string(),
+    };
+    let edge = match &written.edge_binding {
+        Some(k) => format!("${k}:{selector}"),
+        None => selector,
+    };
+    let bounds = match (written.min_hops, written.max_hops) {
+        (1, Some(1)) => String::new(),
+        (min, Some(max)) => format!("{{{min},{max}}}"),
+        (min, None) => format!("{{{min},}}"),
+    };
+    let triple = |a: &str, b: &str| format!("${a} {edge}{bounds} ${b}");
+    let mut d = QueryDiagnostic::typecheck(
+        T82,
+        format!(
+            "`{}` is written against the declared direction of {declared}: a triple is written in its edge's declared order, source first, so its written order is its direction",
+            triple(&written.src, &written.dst)
+        ),
+    )
+    .with_fix(format!(
+        "write the source first: `{}`",
+        triple(&written.dst, &written.src)
+    ));
+    if let Some(span) = span {
+        d.position = Some(span.position);
+        if let [(ss, se), (ds, de)] = span.ranges.as_slice() {
+            d = d.with_suggestion(Suggestion {
+                applicability: Applicability::MachineApplicable,
+                edits: vec![
+                    TextEdit {
+                        start: *ss,
+                        end: *se,
+                        replacement: format!("${}", written.dst),
+                    },
+                    TextEdit {
+                        start: *ds,
+                        end: *de,
+                        replacement: format!("${}", written.src),
+                    },
+                ],
+            });
+        }
+    }
+    Some(d)
 }
 
 /// `T84` for the names an inner scope's triples introduced that no binding
