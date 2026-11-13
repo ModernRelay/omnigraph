@@ -771,6 +771,10 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    static OPTIMIZE_STEP_PROBES: OptimizeStepProbes;
+}
+
+tokio::task_local! {
     static EXTERNAL_PAYLOAD_READ_STALL: ();
 }
 
@@ -970,17 +974,58 @@ pub async fn enter_stage_write_probe() -> Option<StageWriteProbeGuard> {
     let state = STAGE_WRITE_PROBES
         .try_with(|probes| probes.state.clone())
         .ok()?;
+    Some(enter_rendezvous_probe(state).await)
+}
+
+async fn enter_rendezvous_probe(state: Arc<StageWriteProbeState>) -> StageWriteProbeGuard {
     state.entered.fetch_add(1, Ordering::Relaxed);
-    // Count only after every participant is released. The first staging call
-    // must then remain pending in its real storage future for a second call to
+    // Count only after every participant is released. The first participant
+    // must then remain pending in its real storage future for a second one to
     // raise the peak above one; parked rendezvous waiters do not count.
     state.rendezvous.wait().await;
     let active = state.active.fetch_add(1, Ordering::Relaxed) + 1;
     state.peak.fetch_max(active, Ordering::Relaxed);
-    let guard = StageWriteProbeGuard {
-        state: state.clone(),
-    };
-    Some(guard)
+    StageWriteProbeGuard { state }
+}
+
+/// The same rendezvous probe around each heavy step an optimize run holds a
+/// permit of its `OptimizeStepLimit` for (#1384): a compaction task, an
+/// index fold or an index build. It counts how many of the run's steps are
+/// executing at once, across every table the run stages.
+#[derive(Clone)]
+pub struct OptimizeStepProbes(StageWriteProbes);
+
+impl OptimizeStepProbes {
+    /// Create a probe that releases each group of steps after
+    /// `release_after` of them have entered.
+    pub fn rendezvous(release_after: usize) -> Self {
+        Self(StageWriteProbes::rendezvous(release_after))
+    }
+
+    /// Number of steps that entered the probe.
+    pub fn entered(&self) -> u64 {
+        self.0.entered()
+    }
+
+    /// Maximum steps simultaneously inside the probe.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.0.peak_in_flight()
+    }
+}
+
+/// Run `fut` with the optimize-step probe installed.
+pub async fn with_optimize_step_probes<F>(probes: OptimizeStepProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    OPTIMIZE_STEP_PROBES.scope(probes, fut).await
+}
+
+pub async fn enter_optimize_step_probe() -> Option<StageWriteProbeGuard> {
+    let state = OPTIMIZE_STEP_PROBES
+        .try_with(|probes| probes.0.state.clone())
+        .ok()?;
+    Some(enter_rendezvous_probe(state).await)
 }
 
 pub fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
