@@ -3379,6 +3379,7 @@ impl TableStore {
                     .await
             } else {
                 let params = ScalarIndexParams::default();
+                let _probe = crate::instrumentation::enter_index_build_probe().await;
                 ds_clone
                     .create_index_builder(&columns, IndexType::BTree, &params)
                     .name(item.name.clone())
@@ -5946,6 +5947,7 @@ impl TableStore {
                     if let Some(name) = name {
                         builder = builder.name(name.clone());
                     }
+                    let _probe = crate::instrumentation::enter_index_build_probe().await;
                     builder.replace(true).execute_uncommitted().await
                 }
                 IndexBuildSpec::FullText { column } => {

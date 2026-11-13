@@ -771,6 +771,10 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    static INDEX_BUILD_PROBES: IndexBuildProbes;
+}
+
+tokio::task_local! {
     static EXTERNAL_PAYLOAD_READ_STALL: ();
 }
 
@@ -906,10 +910,11 @@ where
 /// Deterministic probe for the number of table-fragment staging futures that
 /// are inside their storage call at once.
 ///
-/// `release_after` is a test rendezvous: the first staged tables wait until
-/// that many participants have entered. A concurrency regression therefore
-/// times out instead of passing from result equivalence alone. Production
-/// leaves this task-local unset, so staging only pays the unset lookup.
+/// `release_after` is a test rendezvous: the first `release_after` staged
+/// tables wait until that many participants have entered; later ones pass
+/// straight through. A concurrency regression therefore times out instead of
+/// passing from result equivalence alone. Production leaves this task-local
+/// unset, so staging only pays the unset lookup.
 #[derive(Clone)]
 pub struct StageWriteProbes {
     state: Arc<StageWriteProbeState>,
@@ -919,6 +924,7 @@ struct StageWriteProbeState {
     active: AtomicU64,
     entered: AtomicU64,
     peak: AtomicU64,
+    release_after: u64,
     rendezvous: tokio::sync::Barrier,
 }
 
@@ -932,6 +938,7 @@ impl StageWriteProbes {
                 active: AtomicU64::new(0),
                 entered: AtomicU64::new(0),
                 peak: AtomicU64::new(0),
+                release_after: release_after as u64,
                 rendezvous: tokio::sync::Barrier::new(release_after),
             }),
         }
@@ -970,17 +977,61 @@ pub async fn enter_stage_write_probe() -> Option<StageWriteProbeGuard> {
     let state = STAGE_WRITE_PROBES
         .try_with(|probes| probes.state.clone())
         .ok()?;
-    state.entered.fetch_add(1, Ordering::Relaxed);
+    Some(enter_probe(state).await)
+}
+
+/// The same rendezvous probe around each BTREE index build (#1385): how many
+/// builds of one index pass are inside Lance's builder at once. Full-text and
+/// vector builds run alone and are not counted.
+#[derive(Clone)]
+pub struct IndexBuildProbes(StageWriteProbes);
+
+impl IndexBuildProbes {
+    /// Create a probe whose first `release_after` BTREE builds wait until
+    /// that many have entered.
+    pub fn rendezvous(release_after: usize) -> Self {
+        Self(StageWriteProbes::rendezvous(release_after))
+    }
+
+    /// Number of BTREE builds that entered the probe.
+    pub fn entered(&self) -> u64 {
+        self.0.entered()
+    }
+
+    /// Maximum BTREE builds simultaneously inside the probe.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.0.peak_in_flight()
+    }
+}
+
+/// Run `fut` with the index-build probe installed.
+pub async fn with_index_build_probes<F>(probes: IndexBuildProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    INDEX_BUILD_PROBES.scope(probes, fut).await
+}
+
+pub async fn enter_index_build_probe() -> Option<StageWriteProbeGuard> {
+    let state = INDEX_BUILD_PROBES
+        .try_with(|probes| probes.0.state.clone())
+        .ok()?;
+    Some(enter_probe(state).await)
+}
+
+async fn enter_probe(state: Arc<StageWriteProbeState>) -> StageWriteProbeGuard {
+    let prior = state.entered.fetch_add(1, Ordering::Relaxed);
     // Count only after every participant is released. The first staging call
     // must then remain pending in its real storage future for a second call to
-    // raise the peak above one; parked rendezvous waiters do not count.
-    state.rendezvous.wait().await;
+    // raise the peak above one; parked rendezvous waiters do not count. Only
+    // the first group waits, so a call count that is not a multiple of the
+    // group never leaves a last participant parked.
+    if prior < state.release_after {
+        state.rendezvous.wait().await;
+    }
     let active = state.active.fetch_add(1, Ordering::Relaxed) + 1;
     state.peak.fetch_max(active, Ordering::Relaxed);
-    let guard = StageWriteProbeGuard {
-        state: state.clone(),
-    };
-    Some(guard)
+    StageWriteProbeGuard { state }
 }
 
 pub fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
