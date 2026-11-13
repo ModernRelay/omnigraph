@@ -480,12 +480,12 @@ async fn maintain_indices_for_branch(
         .iter()
         .map(|target| (target.table_key.clone(), active_branch.clone()))
         .collect();
-    let _schema_permit = db.write_queue().acquire_schema_shared().await;
+    let _schema_permit = db.write_queue().acquire_schema_shared().await?;
     let _branch_guard = db
         .write_queue()
         .acquire_branch(active_branch.as_deref())
-        .await;
-    let _queue_guards = db.write_queue().acquire_many(&queue_keys).await;
+        .await?;
+    let _queue_guards = db.write_queue().acquire_many(&queue_keys).await?;
 
     let live_snapshot = db.revalidate_write_txn(&txn).await?;
     for target in &targets {
@@ -1801,8 +1801,4 @@ async fn demote_superseded_handles(
                 .await;
         }
     }
-}
-
-pub(super) async fn invalidate_graph_index(db: &Omnigraph) {
-    db.runtime_cache.invalidate_all().await;
 }

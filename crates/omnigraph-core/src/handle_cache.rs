@@ -59,6 +59,14 @@ where
         self.lru.clear();
     }
 
+    /// Keep only the entries whose key satisfies `keep`; recency order of the
+    /// kept entries is unchanged.
+    pub fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+        self.entries.retain(|key, _| keep(key));
+        let entries = &self.entries;
+        self.lru.retain(|key| entries.contains_key(key));
+    }
+
     /// Remove the least recently used entry.
     pub fn pop_oldest(&mut self) -> Option<(K, V)> {
         while let Some(oldest) = self.lru.pop_front() {

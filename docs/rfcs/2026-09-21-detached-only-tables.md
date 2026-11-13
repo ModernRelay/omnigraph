@@ -383,12 +383,11 @@ retirement history: its valid identity can be judged by the post-inventory cut.
 
 A dead staging can never be published: its compare-and-swap is against an
 authority the branch has left, and its writer restages rather than reusing it.
-That restaging is narrower than the rule. `mutate` refreshes and reprepares
-only an insert-only mutation after a pre-effect `ReadSetChanged`; an update or
-a delete returns the conflict to the caller instead of replaying a stale
-read-modify-write plan (`exec/mutation.rs`). The proof does not rest on which
-of the two happens, because neither publishes the staging the collector
-reclaims.
+That restaging is narrower than the rule. A writer sent back before effects
+prepares again from its request on a fresh view (`db/reprepare.rs`), or
+returns the conflict to the caller when its identity changed or its bound is
+reached. The proof does not rest on which of the two happens, because neither
+publishes the staging the collector reclaims.
 
 The staging rule retains ambiguous effects; reclamation progress is conditional.
 On a branch that keeps publishing,

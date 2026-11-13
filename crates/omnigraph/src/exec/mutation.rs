@@ -1299,25 +1299,24 @@ impl Omnigraph {
         let mut reprepares =
             crate::db::reprepare::PreEffectReprepares::begin(self, Some(branch), "mutation");
         loop {
-            let mut retryable = false;
-            match self
-                .mutate_one_attempt(
-                    branch,
-                    query_source,
-                    query_name,
-                    &resolved_params,
-                    actor_id,
-                    expected_head,
-                    stage_write_concurrency,
-                    history_release_bytes,
-                    reprepares.is_first(),
-                    &mut retryable,
-                    write_budget,
-                    route,
-                )
-                .await
-            {
-                Err(err) if reprepares.may_prepare_again(&err, retryable) => {
+            let first_attempt = reprepares.is_first();
+            let result = crate::db::write_queue::preparing(self.mutate_one_attempt(
+                branch,
+                query_source,
+                query_name,
+                &resolved_params,
+                actor_id,
+                expected_head,
+                stage_write_concurrency,
+                history_release_bytes,
+                first_attempt,
+                write_budget,
+                route,
+                reprepares.attempt(),
+            ))
+            .await;
+            match result {
+                Err(err) if reprepares.may_prepare_again(&err) => {
                     reprepares.prepare_again().await?;
                 }
                 result => return result,
@@ -1336,9 +1335,9 @@ impl Omnigraph {
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         first_attempt: bool,
-        retryable: &mut bool,
         write_budget: WriteBudget,
         route: &WriteRoute,
+        attempt: &mut crate::db::reprepare::WriteAttempt,
     ) -> Result<crate::MutationReceipt> {
         let requested = Self::normalize_branch_name(branch)?;
         let addressed = requested.as_deref().unwrap_or("main").to_string();
@@ -1392,7 +1391,18 @@ impl Omnigraph {
         // Lower + validate up front so the touched-dataset set is known before
         // execution. A lowering/validation error returns exactly as it did
         // when this happened inside execute_named_mutation.
-        let ir = self.lower_named_mutation(&txn.catalog, query_source, query_name)?;
+        // An update or delete selects existing rows; an insert-only mutation
+        // only adds them (`WriteAttempt::admit`). A query that no longer
+        // lowers is judged as one that selects rows, so a schema changed under
+        // a later attempt is reported as that change.
+        let lowered = self.lower_named_mutation(&txn.catalog, query_source, query_name);
+        let selects_rows = lowered.as_ref().map_or(true, |ir| {
+            !ir.ops
+                .iter()
+                .all(|op| matches!(op, MutationOpIR::Insert { .. }))
+        });
+        attempt.admit(&txn, selects_rows)?;
+        let ir = lowered?;
         debug_assert!(
             route.agrees_with(&ir.write_mode),
             "the lowered write mode {:?} disagrees with the pre-parsed route",
@@ -1400,14 +1410,6 @@ impl Omnigraph {
         );
         fill_declared_params(&mut resolved_params, &ir.params)?;
         validate_params(&resolved_params, &ir.params)?;
-        // Only an insert-only mutation is safe to replay automatically after a
-        // pre-effect authority mismatch. Update/Delete keep strict caller-visible
-        // `ReadSetChanged`; replaying their stale read-modify-write plan would be
-        // a semantic rebase rather than a fresh execution contract.
-        *retryable = ir
-            .ops
-            .iter()
-            .all(|op| matches!(op, MutationOpIR::Insert { .. }));
 
         let exec_result = self
             .execute_named_mutation(
@@ -1423,7 +1425,6 @@ impl Omnigraph {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => {
                 if !self.unpublished_view_is_current(&txn).await? {
-                    *retryable = true;
                     return Err(OmniError::manifest_read_set_changed(
                         format!("manifest_version:{addressed}"),
                         Some(txn.manifest_probe.captured().version.to_string()),
@@ -1438,11 +1439,14 @@ impl Omnigraph {
                     // ordering as effectful writes (shared permit — this pass
                     // only reads the accepted view), revalidate the complete
                     // authority and map a moved caller head to terminal 412.
-                    let _schema_permit = self.write_queue().acquire_schema_shared().await;
-                    let _branch_guard = self
-                        .write_queue()
-                        .acquire_branch(requested.as_deref())
-                        .await;
+                    let _gates = match attempt.admitted_gates()? {
+                        Some(held) => held,
+                        None => {
+                            self.write_queue()
+                                .acquire_branch_write_gates(requested.as_deref())
+                                .await?
+                        }
+                    };
                     self.revalidate_write_txn(&txn).await?;
                 }
                 Ok(crate::MutationReceipt {
@@ -1460,6 +1464,7 @@ impl Omnigraph {
                         actor_id,
                         stage_write_concurrency,
                         history_release_bytes,
+                        attempt,
                     )
                     .await?;
                 let plans = std::mem::take(&mut committed.plans);
@@ -1489,6 +1494,7 @@ impl Omnigraph {
         actor_id: Option<&str>,
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
+        attempt: &mut crate::db::reprepare::WriteAttempt,
     ) -> Result<CommittedStagedMutation> {
         let requested = txn.branch.as_deref();
         let plans = self.validate_staged_mutation(&staging, txn).await?;
@@ -1507,7 +1513,7 @@ impl Omnigraph {
             .await
             .map_err(OmniError::unpublished)?;
         let committed = staged
-            .commit_all(self, requested, txn, early)
+            .commit_all(self, requested, txn, early, attempt)
             .await
             .map_err(OmniError::unpublished)?;
         Ok(CommittedStagedMutation {
@@ -1533,10 +1539,14 @@ impl Omnigraph {
                     expected_versions,
                     detached: _,
                     gates: _held_gates,
+                    carried_txn,
                 },
             lineage_intent,
             plans: _,
         } = committed;
+        // A write carried over row-preserving publications publishes on the
+        // head it was re-anchored on.
+        let txn = carried_txn.as_ref().unwrap_or(txn);
         // `_held_gates` holds the shared schema permit, branch effect gate,
         // and sorted table gates acquired by `commit_all`. They remain held
         // through manifest publication, covering the complete same-process
@@ -1848,7 +1858,7 @@ impl Omnigraph {
                 };
                 staging.append_batch(&table_key, schema, mode, batch)?;
 
-                self.invalidate_graph_index().await;
+                self.invalidate_graph_index_for([table_key.as_str()]).await;
 
                 Ok(MutationResult {
                     affected_nodes: 0,
@@ -2240,6 +2250,7 @@ impl Omnigraph {
         staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
 
         let mut affected_edges = 0usize;
+        let mut cascaded_edge_tables: Vec<String> = Vec::new();
 
         let edge_info: Vec<(String, String, String)> = txn
             .catalog
@@ -2308,6 +2319,7 @@ impl Omnigraph {
             affected_edges += matched;
 
             if matched > 0 {
+                cascaded_edge_tables.push(edge_table_key.clone());
                 staging.record_deleted_ids(&edge_table_key, matched_ids);
                 staging.record_delete(&edge_table_key, cascade_filter);
                 staging.record_deleted_row_addrs(
@@ -2320,9 +2332,8 @@ impl Omnigraph {
 
         staging.record_deleted_ids(&table_key, deleted_ids);
 
-        if affected_edges > 0 {
-            self.invalidate_graph_index().await;
-        }
+        self.invalidate_graph_index_for(cascaded_edge_tables.iter().map(String::as_str))
+            .await;
 
         Ok(MutationResult {
             affected_nodes,
@@ -2385,7 +2396,7 @@ impl Omnigraph {
             staging.record_deleted_ids(&table_key, deleted_ids);
             staging.record_delete(&table_key, pred_expr.clone());
             staging.record_deleted_row_addrs(&table_key, ds.version(), deleted_addrs)?;
-            self.invalidate_graph_index().await;
+            self.invalidate_graph_index_for([table_key.as_str()]).await;
         }
 
         Ok(MutationResult {

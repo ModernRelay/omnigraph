@@ -3200,6 +3200,108 @@ fn warm_read_cost_rows(replay: &str) -> String {
     rows
 }
 
+/// The labels [`GraphIndexRetentionCost`] measures, in order.
+const GRAPH_INDEX_RETENTION_LABELS: [&str; 5] = [
+    "CsrHopCold",
+    "CsrHopWarm",
+    "CsrHopAfterOtherEdgeWrite",
+    "CsrHopAfterBranchCreate",
+    "CsrHopAfterOwnEdgeWrite",
+];
+
+/// One handle (as a server holds one) writes and reads: a `knows` hop forced
+/// onto the CSR path, cold and warm, then after a `WorksAt` insert, after a
+/// branch create, and after a `Knows` insert. The cached topology is keyed by
+/// each edge table's stamp, so only the last write may rebuild `Knows`; the
+/// other rows pin that a write or branch control leaves untouched edge types'
+/// topology cached.
+struct GraphIndexRetentionCost;
+
+impl GraphIndexRetentionCost {
+    async fn hop(db: &Session) -> serde_json::Value {
+        db.query(
+            omnigraph::db::ReadTarget::branch("main"),
+            WARM_READ_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap()
+        .to_rust_json()
+        .unwrap()
+    }
+}
+
+impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage>
+    for GraphIndexRetentionCost
+{
+    type Output = ();
+
+    async fn run(&self, resources: &mut omnigraph_dst::memory::MemoryStorage, _workload_seed: u64) {
+        const HIRE: &str = r#"
+query hire($person: String, $company: String) {
+    insert WorksAt { from: $person, to: $company }
+}
+"#;
+        let [cold, warm, after_other, after_branch, after_own] = GRAPH_INDEX_RETENTION_LABELS;
+        omnigraph_dst::cost::set_label("_retention_setup");
+        let db = Session::from_defaults(
+            Arc::new(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            ),
+            SessionSettings::default().with_traversal(omnigraph_compiler::settings::Traversal::Csr),
+        );
+        db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+        omnigraph_dst::cost::set_label(cold);
+        let before = Self::hop(&db).await;
+        omnigraph_dst::cost::set_label(warm);
+        assert_eq!(Self::hop(&db).await, before);
+        omnigraph_dst::cost::set_label("_retention_other_edge_write");
+        db.mutate(
+            "main",
+            HIRE,
+            "hire",
+            &params(&[("$person", "Alice"), ("$company", "Globex")]),
+        )
+        .await
+        .unwrap();
+        omnigraph_dst::cost::set_label(after_other);
+        assert_eq!(Self::hop(&db).await, before);
+        omnigraph_dst::cost::set_label("_retention_branch_create");
+        db.branch_create("retention").await.unwrap();
+        omnigraph_dst::cost::set_label(after_branch);
+        assert_eq!(Self::hop(&db).await, before);
+        omnigraph_dst::cost::set_label("_retention_own_edge_write");
+        db.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "add_friend",
+            &params(&[("$from", "Alice"), ("$to", "Diana")]),
+        )
+        .await
+        .unwrap();
+        omnigraph_dst::cost::set_label(after_own);
+        let after = Self::hop(&db).await;
+        omnigraph_dst::cost::set_label("_retention_verify");
+        assert_ne!(after, before, "the Knows insert must show in the next hop");
+    }
+}
+
+fn graph_index_retention_cost_rows(replay: &str) -> String {
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-graph-index-retention-cost-{replay}"),
+        &GraphIndexRetentionCost,
+        &GRAPH_INDEX_RETENTION_LABELS,
+    )
+}
+
 /// A `nearest` read over the vector index the engine builds, on a freshly
 /// opened handle and again on the warm one. Before it uses the index, the scan
 /// reads the column's vector index details (issue #1297, through
@@ -3474,6 +3576,153 @@ where
         );
     }
     rows
+}
+
+/// An insert on main that an optimize run on the same handle overtakes
+/// between its staging and its writer gates, beside the same insert with
+/// nothing in between. The run compacts `node:Person`, the insert's own
+/// table, and publishes; the insert is carried over that row-preserving
+/// publication by Lance's conflict resolver instead of preparing again, so
+/// `CarriedInsert` costs `InsertAfterOptimize` plus the walk of the
+/// compaction's commits and the open of the compacted version, not a second
+/// preparation.
+fn carried_write_cost_rows(replay: &str) -> String {
+    struct CarriedWriteCost;
+
+    impl CarriedWriteCost {
+        async fn insert(db: &Session, name: &str) {
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", name)], &[("$age", 30)]),
+            )
+            .await
+            .unwrap();
+        }
+
+        /// Compact on the writer's handle, on another thread and runtime,
+        /// while the overtaken writer's thread waits: a server's optimize
+        /// runs on the handle its writes use.
+        fn optimize_beside(db: Session) {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_time()
+                            .start_paused(true)
+                            .build_local(Default::default())
+                            .expect("overtaking runtime");
+                        runtime.block_on(async move {
+                            let _ids = omnigraph::dst_ids::IDS
+                                .install(Arc::new(omnigraph::dst_ids::SeededUlids::new(24_911)));
+                            let _clock = omnigraph::dst_clock::CLOCK
+                                .install(Arc::new(omnigraph::dst_clock::LogicalClock::default()));
+                            let stats = db
+                                .optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                                .await
+                                .unwrap()
+                                .tables;
+                            assert!(
+                                stats
+                                    .iter()
+                                    .any(|stat| stat.type_key == "node:Person" && stat.committed()),
+                                "the overtaking optimize must compact Person: {stats:?}"
+                            );
+                        });
+                    })
+                    .join()
+                    .unwrap();
+            });
+        }
+    }
+
+    impl omnigraph_dst::UniverseScenario<omnigraph_dst::memory::MemoryStorage> for CarriedWriteCost {
+        type Output = ();
+
+        async fn run(
+            &self,
+            resources: &mut omnigraph_dst::memory::MemoryStorage,
+            _workload_seed: u64,
+        ) {
+            omnigraph_dst::cost::set_label("_carried_setup");
+            let db = session(
+                Omnigraph::init_with_storage(
+                    &resources.root,
+                    TEST_SCHEMA,
+                    resources.adapter.clone(),
+                    InitOptions::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
+            for seed in 0..3 {
+                Self::insert(&db, &format!("seed{seed}")).await;
+            }
+            let db = session(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            );
+            let probes = omnigraph::instrumentation::QueryIoProbes::default();
+            {
+                let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let writer = db.clone();
+                let _overtake = omnigraph::seams::catalog::MUTATION_POST_STAGE_PRE_EFFECT_GATE
+                    .observe(move || {
+                        if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            return;
+                        }
+                        omnigraph_dst::cost::set_label("_carried_optimize");
+                        Self::optimize_beside(writer.clone());
+                        omnigraph_dst::cost::set_label("CarriedInsert");
+                    });
+                omnigraph_dst::cost::set_label("CarriedInsert");
+                omnigraph::instrumentation::with_query_io_probes(
+                    probes.clone(),
+                    Self::insert(&db, "carried"),
+                )
+                .await;
+            }
+            omnigraph_dst::cost::set_label("_carried_verify");
+            assert_eq!(
+                probes
+                    .writes_carried_over_row_preserving
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the insert must be carried over the optimize publication"
+            );
+            assert_eq!(
+                probes
+                    .mutation_reprepares
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "the carried insert must not prepare again"
+            );
+            for seed in 3..6 {
+                Self::insert(&db, &format!("seed{seed}")).await;
+            }
+            db.optimize_as(None, omnigraph::db::OptimizeRequest::default())
+                .await
+                .unwrap();
+            let db = session(
+                Omnigraph::open_with_storage(&resources.root, resources.adapter.clone())
+                    .await
+                    .unwrap(),
+            );
+            omnigraph_dst::cost::set_label("InsertAfterOptimize");
+            Self::insert(&db, "plain").await;
+            omnigraph_dst::cost::set_label("_carried_verify");
+            assert_eq!(count_rows(&db, "node:Person").await, 12);
+        }
+    }
+
+    labeled_cost_rows_of(
+        format!("shared-memory://dst-carried-write-cost-{replay}"),
+        &CarriedWriteCost,
+        &["CarriedInsert", "InsertAfterOptimize"],
+    )
 }
 
 fn branch_write_cost_rows(replay: &str) -> String {
@@ -4204,9 +4453,11 @@ fn dst_bench_cost_count_golden() {
     table.push_str(&overwrite_removal_cost_rows("a"));
     table.push_str(&endpoint_probe_cost_rows("a"));
     table.push_str(&warm_read_cost_rows("a"));
+    table.push_str(&graph_index_retention_cost_rows("a"));
     table.push_str(&update_patch_cost_rows("a"));
     table.push_str(&keyed_write_table_size_cost_rows("a"));
     table.push_str(&nearest_cost_rows("a"));
+    table.push_str(&carried_write_cost_rows("a"));
     table.push_str(&writer_claim_cost_rows("a"));
     let ledger2 = omnigraph_dst::cost::arm();
     let _ = run_universe("shared-memory://dst-bench-cost-b", &sc);
@@ -4220,9 +4471,11 @@ fn dst_bench_cost_count_golden() {
     table2.push_str(&overwrite_removal_cost_rows("b"));
     table2.push_str(&endpoint_probe_cost_rows("b"));
     table2.push_str(&warm_read_cost_rows("b"));
+    table2.push_str(&graph_index_retention_cost_rows("b"));
     table2.push_str(&update_patch_cost_rows("b"));
     table2.push_str(&keyed_write_table_size_cost_rows("b"));
     table2.push_str(&nearest_cost_rows("b"));
+    table2.push_str(&carried_write_cost_rows("b"));
     table2.push_str(&writer_claim_cost_rows("b"));
     assert_eq!(
         table, table2,

@@ -2138,7 +2138,13 @@ async fn prepare_graphs(
         let prior = store
             .read_payload(&kind, &resource.digest)
             .await
-            .map_err(|error| refusal("resource_payload_read_error", error))?;
+            .map_err(|error| {
+                refusal(
+                    "resource_payload_read_error",
+                    format!("could not read the catalog payload of {address}: {error}"),
+                )
+                .with_storage_failure(&error)
+            })?;
         let invalid = prior
             .as_ref()
             .is_some_and(|source| sha256_hex(source.as_bytes()) != resource.digest)

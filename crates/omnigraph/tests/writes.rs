@@ -8,10 +8,9 @@
 //! What this file covers:
 //! - No `__run__*` branches are created by load or mutate.
 //! - Cancellation of a mutation future leaves no graph-level state.
-//! - A pre-effect branch-authority change makes an upsert mutation/load discard
-//!   and fully reprepare with a bounded retry; strict insert conflicts return
-//!   `KeyConflict`, while Update/Delete/Overwrite authority movement surfaces
-//!   `ReadSetChanged`. Post-effect failures require recovery.
+//! - A pre-effect branch-authority change makes a mutation or load of any kind
+//!   discard and fully reprepare with a bounded retry; strict insert conflicts
+//!   return `KeyConflict`. Post-effect failures require recovery.
 //! - Failed mutations and loads leave the target unchanged.
 //! - Multi-statement mutations are atomic (one commit per query).
 //! - actor_id propagates through to the commit graph.

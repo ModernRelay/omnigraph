@@ -912,7 +912,7 @@ gateway_surfaces! {
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::ReadOrPure => [
         "validate_initial_empty_table",
-        "transaction_identity",
+        "transaction_identity", "row_preserving_chain",
         "open_snapshot_at_entry", "open_snapshot_at_table", "open_dataset_head",
         "branch_identifier", "list_native_branches",
         "ensure_expected_version", "scan", "scan_with_row_id", "scan_filtered", "scan_filtered_row_addrs", "scan_batches",
@@ -932,6 +932,7 @@ gateway_surfaces! {
         "stage_overwrite_batches", "stage_overwrite_stream",
         "stage_rename_columns", "stage_schema_evolution", "stage_delete", "stage_delete_rows", "stage_create_indices",
         "stage_compaction", "stage_fragment_rewrite", "stage_index_fold", "stage_index_reconciliation",
+        "rebase_staged_write",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
         "force_delete_branch",
@@ -1131,7 +1132,7 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 39, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 42, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
@@ -4092,24 +4093,32 @@ fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
         );
     }
 
-    for function_name in ["branch_create_as", "branch_create_from_impl"] {
+    // The helpers and the evictions they are made of, so a direct call fails
+    // too. Every eviction is a method call: the `Omnigraph` methods call the
+    // `RuntimeCache` ones directly, with no free function between them.
+    let cache_evictions = [
+        "invalidate_read_caches",
+        "invalidate_all",
+        "invalidate_graph_index_for",
+        "invalidate_edge_tables",
+    ];
+    for function_name in [
+        "branch_create_as",
+        "branch_create_from_impl",
+        "branch_delete_as",
+        "delete_captured_branch_storage",
+    ] {
         let function = functions
             .get(function_name)
             .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
-        assert_eq!(
-            method_call_count(&function.block, "invalidate_read_caches"),
-            1,
-            "Omnigraph::{function_name} must invalidate derived caches after successful ref creation"
-        );
+        for eviction in cache_evictions {
+            assert_eq!(
+                method_call_count(&function.block, eviction),
+                0,
+                "Omnigraph::{function_name} must keep the read caches (no {eviction}): a branch create or delete changes no cache key"
+            );
+        }
     }
-    let delete_helper = functions
-        .get("delete_captured_branch_storage")
-        .expect("missing Omnigraph::delete_captured_branch_storage");
-    assert_eq!(
-        method_call_count(&delete_helper.block, "invalidate_read_caches"),
-        1,
-        "captured branch deletion must invalidate derived caches after successful ref removal"
-    );
 }
 
 fn function_blocks(ast: &syn::File, function_name: &str) -> Vec<syn::Block> {
