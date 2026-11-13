@@ -1,0 +1,1 @@
+- Reading a native tag takes one storage request instead of three, and deleting a branch no longer reads the engine's own reserved tags.
