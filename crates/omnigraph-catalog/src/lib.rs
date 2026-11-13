@@ -92,8 +92,8 @@ pub use history::HistoryRecord;
 use layout::open_manifest_dataset;
 use layout::{
     branch_ref_error, open_manifest_branch_with_identifier,
-    open_manifest_dataset_native_with_session, open_manifest_dataset_with_session,
-    resolve_native_manifest_branch, table_uri_for_path,
+    open_manifest_dataset_native_at_with_session, open_manifest_dataset_native_with_session,
+    open_manifest_dataset_with_session, resolve_native_manifest_branch, table_uri_for_path,
 };
 pub use layout::{history_uri, manifest_uri};
 pub use metadata::TableVersionMetadata;
@@ -1286,10 +1286,16 @@ impl CollectorBranch {
         history: &crate::commit_graph::HistoryCache,
     ) -> Result<Option<Snapshot>> {
         let branch = self.branch.as_deref();
-        let (dataset, state) = snapshot_state_at(
+        // The opened branch checks the version out itself: no reopen from the
+        // root, and the version belongs to the incarnation this run holds.
+        let dataset = self
+            .dataset
+            .checkout_version(version)
+            .await
+            .map_err(OmniError::storage)?;
+        let state = graph::version_state(
             &self.root_uri,
-            branch,
-            version,
+            &dataset,
             history.objects(),
             &self.dataset.session(),
         )
@@ -1679,16 +1685,13 @@ impl ManifestCoordinator {
                 "named {purpose} snapshot lacks native branch provenance"
             )));
         }
-        let dataset = open_manifest_dataset_native_with_session(
+        open_manifest_dataset_native_at_with_session(
             root_uri.trim_end_matches('/'),
             snapshot.native_branch(),
+            snapshot.graph_manifest_version(),
             &snapshot.session,
         )
-        .await?;
-        dataset
-            .checkout_version(snapshot.graph_manifest_version())
-            .await
-            .map_err(OmniError::storage)
+        .await
     }
 
     /// Test-only: production reads pass the reading handle's control session.
@@ -1699,16 +1702,13 @@ impl ManifestCoordinator {
         version: u64,
     ) -> Result<SchemaContractRow> {
         let control_session = crate::lance_access::control_session();
-        let dataset = open_manifest_dataset_with_session(
+        let dataset = layout::open_manifest_dataset_at_with_session(
             root_uri.trim_end_matches('/'),
             branch,
+            version,
             &control_session,
         )
         .await?;
-        let dataset = dataset
-            .checkout_version(version)
-            .await
-            .map_err(OmniError::storage)?;
         let state = read_manifest_state(&dataset).await?;
         read_schema_contract_row(&dataset, state.schema_contract.as_ref()).await
     }
