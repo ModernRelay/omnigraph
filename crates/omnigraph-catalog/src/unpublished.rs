@@ -624,11 +624,8 @@ impl ManifestCoordinator {
         let main =
             open_manifest_dataset_native_with_session(root_uri, None, control_session).await?;
         let name = unpublished_tag_name(graph_commit_id);
-        let tag = match main.tags().get(&name).await {
-            Ok(tag) => tag,
-            Err(lance::Error::RefNotFound { .. }) => return Ok(None),
-            Err(error) if error.is_not_found() => return Ok(None),
-            Err(error) => return Err(OmniError::storage(error)),
+        let Some(tag) = read_native_tag(&main, &name).await? else {
+            return Ok(None);
         };
         Self::unpublished_from_tag(root_uri, &main, &name, &tag)
             .await
@@ -836,16 +833,15 @@ impl ManifestCoordinator {
         fail(&DROP_POST_INPUTS_PRE_TAG)?;
         let name = candidate.tag_name();
         release_unpublished_tag(&main, &name).await?;
-        match main.tags().get(&name).await {
-            Ok(_) => Err(OmniError::manifest_publish_in_doubt(
+        match crate::branch_control::read_native_tag(&main, &name).await {
+            Ok(Some(_)) => Err(OmniError::manifest_publish_in_doubt(
                 &candidate.property.graph_commit_id,
                 format!(
                     "the tag of unpublished commit '{}' is still listed after its deletion",
                     candidate.property.graph_commit_id
                 ),
             )),
-            Err(lance::Error::RefNotFound { .. }) => Ok(()),
-            Err(error) if error.is_not_found() => Ok(()),
+            Ok(None) => Ok(()),
             Err(error) => Err(OmniError::manifest_publish_in_doubt(
                 &candidate.property.graph_commit_id,
                 format!(

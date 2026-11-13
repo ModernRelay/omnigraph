@@ -1506,13 +1506,13 @@ async fn create_candidate_tag(
     let Err(error) = dataset.tags().create(name, reference).await else {
         return Ok(());
     };
-    match dataset.tags().get(name).await {
-        Ok(contents)
+    match crate::branch_control::read_native_tag(dataset, name).await {
+        Ok(Some(contents))
             if contents.branch == *native_branch && contents.version == detached_version =>
         {
             Ok(())
         }
-        Ok(contents) => Err(OmniError::manifest_internal(format!(
+        Ok(Some(contents)) => Err(OmniError::manifest_internal(format!(
             "{} '{name}' names version {} of {:?}; this attempt wrote version \
              {detached_version} of {native_branch:?}",
             kind.tag_noun(),
@@ -1521,7 +1521,7 @@ async fn create_candidate_tag(
         ))),
         // The tag is absent now. A create the store refused cannot land; an
         // ambiguous one still can, and would address the candidate.
-        Err(LanceError::RefNotFound { .. }) => match classify_failed_request(&error) {
+        Ok(None) => match classify_failed_request(&error) {
             FailedRequest::Refused => Err(OmniError::storage(error).unpublished()),
             FailedRequest::Ambiguous => Err(OmniError::manifest_publish_in_doubt(
                 graph_commit_id,

@@ -10,7 +10,8 @@ use std::future::Future;
 use futures::StreamExt;
 use lance::Dataset;
 use lance::dataset::refs::{
-    BranchContents, BranchIdentifier, branch_contents_path, check_valid_branch,
+    BranchContents, BranchIdentifier, TagContents, base_tags_path, branch_contents_path,
+    check_valid_branch, check_valid_tag, tag_path,
 };
 use object_store::{ObjectStoreExt, PutMode, PutOptions};
 
@@ -118,6 +119,49 @@ pub(crate) async fn read_ref_contents(
         return BranchContents::from_path(path, store, name).await;
     }
     Ok(contents)
+}
+
+/// The names of `dataset`'s native tags from one listing of `_refs/tags/`,
+/// no tag opened. Lance's `tags().list()` reads every tag's contents (an
+/// exists HEAD, a size HEAD and a ranged GET each) before returning, so a
+/// reader that needs a few tags selects names here and reads only those with
+/// [`read_native_tag`].
+pub async fn list_native_tag_names(dataset: &Dataset) -> lance::Result<Vec<String>> {
+    let root = dataset.branch_location().find_main()?;
+    let store = dataset.object_store(None).await?;
+    let files = store.read_dir(base_tags_path(&root.path)).await?;
+    let mut names: Vec<String> = files
+        .iter()
+        .filter_map(|file| file.strip_suffix(".json"))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// One native tag of `dataset` by name in a single whole-object GET, as
+/// [`read_ref_contents`] reads a branch ref; `None` when the tag is absent,
+/// since a listing or a create's readback races a release. Lance's
+/// `Tags::get` sends an exists HEAD, a size HEAD and a ranged GET, and a
+/// `Tags::update` landing between the size and the range serves a prefix of
+/// the rewritten object; one GET returns one whole version.
+pub async fn read_native_tag(dataset: &Dataset, name: &str) -> lance::Result<Option<TagContents>> {
+    check_valid_tag(name)?;
+    let root = dataset.branch_location().find_main()?;
+    let store = dataset.object_store(None).await?;
+    let path = tag_path(&root.path, name);
+    let bytes = match store.inner.get(&path).await {
+        Ok(result) => result.bytes().await,
+        Err(error) => Err(error),
+    };
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(lance::Error::from(error)),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| lance::Error::corrupt_file(path, error.to_string()))
 }
 
 /// Read one physical ref's exact lifetime identity; same boundary and
@@ -616,17 +660,10 @@ pub async fn retire_branch_recoverably(
             "branch '{branch}' has no exact retirement identity"
         )));
     }
-    let tags = dataset
-        .tags()
-        .list()
+    if let Some(tag) = user_tag_pinning(dataset, branch)
         .await
-        .map_err(|error| OmniError::storage(error).before_effect())?;
-    if let Some((tag, _)) = tags.iter().find(|(name, tag)| {
-        tag.branch.as_deref() == Some(branch)
-            && !crate::branch_names::is_merge_input_tag(name)
-            && !crate::branch_names::is_unpublished_tag(name)
-            && !crate::branch_names::is_unattached_tag(name)
-    }) {
+        .map_err(|error| OmniError::storage(error).before_effect())?
+    {
         return Err(OmniError::storage(lance::Error::RefConflict {
             message: format!(
                 "cannot retire graph branch '{branch}' while native manifest tag '{tag}' pins it; remove the tag first"
@@ -674,6 +711,26 @@ pub async fn retire_branch_recoverably(
     }
     .await;
     completion.map_err(|error| error.with_completion_evidence(CompletionEvidence::Uncertain))
+}
+
+/// The first user tag, by name, that pins `branch`. Reserved engine tags
+/// (`merge_input_`, `unpublished_`, `unattached_`) are skipped by name and
+/// never read; a user tag released after the listing is skipped too.
+async fn user_tag_pinning(dataset: &Dataset, branch: &str) -> lance::Result<Option<String>> {
+    for name in list_native_tag_names(dataset).await? {
+        if crate::branch_names::is_merge_input_tag(&name)
+            || crate::branch_names::is_unpublished_tag(&name)
+            || crate::branch_names::is_unattached_tag(&name)
+        {
+            continue;
+        }
+        if let Some(tag) = read_native_tag(dataset, &name).await?
+            && tag.branch.as_deref() == Some(branch)
+        {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
 }
 
 /// Pinned Lance treats an already-absent target tree as success. OmniGraph
@@ -1691,6 +1748,247 @@ mod tests {
             7,
             &foreign_parent
         ));
+    }
+
+    /// Counts the requests sent for native tags (`_refs/tags/*.json`): the
+    /// whole-object or ranged GETs by tag file, and the HEADs.
+    #[derive(Debug, Clone, Default)]
+    struct TagRequests {
+        gets: Arc<std::sync::Mutex<Vec<String>>>,
+        heads: Arc<AtomicUsize>,
+    }
+
+    impl TagRequests {
+        fn is_tag(path: &Path) -> bool {
+            path.parent().is_some_and(|parent| {
+                parent.filename() == Some("tags")
+                    && parent
+                        .parent()
+                        .is_some_and(|refs| refs.filename() == Some("_refs"))
+            })
+        }
+
+        /// The tag files read by GET (sorted) and the HEADs, since the last call.
+        fn drain(&self) -> (Vec<String>, usize) {
+            let mut gets = std::mem::take(&mut *self.gets.lock().unwrap());
+            gets.sort();
+            (gets, self.heads.swap(0, Ordering::Relaxed))
+        }
+    }
+
+    impl WrappingObjectStore for TagRequests {
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            _original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            None
+        }
+
+        fn wrap(&self, _: &str, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+            Arc::new(TagRequestStore {
+                original,
+                counts: self.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct TagRequestStore {
+        original: Arc<dyn ObjectStore>,
+        counts: TagRequests,
+    }
+
+    impl fmt::Display for TagRequestStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "tag request counter over {}", self.original)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for TagRequestStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.original.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.original.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            if TagRequests::is_tag(location) {
+                let counts = &self.counts;
+                if options.head {
+                    counts.heads.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    counts
+                        .gets
+                        .lock()
+                        .unwrap()
+                        .push(location.filename().unwrap_or_default().to_string());
+                }
+            }
+            self.original.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, ObjectStoreResult<Path>>,
+        ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.original.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.original.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.original.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> ObjectStoreResult<()> {
+            self.original.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A native tag read is one whole-object GET: no exists HEAD and no size
+    /// HEAD, so a concurrent `Tags::update` cannot tear it (issue #1382). An
+    /// absent tag is `None` from that same GET.
+    #[tokio::test]
+    async fn native_tag_read_is_one_get_issue_1382() {
+        let dir = tempfile::tempdir().unwrap();
+        let dataset = test_dataset(&dir).await;
+        let version = dataset.version().version;
+        dataset
+            .tags()
+            .create(
+                "keep",
+                lance::dataset::refs::Ref::Version(None, Some(version)),
+            )
+            .await
+            .unwrap();
+        let requests = Arc::new(TagRequests::default());
+        let wrapped = dataset.with_object_store_wrappers(vec![
+            Arc::clone(&requests) as Arc<dyn WrappingObjectStore>
+        ]);
+
+        let tag = read_native_tag(&wrapped, "keep").await.unwrap().unwrap();
+        assert_eq!((tag.branch, tag.version), (None, version));
+        assert_eq!(requests.drain(), (vec!["keep.json".to_string()], 0));
+
+        assert!(read_native_tag(&wrapped, "gone").await.unwrap().is_none());
+        assert_eq!(requests.drain(), (vec!["gone.json".to_string()], 0));
+
+        let error = read_native_tag(&wrapped, "../escape").await.unwrap_err();
+        assert!(matches!(error, lance::Error::InvalidRef { .. }), "{error}");
+        assert_eq!(requests.drain(), (Vec::new(), 0));
+    }
+
+    /// Branch delete checks that no user tag pins the branch. It lists tag
+    /// names and reads only the user tags: the reserved `merge_input_`,
+    /// `unpublished_` and `unattached_` tags are skipped by name, unread, and
+    /// each user tag costs one GET (issue #1382). Lance's `tags().list()`
+    /// sent a HEAD and a ranged GET for every tag.
+    #[tokio::test]
+    async fn branch_delete_reads_only_user_tags_issue_1382() {
+        use lance::dataset::refs::Ref;
+        let dir = tempfile::tempdir().unwrap();
+        let mut dataset = test_dataset(&dir).await;
+        let version = dataset.version().version;
+        dataset
+            .create_branch("feature", version, None)
+            .await
+            .unwrap();
+        let identifier = dataset
+            .list_branches()
+            .await
+            .unwrap()
+            .get("feature")
+            .unwrap()
+            .identifier
+            .clone();
+        let on_feature = || Ref::Version(Some("feature".to_string()), Some(version));
+        let root = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let child = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+        let reserved = [
+            format!(
+                "{}{}_n_{child}",
+                crate::branch_names::MERGE_INPUT_PREFIX,
+                "a".repeat(64)
+            ),
+            format!("{}{child}", crate::branch_names::UNPUBLISHED_TAG_PREFIX),
+            crate::branch_names::unattached_tag_name(root, child),
+        ];
+        assert!(crate::branch_names::is_merge_input_tag(&reserved[0]));
+        assert!(crate::branch_names::is_unpublished_tag(&reserved[1]));
+        assert!(crate::branch_names::is_unattached_tag(&reserved[2]));
+        for name in &reserved {
+            dataset.tags().create(name, on_feature()).await.unwrap();
+        }
+        dataset
+            .tags()
+            .create("keep", Ref::Version(None, Some(version)))
+            .await
+            .unwrap();
+        dataset.tags().create("pin", on_feature()).await.unwrap();
+        let requests = Arc::new(TagRequests::default());
+        let wrapped = dataset.with_object_store_wrappers(vec![
+            Arc::clone(&requests) as Arc<dyn WrappingObjectStore>
+        ]);
+
+        // A user tag on the branch still refuses its retirement.
+        let error = retire_branch_recoverably(&wrapped, "feature", &identifier)
+            .await
+            .expect_err("a user tag pins the branch");
+        assert!(
+            error
+                .to_string()
+                .contains("native manifest tag 'pin' pins it"),
+            "{error}"
+        );
+        assert_eq!(
+            requests.drain(),
+            (vec!["keep.json".to_string(), "pin.json".to_string()], 0),
+            "only user tags are read, one GET each"
+        );
+
+        dataset.tags().delete("pin").await.unwrap();
+        retire_branch_recoverably(&wrapped, "feature", &identifier)
+            .await
+            .unwrap();
+        assert_eq!(
+            requests.drain(),
+            (vec!["keep.json".to_string()], 0),
+            "reserved tags on the retired branch are not read"
+        );
+        assert!(
+            !dataset
+                .list_branches()
+                .await
+                .unwrap()
+                .contains_key("feature")
+        );
     }
 
     #[tokio::test]

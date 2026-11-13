@@ -938,13 +938,12 @@ fn descend<'a>(
 /// `graph_commit_id`, confirmed by a read: a tag still listed, or a read that
 /// fails, leaves the release in doubt.
 async fn confirm_tag_released(main: &Dataset, name: &str, graph_commit_id: &str) -> Result<()> {
-    match main.tags().get(name).await {
-        Ok(_) => Err(OmniError::manifest_publish_in_doubt(
+    match crate::branch_control::read_native_tag(main, name).await {
+        Ok(Some(_)) => Err(OmniError::manifest_publish_in_doubt(
             graph_commit_id,
             format!("the candidate tag '{name}' is still listed after its deletion"),
         )),
-        Err(lance::Error::RefNotFound { .. }) => Ok(()),
-        Err(error) if error.is_not_found() => Ok(()),
+        Ok(None) => Ok(()),
         Err(error) => Err(OmniError::manifest_publish_in_doubt(
             graph_commit_id,
             format!("the deletion of the candidate tag '{name}' could not be confirmed: {error}"),

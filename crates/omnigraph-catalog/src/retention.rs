@@ -203,44 +203,17 @@ pub async fn release_merge_input_tags(dataset: &Dataset, names: &[String]) -> Re
 /// returning, so a reader that needs a few tags selects names here and reads
 /// only those with [`read_native_tag`].
 pub async fn list_native_tag_names(dataset: &Dataset) -> Result<Vec<String>> {
-    let root = dataset
-        .branch_location()
-        .find_main()
-        .map_err(OmniError::storage)?;
-    let store = dataset
-        .object_store(None)
+    crate::branch_control::list_native_tag_names(dataset)
         .await
-        .map_err(OmniError::storage)?;
-    let files = store
-        .read_dir(lance::dataset::refs::base_tags_path(&root.path))
-        .await
-        .map_err(OmniError::storage)?;
-    let mut names: Vec<String> = files
-        .iter()
-        .filter_map(|file| file.strip_suffix(".json"))
-        .map(str::to_string)
-        .collect();
-    names.sort();
-    Ok(names)
+        .map_err(OmniError::storage)
 }
 
-/// One native tag's contents by name, one object read; `None` when the tag
-/// is gone, since a listing races a release.
+/// One native tag's contents by name in one whole-object GET; `None` when
+/// the tag is gone, since a listing races a release.
 pub async fn read_native_tag(dataset: &Dataset, name: &str) -> Result<Option<TagContents>> {
-    let root = dataset
-        .branch_location()
-        .find_main()
-        .map_err(OmniError::storage)?;
-    let store = dataset
-        .object_store(None)
+    crate::branch_control::read_native_tag(dataset, name)
         .await
-        .map_err(OmniError::storage)?;
-    match TagContents::from_path(&lance::dataset::refs::tag_path(&root.path, name), &store).await {
-        Ok(tag) => Ok(Some(tag)),
-        Err(lance::Error::RefNotFound { .. }) => Ok(None),
-        Err(error) if error.is_not_found() => Ok(None),
-        Err(error) => Err(OmniError::storage(error)),
-    }
+        .map_err(OmniError::storage)
 }
 
 /// One immutable inventory boundary around all graph snapshots a collector
