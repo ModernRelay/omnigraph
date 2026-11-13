@@ -6913,10 +6913,10 @@ async fn removed_id_memory_refusals_keep_graph_and_admission_usable() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() {
-    // Strict read-modify-write attempts are never automatically reprepared.
-    // Exactly one concurrent UPDATE commits; once it changes branch authority,
-    // every waiter reports a typed 409 before any of its Lance effects begin.
+async fn change_concurrent_updates_same_key_all_commit_by_rerunning_issue_1331() {
+    // A strict update overtaken before its effects reruns on the new head
+    // under the writer gates, as every write does, so concurrent updates of
+    // one row all commit, one after another, and none returns a 409.
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let state = AppState::open(graph.to_string_lossy().to_string())
@@ -6958,70 +6958,30 @@ async fn change_concurrent_updates_same_key_return_typed_pre_effect_conflicts() 
     for h in handles {
         results.push(h.await.unwrap());
     }
-    let statuses: Vec<StatusCode> = results.iter().map(|(s, _)| *s).collect();
-
-    let ok_count = statuses.iter().filter(|s| **s == StatusCode::OK).count();
-    let conflict_count = statuses
-        .iter()
-        .filter(|s| **s == StatusCode::CONFLICT)
-        .count();
-    let other: Vec<_> = statuses
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| **s != StatusCode::OK && **s != StatusCode::CONFLICT)
-        .collect();
-
-    let other_bodies: Vec<(usize, StatusCode, String)> = other
-        .iter()
-        .map(|(i, s)| {
-            let body_str = String::from_utf8_lossy(&results[*i].1).to_string();
-            (*i, **s, body_str)
-        })
-        .collect();
-    assert!(
-        other.is_empty(),
-        "expected only 200 or 409 statuses, got non-200/409 entries: {:?}",
-        other_bodies
-    );
-    assert_eq!(
-        ok_count + conflict_count,
-        N,
-        "all responses must be 200 or 409 to satisfy the RYW invariant; statuses: {:?}",
-        statuses
-    );
-    assert_eq!(
-        ok_count,
-        1,
-        "expected exactly one update to commit and N-1 to receive typed 409 conflicts \
-         before effects. Got {} OK + {} 409 + {} other. Statuses: {:?}",
-        ok_count,
-        conflict_count,
-        statuses.len() - ok_count - conflict_count,
-        statuses,
-    );
-
     for (status, bytes) in &results {
-        if *status != StatusCode::CONFLICT {
-            continue;
-        }
-        let error: ErrorOutput = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
-        let conflict = error
-            .read_set_conflict
-            .expect("strict OCC loser must include structured read-set authority");
-        assert!(
-            matches!(
-                conflict.member.as_str(),
-                "graph_head:main" | "published_dataset_version:node:Person"
-            ),
-            "a strict loser is refused by the branch head, or by the table pin when it \
-             revalidates between the winner's detached table commit and its publish; got {}",
-            conflict.member
+        assert_eq!(
+            *status,
+            StatusCode::OK,
+            "every overtaken update reruns and commits: {}",
+            String::from_utf8_lossy(bytes)
         );
-        assert_ne!(conflict.actual, conflict.expected);
-        assert!(error.published_dataset_version_conflict.is_none());
-        assert!(error.recovery_required.is_none());
     }
+    let (status, rows) = json_response(
+        &app,
+        json_post(
+            "/query",
+            &json!({"query": FIND_PERSON_GQ, "params": {"name": "Alice"}, "branch": "main"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    let alice_age = rows["rows"][0]["p.age"]
+        .as_i64()
+        .expect("Alice is still there");
+    assert!(
+        (100..100 + N as i64).contains(&alice_age),
+        "Alice holds one of the updates' ages, got {alice_age}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

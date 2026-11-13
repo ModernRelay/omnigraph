@@ -850,6 +850,25 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         staged: StagedHandle,
     ) -> Result<ExactCommitOutcome>;
 
+    /// The commits from `current` down to `captured_version` when every one
+    /// leaves the table's rows unchanged (`table_store::row_preserving_chain`).
+    async fn row_preserving_chain(
+        &self,
+        current: &SnapshotHandle,
+        captured_version: u64,
+    ) -> Result<Option<crate::table_store::RowPreservingChain>>;
+
+    /// Carry a staged effect prepared on `base` over a row-preserving chain
+    /// to `current` with Lance's conflict resolver
+    /// (`table_store::rebase_staged_write`). Writes nothing.
+    async fn rebase_staged_write(
+        &self,
+        base: &SnapshotHandle,
+        staged: StagedHandle,
+        current: &SnapshotHandle,
+        chain: &crate::table_store::RowPreservingChain,
+    ) -> Result<std::result::Result<StagedHandle, String>>;
+
     /// RFC 0067: commit one staged effect as a detached version, stamped
     /// with the authority it was staged against, declaring every full-text
     /// column of `declared_full_text` the version holds no segment for
@@ -1476,6 +1495,31 @@ impl TableStorage for TableStore {
         TableStore::commit_staged(self, ds_arc, staged.into_staged())
             .await
             .map(SnapshotHandle::new)
+    }
+
+    async fn row_preserving_chain(
+        &self,
+        current: &SnapshotHandle,
+        captured_version: u64,
+    ) -> Result<Option<crate::table_store::RowPreservingChain>> {
+        crate::table_store::row_preserving_chain(current.dataset(), captured_version).await
+    }
+
+    async fn rebase_staged_write(
+        &self,
+        base: &SnapshotHandle,
+        staged: StagedHandle,
+        current: &SnapshotHandle,
+        chain: &crate::table_store::RowPreservingChain,
+    ) -> Result<std::result::Result<StagedHandle, String>> {
+        Ok(crate::table_store::rebase_staged_write(
+            base.dataset(),
+            staged.into_staged(),
+            current.dataset(),
+            chain,
+        )
+        .await?
+        .map(StagedHandle::new))
     }
 
     async fn commit_staged_detached(

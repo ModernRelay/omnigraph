@@ -98,9 +98,12 @@ route.
 - `429 Too Many Requests`: the write did not start. Honor `Retry-After`, then
   retry. The CLI marks this case with exit `75` and a `disposition` whose
   `action` is `retry`, only when no earlier step of the command took effect.
-- Structured `read_set_conflict` means an input changed before publication.
-  Refresh and reconsider the operation, including schema/table identity changes;
-  an unchanged retry need not succeed. Commit conflicts use generic `conflict`,
+- Structured `read_set_conflict` means the branch was recreated or its schema
+  changed while the write prepared, or another process kept overtaking it. A
+  write merely overtaken by another write, an update or delete included,
+  reruns on the new head instead. Refresh and reconsider the operation; an
+  unchanged retry need not succeed. Use `--if-commit` to refuse a write when
+  the head moved. Commit conflicts use generic `conflict`,
   so HTTP `409` alone does not identify a retryable case.
 - `key_conflict`: an append or strict insert found an existing id. Decide
   whether that entity is the intended one; do not silently turn the operation
