@@ -127,8 +127,43 @@ pub fn check_source(catalog: &Catalog, source: &str) -> Result<CheckedDecls, Que
     Ok(check_file(catalog, &file))
 }
 
-/// Type-check one declaration of a source unit.
+/// [`check_source`] by the typing rules alone ([`type_decl`]): the core term
+/// of every declaration this release types, lowered or not.
+#[cfg(test)]
+pub(crate) fn type_source(
+    catalog: &Catalog,
+    source: &str,
+) -> Result<CheckedDecls, QueryDiagnostic> {
+    let file = crate::query::syntax::parse::parse_source(source)?;
+    let decls: Vec<&Decl> = match &file.body {
+        Body::Decls(d) => d.iter().collect(),
+        Body::Explain(d) => vec![d.as_ref()],
+        Body::Statement(_) => Vec::new(),
+    };
+    let unit: HashMap<String, &Decl> = decls.iter().map(|d| (d.name.clone(), *d)).collect();
+    Ok(decls
+        .iter()
+        .map(|d| (d.name.clone(), type_decl(catalog, &unit, d)))
+        .collect())
+}
+
+/// Type-check one declaration of a source unit. A declaration this
+/// release's planner does not lower is refused (`T86`): acceptance is per
+/// release ([`lowering`]).
 pub fn check_decl(
+    catalog: &Catalog,
+    unit: &HashMap<String, &Decl>,
+    decl: &Decl,
+) -> Result<CheckedDecl, QueryDiagnostic> {
+    let checked = type_decl(catalog, unit, decl)?;
+    lowering::admit(catalog, decl, &checked.core)?;
+    Ok(checked)
+}
+
+/// Type-check one declaration into its core term, lowered by this release
+/// or not: the typing rules alone. A monotone self-call types to `Fix`
+/// here, so every rule of a later stage's term is tested in this one.
+pub(crate) fn type_decl(
     catalog: &Catalog,
     unit: &HashMap<String, &Decl>,
     decl: &Decl,
@@ -5577,6 +5612,7 @@ fn expr_vars(e: &Expr, out: &mut Vec<String>) {
 
 mod bind;
 mod literal;
+mod lowering;
 mod result;
 pub use result::{projection_field, result_schema};
 mod scalar;

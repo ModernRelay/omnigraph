@@ -112,15 +112,16 @@ quoted name is accepted too.
 before it; `where`, later elements, the blocks of `where`, `return` and
 `order` read it as `$v`. A value whose expression cannot fail is read where
 its name is. One that can fail (arithmetic: overflow, a zero divisor) runs for
-every row before `where`, as the core states; the planner has no operator for
-that yet and refuses it (`P006`), so write the expression in `return` or guard
-it with `if`.
+every row before `where`, as the core states; this release's planner has no
+operator for that, so the type checker refuses it (`T86`): write the
+expression where the name is read, in `where` or in `return`, which runs after
+`where`.
 
 `from { match … return { … } }` joins the rows of an inline read, one outer
 row per inner row, correlated on the outer variables it reads. Its returned
 references bind their names and its returned values read by name; a name it
 binds without returning stays its own variable. An inline read with an
-aggregate, `distinct`, `order` or `limit` is refused (`P006`).
+aggregate, `distinct`, `order` or `limit` is refused (`T86`).
 
 Comparison operators are `=`, `!=`, `<`, `<=`, `>`, and `>=`.
 

@@ -3,7 +3,7 @@
 # notes: against the write's snapshot: a traversal deleting an edge binding, an update over a traversal, a `not exists`
 # notes: and a `count {…} > n` block, a `let` and a `from`, assignments that read the row, an insert per selected row
 # notes: with bound endpoint references, and a selection that matches nothing. Two values one statement's rows give one
-# notes: entity's property are `E4`; a group whose selection reads a table an earlier group changes stays `P006`.
+# notes: entity's property are `E4`; a group whose selection reads a table an earlier group changes is not lowered in this release (`T86`).
 
 --- runner
 timeout_ms: 10000
@@ -174,7 +174,7 @@ query second_group_reads_the_first() {
   update $c set { city: $q.name }
 }
 
---- expect error: P006: `second_group_reads_the_first`: the planner does not lower a write group whose selection reads a table an earlier group of the write changes (`node:Person`)
+--- expect error: T86: `second_group_reads_the_first`: this release's planner does not lower a write group whose selection reads a table an earlier group of the write changes (`node:Person`)
 
 --- mutate
 query close_nothing() {

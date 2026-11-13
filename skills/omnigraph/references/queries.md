@@ -68,8 +68,9 @@ The compiler typechecks parameter values against declared types.
 ### Match → Where → Return → Order → Limit
 
 `match { … }` holds the elements, the forms that produce rows: bindings
-`$x: Type` (no property braces), triples `$a edge $b`, `optional { … }`, `let`
-and `from`, separated by commas (a trailing comma is allowed; a newline is not
+`$x: Type` (no property braces), triples `$a edge $b`, `optional { … }` (which
+this release's planner does not lower: `T86`), `let` and `from`, separated by
+commas (a trailing comma is allowed; a newline is not
 a separator). `where`, after the braces, holds one Boolean expression that sees
 every element and removes rows. A filter or `where` inside the braces is
 `Q017`, a property map `$s: Signal { slug: $slug }` is `Q010`, and a missing
@@ -77,10 +78,10 @@ comma is `Q016`; each prints the corrected text. Every list takes commas:
 return items, order keys, call arguments and assignments.
 
 `let $v = expr` names a value for `where`, `return`, `order` and later
-elements; a value that can fail (arithmetic) is refused by the planner
-(`P006`), so put arithmetic in `return` or guard it with `if`.
+elements; a value that can fail (arithmetic) is refused at type check
+(`T86`), so write the arithmetic where the name is read (`where`, `return`).
 `from { match … return { … } }` joins an inline read's rows; one with an
-aggregate, `distinct`, `order` or `limit` is `P006`.
+aggregate, `distinct`, `order` or `limit` is `T86`.
 
 ```gq
 query recent_signals() {
@@ -393,7 +394,7 @@ graph the write started from:
 Assignments may read the row (`city: $c.city`; an endpoint as `to: $c`), and
 an `insert` runs once per row. `optional`, a `Blob` read from a row, and a
 selection that reads a type an earlier group of the write changes are refused
-(`P006`); rows of one statement giving one entity's property two values are
+(`T86`); rows of one statement giving one entity's property two values are
 refused (`E4`).
 
 ### Insert

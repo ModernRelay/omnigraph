@@ -2,7 +2,7 @@
 //! 10, "Type-check tests"), the RFC's examples type-checked, and one repair
 //! per type-level refusal shape.
 
-use super::{CheckedDecl, check_source};
+use super::{CheckedDecl, check_source, type_source};
 use crate::catalog::{Catalog, build_catalog};
 use crate::ir::core::*;
 use crate::query::syntax::parse::parse_source;
@@ -31,8 +31,9 @@ pub(crate) fn catalog() -> Catalog {
     build_catalog(&parse_schema(SCHEMA).expect("the schema parses")).unwrap()
 }
 
-/// Check `src` against [`SCHEMA`]; one
-/// result per declaration.
+/// Type `src` against [`SCHEMA`] by the typing rules alone, lowered by this
+/// release or not (the lowering admission has its own tests); one result per
+/// declaration.
 #[track_caller]
 pub(crate) fn check(
     src: &str,
@@ -40,7 +41,7 @@ pub(crate) fn check(
     String,
     Result<CheckedDecl, crate::query::diagnostic::QueryDiagnostic>,
 )> {
-    check_source(&catalog(), src).unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
+    type_source(&catalog(), src).unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
 }
 
 /// The code of the first refused declaration, or `ok`.
@@ -1177,6 +1178,16 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
 }"#,
         r#"query q() { match { $p: Person } return { $p.name } }"#,
     ),
+    (
+        r#"an order key no return item computes"#,
+        "T86",
+        r#"query q() {
+  match { $p: Person }
+  return { $p.handle }
+  order { $p.age > 30 desc }
+}"#,
+        r#"query q() { match { $p: Person } return { $p.age > 30 as key, $p.handle } order { $p.age > 30 desc } }"#,
+    ),
 ];
 
 #[test]
@@ -1307,7 +1318,7 @@ edge Knows: Person -> Person
 "#;
     let catalog = build_catalog(&parse_schema(LITERAL_SCHEMA).unwrap()).unwrap();
     let outcome = |src: &str| {
-        check_source(&catalog, src)
+        type_source(&catalog, src)
             .unwrap_or_else(|e| panic!("parse: {e}\n{src}"))
             .remove(0)
             .1
@@ -1503,3 +1514,4 @@ fn a_type_error_carries_the_position_of_its_clause() {
 }
 
 mod desugaring;
+mod lowering;

@@ -49,7 +49,7 @@ binding of the written type with a filter over it is evaluated together with
 the statements before it; any other selection runs once as a read of the
 graph the write started from. Such a selection may not read a type an earlier
 group of the same write changes, and `optional` is not supported yet (both
-`P006`). An unbound variable is `T6` and an aggregate `T8`; a filter on one
+`T86`). An unbound variable is `T6` and an aggregate `T8`; a filter on one
 binding testing over four properties twice each with `=`, `!=` or `in` fails.
 
 Assignment values are literals, parameters, `now()`, expressions over them,
@@ -57,7 +57,7 @@ and values read from the row (`city: $c.city`, `to: $c` for an endpoint);
 constants are bound once before any retry. They follow the read rules for
 null: a null result, or `null` written as the value, clears a nullable
 property, and on a non-nullable property is refused with a typed error naming
-it. A value read from the row may not be a `Blob` (`P006`). Rows of one
+it. A value read from the row may not be a `Blob` (`T86`). Rows of one
 statement that give one entity's property two values are refused (`E4`); a
 keyed insert whose rows repeat a key with equal values writes it once. A
 write whose selection matches nothing publishes no commit.

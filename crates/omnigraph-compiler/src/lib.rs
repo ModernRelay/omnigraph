@@ -8,6 +8,7 @@ pub mod query_input;
 pub mod result;
 pub mod schema;
 pub mod settings;
+pub mod shape;
 pub mod traversal;
 pub mod types;
 

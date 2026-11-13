@@ -1,5 +1,6 @@
 # issue: none
-# notes: A well-typed read whose core term the planner does not lower yet (`optional`, a `Union`) is refused with `P006`; nothing executes.
+# notes: A read whose term this release's planner does not lower is refused at type check with `T86`, naming the stage that adds it:
+# notes: an `optional` (stage B) and a read that calls itself (`Fix`, stage Rec); nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -48,4 +49,19 @@ query q($h: String) { match { $p: Person, optional { $p knows $q } } where $p.ha
 --- params
 {"h": "ada"}
 
---- expect error: P006:
+--- expect error: type error: T86: `q`: this release's planner does not lower a `Union` in a pattern (an `optional`, or a `from` over `union`); stage B (the break) adds it
+
+--- query
+query reachable($from: String) {
+    match {
+        from union(
+            { match { $p: Person } where $p.handle = $from return { $p as q } },
+            { match { from reachable($from), $q knows $r } return { $r as q } }),
+    }
+    return distinct { $q }
+}
+
+--- params
+{"from": "ada"}
+
+--- expect error: type error: T86: `reachable`: this release's planner does not lower a read that calls itself (`Fix`); stage Rec (recursion, the `Fix` evaluator) adds it

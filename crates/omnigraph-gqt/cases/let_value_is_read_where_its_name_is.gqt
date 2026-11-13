@@ -4,7 +4,7 @@
 # notes: elements and the blocks of `where` read it by name. A value that
 # notes: cannot fail is the same column wherever it is read, so the planner
 # notes: reads the value in place. A value that can fail (arithmetic) must run
-# notes: for every row before `where`, and stays `P006` until an operator adds
+# notes: for every row before `where`, and is refused at type check (`T86`) until an operator adds
 # notes: a column inside a pattern.
 
 --- runner
@@ -131,4 +131,4 @@ query let_whose_value_can_fail() {
     return { $p.handle }
 }
 
---- expect error: P006: `let_whose_value_can_fail`: the planner does not lower a `let` whose value can fail
+--- expect error: T86: `let_whose_value_can_fail`: this release's planner does not lower a `let` whose value can fail

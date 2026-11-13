@@ -140,4 +140,4 @@ query boolean_key_unbound() {
     order { $p.age > 30 }
 }
 
---- expect error: P006: `boolean_key_unbound`: the planner does not lower an order key computed from columns
+--- expect error: T86: `boolean_key_unbound`: this release's planner does not lower an order key computed from columns

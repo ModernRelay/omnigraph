@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::catalog::{Catalog, build_catalog};
 use crate::ir::core::*;
 use crate::ir::expr::IRExpr;
-use crate::query::check::{SExpr, SKind, check_source};
+use crate::query::check::{SExpr, SKind, type_source};
 use crate::query::value::{AggFunc, CompOp, Literal};
 use crate::schema::parser::parse_schema;
 use crate::types::{Direction, PropType, ScalarType};
@@ -28,7 +28,7 @@ fn catalog() -> Catalog {
 
 #[track_caller]
 fn lower(src: &str) -> CoreDecl {
-    let out = check_source(&catalog(), src).unwrap_or_else(|e| panic!("{e}\n{src}"));
+    let out = type_source(&catalog(), src).unwrap_or_else(|e| panic!("{e}\n{src}"));
     out.into_iter()
         .last()
         .unwrap()
@@ -39,7 +39,7 @@ fn lower(src: &str) -> CoreDecl {
 
 #[track_caller]
 fn refusal(src: &str) -> crate::query::diagnostic::QueryDiagnostic {
-    match check_source(&catalog(), src) {
+    match type_source(&catalog(), src) {
         Err(e) => e,
         Ok(out) => out
             .into_iter()

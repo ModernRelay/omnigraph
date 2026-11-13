@@ -9,8 +9,8 @@
 //! The planner reads only this tree. It lowers the forms the engine runs
 //! (a pattern of scans, expansions, filters and correlated blocks, its
 //! projection, grouping, order and cut, the rankings over a population, and
-//! the write groups) to today's plans, and refuses every other node with
-//! `P006`.
+//! the write groups) to today's plans through [`crate::shape`], which the type
+//! checker also runs: every other node is refused at type check with `T86`.
 //!
 //! Every scalar a term holds (a filter's predicate, a projected or grouped
 //! item, an order key, an aggregate's argument, a score's query, a sink's

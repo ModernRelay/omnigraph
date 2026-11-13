@@ -5,7 +5,7 @@
 # notes: reads: a returned reference binds its name, a returned value is read
 # notes: by name, and a name the inner read binds without returning stays its
 # notes: own variable, so an outer binding of the same name is another one. An
-# notes: inline read with an aggregate stays `P006`.
+# notes: inline read with an aggregate is not lowered in this release (`T86`).
 
 --- runner
 timeout_ms: 10000
@@ -113,4 +113,4 @@ query from_over_a_grouped_read() {
     return { $c.slug, $n }
 }
 
---- expect error: P006: `from_over_a_grouped_read`: the planner does not lower a `Group` node in a pattern
+--- expect error: T86: `from_over_a_grouped_read`: this release's planner does not lower an inline read with an aggregate or `distinct`

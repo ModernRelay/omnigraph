@@ -128,7 +128,7 @@ both paths. Unordered row comparison preserves duplicate counts.
 
 An `expect error: <needle>` holds when the step fails and its error contains
 the needle; a compiler diagnostic renders with its code, `parse error: Q018: …`
-as `type error: T7: …` and `plan error: P006: …` do, so a case can name the
+as `type error: T7: …` and `plan error: P002: …` do, so a case can name the
 code it expects. A `--- query` or `--- mutate` section the compiler refuses at
 parse is a step only under `expect error:` (any other expectation refuses the
 case with the parse error); it runs through the engine's door like any query

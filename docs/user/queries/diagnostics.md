@@ -173,18 +173,54 @@ expected format instead, without an edit.
 Type codes are listed where the construct they guard is described, in
 [Query language](index.md).
 
+## Terms this release does not lower
+
+A read or write the type checker accepts, the planner runs. A term that
+type-checks but that this release's planner has no plan for is refused at
+type check with `T86`, at the construct it was written as (the `let`, the
+`optional`, the `from`, the `limit`, the order key, the block's comparison,
+the write group's `match`, the statement), before any storage is read. The
+message names the stage of the language programme that adds it: `B` for a
+construct of edition 3 that this release does not run yet, `Rec` for a read
+that calls itself.
+
+| Refused | Stage | Rewrite this release runs |
+|---|---|---|
+| `optional { … }`, `from union(…)`, a declared read's call, `distance`, an edge-type binding in a read, `limit $param` | B | none |
+| A `let` whose value can fail (arithmetic) | B | write the value where the name is read, in `where` or `return` |
+| An order key no return item computes | B | return the key under an alias; the edit inserts it |
+| An inline read with an aggregate, `distinct`, `order` or `limit` | B | none |
+| A block compared with a column, a block of several aggregates | B | none |
+| An aggregate over a ranking's score; a `nearest` window read from a parameter outside the read's `limit`; two `rrf` arm windows that differ | B | none |
+| A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B | none |
+| A read that calls itself (`Fix`) | Rec | none |
+
+```text
+query q() { match { $p: Person } return { $p.handle } order { $p.age > 30 } }
+```
+
+```text
+error[T86]: type error: T86: `q`: this release's planner does not lower an order key computed from columns no return item computes; stage B (the break) adds it
+  --> line 1, column 63
+  fix: return the key under an alias, which the sort reads: `$p.age > 30 as key`
+```
+
+Its suggestion inserts `$p.age > 30 as key, ` before the first return item.
+`P006` is no longer a refusal: see [Planner codes](#planner-codes).
+
 ## Planner codes
 
 A planner code refuses a well-formed, type-checked query shape by design. It
 is the caller's error, answered as a bad request with the diagnostic, never as
-an internal error.
+an internal error; `P006` is the exception, the planner's assertion that the
+type checker let through a term it does not lower.
 
 | Code | Meaning |
 |---|---|
 | `P002` | An edge alternation or wildcard traversal has no finite traversal work limit. The fix sets `traversal_work_limit` before the query. |
 | `P003` | The traversal work limit is outside `1..=9223372036854775807`, or a plan records it twice. |
 | `P004` | An edge alternation or wildcard traversal was asked to run in CSR traversal mode; it runs in `auto` or `indexed` mode. |
-| `P006` | A type-checked shape the planner does not run, such as a block compared with a column, `optional`, or a write group whose selection reads a type an earlier group of the write changes; `expected` names it. |
+| `P006` | Not a refusal: the planner's assertion that a term the type checker accepted arrived unlowered. The type checker refuses every such term (`T86`), so `P006` is an internal error and a defect to report. |
 
 `P001` and `P005` are withdrawn. A ranking ranks the binding it names
 whatever its population declares first

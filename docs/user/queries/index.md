@@ -108,8 +108,8 @@ its own `where`, `count { $p knows $q where $q.age > 30 }`, and must read an
 outer variable (`T39`, `T9` under `not`). The row is kept when the aggregate
 comparison is true: `not exists` means `count = 0`, and `exists` means
 `count > 0`. The right side is a literal, `now()` or typed parameter;
-a column, such as `$p.quota`, type-checks but is refused by the planner
-(`P006`). Numeric bounds follow the [comparison rules](#boolean-expressions-and-nulls)
+a column, such as `$p.quota`, is not lowered in this release
+(`T86`). Numeric bounds follow the [comparison rules](#boolean-expressions-and-nulls)
 for the aggregate's result type. Its argument is a scalar expression in the
 block's scope: numeric for `sum` and `avg`; numeric, `String`, `Bool`, `Date`
 or `DateTime` for `min` and `max`, as in `return`. With no matches, `sum`,

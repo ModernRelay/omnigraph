@@ -380,8 +380,8 @@ pub(crate) struct CompiledQuery {
 
 impl CompiledQuery {
     /// Check `decl` against `catalog` and shape its core term for the
-    /// planner; a write or a core node the planner does not lower is
-    /// refused.
+    /// planner; a write is refused, and so, at type check, is a term the
+    /// planner does not lower (`T86`).
     pub(crate) fn compile(
         catalog: &Catalog,
         decl: &omnigraph_compiler::query::file::QueryDecl,
@@ -396,7 +396,10 @@ impl CompiledQuery {
                 )));
             }
         };
-        let ir = Arc::new(ReadShape::of(&core, catalog).map_err(crate::exec::plan_refusal)?);
+        let ir = Arc::new(
+            omnigraph_planner::read_shape::shape(&core, catalog)
+                .map_err(crate::exec::plan_refusal)?,
+        );
         Ok(Self { ir })
     }
 }

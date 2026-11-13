@@ -6,7 +6,7 @@
 # notes: not by row), the elements and `where` after it run over the selected rows and nothing refills a
 # notes: target they remove (law 2), and the `order` is a plain sort that may read the score anywhere.
 # notes: `bm25` has no window; `rrf` windows each `nearest` arm at its own `k`. An aggregate over the
-# notes: score is not lowered yet (`P006`).
+# notes: score is not lowered in this release (`T86`).
 
 --- runner
 timeout_ms: 10000
@@ -258,4 +258,4 @@ query aggregate_over_the_score() {
     return { max($score) as best }
 }
 
---- expect error: P006:
+--- expect error: T86: `aggregate_over_the_score`: this release's planner does not lower an aggregate over a ranking's score

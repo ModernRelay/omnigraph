@@ -164,7 +164,7 @@ query outer_property_as_the_bound_is_refused() {
     } >= $n.followers
     return { $n.slug }
 }
---- expect error: P006: `outer_property_as_the_bound_is_refused`: the planner does not lower a block value compared with a column
+--- expect error: T86: `outer_property_as_the_bound_is_refused`: this release's planner does not lower a block value compared with a column
 
 --- query
 query not_equal_to_a_parameter($bound: I64) {

@@ -27,10 +27,14 @@ A query runs against one resolved `ReadTarget`:
    filter moves below it (law 2). The overfetch ladder fills the cut's `k`
    targets, read from its `selected_targets` counter, instead of the read's
    `limit`. `bm25` has no window, and an `rrf` windows its `nearest` arm at
-   the arm's own `k`. A core node the planner does not lower
-   (`Union`, `Fix`, `Call`, a `let` value that can fail, an inline read with a
-   group, order or cut, a computed order key no return item computes) is
-   refused with `P006`.
+   the arm's own `k`. The shaper is the compiler's
+   (`omnigraph_compiler::shape`), and the type checker runs it on every
+   declaration it accepts: a term it does not lower (`Union`, `Fix`, `Call`,
+   a `let` value that can fail, an inline read with a group, order or cut, a
+   computed order key no return item computes) is refused at type check with
+   `T86`, at the construct and naming the programme stage that adds it, so
+   the planner never refuses a checked read. A term that still arrives
+   unlowered is the planner's `P006`, an internal error and a defect.
 4. Gather the planning inputs once: bound parameters (`now()` among them),
    constants folded to their values, statistics, settings and the index
    facts the full-text coverage of every ranked property is derived from.
@@ -65,8 +69,10 @@ typed membership `id in [ids]` with those values per entity, and an `insert`
 runs once per row; two values for one entity and property through one
 statement's rows are `E4`. Because that read sees the snapshot, not the
 staged statements, a group whose selection reads a table an earlier group
-writes is `P006`, as are a selection the read planner refuses and a `Blob`
-read from a row. Such a write publishes once, through the same staging.
+writes is not lowered, nor are a selection the read shaper refuses and a
+`Blob` read from a row; the write shaper is the compiler's too, so the type
+checker refuses each with `T86`. Such a write publishes once, through the
+same staging.
 
 The executor never refreshes a mutable branch head midway through a query.
 Historical reads build from the requested immutable table versions; current

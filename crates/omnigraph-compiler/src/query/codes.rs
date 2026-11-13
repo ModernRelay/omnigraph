@@ -111,13 +111,17 @@ codes! {
     T79 = "a ranked column is not a node column of its population";
     T80 = "an annotation the language does not read";
     T83 = "two declarations of one name in a source unit";
+    T86 = "a term this release's planner does not lower; the message names the stage that adds it";
 
     // Planner. P001 and P005 are withdrawn: a ranking roots its traversal at
     // the binding it ranks, and `rrf()` arms one traversal connects are T59.
     P002 = "an edge alternation or wildcard traversal needs a finite traversal work limit";
     P003 = "the traversal work limit is out of range or recorded twice";
     P004 = "an edge alternation or wildcard traversal cannot run in CSR traversal mode";
-    P006 = "a core node the planner does not lower yet";
+    // P006 is the planner's assertion, not a refusal: the type checker
+    // refuses every term the planner does not lower (`T86`), so a term that
+    // arrives unlowered is a defect.
+    P006 = "a type-checked term arrived at the planner unlowered: a defect, never a refusal";
 
     // Execution (docs/rfcs/2026-11-07-gq-3.md section 10): an arithmetic
     // term refused a row; the failure keeps its place in the plan.

@@ -43,8 +43,9 @@ pub(crate) mod write_plan;
 /// A failure to find a named statement in query text, as an engine error: a
 /// compile refusal keeps its diagnostic (code, position, fix) on the read and
 /// the mutation door alike, and any other lookup failure is a bad request.
-/// A core node the planner does not lower (`P006`) as the compile refusal
-/// it is; any other planner failure is internal.
+/// A planner refusal by design as the compile refusal it is; any other
+/// planner failure, a term that arrived unlowered (`P006`) among them, is
+/// internal.
 pub(crate) fn plan_refusal(error: omnigraph_planner::PlanError) -> OmniError {
     match error {
         omnigraph_planner::PlanError::Unsupported(diagnostic) => {
