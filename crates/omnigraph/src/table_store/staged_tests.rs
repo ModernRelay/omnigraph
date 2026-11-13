@@ -1205,15 +1205,12 @@ async fn keyed_strict_insert_preflights_typed_conflict_without_changing_mode_iss
     // Strict insertion has no merge-insert route (#1261): the merge-insert
     // stager refuses it before handing anything to Lance.
     let batch = person_pk_batch(&[("carol", Some(41))]);
-    let schema = batch.schema();
-    let reader = arrow_array::RecordBatchIterator::new([Ok(batch)], schema);
-    let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
     let probes = MergeWriteProbes::default();
     let error = with_merge_write_probes(
         probes.clone(),
-        store.stage_keyed_write_from_stream(
+        store.stage_keyed_write_from_batch(
             committed.clone(),
-            stream,
+            batch,
             1,
             KeyedWriteSemantics::StrictInsert,
             committed.schema().field("id").unwrap().id,

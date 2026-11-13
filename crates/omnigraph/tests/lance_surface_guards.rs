@@ -2624,6 +2624,122 @@ async fn _compile_uncommitted_merge_insert_field_shape() -> lance::Result<()> {
     Ok(())
 }
 
+// --- Guard 8c: a keyed write's source statistics pick the merge join's build side ---
+//
+// `TableStore::stage_keyed_write` hands Lance's merge-insert its one
+// materialized batch through `execute_uncommitted_batches`, never a one-shot
+// stream (`forbidden_apis.rs` pins the call). Lance wraps batches in a
+// `MemTable` with exact statistics, which reach DataFusion's join selection
+// under dedupe `Fail`, so a write smaller than the table is the hash join's
+// collected build side and the table is probed. A stream reports no
+// statistics: past DataFusion's collect threshold (128 Ki rows) neither side
+// qualifies, the join is hash-partitioned and the table is the build side, so
+// every row of it is buffered however small the write. Lance runs the merge in
+// its own context with no memory pool, so `write_max_bytes` does not bound
+// that. Both halves ride on DataFusion's defaults: a bump that moves the
+// threshold or the selection turns this red, which is the point, since the
+// keyed write's memory follows this plan shape (invariant 11).
+#[tokio::test]
+async fn keyed_write_batch_source_is_the_merge_join_build_side_issue_1379() {
+    // One row past datafusion.optimizer.hash_join_single_partition_threshold_rows.
+    const TARGET_ROWS: usize = 128 * 1024 + 1;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("v", DataType::UInt64, false),
+    ]));
+    let ids: Vec<String> = (0..TARGET_ROWS).map(|i| format!("n{i:07}")).collect();
+    let target = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(UInt64Array::from_iter_values(0..TARGET_ROWS as u64)),
+        ],
+    )
+    .unwrap();
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let dataset = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(target)], schema.clone()),
+            "memory://issue-1379",
+            Some(params),
+        )
+        .await
+        .unwrap(),
+    );
+    // One matched row and one new row: a write far smaller than the table.
+    let source = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["n0000001", "new"])),
+            Arc::new(UInt64Array::from(vec![10, 11])),
+        ],
+    )
+    .unwrap();
+    // The builder settings of `stage_keyed_write_from_batch` for an upsert.
+    let job = || {
+        let mut builder =
+            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()]).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(false)
+            .conflict_retries(0)
+            .source_dedupe_behavior(
+                lance::dataset::write::merge_insert::SourceDedupeBehavior::Fail,
+            );
+        builder.try_build().unwrap()
+    };
+    fn hash_join_line(analysis: &str) -> &str {
+        analysis
+            .lines()
+            .find(|line| line.contains("HashJoinExec"))
+            .unwrap_or_else(|| panic!("the merge must plan a hash join:\n{analysis}"))
+    }
+    // DataFusion renders counts human-readably (`131.1 K`).
+    fn build_input_rows(join: &str) -> &str {
+        join.split("build_input_rows=")
+            .nth(1)
+            .and_then(|rest| rest.split([',', ']']).next())
+            .unwrap_or_else(|| panic!("the join must report build_input_rows:\n{join}"))
+    }
+
+    let batches = job()
+        .analyze_plan_batches(vec![source.clone()])
+        .await
+        .unwrap();
+    let join = hash_join_line(&batches);
+    assert!(
+        join.contains("mode=CollectLeft") && join.contains("join_type=Left"),
+        "a batch source reports its row count, so the write is collected and the \
+         table probed:\n{batches}"
+    );
+    assert_eq!(
+        build_input_rows(join),
+        "2",
+        "the build side must hold the write's 2 rows, not the table:\n{batches}"
+    );
+
+    let reader = RecordBatchIterator::new(vec![Ok(source.clone())], schema.clone());
+    let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
+    let streamed = job().analyze_plan(stream).await.unwrap();
+    let join = hash_join_line(&streamed);
+    assert!(
+        join.contains("mode=Partitioned") && join.contains("join_type=Right"),
+        "a stream reports no statistics, so past the collect threshold the join is \
+         partitioned with the table as its build side:\n{streamed}"
+    );
+    assert_eq!(
+        build_input_rows(join),
+        "131.1 K",
+        "a streamed source makes the join buffer every table row:\n{streamed}"
+    );
+}
+
 // --- Guard 9: force_delete_branch semantics --------------------------------
 //
 // The branch-delete reconciler (`db/omnigraph/optimize.rs::reconcile_orphaned_branches`)

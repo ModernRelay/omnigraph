@@ -3864,13 +3864,10 @@ impl TableStore {
             .await?;
 
         let merged_rows = batch.num_rows() as u64;
-        let schema = batch.schema();
-        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let stream = lance_datafusion::utils::reader_to_stream(Box::new(reader));
         let (mut staged, stats) = self
-            .stage_keyed_write_from_stream(
+            .stage_keyed_write_from_batch(
                 ds,
-                stream,
+                batch,
                 merged_rows,
                 semantics,
                 id_field_id,
@@ -4297,10 +4294,10 @@ impl TableStore {
         Ok(present.len())
     }
 
-    async fn stage_keyed_write_from_stream(
+    async fn stage_keyed_write_from_batch(
         &self,
         ds: Dataset,
-        stream: SendableRecordBatchStream,
+        batch: RecordBatch,
         merged_rows: u64,
         semantics: KeyedWriteSemantics,
         id_field_id: i32,
@@ -4345,10 +4342,18 @@ impl TableStore {
         }
         builder.conflict_retries(0);
         builder.source_dedupe_behavior(SourceDedupeBehavior::Fail);
+        // Hand Lance the batch itself, not a one-shot stream. Lance wraps
+        // batches in a `MemTable` whose exact row count reaches DataFusion's
+        // join selection (with dedupe `Fail`; `FirstSeen` would hide it), so
+        // the smaller side is the hash join's build side. A stream reports no
+        // statistics: once the table is past DataFusion's 128 Ki-row collect
+        // threshold the join is partitioned with the table as its build
+        // side, buffering every row of it however small the write (#1379).
+        // `lance_surface_guards.rs` pins both plan shapes.
         let uncommitted = builder
             .try_build()
             .map_err(OmniError::lance_internal)?
-            .execute_uncommitted(stream)
+            .execute_uncommitted_batches(vec![batch])
             .await
             .map_err(OmniError::lance_stream)?;
 
