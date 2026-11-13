@@ -95,12 +95,6 @@ pub(crate) struct RebuildFullTextIndexesArgs {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct RepairArgs {
-    #[arg(long)]
-    pub(crate) json: bool,
-}
-
-#[derive(Debug, Args)]
 pub(crate) struct CleanupArgs {
     /// Number of recent graph commits to keep on every live branch. Either
     /// `--keep` or `--older-than` (or both) must be set.

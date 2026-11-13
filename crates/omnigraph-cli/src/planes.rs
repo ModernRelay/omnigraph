@@ -96,7 +96,6 @@ pub(crate) fn requirement(command: &Command) -> Requirement {
         }
         | Command::Index { .. }
         | Command::RebuildFullTextIndexes(_)
-        | Command::Repair(_)
         | Command::Cleanup(_) => Graph {
             direct_only: true,
             root: true,
@@ -198,7 +197,6 @@ pub(crate) fn admits_inline_s3_root(command: &Command) -> bool {
         } | Command::Optimize(_)
             | Command::Index { .. }
             | Command::Cleanup(_)
-            | Command::Repair(_)
             | Command::RebuildFullTextIndexes(_)
     )
 }
@@ -365,7 +363,6 @@ fn accepts_actor(command: &Command) -> bool {
         | Command::Init(_)
         | Command::Upgrade(_)
         | Command::Optimize(_)
-        | Command::Repair(_)
         | Command::Cleanup(_)
         | Command::Lint(_)
         | Command::Alias(_)
@@ -664,7 +661,6 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
             IndexCommand::Rebuild(_) => "index rebuild",
         },
         Command::RebuildFullTextIndexes(_) => "rebuild-full-text-indexes",
-        Command::Repair(_) => "repair",
         Command::Cleanup(_) => "cleanup",
         Command::Cluster { .. } => "cluster",
         Command::Organization { .. } => "organization",
