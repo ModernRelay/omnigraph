@@ -498,8 +498,14 @@ holds one permit, a full-text or vector build holds all of them and runs
 alone, and the batches join in table and specification order, so the
 publication is the one a serial pass makes. The pass owns the budget: one
 `ensure_indices` or full-text rebuild pass, or one optimize run across the
-tables it stages at once, never one budget per table. The first failed build
-in that order ends the staging, and the builds still in flight are dropped.
+tables it stages at once, never one budget per table. In optimize, a
+full-text or vector build therefore runs one at a time across the whole run,
+where each table once built on its own; every BTREE build waits while one
+runs, and a table waiting for its permit keeps its rewrite slot, so later
+tables' compaction waits too. The first failed build in that order ends that
+pass's staging (in optimize, that table's staging: the table is reported
+failed and the others keep staging), and the builds still in flight are
+dropped.
 Each spilling BTREE training gets its own Lance memory pool of 150 MiB per
 core (`available_parallelism()`; `LANCE_MEM_POOL_SIZE` sets the pool size
 instead), so a pass can hold up to four such pools before Lance spills. A
