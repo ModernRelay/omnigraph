@@ -496,8 +496,14 @@ with the explicit rebuild. The tables stage concurrently and share one
 build budget (`IndexBuildLimit`, `INDEX_BUILD_CONCURRENCY` = 4): a BTREE build
 holds one permit, a full-text or vector build holds all of them and runs
 alone, and the batches join in table and specification order, so the
-publication is the one a serial pass makes. A failure before
-publication leaves no graph-visible residue; after publication reads,
+publication is the one a serial pass makes. The pass owns the budget: one
+`ensure_indices` or full-text rebuild pass, or one optimize run across the
+tables it stages at once, never one budget per table. The first failed build
+in that order ends the staging, and the builds still in flight are dropped.
+Each spilling BTREE training gets its own Lance memory pool of 150 MiB per
+core (`available_parallelism()`; `LANCE_MEM_POOL_SIZE` sets the pool size
+instead), so a pass can hold up to four such pools before Lance spills. A
+failure before publication leaves no graph-visible residue; after publication reads,
 including full-text search through the batch's certificate, serve from the
 staged version.
 

@@ -476,6 +476,7 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::table_store::IndexBuildLimit::default(),
         )
         .await
         .unwrap();
@@ -536,6 +537,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::table_store::IndexBuildLimit::default(),
         )
         .await
         .unwrap();
@@ -1250,6 +1252,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::table_store::IndexBuildLimit::default(),
         )
         .await
         .unwrap();
@@ -3261,6 +3264,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                     column: "embedding".to_string(),
                 },
             ],
+            &crate::table_store::IndexBuildLimit::default(),
         )
         .await
         .unwrap();
@@ -3435,6 +3439,7 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
             &[IndexBuildSpec::FullText {
                 column: "text".into(),
             }],
+            &crate::table_store::IndexBuildLimit::default(),
         )
         .await
         .unwrap();
@@ -4009,24 +4014,30 @@ async fn segments_of_one_btree_cover_together_issue_1298() {
     );
 }
 
-/// #1385: a full-text or vector build (`alone`) waits until every BTREE build
-/// (`together`) has released its permit, and a BTREE requested after it waits
-/// behind it instead of overtaking it.
+/// #1385: a full-text or vector build waits until every BTREE build has
+/// released its permit, and a BTREE requested after it waits behind it
+/// instead of overtaking it.
 #[tokio::test]
 async fn index_build_limit_runs_a_lone_build_after_every_shared_one_issue_1385() {
     use futures::FutureExt;
+    use lance_index::IndexType;
 
     let limit = crate::table_store::IndexBuildLimit::new(2);
     assert_eq!(limit.width(), 2);
-    let first = limit.together().await.unwrap();
-    let second = limit.together().await.unwrap();
+    assert_eq!(
+        crate::table_store::IndexBuildLimit::new(usize::MAX).width(),
+        tokio::sync::Semaphore::MAX_PERMITS.min(u32::MAX as usize),
+        "a width beyond the semaphore is clamped, so a lone build still takes every permit"
+    );
+    let first = limit.permit_for(IndexType::BTree).await.unwrap();
+    let second = limit.permit_for(IndexType::BTree).await.unwrap();
 
-    let mut alone = Box::pin(limit.alone());
+    let mut alone = Box::pin(limit.permit_for(IndexType::Inverted));
     assert!(
         (&mut alone).now_or_never().is_none(),
         "a lone build waits for both BTREEs"
     );
-    let mut later = Box::pin(limit.together());
+    let mut later = Box::pin(limit.permit_for(IndexType::BTree));
     drop(first);
     assert!(
         (&mut alone).now_or_never().is_none(),
@@ -4044,4 +4055,55 @@ async fn index_build_limit_runs_a_lone_build_after_every_shared_one_issue_1385()
     );
     drop(held);
     let _permit = later.await.unwrap();
+    assert!(
+        limit.permit_for(IndexType::Vector).now_or_never().is_none(),
+        "a vector build also runs alone"
+    );
+}
+
+/// #1385: the first failed build in specification order ends the batch. No
+/// later build starts after it, so at most the budget's width of builds
+/// entered Lance's builder; a serial pass entered one, and a stream that ran
+/// every build to its end entered all five.
+#[tokio::test]
+async fn stage_create_indices_stops_at_the_first_failed_build_issue_1385() {
+    use crate::instrumentation::{IndexBuildProbes, with_index_build_probes};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/stop.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("a", Some(1)), ("b", Some(2))]))
+        .await
+        .unwrap();
+    let mut specs = vec![IndexBuildSpec::BTree {
+        column: "no_such_column".to_string(),
+        name: None,
+    }];
+    specs.extend((0..4).map(|i| IndexBuildSpec::BTree {
+        column: "id".to_string(),
+        name: Some(format!("id_btree_{i}")),
+    }));
+
+    let limit = crate::table_store::IndexBuildLimit::new(2);
+    let probes = IndexBuildProbes::rendezvous(1);
+    let observed = probes.clone();
+    let Err(error) =
+        with_index_build_probes(probes, store.stage_create_indices(&ds, &specs, &limit)).await
+    else {
+        panic!("a build on a missing column fails the batch");
+    };
+    assert!(
+        error.to_string().contains("no_such_column"),
+        "the batch fails with the first build's error: {error}"
+    );
+    assert!(
+        observed.entered() <= 2,
+        "no build starts after the failed one; {} of 5 builds entered",
+        observed.entered()
+    );
+    assert_eq!(
+        ds.version().version,
+        Dataset::open(&uri).await.unwrap().version().version,
+        "a failed batch moves nothing"
+    );
 }

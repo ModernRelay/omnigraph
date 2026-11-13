@@ -3,7 +3,7 @@ use crate::dataset_index::is_full_text_index;
 use crate::error::{ManifestConflictDetails, ManifestError, missing_graph_type_at_snapshot};
 use crate::seams::{decide_seam, fail};
 use crate::table_store::{RefreshedIndex, TableStore};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance::index::DatasetIndexExt;
 use omnigraph_compiler::types::PropIndexKind;
 
@@ -462,20 +462,22 @@ async fn maintain_indices_for_branch(
                     .map_err(context),
                 IndexMaintenanceMode::RebuildFullText => db
                     .storage()
-                    .stage_create_indices_within(ds, &work.specs, limit)
+                    .stage_create_indices(ds, &work.specs, limit)
                     .await
                     .map(|staged| Some(StagedTarget::Rebuilt(staged)))
                     .map_err(context),
             }
         }
     });
-    let staged_by_target: Vec<Result<Option<StagedTarget>>> =
+    // The first failure in target order ends the stream, so no later table
+    // starts staging after it.
+    let staged_by_target: Vec<Option<StagedTarget>> =
         futures::stream::iter(staging.collect::<Vec<_>>())
             .buffered(limit.width())
-            .collect()
-            .await;
+            .try_collect()
+            .await?;
     for (target, staged) in targets.into_iter().zip(staged_by_target) {
-        let staged = match staged? {
+        let staged = match staged {
             None => continue,
             Some(StagedTarget::Ensure(reconciliation)) => {
                 for (column, reason) in reconciliation.skipped {
@@ -1339,9 +1341,14 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
         return Ok(work.pending);
     }
 
+    // A legacy single-table call: it owns its own budget.
     let staged = db
         .storage()
-        .stage_create_indices(ds, &work.specs)
+        .stage_create_indices(
+            ds,
+            &work.specs,
+            &crate::table_store::IndexBuildLimit::default(),
+        )
         .await
         .map_err(|error| {
             error.with_context(format!(

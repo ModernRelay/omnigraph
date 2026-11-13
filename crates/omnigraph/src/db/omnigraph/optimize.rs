@@ -1219,10 +1219,16 @@ async fn run_table_pipeline(
             (index, started, result)
         }
     };
+    // #1385: the run owns one index build budget, shared by every table it
+    // stages at once, so `rewrite` concurrent tables still build at most
+    // `INDEX_BUILD_CONCURRENCY` BTREEs together.
+    let index_builds = crate::table_store::IndexBuildLimit::default();
+    let index_builds = &index_builds;
     let stage = |index: usize, started: Instant, work: PreparedOptimizeTable| {
         let catalog = std::sync::Arc::clone(catalog);
         async move {
-            let result = apply_optimize_table_effects(db, catalog.as_ref(), work).await;
+            let result =
+                apply_optimize_table_effects(db, catalog.as_ref(), work, index_builds).await;
             (index, started, result)
         }
     };
@@ -1786,11 +1792,13 @@ decide_seam! {
 /// of every foldable index whose coverage lags the rewritten layout (Lance 11
 /// folds only through a linear commit, so `stage_index_fold` rebuilds instead
 /// of merging), then any declared-but-unbuilt index. The rewrite comes first
-/// so an index is rebuilt once, over the settled layout.
+/// so an index is rebuilt once, over the settled layout. The index builds
+/// count against `index_builds`, the run's one budget.
 async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
+    index_builds: &crate::table_store::IndexBuildLimit,
 ) -> Result<OptimizeEffectOutcome> {
     let table_key = work.table_key;
     let full_path = work.full_path;
@@ -1821,7 +1829,7 @@ async fn apply_optimize_table_effects(
     // Lance 13 carries a row-id-domain index's coverage to the new fragments,
     // the engine builds no address-domain index, and no engine writer creates
     // the data overlays that would also drop coverage.
-    let (fold, skipped_folds) = db.storage().stage_index_fold(&tip).await?;
+    let (fold, skipped_folds) = db.storage().stage_index_fold(&tip, index_builds).await?;
     if let Some(staged) = fold {
         if tip_identity.is_some() {
             chain.push(tip.clone());
@@ -1849,7 +1857,7 @@ async fn apply_optimize_table_effects(
     if !index_work.specs.is_empty() {
         let staged = db
             .storage()
-            .stage_create_indices(&tip, &index_work.specs)
+            .stage_create_indices(&tip, &index_work.specs, index_builds)
             .await
             .map_err(|error| {
                 error.with_context(format!(

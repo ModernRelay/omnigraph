@@ -256,6 +256,15 @@ impl IndexBuildSpec {
             Self::Vector { column } => (column, "Vector"),
         }
     }
+
+    /// The Lance index kind this specification builds.
+    pub(crate) fn index_type(&self) -> lance_index::IndexType {
+        match self {
+            Self::BTree { .. } => lance_index::IndexType::BTree,
+            Self::FullText { .. } => lance_index::IndexType::Inverted,
+            Self::Vector { .. } => lance_index::IndexType::Vector,
+        }
+    }
 }
 
 /// A staged index reconciliation
@@ -710,10 +719,12 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// RFC 0067: stage one detached-ready fold of every foldable index whose
     /// coverage lags the fragments, each rebuilt whole under its name; `None`
     /// when every index is current. The second value names the vector
-    /// columns whose index could not be trained.
+    /// columns whose index could not be trained. The builds count against
+    /// `limit`, which the maintenance pass owns.
     async fn stage_index_fold(
         &self,
         snapshot: &SnapshotHandle,
+        limit: &IndexBuildLimit,
     ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)>;
 
     /// Stage, as one detached-ready `CreateIndex`, the declared indexes the
@@ -986,16 +997,10 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// Stage every requested full-table index in one Lance transaction.
     /// Building the index files does not advance HEAD; the returned handle is
-    /// committed through `commit_staged` or `commit_staged_exact`.
+    /// committed through `commit_staged` or `commit_staged_exact`. The builds
+    /// count against `limit`, which the maintenance pass owns and shares
+    /// across the tables it stages.
     async fn stage_create_indices(
-        &self,
-        snapshot: &SnapshotHandle,
-        specs: &[IndexBuildSpec],
-    ) -> Result<StagedHandle>;
-
-    /// [`Self::stage_create_indices`] with its builds counted against
-    /// `limit`, shared by a caller that stages several tables at once.
-    async fn stage_create_indices_within(
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
@@ -1335,8 +1340,9 @@ impl TableStorage for TableStore {
     async fn stage_index_fold(
         &self,
         snapshot: &SnapshotHandle,
+        limit: &IndexBuildLimit,
     ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)> {
-        let fold = TableStore::stage_index_fold(self, snapshot.dataset()).await?;
+        let fold = TableStore::stage_index_fold(self, snapshot.dataset(), limit).await?;
         Ok((fold.staged.map(StagedHandle::new), fold.skipped))
     }
 
@@ -1705,19 +1711,9 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
-    ) -> Result<StagedHandle> {
-        TableStore::stage_create_indices(self, snapshot.dataset(), specs)
-            .await
-            .map(StagedHandle::new)
-    }
-
-    async fn stage_create_indices_within(
-        &self,
-        snapshot: &SnapshotHandle,
-        specs: &[IndexBuildSpec],
         limit: &IndexBuildLimit,
     ) -> Result<StagedHandle> {
-        TableStore::stage_create_indices_within(self, snapshot.dataset(), specs, limit)
+        TableStore::stage_create_indices(self, snapshot.dataset(), specs, limit)
             .await
             .map(StagedHandle::new)
     }

@@ -1,1 +1,1 @@
-- `index build` builds up to four BTREE indexes at once, within a table and across tables, instead of one after another. Full-text and vector builds still run one at a time.
+- `index build` and `optimize` build up to four BTREE indexes at once per run, within and across tables, instead of one after another. Full-text and vector builds still run alone.
