@@ -89,9 +89,6 @@ pub enum Construct {
 pub enum Repair {
     /// A computed order key: return it under an alias, which the sort reads.
     ReturnTheOrderKey,
-    /// A `let` whose value can fail: write the value where its name is read,
-    /// or in `return`, which runs after `where`.
-    WriteTheLetWhereItIsRead,
 }
 
 /// A term this release's planner does not lower: the declaration, what the

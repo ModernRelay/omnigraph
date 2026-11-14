@@ -336,7 +336,8 @@ pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
                 PatternStep::AntiJoin { .. }
                 | PatternStep::Filter(_)
                 | PatternStep::Rank { .. }
-                | PatternStep::Score { .. } => {}
+                | PatternStep::Score { .. }
+                | PatternStep::Let { .. } => {}
             }
         }
     }
@@ -413,7 +414,7 @@ pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
                 PatternStep::Filter(filter) | PatternStep::Rank { key: filter, .. } => {
                     calls(filter, types, out)
                 }
-                PatternStep::Score { .. } => {}
+                PatternStep::Score { .. } | PatternStep::Let { .. } => {}
                 PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
                     let mut inner_types = types.clone();
                     bindings(inner, &mut inner_types);
@@ -820,6 +821,21 @@ fn resolve_pipeline(
                         type_name: type_name.clone(),
                         property: property.clone(),
                         query: query.clone(),
+                        reads,
+                    },
+                    schema,
+                )
+            }
+            PatternStep::Let { name, value } => {
+                let input = bound(current, "let")?;
+                let schema = schema_of(plan, input)?;
+                let mut reads = Vec::new();
+                reads_of_expr(value, &mut reads);
+                plan.add(
+                    LogicalNode::Let {
+                        input,
+                        name: name.clone(),
+                        value: value.clone(),
                         reads,
                     },
                     schema,
@@ -2093,6 +2109,9 @@ fn place_query_filters(
                 // after it stays above it, and its population's own filters
                 // are a scope of their own.
                 Some(LogicalNode::Score { input, .. }) => scopes.push(*input),
+                // A `let` that can fail runs on every row the elements before
+                // it produce: no filter written after it moves below it (A3).
+                Some(LogicalNode::Let { input, .. }) => scopes.push(*input),
                 Some(node) => stack.extend(node.inputs()),
                 None => {}
             }
@@ -2620,6 +2639,12 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             query: _,
             reads,
         } => out.extend(reads.iter().cloned()),
+        LogicalNode::Let {
+            input: _,
+            name: _,
+            value: _,
+            reads,
+        } => out.extend(reads.iter().cloned()),
         LogicalNode::MetadataCount {
             spec: _,
             return_exprs: _,
@@ -2741,6 +2766,7 @@ fn materialize_returns_late(
                 | PhysicalNode::Union { .. }
                 | PhysicalNode::OptionalJoin { .. }
                 | PhysicalNode::Score { .. }
+                | PhysicalNode::Let { .. }
         )
     }) {
         return Ok(false);
@@ -3872,6 +3898,17 @@ impl Lowering<'_> {
                     query: query.clone(),
                 }))
             }
+            LogicalNode::Let {
+                input, name, value, ..
+            } => {
+                let lowered = self.lower(*input)?;
+                self.tracer.record(&[Role::Filter], Rule::Lower, &[]);
+                Ok(self.physical.add(PhysicalNode::Let {
+                    input: lowered,
+                    name: name.clone(),
+                    value: value.clone(),
+                }))
+            }
             LogicalNode::TargetCut {
                 input,
                 binding,
@@ -4836,7 +4873,9 @@ fn derive_properties(
                     sources: Vec::new(),
                 }
             }
-            PhysicalNode::TargetCut { input, .. } | PhysicalNode::Score { input, .. } => {
+            PhysicalNode::TargetCut { input, .. }
+            | PhysicalNode::Score { input, .. }
+            | PhysicalNode::Let { input, .. } => {
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),

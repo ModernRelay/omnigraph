@@ -281,6 +281,11 @@ pub enum NodeMirror {
         property: String,
         query: ExprMirror,
     },
+    Let {
+        input: NodeId,
+        name: String,
+        value: ExprMirror,
+    },
     Page {
         input: NodeId,
         rows: usize,
@@ -486,6 +491,11 @@ impl From<&PhysicalNode> for NodeMirror {
                 type_name: type_name.clone(),
                 property: property.clone(),
                 query: ExprMirror::from(query),
+            },
+            PhysicalNode::Let { input, name, value } => Self::Let {
+                input: *input,
+                name: name.clone(),
+                value: ExprMirror::from(value),
             },
             PhysicalNode::Page {
                 input,
@@ -765,6 +775,11 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 type_name,
                 property,
                 query: IRExpr::from(query),
+            },
+            NodeMirror::Let { input, name, value } => Self::Let {
+                input,
+                name,
+                value: IRExpr::from(value),
             },
             NodeMirror::Page {
                 input,

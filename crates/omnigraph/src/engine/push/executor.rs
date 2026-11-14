@@ -179,6 +179,7 @@ fn require_push_node(node: &PhysicalNode) -> Result<()> {
         | PhysicalNode::Limit { .. }
         | PhysicalNode::TargetCut { .. }
         | PhysicalNode::Score { .. }
+        | PhysicalNode::Let { .. }
         | PhysicalNode::CsvSource { .. }
         | PhysicalNode::DeltaSource { .. }
         | PhysicalNode::Validate { .. }

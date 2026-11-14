@@ -288,6 +288,7 @@ impl Requirements {
         self.check_optionals(plan, &top, budget)?;
         self.check_unions(plan, &top)?;
         self.check_scores(plan, &top)?;
+        self.check_lets(plan, &top)?;
         check_full_text_indexes(plan, input, budget)?;
         self.check_search(plan)?;
         self.check_row_cuts(plan, budget)?;
@@ -652,6 +653,45 @@ impl Requirements {
                         "search identity",
                         format!(
                             "no score of the plan reads `${binding}.{property}` against `{query}` as the query's `distance` does"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The plan runs one `Let` per `let` whose value can fail, evaluating
+    /// the same value: a plan without one would skip the value's failure on
+    /// a row `where` removes.
+    fn check_lets(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
+        let mut planned: Vec<&IRExpr> = top
+            .iter()
+            .filter_map(|id| match plan.node(*id) {
+                Some(PhysicalNode::Let { value, .. }) => Some(value),
+                _ => None,
+            })
+            .collect();
+        if planned.len() != self.lets.len() {
+            return Err(ValidationError::violated(
+                "plan shape",
+                format!(
+                    "the query has {} `let` values that can fail; the plan evaluates {}",
+                    self.lets.len(),
+                    planned.len()
+                ),
+            ));
+        }
+        for value in &self.lets {
+            match planned.iter().position(|v| *v == value) {
+                Some(index) => {
+                    planned.remove(index);
+                }
+                None => {
+                    return Err(ValidationError::violated(
+                        "predicate retention",
+                        format!(
+                            "no `Let` of the plan evaluates `{value}` as the query's `let` does"
                         ),
                     ));
                 }

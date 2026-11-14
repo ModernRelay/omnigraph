@@ -75,6 +75,10 @@ const CLOSURE: &[Row] = &[
                 Lowers,
             ),
             (
+                "query q() { match { $p: Person, let $next = $p.age + 1, $p knows $q } where $next > 30 and $q.age > 3 return { $q.handle, $next } }",
+                Lowers,
+            ),
+            (
                 "query q() { match { $p: Person, from { match { $c: Company, $p worksAt $c } return { $c } } } return { $p.name, $c.name } }",
                 Lowers,
             ),
@@ -323,20 +327,6 @@ fn every_row_marked_works_lowers_and_every_other_construct_names_its_stage() {
 fn t86_is_at_the_construct_with_its_repair() {
     use crate::query::syntax::parse::apply_edits;
     let refused = |text: &str| outcome(text).expect_err("refused");
-    // A `let` whose value can fail: the refusal is at the `let`, and its fix
-    // writes the value where it is read.
-    let text = "query q() {\n  match { $p: Person, let $next = $p.age + 1 }\n  where $next > 30\n  return { $p.handle }\n}";
-    let d = refused(text);
-    assert_eq!(d.code.as_str(), "T86", "{d}");
-    let at = d.position.expect("a position");
-    assert_eq!((at.line, at.column), (2, 23), "{d}");
-    assert!(
-        d.fix.as_deref().is_some_and(|f| f.contains("`$p.age + 1`")),
-        "{d}"
-    );
-    // The value written in `where` lowers.
-    outcome("query q() { match { $p: Person } where $p.age + 1 > 30 return { $p.handle } }")
-        .expect("the value in place lowers");
     // An order key no return item computes: the edit returns it.
     let text = "query q() { match { $p: Person } return { $p.handle } order { $p.age > 30 } }";
     let d = refused(text);
@@ -356,4 +346,43 @@ fn t86_is_at_the_construct_with_its_repair() {
     );
     let at = d.position.expect("a position");
     assert_eq!((at.line, at.column), (4, 11), "{d}");
+}
+
+/// A `let` whose value can fail is evaluated where it was written: after the
+/// steps of the elements before it and before those after it, and no
+/// conjunct of `where` is placed below it, a conjunct over a binding written
+/// before it included.
+#[test]
+fn a_let_that_can_fail_runs_before_where_and_the_elements_after_it() {
+    use crate::shape::read::PatternStep;
+    let catalog = catalog();
+    let text = "query q() { match { $p: Person, let $next = $p.age + 1, $p knows $q } where $p.age > 3 and $next > 30 return { $q.handle } }";
+    let decls = check_source(&catalog, text).expect("parse");
+    let CoreDecl::Read(read) = decls.into_iter().next().unwrap().1.expect("accepted").core else {
+        panic!("a read");
+    };
+    let shape = ReadShape::of(&read, &catalog).expect("shapes");
+    let kinds: Vec<&str> = shape
+        .pipeline
+        .iter()
+        .map(|step| match step {
+            PatternStep::NodeScan { filters, .. } => {
+                assert!(filters.is_empty(), "a filter below the `let`: {filters:?}");
+                "scan"
+            }
+            PatternStep::Let { name, value } => {
+                assert_eq!(name, "next");
+                assert!(value.can_fail(), "{value}");
+                "let"
+            }
+            PatternStep::Expand { .. } => "expand",
+            PatternStep::Filter(_) => "filter",
+            other => panic!("unexpected step {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["scan", "let", "expand", "filter", "filter"],
+        "{shape:#?}"
+    );
 }

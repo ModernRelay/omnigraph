@@ -40,7 +40,7 @@ use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerUdaf};
 use super::operators::{
     AntiJoinMaskExec, ArmOrder, CatalogueExec, ContainsJoinExec, CrossJoinExec, CsvSourceExec,
     ExpandExec, ExpandExecution, ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec,
-    LanceFragmentSink, LimitExec, LookupSpec, MetadataCountExec, OptionalJoinExec,
+    LanceFragmentSink, LetExec, LimitExec, LookupSpec, MetadataCountExec, OptionalJoinExec,
     OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec,
     ScanSource, ScoreExec, SortExec, SortKey, TargetCutExec, UnionExec, ValidateExec,
     fresh_tag_column, tagged_schema,
@@ -754,6 +754,16 @@ impl Lower for Walk<'_, '_> {
             omnigraph_compiler::query::value::DISTANCE_COLUMN
         );
         let exec = ScoreExec::try_new(input, column, score, Arc::new(vector.clone()))?;
+        self.built(id, exec)
+    }
+
+    fn let_value(&mut self, id: NodeId, name: &str, value: &IRExpr, input: Plan) -> Lowers<Plan> {
+        let exec = LetExec::new(
+            input,
+            name.to_string(),
+            value.clone(),
+            Arc::clone(self.lowering.params()),
+        );
         self.built(id, exec)
     }
 

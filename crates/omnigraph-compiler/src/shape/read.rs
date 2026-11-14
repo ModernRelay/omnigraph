@@ -125,6 +125,16 @@ pub enum PatternStep {
         outer_var: String,
         inner: Vec<PatternStep>,
     },
+    /// `let $name = value` whose value can fail, the core's `Project`
+    /// adding one column: `value` evaluated on every row the steps before it
+    /// produce, a failure refusing the read there (A3), the rows passing
+    /// through unchanged. The value is pure, so a later read of `$name`
+    /// evaluates it in place to the same result on the rows that reach it;
+    /// no filter written after the `let` runs below this step.
+    Let {
+        name: String,
+        value: IRExpr,
+    },
 }
 
 impl ReadShape {
@@ -152,7 +162,8 @@ impl ReadShape {
                 PatternStep::NodeScan { .. }
                 | PatternStep::Filter(_)
                 | PatternStep::Rank { .. }
-                | PatternStep::Score { .. } => {}
+                | PatternStep::Score { .. }
+                | PatternStep::Let { .. } => {}
             }
         }
         false
@@ -295,7 +306,8 @@ fn physical_names(pipeline: &[PatternStep]) -> HashSet<String> {
             PatternStep::Filter(_)
             | PatternStep::AntiJoin { .. }
             | PatternStep::Rank { .. }
-            | PatternStep::Score { .. } => {}
+            | PatternStep::Score { .. }
+            | PatternStep::Let { .. } => {}
         }
     }
     names
@@ -308,7 +320,7 @@ struct Shaper<'a> {
 }
 
 /// The pattern facts of one scope, in the order the term states them.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 struct Facts {
     bindings: Vec<BindingFact>,
     traversals: Vec<TraversalFact>,
@@ -328,9 +340,87 @@ struct Facts {
     lets: HashMap<String, IRExpr>,
     /// How many inline reads' hidden names were renamed apart so far.
     inlined: usize,
+    /// Each `let` whose value can fail, with how many facts of each kind
+    /// the elements before it stated: the steps place those first, then the
+    /// value's evaluation, then the rest.
+    checks: Vec<LetCheck>,
+}
+
+/// How many facts of each kind a scope had stated at one point.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+struct Marks {
+    bindings: usize,
+    traversals: usize,
+    filters: usize,
+    blocks: usize,
+    optionals: usize,
+    unions: usize,
+}
+
+/// A `let` whose value can fail, at the point of the scope it was written.
+#[derive(Debug, Clone)]
+struct LetCheck {
+    name: String,
+    value: IRExpr,
+    marks: Marks,
 }
 
 impl Facts {
+    /// How many facts of each kind the scope states so far.
+    fn marks(&self) -> Marks {
+        Marks {
+            bindings: self.bindings.len(),
+            traversals: self.traversals.len(),
+            filters: self.filters.len(),
+            blocks: self.blocks.len(),
+            optionals: self.optionals.len(),
+            unions: self.unions.len(),
+        }
+    }
+
+    /// The facts stated between `from` and `to`, with the scope's names and
+    /// types; the `let` values are already read into them.
+    fn segment(&self, from: Marks, to: Marks) -> Facts {
+        Facts {
+            bindings: self.bindings[from.bindings..to.bindings].to_vec(),
+            traversals: self.traversals[from.traversals..to.traversals].to_vec(),
+            filters: self.filters[from.filters..to.filters].to_vec(),
+            blocks: self.blocks[from.blocks..to.blocks].to_vec(),
+            optionals: self.optionals[from.optionals..to.optionals].to_vec(),
+            unions: self.unions[from.unions..to.unions].to_vec(),
+            optional_names: self.optional_names.clone(),
+            types: self.types.clone(),
+            lets: HashMap::new(),
+            inlined: self.inlined,
+            checks: Vec::new(),
+        }
+    }
+
+    /// `other`'s facts after this scope's, its `let` checks at their place
+    /// among them.
+    fn append(&mut self, other: Facts) {
+        let at = self.marks();
+        self.checks
+            .extend(other.checks.into_iter().map(|mut check| {
+                check.marks = Marks {
+                    bindings: at.bindings + check.marks.bindings,
+                    traversals: at.traversals + check.marks.traversals,
+                    filters: at.filters + check.marks.filters,
+                    blocks: at.blocks + check.marks.blocks,
+                    // An inline read's facts join the scope's bindings,
+                    // traversals, filters and blocks.
+                    optionals: at.optionals,
+                    unions: at.unions,
+                };
+                check
+            }));
+        self.bindings.extend(other.bindings);
+        self.traversals.extend(other.traversals);
+        self.filters.extend(other.filters);
+        self.blocks.extend(other.blocks);
+        self.types.extend(other.types);
+    }
+
     /// Every name the facts bind or read as a node or edge variable.
     fn names(&self) -> Vec<String> {
         let mut out: Vec<String> = self.types.keys().cloned().collect();
@@ -378,6 +468,9 @@ impl Facts {
         self.filters
             .iter_mut()
             .for_each(|f| rename_expr(f, &rename));
+        self.checks
+            .iter_mut()
+            .for_each(|c| rename_expr(&mut c.value, &rename));
         self.types = std::mem::take(&mut self.types)
             .into_iter()
             .map(|(mut name, ty)| {
@@ -441,6 +534,7 @@ impl Facts {
         }
         self.filters.iter_mut().for_each(&mut *f);
         self.lets.values_mut().for_each(&mut *f);
+        self.checks.iter_mut().for_each(|c| f(&mut c.value));
         for block in &mut self.blocks {
             block.inner.each_expr(f);
             if let Some(arg) = block.left.arg_mut() {
@@ -466,6 +560,9 @@ impl Facts {
             binding.filters.iter_mut().for_each(|f| substitute(f, lets));
         }
         self.filters.iter_mut().for_each(|f| substitute(f, lets));
+        self.checks
+            .iter_mut()
+            .for_each(|c| substitute(&mut c.value, lets));
         for block in &mut self.blocks {
             block.inner.substitute(lets);
             if let Some(arg) = block.left.arg_mut() {
@@ -479,7 +576,7 @@ impl Facts {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BindingFact {
     variable: String,
     type_name: String,
@@ -500,19 +597,19 @@ struct TraversalFact {
 
 /// A `from union(…)`: each arm's facts, every arm binding the union's
 /// reference columns under the first arm's names, with their node types.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct UnionFact {
     arms: Vec<Facts>,
     bindings: Vec<(String, String)>,
 }
 
 /// An `optional { }`: its pattern's facts.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct OptionalFact {
     inner: Facts,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct BlockFact {
     inner: Facts,
     /// The outer columns the block may correlate on.
@@ -1446,8 +1543,9 @@ impl<'a> Shaper<'a> {
             // `let $v = e`: a value column, read wherever its name is. The
             // core evaluates it for every row before `where` (A3), which a
             // value that cannot fail makes the same rows as reading it in
-            // place; a value that can fail needs a column computed before the
-            // filter, which no operator adds inside a pattern.
+            // place; a value that can fail is also evaluated where it was
+            // written, on every row the elements before it produce, and the
+            // type checker placed no `where` conjunct below it.
             Term::Project {
                 input,
                 items,
@@ -1456,12 +1554,6 @@ impl<'a> Shaper<'a> {
                 self.facts(input, facts)?;
                 for (name, value) in items {
                     let at = Construct::Element(&[ElementKind::Let], Some(name.clone()));
-                    if value.can_fail() {
-                        return Err(ShapeError::unlowered(
-                            Unlowered::new(self.name, "a `let` whose value can fail", at)
-                                .repair(Repair::WriteTheLetWhereItIsRead),
-                        ));
-                    }
                     let mut cols = Vec::new();
                     value.columns(&mut cols);
                     if cols.iter().any(|c| is_block_column(c)) {
@@ -1469,6 +1561,13 @@ impl<'a> Shaper<'a> {
                     }
                     let mut value = value.clone();
                     substitute(&mut value, &facts.lets);
+                    if value.can_fail() {
+                        facts.checks.push(LetCheck {
+                            name: name.clone(),
+                            value: value.clone(),
+                            marks: facts.marks(),
+                        });
+                    }
                     facts.lets.insert(name.clone(), value);
                 }
                 Ok(())
@@ -1725,16 +1824,21 @@ impl<'a> Shaper<'a> {
                 *variable = name.clone();
             }
         };
+        facts.append(inner);
+        // The inner `return` computes its values on every inner row, before
+        // any outer `where`: a value that can fail is evaluated there.
         for (column, mut value) in values {
             rename_expr(&mut value, &rename);
             bind_params(&mut value, bindings);
+            if value.can_fail() {
+                facts.checks.push(LetCheck {
+                    name: column.clone(),
+                    value: value.clone(),
+                    marks: facts.marks(),
+                });
+            }
             facts.lets.insert(column, value);
         }
-        facts.bindings.extend(inner.bindings);
-        facts.traversals.extend(inner.traversals);
-        facts.filters.extend(inner.filters);
-        facts.blocks.extend(inner.blocks);
-        facts.types.extend(inner.types);
         Ok(())
     }
 
@@ -2009,8 +2113,59 @@ impl<'a> Shaper<'a> {
     }
 
     /// The pattern's steps: the facts placed as the module documentation
-    /// describes.
+    /// describes. A `let` whose value can fail splits them: the facts the
+    /// elements before it stated are placed first, then its evaluation, then
+    /// the rest, so it runs on exactly the rows those elements produce.
     fn place(
+        &self,
+        facts: &Facts,
+        ranked: &[String],
+        pipeline: &mut Vec<PatternStep>,
+        bound_vars: &mut HashSet<String>,
+        outer_physical_names: &HashSet<String>,
+        fresh: &mut FreshNames,
+    ) -> Result<(), ShapeError> {
+        if facts.checks.is_empty() {
+            return self.place_scope(
+                facts,
+                ranked,
+                pipeline,
+                bound_vars,
+                outer_physical_names,
+                fresh,
+            );
+        }
+        let mut from = Marks::default();
+        for check in &facts.checks {
+            let before = facts.segment(from, check.marks);
+            self.place_scope(
+                &before,
+                ranked,
+                pipeline,
+                bound_vars,
+                outer_physical_names,
+                fresh,
+            )?;
+            pipeline.push(PatternStep::Let {
+                name: check.name.clone(),
+                value: check.value.clone(),
+            });
+            from = check.marks;
+        }
+        let rest = facts.segment(from, facts.marks());
+        self.place_scope(
+            &rest,
+            ranked,
+            pipeline,
+            bound_vars,
+            outer_physical_names,
+            fresh,
+        )
+    }
+
+    /// One segment of a scope's facts placed after the steps already in
+    /// `pipeline`.
+    fn place_scope(
         &self,
         facts: &Facts,
         ranked: &[String],
@@ -2246,7 +2401,8 @@ impl<'a> Shaper<'a> {
                 PatternStep::Filter(_)
                 | PatternStep::AntiJoin { .. }
                 | PatternStep::Rank { .. }
-                | PatternStep::Score { .. } => {}
+                | PatternStep::Score { .. }
+                | PatternStep::Let { .. } => {}
             }
         }
         for block in &facts.blocks {
@@ -2557,6 +2713,7 @@ fn rename_inner_bindings(
                 rename(binding);
                 expressions.push(query);
             }
+            PatternStep::Let { value, .. } => expressions.push(value),
             PatternStep::AntiJoin {
                 outer_var,
                 inner,

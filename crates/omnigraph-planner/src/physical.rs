@@ -903,6 +903,17 @@ physical_nodes! {
         query: IRExpr,
     } => "Score" [input: NodeId]
         shape: PipelineShape::Streaming, sides: vec![], cut: None, order: order_of(*input);
+    /// `let $name = value` whose value can fail, the core's `Project`
+    /// adding one column: `value` evaluated on every input row, a failure
+    /// refusing the read there (A3), every row passing through unchanged in
+    /// input order. The value is pure, so a later read of the name evaluates
+    /// it in place to the same result.
+    Let {
+        input: NodeId,
+        name: String,
+        value: IRExpr,
+    } => "Let" [input: NodeId]
+        shape: PipelineShape::Streaming, sides: vec![], cut: None, order: order_of(*input);
     Page {
         input: NodeId,
         rows: usize,
@@ -1490,6 +1501,11 @@ impl PhysicalPlan {
                 "type_name": type_name,
                 "property": property,
                 "typed_query": crate::typed::expr(query),
+            }),
+            PhysicalNode::Let { name, value, .. } => json!({
+                "node": node.name(),
+                "name": name,
+                "typed_value": crate::typed::expr(value),
             }),
             PhysicalNode::Page {
                 rows,

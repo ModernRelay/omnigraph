@@ -37,6 +37,7 @@ query operators() {
 {"o.name":"Page","o.inputs":[1]}
 {"o.name":"TargetCut","o.inputs":[1]}
 {"o.name":"Score","o.inputs":[1]}
+{"o.name":"Let","o.inputs":[1]}
 {"o.name":"CrossJoin","o.inputs":[2]}
 {"o.name":"ContainsJoin","o.inputs":[2]}
 {"o.name":"Filter","o.inputs":[1]}
@@ -106,6 +107,7 @@ query logical_kinds() {
 {"k.name":"Filter","k.coverage":"routable"}
 {"k.name":"FragmentWrite","k.coverage":"refused_by_name"}
 {"k.name":"Join","k.coverage":"routable"}
+{"k.name":"Let","k.coverage":"refused_by_name"}
 {"k.name":"Limit","k.coverage":"routable"}
 {"k.name":"MergeClassify","k.coverage":"routable"}
 {"k.name":"MetadataCount","k.coverage":"refused_by_name"}

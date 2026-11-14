@@ -267,6 +267,7 @@ logical_kinds! {
     Filter => "Filter", Routable;
     FragmentWrite => "FragmentWrite", RefusedByName;
     Join => "Join", Routable;
+    Let => "Let", RefusedByName;
     Limit => "Limit", Routable;
     MergeClassify => "MergeClassify", Routable;
     MetadataCount => "MetadataCount", RefusedByName;
@@ -687,6 +688,16 @@ pub enum LogicalNode {
         query: IRExpr,
         reads: Vec<ColumnRef>,
     },
+    /// `let $name = value` whose value can fail: `value` evaluated on every
+    /// input row, a failure refusing the read, the rows passing through
+    /// unchanged; `reads` the columns the value reads. No filter written
+    /// after the `let` moves below it (A3).
+    Let {
+        input: LogicalId,
+        name: String,
+        value: IRExpr,
+        reads: Vec<ColumnRef>,
+    },
     /// A `return` with an aggregate: the group keys and aggregate arguments
     /// it reads; `count($v)` reads the identity alone.
     Aggregate {
@@ -736,6 +747,7 @@ impl LogicalNode {
             Self::Limit { .. } | Self::Page { .. } => LogicalKind::Limit,
             Self::TargetCut { .. } => LogicalKind::TargetCut,
             Self::Score { .. } => LogicalKind::Score,
+            Self::Let { .. } => LogicalKind::Let,
             Self::Join { .. } | Self::CrossJoin { .. } => LogicalKind::Join,
             Self::RowDiff { .. } => LogicalKind::RowDiff,
             Self::MergeClassify { .. } => LogicalKind::MergeClassify,
@@ -766,6 +778,7 @@ impl LogicalNode {
             | Self::RankFuse { input, .. }
             | Self::TargetCut { input, .. }
             | Self::Score { input, .. }
+            | Self::Let { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![*input],
@@ -803,6 +816,7 @@ impl LogicalNode {
             | Self::RankFuse { input, .. }
             | Self::TargetCut { input, .. }
             | Self::Score { input, .. }
+            | Self::Let { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![input],
@@ -1139,6 +1153,14 @@ impl LogicalPlan {
                 "type_name": type_name,
                 "property": property,
                 "typed_query": crate::typed::expr(query),
+                "reads": rendered(reads),
+            }),
+            LogicalNode::Let {
+                name, value, reads, ..
+            } => json!({
+                "node": "Let",
+                "name": name,
+                "typed_value": crate::typed::expr(value),
                 "reads": rendered(reads),
             }),
             LogicalNode::Nearest {

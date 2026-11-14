@@ -5,6 +5,7 @@ use arrow_ord::cmp;
 use arrow_schema::Fields;
 use datafusion::arrow::compute::kernels::boolean;
 use omnigraph_compiler::catalog::NodeType;
+use omnigraph_compiler::ir::expr::ScalarFunc;
 use omnigraph_planner::PhysicalNode;
 
 /// Node type per pipeline binding, for projecting a bare `$p` as one struct,
@@ -40,6 +41,7 @@ impl ProjectionContext {
                 | PhysicalNode::Limit { .. }
                 | PhysicalNode::TargetCut { .. }
                 | PhysicalNode::Score { .. }
+                | PhysicalNode::Let { .. }
                 | PhysicalNode::Page { .. }
                 | PhysicalNode::CrossJoin { .. }
                 | PhysicalNode::ContainsJoin { .. }
@@ -133,7 +135,10 @@ pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<
             } => {
                 out.insert(dst_var.clone(), dst_type.clone());
             }
-            PatternStep::Filter(_) | PatternStep::Rank { .. } | PatternStep::Score { .. } => {}
+            PatternStep::Filter(_)
+            | PatternStep::Rank { .. }
+            | PatternStep::Score { .. }
+            | PatternStep::Let { .. } => {}
             PatternStep::AntiJoin {
                 outer_var: _,
                 inner,
@@ -415,6 +420,40 @@ pub(super) fn evaluate_expr(
             let values = evaluate_expr(batch, child, params)?;
             super::arith::negate(&values)?
         }
+        // `if` evaluates its condition, then each branch only on the rows
+        // that select it, and `coalesce` each argument only on the rows still
+        // null: a branch not taken never fails (A3).
+        IRExpr::Call {
+            func: ScalarFunc::If,
+            args,
+            ty,
+        } if args.len() == 3 => {
+            let cond = evaluate_expr(batch, &args[0], params)?;
+            let taken: BooleanArray = cond
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| OmniError::manifest_internal("`if` condition is not Boolean"))?
+                .iter()
+                .map(|value| Some(value == Some(true)))
+                .collect();
+            let other = boolean::not(&taken).map_err(OmniError::arrow_internal)?;
+            let then = evaluate_selected(batch, &args[1], params, &taken)?;
+            let otherwise = evaluate_selected(batch, &args[2], params, &other)?;
+            super::arith::call(ScalarFunc::If, &[cond, then, otherwise], ty)?
+        }
+        IRExpr::Call {
+            func: ScalarFunc::Coalesce,
+            args,
+            ty,
+        } if !args.is_empty() => {
+            let mut values = evaluate_expr(batch, &args[0], params)?;
+            for next in &args[1..] {
+                let missing = boolean::is_null(&values).map_err(OmniError::arrow_internal)?;
+                let next = evaluate_selected(batch, next, params, &missing)?;
+                values = super::arith::call(ScalarFunc::Coalesce, &[values, next], ty)?;
+            }
+            values
+        }
         IRExpr::Call { func, args, ty } => {
             let args = args
                 .iter()
@@ -460,6 +499,24 @@ pub(super) fn evaluate_expr(
     };
     check_array_type(&values, expr.ty(), &expr.to_string())?;
     Ok(values)
+}
+
+/// `expr` evaluated on the rows `selected` keeps alone, null on the others;
+/// a row not selected is never evaluated, so it never fails.
+fn evaluate_selected(
+    batch: &RecordBatch,
+    expr: &IRExpr,
+    params: &ParamMap,
+    selected: &BooleanArray,
+) -> Result<ArrayRef> {
+    if selected.true_count() == batch.num_rows() {
+        return evaluate_expr(batch, expr, params);
+    }
+    let rows = arrow_select::filter::filter_record_batch(batch, selected)
+        .map_err(OmniError::arrow_internal)?;
+    let values = evaluate_expr(&rows, expr, params)?;
+    datafusion::physical_expr_common::utils::scatter(selected, &values)
+        .map_err(|err| OmniError::manifest_internal(err.to_string()))
 }
 
 /// The wide-batch column that holds `variable.property`. Evaluation and

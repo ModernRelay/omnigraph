@@ -194,6 +194,9 @@ fn fold_pipeline(pipeline: &mut [PatternStep], params: &ParamMap) -> Result<()> 
             // The ranking's query binds at its scan, as a leading key's does,
             // and a score's query vector at its node.
             PatternStep::Rank { .. } | PatternStep::Score { .. } => {}
+            // A `let` that can fail runs on the rows that reach it, so it is
+            // not folded: a folded value would fail a read with no row.
+            PatternStep::Let { .. } => {}
         }
     }
     Ok(())

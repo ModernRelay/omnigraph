@@ -48,16 +48,6 @@ fn refusal(decl: &Decl, u: &Unlowered) -> QueryDiagnostic {
                 d.suggestion = suggestion.map(Box::new);
             }
         }
-        Some(Repair::WriteTheLetWhereItIsRead) => {
-            if let Construct::Element(_, Some(name)) = &u.construct
-                && let Some(value) = let_value(decl, u.group, name)
-            {
-                d.fix = Some(format!(
-                    "write `{}` in place of `${name}` where it is read: in `return`, which runs after `where` (A3), or in `where` itself",
-                    print::expr(value)
-                ));
-            }
-        }
         None => {}
     }
     d
@@ -211,24 +201,6 @@ fn compared_block(e: &Expr) -> Option<&SourceSpan> {
         } => compared_block(l).or_else(|| compared_block(r)),
         _ => None,
     }
-}
-
-/// The value of the `let` binding `name`.
-fn let_value<'d>(decl: &'d Decl, group: Option<usize>, name: &str) -> Option<&'d Expr> {
-    fn find<'p>(pattern: &'p Pattern, name: &str) -> Option<&'p Expr> {
-        pattern.elements.iter().find_map(|element| match element {
-            Element::Let {
-                name: n,
-                value: LetValue::Expr(e),
-            } if n == name => Some(e),
-            other => nested(other).into_iter().find_map(|p| find(p, name)),
-        })
-    }
-    let pattern = match group {
-        Some(g) => group_pattern(decl, g)?,
-        None => read_body(decl)?.pattern.as_ref(),
-    };
-    find(pattern, name)
 }
 
 /// A computed order key the sort cannot read: return it under an alias,

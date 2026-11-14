@@ -31,8 +31,9 @@ query colleagues($h: String) {
 The elements are bindings `$x: Type`, triples, `optional { ... }`, `let` and
 `from`, separated by commas with a trailing comma allowed; a newline is not a
 separator. `where` sees every variable the elements bind and is evaluated
-after all of them, `let` included, so a `let` whose expression can fail is
-guarded with `if(...)` or computed in `return`. A filter, a `where` or a
+after all of them, `let` included, so a `let` whose expression can fail runs
+on rows `where` then removes; guard it with `if(...)` or compute it in
+`return`. A filter, a `where` or a
 comparison inside the braces is refused (`Q017`), and so is a missing comma
 (`Q016`); a property map `$p: Person { handle: $h }` is refused (`Q010`) with
 the binding and the conjunct `$p.handle = $h`, and `not { ... }` with
@@ -204,11 +205,13 @@ optional introduces whole, `return { $c }`, is not lowered in this release
 `let $v = <expression>` names a value computed for every row of the elements
 before it; `where`, later elements, the blocks of `where`, `return` and
 `order` read it as `$v`. A value whose expression cannot fail is read where
-its name is. One that can fail (arithmetic: overflow, a zero divisor) runs for
-every row before `where`, as the core states; this release's planner has no
-operator for that, so the type checker refuses it (`T86`): write the
-expression where the name is read, in `where` or in `return`, which runs after
-`where`.
+its name is. One that can fail (arithmetic: overflow `E1`, a zero divisor
+`E2`) runs on every row the elements before it produce, as the core states:
+it fails the read on a row that `where`, or an element written after it,
+would remove. No conjunct of `where` runs below it. To keep such a row from
+failing, guard the value with `if`, whose branch not taken is never
+evaluated (`let $r = if($n != 0, $t / $n, 0)`), or write the expression in
+`return`, which runs after `where`.
 
 `from { match … return { … } }` joins the rows of an inline read, one outer
 row per inner row, correlated on the outer variables it reads. Its returned

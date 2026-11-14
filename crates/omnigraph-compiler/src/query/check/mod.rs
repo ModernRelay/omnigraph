@@ -968,6 +968,10 @@ struct Scope {
     steps: Vec<(usize, Step)>,
     /// Binder count so far.
     binders: usize,
+    /// The binder position after the scope's last `let` whose value can
+    /// fail: no filter is placed below it, so `where` removes rows only after
+    /// the value ran on every row the elements before it produced (A3).
+    fence: usize,
     /// Lookahead: the type every binding of this scope declares.
     declared: HashMap<String, BoundVariable>,
     declared_nodes: HashSet<String>,
@@ -1029,6 +1033,7 @@ impl Scope {
             bound_at: HashMap::new(),
             steps: Vec::new(),
             binders: 0,
+            fence: 0,
             declared: HashMap::new(),
             declared_nodes: HashSet::new(),
             future: HashSet::new(),
@@ -1135,12 +1140,14 @@ impl Scope {
     }
 
     /// The step index after which a value naming `vars` may be placed: the
-    /// last binder of a local variable, or before every binder.
+    /// last binder of a local variable, or before every binder, and never
+    /// below a `let` whose value can fail.
     fn position(&self, vars: &[String]) -> usize {
         vars.iter()
             .filter_map(|v| self.bound_at.get(v).map(|i| i + 1))
             .max()
             .unwrap_or(0)
+            .max(self.fence)
     }
 
     fn push_binder(&mut self, step: Step, binds: &[Col]) {
@@ -2774,6 +2781,9 @@ impl Ctx<'_> {
         let v = self.expr(sc, e, At::Value)?;
         let blocks = std::mem::take(&mut sc.block_buf);
         let ty = v.ty.clone();
+        if v.can_fail {
+            sc.fence = sc.binders + 1;
+        }
         sc.push_binder(
             Step::Let {
                 blocks,

@@ -862,7 +862,8 @@ pub(super) fn collect_referenced_edge_names(
             PatternStep::NodeScan { .. }
             | PatternStep::Filter(_)
             | PatternStep::Rank { .. }
-            | PatternStep::Score { .. } => {}
+            | PatternStep::Score { .. }
+            | PatternStep::Let { .. } => {}
         }
     }
 }

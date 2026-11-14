@@ -123,6 +123,7 @@ binary's rows.
 | HashJoin | [2] |
 | HydrateByAddress | [1] |
 | HydrateColumns | [1] |
+| Let | [1] |
 | MetadataCount | [0] |
 | OptionalJoin | [2] |
 | OuterReference | [0] |
@@ -185,6 +186,7 @@ binary's rows.
 | Filter | routable |
 | FragmentWrite | refused_by_name |
 | Join | routable |
+| Let | refused_by_name |
 | Limit | routable |
 | MergeClassify | routable |
 | MetadataCount | refused_by_name |

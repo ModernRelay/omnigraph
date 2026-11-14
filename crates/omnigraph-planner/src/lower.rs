@@ -207,6 +207,16 @@ pub trait Lower {
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
+    /// Every input row with `value` evaluated on it, a failure refusing the
+    /// read; the rows pass through unchanged.
+    fn let_value(
+        &mut self,
+        id: NodeId,
+        name: &str,
+        value: &IRExpr,
+        input: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
     fn page(
         &mut self,
         id: NodeId,
@@ -517,6 +527,10 @@ impl PhysicalPlan {
             } => {
                 let input = self.lower_node(*input, l)?;
                 l.score(id, binding, property, input)
+            }
+            PhysicalNode::Let { input, name, value } => {
+                let input = self.lower_node(*input, l)?;
+                l.let_value(id, name, value, input)
             }
             PhysicalNode::Page {
                 input,

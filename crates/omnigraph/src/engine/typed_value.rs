@@ -804,6 +804,7 @@ pub(super) fn validate_plan_values(
                 | PhysicalNode::Union { .. } => {}
                 PhysicalNode::RankFuse { k, .. } => pending.extend(k),
                 PhysicalNode::Score { query, .. } => pending.push(query),
+                PhysicalNode::Let { value, .. } => pending.push(value),
                 PhysicalNode::Sort { order_by, .. } => {
                     pending.extend(order_by.iter().map(|ordering| &ordering.expr))
                 }

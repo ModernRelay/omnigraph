@@ -3,9 +3,11 @@
 # notes: (`Project`); `where`, the `return` items, the `order` keys, later
 # notes: elements and the blocks of `where` read it by name. A value that
 # notes: cannot fail is the same column wherever it is read, so the planner
-# notes: reads the value in place. A value that can fail (arithmetic) must run
-# notes: for every row before `where`, and is refused at type check (`T86`) until an operator adds
-# notes: a column inside a pattern.
+# notes: reads the value in place. A value that can fail (arithmetic) runs on
+# notes: every row the elements before it produce, the rows `where` then removes
+# notes: among them, so it fails there (`E1` overflow, `E2` zero divisor) even on
+# notes: a row `where` drops or a later element finds no match for; `if` guards
+# notes: it, since the branch not taken is never evaluated.
 
 --- runner
 timeout_ms: 10000
@@ -128,7 +130,70 @@ n: I64
 query let_whose_value_can_fail() {
     match { $p: Person, let $next = $p.age + 1 }
     where $next > 30
-    return { $p.handle }
+    return { $p.handle, $next }
+    order { $p.handle }
 }
 
---- expect error: T86: `let_whose_value_can_fail`: this release's planner does not lower a `let` whose value can fail
+--- expect ordered
+{"p.handle":"ada","next":37}
+{"p.handle":"cy","next":42}
+
+--- expect shape
+p.handle: String
+next: I32?
+
+--- query
+query an_overflow_fails_on_a_row_where_drops() {
+    match { $p: Person, let $big = $p.age * 100000000 }
+    where $p.handle = "di"
+    return { $p.handle, $big }
+}
+
+--- expect error: E1
+
+--- query
+query a_zero_divisor_fails_on_a_row_where_drops() {
+    match { $p: Person, let $r = 100 / ($p.age - 25) }
+    where $p.handle = "ada"
+    return { $p.handle, $r }
+}
+
+--- expect error: E2
+
+--- query
+query a_zero_divisor_fails_before_a_later_element_drops_its_row() {
+    match { $p: Person, let $r = 100 / ($p.age - 19), $p worksAt $c }
+    return { $p.handle, $c.slug, $r }
+}
+
+--- expect error: E2
+
+--- query
+query a_guarded_value_fails_on_no_row() {
+    match { $p: Person, let $r = if($p.age != 25, 100 / ($p.age - 25), 0) }
+    where $p.handle = "ada" or $p.handle = "bob"
+    return { $p.handle, $r }
+    order { $p.handle }
+}
+
+--- expect ordered
+{"p.handle":"ada","r":9}
+{"p.handle":"bob","r":0}
+
+--- expect shape
+p.handle: String
+r: I32?
+
+--- query
+query the_value_in_return_runs_after_where() {
+    match { $p: Person }
+    where $p.handle = "ada"
+    return { $p.handle, 100 / ($p.age - 25) as r }
+}
+
+--- expect unordered
+{"p.handle":"ada","r":9}
+
+--- expect shape
+p.handle: String
+r: I32?

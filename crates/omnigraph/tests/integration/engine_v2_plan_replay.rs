@@ -492,6 +492,11 @@ const PEOPLE_SEED: &[&str] = &[
 ];
 
 const PEOPLE_QUERIES: &str = r#"
+query halved_age() {
+    match { $p: Person, let $part = 100 / ($p.age - 20) }
+    where $p.name = "bob"
+    return { $p.name, $part }
+}
 query liked() {
     match { $p: Person, $p likes $d }
     return { $p.name, $d.title }
@@ -1290,6 +1295,51 @@ async fn an_exact_distance_replays_and_an_edited_one_is_refused() {
         error.to_string().contains("no score of the plan"),
         "{error}"
     );
+}
+
+/// A `let` whose value can fail runs as a `Let` node, which the replays
+/// repeat, and a saved plan without the node is refused at the door: it
+/// would skip the value's failure on a row `where` removes.
+#[tokio::test]
+async fn a_let_that_can_fail_replays_and_a_plan_without_it_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let Replayed {
+        result,
+        rows,
+        plan,
+        envelope,
+        ..
+    } = replayed(&db, PEOPLE_QUERIES, "halved_age", &ParamMap::new()).await;
+    assert_eq!(result.len(), 1, "{result:?}");
+    assert_eq!(result[0]["part"], serde_json::json!(5), "{result:?}");
+    assert!(
+        rows.iter()
+            .any(|row| row["operator"] == "LetExec" && row["status"] == "executed"),
+        "{rows:#?}"
+    );
+    let mut altered = serde_json::to_value(plan).unwrap();
+    let slots = altered["body"]["plan"]["slots"].as_array_mut().unwrap();
+    let at = slots
+        .iter()
+        .position(|node| node["node"] == "Let")
+        .expect("a Let node");
+    let input = slots[at]["input"].clone();
+    for node in slots.iter_mut() {
+        for field in ["input", "left", "right"] {
+            if node[field] == serde_json::json!(at) {
+                node[field] = input.clone();
+            }
+        }
+    }
+    let error = match db
+        .replay_bound_plan("main", &with_plan(&envelope, altered))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a plan without its `Let` replayed"),
+    };
+    assert!(error.to_string().contains("`let`"), "{error}");
 }
 
 #[tokio::test]

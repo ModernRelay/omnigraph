@@ -124,6 +124,16 @@ impl Lower for Trace {
         self.call("score", id, &[&input])
     }
 
+    fn let_value(
+        &mut self,
+        id: NodeId,
+        _: &str,
+        _: &omnigraph_compiler::ir::IRExpr,
+        input: String,
+    ) -> Result<String, PlanError> {
+        self.call("let", id, &[&input])
+    }
+
     fn page(
         &mut self,
         id: NodeId,
