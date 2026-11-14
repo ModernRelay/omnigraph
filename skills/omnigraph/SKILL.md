@@ -5,7 +5,7 @@ license: MIT (see LICENSE at repo root)
 compatibility: Covers the current Omnigraph CLI and server, using HTTP contract 0.14. Upgrade the CLI, server and HTTP integrations together; the storage formats `omnigraph version` reports are served, and a standalone v8, v9 or v13 graph is converted by the offline `omnigraph upgrade`, never on open.
 metadata:
   author: ModernRelay
-  version: "0.15.1"
+  version: "0.16.0"
   repository: https://github.com/ModernRelay/omnigraph
 ---
 
