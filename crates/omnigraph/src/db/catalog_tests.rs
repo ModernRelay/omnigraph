@@ -624,6 +624,7 @@ async fn snapshot_dataset_proves_index_inventory_from_raw_manifest_section() {
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .unwrap();

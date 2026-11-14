@@ -481,8 +481,9 @@ publisher's first attempt, with the lineage intent's nonce and the captured
 head. Its failure publishes nothing and is `Unpublished`. The helper's other
 callers pass no hook. The hook runs under every writer gate and has no bound
 of its own, so it is part of the publication in the writer wait a bounded run
-promises: `max_gate_hold`, plus one table's rewrite, plus the publication with
-its hook, plus the configuration clear.
+promises: `max_gate_hold`, plus the tables already started (their full-text
+and vector builds run one at a time), plus the publication with its hook, plus
+the configuration clear.
 
 The index writer (`ensure_indices`, which `omnigraph index build` runs on any
 branch, and the explicit full-text rebuild) follows the same protocol: it
@@ -492,8 +493,27 @@ and publishes the pins once. For `ensure_indices` one table's batch holds the
 declared indexes the table lacks and a whole rebuild of each BTREE or vector
 index whose coverage lags (`TableStore::stage_index_reconciliation`), the two
 index links optimize chains after its compaction; full-text coverage stays
-with the explicit rebuild. A failure before
-publication leaves no graph-visible residue; after publication reads,
+with the explicit rebuild. The tables stage concurrently and share one
+budget (`MaintenanceBudget`): a BTREE build holds `ceil(width / 4)` permits,
+so at most `INDEX_BUILD_CONCURRENCY` (4) run at once, and exactly 4 only when
+the width is a multiple of 4 (2 at width 5, 3 at 6, 7 or 9); a full-text or
+vector build holds all of them and runs alone; and the batches join in table
+and specification order, so the publication is the one a serial pass makes.
+The pass owns the budget: one `ensure_indices` or full-text rebuild pass
+(width 4), or one optimize run across the tables it stages at once (width
+its rewrite concurrency, shared with every compaction task, which holds one
+permit), never one budget per table. In optimize, a full-text or vector build
+therefore runs one at a time across the whole run, and no compaction task or
+other build runs beside it; a table waiting for its permit keeps its rewrite
+slot, so later tables wait too. No step waits for a permit while it holds
+one, so the budget cannot deadlock. The first failed build in that order ends
+that pass's staging (in optimize, that table's staging: the table is reported
+failed and the others keep staging), and the builds still in flight are
+dropped.
+Each spilling BTREE training gets its own Lance memory pool of 150 MiB per
+core (`available_parallelism()`; `LANCE_MEM_POOL_SIZE` sets the pool size
+instead), so a pass can hold up to four such pools before Lance spills. A
+failure before publication leaves no graph-visible residue; after publication reads,
 including full-text search through the batch's certificate, serve from the
 staged version.
 

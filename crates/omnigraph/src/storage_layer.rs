@@ -56,9 +56,9 @@ use omnigraph_compiler::SystemColumns;
 use crate::db::{DatasetEntry, Snapshot};
 use crate::error::{OmniError, Result};
 use crate::table_store::{
-    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, OverwriteChunk, RefreshedIndex,
-    StagedTransactionIdentity, StagedWrite, TableState, TableStore, UpdateMatchRequest,
-    UpdateMatches,
+    ExternalBlobPreflight, ID_SCAN_BATCH_BYTES, ID_SCAN_BATCH_ROWS, MaintenanceBudget,
+    OverwriteChunk, RefreshedIndex, StagedTransactionIdentity, StagedWrite, TableState, TableStore,
+    UpdateMatchRequest, UpdateMatches,
 };
 
 /// One fenced merge chunk is bounded in both rows and materialized Arrow
@@ -245,6 +245,26 @@ pub enum IndexBuildSpec {
     Vector {
         column: String,
     },
+}
+
+impl IndexBuildSpec {
+    /// The column the index covers and the kind's display name.
+    pub(crate) fn column_and_kind(&self) -> (&str, &'static str) {
+        match self {
+            Self::BTree { column, .. } => (column, "BTREE"),
+            Self::FullText { column } => (column, "FTS"),
+            Self::Vector { column } => (column, "Vector"),
+        }
+    }
+
+    /// The Lance index kind this specification builds.
+    pub(crate) fn index_type(&self) -> lance_index::IndexType {
+        match self {
+            Self::BTree { .. } => lance_index::IndexType::BTree,
+            Self::FullText { .. } => lance_index::IndexType::Inverted,
+            Self::Vector { .. } => lance_index::IndexType::Vector,
+        }
+    }
 }
 
 /// A staged index reconciliation
@@ -686,7 +706,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         options: &lance::dataset::optimize::CompactionOptions,
-        limit: &crate::table_store::OptimizeStepLimit,
+        limit: &crate::table_store::MaintenanceBudget,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>>;
 
     /// #721: stage one detached-ready rewrite of exactly the named
@@ -701,10 +721,12 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// RFC 0067: stage one detached-ready fold of every foldable index whose
     /// coverage lags the fragments, each rebuilt whole under its name; `None`
     /// when every index is current. The second value names the vector
-    /// columns whose index could not be trained.
+    /// columns whose index could not be trained. The builds count against
+    /// `limit`, which the maintenance pass owns.
     async fn stage_index_fold(
         &self,
         snapshot: &SnapshotHandle,
+        limit: &MaintenanceBudget,
     ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)>;
 
     /// Stage, as one detached-ready `CreateIndex`, the declared indexes the
@@ -714,6 +736,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<IndexReconciliation>;
 
     /// Atomically create version 1 from a staged read-version-0 transaction.
@@ -976,11 +999,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     /// Stage every requested full-table index in one Lance transaction.
     /// Building the index files does not advance HEAD; the returned handle is
-    /// committed through `commit_staged` or `commit_staged_exact`.
+    /// committed through `commit_staged` or `commit_staged_exact`. The builds
+    /// count against `limit`, which the maintenance pass owns and shares
+    /// across the tables it stages.
     async fn stage_create_indices(
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<StagedHandle>;
 
     // ── Index presence (reads, no HEAD advance) ──────────────────────
@@ -1293,7 +1319,7 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         options: &lance::dataset::optimize::CompactionOptions,
-        limit: &crate::table_store::OptimizeStepLimit,
+        limit: &crate::table_store::MaintenanceBudget,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>> {
         Ok(
             TableStore::stage_compaction(self, snapshot.dataset(), options, limit)
@@ -1317,8 +1343,9 @@ impl TableStorage for TableStore {
     async fn stage_index_fold(
         &self,
         snapshot: &SnapshotHandle,
+        limit: &MaintenanceBudget,
     ) -> Result<(Option<StagedHandle>, Vec<(String, String)>)> {
-        let fold = TableStore::stage_index_fold(self, snapshot.dataset()).await?;
+        let fold = TableStore::stage_index_fold(self, snapshot.dataset(), limit).await?;
         Ok((fold.staged.map(StagedHandle::new), fold.skipped))
     }
 
@@ -1326,8 +1353,10 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<IndexReconciliation> {
-        let work = TableStore::stage_index_reconciliation(self, snapshot.dataset(), specs).await?;
+        let work =
+            TableStore::stage_index_reconciliation(self, snapshot.dataset(), specs, limit).await?;
         Ok(IndexReconciliation {
             staged: work.staged.map(StagedHandle::new),
             refreshed: work.refreshed,
@@ -1685,8 +1714,9 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<StagedHandle> {
-        TableStore::stage_create_indices(self, snapshot.dataset(), specs)
+        TableStore::stage_create_indices(self, snapshot.dataset(), specs, limit)
             .await
             .map(StagedHandle::new)
     }

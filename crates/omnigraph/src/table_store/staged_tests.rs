@@ -476,6 +476,7 @@ async fn keyed_upsert_forces_filter_route_and_preserves_conflict_metadata() {
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .unwrap();
@@ -536,6 +537,7 @@ async fn known_present_update_is_update_only_and_fails_closed_on_missing_ids() {
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .unwrap();
@@ -1250,6 +1252,7 @@ async fn proven_strict_insert_pins_update_shape_and_leaves_new_fragments_unindex
                 column: "id".to_string(),
                 name: None,
             }],
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .unwrap();
@@ -3261,6 +3264,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                     column: "embedding".to_string(),
                 },
             ],
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .unwrap();
@@ -3435,6 +3439,7 @@ async fn saved_lance10_full_text_index_requires_rebuild_and_preserves_history() 
             &[IndexBuildSpec::FullText {
                 column: "text".into(),
             }],
+            &crate::table_store::MaintenanceBudget::default(),
         )
         .await
         .unwrap();
@@ -4009,6 +4014,120 @@ async fn segments_of_one_btree_cover_together_issue_1298() {
     );
 }
 
+/// #1385: a full-text or vector build waits until every BTREE build has
+/// released its permit, and a BTREE requested after it waits behind it
+/// instead of overtaking it.
+#[tokio::test]
+async fn index_build_limit_runs_a_lone_build_after_every_shared_one_issue_1385() {
+    use futures::FutureExt;
+    use lance_index::IndexType;
+
+    let limit = crate::table_store::MaintenanceBudget::new(2);
+    assert_eq!(limit.width(), 2);
+    assert_eq!(
+        crate::table_store::MaintenanceBudget::new(usize::MAX).width(),
+        tokio::sync::Semaphore::MAX_PERMITS.min(u32::MAX as usize),
+        "a width beyond the semaphore is clamped, so a lone build still takes every permit"
+    );
+    let first = limit.permit_for(IndexType::BTree).await.unwrap();
+    let second = limit.permit_for(IndexType::BTree).await.unwrap();
+
+    let mut alone = Box::pin(limit.permit_for(IndexType::Inverted));
+    assert!(
+        (&mut alone).now_or_never().is_none(),
+        "a lone build waits for both BTREEs"
+    );
+    let mut later = Box::pin(limit.permit_for(IndexType::BTree));
+    drop(first);
+    assert!(
+        (&mut alone).now_or_never().is_none(),
+        "one BTREE is still running"
+    );
+    assert!(
+        (&mut later).now_or_never().is_none(),
+        "a later BTREE does not overtake the waiting lone build"
+    );
+    drop(second);
+    let held = alone.await.unwrap();
+    assert!(
+        (&mut later).now_or_never().is_none(),
+        "no BTREE runs beside a lone build"
+    );
+    drop(held);
+    let _permit = later.await.unwrap();
+    assert!(
+        limit.permit_for(IndexType::Vector).now_or_never().is_none(),
+        "a vector build also runs alone"
+    );
+
+    // An optimize run's budget is its rewrite width (8 on the direct path):
+    // a BTREE takes a share of it, so still at most four build at once.
+    let wide = crate::table_store::MaintenanceBudget::new(8);
+    let mut held = Vec::new();
+    for _ in 0..crate::table_store::INDEX_BUILD_CONCURRENCY {
+        held.push(wide.permit_for(IndexType::BTree).await.unwrap());
+    }
+    assert!(
+        wide.permit_for(IndexType::BTree).now_or_never().is_none(),
+        "a fifth BTREE waits in a budget of eight"
+    );
+    drop(held);
+    assert!(
+        crate::table_store::MaintenanceBudget::new(1)
+            .permit_for(IndexType::BTree)
+            .now_or_never()
+            .is_some(),
+        "a budget of one, the served path's, still admits a BTREE"
+    );
+}
+
+/// #1385: the first failed build in specification order ends the batch. No
+/// later build starts after it, so at most the budget's width of builds
+/// entered Lance's builder; a serial pass entered one, and a stream that ran
+/// every build to its end entered all five.
+#[tokio::test]
+async fn stage_create_indices_stops_at_the_first_failed_build_issue_1385() {
+    use crate::instrumentation::{IndexBuildProbes, with_index_build_probes};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/stop.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("a", Some(1)), ("b", Some(2))]))
+        .await
+        .unwrap();
+    let mut specs = vec![IndexBuildSpec::BTree {
+        column: "no_such_column".to_string(),
+        name: None,
+    }];
+    specs.extend((0..4).map(|i| IndexBuildSpec::BTree {
+        column: "id".to_string(),
+        name: Some(format!("id_btree_{i}")),
+    }));
+
+    let limit = crate::table_store::MaintenanceBudget::new(2);
+    let probes = IndexBuildProbes::rendezvous(1);
+    let observed = probes.clone();
+    let Err(error) =
+        with_index_build_probes(probes, store.stage_create_indices(&ds, &specs, &limit)).await
+    else {
+        panic!("a build on a missing column fails the batch");
+    };
+    assert!(
+        error.to_string().contains("no_such_column"),
+        "the batch fails with the first build's error: {error}"
+    );
+    assert!(
+        observed.entered() <= 2,
+        "no build starts after the failed one; {} of 5 builds entered",
+        observed.entered()
+    );
+    assert_eq!(
+        ds.version().version,
+        Dataset::open(&uri).await.unwrap().version().version,
+        "a failed batch moves nothing"
+    );
+}
+
 /// #1384: a table's compaction tasks run at once, as Lance's own
 /// `compact_files` runs them, instead of one after another. Each task waits
 /// at a two-party rendezvous inside its execution, so tasks that never
@@ -4016,7 +4135,7 @@ async fn segments_of_one_btree_cover_together_issue_1298() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
     use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
-    use crate::table_store::OptimizeStepLimit;
+    use crate::table_store::MaintenanceBudget;
     use lance::dataset::optimize::CompactionOptions;
 
     let dir = tempfile::tempdir().unwrap();
@@ -4044,7 +4163,7 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
         std::time::Duration::from_secs(30),
         with_optimize_step_probes(
             probes.clone(),
-            store.stage_compaction(&ds, &options, &OptimizeStepLimit::new(2)),
+            store.stage_compaction(&ds, &options, &MaintenanceBudget::new(2)),
         ),
     )
     .await
@@ -4073,7 +4192,7 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
     let probes = OptimizeStepProbes::rendezvous(1);
     with_optimize_step_probes(
         probes.clone(),
-        store.stage_compaction(&ds, &options, &OptimizeStepLimit::new(1)),
+        store.stage_compaction(&ds, &options, &MaintenanceBudget::new(1)),
     )
     .await
     .unwrap()
@@ -4084,15 +4203,16 @@ async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
 
 /// #1384: the tables of one optimize run share one budget for every heavy
 /// step, not only for compaction tasks. Two tables' compaction tasks (two
-/// each) and two other tables' index folds run within one budget of two, as
-/// `apply_optimize_table_effects` runs them, and the run never has more than
-/// two steps executing at once. Each step waits at a two-party rendezvous, so
-/// a budget that serialized the steps would time out, and a step outside the
-/// budget (or a budget per table) would raise the peak above two.
+/// each) and two other tables' index folds run within one budget of two,
+/// through the entry points `apply_optimize_table_effects` calls, and the run
+/// never has more than two steps executing at once. The first two steps wait
+/// at a two-party rendezvous, so a budget that serialized the steps would time
+/// out, and a step outside the budget (or a budget per table) would raise the
+/// peak above two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
     use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
-    use crate::table_store::OptimizeStepLimit;
+    use crate::table_store::MaintenanceBudget;
     use lance::dataset::optimize::CompactionOptions;
     use lance::index::DatasetIndexExt;
     use lance_index::IndexType;
@@ -4142,7 +4262,7 @@ async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
         assert_eq!(plan.num_tasks(), 2, "the layout plans two tasks");
     }
 
-    let limit = OptimizeStepLimit::new(2);
+    let limit = MaintenanceBudget::new(2);
     let probes = OptimizeStepProbes::rendezvous(2);
     let (first, second, third, fourth) = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -4150,8 +4270,8 @@ async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
             tokio::join!(
                 store.stage_compaction(&first, &options, &limit),
                 store.stage_compaction(&second, &options, &limit),
-                limit.run(store.stage_index_fold(&third)),
-                limit.run(store.stage_index_fold(&fourth)),
+                store.stage_index_fold(&third, &limit),
+                store.stage_index_fold(&fourth, &limit),
             )
         }),
     )

@@ -466,11 +466,12 @@ impl OptimizeCancellation {
 }
 
 /// How many tables a run plans ahead of the ones it rewrites, and how many it
-/// rewrites at once. Planning only reads. `rewrite` also bounds the heavy
-/// steps in flight across those tables (compaction tasks, index folds and
-/// index builds, one permit each), so a lone table may run that many of its
-/// compaction tasks at once and the run never runs more steps at once than
-/// `rewrite` (#1384).
+/// rewrites at once. Planning only reads. `rewrite` is also the width of the
+/// run's one budget of heavy steps across those tables (compaction tasks and
+/// index builds; `MaintenanceBudget`), so a lone table may run that many of
+/// its compaction tasks at once and the run never runs more steps at once
+/// than `rewrite` (#1384); a full-text or vector build takes the whole
+/// budget, and at most `INDEX_BUILD_CONCURRENCY` BTREEs build at once (#1385).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OptimizeConcurrency {
     pub planning: usize,
@@ -496,8 +497,10 @@ impl OptimizeConcurrency {
 pub struct OptimizeLimits {
     /// Stop starting tables once the run has held main's writer gates this
     /// long. The first table always starts, so every run makes progress; the
-    /// wait of a writer that queued for the gates is at most this, plus that
-    /// table, the publication and the configuration clear.
+    /// wait of a writer that queued for the gates is at most this, plus the
+    /// tables already started, the publication and the configuration clear.
+    /// Those tables share the run's budget, so their full-text and vector
+    /// builds run one at a time.
     pub max_gate_hold: Option<Duration>,
     /// Ceilings on one table's plan, checked before its first write.
     pub table: TableCeilings,
@@ -1177,17 +1180,17 @@ async fn run_table_pipeline(
             (index, started, result)
         }
     };
-    // #1384: the tables being rewritten share one budget of the rewrite
-    // concurrency for their heavy steps (compaction tasks, index folds, index
+    // #1384, #1385: the tables being rewritten share one budget of the
+    // rewrite concurrency for their heavy steps (compaction tasks and index
     // builds), so a run never has more steps in flight than tables it may
-    // rewrite, and a lone large table uses the idle slots.
-    let step_limit = crate::table_store::OptimizeStepLimit::new(concurrency.rewrite);
+    // rewrite, a lone large table uses the idle slots, and at most
+    // `INDEX_BUILD_CONCURRENCY` BTREEs build together.
+    let budget = crate::table_store::MaintenanceBudget::new(concurrency.rewrite);
+    let budget = &budget;
     let stage = |index: usize, started: Instant, work: PreparedOptimizeTable| {
         let catalog = std::sync::Arc::clone(catalog);
-        let step_limit = step_limit.clone();
         async move {
-            let result =
-                apply_optimize_table_effects(db, catalog.as_ref(), work, &step_limit).await;
+            let result = apply_optimize_table_effects(db, catalog.as_ref(), work, budget).await;
             (index, started, result)
         }
     };
@@ -1752,13 +1755,13 @@ decide_seam! {
 /// folds only through a linear commit, so `stage_index_fold` rebuilds instead
 /// of merging), then any declared-but-unbuilt index. The rewrite comes first
 /// so an index is rebuilt once, over the settled layout. Each compaction
-/// task, the fold and the index build hold one permit of `step_limit`, the
-/// run's budget, while they run.
+/// task and each index build takes its permits of `budget`, the run's one
+/// budget, while it runs.
 async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
-    step_limit: &crate::table_store::OptimizeStepLimit,
+    budget: &crate::table_store::MaintenanceBudget,
 ) -> Result<OptimizeEffectOutcome> {
     let table_key = work.table_key;
     let full_path = work.full_path;
@@ -1774,7 +1777,7 @@ async fn apply_optimize_table_effects(
     let mut metrics = CompactionMetrics::default();
     if let Some((staged, compaction_metrics)) = db
         .storage()
-        .stage_compaction(&base, &options, step_limit)
+        .stage_compaction(&base, &options, budget)
         .await?
     {
         let (rewrite, identity) = db
@@ -1791,7 +1794,7 @@ async fn apply_optimize_table_effects(
     // Lance 13 carries a row-id-domain index's coverage to the new fragments,
     // the engine builds no address-domain index, and no engine writer creates
     // the data overlays that would also drop coverage.
-    let (fold, skipped_folds) = step_limit.run(db.storage().stage_index_fold(&tip)).await?;
+    let (fold, skipped_folds) = db.storage().stage_index_fold(&tip, budget).await?;
     if let Some(staged) = fold {
         if tip_identity.is_some() {
             chain.push(tip.clone());
@@ -1817,8 +1820,9 @@ async fn apply_optimize_table_effects(
         });
     }
     if !index_work.specs.is_empty() {
-        let staged = step_limit
-            .run(db.storage().stage_create_indices(&tip, &index_work.specs))
+        let staged = db
+            .storage()
+            .stage_create_indices(&tip, &index_work.specs, budget)
             .await
             .map_err(|error| {
                 error.with_context(format!(

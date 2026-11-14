@@ -87,3 +87,191 @@ async fn node_scalar_and_enum_index_columns_get_btree() {
 // (The companion-BTREE naming-collision regression — a column literally
 // named `{other}_btree` colliding with another column's companion index name
 // — lives on the `dual-btree-companion` branch with the deferred dispatch.)
+
+// #1385: `ensure_indices` builds independent BTREE indexes concurrently, both
+// within one table and across tables, with at most four in Lance's builder at
+// once. The probe's rendezvous parks the first two builds until both have
+// entered, so a serial build loop times out instead of passing on result
+// equivalence alone.
+const WIDE_SCHEMA: &str = r#"
+node Item {
+    slug: String @key
+    status: enum(active, archived) @index
+    published: DateTime @index
+    rank: I32 @index
+    weight: I64 @index
+    born: Date @index
+}
+"#;
+
+const WIDE_DATA: &str = r#"{"type":"Item","data":{"slug":"a","status":"active","published":"2024-06-01T00:00:00Z","rank":1,"weight":10,"born":"2020-01-01"}}
+{"type":"Item","data":{"slug":"b","status":"archived","published":"2023-01-01T00:00:00Z","rank":2,"weight":20,"born":"2021-01-01"}}
+{"type":"Item","data":{"slug":"c","status":"active","published":"2025-02-02T00:00:00Z","rank":3,"weight":30,"born":"2022-01-01"}}"#;
+
+const TWO_TABLE_SCHEMA: &str = r#"
+node Left {
+    name: String
+}
+node Right {
+    name: String
+}
+"#;
+
+const TWO_TABLE_DATA: &str = r#"{"type":"Left","data":{"name":"l1"}}
+{"type":"Left","data":{"name":"l2"}}
+{"type":"Right","data":{"name":"r1"}}
+{"type":"Right","data":{"name":"r2"}}"#;
+
+async fn ensure_indices_under_rendezvous(db: &Omnigraph) -> (u64, u64) {
+    use omnigraph::instrumentation::{IndexBuildProbes, with_index_build_probes};
+
+    let probes = IndexBuildProbes::rendezvous(2);
+    let observed = probes.clone();
+    let build = with_index_build_probes(probes, Box::pin(db.ensure_indices_as(None)));
+    tokio::time::timeout(std::time::Duration::from_secs(30), build)
+        .await
+        .expect("index build ran its BTREE builds one at a time")
+        .unwrap();
+    (observed.entered(), observed.peak_in_flight())
+}
+
+// Two tables, each with its id BTREE and four `@index` BTREEs: ten builds
+// an `optimize` run stages, up to `rewrite` tables at once.
+const TWO_WIDE_TABLES_SCHEMA: &str = r#"
+node Left {
+    slug: String @key
+    status: enum(active, archived) @index
+    rank: I32 @index
+    weight: I64 @index
+    born: Date @index
+}
+node Right {
+    slug: String @key
+    status: enum(active, archived) @index
+    rank: I32 @index
+    weight: I64 @index
+    born: Date @index
+}
+"#;
+
+const TWO_WIDE_TABLES_DATA: &str = r#"{"type":"Left","data":{"slug":"a","status":"active","rank":1,"weight":10,"born":"2020-01-01"}}
+{"type":"Left","data":{"slug":"b","status":"archived","rank":2,"weight":20,"born":"2021-01-01"}}
+{"type":"Right","data":{"slug":"c","status":"active","rank":3,"weight":30,"born":"2022-01-01"}}
+{"type":"Right","data":{"slug":"d","status":"archived","rank":4,"weight":40,"born":"2023-01-01"}}"#;
+
+#[tokio::test]
+async fn index_build_overlaps_btree_builds_of_one_table_issue_1385() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, WIDE_SCHEMA).await.unwrap());
+    db.load_jsonl(WIDE_DATA, LoadMode::Overwrite).await.unwrap();
+
+    let (entered, peak) = ensure_indices_under_rendezvous(&db).await;
+    assert!(
+        entered >= 6,
+        "the table needs its id BTREE and five @index BTREEs, saw {entered} builds"
+    );
+    assert!(
+        (2..=4).contains(&peak),
+        "independent BTREE builds must overlap, at most four at once; peak was {peak}"
+    );
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open_dataset("node:Item").await.unwrap();
+    for col in ["status", "published", "rank", "weight", "born"] {
+        assert_eq!(
+            ds.index_coverage(col).await.unwrap(),
+            IndexCoverage::Indexed,
+            "column '{col}' must be covered by its BTREE after a concurrent build"
+        );
+    }
+    let version_before = ds.published_dataset_version();
+    db.ensure_indices_as(None).await.unwrap();
+    let ds2 = snapshot_main(&db)
+        .await
+        .unwrap()
+        .open_dataset("node:Item")
+        .await
+        .unwrap();
+    assert_eq!(
+        version_before,
+        ds2.published_dataset_version(),
+        "a second index build after a concurrent one must find nothing to do"
+    );
+}
+
+#[tokio::test]
+async fn index_build_overlaps_tables_issue_1385() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, TWO_TABLE_SCHEMA).await.unwrap());
+    db.load_jsonl(TWO_TABLE_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let (entered, peak) = ensure_indices_under_rendezvous(&db).await;
+    assert_eq!(
+        entered, 2,
+        "each table needs exactly its id BTREE, so two builds"
+    );
+    assert_eq!(peak, 2, "the two tables' builds must overlap");
+
+    let snap = snapshot_main(&db).await.unwrap();
+    for table in ["node:Left", "node:Right"] {
+        let ds = snap.open_dataset(table).await.unwrap();
+        assert!(
+            ds.has_btree_index("__id").await.unwrap(),
+            "{table} must have its id BTREE"
+        );
+    }
+}
+
+/// `optimize` stages several tables at once (`rewrite`, 8 on the direct
+/// path), and the run owns one build budget for all of them: its BTREE builds
+/// overlap, but never more than `INDEX_BUILD_CONCURRENCY` at once. With a
+/// budget per table, two tables reached eight builds in flight.
+#[tokio::test]
+async fn optimize_shares_one_index_build_budget_across_tables_issue_1385() {
+    use omnigraph::instrumentation::{IndexBuildProbes, with_index_build_probes};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = session(Omnigraph::init(uri, TWO_WIDE_TABLES_SCHEMA).await.unwrap());
+    db.load_jsonl(TWO_WIDE_TABLES_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    // The first four builds wait until four are inside the builder, so the
+    // run must overlap up to the whole budget to finish.
+    let probes = IndexBuildProbes::rendezvous(4);
+    let observed = probes.clone();
+    let run = with_index_build_probes(
+        probes,
+        Box::pin(db.optimize_as(None, omnigraph::db::OptimizeRequest::default())),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(30), run)
+        .await
+        .expect("optimize did not overlap four BTREE builds")
+        .unwrap();
+    let (entered, peak) = (observed.entered(), observed.peak_in_flight());
+    assert_eq!(
+        entered, 10,
+        "each table builds its id BTREE and four @index BTREEs"
+    );
+    assert!(
+        peak == 4,
+        "one budget per run: four BTREE builds at once across both tables, never more; peak was {peak}"
+    );
+
+    let snap = snapshot_main(&db).await.unwrap();
+    for table in ["node:Left", "node:Right"] {
+        let ds = snap.open_dataset(table).await.unwrap();
+        for col in ["status", "rank", "weight", "born"] {
+            assert_eq!(
+                ds.index_coverage(col).await.unwrap(),
+                IndexCoverage::Indexed,
+                "{table}.{col} must be covered after optimize"
+            );
+        }
+    }
+}

@@ -1041,6 +1041,95 @@ struct IndexLag {
     vector: bool,
 }
 
+/// How many BTREE index builds may run at once in one maintenance pass
+/// (#1385). Each BTREE training that spills gets its own Lance memory pool of
+/// 150 MiB per partition, one partition per core (`LANCE_MEM_POOL_SIZE`
+/// overrides it), so the bound caps how many such pools exist at once;
+/// full-text and vector builds have no such bound yet (#1296) and run alone.
+pub const INDEX_BUILD_CONCURRENCY: usize = 4;
+
+/// The heavy steps one maintenance pass may execute at once, shared by every
+/// table it stages (#1384, #1385). The pass that owns it (an `ensure_indices`
+/// or full-text rebuild pass, one `optimize` run) makes one and passes it to
+/// every step, so the bound holds across its tables. Each step takes its
+/// permits through [`Self::run`] (a compaction task: one permit) or
+/// [`Self::permit_for`] (one index build), never while it holds others, so
+/// permits cannot deadlock. A BTREE build takes enough permits that at most
+/// [`INDEX_BUILD_CONCURRENCY`] run at once; a full-text or vector build takes
+/// all of them, so it never overlaps another step. Permits are granted in
+/// request order, so a waiting full-text build is not starved by later steps.
+/// The pass never has more steps in flight than its width.
+#[derive(Debug, Clone)]
+pub struct MaintenanceBudget {
+    permits: Arc<tokio::sync::Semaphore>,
+    width: u32,
+}
+
+/// The permits one index build holds while it runs.
+pub(crate) struct BuildPermit<'a> {
+    _permit: tokio::sync::SemaphorePermit<'a>,
+    _probe: Option<crate::instrumentation::StageWriteProbeGuard>,
+}
+
+impl MaintenanceBudget {
+    /// A budget of `width` concurrent steps; `1` runs them one after another.
+    pub fn new(width: usize) -> Self {
+        let width = width.clamp(
+            1,
+            tokio::sync::Semaphore::MAX_PERMITS.min(u32::MAX as usize),
+        );
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(width)),
+            width: width as u32,
+        }
+    }
+
+    /// The number of steps that may be in flight.
+    pub fn width(&self) -> usize {
+        self.width as usize
+    }
+
+    /// Run one compaction task holding one permit.
+    pub async fn run<T>(&self, step: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| OmniError::manifest_internal("maintenance budget closed"))?;
+        let _probe = crate::instrumentation::enter_optimize_step_probe().await;
+        step.await
+    }
+
+    /// The permits one build of `kind` holds while it runs: a share of the
+    /// width for a BTREE, so at most `INDEX_BUILD_CONCURRENCY` run at once
+    /// (exactly that many only when the width is a multiple of it), and the
+    /// whole width for any other kind, so a kind without a memory
+    /// bound never overlaps another step. Every build acquires through here.
+    pub(crate) async fn permit_for(&self, kind: IndexType) -> Result<BuildPermit<'_>> {
+        let permits = if kind == IndexType::BTree {
+            self.width.div_ceil(INDEX_BUILD_CONCURRENCY as u32)
+        } else {
+            self.width
+        };
+        let permit = self
+            .permits
+            .acquire_many(permits)
+            .await
+            .map_err(|_| OmniError::manifest_internal("maintenance budget closed"))?;
+        Ok(BuildPermit {
+            _permit: permit,
+            _probe: crate::instrumentation::enter_optimize_step_probe().await,
+        })
+    }
+}
+
+impl Default for MaintenanceBudget {
+    /// An index pass's budget: `INDEX_BUILD_CONCURRENCY` BTREE builds at once.
+    fn default() -> Self {
+        Self::new(INDEX_BUILD_CONCURRENCY)
+    }
+}
+
 /// A staged index fold: the `CreateIndex` to commit detached, if any index
 /// lagged and could be folded, and the columns whose vector delta could not
 /// be trained.
@@ -1114,48 +1203,6 @@ impl IndexBatch {
             .build();
             StagedWrite::new(transaction, Vec::new(), Vec::new())
         })
-    }
-}
-
-/// The heavy steps one optimize run may execute at once, shared by every
-/// table it stages (#1384): each compaction task, index fold and index build
-/// holds one permit while it runs. A table runs its compaction tasks side by
-/// side, as Lance's `compact_files` does, so a run with one large table uses
-/// the slots its idle tables would have, and the run never has more heavy
-/// steps in flight than its rewrite concurrency, the same peak as one step
-/// per staged table. A Blob table still runs its compaction tasks one at a
-/// time: its batch bound holds per task, not across tasks.
-#[derive(Debug, Clone)]
-pub struct OptimizeStepLimit {
-    permits: Arc<tokio::sync::Semaphore>,
-    width: usize,
-}
-
-impl OptimizeStepLimit {
-    /// A budget of `width` concurrent steps; `1` runs them one after another.
-    pub fn new(width: usize) -> Self {
-        let width = width.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
-        Self {
-            permits: Arc::new(tokio::sync::Semaphore::new(width)),
-            width,
-        }
-    }
-
-    /// The number of steps that may be in flight.
-    pub fn width(&self) -> usize {
-        self.width
-    }
-
-    /// Run one heavy step holding one permit. The step must not wait on
-    /// another permit of this budget, so permits cannot deadlock.
-    pub async fn run<T>(&self, step: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-        let _permit = self
-            .permits
-            .acquire()
-            .await
-            .map_err(|_| OmniError::manifest_internal("optimize step budget closed"))?;
-        let _probe = crate::instrumentation::enter_optimize_step_probe().await;
-        step.await
     }
 }
 
@@ -3340,9 +3387,14 @@ impl TableStore {
     /// and commits linearly; this rebuilds each lagging index whole under its
     /// name with the public builder, which leaves the same single segment
     /// Lance's merge would. A vector index the builder cannot train (a column
-    /// with no non-null rows) is skipped and reported by column.
-    pub async fn stage_index_fold(&self, ds: &Dataset) -> Result<StagedIndexFold> {
-        let (batch, _, skipped) = Self::index_fold_batch(ds).await?;
+    /// with no non-null rows) is skipped and reported by column. The builds
+    /// count against `limit`, which the maintenance pass owns.
+    pub async fn stage_index_fold(
+        &self,
+        ds: &Dataset,
+        limit: &MaintenanceBudget,
+    ) -> Result<StagedIndexFold> {
+        let (batch, _, skipped) = Self::index_fold_batch(ds, limit).await?;
         Ok(StagedIndexFold {
             staged: batch.stage(ds.manifest.version),
             skipped,
@@ -3355,15 +3407,18 @@ impl TableStore {
     /// [`Self::stage_index_fold`] builds it): one detached commit leaves every
     /// buildable declared index present and covering every current fragment.
     /// Full-text coverage is not folded (`can_fold_index`).
+    /// The builds count against `limit`, which a caller staging several
+    /// tables shares across them.
     pub async fn stage_index_reconciliation(
         &self,
         ds: &Dataset,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<StagedIndexReconciliation> {
-        let (mut batch, refreshed, skipped) = Self::index_fold_batch(ds).await?;
+        let (mut batch, refreshed, skipped) = Self::index_fold_batch(ds, limit).await?;
         let mut vector_builds = 0;
         if !specs.is_empty() {
-            let (created, builds) = Self::create_index_batch(ds, specs).await?;
+            let (created, builds) = Self::create_index_batch(ds, specs, limit).await?;
             batch.extend(created)?;
             vector_builds = builds;
         }
@@ -3382,8 +3437,11 @@ impl TableStore {
 
     /// The fold batch: every lagging foldable index rebuilt whole under its
     /// name, the columns rebuilt, and the vector columns that could not train.
+    /// The rebuilds run under `limit`, BTREEs together and vectors alone, and
+    /// join the batch in lag order.
     async fn index_fold_batch(
         ds: &Dataset,
+        limit: &MaintenanceBudget,
     ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
         let lag = Self::foldable_index_lag(ds).await?;
         if lag.is_empty() {
@@ -3391,46 +3449,71 @@ impl TableStore {
         }
         let existing = ds.load_indices().await.map_err(OmniError::storage)?;
         let read_version = ds.manifest.version;
-        let mut new_indices = Vec::new();
-        let mut removed_indices = Vec::new();
-        let mut refreshed = Vec::new();
-        let mut skipped = Vec::new();
-        for item in lag {
-            let Some(column) = item
-                .fields
-                .first()
-                .and_then(|id| ds.schema().field_by_id(*id))
-                .map(|field| field.name.clone())
-            else {
-                continue;
-            };
+        let items: Vec<_> = lag
+            .into_iter()
+            .filter_map(|item| {
+                let column = item
+                    .fields
+                    .first()
+                    .and_then(|id| ds.schema().field_by_id(*id))
+                    .map(|field| field.name.clone())?;
+                Some((item, column))
+            })
+            .collect();
+        // A vector build's Lance error is a column that cannot train, kept as
+        // a value and reported as skipped; any other failure ends the stream,
+        // so no later build starts after it (#1385).
+        let builds = items.iter().map(|(item, column)| async move {
             let mut ds_clone = ds.clone();
             let columns = [column.as_str()];
-            let built = if item.vector {
+            if item.vector {
+                let _permit = limit.permit_for(IndexType::Vector).await?;
                 // Keep the index's partition count: the engine builds one
                 // partition, but a partitioned index (Lance's split, or an
                 // explicit build) keeps its shape across folds.
                 let partitions = Self::vector_partition_count(ds, &item.name).await?;
                 let params =
                     lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
-                ds_clone
-                    .create_index_builder(&columns, IndexType::Vector, &params)
-                    .name(item.name.clone())
-                    .replace(true)
-                    .execute_uncommitted()
-                    .await
+                Ok::<_, OmniError>(
+                    ds_clone
+                        .create_index_builder(&columns, IndexType::Vector, &params)
+                        .name(item.name.clone())
+                        .replace(true)
+                        .execute_uncommitted()
+                        .await,
+                )
             } else {
+                let _permit = limit.permit_for(IndexType::BTree).await?;
                 let params = ScalarIndexParams::default();
+                let _probe = crate::instrumentation::enter_index_build_probe().await;
                 ds_clone
                     .create_index_builder(&columns, IndexType::BTree, &params)
                     .name(item.name.clone())
                     .replace(true)
                     .execute_uncommitted()
                     .await
-            };
+                    .map(Ok)
+                    .map_err(|error| {
+                        OmniError::storage_context(
+                            format!("stage_index_fold: fold index '{}' on '{column}'", item.name),
+                            error,
+                        )
+                    })
+            }
+        });
+        let built: Vec<_> = futures::stream::iter(builds.collect::<Vec<_>>())
+            .buffered(limit.width())
+            .try_collect()
+            .await?;
+
+        let mut new_indices = Vec::new();
+        let mut removed_indices = Vec::new();
+        let mut refreshed = Vec::new();
+        let mut skipped = Vec::new();
+        for ((item, column), built) in items.into_iter().zip(built) {
             let new_idx = match built {
                 Ok(index) => index,
-                Err(error) if item.vector => {
+                Err(error) => {
                     tracing::warn!(
                         index = item.name.as_str(),
                         column = column.as_str(),
@@ -3439,12 +3522,6 @@ impl TableStore {
                     );
                     skipped.push((column, error.to_string()));
                     continue;
-                }
-                Err(error) => {
-                    return Err(OmniError::storage_context(
-                        format!("stage_index_fold: fold index '{}' on '{column}'", item.name),
-                        error,
-                    ));
                 }
             };
             if new_idx.dataset_version != read_version {
@@ -4985,12 +5062,12 @@ impl TableStore {
     /// `None` when the plan has no task. Every task of a Blob table is sized
     /// before any executes, so a sizing refusal leaves no rewritten file
     /// behind. The tasks run side by side, each holding one permit of `limit`
-    /// ([`OptimizeStepLimit`]), the run's budget of heavy steps.
+    /// ([`MaintenanceBudget`]), the run's budget of heavy steps.
     pub async fn stage_compaction(
         &self,
         ds: &Dataset,
         options: &CompactionOptions,
-        limit: &OptimizeStepLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<Option<StagedCompaction>> {
         let plan = Self::plan_table_compaction(ds, options).await?;
         Self::stage_compaction_plan(ds, plan, limit).await
@@ -5033,7 +5110,7 @@ impl TableStore {
             read_version: ds.manifest.version,
             options: CompactionOptions::default(),
         };
-        Self::stage_compaction_plan(ds, plan, &OptimizeStepLimit::new(1)).await
+        Self::stage_compaction_plan(ds, plan, &MaintenanceBudget::new(1)).await
     }
 
     /// Execute a compaction plan against `ds` and stage its result as one
@@ -5041,7 +5118,7 @@ impl TableStore {
     async fn stage_compaction_plan(
         ds: &Dataset,
         plan: CompactionPlan,
-        limit: &OptimizeStepLimit,
+        limit: &MaintenanceBudget,
     ) -> Result<Option<StagedCompaction>> {
         if plan.num_tasks() == 0 {
             return Ok(None);
@@ -5940,17 +6017,21 @@ impl TableStore {
     /// This intentionally covers OmniGraph's current one-segment full-table
     /// vector shape. Lance's generic multi-segment commit helper remains an
     /// inline-commit API and is not used here.
+    ///
+    /// The builds count against `limit`, which the maintenance pass owns and
+    /// shares across the tables it stages.
     pub async fn stage_create_indices(
         &self,
         ds: &Dataset,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<StagedWrite> {
         if specs.is_empty() {
             return Err(OmniError::manifest_internal(
                 "stage_create_indices requires at least one index specification",
             ));
         }
-        let (batch, vector_builds) = Self::create_index_batch(ds, specs).await?;
+        let (batch, vector_builds) = Self::create_index_batch(ds, specs, limit).await?;
         let staged = batch.stage(ds.manifest.version).ok_or_else(|| {
             OmniError::manifest_internal(
                 "stage_create_indices built no index for its specifications",
@@ -5971,31 +6052,33 @@ impl TableStore {
     async fn create_index_batch(
         ds: &Dataset,
         specs: &[IndexBuildSpec],
+        limit: &MaintenanceBudget,
     ) -> Result<(IndexBatch, usize)> {
         let read_version = ds.manifest.version;
         let existing_indices = ds
             .load_indices()
             .await
             .map_err(|error| OmniError::storage_context("stage_create_indices", error))?;
-        let mut new_indices = Vec::with_capacity(specs.len());
-        let mut new_names = std::collections::HashSet::with_capacity(specs.len());
-        let mut vector_builds = 0usize;
-        let mut full_text_fields = HashSet::new();
-
         for spec in specs {
-            let (column, index_type) = match spec {
-                IndexBuildSpec::BTree { column, .. } => (column, "BTREE"),
-                IndexBuildSpec::FullText { column } => (column, "FTS"),
-                IndexBuildSpec::Vector { column } => (column, "Vector"),
-            };
+            let (column, index_type) = spec.column_and_kind();
             if column.is_empty() {
                 return Err(OmniError::manifest_internal(format!(
                     "stage_create_indices received an empty {index_type} column name"
                 )));
             }
+        }
 
+        // #1385: independent BTREE builds overlap under `limit`; a full-text
+        // or vector build runs alone. Each builds from the same snapshot and
+        // the results join the batch in specification order, so the batch is
+        // the one a serial loop builds. The first failure in that order ends
+        // the stream: no later build starts, and the builds in flight are
+        // dropped, leaving only unreferenced files, as any failed build does.
+        let builds = specs.iter().map(|spec| async move {
+            let (column, index_type) = spec.column_and_kind();
             let mut ds_clone = ds.clone();
-            let mut new_idx = match spec {
+            let _permit = limit.permit_for(spec.index_type()).await?;
+            let built = match spec {
                 IndexBuildSpec::BTree { column, name } => {
                     let params = ScalarIndexParams::default();
                     let columns = [column.as_str()];
@@ -6007,6 +6090,7 @@ impl TableStore {
                     if let Some(name) = name {
                         builder = builder.name(name.clone());
                     }
+                    let _probe = crate::instrumentation::enter_index_build_probe().await;
                     builder.replace(true).execute_uncommitted().await
                 }
                 IndexBuildSpec::FullText { column } => {
@@ -6020,23 +6104,33 @@ impl TableStore {
                 IndexBuildSpec::Vector { column } => {
                     let params =
                         lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
-                    let new_idx = ds_clone
+                    ds_clone
                         .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
                         .replace(true)
                         .execute_uncommitted()
-                        .await;
-                    if new_idx.is_ok() {
-                        vector_builds += 1;
-                    }
-                    new_idx
+                        .await
                 }
-            }
-            .map_err(|error| {
+            };
+            built.map_err(|error| {
                 OmniError::storage_context(
                     format!("stage_create_indices: build {index_type} index on '{column}'"),
                     error,
                 )
-            })?;
+            })
+        });
+        let built: Vec<_> = futures::stream::iter(builds.collect::<Vec<_>>())
+            .buffered(limit.width())
+            .try_collect()
+            .await?;
+
+        let mut new_indices = Vec::with_capacity(specs.len());
+        let mut new_names = std::collections::HashSet::with_capacity(specs.len());
+        let mut vector_builds = 0usize;
+        let mut full_text_fields = HashSet::new();
+        for (spec, mut new_idx) in specs.iter().zip(built) {
+            if matches!(spec, IndexBuildSpec::Vector { .. }) {
+                vector_builds += 1;
+            }
 
             if new_idx.dataset_version != read_version {
                 return Err(OmniError::manifest_internal(format!(
