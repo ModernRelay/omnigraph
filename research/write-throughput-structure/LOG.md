@@ -265,3 +265,9 @@ Remaining failures, by mechanism:
   at the CAS rather than at capture (evidence `None` instead of `BeforeEffect`). None lands wrong
   rows; each is a later or different refusal. These are the semantics the writer epoch already
   accepts for a holder, so a production B should trust only while holding the epoch.
+
+## Final confirmation (results/final-o2-*.jsonl) and PR
+
+Committed build incl. the correctness fixes, opt-level 2, 16/64 writers: S3 same 9.60/9.33,
+separate 56.60/186.26; local same 60.60/51.66, separate 130.86/191.72 commits/s. Matches the
+earlier best-o2 runs. Draft PR: https://github.com/ModernRelay/omnigraph/pull/1400
