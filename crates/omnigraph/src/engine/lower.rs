@@ -42,8 +42,8 @@ use super::operators::{
     ExpandExec, ExpandExecution, ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec,
     LanceFragmentSink, LimitExec, LookupSpec, MetadataCountExec, OptionalJoinExec,
     OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec,
-    ScanSource, SortExec, SortKey, TargetCutExec, UnionExec, ValidateExec, fresh_tag_column,
-    tagged_schema,
+    ScanSource, ScoreExec, SortExec, SortKey, TargetCutExec, UnionExec, ValidateExec,
+    fresh_tag_column, tagged_schema,
 };
 use super::*;
 use crate::loader::LoadMode;
@@ -740,6 +740,21 @@ impl Lower for Walk<'_, '_> {
             .into());
         };
         self.built(id, TargetCutExec::new(input, column, targets))
+    }
+
+    fn score(&mut self, id: NodeId, binding: &str, property: &str, input: Plan) -> Lowers<Plan> {
+        let column = format!("{binding}.{property}");
+        let vector = self.lowering.values.vectors.get(&id).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "the score {id} of `${binding}.{property}` has no bound query vector"
+            ))
+        })?;
+        let score = format!(
+            "{binding}.{}",
+            omnigraph_compiler::query::value::DISTANCE_COLUMN
+        );
+        let exec = ScoreExec::try_new(input, column, score, Arc::new(vector.clone()))?;
+        self.built(id, exec)
     }
 
     fn page(

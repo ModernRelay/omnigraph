@@ -170,8 +170,9 @@ fn fold_pipeline(pipeline: &mut [PatternStep], params: &ParamMap) -> Result<()> 
                     fold_pipeline(arm, params)?;
                 }
             }
-            // The ranking's query binds at its scan, as a leading key's does.
-            PatternStep::Rank { .. } => {}
+            // The ranking's query binds at its scan, as a leading key's does,
+            // and a score's query vector at its node.
+            PatternStep::Rank { .. } | PatternStep::Score { .. } => {}
         }
     }
     Ok(())

@@ -335,7 +335,8 @@ pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
                 PatternStep::Union { arms, .. } => arms.iter().for_each(|arm| bindings(arm, out)),
                 PatternStep::AntiJoin { .. }
                 | PatternStep::Filter(_)
-                | PatternStep::Rank { .. } => {}
+                | PatternStep::Rank { .. }
+                | PatternStep::Score { .. } => {}
             }
         }
     }
@@ -412,6 +413,7 @@ pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
                 PatternStep::Filter(filter) | PatternStep::Rank { key: filter, .. } => {
                     calls(filter, types, out)
                 }
+                PatternStep::Score { .. } => {}
                 PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
                     let mut inner_types = types.clone();
                     bindings(inner, &mut inner_types);
@@ -794,6 +796,28 @@ fn resolve_pipeline(
                 } else {
                     ranked
                 }
+            }
+            PatternStep::Score {
+                binding,
+                type_name,
+                property,
+                query,
+            } => {
+                let input = bound(current, "score")?;
+                let schema = schema_of(plan, input)?;
+                let mut reads = vec![ColumnRef::property(binding, property)];
+                reads_of_expr(query, &mut reads);
+                plan.add(
+                    LogicalNode::Score {
+                        input,
+                        binding: binding.clone(),
+                        type_name: type_name.clone(),
+                        property: property.clone(),
+                        query: query.clone(),
+                        reads,
+                    },
+                    schema,
+                )
             }
             PatternStep::AntiJoin {
                 outer_var,
@@ -2059,6 +2083,10 @@ fn place_query_filters(
                 // it, where it would decide which targets the window selects
                 // (law 2). The window's population is a scope of its own.
                 Some(LogicalNode::TargetCut { input, .. }) => scopes.push(*input),
+                // A score's column exists only above it: a filter written
+                // after it stays above it, and its population's own filters
+                // are a scope of their own.
+                Some(LogicalNode::Score { input, .. }) => scopes.push(*input),
                 Some(node) => stack.extend(node.inputs()),
                 None => {}
             }
@@ -2578,6 +2606,14 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             binding,
             targets: _,
         } => out.push(ColumnRef::property(binding, IDENTITY_MEMBER)),
+        LogicalNode::Score {
+            input: _,
+            binding: _,
+            type_name: _,
+            property: _,
+            query: _,
+            reads,
+        } => out.extend(reads.iter().cloned()),
         LogicalNode::MetadataCount {
             spec: _,
             return_exprs: _,
@@ -2698,6 +2734,7 @@ fn materialize_returns_late(
             PhysicalNode::Aggregate { .. }
                 | PhysicalNode::Union { .. }
                 | PhysicalNode::OptionalJoin { .. }
+                | PhysicalNode::Score { .. }
         )
     }) {
         return Ok(false);
@@ -3811,6 +3848,24 @@ impl Lowering<'_> {
                     )))
                 }
             }
+            LogicalNode::Score {
+                input,
+                binding,
+                type_name,
+                property,
+                query,
+                ..
+            } => {
+                let lowered = self.lower(*input)?;
+                self.tracer.record(&[Role::Search], Rule::Lower, &[]);
+                Ok(self.physical.add(PhysicalNode::Score {
+                    input: lowered,
+                    binding: binding.clone(),
+                    type_name: type_name.clone(),
+                    property: property.clone(),
+                    query: query.clone(),
+                }))
+            }
             LogicalNode::TargetCut {
                 input,
                 binding,
@@ -4775,7 +4830,7 @@ fn derive_properties(
                     sources: Vec::new(),
                 }
             }
-            PhysicalNode::TargetCut { input, .. } => {
+            PhysicalNode::TargetCut { input, .. } | PhysicalNode::Score { input, .. } => {
                 let input = props(plan, *input)?;
                 Properties {
                     schema: input.schema.clone(),

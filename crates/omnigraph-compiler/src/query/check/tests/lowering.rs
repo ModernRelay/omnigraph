@@ -40,8 +40,8 @@ const B_IN_PROGRESS: &[&str] = &[
     "a node an optional introduces returned whole",
     "a union arm returning a value",
     "a union whose arms read the enclosing scope",
-    "distance",
     "limit over a parameter",
+    "distance as an rrf arm",
 ];
 
 const CLOSURE: &[Row] = &[
@@ -162,9 +162,21 @@ const CLOSURE: &[Row] = &[
                 "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",
                 Lowers,
             ),
-            // "distance"
             (
                 "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, $v) as $distance } return { $d.title, $distance } }",
+                Lowers,
+            ),
+            (
+                "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, $v) as $dist } where $dist < 1.5 return { $d.title, $dist } order { $dist } limit 2 }",
+                Lowers,
+            ),
+            (
+                "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, $v) as $dist } return { min($dist) as closest } }",
+                Lowers,
+            ),
+            // "distance as an rrf arm"
+            (
+                "query q($v: Vector(3), $s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(distance($all, $d.embedding, $v), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",
                 Refused("B"),
             ),
         ],

@@ -131,6 +131,7 @@ binary's rows.
 | RankFuse | [2] |
 | RowCompare | [1] |
 | Scan | [0, 1] |
+| Score | [1] |
 | Sort | [1] |
 | SortMergeJoin | [2] |
 | TargetCut | [1] |
@@ -193,6 +194,7 @@ binary's rows.
 | Projection | routable |
 | RankFuse | refused_by_name |
 | RowDiff | routable |
+| Score | refused_by_name |
 | Sort | routable |
 | TableScan | routable |
 | TargetCut | refused_by_name |

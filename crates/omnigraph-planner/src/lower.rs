@@ -196,6 +196,17 @@ pub trait Lower {
         input: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
+    /// Every input row with the exact distance of `binding`'s vector
+    /// `property` to the node's bound query vector appended; a row whose
+    /// vector is null drops.
+    fn score(
+        &mut self,
+        id: NodeId,
+        binding: &str,
+        property: &str,
+        input: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
     fn page(
         &mut self,
         id: NodeId,
@@ -496,6 +507,16 @@ impl PhysicalPlan {
             } => {
                 let input = self.lower_node(*input, l)?;
                 l.target_cut(id, binding, *targets, input)
+            }
+            PhysicalNode::Score {
+                input,
+                binding,
+                type_name: _,
+                property,
+                query: _,
+            } => {
+                let input = self.lower_node(*input, l)?;
+                l.score(id, binding, property, input)
             }
             PhysicalNode::Page {
                 input,

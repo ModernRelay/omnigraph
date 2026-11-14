@@ -161,6 +161,7 @@ fn flatten<'p>(
                             push_conjuncts(&mut eligibility, std::slice::from_ref(filter))
                         }
                         PatternStep::Rank { .. }
+                        | PatternStep::Score { .. }
                         | PatternStep::AntiJoin { .. }
                         | PatternStep::Optional { .. }
                         | PatternStep::Union { .. } => {}
@@ -194,6 +195,9 @@ pub struct Requirements {
     /// The names every `Union` node of the plan binds: one entry per arm
     /// after the first of each written `union`.
     pub(crate) unions: Vec<Vec<String>>,
+    /// Every `distance` of the query: the scored binding, its vector
+    /// property and the query, each one `Score` node of the plan.
+    pub(crate) scores: Vec<(String, String, IRExpr)>,
     pub(crate) search: Option<Search>,
     /// Every eligibility conjunct of the top-level scope (inline matches,
     /// `match` filters and the filters of a deferred traversal destination),
@@ -238,10 +242,17 @@ impl Requirements {
         let mut steps = Vec::new();
         let mut optionals = Vec::new();
         let mut unions = Vec::new();
+        let mut scores = Vec::new();
         flatten(&ir.pipeline, &mut steps, &mut optionals, &mut unions);
         for op in steps {
             budget.visit(1)?;
             match op {
+                PatternStep::Score {
+                    binding,
+                    property,
+                    query,
+                    ..
+                } => scores.push((binding.clone(), property.clone(), query.clone())),
                 PatternStep::Rank { key, window, .. } => rank_step = Some((key, *window)),
                 PatternStep::NodeScan {
                     variable,
@@ -372,6 +383,7 @@ impl Requirements {
             blocks,
             optionals,
             unions,
+            scores,
             search,
             eligibility,
             returns: ir.return_exprs.clone(),

@@ -859,7 +859,10 @@ pub(super) fn collect_referenced_edge_names(
             PatternStep::Union { arms, .. } => arms
                 .iter()
                 .for_each(|arm| collect_referenced_edge_names(arm, out)),
-            PatternStep::NodeScan { .. } | PatternStep::Filter(_) | PatternStep::Rank { .. } => {}
+            PatternStep::NodeScan { .. }
+            | PatternStep::Filter(_)
+            | PatternStep::Rank { .. }
+            | PatternStep::Score { .. } => {}
         }
     }
 }

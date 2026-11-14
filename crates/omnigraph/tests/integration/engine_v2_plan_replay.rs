@@ -573,6 +573,16 @@ query fused($t: String, $q: Vector(4)) {
     order { $score desc }
     limit 3
 }
+query within($q: Vector(4)) {
+    match {
+      let $pop = { match { $d: Doc } return { $d } },
+      from distance($pop, $d.embedding, $q) as $distance,
+    }
+    where $distance < 10.0
+    return { $d.slug, $distance }
+    order { $distance }
+    limit 3
+}
 query fused_vectors($q: Vector(4), $r: Vector(4)) {
     match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 3), nearest($all, $d.embedding, $r, k: 3), k: 60) as $score, $d: Doc }
     return { $d.slug }
@@ -1230,6 +1240,50 @@ async fn saved_ranked_score_refuses_owner_and_type_drift() {
             );
         }
     }
+}
+
+/// An exact `distance` replays with the query vector its value table
+/// binds, and a saved plan whose `Score` reads another property is refused
+/// at the door.
+#[tokio::test]
+async fn an_exact_distance_replays_and_an_edited_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = docs(&dir).await;
+    let params = ParamMap::from([("q".to_string(), Literal::List(vec![Literal::Float(1.0); 4]))]);
+    let Replayed {
+        result,
+        rows,
+        plan,
+        envelope,
+        ..
+    } = replayed(&db, DOC_QUERIES, "within", &params).await;
+    let slugs: Vec<String> = result.iter().map(|row| row["d.slug"].to_string()).collect();
+    assert_eq!(slugs, ["\"d01\"", "\"d00\"", "\"d02\""], "{result:?}");
+    assert_eq!(result[0]["distance"], serde_json::json!(3.0), "{result:?}");
+    assert!(
+        rows.iter()
+            .any(|row| row["operator"] == "ScoreExec" && row["status"] == "executed"),
+        "{rows:#?}"
+    );
+    let mut altered = serde_json::to_value(plan).unwrap();
+    let node = altered["body"]["plan"]["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|node| node["node"] == "Score")
+        .unwrap();
+    node["property"] = serde_json::json!("text");
+    let error = match db
+        .replay_bound_plan("main", &with_plan(&envelope, altered))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a score of another property replayed"),
+    };
+    assert!(
+        error.to_string().contains("no score of the plan"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

@@ -101,6 +101,18 @@ pub enum PatternStep {
         arms: Vec<Vec<PatternStep>>,
         bindings: Vec<String>,
     },
+    /// `distance(rel, $x.f, q)`, the core's exact `Score`: every row of the
+    /// steps before it with the distance of `binding`'s vector property to
+    /// `query` under the field's declared distance appended as the binding's
+    /// `_distance` column (`F32`); a row whose vector is null drops, and the
+    /// other columns ride through. `type_name` is the binding's node type,
+    /// whose embedding recipe a String query is encoded with.
+    Score {
+        binding: String,
+        type_name: String,
+        property: String,
+        query: IRExpr,
+    },
     /// `optional { p }`: every outer row with each of its matches in
     /// `inner`, which runs over the outer rows; an outer row with none
     /// stays, the names `inner` introduces null on it.
@@ -134,7 +146,8 @@ impl ReadShape {
                 PatternStep::Union { arms, .. } => pending.extend(arms.iter().flatten()),
                 PatternStep::NodeScan { .. }
                 | PatternStep::Filter(_)
-                | PatternStep::Rank { .. } => {}
+                | PatternStep::Rank { .. }
+                | PatternStep::Score { .. } => {}
             }
         }
         false
@@ -182,6 +195,10 @@ struct Ranking {
     /// The `k` of each `nearest` window the ranking draws (its own, or its
     /// `rrf` arms'); `None` for a window read from a parameter.
     windows: Vec<Option<u64>>,
+    /// `distance`'s exact score: the vector property and the query. It is
+    /// a step over its population's rows, never a ranked scan, and its
+    /// `order` and `limit` are the read's own sort and cut.
+    exact: Option<(String, IRExpr)>,
 }
 
 /// A body split at the ranking it draws.
@@ -270,7 +287,10 @@ fn physical_names(pipeline: &[PatternStep]) -> HashSet<String> {
             PatternStep::Union { arms, .. } => arms
                 .iter()
                 .for_each(|arm| names.extend(physical_names(arm))),
-            PatternStep::Filter(_) | PatternStep::AntiJoin { .. } | PatternStep::Rank { .. } => {}
+            PatternStep::Filter(_)
+            | PatternStep::AntiJoin { .. }
+            | PatternStep::Rank { .. }
+            | PatternStep::Score { .. } => {}
         }
     }
     names
@@ -756,6 +776,7 @@ impl<'a> Shaper<'a> {
         // population, cut to its own window, the `order` a plain sort.
         let windowed = ranking.as_ref().is_some_and(|ranking| {
             after.is_some()
+                || ranking.exact.is_some()
                 || self
                     .check_ranking(ranking, order_keys, limit, grouped)
                     .is_err()
@@ -854,6 +875,7 @@ impl<'a> Shaper<'a> {
         }
         let ranked: Vec<String> = ranking
             .as_ref()
+            .filter(|r| r.exact.is_none())
             .map(|r| vec![r.column.clone()])
             .unwrap_or_default();
         let mut pipeline = Vec::new();
@@ -882,6 +904,7 @@ impl<'a> Shaper<'a> {
                 &mut fresh,
             )?;
             let window = match ranking.windows.as_slice() {
+                _ if ranking.exact.is_some() => None,
                 [] => None,
                 [Some(k)] => Some(*k),
                 [Some(k), rest @ ..] if rest.iter().all(|w| *w == Some(*k)) => Some(*k),
@@ -892,10 +915,27 @@ impl<'a> Shaper<'a> {
                     ));
                 }
             };
-            pipeline.push(PatternStep::Rank {
-                key: ranking.key.clone(),
-                binding: ranking.column.clone(),
-                window,
+            pipeline.push(match &ranking.exact {
+                Some((property, query)) => {
+                    PatternStep::Score {
+                        binding: ranking.column.clone(),
+                        type_name: population.types.get(&ranking.column).cloned().ok_or_else(
+                            || {
+                                ShapeError::Internal(format!(
+                                    "`distance` scores `{}`, which its population binds as no node",
+                                    ranking.column
+                                ))
+                            },
+                        )?,
+                        property: property.clone(),
+                        query: query.clone(),
+                    }
+                }
+                None => PatternStep::Rank {
+                    key: ranking.key.clone(),
+                    binding: ranking.column.clone(),
+                    window,
+                },
             });
             // The later elements and `where` read the score by its name.
             let mut score = HashMap::new();
@@ -1080,8 +1120,25 @@ impl<'a> Shaper<'a> {
         };
         let mut read = Vec::new();
         arg.columns(&mut read);
-        if ranking.is_some_and(|r| read.contains(&r.out)) {
-            return Err(self.refuse("an aggregate over a ranking's score"));
+        let mut arg = arg.clone();
+        match ranking {
+            // `distance`'s score is a column of every scored row.
+            Some(r) if r.exact.is_some() && read.contains(&r.out) => {
+                let mut score = HashMap::new();
+                score.insert(
+                    r.out.clone(),
+                    IRExpr::PropAccess {
+                        variable: r.column.clone(),
+                        property: r.score.0.to_string(),
+                        ty: r.score.1.clone(),
+                    },
+                );
+                substitute(&mut arg, &score);
+            }
+            Some(r) if read.contains(&r.out) => {
+                return Err(self.refuse("an aggregate over a ranking's score"));
+            }
+            _ => {}
         }
         let result = nullable_result(agg);
         Ok(IRExpr::Aggregate {
@@ -1112,11 +1169,7 @@ impl<'a> Shaper<'a> {
         let mut node = body;
         loop {
             node = match node {
-                Term::ApproxTopK { .. }
-                | Term::Score {
-                    kind: ScoreKind::Bm25,
-                    ..
-                } => break,
+                Term::ApproxTopK { .. } | Term::Score { .. } => break,
                 Term::Filter { input, .. }
                 | Term::Expand { input, .. }
                 | Term::Project {
@@ -1171,6 +1224,7 @@ impl<'a> Shaper<'a> {
                         Count::Literal(n) => Some(*n),
                         Count::Param(_) => None,
                     }],
+                    exact: None,
                 }),
             )),
             Term::Score {
@@ -1197,9 +1251,33 @@ impl<'a> Shaper<'a> {
                     score: (SCORE_COLUMN, scalar(ScalarType::F32)),
                     descending: true,
                     windows: Vec::new(),
+                    exact: None,
                 }),
             )),
-            Term::Score { .. } => Err(self.refuse("`distance`")),
+            Term::Score {
+                input,
+                column,
+                property,
+                kind: ScoreKind::Distance,
+                query: ScoreQuery::Vector(query),
+                out,
+            } => Ok((
+                self.population(input)?,
+                Some(Ranking {
+                    key: IRExpr::PropAccess {
+                        variable: column.clone(),
+                        property: DISTANCE_COLUMN.to_string(),
+                        ty: scalar(ScalarType::F32),
+                    },
+                    out: out.clone(),
+                    column: column.clone(),
+                    score: (DISTANCE_COLUMN, scalar(ScalarType::F32)),
+                    descending: false,
+                    windows: Vec::new(),
+                    exact: Some((property.clone(), query.clone())),
+                }),
+            )),
+            Term::Score { .. } => Err(self.refuse("a `Score` whose kind and query disagree")),
             other => match fuse_leaf(other) {
                 Some(fuse) => Ok((other, Some(self.fused(fuse)?))),
                 None => Ok((other, None)),
@@ -1223,6 +1301,9 @@ impl<'a> Shaper<'a> {
         let mut windows = Vec::new();
         let mut arm = |t: &Term| -> Result<IRExpr, ShapeError> {
             match self.ranking(t)? {
+                (_, Some(r)) if r.exact.is_some() => {
+                    Err(self.refuse("an `rrf` arm over `distance`"))
+                }
                 (_, Some(r)) => {
                     windows.extend(r.windows);
                     Ok(r.key)
@@ -1255,6 +1336,7 @@ impl<'a> Shaper<'a> {
             score: (RRF_COLUMN, scalar(ScalarType::F64)),
             descending: true,
             windows,
+            exact: None,
         })
     }
 
@@ -2118,7 +2200,8 @@ impl<'a> Shaper<'a> {
                 }
                 PatternStep::Filter(_)
                 | PatternStep::AntiJoin { .. }
-                | PatternStep::Rank { .. } => {}
+                | PatternStep::Rank { .. }
+                | PatternStep::Score { .. } => {}
             }
         }
         for block in &facts.blocks {
@@ -2424,6 +2507,10 @@ fn rename_inner_bindings(
             PatternStep::Rank { binding, key, .. } => {
                 rename(binding);
                 expressions.push(key);
+            }
+            PatternStep::Score { binding, query, .. } => {
+                rename(binding);
+                expressions.push(query);
             }
             PatternStep::AntiJoin {
                 outer_var,

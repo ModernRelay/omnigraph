@@ -274,6 +274,13 @@ pub enum NodeMirror {
         binding: String,
         targets: usize,
     },
+    Score {
+        input: NodeId,
+        binding: String,
+        type_name: String,
+        property: String,
+        query: ExprMirror,
+    },
     Page {
         input: NodeId,
         rows: usize,
@@ -466,6 +473,19 @@ impl From<&PhysicalNode> for NodeMirror {
                 input: *input,
                 binding: binding.clone(),
                 targets: *targets,
+            },
+            PhysicalNode::Score {
+                input,
+                binding,
+                type_name,
+                property,
+                query,
+            } => Self::Score {
+                input: *input,
+                binding: binding.clone(),
+                type_name: type_name.clone(),
+                property: property.clone(),
+                query: ExprMirror::from(query),
             },
             PhysicalNode::Page {
                 input,
@@ -732,6 +752,19 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 input,
                 binding,
                 targets,
+            },
+            NodeMirror::Score {
+                input,
+                binding,
+                type_name,
+                property,
+                query,
+            } => Self::Score {
+                input,
+                binding,
+                type_name,
+                property,
+                query: IRExpr::from(query),
             },
             NodeMirror::Page {
                 input,

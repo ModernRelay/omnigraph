@@ -887,6 +887,22 @@ physical_nodes! {
         targets: usize,
     } => "TargetCut" [input: NodeId]
         shape: PipelineShape::Streaming, sides: vec![], cut: None, order: order_of(*input);
+    /// `distance(rel, $x.f, q)`, the core's exact `Score`: every input row
+    /// with the exact distance of `binding`'s vector `property` to the query
+    /// vector the value table binds for this node, under the field's
+    /// declared distance, appended as `<binding>._distance` (`F32`); a row
+    /// whose vector is null drops, a non-finite input is refused (`E3`), and
+    /// the other columns ride through in input order. No index is read, so
+    /// index state never changes its rows. `type_name` is the binding's node
+    /// type, whose recipe encodes a String `query` at binding.
+    Score {
+        input: NodeId,
+        binding: String,
+        type_name: String,
+        property: String,
+        query: IRExpr,
+    } => "Score" [input: NodeId]
+        shape: PipelineShape::Streaming, sides: vec![], cut: None, order: order_of(*input);
     Page {
         input: NodeId,
         rows: usize,
@@ -1461,6 +1477,19 @@ impl PhysicalPlan {
                 binding, targets, ..
             } => json!({
                 "node": "TargetCut", "binding": binding, "targets": targets,
+            }),
+            PhysicalNode::Score {
+                binding,
+                type_name,
+                property,
+                query,
+                ..
+            } => json!({
+                "node": node.name(),
+                "binding": binding,
+                "type_name": type_name,
+                "property": property,
+                "typed_query": crate::typed::expr(query),
             }),
             PhysicalNode::Page {
                 rows,

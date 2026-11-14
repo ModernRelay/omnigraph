@@ -32,6 +32,25 @@ pub(super) async fn bind(
     }
     let mut vectors = BTreeMap::new();
     for (id, node) in plan.live() {
+        if let PhysicalNode::Score {
+            type_name,
+            property,
+            query,
+            ..
+        } = node
+        {
+            let vector = resolve_nearest_query_vec(
+                source.catalog,
+                type_name,
+                property,
+                query,
+                &params,
+                embedding,
+            )
+            .await?;
+            vectors.insert(id, vector);
+            continue;
+        }
         let PhysicalNode::Scan { spec, ranked, .. } = node else {
             continue;
         };

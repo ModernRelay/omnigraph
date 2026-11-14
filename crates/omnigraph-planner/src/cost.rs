@@ -485,6 +485,7 @@ fn estimate_rows_over(
         | LogicalNode::AntiJoin { input, .. }
         | LogicalNode::OptionalJoin { input, .. }
         | LogicalNode::TargetCut { input, .. }
+        | LogicalNode::Score { input, .. }
         | LogicalNode::Aggregate { input, .. } => estimate_rows(plan, *input, source),
         LogicalNode::Limit { input, rows, .. } | LogicalNode::Page { input, rows, .. } => {
             Some(estimate_rows(plan, *input, source)?.min(*rows as u64))

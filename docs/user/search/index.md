@@ -10,6 +10,7 @@ with `as`.
 | Function | Meaning |
 |---|---|
 | `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by L2 distance, with the distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
+| `distance(rel, $d.embedding, $q)` | Every row of `rel` with the exact squared L2 distance of its vector to `$q` as the score; a row whose vector is null is dropped. `$q` may be a vector or text, as for `nearest`. |
 | `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their BM25 relevance as the score. |
 | `rrf(ranking, ranking, k: 60)` | Two rankings of one population fused with Reciprocal Rank Fusion, the fused score as the score. The default `k` is 60. |
 | `search($d.body, $q)` | Full-text token search. |
@@ -78,6 +79,25 @@ query similar($q: Vector(4)) {
   limit 10
 }
 ```
+
+`distance` is the exact form: it reads no index and scans the population's
+vectors, so its rows are the same whatever the index covers, including rows
+written after the index was built. `order { $distance }` with `limit n` is the
+exact window, ties going to the smaller identity; a `where $distance < r` is a
+radius. A stored component, query component or distance that is not finite
+is refused (`E3`). Prefer `nearest` for an unqualified request for the most
+similar targets: `distance` reads every row of its population.
+
+```gq
+query within($q: Vector(4), $r: F64) {
+  match { let $pop = { match { $d: Document } return { $d } }, from distance($pop, $d.embedding, $q) as $distance }
+  where $distance < $r
+  return { $d.slug, $distance }
+  order { $distance }
+}
+```
+
+`distance` is not an `rrf` arm in this release (`T86`).
 
 Raw vectors are ranked with L2 distance. Vectors produced by OmniGraph's
 embedding client are normalized, so L2 and cosine similarity produce the same

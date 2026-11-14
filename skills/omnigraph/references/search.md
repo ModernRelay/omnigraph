@@ -108,6 +108,25 @@ The query value may also be a `String` (`$q: String`): the configured embedding
 provider embeds it at query time. When `@embed(..., model=...)` records a
 model, the resolved provider model must match it exactly.
 
+### Exact distance
+
+`nearest` is the answer to an unqualified request for the most similar
+targets. `distance(rel, $c.embedding, $q)` is for an exact answer or a radius,
+and it scans the population: every row of `rel` with its exact squared L2
+distance to `$q`, whatever the index covers; a row whose vector is null is
+dropped, and a non-finite component or distance is refused (`E3`).
+`order { $distance }` with `limit n` is the exact window, ties to the smaller
+ID; `where $distance < $r` is a radius. It is not an `rrf` arm (`T86`).
+
+```gq
+query within($q: Vector(1536), $r: F64) {
+    match { let $pop = { match { $c: Chunk } return { $c } }, from distance($pop, $c.embedding, $q) as $distance }
+    where $distance < $r
+    return { $c.text, $distance }
+    order { $distance }
+}
+```
+
 ### BM25 text ranking
 
 ```gq

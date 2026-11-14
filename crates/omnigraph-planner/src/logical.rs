@@ -276,6 +276,7 @@ logical_kinds! {
     Projection => "Projection", Routable;
     RankFuse => "RankFuse", RefusedByName;
     RowDiff => "RowDiff", Routable;
+    Score => "Score", RefusedByName;
     Sort => "Sort", Routable;
     TableScan => "TableScan", Routable;
     TargetCut => "TargetCut", RefusedByName;
@@ -674,6 +675,18 @@ pub enum LogicalNode {
         binding: String,
         targets: u64,
     },
+    /// `distance(rel, $x.f, q)`: every input row with the exact distance of
+    /// `binding`'s vector `property` to `query` appended as the binding's
+    /// `_distance` column; a row whose vector is null drops. `type_name` is
+    /// the binding's node type; `reads` the vector column and the query's.
+    Score {
+        input: LogicalId,
+        binding: String,
+        type_name: String,
+        property: String,
+        query: IRExpr,
+        reads: Vec<ColumnRef>,
+    },
     /// A `return` with an aggregate: the group keys and aggregate arguments
     /// it reads; `count($v)` reads the identity alone.
     Aggregate {
@@ -722,6 +735,7 @@ impl LogicalNode {
             Self::Sort { .. } | Self::Ordered { .. } => LogicalKind::Sort,
             Self::Limit { .. } | Self::Page { .. } => LogicalKind::Limit,
             Self::TargetCut { .. } => LogicalKind::TargetCut,
+            Self::Score { .. } => LogicalKind::Score,
             Self::Join { .. } | Self::CrossJoin { .. } => LogicalKind::Join,
             Self::RowDiff { .. } => LogicalKind::RowDiff,
             Self::MergeClassify { .. } => LogicalKind::MergeClassify,
@@ -751,6 +765,7 @@ impl LogicalNode {
             | Self::TextSearch { input, .. }
             | Self::RankFuse { input, .. }
             | Self::TargetCut { input, .. }
+            | Self::Score { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![*input],
@@ -787,6 +802,7 @@ impl LogicalNode {
             | Self::TextSearch { input, .. }
             | Self::RankFuse { input, .. }
             | Self::TargetCut { input, .. }
+            | Self::Score { input, .. }
             | Self::Aggregate { input, .. }
             | Self::Validate { input, .. }
             | Self::FragmentWrite { input, .. } => vec![input],
@@ -1109,6 +1125,21 @@ impl LogicalPlan {
             LogicalNode::OuterReference { outer_var } => json!({
                 "node": "OuterReference",
                 "outer_var": outer_var,
+            }),
+            LogicalNode::Score {
+                binding,
+                type_name,
+                property,
+                query,
+                reads,
+                ..
+            } => json!({
+                "node": "Score",
+                "binding": binding,
+                "type_name": type_name,
+                "property": property,
+                "typed_query": crate::typed::expr(query),
+                "reads": rendered(reads),
             }),
             LogicalNode::Nearest {
                 query,

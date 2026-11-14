@@ -120,6 +120,10 @@ impl Lower for Trace {
         self.call("target_cut", id, &[&input])
     }
 
+    fn score(&mut self, id: NodeId, _: &str, _: &str, input: String) -> Result<String, PlanError> {
+        self.call("score", id, &[&input])
+    }
+
     fn page(
         &mut self,
         id: NodeId,

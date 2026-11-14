@@ -641,6 +641,15 @@ pub(super) fn validate_plan_values(
                         }
                     }
                 }
+                PhysicalNode::Score { binding, .. } => {
+                    owners.scores.insert(
+                        (
+                            binding.as_str(),
+                            omnigraph_compiler::query::value::DISTANCE_COLUMN,
+                        ),
+                        DataType::Float32,
+                    );
+                }
                 PhysicalNode::RankFuse { arms, .. } => {
                     owners.scores.insert(
                         (
@@ -794,6 +803,7 @@ pub(super) fn validate_plan_values(
                 | PhysicalNode::OptionalJoin { .. }
                 | PhysicalNode::Union { .. } => {}
                 PhysicalNode::RankFuse { k, .. } => pending.extend(k),
+                PhysicalNode::Score { query, .. } => pending.push(query),
                 PhysicalNode::Sort { order_by, .. } => {
                     pending.extend(order_by.iter().map(|ordering| &ordering.expr))
                 }

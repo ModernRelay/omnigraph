@@ -68,7 +68,7 @@ query operator_count() {
 }
 
 --- expect unordered
-{"n":26}
+{"n":27}
 
 --- expect shape
 n: I64
@@ -122,7 +122,7 @@ query distinct_identities() {
 }
 
 --- expect unordered
-{"ids":26,"rows":26}
+{"ids":27,"rows":27}
 
 --- expect shape
 ids: I64

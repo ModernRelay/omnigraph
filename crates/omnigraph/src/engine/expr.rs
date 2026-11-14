@@ -39,6 +39,7 @@ impl ProjectionContext {
                 | PhysicalNode::ClassifyThreeWay { .. }
                 | PhysicalNode::Limit { .. }
                 | PhysicalNode::TargetCut { .. }
+                | PhysicalNode::Score { .. }
                 | PhysicalNode::Page { .. }
                 | PhysicalNode::CrossJoin { .. }
                 | PhysicalNode::ContainsJoin { .. }
@@ -132,7 +133,7 @@ pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<
             } => {
                 out.insert(dst_var.clone(), dst_type.clone());
             }
-            PatternStep::Filter(_) | PatternStep::Rank { .. } => {}
+            PatternStep::Filter(_) | PatternStep::Rank { .. } | PatternStep::Score { .. } => {}
             PatternStep::AntiJoin {
                 outer_var: _,
                 inner,

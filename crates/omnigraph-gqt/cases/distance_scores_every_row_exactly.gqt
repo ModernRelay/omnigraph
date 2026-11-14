@@ -1,0 +1,208 @@
+# issue: none
+# notes: `distance(rel, $x.f, q)` is the core's exact `Score`: every row of
+# notes: its population with the field's declared distance (`l2`, the sum of
+# notes: squared differences) to the query, a row whose vector is null
+# notes: dropped and every other column riding through. It reads no index,
+# notes: so a row written after the index was built scores as any other. The
+# notes: exact window is `order { $distance }` with `limit n`, ties to the
+# notes: smaller identity; a non-finite result is refused with `E3`.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    embedding: Vector(3)? @index
+}
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"a","embedding":[0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"b","embedding":[1.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","embedding":[0.0,2.0,0.0]}}
+{"type":"Doc","data":{"slug":"d"}}
+{"type":"Doc","data":{"slug":"e","embedding":[3.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"f","embedding":[0.0,0.0,1.0]}}
+{"edge":"Cites","from":"a","to":"b"}
+{"edge":"Cites","from":"a","to":"c"}
+{"edge":"Cites","from":"d","to":"a"}
+{"edge":"Cites","from":"e","to":"a"}
+
+--- query
+query scored($q: Vector(3)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    return { $x.slug, $distance }
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0]}
+
+--- expect unordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":1.0,"x.slug":"b"}
+{"distance":4.0,"x.slug":"c"}
+{"distance":9.0,"x.slug":"e"}
+{"distance":1.0,"x.slug":"f"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- query
+query window($q: Vector(3)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+    limit 2
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":1.0,"x.slug":"b"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- expect plan
+pipeline 0: Scan -> Score -> Projection => Sort
+
+--- query
+query radius($q: Vector(3)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    where $distance < 5.0
+    return { $x.slug }
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0]}
+
+--- expect unordered
+{"x.slug":"a"}
+{"x.slug":"b"}
+{"x.slug":"c"}
+{"x.slug":"f"}
+
+--- expect shape
+x.slug: String
+
+--- query
+query citing($q: Vector(3)) {
+    match {
+        let $pop = { match { $x: Doc, $y: Doc, $x cites $y } return { $x, $y } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    return { $x.slug, $y.slug, $distance }
+}
+
+--- params
+{"q": [1.0, 0.0, 0.0]}
+
+--- expect unordered
+{"distance":1.0,"x.slug":"a","y.slug":"b"}
+{"distance":1.0,"x.slug":"a","y.slug":"c"}
+{"distance":4.0,"x.slug":"e","y.slug":"a"}
+
+--- expect shape
+x.slug: String
+y.slug: String
+distance: F32
+
+--- query
+query cited_by_the_nearest($q: Vector(3)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+        $x cites $y,
+    }
+    where $distance < 2.0
+    return { $x.slug, $y.slug }
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0]}
+
+--- expect unordered
+{"x.slug":"a","y.slug":"b"}
+{"x.slug":"a","y.slug":"c"}
+
+--- expect shape
+x.slug: String
+y.slug: String
+
+--- query
+query closest($q: Vector(3)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    return { min($distance) as closest, count($x) as scored }
+}
+
+--- params
+{"q": [0.0, 1.0, 0.0]}
+
+--- expect unordered
+{"closest":1.0,"scored":5}
+
+--- expect shape
+closest: F32?
+scored: I64
+
+--- mutate
+query add() { insert Doc { slug: "g", embedding: [0.5, 0.0, 0.0] } }
+
+--- expect affected: nodes=1 edges=0
+
+--- query
+query window_after_the_index($q: Vector(3)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    return { $x.slug, $distance }
+    order { $distance }
+    limit 3
+}
+
+--- params
+{"q": [0.0, 0.0, 0.0]}
+
+--- expect ordered
+{"distance":0.0,"x.slug":"a"}
+{"distance":0.25,"x.slug":"g"}
+{"distance":1.0,"x.slug":"b"}
+
+--- expect shape
+x.slug: String
+distance: F32
+
+--- query
+query overflowing($q: Vector(3)) {
+    match {
+        let $pop = { match { $x: Doc } return { $x } },
+        from distance($pop, $x.embedding, $q) as $distance,
+    }
+    return { $x.slug, $distance }
+}
+
+--- params
+{"q": [-3.0e38, 0.0, 0.0]}
+
+--- expect error: E3

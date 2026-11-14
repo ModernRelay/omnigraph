@@ -287,6 +287,7 @@ impl Requirements {
         let top = pipeline(plan, plan.root(), budget)?;
         self.check_optionals(plan, &top, budget)?;
         self.check_unions(plan, &top)?;
+        self.check_scores(plan, &top)?;
         check_full_text_indexes(plan, input, budget)?;
         self.check_search(plan)?;
         self.check_row_cuts(plan, budget)?;
@@ -608,6 +609,52 @@ impl Requirements {
                     "predicate origin",
                     format!("the plan tests the optional's `{leaked}` outside the optional"),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The plan runs one `Score` per written `distance`, over the same
+    /// binding, vector property and query.
+    fn check_scores(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
+        let mut planned: Vec<(&String, &String, &IRExpr)> = top
+            .iter()
+            .filter_map(|id| match plan.node(*id) {
+                Some(PhysicalNode::Score {
+                    binding,
+                    property,
+                    query,
+                    ..
+                }) => Some((binding, property, query)),
+                _ => None,
+            })
+            .collect();
+        if planned.len() != self.scores.len() {
+            return Err(ValidationError::violated(
+                "plan shape",
+                format!(
+                    "the query scores {} distances; the plan runs {} scores",
+                    self.scores.len(),
+                    planned.len()
+                ),
+            ));
+        }
+        for (binding, property, query) in &self.scores {
+            match planned
+                .iter()
+                .position(|(b, p, q)| *b == binding && *p == property && *q == query)
+            {
+                Some(index) => {
+                    planned.remove(index);
+                }
+                None => {
+                    return Err(ValidationError::violated(
+                        "search identity",
+                        format!(
+                            "no score of the plan reads `${binding}.{property}` against `{query}` as the query's `distance` does"
+                        ),
+                    ));
+                }
             }
         }
         Ok(())
