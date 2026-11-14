@@ -230,3 +230,38 @@ Correctness fixes made after the O2 build (not in wt-best-o2; behavior-preservin
 instrument's publishing inserts): trust only in the carrying revalidation (a no-op conditional
 write keeps its probe), and a trusted capture marks the head on record so a write that stages
 nothing probes before answering.
+
+## Existing engine suites with the research mechanisms (O0 build, after the correctness fixes)
+
+| suite | all switches off | trusted tip off (A, W on) | all on |
+|---|---|---|---|
+| `writes` | 67/67 | n/r | 67/67 |
+| `failpoints` (engine) | 180/180 | 179/180 | 175/180 |
+| `detached_commit_matrix` | n/r | n/r | 31/31 |
+| integration: branching, recovery, consistency, merge_truth_table, merge_fast_forward, changes, point_in_time, end_to_end, lifecycle, composite_flow, validators (RUST_MIN_STACK=16777216, as CI sets) | 324/324 | 324/324 | 321/324 |
+
+(E, the detached link log, W's cache warm-up and the phase timers have no switch and are on in
+every column.)
+
+Failures found and fixed on the way (all real bugs in the prototype, caught by existing tests):
+- conditional writes (`--if-commit`): the trusted capture/revalidation answered from a stale view,
+  and the pipeline tip went stale once a regular publication landed -> conditional writes capture
+  and revalidate fresh; a regular publication or a claim drains and clears the tip; the
+  publisher's trusted first attempt reloads instead of refusing (writes.rs, 2 tests).
+- the pipelined commit had no lost-acknowledgement read-back (4 failpoints tests at the
+  `publish.post_merge_pre_ack` / `publish.read_back` seams) -> implemented as in
+  `publish_attempts`.
+
+Remaining failures, by mechanism:
+- A (1): `insert_still_reprepares_over_a_row_change_after_optimize_issue_1331` pins that an insert
+  is sent back over another writer's insert; A carries it by design.
+- B/C (4 failpoints + 3 integration), all "storage changed by someone else" with this process's
+  view trusted: a foreign handle's optimize is found at the CAS, so the write re-prepares instead
+  of being carried (#1331 x2); a branch deleted and recreated by another process makes the first
+  attempt bind the dead incarnation (identity-change refusal instead of landing on the new
+  incarnation); a fenced replaced owner's no-op is refused `ReadSetChanged` instead of
+  `WriterFenced`; a schema applied through another handle is not seen (the write fails to compile
+  against the stale catalog); tampered schema/manifest drift and a deleted `__manifest` are found
+  at the CAS rather than at capture (evidence `None` instead of `BeforeEffect`). None lands wrong
+  rows; each is a later or different refusal. These are the semantics the writer epoch already
+  accepts for a holder, so a production B should trust only while holding the epoch.

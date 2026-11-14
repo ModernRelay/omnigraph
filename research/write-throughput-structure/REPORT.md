@@ -388,6 +388,60 @@ Checked against `docs/dev/invariants.md`.
    version, so today the `__manifest` hot file waits for the table commit. A pre-chosen id would
    let them overlap: one round trip less per single-writer commit.
 
+## 9. Correctness evidence
+
+### Instrument checks
+
+Every instrument cell checks exact row counts per (branch, table) on a fresh handle. Every cell in
+`results/` verified. The two-handle mode (`WT_HANDLES=2`: two independently opened handles, so two
+publishers on one branch) verified too. Each overlap was fenced by the version CAS and
+re-prepared.
+
+### Existing engine suites
+
+Run with the research mechanisms on, with only the trusted tip off, and with every switch off.
+E, the link log, W and the timers have no switch, so they are on in every column.
+
+| suite | all switches off | trusted tip off (A, W on) | all on |
+|---|---|---|---|
+| `writes` | 67/67 | not run | 67/67 |
+| `failpoints` (engine) | 180/180 | 179/180 | 175/180 |
+| `detached_commit_matrix` | not run | not run | 31/31 |
+| integration: branching, recovery, consistency, merge_truth_table, merge_fast_forward, changes, point_in_time, end_to_end, lifecycle, composite_flow, validators | 324/324 | 324/324 | 321/324 |
+
+### Prototype bugs the suites caught, all fixed
+
+1. **Conditional (`--if-commit`) writes answered from a stale trusted view, and the pipeline tip
+   went stale after a regular publication.**
+   - Conditional writes now capture and revalidate fresh.
+   - A regular publication or a writer-epoch claim drains and clears the tip.
+   - The publisher's trusted first attempt reloads instead of refusing.
+2. **The pipelined commit had no lost-acknowledgement read-back.** It now reads back the attempted
+   version as `publish_attempts` does, at the same seams.
+
+### Remaining failures
+
+**A, one test.** `insert_still_reprepares_over_a_row_change_after_optimize_issue_1331` asserts
+that an insert is sent back over another writer's insert, which A carries by design.
+
+**B and C, seven tests, one class.** Storage was changed by another handle or process while this
+process trusted its own view:
+
+- Another handle's optimize is discovered at the CAS, so the write re-prepares instead of being
+  carried (#1331, two tests).
+- A branch deleted and recreated by another process: the first attempt binds the dead
+  incarnation, then is refused for the identity change.
+- A replaced owner's no-op is refused with `ReadSetChanged` instead of `WriterFenced`.
+- A schema applied through another handle is not seen, so the write fails to compile against the
+  stale catalog.
+- Tampered schema/manifest drift, and a deleted `__manifest`, are found at the CAS rather than at
+  capture.
+
+None of these lands wrong rows; each is a later or different refusal. They match what the writer
+epoch already accepts for a holder ("Two changes by another process reach the owner by no path but
+a probe"). That is why §6 recommends that production B trust the view only while the process holds
+the branch's writer epoch.
+
 <!-- FINAL2 -->
 
 
