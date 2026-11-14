@@ -34,12 +34,21 @@ struct Row {
 
 /// Texts of a row the RFC marks as working that this build does not lower
 /// yet. Stage B ships in part: each is `T86` naming B, and the set must
-/// shrink to empty before the release ships B whole.
+/// shrink to empty before the release ships B whole. A `Blob` read from a
+/// row in an assignment is also `T86` naming B (the write shaper's test
+/// owns it; this table's schema has no `Blob`).
 const B_IN_PROGRESS: &[&str] = &[
     "a node an optional introduces returned whole",
+    "an inline read with an aggregate in a from",
+    "an inline read with its own order and limit in a from",
     "a union arm returning a value",
     "a union whose arms read the enclosing scope",
     "distance as an rrf arm",
+    "two rrf arm windows that differ",
+    "an rrf of three arms",
+    "a block compared with a column",
+    "an order key no return item computes",
+    "a write group selecting over a table an earlier group changes",
 ];
 
 const CLOSURE: &[Row] = &[
@@ -90,6 +99,11 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { $p: Person } where not exists { $c: Company, $p worksAt $c } return { $p.name } }",
                 Lowers,
             ),
+            // "a block compared with a column"
+            (
+                "query q() { match { $p: Person } where count { $f: Person, $p knows $f } >= $p.age return { $p.name } }",
+                Refused("B"),
+            ),
             (
                 "query q() { match { $k: Knows } return { $k.@src } }",
                 Lowers,
@@ -129,6 +143,16 @@ const CLOSURE: &[Row] = &[
             (
                 "query q() { match { from union({ match { $p: Person } return { $p } }, { match { $q: Person } return { $q as p } }) } return { $p.name } }",
                 Lowers,
+            ),
+            // "an inline read with an aggregate in a from"
+            (
+                "query q() { match { from { match { $p: Person, $c: Company, $p worksAt $c } return { $c, count($p) as n } } } return { $c.name, $n } }",
+                Refused("B"),
+            ),
+            // "an inline read with its own order and limit in a from"
+            (
+                "query q() { match { from { match { $p: Person } return { $p } order { $p.age desc } limit 2 } } return { $p.name } }",
+                Refused("B"),
             ),
             // "a union arm returning a value"
             (
@@ -179,6 +203,16 @@ const CLOSURE: &[Row] = &[
                 "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } return { max($score) as best, count($d) as n } }",
                 Lowers,
             ),
+            // "two rrf arm windows that differ"
+            (
+                "query q($v: Vector(3), $w: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), nearest($all, $d.embedding, $w, k: 5)) as $score } return { $d.title } order { $d.title } }",
+                Refused("B"),
+            ),
+            // "an rrf of three arms"
+            (
+                "query q($v: Vector(3), $s: String, $t: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), bm25($all, $d.body, $t)) as $score } return { $d.title } order { $score desc } limit 3 }",
+                Refused("B"),
+            ),
             // "distance as an rrf arm"
             (
                 "query q($v: Vector(3), $s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(distance($all, $d.embedding, $v), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",
@@ -200,6 +234,11 @@ const CLOSURE: &[Row] = &[
             (
                 "query q($h: String) { match { $p: Person, $p worksAt $c } where $c.slug = $h update $p set { city: $c.name } }",
                 Lowers,
+            ),
+            // "a write group selecting over a table an earlier group changes"
+            (
+                "query q() { match { $p: Person } where $p.name = \"ada\" update $p set { city: \"x\" } match { $q: Person, $q worksAt $c } update $c set { name: $q.name } }",
+                Refused("B"),
             ),
         ],
     },
@@ -231,10 +270,17 @@ const CLOSURE: &[Row] = &[
     },
     Row {
         surface: "Expressions",
-        texts: &[(
+        texts: &[
+            // "an order key no return item computes"
+            (
+                "query q() { match { $p: Person } return { $p.handle } order { $p.age > 30 } }",
+                Refused("B"),
+            ),
+            (
             "query q() { match { $p: Person } where $p.age + 1 > 30 and ($p.city is null or $p.city in [\"Berlin\"]) return { $p.name, -$p.age as neg, coalesce($p.city, \"none\") as city, if($p.age > 30, \"old\", \"young\") as band, concat($p.name, \"!\") as shout } }",
             Lowers,
-        )],
+        ),
+        ],
     },
     Row {
         surface: "Parameters",
