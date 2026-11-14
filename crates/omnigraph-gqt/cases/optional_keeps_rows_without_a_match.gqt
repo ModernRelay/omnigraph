@@ -47,7 +47,7 @@ edge LocatedIn: Company -> City
 {"edge":"LocatedIn","from":"acme","to":"oslo"}
 
 --- query
-query employers() { match { $p: Person, optional { $p worksAt $c } } return { $p.handle, $c.slug } }
+query employers() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.handle, $c.slug } }
 
 --- expect unordered
 {"c.slug":"acme","p.handle":"ada"}
@@ -60,7 +60,7 @@ p.handle: String
 c.slug: String?
 
 --- query
-query filtered_inside() { match { $p: Person, optional { $p worksAt $c where $c.slug = "bolt" } } return { $p.handle, $c.name } }
+query filtered_inside() { match { $p: Person, optional { $c: Company, $p worksAt $c where $c.slug = "bolt" } } return { $p.handle, $c.name } }
 
 --- expect unordered
 {"c.name":"Bolt","p.handle":"ada"}
@@ -72,7 +72,7 @@ p.handle: String
 c.name: String?
 
 --- query
-query filtered_after() { match { $p: Person, optional { $p worksAt $c } } where $c is null or $c.slug = "bolt" return { $p.handle, $c.slug } }
+query filtered_after() { match { $p: Person, optional { $c: Company, $p worksAt $c } } where $c is null or $c.slug = "bolt" return { $p.handle, $c.slug } }
 
 --- expect unordered
 {"c.slug":"bolt","p.handle":"ada"}
@@ -83,7 +83,7 @@ p.handle: String
 c.slug: String?
 
 --- query
-query friend_employers() { match { $p: Person, optional { $p knows $f }, $f worksAt $c } return { $p.handle, $f.handle, $c.slug } }
+query friend_employers() { match { $p: Person, optional { $f: Person, $p knows $f }, $f worksAt $c } return { $p.handle, $f.handle, $c.slug } }
 
 --- expect unordered
 {"c.slug":"acme","f.handle":"bob","p.handle":"ada"}
@@ -96,7 +96,7 @@ f.handle: String?
 c.slug: String
 
 --- query
-query nested() { match { $p: Person, optional { $p worksAt $c, optional { $c locatedIn $t } } } return { $p.handle, $c.slug, $t.slug } }
+query nested() { match { $p: Person, optional { $c: Company, $p worksAt $c, optional { $t: City, $c locatedIn $t } } } return { $p.handle, $c.slug, $t.slug } }
 
 --- expect unordered
 {"c.slug":"acme","p.handle":"ada","t.slug":"oslo"}
@@ -110,7 +110,7 @@ c.slug: String?
 t.slug: String?
 
 --- query
-query counted() { match { $p: Person, optional { $p worksAt $c } } return { $p.handle, count($c) as employers } }
+query counted() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.handle, count($c) as employers } }
 
 --- expect unordered
 {"employers":2,"p.handle":"ada"}
@@ -124,7 +124,7 @@ employers: I64
 
 --- mutate
 query unemployed_age() {
-  match { $p: Person, optional { $p worksAt $c } } where $c is null
+  match { $p: Person, optional { $c: Company, $p worksAt $c } } where $c is null
   update $p set { age: 0 }
 }
 

@@ -1,7 +1,8 @@
 # issue: none
 # notes: A block correlates on an outer name by reading it, so a binding inside a block of a name the enclosing scope holds is
 # notes: `T68`: beside other elements the fix drops the binding, and a block that only binds the name to filter its row is
-# notes: written as that filter, `not ($p.name = "Bob")`; nothing executes.
+# notes: written as that filter, `not ($p.name = "Bob")`. An `optional` is an inner scope too, and its fix drops the binding the
+# notes: same way; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -35,3 +36,8 @@ query not_bob() { match { $p: Person } where not exists { $p: Person where $p.na
 query knows_someone() { match { $p: Person } where exists { $p: Person, $q: Person, $p knows $q } return { $p.name } }
 
 --- expect error: type error: T68: `$p` is bound inside a block, but the scope where the block is written already holds `$p` (node Person)
+
+--- query
+query employers() { match { $p: Person, optional { $p: Person, $c: Company, $p worksAt $c } } return { $p.name, $c.name } }
+
+--- expect error: type error: T68: `$p` is bound inside an `optional`, but the scope where the `optional` is written already holds `$p` (node Person)

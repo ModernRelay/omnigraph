@@ -249,12 +249,30 @@ fn an_inner_scope_binds_a_name_new_to_it_and_reads_an_outer_one() {
     ok(
         "query q() { match { $p: Person } where exists { $q: Person, $p $k:knows $q } return { $p } }",
     );
-    // `match` is not an inner scope, and `optional` keeps edition 2's scoping.
+    // `match` is not an inner scope; `optional` is one, like a block, and the
+    // names it introduces enter the enclosing scope, nullable.
     ok("query q() { match { $p: Person, $p knows $q } return { $q } }");
-    ok("query q() { match { $p: Person, optional { $p worksAt $c } } return { $p, $c } }");
-    ok(
-        "query q() { match { $p: Person, optional { $p: Person, $p worksAt $c where $p.city = \"x\" } } return { $p, $c } }",
+    repaired(
+        "query q() { match { $p: Person, optional { $p worksAt $c } } return { $p, $c } }",
+        "T84",
+        "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p, $c } }",
     );
+    repaired(
+        "query q() { match { $p: Person, optional { $p: Person, $c: Company, $p worksAt $c where $p.city = \"x\" } } return { $p, $c } }",
+        "T68",
+        "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c where $p.city = \"x\" } } return { $p, $c } }",
+    );
+    refused(
+        "query q() { match { $p: Person, $q: Person, $p $k:knows $q, optional { $r: Person, $p $k:knows $r } } return { $p } }",
+        "T68",
+    );
+    // An `optional` whose only element re-mentions an outer name keeps every
+    // row, matched or not, and introduces no name: no edit is certain.
+    let d = refused_with(
+        "query q() { match { $p: Person, optional { $p: Person where $p.city = \"x\" } } return { $p } }",
+        "T68",
+    );
+    assert!(d.suggestion.is_none());
 
     // T68: a block binding an outer name. Beside other elements the fix
     // drops it, so the block reads the outer name and correlates on it.
@@ -653,7 +671,7 @@ fn t40_lifted() {
 #[test]
 fn optional_served() {
     let c = ok(
-        "query q() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name, $c } }",
+        "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name, $c } }",
     );
     assert_eq!(
         cols(&c),
@@ -1077,7 +1095,7 @@ fn write_groups_type_their_sinks() {
         "query tag_near($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 20) as $distance }  update $d set { tags: [\"near\"] } }",
     );
     ok(
-        "query w($h: String) { match { $p: Person, let $n = count { $q: Person, $p knows $q }, optional { $p worksAt $c } } where $p.handle = $h and $n > 1  update $p set { city: \"busy\" } }",
+        "query w($h: String) { match { $p: Person, let $n = count { $q: Person, $p knows $q }, optional { $c: Company, $p worksAt $c } } where $p.handle = $h and $n > 1  update $p set { city: \"busy\" } }",
     );
     // Groups: a later group sees the earlier ones' effects; each has its own
     // clauses.
@@ -1303,7 +1321,7 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query shelved() { match { $p: Person, $s: Collection } where $p.name = "Ada" return { $p.name, $s.slug } }"#,
         r#"query shelved() { match { $p: Person, let $ss = { match { $s: Collection } return { $s } }, from $ss } where $p.name = "Ada" return { $p.name, $s.slug } }"#,
     ),
-    // The two queries of `diagnostics/t84_triple_names_a_name_no_binding_introduces.gqt`.
+    // The three queries of `diagnostics/t84_triple_names_a_name_no_binding_introduces.gqt`.
     (
         r#"a block's triple naming a name it does not bind"#,
         "T84",
@@ -1315,6 +1333,12 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         "T84",
         r#"query headcounts() { match { from { match { $p worksAt $c } return { $c, count($p) as n } } } return { $c.name, $n } }"#,
         r#"query headcounts() { match { from { match { $p: Person, $c: Company, $p worksAt $c } return { $c, count($p) as n } } } return { $c.name, $n } }"#,
+    ),
+    (
+        r#"an optional's triple naming a name it does not bind"#,
+        "T84",
+        r#"query employers() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name } }"#,
+        r#"query employers() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name } }"#,
     ),
     // The two queries of `diagnostics/t82_triple_written_against_its_edge_direction.gqt`
     // (its schema adds `Founded: Person -> Company`; the second is checked in
@@ -1338,7 +1362,7 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query docs() { match { let $docs = { match { $d: Doc } return { $d } }, from $docs as $s } return { $d.id } }"#,
         r#"query docs() { match { let $docs = { match { $d: Doc } return { $d } }, from $docs } return { $d.id } }"#,
     ),
-    // The two queries of `diagnostics/t68_block_binds_an_outer_name.gqt`.
+    // The three queries of `diagnostics/t68_block_binds_an_outer_name.gqt`.
     (
         r#"a block that only binds an outer name to filter its row"#,
         "T68",
@@ -1350,6 +1374,12 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         "T68",
         r#"query knows_someone() { match { $p: Person } where exists { $p: Person, $q: Person, $p knows $q } return { $p.name } }"#,
         r#"query knows_someone() { match { $p: Person } where exists { $q: Person, $p knows $q } return { $p.name } }"#,
+    ),
+    (
+        r#"an optional binding an outer name beside other elements"#,
+        "T68",
+        r#"query employers() { match { $p: Person, optional { $p: Person, $c: Company, $p worksAt $c } } return { $p.name, $c.name } }"#,
+        r#"query employers() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name } }"#,
     ),
 ];
 
@@ -1631,8 +1661,8 @@ edge Knows: Person -> Person
             "query q() { match { $p: Person } where exists { $q: Person, $p knows $q where $q.status = \"retired\" } return { $p.slug } }",
         ),
         (
-            "query q() { match { $p: Person, optional { $p knows $q where $q.status = \"retird\" } } return { $p.slug } }",
-            "query q() { match { $p: Person, optional { $p knows $q where $q.status = \"retired\" } } return { $p.slug } }",
+            "query q() { match { $p: Person, optional { $q: Person, $p knows $q where $q.status = \"retird\" } } return { $p.slug } }",
+            "query q() { match { $p: Person, optional { $q: Person, $p knows $q where $q.status = \"retired\" } } return { $p.slug } }",
         ),
         (
             "query q() { match { $p: Person, let $gone = $p.status = \"retird\" } return { $p.slug, $gone } }",
@@ -1824,8 +1854,8 @@ fn a_triple_is_written_in_its_edges_declared_order() {
         "query q() { match { from { match { $c: Company, $p: Person, $p worksAt $c } return { $p } } } return { $p } }",
     );
     repaired(
-        "query q() { match { $c: Company, optional { $c worksAt $p } } return { $c, $p } }",
-        "query q() { match { $c: Company, optional { $p worksAt $c } } return { $c, $p } }",
+        "query q() { match { $c: Company, optional { $p: Person, $c worksAt $p } } return { $c, $p } }",
+        "query q() { match { $c: Company, optional { $p: Person, $p worksAt $c } } return { $c, $p } }",
     );
     repaired(
         "query w() { match { $c: Company, $c worksAt $p } where $c.slug = \"acme\"  delete $p }",

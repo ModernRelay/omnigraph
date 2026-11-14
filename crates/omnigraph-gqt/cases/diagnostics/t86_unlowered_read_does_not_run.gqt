@@ -45,7 +45,7 @@ edge In: Doc -> Collection
 {"type":"Company","data":{"slug":"acme","name":"Acme"}}
 
 --- query
-query q($h: String) { match { $p: Person, optional { $p knows $q } } where $p.handle = $h return { $p.name } }
+query q($h: String) { match { $p: Person, optional { $q: Person, $p knows $q } } where $p.handle = $h return { $p.name } }
 
 --- params
 {"h": "ada"}
@@ -57,7 +57,7 @@ query q($h: String) { match { $p: Person, optional { $p knows $q } } where $p.ha
 p.name: String
 
 --- query
-query whole($h: String) { match { $p: Person, optional { $p knows $q } } where $p.handle = $h return { $p.name, $q } }
+query whole($h: String) { match { $p: Person, optional { $q: Person, $p knows $q } } where $p.handle = $h return { $p.name, $q } }
 
 --- params
 {"h": "ada"}

@@ -984,14 +984,18 @@ struct Scope {
     /// True inside an inline read or a called body: a binding reusing an
     /// outer name is `T68`, since it would silently become a filter.
     inner: bool,
-    /// True inside `optional`: a binding that re-mentions an outer variable
-    /// correlates on it.
+    /// True while a block whose only element re-mentions an outer variable
+    /// is probed for its filter's nullability: the re-mention correlates.
     correlates: bool,
-    /// True inside a block. A block, like an inline read, is an inner scope:
-    /// it correlates on an outer name by reading it, a binding of an outer
-    /// name is `T68`, and a name new to it is introduced by a binding
-    /// element, so a triple naming one it does not bind is `T84`.
+    /// True inside a block or an `optional`. Each, like an inline read, is
+    /// an inner scope: it correlates on an outer name by reading it, a
+    /// binding of an outer name is `T68`, and a name new to it is introduced
+    /// by a binding element, so a triple naming one it does not bind is
+    /// `T84`.
     block: bool,
+    /// True inside an `optional`, whose new names enter the enclosing scope
+    /// nullable; it names the scope in a refusal.
+    optional: bool,
     /// While a filter written earlier is placed: the names bound before it,
     /// the only outer names a block inside it correlates on.
     block_visible: Option<Vec<String>>,
@@ -1042,6 +1046,7 @@ impl Scope {
             inner,
             correlates: false,
             block: false,
+            optional: false,
             block_visible: None,
             reads: Vec::new(),
             recover: false,
@@ -2248,6 +2253,7 @@ impl Ctx<'_> {
                 return Err(E::D(block_rebinding(
                     pattern,
                     i,
+                    sc.optional,
                     variable,
                     type_name,
                     &outer.ty,
@@ -2417,7 +2423,7 @@ impl Ctx<'_> {
         if sc.correlates
             && let Some(outer) = sc.outer_col(var).cloned()
         {
-            // `optional` re-mentions an outer variable to correlate on it.
+            // The probed block re-mentions an outer variable to correlate on it.
             if !outer.ty.same_base(&ty) {
                 return Err(err(
                     if matches!(outer.ty, Ty::Edge { .. }) || matches!(ty, Ty::Edge { .. }) {
@@ -2426,7 +2432,7 @@ impl Ctx<'_> {
                         T50
                     },
                     format!(
-                        "variable `${var}` is bound to {} outside the `optional`, cannot rebind to `{type_name}`",
+                        "variable `${var}` is bound to {} outside the block, cannot rebind to `{type_name}`",
                         outer.ty.display()
                     ),
                 ));
@@ -2575,7 +2581,13 @@ impl Ctx<'_> {
             }
             if sc.is_bound(k) {
                 if (sc.inner || sc.block) && sc.outer_col(k).is_some() && sc.local(k).is_none() {
-                    let scope = if sc.block { "a block" } else { "an inner read" };
+                    let scope = if sc.optional {
+                        "an `optional`"
+                    } else if sc.block {
+                        "a block"
+                    } else {
+                        "an inner read"
+                    };
                     return Err(err_fix(
                         T68,
                         format!("edge binding `${k}` inside {scope} reuses an outer name"),
@@ -2723,7 +2735,8 @@ impl Ctx<'_> {
         let before: Vec<String> = sc.visible().iter().map(|c| c.name.clone()).collect();
         let mut inner = Scope::new(sc.params.clone(), sc.visible(), sc.rels.clone());
         inner.inner = false;
-        inner.correlates = true;
+        inner.block = true;
+        inner.optional = true;
         self.pattern(&mut inner, pattern)?;
         let new_cols: Vec<Col> = inner
             .cols
@@ -6214,15 +6227,21 @@ fn aggregate_filter_fix(catalog: &Catalog, pattern: &Pattern, in_write: bool) ->
 fn block_rebinding(
     pattern: &Pattern,
     index: usize,
+    optional: bool,
     var: &str,
     type_name: &str,
     outer: &Ty,
     written: Option<&Ty>,
 ) -> QueryDiagnostic {
+    let (scope, noun) = if optional {
+        ("an `optional`", "the `optional`")
+    } else {
+        ("a block", "the block")
+    };
     let mut d = QueryDiagnostic::typecheck(
         T68,
         format!(
-            "`${var}` is bound inside a block, but the scope where the block is written already holds `${var}` ({}); a block reads an outer name to correlate on it, and binds only a name new to it",
+            "`${var}` is bound inside {scope}, but the scope where {noun} is written already holds `${var}` ({}); {scope} reads an outer name to correlate on it, and binds only a name new to it",
             outer.display()
         ),
     );
@@ -6231,7 +6250,14 @@ fn block_rebinding(
     let same = written.is_some_and(|ty| ty.same_base(outer));
     if !same {
         return d.with_fix(format!(
-            "bind another name inside the block: `$x: {type_name}`"
+            "bind another name inside {scope}: `$x: {type_name}`"
+        ));
+    }
+    if optional && pattern.elements.len() == 1 {
+        // An `optional` whose one element re-mentions an outer name keeps
+        // every outer row once, matched or not, and introduces no name.
+        return d.with_fix(format!(
+            "read the outer `${var}` without binding it; an `optional` whose only element is `${var}: {type_name}` keeps every row and introduces no name"
         ));
     }
     d = d.with_fix(format!(
@@ -6421,7 +6447,13 @@ fn unbound_triple_names(
     let Some((first, _)) = found.first() else {
         return Ok(());
     };
-    let scope = if sc.block { "block" } else { "inline read" };
+    let scope = if sc.optional {
+        "`optional`"
+    } else if sc.block {
+        "block"
+    } else {
+        "inline read"
+    };
     let names = seen
         .iter()
         .map(|n| format!("`${n}`"))
@@ -6438,7 +6470,7 @@ fn unbound_triple_names(
     let mut d = QueryDiagnostic::typecheck(
         T84,
         format!(
-            "{names} {verb} named in a triple of this {scope} but bound nowhere: a name new to a block or an inline read is introduced by a binding element inside it, and a name read from the enclosing scope correlates"
+            "{names} {verb} named in a triple of this {scope} but bound nowhere: a name new to a block, an `optional` or an inline read is introduced by a binding element inside it, and a name read from the enclosing scope correlates"
         ),
     )
     .with_fix(format!(

@@ -241,8 +241,8 @@ written.
 
 ## Inner scopes
 
-A triple in a block or an inline read naming a name that is neither in scope
-nor bound there is `T84`; see
+A triple in a block, an `optional` or an inline read naming a name that is
+neither in scope nor bound there is `T84`; see
 [Traversal and match patterns](traversal.md#inner-scopes).
 
 ```text
@@ -250,7 +250,7 @@ query loners() { match { $p: Person } where not exists { $p knows $q } return { 
 ```
 
 ```text
-error[T84]: type error: T84: `$q` is named in a triple of this block but bound nowhere: a name new to a block or an inline read is introduced by a binding element inside it, and a name read from the enclosing scope correlates
+error[T84]: type error: T84: `$q` is named in a triple of this block but bound nowhere: a name new to a block, an `optional` or an inline read is introduced by a binding element inside it, and a name read from the enclosing scope correlates
   --> line 1, column 58
   fix: bind it in the block: `$q: Person`
 ```

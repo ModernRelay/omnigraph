@@ -57,7 +57,7 @@ query enum_in_a_block_where() {
 
 --- query
 query enum_in_an_optional_where() {
-    match { $p: Person, optional { $p knows $q where $q.status = "retird" } }
+    match { $p: Person, optional { $q: Person, $p knows $q where $q.status = "retird" } }
     return { $p.slug }
 }
 --- expect error: T3: property `status` expects one of [active, retired], got 'retird'

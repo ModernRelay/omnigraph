@@ -545,7 +545,7 @@ query oldest($k: I64) {
     limit $k
 }
 query liked_d0_or_not() {
-    match { $p: Person, optional { $p likes $d where $d.title = "d0" } }
+    match { $p: Person, optional { $d: Doc, $p likes $d where $d.title = "d0" } }
     return { $p.name, $d.title }
 }
 query likes_per_person() {

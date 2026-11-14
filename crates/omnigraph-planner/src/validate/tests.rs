@@ -335,7 +335,7 @@ fn a_dropped_conjunct_fails_predicate_retention() {
 fn an_optional_tests_its_conjuncts_inside_its_inner_tree() {
     let fixture = Fixture::new(
         r#"query q() {
-    match { $d: Doc, optional { $d cites $e where $e.year > 2000 } }
+    match { $d: Doc, optional { $e: Doc, $d cites $e where $e.year > 2000 } }
     return { $d.slug, $e.slug }
 }"#,
         &[],

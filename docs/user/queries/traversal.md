@@ -159,8 +159,9 @@ query every_pair() {
 
 ## Inner scopes
 
-A block (`exists`, `not exists`, `count` and the other aggregates) and an
-inline read are inner scopes, and both follow one rule. A name the inner
+A block (`exists`, `not exists`, `count` and the other aggregates), an
+`optional { ... }` and an inline read are inner scopes, and all follow one
+rule. A name the inner
 scope reads from the scope where it is written correlates: it is the outer
 row's value. A name new to it is introduced by a binding element inside it,
 anywhere in the scope: `not exists { $m: Person, $m manages $p }`. A triple
@@ -174,22 +175,26 @@ where $p.name = "bob" }`, is that filter, and the fix writes it in the
 block's place, `not ($p.name = "bob")`, or `not coalesce($p.age > 30, false)`
 where the predicate can be null, which keeps the rows whose test is null. A
 text search is written the same way, `not (search($d.title, $q))`: a
-full-text call is a Boolean operand, never null. `match` itself is not an inner scope, and neither is `optional { ... }`:
-a triple there binds its ends.
+full-text call is a Boolean operand, never null. An `optional` whose only
+element re-mentions an outer name, `optional { $p: Person where ... }`, keeps
+every row, matched or not, and introduces no name: it is `T68` with no edit.
+The names a block or an inline read introduces stay inside it; those an
+`optional` introduces enter the enclosing scope, nullable. `match` itself is
+not an inner scope: a triple there binds its ends.
 
 ## Optional elements
 
 `optional { ... }` keeps every row of the elements before it: a row with
 matches once per match, and a row with none once, with every name the
 optional introduces null on it. The names it introduces are in scope after it
-and nullable, so `$c.name` read from `optional { $p worksAt $c }` is
+and nullable, so `$c.name` read from `optional { $c: Company, $p worksAt $c }` is
 `String?`, `$c is null` tests whether the row had a match, and `count($c)`
 counts the matches. A `where` inside the braces decides which rows match; a
 `where` after `match` filters the joined rows:
 
 ```gq
 query employers() {
-  match { $p: Person, optional { $p worksAt $c where $c.slug = "acme" } }
+  match { $p: Person, optional { $c: Company, $p worksAt $c where $c.slug = "acme" } }
   return { $p.handle, $c.name }
 }
 ```

@@ -156,8 +156,12 @@ call is a Boolean operand and never null, so a block filtering on one becomes
 ends both bound, so the core term is the derived form's `Scan` and `Expand` to
 a fresh column with the identity `Filter`; the shaper reads that filter as the
 triple between the two bindings and places the binding from the bound end, so
-the plan is the one the unbound triple planned. `optional { }` and a
-declaration's own `match` keep a triple's ends introduced by the triple.
+the plan is the one the unbound triple planned. An `optional { }` is an inner
+scope too (the scope's `block` and `optional` flags), so the same rule and
+fixes hold inside it, and its new names enter the enclosing scope nullable; an
+`optional` whose only element is a re-mention keeps every row and introduces
+no name, so its `T68` carries no edit. A declaration's own `match` keeps a
+triple's ends introduced by the triple.
 
 A triple's written order is its direction (`check/mod.rs`, `reversed_triple`).
 `resolve_traversal` still resolves each member's `Direction` from the end

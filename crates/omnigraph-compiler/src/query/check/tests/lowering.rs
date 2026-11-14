@@ -112,16 +112,16 @@ const CLOSURE: &[Row] = &[
                 Lowers,
             ),
             (
-                "query q() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name } }",
+                "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name } }",
                 Lowers,
             ),
             // "a node an optional introduces returned whole"
             (
-                "query q() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c } }",
+                "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c } }",
                 Refused("B"),
             ),
             (
-                "query q() { match { $p: Person, optional { $p knows $f }, $f worksAt $c } where $c.name = \"Acme\" return { $p.name, $f.name } }",
+                "query q() { match { $p: Person, optional { $f: Person, $p knows $f }, $f worksAt $c } where $c.name = \"Acme\" return { $p.name, $f.name } }",
                 Lowers,
             ),
         ],

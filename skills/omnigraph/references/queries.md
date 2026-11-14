@@ -70,7 +70,9 @@ The compiler typechecks parameter values against declared types.
 `match { … }` holds the elements, the forms that produce rows: bindings
 `$x: Type` (no property braces), triples `$a edge $b`, `optional { … }` (every row
 of the elements before it, with its matches or once with the names it
-introduces null; those names are nullable after it, and returning one of its
+introduces null; an inner scope like a block, so it binds a name new to it,
+`optional { $c: Company, $p worksAt $c }` (`T84`), and reads an outer one
+unbound (`T68`); those names are nullable after it, and returning one of its
 nodes whole is `T86`), `let` and `from`, separated by
 commas (a trailing comma is allowed; a newline is not
 a separator). `where`, after the braces, holds one Boolean expression that sees

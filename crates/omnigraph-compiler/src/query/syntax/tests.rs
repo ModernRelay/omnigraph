@@ -1967,10 +1967,10 @@ const PARSE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"OPTIONAL MATCH"#,
         "Q014",
         r#"query q() {
-  match { $p: Person, optional match { $p worksAt $c } }
+  match { $p: Person, optional match { $c: Company, $p worksAt $c } }
   return { $p.name, $c.name }
 }"#,
-        r#"query q() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name } }"#,
+        r#"query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name } }"#,
     ),
     (
         r#"CALL { }"#,

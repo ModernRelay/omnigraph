@@ -1,5 +1,5 @@
 # issue: none
-# notes: A block or an inline read is an inner scope: a name it reads from the enclosing scope correlates, and a name new to it
+# notes: A block, an `optional` or an inline read is an inner scope: a name it reads from the enclosing scope correlates, and a name new to it
 # notes: is introduced by a binding element inside it. A triple naming a name that is neither is `T84`, whose fix inserts the
 # notes: binding with the type the edge declares for that end before the triple; nothing executes.
 
@@ -35,3 +35,8 @@ query loners() { match { $p: Person } where not exists { $p knows $q } return { 
 query headcounts() { match { from { match { $p worksAt $c } return { $c, count($p) as n } } } return { $c.name, $n } }
 
 --- expect error: type error: T84: `$p`, `$c` are named in a triple of this inline read but bound nowhere
+
+--- query
+query employers() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name } }
+
+--- expect error: type error: T84: `$c` is named in a triple of this `optional` but bound nowhere

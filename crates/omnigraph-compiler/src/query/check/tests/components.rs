@@ -189,7 +189,7 @@ fn only_an_element_that_produces_rows_joins_components() {
         "query q() { match { $p: Person, from { match { $c: Company } return { $c } } } return { $p.name, $c.name } }",
     );
     ok(
-        "query q() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name } }",
+        "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name } }",
     );
     t81(
         "query q() { match { $p: Person, $c: Company, let $n = concat($p.name, $c.name) } return { $n } }",

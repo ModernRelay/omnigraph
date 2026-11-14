@@ -296,15 +296,25 @@ fn every_surface_form_lowers_to_the_term_the_table_names() {
         ),
         (
             "optional { p }: Union(Correlate(R, p), Project(Filter(R, ¬ exists p), nulls))",
-            "query f() { match { $p: Person, optional { $p worksAt $c } } return { $p, $c } }",
+            "query f() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p, $c } }",
             {
+                // An `optional` is an inner scope: `$c` is bound inside it,
+                // so the triple expands to a fresh name and filters on
+                // identity, as in a block.
                 let works = || {
-                    expand(
-                        env(&[("p", node("Person"))]),
-                        "p",
-                        "c",
-                        "Company",
-                        &[("WorksAt", Direction::Out)],
+                    filter(
+                        expand(
+                            corr(env(&[("p", node("Person"))]), scan("c", "Company")),
+                            "p",
+                            "__temp_t1",
+                            "Company",
+                            &[("WorksAt", Direction::Out)],
+                        ),
+                        cmp(
+                            CompOp::Eq,
+                            prop("__temp_t1", "__id", val(ScalarType::String, false)),
+                            prop("c", "__id", val(ScalarType::String, false)),
+                        ),
                     )
                 };
                 Term::Union {
