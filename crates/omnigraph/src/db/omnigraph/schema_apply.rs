@@ -419,6 +419,10 @@ where
             // committed row is valid under the wider set, so no table data is
             // touched — the accepted catalog update alone makes the unified
             // validator accept the new variants on all three write surfaces.
+            // RelaxCardinality likewise only widens a `@card` range (#1403):
+            // a count that met the accepted range also meets the wider one,
+            // so no valid stored count becomes invalid, and writes validate
+            // against the new range from the accepted catalog on.
             SchemaMigrationStep::AddConstraint {
                 type_kind,
                 type_name,
@@ -445,6 +449,7 @@ where
             }
             SchemaMigrationStep::AddConstraint { .. }
             | SchemaMigrationStep::ExtendEnum { .. }
+            | SchemaMigrationStep::RelaxCardinality { .. }
             | SchemaMigrationStep::UpdateTypeMetadata { .. }
             | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
             SchemaMigrationStep::DropProperty {

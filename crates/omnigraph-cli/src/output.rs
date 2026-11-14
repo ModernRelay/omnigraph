@@ -787,6 +787,11 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             schema_type_kind_label(*type_kind),
             type_name
         ),
+        SchemaMigrationStep::RelaxCardinality {
+            type_name,
+            from,
+            to,
+        } => format!("relax cardinality on edge '{type_name}' from {from} to {to}"),
         SchemaMigrationStep::UpdateTypeMetadata {
             type_kind,
             name,

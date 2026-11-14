@@ -54,11 +54,12 @@ Ontologies Used for Knowledge Sharing* (Int. J. Human-Computer Studies
 5. **Minimal ontological commitment**: make as few claims about the world as
    the use case requires. In Omnigraph: no required properties, closed enums or
    `@card(1..1)` "in case". Changing a commitment later is a rebuild, not an
-   in-place `schema apply`: adding `@key`/`@unique`/`@range`/`@check` or a
-   required edge to an existing type, changing cardinality in either
-   direction, removing a constraint from a property that stays, and `T?` ↔ `T`
-   are refused; only `@index` additions, nullable additions, enum widening,
-   renames and drops apply in place.
+   in-place `schema apply`: adding `@key`/`@range`/`@check`, an edge `@unique` or a
+   required edge to an existing type, raising a `@card` minimum or lowering
+   its maximum, removing a constraint from a property that stays, and `T` →
+   `T?` are refused; `@index` additions, nullable additions, enum widening,
+   widening a `@card` range, renames and drops apply in place, and `T?` → `T`
+   and a node `@unique` only when the stored rows already satisfy them.
 
 The criteria trade off: Clarity wants tight definitions, Minimal Commitment
 wants weak ones. Gruber's resolution is to decide conservatively what to model

@@ -171,6 +171,28 @@ impl Cardinality {
     pub fn is_default(&self) -> bool {
         self.min == 0 && self.max.is_none()
     }
+
+    /// Whether every edge count inside this range is also inside `wider`:
+    /// its minimum is no higher and its maximum no lower (an absent maximum
+    /// is unbounded). A count that met this range then meets `wider`.
+    pub fn is_within(&self, wider: &Cardinality) -> bool {
+        let max_within = match (self.max, wider.max) {
+            (_, None) => true,
+            (Some(max), Some(wider_max)) => max <= wider_max,
+            (None, Some(_)) => false,
+        };
+        wider.min <= self.min && max_within
+    }
+}
+
+/// The schema spelling, such as `@card(1..1)` or `@card(1..)`.
+impl std::fmt::Display for Cardinality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.max {
+            Some(max) => write!(f, "@card({}..{})", self.min, max),
+            None => write!(f, "@card({}..)", self.min),
+        }
+    }
 }
 
 pub fn has_annotation(annotations: &[Annotation], name: &str) -> bool {
