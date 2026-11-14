@@ -39,6 +39,7 @@
 //! | `OG_CW_LABEL` | `unlabeled` | variant name written to every record |
 //! | `OG_CW_OUT` | unset | append one JSON line per cell here |
 //! | `OG_CW_PROBES` | `1` | `0` disables request counting |
+//! | `OG_CW_CLAIM` | `0` | `1` claims `main`'s writer epoch (same-branch cells) |
 //!
 //! ```bash
 //! OG_CW_WRITERS=1,16 OG_CW_MODES=same cargo test -p omnigraph-engine \
@@ -557,6 +558,12 @@ async fn build_fixture(cfg: &Config, uri: &str, writers: usize, mode: &str) -> A
             db.branch_create(&format!("w{w}")).await.expect("branch create");
         }
     }
+    // The production server shape: the one writer process claims the writer
+    // epoch of the branch it writes, which lets its handle read and write its
+    // bound branch with no freshness probe (`claim_branch_writer`).
+    if env_or("OG_CW_CLAIM", "0") == "1" && mode == "same" {
+        db.claim_branch_writer("main").await.expect("claim writer epoch");
+    }
     db
 }
 
@@ -780,6 +787,9 @@ async fn run_cell(cfg: &Config, writers: usize, mode: &str, run: u64) -> serde_j
             "write_iops": (after.store_io.write_iops - before.store_io.write_iops) as f64 / per.max(1.0),
         },
         "git": git,
+        "claim": env_or("OG_CW_CLAIM", "0"),
+        "group_commit": env_or("OMNIGRAPH_GROUP_COMMIT", "0"),
+        "pipeline": env_or("OMNIGRAPH_GROUP_COMMIT_PIPELINE", "0"),
     });
     eprintln!(
         "[cw] {label} {target} {mode:>8} w={writers:<3} run={run}: {wps:8.2} writes/s {cps:8.2} commits/s p50 {p50:>7.1} ms p99 {p99:>8.1} ms max+drain {mx:>8.1} ms req/write {req:6.1} reprep/write {rp:5.2} per-writer {pw:?}",

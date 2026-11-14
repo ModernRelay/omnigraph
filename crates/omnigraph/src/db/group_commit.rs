@@ -58,9 +58,9 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// Whether a publishing writer captures its bound branch with no probe
-/// (research switch, on by default with group commit).
+/// (research switch, off by default: see the note at its use).
 pub(crate) fn writer_capture_skip_enabled() -> bool {
-    std::env::var("OMNIGRAPH_GROUP_COMMIT_WRITER_CAPTURE_SKIP").map_or(true, |value| value != "0")
+    std::env::var("OMNIGRAPH_GROUP_COMMIT_WRITER_CAPTURE_SKIP").is_ok_and(|value| value == "1")
 }
 
 /// One write's staged effects, submitted for a batch.
@@ -191,9 +191,15 @@ fn moved(txn: &WriteTxn, current: &Option<String>) -> OmniError {
 /// follower prepares again; anything else is reported with its message.
 fn follower_error(error: &OmniError, txn: &WriteTxn) -> OmniError {
     if error.is_read_set_changed() {
-        moved(txn, &None)
-    } else {
-        OmniError::manifest_internal(format!("group commit failed: {error}"))
+        return moved(txn, &None);
+    }
+    // Keep what the failure established about the publication, so a server
+    // classifies every member of the batch as it would the batch's own
+    // failure (`Unpublished` stays definite; anything else stays uncertain).
+    let follower = OmniError::manifest_internal(format!("group commit failed: {error}"));
+    match error.completion_evidence() {
+        Some(evidence) => follower.with_completion_evidence(evidence),
+        None => follower,
     }
 }
 
@@ -391,7 +397,7 @@ impl Omnigraph {
                         .map(|group| group.log.iter().cloned().collect())
                         .unwrap_or_default()
                 };
-                match self.batch_capture(key, &branch, &log_now).await {
+                match self.batch_capture(key, &branch, &log_now, &admitted).await {
                     Ok((txn, coordinator)) => {
                         publish_coordinator = coordinator;
                         Some(txn)
@@ -626,12 +632,24 @@ impl Omnigraph {
         key: &str,
         branch: &Option<String>,
         log: &[BatchEffect],
+        entries: &[Waiting],
     ) -> Result<(
         WriteTxn,
         Option<crate::db::graph_coordinator::GraphCoordinator>,
     )> {
         let (bound, installed) = self.installed_head();
-        let last = log.last().map(|effect| effect.head.clone());
+        // The view this group last published is the batch's capture only
+        // while every entry was captured at a head the group's log explains:
+        // an entry captured at a head the log does not know saw a
+        // publication this view did not, so the leader probes.
+        let explained = entries.iter().all(|waiting| {
+            let head = &waiting.entry.txn.authority.graph_head;
+            head.as_ref().is_some_and(|head| {
+                log.iter()
+                    .any(|effect| &effect.head == head || effect.parent.as_ref() == Some(head))
+            })
+        });
+        let last = log.last().map(|effect| effect.head.clone()).filter(|_| explained);
         if bound == *branch {
             let own_view =
                 capture_skip_enabled() && installed.is_some() && last.as_ref() == installed.as_ref();
@@ -713,7 +731,7 @@ impl Omnigraph {
         let key = group_key(branch.as_deref(), batch[0].entry.actor.as_deref());
         let (current, predecessor) = loop {
             attempts += 1;
-            let current = match self.batch_capture(&key, &branch, &log).await {
+            let current = match self.batch_capture(&key, &branch, &log, &batch).await {
                 Ok((txn, _)) => txn,
                 Err(error) => {
                     for waiting in batch {
@@ -1021,7 +1039,7 @@ impl Omnigraph {
         // unreachable (invariant 5).
         let key = group_key(branch.as_deref(), batch[0].entry.actor.as_deref());
         let (current, mut publish_coordinator) =
-            match self.batch_capture(&key, &branch, log).await {
+            match self.batch_capture(&key, &branch, log, &batch).await {
                 Ok(captured) => captured,
                 Err(error) => return fail_all(batch, error, LogChange::Clear),
             };

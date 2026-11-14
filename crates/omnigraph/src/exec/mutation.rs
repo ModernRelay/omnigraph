@@ -1352,11 +1352,13 @@ impl Omnigraph {
                 self.open_write_txn_on_unattached(requested.as_deref(), base)
                     .await
             }
-            // Research (group commit): a publishing write captures the bound
-            // branch from the handle's installed view with no probe. A view
-            // another writer moved is refused before effects by the group's
-            // admission or by the ordinary path's revalidation under gates,
-            // and by the publication's compare-and-swap in every case.
+            // Research (group commit), switch off by default: a publishing
+            // write captured with no probe. Measured, then withdrawn: a stale
+            // capture is safe for the compare-and-swap but not for the
+            // write's meaning (a query compiled against a schema another
+            // handle replaced fails terminally; the first attempt's identity
+            // is recorded from a recreated branch's old incarnation). The
+            // supported probe-free capture is the writer epoch's holder skip.
             WriteRoute::Publish
                 if expected_head.is_none()
                     && crate::db::group_commit::enabled()

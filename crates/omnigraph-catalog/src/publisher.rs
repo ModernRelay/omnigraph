@@ -471,6 +471,10 @@ pub(crate) fn manifest_image_matches(
 struct LoadedPublishState {
     dataset: Dataset,
     rows: ManifestRows,
+    /// Research: the image was this publisher's own acknowledged version,
+    /// taken with no storage read; a check that fails on it is retried on a
+    /// fresh load, since another writer may have published since.
+    trusted: bool,
 }
 
 type TableRows = BTreeMap<TableIdentity, TableRow>;
@@ -602,7 +606,7 @@ impl GraphNamespacePublisher {
         }
     }
 
-    async fn dataset(&self, trust_acknowledged: bool) -> Result<Dataset> {
+    async fn dataset(&self, trust_acknowledged: bool) -> Result<(Dataset, bool)> {
         let held = self
             .published_rows
             .lock()
@@ -634,7 +638,7 @@ impl GraphNamespacePublisher {
             )
             .await?
         {
-            return Ok(rebound);
+            return Ok((rebound, true));
         }
         if std::env::var("OMNIGRAPH_GROUP_COMMIT_DEBUG").is_ok_and(|value| value == "1") {
             eprintln!(
@@ -651,7 +655,7 @@ impl GraphNamespacePublisher {
                 )
                 .await?
             {
-                return Ok(current);
+                return Ok((current, false));
             }
         }
         open_manifest_dataset_with_session(
@@ -660,6 +664,7 @@ impl GraphNamespacePublisher {
             &self.control_session,
         )
         .await
+        .map(|dataset| (dataset, false))
     }
 
     async fn load_publish_state(&self, trust_acknowledged: bool) -> Result<LoadedPublishState> {
@@ -667,13 +672,17 @@ impl GraphNamespacePublisher {
         // retry loop's re-run-on-retryable-load-error path (no-op without the
         // `failpoints` feature). The migration surfaces the same typed error.
         contention(&PUBLISH_LOAD_STATE)?;
-        let dataset = self.dataset(trust_acknowledged).await?;
+        let (dataset, trusted) = self.dataset(trust_acknowledged).await?;
         guard_stamp(&dataset)?;
         let rows = match self.cached_rows(&dataset) {
             Some(batch) => super::state::rows_of_batch(&batch)?,
             None => read_manifest_rows(&dataset).await?,
         };
-        Ok(LoadedPublishState { dataset, rows })
+        Ok(LoadedPublishState {
+            dataset,
+            rows,
+            trusted,
+        })
     }
 
     /// This publisher's branch in the holder registry, resolved once.
@@ -1626,6 +1635,7 @@ impl GraphNamespacePublisher {
                     writer_epoch,
                     ..
                 },
+            ..
         } = self.load_publish_state(false).await?;
         let stamp = read_stamp(&dataset).ok_or_else(|| {
             OmniError::manifest_internal("the loaded `__manifest` carries no stamp")
@@ -1781,25 +1791,36 @@ impl GraphNamespacePublisher {
                         writer_epoch,
                         ..
                     },
+                trusted,
             } = loaded;
             let native_branch = dataset.manifest().branch.clone();
-
-            self.assert_writer_epoch(
-                WriterEpochRow::resolved(writer_epoch.as_ref(), native_branch.as_deref()),
-                native_branch.as_deref(),
-                EpochAssertion::Publish,
-            )?;
-            self.check_publish_precondition(&dataset, &head, precondition)
-                .await?;
 
             let tables: TableRows = tables
                 .into_iter()
                 .map(|table| (table.registration.identity, table))
                 .collect();
-            // Pre-check on every attempt against freshly loaded state so a
-            // concurrent commit that broke the caller's expectation is
-            // surfaced as `PublishedDatasetVersionMismatch` rather than retried.
-            Self::check_expected_table_versions(&tables, expected_table_versions)?;
+            let checked = async {
+                self.assert_writer_epoch(
+                    WriterEpochRow::resolved(writer_epoch.as_ref(), native_branch.as_deref()),
+                    native_branch.as_deref(),
+                    EpochAssertion::Publish,
+                )?;
+                self.check_publish_precondition(&dataset, &head, precondition)
+                    .await?;
+                // Pre-check on every attempt against freshly loaded state so a
+                // concurrent commit that broke the caller's expectation is
+                // surfaced as `PublishedDatasetVersionMismatch` rather than retried.
+                Self::check_expected_table_versions(&tables, expected_table_versions)
+            }
+            .await;
+            if let Err(err) = checked {
+                // A check that fails on the trusted image may be its
+                // staleness, not the caller's: judge it again on a fresh load.
+                if trusted && attempt < PUBLISHER_RETRY_BUDGET {
+                    continue;
+                }
+                return Err(err);
+            }
 
             let new_manifest_version = dataset.version().version + 1;
             let (next_tables, mut wrote) =
@@ -2155,7 +2176,9 @@ impl GraphNamespacePublisher {
     /// writer epoch against what the claim first read, and the incarnation.
     async fn prepare_claim(&self, claim: &mut ClaimIntent) -> Result<PreparedClaim> {
         self.holder_key()?;
-        let LoadedPublishState { dataset, mut rows } = self.load_publish_state(false).await?;
+        let LoadedPublishState {
+            dataset, mut rows, ..
+        } = self.load_publish_state(false).await?;
         require_control_facts(guard_stamp(&dataset)?)?;
         let native = dataset.manifest().branch.clone();
         let current = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native.as_deref());
@@ -2362,6 +2385,7 @@ impl GraphNamespacePublisher {
         let LoadedPublishState {
             dataset,
             rows: live,
+            ..
         } = self.load_publish_state(false).await?;
         let stamp = read_stamp(&dataset).ok_or_else(|| {
             OmniError::manifest_internal("the loaded `__manifest` carries no stamp")
