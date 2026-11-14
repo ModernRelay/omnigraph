@@ -16,6 +16,7 @@ use super::value::{AggFunc, CompOp, Literal};
 pub mod foreign;
 pub mod parse;
 pub mod print;
+pub(crate) mod recover;
 pub mod statement;
 
 #[cfg(test)]

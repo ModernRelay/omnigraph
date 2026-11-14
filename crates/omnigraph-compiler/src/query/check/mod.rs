@@ -39,9 +39,11 @@ use literal::{assignment_compatible, check_literal_type, literal_type, types_com
 use traversal::{BoundVariable, resolve_traversal};
 
 /// The internal error: a refusal, the signal that a recursive read's type
-/// is not yet known (the base pass of [`Ctx::read_decl`]), or the signal
-/// that the construct was abandoned after its refusals were recorded on the
-/// context (the recovery of [`Ctx::recover`]).
+/// is not yet known (the base pass of [`Ctx::read_decl`]), or the error
+/// type: the construct was refused and its refusal recorded on the context
+/// ([`Ctx::recover`]), or it reads what a refused construct would have
+/// bound. A construct of the error type passes every check, so nothing that
+/// depends on a refused construct is refused again.
 #[derive(Debug, Clone)]
 enum E {
     D(QueryDiagnostic),
@@ -137,16 +139,20 @@ fn source_unit<'d>(decls: &[&'d Decl]) -> HashMap<String, &'d Decl> {
     unit
 }
 
-/// Every refusal of a source in one pass, in source order, each with its
-/// span; empty when the source compiles. A grammar refusal stops the pass
-/// (the tree past it is unknown), so it is the one refusal. Otherwise the
+/// Every refusal of a source's earliest refusing stage in one pass, in
+/// source order, each with its span; empty when the source compiles. The
+/// stages are parsing, then name resolution and typing. Parsing resumes at
+/// the next element, item, statement or declaration boundary after a
+/// refusal ([`crate::query::syntax::recover`]), so every independent parse
+/// refusal is reported, and a source with one is not typed. Otherwise the
 /// pass holds each repeated declaration name (`T83`) and every
-/// declaration's independent refusals: a declaration is checked on its own,
-/// and in its top scope a refusal in one element, `where` conjunct, return
-/// item, order key or write statement is recorded and the next is checked,
-/// unless it names what a refused construct would have bound. A
-/// declaration's later stages (the product rule, the lowering check) run
-/// only when nothing earlier in it was refused.
+/// declaration's independent type refusals: a declaration is checked on its
+/// own, and in each of its scopes a refusal in one element, conjunct, return
+/// item, order key, statement, assignment or operand is recorded and the
+/// next is checked; a refused construct is of the error type, which passes
+/// every check, so what depends on it is not reported. The product rule
+/// (`T81`) and the lowering admission (`T86`) are typing rules of the same
+/// pass.
 pub fn check_source_all(catalog: &Catalog, source: &str) -> Vec<QueryDiagnostic> {
     if let Err(refused) = crate::query::depth::check_query_nesting(source) {
         return vec![refused];
@@ -198,19 +204,65 @@ pub fn check_decl(
     unit: &HashMap<String, &Decl>,
     decl: &Decl,
 ) -> Result<CheckedDecl, QueryDiagnostic> {
-    let checked = type_decl(catalog, unit, decl)?;
-    lowering::admit(catalog, decl, &checked.core)?;
-    Ok(checked)
+    match typed_decl(catalog, unit, decl) {
+        Typed::Checked(checked) => {
+            lowering::admit(catalog, decl, &checked.core)?;
+            Ok(checked)
+        }
+        Typed::Refused {
+            mut refusals,
+            partial,
+        } => {
+            // `T86` is a typing refusal like the others of the pass. The
+            // term of what typed holds no refused construct, nor anything
+            // depending on one: each is of the error type, which lowers as
+            // nothing, and removing a construct removes structure, so it
+            // never makes the rest unlowered. A `T86` found there names a
+            // term the author wrote and the checker accepted, independent of
+            // the other refusals.
+            if let Some(core) = partial
+                && let Err(unlowered) = lowering::admit(catalog, decl, &core)
+                && unlowered.position.is_some()
+            {
+                refusals.push(unlowered);
+            }
+            Err(in_source_order(refusals, &decl.at).expect("a refused declaration holds a refusal"))
+        }
+    }
 }
 
 /// Type-check one declaration into its core term, lowered by this release
 /// or not: the typing rules alone. A monotone self-call types to `Fix`
 /// here, so every rule of a later stage's term is tested in this one.
+#[cfg(test)]
 pub(crate) fn type_decl(
     catalog: &Catalog,
     unit: &HashMap<String, &Decl>,
     decl: &Decl,
 ) -> Result<CheckedDecl, QueryDiagnostic> {
+    match typed_decl(catalog, unit, decl) {
+        Typed::Checked(checked) => Ok(checked),
+        Typed::Refused { refusals, .. } => {
+            Err(in_source_order(refusals, &decl.at).expect("a refused declaration holds a refusal"))
+        }
+    }
+}
+
+/// A declaration typed: its checked form, or its refusals with the term of
+/// what typed beside them when there is one.
+enum Typed {
+    Checked(CheckedDecl),
+    Refused {
+        refusals: Vec<QueryDiagnostic>,
+        partial: Option<CoreDecl>,
+    },
+}
+
+fn typed_decl(catalog: &Catalog, unit: &HashMap<String, &Decl>, decl: &Decl) -> Typed {
+    let refused = |d: QueryDiagnostic| Typed::Refused {
+        refusals: vec![d],
+        partial: None,
+    };
     let mut ctx = Ctx {
         catalog,
         unit,
@@ -225,7 +277,7 @@ pub(crate) fn type_decl(
     };
     let params = match param_types(&decl.params) {
         Ok(p) => p,
-        Err(E::D(d)) => return Err(d.at_span_of(&decl.at)),
+        Err(E::D(d)) => return refused(d.at_span_of(&decl.at)),
         Err(E::Pending(_) | E::Recorded) => unreachable!(),
     };
     ctx.frames.push(Frame {
@@ -252,17 +304,21 @@ pub(crate) fn type_decl(
     // Every refusal recorded by a recovery point, then the one that ended
     // the pass, each at its span or at the declaration's name.
     let mut refusals = std::mem::take(&mut ctx.refusals);
+    let mut partial = None;
     match out {
-        Ok(_) | Err(E::Recorded) if !refusals.is_empty() => {}
+        Ok(core) if !refusals.is_empty() => partial = Some(core),
+        Err(E::Recorded) if !refusals.is_empty() => {}
         Ok(mut core) => {
-            bind::bind_decl(catalog, &mut core).map_err(|e| {
-                match e {
-                    CompilerError::Query(d) => *d,
-                    other => QueryDiagnostic::typecheck(T7, other.to_string()),
-                }
-                .at_span_of(&decl.at)
-            })?;
-            return Ok(CheckedDecl { core });
+            return match bind::bind_decl(catalog, &mut core) {
+                Ok(()) => Typed::Checked(CheckedDecl { core }),
+                Err(e) => refused(
+                    match e {
+                        CompilerError::Query(d) => *d,
+                        other => QueryDiagnostic::typecheck(T7, other.to_string()),
+                    }
+                    .at_span_of(&decl.at),
+                ),
+            };
         }
         Err(E::D(d)) => {
             let d = ctx.placed(d);
@@ -276,7 +332,7 @@ pub(crate) fn type_decl(
         )),
         Err(E::Recorded) => unreachable!("a recorded refusal is on the context"),
     }
-    Err(in_source_order(refusals, &decl.at).expect("a refused declaration holds a refusal"))
+    Typed::Refused { refusals, partial }
 }
 
 /// The refusals of one declaration in source order, each without a position
@@ -293,6 +349,24 @@ fn in_source_order(refusals: Vec<QueryDiagnostic>, decl: &SourceSpan) -> Option<
         }
     }
     QueryDiagnostic::first_of(kept)
+}
+
+/// A refusal without a position, placed at the comparison or membership
+/// test it was found in.
+fn at_written(e: E, written: &SourceSpan) -> E {
+    match e {
+        E::D(d) => E::D(d.at_span_of(written)),
+        other => other,
+    }
+}
+
+/// A refusal without a position from an operand of a comparison: placed at
+/// the first span written inside the operand, or at the comparison.
+fn at_operand(e: E, operand: &Expr, written: &SourceSpan) -> E {
+    match first_span(operand) {
+        Some(span) => at_written(at_written(e, &span), written),
+        None => at_written(e, written),
+    }
 }
 
 /// A diagnostic without a position, placed at `span`.
@@ -902,8 +976,8 @@ struct Ctx<'a> {
     /// The span of the element being checked, when the parser recorded one
     /// per element: where a triple's `T82` fix swaps its two ends.
     element_span: Option<SourceSpan>,
-    /// The refusals the recovery points of the declaration's top scope
-    /// recorded ([`Ctx::recover`]).
+    /// The refusals the recovery points of the declaration recorded
+    /// ([`Ctx::recover`]).
     refusals: Vec<QueryDiagnostic>,
 }
 
@@ -1035,19 +1109,26 @@ struct Scope {
     /// Every column read since an element began, local or outer: what the
     /// element's inner term reads, for the product rule (`components`).
     reads: Vec<String>,
-    /// The declaration's top scope (a read's `match`, return and order, a
-    /// write group): a refusal in one element, conjunct, return item, order
-    /// key or statement is recorded and the next one is checked
-    /// ([`Ctx::recover`]). Inner scopes stop at their first refusal, which
-    /// the top scope records for the construct holding them.
+    /// A scope of the declaration being checked, its top scope or an inner
+    /// one (a block, an `optional`, an inline read): a refusal in one
+    /// element, conjunct, return item, order key, statement or operand is
+    /// recorded and the next one is checked ([`Ctx::recover`]). A called
+    /// read's body and a probe stop at their first refusal.
     recover: bool,
-    /// The names a refused or skipped construct of this scope would have
-    /// bound: a later construct naming one is skipped, since its refusal
-    /// would depend on the one recorded.
+    /// The names of the error type: what a refused construct of this scope
+    /// or an enclosing one would have bound. A construct reading one is of
+    /// the error type itself, so it passes every check unreported.
     poisoned: HashSet<String>,
-    /// A refused `from` drew columns no one knows: a later construct naming
-    /// a name the scope cannot resolve is skipped too.
+    /// A refused `from` drew columns no one knows: a name the scope cannot
+    /// resolve is of the error type too.
     opaque: bool,
+    /// A construct of this scope was refused or is of the error type: an
+    /// inner scope is then of the error type as a whole.
+    refused: bool,
+    /// The variables a refused or error-typed conjunct of the `where` names:
+    /// it passes the key-pin check of the product rule, so `T81` does not
+    /// follow from it.
+    loose_pins: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -1085,15 +1166,31 @@ impl Scope {
             recover: false,
             poisoned: HashSet::new(),
             opaque: false,
+            refused: false,
+            loose_pins: HashSet::new(),
         }
+    }
+
+    /// An inner scope over `outer`: it recovers when this scope does, and
+    /// the names of the error type stay of the error type inside it.
+    fn inner_scope(&self, outer: Vec<Col>) -> Scope {
+        let mut inner = Scope::new(self.params.clone(), outer, self.rels.clone());
+        inner.recover = self.recover;
+        inner.poisoned = self.poisoned.clone();
+        inner.opaque = self.opaque;
+        inner
+    }
+
+    /// Whether `name`, which nothing in scope resolves, is of the error
+    /// type.
+    fn is_error(&self, name: &str) -> bool {
+        !self.in_scope(name)
+            && (self.poisoned.contains(name) || (self.opaque && !self.future.contains(name)))
     }
 
     /// Whether a construct naming `names` depends on a refused one.
     fn depends_on_refused<'n>(&self, names: impl IntoIterator<Item = &'n String>) -> bool {
-        names.into_iter().any(|n| {
-            self.poisoned.contains(n)
-                || (self.opaque && !self.in_scope(n) && !self.future.contains(n))
-        })
+        names.into_iter().any(|n| self.is_error(n))
     }
 
     /// Record that a refused construct would have bound `names`: those the
@@ -1126,11 +1223,6 @@ impl Scope {
                 .map(|r| (format!("${r}"), "relation".into())),
         );
         out
-    }
-
-    /// Whether this scope refused or skipped a construct.
-    fn refused_any(&self) -> bool {
-        !self.poisoned.is_empty() || self.opaque
     }
 
     /// Every column visible here, local first then outer, for an inner
@@ -1442,7 +1534,7 @@ impl Ctx<'_> {
         }
     }
 
-    /// A recovery point of the top scope: a refusal is recorded at its span
+    /// A recovery point: a refusal is recorded at its span
     /// (the construct's, when it names none of its own) and `None` returned,
     /// so the caller checks the next construct; a construct abandoned after
     /// recording is `None` too. A recursive read's pending type is not a
@@ -1470,7 +1562,8 @@ impl Ctx<'_> {
         Ok(budget)
     }
 
-    /// [`Self::recover`] in the top scope; elsewhere the refusal propagates.
+    /// [`Self::recover`] in a scope that recovers; elsewhere (a called
+    /// read's body, a probe) the refusal propagates.
     fn guard<T>(&mut self, top: bool, result: R<T>) -> R<Option<T>> {
         if top {
             self.recover(result)
@@ -1493,6 +1586,42 @@ impl Ctx<'_> {
         d
     }
 
+    /// The errors of two operands that both failed. An operand of the error
+    /// type makes every check over it pass, so the construct holding it is
+    /// of the error type too; but a refusal in the first operand does not
+    /// hide an independent one in the second: it is recorded, and the
+    /// second error stands for the construct.
+    fn join(&mut self, sc: &Scope, first: E, second: E) -> E {
+        match (first, second) {
+            (E::Pending(name), _) | (_, E::Pending(name)) => E::Pending(name),
+            (E::D(d), second) if sc.recover => {
+                let d = self.placed(d);
+                self.refusals.push(d);
+                second
+            }
+            (E::Recorded, second) => second,
+            (first, _) => first,
+        }
+    }
+
+    /// The error so far of a list of operands, joined with the next one's.
+    fn join_failed(&mut self, sc: &Scope, so_far: Option<E>, next: E) -> E {
+        match so_far {
+            None => next,
+            Some(earlier) => self.join(sc, earlier, next),
+        }
+    }
+
+    /// Two operands, typed: both, or the error of the construct holding
+    /// them ([`Self::join`]).
+    fn both(&mut self, sc: &Scope, a: R<SExpr>, b: R<SExpr>) -> R<(SExpr, SExpr)> {
+        match (a, b) {
+            (Ok(a), Ok(b)) => Ok((a, b)),
+            (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e),
+            (Err(first), Err(second)) => Err(self.join(sc, first, second)),
+        }
+    }
+
     /// The construct being checked was written at `span`.
     fn set_at(&mut self, span: &SourceSpan) {
         self.at = Some((span.position, span.end_position));
@@ -1502,9 +1631,11 @@ impl Ctx<'_> {
     // Declarations.
 
     fn read_decl(&mut self, decl: &Decl) -> R<ReadOut> {
-        // The top scope records an independent refusal and checks on; a
-        // refusal of the name or the annotations is independent of the body.
-        let top = self.frames.len() == 1 && self.refusals.is_empty();
+        // The declaration being checked records an independent refusal and
+        // checks on; a refusal of the name or the annotations is independent
+        // of the body. A called read's body stops at its first refusal.
+        let top = self.frames.len() == 1;
+        let mark = self.refusals.len();
         if is_registry_name(&decl.name) || CLAUSE_KEYWORDS.contains(&decl.name.as_str()) {
             let refused = err(
                 T74,
@@ -1541,8 +1672,18 @@ impl Ctx<'_> {
         let mut sc = Scope::new(pmap.clone(), Vec::new(), HashMap::new());
         sc.recover = top;
         let mut rel = self.read_body(body, sc)?;
-        if !self.refusals.is_empty() {
-            return Err(E::Recorded);
+        if self.refusals.len() > mark {
+            // The term of what typed, for the lowering admission; a
+            // recursive read's fixpoint and its plan budget read the whole
+            // term, so they wait for a declaration with no refusal.
+            if self.rec_hits.contains(&name) || !top {
+                return Err(E::Recorded);
+            }
+            return Ok(ReadOut {
+                params,
+                rel,
+                budget: budget.plan,
+            });
         }
         if self.rec_hits.contains(&name) {
             // The fixpoint of the read's type: start from the base arms'
@@ -1639,15 +1780,11 @@ impl Ctx<'_> {
             if self.recover(typed)?.is_none() {
                 continue;
             }
-            let input = if sc.refused_any() || !self.refusals.is_empty() {
-                Term::Unit
-            } else {
-                let finished = self.finish(&mut sc);
-                match self.recover(finished)? {
-                    Some(term) => term.unwrap_or(Term::Unit),
-                    None => continue,
-                }
+            let finished = self.finish(&mut sc);
+            let Some(input) = self.recover(finished)? else {
+                continue;
             };
+            let input = input.unwrap_or(Term::Unit);
             let mut sinks = Vec::new();
             for (i, s) in group.statements.iter().enumerate() {
                 if let Some(span) = group.spans.statements.get(i) {
@@ -1679,9 +1816,6 @@ impl Ctx<'_> {
             }
             groups.push(WriteGroup { input, sinks });
         }
-        if !self.refusals.is_empty() {
-            return Err(E::Recorded);
-        }
         Ok(CoreWrite {
             name: decl.name.clone(),
             params,
@@ -1698,6 +1832,7 @@ impl Ctx<'_> {
     /// enclosing scope's visible columns).
     fn read_body(&mut self, body: &ReadBody, mut sc: Scope) -> R<Rel> {
         let top = sc.recover;
+        let mark = self.refusals.len();
         if let Some(refusal) = ranking_in_order_or_return(self.catalog, body, &sc) {
             if !top {
                 return Err(E::D(refusal));
@@ -1719,40 +1854,49 @@ impl Ctx<'_> {
         let mut aggs = Vec::new();
         let mut post: Vec<(String, SExpr)> = Vec::new();
         let mut shaped = Vec::new();
+        // The columns of the items typed, in written order.
         let mut names: Vec<String> = Vec::new();
-        // An item refused or skipped: an order key, which reads the items,
-        // is then not checked.
-        let mut item_refused = false;
+        // Every item's column, for the duplicate check.
+        let mut seen: Vec<String> = Vec::new();
+        // The items refused or of the error type: their columns are of the
+        // error type, so an order key naming one, or repeating one, is too.
+        let mut refused_items: Vec<&Projection> = Vec::new();
+        let mut refused_columns: Vec<String> = Vec::new();
         for (i, p) in body.projections.iter().enumerate() {
             if let Some(span) = body.spans.items.get(i) {
                 self.set_at(span);
             }
             let name = item_name(&p.expr, p.alias.as_deref());
-            if names.contains(&name) {
+            if seen.contains(&name) {
                 let refused = Err(err(
                     T25,
                     format!("two return items produce the column `{name}`; alias one"),
                 ));
                 self.guard::<()>(top, refused)?;
-                item_refused = true;
+                sc.refused = true;
                 continue;
             }
-            names.push(name.clone());
+            seen.push(name.clone());
+            let typed = self.return_item(&mut sc, p, &name, &mut items, &mut aggs, &mut post);
+            if self.guard(top, typed)?.is_none() {
+                sc.block_buf.clear();
+                sc.refused = true;
+                refused_items.push(p);
+                refused_columns.push(name);
+                continue;
+            }
+            names.push(name);
             shaped.push(
                 (p.alias.is_none() && !matches!(p.expr, Expr::Variable(_)))
                     .then(|| crate::query::syntax::print::expr(&p.expr)),
             );
-            if top && sc.depends_on_refused(&expr_names(&p.expr)) {
-                item_refused = true;
-                continue;
-            }
-            let typed = self.return_item(&mut sc, p, &name, &mut items, &mut aggs, &mut post);
-            if self.guard(top, typed)?.is_none() {
-                sc.block_buf.clear();
-                item_refused = true;
-            }
         }
-        let refused = top && (item_refused || sc.refused_any() || !self.refusals.is_empty());
+        // An order key of the error type: it names a refused item's column
+        // or repeats a refused item.
+        let key_refused = |o: &Ordering| {
+            matches!(&o.expr, Expr::Ident(alias) if refused_columns.contains(alias))
+                || refused_items.iter().any(|p| p.expr == o.expr)
+        };
         // Blocks in return items come before the extension.
         let blocks = std::mem::take(&mut sc.block_buf);
         let at = sc.binders;
@@ -1768,12 +1912,12 @@ impl Ctx<'_> {
                 },
             );
         }
-        let mut term = if refused {
-            Term::Unit
-        } else {
-            self.finish(&mut sc)?.unwrap_or(Term::Unit)
-        };
-        let grouped = !aggs.is_empty() || !post.is_empty() || body.distinct;
+        let mut term = self.finish(&mut sc)?.unwrap_or(Term::Unit);
+        // A refused item holding an aggregate grouped the return too.
+        let grouped = !aggs.is_empty()
+            || !post.is_empty()
+            || body.distinct
+            || refused_items.iter().any(|p| contains_agg(&p.expr));
         if body.distinct && !aggs.is_empty() {
             self.guard::<()>(
                 top,
@@ -1785,10 +1929,7 @@ impl Ctx<'_> {
         }
         let mut out_cols: Vec<Col> = Vec::new();
         let ext_names: Vec<String>;
-        if item_refused {
-            // The order keys read the items; the `limit` reads neither.
-            ext_names = Vec::new();
-        } else if grouped {
+        if grouped {
             let keys: Vec<(String, SExpr)> = items.iter().flatten().cloned().collect();
             for (i, it) in items.iter().enumerate() {
                 let ty = match it {
@@ -1814,11 +1955,12 @@ impl Ctx<'_> {
                 if let Some(span) = body.spans.order.get(k) {
                     self.set_at(span);
                 }
-                if top && sc.depends_on_refused(&expr_names(&o.expr)) {
+                if key_refused(o) {
                     continue;
                 }
                 let key = self.grouped_order_key(&mut sc, body, o, &names, &out_cols, &aggs, &keys);
                 let Some(k) = self.guard(top, key)? else {
+                    sc.refused = true;
                     continue;
                 };
                 order.push((k, o.descending.unwrap_or(false)));
@@ -1837,6 +1979,11 @@ impl Ctx<'_> {
                     .iter()
                     .find(|c| !c.starts_with('^') && !keys.iter().any(|(k, _)| k == *c))
                 {
+                    // A refused item may be the key that groups by it.
+                    sc.refused = true;
+                    if !refused_items.is_empty() {
+                        continue;
+                    }
                     let refused = Err(err(
                         T9,
                         format!(
@@ -1881,7 +2028,7 @@ impl Ctx<'_> {
                 if let Some(span) = body.spans.order.get(k) {
                     self.set_at(span);
                 }
-                if top && sc.depends_on_refused(&expr_names(&o.expr)) {
+                if key_refused(o) {
                     continue;
                 }
                 let key = match &o.expr {
@@ -1903,6 +2050,7 @@ impl Ctx<'_> {
                     e => self.order_key(&mut sc, e),
                 };
                 let Some(k) = self.guard(top, key)? else {
+                    sc.refused = true;
                     continue;
                 };
                 order.push((k, o.descending.unwrap_or(false)));
@@ -1944,7 +2092,10 @@ impl Ctx<'_> {
                 };
             }
         }
-        if top && !self.refusals.is_empty() {
+        // An inline read holding a refusal is of the error type; the top
+        // read body keeps the term of what it typed, which the lowering
+        // admission reads ([`check_decl`]).
+        if sc.inner && (self.refusals.len() > mark || sc.refused) {
             return Err(E::Recorded);
         }
         term = Term::Project {
@@ -2066,7 +2217,7 @@ impl Ctx<'_> {
                 let i = same_item.unwrap();
                 SExpr::new(SKind::Col(format!("^{}", names[i])), out_cols[i].ty.clone())
             }
-            e if self.aggregate(sc, e).is_ok_and(|a| a.is_some()) => {
+            e if self.probe_aggregate(sc, e) => {
                 let a = self.aggregate(sc, e)?.unwrap();
                 match aggs.iter().find(|(_, x)| *x == a) {
                     Some((n, x)) => SExpr::new(SKind::Col(n.clone()), x.ty.clone()),
@@ -2172,6 +2323,16 @@ impl Ctx<'_> {
         })
     }
 
+    /// Whether `e` types as an aggregate, recording nothing.
+    fn probe_aggregate(&mut self, sc: &mut Scope, e: &Expr) -> bool {
+        let mark = self.refusals.len();
+        let recover = std::mem::replace(&mut sc.recover, false);
+        let found = self.aggregate(sc, e).is_ok_and(|a| a.is_some());
+        sc.recover = recover;
+        self.refusals.truncate(mark);
+        found
+    }
+
     /// An aggregate return item, or `None`.
     fn aggregate(&mut self, sc: &mut Scope, e: &Expr) -> R<Option<Agg>> {
         let (func, distinct, arg) = match e {
@@ -2259,7 +2420,6 @@ impl Ctx<'_> {
             return Err(E::D(refusal));
         }
         lookahead(&pattern.elements, sc);
-        let recorded = self.refusals.len();
         let mut parts = components::Parts::default();
         // Each triple of an inner scope and the ends it introduced.
         let mut introduced: Vec<(usize, Vec<String>)> = Vec::new();
@@ -2268,9 +2428,9 @@ impl Ctx<'_> {
                 self.set_at(span);
             }
             if sc.recover && sc.depends_on_refused(&element_names(c)) {
-                // It names what a refused element would have bound.
-                let binds = element_binds(c);
-                sc.poison(&binds);
+                // It names what a refused element would have bound: it is
+                // of the error type.
+                refused_element(sc, &mut parts, i, c);
                 continue;
             }
             self.element_span = (pattern.spans.elements.len() == pattern.elements.len())
@@ -2295,16 +2455,17 @@ impl Ctx<'_> {
                 )));
             }
             let before = sc.cols.len();
+            let (steps, binders) = (sc.steps.len(), sc.binders);
             sc.reads.clear();
             let typed = self.element(sc, c);
             if self.guard(sc.recover, typed)?.is_none() {
                 sc.block_buf.clear();
-                sc.cols.truncate(before);
-                let binds = element_binds(c);
-                sc.poison(&binds);
-                if matches!(c, Element::From { .. }) {
-                    sc.opaque = true;
+                for col in sc.cols.drain(before..) {
+                    sc.bound_at.remove(&col.name);
                 }
+                sc.steps.truncate(steps);
+                sc.binders = binders;
+                refused_element(sc, &mut parts, i, c);
                 continue;
             }
             let bound: Vec<String> = sc.cols[before..].iter().map(|c| c.name.clone()).collect();
@@ -2319,8 +2480,14 @@ impl Ctx<'_> {
             parts.element(i, c, bound, std::mem::take(&mut sc.reads));
             self.flush(sc, false)?;
         }
-        if (sc.block || sc.inner) && !sc.refused_any() {
-            unbound_triple_names(pattern, sc, &introduced)?;
+        // A refused binding still declares its name, so `T84` names only
+        // what no binding element introduces; a refused `from` drew columns
+        // no one knows, any of which may be the name.
+        if (sc.block || sc.inner) && !sc.opaque {
+            let checked = unbound_triple_names(pattern, sc, &introduced);
+            if self.guard(sc.recover, checked)?.is_none() {
+                sc.refused = true;
+            }
         }
         if let Some(predicate) = &pattern.predicate {
             let written = pattern
@@ -2338,12 +2505,10 @@ impl Ctx<'_> {
             }
             self.flush(sc, false)?;
         }
-        // The product rule reads every element: a refused one leaves it
-        // unknown, and a refused conjunct's fix can move it into `match`.
-        if !sc.refused_any()
-            && self.refusals.len() == recorded
-            && let Some(refusal) = parts.refusal(self.catalog, sc, pattern)
-        {
+        // The product rule is a typing rule: a refused element is of the
+        // error type and passes it, joining the components it names, and a
+        // refused conjunct passes the key-pin check.
+        if let Some(refusal) = parts.refusal(self.catalog, sc, pattern) {
             self.guard::<()>(sc.recover, Err(E::D(refusal)))?;
         }
         Ok(())
@@ -2368,7 +2533,7 @@ impl Ctx<'_> {
             let at = sc.position(&vars);
             match p {
                 Pending::Filter(e, before, written) => {
-                    // An error outside the top scope abandons the scope, so
+                    // An error in a scope that does not recover abandons it, so
                     // the restriction needs no reset on that path.
                     sc.block_visible = Some(before);
                     for conj in conjuncts(&e) {
@@ -2379,14 +2544,13 @@ impl Ctx<'_> {
                             None if written.is_some() => self.at = written,
                             None => {}
                         }
-                        if sc.recover && sc.depends_on_refused(&expr_names(conj)) {
-                            continue;
-                        }
                         let typed = self
                             .expr(sc, conj, At::Filter)
                             .and_then(|pred| require_bool(&pred, "a filter").map(|()| pred));
                         let Some(pred) = self.guard(sc.recover, typed)? else {
                             sc.block_buf.clear();
+                            sc.refused = true;
+                            sc.loose_pins.extend(expr_names(conj));
                             continue;
                         };
                         let blocks = std::mem::take(&mut sc.block_buf);
@@ -2767,11 +2931,17 @@ impl Ctx<'_> {
     fn optional(&mut self, sc: &mut Scope, pattern: &Pattern) -> R<()> {
         self.flush(sc, false)?;
         let before: Vec<String> = sc.visible().iter().map(|c| c.name.clone()).collect();
-        let mut inner = Scope::new(sc.params.clone(), sc.visible(), sc.rels.clone());
+        let mut inner = sc.inner_scope(sc.visible());
         inner.inner = false;
         inner.block = true;
         inner.optional = true;
+        let mark = self.refusals.len();
         self.pattern(&mut inner, pattern)?;
+        // An inner scope holding a refusal is of the error type: what reads
+        // its names depends on it.
+        if self.refusals.len() > mark || inner.refused {
+            return Err(E::Recorded);
+        }
         let new_cols: Vec<Col> = inner
             .cols
             .iter()
@@ -2929,7 +3099,8 @@ impl Ctx<'_> {
                 "read the outer `${variable}` without binding it inside the block, or write the filter as a conjunct of the `where`"
             ))));
         }
-        let mut probe = Scope::new(sc.params.clone(), outer.to_vec(), sc.rels.clone());
+        let mut probe = sc.inner_scope(outer.to_vec());
+        probe.recover = false;
         probe.inner = false;
         probe.correlates = true;
         self.pattern(&mut probe, pattern)?;
@@ -3004,15 +3175,23 @@ impl Ctx<'_> {
             None => sc.visible(),
         };
         self.re_mention_only(sc, block, &outer)?;
-        let mut inner = Scope::new(sc.params.clone(), outer, sc.rels.clone());
+        let mut inner = sc.inner_scope(outer);
         inner.inner = false;
         inner.block = true;
+        let mark = self.refusals.len();
         self.pattern(&mut inner, pattern)?;
         self.flush(&mut inner, true)?;
         let arg = match arg {
-            Some(a) => Some(self.expr(&mut inner, a, At::Value)?),
+            Some(a) => {
+                let typed = self.expr(&mut inner, a, At::Value);
+                self.guard(inner.recover, typed)?
+            }
             None => None,
         };
+        // A block holding a refusal is of the error type.
+        if self.refusals.len() > mark || inner.refused || (block.arg.is_some() && arg.is_none()) {
+            return Err(E::Recorded);
+        }
         let free = inner.free.clone();
         let term = self.finish(&mut inner)?.unwrap_or(Term::Unit);
         for f in &free {
@@ -3032,7 +3211,7 @@ impl Ctx<'_> {
                     RelArg::Inline(b) => b,
                     _ => unreachable!(),
                 };
-                let mut inner = Scope::new(sc.params.clone(), sc.visible(), sc.rels.clone());
+                let mut inner = sc.inner_scope(sc.visible());
                 inner.inner = true;
                 let r = self.read_body(body, inner)?;
                 for f in &r.free {
@@ -3095,9 +3274,22 @@ impl Ctx<'_> {
                     name = format!("{base}{n}");
                     n += 1;
                 }
-                return Err(E::D(unnamed_ranking(rel, &name, span)));
+                // The relation typed: only its score's name is refused, so
+                // it is drawn under the name the fix writes, and what it
+                // holds is still checked.
+                let refused = Err(E::D(unnamed_ranking(rel, &name, span)));
+                self.guard::<()>(sc.recover, refused)?;
+                sc.refused = true;
+                rename_score(&mut r, &name)?;
             }
-            (None, Some(name)) => return Err(E::D(named_non_ranking(rel, name, span))),
+            (None, Some(name)) => {
+                // The relation typed and the fix removes the `as`: the name
+                // is of the error type.
+                let refused = Err(E::D(named_non_ranking(rel, name, span)));
+                self.guard::<()>(sc.recover, refused)?;
+                sc.refused = true;
+                sc.poisoned.insert(name.to_string());
+            }
         }
         Ok(r)
     }
@@ -3108,6 +3300,9 @@ impl Ctx<'_> {
                 sc.col(f);
             }
             return Ok(r);
+        }
+        if sc.is_error(v) {
+            return Err(E::Recorded);
         }
         if sc.is_bound(v) || sc.params.contains_key(v) {
             return Err(err_fix(
@@ -3997,28 +4192,38 @@ impl Ctx<'_> {
                 dup_assignments(assignments)?;
                 if let Some(node) = self.catalog.node_types.get(type_name) {
                     let mut out = Vec::new();
+                    // Each assignment is checked; an unknown property may be
+                    // the misspelled required one, so the required check
+                    // waits for none.
+                    let mut failed: Option<E> = None;
+                    let mut unknown = false;
                     for a in assignments {
-                        let Some(pt) = node.properties.get(&a.property).cloned() else {
-                            return Err(err(
-                                T11,
-                                format!(
-                                    "type `{type_name}` has no property `{}`{}{}",
-                                    a.property,
-                                    system_assignment_hint(&a.property),
-                                    nearest::listing(
-                                        &a.property,
-                                        nearest::properties(&node.properties)
-                                    )
-                                ),
-                            ));
+                        let typed = match node.properties.get(&a.property).cloned() {
+                            None => {
+                                unknown = true;
+                                Err(err(
+                                    T11,
+                                    format!(
+                                        "type `{type_name}` has no property `{}`{}{}",
+                                        a.property,
+                                        system_assignment_hint(&a.property),
+                                        nearest::listing(
+                                            &a.property,
+                                            nearest::properties(&node.properties)
+                                        )
+                                    ),
+                                ))
+                            }
+                            Some(pt) => self.assign(sc, &a.value, &pt, &a.property),
                         };
-                        out.push((
-                            a.property.clone(),
-                            self.assign(sc, &a.value, &pt, &a.property)?,
-                        ));
+                        match typed {
+                            Ok(v) => out.push((a.property.clone(), v)),
+                            Err(e) => failed = Some(self.join_failed(sc, failed.take(), e)),
+                        }
                     }
                     let assigned: HashSet<&str> =
                         assignments.iter().map(|a| a.property.as_str()).collect();
+                    let mut missing = None;
                     for (p, t) in &node.properties {
                         if t.nullable || assigned.contains(p.as_str()) {
                             continue;
@@ -4028,12 +4233,19 @@ impl Ctx<'_> {
                         {
                             continue;
                         }
-                        return Err(err(
+                        missing = Some(err(
                             T12,
                             format!(
                                 "insert for `{type_name}` must provide non-nullable property `{p}`"
                             ),
                         ));
+                        break;
+                    }
+                    match (failed, missing) {
+                        (Some(e), Some(m)) if !unknown => return Err(self.join(sc, e, m)),
+                        (Some(e), _) => return Err(e),
+                        (None, Some(m)) => return Err(m),
+                        (None, None) => {}
                     }
                     return Ok((
                         Sink::Insert {
@@ -4048,39 +4260,48 @@ impl Ctx<'_> {
                 if let Some(edge) = self.catalog.edge_types.get(type_name) {
                     let mut out = Vec::new();
                     let (mut from, mut to) = (false, false);
+                    let mut failed: Option<E> = None;
                     for a in assignments {
-                        let v = match a.property.as_str() {
-                            end @ ("from" | "to") => {
-                                if end == "from" {
-                                    from = true
-                                } else {
-                                    to = true
+                        let v = (|| -> R<AssignValue> {
+                            Ok(match a.property.as_str() {
+                                end @ ("from" | "to") => {
+                                    if end == "from" {
+                                        from = true
+                                    } else {
+                                        to = true
+                                    }
+                                    let endpoint = if end == "from" {
+                                        &edge.from_type
+                                    } else {
+                                        &edge.to_type
+                                    };
+                                    self.endpoint(sc, &a.value, endpoint, end, type_name)?
                                 }
-                                let endpoint = if end == "from" {
-                                    &edge.from_type
-                                } else {
-                                    &edge.to_type
-                                };
-                                self.endpoint(sc, &a.value, endpoint, end, type_name)?
-                            }
-                            p => {
-                                let Some(pt) = edge.properties.get(p).cloned() else {
-                                    let mut names = nearest::properties(&edge.properties);
-                                    names.push(("from".into(), edge.from_type.clone()));
-                                    names.push(("to".into(), edge.to_type.clone()));
-                                    return Err(err(
-                                        T11,
-                                        format!(
-                                            "type `{type_name}` has no property `{p}`{}{}",
-                                            system_assignment_hint(p),
-                                            nearest::listing(p, names)
-                                        ),
-                                    ));
-                                };
-                                self.assign(sc, &a.value, &pt, p)?
-                            }
-                        };
-                        out.push((a.property.clone(), v));
+                                p => {
+                                    let Some(pt) = edge.properties.get(p).cloned() else {
+                                        let mut names = nearest::properties(&edge.properties);
+                                        names.push(("from".into(), edge.from_type.clone()));
+                                        names.push(("to".into(), edge.to_type.clone()));
+                                        return Err(err(
+                                            T11,
+                                            format!(
+                                                "type `{type_name}` has no property `{p}`{}{}",
+                                                system_assignment_hint(p),
+                                                nearest::listing(p, names)
+                                            ),
+                                        ));
+                                    };
+                                    self.assign(sc, &a.value, &pt, p)?
+                                }
+                            })
+                        })();
+                        match v {
+                            Ok(v) => out.push((a.property.clone(), v)),
+                            Err(e) => failed = Some(self.join_failed(sc, failed.take(), e)),
+                        }
+                    }
+                    if let Some(e) = failed {
+                        return Err(e);
                     }
                     if !from || !to {
                         return Err(err(
@@ -4141,9 +4362,11 @@ impl Ctx<'_> {
                 dup_assignments(assignments)?;
                 let props = self.node_props(type_name).cloned().unwrap_or_default();
                 let mut out = Vec::new();
+                // Each assignment is checked.
+                let mut failed: Option<E> = None;
                 for a in assignments {
-                    let Some(pt) = props.get(&a.property).cloned() else {
-                        return Err(err(
+                    let typed = match props.get(&a.property).cloned() {
+                        None => Err(err(
                             T11,
                             format!(
                                 "type `{type_name}` has no property `{}`{}{}",
@@ -4151,12 +4374,16 @@ impl Ctx<'_> {
                                 system_assignment_hint(&a.property),
                                 nearest::listing(&a.property, nearest::properties(&props))
                             ),
-                        ));
+                        )),
+                        Some(pt) => self.assign(sc, &a.value, &pt, &a.property),
                     };
-                    out.push((
-                        a.property.clone(),
-                        self.assign(sc, &a.value, &pt, &a.property)?,
-                    ));
+                    match typed {
+                        Ok(v) => out.push((a.property.clone(), v)),
+                        Err(e) => failed = Some(self.join_failed(sc, failed.take(), e)),
+                    }
+                }
+                if let Some(e) = failed {
+                    return Err(e);
                 }
                 Ok((
                     Sink::Update {
@@ -4447,6 +4674,8 @@ impl Ctx<'_> {
                     SExpr::new(SKind::Col(v.clone()), ty)
                 } else if let Some(t) = sc.params.get(v) {
                     SExpr::new(SKind::Param(v.clone()), Ty::Value(t.clone()))
+                } else if sc.is_error(v) {
+                    return Err(E::Recorded);
                 } else if sc.rels.contains_key(v) {
                     return Err(err_fix(
                         T69,
@@ -4467,6 +4696,9 @@ impl Ctx<'_> {
             }
             Expr::Prop { variable, property } => {
                 let Some(ty) = sc.col(variable) else {
+                    if sc.is_error(variable) {
+                        return Err(E::Recorded);
+                    }
                     if sc.params.contains_key(variable) {
                         return Err(err(
                             T6,
@@ -4590,8 +4822,9 @@ impl Ctx<'_> {
                 SExpr::new(SKind::Neg(v.boxed()), ty)
             }
             Expr::Arith { op, left, right } => {
-                let l = self.expr(sc, left, sub)?;
-                let r = self.expr(sc, right, sub)?;
+                let l = self.expr(sc, left, sub);
+                let r = self.expr(sc, right, sub);
+                let (l, r) = self.both(sc, l, r)?;
                 arith(*op, l, r)?
             }
             Expr::Compare {
@@ -4600,11 +4833,18 @@ impl Ctx<'_> {
                 right,
                 at: written,
             } => {
-                let l = self.expr(sc, left, sub)?;
-                let r = self.expr(sc, right, sub)?;
-                literal_against_property(&l, &r, written, 1)?;
-                literal_against_property(&r, &l, written, 0)?;
-                compare(*op, l, r)?
+                // A refusal inside a comparison is placed at it.
+                let l = self
+                    .expr(sc, left, sub)
+                    .map_err(|e| at_operand(e, left, written));
+                let r = self
+                    .expr(sc, right, sub)
+                    .map_err(|e| at_operand(e, right, written));
+                let (l, r) = self.both(sc, l, r)?;
+                let compared = literal_against_property(&l, &r, written, 1)
+                    .and_then(|()| literal_against_property(&r, &l, written, 0))
+                    .and_then(|()| compare(*op, l, r));
+                compared.map_err(|e| at_written(e, written))?
             }
             Expr::In {
                 needle,
@@ -4614,7 +4854,10 @@ impl Ctx<'_> {
                 // `$d in $x` over a node is a triple over the edge named
                 // `in`, which is written in `match`; refused before the
                 // needle is typed, since only a triple would bind it.
-                if let (Expr::Variable(a), Expr::Variable(b)) = (needle.as_ref(), list.as_ref()) {
+                if let (Expr::Variable(a), Expr::Variable(b)) = (needle.as_ref(), list.as_ref())
+                    && !sc.is_error(a)
+                    && !sc.is_error(b)
+                {
                     // A node on the right, or an unbound name beside a node
                     // when the schema has an edge named `in`.
                     let node = matches!(sc.col(b), Some(Ty::Node { .. }));
@@ -4640,8 +4883,13 @@ impl Ctx<'_> {
                         return Err(E::D(d));
                     }
                 }
-                let n = self.expr(sc, needle, sub)?;
-                let l = self.expr(sc, list, sub)?;
+                let n = self
+                    .expr(sc, needle, sub)
+                    .map_err(|e| at_operand(e, needle, written));
+                let l = self
+                    .expr(sc, list, sub)
+                    .map_err(|e| at_operand(e, list, written));
+                let (n, l) = self.both(sc, n, l)?;
                 literal_in_against_property(&n, &l, written)?;
                 let l = match &n.ty {
                     Ty::Value(t) if !t.list => {
@@ -4724,8 +4972,9 @@ impl Ctx<'_> {
                 SExpr::new(SKind::Not(v.boxed()), ty)
             }
             Expr::And(l, r) | Expr::Or(l, r) => {
-                let a = self.expr(sc, l, sub)?;
-                let b = self.expr(sc, r, sub)?;
+                let a = self.expr(sc, l, sub);
+                let b = self.expr(sc, r, sub);
+                let (a, b) = self.both(sc, a, b)?;
                 let what = if matches!(e, Expr::And(..)) {
                     "`and`"
                 } else {
@@ -4764,6 +5013,9 @@ impl Ctx<'_> {
             ));
         }
         let mut args = Vec::new();
+        // Every argument is typed, so a refusal in one does not hide an
+        // independent refusal in another.
+        let mut failed: Option<E> = None;
         for a in &c.args {
             match a {
                 Arg::Expr(e) => {
@@ -4772,7 +5024,15 @@ impl Ctx<'_> {
                     {
                         continue;
                     }
-                    args.push(self.expr(sc, e, At::Value)?)
+                    match self.expr(sc, e, At::Value) {
+                        Ok(v) => args.push(v),
+                        Err(e) => {
+                            failed = Some(match failed.take() {
+                                None => e,
+                                Some(earlier) => self.join(sc, earlier, e),
+                            })
+                        }
+                    }
                 }
                 Arg::Inline(_) => {
                     return Err(err(
@@ -4781,6 +5041,9 @@ impl Ctx<'_> {
                     ));
                 }
             }
+        }
+        if let Some(e) = failed {
+            return Err(e);
         }
         let bool_ty = |nullable| Ty::scalar(ScalarType::Bool, nullable);
         let string =
@@ -6871,47 +7134,50 @@ fn for_each_child(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     }
 }
 
-/// The variables a write statement names.
+/// The variable a write statement targets: a statement targeting one of
+/// the error type is of the error type; its values read their names where
+/// they are typed.
 fn statement_names(s: &Stmt) -> Vec<String> {
-    let mut out = Vec::new();
-    let assignments = match s {
-        Stmt::Insert { assignments, .. } => assignments.as_slice(),
-        Stmt::Update {
-            variable,
-            assignments,
-        } => {
-            out.push(variable.clone());
-            assignments.as_slice()
-        }
-        Stmt::Delete { variable } => {
-            out.push(variable.clone());
-            &[]
-        }
+    match s {
+        Stmt::Insert { .. } => Vec::new(),
+        Stmt::Update { variable, .. } | Stmt::Delete { variable } => vec![variable.clone()],
+    }
+}
+
+/// The variables an element names outside its expressions and inner
+/// scopes: what it binds, and the named relation a `from` draws. An element
+/// naming one of the error type is of the error type; a name read inside an
+/// expression or an inner scope is of the error type where it is read, so
+/// the rest of that expression or scope is still checked.
+fn element_names(c: &Element) -> Vec<String> {
+    let mut out = match c {
+        Element::Optional(_) => Vec::new(),
+        Element::From { score, .. } => score.iter().cloned().collect(),
+        _ => element_binds(c),
     };
-    for a in assignments {
-        expr_vars(&a.value, &mut out);
+    if let Element::From {
+        rel: RelExpr::Variable(v),
+        ..
+    } = c
+    {
+        out.push(v.clone());
     }
     out
 }
 
-/// The variables an element names, bound or read, a `from`'s relation and
-/// a `let`'s value included: what a refused element's dependents name.
-fn element_names(c: &Element) -> Vec<String> {
-    let mut out = element_binds(c);
-    match c {
-        Element::Let { value, .. } => match value {
-            LetValue::Expr(e) => expr_vars(e, &mut out),
-            LetValue::Relation(body) => body_vars(body, &mut out),
-        },
-        Element::From { rel, .. } => match rel {
-            RelExpr::Variable(v) => out.push(v.clone()),
-            RelExpr::Call(c) => call_vars(c, &mut out),
-            RelExpr::Inline(body) => body_vars(body, &mut out),
-        },
-        Element::Optional(p) => pattern_vars(p, &mut out),
-        Element::Binding { .. } | Element::Traversal(_) => {}
+/// Element `index` of a scope was refused, or is of the error type: what it
+/// would have bound is of the error type, the columns of a `from` that is
+/// not an inline read are unknown, and it joins the components it names.
+fn refused_element(sc: &mut Scope, parts: &mut components::Parts, index: usize, c: &Element) {
+    let binds = element_binds(c);
+    sc.poison(&binds);
+    if matches!(c, Element::From { rel, .. } if !matches!(rel, RelExpr::Inline(_))) {
+        sc.opaque = true;
     }
-    out
+    sc.refused = true;
+    let mut names = element_names(c);
+    names.extend(binds);
+    parts.refused(index, names);
 }
 
 /// The names an element would bind.
@@ -6943,31 +7209,6 @@ fn element_binds(c: &Element) -> Vec<String> {
             }
             out
         }
-    }
-}
-
-/// Every variable a relation call names in its arguments and options.
-fn call_vars(c: &Call, out: &mut Vec<String>) {
-    for a in &c.args {
-        match a {
-            Arg::Expr(e) => expr_vars(e, out),
-            Arg::Inline(body) => body_vars(body, out),
-        }
-    }
-    for (_, e) in &c.options {
-        expr_vars(e, out);
-    }
-}
-
-/// Every variable a read body names: its pattern, return items and order
-/// keys.
-fn body_vars(body: &ReadBody, out: &mut Vec<String>) {
-    pattern_vars(&body.pattern, out);
-    for p in &body.projections {
-        expr_vars(&p.expr, out);
-    }
-    for o in &body.order {
-        expr_vars(&o.expr, out);
     }
 }
 

@@ -39,6 +39,9 @@ struct Producer {
     binding: Option<String>,
     /// A `from` whose relation reads no column of the scope.
     uncorrelated_from: bool,
+    /// A refused element, or one of the error type: it passes the product
+    /// rule, so the component holding it is admitted.
+    error: bool,
 }
 
 /// What a scope's elements produce, gathered while they are typed.
@@ -116,6 +119,21 @@ impl Parts {
             bound,
             binding,
             uncorrelated_from,
+            error: false,
+        });
+    }
+
+    /// Record element `index`, refused or of the error type, with the names
+    /// it binds or names: it joins the components sharing one, and passes.
+    pub(super) fn refused(&mut self, index: usize, names: Vec<String>) {
+        let vars: BTreeSet<String> = names.into_iter().filter(|n| n != "_").collect();
+        self.producers.push(Producer {
+            element: index,
+            vars,
+            bound: Vec::new(),
+            binding: None,
+            uncorrelated_from: false,
+            error: true,
         });
     }
 
@@ -207,12 +225,19 @@ impl Parts {
         sc: &Scope,
         pins: &HashMap<String, HashSet<String>>,
     ) -> bool {
+        if component.iter().any(|&p| self.producers[p].error) {
+            return true;
+        }
         let [only] = component else {
             return false;
         };
         let Some(var) = &self.producers[*only].binding else {
             return false;
         };
+        // A refused conjunct naming it passes the key-pin check.
+        if sc.loose_pins.contains(var) {
+            return true;
+        }
         let Some(Ty::Node { type_name, .. }) = sc.local(var).map(|c| &c.ty) else {
             return false;
         };

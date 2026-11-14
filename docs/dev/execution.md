@@ -125,6 +125,26 @@ result-schema inference (`check::result::result_schema`) and every header
 consumer (server, CLI, cluster, MCP, lint, the operation descriptor) read that
 core term; nothing re-derives types from the text.
 
+A compile returns every independent refusal of its earliest refusing stage:
+parsing, then name resolution and typing (`T83`, `T81` and `T86` among the
+latter). Parsing recovers at element, item, assignment, argument, parameter,
+`where`, statement and declaration boundaries (`query/syntax/recover.rs`):
+the grammar has no recovery, so a lexical scan of balanced brackets finds
+the unit holding a grammar refusal, which is replaced byte for byte by
+spaces or by a placeholder the grammar accepts there, and the text is parsed
+again; the builder records a refusal at the same boundaries and builds on.
+The type checker records a refusal at every element, conjunct, item, key,
+statement, assignment and operand of every scope of the declaration, and
+gives the refused construct the error type (`check::E::Recorded`): the names
+it would bind are of that type, a construct reading one is of it too and
+passes every check unreported, and a block, `optional` or inline read
+holding a refusal is of it as a whole. In a product, a refused element joins
+the components it names and passes; a refused conjunct passes the key-pin
+check; a `from` whose `as` alone is refused (`T85`) still draws its
+relation. `T86` reads the term of what typed, which holds no construct of
+the error type: removing a construct removes structure and never makes the
+rest unlowered, so a `T86` found there stands beside the other refusals.
+
 Each scope's elements form components (`check/components.rs`): a binding, a
 triple, an `optional` or a `from` joins the components of every variable it
 binds or reads; a `let` value stands for the variables it reads, and the

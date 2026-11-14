@@ -7,12 +7,13 @@
 //! One pass is [`check_source_all`]: every independent refusal of the
 //! source, each with its span. The suggestions of one pass may not overlap.
 //! "Strictly shrinks" counts the refusals of the stage the pass reached. A
-//! compile has three stages, each reading what the one before accepted: the
-//! grammar (a refused source holds one refusal), the typing rules, and the
-//! lowering admission (`T86`), which reads a typed declaration. A pass whose
-//! fixes clear its stage may reveal the next stage's refusals; every other
-//! pass must leave fewer refusals than it found, and no pass may leave an
-//! earlier stage's refusal than the one it found.
+//! compile has two refusing stages, the second reading what the first
+//! accepted: parsing, then name resolution and typing, where the lowering
+//! admission (`T86`) and a repeated declaration name (`T83`) belong; lowering
+//! refuses nothing. A pass whose fixes clear its stage may reveal the next
+//! stage's refusals; every other pass must leave fewer refusals than it
+//! found, and no pass may leave an earlier stage's refusal than the one it
+//! found.
 
 use std::path::{Path, PathBuf};
 
@@ -139,18 +140,16 @@ fn written(edits: &[TextEdit], source: &str) -> Vec<(usize, usize, String)> {
     out
 }
 
-/// The stage a pass reached: the grammar, the typing rules, or the
-/// lowering admission.
+/// The stage a pass reached: parsing, or name resolution and typing.
 fn stage(refusals: &[QueryDiagnostic]) -> u8 {
     refusals
         .iter()
-        .map(|d| match (d.kind, d.code.as_str()) {
-            (QueryDiagnosticKind::Parse, _) => 0,
-            (_, "T86") => 2,
+        .map(|d| match d.kind {
+            QueryDiagnosticKind::Parse => 0,
             _ => 1,
         })
         .min()
-        .unwrap_or(3)
+        .unwrap_or(2)
 }
 
 fn render(refusals: &[QueryDiagnostic]) -> String {

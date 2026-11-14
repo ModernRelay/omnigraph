@@ -220,6 +220,27 @@ fn with_ctx<T>(f: impl FnOnce(&mut Ctx) -> T) -> T {
     CTX.with(|c| f(&mut c.borrow_mut()))
 }
 
+thread_local! {
+    /// The refusals the builder recorded at its boundaries during the
+    /// current [`structural`] parse.
+    static RECOVERED: RefCell<Vec<Refusal>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A boundary of the builder (a declaration, an element, a return item, an
+/// order key, a `where` predicate, a statement, a parameter, an
+/// annotation): a refusal is recorded and the builder goes on with the next
+/// one, so every independent refusal of a source the grammar accepts is
+/// reported. The tree of a source with a recorded refusal is never used.
+fn recovered<T>(built: R<T>) -> Option<T> {
+    match built {
+        Ok(value) => Some(value),
+        Err(refused) => {
+            RECOVERED.with(|r| r.borrow_mut().push(refused));
+            None
+        }
+    }
+}
+
 fn first_binding() -> Option<String> {
     with_ctx(|c| c.bindings.first().map(|(v, _)| v.clone()))
 }
@@ -309,48 +330,83 @@ pub fn parse_source(input: &str) -> std::result::Result<SourceFile, QueryDiagnos
     }
 }
 
-/// [`parse_source`] keeping the construct span of a refusal.
-pub fn parse_source_detailed(input: &str) -> R<SourceFile> {
-    match structural(input) {
-        Ok((file, names)) => {
-            let mut duplicates = duplicate_declarations(input, &names);
-            if duplicates.is_empty() {
-                return Ok(file);
-            }
-            let mut first = duplicates.remove(0);
-            if !duplicates.is_empty() {
-                first.diagnostic.extra.get_or_insert_default().further =
-                    duplicates.into_iter().map(|r| *r.diagnostic).collect();
-            }
-            Err(first)
-        }
-        Err(first) => Err(foreign::with_habits(input, first, structural_refusal)),
-    }
-}
+/// The most refusals one parse reports: a bound on the recovery loop.
+const MAX_PARSE_REFUSALS: usize = 256;
 
-/// Every refusal of the parse in source order, and the tree when the
-/// grammar accepted the source: a grammar refusal stops the parse, so it is
-/// the one refusal; a source the grammar accepts is refused only for
-/// repeating a declaration name (`T83`, one per later declaration), and its
-/// tree is still returned so that the type checker can report the
-/// declarations' own refusals beside them.
+/// Every refusal of the parse in source order, and the tree when the source
+/// parses. After a parse refusal the parser resumes at the next element,
+/// item, statement or declaration boundary ([`super::recover`]), so every
+/// independent parse refusal is reported: a grammar refusal neutralizes the
+/// unit that holds it and the source is parsed again; the builder records a
+/// refusal at its boundaries and builds on. A source that parses is refused
+/// only for repeating a declaration name (`T83`, one per later declaration,
+/// a refusal of name resolution), and its tree is still returned so that the
+/// type checker reports the declarations' own refusals beside them.
 pub fn parse_source_all(input: &str) -> (Option<SourceFile>, Vec<QueryDiagnostic>) {
-    match structural(input) {
-        Ok((file, names)) => {
-            let duplicates = duplicate_declarations(input, &names)
-                .into_iter()
-                .map(|r| spanned(input, r))
-                .collect();
-            (Some(file), duplicates)
+    let mut text = input.to_string();
+    let mut out: Vec<QueryDiagnostic> = Vec::new();
+    // The text before the last neutralization and the region it replaced.
+    let mut last: Option<(String, (usize, usize))> = None;
+    while out.len() < MAX_PARSE_REFUSALS {
+        match structural(&text) {
+            Ok((file, names)) => {
+                if out.is_empty() {
+                    let duplicates = duplicate_declarations(input, &names)
+                        .into_iter()
+                        .map(|r| spanned(input, r))
+                        .collect();
+                    return (Some(file), duplicates);
+                }
+                break;
+            }
+            Err(Refused::Builder(refusals)) => {
+                for refused in refusals {
+                    let at = refused.span.map_or_else(
+                        || refused.diagnostic.position.map_or(0, |p| p.byte as usize),
+                        |(start, _)| start,
+                    );
+                    let region = super::recover::region_at(&text, at);
+                    out.push(spanned(
+                        &text,
+                        foreign::with_habits(&text, refused, structural_refusals, region),
+                    ));
+                }
+                break;
+            }
+            Err(Refused::Grammar(first)) => {
+                let at = first.diagnostic.position.map_or(0, |p| p.byte as usize);
+                // A refusal inside the unit just neutralized comes from the
+                // neutralization, not the source: the unit around it is
+                // neutralized instead.
+                if let Some((before, region)) = &last
+                    && region.0 <= at
+                    && at <= region.1
+                {
+                    match super::recover::neutralize_parent(before, *region) {
+                        Some(n) => {
+                            last = Some((before.clone(), n.region));
+                            text = n.text;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+                let region = super::recover::region_at(&text, at);
+                out.push(spanned(
+                    &text,
+                    foreign::with_habits(&text, first, structural_refusals, region),
+                ));
+                match super::recover::neutralize(&text, at) {
+                    Some(n) => {
+                        last = Some((std::mem::replace(&mut text, n.text), n.region));
+                    }
+                    None => break,
+                }
+            }
         }
-        Err(first) => (
-            None,
-            vec![spanned(
-                input,
-                foreign::with_habits(input, first, structural_refusal),
-            )],
-        ),
     }
+    out.sort_by_key(|d| d.position.map_or(0, |p| p.byte));
+    (None, out)
 }
 
 /// A refusal's diagnostic with the end of its construct's span.
@@ -364,9 +420,22 @@ fn spanned(input: &str, refused: Refusal) -> QueryDiagnostic {
     d
 }
 
-/// The structural parse alone, for the habit pass to reparse a candidate.
-fn structural_refusal(input: &str) -> Option<Refusal> {
-    structural(input).err()
+/// Every refusal of a structural parse, for the habit pass to reparse a
+/// candidate.
+fn structural_refusals(input: &str) -> Vec<Refusal> {
+    match structural(input) {
+        Ok(_) => Vec::new(),
+        Err(Refused::Grammar(refused)) => vec![refused],
+        Err(Refused::Builder(refusals)) => refusals,
+    }
+}
+
+/// Why a structural parse refused a source: the grammar refused it, with no
+/// tree past the refusal, or the builder refused constructs of a tree the
+/// grammar accepted, each recorded at its boundary, in source order.
+enum Refused {
+    Grammar(Refusal),
+    Builder(Vec<Refusal>),
 }
 
 /// A declaration's name as written and the byte range of the name.
@@ -427,17 +496,36 @@ fn duplicate_declarations(input: &str, names: &[DeclName]) -> Vec<Refusal> {
 }
 
 /// The file and each declaration's name span, in source order.
-fn structural(input: &str) -> R<(SourceFile, Vec<DeclName>)> {
-    let pairs =
-        QueryParser::parse(Rule::query_file, input).map_err(|error| grammar_error(input, error))?;
+fn structural(input: &str) -> std::result::Result<(SourceFile, Vec<DeclName>), Refused> {
+    let pairs = QueryParser::parse(Rule::query_file, input)
+        .map_err(|error| Refused::Grammar(grammar_error(input, error)))?;
     let file = pairs.into_iter().next().expect("grammar: one query_file");
+    // The habit pass reparses inside a parse: each parse records its own.
+    let outer = RECOVERED.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    let built = build_file(input, file);
+    let mut refusals = RECOVERED.with(|r| std::mem::replace(&mut *r.borrow_mut(), outer));
+    match built {
+        Ok(file) if refusals.is_empty() => Ok(file),
+        built => {
+            refusals.extend(built.err());
+            refusals.sort_by_key(|r| r.span.map_or(0, |(start, _)| start));
+            Err(Refused::Builder(refusals))
+        }
+    }
+}
+
+/// The tree of a source the grammar accepted, recording the refusal of each
+/// setting, statement and declaration and going on.
+fn build_file(input: &str, file: Pair<Rule>) -> R<(SourceFile, Vec<DeclName>)> {
     let mut settings = Vec::new();
     let mut decls = Vec::new();
     let mut names = Vec::new();
     let mut statement: Option<Body> = None;
     for inner in file.into_inner() {
         match inner.as_rule() {
-            Rule::setting_stmt => settings.push(parse_setting_stmt(inner)?),
+            Rule::setting_stmt => {
+                settings.extend(recovered(parse_setting_stmt(inner).map_err(Refusal::from)))
+            }
             Rule::branch_stmt => {
                 statement = Some(Body::Statement(Box::new(StatementBody(FileBody::Branch(
                     parse_branch_stmt(inner)?,
@@ -471,9 +559,12 @@ fn structural(input: &str) -> R<(SourceFile, Vec<DeclName>)> {
                 });
             }
             Rule::statement_trailer => {
-                return Err(
-                    diagnostic_at(Q004, "a statement stands alone in its file", &inner).into(),
-                );
+                recovered::<()>(Err(diagnostic_at(
+                    Q004,
+                    "a statement stands alone in its file",
+                    &inner,
+                )
+                .into()));
             }
             Rule::missing_param_list => {
                 let name = inner
@@ -504,10 +595,14 @@ fn structural(input: &str) -> R<(SourceFile, Vec<DeclName>)> {
                             .find(|p| p.as_rule() == Rule::ident)
                             .expect("grammar: query_decl names itself");
                         names.push((name.as_str().to_string(), span_of(&name)));
-                        decls.push(decl(d)?)
+                        decls.extend(recovered(decl(d)))
                     }
-                    Rule::mutation_decl => return Err(declaration_keyword(input, d, "mutation")),
-                    Rule::view_decl => return Err(declaration_keyword(input, d, "view")),
+                    Rule::mutation_decl => {
+                        recovered::<()>(Err(declaration_keyword(input, d, "mutation")));
+                    }
+                    Rule::view_decl => {
+                        recovered::<()>(Err(declaration_keyword(input, d, "view")));
+                    }
                     other => unreachable!("grammar: declaration holds no {other:?}"),
                 }
             }
@@ -725,7 +820,10 @@ fn collect_ctx(pair: &Pair<Rule>) -> Ctx {
                     }
                     _ => None,
                 });
-                if let (Some(v), Some(t)) = (v, t) {
+                // `$_` binds nothing a fix may name (a recovery placeholder).
+                if let (Some(v), Some(t)) = (v, t)
+                    && v != "_"
+                {
                     ctx.bindings.push((v, t));
                 }
             }
@@ -757,10 +855,10 @@ fn decl(pair: Pair<Rule>) -> R<Decl> {
             }
             Rule::param_list => {
                 for p in item.into_inner() {
-                    params.push(param(p)?);
+                    params.extend(recovered(param(p)));
                 }
             }
-            Rule::annotation => annotations.push(annotation(item)?),
+            Rule::annotation => annotations.extend(recovered(annotation(item))),
             Rule::as_commit_clause | Rule::as_unattached_clause => write_clause = Some(item),
             Rule::read_body => body = Some(DeclBody::Read(read_body(item)?)),
             Rule::swapped_read_rec => {
@@ -967,7 +1065,11 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
                 let open = s + input[s..e].find('{').unwrap_or(0) + 1;
                 let close = s + input[s..e].rfind('}').unwrap_or(e - s);
                 body.spans.match_inner = Some(SourceSpan::of(input, open, close));
-                body.pattern = Box::new(match_pattern(&section, where_pair.as_ref())?);
+                // A refusal of the `match` as a whole (its elements' shape)
+                // leaves the clauses after it to be checked.
+                body.pattern = Box::new(
+                    recovered(match_pattern(&section, where_pair.as_ref())).unwrap_or_default(),
+                );
             }
             Rule::where_clause => {}
             Rule::match_nobrace_rec => return Err(match_nobrace(&section)),
@@ -982,59 +1084,67 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
             }
             Rule::return_clause => {
                 seen_return = true;
-                missing_commas(&section, "return items")?;
-                let mut distinct_items = Vec::new();
-                let return_span = span_of(&section);
-                let mut keyword_end = 0;
-                for p in section.into_inner() {
-                    match p.as_rule() {
-                        Rule::kw_return => keyword_end = p.as_span().end(),
-                        Rule::kw_distinct => {
-                            body.distinct = true;
-                            keyword_end = p.as_span().end();
-                        }
-                        Rule::missing_comma_rec => {}
-                        Rule::projection => {
-                            if let Some(item) = p
-                                .clone()
-                                .into_inner()
-                                .find(|i| i.as_rule() == Rule::distinct_item_rec)
-                            {
-                                distinct_items.push(item);
-                            } else if distinct_items.is_empty() {
-                                if let Some(e) =
-                                    p.clone().into_inner().find(|i| i.as_rule() == Rule::expr)
-                                {
-                                    body.spans.items.push(source_span(&e));
-                                }
-                                body.projections.push(projection(p)?);
+                // A refusal of the `return` as a whole leaves `order` and
+                // `limit` to be checked.
+                recovered((|| -> R<()> {
+                    missing_commas(&section, "return items")?;
+                    let mut distinct_items = Vec::new();
+                    let return_span = span_of(&section);
+                    let mut keyword_end = 0;
+                    for p in section.into_inner() {
+                        match p.as_rule() {
+                            Rule::kw_return => keyword_end = p.as_span().end(),
+                            Rule::kw_distinct => {
+                                body.distinct = true;
+                                keyword_end = p.as_span().end();
                             }
+                            Rule::missing_comma_rec => {}
+                            Rule::projection => {
+                                if let Some(item) = p
+                                    .clone()
+                                    .into_inner()
+                                    .find(|i| i.as_rule() == Rule::distinct_item_rec)
+                                {
+                                    distinct_items.push(item);
+                                } else if distinct_items.is_empty() {
+                                    if let Some(e) =
+                                        p.clone().into_inner().find(|i| i.as_rule() == Rule::expr)
+                                    {
+                                        body.spans.items.push(source_span(&e));
+                                    }
+                                    body.projections.extend(recovered(projection(p)));
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
-                if !distinct_items.is_empty() {
-                    let mut edits: Vec<TextEdit> = distinct_items
-                        .iter()
-                        .map(|item| {
-                            let kw = item.clone().into_inner().next().unwrap();
-                            let (s, e) =
-                                with_trailing_ws(input, kw.as_span().start(), kw.as_span().end());
-                            edit(s, e, "")
-                        })
-                        .collect();
-                    if !body.distinct {
-                        edits.push(edit(keyword_end, keyword_end, " distinct"));
+                    if !distinct_items.is_empty() {
+                        let mut edits: Vec<TextEdit> = distinct_items
+                            .iter()
+                            .map(|item| {
+                                let kw = item.clone().into_inner().next().unwrap();
+                                let (s, e) = with_trailing_ws(
+                                    input,
+                                    kw.as_span().start(),
+                                    kw.as_span().end(),
+                                );
+                                edit(s, e, "")
+                            })
+                            .collect();
+                        if !body.distinct {
+                            edits.push(edit(keyword_end, keyword_end, " distinct"));
+                        }
+                        return Err(refusal(
+                            input,
+                            Q014,
+                            "`distinct` belongs to the `return`, not to an item: `return distinct { … }`",
+                            return_span,
+                            edits,
+                            MACHINE,
+                        ));
                     }
-                    return Err(refusal(
-                        input,
-                        Q014,
-                        "`distinct` belongs to the `return`, not to an item: `return distinct { … }`",
-                        return_span,
-                        edits,
-                        MACHINE,
-                    ));
-                }
+                    Ok(())
+                })());
             }
             Rule::return_nobrace_rec => {
                 let mut kw_end = 0;
@@ -1048,14 +1158,15 @@ fn read_body(pair: Pair<Rule>) -> R<ReadBody> {
                     .trim_end_matches([' ', '\t', '\r', '\n', ','])
                     .len()
                     .max(kw_end);
-                return Err(refusal(
+                seen_return = true;
+                recovered::<()>(Err(refusal(
                     input,
                     Q020,
                     "`return` takes its items in braces",
                     (s, e),
                     vec![edit(kw_end, kw_end, " {"), edit(e, e, " }")],
                     MACHINE,
-                ));
+                )));
             }
             _ => tail.push(section),
         }
@@ -1121,7 +1232,7 @@ fn read_tail(input: &str, body: &mut ReadBody, tail: Vec<Pair<Rule>>) -> R<()> {
                 for o in section.clone().into_inner() {
                     if o.as_rule() == Rule::ordering {
                         body.spans.order.push(source_span(&o));
-                        body.order.push(ordering(o)?);
+                        body.order.extend(recovered(ordering(o)));
                     }
                 }
                 order_pair = Some(section);
@@ -1427,7 +1538,7 @@ fn write_body(pair: Pair<Rule>) -> R<WriteBody> {
                     ));
                 }
                 let pattern = match &selection {
-                    Some(m) => match_pattern(m, where_pair.as_ref())?,
+                    Some(m) => recovered(match_pattern(m, where_pair.as_ref())).unwrap_or_default(),
                     None => Pattern::default(),
                 };
                 let mut statements = Vec::new();
@@ -1460,7 +1571,7 @@ fn write_body(pair: Pair<Rule>) -> R<WriteBody> {
                         }
                         _ => {
                             spans.statements.push(source_span(p));
-                            statements.push(statement(p.clone())?);
+                            statements.extend(recovered(statement(p.clone())));
                         }
                     }
                 }
@@ -2445,7 +2556,7 @@ fn build_elements(
     let spans = pairs.iter().map(element_span).collect();
     let mut elements = Vec::new();
     for (i, p) in pairs.iter().enumerate() {
-        elements.push(element(p.clone(), &pairs[..i])?);
+        elements.extend(recovered(element(p.clone(), &pairs[..i])));
     }
     Ok((elements, spans))
 }
@@ -2500,7 +2611,7 @@ fn match_pattern(m: &Pair<Rule>, w: Option<&Pair<Rule>>) -> R<Pattern> {
     let (predicate, predicate_span) = match w {
         Some(w) => {
             let e = child(w, Rule::expr).expect("grammar: a where holds its expression");
-            (Some(expr(e.clone())?), Some(source_span(&e)))
+            (recovered(expr(e.clone())), Some(source_span(&e)))
         }
         None => (None, None),
     };
@@ -2529,7 +2640,7 @@ fn block_pattern(body: &Pair<Rule>) -> R<Pattern> {
     let (predicate, predicate_span) = match &w {
         Some(w) => {
             let e = child(w, Rule::expr).expect("grammar: a where holds its expression");
-            (Some(expr(e.clone())?), Some(source_span(&e)))
+            (recovered(expr(e.clone())), Some(source_span(&e)))
         }
         None => (None, None),
     };

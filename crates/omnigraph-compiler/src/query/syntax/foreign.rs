@@ -606,13 +606,19 @@ fn construct_at(text: &str, pos: usize) -> Option<(usize, usize)> {
 }
 
 /// The refusal of a source whose structural refusal is `first`, with the
-/// lexical habits it holds folded in.
+/// lexical habits of its `region` folded in: the parse unit that holds it
+/// (`super::recover`), so each independent refusal carries its own habits
+/// and no other's.
 pub(crate) fn with_habits(
     input: &str,
     first: Refusal,
-    reparse: fn(&str) -> Option<Refusal>,
+    reparse: fn(&str) -> Vec<Refusal>,
+    region: (usize, usize),
 ) -> Refusal {
-    let habits = scan(input);
+    let habits: Vec<Habit> = scan(input)
+        .into_iter()
+        .filter(|h| region.0 <= h.span.0 && h.span.1 <= region.1)
+        .collect();
     let Some(lead) = habits.first().cloned() else {
         return first;
     };
@@ -642,8 +648,16 @@ pub(crate) fn with_habits(
         .map(|(s, e)| (t1_track.map_start(s, input.len()), t1_track.map_end(e)))
         .map(|(s, e)| (s.min(lead.span.0), e.max(lead.span.1)))
         .unwrap_or(lead.span);
-    let r2 = match reparse(&t1) {
-        Some(r2) if !r2.edits().is_empty() && r2.span.is_some() => r2,
+    // The edited text's first refusal of a construct meeting the region; a
+    // refusal of a construct apart from it is another unit's own.
+    let within = |r: &Refusal| {
+        r.span.is_some_and(|(rs, re)| {
+            let (s, e) = (t1_track.map_start(rs, input.len()), t1_track.map_end(re));
+            s < region.1.max(region.0 + 1) && region.0 < e.max(s + 1)
+        })
+    };
+    let r2 = match reparse(&t1).into_iter().find(within) {
+        Some(r2) if !r2.edits().is_empty() => r2,
         _ => return refusal(input, lead.code, lead.message, lead_span, e1, applicability),
     };
     let (rs, re) = r2.span.unwrap();

@@ -2449,11 +2449,20 @@ fn every_refusal_shape_prints_a_repair_that_reparses_to_the_intended_text() {
             .err()
             .unwrap_or_else(|| panic!("{shape}: accepted\n{source}"));
         assert_eq!(diagnostic.code.as_str(), *code, "{shape}: {diagnostic}");
-        let suggestion = diagnostic
-            .suggestion
-            .as_ref()
-            .unwrap_or_else(|| panic!("{shape}: no suggestion: {diagnostic}"));
-        let repaired = super::parse::apply_edits(&source, &suggestion.edits);
+        assert!(
+            diagnostic.suggestion.is_some(),
+            "{shape}: no suggestion: {diagnostic}"
+        );
+        // Every refusal of the pass is repaired at once: the parser reports
+        // each independent unit's refusal with its own edits.
+        let mut edits: Vec<_> = super::parse::parse_source_all(&source)
+            .1
+            .iter()
+            .filter_map(|d| d.suggestion.as_ref())
+            .flat_map(|s| s.edits.iter().cloned())
+            .collect();
+        edits.sort_by_key(|e| (e.start, e.end));
+        let repaired = super::parse::apply_edits(&source, &edits);
         let got = parse_source(&repaired)
             .unwrap_or_else(|e| panic!("{shape}: the repair does not parse: {e}\n{repaired}"));
         let want = parse_source(&as_source(intended)).expect("the intended text parses");

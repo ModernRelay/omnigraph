@@ -24,17 +24,17 @@ fields travel beside it.
 
 ## Every refusal in one pass
 
-A compile returns every independent refusal in one pass, in source order,
-each with its span; the first is the diagnostic and the `error` line, the
-others its `further` list. A grammar refusal stops the pass, since the text
-after it has no tree. Otherwise the pass holds a `T83` at each later
-declaration of a repeated name and every declaration's own refusals: each
-element of `match`, top-level conjunct of `where`, return item, order key and
-write statement is checked by itself. A construct naming a variable that a
-refused one would bind is skipped, and so are the order keys after a refused
-return item; a block, an `optional` or an inline read stops at its first
-refusal. `T81` and `T86` are checked only when nothing else in the
-declaration was refused.
+A compile returns every independent refusal of its earliest refusing stage
+in one pass, in source order, each with its span; the first is the
+diagnostic and the `error` line, the others its `further` list. The stages
+are parsing, then name resolution and typing (`T83`, `T81` and `T86`
+included). After a parse refusal the parser resumes at the next element,
+return item or order key, assignment, argument, parameter, `where`,
+statement or declaration. The type checker checks every element, conjunct,
+item, key, statement, assignment and operand, in blocks, `optional`s and
+inline reads too, and gives a refused construct an error type that passes
+every check: what reads a name a refused construct would bind is not
+reported, and a block or inline read holding a refusal is of that type.
 
 ```text
 query q() { match { $c: Company } where $c.names = "x" and $c.slug = 3 return { $c } }
@@ -53,9 +53,9 @@ with its type. An enum value outside its set lists the declared values, the
 five nearest when there are more.
 
 Applying every `machine_applicable` suggestion of one pass at once (they never
-overlap) gives a source that parses, holds fewer refusals and undoes no
-earlier edit; repairing the grammar can reveal type refusals, and those
-`T86`. Every expect-error case of the logic tests reaches a source with no such
+overlap) undoes no earlier edit and leaves fewer refusals of that stage or
+none, so that repairing the parse reveals the type refusals. Every
+expect-error case of the logic tests reaches a source with no such
 suggestion left within three passes.
 
 ## Typed suggestions
