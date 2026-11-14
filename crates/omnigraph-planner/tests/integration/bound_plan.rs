@@ -94,6 +94,7 @@ fn query(order_by: IRExpr) -> ReadShape {
             descending: false,
         }],
         limit: Some(3),
+        limit_param: None,
     }
 }
 
@@ -438,6 +439,7 @@ fn two_docs(filter: Option<IRExpr>) -> PhysicalPlan {
         distinct: false,
         order_by: vec![],
         limit: Some(3),
+        limit_param: None,
     };
     futures::executor::block_on(plan_query(&query, &source(), &fixture_bounds::BOUNDS))
         .expect("the query plans")

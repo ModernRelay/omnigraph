@@ -70,7 +70,9 @@ A query runs against one resolved `ReadTarget`:
    the planner never refuses a checked read. A term that still arrives
    unlowered is the planner's `P006`, an internal error and a defect.
 4. Gather the planning inputs once: bound parameters (`now()` among them),
-   constants folded to their values, statistics, settings and the index
+   constants folded to their values (a `limit $k`, which the shape records as
+   `limit_param`, takes its bound count here, so the plan's cut is that count
+   and a replay folds the count its own value table binds), statistics, settings and the index
    facts the full-text coverage of every ranked property is derived from.
 5. Plan the query and accept the plan (see [Plan acceptance](#plan-acceptance)).
 6. Bind the accepted plan's values and execute it against the same snapshot.

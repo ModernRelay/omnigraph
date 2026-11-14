@@ -39,7 +39,6 @@ const B_IN_PROGRESS: &[&str] = &[
     "a node an optional introduces returned whole",
     "a union arm returning a value",
     "a union whose arms read the enclosing scope",
-    "limit over a parameter",
     "distance as an rrf arm",
 ];
 
@@ -236,10 +235,13 @@ const CLOSURE: &[Row] = &[
                 "query q($n: I32? = 30) { match { $p: Person } where $p.age > $n return { $p.name } }",
                 Lowers,
             ),
-            // "limit over a parameter"
             (
                 "query q($k: I64) { match { $p: Person } return { $p.name } limit $k }",
-                Refused("B"),
+                Lowers,
+            ),
+            (
+                "query q($k: I64, $s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } return { $d.title } order { $score desc } limit $k }",
+                Lowers,
             ),
         ],
     },
@@ -354,7 +356,4 @@ fn t86_is_at_the_construct_with_its_repair() {
     );
     let at = d.position.expect("a position");
     assert_eq!((at.line, at.column), (4, 11), "{d}");
-    // `limit` over a parameter is refused at the `limit`.
-    let d = refused("query q($k: I64) { match { $p: Person } return { $p.name } limit $k }");
-    assert_eq!(d.position.map(|p| p.column), Some(66), "{d}");
 }

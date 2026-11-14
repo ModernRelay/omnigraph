@@ -250,6 +250,7 @@ mod tests {
                 descending: false,
             }],
             limit: Some(2),
+            limit_param: None,
         };
         let plan = futures::executor::block_on(crate::plan_query(&query, &source, &BOUNDS))
             .expect("the query plans");

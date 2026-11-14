@@ -533,6 +533,12 @@ query old_or_liking() {
     }
     return { $p.name }
 }
+query oldest($k: I64) {
+    match { $p: Person }
+    return { $p.name }
+    order { $p.age desc }
+    limit $k
+}
 query liked_d0_or_not() {
     match { $p: Person, optional { $p likes $d where $d.title = "d0" } }
     return { $p.name, $d.title }
@@ -1736,6 +1742,32 @@ async fn an_optional_replays_and_an_edited_one_is_refused() {
         error.to_string().contains("no optional of the plan"),
         "{error}"
     );
+}
+
+/// A `limit $k` plans the count its value table binds: the replay cuts at
+/// that count, and a saved plan whose value table binds another count than
+/// its cut holds is invalid evidence at the door.
+#[tokio::test]
+async fn a_parameter_limit_replays_its_bound_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let params = ParamMap::from([("k".to_string(), Literal::Integer(2))]);
+    let Replayed {
+        result, envelope, ..
+    } = replayed(&db, PEOPLE_QUERIES, "oldest", &params).await;
+    let names: Vec<String> = result.iter().map(|row| row["p.name"].to_string()).collect();
+    assert_eq!(names, ["\"cyd\"", "\"bob\""], "{result:?}");
+    let mut edited: Value = serde_json::from_slice(&envelope).unwrap();
+    edited["plan"]["body"]["values"]["params"]["k"] =
+        serde_json::json!({"literal": "integer", "value": 1});
+    let error = match db
+        .replay_bound_plan("main", &serde_json::to_vec(&edited).unwrap())
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a cut of 2 replayed under a value table binding 1"),
+    };
+    assert!(error.to_string().contains("row cut"), "{error}");
 }
 
 /// A union replays with every row of both arms, and a saved plan whose

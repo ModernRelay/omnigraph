@@ -1,0 +1,43 @@
+# issue: none
+# notes: `limit $k` over a ranking cuts the ranked rows after the ranking,
+# notes: never sizing it: `bm25` scores every match, the read's order sorts
+# notes: them by score, and the bound count takes the first.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    body: String @index
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"a","body":"graph graph graph"}}
+{"type":"Doc","data":{"slug":"b","body":"graph and more words here"}}
+{"type":"Doc","data":{"slug":"c","body":"nothing relevant"}}
+{"type":"Doc","data":{"slug":"d","body":"graph graph"}}
+
+--- query
+query top($s: String, $k: I64) {
+    match {
+        let $pop = { match { $d: Doc } return { $d } },
+        from bm25($pop, $d.body, $s) as $score,
+    }
+    return { $d.slug }
+    order { $score desc }
+    limit $k
+}
+
+--- params
+{"s": "graph", "k": 2}
+
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"d"}
+
+--- expect shape
+d.slug: String

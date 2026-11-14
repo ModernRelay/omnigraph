@@ -358,6 +358,7 @@ fn documents_query() -> Operation {
         distinct: false,
         order_by: Vec::new(),
         limit: None,
+        limit_param: None,
     }))
 }
 

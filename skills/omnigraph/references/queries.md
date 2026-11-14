@@ -157,6 +157,8 @@ than introducing a second `$p`. Variable names beginning `__` are reserved.
 
 Without `order`, `limit n` may return any `n` valid rows, and the subset can
 change between releases. Add `order { … }` when a stable page matters.
+`limit $n` reads the count from a parameter, which must be bound to a
+non-negative integer.
 
 ### Reverse traversal
 

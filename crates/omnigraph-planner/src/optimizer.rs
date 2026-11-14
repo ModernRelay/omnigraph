@@ -495,7 +495,13 @@ fn resolve_query(
         distinct,
         order_by,
         limit,
+        limit_param,
     } = ir;
+    if let (Some(param), None) = (limit_param, limit) {
+        return Err(PlanError::Internal(format!(
+            "`limit ${param}` reached the planner without its bound count"
+        )));
+    }
     let mut next_binding = 0u16;
     let mut current = resolve_pipeline(plan, pipeline, source, &mut next_binding, None)?;
     let schema = schema_of(plan, current)?;

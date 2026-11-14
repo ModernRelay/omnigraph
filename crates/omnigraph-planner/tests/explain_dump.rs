@@ -56,6 +56,7 @@ fn dump_failure_child() {
         distinct: false,
         order_by: vec![],
         limit: None,
+        limit_param: None,
     }));
     let source = MemorySource::default();
     let expected = route(

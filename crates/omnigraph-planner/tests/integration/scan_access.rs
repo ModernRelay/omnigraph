@@ -157,6 +157,7 @@ fn query(two: bool) -> ReadShape {
         distinct: false,
         order_by: vec![],
         limit: None,
+        limit_param: None,
     }
 }
 fn prepared(query: &ReadShape, source: &ProbeSource) -> Decision {

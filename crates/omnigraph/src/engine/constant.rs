@@ -143,9 +143,30 @@ fn literal_list(values: &ArrayRef) -> Result<Literal> {
 }
 
 /// Fold bound constant filters without changing their compiler-selected types.
+/// A `limit $param` takes the count the parameter is bound to here, so the
+/// plan's cut is that count and a replay folds its own value table's.
 pub(crate) fn fold_query_constants(ir: &ReadShape, params: &ParamMap) -> Result<ReadShape> {
     let mut folded = ir.clone();
     fold_pipeline(&mut folded.pipeline, params)?;
+    if let Some(name) = &folded.limit_param {
+        let ty = folded
+            .params
+            .iter()
+            .find(|param| param.declaration.name == *name)
+            .map(|param| param.ty.clone())
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!("`limit ${name}` names no declared parameter"))
+            })?;
+        let count = super::scan::resolve_to_int(&IRExpr::Param(name.clone(), ty), params)
+            .ok()
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "`limit ${name}` must be bound to a non-negative integer"
+                ))
+            })?;
+        folded.limit = Some(count);
+    }
     Ok(folded)
 }
 

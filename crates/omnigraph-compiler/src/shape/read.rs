@@ -48,6 +48,11 @@ pub struct ReadShape {
     pub distinct: bool,
     pub order_by: Vec<IROrdering>,
     pub limit: Option<u64>,
+    /// `limit $param`: the parameter the cut reads, its count bound at
+    /// execution. The engine folds the bound value into `limit` before
+    /// planning, so the plan's cut is that value and a replay folds the
+    /// value its own value table holds.
+    pub limit_param: Option<String>,
 }
 
 /// One step of a pattern.
@@ -622,13 +627,12 @@ impl<'a> Shaper<'a> {
         };
         let mut term: &Term = input;
         let mut limit = None;
+        let mut limit_param = None;
         if let Term::Cut { input, k } = term {
-            limit = Some(match k {
-                Count::Literal(n) => *n,
-                Count::Param(_) => {
-                    return Err(self.refuse_at("`limit` over a parameter", Construct::Limit));
-                }
-            });
+            match k {
+                Count::Literal(n) => limit = Some(*n),
+                Count::Param(p) => limit_param = Some(p.clone()),
+            }
             term = input;
         }
         let mut order_keys: &[(IRExpr, bool)] = &[];
@@ -774,9 +778,12 @@ impl<'a> Shaper<'a> {
         // its score leading the `order` in its direction and its window the
         // read's `limit`; any other ranking is a `Rank` step over its
         // population, cut to its own window, the `order` a plain sort.
+        // A cut read from a parameter has no count yet, so no ranking can
+        // take it for its window.
         let windowed = ranking.as_ref().is_some_and(|ranking| {
             after.is_some()
                 || ranking.exact.is_some()
+                || limit_param.is_some()
                 || self
                     .check_ranking(ranking, order_keys, limit, grouped)
                     .is_err()
@@ -986,6 +993,7 @@ impl<'a> Shaper<'a> {
             distinct,
             order_by,
             limit,
+            limit_param,
         })
     }
 
