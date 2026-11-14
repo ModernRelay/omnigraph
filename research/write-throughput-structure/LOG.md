@@ -215,3 +215,18 @@ the manifest's inline transaction). Bandwidth is not a bottleneck at these rates
 O2 builds: workspace crates at opt-level 2 via `CARGO_PROFILE_DEV_OPT_LEVEL=2` (deps unchanged);
 the baseline built in a worktree at 1dfc121c sharing target/ (note: the worktree path recompiled
 every dependency once, ~9 min, and its test binary landed at the same path as the main tree's).
+
+## Final comparison at opt-level 2 (results/{baseline,best}-o2-*.jsonl), rep 1
+
+S3 +30 ms (commits/s, p99 ms): same 1w 2.80/376 -> 4.07/279; 4w 2.07/1988 -> 9.73/430;
+16w 2.13/7705 -> 9.60/1946; 64w 2.33/17879 -> 9.13/13248. separate 1w 1.60/659 -> 3.67/282;
+4w 4.33/1047 -> 14.40/292; 16w 13.53/1493 -> 56.59/301; 64w 23.47/6141 -> 182.19/3078.
+Local: same 1w 22.13 -> 27.40; 4w 20.67 -> 43.87; 16w 20.73/935 -> 64.19/433; 64w 22.27/3270 ->
+56.73/2144. separate 16w 113.46/218 -> 141.25/170; 64w 125.18/683 -> 179.92/1825.
+The local separate 64w p99 of 1825 ms did not reproduce: rep 2 186.32/529, warm-up off
+188.65/533 (results/best-o2-rep2-file, best-o2-nowarm-file). Run-to-run tail variance, not W.
+
+Correctness fixes made after the O2 build (not in wt-best-o2; behavior-preserving for the
+instrument's publishing inserts): trust only in the carrying revalidation (a no-op conditional
+write keeps its probe), and a trusted capture marks the head on record so a write that stages
+nothing probes before answering.
