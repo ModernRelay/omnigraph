@@ -1,5 +1,5 @@
 //! Group commit for insert-only writes on one branch (research prototype,
-//! `research/write-throughput`; design in the group-commit RFC of PR #785).
+//! `research/write-throughput`; design in the draft group-commit RFC).
 //!
 //! A write that only inserts by key, names no expected head and publishes on
 //! its branch prepares as before (capture, execute, validate, stage), then
@@ -18,21 +18,34 @@
 //! Admission (an entry captured at head `H0`, the batch forming at `Hc`):
 //! - its branch incarnation and accepted schema are the batch's;
 //! - `H0 == Hc`, or every commit in `(H0, Hc]` is one of this group's own
-//!   batches (the effect log), whose per-table key filters do not overlap the
-//!   entry's on any table the entry writes: an insert-only entry read only
-//!   key absence on its own tables (Lance's key filters decide it; a Bloom
-//!   false positive refuses, never admits) and endpoint existence, which
-//!   inserts keep;
-//! - no entry admitted earlier in this batch inserts a key it may share.
+//!   batches (the effect log), whose inserted ids do not meet the entry's on
+//!   any table the entry writes: an insert-only entry read only key absence
+//!   on its own tables and endpoint existence, which inserts keep. Exact id
+//!   sets decide when both sides kept them (`StagedWrite::inserted_ids`);
+//!   otherwise Lance's key filters do, whose Bloom false positives refuse and
+//!   never admit;
+//! - no entry admitted earlier in this batch inserts an id it may share.
 //!
 //! The batch is conflict-serializable in admission order. A commit by any
 //! other writer clears the effect log, so every entry captured before it is
-//! refused. The compare-and-swap stays the only cross-process fence.
+//! refused and prepares again outside the gates. The compare-and-swap stays
+//! the only cross-process fence.
+//!
+//! On a branch other than the handle's bound branch the group keeps the
+//! coordinator it last published through (and installs it as the handle's
+//! branch authority), so a batch there neither probes nor reopens the branch.
+//! With `OMNIGRAPH_GROUP_COMMIT_PIPELINE=1` a batch composes and commits its
+//! detached versions on the pins the in-flight batch will publish while that
+//! batch publishes (`lead_pipelined`); its staging witness then names the
+//! predecessor's parent head, which the collector's staging rule does not yet
+//! accept (see the research report).
 //!
 //! Not production: a dropped leader future strands its batch (the server owns
 //! its writes, an embedded caller may not), an in-doubt outcome is reported to
-//! followers as an internal error carrying the leader's message, and the queue
-//! is unbounded.
+//! followers as an internal error carrying the leader's message and evidence,
+//! the queue is unbounded, the ordinary path's failpoint seams are not crossed,
+//! and an entry refused by a row-preserving publication (optimize, an index
+//! build) is not carried over it.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Mutex;

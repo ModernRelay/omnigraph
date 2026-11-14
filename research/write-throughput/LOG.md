@@ -367,3 +367,52 @@ A/B on group11-opt (group commit on), `OMNIGRAPH_KNOWN_KEYS=0` → default:
 **Verdict: keep.** Also found: with group commit off the ordinary path still
 had the discarded insert carry on (0.9 w/s on S3 at 16 writers); made opt-in
 (`OMNIGRAPH_INSERT_CARRY=1`).
+
+## Upstream Lance pages read (2026-11-14, via `npx defuddle`, pandoc absent)
+
+transaction, versioning (feature flags), branch_tag, tags_and_branches,
+object_store, index overview, distributed_write, row_id_lineage. What they
+confirm for this design:
+
+- Transaction files serve conflict detection and manifest reconstruction on
+  retry; the inline transaction section (field 23) is an optional cache.
+  `FLAG_DISABLE_TRANSACTION_FILE` (2^5, writer-required) is a format feature
+  ("transactions are recorded in the manifest rather than in a separate
+  transaction file"); Lance 13 only lacks a public `CommitBuilder` switch.
+  This is the upstream ask that would make a publication 3 serial PUTs.
+- Update's `inserted_rows` is the key-existence filter "used for conflict
+  detection", tracking keys from inserts only: what admission's Bloom
+  fallback and the insert carry rely on.
+- Distributed write: fragment ids and stable row ids are assigned by the
+  commit ("only the commit knows which values are free"), version metadata is
+  derived while building the manifest: what composing raw staged fragments on
+  a later pin relies on (pinned by #785's surface guard).
+- Object store: safe concurrent S3 writers require create-only `PutObject`
+  with `If-None-Match: *` (RustFS enforces it; the CI-pinned version is used).
+- `CompositeOperation` (Lance 14) and `FLAG_FRAGMENT_TREE` (fragment records
+  outside the manifest) are future substrate features relevant here: the
+  first could carry several operations in one table commit, the second would
+  stop table manifests from growing with the many small fragments high-rate
+  inserts create.
+
+## Final run (group12-opt vs baseline-opt, `scripts/matrix-final.sh`)
+
+Medians of 3 (same branch) / 2 (separate) interleaved repetitions; full table
+`results/final-best-matrix.md`.
+
+| cell | baseline w/s | best w/s | best commits/s | p99 baseline → best |
+|---|---:|---:|---:|---|
+| S3 same 1 | 2.90 | 4.15 (claim 4.85) | 4.15 | 360 → 263 ms |
+| S3 same 16 | 2.20 | 44.85 | 5.65 | 7,519 → 367 ms |
+| S3 same 64 | 2.35 | 153.54 | 4.75 | 22,663 → 504 ms |
+| S3 same 128 | — | 208.05 | 3.25 | → 2,100 ms (claim 798) |
+| S3 same 256 | — | 244.53 | 2.05 | → 2,070 ms |
+| local same 1 | 25.65 | 57.34 | 57.3 | 64 → 26 ms |
+| local same 16 | 21.10 | 203.19 | 25.8 | 1,061 → 142 ms |
+| local same 64 | 22.30 | 247.49 | 8.0 | 3,878 → 534 ms |
+| S3 separate 16 | 13.97 | 29.62 | 29.6 | 1,431 → 741 ms |
+| S3 separate 64 | 34.20 | 73.90 | 73.9 | 3,847 → 3,701 ms |
+| local separate 64 | 191.97 | 306.23 | 306 | 500 → 333 ms |
+
+Final correctness (dev build, final code): writes 67/67 and integration
+703/703 (9 ignored) with group commit off and on.

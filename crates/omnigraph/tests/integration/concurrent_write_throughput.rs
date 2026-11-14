@@ -10,7 +10,7 @@
 //!   (they differ only when several writes share one publication);
 //! - service-time percentiles of the writes acknowledged in the window, and
 //!   the longest service time of any write, drain included, so a starved
-//!   writer is visible (#784);
+//!   writer is visible;
 //! - per-writer acknowledged counts;
 //! - object-store requests per acknowledged write, by method, counted by a
 //!   wrapper on every Lance store the writers open (complete on S3; on

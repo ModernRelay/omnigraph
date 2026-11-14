@@ -8,7 +8,71 @@ every intermediate verdict are in [`LOG.md`](LOG.md); instrument output in
 
 ## Summary
 
-<!-- SUMMARY -->
+**Problem.** With many writers on one branch, every `__manifest` publication
+invalidated every other prepared write, which then prepared again holding the
+branch gate. A branch served one write per ~10 serial object-store round trips
+no matter how many writers it had: 2.2 writes/s at 4, 16 and 64 writers on an
+object store with ~30 ms per request (22/s on local disk), with p99 growing
+linearly in N (22.9 s at 64 writers) and, before the gated re-prepare, one
+writer making every commit (#784).
+
+**Winning design.** *Group commit with exact-key admission, plus a leaner
+write path around it* (§7):
+
+1. Insert-only writes on a branch that arrive while a publication is in flight
+   join the next batch (leader/follower write group, natural batching, no
+   timer). The leader admits each entry by proving its keys disjoint from
+   everything published since its capture (an in-memory log of the group's own
+   batches with exact inserted-id sets), composes each table's inserts into one
+   Lance transaction on the current pin, commits it detached and publishes all
+   pins in one `__manifest` compare-and-swap, as one graph commit.
+2. Round trips around the publication are removed where the compare-and-swap
+   already decides: the publisher's first attempt uses its own acknowledged
+   image instead of listing `_versions`; the leader captures from its own last
+   publication; the next version's index metadata is read during the
+   publication; named branches keep a warm coordinator and publisher image.
+3. A writer's key-absence probe answers the unindexed tail from a cache of the
+   exact ids this process wrote into those immutable data files, instead of
+   reading every unindexed fragment (a cost that grew with every write).
+
+**Result** (optimized builds, closed-loop, medians of 3 interleaved runs; §6):
+
+| | writers | baseline writes/s | **best writes/s** | best graph commits/s | baseline p99 | **best p99** |
+|---|---:|---:|---:|---:|---:|---:|
+| S3 +30 ms, one branch | 16 | 2.20 | **44.85** (20×) | 5.65 | 7,519 ms | **367 ms** |
+| S3 +30 ms, one branch | 64 | 2.35 | **153.54** (65×) | 4.75 | 22,663 ms | **504 ms** |
+| local, one branch | 16 | 21.10 | **203.19** (9.6×) | 25.8 | 1,061 ms | **142 ms** |
+| local, one branch | 64 | 22.30 | **247.49** (11×) | 8.0 | 3,878 ms | **534 ms** |
+| S3 +30 ms, separate branches | 16 | 13.97 | **29.62** (2.1×) | 29.6 | 1,431 ms | 741 ms |
+| S3 +30 ms, separate branches | 64 | 34.20 | **73.90** (2.2×) | 73.9 | 3,847 ms | 3,701 ms |
+| local, separate branches | 16 | 134.39 | **196.09** (1.5×) | 196 | 362 ms | 137 ms |
+| local, separate branches | 64 | 191.97 | **306.23** (1.6×) | 306 | 500 ms | 333 ms |
+
+Every write in both columns is acknowledged only after its `__manifest`
+compare-and-swap; "writes/s" counts acknowledged writes (each a committed
+write), "graph commits/s" counts publications (one per batch). Writes per
+publication: 8 at 16 and 32 at 64 writers on S3. Engine re-prepares per write
+fall from ~1.0 to 0; requests per write on S3 from 24 to 3.8 (16 writers) and
+22 to 3.2 (64). A single writer on S3 is 1.4× faster (4.15 vs 2.90 writes/s,
+p99 263 vs 360 ms; 4.85 with the claim), and locally 2.2× (57.3 vs 25.7).
+
+**What did not work:** rebasing each write over intervening inserts instead of
+re-preparing (O(N) chain reads under the gate; worse at 16+ writers on S3); a
+leader linger (cohorts alternate anyway); pipelining batches (+60–70 %
+publications/s, no gain in closed-loop writes/s, and it needs a collector
+change); capturing every write without a probe (safe for the CAS but not for
+the write's meaning; withdrawn in favour of the writer epoch claim).
+
+**What it changes** (§8): the commit grain (several writes of one actor share
+a graph commit) and the wording of invariant 3 (an entry's footprint is proven
+unchanged rather than its whole view revalidated) — both RFC-level, in the
+direction of the open group-commit RFC (#785). Everything else keeps the hard
+invariants: one publication door, detached effects unreachable until the CAS,
+acknowledgement only after the CAS, bounded retries. §10 lists what a
+production version needs (seams, typed in-doubt outcomes for every member,
+admission across row-preserving publications for #1331, a bounded queue,
+docs).
+
 
 ## 1. Question and boundary
 
@@ -305,7 +369,41 @@ one named-branch writer); this also removed the two `warm_read_cost` deltas
 | S3 +30 ms | 16 | 38.95 → 44.85 | 578 → 372 | 11.0 → 3.8 | 7.1 → 7.9 |
 | S3 +30 ms | 64 | 68.60 → 152.74 | 2,012 → 485 | 7.7 → 3.2 | 16.0 → 32.2 |
 
-<!-- KK-MORE -->
+### 5.11 Scaling past 64 writers (group12, one branch, 1 run each)
+
+| writers | S3 writes/s | S3 commits/s | S3 p99 | local writes/s | local p99 |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 153.5 | 4.75 | 504 ms | 247.5 | 534 ms |
+| 128 | 208.1 (claim 211.2) | 3.25 | 2,100 ms (claim 798) | 246.6 (claim 275.9) | 1,738 ms (claim 814) |
+| 256 | 244.5 (claim 230.4) | 2.05 | 2,070 ms (claim 1,542) | 260.7 (claim 281.1) | 1,698 ms (claim 1,465) |
+
+Throughput keeps rising with writers on S3 but flattens near 250 writes/s on
+both backends: batches grow to ~120 writes while publications fall to ~2/s,
+because a batch's own work grows with its size (one fragment per write to
+compose and list in the table manifest, plus the client CPU of 256 writers'
+preparation). The next levers there are fewer, larger fragments per batch
+(the leader writing one data file per table), pipelining (§5.5), and Lance's
+fragment tree.
+
+### 5.10 Final configuration (group12, every switch at its default)
+
+Same binary, `OMNIGRAPH_GROUP_COMMIT` off vs on, beside the original
+baseline (medians of 3; separate branches of 2):
+
+| cell | baseline | ordinary path + trims + known keys | best (group commit) |
+|---|---:|---:|---:|
+| S3 same, 16 writers | 2.20 | 2.45 | 44.85 |
+| S3 same, 64 writers | 2.35 | 2.65 | 153.54 |
+| local same, 16 writers | 21.10 | 47.80 | 203.19 |
+| local same, 64 writers | 22.30 | 49.25 | 247.49 |
+| S3 separate, 16 writers | 13.97 | 13.72 | 29.62 |
+| S3 separate, 64 writers | 34.20 | 33.97 | 73.90 |
+| local separate, 64 writers | 191.97 | 218.00 | 306.23 |
+
+The ordinary path keeps its one-publication-per-write ceiling on S3 (+10 %);
+locally the known-keys probe and the missing LIST alone give 2.2× on one
+branch. Batching is what moves the object-store numbers; the named-branch warm
+state (which only the group path uses) is what doubles separate branches.
 
 ### 5.8 Ruled out by analysis
 
@@ -429,6 +527,12 @@ one gated critical section per write becomes one per batch. Concretely:
    parallel, stamped with the batch head's staging witness.
 5. **Publication.** One `__manifest` compare-and-swap through the unchanged
    publisher, as one graph commit whose receipt every admitted entry gets.
+6. **Cheap preparation.** A writer's key-absence probe answers the fragments
+   the id index does not cover from a cache of the exact ids this process
+   wrote into those (immutable) data files, scanning only the indexed part;
+   anything unknown or touched by a deletion is read as before. Without it
+   the writers' own probes, which grow with every unindexed fragment, become
+   the bottleneck once publication is amortized.
    The publisher's first attempt reuses its own acknowledged image (no LIST);
    the leader captures from its own last publication (no probe) when the log
    explains every entry; each new version's index metadata is warmed during
@@ -456,7 +560,7 @@ saturation, pending the collector-witness change it needs.
 | 8 Loud integrity | Constraints an entry validated hold at publication: the class rules exclude every check an intervening insert could change. Errors keep their completion evidence (`Unpublished` stays definite). In-doubt is reported to followers as an internal error carrying the leader's message. | Carry the typed in-doubt outcome (and commit id) to every member. |
 | 10 Policy | Unchanged: enforced at each write's `_as` entry point before submission. | — |
 | 11 Bounded, observable | Effect log bounded (128 batches), batch bounded (512 entries), retries bounded (32). Queue unbounded; a refused entry re-prepares outside the gates (no progress bound against a continuously running `optimize`, issue #1331). | Bound the queue (server admission already bounds HTTP writes); carry entries over row-preserving foreign commits in admission, or fall back to the gated re-prepare after k refusals. |
-| 12 One source of truth | The effect log caches facts about immutable published commits; the trusted acknowledged image and the leader's own view are hints whose staleness costs a refused CAS, never commit authority. | — |
+| 12 One source of truth | The effect log caches facts about immutable published commits; the trusted acknowledged image and the leader's own view are hints whose staleness costs a refused CAS, never commit authority. The known-keys cache holds the contents of immutable data files keyed by their random path; it is consulted only for fragments with no deletion file and falls back to the scan on any miss. | Bound by bytes, not ids; make the file-path key carry the dataset root as well. |
 | Deny-list: process-local lock as fencing | The group is process-local and fences nothing; the CAS (and the writer epoch) remain the cross-process fences. | — |
 
 The round-trip trims (5.3, 5.6) change no invariant: a mutable-tip cache is
@@ -468,30 +572,37 @@ can still change what a write *means* before it reaches the CAS.
 
 ## 9. Correctness evidence so far
 
-Run with the dev build, group commit forced on process-wide
-(`OMNIGRAPH_GROUP_COMMIT=1`), `RUST_MIN_STACK=16777216` as CI sets it:
+Final code (`group12` plus a defensive overlay check in the known-keys probe),
+dev build, `RUST_MIN_STACK=16777216` as CI sets it:
 
-- `crates/omnigraph/tests/writes.rs`: 67 passed, 0 failed (also 67/67 with
-  group commit off, after the publisher fix in 5.3).
-- Engine `integration` binary: 701 passed, 2 failed, 9 ignored. Both failures
-  are request-count assertions in `warm_read_cost.rs`
-  (`branch_delete_reuses_only_a_current_write_capture`,
-  `named_read_borrows_write_capture_and_rejects_recreated_branch`): a
-  named-branch write through the group keeps its own coordinator instead of
-  the handle's one-entry cache, so a following read or branch delete opens one
-  more. All 712 pass with group commit off.
-- `failpoints.rs` (stopped after 25 tests: 20 passed, 5 failed or hung). The
-  failing tests park a writer at seams on the ordinary path that the group
-  path bypasses (`commit_all`, revalidation), including two-process
-  `branch_claim_*` cases whose child never reaches its seam, and the two
-  #1331 cases, which expect a write sent back by another handle's `optimize`
-  to be carried over or to hold off the next run.
-- Every instrument run verifies exact row counts per branch on a fresh handle
-  (seed + every acknowledged insert, no loss, no duplicate).
+| suite | group commit off | group commit forced on |
+|---|---|---|
+| `crates/omnigraph/tests/writes.rs` | 67 passed, 1 ignored | 67 passed, 1 ignored |
+| engine `integration` binary | 703 passed, 9 ignored | 703 passed, 9 ignored |
+| `failpoints.rs` | 180 passed, 2 ignored | partial, earlier build: 20 of 25 run passed |
+
+Found and fixed on the way by these suites: a conditional write refused
+terminally because the publisher judged its head precondition on the trusted,
+stale image (`writes.rs::refreshed_warm_read_token_is_accepted_by_next_conditional_write`;
+now re-judged on a fresh load); followers losing the batch's completion
+evidence (`writes.rs::publisher_failure_before_the_manifest_put_is_definite_issue_1067`);
+four contract breaks from the probe-free writer capture (§5.7, withdrawn);
+two request-count deltas from keeping a separate group coordinator
+(`warm_read_cost.rs`, fixed by one per-branch writer state).
+
+The failpoints run with group commit forced on was stopped after 25 tests:
+the failures park a writer at seams on the ordinary path that the group path
+bypasses (two-process `branch_claim_*` children never reach their seam) and
+the two #1331 cases (a write sent back by another handle's optimize is
+expected to be carried over or to hold off the next run; a refused group
+entry instead prepares again outside the gates). Both are production work
+(§10).
+
+Every instrument run (about 400 cells) verified exact row counts per branch
+on a fresh handle: seed plus every acknowledged insert, no loss, no duplicate.
 
 Not run: DST concurrent universes and the GQT corpus with the switch on, the
 S3/Azure suites, release-profile guards.
-
 
 ## 10. What a production version needs
 
@@ -532,6 +643,36 @@ S3/Azure suites, release-profile guards.
    transaction rather than the `.txn` file name), and a way to stage a detached
    manifest whose version the caller chooses (the `__manifest` rows could then
    be written in parallel with the table commit).
-9. **Docs** in the same change: `writes.md` (the write path and the commit
+9. **Known keys.** A byte bound and eviction policy; key by dataset root plus
+   file path; record the exact ids for every keyed insert writer, not only the
+   absence-proven one; consider letting the probe use it beyond the
+   8,192-row tail limit (`stage_keyed_write`'s `tail.fragments × ids` cap),
+   where the scan it replaces is the expensive merge join. Another process's
+   fragments are unknown and still scanned, which is correct and only slower.
+10. **Docs** in the same change: `writes.md` (the write path and the commit
    grain), the user guide's commit pages, a changelog fragment, the skill.
 
+
+## Appendix: reproducing
+
+```bash
+# Object store with latency (RustFS 1.0.0-beta.12 + toxiproxy, +15 ms each way)
+research/write-throughput/scripts/s3-up.sh
+# Dev build of the instrument, or an optimized one (every crate at opt-level 2)
+cargo dev-build-tests
+research/write-throughput/scripts/build-opt.sh /src/omnigraph best-opt
+echo /srv/bins/best-opt > /tmp/cw_bin
+# One sweep: label, target, writers, modes, repetitions, window seconds
+OMNIGRAPH_GROUP_COMMIT=1 research/write-throughput/scripts/sweep.sh best s3 1,4,16,64 same,separate 1 20
+# Summaries
+python3 research/write-throughput/scripts/summarize.py research/write-throughput/results <label>...
+```
+
+Research switches (environment): `OMNIGRAPH_GROUP_COMMIT=1` (group commit and
+its trims), `OMNIGRAPH_GROUP_COMMIT_PIPELINE=1`, `OMNIGRAPH_KNOWN_KEYS=0`
+(disable the known-keys probe), `OMNIGRAPH_PUBLISH_TRUST_ACKNOWLEDGED=0`
+(restore the publisher's listing), `OMNIGRAPH_INSERT_CARRY=1` (the discarded
+carry), `OMNIGRAPH_GROUP_COMMIT_WRITER_CAPTURE_SKIP=1` (the withdrawn
+probe-free writer capture), `OMNIGRAPH_GROUP_COMMIT_TIMING=1` /
+`OMNIGRAPH_GROUP_COMMIT_DEBUG=1` (phase timing, refusal reasons). Instrument
+knobs are `OG_CW_*` (module docs of the instrument).

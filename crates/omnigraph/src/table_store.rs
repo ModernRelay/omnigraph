@@ -1472,7 +1472,13 @@ async fn known_tail_members(
         .iter()
         .filter(|fragment| uncovered.contains(&fragment.id))
     {
-        if fragment.deletion_file.is_some() || fragment.files.len() != 1 {
+        // Only a fragment whose live rows are exactly its one data file's
+        // rows: no deletion file, no second data file (a patched or added
+        // column), no overlay (changes cell values on read).
+        if fragment.deletion_file.is_some()
+            || fragment.files.len() != 1
+            || !fragment.overlays.is_empty()
+        {
             return Ok(None);
         }
         let Some(ids) = known_keys::get(&fragment.files[0].path) else {
