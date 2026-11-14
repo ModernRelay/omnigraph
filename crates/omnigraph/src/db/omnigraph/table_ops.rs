@@ -1767,6 +1767,74 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     Ok(published)
 }
 
+/// Research (pipelined publication): publish a mutation's detached effects on
+/// the handle's bound branch through the publisher's pipeline. The
+/// publication's rows are fixed on the pipeline tip under the caller's gates;
+/// the branch and table gates are then released, so the next writer stages
+/// behind this one while this one waits for its predecessor and puts its
+/// version. The shared schema permit is held until the publication settles.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn commit_updates_pipelined(
+    db: &Omnigraph,
+    branch: Option<&str>,
+    updates: &[crate::db::DatasetUpdate],
+    expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
+    txn: &crate::db::WriteTxn,
+    lineage_intent: crate::db::manifest::LineageIntent,
+    gates: crate::db::write_queue::HeldWriteGates,
+    gates_acquired_at: std::time::Instant,
+) -> Result<crate::db::GraphCommit> {
+    let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn))
+        .await
+        .map_err(OmniError::unpublished)?;
+    let changes = prepared
+        .iter()
+        .cloned()
+        .map(ManifestChange::Update)
+        .collect::<Vec<_>>();
+    let expectation = crate::db::manifest::GraphHeadExpectation::new(
+        branch,
+        txn.authority.branch_identifier.clone(),
+        txn.authority.graph_head.clone(),
+    );
+    let precondition = crate::db::manifest::PublishPrecondition::ExactGraphHead(expectation);
+    let publish_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+        crate::instrumentation::phase_timers::WritePhase::Publish,
+    );
+    let installed = db.coordinator.load_full();
+    let mut next = crate::db::graph_coordinator::GraphCoordinator::clone(&installed);
+    let gates = std::sync::Arc::new(std::sync::Mutex::new(Some(gates)));
+    let permit = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let (gate_cell, permit_cell) = (gates.clone(), permit.clone());
+    let between: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
+        if let Some(held) = gate_cell.lock().expect("gate cell").take() {
+            *permit_cell.lock().expect("permit cell") = Some(held.release_branch_and_tables());
+        }
+        crate::instrumentation::phase_timers::record(
+            crate::instrumentation::phase_timers::WritePhase::GateHold,
+            gates_acquired_at.elapsed(),
+        );
+    });
+    let outcome = next
+        .commit_changes_pipelined(
+            &changes,
+            expected_table_versions,
+            lineage_intent,
+            &precondition,
+            between,
+        )
+        .await;
+    db.install_coordinator(next, &installed);
+    drop(gates);
+    drop(permit);
+    let published = outcome
+        .map(|published| published.commit)
+        .map_err(|error| caller_precondition_at_publish(txn, branch, error))?;
+    publish_timer.stop();
+    demote_superseded_handles(db, &txn.base, updates).await;
+    Ok(published)
+}
+
 /// The publisher's refusal on the branch head is the caller's `--if-commit`
 /// miss when the write carries one: terminal `PreconditionFailed` naming the
 /// head the publisher read, as the under-gate revalidation answers it.

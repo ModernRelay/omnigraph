@@ -1100,6 +1100,55 @@ impl GraphCoordinator {
         })
     }
 
+    /// Research (pipelined publication): [`Self::commit_changes_with_intent_and_expected`]
+    /// through the publisher's pipeline; `between` runs once the rows are
+    /// fixed on the pipeline tip and before the version CAS.
+    pub(crate) async fn commit_changes_pipelined(
+        &mut self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        intent: LineageIntent,
+        precondition: &PublishPrecondition,
+        between: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<PublishedSnapshot> {
+        fail(&GRAPH_PUBLISH_BEFORE_COMMIT_APPEND)?;
+        let outcome = self
+            .manifest
+            .commit_changes_pipelined(changes, expected_table_versions, &intent, precondition, between)
+            .await?;
+        fail(&GRAPH_PUBLISH_AFTER_MANIFEST_COMMIT)?;
+        let record = outcome.commit.ok_or_else(|| {
+            OmniError::manifest_internal("a pipelined publish returned no graph commit record")
+        })?;
+        let commit = graph_commit_from_manifest_row(record);
+        Ok(PublishedSnapshot {
+            graph_manifest_version: outcome.version,
+            _snapshot_id: SnapshotId::new(commit.graph_commit_id.clone()),
+            commit,
+        })
+    }
+
+    /// Research (pipelined publication): the publisher's pipeline tip.
+    pub(crate) fn pipeline_tip(&self) -> Option<omnigraph_catalog::PipelineView> {
+        self.manifest.pipeline_tip()
+    }
+
+    /// Research (pipelined publication): wait for an in-flight pipelined
+    /// publication to settle.
+    pub(crate) async fn drain_pipeline(&self) {
+        self.manifest.drain_pipeline().await
+    }
+
+    /// Research (pipelined publication): the authority a pipeline tip
+    /// predicts on this coordinator's branch.
+    pub(crate) fn predicted_authority(
+        &self,
+        view: &omnigraph_catalog::PipelineView,
+    ) -> (Option<String>, Option<String>, Snapshot) {
+        let (exact, effective, snapshot) = self.manifest.predicted(view);
+        (exact, Some(effective), Snapshot::wrap(snapshot))
+    }
+
     /// Write `changes` as an unpublished commit under the exact `authority`
     /// (RFC "Unpublished graph commits"): the head and this coordinator's
     /// view stay as captured. The commit reports the detached version it

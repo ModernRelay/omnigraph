@@ -260,6 +260,9 @@ impl<'a> PreEffectReprepares<'a> {
             identity_changed: false,
             insert_only: false,
         };
+        // Research (pipelined publication): the gated attempt prepares on
+        // landed state, so a publication still in flight settles first.
+        self.db.drain_pipeline(self.branch).await;
         self.db.refresh_coordinator_only().await
     }
 }

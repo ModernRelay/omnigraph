@@ -529,6 +529,17 @@ pub(crate) struct HeldWriteGates {
 }
 
 impl HeldWriteGates {
+    /// Research (pipelined publication): release the branch and table gates,
+    /// keeping the shared schema permit until the publication settles.
+    pub(crate) fn release_branch_and_tables(self) -> SchemaSharedPermit {
+        let Self {
+            _schema, _branch, _tables,
+        } = self;
+        drop(_tables);
+        drop(_branch);
+        _schema
+    }
+
     /// Assemble the envelope from the gates in acquisition order: the
     /// shared schema permit, then the branch gate, then the sorted table
     /// gates.

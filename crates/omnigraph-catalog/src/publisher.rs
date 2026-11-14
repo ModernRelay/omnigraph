@@ -391,6 +391,46 @@ pub trait ManifestBatchPublisher: Send + Sync {
     /// This process deleted the incarnation `native` of `branch`: it holds
     /// nothing there from here on.
     fn release_writer_epoch(&self, _branch: &str, _native: &str) {}
+
+    /// Research (pipelined publication): publish like
+    /// `publish_with_precondition`, calling `between` once the publication's
+    /// rows are fixed on the pipeline tip and before its version CAS, so the
+    /// caller can release the gates that order publications on the branch.
+    /// The default implementation has no pipeline.
+    async fn publish_pipelined(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        lineage: Option<&LineageIntent>,
+        precondition: &PublishPrecondition,
+        between: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<PublishOutcome> {
+        let outcome = self
+            .publish_with_precondition(changes, expected_table_versions, lineage, precondition)
+            .await;
+        between();
+        outcome
+    }
+
+    /// Research (pipelined publication): the state a pending or landed
+    /// pipelined publication of this process predicts for its version, the
+    /// view a writer staging behind it must take; `None` when the pipeline is
+    /// empty or its last publication failed.
+    fn pipeline_tip(&self) -> Option<PipelineView> {
+        None
+    }
+
+    /// Research (pipelined publication): wait until no pipelined publication
+    /// of this process is in flight on the branch.
+    async fn drain_pipeline(&self) {}
+}
+
+/// Research (pipelined publication): what a pipeline tip predicts.
+#[derive(Clone)]
+pub struct PipelineView {
+    pub version: u64,
+    pub head: GraphLineageRow,
+    pub known_state: ManifestState,
 }
 
 pub struct GraphNamespacePublisher {
@@ -400,6 +440,39 @@ pub struct GraphNamespacePublisher {
     published_rows: Mutex<Option<PublishedRows>>,
     holders: Arc<WriterEpochHolders>,
     holder_key: OnceLock<HolderKey>,
+    /// Research (pipelined publication): the last pipelined publication of
+    /// this process on the branch, pending or settled.
+    pipeline: tokio::sync::Mutex<Option<PipelineTip>>,
+}
+
+type PipelineOutcome = tokio::sync::watch::Receiver<Option<std::result::Result<Dataset, ()>>>;
+
+/// Research (pipelined publication): one pipelined publication, as the next
+/// publication builds on it.
+struct PipelineTip {
+    version: u64,
+    rows: ManifestRows,
+    known_state: ManifestState,
+    outcome: PipelineOutcome,
+}
+
+impl PipelineTip {
+    /// `Some(Ok)` landed, `Some(Err)` failed, `None` pending.
+    fn settled(&self) -> Option<std::result::Result<Dataset, ()>> {
+        self.outcome.borrow().clone()
+    }
+}
+
+/// Wait for a pipelined publication to settle; a dropped sender is a failure.
+async fn settle(mut outcome: PipelineOutcome) -> std::result::Result<Dataset, ()> {
+    loop {
+        if let Some(settled) = outcome.borrow_and_update().clone() {
+            return settled;
+        }
+        if outcome.changed().await.is_err() {
+            return outcome.borrow().clone().unwrap_or(Err(()));
+        }
+    }
 }
 
 pub(crate) const PUBLISHED_ROWS_CACHE_BYTES: usize = 8 * 1024 * 1024;
@@ -589,6 +662,7 @@ impl GraphNamespacePublisher {
             published_rows: Mutex::new(None),
             holders: WriterEpochHolders::of_process(),
             holder_key: OnceLock::new(),
+            pipeline: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -1434,6 +1508,49 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
         .map_err(OmniError::unpublished)
     }
 
+    async fn publish_pipelined(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        lineage: Option<&LineageIntent>,
+        precondition: &PublishPrecondition,
+        between: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<PublishOutcome> {
+        self.publish_pipelined_impl(
+            changes,
+            expected_table_versions,
+            lineage,
+            precondition,
+            between,
+        )
+        .await
+    }
+
+    fn pipeline_tip(&self) -> Option<PipelineView> {
+        let pipe = self.pipeline.try_lock().ok()?;
+        let tip = pipe.as_ref()?;
+        match tip.settled() {
+            Some(Err(())) => None,
+            _ => Some(PipelineView {
+                version: tip.version,
+                head: tip.rows.head.clone(),
+                known_state: tip.known_state.clone(),
+            }),
+        }
+    }
+
+    async fn drain_pipeline(&self) {
+        let outcome = self
+            .pipeline
+            .lock()
+            .await
+            .as_ref()
+            .map(|tip| tip.outcome.clone());
+        if let Some(outcome) = outcome {
+            let _ = settle(outcome).await;
+        }
+    }
+
     async fn write_candidate(
         &self,
         changes: &[ManifestChange],
@@ -2106,6 +2223,282 @@ impl GraphNamespacePublisher {
             "manifest publish exhausted {} retries against concurrent writers",
             PUBLISHER_RETRY_BUDGET
         )))
+    }
+}
+
+impl GraphNamespacePublisher {
+    /// Research (pipelined publication). Phase A, under the caller's branch
+    /// gate: build the next rows on the pipeline tip (a pending or landed
+    /// publication of this process), or, with no tip yet, on this process's
+    /// own acknowledged version, or after a failed tip on a fresh load;
+    /// register them as the new tip. `between` then releases the caller's
+    /// gates. Phase B: write the hot file, wait for the predecessor to land,
+    /// and commit on its version with the zero-retry version CAS. A failed
+    /// predecessor, a lost CAS or any error fails this publication with no
+    /// internal retry, because every successor built on its predicted rows;
+    /// the caller prepares again.
+    async fn publish_pipelined_impl(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        lineage: Option<&LineageIntent>,
+        precondition: &PublishPrecondition,
+        between: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<PublishOutcome> {
+        let mut held = HeldVersion {
+            publisher: self,
+            settled: false,
+        };
+        enum Base {
+            Ready(Dataset),
+            Pending(PipelineOutcome),
+        }
+        let mut pipe = self.pipeline.lock().await;
+        let tip = pipe.as_ref().map(|tip| (tip.settled(), tip));
+        let (base, base_version, rows, any_version) = match tip {
+            Some((None, tip)) => {
+                // Pending: build on its predicted rows; the hot file is
+                // staged through any handle of this branch's `__manifest`.
+                let acknowledged = self
+                    .published_rows
+                    .lock()
+                    .expect("published rows cache lock poisoned")
+                    .as_ref()
+                    .and_then(|rows| rows.acknowledged.clone());
+                let any = match acknowledged {
+                    Some(dataset) => {
+                        crate::instrumentation::rebind_control_dataset(
+                            &dataset,
+                            crate::instrumentation::manifest_wrapper(),
+                        )
+                        .await?
+                    }
+                    None => self.dataset().await?,
+                };
+                (
+                    Base::Pending(tip.outcome.clone()),
+                    tip.version,
+                    tip.rows.clone(),
+                    any,
+                )
+            }
+            Some((Some(Ok(dataset)), tip)) => {
+                (Base::Ready(dataset.clone()), tip.version, tip.rows.clone(), dataset)
+            }
+            other => {
+                // No tip yet: this process's own acknowledged version. After a
+                // failed tip: storage, since a foreign publication may be why.
+                let trust = other.is_none();
+                let loaded = self.load_publish_state_trusting(trust).await?;
+                let version = loaded.dataset.version().version;
+                (
+                    Base::Ready(loaded.dataset.clone()),
+                    version,
+                    loaded.rows,
+                    loaded.dataset,
+                )
+            }
+        };
+        let ManifestRows {
+            tables,
+            head,
+            buffer,
+            schema_contract,
+            registry,
+            writer_epoch,
+            ..
+        } = rows;
+        let native_branch = any_version.manifest().branch.clone();
+        self.assert_writer_epoch(
+            WriterEpochRow::resolved(writer_epoch.as_ref(), native_branch.as_deref()),
+            native_branch.as_deref(),
+            EpochAssertion::Publish,
+        )?;
+        self.check_publish_precondition(&any_version, &head, precondition)
+            .await?;
+        let tables: TableRows = tables
+            .into_iter()
+            .map(|table| (table.registration.identity, table))
+            .collect();
+        Self::check_expected_table_versions(&tables, expected_table_versions)?;
+        let new_manifest_version = base_version + 1;
+        let (next_tables, _wrote) = Self::apply_changes(changes, &tables, new_manifest_version)?;
+        let mut next_contract = schema_contract;
+        let mut seen_contract = false;
+        for change in changes {
+            if let ManifestChange::SchemaContract(contract) = change {
+                if seen_contract {
+                    return Err(OmniError::manifest(
+                        "schema_contract row cannot be replaced twice in one publish".to_string(),
+                    ));
+                }
+                seen_contract = true;
+                next_contract = Some(contract.clone());
+            }
+        }
+        let Some(intent) = lineage else {
+            return Err(OmniError::manifest_internal(
+                "a pipelined publication carries a lineage intent",
+            ));
+        };
+        let mut next_head = Self::next_head(
+            intent,
+            &head,
+            &buffer,
+            &tables,
+            native_branch.clone(),
+            new_manifest_version,
+        )?;
+        let changed = Self::replaced_tables(&tables, &next_tables, new_manifest_version);
+        let tables: Vec<TableRow> = tables.into_values().collect();
+        let next_tables: Vec<TableRow> = next_tables.into_values().collect();
+        next_head.schema_contract = next_contract.as_ref().map(|row| row.head.clone());
+        let content_unchanged = !seen_contract
+            && head.schema_content_hash.is_some()
+            && head.schema_contract == next_head.schema_contract;
+        if !content_unchanged {
+            next_head.schema_content_hash = next_contract
+                .as_ref()
+                .map(history::schema_content_hash)
+                .transpose()?;
+        }
+        history::check_head_record(&next_head, &next_tables)?;
+        if let Some(contract) = &next_contract
+            && next_head.schema_content_hash != head.schema_content_hash
+        {
+            history::archive_schema(&self.root_uri, &self.control_session, contract).await?;
+        }
+        let parent_commit_id = Some(head.graph_commit_id.clone());
+        let mut known_state = manifest_state(
+            &next_tables,
+            &next_head,
+            writer_epoch.as_ref(),
+            new_manifest_version,
+            native_branch.as_deref(),
+        )?;
+        known_state.schema_contract = next_contract.as_ref().map(|row| row.head.clone());
+        let mut registry = registry;
+        let read = HeldRows {
+            tables: &tables,
+            head: &head,
+            buffer: &buffer,
+        };
+        let (records, closed) = Self::records_to_append(&read, native_branch.as_deref(), intent)?;
+        registry.merge(&Self::released_registry(&records));
+        if let Some(merged) = &intent.merged_parent {
+            registry.merge(&merged.registry);
+        }
+        let appended = match records.is_empty() {
+            true => None,
+            false => Some(
+                history::settle_closed(&self.root_uri, &self.control_session, &records, &closed)
+                    .await?,
+            ),
+        };
+        let next = ManifestRows {
+            schema_contract_head: next_contract.as_ref().map(|row| row.head.clone()),
+            buffer: buffer.after_publish(
+                Some(&head),
+                changed,
+                &next_head,
+                appended.as_ref(),
+                &tables,
+                intent.history_release_bytes,
+            )?,
+            tables: next_tables,
+            head: next_head,
+            schema_contract: next_contract,
+            registry,
+            writer_epoch,
+        };
+        let mut next = next;
+        let cold = next.registry.cold_push();
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        *pipe = Some(PipelineTip {
+            version: new_manifest_version,
+            rows: next.clone(),
+            known_state: known_state.clone(),
+            outcome: receiver,
+        });
+        drop(pipe);
+        between();
+
+        // Phase B, outside the caller's gates.
+        let finish = async {
+            let staged = match cold {
+                None => Some(commit::stage_hot(&any_version, &next).await?),
+                Some(_) => None,
+            };
+            let base_dataset = match base {
+                Base::Ready(dataset) => dataset,
+                Base::Pending(outcome) => settle(outcome).await.map_err(|()| {
+                    OmniError::manifest_read_set_changed(
+                        "pipelined_predecessor".to_string(),
+                        Some(base_version.to_string()),
+                        None,
+                    )
+                })?,
+            };
+            if base_dataset.version().version != base_version {
+                return Err(OmniError::manifest_read_set_changed(
+                    "pipelined_predecessor_version".to_string(),
+                    Some(base_version.to_string()),
+                    Some(base_dataset.version().version.to_string()),
+                ));
+            }
+            fail(&PUBLISH_PRE_MERGE)?;
+            let (new_dataset, batch) = match (staged, cold) {
+                (Some(staged), _) => commit::commit_staged_hot(base_dataset, staged).await?,
+                // A cold push reads the base's cold registry: no overlap.
+                (None, cold) => commit::overwrite(base_dataset, &next, cold.as_ref()).await?,
+            };
+            Ok::<_, OmniError>((new_dataset, batch))
+        };
+        match finish.await {
+            Ok((new_dataset, batch)) => {
+                if new_dataset.version().version != new_manifest_version {
+                    let _ = sender.send(Some(Err(())));
+                    return Err(OmniError::manifest_internal(
+                        "a pipelined publication landed at another version",
+                    )
+                    .with_completion_evidence(CompletionEvidence::Uncertain));
+                }
+                let cached = PublishedRows::new(&new_dataset, batch).await;
+                *self
+                    .published_rows
+                    .lock()
+                    .expect("published rows cache lock poisoned") = cached;
+                let _ = sender.send(Some(Ok(new_dataset.clone())));
+                known_state.version = new_manifest_version;
+                held.record_landed(native_branch.as_deref(), new_manifest_version);
+                Ok(PublishOutcome {
+                    dataset: new_dataset,
+                    parent_commit_id,
+                    known_state,
+                    head: next.head,
+                    tables: next.tables,
+                    buffer: next.buffer,
+                    schema_contract: next.schema_contract,
+                    registry: next.registry,
+                    writer_epoch: next.writer_epoch,
+                })
+            }
+            Err(error) => {
+                let _ = sender.send(Some(Err(())));
+                // A lost CAS is a read-set change the caller prepares again
+                // from; a failed predecessor already is one. An opaque error
+                // keeps its shape (and its in-doubt evidence).
+                if is_retryable_publish_conflict(&error) {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("graph_head:{}", self.branch.as_deref().unwrap_or("main")),
+                        Some(base_version.to_string()),
+                        None,
+                    )
+                    .unpublished());
+                }
+                Err(error)
+            }
+        }
     }
 }
 

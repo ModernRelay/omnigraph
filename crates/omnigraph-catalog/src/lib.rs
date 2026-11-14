@@ -105,8 +105,8 @@ pub use migrations::stamp_for_system_columns;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 pub use publisher::{
-    CandidateOutcome, GraphHeadExpectation, LineageIntent, PublishPrecondition, UnattachedIntent,
-    UnattachedOutcome, UnattachedWriteBase,
+    CandidateOutcome, GraphHeadExpectation, LineageIntent, PipelineView, PublishPrecondition,
+    UnattachedIntent, UnattachedOutcome, UnattachedWriteBase,
 };
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher, PublishOutcome};
 pub use state::DatasetEntry;
@@ -2374,6 +2374,74 @@ impl ManifestCoordinator {
             parent_commit_id,
             commit: recorded.then_some(head),
         })
+    }
+
+    /// Research (pipelined publication): [`Self::commit_changes_with_lineage_and_precondition`]
+    /// through the publisher's pipeline, calling `between` once the
+    /// publication's rows are fixed on the pipeline tip and before its CAS.
+    pub async fn commit_changes_pipelined(
+        &mut self,
+        changes: &[ManifestChange],
+        expected_table_versions: &ExpectedTableVersions,
+        lineage: &LineageIntent,
+        precondition: &PublishPrecondition,
+        between: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<CommitOutcome> {
+        let published = self
+            .publisher
+            .publish_pipelined(
+                changes,
+                expected_table_versions,
+                Some(lineage),
+                precondition,
+                between,
+            )
+            .await?;
+        let parent_commit_id = published.parent_commit_id.clone();
+        let merged = lineage
+            .merged_parent
+            .as_ref()
+            .into_iter()
+            .flat_map(BranchRecords::commits)
+            .cloned()
+            .collect();
+        let head = self.install_outcome(published, merged);
+        Ok(CommitOutcome {
+            version: self.version(),
+            parent_commit_id,
+            commit: Some(head),
+        })
+    }
+
+    /// Research (pipelined publication): the publisher's pipeline tip.
+    pub fn pipeline_tip(&self) -> Option<PipelineView> {
+        self.publisher.pipeline_tip()
+    }
+
+    /// Research (pipelined publication): wait for the publisher's in-flight
+    /// pipelined publication, if any, to settle.
+    pub async fn drain_pipeline(&self) {
+        self.publisher.drain_pipeline().await
+    }
+
+    /// Research (pipelined publication): the exact head, effective head and
+    /// snapshot a pipeline tip predicts on this coordinator's branch. The
+    /// snapshot carries no `__manifest` handle: its version has not landed.
+    pub fn predicted(&self, view: &PipelineView) -> (Option<String>, String, Snapshot) {
+        let branch_key = self
+            .active_branch
+            .as_deref()
+            .unwrap_or(MAIN_BRANCH_HEAD_KEY);
+        let exact = view.known_state.graph_heads.get(branch_key).cloned();
+        let mut snapshot = Self::snapshot_from_state(
+            &self.root_uri,
+            view.known_state.clone(),
+            self.dataset.session(),
+        );
+        snapshot.native_branch = self.native_branch.clone();
+        snapshot.graph_branch = self.active_branch.clone();
+        snapshot.captured_contract = self.captured_contract.clone();
+        (exact, view.head.graph_commit_id.clone(), snapshot)
     }
 
     /// Claim this branch's writer epoch for this process, on the incarnation

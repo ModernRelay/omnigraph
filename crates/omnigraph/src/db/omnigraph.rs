@@ -2042,6 +2042,23 @@ impl Omnigraph {
         let bound = {
             let coord = self.coordinator.load_full();
             let bound = branch == coord.current_branch();
+            // Research (pipelined publication): a writer on the bound branch
+            // stages behind the pipeline tip, the state the publications of
+            // this process in flight predict; readers keep the installed view.
+            if bound
+                && !fresh
+                && crate::instrumentation::phase_timers::research_enabled("PIPELINE")
+                && let Some(view) = coord.pipeline_tip()
+            {
+                let (exact, effective, snapshot) = coord.predicted_authority(&view);
+                return Ok((
+                    coord.branch_identifier().await?,
+                    exact,
+                    effective,
+                    snapshot,
+                    coord.captured_manifest_probe(),
+                ));
+            }
             if bound && (!fresh || coord.head_is_current().await?) {
                 return Ok((
                     coord.branch_identifier().await?,
@@ -5350,6 +5367,48 @@ impl Omnigraph {
         entry: &crate::db::DatasetEntry,
     ) -> Result<SnapshotHandle> {
         promotion::open_pinned_for_write(self, full_path, entry).await
+    }
+
+    /// Research (pipelined publication): wait for the bound branch's in-flight
+    /// pipelined publication, if `branch` is it.
+    pub(crate) async fn drain_pipeline(&self, branch: Option<&str>) {
+        let coord = self.coordinator.load_full();
+        if branch == coord.current_branch() {
+            coord.drain_pipeline().await;
+        }
+    }
+
+    /// Research (pipelined publication): whether a mutation on `branch`
+    /// publishes through the pipeline.
+    pub(crate) fn pipelines(&self, branch: Option<&str>) -> bool {
+        crate::instrumentation::phase_timers::research_enabled("PIPELINE")
+            && crate::instrumentation::phase_timers::research_enabled("TRUST_TIP")
+            && branch == self.coordinator.load_full().current_branch()
+    }
+
+    /// Research (pipelined publication): see `table_ops::commit_updates_pipelined`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn commit_updates_pipelined(
+        &self,
+        branch: Option<&str>,
+        updates: &[crate::db::DatasetUpdate],
+        expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
+        txn: &crate::db::WriteTxn,
+        lineage_intent: crate::db::manifest::LineageIntent,
+        gates: crate::db::write_queue::HeldWriteGates,
+        gates_acquired_at: std::time::Instant,
+    ) -> Result<crate::db::GraphCommit> {
+        table_ops::commit_updates_pipelined(
+            self,
+            branch,
+            updates,
+            expected_table_versions,
+            txn,
+            lineage_intent,
+            gates,
+            gates_acquired_at,
+        )
+        .await
     }
 
     // Used only by in-tree tests (`#[cfg(test)]`); the runtime path now

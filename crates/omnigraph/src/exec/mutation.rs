@@ -1557,7 +1557,7 @@ impl Omnigraph {
                     updates,
                     expected_versions,
                     detached: _,
-                    gates: _held_gates,
+                    gates: held_gates,
                     carried_txn,
                     gates_acquired_at,
                 },
@@ -1579,6 +1579,26 @@ impl Omnigraph {
         // reclaimable garbage. See
         // `tests/failpoints.rs::finalize_publisher_residual_does_not_drift_untouched_tables`.
         fail(&MUTATION_POST_FINALIZE_PRE_PUBLISHER).map_err(OmniError::unpublished)?;
+        // Research (pipelined publication): an ordinary publication on the
+        // bound branch fixes its rows on the pipeline tip under the gates and
+        // releases them before its version CAS.
+        if matches!(publication, crate::db::omnigraph::Publication::Publish)
+            && txn.caller_expected_graph_head.is_none()
+            && self.pipelines(txn.branch.as_deref())
+        {
+            return self
+                .commit_updates_pipelined(
+                    txn.branch.as_deref(),
+                    &updates,
+                    &expected_versions,
+                    txn,
+                    lineage_intent,
+                    held_gates,
+                    gates_acquired_at,
+                )
+                .await;
+        }
+        let _held_gates = held_gates;
         // RFC 0067: every effect is a detached commit of its pinned base, so a
         // publish failure leaves the graph unchanged; the error is returned as
         // is (a moved head is `ReadSetChanged`). The publisher alone decides
