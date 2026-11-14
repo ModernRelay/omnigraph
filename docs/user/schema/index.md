@@ -148,6 +148,13 @@ Schema apply refuses a new edge type with a non-zero minimum whose source node
 type already exists (`OG-MF-107`): its existing nodes have none of the new
 edges. Declare such an edge with its source type, or without a minimum.
 
+Schema apply widens an existing edge type's range in place: lowering `min`, or
+raising or removing `max`, as in `@card(1..1)` to `@card(0..1)`, rewrites no
+data, because every stored count inside the old range is also inside the new
+one. The new range holds from the next write. Raising `min` or lowering `max`
+is refused, because the stored counts would need a check that apply does not
+make.
+
 Earlier Omnigraph versions did not count inserted source nodes, so a graph they
 wrote can hold nodes below the minimum. Each is counted the next time a write
 inserts or updates it or changes its edges of the type, and a load that
@@ -254,7 +261,7 @@ same accepted source again leaves the graph unchanged.
 
 Changes such as adding a required property to existing entities (add it nullable,
 then promote it), changing a property
-type (except enum widening and making a property required), changing edge endpoints or cardinality, adding an
+type (except enum widening and making a property required), changing edge endpoints, raising an edge's `@card` minimum or lowering its maximum, adding an
 edge type with a non-zero `@card` minimum from an existing node type, changing a
 node's implemented interfaces, adding a constraint other than `@index` and a node's `@unique`,
 removing a constraint from a property that stays, and adding, removing or

@@ -181,15 +181,17 @@ check: every stored row holds a null there, and a key with a null part is exempt
 
 Adding another constraint (`@key`, `@range`, `@check`, an edge `@unique`)
 to an existing type, removing a constraint from a property that stays,
-changing edge cardinality or endpoints, and adding an edge type with a non-zero
-`@card` minimum from an existing node type (OG-MF-107) are refused as
-unsupported. Dropping a
+changing edge endpoints, raising an edge's `@card` minimum or lowering its
+maximum, and adding an edge type with a non-zero `@card` minimum from an
+existing node type (OG-MF-107) are refused as unsupported. Widening a `@card`
+range (`@card(1..1)` to `@card(0..1)`, or lifting the maximum) is metadata
+only: every stored count already fits the wider range. Dropping a
 property drops every constraint that names only dropped properties (its own
 `@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
 or a constraint that also names a field that stays, is refused. In-place
 migrations are additions of nullable properties and types, `@index` and node
-`@unique` additions, nullable-to-required promotion, enum widening, renames,
-and drops; any other tightening means a rebuild.
+`@unique` additions, nullable-to-required promotion, enum widening, `@card`
+widening, renames, and drops; any other tightening means a rebuild.
 
 ### `schema apply` blocks writes while running
 
