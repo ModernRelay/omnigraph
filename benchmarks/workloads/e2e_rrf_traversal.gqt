@@ -33,7 +33,7 @@ c.slug: String
 
 --- expect plan
 expand $c $a: selection named [ChunkOfArtifact out]
-rank fuse row tiebreak [$a.@id]
+rank fuse no row tiebreak
 
 --- restart
 
@@ -63,4 +63,4 @@ c.slug: String
 
 --- expect plan
 expand $c $a: selection named [ChunkOfArtifact out]
-rank fuse row tiebreak [$a.@id]
+rank fuse no row tiebreak

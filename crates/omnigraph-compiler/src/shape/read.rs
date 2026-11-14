@@ -323,6 +323,8 @@ struct Split<'t> {
 fn ranked_input(node: &Term) -> &Term {
     match node {
         Term::ApproxTopK { input, .. } | Term::Score { input, .. } => input,
+        // A fusion's arms rank one population (`Shaper::fused_population`).
+        Term::Fuse { arms, .. } => arms.first().map_or(node, ranked_input),
         other => other,
     }
 }
@@ -1447,15 +1449,14 @@ impl<'a> Shaper<'a> {
             return Ok(Split {
                 population,
                 ranking,
-                node: Some(body)
-                    .filter(|b| !matches!(b, Term::Fuse { .. }) && fuse_leaf(b).is_none()),
+                node: Some(body),
                 after: None,
             });
         }
         let mut node = body;
         loop {
             node = match node {
-                Term::ApproxTopK { .. } | Term::Score { .. } => break,
+                Term::ApproxTopK { .. } | Term::Score { .. } | Term::Fuse { .. } => break,
                 Term::Filter { input, .. }
                 | Term::Expand { input, .. }
                 | Term::Project {
@@ -1561,15 +1562,30 @@ impl<'a> Shaper<'a> {
                 }),
             )),
             Term::Score { .. } => Err(self.refuse("a `Score` whose kind and query disagree")),
-            other => match fuse_leaf(other) {
-                Some(fuse) => Ok((other, Some(self.fused(fuse)?))),
-                None => Ok((other, None)),
-            },
+            Term::Fuse { .. } => Ok((self.fused_population(body)?, Some(self.fused(body)?))),
+            other => Ok((other, None)),
         }
     }
 
-    /// `rrf` over the type population: the `Fuse` at the leaf of the
-    /// pattern, which the rest of the pattern extends from its target.
+    /// The pattern of the one population every arm of an `rrf` ranks: the
+    /// fusion runs its arms over it and yields one row per target, and the
+    /// elements after the `from` extend from that target.
+    fn fused_population<'t>(&self, fuse: &'t Term) -> Result<&'t Term, ShapeError> {
+        let Term::Fuse { arms, .. } = fuse else {
+            unreachable!("called on a Fuse")
+        };
+        let mut populations = arms.iter().map(ranked_input);
+        let first = populations
+            .next()
+            .ok_or_else(|| ShapeError::Internal("an `rrf` has no arm".to_string()))?;
+        if populations.any(|population| population != first) {
+            return Err(self.refuse("`rrf` arms over different populations"));
+        }
+        self.population(first)
+    }
+
+    /// `rrf`: the ranking of its fused targets, each arm's key ranking the
+    /// population (`fused_population`).
     fn fused(&self, fuse: &Term) -> Result<Ranking, ShapeError> {
         let Term::Fuse {
             arms,
@@ -1775,24 +1791,6 @@ impl<'a> Shaper<'a> {
                     return self.inline_read(input, items, bindings, facts);
                 }
                 self.facts(inner, facts)
-            }
-            Term::Fuse { arms, target, .. } => {
-                let type_name = arms
-                    .first()
-                    .and_then(|arm| population_type(arm, target))
-                    .ok_or_else(|| {
-                        self.refuse_at(
-                            "an `rrf` arm over a population that is not a type",
-                            Construct::Element(FROM, None),
-                        )
-                    })?;
-                facts.types.insert(target.clone(), type_name.clone());
-                facts.bindings.push(BindingFact {
-                    variable: target.clone(),
-                    type_name,
-                    filters: Vec::new(),
-                });
-                Ok(())
             }
             Term::Union { left, right } => match optional_parts(left, right) {
                 Some((outer, pattern)) => self.optional(outer, pattern, facts),
@@ -3371,34 +3369,6 @@ fn optional_parts<'t>(left: &'t Term, right: &'t Term) -> Option<(&'t Term, &'t 
     };
     (unmatched == outer && counted == inner && keys.is_empty() && aggs.len() == 1)
         .then_some((outer.as_ref(), inner.as_ref()))
-}
-
-/// The `Fuse` a pattern extends from: the leaf its first inputs reach.
-fn fuse_leaf(term: &Term) -> Option<&Term> {
-    match term {
-        Term::Fuse { .. } => Some(term),
-        Term::Expand { input, .. } | Term::Filter { input, .. } => fuse_leaf(input),
-        Term::Correlate { outer, .. } => fuse_leaf(outer),
-        _ => None,
-    }
-}
-
-/// The node type an `rrf` arm ranks: the scan under its population.
-fn population_type(arm: &Term, target: &str) -> Option<String> {
-    let mut term = arm;
-    loop {
-        term = match term {
-            Term::ApproxTopK { input, .. }
-            | Term::Score { input, .. }
-            | Term::Project { input, .. }
-            | Term::Filter { input, .. } => input,
-            Term::Scan {
-                var,
-                ty: Ty::Node { type_name, .. },
-            } if var == target => return Some(type_name.clone()),
-            _ => return None,
-        };
-    }
 }
 
 /// The window an `rrf`'s `nearest` arm draws when the read has no `limit`

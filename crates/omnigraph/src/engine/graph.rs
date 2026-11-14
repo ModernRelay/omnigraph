@@ -89,7 +89,9 @@ pub(super) fn fused_schema(
 
 /// Fuse arms sorted by search score and identity; BM25 arms must be uncapped.
 /// Rank each entity once, sum `1 / (k + rank)` over the arms that hold it,
-/// and emit every one of its rows with that sum in `fused_score`; the
+/// and emit one row per entity, its first in its arm's rank order, with that
+/// sum in `fused_score`: fan-out rows of one target carry its score and add
+/// no vote, and no population column is in scope after the fusion. The
 /// `Sort` above orders by the sum and the query's `limit` cuts rows there
 /// (RFC 0047 §Total order).
 pub(super) fn fuse_arms(
@@ -198,8 +200,9 @@ pub(super) fn extract_id_column_by_name(
     Ok((0..ids.len()).map(|i| ids.value(i).to_string()).collect())
 }
 
-/// Gather primary rows, then secondary-only rows, in scored entity order
-/// within each arm, preserving each entity's row order and fused score.
+/// Gather each entity's first primary row, then the secondary-only
+/// entities' first rows, in scored entity order within each arm, with the
+/// fused score.
 fn build_fused_batch(
     scored: &[(String, f64)],
     primary_batch: &RecordBatch,
@@ -220,8 +223,8 @@ fn build_fused_batch(
     }
 
     let selected_rows = |id| match (primary_rows.get(id), secondary_rows.get(id)) {
-        (Some(rows), _) => Some((0, rows)),
-        (None, Some(rows)) => Some((1, rows)),
+        (Some(rows), _) => Some((0, &rows[..1])),
+        (None, Some(rows)) => Some((1, &rows[..1])),
         (None, None) => None,
     };
     let mut counts = [0usize; 2];

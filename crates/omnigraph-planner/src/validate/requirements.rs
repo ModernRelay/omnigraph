@@ -114,6 +114,9 @@ pub(crate) struct Traversal {
 pub(crate) struct Block {
     pub outer_var: String,
     pub predicate: SubqueryPredicate,
+    /// Written after a ranking drawn as a pattern step, over its selected
+    /// rows.
+    pub after_rank: bool,
 }
 
 /// An `optional { }` of the top-level scope: its correlation binding and
@@ -353,6 +356,9 @@ pub struct Requirements {
     /// split at its top-level `and`; a constant `true` constrains nothing and
     /// is left out.
     pub(crate) eligibility: Vec<IRExpr>,
+    /// The conjuncts of `eligibility` written after a ranking drawn as a
+    /// pattern step, which run over its selected rows.
+    pub(crate) after_rank: Vec<IRExpr>,
     pub(crate) returns: Vec<IRProjection>,
     /// The return items that read the leading ranking's score column, by
     /// position, with that ranking.
@@ -387,6 +393,7 @@ impl Requirements {
         let mut blocks = Vec::new();
         let mut bindings: BTreeMap<String, BoundVariable> = BTreeMap::new();
         let mut rank_step: Option<(&IRExpr, Option<u64>)> = None;
+        let mut rank_at: Option<usize> = None;
         let mut steps = Vec::new();
         let mut optionals = Vec::new();
         let mut unions = Vec::new();
@@ -410,7 +417,10 @@ impl Requirements {
                     ..
                 } => scores.push((binding.clone(), property.clone(), query.clone())),
                 PatternStep::Let { value, .. } => lets.push(value.clone()),
-                PatternStep::Rank { key, window, .. } => rank_step = Some((key, *window)),
+                PatternStep::Rank { key, window, .. } => {
+                    rank_step = Some((key, *window));
+                    rank_at = Some(eligibility.len());
+                }
                 PatternStep::NodeScan {
                     variable,
                     type_name,
@@ -474,6 +484,7 @@ impl Requirements {
                 } => blocks.push(Block {
                     outer_var: outer_var.clone(),
                     predicate: predicate.clone(),
+                    after_rank: rank_at.is_some(),
                 }),
                 PatternStep::Optional { .. }
                 | PatternStep::Union { .. }
@@ -547,6 +558,7 @@ impl Requirements {
             scores,
             lets,
             search,
+            after_rank: rank_at.map_or_else(Vec::new, |at| eligibility[at..].to_vec()),
             eligibility,
             returns: ir.return_exprs.clone(),
             projected_ranks,

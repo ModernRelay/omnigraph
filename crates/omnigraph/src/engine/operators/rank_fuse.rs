@@ -1,7 +1,7 @@
 //! `RankFuseExec` drains and ranks both arms by score, fused identity, and
 //! downstream row keys. `fuse_arms` sums reciprocal ranks per entity and
-//! emits every arm row with that sum in the fused score column; the `Sort`
-//! above orders and cuts (RFC 0047 §Total order).
+//! emits one row per entity with that sum in the fused score column; the
+//! `Sort` above orders and cuts (RFC 0047 §Total order).
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use std::fmt;
@@ -289,10 +289,11 @@ mod tests {
             &memory,
         )
         .unwrap();
-        assert_eq!(fused.num_rows(), 3);
+        // One row per fused entity: its first in the arm's rank order.
+        assert_eq!(fused.num_rows(), 1);
         assert_eq!(
             crate::engine::graph::extract_id_column_by_name(&fused, &edge_type).unwrap(),
-            types
+            ["Knows"]
         );
         let scores = fused
             .column_by_name("p._rrf")
@@ -300,6 +301,6 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow_array::Float64Array>()
             .unwrap();
-        assert_eq!(scores.values(), &[2.0 / 61.0; 3]);
+        assert_eq!(scores.values(), &[2.0 / 61.0]);
     }
 }

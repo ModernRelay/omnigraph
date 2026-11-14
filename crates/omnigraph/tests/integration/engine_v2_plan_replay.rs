@@ -67,7 +67,7 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
     db.load_jsonl(&edges, LoadMode::Append).await.unwrap();
     db.ensure_indices_as(None).await.unwrap();
     let query = r#"query selected_page() {
-        match { let $all = { match { $p: Person } return { $p } }, from rrf(bm25($all, $p.text, "needle"), bm25($all, $p.text, "needle needle"), k: 60) as $score, $p: Person, $p $e:(knows | likes) $q }
+        match { let $pop = { match { $p: Person, $q: Person, $p $e:(knows | likes) $q } return { $p } }, from rrf(bm25($pop, $p.text, "needle"), bm25($pop, $p.text, "needle needle"), k: 60) as $score, $p $e:(knows | likes) $q }
         return { $e.@type as edge_type, $e.@id as edge_id, $q.name as target }
         order { $score desc }
         limit 1
@@ -85,10 +85,26 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
     let restored = serde_json::to_vec(&encoded).unwrap();
     let replay = db.replay_bound_plan("main", &restored).await.unwrap();
     assert_eq!(rows_of(&replay.result), expected);
-    let type_key = serde_json::json!({"binding":"e","property":"@type"});
-    let edge_key = serde_json::json!({"binding":"e","property":"@id"});
-    let node_key = serde_json::json!({"binding":"q","property":"@id"});
-    let expected_keys = vec![type_key.clone(), edge_key.clone(), node_key.clone()];
+    // The population's selected edge and its end key the fusion's rows:
+    // names its read binds without returning, renamed apart.
+    let saved_keys = |plan: &Value| -> Vec<Value> {
+        plan["plan"]["body"]["plan"]["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["node"] == "RankFuseWithTiebreak")
+            .expect("the saved plan carries a RankFuse")["row_tiebreak"]
+            .as_array()
+            .expect("the saved RankFuse carries a row_tiebreak list")
+            .clone()
+    };
+    let expected_keys = saved_keys(&encoded);
+    let [type_key, edge_key, node_key] = <[Value; 3]>::try_from(expected_keys.clone())
+        .unwrap_or_else(|keys| panic!("the edge's type and id, then its end's id: {keys:?}"));
+    assert_eq!(
+        [&type_key, &edge_key, &node_key].map(|key| key["property"].clone()),
+        ["@type", "@id", "@id"].map(Value::from)
+    );
     for (mutation, altered_keys) in [
         ("missing type", vec![edge_key.clone(), node_key.clone()]),
         ("missing edge ID", vec![type_key.clone(), node_key.clone()]),

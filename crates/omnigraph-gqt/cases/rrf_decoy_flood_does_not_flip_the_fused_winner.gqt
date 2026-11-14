@@ -59,7 +59,7 @@ c.slug: String
 
 --- expect plan
 expand $c $a: selection named [ChunkOfArtifact out]
-rank fuse row tiebreak [$a.@id]
+rank fuse no row tiebreak
 
 --- query
 query recall_alternation($q1: String, $q2: String) {
@@ -87,7 +87,7 @@ c.slug: String
 
 --- expect plan
 expand $c $a: selection alternation [ChunkOfArtifact out]
-rank fuse row tiebreak [$a.@id]
+rank fuse no row tiebreak
 expand $c $a: mode indexed_scan ran indexed_scan
 
 --- query
@@ -116,5 +116,5 @@ c.slug: String
 
 --- expect plan
 expand $c $a: selection wildcard [ChunkOfArtifact out]
-rank fuse row tiebreak [$a.@id]
+rank fuse no row tiebreak
 expand $c $a: mode indexed_scan ran indexed_scan

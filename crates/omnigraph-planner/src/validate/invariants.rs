@@ -22,7 +22,7 @@ use omnigraph_compiler::query::value::RRF_COLUMN;
 use omnigraph_compiler::types::{ExprType, ScalarType};
 
 use super::budget::Budget;
-use super::requirements::{Requirements, Retrieval, Search, constant_true};
+use super::requirements::{Block, Requirements, Retrieval, Search, constant_true};
 use super::{AcceptInput, ValidationError};
 use crate::cost::AntiJoinStrategy;
 use crate::logical::{ColumnRef, EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
@@ -107,6 +107,9 @@ fn check_block_strategy(
 struct Constrained {
     own: Vec<NodeId>,
     after: Vec<NodeId>,
+    /// Whether a fusion splits the rows: `own` is one arm, `after` what the
+    /// fused rows pass through.
+    fused: bool,
 }
 
 impl Constrained {
@@ -132,6 +135,7 @@ fn constrained_pipelines(
         return Ok(vec![Constrained {
             own: top,
             after: Vec::new(),
+            fused: false,
         }]);
     };
     let mut below = HashSet::new();
@@ -150,6 +154,7 @@ fn constrained_pipelines(
         .map(|own| Constrained {
             own,
             after: after.clone(),
+            fused: true,
         })
         .collect())
 }
@@ -266,23 +271,28 @@ impl Requirements {
         // A fused query's eligibility belongs inside each arm (retention);
         // what its rows pass through after the fusion is checked with the
         // arm for origin, extra traversals and blocks.
+        // The elements written after a fusion's `from` run over its fused
+        // rows: their conjuncts and blocks belong above it, the
+        // population's in each arm.
         for pipeline in &constrained_pipelines(plan, budget)? {
             let reached = pipeline.reached();
             self.check_bindings(plan, &reached)?;
-            self.check_eligibility(plan, &pipeline.own, &reached, input, budget)?;
-            self.check_blocks(plan, &pipeline.own, budget)?;
-            if let Some(id) = pipeline
-                .after
+            let (population, after): (Vec<IRExpr>, Vec<IRExpr>) = if pipeline.fused {
+                self.eligibility
+                    .iter()
+                    .cloned()
+                    .partition(|conjunct| !self.after_rank.contains(conjunct))
+            } else {
+                (self.eligibility.clone(), Vec::new())
+            };
+            self.check_eligibility(plan, &pipeline.own, &reached, &population, input, budget)?;
+            self.check_retained(plan, &pipeline.after, &after)?;
+            let (own_blocks, after_blocks): (Vec<&Block>, Vec<&Block>) = self
+                .blocks
                 .iter()
-                .find(|id| matches!(plan.node(**id), Some(PhysicalNode::AntiJoin { .. })))
-            {
-                return Err(ValidationError::violated(
-                    "predicate origin",
-                    format!(
-                        "node {id} decides a correlated block above the fusion, outside every arm"
-                    ),
-                ));
-            }
+                .partition(|block| !(pipeline.fused && block.after_rank));
+            self.check_blocks(plan, &pipeline.own, &own_blocks, budget)?;
+            self.check_blocks(plan, &pipeline.after, &after_blocks, budget)?;
         }
         let top = pipeline(plan, plan.root(), budget)?;
         self.check_optionals(plan, &top, budget)?;
@@ -409,17 +419,39 @@ impl Requirements {
         plan: &PhysicalPlan,
         retained: &[NodeId],
         reached: &[NodeId],
+        required: &[IRExpr],
         input: &AcceptInput<'_>,
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
-        let kept = conjuncts(plan, retained);
         let placed = conjuncts(plan, reached);
-        budget.visit(
-            u64::try_from(kept.len() + placed.len() + self.eligibility.len()).unwrap_or(u64::MAX),
-        )?;
+        budget.visit(u64::try_from(placed.len() + self.eligibility.len()).unwrap_or(u64::MAX))?;
+        self.check_retained(plan, retained, required)?;
+        let required: HashSet<&IRExpr> = self.eligibility.iter().collect();
+        for (id, conjunct) in &placed {
+            if constant_true(conjunct)
+                || required.contains(conjunct)
+                || self.narrowed_key(plan, *id, conjunct, &required, input)
+            {
+                continue;
+            }
+            return Err(ValidationError::violated(
+                "predicate origin",
+                format!("the plan tests `{conjunct}`, which the query does not require"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Every conjunct of `required` is tested by one of `retained`.
+    fn check_retained(
+        &self,
+        plan: &PhysicalPlan,
+        retained: &[NodeId],
+        required: &[IRExpr],
+    ) -> Result<(), ValidationError> {
+        let kept = conjuncts(plan, retained);
         let kept_set: HashSet<&IRExpr> = kept.iter().map(|(_, conjunct)| conjunct).collect();
-        if let Some(missing) = self
-            .eligibility
+        if let Some(missing) = required
             .iter()
             .find(|required| !kept_set.contains(required))
         {
@@ -434,19 +466,6 @@ impl Requirements {
                 format!("the plan tests no conjunct for `{missing}`")
             };
             return Err(ValidationError::violated("predicate retention", detail));
-        }
-        let required: HashSet<&IRExpr> = self.eligibility.iter().collect();
-        for (id, conjunct) in &placed {
-            if constant_true(conjunct)
-                || required.contains(conjunct)
-                || self.narrowed_key(plan, *id, conjunct, &required, input)
-            {
-                continue;
-            }
-            return Err(ValidationError::violated(
-                "predicate origin",
-                format!("the plan tests `{conjunct}`, which the query does not require"),
-            ));
         }
         Ok(())
     }
@@ -490,6 +509,7 @@ impl Requirements {
         &self,
         plan: &PhysicalPlan,
         nodes: &[NodeId],
+        blocks: &[&Block],
         budget: &mut Budget,
     ) -> Result<(), ValidationError> {
         let mut planned: Vec<(&String, &omnigraph_compiler::ir::SubqueryPredicate)> = Vec::new();
@@ -506,17 +526,17 @@ impl Requirements {
                 planned.push((outer_var, predicate));
             }
         }
-        if planned.len() != self.blocks.len() {
+        if planned.len() != blocks.len() {
             return Err(ValidationError::violated(
                 "predicate retention",
                 format!(
-                    "the query writes {} correlated blocks; the plan runs {}",
-                    self.blocks.len(),
+                    "the query writes {} correlated blocks there; the plan runs {}",
+                    blocks.len(),
                     planned.len()
                 ),
             ));
         }
-        for block in &self.blocks {
+        for block in blocks {
             let found = planned.iter().position(|(outer_var, predicate)| {
                 **outer_var == block.outer_var && **predicate == block.predicate
             });

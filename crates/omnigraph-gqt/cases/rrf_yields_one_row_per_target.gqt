@@ -1,0 +1,96 @@
+# issue: none
+# notes: `rrf` yields one row per target with its fused score and no population column: a population
+# notes: whose pattern fans out (a Doc tagged twice) adds no row and no vote, a filtered population
+# notes: ranks only its own rows, and a read that needs a population column draws it again with an
+# notes: element after the `from`, correlated on the target.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    body: String @index
+    embedding: Vector(3) @index
+}
+node Tag {
+    name: String @key
+}
+edge Tagged: Doc -> Tag
+
+--- seed
+{"type":"Doc","data":{"slug":"x","body":"needle","embedding":[1.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"y","body":"needle hay","embedding":[0.9,0.1,0.0]}}
+{"type":"Doc","data":{"slug":"z","body":"hay","embedding":[0.0,1.0,0.0]}}
+{"type":"Tag","data":{"name":"t1"}}
+{"type":"Tag","data":{"name":"t2"}}
+{"edge":"Tagged","from":"x","to":"t1"}
+{"edge":"Tagged","from":"x","to":"t2"}
+{"edge":"Tagged","from":"y","to":"t1"}
+
+--- query
+query fan_out_population($v: Vector(3)) {
+    match {
+      let $pop = { match { $d: Doc, $t: Tag, $d tagged $t } return { $d } },
+      from rrf(nearest($pop, $d.embedding, $v, k: 3), bm25($pop, $d.body, "needle")) as $score,
+    }
+    return { $d.slug }
+    order { $score desc }
+}
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"x"}
+{"d.slug":"y"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query filtered_population($v: Vector(3)) {
+    match {
+      let $pop = { match { $d: Doc } where $d.slug != "x" return { $d } },
+      from rrf(nearest($pop, $d.embedding, $v, k: 3), bm25($pop, $d.body, "needle")) as $score,
+    }
+    return { $d.slug }
+    order { $score desc }
+}
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"y"}
+{"d.slug":"z"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query population_columns_drawn_again($v: Vector(3)) {
+    match {
+      let $pop = { match { $d: Doc, $t: Tag, $d tagged $t } return { $d } },
+      from rrf(nearest($pop, $d.embedding, $v, k: 3), bm25($pop, $d.body, "needle")) as $score,
+      $t: Tag,
+      $d tagged $t,
+    }
+    return { $d.slug, $t.name }
+    order { $score desc, $t.name }
+}
+
+--- params
+{"v": [1.0, 0.0, 0.0]}
+
+--- expect ordered
+{"d.slug":"x","t.name":"t1"}
+{"d.slug":"x","t.name":"t2"}
+{"d.slug":"y","t.name":"t1"}
+
+--- expect shape
+d.slug: String
+t.name: String

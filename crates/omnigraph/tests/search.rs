@@ -483,7 +483,7 @@ query nearest_all($q: Vector(4)) {
 }
 
 query rrf_keep($q: Vector(4)) {
-    match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $q, k: 10), nearest($all, $d.embedding, [0.0, 0.0, 0.0, 0.0], k: 10), k: 60) as $score, $d: Doc } where $d.keep = true
+    match { let $keep = { match { $d: Doc } where $d.keep = true return { $d } }, from rrf(nearest($keep, $d.embedding, $q, k: 10), nearest($keep, $d.embedding, [0.0, 0.0, 0.0, 0.0], k: 10), k: 60) as $score }
     return { $d.slug }
     order { $score desc }
     limit 10

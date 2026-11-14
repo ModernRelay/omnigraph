@@ -2473,6 +2473,14 @@ fn place_query_filters(
                 // it, where it would decide which targets the window selects
                 // (law 2). The window's population is a scope of its own.
                 Some(LogicalNode::TargetCut { input, .. }) => scopes.push(*input),
+                // A fusion drawn as a step ranks its population's targets: a
+                // filter written after it moves below it no more than below a
+                // window, where it would change every arm's ranks.
+                Some(LogicalNode::RankFuse {
+                    input,
+                    leads: false,
+                    ..
+                }) => scopes.push(*input),
                 // A score's column exists only above it: a filter written
                 // after it stays above it, and its population's own filters
                 // are a scope of their own.

@@ -65,14 +65,26 @@ Full-text rankings inside `rrf` are
 never bounded this way: each full-text arm scans every matching entity, and
 fusion ranks the entities that satisfy the graph and property filters, so
 bounding an arm could silently drop an entity's contribution and shift fused
-results. When a traversal constrains the ranked variable and the graph shows
-few entities could satisfy it, the full-text arms instead rank only those
-entities (an unbounded, index-served prefilter — results are identical, the
-scan is just smaller); broad traversals keep the full scan. A `nearest`
-ranking inside `rrf` is inherently top-k, as vector
+results. When a traversal in the population constrains the ranked variable
+and the graph shows few entities could satisfy it, the full-text arms
+instead rank only those entities (an unbounded, index-served prefilter —
+results are identical, the scan is just smaller); broad traversals keep the
+full scan. A `nearest` ranking inside `rrf` is inherently top-k, as vector
 search always is: an entity outside its window adds no vector contribution
-to its fused score, so a traversal that drops the window's top matches can
-shift fused ranks.
+to its fused score.
+
+`rrf` yields one row per target with the target and its fused score, and no
+other column of the population: a population whose pattern reaches a target
+several times adds no row and no vote for it. Elements and a `where` written
+after the `from` run over those rows; a read that needs a population column
+draws it again there, correlated on the target:
+
+```gq fragment
+let $pop = { match { $d: Doc, $t: Tag, $d tagged $t } return { $d } },
+from rrf(nearest($pop, $d.embedding, $q, k: 10), bm25($pop, $d.body, $s)) as $score,
+$t: Tag,
+$d tagged $t,
+```
 
 ## Vector search
 
@@ -224,8 +236,9 @@ Ranking order is a contract, not a side effect: search-ordered results are
 sorted on the search score itself, including through multi-hop traversals, with
 secondary keys and the entity-id tie-break applied after the score. A fused
 order sorts every row by the fused score, then the keys written after it,
-then every binding's id, and `limit` counts rows after that order;
-an entity that fans out to several rows contributes each of them. The full
+then every binding's id, and `limit` counts rows after that order; an
+element after the `from` that reaches a target several times multiplies its
+row. The full
 ordering contract lives on the [queries page](../queries/index.md).
 
 ## Ranking a traversal-reached binding

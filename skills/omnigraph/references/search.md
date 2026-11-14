@@ -142,7 +142,11 @@ query top_titles($q: String) {
 ### Hybrid (Reciprocal Rank Fusion)
 
 `let` names the population once and both arms rank it. `rrf` takes two arms;
-identical arms, or arms that rank two different bindings, are refused (`T75`):
+identical arms, or arms that rank two different bindings, are refused (`T75`).
+It yields one row per target with the fused score and no other population
+column; a population that reaches a target several times adds no row, and a
+read that needs a population column draws it again after the `from`
+(`$t: Tag, $d tagged $t`), correlated on the target:
 
 ```gq
 query hybrid($vq: Vector(1536), $tq: String) {
@@ -182,7 +186,8 @@ A ranking may feed aggregates, but it only selects the rows that are
 aggregated: the `k` window under `nearest`, every text match under
 `bm25`. Groups are not score-ranked, and the score is not an order key over
 groups (`T42`): the written keys order the groups (or `return distinct` rows),
-then every group key ascending; with none, output is unordered.
+then every group key ascending; with neither keys nor a `limit`, output is
+unordered.
 
 ### What a ranked read reports
 

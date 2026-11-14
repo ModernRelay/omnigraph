@@ -1,6 +1,8 @@
 # issue: 659
 # red_on: 7f1233bb
-# notes: RRF retains concrete edge multiplicity and orders equal IDs by type before applying a row limit.
+# notes: RRF retains concrete edge multiplicity and orders equal IDs by type before applying a row limit: the
+# notes: fusion yields one row per Person, the traversal after its `from` multiplies them by edge, and the
+# notes: final sort's tie rule orders a selected edge by type then id.
 # notes: The second arm ranks `hay` so the two arms differ; it selects only `b`, which has no outgoing edge, so the rows are `a`'s.
 
 --- runner
@@ -46,7 +48,8 @@ edge_id: String
 
 --- expect plan
 expand $p $q: selection alternation [Knows out, Likes out]
-rank fuse row tiebreak [$e.@type, $e.@id, $q.@id]
+rank fuse no row tiebreak
+sort tiebreak [$p, $q, $e.@type, $e.@id]
 
 --- query
 query fused_type_page() {
@@ -91,4 +94,5 @@ edge_id: String
 
 --- expect plan
 expand $p $q: selection wildcard [Knows out, Likes out]
-rank fuse row tiebreak [$e.@type, $e.@id, $q.@id]
+rank fuse no row tiebreak
+sort tiebreak [$p, $q, $e.@type, $e.@id]

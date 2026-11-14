@@ -45,6 +45,7 @@ const B_IN_PROGRESS: &[&str] = &[
     "distance as an rrf arm",
     "two rrf arm windows that differ",
     "an rrf of three arms",
+    "rrf arms over different populations",
     "a block compared with another block's value",
     "a write group selecting over a table an earlier group changes",
     "a full-text call read as a value",
@@ -241,6 +242,17 @@ const CLOSURE: &[Row] = &[
             // "an rrf of three arms"
             (
                 "query q($v: Vector(3), $s: String, $t: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), bm25($all, $d.body, $t)) as $score } return { $d.title } order { $score desc } limit 3 }",
+                Refused("B"),
+            ),
+            // An `rrf` over a population whose pattern fans out or filters:
+            // one row per target.
+            (
+                "query q($s: String, $v: Vector(3)) { match { let $pop = { match { $d: Doc, $p: Person, $p authored $d } where $p.age > 30 return { $d } }, from rrf(nearest($pop, $d.embedding, $v, k: 3), bm25($pop, $d.body, $s)) as $score, $p: Person, $p authored $d } return { $d.title, $p.name } order { $score desc } }",
+                Lowers,
+            ),
+            // "rrf arms over different populations"
+            (
+                "query q($s: String, $v: Vector(3)) { match { let $old = { match { $d: Doc, $p: Person, $p authored $d } where $p.age > 30 return { $d } }, let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($old, $d.embedding, $v, k: 3), bm25($all, $d.body, $s)) as $score } return { $d.title } order { $score desc } limit 3 }",
                 Refused("B"),
             ),
             // "distance as an rrf arm"
