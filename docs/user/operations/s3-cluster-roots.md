@@ -14,10 +14,11 @@ omnigraph --target s3://bucket/company-brain cluster status --json
 omnigraph optimize --target s3://bucket/company-brain --graph knowledge
 ```
 
-Every direct writer on a root takes the cluster's admission lock and keeps it
-after it finishes, as a direct `cluster apply` does. A stopped server's lock
-blocks the first direct command, and each command's lock blocks the next one
-and the server's boot. Read the held `lock_id` from `cluster status --json`,
+Every direct writer on a root takes the cluster's admission lock. A
+maintenance command keeps it after it finishes; a `cluster apply` releases it
+only when its deployment converges and every write it sent has settled, and
+keeps it otherwise. A stopped server's lock blocks the first direct command,
+and each kept lock blocks the next command and the server's boot. Read the held `lock_id` from `cluster status --json`,
 establish that its owner has settled, and release that exact ID with
 `cluster force-unlock` before the next writer or the server starts.
 

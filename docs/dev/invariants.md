@@ -180,7 +180,8 @@ Cases an RFC has argued: the flat locator objects and legacy data files under
   One outstanding durable authority owns completion/recovery. Generic drain
   does not prove native-I/O settlement. Clean server release additionally closes
   its explicit storage scope, drains accepted backend mutations and refuses
-  sticky uncertainty; S3 release/reacquisition uses the same lock key by CAS.
+  sticky uncertainty; a converged direct apply releases by the same proof.
+  S3 release/reacquisition uses the same lock key by CAS.
   Excluding raw and older writers remains an operator obligation.
 - Azure writes require the admission wrapper and remain a qualification preview
   pending the adversarial live-Azure matrix. The narrower managed-identity

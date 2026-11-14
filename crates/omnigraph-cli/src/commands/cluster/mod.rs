@@ -322,7 +322,7 @@ pub(crate) async fn apply_source(
         config, binding, requested_id, caller,
         |id, root, lock| {
             let root = omnigraph::storage::redacted_storage_uri(root);
-            let message = format!("Deployment-ID: {id}\nCluster-root: {root}\nAdmission lock: {lock}; retain until prior work is quiescent, then exact-ID force-unlock");
+            let message = format!("Deployment-ID: {id}\nCluster-root: {root}\nAdmission lock: {lock}; released when the deployment converges and its writes settle (never on Azure), else retained: after prior work is quiescent, exact-ID force-unlock");
             custody_report = (|| -> Result<()> {
                 writeln!(stderr, "{message}")?;
                 stderr.flush()?;

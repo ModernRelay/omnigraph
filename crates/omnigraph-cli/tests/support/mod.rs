@@ -38,18 +38,20 @@ pub fn bootstrap_cluster_fixture(config: &Path, root: &str) {
     unlock_storage_fixture(root);
 }
 
-/// Only call after the fixture's writer has stopped: completed direct owners
-/// retain admission and serving restarts need an explicit exact-ID handoff.
+/// Only call after the fixture's writer has stopped: completed direct writers
+/// other than a converged apply retain admission, and serving restarts need an
+/// explicit exact-ID handoff.
 pub fn unlock_storage_fixture(root: &str) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let caller = omnigraph_cluster::DeploymentCaller::storage_owner(None);
         let status = omnigraph_cluster::deployment_status(root, None, &caller)
             .await
             .unwrap();
-        let lock = status.lock_id.expect("fixture owner retains exact lock");
-        omnigraph_cluster::force_unlock_storage_root(root, &lock)
-            .await
-            .unwrap();
+        if let Some(lock) = status.lock_id {
+            omnigraph_cluster::force_unlock_storage_root(root, &lock)
+                .await
+                .unwrap();
+        }
     });
 }
 

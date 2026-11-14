@@ -2276,22 +2276,12 @@ async fn offline_deployment_captures_schema_queries_and_retains_original_lookup(
         fs::read_to_string(query_payload_path(dir.path(), &query_digest)).unwrap(),
         query
     );
-    assert_eq!(
-        acquire_cluster_admission(root, ClusterAdmissionPurpose::GraphOperation)
-            .await
-            .unwrap_err()
-            .code,
-        "state_lock_held"
-    );
-    assert!(
-        force_unlock_storage_root(root, "wrong-lock-id")
-            .await
-            .is_err()
-    );
-    assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+    // The converged apply released the lock it exposed (#1359).
+    assert!(!lock_id.is_empty());
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
 
-    // Repeating the same full ID with exact input observes while admission is
-    // still held; changed input refuses instead of reusing its receipt.
+    // Repeating the same full ID with exact input observes without taking
+    // admission; changed input refuses instead of reusing its receipt.
     fs::write(dir.path().join("people.pg"), &schema).unwrap();
     fs::write(dir.path().join("people.gq"), &query).unwrap();
     assert!(matches!(
@@ -2318,7 +2308,7 @@ async fn offline_deployment_captures_schema_queries_and_retains_original_lookup(
     let lookup = deployment_status(&canonical_root, Some(&id), &caller)
         .await
         .unwrap();
-    assert_eq!(lookup.lock_id.as_deref(), Some(lock_id.as_str()));
+    assert_eq!(lookup.lock_id, None);
     assert!(
         matches!(lookup.lookup, Some(DeploymentLookup::Complete { result: observed }) if observed.id == id && observed.input_digest == result.input_digest)
     );
@@ -2332,9 +2322,6 @@ async fn offline_deployment_captures_schema_queries_and_retains_original_lookup(
         identity_manifest_version(dir.path()).await,
         before_version + 1
     );
-    force_unlock_storage_root(&canonical_root, &lock_id)
-        .await
-        .unwrap();
     let serving = read_serving_snapshot_from_storage(&canonical_root)
         .await
         .unwrap();
@@ -2440,9 +2427,7 @@ async fn offline_deployment_query_only_preserves_branched_graph_history() {
     let status = deployment_status(root, Some(&result.id), &caller)
         .await
         .unwrap();
-    force_unlock_storage_root(root, status.lock_id.as_deref().unwrap())
-        .await
-        .unwrap();
+    assert_eq!(status.lock_id, None);
 
     // Retention may discard every terminal receipt. The achieved projection
     // still has to detect a graph recreated with identical source bytes and

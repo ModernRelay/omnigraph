@@ -73,13 +73,15 @@ Fresh apply creates the ledger and declared graphs in the selected root, capture
 source bytes before execution and prints the original `Deployment-ID` with exact
 outcomes. Use `load` or `mutate` for rows.
 
-Direct apply retains its admission lock after completion. Establish that the
-owner and its accepted I/O have settled, then follow
-[ownership transfer](../deployment.md#writer-topology) using the exact printed
-lock ID before starting the server:
+A direct apply whose deployment converges releases its admission lock when it
+returns, after every write it sent has settled, so the server can start next.
+An apply that fails, does not converge or cannot prove its writes settled, and
+any apply on Azure, keeps the lock: `cluster status --json` then reports its
+`lock_id`. Establish that the owner and its accepted I/O have settled, then
+follow [ownership transfer](../deployment.md#writer-topology) with that exact
+ID before starting the server.
 
 ```bash
-omnigraph --target file:///srv/company-brain cluster force-unlock '<LOCK_ID>'
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-alice":"secret"}' \
   omnigraph-server --cluster file:///srv/company-brain --bind 0.0.0.0:8080
 ```

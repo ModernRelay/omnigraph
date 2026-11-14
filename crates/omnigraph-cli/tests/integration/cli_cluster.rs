@@ -3078,7 +3078,7 @@ fn cluster_apply_json_applies_query_and_policy() {
 }
 
 #[test]
-fn cluster_apply_bootstraps_v2_and_retains_exact_owner() {
+fn cluster_apply_bootstraps_v2_and_releases_its_lock_issue_1359() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     let output = output_success(
@@ -3100,7 +3100,17 @@ fn cluster_apply_bootstraps_v2_and_retains_exact_owner() {
             .join("graphs/knowledge.omni/__manifest")
             .exists()
     );
-    assert!(temp.path().join("__cluster/lock.json").exists());
+    // The stderr custody line named the lock; the converged apply released it,
+    // so the first server needs no force-unlock.
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Admission lock: "));
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+    let status = parse_stdout_json(&output_success(
+        cli()
+            .arg("--target")
+            .arg(temp.path())
+            .args(["cluster", "status", "--json"]),
+    ));
+    assert!(status["lock_id"].is_null(), "{status}");
 }
 
 #[test]

@@ -88,7 +88,7 @@ async fn offline_fixture() -> tempfile::TempDir {
         matches!(applied, DeploymentLookup::Complete { ref result } if result.converged),
         "{applied:?}"
     );
-    unlock_offline(dir.path()).await;
+    assert_released(dir.path()).await;
     let graph_uri = dir.path().join("graphs/knowledge.omni");
     let session = omnigraph::Session::from_defaults(
         std::sync::Arc::new(Omnigraph::open(graph_uri.to_str().unwrap()).await.unwrap()),
@@ -104,6 +104,15 @@ async fn offline_fixture() -> tempfile::TempDir {
     drop(session);
     fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
     dir
+}
+
+/// A converged direct apply releases its own lock (#1359); nothing to unlock.
+async fn assert_released(root: &Path) {
+    let status =
+        omnigraph_cluster::deployment_status(root.to_str().unwrap(), None, &deployment_owner())
+            .await
+            .unwrap();
+    assert_eq!(status.lock_id, None);
 }
 
 async fn unlock_offline(root: &Path) {
@@ -319,7 +328,7 @@ async fn offline_deployment_failure_windows_preserve_original_identity() {
             assert!(
                 matches!(evolved, DeploymentLookup::Complete { ref result } if result.converged)
             );
-            unlock_offline(dir.path()).await;
+            assert_released(dir.path()).await;
         }
         let contract = Omnigraph::open_read_only(graph.to_str().unwrap())
             .await
@@ -556,7 +565,7 @@ async fn offline_partial_result_allows_corrective_successor_without_replay() {
         matches!(applied, DeploymentLookup::Complete { ref result } if result.converged),
         "{applied:?}"
     );
-    unlock_offline(dir.path()).await;
+    assert_released(dir.path()).await;
     let root = dir.path().to_str().unwrap();
     omnigraph_cluster::upgrade_deployment_ledger(root, true, &deployment_owner())
         .await
@@ -1003,7 +1012,7 @@ async fn graph_creation_crash_reconciles_exact_genesis_without_replay() {
             .await
             .unwrap();
         assert!(matches!(first, DeploymentLookup::Complete { ref result } if result.converged));
-        unlock_offline(dir.path()).await;
+        assert_released(dir.path()).await;
         let target = "second";
         let path = dir.path().join("cluster.yaml");
         let source = fs::read_to_string(&path).unwrap();
@@ -1185,7 +1194,7 @@ async fn graph_creation_partial_result_keeps_only_achieved_policy_bindings() {
     apply_deployment(dir.path(), None, &deployment_owner(), |_, _, _| {})
         .await
         .unwrap();
-    unlock_offline(dir.path()).await;
+    assert_released(dir.path()).await;
     let config = fs::read_to_string(dir.path().join("cluster.yaml")).unwrap()
         .replace("graphs:\n", "providers:\n  embedding:\n    added:\n      kind: mock\n      model: test\ngraphs:\n  second:\n    schema: ./people.pg\n    embedding_provider: added\n  third:\n    schema: ./people.pg\n    embedding_provider: added\n")
         .replace("applies_to: [knowledge]", "applies_to: [knowledge, second, third]");

@@ -201,7 +201,7 @@ backend. `--config DIR` is source input only.
 - Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
 - Server: `--target production --graph knowledge`; the registered target owns endpoint and one auth provider.
 - Managed: `--profile work` for account operations; a managed target references that profile and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
-- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup --graph` while the server is stopped. Each direct writer on the root takes the admission lock and keeps it; once that writer has stopped and its I/O has settled, release its exact `lock_id` (from `cluster status --json`) with `cluster force-unlock` before the next writer or the server starts. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
+- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup --graph` while the server is stopped. Each direct writer on the root takes the admission lock. A `cluster apply` that converges releases it once its writes have settled (never on Azure); maintenance, and an apply that fails or does not converge, keep it. Once that writer has stopped and its I/O has settled, release a kept lock's exact `lock_id` (from `cluster status --json`) with `cluster force-unlock` before the next writer or the server starts. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
@@ -321,9 +321,11 @@ Direct `init`/`load` write local storage, and direct **`cluster apply`** writes 
   whole deployment (graphs, schemas, stored queries, policies, optional S3/Azure
   `storage:` root); `omnigraph cluster apply` converges it and
   `omnigraph-server --cluster .` (or `--cluster s3://bucket/prefix`,
-  config-free) serves it. A direct apply keeps its admission lock: once its
-  writes have settled, release that exact lock with
-  `cluster force-unlock <LOCK_ID>` before starting the server, and send later
+  config-free) serves it. A direct apply that converges releases its
+  admission lock once its writes have settled (never on Azure); one that fails
+  or does not converge keeps it (`cluster status --json` reports its `lock_id`), and after
+  its writes have settled you release that exact lock with
+  `cluster force-unlock <LOCK_ID>` before starting the server. Send later
   changes with `cluster apply --target NAME --config DIR` using a registered server target.
   See `references/cluster.md`.
 - **Direct / embedded access — no server.** Address a graph's storage directly
