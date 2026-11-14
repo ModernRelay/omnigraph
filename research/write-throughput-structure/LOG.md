@@ -140,3 +140,43 @@ the CAS stays the authority, a stale tip costs one failed CAS and a retry with a
 
 Open question: detached commit under the gate went 68 -> 103 ms when rebased (no extra request
 counted). Possibly store contention from concurrent ungated staging; not yet explained.
+
+## B on named branches + Lance detached-commit cache gap (EAB6, EAB7)
+
+- `retain_control_dataset` refused every named-branch publication (a branch `__manifest` is a
+  Lance shallow clone and lists its parent's base path), so each named publish reopened
+  `__manifest` from the root (327/327 refusals). Allowed under the trusted tip; per-branch slots
+  are trusted for capture/revalidation; a refused publication clears the slot.
+- EAB6 S3: separate 1w 1.53 -> 3.07, 4w 4.27 -> 12.07, 16w 12.66 -> 46.53, 64w 26.67 -> 113.46
+  commits/s; p99 16w 1671 -> 509 ms, 64w 5007 -> 3427 ms; requests/commit 35 -> 9. Same branch
+  4.53-4.6 at 4-64 writers.
+- Lance finding: `do_commit_detached_transaction` (lance 13.0.0 io/commit.rs) never calls
+  `record_successful_commit`, so a detached commit leaves no transaction, manifest or index
+  metadata in the session caches (a linear commit does). A writer chained on the previous
+  writer's detached version pays a cold index-metadata read under the gate (detached 68 -> 103 ms
+  when rebased; control with disjoint tables: 68 ms). Workaround: warm `load_indices()` in the
+  background after each detached commit (EAB7): same 4w/16w 4.6 -> 5.33/5.27, gate hold 184 ms.
+  Upstream ask: populate the caches on detached commits as on linear ones.
+
+## C: pipelined publication (P1, P2), bound branch
+
+Design: the publisher keeps a pipeline tip (predicted rows, version, known state, an outcome
+watch channel). Phase A, under the branch + table gates: rebase/detached commits against the
+tip's predicted pins (writers capture/revalidate against `pipeline_tip()` on the bound branch;
+readers keep the installed view), build the next rows on the tip, register them as the new tip,
+release branch + table gates (schema permit kept). Phase B: stage the hot file, wait for the
+predecessor's outcome, commit txn + CAS on its version (zero retries). A failed predecessor or a
+lost CAS fails the publication (ReadSetChanged); the gated retry drains the pipeline first.
+- P1 S3 same: 1w 3.53 -> 4.0, 4w 5.33 -> 9.33, 16w 5.27 -> 8.93, 64w 4.53 -> 9.13 commits/s;
+  p99 16w 3253 -> 2104 ms, 64w 14300 -> 8020 ms. Gate hold ~100 ms = detached commit 93 ms (the
+  background warm-up only partly lands before the successor enters) + ~7 ms rows.
+- P1 local same: 1w 21.8, 4w 30.2, 16w 29.8 (gate hold 17 ms).
+- Correctness under foreign publications (WT_HANDLES=2: two independently opened handles = two
+  publishers on one branch): rows verified, ~1 re-prepare/commit, 2 driver resubmits in 4w
+  (32-reprepare budget), 16.3-16.8 commits/s local. The CAS remains the fence.
+
+Ceiling analysis now (S3 +30 ms): same table = per-table detached chain (txn PUT + manifest PUT +
+the cold metadata read) ~93 ms -> ~10/s; CAS chain (txn PUT + CAS PUT) ~70 ms -> ~14/s. Beyond
+that needs batching (group commit) or Lance changes (cache population on detached commits; an
+inline-only transaction instead of the separate `.txn` PUT, which `ManifestWriteConfig::
+disable_transaction_file` supports but only under `#[cfg(test)]`).
