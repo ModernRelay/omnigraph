@@ -290,6 +290,14 @@ impl ObjectStore for LatencyStore {
         } else {
             "get"
         };
+        if op == "get_range"
+            && location.as_ref().contains("/nodes/")
+            && location.as_ref().contains("_versions/d")
+            && std::env::var("OG_WT_BACKTRACE").is_ok()
+            && self.counters.tracing()
+        {
+            eprintln!("--- get_range {location}\n{}", std::backtrace::Backtrace::force_capture());
+        }
         let start = self.charge(op, location).await;
         let result = self.inner.get_opts(location, options).await;
         self.finish(start, op, location);

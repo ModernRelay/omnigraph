@@ -312,3 +312,15 @@ existing key) is refused before any chain tip moves, instead of failing in compo
   pipeline. Group commit now fans a fenced batch out as typed `WriterFenced`. Recheck with
   claims as records (`final-wal-fenced`): one branch 7.1 / 63.4 / 285.0 at N=1/16/64,
   branches 7.0 / 110.0 / 195.5; mixed test 2 of 2.
+
+## Tip index prefetch (`OMNIGRAPH_GROUP_PREFETCH=1`), 2026-11-14
+
+A backtrace on the per-write ranged GET of the table's detached manifest
+(`OG_WT_BACKTRACE=1`): `validate_staged_mutation` → `plan_write` → `Dataset::load_indices`
+→ `load_all_indices` (index metadata of the pinned version, not in Lance's index cache for a
+freshly committed detached version). The pipeline now spawns `load_indices` on each new tip
+right after its commit, beside the log stage, so writers' validation hits the cache. Mem 20 ms,
+one branch: N=1 7.0 → 8.4 (140 → 118 ms), N=16 66.0 → 81.8, N=64 279.3 → 354.0 (p99 375 →
+332). Full sweep `final-wal-pf` (+ `-lat5`, `-lat50`): one branch 8.3 / 16.2 / 81.5 / 351.5,
+branches 8.3 / 32.8 / 128.2 / 187.2, local one branch 37.2 / 63.3 / 295.6 / 1158.9, 5 ms
+188.7 / 751.2 at N=16/64, 50 ms 29.0 / 126.3. All verified.

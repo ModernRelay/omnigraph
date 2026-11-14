@@ -10,11 +10,14 @@
 
 **Headline.** On one branch at 20 ms per object-store request, the best existing path
 (writer epoch held) lands 1.7 commits/s with 16 writers (p99 5.2 s) and none at all with 64.
-The prototype here lands **64 commits/s at 16 writers (p99 379 ms) and 280/s at 64 (p99
-366 ms)**. On local files, one branch goes from 24.6 and 19.9 commits/s (p99 0.8 s and
-3.2 s) to **316 and 1182 (p99 98 and 93 ms)**. With one branch per writer at 20 ms, 16.6 and
-59.8 commits/s become **111 and 197** (p99 155 and 527 ms). Every cell is verified: after the
-run a fresh handle finds every acknowledged insert exactly once.
+The prototype lands **81.5 commits/s at 16 writers (p99 337 ms) and 351.5/s at 64 (p99
+331 ms)**. With one branch per writer at 20 ms, 16.6 and 59.8 commits/s (p99 0.97 s and
+1.09 s) become **128.2 and 187.2** (p99 140 and 571 ms). On local files, one branch goes
+from 24.6 and 19.9 commits/s (p99 0.84 s and 3.17 s) to **296 and 1159** (p99 100 and 89 ms)
+with the full design, or 361 and 1362 with group commit and leader staging alone, which is
+the faster choice on a local disk. At 5 ms per request one branch reaches 189 and 751
+commits/s; at 50 ms, where the existing path lands nothing, 29 and 126. Every cell is
+verified: after the run a fresh handle finds every acknowledged insert exactly once.
 
 **Cost model.** A commit today is about 10 sequential object-store round trips, 6 of them
 under the branch gate; its commit point is three dependent puts (the `__manifest` hot-row
@@ -30,7 +33,9 @@ writer-staged form hits. (2) *A record log in front of `__manifest`*: the public
 version V becomes one conditional put of a record holding V's complete row set, read by
 every log-aware reader at once and folded into `__manifest` V in the background; with
 pipelined batches it adds +32% commits/s and −33% median latency at 64 writers (211 → 280
-commits/s) and cuts a single writer from 208 to 140 ms. A per-branch authority cache plus
+commits/s) and cuts a single writer from 208 to 140 ms. Prefetching each new table tip's
+index metadata once per batch, instead of every writer reading it in validation, takes
+the pipeline from 280 to 352 commits/s at 64 writers and a single writer to 119 ms. A per-branch authority cache plus
 PR #1350's probe skip extended to held named branches is what makes separate branches scale.
 
 **Where the log does not help.** On a local disk the system is CPU-bound and I/O is
@@ -206,56 +211,62 @@ in each row.
 | 7 | Pipeline the batch: stage / commit-on-tip / record | same branch N=64: 217 → **280–292 (205–212 ms, p99 366)**; N=16: 56 → 64–66; without the log the best pipeline is 211 at N=64 (`final-wal`, `pipeline-*`) | Keep |
 | 8 | Pipeline with ticket order and a depth semaphore | depth 2: 246, 3: 253, 4: 192 at N=64 | Discard: smaller batches; hand-over-hand batch formation is better |
 | 9 | Crash recovery and cold reads from the log tail | test passes: 12 of 12 acknowledged rows visible to a fresh reader with 7 unfolded; the next owner folds them | Keep (correctness evidence) |
+| 10 | Fencing by making the claim the next record | the old owner's next write is refused `WriterFenced`; throughput unchanged (285 at N=64) | Keep |
+| 11 | Cold reads: newest record only, exponential + binary probe | 63 unfolded records: 2.98 s / 138 requests → 0.77 s / 36; caught up: as today | Keep |
+| 12 | Prefetch each new tip's index metadata once per batch | N=1: 140 → 119 ms; N=16: 66 → 82; N=64: 279 → **352 (p99 331)** (`final-wal-pf`) | Keep |
 
 ### 5.1 Final measurements
 
-`final-wal` = group commit + leader staging + record log + pipeline (+ the per-branch
-cache, always on in this branch). Commits/s (p50 ms, p99 ms); every cell verified.
+`final` = group commit + leader staging + record log + pipeline + the tip index prefetch
+(`OMNIGRAPH_GROUP_PREFETCH=1`), with the per-branch cache (always on in this branch);
+`final-wal` is the same without the prefetch. Commits/s (p50 ms, p99 ms); every cell
+verified.
 
 **One branch, mem 20 ms**
 
-| N | baseline | baseline, epoch claimed | final-wal |
-|---|---|---|---|
-| 1 | 4.3 (230, 233) | 4.7 (208, 212) | 6.9 (141, 145) |
-| 4 | 2.4 (1391, 1609) | 2.9 (1183, 1356) | 13.9 (276, 302) |
-| 16 | 1.3 (5621, 5912) | 1.7 (4858, 5214) | **64.1 (220, 379)** |
-| 64 | 0 in 10 s | 0 in 10 s | **279.6 (212, 366)** |
+| N | baseline | baseline, epoch claimed | final-wal | final |
+|---|---|---|---|---|
+| 1 | 4.3 (230, 233) | 4.7 (208, 212) | 6.9 (141, 145) | 8.3 (119, 123) |
+| 4 | 2.4 (1391, 1609) | 2.9 (1183, 1356) | 13.9 (276, 302) | 16.2 (264, 283) |
+| 16 | 1.3 (5621, 5912) | 1.7 (4858, 5214) | 64.1 (220, 379) | **81.5 (196, 337)** |
+| 64 | 0 in 10 s | 0 in 10 s | 279.6 (212, 366) | **351.5 (193, 331)** |
 
 **One branch per writer, mem 20 ms**
 
-| N | baseline | baseline, epoch claimed | final-wal |
-|---|---|---|---|
-| 1 | 2.3 (423, 426) | 2.3 (423, 427) | 7.0 (141, 145) |
-| 4 | 5.6 (725, 813) | 5.5 (724, 919) | 26.6 (143, 186) |
-| 16 | 16.5 (922, 1010) | 16.6 (915, 972) | **110.5 (142, 155)** |
-| 64 | 60.0 (1023, 1102) | 59.8 (1022, 1094) | **197.3 (308, 527)** |
+| N | baseline | baseline, epoch claimed | final-wal | final |
+|---|---|---|---|---|
+| 1 | 2.3 (423, 426) | 2.3 (423, 427) | 7.0 (141, 145) | 8.3 (120, 125) |
+| 4 | 5.6 (725, 813) | 5.5 (724, 919) | 26.6 (143, 186) | 32.8 (120, 141) |
+| 16 | 16.5 (922, 1010) | 16.6 (915, 972) | 110.5 (142, 155) | **128.2 (122, 140)** |
+| 64 | 60.0 (1023, 1102) | 59.8 (1022, 1094) | 197.3 (308, 527) | **187.2 (306, 571)** |
 
 **One branch, local files**
 
-| N | baseline | baseline, epoch claimed | final-wal | best local: group commit + leader staging, no log |
+| N | baseline | baseline, epoch claimed | final | best local: group commit + leader staging, no log |
 |---|---|---|---|---|
-| 1 | 30.8 (33, 50) | 30.7 (33, 47) | 38.3 (27, 38) | 33.8 (29, 39) |
-| 4 | 24.5 (155, 220) | 24.7 (152, 281) | 67.0 (58, 98) | 84.3 (40, 97) |
-| 16 | 24.5 (638, 825) | 24.6 (613, 836) | **315.5 (49, 98)** | 361.2 (38, 80) |
-| 64 | 21.4 (2487, 2808) | 19.9 (2494, 3167) | **1181.9 (51, 93)** | 1361.7 (41, 86) |
+| 1 | 30.8 (33, 50) | 30.7 (33, 47) | 37.2 (26, 39) | 33.8 (29, 39) |
+| 4 | 24.5 (155, 220) | 24.7 (152, 281) | 63.3 (59, 113) | 84.3 (40, 97) |
+| 16 | 24.5 (638, 825) | 24.6 (613, 836) | **295.6 (52, 100)** | 361.2 (38, 80) |
+| 64 | 21.4 (2487, 2808) | 19.9 (2494, 3167) | **1158.9 (55, 89)** | 1361.7 (41, 86) |
 
 **One branch per writer, local files**
 
-| N | baseline | baseline, epoch claimed | final-wal |
+| N | baseline | baseline, epoch claimed | final |
 |---|---|---|---|
-| 1 | 29.7 (34, 57) | 28.7 (36, 50) | 36.3 (27, 38) |
-| 4 | 78.6 (52, 84) | 75.7 (52, 84) | 102.6 (38, 65) |
-| 16 | 169.2 (91, 190) | 154.2 (101, 175) | 174.7 (90, 125) |
-| 64 | 175.7 (353, 502) | 170.7 (372, 435) | 238.5 (253, 359) |
+| 1 | 29.7 (34, 57) | 28.7 (36, 50) | 36.0 (28, 39) |
+| 4 | 78.6 (52, 84) | 75.7 (52, 84) | 100.8 (37, 81) |
+| 16 | 169.2 (91, 190) | 154.2 (101, 175) | 205.1 (75, 123) |
+| 64 | 175.7 (353, 502) | 170.7 (372, 435) | 252.7 (237, 415) |
 
-**Latency sensitivity (one branch; one branch per writer in the last column)**
+**Latency sensitivity** (`final-wal` rows have no prefetch; the `final` cells were run at
+16 and 64 writers)
 
-| N | 5 ms: epoch claimed | 5 ms: final-wal | 50 ms: epoch claimed | 50 ms: final-wal | 50 ms branches: final-wal |
-|---|---|---|---|---|---|
-| 1 | 13.5 (73, 78) | 19.2 (51, 58) | 2.0 (477, 479) | 3.0 (321, 323) | 3.0 (320, 322) |
-| 4 | 8.6 (449, 465) | 38.1 (103, 135) | 1.0 (2736, 2738) | 6.0 (629, 635) | 12.0 (320, 323) |
-| 16 | 7.4 (1796, 1935) | 183.1 (84, 137) | 0 in 10 s | 27.8 (473, 791) | 48.4 (319, 331) |
-| 64 | 2.7 (7123, 7159) | 699.7 (92, 139) | 0 in 10 s | 129.7 (474, 792) | 181.4 (324, 558) |
+| N | 5 ms: epoch claimed | 5 ms: final-wal | 5 ms: final | 50 ms: epoch claimed | 50 ms: final | 50 ms branches: final |
+|---|---|---|---|---|---|---|
+| 1 | 13.5 (73, 78) | 19.2 (51, 58) | - | 2.0 (477, 479) | - | - |
+| 4 | 8.6 (449, 465) | 38.1 (103, 135) | - | 1.0 (2736, 2738) | - | - |
+| 16 | 7.4 (1796, 1935) | 183.1 (84, 137) | 188.7 (84, 154) | 0 in 10 s | 29.0 (468, 784) | 57.6 (268, 285) |
+| 64 | 2.7 (7123, 7159) | 699.7 (92, 139) | 751.2 (85, 136) | 0 in 10 s | 126.3 (469, 783) | 208.6 (277, 585) |
 
 **Ablation: what each piece contributes (one branch, mem 20 ms)**
 
@@ -291,8 +302,11 @@ process, every head-advancing publication now goes through it.
 
 ### 5.2 Findings outside the log
 
-- Each writer's preparation reads the pinned table manifest's index metadata (one ranged
-  GET) even on a handle-cache hit; with leader staging the writer does not need it.
+- Each writer's validation planning (`validate_staged_mutation` → `plan_write` →
+  `load_indices`) reads the pinned table version's index metadata, one ranged GET per write,
+  because Lance has not cached it for a freshly committed detached version. Loading it once
+  per batch in the background right after the commit stage (the prefetch) removes it from
+  every writer's path: 279 → 352 commits/s at 64 writers, 140 → 119 ms for one writer.
 - Lance caches a committed version's index metadata only when the list is non-empty
   (`io/commit.rs` ~1556); an index-less table pays one GET per commit for its successor.
 - Under load, the pipeline's commit stage measures ~66 ms against 45 ms at one writer: the
@@ -630,7 +644,8 @@ In order of dependency:
 Prototype switches (environment, read once per process; all default off):
 `OMNIGRAPH_GROUP_COMMIT=1` (group commit), `OMNIGRAPH_WAL=1` (record log; implies group
 commit), `OMNIGRAPH_GROUP_STAGE=leader` (leader staging), `OMNIGRAPH_GROUP_PIPELINE=1`
-(pipeline; needs the two before), `OMNIGRAPH_GROUP_DEPTH`, `OMNIGRAPH_WAL_MAX_UNFOLDED`.
+(pipeline; needs the two before), `OMNIGRAPH_GROUP_PREFETCH=1` (tip index prefetch),
+`OMNIGRAPH_GROUP_DEPTH`, `OMNIGRAPH_WAL_MAX_UNFOLDED`.
 The per-branch authority cache and the held-branch probe skip are always on in this branch.
 
 | Piece | Where |
@@ -651,7 +666,8 @@ Build and run (from the repository root):
 CARGO_PROFILE_DEV_OPT_LEVEL=2 cargo test -p omnigraph-engine --features dst \
   --test write_throughput --no-run
 OG_WT_CLAIM=1 OMNIGRAPH_WAL=1 OMNIGRAPH_GROUP_STAGE=leader OMNIGRAPH_GROUP_PIPELINE=1 \
-  research/write-throughput-wal/scripts/sweep.sh final-wal "mem file" "same,branches" "1,4,16,64"
+  OMNIGRAPH_GROUP_PREFETCH=1 \
+  research/write-throughput-wal/scripts/sweep.sh final-wal-pf "mem file" "same,branches" "1,4,16,64"
 OMNIGRAPH_WAL=1 target/debug/deps/write_throughput-<hash> --ignored --nocapture \
   --exact wal_recovery_and_cold_reads
 python3 research/write-throughput-wal/scripts/table.py mem:20:same baseline final-wal

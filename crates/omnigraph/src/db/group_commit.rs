@@ -212,6 +212,13 @@ impl BranchGroup {
     }
 }
 
+/// Whether the pipeline prefetches each new tip's index metadata
+/// (`OMNIGRAPH_GROUP_PREFETCH=1`).
+fn prefetch_indices() -> bool {
+    static PREFETCH: OnceLock<bool> = OnceLock::new();
+    *PREFETCH.get_or_init(|| std::env::var("OMNIGRAPH_GROUP_PREFETCH").is_ok_and(|value| value == "1"))
+}
+
 /// Batches in flight in a pipelined branch group (`OMNIGRAPH_GROUP_DEPTH`).
 fn pipeline_depth() -> usize {
     static DEPTH: OnceLock<usize> = OnceLock::new();
@@ -939,6 +946,16 @@ async fn run_pipelined_batch(
                             detached.dataset().clone(),
                         )
                         .await;
+                    // Writers validate against this version next: load its
+                    // index metadata into the session cache once, beside the
+                    // log stage, instead of once per writer.
+                    if prefetch_indices() {
+                        let tip = detached.dataset().clone();
+                        tokio::spawn(async move {
+                            use lance::index::DatasetIndexExt as _;
+                            let _ = tip.load_indices().await;
+                        });
+                    }
                     chain.tips.insert(
                         component.table_key.clone(),
                         ChainTip {
