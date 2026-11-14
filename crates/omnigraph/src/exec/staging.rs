@@ -1217,6 +1217,17 @@ impl StagedMutation {
         // exclusive side excludes every writer, RFC
         // 2026-09-18-shared-schema-gate), branch gate, then sorted
         // per-table gates. Hold the full set through manifest publish.
+        // Research (concurrent writes): an insert-only attempt whose every
+        // written table is a node type without a non-key `@unique` reads
+        // nothing but the key checks of those tables, so publications since
+        // its capture that are disjoint from them, or only insert into them,
+        // commute with it.
+        let commuting: Option<HashSet<String>> = (attempt.insert_only()
+            && !staged.is_empty()
+            && staged
+                .iter()
+                .all(|entry| commuting_eligible_table(&txn.catalog, &entry.table_key)))
+        .then(|| staged.iter().map(|entry| entry.table_key.clone()).collect());
         let gate_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
             crate::instrumentation::phase_timers::WritePhase::GateWait,
         );
@@ -1254,10 +1265,11 @@ impl StagedMutation {
         // only read keeps its moved pin. Otherwise mutation inserts and load
         // append/merge reprepare at their outer bounded retry loop, and strict
         // read-modify-write operations return the typed conflict.
-        let (snapshot, carried_txn, mut carried) = match db
-            .revalidate_write_txn_carrying(txn, early)
-            .await?
-        {
+        let revalidated = match &commuting {
+            Some(written) => db.revalidate_write_txn_commuting(txn, early, written).await?,
+            None => db.revalidate_write_txn_carrying(txn, early).await?,
+        };
+        let (snapshot, carried_txn, mut carried) = match revalidated {
             crate::db::WriteRevalidation::Current(snapshot) => (*snapshot, None, HashMap::new()),
             crate::db::WriteRevalidation::RowPreserving { txn, tables } => {
                 (txn.base.clone(), Some(txn), tables)
@@ -1290,6 +1302,9 @@ impl StagedMutation {
             // Without a row-preserving chain, a moved pin is a stale read set:
             // restart the whole validation attempt before effects.
             let Some(table) = carried.remove(&entry.table_key) else {
+                crate::instrumentation::phase_timers::bump(
+                    crate::instrumentation::phase_timers::Event::CarryChainRefused,
+                );
                 return Err(refused);
             };
             let Some(staged_write) = entry.staged_write.take() else {
@@ -1310,6 +1325,9 @@ impl StagedMutation {
                     }
                 }
                 Err(reason) => {
+                    crate::instrumentation::phase_timers::bump(
+                        crate::instrumentation::phase_timers::Event::CarryLanceRefused,
+                    );
                     tracing::debug!(
                         table = %entry.table_key,
                         %reason,
@@ -1433,6 +1451,16 @@ impl StagedMutation {
             gates_acquired_at,
         })
     }
+}
+
+/// Research (concurrent writes): a node table whose inserts read nothing but
+/// their own key check (no non-key `@unique`, which an insert validates by
+/// scanning the table).
+fn commuting_eligible_table(catalog: &omnigraph_compiler::catalog::Catalog, table_key: &str) -> bool {
+    table_key
+        .strip_prefix("node:")
+        .and_then(|name| catalog.node_types.get(name))
+        .is_some_and(|node| node.unique_constraints.is_empty())
 }
 
 /// Compare two schemas for the purposes of `MutationStaging::append_batch`'s

@@ -811,6 +811,88 @@ pub(crate) async fn row_preserving_chain(
     current: &Dataset,
     captured_version: u64,
 ) -> Result<Option<RowPreservingChain>> {
+    chain_of(current, captured_version, false).await
+}
+
+/// Research (concurrent writes): [`row_preserving_chain`] that also admits
+/// insert-only links, keyed inserts (`Operation::Update` adding fragments,
+/// replacing none, with the inserted-key filter) and appends, so an
+/// insert-only write staged before them can be carried over them by Lance's
+/// resolver, which refuses intersecting key filters.
+pub(crate) async fn commuting_chain(
+    current: &Dataset,
+    captured_version: u64,
+) -> Result<Option<RowPreservingChain>> {
+    chain_of(current, captured_version, true).await
+}
+
+/// An insert-only link: rows only added, none moved, replaced or deleted.
+pub(crate) fn link_is_insert_only(operation: &Operation) -> bool {
+    match operation {
+        Operation::Append { .. } => true,
+        Operation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+            fields_modified,
+            inserted_rows_filter,
+            updated_fragment_offsets,
+            ..
+        } => {
+            removed_fragment_ids.is_empty()
+                && updated_fragments.is_empty()
+                && !new_fragments.is_empty()
+                && fields_modified.is_empty()
+                && inserted_rows_filter.is_some()
+                && updated_fragment_offsets.is_none()
+        }
+        _ => false,
+    }
+}
+
+async fn chain_of(
+    current: &Dataset,
+    captured_version: u64,
+    commuting: bool,
+) -> Result<Option<RowPreservingChain>> {
+    // Research: every link this process committed is in the detached link
+    // log; walk it first and read storage only on a miss.
+    let allowed = |operation: &Operation| {
+        matches!(
+            operation,
+            Operation::Rewrite { .. } | Operation::CreateIndex { .. }
+        ) || (commuting && link_is_insert_only(operation))
+    };
+    {
+        let uri = current.uri();
+        let mut version = current.version().version;
+        let mut links = Vec::new();
+        // In memory, so bounded by the log rather than the storage walk's cap.
+        for _ in 0..detached_links::ENTRIES {
+            let Some(transaction) = detached_links::get(uri, version) else {
+                break;
+            };
+            if !allowed(&transaction.operation) {
+                return Ok(None);
+            }
+            let read_version = transaction.read_version;
+            links.push((version, (*transaction).clone()));
+            if read_version == captured_version {
+                links.reverse();
+                crate::instrumentation::phase_timers::bump(
+                    crate::instrumentation::phase_timers::Event::LinkLogHit,
+                );
+                return Ok(Some(RowPreservingChain { links }));
+            }
+            if read_version == 0 {
+                return Ok(None);
+            }
+            version = read_version;
+        }
+    }
+    crate::instrumentation::phase_timers::bump(
+        crate::instrumentation::phase_timers::Event::LinkLogMiss,
+    );
     let mut links = Vec::new();
     let mut dataset = current.clone();
     for _ in 0..ROW_PRESERVING_CHAIN_MAX_LINKS {
@@ -821,10 +903,11 @@ pub(crate) async fn row_preserving_chain(
         else {
             return Ok(None);
         };
-        if !matches!(
+        let preserving = matches!(
             transaction.operation,
             Operation::Rewrite { .. } | Operation::CreateIndex { .. }
-        ) {
+        );
+        if !preserving && !(commuting && link_is_insert_only(&transaction.operation)) {
             return Ok(None);
         }
         let read_version = transaction.read_version;
@@ -1295,12 +1378,62 @@ async fn commit_detached(
     if let Some(affected_rows) = affected_rows {
         builder = builder.with_affected_rows(affected_rows);
     }
+    let recorded = transaction.clone();
     // A detached commit is unreachable until a manifest names it, so its
     // failure is definite for the graph whatever its storage cause.
-    builder
+    let committed = builder
         .execute(transaction)
         .await
-        .map_err(|error| OmniError::storage(error).unpublished())
+        .map_err(|error| OmniError::storage(error).unpublished())?;
+    detached_links::record(committed.uri(), committed.version().version, recorded);
+    Ok(committed)
+}
+
+/// Research (concurrent writes): the transactions of the detached versions
+/// this process committed, by `(table URI, version)`. A detached version's
+/// transaction is immutable, so this is a cache of immutable version-pinned
+/// state (invariant 12): a chain walk that finds every link here reads no
+/// manifest, and one that misses walks storage as before.
+pub(crate) mod detached_links {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use lance::dataset::transaction::Transaction;
+
+    pub(crate) const ENTRIES: usize = 1024;
+
+    #[derive(Default)]
+    struct Log {
+        map: HashMap<(String, u64), Arc<Transaction>>,
+        order: VecDeque<(String, u64)>,
+    }
+
+    static LOG: LazyLock<Mutex<Log>> = LazyLock::new(|| Mutex::new(Log::default()));
+
+    fn normalize(uri: &str) -> String {
+        uri.trim_start_matches("file://").trim_end_matches('/').to_string()
+    }
+
+    pub(crate) fn record(uri: &str, version: u64, transaction: Transaction) {
+        let mut log = LOG.lock().expect("detached link log poisoned");
+        let key = (normalize(uri), version);
+        if log.map.insert(key.clone(), Arc::new(transaction)).is_none() {
+            log.order.push_back(key);
+        }
+        while log.order.len() > ENTRIES {
+            if let Some(old) = log.order.pop_front() {
+                log.map.remove(&old);
+            }
+        }
+    }
+
+    pub(crate) fn get(uri: &str, version: u64) -> Option<Arc<Transaction>> {
+        LOG.lock()
+            .expect("detached link log poisoned")
+            .map
+            .get(&(normalize(uri), version))
+            .cloned()
+    }
 }
 
 /// The columns of `columns` that hold no full-text segment once `effect`

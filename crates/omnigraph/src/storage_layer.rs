@@ -860,6 +860,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         captured_version: u64,
     ) -> Result<Option<crate::table_store::RowPreservingChain>>;
 
+    /// [`Self::row_preserving_chain`] that also admits insert-only links
+    /// (`table_store::commuting_chain`).
+    async fn commuting_chain(
+        &self,
+        current: &SnapshotHandle,
+        captured_version: u64,
+    ) -> Result<Option<crate::table_store::RowPreservingChain>>;
+
     /// Carry a staged effect prepared on `base` over a row-preserving chain
     /// to `current` with Lance's conflict resolver
     /// (`table_store::rebase_staged_write`). Writes nothing.
@@ -1506,6 +1514,14 @@ impl TableStorage for TableStore {
         captured_version: u64,
     ) -> Result<Option<crate::table_store::RowPreservingChain>> {
         crate::table_store::row_preserving_chain(current.dataset(), captured_version).await
+    }
+
+    async fn commuting_chain(
+        &self,
+        current: &SnapshotHandle,
+        captured_version: u64,
+    ) -> Result<Option<crate::table_store::RowPreservingChain>> {
+        crate::table_store::commuting_chain(current.dataset(), captured_version).await
     }
 
     async fn rebase_staged_write(

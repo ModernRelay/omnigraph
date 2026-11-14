@@ -628,10 +628,37 @@ impl GraphNamespacePublisher {
     }
 
     async fn load_publish_state(&self) -> Result<LoadedPublishState> {
+        self.load_publish_state_trusting(false).await
+    }
+
+    /// Research (trusted tip): with `trust_held`, a publisher holding the
+    /// version its own last publication acknowledged starts from it without
+    /// the freshness listing. The version CAS stays the authority: a foreign
+    /// publication since makes the put of the next version fail, and the
+    /// retry loads fresh state (`trust_held` is only the first attempt's).
+    async fn load_publish_state_trusting(&self, trust_held: bool) -> Result<LoadedPublishState> {
         // Test seam: inject a retryable contention here to exercise the outer
         // retry loop's re-run-on-retryable-load-error path (no-op without the
         // `failpoints` feature). The migration surfaces the same typed error.
         contention(&PUBLISH_LOAD_STATE)?;
+        if trust_held && crate::instrumentation::phase_timers::research_enabled("TRUST_TIP") {
+            let held = self
+                .published_rows
+                .lock()
+                .expect("published rows cache lock poisoned")
+                .as_ref()
+                .and_then(|rows| rows.acknowledged.clone().map(|ds| (ds, rows.batch.clone())));
+            if let Some((held, batch)) = held {
+                let dataset = crate::instrumentation::rebind_control_dataset(
+                    &held,
+                    crate::instrumentation::manifest_wrapper(),
+                )
+                .await?;
+                guard_stamp(&dataset)?;
+                let rows = super::state::rows_of_batch(&batch)?;
+                return Ok(LoadedPublishState { dataset, rows });
+            }
+        }
         let dataset = self.dataset().await?;
         guard_stamp(&dataset)?;
         let rows = match self.cached_rows(&dataset) {
@@ -1728,7 +1755,7 @@ impl GraphNamespacePublisher {
             let load_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
                 crate::instrumentation::phase_timers::WritePhase::PublisherLoad,
             );
-            let loaded = match self.load_publish_state().await {
+            let loaded = match self.load_publish_state_trusting(attempt == 0).await {
                 Ok(loaded) => {
                     load_timer.stop();
                     loaded

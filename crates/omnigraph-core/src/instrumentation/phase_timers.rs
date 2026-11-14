@@ -115,3 +115,63 @@ pub fn snapshot() -> Vec<(&'static str, u64, u64)> {
         })
         .collect()
 }
+
+/// Research switches, read once per process. Each mechanism this research
+/// adds is on by default and turned off by `OMNIGRAPH_RESEARCH_NO_<NAME>`,
+/// so one binary measures every arm.
+pub fn research_enabled(name: &'static str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    static FLAGS: LazyLock<Mutex<HashMap<&'static str, bool>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut flags = FLAGS.lock().expect("research flags poisoned");
+    *flags
+        .entry(name)
+        .or_insert_with(|| std::env::var_os(format!("OMNIGRAPH_RESEARCH_NO_{name}")).is_none())
+}
+
+/// Research event counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A chain walk served wholly from the detached link log.
+    LinkLogHit,
+    /// A chain walk that fell back to storage.
+    LinkLogMiss,
+    /// A carry refused because a moved table's chain was not admissible.
+    CarryChainRefused,
+    /// A carry refused by Lance's resolver.
+    CarryLanceRefused,
+}
+
+impl Event {
+    pub const ALL: [Event; 4] = [
+        Event::LinkLogHit,
+        Event::LinkLogMiss,
+        Event::CarryChainRefused,
+        Event::CarryLanceRefused,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Event::LinkLogHit => "link_log_hit",
+            Event::LinkLogMiss => "link_log_miss",
+            Event::CarryChainRefused => "carry_chain_refused",
+            Event::CarryLanceRefused => "carry_lance_refused",
+        }
+    }
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|e| *e == self).unwrap_or(0)
+    }
+}
+
+static EVENTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub fn bump(event: Event) {
+    EVENTS[event.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn events() -> Vec<(&'static str, u64)> {
+    Event::ALL
+        .iter()
+        .map(|e| (e.name(), EVENTS[e.index()].load(Ordering::Relaxed)))
+        .collect()
+}

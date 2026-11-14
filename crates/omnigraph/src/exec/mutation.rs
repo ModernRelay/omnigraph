@@ -1410,6 +1410,9 @@ impl Omnigraph {
                 .all(|op| matches!(op, MutationOpIR::Insert { .. }))
         });
         attempt.admit(&txn, selects_rows)?;
+        if !selects_rows && std::env::var_os("OMNIGRAPH_RESEARCH_NO_COMMUTE").is_none() {
+            attempt.mark_insert_only();
+        }
         let ir = lowered?;
         debug_assert!(
             route.agrees_with(&ir.write_mode),

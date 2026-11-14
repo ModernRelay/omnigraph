@@ -121,6 +121,10 @@ pub(crate) struct WriteAttempt {
     first: Option<AttemptIdentity>,
     admitted: bool,
     identity_changed: bool,
+    /// Research (concurrent writes): every operation the attempt executed
+    /// was an insert, so its only reads are the key checks of the tables it
+    /// writes.
+    insert_only: bool,
 }
 
 impl WriteAttempt {
@@ -131,6 +135,16 @@ impl WriteAttempt {
     /// admit its capture would otherwise rerun across a recreated branch or a
     /// schema change unchecked. This is the attempt's commit point: its
     /// preparation ends here, and the writer gates may be taken from here on.
+    /// Mark this attempt insert-only (a mutation whose every statement is an
+    /// insert); see [`WriteAttempt::insert_only`].
+    pub(crate) fn mark_insert_only(&mut self) {
+        self.insert_only = true;
+    }
+
+    pub(crate) fn insert_only(&self) -> bool {
+        self.insert_only
+    }
+
     pub(crate) fn admitted_gates(&mut self) -> Result<Option<BranchWriteGates>> {
         if !self.admitted {
             return Err(OmniError::manifest_internal(
@@ -244,6 +258,7 @@ impl<'a> PreEffectReprepares<'a> {
             first,
             admitted: false,
             identity_changed: false,
+            insert_only: false,
         };
         self.db.refresh_coordinator_only().await
     }

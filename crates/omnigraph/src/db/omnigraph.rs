@@ -1717,8 +1717,11 @@ impl Omnigraph {
         let branch = normalize_branch_name(branch.unwrap_or("main"))?;
 
         let head_on_record = self.holds_head_of(branch.as_deref());
+        // Research (trusted tip): capture from the installed view of the
+        // bound branch without a freshness probe; the version CAS fences.
+        let fresh = !crate::instrumentation::phase_timers::research_enabled("TRUST_TIP");
         let (branch_identifier, graph_head, effective_graph_head, snapshot, manifest_probe) = self
-            .write_authority_for_known_branch(branch.as_deref(), true)
+            .write_authority_for_known_branch(branch.as_deref(), fresh)
             .await?;
         let (catalog, identity) = self.accepted_catalog_for_snapshot(&snapshot).await?;
         validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;
@@ -2226,6 +2229,11 @@ impl Omnigraph {
     /// the bound branch, when this process holds the branch and owes no
     /// probe, or when the probe failed, so the revalidation probes itself.
     pub(crate) async fn early_revalidation(&self, txn: &WriteTxn) -> Option<EarlyRevalidation> {
+        // Research (trusted tip): the bound branch's revalidation takes the
+        // installed view, so the beside-staging probe has no reader.
+        if crate::instrumentation::phase_timers::research_enabled("TRUST_TIP") {
+            return None;
+        }
         let coord = self.coordinator.load_full();
         if txn.branch.as_deref() != coord.current_branch() || coord.held_head().is_some() {
             return None;
@@ -2252,7 +2260,7 @@ impl Omnigraph {
         txn: &WriteTxn,
         early: Option<EarlyRevalidation>,
     ) -> Result<Snapshot> {
-        match self.revalidate_write_txn_inner(txn, early, false).await? {
+        match self.revalidate_write_txn_inner(txn, early, false, None).await? {
             WriteRevalidation::Current(snapshot) => Ok(*snapshot),
             WriteRevalidation::RowPreserving { .. } => Err(OmniError::manifest_internal(
                 "a revalidation that may not carry the write carried it",
@@ -2276,7 +2284,24 @@ impl Omnigraph {
         txn: &WriteTxn,
         early: Option<EarlyRevalidation>,
     ) -> Result<WriteRevalidation> {
-        self.revalidate_write_txn_inner(txn, early, true).await
+        self.revalidate_write_txn_inner(txn, early, true, None)
+            .await
+    }
+
+    /// Research (concurrent writes): [`Self::revalidate_write_txn_carrying`]
+    /// for an insert-only write whose only reads are the tables it writes
+    /// (`commuting`): publications since the capture that touched other
+    /// tables are disjoint from it, and a written table may have moved
+    /// through insert-only commits too, which Lance's resolver carries the
+    /// staged insert over unless their key filters intersect.
+    pub(crate) async fn revalidate_write_txn_commuting(
+        &self,
+        txn: &WriteTxn,
+        early: Option<EarlyRevalidation>,
+        commuting: &HashSet<String>,
+    ) -> Result<WriteRevalidation> {
+        self.revalidate_write_txn_inner(txn, early, true, Some(commuting))
+            .await
     }
 
     async fn revalidate_write_txn_inner(
@@ -2284,6 +2309,7 @@ impl Omnigraph {
         txn: &WriteTxn,
         early: Option<EarlyRevalidation>,
         carry: bool,
+        commuting: Option<&HashSet<String>>,
     ) -> Result<WriteRevalidation> {
         let installed = self.coordinator.load_full();
         let bound = txn.branch.as_deref() == installed.current_branch();
@@ -2292,8 +2318,14 @@ impl Omnigraph {
                 early.latest.matches(&early.held)
                     && installed.manifest_incarnation().matches(&early.held)
             });
+        // Research (trusted tip): on the bound branch the installed view is
+        // the head this process last published or loaded; a foreign
+        // publication since is refused by the version CAS, and the write
+        // prepares again.
+        let trusted =
+            bound && crate::instrumentation::phase_timers::research_enabled("TRUST_TIP");
         let (branch_identifier, graph_head, effective_graph_head, snapshot, probe) =
-            if probed_current {
+            if probed_current || trusted {
                 self.write_authority_for_known_branch(txn.branch.as_deref(), false)
                     .await?
             } else if !bound && txn.manifest_probe.is_current().await? {
@@ -2348,9 +2380,21 @@ impl Omnigraph {
             if !carry || !same_schema || txn.unattached_base.is_some() {
                 return Err(moved);
             }
-            match self.row_preserving_tables(&txn.base, &snapshot).await? {
+            let tables = match commuting {
+                Some(written) => {
+                    self.commuting_tables(&txn.base, &snapshot, written)
+                        .await?
+                }
+                None => self.row_preserving_tables(&txn.base, &snapshot).await?,
+            };
+            match tables {
                 Some(tables) => Some(tables),
-                None => return Err(moved),
+                None => {
+                    crate::instrumentation::phase_timers::bump(
+                        crate::instrumentation::phase_timers::Event::CarryChainRefused,
+                    );
+                    return Err(moved);
+                }
             }
         } else {
             None
@@ -2450,6 +2494,75 @@ impl Omnigraph {
                 let chain = self
                     .storage()
                     .row_preserving_chain(&handle, captured_version)
+                    .await?;
+                Ok::<_, OmniError>(chain.map(|chain| {
+                    (
+                        after.type_key.clone(),
+                        CarriedTable {
+                            chain,
+                            current: handle,
+                            entry: after.clone(),
+                        },
+                    )
+                }))
+            }))
+            .await?;
+        Ok(proofs.into_iter().collect::<Option<HashMap<_, _>>>())
+    }
+
+    /// Research (concurrent writes): every table the write touches whose pin
+    /// moved since the capture, with the commits between them and the current
+    /// handle, when the table set and every table's identity, location and
+    /// native ref are unchanged and each written table moved only through
+    /// row-preserving or insert-only commits; a table the write neither reads
+    /// nor writes may have moved in any way. `None` refuses the carry.
+    async fn commuting_tables(
+        &self,
+        captured: &Snapshot,
+        current: &Snapshot,
+        written: &HashSet<String>,
+    ) -> Result<Option<HashMap<String, CarriedTable>>> {
+        if captured.datasets().count() != current.datasets().count() {
+            return Ok(None);
+        }
+        let mut moved = Vec::new();
+        for before in captured.datasets() {
+            let Some(after) = current.dataset(&before.type_key) else {
+                return Ok(None);
+            };
+            if after.identity != before.identity
+                || after.dataset_path != before.dataset_path
+                || after.native_dataset_branch != before.native_dataset_branch
+            {
+                return Ok(None);
+            }
+            let pin = |entry: &crate::db::DatasetEntry| {
+                (
+                    entry.published_dataset_version,
+                    entry.version_metadata.staged_version(),
+                )
+            };
+            if pin(after) == pin(before) || !written.contains(&before.type_key) {
+                continue;
+            }
+            if after.published_dataset_version < before.published_dataset_version {
+                return Ok(None);
+            }
+            moved.push((before, after));
+        }
+        let proofs =
+            futures::future::try_join_all(moved.into_iter().map(|(before, after)| async move {
+                // The current pin was committed by this process in the common
+                // case: the read-handle cache holds it and the open is free.
+                let full_path = self.storage().dataset_uri(&after.dataset_path);
+                let handle = self.open_pinned_for_write(&full_path, after).await?;
+                let captured_version = before
+                    .version_metadata
+                    .staged_version()
+                    .unwrap_or(before.published_dataset_version);
+                let chain = self
+                    .storage()
+                    .commuting_chain(&handle, captured_version)
                     .await?;
                 Ok::<_, OmniError>(chain.map(|chain| {
                     (

@@ -48,11 +48,22 @@ async fn rebind(
     Ok(rebound)
 }
 
+/// Research (trusted tip): bind a retained control dataset to the current
+/// query's IO scope without any storage request.
+pub async fn rebind_control_dataset(
+    dataset: &Dataset,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    rebind(dataset, wrapper).await
+}
+
 /// Retain bounded acknowledged control metadata without retaining a query's IO scope.
 /// Shared session/provider resources remain owned by their existing owners.
 pub async fn retain_control_dataset(dataset: &Dataset, budget: usize) -> Option<Dataset> {
     let manifest = dataset.manifest();
-    if manifest.branch.is_some()
+    // Research (trusted tip): a named branch's acknowledged version is
+    // retained too; its publication still checks the live branch identity.
+    if (manifest.branch.is_some() && !super::phase_timers::research_enabled("TRUST_TIP"))
         || !manifest.base_paths.is_empty()
         || manifest
             .schema

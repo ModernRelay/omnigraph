@@ -505,6 +505,7 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
 
     tokio::time::sleep(cfg.warmup).await;
     let phases_before = phase_timers::snapshot();
+    let events_before = phase_timers::events();
     let before = planes.snapshot();
     let reprepares_before = reprepares.load(Ordering::Relaxed);
     let carried_before = carried.load(Ordering::Relaxed);
@@ -515,6 +516,7 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
     let window = window_started.elapsed();
     let after = planes.snapshot();
     let phases_after = phase_timers::snapshot();
+    let events_after = phase_timers::events();
     let reprepares_in_window = reprepares.load(Ordering::Relaxed) - reprepares_before;
     let carried_in_window = carried.load(Ordering::Relaxed) - carried_before;
 
@@ -595,6 +597,12 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
             }),
         );
     }
+    let mut events = serde_json::Map::new();
+    for ((name, a), (_, b)) in events_before.iter().zip(events_after.iter()) {
+        if b > a {
+            events.insert((*name).to_string(), serde_json::json!(b - a));
+        }
+    }
     let min_w = per_writer.iter().copied().min().unwrap_or(0);
     let max_w = per_writer.iter().copied().max().unwrap_or(0);
     let record = serde_json::json!({
@@ -622,6 +630,7 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
         "driver_retries": driver_retries,
         "requests_per_commit": before.delta_per_commit(&after, commits),
         "phases": serde_json::Value::Object(phases),
+        "events": serde_json::Value::Object(events),
         "verified": verified,
         "errors": errors.iter().take(3).collect::<Vec<_>>(),
         "driver": "closed-loop",
