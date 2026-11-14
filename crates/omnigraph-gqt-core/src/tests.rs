@@ -315,8 +315,23 @@ async fn generated_load_observes_typed_errors_for_single_and_multiple_calls() {
     }
 }
 
+/// The first refusal's message, without its code and line.
 fn refusal(stem: &str, text: &str) -> String {
-    parse_case(stem, text).expect_err("expected the case to be refused")
+    parse_case(stem, text)
+        .expect_err("expected the case to be refused")
+        .first()
+        .message
+        .clone()
+}
+
+/// The first refusal as `line N: message`, for the tests that pin the line.
+fn refusal_at(stem: &str, text: &str) -> String {
+    let errors = parse_case(stem, text).expect_err("expected the case to be refused");
+    let first = errors.first();
+    match first.line {
+        Some(line) => format!("line {line}: {}", first.message),
+        None => first.message.clone(),
+    }
 }
 
 #[test]
@@ -828,7 +843,7 @@ fn refuses_substitution_marker_in_a_statement_body() {
         "{HDR}{SCHEMA}{SEED}--- foreach $i a b\n--- mutate\nbranch create \"${{i}}\"\n{EXPECT_OK}--- endloop\n"
     );
     assert_eq!(
-        refusal("x", &text),
+        refusal_at("x", &text),
         "line 16: `${` may appear only inside a params or expect body"
     );
 }
@@ -948,7 +963,7 @@ fn bind_commit_refusals() {
         ),
         (
             format!("{PROPOSE}--- bind commit $c\nbody\n"),
-            "line 20: `--- bind` carries no body",
+            "`--- bind` carries no body",
         ),
         (
             format!("--- mutate\ncommit publish \"${{c}}\"\n{EXPECT_OK}"),
@@ -988,7 +1003,7 @@ fn bind_commit_refusals() {
         ),
         (
             format!("--- foreach $i a b\n{PROPOSE}{BIND}--- endloop\n"),
-            "invalid_case: `--- bind` inside a loop is refused; a binding is one id for the case",
+            "`--- bind` inside a loop is refused; a binding is one id for the case",
         ),
         (
             BIND.to_string(),
@@ -1007,7 +1022,7 @@ fn bind_fence_admits_only_a_whole_quoted_commit_operand() {
         "{HDR}{SCHEMA}{SEED}{PROPOSE}{BIND}--- mutate\nbranch create \"${{c}}\"\n{EXPECT_OK}"
     );
     assert_eq!(
-        refusal("x", &text),
+        refusal_at("x", &text),
         "line 21: `${` may appear only inside a params or expect body"
     );
 }
@@ -1066,7 +1081,7 @@ fn unattached_base_operand_resolves_its_binding() {
     );
     let elsewhere = CHILD.replace("name: \"carol\"", "name: \"${r}\"");
     assert_eq!(
-        refusal("x", &format!("{HDR}{SCHEMA}{SEED}{ROOT}{elsewhere}")),
+        refusal_at("x", &format!("{HDR}{SCHEMA}{SEED}{ROOT}{elsewhere}")),
         "line 21: `${` may appear only inside a params or expect body"
     );
     let unbound_param =
@@ -1213,10 +1228,7 @@ fn same_as_v1_is_refused_off_a_query_rows_expect() {
         format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{EXPECT_OK}{SAME}"),
     ] {
         let refused = refusal("x", &text);
-        assert!(
-            refused.starts_with("invalid_case: ") && refused.contains("refused on a mutate step"),
-            "{refused}"
-        );
+        assert!(refused.contains("refused on a mutate step"), "{refused}");
     }
     let rows = "--- expect unordered\n{\"p.name\": \"alice\"}\n";
     for (text, needle) in [
@@ -2145,7 +2157,7 @@ mod shape_section {
     fn a_rows_expect_without_a_shape_section_is_refused() {
         let text =
             format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect unordered\n{{\"p.name\": \"alice\"}}\n");
-        let reason = refusal("x", &text);
+        let reason = refusal_at("x", &text);
         assert!(
             reason.contains("line 19: the rows expect needs an `--- expect shape` section"),
             "{reason}"
@@ -2937,7 +2949,7 @@ fn refuses_a_process_setting_anywhere_in_a_case_body() {
     let text = format!(
         "{HDR}{SCHEMA}{SEED}--- mutate\nset merge_lineage = off;\nset merge_lineage = on; set rrf_plan = force_prefilter;\n--- expect ok\n"
     );
-    let reason = refusal("x", &text);
+    let reason = refusal_at("x", &text);
     assert!(reason.contains(needle), "{reason}");
     assert!(
         reason.starts_with("line 16: "),

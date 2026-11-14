@@ -692,6 +692,11 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// A case's text as a run reads it: a regular file within `LIMIT`, UTF-8.
+pub(crate) fn read_case_text(path: &Path) -> Result<String, String> {
+    String::from_utf8(read_bounded(path)?).map_err(|e| format!("invalid_case: UTF-8: {e}"))
+}
+
 mod shared_text {
     pub fn serialize<S: serde::Serializer>(
         text: &std::sync::Arc<str>,
@@ -1568,17 +1573,9 @@ fn run_invocation(
     let selected = selection.target;
     let selected_storage = selection.storage;
     let selected_seed = selection.seed;
-    let text =
-        String::from_utf8(read_bounded(path)?).map_err(|e| format!("invalid_case: UTF-8: {e}"))?;
-    let text: std::sync::Arc<str> = text.into();
+    let text: std::sync::Arc<str> = read_case_text(path)?.into();
     summary.case_digest = Some(digest(text.as_bytes()));
-    let case = parse_case(&stem_of(path), &text).map_err(|error| {
-        if error.starts_with("invalid_case:") {
-            error
-        } else {
-            format!("invalid_case: {error}")
-        }
-    })?;
+    let case = parse_case(&stem_of(path), &text).map_err(|errors| errors.to_string())?;
     summary.declared = Some(case.runner.environments.clone());
     for env in &case.runner.environments {
         if matches!(env.execution, Execution::ServerDst { .. }) {
