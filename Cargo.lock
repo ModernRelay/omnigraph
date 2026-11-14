@@ -5360,6 +5360,7 @@ name = "omnigraph-catalog"
 version = "0.15.1"
 dependencies = [
  "arrow-array",
+ "arrow-ipc",
  "arrow-schema",
  "async-trait",
  "bytes",
