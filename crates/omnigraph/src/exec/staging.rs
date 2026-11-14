@@ -1108,6 +1108,67 @@ pub(crate) struct StagedMutation {
     expected_versions: crate::db::manifest::ExpectedTableVersions,
 }
 
+/// One table's effect of a write that joins a group commit (research
+/// prototype): the staged insert-only effect, its key filter and where the
+/// table lives.
+pub(crate) struct GroupTableWrite {
+    pub(crate) table_key: String,
+    pub(crate) identity: crate::db::manifest::TableIdentity,
+    pub(crate) full_path: String,
+    pub(crate) staged: StagedHandle,
+    pub(crate) filter: lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter,
+    /// The exact inserted ids, when staging kept them.
+    pub(crate) ids: Option<Arc<Vec<String>>>,
+}
+
+impl StagedMutation {
+    /// Whether this staged mutation may join a group commit: it stages at
+    /// least one effect, every effect only inserts by key, and no written
+    /// table carries a constraint an insert elsewhere can break.
+    pub(crate) fn group_eligible(&self, catalog: &omnigraph_compiler::catalog::Catalog) -> bool {
+        !self.staged.is_empty()
+            && self.staged.iter().all(|entry| {
+                entry.staged_write.as_ref().is_some_and(|write| {
+                    write.is_insert_only() && write.inserted_rows_filter().is_some()
+                }) && insert_carry_allowed(catalog, &entry.table_key)
+            })
+    }
+
+    /// The parts a group commit composes: one effect per written table and
+    /// the pins of every touched table.
+    pub(crate) fn into_group_parts(
+        self,
+    ) -> Result<(
+        Vec<GroupTableWrite>,
+        crate::db::manifest::ExpectedTableVersions,
+    )> {
+        let StagedMutation {
+            staged,
+            expected_versions,
+        } = self;
+        let mut writes = Vec::with_capacity(staged.len());
+        for entry in staged {
+            let staged = entry.staged_write.ok_or_else(|| {
+                OmniError::manifest_internal("a group entry holds a table without an effect")
+            })?;
+            let filter = staged
+                .inserted_rows_filter()
+                .cloned()
+                .ok_or_else(|| OmniError::manifest_internal("a group entry has no key filter"))?;
+            let ids = staged.inserted_ids().cloned();
+            writes.push(GroupTableWrite {
+                table_key: entry.table_key,
+                identity: entry.path.identity,
+                full_path: entry.path.full_path,
+                staged,
+                filter,
+                ids,
+            });
+        }
+        Ok((writes, expected_versions))
+    }
+}
+
 impl StagedMutation {
     /// The tables with a staged effect, in staging order.
     #[cfg(test)]
@@ -1194,11 +1255,26 @@ impl StagedMutation {
         txn: &crate::db::WriteTxn,
         early: Option<crate::db::EarlyRevalidation>,
         attempt: &mut crate::db::reprepare::WriteAttempt,
+        insert_only: bool,
     ) -> Result<CommittedMutation> {
         let StagedMutation {
             mut staged,
             mut expected_versions,
         } = self;
+        // An insert-only write may also be carried over publications that
+        // only inserted rows by key, when every effect it staged only inserts
+        // and no written table carries a constraint an insert elsewhere can
+        // break (non-key uniqueness, bounded cardinality): its reads were key
+        // absence, checked by Lance's resolver against each link's key
+        // filter, and existence, which inserts keep.
+        let insert_carry = insert_only
+            && staged.iter().all(|entry| {
+                entry
+                    .staged_write
+                    .as_ref()
+                    .is_none_or(|write| write.is_insert_only())
+                    && insert_carry_allowed(&txn.catalog, &entry.table_key)
+            });
 
         // Per-(table_key, branch) queues for every touched table. Sorted by
         // `acquire_many` internally so all multi-table writers (mutation,
@@ -1245,7 +1321,7 @@ impl StagedMutation {
         // append/merge reprepare at their outer bounded retry loop, and strict
         // read-modify-write operations return the typed conflict.
         let (snapshot, carried_txn, mut carried) = match db
-            .revalidate_write_txn_carrying(txn, early)
+            .revalidate_write_txn_carrying(txn, early, insert_carry)
             .await?
         {
             crate::db::WriteRevalidation::Current(snapshot) => (*snapshot, None, HashMap::new()),
@@ -1416,6 +1492,32 @@ impl StagedMutation {
             carried_txn: carried_txn.map(|txn| *txn),
         })
     }
+}
+
+/// Whether a write that only inserts into `table_key` may be carried over
+/// publications that inserted into it: no constraint of the table reads more
+/// than key absence and endpoint existence. A non-key uniqueness group or a
+/// bounded edge cardinality reads committed rows an insert can change.
+pub(crate) fn insert_carry_allowed(
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    table_key: &str,
+) -> bool {
+    if let Some(name) = table_key.strip_prefix("node:") {
+        let Some(node) = catalog.node_types.get(name) else {
+            return false;
+        };
+        return node
+            .unique_constraints
+            .iter()
+            .all(|group| node.key.as_ref() == Some(group));
+    }
+    if let Some(name) = table_key.strip_prefix("edge:") {
+        let Some(edge) = catalog.edge_types.get(name) else {
+            return false;
+        };
+        return edge.cardinality.is_default() && edge.unique_constraints.is_empty();
+    }
+    false
 }
 
 /// Compare two schemas for the purposes of `MutationStaging::append_batch`'s

@@ -444,6 +444,37 @@ impl StagedHandle {
         self.inner.transaction_identity()
     }
 
+    /// Whether this effect only inserts rows by key
+    /// (`table_store::is_insert_only_update`).
+    pub(crate) fn is_insert_only(&self) -> bool {
+        self.inner.is_insert_only()
+    }
+
+    /// The exact ids an absence-proven insert adds, when staging kept them.
+    pub(crate) fn inserted_ids(&self) -> Option<&std::sync::Arc<Vec<String>>> {
+        self.inner.inserted_ids()
+    }
+
+    /// Lance's inserted-key filter of this effect, when it carries one.
+    pub(crate) fn inserted_rows_filter(
+        &self,
+    ) -> Option<&lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter> {
+        self.inner.inserted_rows_filter()
+    }
+
+    /// Compose insert-only effects of one table into one effect read on
+    /// `base` (research: group commit; `table_store::compose_insert_only`).
+    pub(crate) fn compose_insert_only(
+        base: &SnapshotHandle,
+        staged: Vec<StagedHandle>,
+    ) -> Result<StagedHandle> {
+        crate::table_store::compose_insert_only(
+            base.dataset(),
+            staged.into_iter().map(|handle| handle.inner).collect(),
+        )
+        .map(StagedHandle::new)
+    }
+
     /// Rows a `stage_delete` removes, as Lance's delete scan counted them;
     /// see `StagedWrite::deleted_rows`.
     pub(crate) fn deleted_rows(&self) -> Option<u64> {
@@ -858,6 +889,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         &self,
         current: &SnapshotHandle,
         captured_version: u64,
+        inserts: bool,
     ) -> Result<Option<crate::table_store::RowPreservingChain>>;
 
     /// Carry a staged effect prepared on `base` over a row-preserving chain
@@ -1504,8 +1536,9 @@ impl TableStorage for TableStore {
         &self,
         current: &SnapshotHandle,
         captured_version: u64,
+        inserts: bool,
     ) -> Result<Option<crate::table_store::RowPreservingChain>> {
-        crate::table_store::row_preserving_chain(current.dataset(), captured_version).await
+        crate::table_store::carry_chain(current.dataset(), captured_version, inserts).await
     }
 
     async fn rebase_staged_write(

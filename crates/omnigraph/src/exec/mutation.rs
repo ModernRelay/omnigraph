@@ -1456,6 +1456,73 @@ impl Omnigraph {
                     plans: Vec::new(),
                 })
             }
+            Ok(total)
+                if crate::db::group_commit::enabled()
+                    && matches!(route, WriteRoute::Publish)
+                    && txn.caller_expected_graph_head.is_none()
+                    && txn.unattached_base.is_none()
+                    && !selects_rows
+                    && !attempt.holds_gates() =>
+            {
+                // Research: group commit (`db::group_commit`). Validate and
+                // stage as the ordinary path does; an eligible write then
+                // submits its staged effects to its branch's batch instead of
+                // taking the gates itself.
+                let requested_branch = txn.branch.as_deref();
+                let plans = self.validate_staged_mutation(&staging, &txn).await?;
+                let staged = staging
+                    .stage_all_with_concurrency(self, requested_branch, stage_write_concurrency)
+                    .await
+                    .map_err(OmniError::unpublished)?;
+                fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
+                if staged.group_eligible(&txn.catalog) {
+                    // The commit point of this attempt: its preparation ends
+                    // here, so the leader (this task, perhaps) may take gates.
+                    attempt.admitted_gates()?;
+                    attempt.mark_grouped();
+                    let (writes, expected) = staged.into_group_parts()?;
+                    let commit = self
+                        .group_commit(crate::db::group_commit::GroupEntry {
+                            txn: txn.clone(),
+                            writes,
+                            expected,
+                            actor: actor_id.map(str::to_string),
+                            history_release_bytes,
+                        })
+                        .await?;
+                    return Ok(crate::MutationReceipt {
+                        result: total,
+                        commit: Some(commit),
+                        branch: addressed,
+                        plans,
+                    });
+                }
+                // Not eligible (an upsert matched a key, a constrained
+                // table): the ordinary commit of the same staged effects.
+                let lineage_intent = self
+                    .new_lineage_intent_for_branch(requested_branch, actor_id, history_release_bytes)
+                    .await
+                    .map_err(OmniError::unpublished)?;
+                let committed = staged
+                    .commit_all(self, requested_branch, &txn, None, attempt, true)
+                    .await
+                    .map_err(OmniError::unpublished)?;
+                let committed = CommittedStagedMutation {
+                    committed,
+                    lineage_intent,
+                    plans,
+                };
+                let publication = route.publication(&txn).map_err(OmniError::unpublished)?;
+                let commit = self
+                    .publish_committed_mutation(committed, &txn, actor_id, publication)
+                    .await?;
+                Ok(crate::MutationReceipt {
+                    result: total,
+                    commit: Some(commit),
+                    branch: addressed,
+                    plans: Vec::new(),
+                })
+            }
             Ok(total) => {
                 let mut committed = self
                     .commit_staged_mutation(
@@ -1465,6 +1532,7 @@ impl Omnigraph {
                         stage_write_concurrency,
                         history_release_bytes,
                         attempt,
+                        !selects_rows,
                     )
                     .await?;
                 let plans = std::mem::take(&mut committed.plans);
@@ -1495,6 +1563,7 @@ impl Omnigraph {
         stage_write_concurrency: usize,
         history_release_bytes: HistoryReleaseBytes,
         attempt: &mut crate::db::reprepare::WriteAttempt,
+        insert_only: bool,
     ) -> Result<CommittedStagedMutation> {
         let requested = txn.branch.as_deref();
         let plans = self.validate_staged_mutation(&staging, txn).await?;
@@ -1513,7 +1582,7 @@ impl Omnigraph {
             .await
             .map_err(OmniError::unpublished)?;
         let committed = staged
-            .commit_all(self, requested, txn, early, attempt)
+            .commit_all(self, requested, txn, early, attempt, insert_only)
             .await
             .map_err(OmniError::unpublished)?;
         Ok(CommittedStagedMutation {

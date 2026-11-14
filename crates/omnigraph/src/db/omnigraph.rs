@@ -477,6 +477,9 @@ pub struct Omnigraph {
     /// each other's full open. Two captures that miss on the same branch
     /// open it twice; the entry is a hint either way.
     merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
+    /// Research prototype: the group commits of this handle
+    /// (`db::group_commit`).
+    group_commits: crate::db::group_commit::GroupCommits,
     /// The settled commits this handle has read from `__history`, shared by
     /// every coordinator it opens. Only an operation that asks for history
     /// fills it.
@@ -798,6 +801,7 @@ impl Omnigraph {
             })),
             write_queue,
             merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            group_commits: Default::default(),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -1005,6 +1009,7 @@ impl Omnigraph {
             })),
             write_queue,
             merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            group_commits: Default::default(),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -1161,6 +1166,7 @@ impl Omnigraph {
             schema_view: Arc::clone(&self.schema_view),
             write_queue: Arc::clone(&self.write_queue),
             merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            group_commits: Default::default(),
             history: self.history.clone(),
             policy,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -1545,6 +1551,10 @@ impl Omnigraph {
     /// whose remote URIs match) return the same manager.
     /// Returns an `Arc` clone so callers can hold the manager across
     /// `&mut self` engine API boundaries.
+    pub(crate) fn group_commits(&self) -> &crate::db::group_commit::GroupCommits {
+        &self.group_commits
+    }
+
     pub(crate) fn write_queue(&self) -> Arc<crate::db::write_queue::WriteQueueManager> {
         Arc::clone(&self.write_queue)
     }
@@ -2204,7 +2214,10 @@ impl Omnigraph {
         txn: &WriteTxn,
         early: Option<EarlyRevalidation>,
     ) -> Result<Snapshot> {
-        match self.revalidate_write_txn_inner(txn, early, false).await? {
+        match self
+            .revalidate_write_txn_inner(txn, early, false, false)
+            .await?
+        {
             WriteRevalidation::Current(snapshot) => Ok(*snapshot),
             WriteRevalidation::RowPreserving { .. } => Err(OmniError::manifest_internal(
                 "a revalidation that may not carry the write carried it",
@@ -2227,8 +2240,10 @@ impl Omnigraph {
         &self,
         txn: &WriteTxn,
         early: Option<EarlyRevalidation>,
+        inserts: bool,
     ) -> Result<WriteRevalidation> {
-        self.revalidate_write_txn_inner(txn, early, true).await
+        self.revalidate_write_txn_inner(txn, early, true, inserts)
+            .await
     }
 
     async fn revalidate_write_txn_inner(
@@ -2236,6 +2251,7 @@ impl Omnigraph {
         txn: &WriteTxn,
         early: Option<EarlyRevalidation>,
         carry: bool,
+        inserts: bool,
     ) -> Result<WriteRevalidation> {
         let installed = self.coordinator.load_full();
         let bound = txn.branch.as_deref() == installed.current_branch();
@@ -2300,7 +2316,10 @@ impl Omnigraph {
             if !carry || !same_schema || txn.unattached_base.is_some() {
                 return Err(moved);
             }
-            match self.row_preserving_tables(&txn.base, &snapshot).await? {
+            match self
+                .row_preserving_tables(&txn.base, &snapshot, inserts)
+                .await?
+            {
                 Some(tables) => Some(tables),
                 None => return Err(moved),
             }
@@ -2361,6 +2380,7 @@ impl Omnigraph {
         &self,
         captured: &Snapshot,
         current: &Snapshot,
+        inserts: bool,
     ) -> Result<Option<HashMap<String, CarriedTable>>> {
         if captured.datasets().count() != current.datasets().count() {
             return Ok(None);
@@ -2385,9 +2405,13 @@ impl Omnigraph {
             if pin(after) == pin(before) {
                 continue;
             }
-            if after.entity_count != before.entity_count
-                || after.published_dataset_version < before.published_dataset_version
-            {
+            // An insert-only link adds rows; every other link keeps the count.
+            let count_ok = if inserts {
+                after.entity_count >= before.entity_count
+            } else {
+                after.entity_count == before.entity_count
+            };
+            if !count_ok || after.published_dataset_version < before.published_dataset_version {
                 return Ok(None);
             }
             moved.push((before, after));
@@ -2401,7 +2425,7 @@ impl Omnigraph {
                     .unwrap_or(before.published_dataset_version);
                 let chain = self
                     .storage()
-                    .row_preserving_chain(&handle, captured_version)
+                    .row_preserving_chain(&handle, captured_version, inserts)
                     .await?;
                 Ok::<_, OmniError>(chain.map(|chain| {
                     (

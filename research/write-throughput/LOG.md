@@ -94,3 +94,92 @@ gated re-prepare of `PreEffectReprepares` makes the branch gate FIFO-like),
 every write prepared twice. Separate branches scale; request count per write
 grows with the branch count (one-entry `merge_authority_cache` thrash, to be
 checked).
+
+### Baseline, S3 +30 ms (RustFS + toxiproxy), label `baseline`
+
+| mode | writers | writes/s | p50 ms | p99 ms | req/write | reprepares/write |
+|---|---:|---:|---:|---:|---:|---:|
+| same | 1 | 2.75 | 362 | 375 | 13.1 | 0 |
+| same | 4 | 2.15 | 1,864 | 1,975 | 24.0 | 1.05 |
+| same | 16 | 2.15 | 7,319 | 7,612 | 24.3 | 1.02 |
+| same | 64 | 2.35 | 12,930 | 22,886 | 22.2 | (0.02, see note) |
+| separate | 1 | 1.55 | 645 | 674 | 20.9 | 0 |
+| separate | 4 | 4.40 | 987 | 1,255 | 28.4 | 0 |
+| separate | 16 | 13.80 | 1,041 | 1,387 | 34.0 | 0 |
+| separate | 64 | 22.25 | 2,825 | 5,320 | 35.3 | 0 |
+
+Note: at 64 same-branch writers each write waits ~13 s, longer than the 3 s
+warm-up, so the reprepare counter (recorded when the first attempt fails,
+long before the write completes) undercounts in the window; throughput is
+unaffected because the branch gate is saturated from the start.
+
+A single writer on a *named* branch is much slower than on `main`
+(1.55 vs 2.75 writes/s, 21 vs 13 requests): a cross-branch lever to look at.
+
+## Idea 1 — carry insert-only writes over insert-only commits (rebase, not re-prepare)
+
+Hypothesis: a same-branch write is invalidated only because the head moved;
+when every commit since its capture only inserted keys into tables, Lance's
+own resolver (`TransactionRebase`, which already checks merge-insert key
+filters) can carry the staged write onto the current pin, as the engine
+already does for row-preserving publications. Removes the gated re-prepare.
+
+Prototype: `carry_chain(.., inserts=true)` accepts insert-only `Update` links;
+`row_preserving_tables` accepts a growing row count; `commit_all` carries an
+insert-only write when no written table has non-key `@unique` or bounded
+`@card`. Binary `/srv/bins/carry`.
+
+| target | writers | baseline w/s | carry w/s | carry req/write |
+|---|---:|---:|---:|---:|
+| local | 4 | 15.20 | 20.75 | 9.0 |
+| local | 16 | 15.35 | 14.85 | 10.5 |
+| local | 64 | 15.35 | 11.15 | 12.8 (0.56 reprepares: chain > 32 links) |
+| s3 | 4 | 2.15 | 2.20 | 21.1 |
+| s3 | 16 | 2.15 | 0.90 | 41.2 |
+| s3 | 64 | 2.35 | 0.85 | 43.2 |
+
+**Verdict: discard as a standalone lever.** Carrying a write over N-1
+intervening commits walks N-1 links (a transaction read and a manifest
+checkout per link) under the branch gate; on S3 that is O(N) serial GETs per
+write. Even with the walk free, each write still pays the full gated commit
+(~6.5 round trips), a ceiling of ~4.6 writes/s at +30 ms. Kept in the branch
+because group commit uses the same insert-only classification.
+
+## Idea 2 — group commit (leader/follower write group, compose same-table inserts)
+
+Prototype (`crates/omnigraph/src/db/group_commit.rs`, switch
+`OMNIGRAPH_GROUP_COMMIT=1`): an insert-only mutation prepares and stages as
+before, then submits its staged effects to a per-(handle, branch, actor)
+queue. The writer that finds no batch in flight leads: takes the branch
+gates, captures the current authority once, admits queued entries (same
+incarnation/schema; captured at the current head, or at an older head reached
+only through this group's own batches whose inserted ids are disjoint; no
+duplicate id within the batch), composes each table's admitted inserts into
+one Lance `Update` read on the table's current pin (raw fragments, union of
+key filters, Lance assigns fragment and row ids at commit), commits detached,
+publishes once. Leader leads only the batch holding its own entry, then hands
+the lead to the next waiting entry: natural batching, no timer.
+
+First version collapsed at 16 writers: a Bloom-filter overlap (a false
+positive: keys are disjoint) refused one entry; it re-prepared under the
+gates on the ordinary path, its commit was not in the group's log, so the log
+cleared and every older entry was refused too (cascade). Fixed by (a) exact
+inserted-id sets on the staged write (`StagedWrite::inserted_ids`, Bloom only
+as fallback), (b) refused group entries re-prepare *outside* the gates and
+rejoin the queue.
+
+| target | writers | baseline w/s | group w/s | group commits/s | writes/batch | p99 ms (base → group) |
+|---|---:|---:|---:|---:|---:|---|
+| local | 1 | 17.65 | 18.10 | 18.10 | 1.0 | 86 → 84 |
+| local | 4 | 15.20 | 34.90 | 24.05 | 1.5 | 368 → 204 |
+| local | 16 | 15.35 | 68.50 | 16.30 | 4.2 | 1,561 → 435 |
+| local | 64 | 15.35 | 74.55 | 15.65 | 4.8 | 5,784 → 2,502 |
+| s3 | 1 | 2.75 | 2.60 | 2.60 | 1.0 | 375 → 402 |
+| s3 | 4 | 2.15 | 6.80 | 3.40 | 2.0 | 1,975 → 616 |
+| s3 | 16 | 2.15 | 26.45 | 3.35 | 7.9 | 7,612 → 636 |
+| s3 | 64 | 2.35 | 69.45 | 2.65 | 26.2 | 22,886 → 1,344 |
+
+Zero re-prepares, per-writer counts within a few percent (S3 64 writers:
+20–24 each). **Verdict: keep — 12× at 16 and 30× at 64 writers on S3.**
+Publications stay at ~3/s on S3 (≈300 ms per batch): next lever is the
+batch's critical path.

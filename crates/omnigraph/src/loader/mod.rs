@@ -1520,7 +1520,7 @@ async fn publish_staged_load(
         gates: _held_gates,
         carried_txn,
     } = staged
-        .commit_all(db, branch, txn, None, attempt)
+        .commit_all(db, branch, txn, None, attempt, false)
         .await
         .map_err(OmniError::unpublished)?;
     // A load carried over row-preserving publications publishes on the head

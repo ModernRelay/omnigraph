@@ -121,6 +121,10 @@ pub(crate) struct WriteAttempt {
     first: Option<AttemptIdentity>,
     admitted: bool,
     identity_changed: bool,
+    /// Research (group commit): this attempt submitted to a group commit,
+    /// whose refusal sends it back to prepare again outside the gates and
+    /// join the next batch.
+    grouped: bool,
 }
 
 impl WriteAttempt {
@@ -131,6 +135,17 @@ impl WriteAttempt {
     /// admit its capture would otherwise rerun across a recreated branch or a
     /// schema change unchecked. This is the attempt's commit point: its
     /// preparation ends here, and the writer gates may be taken from here on.
+    /// Whether this attempt prepared under its writer gates (a later
+    /// attempt after a send-back).
+    pub(crate) fn holds_gates(&self) -> bool {
+        self.gates.is_some()
+    }
+
+    /// Mark this attempt as submitted to a group commit.
+    pub(crate) fn mark_grouped(&mut self) {
+        self.grouped = true;
+    }
+
     pub(crate) fn admitted_gates(&mut self) -> Result<Option<BranchWriteGates>> {
         if !self.admitted {
             return Err(OmniError::manifest_internal(
@@ -222,6 +237,20 @@ impl<'a> PreEffectReprepares<'a> {
     /// Go round again: take the branch's writer gates for the next attempt,
     /// then refresh the coordinator it prepares from under them.
     pub(crate) async fn prepare_again(&mut self) -> Result<()> {
+        if self.current.grouped {
+            // A group commit refused the attempt before any effect of its
+            // own: prepare again outside the gates and join the next batch,
+            // so the group keeps publishing every write of the branch (a
+            // gated attempt would publish alone and clear the group's log).
+            self.attempt += 1;
+            crate::instrumentation::record_mutation_reprepare();
+            let first = self.current.first.take();
+            self.current = WriteAttempt {
+                first,
+                ..WriteAttempt::default()
+            };
+            return self.db.refresh_coordinator_only().await;
+        }
         self.attempt += 1;
         tracing::debug!(
             attempt = self.attempt,
@@ -244,6 +273,7 @@ impl<'a> PreEffectReprepares<'a> {
             first,
             admitted: false,
             identity_changed: false,
+            grouped: false,
         };
         self.db.refresh_coordinator_only().await
     }

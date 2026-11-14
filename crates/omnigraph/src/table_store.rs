@@ -807,9 +807,44 @@ pub(crate) struct RowPreservingChain {
 /// records no transaction, or the walk reaches neither the captured version
 /// nor a stop within [`ROW_PRESERVING_CHAIN_MAX_LINKS`]: the write must then
 /// treat the table as changed.
-pub(crate) async fn row_preserving_chain(
+
+/// Whether `transaction` only inserts rows by key: a keyed `Update` that adds
+/// fragments, removes and rewrites none, and carries Lance's inserted-key
+/// filter (the shape the absence-proven insert writer and an all-new keyed
+/// merge-insert stage). Lance's conflict resolver checks two such commits
+/// against each other by their key filters.
+pub(crate) fn is_insert_only_update(transaction: &Transaction) -> bool {
+    matches!(
+        &transaction.operation,
+        Operation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+            fields_modified,
+            compacted_sstables,
+            update_mode,
+            inserted_rows_filter,
+            updated_fragment_offsets,
+            ..
+        } if removed_fragment_ids.is_empty()
+            && updated_fragments.is_empty()
+            && !new_fragments.is_empty()
+            && fields_modified.is_empty()
+            && compacted_sstables.is_empty()
+            && update_mode == &Some(UpdateMode::RewriteRows)
+            && updated_fragment_offsets.is_none()
+            && inserted_rows_filter.is_some()
+    )
+}
+
+/// [`row_preserving_chain`], also following insert-only links
+/// ([`is_insert_only_update`]) when `inserts` is set: the chain a write that
+/// only inserts by key may be carried over, with Lance's resolver checking
+/// its key filter against each link's.
+pub(crate) async fn carry_chain(
     current: &Dataset,
     captured_version: u64,
+    inserts: bool,
 ) -> Result<Option<RowPreservingChain>> {
     let mut links = Vec::new();
     let mut dataset = current.clone();
@@ -824,7 +859,8 @@ pub(crate) async fn row_preserving_chain(
         if !matches!(
             transaction.operation,
             Operation::Rewrite { .. } | Operation::CreateIndex { .. }
-        ) {
+        ) && !(inserts && is_insert_only_update(&transaction))
+        {
             return Ok(None);
         }
         let read_version = transaction.read_version;
@@ -869,6 +905,7 @@ pub(crate) async fn rebase_staged_write(
         new_fragments,
         removed_fragment_ids,
         deleted_rows,
+        inserted_ids,
     } = staged;
     let mut rebase = lance::io::commit::conflict_resolver::TransactionRebase::try_new(
         base,
@@ -903,6 +940,7 @@ pub(crate) async fn rebase_staged_write(
         new_fragments,
         removed_fragment_ids,
         deleted_rows,
+        inserted_ids,
     }))
 }
 
@@ -1263,6 +1301,204 @@ pub struct StagedWrite {
     /// staging. `None` for every other effect, including `stage_delete_rows`,
     /// whose rows the caller supplies and Lance does not count.
     deleted_rows: Option<u64>,
+    /// Research (group commit): the exact ids an absence-proven insert adds,
+    /// so admission compares exact key sets instead of Bloom filters.
+    inserted_ids: Option<Arc<Vec<String>>>,
+}
+
+impl StagedWrite {
+    /// Whether this staged effect only inserts rows by key
+    /// ([`is_insert_only_update`]).
+    pub(crate) fn is_insert_only(&self) -> bool {
+        is_insert_only_update(&self.transaction)
+    }
+
+    /// The exact ids an absence-proven insert adds, when staging kept them.
+    pub(crate) fn inserted_ids(&self) -> Option<&Arc<Vec<String>>> {
+        self.inserted_ids.as_ref()
+    }
+
+    /// Lance's inserted-key filter of this effect, when it carries one.
+    pub(crate) fn inserted_rows_filter(
+        &self,
+    ) -> Option<&lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter> {
+        match &self.transaction.operation {
+            Operation::Update {
+                inserted_rows_filter,
+                ..
+            } => inserted_rows_filter.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// The union of two inserted-key filters of one key column: the bitwise OR
+/// of two Bloom filters under Lance's one default configuration. `None` when
+/// the shapes differ (an exact set, another key or another configuration):
+/// the caller then treats the pair as overlapping.
+pub(crate) fn union_key_filters(
+    a: &lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter,
+    b: &lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter,
+) -> Option<lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter> {
+    use lance::dataset::write::merge_insert::inserted_rows::{FilterType, KeyExistenceFilter};
+    if a.field_ids != b.field_ids {
+        return None;
+    }
+    match (&a.filter, &b.filter) {
+        (
+            FilterType::Bloom {
+                bitmap: a_bits,
+                num_bits,
+                number_of_items,
+                probability,
+            },
+            FilterType::Bloom {
+                bitmap: b_bits,
+                num_bits: b_num_bits,
+                number_of_items: b_items,
+                probability: b_probability,
+            },
+        ) if num_bits == b_num_bits
+            && number_of_items == b_items
+            && (probability - b_probability).abs() < f64::EPSILON
+            && a_bits.len() == b_bits.len() =>
+        {
+            Some(KeyExistenceFilter {
+                field_ids: a.field_ids.clone(),
+                filter: FilterType::Bloom {
+                    bitmap: a_bits.iter().zip(b_bits).map(|(x, y)| x | y).collect(),
+                    num_bits: *num_bits,
+                    number_of_items: *number_of_items,
+                    probability: *probability,
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether two inserted-key filters may share a key. A shape Lance cannot
+/// compare counts as overlap.
+pub(crate) fn key_filters_may_overlap(
+    a: &lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter,
+    b: &lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter,
+) -> bool {
+    a.field_ids != b.field_ids || a.intersects(b).map_or(true, |(overlap, _)| overlap)
+}
+
+/// Compose insert-only staged writes of one table into one transaction read
+/// on `base` (research: group commit). Each component was staged against
+/// `base` or an earlier pin that `base` reaches only through insert-only
+/// commits whose keys the caller proved disjoint from the component's.
+/// Lance assigns what the union needs at commit from `base`: the raw staged
+/// fragments carry fragment id 0 and no row ids of their own (the
+/// `group_commit_composes_inserts_staged_against_older_pins_onto_a_later_pin`
+/// guard of the group-commit RFC pins this). The composed key filter is the
+/// union of the components'; a marker survives only when every component
+/// carries it.
+pub(crate) fn compose_insert_only(base: &Dataset, staged: Vec<StagedWrite>) -> Result<StagedWrite> {
+    let mut components = staged.into_iter();
+    let first = components
+        .next()
+        .ok_or_else(|| OmniError::manifest_internal("compose_insert_only of no write"))?;
+    if !first.is_insert_only() {
+        return Err(OmniError::manifest_internal(
+            "compose_insert_only of a write that does not only insert",
+        ));
+    }
+    let mut insert_absence = has_insert_absence_certificate(&first.transaction);
+    let mut no_by_source = first
+        .transaction
+        .transaction_properties
+        .as_ref()
+        .and_then(|properties| properties.get(NO_BY_SOURCE_DELETE_PROPERTY))
+        .is_some_and(|value| value == NO_BY_SOURCE_DELETE_V1);
+    let mut operation = first.transaction.operation.clone();
+    {
+        let Operation::Update {
+            new_fragments,
+            inserted_rows_filter,
+            ..
+        } = &mut operation
+        else {
+            unreachable!("checked insert-only above");
+        };
+        for other in components {
+            if !other.is_insert_only() {
+                return Err(OmniError::manifest_internal(
+                    "compose_insert_only of a write that does not only insert",
+                ));
+            }
+            insert_absence &= has_insert_absence_certificate(&other.transaction);
+            no_by_source &= other
+                .transaction
+                .transaction_properties
+                .as_ref()
+                .and_then(|properties| properties.get(NO_BY_SOURCE_DELETE_PROPERTY))
+                .is_some_and(|value| value == NO_BY_SOURCE_DELETE_V1);
+            let Operation::Update {
+                new_fragments: other_fragments,
+                inserted_rows_filter: other_filter,
+                fields_for_preserving_frag_bitmap: other_fields,
+                ..
+            } = &other.transaction.operation
+            else {
+                unreachable!("checked insert-only above");
+            };
+            if let Operation::Update {
+                fields_for_preserving_frag_bitmap,
+                ..
+            } = &first.transaction.operation
+                && fields_for_preserving_frag_bitmap != other_fields
+            {
+                return Err(OmniError::manifest_internal(
+                    "compose_insert_only of writes staged under different schemas",
+                ));
+            }
+            new_fragments.extend(other_fragments.iter().cloned());
+            let (Some(mine), Some(theirs)) = (inserted_rows_filter.as_ref(), other_filter.as_ref())
+            else {
+                return Err(OmniError::manifest_internal(
+                    "compose_insert_only of a write without a key filter",
+                ));
+            };
+            *inserted_rows_filter = Some(union_key_filters(mine, theirs).ok_or_else(|| {
+                OmniError::manifest_internal("compose_insert_only of incomparable key filters")
+            })?);
+        }
+        for fragment in new_fragments.iter() {
+            if fragment.id != 0 {
+                return Err(OmniError::manifest_internal(
+                    "compose_insert_only of a fragment that already carries an id",
+                ));
+            }
+        }
+    }
+    let mut transaction = TransactionBuilder::new(base.manifest.version, operation).build();
+    if insert_absence || no_by_source {
+        let properties = transaction
+            .transaction_properties
+            .get_or_insert_with(|| Arc::new(HashMap::new()));
+        let properties = Arc::make_mut(properties);
+        if insert_absence {
+            properties.insert(
+                INSERT_ABSENCE_PROPERTY.to_string(),
+                INSERT_ABSENCE_V1.to_string(),
+            );
+        }
+        if no_by_source {
+            properties.insert(
+                NO_BY_SOURCE_DELETE_PROPERTY.to_string(),
+                NO_BY_SOURCE_DELETE_V1.to_string(),
+            );
+        }
+    }
+    Ok(StagedWrite::with_commit_metadata(
+        transaction,
+        StagedCommitMetadata::affected_rows(Some(RowAddrTreeMap::new())),
+        Vec::new(),
+        Vec::new(),
+    ))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1390,6 +1626,7 @@ impl StagedWrite {
             new_fragments,
             removed_fragment_ids,
             deleted_rows: None,
+            inserted_ids: None,
         }
     }
 
@@ -1405,7 +1642,13 @@ impl StagedWrite {
             new_fragments,
             removed_fragment_ids,
             deleted_rows: None,
+            inserted_ids: None,
         }
+    }
+
+    fn with_inserted_ids(mut self, ids: Vec<String>) -> Self {
+        self.inserted_ids = Some(Arc::new(ids));
+        self
     }
 
     fn with_deleted_rows(mut self, deleted_rows: u64) -> Self {
@@ -4157,7 +4400,8 @@ impl TableStore {
             StagedCommitMetadata::affected_rows(Some(RowAddrTreeMap::new())),
             visible_fragments,
             Vec::new(),
-        ))
+        )
+        .with_inserted_ids(source_ids))
     }
 
     /// Resolve any URI-bearing logical blobs into a bounded in-memory keyed

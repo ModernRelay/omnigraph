@@ -342,6 +342,7 @@ impl Omnigraph {
                 stage_write_concurrency,
                 history_release_bytes,
                 attempt,
+                false,
             )
             .await?;
         // The validator evidence comes from the exact detached version the pin

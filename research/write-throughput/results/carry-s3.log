@@ -1,0 +1,4 @@
+[cw] carry s3     same w=1   run=0:     2.75 writes/s     2.75 commits/s p50   361.7 ms p99    374.1 ms max+drain    385.5 ms req/write   13.1 reprep/write  0.00 per-writer [55]
+[cw] carry s3     same w=4   run=0:     2.20 writes/s     2.20 commits/s p50  1795.6 ms p99   1840.6 ms max+drain   1843.1 ms req/write   21.1 reprep/write  0.00 per-writer [11, 11, 11, 11]
+[cw] carry s3     same w=16  run=0:     0.90 writes/s     0.90 commits/s p50 10732.3 ms p99  17929.7 ms max+drain  19836.2 ms req/write   41.2 reprep/write  0.00 per-writer [1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1]
+[cw] carry s3     same w=64  run=0:     0.85 writes/s     0.85 commits/s p50 10697.4 ms p99  22435.5 ms max+drain 182635.5 ms req/write   43.2 reprep/write  0.00 per-writer [1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
