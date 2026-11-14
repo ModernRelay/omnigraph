@@ -180,3 +180,38 @@ the cold metadata read) ~93 ms -> ~10/s; CAS chain (txn PUT + CAS PUT) ~70 ms ->
 that needs batching (group commit) or Lance changes (cache population on detached commits; an
 inline-only transaction instead of the separate `.txn` PUT, which `ManifestWriteConfig::
 disable_transaction_file` supports but only under `#[cfg(test)]`).
+
+## best1 = E + A + B (+named branches) + W (warm detached) + C (pipeline), O0 engine
+
+results/best1-{file,s3}.jsonl (verified every cell):
+
+| backend | mode | w | baseline c/s | best1 c/s | baseline p99 | best1 p99 | req/commit |
+|---|---|---:|---:|---:|---:|---:|---:|
+| s3 | same | 1 | 2.73 | 3.87 | 381 | 285 | 12.9 -> 8.1 |
+| s3 | same | 4 | 2.07 | 9.33 | 2093 | 446 | 24.0 -> 8.0 |
+| s3 | same | 16 | 2.07 | 9.40 | 7899 | 1767 | 23.8 -> 8.0 |
+| s3 | same | 64 | 2.20 | 8.73 | 17813 | 13391 | 21.9 -> 8.1 |
+| s3 | separate | 1 | 1.53 | 3.40 | 685 | 294 | 20.5 -> 9.2 |
+| s3 | separate | 4 | 4.27 | 13.40 | 1068 | 502 | 28.7 -> 9.0 |
+| s3 | separate | 16 | 12.66 | 52.13 | 1671 | 331 | 33.8 -> 9.0 |
+| s3 | separate | 64 | 26.67 | 122.06 | 5007 | 3221 | 34.8 -> 9.8 |
+| file | same | 1 | 14.80 | 17.60 | 91 | 83 | |
+| file | same | 4 | 13.93 | 33.46 | 410 | 191 | |
+| file | same | 16 | 14.53 | 32.86 | 1442 | 746 | |
+| file | same | 64 | 14.33 | 32.60 | 5552 | 2926 | |
+| file | separate | 1 | 14.40 | 15.33 | 99 | 96 | |
+| file | separate | 4 | 43.46 | 53.73 | 137 | 107 | |
+| file | separate | 16 | 85.26 | 102.39 | 298 | 229 | |
+| file | separate | 64 | 97.85 | 124.52 | 836 | 1151 | |
+
+(64-writer same-branch p99 is closed-loop queueing: 64 writers / ~9 commits/s ~ 7 s per lap.)
+
+8 tables on one branch (best1-t8-s3): 16w 11.33, 64w 11.40 commits/s; gate hold 77 ms (no cold
+metadata read across tables); phase B (hot PUT + wait + txn + CAS) bounds it. PUT bytes per
+1-row commit: `__manifest` ~117 KB (hot row set incl. the commit buffer, < 256 KiB release),
+table ~70 KB (data file + `.txn` + detached manifest; the key filter is in both the `.txn` and
+the manifest's inline transaction). Bandwidth is not a bottleneck at these rates.
+
+O2 builds: workspace crates at opt-level 2 via `CARGO_PROFILE_DEV_OPT_LEVEL=2` (deps unchanged);
+the baseline built in a worktree at 1dfc121c sharing target/ (note: the worktree path recompiled
+every dependency once, ~9 min, and its test binary landed at the same path as the main tree's).
