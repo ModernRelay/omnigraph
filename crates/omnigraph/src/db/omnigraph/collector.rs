@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use futures::StreamExt;
 use lance::index::DatasetIndexExt;
+use lance_table::format::IndexMetadata;
 use lance_table::io::commit::ManifestNamingScheme;
 
 use crate::db::commit_graph::{CommitGraph, GraphCommit, Lineage, MergeBaseResolver};
@@ -82,9 +83,8 @@ pub struct CollectorCost {
     /// Listings: per table location its `_versions/` once, then its objects
     /// once for the orphan rule.
     pub listings: u64,
-    /// Table manifests opened: each chain link once for its predecessor, then
-    /// each root, frozen linear version, unpublished manifest and sweep
-    /// candidate once for its paths.
+    /// Versioned table opens during tracing, including auxiliary native history.
+    /// A published manifest supplies its predecessor and paths in the same open.
     pub table_opens: u64,
     /// Index sections read: one per marked or examined manifest.
     pub index_reads: u64,
@@ -1351,7 +1351,6 @@ async fn trace_table(
     table_tags: &mut HashMap<String, TableTagInventory>,
     cost: &mut CollectorCost,
 ) -> Result<()> {
-    let location = plan.location.clone();
     let handle = db
         .storage()
         .open_dataset_head(&plan.full_path, table_branch)
@@ -1377,8 +1376,6 @@ async fn trace_table(
         .iter()
         .filter_map(|entry| entry.version_metadata.last_linear_version())
         .max();
-    let (published, chain_order) = discover_published(db, &location, rows, &present, cost).await?;
-    plan.published_set = published.clone();
     resolve_roots(
         plan,
         &present,
@@ -1410,31 +1407,25 @@ async fn trace_table(
             ));
         }
     }
-    for root in plan.roots.iter().chain(plan.linear_roots.iter()) {
-        let Some(handle) = open_at(db, &location, *root).await? else {
+    trace_published(db, plan, rows, cost).await?;
+    let remaining_roots: Vec<_> = plan
+        .roots
+        .difference(&plan.published_set)
+        .chain(&plan.linear_roots)
+        .copied()
+        .collect();
+    for root in remaining_roots {
+        let Some(handle) = open_at(db, &plan.location, root).await? else {
             plan.errors
                 .push(format!("root version {root} listed but not openable"));
             continue;
         };
         cost.table_opens += 1;
-        let paths = referenced_paths(&handle, cost).await?;
-        plan.referenced_paths.extend(paths.iter().cloned());
-        plan.marked_paths.extend(paths);
-        plan.borrowed_origins
-            .extend(borrowed_origins(handle.dataset(), cost).await?);
+        trace_root(plan, &handle, cost).await?;
     }
-    let outside = judge_outside(
-        db,
-        plan,
-        &present,
-        &published,
-        rows,
-        views,
-        &post_inventory_live,
-        cost,
-    )
-    .await?;
-    plan_sweep(db, plan, &chain_order, &outside, cost).await?;
+    let outside =
+        judge_outside(db, plan, &present, rows, views, &post_inventory_live, cost).await?;
+    finish_sweep_paths(plan, &outside);
     plan.foreign_versions = foreign_versions(rows, &linear_present, plan.last_linear_version);
     plan_orphans(handle.dataset(), plan, cost).await?;
     Ok(())
@@ -1563,40 +1554,58 @@ async fn list_manifests(
     Ok((present, linear_present))
 }
 
-/// The published set (every staged version a registration row ever named that
-/// the listing shows, plus the chain links behind it; a walk ends at a covered
-/// or absent version) and the same set in sweep order, links before tips.
-async fn discover_published(
+/// Trace each published manifest while following its predecessor. Each walk
+/// visits tips first, but its unrooted links must be swept before their tips.
+async fn trace_published(
     db: &Omnigraph,
-    location: &str,
+    plan: &mut TableCollectionPlan,
     rows: &[DatasetEntry],
-    present: &BTreeMap<u64, u64>,
     cost: &mut CollectorCost,
-) -> Result<(BTreeSet<u64>, Vec<u64>)> {
-    let mut published = BTreeSet::new();
-    let mut order = Vec::new();
+) -> Result<()> {
     for member in rows
         .iter()
         .filter_map(|entry| entry.version_metadata.staged_version())
     {
         let mut walk = Vec::new();
         let mut version = member;
-        while present.contains_key(&version) && published.insert(version) {
-            let Some(handle) = open_at(db, location, version).await? else {
-                published.remove(&version);
+        while plan.present_manifests.contains(&version) && !plan.published_set.contains(&version) {
+            let Some(handle) = open_at(db, &plan.location, version).await? else {
                 break;
             };
-            walk.push(version);
             cost.table_opens += 1;
             let link = db.storage().transaction_identity(&handle)?;
+            plan.published_set.insert(version);
+            if plan.roots.contains(&version) {
+                trace_root(plan, &handle, cost).await?;
+            } else {
+                let indices = read_indices(handle.dataset(), cost).await?;
+                let paths = referenced_paths(&handle, &indices, cost).await?;
+                plan.referenced_paths.extend(paths.iter().cloned());
+                plan.sweep_paths.extend(paths);
+                walk.push(version);
+            }
             if !link.base_is_detached() {
                 break;
             }
             version = link.read_version;
         }
-        order.extend(walk.into_iter().rev());
+        plan.sweep.extend(walk.into_iter().rev());
     }
-    Ok((published, order))
+    Ok(())
+}
+
+async fn trace_root(
+    plan: &mut TableCollectionPlan,
+    handle: &SnapshotHandle,
+    cost: &mut CollectorCost,
+) -> Result<()> {
+    let indices = read_indices(handle.dataset(), cost).await?;
+    let paths = referenced_paths(handle, &indices, cost).await?;
+    plan.referenced_paths.extend(paths.iter().cloned());
+    plan.marked_paths.extend(paths);
+    plan.borrowed_origins
+        .extend(borrowed_origins(handle.dataset(), &indices)?);
+    Ok(())
 }
 
 /// Roots against the listing: a staged pin by its copy, or by its linear
@@ -1664,12 +1673,10 @@ fn linear_swept(plan: &TableCollectionPlan, rows: &[DatasetEntry], version: u64)
 /// The kept manifests outside the published set, the frozen linear versions
 /// and the unpublished staging, with each staging's verdict; the linear
 /// versions the run sweeps are recorded on the plan instead.
-#[allow(clippy::too_many_arguments)]
 async fn judge_outside(
     db: &Omnigraph,
     plan: &mut TableCollectionPlan,
     present: &BTreeMap<u64, u64>,
-    published: &BTreeSet<u64>,
     rows: &[DatasetEntry],
     views: &mut [BranchView],
     post_inventory_live: &BTreeSet<String>,
@@ -1684,29 +1691,32 @@ async fn judge_outside(
         if plan.linear_roots.contains(version) {
             continue;
         }
+        let Some(handle) = open_at(db, &location, *version).await? else {
+            continue;
+        };
+        cost.table_opens += 1;
+        let indices = read_indices(handle.dataset(), cost).await?;
+        let paths = referenced_paths(&handle, &indices, cost).await?;
+        plan.referenced_paths.extend(paths.iter().cloned());
         if linear_swept(plan, rows, *version) {
             plan.linear_sweep.push(*version);
+            plan.sweep_paths.extend(paths);
             continue;
         }
-        let Some(handle) = open_at(db, &location, *version).await? else {
-            continue;
-        };
-        cost.table_opens += 1;
-        let paths = referenced_paths(&handle, cost).await?;
-        plan.referenced_paths.extend(paths.iter().cloned());
         outside.linear.extend(paths);
         plan.borrowed_origins
-            .extend(borrowed_origins(handle.dataset(), cost).await?);
+            .extend(borrowed_origins(handle.dataset(), &indices)?);
     }
     for (version, bytes) in present {
-        if published.contains(version) || plan.roots.contains(version) {
+        if plan.published_set.contains(version) || plan.roots.contains(version) {
             continue;
         }
         let Some(handle) = open_at(db, &location, *version).await? else {
             continue;
         };
         cost.table_opens += 1;
-        let paths = referenced_paths(&handle, cost).await?;
+        let indices = read_indices(handle.dataset(), cost).await?;
+        let paths = referenced_paths(&handle, &indices, cost).await?;
         plan.referenced_paths.extend(paths.iter().cloned());
         outside.unpublished.insert(*version, paths);
         let transaction = handle
@@ -1726,7 +1736,7 @@ async fn judge_outside(
         };
         if !matches!(verdict, StagingVerdict::Dead(_)) {
             plan.borrowed_origins
-                .extend(borrowed_origins(handle.dataset(), cost).await?);
+                .extend(borrowed_origins(handle.dataset(), &indices)?);
         }
         plan.unpublished.push(UnpublishedManifest {
             version: *version,
@@ -1740,9 +1750,9 @@ async fn judge_outside(
 /// A native clone reads files at these origins without retaining their old
 /// manifest versions. Keep each borrowed origin's files until no retained
 /// snapshot references it; unrelated locations remain independently collectable.
-async fn borrowed_origins(
+fn borrowed_origins(
     dataset: &lance::Dataset,
-    cost: &mut CollectorCost,
+    indices: &[IndexMetadata],
 ) -> Result<BTreeSet<String>> {
     let manifest = dataset.manifest();
     let mut ids = BTreeSet::new();
@@ -1759,8 +1769,6 @@ async fn borrowed_origins(
                 .filter_map(|file| file.base_id),
         );
     }
-    let indices = dataset.load_indices().await.map_err(OmniError::storage)?;
-    cost.index_reads += 1;
     ids.extend(indices.iter().filter_map(|index| index.base_id));
     ids.into_iter()
         .map(|id| {
@@ -1847,7 +1855,8 @@ async fn auxiliary_native_origins(
                 ));
             };
             cost.table_opens += 1;
-            origins.extend(borrowed_origins(native.dataset(), &mut cost).await?);
+            let indices = read_indices(native.dataset(), &mut cost).await?;
+            origins.extend(borrowed_origins(native.dataset(), &indices)?);
         }
     }
     Ok((origins, cost))
@@ -1906,48 +1915,14 @@ fn protect_borrowed_files(report: &mut CollectorReport) {
     }
 }
 
-/// The sweep: published, unrooted, still present, a chain's links before its
-/// tip, then the swept linear versions; the paths only the swept manifests
-/// reference, and the paths only the dead stagings reference.
-async fn plan_sweep(
-    db: &Omnigraph,
-    plan: &mut TableCollectionPlan,
-    chain_order: &[u64],
-    outside: &Outside,
-    cost: &mut CollectorCost,
-) -> Result<()> {
-    let location = plan.location.clone();
-    let linear_candidates = std::mem::take(&mut plan.linear_sweep);
-    let candidates: Vec<u64> = chain_order
-        .iter()
-        .copied()
-        .filter(|version| !plan.roots.contains(version))
-        .chain(linear_candidates.iter().copied())
-        .collect();
-    let mut swept_paths = BTreeSet::new();
-    for version in candidates.iter() {
-        let Some(handle) = open_at(db, &location, *version).await? else {
-            continue;
-        };
-        cost.table_opens += 1;
-        let paths = referenced_paths(&handle, cost).await?;
-        plan.referenced_paths.extend(paths.iter().cloned());
-        swept_paths.extend(paths);
-        if linear_candidates.contains(version) {
-            plan.linear_sweep.push(*version);
-        } else {
-            plan.sweep.push(*version);
-        }
-    }
+/// Only paths exclusive to the swept manifests or dead stagings may be deleted.
+fn finish_sweep_paths(plan: &mut TableCollectionPlan, outside: &Outside) {
     let staging_paths = outside.staging_paths(&[]);
-    plan.sweep_paths = swept_paths
-        .into_iter()
-        .filter(|path| {
-            !plan.marked_paths.contains(path)
-                && !outside.linear.contains(path)
-                && !staging_paths.contains(path)
-        })
-        .collect();
+    plan.sweep_paths.retain(|path| {
+        !plan.marked_paths.contains(path)
+            && !outside.linear.contains(path)
+            && !staging_paths.contains(path)
+    });
     let dead = plan.dead_stagings();
     let kept_staging_paths = outside.staging_paths(&dead);
     plan.dead_paths = dead
@@ -1960,7 +1935,6 @@ async fn plan_sweep(
                 && !kept_staging_paths.contains(path)
         })
         .collect();
-    Ok(())
 }
 
 /// Linear versions above the last linear version, or above the newest pin any
@@ -1983,9 +1957,19 @@ fn foreign_versions(
         .collect()
 }
 
+async fn read_indices(
+    dataset: &lance::Dataset,
+    cost: &mut CollectorCost,
+) -> Result<std::sync::Arc<Vec<IndexMetadata>>> {
+    let indices = dataset.load_indices().await.map_err(OmniError::storage)?;
+    cost.index_reads += 1;
+    Ok(indices)
+}
+
 /// Every path under the location a manifest references, relative to it.
 async fn referenced_paths(
     handle: &SnapshotHandle,
+    indices: &[IndexMetadata],
     cost: &mut CollectorCost,
 ) -> Result<BTreeSet<String>> {
     let dataset = handle.dataset();
@@ -2024,9 +2008,7 @@ async fn referenced_paths(
             paths.insert(relative);
         }
     }
-    let indices = dataset.load_indices().await.map_err(OmniError::storage)?;
-    cost.index_reads += 1;
-    for index in indices.iter() {
+    for index in indices {
         paths.insert(match index.base_id {
             Some(base) => format!("base:{base}/_indices/{}", index.uuid),
             None => format!("_indices/{}", index.uuid),
