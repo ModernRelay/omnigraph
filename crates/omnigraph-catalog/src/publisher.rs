@@ -436,6 +436,11 @@ impl PublishedRows {
             PUBLISHED_ROWS_CACHE_BYTES - bytes,
         )
         .await;
+        if acknowledged.is_none() {
+            crate::instrumentation::phase_timers::bump(
+                crate::instrumentation::phase_timers::Event::RetainRefused,
+            );
+        }
         Some(Self {
             manifest: manifest.clone(),
             location: location.clone(),
@@ -656,9 +661,15 @@ impl GraphNamespacePublisher {
                 .await?;
                 guard_stamp(&dataset)?;
                 let rows = super::state::rows_of_batch(&batch)?;
+                crate::instrumentation::phase_timers::bump(
+                    crate::instrumentation::phase_timers::Event::TrustedLoad,
+                );
                 return Ok(LoadedPublishState { dataset, rows });
             }
         }
+        crate::instrumentation::phase_timers::bump(
+            crate::instrumentation::phase_timers::Event::StorageLoad,
+        );
         let dataset = self.dataset().await?;
         guard_stamp(&dataset)?;
         let rows = match self.cached_rows(&dataset) {

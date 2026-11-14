@@ -1739,7 +1739,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         // publisher still reads fresh state and enforces ExactGraphHead on
         // every CAS attempt. On error, drop a taken cache view; the next
         // capture must resolve any ambiguous durable publication.
-        let published = publish_prepared(
+        let published = match publish_prepared(
             &mut coordinator,
             &changes,
             expected_table_versions,
@@ -1748,7 +1748,15 @@ pub(super) async fn commit_updates_on_branch_with_expected(
             publication,
         )
         .await
-        .map_err(|error| caller_precondition_at_publish(txn, branch, error))?;
+        {
+            Ok(published) => published,
+            Err(error) => {
+                // Research (trusted tip): a refused publication proves the
+                // slot's view stale; the next capture opens the branch again.
+                *db.merge_authority_cache.lock(cache_key).await = None;
+                return Err(caller_precondition_at_publish(txn, branch, error));
+            }
+        };
         *db.merge_authority_cache.lock(cache_key).await = Some(coordinator);
         published
     };

@@ -2159,6 +2159,13 @@ impl Omnigraph {
     ) -> Result<tokio::sync::OwnedMutexGuard<Option<GraphCoordinator>>> {
         let key = branch.unwrap_or("main").to_string();
         let mut cache = self.merge_authority_cache.lock(&key).await;
+        // Research (trusted tip): the slot holds what this process last
+        // published or opened on the branch; the publisher's identity check
+        // and version CAS refuse a stale one, and a refused publication
+        // clears the slot.
+        if cache.is_some() && crate::instrumentation::phase_timers::research_enabled("TRUST_TIP") {
+            return Ok(cache);
+        }
         if let Some(coord) = cache.as_mut() {
             let held = coord.manifest_incarnation();
             let current = match coord.probe_latest_incarnation().await {
@@ -2328,7 +2335,10 @@ impl Omnigraph {
             if probed_current || trusted {
                 self.write_authority_for_known_branch(txn.branch.as_deref(), false)
                     .await?
-            } else if !bound && txn.manifest_probe.is_current().await? {
+            } else if !bound
+                && !crate::instrumentation::phase_timers::research_enabled("TRUST_TIP")
+                && txn.manifest_probe.is_current().await?
+            {
                 (
                     txn.authority.branch_identifier.clone(),
                     txn.authority.graph_head.clone(),

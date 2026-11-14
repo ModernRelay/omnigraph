@@ -63,8 +63,11 @@ pub async fn retain_control_dataset(dataset: &Dataset, budget: usize) -> Option<
     let manifest = dataset.manifest();
     // Research (trusted tip): a named branch's acknowledged version is
     // retained too; its publication still checks the live branch identity.
-    if (manifest.branch.is_some() && !super::phase_timers::research_enabled("TRUST_TIP"))
-        || !manifest.base_paths.is_empty()
+    // A branch's `__manifest` is a shallow clone whose manifest lists the
+    // parent's base path; the retained handle keeps that list.
+    let trust = super::phase_timers::research_enabled("TRUST_TIP");
+    if (manifest.branch.is_some() && !trust)
+        || (!manifest.base_paths.is_empty() && !trust)
         || manifest
             .schema
             .fields_pre_order()

@@ -1386,6 +1386,17 @@ async fn commit_detached(
         .await
         .map_err(|error| OmniError::storage(error).unpublished())?;
     detached_links::record(committed.uri(), committed.version().version, recorded);
+    // Research (concurrent writes): Lance 13's detached commit records nothing
+    // in the session caches (only `commit_transaction` runs
+    // `record_successful_commit`), so the next writer chained on this version
+    // reloads its index metadata under the writer gates. Warm it now, beside
+    // the rest of this publication.
+    if crate::instrumentation::phase_timers::research_enabled("WARM_DETACHED") {
+        let warm = committed.clone();
+        tokio::spawn(async move {
+            let _ = warm.load_indices().await;
+        });
+    }
     Ok(committed)
 }
 

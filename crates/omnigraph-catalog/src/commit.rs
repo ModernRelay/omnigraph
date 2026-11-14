@@ -203,6 +203,104 @@ async fn overwrite_probed(
     Ok((committed, batch))
 }
 
+/// Research (pipelined publication): the hot data file of a publication,
+/// written before the version it lands on exists.
+pub(crate) struct StagedHot {
+    fragment: Fragment,
+    schema: lance_core::datatypes::Schema,
+    batch: RecordBatch,
+    stamp: u32,
+}
+
+/// Write `rows` as a hot data file through `any_version`, a handle of the same
+/// `__manifest` branch at any version whose stamp and schema metadata the
+/// publication keeps (the file is a fresh object no manifest names yet).
+pub(crate) async fn stage_hot(any_version: &Dataset, rows: &ManifestRows) -> Result<StagedHot> {
+    let loaded = guard_stamp(any_version)?;
+    let written = stamp_after_publish(loaded);
+    if rows.writer_epoch.is_some() && !supports_control_facts(written) {
+        return Err(OmniError::manifest_internal(format!(
+            "a `__manifest` version stamped v{written} cannot hold a control fact; control \
+             facts need v{CONTROL_FACTS_STAMP}"
+        )));
+    }
+    let mut metadata = any_version.schema().metadata.clone();
+    let (stamp_key, stamp_value) = stamp_entry(written);
+    metadata.insert(stamp_key, stamp_value);
+    let schema = manifest_storage_schema(metadata);
+    let batch = compact_to_storage(&rows.to_batch()?, &schema)?;
+    let hot_rows = batch.num_rows();
+    if u32::try_from(hot_rows).is_err() {
+        return Err(OmniError::manifest_internal(
+            "manifest hot rows exceed the Lance fragment limit",
+        ));
+    }
+    let dataset = Arc::new(any_version.clone());
+    let (mut hot, schema) = stage(&dataset, batch.clone(), Some(hot_rows.max(1))).await?;
+    if hot.len() != 1 {
+        return Err(OmniError::manifest_internal(
+            "manifest hot rows must occupy exactly one fragment",
+        ));
+    }
+    Ok(StagedHot {
+        fragment: hot.remove(0),
+        schema,
+        batch,
+        stamp: loaded,
+    })
+}
+
+/// Commit a staged hot file as `base`'s version + 1 with `base`'s cold
+/// fragments, under the same zero-retry version CAS as [`overwrite`].
+pub(crate) async fn commit_staged_hot(base: Dataset, staged: StagedHot) -> Result<(Dataset, RecordBatch)> {
+    let probe = ManifestRequestProbe::new();
+    let StagedHot {
+        fragment,
+        schema,
+        batch,
+        stamp,
+    } = staged;
+    let result = async {
+        if guard_stamp(&base)? != stamp {
+            return Err(OmniError::manifest_internal(
+                "a staged `__manifest` hot file was written under another stamp",
+            ));
+        }
+        let base = Arc::new(base);
+        let mut fragments = match stamp >= BLOCK_REGISTRY_STAMP {
+            true => state::cold_fragments(&base),
+            false => Vec::new(),
+        };
+        fragments.push(fragment);
+        let operation = Operation::Overwrite {
+            fragments,
+            schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        };
+        let transaction = TransactionBuilder::new(base.version().version, operation).build();
+        let handler = crate::lance_clone::probed_commit_handler(&base, probe.clone())
+            .await
+            .map_err(OmniError::storage)?;
+        let committed = crate::lance_commit::commit_builder(base)
+            .with_max_retries(0)
+            .with_commit_handler(handler)
+            .with_skip_auto_cleanup(true)
+            .execute(transaction)
+            .await
+            .map_err(map_lance_publish_error)?;
+        Ok((committed, batch))
+    }
+    .await;
+    result.map_err(|error| {
+        if probe.outcome().may_have_landed() {
+            error
+        } else {
+            error.unpublished()
+        }
+    })
+}
+
 /// Write `batch` as a data file of `dataset` without committing it: the
 /// fragment, and the stored schema it was written under, the same for every
 /// file of `__manifest` so one version's fragments agree on field ids.

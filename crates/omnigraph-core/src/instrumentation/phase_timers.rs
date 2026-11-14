@@ -141,14 +141,23 @@ pub enum Event {
     CarryChainRefused,
     /// A carry refused by Lance's resolver.
     CarryLanceRefused,
+    /// A publisher attempt that started from its own acknowledged version.
+    TrustedLoad,
+    /// A publisher attempt that loaded `__manifest` from storage.
+    StorageLoad,
+    /// An acknowledged publication the publisher could not retain.
+    RetainRefused,
 }
 
 impl Event {
-    pub const ALL: [Event; 4] = [
+    pub const ALL: [Event; 7] = [
         Event::LinkLogHit,
         Event::LinkLogMiss,
         Event::CarryChainRefused,
         Event::CarryLanceRefused,
+        Event::TrustedLoad,
+        Event::StorageLoad,
+        Event::RetainRefused,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -156,6 +165,9 @@ impl Event {
             Event::LinkLogMiss => "link_log_miss",
             Event::CarryChainRefused => "carry_chain_refused",
             Event::CarryLanceRefused => "carry_lance_refused",
+            Event::TrustedLoad => "trusted_load",
+            Event::StorageLoad => "storage_load",
+            Event::RetainRefused => "retain_refused",
         }
     }
     fn index(self) -> usize {
@@ -163,7 +175,7 @@ impl Event {
     }
 }
 
-static EVENTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static EVENTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 pub fn bump(event: Event) {
     EVENTS[event.index()].fetch_add(1, Ordering::Relaxed);
