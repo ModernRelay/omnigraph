@@ -56,7 +56,7 @@ const OPERATIONS_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionScope {
-    /// Shared by optimize, cleanup, repair and the full-text rebuild: one
+    /// Shared by optimize, cleanup and the full-text rebuild: one
     /// active operation per cluster.
     Maintenance,
 }
@@ -250,10 +250,12 @@ pub struct OperationTimings {
     /// How long the run held the branch's writer gates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_hold_ms: Option<u64>,
-    /// How long the run waited, before it took the gates, for writers that
-    /// an earlier publication sent back to prepare again.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub writer_yield_ms: Option<u64>,
+    /// Read and dropped: how long a run waited for writers before it took
+    /// the gates, which builds of `main` between the served-optimize and
+    /// carried-writes changes recorded. Nothing writes or reads it now; it
+    /// stays so their records still decode under `deny_unknown_fields`.
+    #[serde(default, rename = "writer_yield_ms", skip_serializing)]
+    retired_writer_yield_ms: Option<u64>,
     /// The start of execution to the end of the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compute_ms: Option<u64>,
@@ -1454,5 +1456,31 @@ mod tests {
         assert!(decode(&text).is_err());
         let valid = OperationRecord::new(LEDGER);
         assert_eq!(decode(&encode(&valid).unwrap()).unwrap(), valid);
+    }
+
+    /// A record that a build between the served-optimize and carried-writes
+    /// changes wrote still decodes: its retired `timings.writer_yield_ms` is
+    /// read and dropped, and writing the record again omits it.
+    #[test]
+    fn a_record_with_the_retired_writer_yield_timing_still_decodes() {
+        let mut record = OperationRecord::new(LEDGER);
+        record.admit_now(operation(1, "g")).unwrap();
+        let mut value = serde_json::to_value(&record).unwrap();
+        let timings = value["active"]
+            .as_object_mut()
+            .and_then(|active| active.values_mut().next())
+            .map(|operation| &mut operation["timings"])
+            .expect("the record has an active operation");
+        if timings.is_null() {
+            *timings = serde_json::json!({});
+        }
+        let timings = timings.as_object_mut().unwrap();
+        timings.insert("gate_hold_ms".to_string(), 40.into());
+        timings.insert("writer_yield_ms".to_string(), 7.into());
+        let decoded = decode(&value.to_string()).unwrap();
+        let operation = decoded.operations().next().unwrap();
+        assert_eq!(operation.timings.gate_hold_ms, Some(40));
+        let rewritten = encode(&decoded).unwrap();
+        assert!(!rewritten.contains("writer_yield_ms"), "{rewritten}");
     }
 }

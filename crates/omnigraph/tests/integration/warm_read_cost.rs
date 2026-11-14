@@ -1439,15 +1439,17 @@ async fn recreated_branch_owned_table_handle_uses_table_etag() {
     );
 }
 
-/// A recreated branch can reuse the same edge table `(branch, version)`. The
-/// graph-index cache is keyed (A1) by each edge table's physical identity
-/// `(table_key, version, table_branch, e_tag)`; on local FS the e_tag is `None`,
-/// so a recreated branch at the same version has the same key — the stale topology
-/// is instead evicted by the same-branch manifest refresh (`invalidate_all` on the
-/// `version_probes == 2` stale path), the documented e_tag-less fallback. This
-/// traversal takes the indexed path (single-source frontier), so it also exercises
-/// the table-handle cache incarnation; the assertion is that recreated-branch
-/// topology is never stale regardless of path.
+/// A recreated branch reuses the same edge table, native ref (`main`'s) and
+/// version number as the deleted one. The graph-index cache key (A1) carries each
+/// edge table's identity, version, detached pin (`staged_version`), native ref and
+/// e_tag; the recreated branch's new random detached pin keeps its key apart from
+/// the dead branch's on every store (the e_tag differs too where the store has
+/// one, Linux local files included). This reader is
+/// a second handle, so it also takes the manifest refresh; this traversal takes
+/// the indexed path (single-source frontier), so it also exercises the table-handle
+/// cache; the assertion is that recreated-branch topology is never stale
+/// regardless of path. `recreated_branch_misses_cached_topology` checks the same
+/// on one handle, with no refresh to clear the cache.
 #[tokio::test]
 async fn recreated_branch_traversal_uses_graph_index_incarnation() {
     cost_harness(async {
@@ -1858,6 +1860,220 @@ async fn single_edge_query_builds_only_referenced_edge() {
         graph_edges.load(Ordering::Relaxed),
         1,
         "a query referencing only `knows` must build only that edge, not all catalog edges"
+    );
+}
+
+/// A write keeps the cached topology of the edge tables it did not change. The
+/// cache key carries each covered table's stamp, so after a `WorksAt` insert, a
+/// node-only insert, a branch create, a `WorksAt` merge from that branch and its
+/// delete, a `Knows` traversal on main on the writing handle reuses its CSR (no
+/// build), and a `Knows` insert makes the next one build once and see the new
+/// edge.
+#[tokio::test]
+async fn write_keeps_graph_index_of_untouched_edge_tables() {
+    const HIRE: &str = r#"
+query hire($person: String, $company: String) {
+    insert WorksAt { from: $person, to: $company }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(
+            &[("$name", "Walker"), ("$friend", "Alice")],
+            &[("$age", 41)],
+        ),
+    )
+    .await
+    .unwrap();
+    let csr_db = with_traversal(&db, Traversal::Csr);
+    let friends_of_walker = || async {
+        let builds = Arc::new(AtomicU64::new(0));
+        let probes = QueryIoProbes {
+            graph_build_count: Arc::clone(&builds),
+            ..Default::default()
+        };
+        let result = with_query_io_probes(
+            probes,
+            csr_db.query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "Walker")]),
+            ),
+        )
+        .await
+        .unwrap();
+        (first_column_sorted(&result), builds.load(Ordering::Relaxed))
+    };
+
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 1),
+        "test setup: the first traversal builds the Knows topology"
+    );
+
+    mutate_main(
+        &db,
+        HIRE,
+        "hire",
+        &params(&[("$person", "Walker"), ("$company", "Acme")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 0),
+        "a WorksAt insert must keep the cached Knows topology"
+    );
+
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Loner")], &[("$age", 30)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 0),
+        "a node-only insert must keep the cached Knows topology"
+    );
+
+    db.branch_create("hiring").await.unwrap();
+    mutate_branch(
+        &db,
+        "hiring",
+        HIRE,
+        "hire",
+        &params(&[("$person", "Walker"), ("$company", "Globex")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 0),
+        "creating and writing another branch must keep main's cached Knows topology"
+    );
+    db.branch_merge("hiring", "main").await.unwrap();
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 0),
+        "a merge that changed only WorksAt must keep the cached Knows topology"
+    );
+    db.branch_delete("hiring").await.unwrap();
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string()], 0),
+        "deleting another branch must keep main's cached Knows topology"
+    );
+
+    mutate_main(
+        &db,
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Walker"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        friends_of_walker().await,
+        (vec!["Alice".to_string(), "Bob".to_string()], 1),
+        "a Knows insert must rebuild the Knows topology and show the new edge"
+    );
+}
+
+/// On one handle, with no refresh in between, a branch deleted and recreated
+/// at the same edge-table version misses the dead branch's cached topology. A
+/// branch control clears no cache: both incarnations stage on `main`'s ref at
+/// the same version number (docs/dev/execution.md, traversal and joins). This
+/// checks the end result only. Three things keep the keys apart here, and each
+/// is enough alone: the new random detached pin, the e_tag (Linux local files
+/// have one) and the eviction by the second `Knows` write. The pin is the one
+/// that holds on every store; `runtime_cache::tests::
+/// same_counter_different_pin_splits_both_keys_without_etag` owns that rule.
+#[tokio::test]
+async fn recreated_branch_misses_cached_topology() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let csr_db = with_traversal(&db, Traversal::Csr);
+    let friends_on_feature = || async {
+        let builds = Arc::new(AtomicU64::new(0));
+        let probes = QueryIoProbes {
+            graph_build_count: Arc::clone(&builds),
+            ..Default::default()
+        };
+        let result = with_query_io_probes(
+            probes,
+            csr_db.query(
+                ReadTarget::branch("feature"),
+                TEST_QUERIES,
+                "friends_of",
+                &params(&[("$name", "Walker")]),
+            ),
+        )
+        .await
+        .unwrap();
+        (first_column_sorted(&result), builds.load(Ordering::Relaxed))
+    };
+    let write_walker_friend = |friend: &'static str| {
+        let db = &db;
+        async move {
+            mutate_branch(
+                db,
+                "feature",
+                MUTATION_QUERIES,
+                "insert_person_and_friend",
+                &mixed_params(&[("$name", "Walker"), ("$friend", friend)], &[("$age", 41)]),
+            )
+            .await
+            .unwrap();
+        }
+    };
+    let knows_entry = || async {
+        db.snapshot_of(ReadTarget::branch("feature"))
+            .await
+            .unwrap()
+            .dataset("edge:Knows")
+            .unwrap()
+            .clone()
+    };
+
+    db.branch_create("feature").await.unwrap();
+    write_walker_friend("Alice").await;
+    assert_eq!(
+        friends_on_feature().await,
+        (vec!["Alice".to_string()], 1),
+        "test setup: the first traversal builds the branch's Knows topology"
+    );
+    let old_entry = knows_entry().await;
+    let old_pin = helpers::pinned_version(&db, "feature", "edge:Knows").await;
+
+    db.branch_delete("feature").await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    write_walker_friend("Bob").await;
+    let new_entry = knows_entry().await;
+    assert_eq!(
+        (
+            new_entry.native_dataset_branch.as_deref(),
+            new_entry.published_dataset_version
+        ),
+        (None, old_entry.published_dataset_version),
+        "test setup: both incarnations stage on main's ref at the same version"
+    );
+    assert_ne!(
+        helpers::pinned_version(&db, "feature", "edge:Knows").await,
+        old_pin,
+        "test setup: the recreated branch's write stages a new detached pin"
+    );
+    assert_eq!(
+        friends_on_feature().await,
+        (vec!["Bob".to_string()], 1),
+        "the recreated branch must miss the dead branch's topology and build its own"
     );
 }
 
@@ -2542,6 +2758,150 @@ async fn by_id_read_of_a_commit_held_elsewhere_scans_the_likely_branches_first()
             opens_and_scans(&io),
             (1, 3),
             "the handle's branch, main, then the branch created last"
+        );
+    })
+    .await;
+}
+
+/// A by-id read remembers the branch it found a commit's history block on. A
+/// later read of a commit of that block, as a history list or a review reads
+/// a branch's commits one after another, opens `__manifest` once and scans
+/// that branch alone. Once the branch is gone, the commit is found as before.
+#[tokio::test]
+async fn by_id_read_of_a_block_found_before_scans_only_its_branch() {
+    cost_harness(async {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = init_and_load(&dir).await;
+        let insert_on = |branch: &'static str, name: &'static str| {
+            let person = mixed_params(&[("$name", name)], &[("$age", 30)]);
+            let writer = &writer;
+            async move {
+                mutate_branch(writer, branch, MUTATION_QUERIES, "insert_person", &person)
+                    .await
+                    .unwrap();
+            }
+        };
+        for branch in ["task", "b_idle", "c_idle", "d_idle", "z_recent"] {
+            writer.branch_create(branch).await.unwrap();
+        }
+        insert_on("task", "First").await;
+        insert_on("task", "Second").await;
+        let task = writer.list_commits(Some("task")).await.unwrap();
+        let (second, first) = (task[0].clone(), task[1].clone());
+        let block = |id: &str| id.split('.').nth(1).map(str::to_string);
+        assert_eq!(
+            block(&first.graph_commit_id),
+            block(&second.graph_commit_id),
+            "one branch wrote both commits, so they share a history block"
+        );
+        let main_head = writer.list_commits(Some("main")).await.unwrap().remove(0);
+
+        let reader = session(Omnigraph::open(uri).await.unwrap());
+        let (found, held_io) = measure(reader.get_commit(&main_head.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), main_head);
+        let opens_and_scans = |io: &helpers::cost::IoCounts| {
+            (
+                io.internal_open_count - held_io.internal_open_count,
+                io.manifest_scan_count - held_io.manifest_scan_count,
+            )
+        };
+
+        let (found, io) = measure(reader.get_commit(&first.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), first);
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 6),
+            "main, then the four branches created after `task`, then `task`"
+        );
+
+        let (found, io) = measure(reader.get_commit(&second.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), second);
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 1),
+            "a commit of a block found before: the branch it was found on, alone"
+        );
+        assert_eq!(
+            people_as_of(&reader, &second).await,
+            people_as_of(&reader, &main_head).await + 2,
+            "the graph as of a commit read from the branch it was found on"
+        );
+
+        // `task` releases the block to `__history`: the hint now names a
+        // branch that no longer buffers it.
+        let release_writer = with_setting(&writer, "history_release_bytes", "2048");
+        let control = omnigraph_core::lance_access::control_session();
+        for published in 0..=TAIL_MAX_COMMITS + 1 {
+            let released =
+                omnigraph_catalog::history::read_commit(uri, &control, &first.graph_commit_id)
+                    .await
+                    .unwrap();
+            if released.is_some() {
+                break;
+            }
+            assert!(
+                published <= TAIL_MAX_COMMITS,
+                "test setup: {published} publishes on `task` released nothing"
+            );
+            let name = format!("Release{published}");
+            let person = mixed_params(&[("$name", &name)], &[("$age", 30)]);
+            mutate_branch(
+                &release_writer,
+                "task",
+                MUTATION_QUERIES,
+                "insert_person",
+                &person,
+            )
+            .await
+            .unwrap();
+        }
+        let (found, io) = measure(reader.get_commit(&first.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), first);
+        assert_eq!(
+            opens_and_scans(&io),
+            (1, 1),
+            "the hinted branch, which no longer holds the block, then `__history`"
+        );
+        let (found, io) = measure(reader.get_commit(&second.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), second);
+        assert_eq!(
+            opens_and_scans(&io),
+            (0, 0),
+            "the miss dropped the hint: `__history` alone"
+        );
+
+        // A deleted branch keeps its hint while its tree is on disk: the
+        // checkout opens the tree without reading the ref, and the retired
+        // tree still buffers the block, so every later lookup of the block
+        // reads that tree, until `cleanup` reclaims it.
+        insert_on("d_idle", "Third").await;
+        insert_on("d_idle", "Fourth").await;
+        let idle = writer.list_commits(Some("d_idle")).await.unwrap();
+        let (fourth, third) = (idle[0].clone(), idle[1].clone());
+        assert_eq!(
+            block(&third.graph_commit_id),
+            block(&fourth.graph_commit_id),
+            "one branch wrote both commits, so they share a history block"
+        );
+        let (found, _) = measure(reader.get_commit(&third.graph_commit_id)).await;
+        assert_eq!(found.unwrap(), third, "the first lookup learns the hint");
+        writer.branch_delete("d_idle").await.unwrap();
+        for commit in [&fourth, &third, &fourth] {
+            let (found, io) = measure(reader.get_commit(&commit.graph_commit_id)).await;
+            assert_eq!(&found.unwrap(), commit);
+            assert_eq!(
+                opens_and_scans(&io),
+                (1, 1),
+                "the deleted branch's retired tree answers, and the hint stays"
+            );
+        }
+
+        writer.branch_delete("task").await.unwrap();
+        let resolved = reader.get_commit(&first.graph_commit_id).await.unwrap();
+        assert_eq!(
+            resolved, first,
+            "a commit of a deleted branch is found in `__history`"
         );
     })
     .await;

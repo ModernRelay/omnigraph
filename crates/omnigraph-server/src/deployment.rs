@@ -190,6 +190,9 @@ fn admission(state: &AppState) -> Result<&omnigraph_cluster::ClusterAdmission, A
 }
 
 fn refusal(error: omnigraph_cluster::Diagnostic) -> ApiError {
+    if let Some(answer) = ApiError::failed_control_read(&error) {
+        return answer;
+    }
     let message = format!("[{}] {}", error.code, error.message);
     if matches!(
         error.code.as_str(),
@@ -321,8 +324,9 @@ fn active_result(
 #[utoipa::path(
     get, path = "/cluster/deployments", tag = "cluster", operation_id = "deployment_status",
     responses((status = 200, body = DeploymentStatusOutput), (status = 403, body = crate::api::ErrorOutput),
-        (status = 500, description = "Internal failure (code `internal`) while evaluating deployment access", body = crate::api::ErrorOutput),
-        (status = 503, description = "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline", body = crate::api::ErrorOutput)),
+        (status = 409, description = "Conflict (code `conflict`), for example a cluster control object whose stored text is corrupt: an applied policy payload that does not match its recorded digest, or a state file that is not valid cluster state; restore the object from a trusted copy. Its bytes failing to decode as text answer 500 instead", body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`) while evaluating deployment access, or a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read, such as bytes that are not text (`effects: none`)", body = crate::api::ErrorOutput),
+        (status = 503, description = "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline. Also a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry)", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn status(
@@ -337,7 +341,9 @@ pub(crate) async fn status(
     get, path = "/cluster/deployments/{deployment_id}", tag = "cluster", operation_id = "deployment_lookup",
     params(("deployment_id" = String, Path, description = "Original deployment identity")),
     responses((status = 200, body = DeploymentOutput), (status = 403, body = crate::api::ErrorOutput),
-        (status = 503, description = "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline", body = crate::api::ErrorOutput)),
+        (status = 409, description = "Conflict (code `conflict`), for example a cluster control object whose stored text is corrupt: an applied policy payload that does not match its recorded digest, or a state file that is not valid cluster state; restore the object from a trusted copy. Its bytes failing to decode as text answer 500 instead", body = crate::api::ErrorOutput),
+        (status = 500, description = "Internal failure (code `internal`), or a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read, such as bytes that are not text (`effects: none`)", body = crate::api::ErrorOutput),
+        (status = 503, description = "Deployment ownership changed during the bounded ledger observation; retry this GET within the caller deadline. Also a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry)", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn lookup(
@@ -390,9 +396,10 @@ async fn lookup_status(
     post, path = "/cluster/plan", tag = "cluster", operation_id = "deployment_plan",
     request_body = PlanRequest,
     responses((status = 200, body = Object), (status = 400, body = crate::api::ErrorOutput),
-        (status = 403, body = crate::api::ErrorOutput), (status = 409, body = crate::api::ErrorOutput),
+        (status = 403, body = crate::api::ErrorOutput), (status = 409, description = "Conflict (code `conflict`), including a cluster control object whose stored text is corrupt: a catalog payload that does not match its recorded digest, or a state file that is not valid cluster state; restore the object from a trusted copy. Its bytes failing to decode as text answer 500 instead", body = crate::api::ErrorOutput),
         (status = 413, body = crate::api::ErrorOutput), (status = 415, body = crate::api::ErrorOutput),
-        (status = 500, description = "Internal failure (code `internal`) while evaluating deployment access or planning", body = crate::api::ErrorOutput)),
+        (status = 500, description = "Internal failure (code `internal`) while evaluating deployment access or planning, or a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read, such as bytes that are not text (`effects: none`)", body = crate::api::ErrorOutput),
+        (status = 503, description = "Nothing was planned: a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry)", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn plan(
@@ -429,10 +436,10 @@ pub(crate) async fn plan(
     post, path = "/cluster/deployments", tag = "cluster", operation_id = "deployment_apply",
     request_body = DeploymentRequest,
     responses((status = 200, body = DeploymentOutput), (status = 202, description = "Durably accepted; poll the exact receipt until in_progress is false and inspect active", body = DeploymentOutput), (status = 400, body = crate::api::ErrorOutput),
-        (status = 403, body = crate::api::ErrorOutput), (status = 409, body = crate::api::ErrorOutput),
+        (status = 403, body = crate::api::ErrorOutput), (status = 409, description = "Conflict (code `conflict`), including a cluster control object whose stored text is corrupt: a catalog payload that does not match its recorded digest, or a state file that is not valid cluster state; restore the object from a trusted copy. Its bytes failing to decode as text answer 500 instead", body = crate::api::ErrorOutput),
         (status = 413, body = crate::api::ErrorOutput), (status = 415, body = crate::api::ErrorOutput),
-        (status = 500, description = "Internal failure (code `internal`), or unsettled deployment completion (code `outcome_unknown`); reconcile the original deployment identity before submitting another deployment", body = crate::api::ErrorOutput),
-        (status = 503, body = crate::api::ErrorOutput)),
+        (status = 500, description = "Internal failure (code `internal`), or unsettled deployment completion (code `outcome_unknown`); reconcile the original deployment identity before submitting another deployment. Also, before any effect, a storage read of a cluster control object (the state file, its lock or a catalog payload) that fails the same way on every read, such as bytes that are not text (`effects: none`)", body = crate::api::ErrorOutput),
+        (status = 503, description = "Nothing changed: before any effect, a storage read of a cluster control object (the state file, its lock or a catalog payload) that failed temporarily or for an unknown reason (`effects: none`; retry)", body = crate::api::ErrorOutput)),
     security(("bearer_token" = []))
 )]
 pub(crate) async fn apply(
@@ -901,6 +908,41 @@ fn abort_before_effects(
 mod tests {
     use super::*;
     use axum::response::IntoResponse;
+
+    /// A failed storage read of a control object, met before any effect, is
+    /// answered by the storage crate's class of the failure, on the deployment
+    /// routes as on the recorded-operation routes, which share the mapping.
+    /// Marking the answer as following an owned write proves it says
+    /// `effects: none` even there. Any other diagnostic keeps its answer.
+    #[test]
+    fn a_failed_control_read_answers_by_its_storage_class_issue_1356() {
+        use crate::api::{DispositionAction, DispositionEffects};
+        use omnigraph::error::StorageFailureKind as Kind;
+        let read = |storage_failure| omnigraph_cluster::Diagnostic {
+            code: "state_read_error".into(),
+            severity: omnigraph_cluster::DiagnosticSeverity::Error,
+            path: "__cluster/state.json".into(),
+            message: "could not read state file".into(),
+            detail: None,
+            storage_failure,
+        };
+        for (kind, status, action) in [
+            (Kind::Transient, 503, DispositionAction::Retry),
+            (Kind::Unknown, 503, DispositionAction::Retry),
+            (Kind::Configuration, 500, DispositionAction::Refresh),
+            (Kind::Permanent, 500, DispositionAction::Refresh),
+            (Kind::NotFound, 500, DispositionAction::Refresh),
+            (Kind::Precondition, 409, DispositionAction::Refresh),
+        ] {
+            let answer = refusal(read(Some(kind))).after_owned_write();
+            assert_eq!(answer.status().as_u16(), status, "{kind:?}");
+            let disposition = answer.disposition();
+            assert_eq!(disposition.effects, DispositionEffects::None, "{kind:?}");
+            assert_eq!(disposition.action, action, "{kind:?}");
+        }
+        let other = refusal(read(None));
+        assert_eq!(other.status(), StatusCode::CONFLICT);
+    }
 
     // The same observer serves aggregate status and exact receipts. Suspend its
     // read after capturing old ledger data, then cross real owner boundaries.

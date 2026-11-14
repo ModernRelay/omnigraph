@@ -9801,6 +9801,104 @@ async fn freshness_probe_asks_for_the_next_version_by_name() {
     }
 }
 
+/// A read at a `__manifest` version the caller already knows resolves only
+/// that version (issue #1380). Main opens at the version, with no listing of
+/// `_versions/`; a named branch lists its refs and opens main to reach them,
+/// then checks the branch out at the version, not at its latest first; the
+/// collector checks a version out on the branch it holds, with no reopen.
+/// Each read is still the version asked for, on the branch asked for.
+#[tokio::test]
+async fn reads_at_a_known_manifest_version_resolve_only_that_version_issue_1380() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(root, &catalog).await.unwrap();
+    mc.create_branch("feature", None).await.unwrap();
+    let publish = |branch: Option<&'static str>| async move {
+        GraphNamespacePublisher::new(root, branch)
+            .publish(&[], &HashMap::new(), Some(&lineage_intent(branch, None)))
+            .await
+            .unwrap()
+            .dataset
+            .version()
+            .version
+    };
+    // Each branch reads a version below its latest.
+    let main_read = publish(None).await;
+    publish(None).await;
+    let feature_read = publish(Some("feature")).await;
+    publish(Some("feature")).await;
+
+    let manifest = HistoryGets::default();
+    let probes = crate::instrumentation::QueryIoProbes {
+        manifest_wrapper: Some(Arc::new(manifest.clone())),
+        history_wrapper: Some(Arc::new(HistoryGets::default())),
+        ..Default::default()
+    };
+    let opens = probes.internal_open_count.clone();
+    crate::instrumentation::with_query_io_probes(probes, async {
+        let session = crate::lance_access::control_session();
+        // (branch, version, (GET, absent GET, HEAD), listings). A local root
+        // finds a latest version without a listing, so the saving shows as
+        // the latest manifest's GET; on S3, GCS and Azure a `_versions/`
+        // listing goes with it. Main resolves only the version. A named
+        // branch lists its refs, opens main to reach them and reads its own
+        // ref, then resolves only the version: no latest of its own.
+        for (branch, version, requests, lists) in [
+            (None, main_read, (1, 0, 1), 0),
+            (Some("feature"), feature_read, (3, 0, 1), 1),
+        ] {
+            manifest.drain();
+            manifest.drain_lists();
+            let snapshot =
+                ManifestCoordinator::snapshot_at_with_session(root, branch, version, &session)
+                    .await
+                    .unwrap();
+            assert_eq!(snapshot.version, version, "{branch:?}");
+            assert_eq!(snapshot.graph_branch(), branch, "{branch:?}");
+            assert_eq!(
+                snapshot.native_branch().is_some(),
+                branch.is_some(),
+                "{branch:?}"
+            );
+            assert_eq!(
+                (manifest.drain(), manifest.drain_lists()),
+                (requests, lists),
+                "{branch:?} at {version}"
+            );
+        }
+
+        for (branch, version) in [(None, main_read), (Some("feature"), feature_read)] {
+            let held =
+                ManifestCoordinator::collector_branch_under_control_gates(root, branch, &session)
+                    .await
+                    .unwrap();
+            assert!(held.head_version() > version, "{branch:?}");
+            manifest.drain();
+            manifest.drain_lists();
+            opens.store(0, Ordering::Relaxed);
+            let snapshot = held
+                .snapshot_at(version, &crate::commit_graph::HistoryCache::default())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.version, version, "{branch:?}");
+            assert_eq!(snapshot.graph_branch(), branch, "{branch:?}");
+            assert_eq!(
+                (
+                    manifest.drain(),
+                    manifest.drain_lists(),
+                    opens.load(Ordering::Relaxed)
+                ),
+                ((1, 0, 1), 0, 0),
+                "the collector reads {branch:?} at {version} through its held branch"
+            );
+        }
+    })
+    .await;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SmallScanIo {
     requests: u64,

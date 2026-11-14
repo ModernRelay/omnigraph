@@ -92,8 +92,8 @@ pub use history::HistoryRecord;
 use layout::open_manifest_dataset;
 use layout::{
     branch_ref_error, open_manifest_branch_with_identifier,
-    open_manifest_dataset_native_with_session, open_manifest_dataset_with_session,
-    resolve_native_manifest_branch, table_uri_for_path,
+    open_manifest_dataset_native_at_with_session, open_manifest_dataset_native_with_session,
+    open_manifest_dataset_with_session, resolve_native_manifest_branch, table_uri_for_path,
 };
 pub use layout::{history_uri, manifest_uri};
 pub use metadata::TableVersionMetadata;
@@ -1286,10 +1286,16 @@ impl CollectorBranch {
         history: &crate::commit_graph::HistoryCache,
     ) -> Result<Option<Snapshot>> {
         let branch = self.branch.as_deref();
-        let (dataset, state) = snapshot_state_at(
+        // The opened branch checks the version out itself: no reopen from the
+        // root, and the version belongs to the incarnation this run holds.
+        let dataset = self
+            .dataset
+            .checkout_version(version)
+            .await
+            .map_err(OmniError::storage)?;
+        let state = graph::version_state(
             &self.root_uri,
-            branch,
-            version,
+            &dataset,
             history.objects(),
             &self.dataset.session(),
         )
@@ -1448,6 +1454,14 @@ pub struct ManifestCoordinator {
     /// The block registry rows that version's hot fragment holds.
     registry: Arc<LineageRegistry>,
     history: HistoryCache,
+}
+
+/// The history block an addressable commit id names; `None` for any other id.
+fn commit_block(graph_commit_id: &str) -> Option<ulid::Ulid> {
+    omnigraph_core::graph_commit_id::parse_history_block_id(graph_commit_id)
+        .ok()
+        .flatten()
+        .map(|id| id.block)
 }
 
 decide_seam! {
@@ -1671,16 +1685,13 @@ impl ManifestCoordinator {
                 "named {purpose} snapshot lacks native branch provenance"
             )));
         }
-        let dataset = open_manifest_dataset_native_with_session(
+        open_manifest_dataset_native_at_with_session(
             root_uri.trim_end_matches('/'),
             snapshot.native_branch(),
+            snapshot.graph_manifest_version(),
             &snapshot.session,
         )
-        .await?;
-        dataset
-            .checkout_version(snapshot.graph_manifest_version())
-            .await
-            .map_err(OmniError::storage)
+        .await
     }
 
     /// Test-only: production reads pass the reading handle's control session.
@@ -1691,16 +1702,13 @@ impl ManifestCoordinator {
         version: u64,
     ) -> Result<SchemaContractRow> {
         let control_session = crate::lance_access::control_session();
-        let dataset = open_manifest_dataset_with_session(
+        let dataset = layout::open_manifest_dataset_at_with_session(
             root_uri.trim_end_matches('/'),
             branch,
+            version,
             &control_session,
         )
         .await?;
-        let dataset = dataset
-            .checkout_version(version)
-            .await
-            .map_err(OmniError::storage)?;
         let state = read_manifest_state(&dataset).await?;
         read_schema_contract_row(&dataset, state.schema_contract.as_ref()).await
     }
@@ -2500,10 +2508,71 @@ impl ManifestCoordinator {
             };
             let rows = state::read_manifest_rows_projected(&branch).await?;
             if let Some(record) = rows.record(graph_commit_id) {
+                if let Some(block) = commit_block(graph_commit_id) {
+                    self.history.remember_block_home(block, native);
+                }
                 return Ok(Some(record));
             }
         }
         Ok(None)
+    }
+
+    /// The record of `graph_commit_id` from the branch where a lookup through
+    /// this coordinator's history cache last found a commit of the same
+    /// history block: one open of `__manifest` and one branch scan, before
+    /// `__history` and [`Self::record_in_live_branches`]. `None` when no such
+    /// branch is known, or it no longer holds the commit (released or merged
+    /// since), or its tree is gone (`cleanup` reclaims a retired branch's tree
+    /// after its commits reached `__history`); the hint is then dropped and
+    /// the caller looks as before. A deleted branch keeps its hint while its
+    /// tree is on disk: the checkout opens the tree without reading the ref,
+    /// the retired tree still holds the commit and answers it, at one open
+    /// and one scan per lookup, until `cleanup` reclaims it. A stop-gap until a durable
+    /// commit-to-branch address (#972) removes both the hint and the scan.
+    pub async fn record_in_hinted_branch(
+        &self,
+        graph_commit_id: &str,
+    ) -> Result<Option<HistoryRecord>> {
+        Box::pin(self.record_in_hinted_branch_inner(graph_commit_id)).await
+    }
+
+    /// The body of [`Self::record_in_hinted_branch`], boxed there as
+    /// [`Self::refresh`] boxes its body: it is awaited inside the commit
+    /// lookups of the merge, snapshot and cluster futures, which already meet
+    /// the compiler's query depth limit, and the box keeps its layout out of
+    /// theirs.
+    async fn record_in_hinted_branch_inner(
+        &self,
+        graph_commit_id: &str,
+    ) -> Result<Option<HistoryRecord>> {
+        let Some(block) = commit_block(graph_commit_id) else {
+            return Ok(None);
+        };
+        let Some(native) = self.history.block_home(block) else {
+            return Ok(None);
+        };
+        let session = self.dataset.session();
+        let main = open_manifest_dataset_with_session(&self.root_uri, None, &session).await?;
+        let branch = match &native {
+            None => main,
+            Some(native) => match main.checkout_branch(native).await {
+                Ok(branch) => branch,
+                // `NotFound`: the tree has no `_versions` listing, as after
+                // `cleanup` reclaims a retired tree. The checkout does not
+                // read the ref.
+                Err(lance::Error::RefNotFound { .. } | lance::Error::NotFound { .. }) => {
+                    self.history.forget_block_home(block);
+                    return Ok(None);
+                }
+                Err(error) => return Err(OmniError::storage(error)),
+            },
+        };
+        let rows = state::read_manifest_rows_projected(&branch).await?;
+        let record = rows.record(graph_commit_id);
+        if record.is_none() {
+            self.history.forget_block_home(block);
+        }
+        Ok(record)
     }
 
     /// Refuse `commit` unless the branch incarnation that wrote it is the live

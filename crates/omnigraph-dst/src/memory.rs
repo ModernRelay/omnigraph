@@ -8,7 +8,7 @@ use futures::{StreamExt, TryStreamExt};
 use lance_io::object_store::providers::shared_memory::SharedMemoryStoreProvider;
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreProvider};
 use object_store::path::Path;
-use omnigraph::object_store_seam::{ReadThroughMount, mount_read_through};
+use omnigraph::object_store_seam::{ReadThroughMountGuard, mount_read_through};
 use omnigraph::storage::ObjectStorageAdapter;
 use omnigraph_storage::FrozenDirectory;
 use url::Url;
@@ -42,7 +42,7 @@ pub struct MemoryStorage {
     lance: Arc<dyn object_store::ObjectStore>,
     prefix: Path,
     authority: String,
-    mount: Option<ReadThroughMount>,
+    mount: Option<ReadThroughMountGuard>,
     _lease: AuthorityLease,
 }
 

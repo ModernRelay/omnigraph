@@ -10,8 +10,8 @@
 //! `ingest_as`, `branch_create_as` / `branch_create_from_as`,
 //! `branch_delete_as`, `branch_merge_as`. The maintenance entry points —
 //! `optimize_as`, `ensure_indices_as` / `ensure_indices_on_as`,
-//! `rebuild_full_text_indices_on_as`, `repair_report_as` (`maintain`) and
-//! `cleanup_as` (`reclaim`) — are covered the same way. Each writer pair below
+//! `rebuild_full_text_indices_on_as` (`maintain`) and `cleanup_as`
+//! (`reclaim`) — are covered the same way. Each writer pair below
 //! covers allow + deny via the engine-side gate; the allow case proves
 //! the enforce call is correctly scoped (i.e. doesn't reject a legit
 //! actor), the deny case proves it actually denies an unauthorized
@@ -1031,7 +1031,7 @@ fn assert_no_actor(result: Result<impl std::fmt::Debug, OmniError>, what: &str) 
     }
 }
 
-/// Optimize, index builds and the repair report require `maintain` on the
+/// Optimize and index builds require `maintain` on the
 /// branch they maintain, before any effect: `change` does not imply it, a
 /// grant on unprotected branches does not reach main, and a missing actor is
 /// refused. An allowed index build or optimize records its actor on the
@@ -1060,7 +1060,6 @@ async fn maintenance_entry_points_enforce_maintain_on_their_branch_before_effect
             db.ensure_indices_on_as("main", actor).await,
             "ensure_indices_on_as(main)",
         );
-        assert_denied(db.repair_report_as(actor).await, "repair_report_as");
     }
     for actor in ["act-denied", "act-writer", "act-reclaimer"] {
         assert_denied(
@@ -1078,7 +1077,6 @@ async fn maintenance_entry_points_enforce_maintain_on_their_branch_before_effect
         db.ensure_indices_on_as("feature", None).await,
         "ensure_indices_on_as",
     );
-    assert_no_actor(db.repair_report_as(None).await, "repair_report_as");
     assert_eq!(
         physical_tree(dir.path()),
         files_before,
@@ -1111,11 +1109,6 @@ async fn maintenance_entry_points_enforce_maintain_on_their_branch_before_effect
         Some("act-branch-maintainer")
     );
     assert_eq!(db.list_commits(None).await.unwrap(), main_before);
-    let report = db
-        .repair_report_as(Some("act-maintainer"))
-        .await
-        .expect("maintain on main admits the repair report");
-    assert!(!report.datasets.is_empty());
     db.ensure_indices_as(Some("act-maintainer"))
         .await
         .expect("maintain on main admits index builds");

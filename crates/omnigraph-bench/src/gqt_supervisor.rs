@@ -1322,6 +1322,9 @@ pub(crate) fn preflight_plan(plan: &crate::gqt_case::PlannedGqt, cache: &Path) -
                     shape_sha256: "0".repeat(64),
                     state_sha256: "0".repeat(64),
                 },
+                route: crate::gqt_evidence::LocalRoute::ReadThrough {
+                    base_root: entry.join("root"),
+                },
             },
             worker_scratch_root: entry.join("worker-scratch-00010000"),
         }),

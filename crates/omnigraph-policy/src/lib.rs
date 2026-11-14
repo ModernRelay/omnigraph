@@ -34,11 +34,10 @@ pub enum PolicyAction {
     /// Drop an unpublished graph commit (`commit drop "<id>"`). Target-branch
     /// scoped: the branch the proposal would have landed on.
     CommitDrop,
-    /// Content-preserving maintenance: optimize, index builds, the full-text
-    /// rebuild and the repair report. Branch scoped like `change`: the scope
-    /// is the branch whose tables the operation maintains, `main` for
-    /// optimize and repair. It grants no right to change data or to delete
-    /// history.
+    /// Content-preserving maintenance: optimize, index builds and the
+    /// full-text rebuild. Branch scoped like `change`: the scope is the
+    /// branch whose tables the operation maintains, `main` for optimize. It
+    /// grants no right to change data or to delete history.
     Maintain,
     /// Reclaim storage: cleanup, which permanently deletes table versions and
     /// files no retained commit needs. A run covers every branch's history,

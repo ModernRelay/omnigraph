@@ -251,7 +251,7 @@ write_surfaces! {
     "db/omnigraph.rs" => WriteProtocol::Bootstrap => ["init", "init_with_options", "init_with_storage"],
     "db/omnigraph/prepared_create.rs" => WriteProtocol::Bootstrap => ["apply_prepared_graph_create", "apply_prepared_graph_create_with_io_scope", "apply_prepared_graph_create_with_storage"],
     "db/omnigraph/prepared_create.rs" => WriteProtocol::Exact("quiesced birth settlement: exact init claim, bounded original empty tables, no published manifest or refs") => ["settle_prepared_graph_create_after_quiescence", "settle_prepared_graph_create_after_quiescence_with_storage"],
-    "db/omnigraph.rs" => WriteProtocol::Composed("read-write admission + owned local-root create-if-absent capability probe") => ["open", "open_with_storage", "open_with_io_scope"],
+    "db/omnigraph.rs" => WriteProtocol::Composed("read-write admission + owned local-root create-if-absent capability probe") => ["open", "open_with_storage", "open_with_io_scope", "open_clone"],
     "exec/mutation.rs" => MUTATION_V9 => ["mutate", "mutate_with_receipt", "mutate_as", "mutate_as_with_receipt", "mutate_as_with_expected_head", "mutate_as_with_expected_head_receipt", "mutate_as_with_optional_branch_receipt"],
     "exec/blob_write.rs" => MUTATION_V9 => ["put_blob_at_as", "clear_blob_at_as"],
     "loader/mod.rs" => LOAD_V9 => ["load_jsonl", "load_jsonl_file", "load", "load_with_receipt", "load_file", "load_graph_batch"],
@@ -297,9 +297,6 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "refresh"),
     ("db/omnigraph.rs", "cleanup_plan"),
-    // The repair report: it publishes nothing, but `maintain` gates it like
-    // the maintenance writers (`maintenance_entry_points_take_an_actor`).
-    ("db/omnigraph.rs", "repair_report_as"),
     ("db/omnigraph.rs", "cleanup_plan_missing_paths"),
     ("db/omnigraph.rs", "cleanup_plan_path_snapshot"),
     ("db/omnigraph.rs", "open_read_only_with_storage"),
@@ -608,6 +605,11 @@ const LOW_LEVEL_READ_ONLY_SURFACES: &[(&str, &str, &str)] = &[
     (
         "omnigraph-catalog/lib.rs",
         "ManifestCoordinator",
+        "record_in_hinted_branch",
+    ),
+    (
+        "omnigraph-catalog/lib.rs",
+        "ManifestCoordinator",
         "ensure_incarnation_live",
     ),
     (
@@ -888,7 +890,7 @@ gateway_surfaces! {
         "manifest_scan_dataset",
     ],
     "omnigraph-core/storage.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
-        "binding", "io_scope", "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
+        "binding", "io_scope", "read_through_mount", "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
         "read_bytes_if_exists_bounded", "exists",
         "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
@@ -897,7 +899,7 @@ gateway_surfaces! {
         "write_text_if_match", "delete_prefix",
     ],
     "omnigraph-storage/lib.rs" => "StorageAdapter" => GatewayDisposition::ReadOrPure => [
-        "io_scope", "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
+        "io_scope", "read_through_mount", "read_text", "read_text_if_exists", "read_text_if_exists_bounded",
         "read_bytes_if_exists_bounded", "read_text_versioned_if_exists_bounded", "exists",
         "list_dir", "list_dir_bounded", "read_text_versioned",
     ],
@@ -907,7 +909,7 @@ gateway_surfaces! {
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::ReadOrPure => [
         "validate_initial_empty_table",
-        "transaction_identity",
+        "transaction_identity", "row_preserving_chain",
         "open_snapshot_at_entry", "open_snapshot_at_table", "open_dataset_head",
         "branch_identifier", "list_native_branches",
         "ensure_expected_version", "scan", "scan_with_row_id", "scan_filtered", "scan_filtered_row_addrs", "scan_batches",
@@ -927,6 +929,7 @@ gateway_surfaces! {
         "stage_overwrite_batches", "stage_overwrite_stream",
         "stage_rename_columns", "stage_schema_evolution", "stage_delete", "stage_delete_rows", "stage_create_indices",
         "stage_compaction", "stage_fragment_rewrite", "stage_index_fold", "stage_index_reconciliation",
+        "rebase_staged_write",
     ],
     "storage_layer.rs" => "TableStorage" => GatewayDisposition::Durable(WriteProtocol::NativeRefControl) => [
         "force_delete_branch",
@@ -1002,7 +1005,7 @@ gateway_surfaces! {
         "validate_full_text_scan", "validate_full_text_demand", "is_full_text_index",
         "is_untrained_full_text", "key_column_index_coverage", "has_unindexed_fragments", "user_indices_for_column",
         "has_btree_index_on", "has_fts_index_on", "has_fts_postings_on", "has_vector_index_on",
-        "current_fragments", "is_btree_index", "key_column_coverage",
+        "current_fragments", "is_btree_index", "key_column_coverage", "key_column_uncovered_tail",
     ],
     "omnigraph-core/staging.rs" => "(free fn)" => GatewayDisposition::ReadOrPure => [
         "is_detached_version",
@@ -1115,8 +1118,9 @@ durable_calls! {
     ("omnigraph-storage/scoped.rs", ".put_part(", 1, WriteProtocol::Composed("tracked child of an owned multipart upload")),
     ("omnigraph-storage/scoped.rs", ".complete(", 1, WriteProtocol::Composed("owned multipart publication, never success after uncertain part completion")),
     ("omnigraph-storage/scoped.rs", ".abort(", 1, WriteProtocol::Composed("owned multipart cleanup retained across detached abort")),
-    ("omnigraph-storage/read_through.rs", ".put_opts(", 5, WriteProtocol::Composed("memory-layer put over a frozen directory (a prepared store under DST): overwrite, create, update of a layer object, update of a directory object landing as a create, and the copy's put")),
-    ("omnigraph-storage/read_through.rs", ".delete(", 1, WriteProtocol::Composed("memory-layer delete over a frozen directory, which it masks")),
+    ("omnigraph-storage/read_through.rs", ".put(", 2, WriteProtocol::Composed("durable read-through store only, two empty objects under the clone root's reserved `__clone/`: `created`, written once when a mount is first built over a clone root that has none, so that every clone root is told apart from a base; and `deleted/<key>`, the whiteout written before a delete of a base object takes effect so that a later mount over the same clone root hides that object again. A whiteout that lands after its caller gave up hides the base object from the next open on and nothing else, since a later create lives in the clone root; a repeated write lands the same empty object, and the in-memory form never writes either")),
+    ("omnigraph-storage/read_through.rs", ".put_opts(", 5, WriteProtocol::Composed("layer put over a frozen directory (the memory layer of a prepared store under DST, or a durable layer): overwrite, create, update of a layer object, update of a directory object landing as a create, and the copy's put")),
+    ("omnigraph-storage/read_through.rs", ".delete(", 2, WriteProtocol::Composed("layer delete over a frozen directory, which it masks; and the delete half of the store's own rename, which runs only for a source the base does not hold, so it is a plain clone-root delete after the copy")),
     ("engine/operators/memory.rs", ".abort(", 1, WriteProtocol::ReadTaskCancellation),
     ("omnigraph-storage/lib.rs", ".rename(", 1, WriteProtocol::Composed("object storage rename primitive")),
     ("storage_layer.rs", ".force_delete_branch(", 1, WriteProtocol::NativeRefControl),
@@ -1125,7 +1129,7 @@ durable_calls! {
     ("storage_layer.rs", ".commit_staged_exact(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".commit_staged_detached(", 1, WriteProtocol::Exact("sealed TableStorage forwarding")),
     ("db/omnigraph/promotion.rs", "SnapshotHandle::new(", 1, WriteProtocol::ReadOnlyAccess),
-    ("storage_layer.rs", ".dataset()", 39, WriteProtocol::Composed("sealed TableStorage forwarding")),
+    ("storage_layer.rs", ".dataset()", 42, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", ".into_arc()", 6, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("storage_layer.rs", "SnapshotHandle::new(", 4, WriteProtocol::Composed("sealed TableStorage forwarding")),
     ("table_store.rs", "Dataset::write(", 2, WriteProtocol::EphemeralScratch),
@@ -1207,8 +1211,6 @@ durable_calls! {
     ("db/omnigraph/collector.rs", ".dataset()", 17, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".delete(", 1, WriteProtocol::Composed("detached-only sweep through the table's own Lance store: freed files, then the published manifests no retained `__manifest` version pins (links before tips) and the dead stagings; an interrupted pass is re-swept by the next")),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
-    // The repair report reads raw transaction history; it publishes nothing.
-    ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
     ("db/omnigraph/optimize.rs", ".dataset()", 11, WriteProtocol::Composed("Optimize planning, including each plan's measure against its table ceilings, + read-only coverage and native-fork inventory + the configuration clear's read-back after a failed removal + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
@@ -2239,15 +2241,13 @@ fn graph_write_surfaces_are_registered() {
 }
 
 /// The public surfaces of maintenance: the graph writers registered under
-/// these protocols, plus the read-only repair report the same gate covers.
+/// these protocols.
 fn is_maintenance_protocol(protocol: WriteProtocol) -> bool {
     protocol == INDICES_V9 || protocol == OPTIMIZE_V9 || protocol == WriteProtocol::PhysicalOnly
 }
 
-const READ_ONLY_MAINTENANCE_SURFACES: &[(&str, &str)] = &[("db/omnigraph.rs", "repair_report_as")];
-
 /// Maintenance has no actor-less public form (invariant 10). Every public
-/// optimize, cleanup, index or repair entry point is an `_as` method taking the
+/// optimize, cleanup or index entry point is an `_as` method taking the
 /// `actor: Option<&str>` its policy check judges, so neither an embedded nor a
 /// direct caller reaches maintenance around the gate; with a policy installed,
 /// a `None` actor is refused. `policy_engine_chassis.rs` owns which action and
@@ -2255,18 +2255,10 @@ const READ_ONLY_MAINTENANCE_SURFACES: &[(&str, &str)] = &[("db/omnigraph.rs", "r
 #[test]
 fn maintenance_entry_points_take_an_actor() {
     let src = engine_src_root();
-    let read_only = READ_ONLY_SURFACES.iter().copied().collect::<BTreeSet<_>>();
-    for surface in READ_ONLY_MAINTENANCE_SURFACES {
-        assert!(
-            read_only.contains(surface),
-            "{surface:?} must stay a registered read-only surface"
-        );
-    }
     let surfaces = WRITE_SURFACES
         .iter()
         .filter(|surface| is_maintenance_protocol(surface.protocol))
         .map(|surface| (surface.file, surface.function))
-        .chain(READ_ONLY_MAINTENANCE_SURFACES.iter().copied())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         surfaces,
@@ -2276,7 +2268,6 @@ fn maintenance_entry_points_take_an_actor() {
             ("db/omnigraph.rs", "ensure_indices_on_as"),
             ("db/omnigraph.rs", "optimize_as"),
             ("db/omnigraph.rs", "rebuild_full_text_indices_on_as"),
-            ("db/omnigraph.rs", "repair_report_as"),
         ]),
         "a maintenance surface was added or removed; give it an actor and a policy case"
     );
@@ -2847,8 +2838,8 @@ const MUTABLE_KEY_REQUESTS: &[(&str, &str, usize, &str)] = &[
     (
         "omnigraph-storage/read_through.rs",
         ".delete(",
-        1,
-        "the read-through store's delete removes the memory layer's object in this process and masks the frozen directory's; DST only, nothing lands late",
+        2,
+        "the read-through store forwards its caller's delete to the layer and masks the frozen directory's object; it issues no delete of its own, so a late landing is the caller's, argued where that caller is registered. Under DST the layer is memory in this process and nothing lands late; in the durable form the marker that masks the directory's object is written before the forward. The second site is the delete half of the store's own rename, which runs only for a source the base does not hold, so it is the caller's rename-source delete on a clone-root key and lands late exactly as a rename on a plain store does",
     ),
     (
         "storage_layer.rs",
@@ -3629,6 +3620,7 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "storage.rs: omnigraph_core::storage::DecorateStorage",
     "storage.rs: omnigraph_core::storage::ListDirBounds",
     "storage.rs: omnigraph_core::storage::ObjectStorageAdapter",
+    "storage.rs: omnigraph_core::storage::ReadThroughMount",
     "storage.rs: omnigraph_core::storage::STORAGE",
     "storage.rs: omnigraph_core::storage::StorageAdapter",
     "storage.rs: omnigraph_core::storage::StorageDestination",
@@ -3642,6 +3634,8 @@ const SPLIT_CRATE_REEXPORTS: &[&str] = &[
     "storage.rs: omnigraph_core::storage::storage_for_uri",
     "storage.rs: omnigraph_core::storage::storage_for_uri_scoped",
     "storage.rs: omnigraph_core::storage::storage_kind_for_uri",
+    "storage.rs: omnigraph_core::storage::storage_read_through",
+    "storage.rs: omnigraph_core::storage::storage_read_through_scoped",
     "table_store.rs: omnigraph_core::dataset_index::IndexCoverage",
 ];
 
@@ -4083,24 +4077,32 @@ fn native_branch_controls_use_post_gate_captures_not_handle_refreshes() {
         );
     }
 
-    for function_name in ["branch_create_as", "branch_create_from_impl"] {
+    // The helpers and the evictions they are made of, so a direct call fails
+    // too. Every eviction is a method call: the `Omnigraph` methods call the
+    // `RuntimeCache` ones directly, with no free function between them.
+    let cache_evictions = [
+        "invalidate_read_caches",
+        "invalidate_all",
+        "invalidate_graph_index_for",
+        "invalidate_edge_tables",
+    ];
+    for function_name in [
+        "branch_create_as",
+        "branch_create_from_impl",
+        "branch_delete_as",
+        "delete_captured_branch_storage",
+    ] {
         let function = functions
             .get(function_name)
             .unwrap_or_else(|| panic!("missing Omnigraph::{function_name}"));
-        assert_eq!(
-            method_call_count(&function.block, "invalidate_read_caches"),
-            1,
-            "Omnigraph::{function_name} must invalidate derived caches after successful ref creation"
-        );
+        for eviction in cache_evictions {
+            assert_eq!(
+                method_call_count(&function.block, eviction),
+                0,
+                "Omnigraph::{function_name} must keep the read caches (no {eviction}): a branch create or delete changes no cache key"
+            );
+        }
     }
-    let delete_helper = functions
-        .get("delete_captured_branch_storage")
-        .expect("missing Omnigraph::delete_captured_branch_storage");
-    assert_eq!(
-        method_call_count(&delete_helper.block, "invalidate_read_caches"),
-        1,
-        "captured branch deletion must invalidate derived caches after successful ref removal"
-    );
 }
 
 fn function_blocks(ast: &syn::File, function_name: &str) -> Vec<syn::Block> {

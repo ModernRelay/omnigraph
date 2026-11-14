@@ -24,10 +24,7 @@ use omnigraph::db::{
     OptimizeCancellation, OptimizeLimits, OptimizePublication, OptimizeRequest, ResourceMeasure,
     RunCancellation, TableCeilings, TableOptimizeOutcome,
 };
-use omnigraph::db::{
-    CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, RepairAction, RepairClassification,
-    SnapshotId,
-};
+use omnigraph::db::{CleanupPolicyOptions, MergeOutcome, Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::error::{BranchStartRefusal, CompletionEvidence, OmniError};
 use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
 use omnigraph::loader::LoadMode;
@@ -1494,7 +1491,6 @@ node Tag {\n    slug: String @key\n}\n";
         .find(|s| s.type_key == "node:Tag")
         .expect("Tag stat present");
     // Lance 10's null/empty-safe blob-v2 compaction uses the ordinary path.
-    assert_eq!(doc.skipped(), None, "blob table must no longer be skipped");
     assert!(doc.committed(), "blob table compaction must be published");
     assert!(
         doc.fragments_removed >= 2 && doc.fragments_added >= 1,
@@ -1503,7 +1499,6 @@ node Tag {\n    slug: String @key\n}\n";
         doc.fragments_removed,
         doc.fragments_added
     );
-    assert_eq!(tag.skipped(), None, "non-blob table must not be skipped");
     assert!(tag.committed(), "plain table compaction must be published");
 
     // Both productive tables share one graph visibility point. Physical
@@ -1628,7 +1623,6 @@ async fn optimize_compacts_large_blob_rows_in_bounded_batches() {
         .iter()
         .find(|stat| stat.type_key == "node:Doc")
         .expect("Doc stat present");
-    assert_eq!(doc.skipped(), None);
     assert!(
         doc.committed(),
         "the Blob table compaction must be published"
@@ -2450,7 +2444,6 @@ async fn optimize_compacts_the_pin_under_foreign_head_drift() {
         .iter()
         .find(|s| s.type_key == "node:Person")
         .expect("Person stat present");
-    assert_eq!(person.skipped(), None);
     assert!(
         person.committed(),
         "optimize compacts the multi-fragment pin"
@@ -2466,11 +2459,11 @@ async fn optimize_compacts_the_pin_under_foreign_head_drift() {
     assert_eq!(count_rows(&db, "node:Person").await, rows_before);
 }
 
-/// The repair report names linear commits above the last linear version as
-/// `foreign_drift` and publishes nothing, and writers stage on the pin
+/// The collector's plan names linear commits above the last linear version
+/// as foreign and publishes nothing, and writers stage on the pin
 /// regardless: a strict schema apply still succeeds.
 #[tokio::test]
-async fn repair_report_names_foreign_drift_without_adopting_it() {
+async fn foreign_drift_is_listed_without_publishing_and_schema_apply_stages_on_the_pin() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir
         .path()
@@ -2482,24 +2475,20 @@ async fn repair_report_names_foreign_drift_without_adopting_it() {
     let (pin_before, head_before, _) = forge_person_compaction_drift(&db, &root).await;
 
     let commits_before = db.list_commits(None).await.unwrap();
-    let stats = db.repair_report_as(None).await.unwrap();
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
     assert_eq!(
         db.list_commits(None).await.unwrap(),
         commits_before,
-        "the repair report publishes nothing"
+        "the collector's plan publishes nothing"
     );
-    let person = stats
-        .datasets
-        .iter()
-        .find(|s| s.type_key == "node:Person")
-        .expect("Person repair stat present");
-    assert_eq!(person.classification, RepairClassification::ForeignDrift);
-    assert_eq!(person.action, RepairAction::NoOp);
-    assert_eq!(person.lance_head_version, head_before);
-    assert!(
-        person.operations.len() == 1 && person.operations[0].contains("foreign linear version"),
-        "foreign drift names the linear versions above the last linear version: {:?}",
-        person.operations
+    let person = main_plan(&report, "node:Person");
+    let last_linear = person
+        .last_linear_version
+        .expect("every registration records its last linear version");
+    assert_eq!(
+        person.foreign_versions,
+        (last_linear + 1..=head_before).collect::<Vec<_>>(),
+        "the plan names every linear version above the last linear version"
     );
 
     let (pin_after, head_after, _) = person_pin_and_head(&db, &root).await;
@@ -2515,12 +2504,17 @@ async fn repair_report_names_foreign_drift_without_adopting_it() {
         .await
         .expect("strict schema apply stages on the pin under foreign drift");
     assert!(result.applied);
+    let (_, head_after_apply, _) = person_pin_and_head(&db, &root).await;
+    assert_eq!(
+        head_after_apply, head_before,
+        "the schema apply neither moves nor adopts the foreign HEAD"
+    );
 }
 
-/// A foreign raw delete is reported as `foreign_drift`, never adopted, and
-/// reads still resolve the pin.
+/// A foreign raw delete is listed by the collector, never adopted, and reads
+/// still resolve the pin.
 #[tokio::test]
-async fn repair_report_never_adopts_a_foreign_delete() {
+async fn a_foreign_delete_is_listed_by_the_collector_and_never_adopted() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir
         .path()
@@ -2531,14 +2525,13 @@ async fn repair_report_never_adopts_a_foreign_delete() {
     let db = init_and_load(&dir).await;
     let (pin_before, head_before, _) = forge_person_delete_drift(&db, &root).await;
 
-    let stats = db.repair_report_as(None).await.unwrap();
-    let person = stats
-        .datasets
-        .iter()
-        .find(|s| s.type_key == "node:Person")
-        .expect("Person repair stat present");
-    assert_eq!(person.classification, RepairClassification::ForeignDrift);
-    assert_eq!(person.action, RepairAction::NoOp);
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let person = main_plan(&report, "node:Person");
+    assert!(
+        person.foreign_versions.contains(&head_before),
+        "the foreign delete is listed: {:?}",
+        person.foreign_versions
+    );
 
     let (pin_after, head_after, _) = person_pin_and_head(&db, &root).await;
     assert_eq!(pin_after, pin_before);
@@ -2552,9 +2545,9 @@ async fn repair_report_never_adopts_a_foreign_delete() {
 
 /// A never-written table's linear creation pin under a foreign linear commit:
 /// the write stages a detached pin on the pin, the foreign HEAD stays, and
-/// repair reports it as `foreign_drift` without publishing.
+/// the collector lists it as foreign without publishing.
 #[tokio::test]
-async fn write_on_a_never_written_table_succeeds_over_foreign_drift_and_repair_reports_it() {
+async fn write_on_a_never_written_table_succeeds_over_foreign_drift_and_the_collector_lists_it() {
     let dir = tempfile::tempdir().unwrap();
     let db = helpers::session(
         Omnigraph::init(dir.path().to_str().unwrap(), TEST_SCHEMA)
@@ -2597,15 +2590,13 @@ async fn write_on_a_never_written_table_succeeds_over_foreign_drift_and_repair_r
         "the write neither moves nor adopts the foreign HEAD"
     );
 
-    let stats = db.repair_report_as(None).await.unwrap();
-    let company = stats
-        .datasets
-        .iter()
-        .find(|s| s.type_key == "node:Company")
-        .expect("Company repair stat present");
-    assert_eq!(company.classification, RepairClassification::ForeignDrift);
-    assert_eq!(company.action, RepairAction::NoOp);
-    assert_eq!(company.lance_head_version, forged_head);
+    let report = db.cleanup_plan(keep_one()).await.unwrap();
+    let company = main_plan(&report, "node:Company");
+    assert_eq!(
+        company.foreign_versions,
+        vec![forged_head],
+        "the foreign commit above the creation pin is listed"
+    );
     assert_eq!(
         helpers::pinned_version(&db, "main", "node:Company").await,
         pin
@@ -4041,21 +4032,21 @@ async fn cleanup_age_window_preserves_recent_ref_absent_descendant() {
     );
 }
 
-/// The archive begins a retirement age window, then leaves with its unneeded tree.
-/// Native lifecycle contents and filesystem timestamps require the Rust owner.
-#[tokio::test]
-async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
-    db.branch_create("feature").await.unwrap();
-    let manifest_uri = dir.path().join("__manifest");
+/// Backdate the live `__manifest` branch `branch`: its ref's `create_at` to
+/// zero and every file of its ref and tree to the epoch, so `cleanup`'s age
+/// window has passed for them. Returns the ref and tree paths.
+async fn age_manifest_branch(
+    root: &std::path::Path,
+    branch: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let manifest_uri = root.join("__manifest");
     let manifest = Dataset::open(manifest_uri.to_str().unwrap()).await.unwrap();
     let native = manifest
         .list_branches()
         .await
         .unwrap()
         .into_keys()
-        .find(|name| name.starts_with("feature."))
+        .find(|name| name.starts_with(&format!("{branch}.")))
         .unwrap();
     let live_ref = manifest_uri
         .join("_refs/branches")
@@ -4082,6 +4073,19 @@ async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
                 .unwrap();
         }
     }
+    (live_ref, tree)
+}
+
+/// The archive begins a retirement age window, then leaves with its unneeded tree.
+/// Native lifecycle contents and filesystem timestamps require the Rust owner.
+#[tokio::test]
+async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    let manifest_uri = dir.path().join("__manifest");
+    let manifest = Dataset::open(manifest_uri.to_str().unwrap()).await.unwrap();
+    let (live_ref, tree) = age_manifest_branch(dir.path(), "feature").await;
     db.branch_delete("feature").await.unwrap();
     assert!(!live_ref.exists());
     let archive = tree.join("_omnigraph_retired_branch.json");
@@ -4135,6 +4139,60 @@ async fn cleanup_reclaims_retirement_archive_after_the_age_window() {
     assert!(
         !tree.exists(),
         "unneeded native history is reclaimed with its archive"
+    );
+}
+
+/// A handle that found a commit on a branch looks there first for the other
+/// commits of its history block. Once the branch is deleted and `cleanup`
+/// reclaims its tree, that branch has no `_versions` listing: the lookup must
+/// drop the hint and answer from `__history`, where the deletion archived the
+/// branch's commits. A warm handle across `cleanup` is not a `.gqt` step.
+#[tokio::test]
+async fn commit_lookup_past_a_reclaimed_branch_tree_reads_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    for name in ["First", "Second"] {
+        let person = mixed_params(&[("$name", name)], &[("$age", 30)]);
+        helpers::mutate_branch(&db, "feature", MUTATION_QUERIES, "insert_person", &person)
+            .await
+            .unwrap();
+    }
+    let commits = db.list_commits(Some("feature")).await.unwrap();
+    let (second, first) = (commits[0].clone(), commits[1].clone());
+
+    let reader = helpers::session(Omnigraph::open(uri).await.unwrap());
+    assert_eq!(
+        reader.get_commit(&first.graph_commit_id).await.unwrap(),
+        first,
+        "test setup: the scan finds the commit on `feature` and remembers its block there"
+    );
+    let (_, tree) = age_manifest_branch(dir.path(), "feature").await;
+    db.branch_delete("feature").await.unwrap();
+    db.cleanup_as(
+        CleanupPolicyOptions {
+            keep_versions: None,
+            older_than: Some(Duration::ZERO),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !tree.exists(),
+        "test setup: cleanup reclaimed the deleted branch's tree"
+    );
+
+    assert_eq!(
+        reader.get_commit(&second.graph_commit_id).await.unwrap(),
+        second,
+        "the hinted branch's tree is gone: the lookup reads `__history`"
+    );
+    assert_eq!(
+        reader.get_commit(&first.graph_commit_id).await.unwrap(),
+        first,
+        "and keeps reading it once the hint is dropped"
     );
 }
 

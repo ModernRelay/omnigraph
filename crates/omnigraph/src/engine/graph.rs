@@ -931,26 +931,52 @@ where
         .ok_or_else(|| {
             OmniError::manifest(format!("wide batch has no Utf8 '{src_name}' column"))
         })?;
+    u32::try_from(src_ids.len())
+        .map_err(|_| OmniError::manifest_internal("expand source ordinal exceeds UInt32"))?;
+    // A bound source is a node the frontier holds, and a node's id is never
+    // null: a null here is an integrity fault, refused rather than dropped.
+    if src_ids.null_count() > 0 {
+        return Err(OmniError::manifest_internal(format!(
+            "bound expand frontier has a null '{src_name}'"
+        )));
+    }
+    // The source groups, each group's wide rows (`group_starts` into
+    // `group_rows`, in row order) and one owned key per group.
+    super::operators::KeyGroups::charge(&source_memory, src_ids.len())
+        .map_err(|error| memory.error(error))?;
     source_memory
-        .entries::<(&str, Vec<u32>, u32, String)>(src_ids.len())
+        .entries::<(u32, u32, String)>(src_ids.len())
         .map_err(|error| memory.error(error))?;
     source_memory
         .string(src_ids.value_data().len())
         .map_err(|error| memory.error(error))?;
-    let mut rows_by_src: HashMap<&str, Vec<u32>> = HashMap::new();
     source_memory
         .charge_traversal(src_ids.len() as u64)
         .map_err(|error| memory.error(error))?;
-    for row in 0..src_ids.len() {
-        source_memory.check().map_err(|error| memory.error(error))?;
-        let ordinal = u32::try_from(row)
-            .map_err(|_| OmniError::manifest_internal("expand source ordinal exceeds UInt32"))?;
-        rows_by_src
-            .entry(src_ids.value(row))
-            .or_default()
-            .push(ordinal);
+    source_memory.check().map_err(|error| memory.error(error))?;
+    let (src_groups, row_groups) = super::operators::KeyGroups::build_numbered(src_ids)
+        .map_err(|error| memory.error(error))?;
+    let mut group_starts = vec![0u32; src_groups.len() + 1];
+    for group in row_groups.iter().flatten() {
+        group_starts[*group as usize + 1] += 1;
     }
-    let keys: Vec<String> = rows_by_src.keys().map(|key| (*key).to_owned()).collect();
+    for group in 0..src_groups.len() {
+        group_starts[group + 1] += group_starts[group];
+    }
+    let mut group_rows = vec![0u32; group_starts[src_groups.len()] as usize];
+    let mut next = group_starts.clone();
+    for (row, group) in row_groups.iter().enumerate() {
+        if let Some(group) = group {
+            let slot = &mut next[*group as usize];
+            group_rows[*slot as usize] = row as u32;
+            *slot += 1;
+        }
+    }
+    drop((row_groups, next));
+    let keys: Vec<String> = (0..src_groups.len() as u32)
+        .map(|group| src_groups.key(group).to_owned())
+        .collect();
+    let (mut probe_hashes, mut probe_groups) = (Vec::new(), Vec::new());
     let attach_columns: Vec<&str> = schema.fields()[2..]
         .iter()
         .map(|field| field.name().as_str())
@@ -1072,6 +1098,9 @@ where
                     .child("bound edge pairs")
                     .map_err(|error| memory.error(error))?,
             );
+            src_groups
+                .probe(keys, &mut probe_hashes, &mut probe_groups)
+                .map_err(|error| memory.error(error))?;
             for (row, attached_bytes) in attach_bytes.into_iter().enumerate() {
                 memory
                     .charge_traversal(1)
@@ -1079,9 +1108,12 @@ where
                 if probe == 1 && keys.value(row) == opposites.value(row) {
                     continue;
                 }
-                let Some(wide_rows) = rows_by_src.get(keys.value(row)) else {
+                let Some(group) = probe_groups[row] else {
                     continue;
                 };
+                let group = group as usize;
+                let wide_rows =
+                    &group_rows[group_starts[group] as usize..group_starts[group + 1] as usize];
                 let edge_row = u32::try_from(row).map_err(|_| {
                     OmniError::manifest_internal("edge batch ordinal exceeds UInt32")
                 })?;

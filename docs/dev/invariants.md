@@ -30,7 +30,8 @@ five more changes like this one?**
    names, every pin is a detached version that opens, and the pin is the
    table's version for its whole life. A graph table's linear HEAD stays at
    its creation version, recorded per registration as
-   `omnigraph.last_linear_version`; `repair` reads it for drift. Added-type
+   `omnigraph.last_linear_version`; the collector reads it to list foreign
+   versions. Added-type
    admission may also inspect an unregistered deterministic path, but accepts
    only its qualified original empty version 1, never an advanced HEAD.
    Per-table publication is never graph publication.
@@ -69,7 +70,8 @@ five more changes like this one?**
    lists still exists after the run; and progress, that a table version no
    retained `__manifest` version names is gone after a run that retains
    nothing else. Foreign movement fails closed: a linear commit above a
-   table's last linear version is reported by `repair` and never adopted.
+   table's last linear version is reported by the collector (`cleanup`'s
+   `foreign_versions`), never deleted and never adopted.
    See [recovery.md](recovery.md).
 
 6. **Stable identity survives renames, not lifetimes.** Accepted SchemaIR owns
@@ -212,9 +214,9 @@ code, tests, guide, and—when irreversible—RFC.
 - Is graph visibility still one manifest publication?
 - Is every pre-publication durable effect unreachable until the manifest names
   it, and are the table pins and accepted contract complete in that publication?
-- Does it read linear HEAD outside `repair` or qualified original-version
-  admission for an unregistered added-type path, or rebuild a row without carrying
-  `omnigraph.last_linear_version` forward?
+- Does it read linear HEAD outside the collector's foreign-version listing or
+  qualified original-version admission for an unregistered added-type path, or
+  rebuild a row without carrying `omnigraph.last_linear_version` forward?
 - Does the collector's mark set still cover every retained pin, and does its
   sweep still reach every unretained published version?
 - Are names kept separate from stable identity?

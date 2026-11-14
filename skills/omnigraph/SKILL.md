@@ -201,7 +201,7 @@ backend. `--config DIR` is source input only.
 - Direct cluster root: `--target ./cluster --graph knowledge`; registered root targets can set `default_graph`.
 - Server: `--target production --graph knowledge`; the registered target owns endpoint and one auth provider.
 - Managed: `--profile work` for account operations; a managed target references that profile and pins cluster ID/incarnation. Graph operations need its endpoint and `--graph` or `default_graph`.
-- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph` while the server is stopped. Each direct writer on the root takes the admission lock. A `cluster apply` that converges releases it once its writes have settled (never on Azure); maintenance, and an apply that fails or does not converge, keep it. Once that writer has stopped and its I/O has settled, release a kept lock's exact `lock_id` (from `cluster status --json`) with `cluster force-unlock` before the next writer or the server starts. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
+- Direct targets support local files, plus an inline `s3://` cluster root for `cluster plan/apply/status/force-unlock/upgrade-ledger` and `optimize`/`index build`/`index rebuild`/`cleanup --graph` while the server is stopped. Each direct writer on the root takes the admission lock. A `cluster apply` that converges releases it once its writes have settled (never on Azure); maintenance, and an apply that fails or does not converge, keep it. Once that writer has stopped and its I/O has settled, release a kept lock's exact `lock_id` (from `cluster status --json`) with `cluster force-unlock` before the next writer or the server starts. Other cloud-direct, catalogue and Unix socket targets are unsupported. Remote inline URLs must be registered.
 
 Bare target names resolve from the operator file; use `./` for relative inline
 paths. `init --schema schema.pg ./graph.omni` is the sole positional backend
@@ -219,7 +219,7 @@ destination line.
 | Data | `query`, `mutate`, `load --mode overwrite\|append\|merge`, `branch`, `commit`, `snapshot`, `export`, `blob`, `diff`, `changes`; direct or served targets |
 | Managed data | `graphs list` and common served graph commands, subject to endpoint capabilities and policy; no direct maintenance fallback |
 | Direct schema | `schema plan`; `schema apply` and `schema upgrade-system-columns` require standalone graph targets |
-| Direct maintenance | `optimize`, `index build`, `index rebuild --kind full-text`, `repair`, `cleanup`; `upgrade --target ADDRESS` is standalone and offline |
+| Direct maintenance | `optimize`, `index build`, `index rebuild --kind full-text`, `cleanup`; `upgrade --target ADDRESS` is standalone and offline |
 | Source-only | `lint --schema FILE --query FILE`, `cluster validate --config DIR`; no backend target |
 | Root control | `queries list/validate`, `policy validate/test/explain`, `cluster observe/force-unlock/upgrade-ledger`; direct root targets; `queries list` also reads one served graph |
 | Deployment | `cluster plan/apply --config DIR` on a direct root or server; `cluster status` uses only the target |

@@ -46,7 +46,6 @@ prints the exact flags of the installed binary.
 | `upgrade` | — | Convert a standalone graph's storage offline |
 | `optimize` | — | Compact data and reconcile declared indexes on `main` |
 | `index` | `build` `rebuild` | Build a branch's missing or lagging indexes; replace its full-text indexes |
-| `repair` | — | Report foreign Lance history without adopting it |
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
@@ -320,7 +319,10 @@ indexes are preserved and any uncovered tail is scanned; use the explicit
 rebuild command when full-text coverage or analyzer compatibility must change.
 `optimize` also persists the derived traversal adjacency used to speed up
 traversal startup; it does not collect unused forks (that is `cleanup`). It
-works on `main`; use `index build` for another branch. Against a server
+works on `main`; use `index build` for another branch. Writes running beside
+it are not refused by its publication: a write it overtook commits over the
+compaction, or prepares again once, holding writes off, when it changes a row
+the run moved. None returns `read_set_conflict` for it. Against a server
 target it runs as a recorded operation: it prints an operation id, waits for
 the operation's record (`--no-wait`, `--timeout`), and `--operation <id>`
 observes one; after a lost response it looks the id up and never resubmits.
@@ -499,7 +501,7 @@ identities use different targets. There is no `--auth` selector or last-used ide
 
 Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
-`optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph`, with region
+`optimize`/`index build`/`index rebuild`/`cleanup --graph`, with region
 and endpoint captured from the environment
 ([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
 Each direct writer except a converged `cluster apply` (never on Azure) keeps

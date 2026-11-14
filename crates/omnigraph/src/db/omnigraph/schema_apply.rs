@@ -227,7 +227,7 @@ where
 
     let _export_exclusion = db.reserve_export_destructive_control()?;
 
-    let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
+    let _schema_gate = db.write_queue().acquire_schema_exclusive().await?;
     apply_schema_with_lock(db, desired_schema_source, actor, validate_catalog, None).await
 }
 
@@ -239,7 +239,7 @@ pub(super) async fn apply_prepared_schema(
     prepared::authorize(db, actor)?;
     prepared.validate_envelope(db, actor)?;
     let _export_exclusion = db.reserve_export_destructive_control()?;
-    let _schema_gate = db.write_queue().acquire_schema_exclusive().await;
+    let _schema_gate = db.write_queue().acquire_schema_exclusive().await?;
     apply_schema_with_lock(
         db,
         &prepared.desired_source,
@@ -348,7 +348,6 @@ where
     let mut evolved_tables = BTreeSet::new();
     let mut dropped_tables = BTreeSet::new();
     let mut property_renames = HashMap::<String, HashMap<String, String>>::new();
-    let mut changed_edge_tables = false;
     let mut promotion_required = HashMap::<String, Vec<String>>::new();
     let mut promotion_unique = HashMap::<String, Vec<Vec<String>>>::new();
     // Properties this apply adds, by desired table and name: no stored column
@@ -362,9 +361,6 @@ where
                     continue;
                 }
                 let table_key = schema_table_key(*type_kind, name);
-                if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
                 added_tables.insert(table_key);
             }
             SchemaMigrationStep::RenameType {
@@ -377,9 +373,6 @@ where
                 }
                 let source_key = schema_table_key(*type_kind, from);
                 let target_key = schema_table_key(*type_kind, to);
-                if source_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
                 debug_assert_eq!(renamed_tables.get(&target_key), Some(&source_key));
             }
             SchemaMigrationStep::AddProperty {
@@ -392,9 +385,6 @@ where
                     continue;
                 }
                 let table_key = schema_table_key(*type_kind, type_name);
-                if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
                 added_properties
                     .entry(table_key.clone())
                     .or_default()
@@ -411,9 +401,6 @@ where
                     continue;
                 }
                 let table_key = schema_table_key(*type_kind, type_name);
-                if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
                 evolved_tables.insert(table_key.clone());
                 property_renames
                     .entry(table_key)
@@ -474,9 +461,6 @@ where
                 // Nothing is reclaimed at apply; see
                 // `SchemaMigrationStep::DropProperty`.
                 let table_key = schema_table_key(*type_kind, type_name);
-                if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
                 evolved_tables.insert(table_key);
             }
             SchemaMigrationStep::DropType { type_kind, name } => {
@@ -488,9 +472,6 @@ where
                 // Nothing is reclaimed after the publish; see
                 // `SchemaMigrationStep::DropType`.
                 let table_key = schema_table_key(*type_kind, name);
-                if table_key.starts_with("edge:") {
-                    changed_edge_tables = true;
-                }
                 dropped_tables.insert(table_key);
             }
             step @ SchemaMigrationStep::UnsupportedChange { .. } => {
@@ -617,11 +598,11 @@ where
         .datasets()
         .map(|entry| (entry.type_key.clone(), entry.native_dataset_branch.clone()))
         .collect();
-    let _main_branch_guard = db.write_queue().acquire_branch(None).await;
+    let _main_branch_guard = db.write_queue().acquire_branch(None).await?;
     let _schema_apply_queue_guards = db
         .write_queue()
         .acquire_many(&schema_apply_queue_keys)
-        .await;
+        .await?;
 
     // The snapshot was captured before the branch/table waits. Revalidate the
     // complete authority token now, while those gates are held, so a stale
@@ -1166,9 +1147,6 @@ where
             &desired_ir,
         )?;
         db.runtime_cache.invalidate_all().await;
-        if changed_edge_tables {
-            db.invalidate_graph_index().await;
-        }
         fail(&SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
         Ok::<PublishedSnapshot, OmniError>(published)
     }

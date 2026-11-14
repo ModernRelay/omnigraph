@@ -903,21 +903,6 @@ async fn run_bound(
             )
             .await;
         }
-        Command::Repair(args) => {
-            return commands::maintenance::run_repair(
-                args,
-                commands::maintenance::MaintenanceScope {
-                    operator: &operator,
-                    target: required_target(),
-                    graph: cli.graph.as_deref(),
-                    actor: cli.as_actor.as_deref(),
-                    yes: cli.yes,
-                },
-                stdout,
-                stderr,
-            )
-            .await;
-        }
         Command::Cleanup(args) => {
             return commands::maintenance::run_cleanup(
                 args,

@@ -62,41 +62,6 @@ pub struct CleanupPolicyOptions {
     pub older_than: Option<Duration>,
 }
 
-/// Why `optimize` did not compact a dataset. Typed so callers branch on the
-/// reason rather than sniffing a string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SkipReason {
-    /// The Lance dataset HEAD is ahead of the version recorded in
-    /// `__manifest`, and no pending pin explains that movement. `optimize`
-    /// cannot infer whether the drift is benign maintenance or an external
-    /// semantic write, so it leaves the dataset untouched and points operators at
-    /// explicit `repair`.
-    DriftNeedsRepair,
-}
-
-impl SkipReason {
-    /// Stable machine-readable token for serialized output (e.g. CLI `--json`).
-    /// Once emitted this is part of the output contract — keep it stable.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SkipReason::DriftNeedsRepair => "drift_needs_repair",
-        }
-    }
-}
-
-impl std::fmt::Display for SkipReason {
-    /// Human-readable reason for CLI and log output.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let msg = match self {
-            SkipReason::DriftNeedsRepair => {
-                "published dataset/Lance HEAD drift — run omnigraph repair"
-            }
-        };
-        f.write_str(msg)
-    }
-}
-
 /// What one optimize run did to one table. A run reports exactly one outcome
 /// for every table it considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,8 +73,6 @@ pub enum TableOptimizeOutcome {
     Unchanged,
     /// Not started: nothing was written for the table.
     Deferred(DeferReason),
-    /// Deliberately left alone.
-    Skipped(SkipReason),
     /// A failure of this table's own planning or staging, with definite
     /// evidence: its staging is unreachable and the other tables still
     /// publish. [`DatasetOptimizeStats::failure`] holds the error.
@@ -124,7 +87,6 @@ impl TableOptimizeOutcome {
             TableOptimizeOutcome::Optimized => "optimized",
             TableOptimizeOutcome::Unchanged => "unchanged",
             TableOptimizeOutcome::Deferred(_) => "deferred",
-            TableOptimizeOutcome::Skipped(_) => "skipped",
             TableOptimizeOutcome::Failed => "failed",
         }
     }
@@ -310,14 +272,6 @@ impl DatasetOptimizeStats {
     pub fn committed(&self) -> bool {
         self.outcome == TableOptimizeOutcome::Optimized
     }
-
-    /// `Some(reason)` if this table was deliberately not compacted.
-    pub fn skipped(&self) -> Option<SkipReason> {
-        match self.outcome {
-            TableOptimizeOutcome::Skipped(reason) => Some(reason),
-            _ => None,
-        }
-    }
 }
 
 /// The configuration clear that follows a run's publication under the writer
@@ -433,10 +387,6 @@ pub struct OptimizeReport {
     pub resume_at: Option<String>,
     /// How long the run held main's writer gates, from acquisition to release.
     pub gate_hold: Duration,
-    /// How long the run waited, before it took the gates, for writers on main
-    /// that an earlier publication sent back to prepare again
-    /// ([`OptimizeLimits::max_writer_yield`]).
-    pub writer_yield: Duration,
     /// The configuration clear, under the gates after the publication.
     pub configuration_clear: ConfigurationClear,
     /// The adjacency artifact refresh, after the gates are released.
@@ -516,7 +466,11 @@ impl OptimizeCancellation {
 }
 
 /// How many tables a run plans ahead of the ones it rewrites, and how many it
-/// rewrites at once. Planning only reads.
+/// rewrites at once. Planning only reads. `rewrite` also bounds the heavy
+/// steps in flight across those tables (compaction tasks, index folds and
+/// index builds, one permit each), so a lone table may run that many of its
+/// compaction tasks at once and the run never runs more steps at once than
+/// `rewrite` (#1384).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OptimizeConcurrency {
     pub planning: usize,
@@ -536,12 +490,7 @@ impl OptimizeConcurrency {
     }
 }
 
-/// How long a run waits, at most, for writers preparing again when the
-/// request names no limit ([`OptimizeLimits::max_writer_yield`]).
-pub const DEFAULT_MAX_WRITER_YIELD: Duration = Duration::from_secs(10);
-
-/// Bounds on one run. An absent limit does not bound it, except
-/// `max_writer_yield`, which defaults to [`DEFAULT_MAX_WRITER_YIELD`].
+/// Bounds on one run. An absent limit does not bound it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OptimizeLimits {
@@ -550,12 +499,6 @@ pub struct OptimizeLimits {
     /// wait of a writer that queued for the gates is at most this, plus that
     /// table, the publication and the configuration clear.
     pub max_gate_hold: Option<Duration>,
-    /// Before it takes the gates, the run waits for writers on main that an
-    /// earlier publication sent back to prepare again, at most this long
-    /// (absent: [`DEFAULT_MAX_WRITER_YIELD`]; zero: no wait). Without the
-    /// wait, runs submitted back to back could each take the gates while such
-    /// a writer prepares, and one write would wait through many runs.
-    pub max_writer_yield: Option<Duration>,
     /// Ceilings on one table's plan, checked before its first write.
     pub table: TableCeilings,
     /// Total source bytes across the tables the run starts. It is also the
@@ -571,11 +514,6 @@ pub struct OptimizeLimits {
 impl OptimizeLimits {
     pub fn with_max_gate_hold(mut self, hold: Duration) -> Self {
         self.max_gate_hold = Some(hold);
-        self
-    }
-
-    pub fn with_max_writer_yield(mut self, wait: Duration) -> Self {
-        self.max_writer_yield = Some(wait);
         self
     }
 
@@ -909,25 +847,6 @@ pub async fn optimize_all_datasets(
     let concurrency = request
         .concurrency
         .unwrap_or_else(OptimizeConcurrency::from_env);
-    // A writer an earlier publication sent back to prepare again has left
-    // the gate queue. Let it finish before this run publishes over it again;
-    // a cancellation during the wait is seen at the pipeline's first check.
-    let writer_yield = db
-        .write_queue()
-        .yield_to_writers_published_over(
-            None,
-            request
-                .limits
-                .max_writer_yield
-                .unwrap_or(DEFAULT_MAX_WRITER_YIELD),
-            async {
-                match request.cancellation.as_ref() {
-                    Some(cancellation) => cancellation.cancelled().await,
-                    None => std::future::pending().await,
-                }
-            },
-        )
-        .await;
     let _export_exclusion = db
         .reserve_export_destructive_control()
         .map_err(OmniError::before_effect)?;
@@ -949,7 +868,7 @@ pub async fn optimize_all_datasets(
     // Canonical writer order: schema -> branch -> sorted tables. Planning reads
     // catalog index intent, so it must use an operation-local accepted catalog
     // under the same schema gate as schema apply and the exact RFC-022 writers.
-    let schema_permit = db.write_queue().acquire_schema_shared().await;
+    let schema_permit = db.write_queue().acquire_schema_shared().await?;
     db.refresh_coordinator_only()
         .await
         .map_err(OmniError::before_effect)?;
@@ -963,8 +882,8 @@ pub async fn optimize_all_datasets(
         .map_err(OmniError::before_effect)?;
     let full_catalog = request.tables.is_none();
 
-    // A run cancelled before it holds main's gates (during its writer yield,
-    // or while it waits for the gates behind writers) stops there, holding
+    // A run cancelled before it holds main's gates (while it waits for the
+    // gates behind writers) stops there, holding
     // only the shared schema permit that writers also share: it must not
     // queue for main's gates, nor hold them, only to report every table
     // cancelled.
@@ -981,7 +900,6 @@ pub async fn optimize_all_datasets(
             .collect(),
         resume_at: None,
         gate_hold: Duration::ZERO,
-        writer_yield,
         configuration_clear: ConfigurationClear::NotRun,
         artifact: ArtifactRefresh::Skipped(ArtifactSkip::Cancelled),
         cancellation: RunCancellation::Cancelled,
@@ -1002,9 +920,9 @@ pub async fn optimize_all_datasets(
         .map(|table_key| (table_key.clone(), None))
         .collect::<Vec<_>>();
     let gates = async {
-        let main_branch_guard = db.write_queue().acquire_branch(None).await;
-        let table_guards = db.write_queue().acquire_many(&queue_keys).await;
-        (main_branch_guard, table_guards)
+        let main_branch_guard = db.write_queue().acquire_branch(None).await?;
+        let table_guards = db.write_queue().acquire_many(&queue_keys).await?;
+        Ok::<_, OmniError>((main_branch_guard, table_guards))
     };
     // A gate wait dropped before it holds leaves the queue as it was.
     let (main_branch_guard, table_guards) = match request.cancellation.as_ref() {
@@ -1014,9 +932,9 @@ pub async fn optimize_all_datasets(
                 drop(schema_permit);
                 return Ok(cancelled_before_gates());
             }
-            gates = gates => gates,
+            gates = gates => gates?,
         },
-        None => gates.await,
+        None => gates.await?,
     };
     let gates_acquired = Instant::now();
 
@@ -1144,17 +1062,8 @@ pub async fn optimize_all_datasets(
                 .map(|hook| hook as super::table_ops::BeforePublishHook<'_>),
         )
         .await;
-        // Every write in flight on main now started before this publication,
-        // so the next run waits for them (`yield_to_writers_published_over`).
-        // A publication whose outcome is in doubt may have landed, so it
-        // counts too: when it did not, the next run waits for writes no
-        // publication sent back, which costs only its wait.
-        db.write_queue().optimize_published(None);
         graph_commit_id = Some(commit?.graph_commit_id);
         db.runtime_cache.invalidate_all().await;
-        if edge_tables_committed {
-            db.invalidate_graph_index().await;
-        }
     }
 
     // The graph commit is durable from here: nothing below fails the run. A
@@ -1208,7 +1117,6 @@ pub async fn optimize_all_datasets(
         // A cancelled run moved nothing, so the next run starts where this one did.
         resume_at: visited.resume_at.filter(|_| full_catalog && !cancelled),
         gate_hold,
-        writer_yield,
         configuration_clear,
         artifact,
         cancellation,
@@ -1269,10 +1177,17 @@ async fn run_table_pipeline(
             (index, started, result)
         }
     };
+    // #1384: the tables being rewritten share one budget of the rewrite
+    // concurrency for their heavy steps (compaction tasks, index folds, index
+    // builds), so a run never has more steps in flight than tables it may
+    // rewrite, and a lone large table uses the idle slots.
+    let step_limit = crate::table_store::OptimizeStepLimit::new(concurrency.rewrite);
     let stage = |index: usize, started: Instant, work: PreparedOptimizeTable| {
         let catalog = std::sync::Arc::clone(catalog);
+        let step_limit = step_limit.clone();
         async move {
-            let result = apply_optimize_table_effects(db, catalog.as_ref(), work).await;
+            let result =
+                apply_optimize_table_effects(db, catalog.as_ref(), work, &step_limit).await;
             (index, started, result)
         }
     };
@@ -1836,11 +1751,14 @@ decide_seam! {
 /// of every foldable index whose coverage lags the rewritten layout (Lance 11
 /// folds only through a linear commit, so `stage_index_fold` rebuilds instead
 /// of merging), then any declared-but-unbuilt index. The rewrite comes first
-/// so an index is rebuilt once, over the settled layout.
+/// so an index is rebuilt once, over the settled layout. Each compaction
+/// task, the fold and the index build hold one permit of `step_limit`, the
+/// run's budget, while they run.
 async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
+    step_limit: &crate::table_store::OptimizeStepLimit,
 ) -> Result<OptimizeEffectOutcome> {
     let table_key = work.table_key;
     let full_path = work.full_path;
@@ -1854,8 +1772,10 @@ async fn apply_optimize_table_effects(
     let mut tip = base.clone();
     let mut tip_identity = None;
     let mut metrics = CompactionMetrics::default();
-    if let Some((staged, compaction_metrics)) =
-        db.storage().stage_compaction(&base, &options).await?
+    if let Some((staged, compaction_metrics)) = db
+        .storage()
+        .stage_compaction(&base, &options, step_limit)
+        .await?
     {
         let (rewrite, identity) = db
             .storage()
@@ -1871,7 +1791,7 @@ async fn apply_optimize_table_effects(
     // Lance 13 carries a row-id-domain index's coverage to the new fragments,
     // the engine builds no address-domain index, and no engine writer creates
     // the data overlays that would also drop coverage.
-    let (fold, skipped_folds) = db.storage().stage_index_fold(&tip).await?;
+    let (fold, skipped_folds) = step_limit.run(db.storage().stage_index_fold(&tip)).await?;
     if let Some(staged) = fold {
         if tip_identity.is_some() {
             chain.push(tip.clone());
@@ -1897,9 +1817,8 @@ async fn apply_optimize_table_effects(
         });
     }
     if !index_work.specs.is_empty() {
-        let staged = db
-            .storage()
-            .stage_create_indices(&tip, &index_work.specs)
+        let staged = step_limit
+            .run(db.storage().stage_create_indices(&tip, &index_work.specs))
             .await
             .map_err(|error| {
                 error.with_context(format!(
@@ -2114,7 +2033,7 @@ pub async fn cleanup_all_datasets(
     // envelope before deleting any version history.
     let authority_txn = db.open_write_txn(None).await?;
 
-    let _cleanup_schema_permit = db.write_queue().acquire_schema_shared().await;
+    let _cleanup_schema_permit = db.write_queue().acquire_schema_shared().await?;
     db.refresh_coordinator_only().await?;
     let cleanup_catalog = db.load_accepted_catalog_with_schema_gate_held().await?;
     let snapshot = db.revalidate_write_txn(&authority_txn).await?;
@@ -2129,9 +2048,9 @@ pub async fn cleanup_all_datasets(
         .collect();
 
     let graph_branches = cleanup_graph_branches(db).await?;
-    let _cleanup_branch_guards = db.write_queue().acquire_branches(&graph_branches).await;
+    let _cleanup_branch_guards = db.write_queue().acquire_branches(&graph_branches).await?;
     let gc_queue_keys = db.table_queue_keys_for_branches(&graph_branches, &cleanup_catalog);
-    let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await;
+    let _cleanup_table_guards = db.write_queue().acquire_many(&gc_queue_keys).await?;
 
     db.revalidate_write_txn(&authority_txn).await?;
 
@@ -2289,12 +2208,12 @@ pub struct BranchReconcileStats {
 /// Collect unreferenced table forks under cleanup's complete writer gates.
 #[cfg(all(test, feature = "failpoints"))]
 pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconcileStats> {
-    let _schema = db.write_queue().acquire_schema_shared().await;
+    let _schema = db.write_queue().acquire_schema_shared().await?;
     let catalog = db.catalog();
     let graph_branches = cleanup_graph_branches(db).await?;
-    let _branches = db.write_queue().acquire_branches(&graph_branches).await;
+    let _branches = db.write_queue().acquire_branches(&graph_branches).await?;
     let table_keys = db.table_queue_keys_for_branches(&graph_branches, &catalog);
-    let _tables = db.write_queue().acquire_many(&table_keys).await;
+    let _tables = db.write_queue().acquire_many(&table_keys).await?;
     reconcile_orphaned_branches_under_control_gates(db, None).await
 }
 

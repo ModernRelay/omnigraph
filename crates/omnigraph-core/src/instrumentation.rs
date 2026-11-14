@@ -199,11 +199,17 @@ pub struct QueryIoProbes {
     /// This must equal the newly deleted offset count; a fragment scan would
     /// make it grow with the compacted catalog's history instead.
     pub projection_identity_rows: Arc<AtomicU64>,
-    /// Pre-effect reprepares a mutation or a load took after a `ReadSetChanged`
-    /// (bounded by `MAX_PRE_EFFECT_REPREPARES`). The caller sees only the
-    /// exhaustion of that loop, so this is the one view of the attempts behind
-    /// an acknowledged write.
+    /// Pre-effect reprepares a mutation, a load or a Blob write took after a
+    /// `ReadSetChanged` (bounded by `MAX_PRE_EFFECT_REPREPARES`); each such
+    /// attempt prepares under the branch's writer gates. The caller sees only
+    /// the exhaustion of that loop, so this is the one view of the attempts
+    /// behind an acknowledged write.
     pub mutation_reprepares: Arc<AtomicU64>,
+    /// Attempts carried, under the writer gates, over publications that
+    /// changed no row (an optimize compaction or an index build), every staged
+    /// table rebased, instead of preparing again. An attempt whose carry Lance
+    /// refused is not counted; it prepares again.
+    pub writes_carried_over_row_preserving: Arc<AtomicU64>,
     /// The Lance `ObjectStore`s behind the opens that carried
     /// `manifest_wrapper` / `history_wrapper` / `table_wrapper`. A store's own
     /// `io_tracker` also sees Lance's direct local reader and writer, which on
@@ -765,6 +771,10 @@ tokio::task_local! {
 }
 
 tokio::task_local! {
+    static OPTIMIZE_STEP_PROBES: OptimizeStepProbes;
+}
+
+tokio::task_local! {
     static EXTERNAL_PAYLOAD_READ_STALL: ();
 }
 
@@ -964,17 +974,58 @@ pub async fn enter_stage_write_probe() -> Option<StageWriteProbeGuard> {
     let state = STAGE_WRITE_PROBES
         .try_with(|probes| probes.state.clone())
         .ok()?;
+    Some(enter_rendezvous_probe(state).await)
+}
+
+async fn enter_rendezvous_probe(state: Arc<StageWriteProbeState>) -> StageWriteProbeGuard {
     state.entered.fetch_add(1, Ordering::Relaxed);
-    // Count only after every participant is released. The first staging call
-    // must then remain pending in its real storage future for a second call to
+    // Count only after every participant is released. The first participant
+    // must then remain pending in its real storage future for a second one to
     // raise the peak above one; parked rendezvous waiters do not count.
     state.rendezvous.wait().await;
     let active = state.active.fetch_add(1, Ordering::Relaxed) + 1;
     state.peak.fetch_max(active, Ordering::Relaxed);
-    let guard = StageWriteProbeGuard {
-        state: state.clone(),
-    };
-    Some(guard)
+    StageWriteProbeGuard { state }
+}
+
+/// The same rendezvous probe around each heavy step an optimize run holds a
+/// permit of its `OptimizeStepLimit` for (#1384): a compaction task, an
+/// index fold or an index build. It counts how many of the run's steps are
+/// executing at once, across every table the run stages.
+#[derive(Clone)]
+pub struct OptimizeStepProbes(StageWriteProbes);
+
+impl OptimizeStepProbes {
+    /// Create a probe that releases each group of steps after
+    /// `release_after` of them have entered.
+    pub fn rendezvous(release_after: usize) -> Self {
+        Self(StageWriteProbes::rendezvous(release_after))
+    }
+
+    /// Number of steps that entered the probe.
+    pub fn entered(&self) -> u64 {
+        self.0.entered()
+    }
+
+    /// Maximum steps simultaneously inside the probe.
+    pub fn peak_in_flight(&self) -> u64 {
+        self.0.peak_in_flight()
+    }
+}
+
+/// Run `fut` with the optimize-step probe installed.
+pub async fn with_optimize_step_probes<F>(probes: OptimizeStepProbes, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    OPTIMIZE_STEP_PROBES.scope(probes, fut).await
+}
+
+pub async fn enter_optimize_step_probe() -> Option<StageWriteProbeGuard> {
+    let state = OPTIMIZE_STEP_PROBES
+        .try_with(|probes| probes.0.state.clone())
+        .ok()?;
+    Some(enter_rendezvous_probe(state).await)
 }
 
 pub fn manifest_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
@@ -1062,6 +1113,15 @@ pub fn record_probed_store(
 pub fn record_mutation_reprepare() {
     let _ = current(|p| {
         p.mutation_reprepares.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Record one write carried over row-preserving publications. No-op unless a
+/// cost probe is active.
+pub fn record_write_carried_over_row_preserving() {
+    let _ = current(|p| {
+        p.writes_carried_over_row_preserving
+            .fetch_add(1, Ordering::Relaxed);
     });
 }
 
@@ -2111,42 +2171,53 @@ pub async fn open_dataset(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Dataset> {
-    let builder = dataset_builder(uri, version, session, &wrapper).await?;
-    let dataset = builder.load().await.map_err(|error| match error {
-        // Only the two shapes cleanup/drop legitimately leaves behind for a
-        // pinned historical read count as reclaimed history:
-        //   - VersionNotFound: the dataset exists, that version was GC'd.
-        //   - DatasetNotFound: the whole dataset directory is gone (a dropped
-        //     table's history fully GC'd).
-        // A bare NotFound is NOT a cleanup shape: it is a live manifest
-        // referencing a missing object — corruption or an object-store
-        // inconsistency — so it must stay loud rather than be masked as a benign
-        // retention gap (which the change feed would surface as a 410 "reset via
-        // baseline"). Residual: this cannot tell a corrupt CURRENT table's
-        // DatasetNotFound from a legitimately dropped historical table's; that
-        // needs caller context (whether the version is the table's current one),
-        // and the baseline handshake the gap points to still fails loudly on
-        // genuine current-state loss.
-        lance::Error::VersionNotFound { .. } | lance::Error::DatasetNotFound { .. }
-            if matches!(version, VersionResolution::At(_)) =>
-        {
-            OmniError::HistoricalVersionReclaimed {
-                published_dataset_version: match version {
-                    VersionResolution::At(version) => version,
-                    VersionResolution::Latest => 0,
-                },
+    load_recorded(uri, version, session, wrapper)
+        .await?
+        .map_err(|error| match error {
+            // Only the two shapes cleanup/drop legitimately leaves behind for a
+            // pinned historical read count as reclaimed history:
+            //   - VersionNotFound: the dataset exists, that version was GC'd.
+            //   - DatasetNotFound: the whole dataset directory is gone (a dropped
+            //     table's history fully GC'd).
+            // A bare NotFound is NOT a cleanup shape: it is a live manifest
+            // referencing a missing object — corruption or an object-store
+            // inconsistency — so it must stay loud rather than be masked as a benign
+            // retention gap (which the change feed would surface as a 410 "reset via
+            // baseline"). Residual: this cannot tell a corrupt CURRENT table's
+            // DatasetNotFound from a legitimately dropped historical table's; that
+            // needs caller context (whether the version is the table's current one),
+            // and the baseline handshake the gap points to still fails loudly on
+            // genuine current-state loss.
+            lance::Error::VersionNotFound { .. } | lance::Error::DatasetNotFound { .. }
+                if matches!(version, VersionResolution::At(_)) =>
+            {
+                OmniError::HistoricalVersionReclaimed {
+                    published_dataset_version: match version {
+                        VersionResolution::At(version) => version,
+                        VersionResolution::Latest => 0,
+                    },
+                }
             }
-        }
-        error => OmniError::storage(error),
-    })?;
-    if let Some(wrapper) = &wrapper {
-        let store = dataset
-            .object_store(None)
-            .await
-            .map_err(OmniError::storage)?;
-        record_probed_store(wrapper, store);
-    }
-    Ok(dataset)
+            error => OmniError::storage(error),
+        })
+}
+
+/// [`open_dataset`] at exactly `version`, resolving only that version (no
+/// listing of `_versions/` for the latest), with every Lance failure reported
+/// as the storage error it is. Unlike `open_dataset(.., At(version), ..)`, a
+/// missing version or dataset is not classified as reclaimed history: for a
+/// control dataset such as `__manifest` the caller already holds the version
+/// from a read, so a miss keeps the classification a latest open followed by
+/// `checkout_version` gives it.
+pub async fn open_dataset_at_version(
+    uri: &str,
+    version: u64,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Dataset> {
+    load_recorded(uri, VersionResolution::At(version), session, wrapper)
+        .await?
+        .map_err(OmniError::storage)
 }
 
 /// [`open_dataset`] at the latest version of a dataset that may not exist:
@@ -2156,11 +2227,27 @@ pub async fn open_dataset_if_present(
     session: Option<&Arc<lance::session::Session>>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Option<Dataset>> {
-    let builder = dataset_builder(uri, VersionResolution::Latest, session, &wrapper).await?;
+    match load_recorded(uri, VersionResolution::Latest, session, wrapper).await? {
+        Ok(dataset) => Ok(Some(dataset)),
+        Err(lance::Error::DatasetNotFound { .. }) => Ok(None),
+        Err(error) => Err(OmniError::storage(error)),
+    }
+}
+
+/// The one body of every open above: the recorded, wrapped builder, its load,
+/// and the probed store of a loaded dataset. The inner result is Lance's own
+/// load failure, which each caller reports in its own terms; the outer one is
+/// a failure to build the open or to probe the loaded store.
+async fn load_recorded(
+    uri: &str,
+    version: VersionResolution,
+    session: Option<&Arc<lance::session::Session>>,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<std::result::Result<Dataset, lance::Error>> {
+    let builder = dataset_builder(uri, version, session, &wrapper).await?;
     let dataset = match builder.load().await {
         Ok(dataset) => dataset,
-        Err(lance::Error::DatasetNotFound { .. }) => return Ok(None),
-        Err(error) => return Err(OmniError::storage(error)),
+        Err(error) => return Ok(Err(error)),
     };
     if let Some(wrapper) = &wrapper {
         let store = dataset
@@ -2169,7 +2256,7 @@ pub async fn open_dataset_if_present(
             .map_err(OmniError::storage)?;
         record_probed_store(wrapper, store);
     }
-    Ok(Some(dataset))
+    Ok(Ok(dataset))
 }
 
 /// The builder of [`open_dataset`]: the open is recorded, and the session, the
@@ -2284,6 +2371,9 @@ impl StorageAdapter for CountingStorageAdapter {
     }
     fn io_scope(&self) -> Option<crate::storage::StorageIoScope> {
         self.inner.io_scope()
+    }
+    fn read_through_mount(&self) -> Option<crate::storage::ReadThroughMount> {
+        self.inner.read_through_mount()
     }
     async fn read_text(&self, uri: &str) -> Result<String> {
         self.counts.read_text.fetch_add(1, Ordering::Relaxed);

@@ -84,11 +84,13 @@ arc-swap = { workspace = true }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.15.1" }
 omnigraph-core = { path = "../omnigraph-core", version = "0.15.1", features = ["test-util"] }
 omnigraph-catalog = { path = "../omnigraph-catalog", version = "0.15.1", features = ["test-util"] }
-tokio = { workspace = true }
-lance-namespace-impls = { workspace = true }
+# Paused time for the load deadline test in tests/writes.rs, so the crate's own test build runs it.
+tokio = { workspace = true, features = ["test-util"] }
 # test-util gates IoStats.requests + assert_io_eq! (failure diagnostics only); dev-dep,
-# so production builds (which exclude dev-deps) never see it.
-lance-io = { version = "13.0.0", features = ["test-util"] }
+# so production builds (which exclude dev-deps) never see it. `workspace = true` keeps the
+# workspace's `default-features = false`: a bare version here re-enabled lance-io's defaults
+# (aws, azure, gcp) in the gate graph only, a second Lance world.
+lance-io = { workspace = true, features = ["test-util"] }
 serial_test = "3"
 proptest = "1"
 # tests/forbidden_apis.rs walks the engine's sources.

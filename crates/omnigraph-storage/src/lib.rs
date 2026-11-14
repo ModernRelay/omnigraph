@@ -28,7 +28,7 @@ use conditional::{Answer, ConditionalRequest, Resolution, Step};
 pub use conditional::{CONDITIONAL_REQUEST_REISSUES, RequestClient};
 
 mod read_through;
-pub use read_through::{FrozenDirectory, ReadThroughStore};
+pub use read_through::{FrozenDirectory, ReadThroughMount, ReadThroughStore};
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
@@ -300,6 +300,21 @@ impl StorageError {
     /// an unsettled request included.
     pub fn is_unresolved_conditional(&self) -> bool {
         matches!(self, Self::Unresolved(_))
+    }
+
+    /// The class of evidence this error carries, for a caller that must
+    /// answer its own client by it. A resource limit is an operator-actionable
+    /// capacity constraint (`Configuration`), and an internal error a broken
+    /// contract of the backend or this adapter (`Permanent`). Like the kind
+    /// itself, this is not a replay decision.
+    pub fn failure_kind(&self) -> StorageFailureKind {
+        match self {
+            Self::Backend(failure) | Self::Unresolved(failure) | Self::Io { failure, .. } => {
+                failure.kind
+            }
+            Self::ResourceLimit { .. } => StorageFailureKind::Configuration,
+            Self::Internal(_) => StorageFailureKind::Permanent,
+        }
     }
 
     /// The failure this error carries, when it carries one.
@@ -1075,6 +1090,12 @@ pub trait StorageAdapter: Debug + Send + Sync {
         None
     }
 
+    /// The mount this adapter reads through, which every other store of the
+    /// same root must read through as well.
+    fn read_through_mount(&self) -> Option<ReadThroughMount> {
+        None
+    }
+
     async fn read_text(&self, uri: &str) -> Result<String>;
     /// Read a text object if it exists using one backend GET.
     ///
@@ -1268,6 +1289,10 @@ pub struct ObjectStorageAdapter {
     omit_read_etag: bool,
     #[cfg(test)]
     omit_write_etag: bool,
+    /// Set when `store` reads through a frozen directory; `codec` is then
+    /// [`UriCodec::Local`] and nothing may reach the directory tree except
+    /// through `store`.
+    read_through: Option<ReadThroughMount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1311,6 +1336,7 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+            read_through: None,
         }
     }
 
@@ -1411,6 +1437,7 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+            read_through: None,
         };
         Ok(match (scope, retrying) {
             (Some(scope), Some(retrying)) => {
@@ -1521,6 +1548,7 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+            read_through: None,
         };
         Ok(match (scope, retrying) {
             (Some(scope), Some(retrying)) => {
@@ -1544,6 +1572,7 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+            read_through: None,
         }
     }
 
@@ -1565,7 +1594,89 @@ impl ObjectStorageAdapter {
             omit_read_etag: false,
             #[cfg(test)]
             omit_write_etag: false,
+            read_through: None,
         }
+    }
+
+    /// Storage for the graph root `root_uri` read through the base `base_uri`:
+    /// an object the root does not hold is read from the base, every write
+    /// and every delete marker lands under the root, and the base is never
+    /// written. Both are root URIs of one backend; this phase wires the local
+    /// instance, so both name local directories. The root is the layer of a
+    /// [`ReadThroughMount`], so a later adapter over the same root finds the
+    /// same graph, and [`StorageAdapter::read_through_mount`] hands the mount
+    /// to the other stores of the root.
+    ///
+    /// # Errors
+    /// When the two roots are not of one kind, when that kind is not local,
+    /// when the root and the base are one directory or one lies inside the
+    /// other, when the base cannot be listed or holds a symlink, or when the
+    /// root's delete markers cannot be listed.
+    pub async fn durable_read_through(base_uri: &str, root_uri: &str) -> Result<Self> {
+        let kind = storage_kind_for_uri(root_uri)?;
+        if storage_kind_for_uri(base_uri)? != kind {
+            return Err(StorageError::backend(
+                StorageFailureKind::Configuration,
+                format!(
+                    "read-through storage needs a base and a clone root of one kind, got '{base_uri}' and '{root_uri}'"
+                ),
+            ));
+        }
+        if kind != StorageKind::Local {
+            return Err(StorageError::backend(
+                StorageFailureKind::Configuration,
+                format!("read-through storage needs a local clone root, got '{root_uri}'"),
+            ));
+        }
+        let root = absolutize_lexically(local_path_from_uri(root_uri)?)?;
+        let base = absolutize_lexically(local_path_from_uri(base_uri)?)?;
+        let held = resolve_existing(&root);
+        let read = resolve_existing(&base);
+        if held.starts_with(&read) || read.starts_with(&held) {
+            return Err(StorageError::backend(
+                StorageFailureKind::Configuration,
+                format!(
+                    "read-through storage needs a clone root and a base that do not contain each other, got '{root_uri}' and '{base_uri}'"
+                ),
+            ));
+        }
+        let prefix = ObjectPath::from_absolute_path(&root).map_err(|err| {
+            StorageError::backend(
+                StorageFailureKind::Configuration,
+                format!("invalid local object path for '{root_uri}': {err}"),
+            )
+        })?;
+        let layer: Arc<DynObjectStore> = Arc::new(LocalFileSystem::new());
+        let frozen = FrozenDirectory::local(&base)
+            .await
+            .map_err(|err| storage_backend_error("read_through_open", base_uri, err))?;
+        let mount = ReadThroughMount::open(layer.as_ref(), frozen, prefix)
+            .await
+            .map_err(|err| storage_backend_error("read_through_open", root_uri, err))?;
+        Ok(Self {
+            store: Arc::new(mount.store(layer)),
+            scope: None,
+            codec: UriCodec::Local,
+            supports_conditional_update: false,
+            #[cfg(test)]
+            omit_read_etag: false,
+            #[cfg(test)]
+            omit_write_etag: false,
+            read_through: Some(mount),
+        })
+    }
+
+    /// [`Self::durable_read_through`] whose mutations belong to the supplied
+    /// owner, the scope sitting above the mount as it sits above a plain
+    /// local store.
+    pub async fn durable_read_through_scoped(
+        base_uri: &str,
+        root_uri: &str,
+        scope: StorageIoScope,
+    ) -> Result<Self> {
+        Ok(Self::durable_read_through(base_uri, root_uri)
+            .await?
+            .with_scope(scope))
     }
 
     /// Shared body of the bounded existence-tolerant reads: one ranged GET of
@@ -2009,6 +2120,10 @@ fn is_hard_link_capability_refusal(error: &std::io::Error) -> bool {
 impl StorageAdapter for ObjectStorageAdapter {
     fn io_scope(&self) -> Option<StorageIoScope> {
         self.scope.clone()
+    }
+
+    fn read_through_mount(&self) -> Option<ReadThroughMount> {
+        self.read_through.clone()
     }
 
     async fn read_text(&self, uri: &str) -> Result<String> {
@@ -2573,7 +2688,7 @@ impl StorageAdapter for ObjectStorageAdapter {
         // leave empty directory skeletons that local existence probes
         // (cluster graph_root_exists uses std Path::exists) report as
         // still-present. remove_dir_all reclaims them in one call.
-        if self.codec == UriCodec::Local {
+        if self.codec == UriCodec::Local && self.read_through.is_none() {
             let path = absolutize_lexically(local_path_from_uri(prefix_uri)?)?;
             let request = scoped::Request::new(
                 "delete_prefix",
@@ -2599,6 +2714,11 @@ impl StorageAdapter for ObjectStorageAdapter {
             return result;
         }
         let prefix = self.object_path(prefix_uri.trim_end_matches('/'))?;
+        if let Some(mount) = &self.read_through {
+            mount
+                .refuse_reserved(&prefix)
+                .map_err(|err| storage_backend_error("delete_prefix", prefix_uri, err))?;
+        }
         let mut entries = self.store.list(Some(&prefix));
         // Consume the backend's paginated stream without retaining the full
         // graph inventory. The caller keeps writers excluded throughout purge.
@@ -2612,6 +2732,9 @@ impl StorageAdapter for ObjectStorageAdapter {
                 Err(object_store::Error::NotFound { .. }) => {}
                 Err(err) => return Err(storage_backend_error("delete_prefix", prefix_uri, err)),
             }
+        }
+        if self.codec == UriCodec::Local && self.read_through.is_some() {
+            return Ok(());
         }
         // ObjectStore::list is segment-scoped and excludes an exact prefix
         // object on some backends. Such a marker belongs to this root too.
@@ -2856,6 +2979,26 @@ fn is_windows_drive_path(value: &str) -> bool {
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && matches!(bytes[2], b'/' | b'\\')
+}
+
+/// `path` with its longest existing ancestor resolved through symlinks, so
+/// two spellings of one directory compare equal.
+fn resolve_existing(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(existing) {
+            return missing
+                .iter()
+                .rev()
+                .fold(resolved, |path, name| path.join(name));
+        }
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return path.to_path_buf();
+        };
+        missing.push(name);
+        existing = parent;
+    }
 }
 
 /// Lexically absolutize a local path: join relative paths onto the current
@@ -4145,6 +4288,7 @@ mod tests {
                 supports_conditional_update: true,
                 omit_read_etag: false,
                 omit_write_etag: false,
+                read_through: None,
             },
             probe,
         )
@@ -4735,6 +4879,7 @@ mod tests {
             supports_conditional_update: true,
             omit_read_etag: false,
             omit_write_etag: false,
+            read_through: None,
         };
         assert_bounded_list_prefix_and_uri_contract(
             &s3_adapter,
@@ -4987,6 +5132,7 @@ mod tests {
             supports_conditional_update: true,
             omit_read_etag: false,
             omit_write_etag: false,
+            read_through: None,
         };
         match scope {
             Some(scope) => adapter.with_scope(scope),
@@ -5017,6 +5163,7 @@ mod tests {
                 supports_conditional_update: false,
                 omit_read_etag: false,
                 omit_write_etag: false,
+                read_through: None,
             }
             .with_scope(scope.clone());
             adapter.write_text(RECORD, "v1").await.unwrap();
@@ -5064,6 +5211,7 @@ mod tests {
                     supports_conditional_update: false,
                     omit_read_etag: false,
                     omit_write_etag: false,
+                    read_through: None,
                 },
                 _ => scripted_adapter(&store, UriCodec::Memory, None),
             };
@@ -6153,6 +6301,7 @@ mod tests {
             supports_conditional_update: true,
             omit_read_etag: false,
             omit_write_etag: false,
+            read_through: None,
         };
         assert!(
             adapter
@@ -6253,6 +6402,49 @@ mod tests {
         assert_eq!(adapter.read_text(uri).await.unwrap(), "new");
     }
 
+    /// A caller answering its own client by the failure's class (the served
+    /// cluster's control-object reads) gets it from the error, never from its
+    /// text: bytes that are not UTF-8 and an object over the bound fail the
+    /// same way on every read, while an I/O error with no typed kind is
+    /// `Unknown`.
+    #[tokio::test]
+    async fn a_failed_bounded_versioned_read_carries_its_failure_kind_issue_1356() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ObjectStorageAdapter::local();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_owned();
+
+        std::fs::write(dir.path().join("bytes.json"), [0xff, 0xfe, 0xfd]).unwrap();
+        let not_text = adapter
+            .read_text_versioned_if_exists_bounded(&path("bytes.json"), 16)
+            .await
+            .expect_err("bytes that are not UTF-8 are not text");
+        assert_eq!(not_text.failure_kind(), StorageFailureKind::Permanent);
+
+        std::fs::write(dir.path().join("large.json"), "0123456789").unwrap();
+        let over_bound = adapter
+            .read_text_versioned_if_exists_bounded(&path("large.json"), 4)
+            .await
+            .expect_err("an object over the bound is refused");
+        assert!(matches!(over_bound, StorageError::ResourceLimit { .. }));
+        assert_eq!(over_bound.failure_kind(), StorageFailureKind::Configuration);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("loop.json"), dir.path().join("loop.json"))
+                .unwrap();
+            let untyped = adapter
+                .read_text_versioned_if_exists_bounded(&path("loop.json"), 16)
+                .await
+                .expect_err("a self-symlink cannot be read");
+            assert_eq!(untyped.failure_kind(), StorageFailureKind::Unknown);
+        }
+
+        assert_eq!(
+            StorageError::internal("broken contract").failure_kind(),
+            StorageFailureKind::Permanent
+        );
+    }
+
     /// Where hard links work the probe is negative and cleans up after
     /// itself. (The positive branch needs a filesystem that refuses
     /// `hard_link(2)`, e.g. FAT32, which this suite cannot assume.)
@@ -6293,6 +6485,153 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent");
         assert!(hard_link_refusal_in(&missing).is_none());
+    }
+
+    #[tokio::test]
+    async fn read_through_storage_refuses_a_remote_clone_root() {
+        let err =
+            ObjectStorageAdapter::durable_read_through("s3://bucket/base", "s3://bucket/root")
+                .await
+                .expect_err("a clone root is a local directory in this phase");
+        let text = err.to_string();
+        assert!(
+            text.contains("read-through storage needs a local clone root"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_through_storage_refuses_a_base_and_a_clone_root_of_different_kinds() {
+        let local = tempfile::tempdir().unwrap();
+        let local = local.path().to_str().unwrap();
+        for (base, root) in [(local, "s3://bucket/root"), ("s3://bucket/base", local)] {
+            let text = ObjectStorageAdapter::durable_read_through(base, root)
+                .await
+                .expect_err("both roots on one backend")
+                .to_string();
+            assert!(
+                text.contains("needs a base and a clone root of one kind"),
+                "{base} and {root}: {text}"
+            );
+        }
+        assert!(!std::path::Path::new(local).join("__clone").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_over_a_clone_root_masks_the_base_and_keeps_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("base");
+        let root = directory.path().join("root");
+        std::fs::create_dir_all(base.join("graph/table")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(base.join("graph/table/a"), b"base a").unwrap();
+        std::fs::write(base.join("graph/other"), b"base other").unwrap();
+        let root_uri = root.to_str().unwrap().to_owned();
+        let adapter = ObjectStorageAdapter::durable_read_through(base.to_str().unwrap(), &root_uri)
+            .await
+            .unwrap();
+        let table = format!("{root_uri}/graph/table");
+        StorageAdapter::write_text(&adapter, &format!("{table}/b"), "clone b")
+            .await
+            .unwrap();
+
+        StorageAdapter::delete_prefix(&adapter, &table)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            StorageAdapter::list_dir(&adapter, &table).await.unwrap(),
+            Vec::<String>::new(),
+            "the base object and the clone's own object are both gone from the clone"
+        );
+        assert_eq!(
+            StorageAdapter::read_text(&adapter, &format!("{root_uri}/graph/other"))
+                .await
+                .unwrap(),
+            "base other",
+            "a sibling outside the prefix still reads through"
+        );
+        assert_eq!(
+            std::fs::read(base.join("graph/table/a")).unwrap(),
+            b"base a"
+        );
+        assert!(
+            root.join("__clone/deleted/graph/table/a").is_file(),
+            "the whiteout's key is the deleted key relative to the clone root"
+        );
+        assert!(!root.join("graph/table/b").exists());
+        assert!(
+            root.join("__clone/created").is_file(),
+            "the reserved directory is never deleted as part of a prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_refuses_the_reserved_directory_of_a_clone_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("base");
+        let root = directory.path().join("root");
+        std::fs::create_dir_all(base.join("graph")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(base.join("graph/a"), b"base a").unwrap();
+        let root_uri = root.to_str().unwrap().to_owned();
+        let adapter = ObjectStorageAdapter::durable_read_through(base.to_str().unwrap(), &root_uri)
+            .await
+            .unwrap();
+        StorageAdapter::delete(&adapter, &format!("{root_uri}/graph/a"))
+            .await
+            .unwrap();
+
+        for reserved in ["__clone", "__clone/deleted", "__clone/deleted/graph"] {
+            let text = StorageAdapter::delete_prefix(&adapter, &format!("{root_uri}/{reserved}"))
+                .await
+                .expect_err("the reserved directory is the storage's own")
+                .to_string();
+            assert!(
+                text.contains("is inside the store's reserved directory"),
+                "{reserved}: {text}"
+            );
+        }
+        assert!(root.join("__clone/deleted/graph/a").is_file());
+    }
+
+    #[tokio::test]
+    async fn read_through_storage_refuses_a_clone_root_and_a_base_that_contain_each_other() {
+        let directory = tempfile::tempdir().unwrap();
+        let outer = directory.path().join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("a"), b"base a").unwrap();
+        let mut pairs = vec![
+            (outer.clone(), outer.clone()),
+            (outer.clone(), inner.join("new")),
+            (inner.clone(), outer.clone()),
+        ];
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("alias");
+            std::os::unix::fs::symlink(&outer, &alias).unwrap();
+            pairs.push((outer.clone(), alias.join("inner/new")));
+        }
+
+        for (base, root) in pairs {
+            let text = ObjectStorageAdapter::durable_read_through(
+                base.to_str().unwrap(),
+                root.to_str().unwrap(),
+            )
+            .await
+            .expect_err("a clone root apart from its base")
+            .to_string();
+            assert!(
+                text.contains("do not contain each other"),
+                "{} over {}: {text}",
+                root.display(),
+                base.display()
+            );
+        }
+        assert!(!outer.join("__clone").exists());
+        assert!(!inner.join("__clone").exists());
+        assert!(!inner.join("new").exists());
     }
 
     /// A generic create-if-absent failure on a link-capable filesystem keeps

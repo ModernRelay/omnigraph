@@ -214,11 +214,10 @@ client's write evidence; initialization and system-column upgrade retain their
 own execution paths and do not claim the data-write outcome envelope. The upgrade
 adapter keeps its separate read-only check and execution modes.
 
-`commands/maintenance` owns optimize, repair, cleanup, full-text index rebuilding
+`commands/maintenance` owns optimize, cleanup, full-text index rebuilding
 and storage upgrade arguments and dispatch. Supplied output writers keep delivery
 failures in application completion. Cleanup retains preview and consent before
-write admission; rebuild retains its actor and branch; repair delivers its report
-before any refusal error. The storage-upgrade adapter retains its existing
+write admission; rebuild retains its actor and branch. The storage-upgrade adapter retains its existing
 conversion and recovery owner. These commands do not use the data-write outcome
 envelope or replay an operation after delivery failure.
 

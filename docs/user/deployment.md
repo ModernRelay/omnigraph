@@ -291,8 +291,8 @@ cluster, supported servers and direct CLI writers acquire the same exclusive
 cluster admission before writable graph work and recheck the applied inventory.
 CLI queries, exports, schema inspection/planning, lint and stored-query
 validation check the applied identity without acquiring or changing that lock;
-they refuse outstanding deployments or schema drift. Native maintenance,
-including `repair` preview, uses writer admission. An outstanding deployment
+they refuse outstanding deployments or schema drift. Native maintenance
+uses writer admission. An outstanding deployment
 admits only reconciliation of its exact original ID.
 Keep older binaries, raw storage tools and embedded writers outside this
 cooperating boundary stopped; the lock cannot fence their native storage I/O.

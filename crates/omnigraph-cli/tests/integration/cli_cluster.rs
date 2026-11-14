@@ -3709,7 +3709,7 @@ fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
     // Robustness (Greptile, #221): maintenance resolves the graph URI from the
     // state ledger alone, so an unrelated corrupt/missing catalog payload (or a
     // pending recovery sweep) does NOT block it — unlike the full serving-snapshot
-    // read. This is what keeps `repair --target ROOT --graph GRAPH` usable on a degraded cluster.
+    // read. This is what keeps `optimize --target ROOT --graph GRAPH` usable on a degraded cluster.
     let temp = applied_knowledge_cluster();
     // Remove the verified catalog payloads (queries/policies) — a serving read
     // would refuse with a catalog-payload diagnostic; the ledger-only resolve

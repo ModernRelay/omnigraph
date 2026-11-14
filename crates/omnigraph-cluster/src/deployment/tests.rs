@@ -1573,10 +1573,16 @@ async fn corrupt_catalog_payloads_refuse_without_repair_or_candidate_authority()
     let trusted = fs::read(&payload).unwrap();
     fs::write(&payload, [0xff, 0xfe]).unwrap();
     for caller in [owner(), identity("principal:owner")] {
-        assert!(
-            apply_deployment(dir.path(), None, &caller, |_, _, _| {})
-                .await
-                .is_err()
+        // Authorization reads the applied policy before any effect. Bytes that
+        // are not text fail on every read, and the refusal says so (#1356).
+        let refused = apply_deployment(dir.path(), None, &caller, |_, _, _| {})
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "catalog_payload_missing", "{refused:?}");
+        assert_eq!(
+            refused.storage_failure,
+            Some(omnigraph_storage::StorageFailureKind::Permanent),
+            "{refused:?}"
         );
         assert_eq!(fs::read(&payload).unwrap(), [0xff, 0xfe]);
         assert_eq!(
@@ -1592,6 +1598,28 @@ async fn corrupt_catalog_payloads_refuse_without_repair_or_candidate_authority()
     let digest = &state.applied_revision.resources[address].digest;
     let relative = ClusterStore::payload_relative(&resource_kind(address), digest).unwrap();
     let payload = dir.path().join(relative);
+    // The deployment's own payload check reads every affected query before
+    // any effect; a read that fails on every attempt keeps its class (#1356).
+    fs::write(&payload, [0xff, 0xfe]).unwrap();
+    fs::write(
+        dir.path().join("people.gq"),
+        fs::read_to_string(dir.path().join("people.gq")).unwrap() + "\n",
+    )
+    .unwrap();
+    let refused = apply_deployment(dir.path(), None, &owner(), |_, _, _| {})
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "resource_payload_read_error", "{refused:?}");
+    assert_eq!(
+        refused.storage_failure,
+        Some(omnigraph_storage::StorageFailureKind::Permanent),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fs::read(dir.path().join(CLUSTER_STATE_FILE)).unwrap(),
+        ledger
+    );
+    assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
     fs::write(&payload, "corrupt").unwrap();
     let query_path = dir.path().join("people.gq");
     let source = fs::read_to_string(&query_path).unwrap();

@@ -164,7 +164,7 @@ Graph-scoped actions are:
 | `branch_create`, `branch_delete`, `branch_merge` | Corresponding branch operation |
 | `branch_claim` | Claim of a branch's writer epoch; no CLI command or HTTP route claims in this release, only a program embedding the engine |
 | `commit_publish`, `commit_drop` | Publish or drop an unpublished commit; drop an unattached commit |
-| `maintain` | Optimize, index builds, the full-text rebuild (which also accepts `change` for now) and the repair report |
+| `maintain` | Optimize, index builds and the full-text rebuild (which also accepts `change` for now) |
 | `reclaim` | Cleanup, which permanently removes unretained history |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved; no current public operation |

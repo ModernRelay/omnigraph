@@ -680,11 +680,13 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn stage_create(&self, dataset_uri: &str, batch: RecordBatch) -> Result<StagedHandle>;
 
     /// RFC 0067: stage one detached-ready compaction rewrite of the pinned
-    /// base, or `None` when there is nothing to compact.
+    /// base, or `None` when there is nothing to compact. Its tasks run within
+    /// `limit`, the run's shared budget of heavy steps.
     async fn stage_compaction(
         &self,
         snapshot: &SnapshotHandle,
         options: &lance::dataset::optimize::CompactionOptions,
+        limit: &crate::table_store::OptimizeStepLimit,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>>;
 
     /// #721: stage one detached-ready rewrite of exactly the named
@@ -849,6 +851,25 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         snapshot: SnapshotHandle,
         staged: StagedHandle,
     ) -> Result<ExactCommitOutcome>;
+
+    /// The commits from `current` down to `captured_version` when every one
+    /// leaves the table's rows unchanged (`table_store::row_preserving_chain`).
+    async fn row_preserving_chain(
+        &self,
+        current: &SnapshotHandle,
+        captured_version: u64,
+    ) -> Result<Option<crate::table_store::RowPreservingChain>>;
+
+    /// Carry a staged effect prepared on `base` over a row-preserving chain
+    /// to `current` with Lance's conflict resolver
+    /// (`table_store::rebase_staged_write`). Writes nothing.
+    async fn rebase_staged_write(
+        &self,
+        base: &SnapshotHandle,
+        staged: StagedHandle,
+        current: &SnapshotHandle,
+        chain: &crate::table_store::RowPreservingChain,
+    ) -> Result<std::result::Result<StagedHandle, String>>;
 
     /// RFC 0067: commit one staged effect as a detached version, stamped
     /// with the authority it was staged against, declaring every full-text
@@ -1272,9 +1293,10 @@ impl TableStorage for TableStore {
         &self,
         snapshot: &SnapshotHandle,
         options: &lance::dataset::optimize::CompactionOptions,
+        limit: &crate::table_store::OptimizeStepLimit,
     ) -> Result<Option<(StagedHandle, lance::dataset::optimize::CompactionMetrics)>> {
         Ok(
-            TableStore::stage_compaction(self, snapshot.dataset(), options)
+            TableStore::stage_compaction(self, snapshot.dataset(), options, limit)
                 .await?
                 .map(|compaction| (StagedHandle::new(compaction.staged), compaction.metrics)),
         )
@@ -1476,6 +1498,31 @@ impl TableStorage for TableStore {
         TableStore::commit_staged(self, ds_arc, staged.into_staged())
             .await
             .map(SnapshotHandle::new)
+    }
+
+    async fn row_preserving_chain(
+        &self,
+        current: &SnapshotHandle,
+        captured_version: u64,
+    ) -> Result<Option<crate::table_store::RowPreservingChain>> {
+        crate::table_store::row_preserving_chain(current.dataset(), captured_version).await
+    }
+
+    async fn rebase_staged_write(
+        &self,
+        base: &SnapshotHandle,
+        staged: StagedHandle,
+        current: &SnapshotHandle,
+        chain: &crate::table_store::RowPreservingChain,
+    ) -> Result<std::result::Result<StagedHandle, String>> {
+        Ok(crate::table_store::rebase_staged_write(
+            base.dataset(),
+            staged.into_staged(),
+            current.dataset(),
+            chain,
+        )
+        .await?
+        .map(StagedHandle::new))
     }
 
     async fn commit_staged_detached(

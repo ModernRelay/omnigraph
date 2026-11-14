@@ -162,11 +162,11 @@ pub(super) async fn upgrade_system_columns(
         Option<crate::db::write_queue::SchemaSharedPermit>,
         Option<crate::db::write_queue::SchemaExclusivePermit>,
     ) = if options.check {
-        (Some(db.write_queue().acquire_schema_shared().await), None)
+        (Some(db.write_queue().acquire_schema_shared().await?), None)
     } else {
         (
             None,
-            Some(db.write_queue().acquire_schema_exclusive().await),
+            Some(db.write_queue().acquire_schema_exclusive().await?),
         )
     };
     db.refresh_coordinator_only().await?;
@@ -303,8 +303,8 @@ async fn execute_with_lock(
         .datasets()
         .map(|entry| (entry.type_key.clone(), entry.native_dataset_branch.clone()))
         .collect();
-    let _main_branch_guard = db.write_queue().acquire_branch(None).await;
-    let _table_guards = db.write_queue().acquire_many(&queue_keys).await;
+    let _main_branch_guard = db.write_queue().acquire_branch(None).await?;
+    let _table_guards = db.write_queue().acquire_many(&queue_keys).await?;
 
     db.refresh_coordinator_only().await?;
     let (current_branch_identifier, current_graph_head) = {
@@ -457,7 +457,6 @@ async fn execute_with_lock(
 
         db.store_schema_view(desired_catalog, desired_source, &desired_ir)?;
         db.runtime_cache.invalidate_all().await;
-        db.invalidate_graph_index().await;
         fail(&catalog::SCHEMA_APPLY_AFTER_MANIFEST_COMMIT)?;
         Ok::<u64, OmniError>(graph_manifest_version)
     }
