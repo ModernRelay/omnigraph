@@ -117,7 +117,7 @@ query remove($slug: String)              { match { $x: Signal } where $x.slug = 
   execution still requires the vector. Supply it explicitly; writes never
   embed automatically.
 - A single mutation is insert/update-only **or** delete-only — never both (`T76`, which `lint` reports); split them.
-- A write group's `match … where` is a read's: traversals, edge bindings (`delete $k`), blocks, `let` and `from`; assignments may read the row (`city: $c.city`, `to: $c`). A `Blob` read from a row and a selection reading a type an earlier group of the write changes are `T86`; one statement giving an entity two values is `E4`.
+- A write group's `match … where` is a read's: traversals, edge bindings (`delete $k`; `$k: Knows` alone binds every edge of the type, in a read too), blocks, `let` and `from`; assignments may read the row (`city: $c.city`, `to: $c`). A `Blob` read from a row and a selection reading a type an earlier group of the write changes are `T86`; one statement giving an entity two values is `E4`.
 - Edge inserts give logical `from`/`to` endpoint IDs; a propertyless edge needs only those, and there is no nested `data` block in GQ. An unkeyed edge insert is strict (inserting twice creates two edges). An edge type may declare `@key(@src, @dst[, prop…])` in its body when created; inserts then upsert by the derived id, and identical inserts on two branches converge on merge. Edges cannot be `update`d (T16).
 
 ### Bulk load (JSONL)

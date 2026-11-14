@@ -47,6 +47,9 @@ A query runs against one resolved `ReadTarget`:
    replaced by its argument, so an argument reading a caller's variable is
    never captured by a name the body binds; a binding filter that then reads
    a caller's column joins the scope's filters. A call adds no plan node.
+   An edge-type binding `$k: E` (the `Scan` of an edge type) is the single
+   hop over `E` from a scan of its source type with `$k` bound, both ends
+   fresh names whose identities tie after every named binding's.
    A `from distance(rel, $x.f, q)` (the core's exact `Score`) is always
    drawn as a step: its population placed first, then a
    `PatternStep::Score`, the logical and physical `Score` (a new node kind:

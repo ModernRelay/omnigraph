@@ -916,6 +916,36 @@ fn a_missing_identity_key_fails_the_order() {
     assert_eq!(check, "order", "{detail}");
 }
 
+/// An edge binding `$e: Cites` scans the edge type through fresh ends the
+/// query never names: the edge's identity leads the tie-break and theirs
+/// follow, and a plan that drops the edge's is refused.
+#[test]
+fn an_edge_scan_ties_by_its_edge_before_its_fresh_ends() {
+    let fixture = Fixture::new(
+        r#"query q() {
+    match { $e: Cites }
+    return { $e.@src, $e.@dst }
+    order { $e.@src }
+}"#,
+        &[],
+    );
+    let plan = fixture.plan();
+    fixture.accept(plan.clone()).expect("the planned tie-break");
+    let mut dropped = plan;
+    for id in node_ids(&dropped, |node| matches!(node, PhysicalNode::Sort { .. })) {
+        if let Some(PhysicalNode::Sort { tiebreak, .. }) = dropped.node_mut(id) {
+            assert_eq!(
+                tiebreak.first(),
+                Some(&ColumnRef::property("e", IDENTITY_MEMBER)),
+                "{tiebreak:?}"
+            );
+            tiebreak.remove(0);
+        }
+    }
+    let (check, detail) = fixture.refused(dropped);
+    assert_eq!(check, "order", "{detail}");
+}
+
 #[test]
 fn another_alias_or_item_fails_the_projection() {
     let fixture = filtered();

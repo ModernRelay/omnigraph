@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 
 use super::requirements::BoundVariable;
-use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, is_fresh_variable};
 use omnigraph_compiler::query::value::RRF_COLUMN;
 use omnigraph_compiler::types::{ExprType, ScalarType};
 
@@ -1406,8 +1406,13 @@ impl Requirements {
                     if *variable == column.binding && property == physical)
             })
         };
+        // A fresh name (an inline read's hidden binding, an edge scan's
+        // ends) is no binding the query names: its identity ties after
+        // every named one, as an anonymous endpoint's does.
+        let named_binding =
+            |name: &String| self.bindings.contains_key(name) && !is_fresh_variable(name);
         let mut expected = Vec::new();
-        for name in self.bindings.keys() {
+        for name in self.bindings.keys().filter(|name| !is_fresh_variable(name)) {
             if self.selected_edges.contains(name) {
                 expected.push(ColumnRef::property(name, EDGE_TYPE_MEMBER));
             }
@@ -1418,9 +1423,7 @@ impl Requirements {
         let named = planned.len().min(expected.len());
         let (head, tail) = planned.split_at(named);
         let head_ok = head.iter().copied().eq(expected.iter());
-        let tail_ok = tail
-            .iter()
-            .all(|column| !self.bindings.contains_key(&column.binding));
+        let tail_ok = tail.iter().all(|column| !named_binding(&column.binding));
         if !head_ok || named != expected.len() || !tail_ok {
             return Err(ValidationError::violated(
                 "order",

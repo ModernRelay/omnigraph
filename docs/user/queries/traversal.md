@@ -74,7 +74,10 @@ self-loop or through a cycle back to it. The start node is returned only
 through its own self-loop, which counts as one hop, never through a cycle.
 
 An unbound traversal has set semantics for endpoint pairs. Binding the edge
-returns one result per matching edge, so parallel edges remain distinct. Edge
+returns one result per matching edge, so parallel edges remain distinct. An
+edge-type binding, `$k: Knows`, binds every edge of the type, one row per edge
+with neither end named: `match { $k: Knows } where $k.since > 2020 return {
+$k.@src, $k.@dst }`. Edge
 bindings are available only for a single hop. Alternatives share the same
 deduplication and shortest-distance search across all members. Bound edges are
 identified by canonical type plus ID, so equal IDs in different types remain

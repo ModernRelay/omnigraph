@@ -30,8 +30,8 @@ use crate::query::file::Param;
 use crate::query::value::{
     AggFunc, BinaryOp, CompOp, DISTANCE_COLUMN, Literal, RRF_COLUMN, SCORE_COLUMN,
 };
-use crate::traversal::EdgeSelection;
-use crate::types::{AggSignature, ExprType, PropType, ScalarType};
+use crate::traversal::{EdgeMember, EdgeSelection};
+use crate::types::{AggSignature, Direction, ExprType, PropType, ScalarType};
 
 use super::{Construct, ElementKind, ProgrammeStage, Repair, ShapeError, Unlowered};
 
@@ -1366,8 +1366,45 @@ impl<'a> Shaper<'a> {
                 });
                 Ok(())
             }
+            // `$k: E`, the `Scan` of an edge type: every edge of `E` once,
+            // which is the single hop over `E` from a scan of its source type
+            // with the edge bound, its two ends fresh names nothing reads.
+            Term::Scan {
+                var,
+                ty: Ty::Edge { type_name, .. },
+            } => {
+                let edge = self.catalog.lookup_edge_by_name(type_name).ok_or_else(|| {
+                    ShapeError::Internal(format!("`${var}` scans `{type_name}`, no edge type"))
+                })?;
+                let src = format!("{FRESH_PREFIX}e{}_{var}_src", facts.inlined);
+                let dst = format!("{FRESH_PREFIX}e{}_{var}_dst", facts.inlined);
+                facts.inlined += 1;
+                facts.types.insert(src.clone(), edge.from_type.clone());
+                facts.bindings.push(BindingFact {
+                    variable: src.clone(),
+                    type_name: edge.from_type.clone(),
+                    filters: Vec::new(),
+                });
+                self.traversal(
+                    facts,
+                    TraversalFact {
+                        src,
+                        dst,
+                        edges: EdgeSelection::Named(EdgeMember {
+                            edge_type: edge.name.clone(),
+                            direction: Direction::Out,
+                        }),
+                        src_type: edge.from_type.clone(),
+                        dst_type: edge.to_type.clone(),
+                        min_hops: 1,
+                        max_hops: Some(1),
+                        edge_binding: Some(var.clone()),
+                    },
+                );
+                Ok(())
+            }
             Term::Scan { var, .. } => Err(self.refuse_at(
-                "a scan of an edge type in a read",
+                "a scan of this type in a read",
                 Construct::Element(&[ElementKind::Binding], Some(var.clone())),
             )),
             Term::Expand {

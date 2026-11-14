@@ -36,7 +36,6 @@ struct Row {
 /// yet. Stage B ships in part: each is `T86` naming B, and the set must
 /// shrink to empty before the release ships B whole.
 const B_IN_PROGRESS: &[&str] = &[
-    "edge binding in a read",
     "a node an optional introduces returned whole",
     "a union arm returning a value",
     "a union whose arms read the enclosing scope",
@@ -88,10 +87,9 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { $p: Person } where not exists { $c: Company, $p worksAt $c } return { $p.name } }",
                 Lowers,
             ),
-            // "edge binding in a read"
             (
                 "query q() { match { $k: Knows } return { $k.@src } }",
-                Refused("B"),
+                Lowers,
             ),
             (
                 "query q() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name } }",
