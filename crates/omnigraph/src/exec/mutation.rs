@@ -1360,7 +1360,8 @@ impl Omnigraph {
                     .await
             }
             WriteRoute::Publish | WriteRoute::AsCommit | WriteRoute::UnattachedRoot => {
-                self.open_write_txn(requested.as_deref()).await
+                self.open_write_txn_with(requested.as_deref(), expected_head.is_some())
+                    .await
             }
         };
         capture_timer.stop();

@@ -1714,12 +1714,28 @@ impl Omnigraph {
     /// per-graph `Session` (the dataset-opener unification); the S3 cost gate
     /// for that term is still owed (handoff §1d).
     pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
+        self.open_write_txn_with(branch, false).await
+    }
+
+    /// [`Self::open_write_txn`]; `require_fresh` probes the head even where
+    /// the trusted tip would not (research): a caller's `--if-commit` token
+    /// may come from a view fresher than this process's own.
+    pub(crate) async fn open_write_txn_with(
+        &self,
+        branch: Option<&str>,
+        require_fresh: bool,
+    ) -> Result<WriteTxn> {
         let branch = normalize_branch_name(branch.unwrap_or("main"))?;
 
-        let head_on_record = self.holds_head_of(branch.as_deref());
         // Research (trusted tip): capture from the installed view of the
-        // bound branch without a freshness probe; the version CAS fences.
-        let fresh = !crate::instrumentation::phase_timers::research_enabled("TRUST_TIP");
+        // bound branch without a freshness probe; the version CAS fences a
+        // write that publishes, and a write that stages nothing probes once
+        // before it answers (`unpublished_view_is_current`), as a writer-epoch
+        // holder's does.
+        let fresh =
+            require_fresh || !crate::instrumentation::phase_timers::research_enabled("TRUST_TIP");
+        let head_on_record = self.holds_head_of(branch.as_deref())
+            || (!fresh && branch.as_deref() == self.coordinator.load_full().current_branch());
         let (branch_identifier, graph_head, effective_graph_head, snapshot, manifest_probe) = self
             .write_authority_for_known_branch(branch.as_deref(), fresh)
             .await?;
@@ -2346,8 +2362,13 @@ impl Omnigraph {
         // the head this process last published or loaded; a foreign
         // publication since is refused by the version CAS, and the write
         // prepares again.
-        let trusted =
-            bound && crate::instrumentation::phase_timers::research_enabled("TRUST_TIP");
+        // Only a write that publishes may trust the view: the version CAS is
+        // its fence. The non-carrying revalidation answers a write that
+        // stages nothing (a conditional no-op), which nothing else checks.
+        let trusted = bound
+            && carry
+            && txn.caller_expected_graph_head.is_none()
+            && crate::instrumentation::phase_timers::research_enabled("TRUST_TIP");
         let (branch_identifier, graph_head, effective_graph_head, snapshot, probe) =
             if probed_current || trusted {
                 self.write_authority_for_known_branch(txn.branch.as_deref(), false)

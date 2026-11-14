@@ -1493,19 +1493,26 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
         lineage: Option<&LineageIntent>,
         precondition: &PublishPrecondition,
     ) -> Result<PublishOutcome> {
+        // Research (pipelined publication): a publication outside the
+        // pipeline waits for the pipelined one in flight and supersedes the
+        // tip, which no longer names the head once this lands (or may not).
+        self.settle_pipeline().await;
         let mut held = HeldVersion {
             publisher: self,
             settled: false,
         };
-        self.publish_attempts(
-            changes,
-            expected_table_versions,
-            lineage,
-            precondition,
-            &mut held,
-        )
-        .await
-        .map_err(OmniError::unpublished)
+        let published = self
+            .publish_attempts(
+                changes,
+                expected_table_versions,
+                lineage,
+                precondition,
+                &mut held,
+            )
+            .await
+            .map_err(OmniError::unpublished);
+        *self.pipeline.lock().await = None;
+        published
     }
 
     async fn publish_pipelined(
@@ -1614,9 +1621,12 @@ impl ManifestBatchPublisher for GraphNamespacePublisher {
         &self,
         branch_identifier: &lance::dataset::refs::BranchIdentifier,
     ) -> Result<WriterEpochClaim> {
-        self.claim_attempts(&mut self.claim_intent(branch_identifier))
-            .await
-            .map_err(OmniError::unpublished)
+        self.settle_pipeline().await;
+        let claimed = self
+            .claim_attempts(&mut self.claim_intent(branch_identifier))
+            .await;
+        *self.pipeline.lock().await = None;
+        claimed.map_err(OmniError::unpublished)
     }
 }
 
@@ -1910,13 +1920,24 @@ impl GraphNamespacePublisher {
             } = loaded;
             let native_branch = dataset.manifest().branch.clone();
 
+            // Research (trusted tip): the first attempt may start from this
+            // process's own last acknowledged version, which proves nothing
+            // about a head the caller saw elsewhere; a refusal against it
+            // loads fresh state and checks again.
+            let trusted_start = attempt == 0
+                && crate::instrumentation::phase_timers::research_enabled("TRUST_TIP");
             self.assert_writer_epoch(
                 WriterEpochRow::resolved(writer_epoch.as_ref(), native_branch.as_deref()),
                 native_branch.as_deref(),
                 EpochAssertion::Publish,
             )?;
-            self.check_publish_precondition(&dataset, &head, precondition)
-                .await?;
+            match self
+                .check_publish_precondition(&dataset, &head, precondition)
+                .await
+            {
+                Err(error) if trusted_start && error.is_read_set_changed() => continue,
+                other => other?,
+            }
 
             let tables: TableRows = tables
                 .into_iter()
@@ -1925,7 +1946,10 @@ impl GraphNamespacePublisher {
             // Pre-check on every attempt against freshly loaded state so a
             // concurrent commit that broke the caller's expectation is
             // surfaced as `PublishedDatasetVersionMismatch` rather than retried.
-            Self::check_expected_table_versions(&tables, expected_table_versions)?;
+            match Self::check_expected_table_versions(&tables, expected_table_versions) {
+                Err(_) if trusted_start => continue,
+                other => other?,
+            }
 
             let new_manifest_version = dataset.version().version + 1;
             let (next_tables, mut wrote) =
@@ -2227,6 +2251,20 @@ impl GraphNamespacePublisher {
 }
 
 impl GraphNamespacePublisher {
+    /// Research (pipelined publication): wait for the pipelined publication
+    /// in flight, if any.
+    async fn settle_pipeline(&self) {
+        let outcome = self
+            .pipeline
+            .lock()
+            .await
+            .as_ref()
+            .map(|tip| tip.outcome.clone());
+        if let Some(outcome) = outcome {
+            let _ = settle(outcome).await;
+        }
+    }
+
     /// Research (pipelined publication). Phase A, under the caller's branch
     /// gate: build the next rows on the pipeline tip (a pending or landed
     /// publication of this process), or, with no tip yet, on this process's
@@ -2424,81 +2462,190 @@ impl GraphNamespacePublisher {
         between();
 
         // Phase B, outside the caller's gates.
-        let finish = async {
-            let staged = match cold {
-                None => Some(commit::stage_hot(&any_version, &next).await?),
-                Some(_) => None,
-            };
-            let base_dataset = match base {
-                Base::Ready(dataset) => dataset,
-                Base::Pending(outcome) => settle(outcome).await.map_err(|()| {
-                    OmniError::manifest_read_set_changed(
-                        "pipelined_predecessor".to_string(),
-                        Some(base_version.to_string()),
-                        None,
-                    )
-                })?,
-            };
-            if base_dataset.version().version != base_version {
-                return Err(OmniError::manifest_read_set_changed(
-                    "pipelined_predecessor_version".to_string(),
-                    Some(base_version.to_string()),
-                    Some(base_dataset.version().version.to_string()),
-                ));
-            }
-            fail(&PUBLISH_PRE_MERGE)?;
-            let (new_dataset, batch) = match (staged, cold) {
-                (Some(staged), _) => commit::commit_staged_hot(base_dataset, staged).await?,
-                // A cold push reads the base's cold registry: no overlap.
-                (None, cold) => commit::overwrite(base_dataset, &next, cold.as_ref()).await?,
-            };
-            Ok::<_, OmniError>((new_dataset, batch))
-        };
-        match finish.await {
-            Ok((new_dataset, batch)) => {
-                if new_dataset.version().version != new_manifest_version {
+        let staged = match cold {
+            None => match commit::stage_hot(&any_version, &next).await {
+                Ok(staged) => Some(staged),
+                Err(error) => {
                     let _ = sender.send(Some(Err(())));
-                    return Err(OmniError::manifest_internal(
-                        "a pipelined publication landed at another version",
-                    )
-                    .with_completion_evidence(CompletionEvidence::Uncertain));
+                    return Err(error.unpublished());
                 }
-                let cached = PublishedRows::new(&new_dataset, batch).await;
-                *self
-                    .published_rows
-                    .lock()
-                    .expect("published rows cache lock poisoned") = cached;
-                let _ = sender.send(Some(Ok(new_dataset.clone())));
-                known_state.version = new_manifest_version;
-                held.record_landed(native_branch.as_deref(), new_manifest_version);
-                Ok(PublishOutcome {
-                    dataset: new_dataset,
-                    parent_commit_id,
-                    known_state,
-                    head: next.head,
-                    tables: next.tables,
-                    buffer: next.buffer,
-                    schema_contract: next.schema_contract,
-                    registry: next.registry,
-                    writer_epoch: next.writer_epoch,
-                })
-            }
-            Err(error) => {
-                let _ = sender.send(Some(Err(())));
-                // A lost CAS is a read-set change the caller prepares again
-                // from; a failed predecessor already is one. An opaque error
-                // keeps its shape (and its in-doubt evidence).
-                if is_retryable_publish_conflict(&error) {
+            },
+            Some(_) => None,
+        };
+        let base_dataset = match base {
+            Base::Ready(dataset) => dataset,
+            Base::Pending(outcome) => match settle(outcome).await {
+                Ok(dataset) => dataset,
+                Err(()) => {
+                    let _ = sender.send(Some(Err(())));
                     return Err(OmniError::manifest_read_set_changed(
-                        format!("graph_head:{}", self.branch.as_deref().unwrap_or("main")),
+                        "pipelined_predecessor".to_string(),
                         Some(base_version.to_string()),
                         None,
                     )
                     .unpublished());
                 }
-                Err(error)
+            },
+        };
+        if base_dataset.version().version != base_version {
+            let _ = sender.send(Some(Err(())));
+            return Err(OmniError::manifest_read_set_changed(
+                "pipelined_predecessor_version".to_string(),
+                Some(base_version.to_string()),
+                Some(base_dataset.version().version.to_string()),
+            )
+            .unpublished());
+        }
+        if let Err(error) = fail(&PUBLISH_PRE_MERGE) {
+            let _ = sender.send(Some(Err(())));
+            return Err(error.unpublished());
+        }
+        let readback_base = base_dataset.clone();
+        let committed = match (staged, cold) {
+            (Some(staged), _) => commit::commit_staged_hot(base_dataset, staged).await,
+            // A cold push reads the base's cold registry: no overlap.
+            (None, cold) => commit::overwrite(base_dataset, &next, cold.as_ref()).await,
+        };
+        // As in `publish_attempts`: after the store acknowledged the version,
+        // only the result can be lost; before it, an opaque error may have
+        // landed. Either is read back at the attempted version.
+        let (failure, after_ack) = match committed {
+            Ok((new_dataset, batch)) => match fail(&PUBLISH_POST_MERGE_PRE_ACK) {
+                Ok(()) => {
+                    return self
+                        .pipelined_landed(
+                            new_dataset,
+                            batch,
+                            new_manifest_version,
+                            sender,
+                            &mut held,
+                            native_branch,
+                            known_state,
+                            next,
+                            parent_commit_id,
+                        )
+                        .await;
+                }
+                Err(error) => (error, true),
+            },
+            Err(error) => (error, false),
+        };
+        if !after_ack {
+            if is_retryable_publish_conflict(&failure) {
+                let _ = sender.send(Some(Err(())));
+                // A lost CAS is a read-set change the caller prepares again from.
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("graph_head:{}", self.branch.as_deref().unwrap_or("main")),
+                    Some(base_version.to_string()),
+                    None,
+                )
+                .unpublished());
+            }
+            if failure.completion_evidence().is_some() || !failure.outcome_opaque() {
+                let _ = sender.send(Some(Err(())));
+                return Err(failure);
             }
         }
+        if let Err(readback_err) = fail(&PUBLISH_READ_BACK) {
+            let _ = sender.send(Some(Err(())));
+            return Err(publish_outcome_in_doubt(
+                &failure,
+                &next.head.graph_commit_id,
+                readback_err,
+            ));
+        }
+        match readback_base.checkout_version(new_manifest_version).await {
+            Ok(reloaded) => match read_manifest_rows(&reloaded).await {
+                Ok(rows) if rows.head == next.head => {
+                    // Durable; only the acknowledgement was lost.
+                    let batch = next.to_batch()?;
+                    self.pipelined_landed(
+                        reloaded,
+                        batch,
+                        new_manifest_version,
+                        sender,
+                        &mut held,
+                        native_branch,
+                        known_state,
+                        next,
+                        parent_commit_id,
+                    )
+                    .await
+                }
+                Ok(rows) => {
+                    let _ = sender.send(Some(Err(())));
+                    if rows.head.graph_commit_id == next.head.graph_commit_id || after_ack {
+                        return Err(publish_outcome_in_doubt(
+                            &failure,
+                            &next.head.graph_commit_id,
+                            "the attempted version holds another record",
+                        ));
+                    }
+                    // The version belongs to another commit: nothing of this
+                    // attempt can land.
+                    Err(failure)
+                }
+                Err(scan_err) => {
+                    let _ = sender.send(Some(Err(())));
+                    Err(publish_outcome_in_doubt(
+                        &failure,
+                        &next.head.graph_commit_id,
+                        scan_err,
+                    ))
+                }
+            },
+            Err(readback_err) => {
+                let _ = sender.send(Some(Err(())));
+                Err(publish_outcome_in_doubt(
+                    &failure,
+                    &next.head.graph_commit_id,
+                    readback_err,
+                ))
+            }
+        }
+    }
+
+    /// The landed half of a pipelined publication: cache its rows, tell the
+    /// successors, record the version held, answer the outcome.
+    #[allow(clippy::too_many_arguments)]
+    async fn pipelined_landed(
+        &self,
+        new_dataset: Dataset,
+        batch: RecordBatch,
+        new_manifest_version: u64,
+        sender: tokio::sync::watch::Sender<Option<std::result::Result<Dataset, ()>>>,
+        held: &mut HeldVersion<'_>,
+        native_branch: Option<String>,
+        mut known_state: ManifestState,
+        next: ManifestRows,
+        parent_commit_id: Option<String>,
+    ) -> Result<PublishOutcome> {
+        if new_dataset.version().version != new_manifest_version {
+            let _ = sender.send(Some(Err(())));
+            return Err(OmniError::manifest_internal(
+                "a pipelined publication landed at another version",
+            )
+            .with_completion_evidence(CompletionEvidence::Uncertain));
+        }
+        let cached = PublishedRows::new(&new_dataset, batch).await;
+        *self
+            .published_rows
+            .lock()
+            .expect("published rows cache lock poisoned") = cached;
+        let _ = sender.send(Some(Ok(new_dataset.clone())));
+        known_state.version = new_manifest_version;
+        held.record_landed(native_branch.as_deref(), new_manifest_version);
+        Ok(PublishOutcome {
+            dataset: new_dataset,
+            parent_commit_id,
+            known_state,
+            head: next.head,
+            tables: next.tables,
+            buffer: next.buffer,
+            schema_contract: next.schema_contract,
+            registry: next.registry,
+            writer_epoch: next.writer_epoch,
+        })
     }
 }
 
