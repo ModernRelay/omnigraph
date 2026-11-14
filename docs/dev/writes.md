@@ -343,9 +343,9 @@ ever reached (`1` for a table created under v11), and every writer that
 rebuilds the row copies it forward (`TableVersionMetadata`,
 `crates/omnigraph-core/src/metadata.rs`). A writer whose captured snapshot predates another
 publication loses the CAS and reprepares (`ReadSetChanged`). Existing-table
-writes do not read linear HEAD; `repair` reports a foreign linear commit above
-`omnigraph.last_linear_version` as `foreign_drift`
-(`repair.rs`, `judge_against_last_linear_version`). Added-type admission can
+writes do not read linear HEAD; the collector lists a foreign linear commit
+above `omnigraph.last_linear_version` under `foreign_versions`
+(`collector.rs`, `foreign_versions`). Added-type admission can
 inspect an unregistered deterministic path's HEAD only to prove it remains
 its qualified original empty version 1; it never adopts an advanced HEAD.
 
@@ -481,8 +481,9 @@ publisher's first attempt, with the lineage intent's nonce and the captured
 head. Its failure publishes nothing and is `Unpublished`. The helper's other
 callers pass no hook. The hook runs under every writer gate and has no bound
 of its own, so it is part of the publication in the writer wait a bounded run
-promises: `max_gate_hold`, plus one table's rewrite, plus the publication with
-its hook, plus the configuration clear.
+promises: `max_gate_hold`, plus the tables already started (their full-text
+and vector builds run one at a time), plus the publication with its hook, plus
+the configuration clear.
 
 The index writer (`ensure_indices`, which `omnigraph index build` runs on any
 branch, and the explicit full-text rebuild) follows the same protocol: it
@@ -929,7 +930,7 @@ carried stored external reference the policy refuses fails as
 | A manifest request no re-issue settles | The write is reported in doubt and nothing records it. The version is created only if absent, so the request lands before the branch's next publication or never: that publication either loads it as the head and builds on it, or takes the version first, after which the late request fails its precondition (a race between the two is the ordinary version-CAS retry). The attempt's detached effects stay unreachable unless it lands, and the collector keeps them while their recorded publication authority is current |
 | The publisher fails | Every publisher failure carries its evidence. Its reads, preparation and history archiving, and a manifest request that was never sent (a failed transaction-file put precedes it) or that the store refused outright, are `Unpublished`. A manifest request with an ambiguous answer is re-issued unchanged by the dataset's commit handler until the store answers it; Lance reads a held version back by its transaction. Lance deletes the attempt's transaction file only on a missing version the commit's own request record calls definitive, so a request that may still land keeps the file its manifest would name. A version that may hold the commit after that is read back, and only an outcome the read-back cannot settle is reported in doubt |
 | Schema apply or the system-column upgrade reports an error after proven publication | `RecoveryRequired` can name the committed outcome; its tables and contract are durable, and refresh/reopen rebuilds only the in-memory view |
-| A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it; `repair` reports the table as `foreign_drift` and never adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions` |
+| A foreign linear commit lands above a table's `omnigraph.last_linear_version` | No read or write resolves it and nothing adopts the commit; the collector deletes neither its manifest nor its files and lists it under `foreign_versions`, which `cleanup` reports per table |
 | A sidecar from a build that predates detached commits is present | A read-write open refuses until that build has resolved it |
 | `commit publish` of an unpublished commit whose target head moved past its captured parent, or whose target incarnation is retired | `PreconditionFailed` naming the captured parent and the current head, or not found; the proposal stays retained until `cleanup` releases its expired tag |
 | `commit publish` or `commit drop` of a published commit id | Publish answers the established published commit; drop is a conflict |
@@ -957,8 +958,7 @@ manifest CAS.
 Maintenance has no actor-less public form. `optimize_as`, `ensure_indices_as`,
 `ensure_indices_on_as` and `rebuild_full_text_indices_on_as` check `maintain`
 on the branch they maintain, `main` for optimize. `cleanup_as` checks `reclaim`
-with no branch, and the read-only `repair_report_as` checks `maintain` on
-`main`.
+with no branch.
 `forbidden_apis.rs::maintenance_entry_points_take_an_actor` keeps every
 registered maintenance surface an `_as` form with an `actor` parameter.
 

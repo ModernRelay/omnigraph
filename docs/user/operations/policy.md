@@ -22,7 +22,7 @@ Graph-scoped actions:
 | `branch_claim` | Claim of a branch's [writer epoch](troubleshooting.md#writer-epoch) |
 | `commit_publish` | Publication of an unpublished commit onto its recorded target branch |
 | `commit_drop` | Drop of an unpublished commit |
-| `maintain` | Content-preserving maintenance: optimize, index builds, the full-text rebuild and the repair report |
+| `maintain` | Content-preserving maintenance: optimize, index builds and the full-text rebuild |
 | `reclaim` | Cleanup, which permanently removes table versions and files no retained commit needs |
 | `invoke_query` | Entry to a stored query |
 | `admin` | Reserved graph administration |
@@ -48,7 +48,7 @@ requires `invoke_query` and `read`.
 `maintain` and `reclaim` are separate from `change`, so an automation account
 can compact a graph without the right to write data, and can hold `maintain`
 without the right to delete history. `maintain` is judged on the branch the
-operation maintains (`main` for optimize and the repair report) and takes
+operation maintains (`main` for optimize) and takes
 `branch_scope`; `reclaim` covers every branch's history and takes no branch
 scope. `change` admits no maintenance: index builds and the full-text rebuild
 need `maintain` on their branch. The engine checks these actions whenever a policy is installed on the
