@@ -666,10 +666,13 @@ pub(super) fn validate_plan_values(
                         if let (Some(data_type), ExprType::Value { nullable, .. }) =
                             (projection.ty.to_arrow(), &projection.ty)
                         {
-                            owners.scores.insert(
-                                (read.values.as_str(), projection.column.as_str()),
-                                (data_type, *nullable),
-                            );
+                            // A union's arms share one `values` binding: a
+                            // column is nullable when any arm's is.
+                            owners
+                                .scores
+                                .entry((read.values.as_str(), projection.column.as_str()))
+                                .and_modify(|(_, known)| *known |= *nullable)
+                                .or_insert((data_type, *nullable));
                         }
                     }
                 }

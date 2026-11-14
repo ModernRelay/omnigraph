@@ -4,7 +4,9 @@
 # notes: named by the first arm and matched by position. Each arm is its own
 # notes: inline read whose other names stay inside it, a `where` after the
 # notes: union filters the union's rows, and the elements after it join on
-# notes: the names it binds.
+# notes: the names it binds. An arm may return a value, or group, order and
+# notes: cut its own rows: each arm is then drawn as a read of its own, its
+# notes: values one column each under the first arm's names.
 
 --- runner
 timeout_ms: 10000
@@ -150,3 +152,40 @@ query first_two() {
 --- expect shape
 p.handle: String
 p.name: String
+
+--- query
+query arms_returning_a_value() {
+    match {
+        from union(
+            { match { $p: Person } where $p.age > 30 return { $p, 1 as d } },
+            { match { $a: Person, $q: Person, $a knows $q } return { $q as p, 2 as d } }),
+    }
+    return { $p.handle, $d }
+}
+
+--- expect unordered
+{"d":1,"p.handle":"ada"}
+{"d":1,"p.handle":"cy"}
+{"d":2,"p.handle":"bob"}
+{"d":2,"p.handle":"bob"}
+
+--- expect shape
+p.handle: String
+d: I64
+
+--- query
+query arms_with_their_own_cut() {
+    match {
+        from union(
+            { match { $p: Person } return { $p } order { $p.age desc } limit 1 },
+            { match { $q: Person } return { $q as p } order { $q.age } limit 1 }),
+    }
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"cy"}
+{"p.handle":"bob"}
+
+--- expect shape
+p.handle: String

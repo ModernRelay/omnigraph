@@ -255,9 +255,11 @@ query older_or_known() {
 }
 ```
 
-In this release every column of a union is a node of one type in every
-arm, and no arm reads a name of the enclosing scope; an arm returning a value
-or an edge, or reading an outer name, is refused (`T86`).
+An arm may return values, `return { $p, 1 as d }`, which match by position
+and are nullable where any arm's is, and may group, order and cut its own
+rows (`order { $p.age } limit 3` belongs to the arm). In this release a node
+column is one type in every arm, and no arm returns an edge or reads a name
+of the enclosing scope (`T86`).
 
 `from name(args)` calls a read declared in the same source: its body runs as
 an inline read, each parameter bound to its argument evaluated in the

@@ -36,12 +36,16 @@ A query runs against one resolved `ReadTarget`:
    tree as a scope of its own, `$x is null` over a reference tests the
    identity column, and plan acceptance requires one `OptionalJoin` per
    written optional testing its own conjuncts inside its inner tree and
-   nowhere else. A `from union(…)` whose arms return nodes and read no
-   outer name is a `PatternStep::Union` placed first, each arm its own
-   pipeline from nothing with its unreturned names renamed apart, and the
-   logical and physical `Union` (a new node kind: no existing one emits the
-   rows of two pipelines) folded from the left; each arm is a scope of its
-   own for filter placement, and the union's columns are its bindings'.
+   nowhere else. A `from union(…)` whose arms read no outer name is a
+   `PatternStep::Union` placed first, each arm its own pipeline from nothing
+   with its unreturned names renamed apart, and the logical and physical
+   `Union` (a new node kind: no existing one emits the rows of two
+   pipelines) folded from the left; each arm is a scope of its own for filter
+   placement, and the union's columns are its bindings'. When an arm returns
+   a value or groups, orders or cuts its rows, every arm is an uncorrelated
+   `PatternStep::Correlate` returning its columns under the first arm's
+   names, its values columns of one `values` binding all arms share, which
+   the union binds beside its references.
    A `from` over an inline read (or a call) with its own aggregate,
    `distinct`, `order` or `limit` (the core's `Correlate` over its `Group`,
    `Order` and `Cut`) is a `PatternStep::Correlate`, placed beside the
@@ -86,8 +90,8 @@ A query runs against one resolved `ReadTarget`:
    argument only on the rows that select it.
    The shaper is the compiler's
    (`omnigraph_compiler::shape`), and the type checker runs it on every
-   declaration it accepts: a term it does not lower (a `union` arm with a
-   value or an outer name, `Fix`,
+   declaration it accepts: a term it does not lower (a `union` arm with
+   an edge or an outer name, `Fix`,
    a ranking inside an inline read with a group, order or cut) is refused at
    type check with
    `T86`, at the construct and naming the programme stage that adds it, so

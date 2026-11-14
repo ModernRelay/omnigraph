@@ -295,7 +295,7 @@ that calls itself.
 | Refused | Stage | Rewrite this release runs |
 |---|---|---|
 | `distance` as an `rrf` arm | B | none |
-| A `union` arm returning a value or an edge, or reading a name of the enclosing scope | B | none |
+| A `union` arm returning an edge, or reading a name of the enclosing scope | B | none |
 | A node an `optional` introduces, returned whole | B | return its properties |
 | A ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit` | B | none |
 | A block compared with another block's value, a block of several aggregates | B | none |

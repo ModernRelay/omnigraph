@@ -40,7 +40,7 @@ struct Row {
 const B_IN_PROGRESS: &[&str] = &[
     "a node an optional introduces returned whole",
     "a ranking inside an inline read with its own order and limit",
-    "a union arm returning a value",
+    "a union arm returning an edge",
     "a union whose arms read the enclosing scope",
     "distance as an rrf arm",
     "two rrf arm windows that differ",
@@ -171,9 +171,17 @@ const CLOSURE: &[Row] = &[
                 "query q($s: String) { match { from { match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.body, $s) as $score } return { $d } order { $score desc } limit 2 } } return { $d.title } }",
                 Refused("B"),
             ),
-            // "a union arm returning a value"
             (
                 "query q() { match { from union({ match { $p: Person } return { $p, 1 as d } }, { match { $q: Person } return { $q as p, 2 as d } }) } return { $p.name, $d } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { from union({ match { $p: Person } return { $p } order { $p.age } limit 1 }, { match { $q: Person } return { $q as p } }) } return { $p.name } }",
+                Lowers,
+            ),
+            // "a union arm returning an edge"
+            (
+                "query q() { match { from union({ match { $p: Person, $q: Person, $p $k:knows $q } return { $k } }, { match { $a: Person, $b: Person, $a $e:knows $b } return { $e as k } }) } return { $k.@src } }",
                 Refused("B"),
             ),
             // "a union whose arms read the enclosing scope"

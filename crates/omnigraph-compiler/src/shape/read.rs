@@ -743,6 +743,9 @@ struct TraversalFact {
 struct UnionFact {
     arms: Vec<Facts>,
     bindings: Vec<(String, String)>,
+    /// The `values` binding every arm's value columns belong to, when the
+    /// arms return values.
+    values: Option<String>,
 }
 
 /// An `optional { }`: its pattern's facts.
@@ -1826,12 +1829,32 @@ impl<'a> Shaper<'a> {
                 arm => arms.push(arm),
             }
         }
+        // An arm returning a value, or grouping, ordering or cutting its own
+        // rows, is drawn as an uncorrelated read: every arm
+        // then returns its references and a column of one shared `values`
+        // binding per value, under the first arm's names.
+        let mut parts = Vec::with_capacity(arms.len());
+        for arm in &arms {
+            parts.push(read_parts(arm).ok_or_else(|| self.unlowered_node(arm))?);
+        }
+        if parts.iter().any(|(_, items, _)| {
+            items
+                .iter()
+                .any(|(_, e)| matches!(e.ty(), ExprType::Edge { .. }))
+        }) {
+            return Err(self.refuse_at("a `union` arm returning an edge", at()));
+        }
+        if parts.iter().any(|(input, items, _)| {
+            groups_or_cuts(input)
+                || items
+                    .iter()
+                    .any(|(_, e)| !matches!(e.ty(), ExprType::Node { .. }))
+        }) {
+            return self.union_of_reads(&parts, facts);
+        }
         let mut columns: Vec<(String, String)> = Vec::new();
         let mut shaped = Vec::new();
-        for (index, arm) in arms.into_iter().enumerate() {
-            let Some((input, items, bindings)) = read_parts(arm) else {
-                return Err(self.unlowered_node(arm));
-            };
+        for (index, &(input, items, bindings)) in parts.iter().enumerate() {
             let reads_outer = bindings.iter().any(|(_, arg)| {
                 let mut read = Vec::new();
                 arg.columns(&mut read);
@@ -1853,9 +1876,9 @@ impl<'a> Shaper<'a> {
                 let mut expr = expr.clone();
                 substitute(&mut expr, &inner_lets);
                 let IRExpr::Variable(variable, ExprType::Node { type_name }) = &expr else {
-                    return Err(self.refuse_at(
-                        "a `union` arm returning a value or an edge, not a node",
-                        at(),
+                    return Err(ShapeError::Internal(
+                        "a union arm's column is not a node after the value arms were drawn"
+                            .to_string(),
                     ));
                 };
                 if index == 0 {
@@ -1900,6 +1923,113 @@ impl<'a> Shaper<'a> {
         facts.unions.push(UnionFact {
             arms: shaped,
             bindings: columns,
+            values: None,
+        });
+        Ok(())
+    }
+
+    /// `from union(a, b, …)` whose arms return a value, or group, order or
+    /// cut their own rows: each arm an uncorrelated read of its own
+    /// (`correlate_read`) returning its columns under the first arm's names,
+    /// its values as columns of one `values` binding all arms share, which
+    /// the union carries beside the references. A column is nullable when
+    /// any arm's is.
+    fn union_of_reads(
+        &self,
+        parts: &[(&Term, &[Item], &[Item])],
+        facts: &mut Facts,
+    ) -> Result<(), ShapeError> {
+        let at = || Construct::Element(FROM, None);
+        let values = format!("{FRESH_PREFIX}r{}", facts.inlined);
+        facts.inlined += 1;
+        let Some((_, first, _)) = parts.first() else {
+            return Err(ShapeError::Internal("a union has no arm".to_string()));
+        };
+        let names: Vec<String> = first.iter().map(|(column, _)| column.clone()).collect();
+        let mut nodes: Vec<(String, String)> = Vec::new();
+        let mut value_types: Vec<(String, ExprType)> = Vec::new();
+        let mut shaped = Vec::new();
+        for (index, (input, items, bindings)) in parts.iter().enumerate() {
+            let reads_outer = bindings.iter().any(|(_, arg)| !arg.columns_empty());
+            if reads_outer || !env_columns(input).is_empty() {
+                return Err(self.refuse_at("a `union` arm that reads the enclosing scope", at()));
+            }
+            if items.len() != names.len() {
+                return Err(ShapeError::Internal(
+                    "a union arm returns another number of columns than the first".to_string(),
+                ));
+            }
+            let renamed: Vec<(String, IRExpr)> = names
+                .iter()
+                .zip(items.iter())
+                .map(|(name, (_, e))| (name.clone(), e.clone()))
+                .collect();
+            let mut inner = Facts {
+                inlined: facts.inlined,
+                ..Facts::default()
+            };
+            self.correlate_read_as(input, &renamed, bindings, &mut inner, Some(&values))?;
+            facts.inlined = inner.inlined;
+            let Some(correlate) = inner.correlates.last() else {
+                return Err(ShapeError::Internal("a union arm drew no read".to_string()));
+            };
+            for (position, column) in correlate.read.columns.iter().enumerate() {
+                match (&column.expr, column.ty.clone()) {
+                    (IRExpr::Variable(_, _), ExprType::Node { type_name }) => {
+                        match nodes.iter().find(|(name, _)| *name == column.column) {
+                            Some((_, declared)) if *declared != type_name => {
+                                return Err(self.refuse_at(
+                                    "a `union` whose arms return one column as different node types",
+                                    at(),
+                                ));
+                            }
+                            Some(_) => {}
+                            None if index == 0 => nodes.push((column.column.clone(), type_name)),
+                            None => {
+                                return Err(ShapeError::Internal(format!(
+                                    "union column {position} is a node only in a later arm"
+                                )));
+                            }
+                        }
+                    }
+                    (IRExpr::Variable(_, _), _) => {
+                        return Err(self.refuse_at("a `union` arm returning an edge", at()));
+                    }
+                    (_, ty) => match value_types
+                        .iter_mut()
+                        .find(|(name, _)| *name == column.column)
+                    {
+                        Some((_, declared)) => {
+                            if ty.nullable()
+                                && let ExprType::Value { nullable, .. } = declared
+                            {
+                                *nullable = true;
+                            }
+                        }
+                        None => value_types.push((column.column.clone(), ty)),
+                    },
+                }
+            }
+            inner.lets.clear();
+            shaped.push(inner);
+        }
+        for (name, ty) in &value_types {
+            facts.lets.insert(
+                name.clone(),
+                IRExpr::PropAccess {
+                    variable: values.clone(),
+                    property: name.clone(),
+                    ty: ty.clone(),
+                },
+            );
+        }
+        facts
+            .types
+            .extend(nodes.iter().map(|(name, ty)| (name.clone(), ty.clone())));
+        facts.unions.push(UnionFact {
+            arms: shaped,
+            bindings: nodes,
+            values: (!value_types.is_empty()).then_some(values),
         });
         Ok(())
     }
@@ -2017,6 +2147,19 @@ impl<'a> Shaper<'a> {
         bindings: &[(String, IRExpr)],
         facts: &mut Facts,
     ) -> Result<(), ShapeError> {
+        self.correlate_read_as(input, items, bindings, facts, None)
+    }
+
+    /// `correlate_read` whose value columns are columns of `values` when
+    /// given (a union's arms share one), else of a fresh binding.
+    fn correlate_read_as(
+        &self,
+        input: &Term,
+        items: &[(String, IRExpr)],
+        bindings: &[(String, IRExpr)],
+        facts: &mut Facts,
+        values: Option<&str>,
+    ) -> Result<(), ShapeError> {
         let at = || Construct::Element(FROM, None);
         let mut outer: HashSet<String> = env_columns(input).into_iter().collect();
         for (_, arg) in bindings {
@@ -2133,8 +2276,14 @@ impl<'a> Shaper<'a> {
         }
         // What each hidden column is over the read's rows: an item over the
         // pattern's rows, or a group's key or aggregate column.
-        let values = format!("{FRESH_PREFIX}r{}", inner.inlined);
-        inner.inlined += 1;
+        let values = match values {
+            Some(values) => values.to_string(),
+            None => {
+                let values = format!("{FRESH_PREFIX}r{}", inner.inlined);
+                inner.inlined += 1;
+                values
+            }
+        };
         let mut rows: HashMap<String, IRExpr> = HashMap::new();
         let mut group = None;
         if grouped {
@@ -2689,12 +2838,13 @@ impl<'a> Shaper<'a> {
                 )?;
                 arms.push(steps);
             }
-            let bindings: Vec<String> = union
+            let mut bindings: Vec<String> = union
                 .bindings
                 .iter()
                 .map(|(name, _)| name.clone())
                 .collect();
             bound_vars.extend(bindings.iter().cloned());
+            bindings.extend(union.values.iter().cloned());
             pipeline.push(PatternStep::Union { arms, bindings });
         }
         let bindings: Vec<&BindingFact> = facts.bindings.iter().collect();
