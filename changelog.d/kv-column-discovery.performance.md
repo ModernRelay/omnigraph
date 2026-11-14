@@ -1,0 +1,1 @@
+- Key-value query output resolves column order once per response, including older servers that omit column names.
