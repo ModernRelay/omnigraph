@@ -248,6 +248,10 @@ const CLOSURE: &[Row] = &[
                 Lowers,
             ),
             (
+                "query q($k: I64, $v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $v, k: $k) as $distance } return { $d.title } order { $d.title } }",
+                Lowers,
+            ),
+            (
                 "query q($k: I64, $s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } return { $d.title } order { $score desc } limit $k }",
                 Lowers,
             ),

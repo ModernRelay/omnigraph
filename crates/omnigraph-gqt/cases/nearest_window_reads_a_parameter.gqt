@@ -1,0 +1,98 @@
+# issue: none
+# notes: `nearest(…, k: $k)` takes its window from a parameter bound at execution: the
+# notes: window is the `k` nearest targets with every row of each, whatever the read's `order`
+# notes: and `limit`, so a window read from a parameter runs wherever a literal one does, and
+# notes: an `rrf` arm's window too. A count below 1 is refused before the read runs.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    text: String @index
+    embedding: Vector(2) @index
+}
+edge Cites: Doc -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"a","text":"needle","embedding":[0.0,1.0]}}
+{"type":"Doc","data":{"slug":"b","text":"needle hay","embedding":[1.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","text":"hay","embedding":[1.0,1.0]}}
+{"edge":"Cites","from":"a","to":"b"}
+{"edge":"Cites","from":"a","to":"c"}
+{"edge":"Cites","from":"c","to":"a"}
+
+--- query
+query window_from_a_parameter($k: I64) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: $k) as $distance }
+    return { $d.slug, $distance }
+    order { $d.slug }
+}
+
+--- params
+{"k": 2}
+
+--- expect ordered
+{"d.slug":"a","distance":0.0}
+{"d.slug":"c","distance":1.0}
+
+--- expect shape
+d.slug: String
+distance: F32
+
+--- query
+query window_from_a_parameter_keeps_every_row_of_a_target($k: I64) {
+    match {
+        let $pop = { match { $d: Doc, $e: Doc, $d cites $e } return { $d, $e } },
+        from nearest($pop, $d.embedding, [0.0, 1.0], k: $k) as $distance,
+    }
+    return { $d.slug, $e.slug }
+    order { $d.slug, $e.slug }
+}
+
+--- params
+{"k": 1}
+
+--- expect ordered
+{"d.slug":"a","e.slug":"b"}
+{"d.slug":"a","e.slug":"c"}
+
+--- expect shape
+d.slug: String
+e.slug: String
+
+--- query
+query an_rrf_arm_window_from_a_parameter($k: I64) {
+    match {
+        let $all = { match { $d: Doc } return { $d } },
+        from rrf(nearest($all, $d.embedding, [0.0, 1.0], k: $k), bm25($all, $d.text, "needle")) as $score,
+    }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"k": 1}
+
+--- expect ordered
+{"d.slug":"a"}
+{"d.slug":"b"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query a_window_below_one_is_refused($k: I64) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: $k) as $distance }
+    return { $d.slug }
+    order { $d.slug }
+}
+
+--- params
+{"k": 0}
+
+--- expect error: must be bound to an integer of at least 1

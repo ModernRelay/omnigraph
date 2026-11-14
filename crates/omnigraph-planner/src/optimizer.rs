@@ -748,6 +748,7 @@ fn resolve_pipeline(
                 key,
                 binding,
                 window,
+                ..
             } => {
                 let input = bound(current, "ranking")?;
                 let schema = schema_of(plan, input)?;

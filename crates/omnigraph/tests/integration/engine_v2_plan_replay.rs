@@ -584,6 +584,11 @@ query fused($t: String, $q: Vector(4)) {
     order { $score desc }
     limit 3
 }
+query window_of($q: Vector(4), $k: I64) {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: $k) as $distance }
+    return { $d.slug }
+    order { $d.slug }
+}
 query within($q: Vector(4)) {
     match {
       let $pop = { match { $d: Doc } return { $d } },
@@ -1340,6 +1345,34 @@ async fn a_let_that_can_fail_replays_and_a_plan_without_it_is_refused() {
         Ok(_) => panic!("a plan without its `Let` replayed"),
     };
     assert!(error.to_string().contains("`let`"), "{error}");
+}
+
+/// A `nearest` window `k: $k` plans the count its value table binds: the
+/// replay selects that many targets, and a saved plan whose value table binds
+/// another count than its window holds is refused at the door.
+#[tokio::test]
+async fn a_parameter_window_replays_its_bound_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = docs(&dir).await;
+    let params = ParamMap::from([
+        ("q".to_string(), Literal::List(vec![Literal::Float(1.0); 4])),
+        ("k".to_string(), Literal::Integer(2)),
+    ]);
+    let Replayed {
+        result, envelope, ..
+    } = replayed(&db, DOC_QUERIES, "window_of", &params).await;
+    assert_eq!(result.len(), 2, "{result:?}");
+    let mut edited: Value = serde_json::from_slice(&envelope).unwrap();
+    edited["plan"]["body"]["values"]["params"]["k"] =
+        serde_json::json!({"literal": "integer", "value": 1});
+    let error = match db
+        .replay_bound_plan("main", &serde_json::to_vec(&edited).unwrap())
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a window of 2 replayed under a value table binding 1"),
+    };
+    assert!(error.to_string().contains("row cut"), "{error}");
 }
 
 #[tokio::test]

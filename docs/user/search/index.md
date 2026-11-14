@@ -39,8 +39,8 @@ Search arguments use their declared types. `nearest` requires its window
 `k` (`T17`), an integer literal or parameter of at least 1: it selects the `k`
 nearest targets of the population with every row each has, and the read's
 `limit`, which may be larger, smaller or absent, cuts the rows after that. A
-window read from a parameter is not lowered in this release unless it is the
-read's `limit` with the score leading the `order` (`T86`). `fuzzy` defaults `max_edits` to 2 when
+window read from a parameter takes the count the parameter is bound to when
+the read runs, in an `rrf` arm too; a count below 1 is refused. `fuzzy` defaults `max_edits` to 2 when
 omitted; a literal must be 0 to 2 (`T71`) and a parameter an integer from 0
 to 4,294,967,295. `rrf` takes `k` as an integer literal from 1 to 1,000,000
 or an integer parameter. Options are named: `fuzzy($d.body, $q, 2)` is

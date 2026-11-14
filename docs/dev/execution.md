@@ -83,7 +83,9 @@ A query runs against one resolved `ReadTarget`:
 4. Gather the planning inputs once: bound parameters (`now()` among them),
    constants folded to their values (a `limit $k`, which the shape records as
    `limit_param`, takes its bound count here, so the plan's cut is that count
-   and a replay folds the count its own value table binds), statistics, settings and the index
+   and a replay folds the count its own value table binds; a `nearest`
+   window `k: $k`, a ranking step's `window_param`, takes its count, at
+   least 1, the same way), statistics, settings and the index
    facts the full-text coverage of every ranked property is derived from.
 5. Plan the query and accept the plan (see [Plan acceptance](#plan-acceptance)).
 6. Bind the accepted plan's values and execute it against the same snapshot.

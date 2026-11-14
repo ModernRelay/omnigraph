@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use datafusion::scalar::ScalarValue;
-use omnigraph_compiler::ir::{IRExpr, ParamMap};
+use omnigraph_compiler::ir::{IRExpr, IRParam, ParamMap};
 use omnigraph_compiler::query::value::{BinaryOp, Literal};
 use omnigraph_compiler::types::{ExprType, ScalarType};
 use omnigraph_planner::{PatternStep, ReadShape};
@@ -145,32 +145,51 @@ fn literal_list(values: &ArrayRef) -> Result<Literal> {
 /// Fold bound constant filters without changing their compiler-selected types.
 /// A `limit $param` takes the count the parameter is bound to here, so the
 /// plan's cut is that count and a replay folds its own value table's.
+/// A `nearest` window `k: $param` takes its bound count the same way.
 pub(crate) fn fold_query_constants(ir: &ReadShape, params: &ParamMap) -> Result<ReadShape> {
     let mut folded = ir.clone();
-    fold_pipeline(&mut folded.pipeline, params)?;
+    fold_pipeline(&mut folded.pipeline, &ir.params, params)?;
     if let Some(name) = &folded.limit_param {
-        let ty = folded
-            .params
-            .iter()
-            .find(|param| param.declaration.name == *name)
-            .map(|param| param.ty.clone())
-            .ok_or_else(|| {
-                OmniError::manifest_internal(format!("`limit ${name}` names no declared parameter"))
-            })?;
-        let count = super::scan::resolve_to_int(&IRExpr::Param(name.clone(), ty), params)
-            .ok()
-            .and_then(|value| u64::try_from(value).ok())
-            .ok_or_else(|| {
-                OmniError::manifest(format!(
-                    "`limit ${name}` must be bound to a non-negative integer"
-                ))
-            })?;
-        folded.limit = Some(count);
+        folded.limit = Some(bound_count(name, "limit", 0, &ir.params, params)?);
     }
     Ok(folded)
 }
 
-fn fold_pipeline(pipeline: &mut [PatternStep], params: &ParamMap) -> Result<()> {
+/// The count of at least `min` the parameter `name` is bound to; `what`
+/// names the construct that reads it.
+fn bound_count(
+    name: &str,
+    what: &str,
+    min: u64,
+    declared: &[IRParam],
+    params: &ParamMap,
+) -> Result<u64> {
+    let ty = declared
+        .iter()
+        .find(|param| param.declaration.name == *name)
+        .map(|param| param.ty.clone())
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("`{what} ${name}` names no declared parameter"))
+        })?;
+    super::scan::resolve_to_int(&IRExpr::Param(name.to_string(), ty), params)
+        .ok()
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|count| *count >= min)
+        .ok_or_else(|| match min {
+            0 => OmniError::manifest(format!(
+                "`{what} ${name}` must be bound to a non-negative integer"
+            )),
+            _ => OmniError::manifest(format!(
+                "`{what} ${name}` must be bound to an integer of at least {min}"
+            )),
+        })
+}
+
+fn fold_pipeline(
+    pipeline: &mut [PatternStep],
+    declared: &[IRParam],
+    params: &ParamMap,
+) -> Result<()> {
     for op in pipeline {
         match op {
             PatternStep::NodeScan { filters, .. }
@@ -184,13 +203,20 @@ fn fold_pipeline(pipeline: &mut [PatternStep], params: &ParamMap) -> Result<()> 
             }
             PatternStep::Filter(filter) => *filter = fold_expr(filter, params)?,
             PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
-                fold_pipeline(inner, params)?
+                fold_pipeline(inner, declared, params)?
             }
             PatternStep::Union { arms, .. } => {
                 for arm in arms {
-                    fold_pipeline(arm, params)?;
+                    fold_pipeline(arm, declared, params)?;
                 }
             }
+            // A window `k: $param` takes its bound count; the ranking's query
+            // binds at its scan.
+            PatternStep::Rank {
+                window,
+                window_param: Some(name),
+                ..
+            } => *window = Some(bound_count(name, "k:", 1, declared, params)?),
             // The ranking's query binds at its scan, as a leading key's does,
             // and a score's query vector at its node.
             PatternStep::Rank { .. } | PatternStep::Score { .. } => {}

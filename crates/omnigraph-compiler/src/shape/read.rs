@@ -91,6 +91,11 @@ pub enum PatternStep {
         key: IRExpr,
         binding: String,
         window: Option<u64>,
+        /// `k: $param`: the parameter the window reads, its count bound at
+        /// execution. The engine folds the bound value into `window` before
+        /// planning, so the plan's window is that value and a replay folds
+        /// the value its own value table holds.
+        window_param: Option<String>,
     },
     /// A correlated block: `inner` runs over the outer rows and `predicate`
     /// decides per outer row on the aggregate of its matches.
@@ -209,8 +214,8 @@ struct Ranking {
     score: (&'static str, ExprType),
     descending: bool,
     /// The `k` of each `nearest` window the ranking draws (its own, or its
-    /// `rrf` arms'); `None` for a window read from a parameter.
-    windows: Vec<Option<u64>>,
+    /// `rrf` arms'): a literal, or a parameter bound at execution.
+    windows: Vec<Count>,
     /// `distance`'s exact score: the vector property and the query. It is
     /// a step over its population's rows, never a ranked scan, and its
     /// `order` and `limit` are the read's own sort and cut.
@@ -1007,14 +1012,18 @@ impl<'a> Shaper<'a> {
                 &HashSet::new(),
                 &mut fresh,
             )?;
-            let window = match ranking.windows.as_slice() {
-                _ if ranking.exact.is_some() => None,
-                [] => None,
-                [Some(k)] => Some(*k),
-                [Some(k), rest @ ..] if rest.iter().all(|w| *w == Some(*k)) => Some(*k),
+            // A window read from a parameter takes its bound count when the
+            // engine gathers the planning inputs.
+            let (window, window_param) = match ranking.windows.as_slice() {
+                _ if ranking.exact.is_some() => (None, None),
+                [] => (None, None),
+                [first, rest @ ..] if rest.iter().all(|w| w == first) => match first {
+                    Count::Literal(k) => (Some(*k), None),
+                    Count::Param(p) => (None, Some(p.clone())),
+                },
                 _ => {
                     return Err(self.refuse_at(
-                        "a `nearest` window read from a parameter, or two `rrf` arm windows that differ",
+                        "two `rrf` arm windows that differ",
                         Construct::Element(FROM, None),
                     ));
                 }
@@ -1039,6 +1048,7 @@ impl<'a> Shaper<'a> {
                     key: ranking.key.clone(),
                     binding: ranking.column.clone(),
                     window,
+                    window_param,
                 },
             });
             // The later elements and `where` read the score by its name.
@@ -1208,11 +1218,10 @@ impl<'a> Shaper<'a> {
             (None, true) => Some(RRF_NEAREST_ARM_WINDOW),
             (None, false) => None,
         };
-        if ranking
-            .windows
-            .iter()
-            .any(|w| w.is_none() || *w != expected)
-        {
+        if ranking.windows.iter().any(|w| match w {
+            Count::Literal(k) => Some(*k) != expected,
+            Count::Param(_) => true,
+        }) {
             return Err(self.refuse("a `nearest` window `k` other than the read's `limit`"));
         }
         Ok(())
@@ -1323,10 +1332,7 @@ impl<'a> Shaper<'a> {
                     column: column.clone(),
                     score: (DISTANCE_COLUMN, scalar(ScalarType::F32)),
                     descending: false,
-                    windows: vec![match k {
-                        Count::Literal(n) => Some(*n),
-                        Count::Param(_) => None,
-                    }],
+                    windows: vec![k.clone()],
                     exact: None,
                 }),
             )),
