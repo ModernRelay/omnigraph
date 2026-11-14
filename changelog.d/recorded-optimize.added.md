@@ -1,5 +1,3 @@
-- A cluster server can run `optimize` as a recorded operation that a caller
-  looks up by its own id; `omnigraph optimize` against a server submits one and
-  waits for it. See [recorded operations][recorded-optimize].
+- A cluster server can run `optimize` while it serves, as a recorded operation tracked by id; `omnigraph optimize` against it submits and waits. Enable with `OMNIGRAPH_OPERATION_ROUTES=true`. See [operations][recorded-optimize].
 
 [recorded-optimize]: ../docs/user/operations/recorded-operations.md
