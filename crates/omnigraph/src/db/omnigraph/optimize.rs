@@ -62,6 +62,30 @@ pub struct CleanupPolicyOptions {
     pub older_than: Option<Duration>,
 }
 
+impl CleanupPolicyOptions {
+    /// The instant `older_than` puts before `now`. A duration that reaches
+    /// before the earliest instant the calendar represents is a bad request:
+    /// reading it as "no cutoff" would drop the age rule the caller asked for.
+    pub(crate) fn cutoff(
+        &self,
+        now: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let Some(older_than) = self.older_than else {
+            return Ok(None);
+        };
+        chrono::TimeDelta::from_std(older_than)
+            .ok()
+            .and_then(|age| now().checked_sub_signed(age))
+            .map(Some)
+            .ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "older_than of {}s reaches before the earliest representable time",
+                    older_than.as_secs()
+                ))
+            })
+    }
+}
+
 /// What one optimize run did to one table. A run reports exactly one outcome
 /// for every table it considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2066,9 +2090,7 @@ async fn cleanup_detached_only(
     graph_branches: &[Option<String>],
     table_tasks: &[(String, String)],
 ) -> Result<Vec<DatasetCleanupStats>> {
-    let before_timestamp = options
-        .older_than
-        .map(|duration| crate::dst_clock::now_utc() - duration);
+    let before_timestamp = options.cutoff(crate::dst_clock::now_utc)?;
     let native_plan = prepare_native_fork_reconciliation(db, before_timestamp).await?;
     let plan = super::collector::plan_collection(db, options, graph_branches).await?;
     let mut table_tasks = table_tasks.to_vec();

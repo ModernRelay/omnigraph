@@ -5056,6 +5056,16 @@ fn cleanup_against_local_scope_executes_with_confirm() {
             "cleanup requires at least one of --keep or --older-than",
         ),
         (
+            vec!["--older-than", "307445734561825861m"],
+            false,
+            "invalid duration '307445734561825861m'",
+        ),
+        (
+            vec!["--older-than", "18446744073709551615s", "--confirm"],
+            false,
+            "earliest representable time",
+        ),
+        (
             vec!["--older-than", "invalid", "--confirm"],
             false,
             "invalid duration 'invalid'",

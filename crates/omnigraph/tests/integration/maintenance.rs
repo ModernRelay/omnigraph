@@ -3218,6 +3218,27 @@ async fn cleanup_without_any_policy_option_errors() {
         msg.contains("keep_versions") && msg.contains("older_than"),
         "error should name the two policy fields, got: {msg}"
     );
+
+    // An age the calendar cannot subtract is refused, not a panic, by both
+    // the plan and the run.
+    let unrepresentable = CleanupPolicyOptions {
+        keep_versions: None,
+        older_than: Some(Duration::from_secs(u64::MAX)),
+    };
+    for err in [
+        db.cleanup_plan(unrepresentable.clone())
+            .await
+            .expect_err("plan must refuse"),
+        db.cleanup_as(unrepresentable, None)
+            .await
+            .expect_err("cleanup must refuse"),
+    ] {
+        let msg = err.to_string();
+        assert!(
+            msg.contains("earliest representable time"),
+            "error should name the unrepresentable age, got: {msg}"
+        );
+    }
 }
 
 #[tokio::test]
