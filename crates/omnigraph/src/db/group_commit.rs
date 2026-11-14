@@ -352,10 +352,20 @@ fn refused(reason: &str) -> OmniError {
 
 fn fan_out_error(error: &OmniError) -> OmniError {
     if error.is_read_set_changed() {
-        refused("publication")
-    } else {
-        OmniError::manifest_internal(format!("group commit batch failed: {error}"))
+        return refused("publication");
     }
+    // A fenced batch tells every entry it was fenced, typed, so a caller
+    // never retries it as an ordinary conflict.
+    if let OmniError::Manifest(manifest) = error
+        && let Some(crate::error::ManifestConflictDetails::WriterFenced {
+            held,
+            read,
+            current,
+        }) = &manifest.details
+    {
+        return OmniError::manifest_writer_fenced("this branch", *held, *read, *current);
+    }
+    OmniError::manifest_internal(format!("group commit batch failed: {error}"))
 }
 
 async fn run_batch(

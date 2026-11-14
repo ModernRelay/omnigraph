@@ -45,8 +45,8 @@ A crash test shows 7 acknowledged, unfolded writes visible to a fresh reader and
 the next owner. The design keeps every hard invariant's contract but changes the text of
 three (the publication door is "version V's record or `__manifest` V", the fold is derived
 state that follows the publication, and the bounded tail is a second place versions live),
-and it needs a fencing record SlateDB-style before production; argued RFC-style in
-section 7. It overlaps RFC 0068 (records as the door) and is a migration path to it that
+and fences an old owner SlateDB-style by making the epoch claim itself the next record
+(implemented and tested); argued RFC-style in section 7. It overlaps RFC 0068 (records as the door) and is a migration path to it that
 keeps `__manifest` as the checkpoint every history surface already reads.
 
 **MemWAL.** Omnigraph removed RFC 0018/0026 because per-dataset MemWAL added a second
@@ -279,7 +279,9 @@ commits/s at N = 1/4/16/64); one branch per writer improves to 115.6 at 16 and *
 pays alone.
 
 **Correctness instruments (all pass):** per-cell verification; `wal_recovery_and_cold_reads`
-(crash between records and fold); `group_commit_mixed_workload_is_consistent` (20 writers
+(crash between records and fold); `wal_claim_record_fences_the_previous_owner` (a takeover
+fences the old owner's next write); `wal_cold_read_cost` (a reader in another process sees
+every acknowledged write over an unfolded tail of 0–63 records); `group_commit_mixed_workload_is_consistent` (20 writers
 upserting 120 colliding keys beside 4 updaters, 5 ms latency, 5 of 5 runs: every
 acknowledged key present exactly once, no errors beyond bounded conflicts). The mixed test
 found one real bug, now fixed: after a failed publish attempt the writer-epoch holder
@@ -379,10 +381,16 @@ the cold registry rows the publication pushes, if any. Properties:
 - **Visible at once in the process.** The coordinator installs version `V` when the record
   lands (`ManifestCoordinator::version()` is the installed state's version; opens and
   refreshes overlay the in-process tail).
-- **Visible to other readers through the tail.** A reader with no in-process log probes the
-  record names above the latest `__manifest` version (one GET when caught up, `k+1` when `k`
-  records are unfolded) and opens at the newest record (`read_storage_tail`, used by opens,
-  refreshes and freshness probes).
+- **Visible to other readers through the tail.** A reader with no in-process log finds the
+  newest record above the latest `__manifest` version (one HEAD when caught up; otherwise an
+  exponential probe then a binary search, as SlateDB's reader does, since records are
+  contiguous) and reads only that record, which holds the complete rows
+  (`read_latest_record`, used by opens, refreshes and freshness probes). Measured cold open
+  plus one row count at 20 ms (`wal_cold_read_cost`): caught up, 8 requests and 178 ms
+  (today: 9 and 178); 1 unfolded record, 14 and 306 ms; 8, 26 and 558 ms; 32 or 63, 36 and
+  ~770 ms (reading every record in turn, the first version, cost 138 requests and 2.98 s at
+  63). Under load the fold keeps up: 1.0–1.6 unfolded records on average, at most 2, at 16
+  and 64 writers (`foldlag.jsonl`), so a reader normally pays one or two HEADs and one GET.
 - **Folded in the background, in order.** A fold task per branch writes `__manifest` version
   `V` from record `V` with the ordinary `commit::overwrite` (the same rows, so every history
   surface later sees exactly the versions it would have seen). A fold whose answer was lost
@@ -391,10 +399,17 @@ the cold registry rows the publication pushes, if any. Properties:
   (`OMNIGRAPH_WAL_MAX_UNFOLDED`), bounding the tail's length, the memory its rows hold and a
   cold reader's tail reads (Unity Catalog bounds unpublished commits at 50, SlateDB by
   bytes).
-- **Recovered by the next owner.** A writer-epoch claim first folds every record storage
-  holds above `__manifest`, then claims (the test `wal_recovery_and_cold_reads`: 7
-  acknowledged, unfolded writes survive a crash, a fresh reader sees all 12 rows, the next
-  owner folds them and continues).
+- **Fenced by a claim record, recovered by the next owner.** With the log on, a writer-epoch
+  claim is itself the record at the next version, built on a tail that first adopts the
+  records storage holds above `__manifest` (a previous owner's acknowledged, unfolded
+  writes). The record CAS orders the claim with every append, so a previous owner that is
+  still alive meets the claim at its next append, reads the higher writer epoch and is
+  refused `WriterFenced` (test `wal_claim_record_fences_the_previous_owner`, all three
+  staging modes); a previous owner's record that lands before the claim is adopted (it was
+  acknowledged first) and the claim retries one version up. This is SlateDB's and Lance
+  MemWAL's fence (occupy the next log slot), with the claim as the fence. Test
+  `wal_recovery_and_cold_reads`: 7 acknowledged, unfolded writes survive a crash, a fresh
+  reader sees all 12 rows, and the next owner's claim adopts and folds them.
 - **One path per branch.** Once the process holds a log of a branch, every head-advancing
   publication on it goes through the log, the group's batches and the ordinary path alike:
   the record's conditional create is what orders them (the mixed-workload test found the
@@ -504,15 +519,14 @@ derived lag, not a shadow copy that can drift.
 
 **Invariant 10 and the fencing support boundary.** The log relies on the writer epoch: only
 a process holding the branch's epoch appends records, and every head-advancing publication
-on a held branch goes through its log. The prototype's claim folds the previous owner's
-records and then claims, but does not yet write a fencing record: a previous owner that is
-still alive could append record V+1 after the new owner folded V and claimed at V+1 in
-`__manifest`. SlateDB and Lance MemWAL close exactly this gap by having the new writer
-occupy the next log slot with a fence before replay (`ShardWriter::open` writes a sentinel;
-SlateDB puts a zero-byte object at the next WAL id), so the old writer's next append
-collides and it learns it is fenced. A production version must do the same (claim → fence
-record at the next free version → fold up to the fence → publish), and readers must ignore
-records whose epoch is below the newest claim.
+on a held branch goes through its log. A claim is the record at the next version, so the
+record CAS fences an old owner exactly as SlateDB's fence object and MemWAL's sentinel do: its
+next append collides with the claim, it decodes the record and is refused with the typed
+`WriterFenced` (implemented and tested). An old owner's record that landed before the claim
+was acknowledged before the takeover, and the claim adopts it. Two production gaps remain:
+a fenced process should clear its holder entry and drop its log (the prototype refuses every
+later write instead), and readers should refuse a record whose epoch is lower than an earlier
+record's (it cannot happen through the protocol, but a reader should not trust it).
 
 **Deny-list: "a custom WAL ... already owned by Lance".** Lance owns per-dataset
 transactions; the graph's multi-dataset commit journal is Omnigraph's (today the
@@ -588,8 +602,9 @@ In order of dependency:
    - record format on Lance's `WalAppender` (one shard per branch life; epoch per entry);
      deltas rather than complete rows (the prototype stores complete rows: simplest, and a
      reader needs only the newest record, but bytes grow with the catalog);
-   - claim → fence record → fold to the fence → publish; readers ignore records below the
-     newest claim's epoch;
+   - fencing as prototyped (the claim is the next record; adoption of an earlier owner's
+     records; `WriterFenced` on a higher epoch), plus clearing the holder and dropping the
+     log when fenced, and readers refusing an epoch that goes backwards;
    - every reader that resolves a branch head made log-aware (opens, refreshes, probes:
      done in the prototype) and every history surface either log-aware or folding first;
    - the collector: records as retention roots, record deletion only after the fold landed

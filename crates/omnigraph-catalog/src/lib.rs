@@ -1036,9 +1036,7 @@ async fn latest_version_with_log(dataset: &Dataset) -> Result<u64> {
         .next()
         .unwrap_or_default()
         .to_string();
-    let records =
-        crate::wal::read_storage_tail(&root, native, &dataset.session(), folded).await?;
-    Ok(records.last().map_or(folded, |(version, _)| *version))
+    crate::wal::latest_record_version(&root, native, &dataset.session(), folded).await
 }
 
 async fn probe_dataset_latest_incarnation(
@@ -1884,14 +1882,14 @@ impl ManifestCoordinator {
         // version (one GET for the first absent one when caught up) and opens
         // at the newest, so an acknowledged write is visible to it.
         if crate::wal::enabled() && crate::wal::existing_tail(root, branch).is_none() {
-            let records = crate::wal::read_storage_tail(
+            let newest = crate::wal::read_latest_record(
                 root,
                 native_branch.as_deref(),
                 &dataset.session(),
                 dataset.version().version,
             )
             .await?;
-            if let Some((version, tip)) = records.into_iter().last() {
+            if let Some((version, tip)) = newest {
                 known_state = tip.state(version, native_branch.as_deref())?;
                 rows = tip;
             }
@@ -2174,15 +2172,13 @@ impl ManifestCoordinator {
                 Some(tail) if tail.native() == native_branch.as_deref() => tail
                     .above(dataset.version().version)
                     .map(|(version, rows)| (version, (*rows).clone())),
-                _ => crate::wal::read_storage_tail(
+                _ => crate::wal::read_latest_record(
                     &self.root_uri,
                     native_branch.as_deref(),
                     &control_session,
                     dataset.version().version,
                 )
-                .await?
-                .into_iter()
-                .last(),
+                .await?,
             };
             if let Some((version, tip)) = tip {
                 known_state = tip.state(version, native_branch.as_deref())?;

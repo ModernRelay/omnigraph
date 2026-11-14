@@ -485,6 +485,7 @@ struct CellResult {
     control_calls: u64,
     verified: bool,
     phases: [u64; 7],
+    fold_lag: (f64, u64),
 }
 
 fn percentile(sorted: &[u64], q: f64) -> u64 {
@@ -671,6 +672,7 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
 
     tokio::time::sleep(config.warmup).await;
     let _ = omnigraph::db::group_commit::stats::take();
+    let _ = omnigraph_catalog::wal::lag::take();
     let before = counters.snapshot();
     let control_before = control.mutation_calls.load(Ordering::Relaxed)
         + control.read_text.load(Ordering::Relaxed)
@@ -685,6 +687,7 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
     let elapsed = started.elapsed();
     let after = counters.snapshot();
     let phases = omnigraph::db::group_commit::stats::take();
+    let fold_lag = omnigraph_catalog::wal::lag::take();
     let control_after = control.mutation_calls.load(Ordering::Relaxed)
         + control.read_text.load(Ordering::Relaxed)
         + control.read_text_if_exists.load(Ordering::Relaxed)
@@ -704,6 +707,7 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
         control_calls: control_after - control_before,
         verified: false,
         phases,
+        fold_lag,
     };
     for handle in handles {
         let (commits, latencies, conflicts, errors, reprepares) = handle.await.unwrap();
@@ -810,6 +814,8 @@ fn report(config: &Config, mode: &str, writers: usize, mut result: CellResult) -
         "control_plane_calls": result.control_calls,
         "errors": result.other_errors.len(),
         "verified": result.verified,
+        "unfolded_records_mean": result.fold_lag.0,
+        "unfolded_records_max": result.fold_lag.1,
         "batches": result.phases[0],
         "mean_batch": result.phases[1] as f64 / result.phases[0].max(1) as f64,
         "batch_ms": {
@@ -1057,4 +1063,127 @@ async fn group_commit_mixed_workload_is_consistent() {
         "an acknowledged key is missing"
     );
     assert_eq!(seen.len(), acked.len(), "a key is present that no acknowledged insert wrote");
+}
+
+/// What reading the log tail costs a reader in another process: a cold open
+/// plus one row count on `main`, with `k` acknowledged records unfolded (run
+/// with `OMNIGRAPH_WAL=1`; `OG_WT_LATENCY_MS` per request).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "instrument: cold read cost over an unfolded log tail (WAL research)"]
+async fn wal_cold_read_cost() {
+    let latency = Duration::from_millis(env("OG_WT_LATENCY_MS", "20").parse().unwrap());
+    let counters = counters(latency);
+    for k in [0u64, 1, 8, 32, 63] {
+        let uri = format!("shared-memory://wt-coldread-{}-{k}/graph", std::process::id());
+        let adapter: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
+        let db = Omnigraph::init_with_storage(&uri, SCHEMA, Arc::clone(&adapter), InitOptions::default())
+            .await
+            .unwrap();
+        let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+        if omnigraph_catalog::wal::enabled() {
+            session.db().claim_branch_writer("main").await.unwrap();
+        }
+        session
+            .mutate("main", QUERIES, "put", &params("first", 0, None))
+            .await
+            .unwrap();
+        omnigraph_catalog::wal::quiesce_all().await.unwrap();
+        omnigraph_catalog::wal::FOLD_PAUSED.store(true, Ordering::SeqCst);
+        for i in 0..k {
+            session
+                .mutate("main", QUERIES, "put", &params(&format!("r{i}"), i as i64, None))
+                .await
+                .unwrap();
+        }
+        let before = counters.snapshot();
+        let started = Instant::now();
+        let fresh = {
+            // A reader with no log of the branch in its process.
+            let tails_hidden = omnigraph_catalog::wal::hide_tails();
+            let fresh = Omnigraph::open_with_storage(&uri, Arc::clone(&adapter)).await.unwrap();
+            let snapshot = fresh
+                .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+                .await
+                .unwrap();
+            let rows = snapshot
+                .open_dataset("node:Item")
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap() as u64;
+            drop(tails_hidden);
+            rows
+        };
+        let elapsed = started.elapsed();
+        let after = counters.snapshot();
+        let requests: u64 = after
+            .iter()
+            .map(|(key, value)| value - before.get(key).copied().unwrap_or(0))
+            .sum();
+        let wal_requests: u64 = after
+            .iter()
+            .filter(|((_, class), _)| *class == "wal")
+            .map(|(key, value)| value - before.get(key).copied().unwrap_or(0))
+            .sum();
+        eprintln!(
+            "cold read, {k} unfolded records: {fresh} rows (expect {}), {requests} requests ({wal_requests} on the log), {:.1} ms",
+            k + 1,
+            elapsed.as_secs_f64() * 1000.0
+        );
+        assert_eq!(fresh, k + 1);
+        omnigraph_catalog::wal::FOLD_PAUSED.store(false, Ordering::SeqCst);
+        omnigraph_catalog::wal::forget_all().await.unwrap();
+    }
+}
+
+/// Fencing through the log (run with `OMNIGRAPH_WAL=1`): a claim is the
+/// record at the next version, so after another process claims, this
+/// process's next append meets the claim, reads its higher writer epoch and is
+/// refused `WriterFenced`; nothing it tried lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "instrument: WAL fencing by a claim record (WAL research); run with OMNIGRAPH_WAL=1"]
+async fn wal_claim_record_fences_the_previous_owner() {
+    assert!(omnigraph_catalog::wal::enabled(), "run with OMNIGRAPH_WAL=1");
+    let _counters = counters(Duration::ZERO);
+    let uri = format!("shared-memory://wt-fence-{}/graph", std::process::id());
+    let adapter: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
+    let db = Omnigraph::init_with_storage(&uri, SCHEMA, Arc::clone(&adapter), InitOptions::default())
+        .await
+        .unwrap();
+    let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+    let epoch = session.db().claim_branch_writer("main").await.unwrap();
+    for i in 0..3 {
+        session
+            .mutate("main", QUERIES, "put", &params(&format!("before-{i}"), i, None))
+            .await
+            .unwrap();
+    }
+    let foreign = omnigraph_catalog::wal::forge_foreign_claim_for_tests(&uri, None)
+        .await
+        .unwrap();
+    assert_eq!(foreign, epoch + 1);
+    let refused = session
+        .mutate("main", QUERIES, "put", &params("after-takeover", 9, None))
+        .await
+        .expect_err("a write after another process's claim must be refused");
+    let text = format!("{refused:?}");
+    eprintln!("refused: {refused}");
+    assert!(text.contains("WriterFenced"), "expected WriterFenced, got {text}");
+    omnigraph_catalog::wal::forget_all().await.unwrap();
+    drop(session);
+    let fresh = Omnigraph::open_with_storage(&uri, Arc::clone(&adapter)).await.unwrap();
+    let snapshot = fresh
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let rows = snapshot
+        .open_dataset("node:Item")
+        .await
+        .unwrap()
+        .count_rows(None)
+        .await
+        .unwrap();
+    eprintln!("rows after the takeover: {rows} (expect 3)");
+    assert_eq!(rows, 3);
 }

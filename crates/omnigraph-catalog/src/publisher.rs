@@ -2182,6 +2182,8 @@ enum PreparedClaim {
         rows: ManifestRows,
         read: u64,
         known_state: ManifestState,
+        /// WAL research prototype: the log the claim is appended to.
+        tail: Option<Arc<crate::wal::Tail>>,
     },
 }
 
@@ -2229,25 +2231,26 @@ impl GraphNamespacePublisher {
         // folds the records a previous owner acknowledged and did not fold
         // (SlateDB-style recovery; the fencing record that would also stop a
         // live previous owner is not prototyped).
-        let (dataset, mut rows) = if crate::wal::enabled() {
+        // With the log on, the claim goes through it: the claim is the record
+        // at the next version, built on the tail (which first adopts a
+        // previous owner's unfolded records), so the record CAS orders it
+        // with every append and an old owner's next append meets it.
+        let (dataset, mut rows, base_version, tail) = if crate::wal::enabled() {
             let native = dataset.manifest().branch.clone();
-            let before = dataset.version().version;
-            let folded = crate::wal::fold_storage_tail(
+            let tail = crate::wal::tail_for(
                 &self.root_uri,
                 self.branch.as_deref(),
                 native.as_deref(),
                 &self.control_session,
-                dataset,
+                &dataset,
+                &rows,
             )
             .await?;
-            if folded.version().version == before {
-                (folded, rows)
-            } else {
-                let rows = crate::state::read_manifest_rows(&folded).await?;
-                (folded, rows)
-            }
+            let (version, tip, folded) = tail.snapshot();
+            (folded, (*tip).clone(), version, Some(tail))
         } else {
-            (dataset, rows)
+            let version = dataset.version().version;
+            (dataset, rows, version, None)
         };
         require_control_facts(guard_stamp(&dataset)?)?;
         let native = dataset.manifest().branch.clone();
@@ -2257,7 +2260,7 @@ impl GraphNamespacePublisher {
             self.assert_writer_epoch(current, native.as_deref(), EpochAssertion::Claim { read })?;
         self.check_publish_precondition(&dataset, &rows.head, &claim.identity)
             .await?;
-        let version = dataset.version().version;
+        let version = base_version;
         if verdict == EpochVerdict::AlreadyHeld {
             let known_state = rows.state(version, native.as_deref())?;
             return Ok(PreparedClaim::Held(WriterEpochClaim {
@@ -2279,12 +2282,39 @@ impl GraphNamespacePublisher {
             rows,
             read,
             known_state,
+            tail,
         })
     }
 
     /// Put a prepared claim and record what the process holds from here on.
     /// The version held before it is withdrawn first: the put moves the head,
     /// and one that is dropped or stays in doubt leaves no record.
+    /// WAL research prototype: append a claim as the record of the next
+    /// version.
+    async fn put_claim_record(
+        &self,
+        tail: &Arc<crate::wal::Tail>,
+        dataset: Dataset,
+        mut rows: ManifestRows,
+        mut known_state: ManifestState,
+    ) -> Result<WriterEpochClaim> {
+        let key = self.holder_key()?;
+        let native = tail.native().map(str::to_string);
+        let cold = rows.registry.cold_push();
+        self.holders.withdraw_version(key);
+        let version = known_state.version;
+        let folded = tail.append(version, &rows, cold.as_ref()).await?;
+        let _ = dataset;
+        let epoch = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native.as_deref());
+        known_state.version = version;
+        self.holders
+            .record_claim(key, native.as_deref(), epoch, version);
+        Ok(WriterEpochClaim {
+            epoch,
+            published: Self::control_fact_outcome(folded, rows, known_state),
+        })
+    }
+
     async fn put_claim(
         &self,
         claim: &ClaimIntent,
@@ -2373,10 +2403,17 @@ impl GraphNamespacePublisher {
                     rows,
                     read,
                     known_state,
-                }) => {
-                    self.put_claim(claim, dataset, rows, read, known_state)
-                        .await
-                }
+                    tail,
+                }) => match tail {
+                    Some(tail) => {
+                        self.put_claim_record(&tail, dataset, rows, known_state)
+                            .await
+                    }
+                    None => {
+                        self.put_claim(claim, dataset, rows, read, known_state)
+                            .await
+                    }
+                },
                 Err(err) => Err(err),
             };
             match attempted {

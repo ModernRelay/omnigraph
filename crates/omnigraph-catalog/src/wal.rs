@@ -116,6 +116,27 @@ fn key(root_uri: &str, branch: Option<&str>) -> TailKey {
     )
 }
 
+/// Research instrument: unfolded records seen at each append (sum, count,
+/// max), the fold lag under load.
+pub mod lag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static SUM: AtomicU64 = AtomicU64::new(0);
+    pub static COUNT: AtomicU64 = AtomicU64::new(0);
+    pub static MAX: AtomicU64 = AtomicU64::new(0);
+    pub fn record(unfolded: u64) {
+        SUM.fetch_add(unfolded, Ordering::Relaxed);
+        COUNT.fetch_add(1, Ordering::Relaxed);
+        MAX.fetch_max(unfolded, Ordering::Relaxed);
+    }
+    /// Take (mean, max) since the last take.
+    pub fn take() -> (f64, u64) {
+        let sum = SUM.swap(0, Ordering::Relaxed);
+        let count = COUNT.swap(0, Ordering::Relaxed);
+        let max = MAX.swap(0, Ordering::Relaxed);
+        (sum as f64 / count.max(1) as f64, max)
+    }
+}
+
 /// Research instrument: while set, folds do not run (a crash between the
 /// records and their fold).
 pub static FOLD_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -136,35 +157,45 @@ pub fn crash_forget_all() {
     }
 }
 
-/// Fold, before a publication that does not go through a log (a writer
-/// epoch claim taking a branch over), every record storage holds above
-/// `dataset`, the latest folded `__manifest` version: a previous owner's
-/// acknowledged, unfolded writes. Answers the folded dataset. A log this
-/// process holds is folded instead.
-pub(crate) async fn fold_storage_tail(
-    root_uri: &str,
-    branch: Option<&str>,
-    native: Option<&str>,
-    session: &Arc<lance::session::Session>,
-    dataset: Dataset,
-) -> Result<Dataset> {
-    if let Some(tail) = existing_tail(root_uri, branch) {
-        tail.quiesce().await?;
-        return Ok(tail.snapshot().2);
-    }
-    let records = read_storage_tail(root_uri, native, session, dataset.version().version).await?;
-    let mut folded = dataset;
-    for (version, rows) in records {
-        let (next, _) = crate::commit::overwrite(folded, &rows, None).await?;
-        if next.version().version != version {
-            return Err(OmniError::manifest_internal(format!(
-                "recovered record {version} folded as __manifest version {}",
-                next.version().version
-            )));
+/// Research instrument: write, straight to storage and outside this
+/// process's log, the claim another process would append for `(root,
+/// branch)`: this process's tip rows with the writer epoch raised by one, at
+/// the version after the tip. The process's own next append then meets it.
+pub async fn forge_foreign_claim_for_tests(root_uri: &str, branch: Option<&str>) -> Result<u64> {
+    let tail = existing_tail(root_uri, branch)
+        .ok_or_else(|| OmniError::manifest_internal("no log to forge a claim over"))?;
+    let (version, tip, _) = tail.snapshot();
+    let mut rows = (*tip).clone();
+    let current = rows.writer_epoch.as_ref().map_or(0, |row| row.epoch);
+    rows.writer_epoch = Some(crate::state::WriterEpochRow {
+        epoch: current + 1,
+        native: tail.native.clone(),
+        attempt_id: ulid::Ulid::new().to_string(),
+    });
+    let bytes = encode(&rows, None)?;
+    tail.store
+        .put_if_absent(&tail.base.clone().join(record_name(version + 1)), bytes.into())
+        .await
+        .map_err(|error| OmniError::storage(error.into()))?;
+    Ok(current + 1)
+}
+
+/// Research instrument: hide every log this process holds from opens until
+/// the guard drops, as if the reader ran in another process.
+pub fn hide_tails() -> HiddenTails {
+    let hidden = std::mem::take(&mut *TAILS.lock().expect("wal tails poisoned"));
+    HiddenTails(Some(hidden))
+}
+
+/// The guard of [`hide_tails`].
+pub struct HiddenTails(Option<HashMap<TailKey, Arc<Tail>>>);
+
+impl Drop for HiddenTails {
+    fn drop(&mut self) {
+        if let Some(hidden) = self.0.take() {
+            TAILS.lock().expect("wal tails poisoned").extend(hidden);
         }
-        folded = next;
     }
-    Ok(folded)
 }
 
 /// Research instrument: wait until every log this process holds is folded.
@@ -281,6 +312,80 @@ pub(crate) async fn read_storage_tail(
             Err(error) => return Err(OmniError::storage(error.into())),
         }
     }
+}
+
+/// The newest record version above `folded_version` storage holds, or
+/// `folded_version` when there is none: one HEAD when the log is caught up;
+/// otherwise one round of HEADs over the bounded tail (records are contiguous,
+/// so the newest is the last of the leading run of present names).
+pub(crate) async fn latest_record_version(
+    root_uri: &str,
+    native: Option<&str>,
+    session: &Arc<lance::session::Session>,
+    folded_version: u64,
+) -> Result<u64> {
+    let (store, base) = open_store(root_uri, native, session).await?;
+    let exists = |version: u64| {
+        let store = Arc::clone(&store);
+        let path = base.clone().join(record_name(version));
+        async move {
+            match store.inner.head(&path).await {
+                Ok(_) => Ok(true),
+                Err(object_store::Error::NotFound { .. }) => Ok(false),
+                Err(error) => Err(OmniError::storage(error.into())),
+            }
+        }
+    };
+    if !exists(folded_version + 1).await? {
+        return Ok(folded_version);
+    }
+    // Exponential probe, then binary search (SlateDB's WAL tail probe):
+    // records are contiguous, so `present` is a prefix of the versions.
+    let mut present = folded_version + 1;
+    let mut step = 1u64;
+    let absent = loop {
+        let candidate = present + step;
+        if exists(candidate).await? {
+            present = candidate;
+            step *= 2;
+        } else {
+            break candidate;
+        }
+    };
+    let (mut low, mut high) = (present, absent);
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        if exists(middle).await? {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    Ok(low)
+}
+
+/// The newest record above `folded_version` with its complete rows, or `None`
+/// when the log holds none: what a reader with no log of the branch in its
+/// process opens at. One HEAD when caught up; otherwise one round of HEADs and
+/// one GET.
+pub(crate) async fn read_latest_record(
+    root_uri: &str,
+    native: Option<&str>,
+    session: &Arc<lance::session::Session>,
+    folded_version: u64,
+) -> Result<Option<(u64, ManifestRows)>> {
+    let newest = latest_record_version(root_uri, native, session, folded_version).await?;
+    if newest == folded_version {
+        return Ok(None);
+    }
+    let (store, base) = open_store(root_uri, native, session).await?;
+    let result = store
+        .inner
+        .get(&base.join(record_name(newest)))
+        .await
+        .map_err(|error| OmniError::storage(error.into()))?;
+    let bytes = result.bytes().await.map_err(|e| OmniError::storage(e.into()))?;
+    Ok(Some((newest, decode(&bytes)?)))
 }
 
 /// The tail of `(root, native)`, created over `dataset` (the latest folded
@@ -405,20 +510,44 @@ impl Tail {
         let bytes = encode(rows, cold)?;
         let path = self.base.clone().join(record_name(version));
         if let Err(error) = self.store.put_if_absent(&path, bytes.clone().into()).await {
-            // A held name is the version CAS lost, or our own earlier copy
-            // whose answer was lost: read it back by its bytes.
-            match self.store.inner.get(&path).await {
-                Ok(result) => {
-                    let existing = result.bytes().await.map_err(|e| OmniError::storage(e.into()))?;
-                    if existing != bytes {
-                        return Err(OmniError::manifest_read_set_changed(
-                            format!("wal_record:{version}"),
-                            None,
-                            None,
-                        ));
-                    }
-                }
+            // A held name is our own earlier copy whose answer was lost (equal
+            // bytes), or another writer's record: a lower or equal writer
+            // epoch is a previous owner's acknowledged write that landed
+            // first, adopted into this tail so the next attempt builds above
+            // it; a higher epoch fences this writer (the claim is a record,
+            // so a takeover always occupies a slot an old owner reaches).
+            let existing = match self.store.inner.get(&path).await {
+                Ok(result) => result.bytes().await.map_err(|e| OmniError::storage(e.into()))?,
                 Err(_) => return Err(OmniError::storage(error.into())),
+            };
+            if existing != bytes {
+                let theirs = decode(&existing)?;
+                let epoch_of = |rows: &ManifestRows| rows.writer_epoch.as_ref().map_or(0, |row| row.epoch);
+                let (ours_epoch, their_epoch) = (epoch_of(rows), epoch_of(&theirs));
+                if their_epoch > ours_epoch {
+                    return Err(OmniError::manifest_writer_fenced(
+                        self.native.as_deref().unwrap_or("main"),
+                        Some(ours_epoch),
+                        None,
+                        their_epoch,
+                    ));
+                }
+                let mut state = self.state.lock().expect("wal tail poisoned");
+                if state.tip_version + 1 == version {
+                    let theirs = Arc::new(theirs);
+                    state.tip_version = version;
+                    state.tip_rows = Arc::clone(&theirs);
+                    state.pending.push_back(Pending {
+                        version,
+                        rows: theirs,
+                        cold: None,
+                    });
+                    drop(state);
+                    self.wake.notify_one();
+                }
+                return Err(OmniError::manifest_row_level_cas_contention(format!(
+                    "WAL record {version} is held by another writer's record"
+                )));
             }
         }
         let mut state = self.state.lock().expect("wal tail poisoned");
@@ -430,6 +559,7 @@ impl Tail {
             rows,
             cold: cold.cloned().map(Arc::new),
         });
+        lag::record(state.pending.len() as u64);
         let folded = state.folded.clone();
         drop(state);
         self.wake.notify_one();

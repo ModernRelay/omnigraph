@@ -291,3 +291,24 @@ fixed binary (`final-wal-recheck`: 63.1 and 279.0 at N=16/64).
 
 Also fixed: a pipelined batch whose merged write is not insertion-only (an upsert met an
 existing key) is refused before any chain tip moves, instead of failing in composition.
+
+## Cold reads over the tail, fold lag, fencing by a claim record, 2026-11-14
+
+- `wal_cold_read_cost` (20 ms, a reader with no in-process log: open + one count): first
+  version read every record in turn, twice per open: k=63 unfolded cost 138 requests,
+  2.98 s. A parallel window of HEADs bounded latency (350 ms) at ~140 requests. Final: one
+  HEAD when caught up, else exponential probe + binary search, then GET only the newest
+  record (complete rows): k=0 8 req 178 ms (no log: 9 req 178 ms); k=1 14 req 306 ms; k=8
+  26 req 558 ms; k=32/63 36 req ~770 ms.
+- Fold lag (`results/foldlag.jsonl`, final config, mem 20 ms): mean unfolded records at an
+  append 1.0 (N=1), 1.6 (N=16, 64 one branch), 1.0 (branches); max 2.
+- Fencing: a claim with the log on is the record at the next version (`prepare_claim` builds
+  it on the tail, `put_claim_record` appends it). `Tail::append` on a held name: equal bytes =
+  our lost ack; a record with a higher writer epoch = `WriterFenced`; lower/equal epoch = a
+  previous owner's acknowledged record, adopted (tip advanced, folded) and the attempt is
+  retried as `RowLevelCasContention`. Test `wal_claim_record_fences_the_previous_owner`
+  (forges another process's claim record at tip+1): the old owner's next write is refused
+  `WriterFenced`, the graph keeps 3 rows; passes with writer staging, leader staging and the
+  pipeline. Group commit now fans a fenced batch out as typed `WriterFenced`. Recheck with
+  claims as records (`final-wal-fenced`): one branch 7.1 / 63.4 / 285.0 at N=1/16/64,
+  branches 7.0 / 110.0 / 195.5; mixed test 2 of 2.
