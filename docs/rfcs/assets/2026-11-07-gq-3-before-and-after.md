@@ -885,18 +885,18 @@ Unchanged in both editions: `show`, `branch`, `commit`, `load`, `explain`,
 and the `set` settings. Edition 3 adds nothing at this level and has no
 edition line.
 
-## What the rewriter does to the edition 2 column
+## What a rewrite does to the edition 2 column
 
-Every difference between the columns is a rewriter row. Most examples
-differ only by the respelling rows: commas between elements, items and
-assignments; filters and property maps moved into one `where`; `not { }`
+Every difference between the columns is a row of the respelling map. Most
+examples differ only by the respelling rows: commas between elements, items
+and assignments; filters and property maps moved into one `where`; `not { }`
 written `not exists { }`; a block's filters in its own `where`; a write's
-selection in a `match`; and the bare name of a reserved edge. The others
-are the infix string predicates, the list `contains`, the positional
-`fuzzy` option, `nearest` and `bm25` out of `order` and `return`, `rrf` out
-of `order`, and the `where` on `update` and `delete`. The one-shot rewriter
-applies every row to this repository's text in the break, and no shipped
-command does; a stored source in the old syntax fails with a diagnostic
-whose fix applies the row; every row but `rrf` is proved IR-equal and the
-`rrf` row rows-equal. Every "Not supported" above is new text that
+selection in a `match`; and the bare name of a reserved edge. The others are
+the infix string predicates, the list `contains`, the positional `fuzzy`
+option, `nearest` and `bm25` out of `order` and `return`, `rrf` out of
+`order`, and the `where` on `update` and `delete`. No rewriter is built and
+no shipped command converts text: agents apply the rows to this repository's
+text in the break, and a stored source in the old syntax fails with a
+diagnostic whose fix applies the row. The GQT corpus keeping its rows,
+shapes and plans is the proof. Every "Not supported" above is new text that
 edition 2 never parsed, so it rewrites nothing.
