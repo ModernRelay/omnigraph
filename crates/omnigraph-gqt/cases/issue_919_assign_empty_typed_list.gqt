@@ -2,7 +2,7 @@
 # red_on: main @ 9fb5b48e: inserting [] into an [I64] property failed with T3, expected [I64] but got [String].
 
 --- runner
-timeout_ms: 60000
+timeout_ms: 10000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem
