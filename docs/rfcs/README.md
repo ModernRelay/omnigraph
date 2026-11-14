@@ -48,8 +48,9 @@ RFCs 0001 to 0068 use `NNNN-kebab-title.md`, the heading
 closed at 0068: no new number is allocated, and `scripts/check-docs.py`
 rejects any numbered filename outside the allocated and reserved numbers it
 lists. Numbers reserved by PRs that were open
-when the namespace closed (0047 and 0048 by PR #606, carried on by PR #791
-and PR #793; 0050 by the
+when the namespace closed (0047 and 0048 by PR #606, 0047 carried on by
+PR #791 and 0048 by PR #793 until its content was folded into the
+[GQ 3 RFC](2026-11-07-gq-3.md) on 2026-11-07, leaving 0048 unused; 0050 by the
 `rfc/0050-engine-crate-topology` branch; 0056 by PR #670; 0059 by PR #675;
 0060 by PR #677; 0067 and 0068 by PR #725) may still land under their
 reserved numbers. Every other gap
@@ -255,6 +256,7 @@ then dated RFCs by date.
 | [2026-10-19](2026-10-19-storage-outcomes-and-restartable-ownership.md) | Storage outcomes per operation and restartable ownership | maintainer | accepted | in-progress |
 | [2026-10-20](2026-10-20-operator-connections-and-credential-providers.md) | Operator profiles and credential providers | maintainer | draft | in-progress |
 | [2026-10-26](2026-10-26-change-discovery-by-fragment-identity.md) | Change discovery by fragment and row identity | maintainer | draft | in-progress |
+| [2026-11-07](2026-11-07-gq-3.md) | GQ 3: the language, its search contracts, one break and the programme | maintainer | draft | not-started |
 | [2026-10-29](2026-10-29-remote-optimize-through-the-serving-owner.md) | Remote optimize through the serving owner | maintainer | accepted | in-progress |
 | [2026-11-09](2026-11-09-writer-epoch-fence.md) | Writer epoch fence on the branch manifest | maintainer | draft | not-started |
 | [2026-11-10](2026-11-10-writes-carried-over-row-preserving-publications.md) | Writes carried over row-preserving publications | maintainer | draft | in-progress |
