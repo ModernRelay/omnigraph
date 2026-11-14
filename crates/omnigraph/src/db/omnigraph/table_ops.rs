@@ -1653,6 +1653,9 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         txn.authority.graph_head.clone(),
     );
 
+    let publish_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+        crate::instrumentation::phase_timers::WritePhase::Publish,
+    );
     let advances_head = matches!(publication, Publication::Publish);
     let installed = db.coordinator.load_full();
     let bound_view = if branch == installed.current_branch() {
@@ -1673,10 +1676,17 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     let published = if let Some(captured) = bound_view {
         let mut next = match captured {
             Some(view) => view,
-            None => db
-                .open_coordinator_for_branch(branch)
-                .await
-                .map_err(OmniError::unpublished)?,
+            None => {
+                let open_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+                    crate::instrumentation::phase_timers::WritePhase::CoordinatorOpen,
+                );
+                let opened = db
+                    .open_coordinator_for_branch(branch)
+                    .await
+                    .map_err(OmniError::unpublished)?;
+                open_timer.stop();
+                opened
+            }
         };
         let outcome = publish_prepared(
             &mut next,
@@ -1694,10 +1704,9 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         // it must never temporarily change this handle's query/write binding.
         let cache_key = branch.unwrap_or("main");
         let captured = {
-            let mut cache = db.merge_authority_cache.lock().await;
-            let matches = if let Some((key, coordinator)) = cache.as_ref() {
-                key == cache_key
-                    && coordinator.current_branch() == branch
+            let cache = db.merge_authority_cache.lock(cache_key).await;
+            let matches = if let Some(coordinator) = cache.as_ref() {
+                coordinator.current_branch() == branch
                     && coordinator
                         .branch_identifier()
                         .await
@@ -1708,18 +1717,23 @@ pub(super) async fn commit_updates_on_branch_with_expected(
             } else {
                 false
             };
-            if matches {
-                cache.take().map(|(_, coordinator)| coordinator)
-            } else {
-                None
-            }
+            // Research: publish on a copy so captures and reads of this
+            // branch keep the warm view while the publication is in flight.
+            if matches { cache.clone() } else { None }
         };
         let mut coordinator = match captured {
             Some(coordinator) => coordinator,
-            None => db
-                .open_coordinator_for_branch(branch)
-                .await
-                .map_err(OmniError::unpublished)?,
+            None => {
+                let open_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+                    crate::instrumentation::phase_timers::WritePhase::CoordinatorOpen,
+                );
+                let opened = db
+                    .open_coordinator_for_branch(branch)
+                    .await
+                    .map_err(OmniError::unpublished)?;
+                open_timer.stop();
+                opened
+            }
         };
         // The cache supplies only the already captured starting view. The
         // publisher still reads fresh state and enforces ExactGraphHead on
@@ -1735,9 +1749,10 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         )
         .await
         .map_err(|error| caller_precondition_at_publish(txn, branch, error))?;
-        *db.merge_authority_cache.lock().await = Some((cache_key.to_string(), coordinator));
+        *db.merge_authority_cache.lock(cache_key).await = Some(coordinator);
         published
     };
+    publish_timer.stop();
     if advances_head {
         demote_superseded_handles(db, &txn.base, updates).await;
     }

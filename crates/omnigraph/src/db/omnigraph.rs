@@ -404,6 +404,60 @@ impl HandleSchemaView {
 /// An Omnigraph is a Lance-native graph database with git-style branching.
 /// It stores typed property graphs as per-type Lance datasets coordinated
 /// through a Lance manifest table.
+/// Most branches whose authority coordinator a handle keeps warm. Each entry
+/// holds one branch's complete projection, so the bound is a memory bound.
+pub(crate) const BRANCH_AUTHORITY_CACHE_ENTRIES: usize = 64;
+
+type AuthoritySlot = Arc<tokio::sync::Mutex<Option<GraphCoordinator>>>;
+
+/// One authority-coordinator slot per branch (research: replaces the
+/// single-entry cache). The map is locked only to find or insert a slot,
+/// never across a round trip; each slot has its own async mutex, held by a
+/// capture across its probe and refresh, so captures on different branches
+/// never wait for each other.
+pub(crate) struct BranchAuthorityCache {
+    slots: std::sync::Mutex<(u64, HashMap<String, (u64, AuthoritySlot)>)>,
+}
+
+impl BranchAuthorityCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: std::sync::Mutex::new((0, HashMap::new())),
+        }
+    }
+
+    fn slot(&self, key: &str) -> AuthoritySlot {
+        let mut guard = self.slots.lock().expect("authority cache map poisoned");
+        let (tick, map) = &mut *guard;
+        *tick += 1;
+        let now = *tick;
+        if let Some((used, slot)) = map.get_mut(key) {
+            *used = now;
+            return slot.clone();
+        }
+        if map.len() >= BRANCH_AUTHORITY_CACHE_ENTRIES
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (used, _))| *used)
+                .map(|(key, _)| key.clone())
+        {
+            map.remove(&oldest);
+        }
+        // forbidden-api-allow: a per-branch cache slot, not a writer gate (write_queue §Gates)
+        let slot: AuthoritySlot = Arc::new(tokio::sync::Mutex::new(None));
+        map.insert(key.to_string(), (now, slot.clone()));
+        slot
+    }
+
+    /// Lock `key`'s slot.
+    pub(crate) async fn lock(
+        &self,
+        key: &str,
+    ) -> tokio::sync::OwnedMutexGuard<Option<GraphCoordinator>> {
+        self.slot(key).lock_owned().await
+    }
+}
+
 pub struct Omnigraph {
     root_uri: String,
     storage: Arc<dyn StorageAdapter>,
@@ -476,7 +530,12 @@ pub struct Omnigraph {
     /// across that open would make captures on different branches wait out
     /// each other's full open. Two captures that miss on the same branch
     /// open it twice; the entry is a hint either way.
-    merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
+    ///
+    /// Research (concurrent writes): one slot per branch, bounded by
+    /// [`BRANCH_AUTHORITY_CACHE_ENTRIES`], so writers on different non-bound
+    /// branches neither evict each other's coordinator nor serialize on one
+    /// mutex across the probe, refresh and open round trips.
+    merge_authority_cache: BranchAuthorityCache,
     /// The settled commits this handle has read from `__history`, shared by
     /// every coordinator it opens. Only an operation that asks for history
     /// fills it.
@@ -797,7 +856,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            merge_authority_cache: BranchAuthorityCache::new(),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -1004,7 +1063,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            merge_authority_cache: BranchAuthorityCache::new(),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -1160,7 +1219,7 @@ impl Omnigraph {
             read_caches: Arc::clone(&self.read_caches),
             schema_view: Arc::clone(&self.schema_view),
             write_queue: Arc::clone(&self.write_queue),
-            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            merge_authority_cache: BranchAuthorityCache::new(),
             history: self.history.clone(),
             policy,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -1630,7 +1689,6 @@ impl Omnigraph {
         Ok(cache
             .as_ref()
             .expect("validated authority cache entry is present")
-            .1
             .capture_for_branch_control())
     }
 
@@ -1995,10 +2053,9 @@ impl Omnigraph {
         if !bound {
             return Box::pin(async {
                 let cache = self.validated_cached_coordinator(branch).await?;
-                let coord = &cache
+                let coord = cache
                     .as_ref()
-                    .expect("validated authority cache entry is present")
-                    .1;
+                    .expect("validated authority cache entry is present");
                 Ok((
                     coord.branch_identifier().await?,
                     coord.exact_graph_head(),
@@ -2075,10 +2132,9 @@ impl Omnigraph {
         crate::db::manifest::CapturedManifestProbe,
     )> {
         let cache = self.validated_cached_coordinator(branch).await?;
-        let coord = &cache
+        let coord = cache
             .as_ref()
-            .expect("validated authority cache entry is present")
-            .1;
+            .expect("validated authority cache entry is present");
         Ok((
             coord.branch_identifier().await?,
             coord.exact_graph_head(),
@@ -2092,21 +2148,15 @@ impl Omnigraph {
         ))
     }
 
-    /// Select and freshly validate the existing single-entry authority cache.
+    /// Select and freshly validate the branch's authority cache slot.
     /// Returning its guard keeps selection and capture in one critical section.
     async fn validated_cached_coordinator(
         &self,
         branch: Option<&str>,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<(String, GraphCoordinator)>>> {
+    ) -> Result<tokio::sync::OwnedMutexGuard<Option<GraphCoordinator>>> {
         let key = branch.unwrap_or("main").to_string();
-        let mut cache = self.merge_authority_cache.lock().await;
-        if cache
-            .as_ref()
-            .is_some_and(|(cached_key, _)| cached_key != &key)
-        {
-            *cache = None;
-        }
-        if let Some((_, coord)) = cache.as_mut() {
+        let mut cache = self.merge_authority_cache.lock(&key).await;
+        if let Some(coord) = cache.as_mut() {
             let held = coord.manifest_incarnation();
             let current = match coord.probe_latest_incarnation().await {
                 Ok(latest) => latest.matches(&held),
@@ -2124,14 +2174,11 @@ impl Omnigraph {
                 }
             }
         } else {
-            // A miss reopens the branch's coordinator: many storage round
-            // trips. Open it without the lock so captures on other branches
-            // proceed meanwhile, then install it; the entry is a hint, and
-            // the capture reads it under the returned guard.
-            drop(cache);
+            // A miss reopens the branch's coordinator under this branch's slot
+            // alone: captures on other branches proceed, and a second capture
+            // of this branch waits for this open instead of repeating it.
             let coord = self.open_coordinator_for_branch(branch).await?;
-            cache = self.merge_authority_cache.lock().await;
-            *cache = Some((key, coord));
+            *cache = Some(coord);
         }
         Ok(cache)
     }
@@ -2141,10 +2188,11 @@ impl Omnigraph {
         branch: Option<&str>,
         target: &ReadTarget,
     ) -> Result<Option<ResolvedTarget>> {
-        let cache = self.merge_authority_cache.lock().await;
-        let Some((_, coordinator)) = cache.as_ref().filter(|(key, coordinator)| {
-            key == branch.unwrap_or("main") && coordinator.current_branch() == branch
-        }) else {
+        let cache = self.merge_authority_cache.lock(branch.unwrap_or("main")).await;
+        let Some(coordinator) = cache
+            .as_ref()
+            .filter(|coordinator| coordinator.current_branch() == branch)
+        else {
             return Ok(None);
         };
         let held = coordinator.manifest_incarnation();
@@ -3504,7 +3552,7 @@ impl Omnigraph {
             }
         }
         let cache = self.validated_cached_coordinator(branch).await?;
-        let (_, coord) = cache
+        let coord = cache
             .as_ref()
             .expect("validated authority cache entry is present");
         Self::descends_linearly_from(coord, from, from_commit, to).await
@@ -4584,16 +4632,7 @@ impl Omnigraph {
         fail(&BRANCH_CONTROL_PRE_GATES).map_err(OmniError::before_effect)?;
         let _schema_permit = self.write_queue().acquire_schema_shared().await?;
         let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await?;
-        let mut cache = self.merge_authority_cache.lock().await;
-        let cached_target = if cache
-            .as_ref()
-            .is_some_and(|(cached_branch, _)| cached_branch == &branch)
-        {
-            cache.take().map(|(_, coordinator)| coordinator)
-        } else {
-            None
-        };
-        drop(cache);
+        let cached_target = self.merge_authority_cache.lock(&branch).await.take();
         let branches = [Some(branch.clone())];
         let warm_snapshot = self.coordinator.load_full().snapshot();
         let (control_catalog, identity) = self
@@ -5017,7 +5056,7 @@ impl Omnigraph {
         } else {
             let mut coordinator = self.open_coordinator_for_branch(target.as_deref()).await?;
             let published = coordinator.publish_unpublished(&candidate).await?;
-            *self.merge_authority_cache.lock().await = Some((target_name, coordinator));
+            *self.merge_authority_cache.lock(&target_name).await = Some(coordinator);
             published
         };
         self.invalidate_graph_index_for(
