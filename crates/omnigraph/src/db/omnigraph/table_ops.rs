@@ -1692,30 +1692,25 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     } else {
         // An operation on a non-bound branch owns its coordinator locally;
         // it must never temporarily change this handle's query/write binding.
-        let cache_key = branch.unwrap_or("main");
-        let captured = {
-            let mut cache = db.merge_authority_cache.lock().await;
-            let matches = if let Some((key, coordinator)) = cache.as_ref() {
-                key == cache_key
-                    && coordinator.current_branch() == branch
-                    && coordinator
-                        .branch_identifier()
-                        .await
-                        .map_err(OmniError::unpublished)?
-                        == txn.authority.branch_identifier
+        // It starts from a copy of the branch's cached authority only when
+        // that entry is exactly the captured view, so captures and reads of
+        // the branch keep the entry while the publication runs.
+        let cached = db.branch_authorities.get(branch);
+        let started_from = match cached {
+            Some(coordinator) if coordinator.current_branch() == branch => {
+                let identifier = coordinator
+                    .branch_identifier()
+                    .await
+                    .map_err(OmniError::unpublished)?;
+                (identifier == txn.authority.branch_identifier
                     && coordinator.exact_graph_head() == txn.authority.graph_head
-                    && coordinator.version() == txn.base.graph_manifest_version()
-            } else {
-                false
-            };
-            if matches {
-                cache.take().map(|(_, coordinator)| coordinator)
-            } else {
-                None
+                    && coordinator.version() == txn.base.graph_manifest_version())
+                .then_some(coordinator)
             }
+            _ => None,
         };
-        let mut coordinator = match captured {
-            Some(coordinator) => coordinator,
+        let mut coordinator = match &started_from {
+            Some(coordinator) => crate::db::graph_coordinator::GraphCoordinator::clone(coordinator),
             None => db
                 .open_coordinator_for_branch(branch)
                 .await
@@ -1723,9 +1718,10 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         };
         // The cache supplies only the already captured starting view. The
         // publisher still reads fresh state and enforces ExactGraphHead on
-        // every CAS attempt. On error, drop a taken cache view; the next
-        // capture must resolve any ambiguous durable publication.
-        let published = publish_prepared(
+        // every CAS attempt. On error, discard the entry the publication
+        // started from; the next capture must resolve any ambiguous durable
+        // publication from storage.
+        let outcome = publish_prepared(
             &mut coordinator,
             &changes,
             expected_table_versions,
@@ -1733,10 +1729,24 @@ pub(super) async fn commit_updates_on_branch_with_expected(
             expectation,
             publication,
         )
-        .await
-        .map_err(|error| caller_precondition_at_publish(txn, branch, error))?;
-        *db.merge_authority_cache.lock().await = Some((cache_key.to_string(), coordinator));
-        published
+        .await;
+        match outcome {
+            Ok(published) => {
+                db.branch_authorities
+                    .install(coordinator, started_from.as_ref());
+                published
+            }
+            Err(error) => {
+                if let Some(started_from) = &started_from {
+                    db.branch_authorities.discard(
+                        branch,
+                        started_from,
+                        crate::db::branch_authority::Discard::PublishFailed,
+                    );
+                }
+                return Err(caller_precondition_at_publish(txn, branch, error));
+            }
+        }
     };
     if advances_head {
         demote_superseded_handles(db, &txn.base, updates).await;

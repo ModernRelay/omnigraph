@@ -48,16 +48,30 @@ schema/catalog, target graph branch, optional graph head, native branch
 identity, table-incarnation identities, and expected table versions. Every
 planning and validation step uses that view.
 
-Ordinary non-bound branch writes retain their capture in the same one-entry
-coordinator cache used by branch merge. Branch merge also uses the captured
-target for physical table opens and publication. It never changes the `Omnigraph` handle's active branch while the
-merge runs. Publication reuses the active coordinator, or takes the cached
-non-active target coordinator, only when its branch identity, graph head, and
-manifest version match the captured transaction; otherwise it opens the target
-coordinator from durable state. The publisher independently reads fresh authority
-and enforces the exact graph-head precondition on every attempt. Successful
-publication returns a taken coordinator to the one-entry merge cache; failure
-drops it. The intent nonce and timestamps are minted for the captured branch
+A write, merge, branch-source capture or diff on a branch other than the
+handle's bound branch captures from the handle's per-branch authority cache
+(`db/branch_authority.rs`): one coordinator per branch, for at most 64
+branches, the least recently used evicted beyond that. Every capture first
+probes the branch's manifest incarnation. A branch that advanced within its
+lifetime is refreshed on a copy; one deleted and created again under its name
+(another branch identifier) loses its entry and is opened from durable state,
+never refreshed into the old lifetime's entry. Branch merge also uses the
+captured target for physical table opens and publication. It never changes the
+`Omnigraph` handle's active branch while the merge runs. Publication starts
+from the active coordinator, or from a copy of the target's cached
+coordinator, only when its branch identity, graph head, and manifest version
+match the captured transaction; otherwise it opens the target coordinator from
+durable state. The publisher independently reads fresh authority and enforces
+the exact graph-head precondition on every attempt. A successful publication
+installs its coordinator as the branch's entry unless the entry already holds
+a newer version of that lifetime; a failed one discards the entry it started
+from. The cache is a hint whose lock is held across no round trip, so two
+operations that miss on one branch both open it. Named-branch reads borrow a
+current entry and never insert one, and branch delete takes the deleted
+branch's entry after its branch gate. Evictions and discards are `debug`
+events under the `omnigraph::branch_authority` target.
+
+The intent nonce and timestamps are minted for the captured branch
 without reloading manifest history; the publish wraps the nonce into the
 addressable commit id `hb1.<block>.<slot>.<nonce>`. The existing schema and branch gates still serialize
 conflicting control operations. A merge holds its target's branch gate and
@@ -71,7 +85,7 @@ the merge's final re-read still refuses a source whose incarnation or schema
 changed.
 
 Native branch creation uses an operation-local capture of the bound coordinator
-or that same one-entry cache after the control gates. Reuse
+or that same per-branch cache after the control gates. Reuse
 requires a fresh match of the complete manifest incarnation, including the
 native branch lifetime; a stale or missing view takes the existing refresh/open
 path. Captures share immutable lineage and the Lance session, copy current

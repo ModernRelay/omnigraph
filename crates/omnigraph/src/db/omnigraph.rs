@@ -452,31 +452,23 @@ pub struct Omnigraph {
     /// independently opened handles is required because ref deletion is
     /// destructive.
     write_queue: Arc<crate::db::write_queue::WriteQueueManager>,
-    /// One hot non-bound authority coordinator, shared by merge preparation
-    /// and branch-source capture, so repeated operations stop paying a fresh
-    /// open with a full O(history) `__manifest` scan.
-    /// Each use revalidates with the
-    /// manifest-incarnation probe (the same currency the bound-branch fast
-    /// path trusts, including the BranchIdentifier delete/recreate fence)
-    /// and refreshes via the incremental projection fold — provably current
-    /// or full read. Entries are evicted on refresh failure and purged on
-    /// branch delete. Capacity is deliberately one: the handle's bound
-    /// coordinator is the common target and retaining one counterpart covers
-    /// that hot shape without multiplying complete lineage by live branches.
-    /// A merge between two non-bound branches temporarily references both
-    /// complete maps through O(1)-to-clone immutable snapshots, but persists
-    /// only the most recently used coordinator. A non-bound publisher
-    /// may take the exact captured target view from this slot as its starting
-    /// state; its independent fresh graph-head CAS remains authoritative. A
-    /// successful publish returns the updated coordinator, while failure drops
-    /// the taken view so the next capture starts fresh.
-    /// The mutex serializes a capture's selection and read of the entry, but
-    /// a miss opens the branch's coordinator with the mutex released: the
-    /// schema gate is shared by merges and branch captures, so holding it
-    /// across that open would make captures on different branches wait out
-    /// each other's full open. Two captures that miss on the same branch
-    /// open it twice; the entry is a hint either way.
-    merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
+    /// The authority coordinator of every branch this handle uses other
+    /// than its bound branch, one entry per branch
+    /// ([`crate::db::branch_authority`]): writes, merges, branch-source
+    /// captures, diffs and named-branch reads start from it instead of a
+    /// fresh open with a full `__manifest` scan. Each use first proves the
+    /// entry current with the manifest-incarnation probe (the currency the
+    /// bound-branch fast path trusts, including the BranchIdentifier
+    /// delete/recreate fence), refreshes it within its lifetime, and opens a
+    /// branch created again under its name from durable state. A publisher
+    /// starts from the entry only when it is exactly the captured view; its
+    /// independent fresh graph-head CAS remains authoritative. A successful
+    /// publish installs the published coordinator, a failed one discards the
+    /// entry it started from, and branch delete takes the deleted branch's
+    /// entry after its branch gate. The map holds at most
+    /// `BRANCH_AUTHORITY_ENTRIES` branches and evicts the least recently
+    /// used one beyond that; its lock is held across no round trip.
+    branch_authorities: crate::db::branch_authority::BranchAuthorityCache,
     /// The settled commits this handle has read from `__history`, shared by
     /// every coordinator it opens. Only an operation that asks for history
     /// fills it.
@@ -797,7 +789,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            branch_authorities: Default::default(),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -1004,7 +996,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            branch_authorities: Default::default(),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -1160,7 +1152,7 @@ impl Omnigraph {
             read_caches: Arc::clone(&self.read_caches),
             schema_view: Arc::clone(&self.schema_view),
             write_queue: Arc::clone(&self.write_queue),
-            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            branch_authorities: Default::default(),
             history: self.history.clone(),
             policy,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -1609,8 +1601,9 @@ impl Omnigraph {
     /// Capture a source after the branch-control gates and schema-state checks.
     /// Reuse only a view whose complete manifest incarnation still matches;
     /// the returned coordinator belongs to this operation and never changes
-    /// the handle's active branch. A miss uses the existing bounded authority
-    /// cache, whose refresh keeps manifest and lineage state coherent.
+    /// the handle's active branch. Another branch's source comes from the
+    /// per-branch authority cache, whose refresh keeps manifest and lineage
+    /// state coherent.
     async fn capture_branch_control_source(
         &self,
         branch: Option<&str>,
@@ -1626,12 +1619,8 @@ impl Omnigraph {
         }
         // Keep the large cold-open / incremental-refresh future out of every
         // native-create caller's frame, as the merge capture already does.
-        let cache = Box::pin(self.validated_cached_coordinator(branch)).await?;
-        Ok(cache
-            .as_ref()
-            .expect("validated authority cache entry is present")
-            .1
-            .capture_for_branch_control())
+        let source = Box::pin(self.validated_cached_coordinator(branch)).await?;
+        Ok(source.capture_for_branch_control())
     }
 
     /// Open a capture-once write transaction (RFC-013 step 3b): pin the base
@@ -1994,11 +1983,7 @@ impl Omnigraph {
         };
         if !bound {
             return Box::pin(async {
-                let cache = self.validated_cached_coordinator(branch).await?;
-                let coord = &cache
-                    .as_ref()
-                    .expect("validated authority cache entry is present")
-                    .1;
+                let coord = self.validated_cached_coordinator(branch).await?;
                 Ok((
                     coord.branch_identifier().await?,
                     coord.exact_graph_head(),
@@ -2055,14 +2040,14 @@ impl Omnigraph {
         }
 
         // Every other branch goes through the per-branch authority cache
-        // (see the `merge_authority_cache` field doc). Boxed: the arm's
-        // layout (lock guard, probe, refresh/open futures) rides inside the
-        // already-deep merge future.
+        // (see the `branch_authorities` field doc). Boxed: the arm's layout
+        // (probe, refresh/open futures) rides inside the already-deep merge
+        // future.
         Box::pin(self.merge_authority_from_cache(branch)).await
     }
 
     /// The cache arm of [`Self::merge_authority_for_known_branch`]; contract
-    /// on the `merge_authority_cache` field.
+    /// on the `branch_authorities` field.
     async fn merge_authority_from_cache(
         &self,
         branch: Option<&str>,
@@ -2074,11 +2059,7 @@ impl Omnigraph {
         CapturedLineage,
         crate::db::manifest::CapturedManifestProbe,
     )> {
-        let cache = self.validated_cached_coordinator(branch).await?;
-        let coord = &cache
-            .as_ref()
-            .expect("validated authority cache entry is present")
-            .1;
+        let coord = self.validated_cached_coordinator(branch).await?;
         Ok((
             coord.branch_identifier().await?,
             coord.exact_graph_head(),
@@ -2092,48 +2073,52 @@ impl Omnigraph {
         ))
     }
 
-    /// Select and freshly validate the existing single-entry authority cache.
-    /// Returning its guard keeps selection and capture in one critical section.
+    /// The authority of `branch`, a branch other than the bound one, from
+    /// the per-branch cache after a fresh incarnation probe proves it
+    /// current: refreshed on a copy when the branch advanced within its
+    /// lifetime, opened from durable state when the cache holds none, or when
+    /// the branch was deleted and created again since. The returned view is
+    /// immutable and holds no lock.
     async fn validated_cached_coordinator(
         &self,
         branch: Option<&str>,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<(String, GraphCoordinator)>>> {
-        let key = branch.unwrap_or("main").to_string();
-        let mut cache = self.merge_authority_cache.lock().await;
-        if cache
-            .as_ref()
-            .is_some_and(|(cached_key, _)| cached_key != &key)
-        {
-            *cache = None;
-        }
-        if let Some((_, coord)) = cache.as_mut() {
-            let held = coord.manifest_incarnation();
-            let current = match coord.probe_latest_incarnation().await {
-                Ok(latest) => latest.matches(&held),
+    ) -> Result<Arc<GraphCoordinator>> {
+        use crate::db::branch_authority::Discard;
+        if let Some(held) = self.branch_authorities.get(branch) {
+            let incarnation = held.manifest_incarnation();
+            let latest = match held.probe_latest_incarnation().await {
+                Ok(latest) => latest,
                 Err(error) => {
                     // A branch that no longer probes (deleted, storage error)
                     // must not linger as a cache entry.
-                    *cache = None;
+                    self.branch_authorities
+                        .discard(branch, &held, Discard::ProbeFailed);
                     return Err(error);
                 }
             };
-            if !current {
-                if let Err(error) = coord.refresh().await {
-                    *cache = None;
+            if latest.matches(&incarnation) {
+                return Ok(held);
+            }
+            if latest.same_lifetime(&incarnation) {
+                let mut next = GraphCoordinator::clone(&held);
+                if let Err(error) = next.refresh().await {
+                    self.branch_authorities
+                        .discard(branch, &held, Discard::RefreshFailed);
                     return Err(error);
                 }
+                // A recreation between the probe and the refresh is a new
+                // lifetime too.
+                if next.manifest_incarnation().same_lifetime(&incarnation) {
+                    return Ok(self.branch_authorities.install(next, Some(&held)));
+                }
             }
-        } else {
-            // A miss reopens the branch's coordinator: many storage round
-            // trips. Open it without the lock so captures on other branches
-            // proceed meanwhile, then install it; the entry is a hint, and
-            // the capture reads it under the returned guard.
-            drop(cache);
-            let coord = self.open_coordinator_for_branch(branch).await?;
-            cache = self.merge_authority_cache.lock().await;
-            *cache = Some((key, coord));
+            // Deleted and created again under its name: nothing of the old
+            // lifetime's entry is reused.
+            self.branch_authorities
+                .discard(branch, &held, Discard::LifetimeChanged);
         }
-        Ok(cache)
+        let opened = self.open_coordinator_for_branch(branch).await?;
+        Ok(self.branch_authorities.install(opened, None))
     }
 
     async fn cached_read_target(
@@ -2141,10 +2126,11 @@ impl Omnigraph {
         branch: Option<&str>,
         target: &ReadTarget,
     ) -> Result<Option<ResolvedTarget>> {
-        let cache = self.merge_authority_cache.lock().await;
-        let Some((_, coordinator)) = cache.as_ref().filter(|(key, coordinator)| {
-            key == branch.unwrap_or("main") && coordinator.current_branch() == branch
-        }) else {
+        let Some(coordinator) = self
+            .branch_authorities
+            .get(branch)
+            .filter(|coordinator| coordinator.current_branch() == branch)
+        else {
             return Ok(None);
         };
         let held = coordinator.manifest_incarnation();
@@ -3503,11 +3489,8 @@ impl Omnigraph {
                 return Self::descends_linearly_from(&coord, from, from_commit, to).await;
             }
         }
-        let cache = self.validated_cached_coordinator(branch).await?;
-        let (_, coord) = cache
-            .as_ref()
-            .expect("validated authority cache entry is present");
-        Self::descends_linearly_from(coord, from, from_commit, to).await
+        let coord = self.validated_cached_coordinator(branch).await?;
+        Self::descends_linearly_from(&coord, from, from_commit, to).await
     }
 
     /// [`GraphCoordinator::descends_linearly_from`] for `from`, whose
@@ -4584,16 +4567,7 @@ impl Omnigraph {
         fail(&BRANCH_CONTROL_PRE_GATES).map_err(OmniError::before_effect)?;
         let _schema_permit = self.write_queue().acquire_schema_shared().await?;
         let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await?;
-        let mut cache = self.merge_authority_cache.lock().await;
-        let cached_target = if cache
-            .as_ref()
-            .is_some_and(|(cached_branch, _)| cached_branch == &branch)
-        {
-            cache.take().map(|(_, coordinator)| coordinator)
-        } else {
-            None
-        };
-        drop(cache);
+        let cached_target = self.branch_authorities.take(Some(&branch));
         let branches = [Some(branch.clone())];
         let warm_snapshot = self.coordinator.load_full().snapshot();
         let (control_catalog, identity) = self
@@ -4620,7 +4594,7 @@ impl Omnigraph {
             _ => None,
         };
         let mut target_control = match cached_target {
-            Some(coordinator) => coordinator,
+            Some(coordinator) => GraphCoordinator::clone(&coordinator),
             None => self
                 .open_coordinator_for_branch(Some(branch.as_str()))
                 .await
@@ -4991,7 +4965,6 @@ impl Omnigraph {
             }
         };
         let target = candidate.property.graph_branch.clone();
-        let target_name = target.clone().unwrap_or_else(|| "main".to_string());
         self.enforce_commit_control(
             omnigraph_policy::PolicyAction::CommitPublish,
             target.as_deref(),
@@ -5017,7 +4990,7 @@ impl Omnigraph {
         } else {
             let mut coordinator = self.open_coordinator_for_branch(target.as_deref()).await?;
             let published = coordinator.publish_unpublished(&candidate).await?;
-            *self.merge_authority_cache.lock().await = Some((target_name, coordinator));
+            self.branch_authorities.install(coordinator, None);
             published
         };
         self.invalidate_graph_index_for(

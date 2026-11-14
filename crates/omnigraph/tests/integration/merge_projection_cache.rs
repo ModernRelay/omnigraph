@@ -1,10 +1,11 @@
-//! Structural gates for the merge-authority cache: a repeated merge reuses
-//! acknowledged local publication views and refreshes foreign changes from
-//! `__manifest` without reading `__history`, retains at most one non-bound
-//! branch's authority, and a delete/recreate of a cached branch must be fenced
+//! Structural gates for the per-branch authority cache: a repeated merge
+//! reuses acknowledged local publication views and refreshes foreign changes
+//! from `__manifest` without reading `__history`, every non-bound branch keeps
+//! its own authority, and a delete/recreate of a cached branch must be fenced
 //! to a full re-read, never a stale reuse. The refresh-vs-reopen correctness
 //! oracle lives with the manifest unit tests; it is not hidden in the measured
-//! production path.
+//! production path. The bound and its eviction order are owned by the cache's
+//! in-source tests.
 
 use crate::helpers;
 
@@ -36,9 +37,9 @@ where
 
 /// Cache invalidation and merge insertion share the branch gate. Purging
 /// before that gate lets an already-running merge insert the deleted
-/// incarnation after the purge and retain it indefinitely.
+/// incarnation after the purge and retain it until its next probe.
 #[test]
-fn branch_delete_purges_merge_authority_after_acquiring_branch_gate() {
+fn branch_delete_purges_branch_authority_after_acquiring_branch_gate() {
     let source = include_str!("../../src/db/omnigraph.rs");
     let body = source
         .split("pub async fn branch_delete_as")
@@ -49,8 +50,8 @@ fn branch_delete_purges_merge_authority_after_acquiring_branch_gate() {
         .find(".acquire_branch")
         .expect("branch_delete must acquire its branch gate");
     let purge = body
-        .find("merge_authority_cache.lock()")
-        .expect("branch_delete must purge cached merge authority");
+        .find("branch_authorities.take(")
+        .expect("branch_delete must purge cached branch authority");
     assert!(
         gate < purge,
         "branch deletion must acquire the incarnation gate before purging cached authority"
@@ -326,11 +327,11 @@ fn consecutive_recent_fork_merges_avoid_settled_history() {
     });
 }
 
-/// The persistent cache has capacity one. Alternating to another non-bound
-/// branch must evict the first, so returning to it performs a real coordinator
-/// open rather than retaining O(branches * history) lineage.
+/// Every non-bound branch keeps its own authority: returning to a branch
+/// after work on another one reuses its coordinator behind the incarnation
+/// probe instead of opening it again from `__manifest`.
 #[tokio::test]
-async fn merge_authority_cache_retains_only_one_non_bound_branch() {
+async fn branch_authority_cache_keeps_each_non_bound_branch() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     db.branch_create("feature-a").await.unwrap();
@@ -347,17 +348,21 @@ async fn merge_authority_cache_retains_only_one_non_bound_branch() {
 
     let (outcome, io) = measure(db.branch_merge("feature-a", "main")).await;
     assert_eq!(outcome.unwrap().outcome, MergeOutcome::AlreadyUpToDate);
-    assert!(
-        io.internal_open_count >= 1,
-        "feature-a must have been evicted when feature-b became the one hot authority"
+    assert_eq!(
+        (io.internal_open_count, io.manifest_scan_count),
+        (0, 0),
+        "feature-a must keep its authority while feature-b holds its own: {io:?}"
     );
 }
 
 /// The ABA fence: deleting and recreating a cached branch must not reuse the
 /// old lifetime's projection. The incarnation probe carries the
-/// BranchIdentifier, so the recreated branch takes a full re-open/refresh and
-/// the merge sees the NEW branch's (empty) divergence — asserted through the
-/// merge outcome, which would be wrong under stale reuse.
+/// BranchIdentifier, so the recreated branch takes a full re-open and the
+/// merge sees the NEW branch's (empty) divergence — asserted through the
+/// merge outcome, which would be wrong under stale reuse. A recreation by
+/// another handle leaves this handle's entry in place until its next use,
+/// whose probe finds the new lifetime: the write lands there, and nothing the
+/// old lifetime held shows through.
 #[tokio::test]
 async fn branch_recreate_is_fenced_from_the_cached_projection() {
     let dir = tempfile::tempdir().unwrap();
@@ -383,4 +388,45 @@ async fn branch_recreate_is_fenced_from_the_cached_projection() {
         "a recreated branch must be re-read from its new lifetime, never \
          served from the deleted lifetime's cached projection"
     );
+
+    mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "OldLifetime")], &[("$age", 50)]),
+    )
+    .await
+    .unwrap();
+    let other = helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+    other.branch_delete("feature").await.unwrap();
+    other.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "NewLifetime")], &[("$age", 51)]),
+    )
+    .await
+    .unwrap();
+    for reader in [&db, &other] {
+        for (name, rows) in [("OldLifetime", 0), ("NewLifetime", 1)] {
+            let result = reader
+                .query(
+                    omnigraph::db::ReadTarget::branch("feature"),
+                    TEST_QUERIES,
+                    "get_person",
+                    &params(&[("$name", name)]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result.num_rows(),
+                rows,
+                "{name}: a write after another handle recreated the branch lands on \
+                 its new lifetime"
+            );
+        }
+    }
 }
