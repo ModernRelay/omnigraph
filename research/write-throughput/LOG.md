@@ -273,3 +273,68 @@ dead; a concurrent `cleanup` could reclaim them before they publish. A
 production version needs the witness to name the head they will publish on
 (e.g. the predecessor's pre-minted nonce, which its commit id carries) and the
 collector rule extended accordingly — RFC-level.
+
+## Idea 6 — warm writer state for named branches (cross-branch lever)
+
+Trace of one named-branch writer (baseline, S3): 637 ms, ~19 round trips. The
+capture and revalidation each read the branch ref beside the HEAD pair, and
+the publish reopened the branch's coordinator from durable state (LIST + GET
+of main's `__manifest`, LIST of `_refs/branches`, ref GETs, LIST + GET of the
+branch's `__manifest`) because the one-entry `merge_authority_cache` missed.
+
+Changes: a group keeps the coordinator it last published through for a branch
+other than the bound one, captures from it (no probe) and publishes through
+it (`commit_updates_with_coordinator`); the publisher retains its acknowledged
+image for named branches too (`retain_control_dataset_of(.., branches=true)`:
+a branch's `__manifest` image has `base_paths`, which the retention excluded).
+Delete-and-recreate stays refused: the publish precondition reads the exact
+native ref the image names (`get_live_manifest_branch_contents`); a retired
+ref is `BranchNotFound` → `ReadSetChanged`.
+
+One named-branch writer, S3: 637 → 282 ms per write; 1.55 → 3.50 w/s;
+21.8 → 9.1 requests/write.
+
+## Idea 7 — probe-free capture for every writer: withdrawn
+
+Measured as part of group4 (−1 RTT per write). With group commit forced on,
+the engine integration suite found 4 contract breaks from it:
+`composite_flow::composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh`
+(a query compiled against the catalog another handle's schema apply replaced
+fails terminally), `warm_read_cost::recreated_branch_misses_cached_topology`
+(the first attempt's identity came from a recreated branch's old incarnation),
+`lifecycle::write_preparation_manifest_read_failures_carry_before_effect_evidence`
+(a vanished `__manifest` lost `BeforeEffect` evidence),
+`write_cost::branch_claim_adds_no_request_to_a_write` (probe count). A stale
+capture is safe for the CAS, not for the write's meaning. Writers probe again
+(switch `OMNIGRAPH_GROUP_COMMIT_WRITER_CAPTURE_SKIP=1` keeps the experiment);
+the supported probe-free capture is the writer epoch claim (#1350), measured
+as the `claim` variants. The leader still captures from its own last
+publication, but only when the group's log explains every entry's capture.
+
+## Correctness evidence (dev build, group commit forced on)
+
+- `writes.rs`: 67/67 on and off. It caught a regression of the always-on
+  publisher trust: a conditional write whose head check failed on the stale
+  trusted image was refused terminally; now a check that fails on the trusted
+  image is retried on a fresh load.
+- Engine `integration`: 701/712 on (2 request-count deltas,
+  `warm_read_cost::branch_delete_reuses_only_a_current_write_capture`,
+  `warm_read_cost::named_read_borrows_write_capture_and_rejects_recreated_branch`:
+  the group's own coordinator is not the handle's one-entry cache); 712/712 off.
+- `failpoints.rs` (stopped after 25 tests): 20 pass, 5 fail or hang — seams on
+  the ordinary path the group path bypasses (two-process `branch_claim_*`
+  children never reach their seam) and the two #1331 cases (a write sent back
+  by another handle's optimize is expected to be carried over / hold off the
+  next run; group entries re-prepare outside the gates instead).
+- Followers now keep the batch's completion evidence (`Unpublished` stays
+  definite), found by `writes.rs::publisher_failure_before_the_manifest_put_is_definite_issue_1067`.
+
+## Final matrix (optimized builds)
+
+`scripts/build-opt.sh` builds every crate at opt-level 2 into
+`/srv/target-opt`; binaries `baseline-opt` (ed09ee63 + instrument) and
+`group10-opt` (e6c809c5). `scripts/matrix.sh` interleaves variants per
+repetition: `opt-baseline`, `opt-group`, and for same-branch cells
+`opt-baseline-claim`, `opt-group-claim` (writer epoch claimed on `main`),
+`opt-group-pipe`. 3 repetitions at 16 and 64 writers, 1 at 1 and 4.
+`scripts/summarize.py` prints medians.

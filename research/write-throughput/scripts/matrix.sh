@@ -18,9 +18,11 @@ for rep in $(seq 1 "$REPS"); do
   for target in ${TARGETS//,/ }; do
     for mode in ${MODES//,/ }; do
       run opt-baseline /srv/bins/baseline-opt "$target" "$mode" OG_CW_REP="$rep"
-      run opt-group /srv/bins/group9-opt "$target" "$mode" OG_CW_REP="$rep" OMNIGRAPH_GROUP_COMMIT=1
+      run opt-group /srv/bins/group10-opt "$target" "$mode" OG_CW_REP="$rep" OMNIGRAPH_GROUP_COMMIT=1
       if [ "$mode" = same ]; then
-        run opt-group-pipe /srv/bins/group9-opt "$target" "$mode" OG_CW_REP="$rep" OMNIGRAPH_GROUP_COMMIT=1 OMNIGRAPH_GROUP_COMMIT_PIPELINE=1
+        run opt-baseline-claim /srv/bins/baseline-opt "$target" "$mode" OG_CW_REP="$rep" OG_CW_CLAIM=1
+        run opt-group-claim /srv/bins/group10-opt "$target" "$mode" OG_CW_REP="$rep" OMNIGRAPH_GROUP_COMMIT=1 OG_CW_CLAIM=1
+        run opt-group-pipe /srv/bins/group10-opt "$target" "$mode" OG_CW_REP="$rep" OMNIGRAPH_GROUP_COMMIT=1 OMNIGRAPH_GROUP_COMMIT_PIPELINE=1
       fi
     done
   done
