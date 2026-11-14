@@ -3,7 +3,8 @@
 //! columns; every row of both leaves under the columns of those bindings
 //! (`<binding>.<column>`), in the left arm's order, matched by name in the
 //! right arm. The arms' other columns, the names an arm binds without
-//! returning them, stay behind.
+//! returning them, stay behind; inside a correlated read, whose arms each
+//! start from the outer rows, the outer rows' tag both arms carry leaves too.
 
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use std::fmt;
@@ -51,11 +52,12 @@ impl UnionExec {
 fn union_schema(left: &Schema, right: &Schema, bindings: &[String]) -> Result<SchemaRef> {
     let mut fields = Vec::new();
     for field in left.fields() {
-        let Some((binding, _)) = field.name().split_once('.') else {
-            continue;
-        };
-        if !bindings.iter().any(|name| name == binding) {
-            continue;
+        // A column of no binding that both arms carry is the outer rows'
+        // tag, inside a correlated read whose arms each start from them.
+        match field.name().split_once('.') {
+            Some((binding, _)) if bindings.iter().any(|name| name == binding) => {}
+            None if right.field_with_name(field.name()).is_ok() => {}
+            _ => continue,
         }
         let other = right.field_with_name(field.name()).map_err(|_| {
             OmniError::manifest_internal(format!(

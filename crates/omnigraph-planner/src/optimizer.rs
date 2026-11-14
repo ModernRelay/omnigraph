@@ -875,10 +875,33 @@ fn resolve_pipeline(
                     schema,
                 )
             }
-            PatternStep::Union { arms, bindings } => {
+            PatternStep::Union {
+                arms,
+                bindings,
+                outer_var,
+            } => {
+                // Arms that read the enclosing scope each start from its
+                // rows: the first from the correlated read's own leaf, the
+                // others from leaves of their own over the same rows.
+                let mut seeds: Vec<Option<LogicalId>> = Vec::with_capacity(arms.len());
+                if let Some(outer_var) = outer_var {
+                    let first = bound(current, "correlated union")?;
+                    let schema = schema_of(plan, first)?;
+                    seeds.push(Some(first));
+                    for _ in 1..arms.len() {
+                        seeds.push(Some(plan.add(
+                            LogicalNode::OuterReference {
+                                outer_var: outer_var.clone(),
+                            },
+                            schema.clone(),
+                        )));
+                    }
+                } else {
+                    seeds.resize(arms.len(), None);
+                }
                 let mut folded: Option<LogicalId> = None;
-                for arm in arms {
-                    let arm = resolve_pipeline(plan, arm, source, next_binding, None)?;
+                for (arm, seed) in arms.iter().zip(seeds) {
+                    let arm = resolve_pipeline(plan, arm, source, next_binding, seed)?;
                     folded = Some(match folded {
                         None => arm,
                         Some(left) => {
@@ -897,6 +920,7 @@ fn resolve_pipeline(
                 let union =
                     folded.ok_or_else(|| PlanError::Internal("a union has no arm".to_string()))?;
                 match current {
+                    _ if outer_var.is_some() => union,
                     None => union,
                     Some(left) => {
                         let joined = join_schema(

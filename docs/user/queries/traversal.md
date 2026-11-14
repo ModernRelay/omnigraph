@@ -257,9 +257,11 @@ query older_or_known() {
 
 An arm may return values, `return { $p, 1 as d }`, which match by position
 and are nullable where any arm's is, and may group, order and cut its own
-rows (`order { $p.age } limit 3` belongs to the arm). In this release a node
-column is one type in every arm, and no arm returns an edge or reads a name
-of the enclosing scope (`T86`).
+rows (`order { $p.age } limit 3` belongs to the arm). An arm may read a name
+bound before the union, `$p worksAt $c`: the union then runs for each outer
+row. In this release a node column is one type in every arm, no arm returns
+an edge, and an arm returning a value or keeping its own cut reads no outer
+name (`T86`).
 
 `from name(args)` calls a read declared in the same source: its body runs as
 an inline read, each parameter bound to its argument evaluated in the

@@ -55,6 +55,15 @@ impl OuterSlot {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     }
+
+    /// The filled batch, left in place for every leaf that reads it: a
+    /// correlated union's arms each start from the same outer rows.
+    fn read(&self) -> Option<RecordBatch> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 pub(super) struct FilledSlot<'a>(pub(super) &'a OuterSlot);
@@ -127,7 +136,7 @@ impl ExecutionPlan for OuterReferenceExec {
         Ok(self
             .shape
             .stream(memory, &self.metrics, move |_reservation| async move {
-                slot.take().ok_or_else(|| {
+                slot.read().ok_or_else(|| {
                     external(OmniError::manifest_internal(
                         "OuterReference executed without its outer batch",
                     ))

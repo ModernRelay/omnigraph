@@ -45,7 +45,13 @@ A query runs against one resolved `ReadTarget`:
    a value or groups, orders or cuts its rows, every arm is an uncorrelated
    `PatternStep::Correlate` returning its columns under the first arm's
    names, its values columns of one `values` binding all arms share, which
-   the union binds beside its references.
+   the union binds beside its references. A union whose node-returning arms
+   read the enclosing scope is the pattern of a correlated
+   `PatternStep::Correlate` returning its references: its `PatternStep::Union`
+   names the `outer_var` each arm starts from, the first arm from the read's
+   `OuterReference` and the others from leaves of their own over the same
+   slot, which `OuterReferenceExec` reads without emptying, and `UnionExec`
+   carries the outer rows' tag both arms hold.
    A `from` over an inline read (or a call) with its own aggregate,
    `distinct`, `order` or `limit` (the core's `Correlate` over its `Group`,
    `Order` and `Cut`) is a `PatternStep::Correlate`, placed beside the
@@ -91,7 +97,7 @@ A query runs against one resolved `ReadTarget`:
    The shaper is the compiler's
    (`omnigraph_compiler::shape`), and the type checker runs it on every
    declaration it accepts: a term it does not lower (a `union` arm with
-   an edge or an outer name, `Fix`,
+   an edge, or with a value and an outer name, `Fix`,
    a ranking inside an inline read with a group, order or cut) is refused at
    type check with
    `T86`, at the construct and naming the programme stage that adds it, so

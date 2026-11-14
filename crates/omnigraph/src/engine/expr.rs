@@ -154,7 +154,7 @@ pub(super) fn collect_node_bindings(pipeline: &[PatternStep], out: &mut HashMap<
                 inner,
                 read: _,
             } => collect_node_bindings(inner, out),
-            PatternStep::Union { arms, bindings: _ } => {
+            PatternStep::Union { arms, .. } => {
                 arms.iter().for_each(|arm| collect_node_bindings(arm, out))
             }
         }

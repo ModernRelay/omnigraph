@@ -41,7 +41,7 @@ const B_IN_PROGRESS: &[&str] = &[
     "a node an optional introduces returned whole",
     "a ranking inside an inline read with its own order and limit",
     "a union arm returning an edge",
-    "a union whose arms read the enclosing scope",
+    "a union arm returning a value that reads the enclosing scope",
     "distance as an rrf arm",
     "two rrf arm windows that differ",
     "an rrf of three arms",
@@ -184,9 +184,13 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { from union({ match { $p: Person, $q: Person, $p $k:knows $q } return { $k } }, { match { $a: Person, $b: Person, $a $e:knows $b } return { $e as k } }) } return { $k.@src } }",
                 Refused("B"),
             ),
-            // "a union whose arms read the enclosing scope"
             (
                 "query q() { match { $c: Company, from union({ match { $p: Person, $p worksAt $c } return { $p } }, { match { $q: Person } return { $q as p } }) } return { $p.name } }",
+                Lowers,
+            ),
+            // "a union arm returning a value that reads the enclosing scope"
+            (
+                "query q() { match { $c: Company, from union({ match { $p: Person, $p worksAt $c } return { $p, 1 as d } }, { match { $q: Person } return { $q as p, 2 as d } }) } return { $p.name, $d } }",
                 Refused("B"),
             ),
             (

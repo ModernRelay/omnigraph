@@ -189,3 +189,23 @@ query arms_with_their_own_cut() {
 
 --- expect shape
 p.handle: String
+
+--- query
+query arms_reading_the_enclosing_scope() {
+    match {
+        $c: Company,
+        from union(
+            { match { $p: Person, $p worksAt $c } return { $p } },
+            { match { $a: Person, $q: Person, $a worksAt $c, $a knows $q } return { $q as p } }),
+    }
+    return { $c.slug, $p.handle }
+}
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"ada"}
+{"c.slug":"acme","p.handle":"bob"}
+{"c.slug":"bolt","p.handle":"bob"}
+
+--- expect shape
+c.slug: String
+p.handle: String

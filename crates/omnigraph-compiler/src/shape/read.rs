@@ -110,6 +110,10 @@ pub enum PatternStep {
     Union {
         arms: Vec<Vec<PatternStep>>,
         bindings: Vec<String>,
+        /// Inside a correlated read's pattern, the arms that read the
+        /// enclosing scope each start from the outer rows, an
+        /// `OuterReference` on this name; `None` for arms from nothing.
+        outer_var: Option<String>,
     },
     /// `distance(rel, $x.f, q)`, the core's exact `Score`: every row of the
     /// steps before it with the distance of `binding`'s vector property to
@@ -610,6 +614,13 @@ impl Facts {
         for union in &mut self.unions {
             union.arms.iter_mut().for_each(|arm| arm.rename(renames));
             union.bindings.iter_mut().for_each(|(name, _)| rename(name));
+            union.outer = std::mem::take(&mut union.outer)
+                .into_iter()
+                .map(|mut name| {
+                    rename(&mut name);
+                    name
+                })
+                .collect();
         }
         for correlate in &mut self.correlates {
             correlate.inner.rename(renames);
@@ -746,6 +757,9 @@ struct UnionFact {
     /// The `values` binding every arm's value columns belong to, when the
     /// arms return values.
     values: Option<String>,
+    /// The enclosing scope's names the arms read: they run inside a
+    /// correlated read, each from its rows.
+    outer: HashSet<String>,
 }
 
 /// An `optional { }`: its pattern's facts.
@@ -1854,14 +1868,13 @@ impl<'a> Shaper<'a> {
         }
         let mut columns: Vec<(String, String)> = Vec::new();
         let mut shaped = Vec::new();
+        let mut outer: HashSet<String> = HashSet::new();
         for (index, &(input, items, bindings)) in parts.iter().enumerate() {
-            let reads_outer = bindings.iter().any(|(_, arg)| {
+            let mut arm_outer: HashSet<String> = env_columns(input).into_iter().collect();
+            for (_, arg) in bindings {
                 let mut read = Vec::new();
                 arg.columns(&mut read);
-                !read.is_empty()
-            });
-            if reads_outer || !env_columns(input).is_empty() {
-                return Err(self.refuse_at("a `union` arm that reads the enclosing scope", at()));
+                arm_outer.extend(read);
             }
             let mut inner = Facts {
                 inlined: facts.inlined,
@@ -1903,7 +1916,9 @@ impl<'a> Shaper<'a> {
             let mut hidden: Vec<String> = inner
                 .names()
                 .into_iter()
-                .filter(|name| !exposed.contains(name) && !is_anon(name))
+                .filter(|name| {
+                    !exposed.contains(name) && !is_anon(name) && !arm_outer.contains(name)
+                })
                 .collect();
             hidden.sort();
             hidden.dedup();
@@ -1916,14 +1931,60 @@ impl<'a> Shaper<'a> {
             bind_arguments(&mut inner, bindings);
             facts.inlined = inner.inlined;
             shaped.push(inner);
+            outer.extend(arm_outer);
         }
         facts
             .types
             .extend(columns.iter().map(|(name, ty)| (name.clone(), ty.clone())));
-        facts.unions.push(UnionFact {
+        let reads_outer = !outer.is_empty();
+        let union = UnionFact {
             arms: shaped,
-            bindings: columns,
+            bindings: columns.clone(),
             values: None,
+            outer: outer.clone(),
+        };
+        if !reads_outer {
+            facts.unions.push(union);
+            return Ok(());
+        }
+        // Arms reading the enclosing scope run per outer row: the union is
+        // the pattern of a correlated read returning its references.
+        let mut inner = Facts {
+            inlined: facts.inlined,
+            ..Facts::default()
+        };
+        inner.unions.push(union);
+        inner
+            .types
+            .extend(columns.iter().map(|(name, ty)| (name.clone(), ty.clone())));
+        let values = format!("{FRESH_PREFIX}r{}", facts.inlined);
+        facts.inlined += 1;
+        let read = InnerRead {
+            values,
+            group: None,
+            columns: columns
+                .iter()
+                .map(|(name, type_name)| {
+                    let ty = ExprType::Node {
+                        type_name: type_name.clone(),
+                    };
+                    IRProjection {
+                        expr: IRExpr::Variable(name.clone(), ty.clone()),
+                        alias: None,
+                        column: name.clone(),
+                        ty,
+                    }
+                })
+                .collect(),
+            order_by: Vec::new(),
+            limit: None,
+            limit_param: None,
+        };
+        facts.correlates.push(CorrelateFact {
+            inner,
+            outer,
+            read,
+            optionals_before: facts.optionals.len(),
         });
         Ok(())
     }
@@ -1952,7 +2013,10 @@ impl<'a> Shaper<'a> {
         for (index, (input, items, bindings)) in parts.iter().enumerate() {
             let reads_outer = bindings.iter().any(|(_, arg)| !arg.columns_empty());
             if reads_outer || !env_columns(input).is_empty() {
-                return Err(self.refuse_at("a `union` arm that reads the enclosing scope", at()));
+                return Err(self.refuse_at(
+                    "a `union` arm that returns a value or keeps its own cut and reads the enclosing scope",
+                    at(),
+                ));
             }
             if items.len() != names.len() {
                 return Err(ShapeError::Internal(
@@ -2030,6 +2094,7 @@ impl<'a> Shaper<'a> {
             arms: shaped,
             bindings: nodes,
             values: (!value_types.is_empty()).then_some(values),
+            outer: HashSet::new(),
         });
         Ok(())
     }
@@ -2825,17 +2890,25 @@ impl<'a> Shaper<'a> {
         // A union is a source: its arms run from nothing, and the names it
         // binds are bound for the elements that join it.
         for union in &facts.unions {
+            // Arms that read the enclosing scope start from its rows, the
+            // names they read already bound.
+            let visible: Vec<&String> = {
+                let mut visible: Vec<&String> = bound_vars
+                    .iter()
+                    .filter(|name| union.outer.contains(*name))
+                    .collect();
+                visible.sort();
+                visible
+            };
+            let outer_var = visible.first().map(|name| name.to_string());
             let mut arms = Vec::with_capacity(union.arms.len());
             for arm in &union.arms {
                 let mut steps = Vec::new();
-                self.place(
-                    arm,
-                    &[],
-                    &mut steps,
-                    &mut HashSet::new(),
-                    &HashSet::new(),
-                    fresh,
-                )?;
+                let mut arm_bound: HashSet<String> = match outer_var {
+                    Some(_) => visible.iter().map(|name| name.to_string()).collect(),
+                    None => HashSet::new(),
+                };
+                self.place(arm, &[], &mut steps, &mut arm_bound, &HashSet::new(), fresh)?;
                 arms.push(steps);
             }
             let mut bindings: Vec<String> = union
@@ -2845,7 +2918,11 @@ impl<'a> Shaper<'a> {
                 .collect();
             bound_vars.extend(bindings.iter().cloned());
             bindings.extend(union.values.iter().cloned());
-            pipeline.push(PatternStep::Union { arms, bindings });
+            pipeline.push(PatternStep::Union {
+                arms,
+                bindings,
+                outer_var,
+            });
         }
         let bindings: Vec<&BindingFact> = facts.bindings.iter().collect();
         let traversals: Vec<&TraversalFact> = facts.traversals.iter().collect();
@@ -3412,8 +3489,15 @@ fn rename_inner_bindings(
                 rename(outer_var);
                 pending.extend(inner);
             }
-            PatternStep::Union { arms, bindings } => {
+            PatternStep::Union {
+                arms,
+                bindings,
+                outer_var,
+            } => {
                 bindings.iter_mut().for_each(&rename);
+                if let Some(outer_var) = outer_var {
+                    rename(outer_var);
+                }
                 pending.extend(arms.iter_mut().flatten());
             }
             PatternStep::Correlate {

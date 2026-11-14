@@ -177,7 +177,7 @@ fn flatten<'p>(
             // A union's arms each bind its names: their bindings,
             // traversals, conjuncts and blocks are the scope's, and the plan
             // folds the arms with one `Union` per arm after the first.
-            PatternStep::Union { arms, bindings } => {
+            PatternStep::Union { arms, bindings, .. } => {
                 for _ in 1..arms.len() {
                     unions.push(bindings.clone());
                 }
