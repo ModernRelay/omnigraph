@@ -190,3 +190,28 @@ record's contribution in this regime: +48% commits/s, -32% p50 at N=64. In a clo
 loop a writer waits ~2 batch cycles (queue ~120 ms + its own batch ~140 ms), so
 commits/s ~= N / 280 ms: latency, not capacity, is now the limit. Single-batch trace: 5
 sequential RTT in the batch + 1 RTT preparation (table manifest GET).
+
+## Cross-branch: per-branch authority cache and the held-branch probe skip, 2026-11-14
+
+The non-bound write path (`validated_cached_coordinator`) used ONE cache entry behind ONE
+tokio mutex held across a storage probe: with 64 branches every capture serialized on it
+and evicted the previous branch's coordinator (a reopen: ~20-40 requests). Prototype
+changes: `AuthorityCache` with one slot per branch (`omnigraph.rs`); a non-bound branch
+this process holds, at the version of its own last publication, is current with no probe
+(PR #1350's rule extended to non-bound branches, both in the cached capture and in write
+revalidation); with the log on, the publisher does not reread the branch ref on every
+publication of a branch whose log it holds.
+
+Raw: `results/branchcache.jsonl` (cache + probe skip only), `results/gc-wal-leader.jsonl`
+(branches rows). Separate branches, mem 20 ms, claimed, commits/s (p50 ms):
+
+| N | baseline | per-branch cache + held skip | + group commit + log + leader staging |
+|---|---|---|---|
+| 1 | 2.3 (423) | 2.9 (335) | **7.0 (140)** |
+| 4 | 5.6 (725) | 11.6 (337) | **28.0 (140)** |
+| 16 | 16.5 (922) | 46.4 (333) | **111.0 (141)** |
+| 64 | 60.0 (1024) | 148.0 (400) | **206.9 (298)** |
+
+A named-branch write with the log costs 9.2 requests (vs 21.6 baseline), the same as main.
+Note: a shell pitfall cost one run: zsh does not word-split `$env` in `env $env cmd`; the
+sweep script (bash) is the reliable runner.

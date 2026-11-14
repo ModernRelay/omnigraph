@@ -476,7 +476,11 @@ pub struct Omnigraph {
     /// across that open would make captures on different branches wait out
     /// each other's full open. Two captures that miss on the same branch
     /// open it twice; the entry is a hint either way.
-    merge_authority_cache: tokio::sync::Mutex<Option<(String, GraphCoordinator)>>,
+    ///
+    /// WAL research prototype: one slot per branch (`AuthorityCache`), so
+    /// captures on different branches neither serialize on one mutex nor
+    /// evict each other's coordinator.
+    merge_authority_cache: AuthorityCache,
     /// The settled commits this handle has read from `__history`, shared by
     /// every coordinator it opens. Only an operation that asks for history
     /// fills it.
@@ -797,7 +801,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            merge_authority_cache: AuthorityCache::default(),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -1004,7 +1008,7 @@ impl Omnigraph {
                 schema_identity_domain,
             })),
             write_queue,
-            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            merge_authority_cache: AuthorityCache::default(),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
             embedding_config: None,
@@ -1160,7 +1164,7 @@ impl Omnigraph {
             read_caches: Arc::clone(&self.read_caches),
             schema_view: Arc::clone(&self.schema_view),
             write_queue: Arc::clone(&self.write_queue),
-            merge_authority_cache: tokio::sync::Mutex::new(None), // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+            merge_authority_cache: AuthorityCache::default(),
             history: self.history.clone(),
             policy,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
@@ -2097,9 +2101,9 @@ impl Omnigraph {
     async fn validated_cached_coordinator(
         &self,
         branch: Option<&str>,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<(String, GraphCoordinator)>>> {
+    ) -> Result<tokio::sync::OwnedMutexGuard<Option<(String, GraphCoordinator)>>> {
         let key = branch.unwrap_or("main").to_string();
-        let mut cache = self.merge_authority_cache.lock().await;
+        let mut cache = self.merge_authority_cache.lock_for(&key).await;
         if cache
             .as_ref()
             .is_some_and(|(cached_key, _)| cached_key != &key)
@@ -2107,9 +2111,11 @@ impl Omnigraph {
             *cache = None;
         }
         if let Some((_, coord)) = cache.as_mut() {
-            let held = coord.manifest_incarnation();
-            let current = match coord.probe_latest_incarnation().await {
-                Ok(latest) => latest.matches(&held),
+            // WAL research prototype: a branch this process holds, at the
+            // version of the process's own last publication there, is current
+            // with no probe (PR #1350's rule, here for a non-bound branch).
+            let current = match coord.head_is_current().await {
+                Ok(current) => current,
                 Err(error) => {
                     // A branch that no longer probes (deleted, storage error)
                     // must not linger as a cache entry.
@@ -2130,7 +2136,7 @@ impl Omnigraph {
             // the capture reads it under the returned guard.
             drop(cache);
             let coord = self.open_coordinator_for_branch(branch).await?;
-            cache = self.merge_authority_cache.lock().await;
+            cache = self.merge_authority_cache.lock_for(&key).await;
             *cache = Some((key, coord));
         }
         Ok(cache)
@@ -2141,7 +2147,10 @@ impl Omnigraph {
         branch: Option<&str>,
         target: &ReadTarget,
     ) -> Result<Option<ResolvedTarget>> {
-        let cache = self.merge_authority_cache.lock().await;
+        let cache = self
+            .merge_authority_cache
+            .lock_for(branch.unwrap_or("main"))
+            .await;
         let Some((_, coordinator)) = cache.as_ref().filter(|(key, coordinator)| {
             key == branch.unwrap_or("main") && coordinator.current_branch() == branch
         }) else {
@@ -2244,11 +2253,23 @@ impl Omnigraph {
                 early.latest.matches(&early.held)
                     && installed.manifest_incarnation().matches(&early.held)
             });
+        // WAL research prototype: a non-bound branch this process holds, still
+        // at the version of the process's own last publication there, is
+        // current with no probe (PR #1350's rule, extended).
+        let held_current = !bound && {
+            let key = txn.branch.as_deref().unwrap_or("main");
+            let slot = self.merge_authority_cache.lock_for(key).await;
+            slot.as_ref().is_some_and(|(_, coord)| {
+                coord
+                    .held_head()
+                    .is_some_and(|landed| landed == txn.manifest_probe.captured().version)
+            })
+        };
         let (branch_identifier, graph_head, effective_graph_head, snapshot, probe) =
             if probed_current {
                 self.write_authority_for_known_branch(txn.branch.as_deref(), false)
                     .await?
-            } else if !bound && txn.manifest_probe.is_current().await? {
+            } else if !bound && (held_current || txn.manifest_probe.is_current().await?) {
                 (
                     txn.authority.branch_identifier.clone(),
                     txn.authority.graph_head.clone(),
@@ -4584,7 +4605,7 @@ impl Omnigraph {
         fail(&BRANCH_CONTROL_PRE_GATES).map_err(OmniError::before_effect)?;
         let _schema_permit = self.write_queue().acquire_schema_shared().await?;
         let _branch_guard = self.write_queue().acquire_branch(Some(&branch)).await?;
-        let mut cache = self.merge_authority_cache.lock().await;
+        let mut cache = self.merge_authority_cache.lock_for(&branch).await;
         let cached_target = if cache
             .as_ref()
             .is_some_and(|(cached_branch, _)| cached_branch == &branch)
@@ -5017,7 +5038,8 @@ impl Omnigraph {
         } else {
             let mut coordinator = self.open_coordinator_for_branch(target.as_deref()).await?;
             let published = coordinator.publish_unpublished(&candidate).await?;
-            *self.merge_authority_cache.lock().await = Some((target_name, coordinator));
+            let key = target_name.clone();
+            *self.merge_authority_cache.lock_for(&key).await = Some((target_name, coordinator));
             published
         };
         self.invalidate_graph_index_for(
@@ -5256,6 +5278,32 @@ impl Omnigraph {
 /// A caller's branch name as the engine addresses it: `None` for main, the
 /// name itself otherwise. The name is taken as written, the spelling a policy
 /// decision judged; one that is not canonical is refused, never corrected.
+/// WAL research prototype: the non-bound authority cache with one slot per
+/// branch. Each slot keeps the shape of the former single entry.
+#[derive(Default)]
+pub(crate) struct AuthorityCache {
+    slots: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            Arc<tokio::sync::Mutex<Option<(String, GraphCoordinator)>>>, // forbidden-api-allow: a cache held across no round trip, not a gate (write_queue §Gates)
+        >,
+    >,
+}
+
+impl AuthorityCache {
+    /// The slot of branch `key` (`"main"` for main), locked.
+    pub(crate) async fn lock_for(
+        &self,
+        key: &str,
+    ) -> tokio::sync::OwnedMutexGuard<Option<(String, GraphCoordinator)>> {
+        let slot = {
+            let mut slots = self.slots.lock().expect("authority cache poisoned");
+            Arc::clone(slots.entry(key.to_string()).or_default())
+        };
+        slot.lock_owned().await
+    }
+}
+
 /// WAL research prototype: whether publications go through the branch's
 /// record log (`OMNIGRAPH_WAL=1`, read once).
 pub(crate) fn wal_enabled() -> bool {

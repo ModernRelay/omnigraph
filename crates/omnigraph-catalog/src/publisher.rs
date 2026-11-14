@@ -1222,7 +1222,20 @@ impl GraphNamespacePublisher {
                 "failed to encode expected Lance branch identifier: {e}"
             ))
         })?;
+        // WAL research prototype: on a branch whose log this process holds
+        // (its writer epoch held, the log bound to this native ref), the
+        // identifier the tail was opened with stands; the ref is not read
+        // again on every publication. A delete by another process is not
+        // fenced by the epoch either way (see writes.md); the fold then fails.
+        let wal_held = crate::wal::enabled()
+            && crate::wal::existing_tail(&self.root_uri, self.branch.as_deref()).is_some_and(
+                |tail| {
+                    tail.native() == dataset.manifest().branch.as_deref()
+                        && self.held_writer_version(tail.native()).is_some()
+                },
+            );
         let observed_identifier = match dataset.manifest().branch.as_deref() {
+            Some(_) if wal_held => Ok(branch_identifier.clone()),
             Some(native) => {
                 crate::branch_control::get_live_manifest_branch_contents(dataset, native)
                     .await

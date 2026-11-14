@@ -1694,7 +1694,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         // it must never temporarily change this handle's query/write binding.
         let cache_key = branch.unwrap_or("main");
         let captured = {
-            let mut cache = db.merge_authority_cache.lock().await;
+            let mut cache = db.merge_authority_cache.lock_for(cache_key).await;
             let matches = if let Some((key, coordinator)) = cache.as_ref() {
                 key == cache_key
                     && coordinator.current_branch() == branch
@@ -1735,7 +1735,8 @@ pub(super) async fn commit_updates_on_branch_with_expected(
         )
         .await
         .map_err(|error| caller_precondition_at_publish(txn, branch, error))?;
-        *db.merge_authority_cache.lock().await = Some((cache_key.to_string(), coordinator));
+        *db.merge_authority_cache.lock_for(cache_key).await =
+            Some((cache_key.to_string(), coordinator));
         published
     };
     if advances_head {
