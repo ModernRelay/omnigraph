@@ -216,8 +216,28 @@ evaluated (`let $r = if($n != 0, $t / $n, 0)`), or write the expression in
 `from { match … return { … } }` joins the rows of an inline read, one outer
 row per inner row, correlated on the outer variables it reads. Its returned
 references bind their names and its returned values read by name; a name it
-binds without returning stays its own variable. An inline read with an
-aggregate, `distinct`, `order` or `limit` is refused (`T86`).
+binds without returning stays its own variable.
+
+An inline read with its own aggregate, `distinct`, `order` or `limit` keeps
+them: its rows are grouped, ordered and cut as written, per outer row when it
+reads a name of the enclosing scope and once otherwise, before they are
+joined. An outer `where` never widens the inner cut and an outer `limit`
+never becomes it. A read grouped by no key is one row per outer row, its
+`count` 0 where nothing matches:
+
+```gq
+query friends_and_oldest() {
+  match {
+    $p: Person,
+    from { match { $q: Person, $p knows $q } return { count($q) as friends } },
+    from { match { $o: Person, $p knows $o } return { $o } order { $o.age desc } limit 1 },
+  }
+  return { $p.handle, $friends, $o.handle }
+}
+```
+
+A ranking (`nearest`, `bm25`, `rrf`, `distance`) inside such a read is not
+run in this release (`T86`).
 
 `from union(a, b, …)` joins the bag union of its arms, each an inline read:
 every row of every arm, duplicates kept (`return distinct` removes them). The
@@ -243,9 +263,8 @@ or an edge, or reading an outer name, is refused (`T86`).
 an inline read, each parameter bound to its argument evaluated in the
 caller's scope, and its returned columns enter the caller's scope. An argument
 is a binding, not text: `$p.handle` below reads the caller's `$p`, never the
-`$p` the called read binds for itself. The called read's own `order` and
-`limit` belong to it, so they are refused there as an inline read's are
-(`T86`):
+`$p` the called read binds for itself. The called read's own aggregate,
+`order` and `limit` belong to it, as an inline read's do:
 
 ```gq
 query colleagues($h: String) {

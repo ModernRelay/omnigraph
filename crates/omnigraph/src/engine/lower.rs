@@ -28,22 +28,22 @@ use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 use omnigraph_planner::logical::{EDGE_TYPE_MEMBER, IDENTITY_MEMBER};
 use omnigraph_planner::{
     Accumulator, AggregateFields, AntiJoinStrategy, BoundPlan, ColumnRef, ContainsJoinFields,
-    CsvSourceFields, DeltaSourceFields, ExpandFields, FragmentWriteFields, HashJoinFields,
-    HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError, Predicate,
-    ROW_ADDRESS_PREFIX, RankArm, RankFuseFields, RankKind, RankedAccess, RuntimeFilterKind,
-    RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields, ValidateFields,
-    ValueTable,
+    CorrelateFields, CsvSourceFields, DeltaSourceFields, ExpandFields, FragmentWriteFields,
+    HashJoinFields, HydratedBinding, Lower, NodeId, PhysicalNode, PhysicalPlan, PlanError,
+    Predicate, ROW_ADDRESS_PREFIX, RankArm, RankFuseFields, RankKind, RankedAccess,
+    RuntimeFilterKind, RuntimeFilterSpec, ScanInput, ScanSpec, SideId, SortMergeJoinFields,
+    ValidateFields, ValueTable,
 };
 
 use super::adapters::{GqProjectionExpr, LoweringId, Projected};
 use super::exact_aggregate::{EXACT_CARRIER, ExactIntegerUdaf};
 use super::operators::{
-    AntiJoinMaskExec, ArmOrder, CatalogueExec, ContainsJoinExec, CrossJoinExec, CsvSourceExec,
-    ExpandExec, ExpandExecution, ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec,
-    LanceFragmentSink, LetExec, LimitExec, LookupSpec, MetadataCountExec, OptionalJoinExec,
-    OuterReferenceExec, OuterSlot, ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec,
-    ScanSource, ScoreExec, SortExec, SortKey, TargetCutExec, UnionExec, ValidateExec,
-    fresh_tag_column, tagged_schema,
+    AntiJoinMaskExec, ArmOrder, CatalogueExec, ContainsJoinExec, CorrelateExec, CorrelateGroup,
+    CorrelateOuter, CorrelateRead, CrossJoinExec, CsvSourceExec, ExpandExec, ExpandExecution,
+    ExpandStep, FilterExec, GraphEnv, HashJoinExec, HydrateExec, LanceFragmentSink, LetExec,
+    LimitExec, LookupSpec, MetadataCountExec, OptionalJoinExec, OuterReferenceExec, OuterSlot,
+    ProjectionExec, RankFuseExec, RuntimeFilterSlot, ScanExec, ScanSource, ScoreExec, SortExec,
+    SortKey, TargetCutExec, UnionExec, ValidateExec, fresh_tag_column, tagged_schema,
 };
 use super::*;
 use crate::loader::LoadMode;
@@ -472,6 +472,99 @@ impl<'l, 'a> Walk<'l, 'a> {
         let (needle_binding, property) = &filter.needle;
         let needle = format!("{needle_binding}.{property}");
         Ok(RuntimeFilterSlot::new(binding, &filter.column, needle))
+    }
+
+    /// One declared aggregate over `input_schema` as `AggregateExec` runs
+    /// it, under `name`: the stored implementation the planner selected,
+    /// its argument and result checked against the signature.
+    fn aggregate_expr(
+        &self,
+        expr: &IRExpr,
+        spec: omnigraph_planner::AggregateSpec,
+        input_schema: &SchemaRef,
+        name: String,
+    ) -> Lowers<Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>> {
+        let IRExpr::Aggregate {
+            func,
+            distinct,
+            arg,
+            signature,
+        } = expr
+        else {
+            return Err(
+                OmniError::manifest_internal("an aggregate column is not an aggregate").into(),
+            );
+        };
+        let spec = &spec;
+        let projected = aggregate_argument(func, arg, &signature.arg);
+        let mut argument = self.lowering.projection(projected, &self.scope);
+        let data_type = argument
+            .data_type(input_schema)
+            .map_err(OmniError::datafusion)?;
+        if let Some(expected) = signature.arg.to_arrow() {
+            if data_type != expected {
+                return Err(OmniError::manifest_internal(format!(
+                    "aggregate argument has {data_type}, declared {expected}"
+                ))
+                .into());
+            }
+        }
+        let result = signature
+            .result
+            .to_arrow()
+            .ok_or_else(|| OmniError::manifest_internal("aggregate result must be scalar"))?;
+        let udaf = match (func, spec.accumulator) {
+            (AggFunc::Count, Accumulator::Count) => count_udaf(),
+            (AggFunc::Sum, Accumulator::ExactInteger) => {
+                argument = Arc::new(CastExpr::new(argument, EXACT_CARRIER, None));
+                Arc::new(datafusion::logical_expr::AggregateUDF::from(
+                    ExactIntegerUdaf::new(result.clone()),
+                ))
+            }
+            (AggFunc::Sum | AggFunc::Avg, Accumulator::Float64) => {
+                argument = Arc::new(CastExpr::new(argument, DataType::Float64, None));
+                if *func == AggFunc::Sum {
+                    sum_udaf()
+                } else {
+                    avg_udaf()
+                }
+            }
+            (AggFunc::Min, Accumulator::Extremum) => min_udaf(),
+            (AggFunc::Max, Accumulator::Extremum) => max_udaf(),
+            (
+                AggFunc::Count,
+                Accumulator::ExactInteger | Accumulator::Float64 | Accumulator::Extremum,
+            )
+            | (AggFunc::Sum, Accumulator::Count | Accumulator::Extremum)
+            | (
+                AggFunc::Avg,
+                Accumulator::Count | Accumulator::ExactInteger | Accumulator::Extremum,
+            )
+            | (
+                AggFunc::Min | AggFunc::Max,
+                Accumulator::Count | Accumulator::ExactInteger | Accumulator::Float64,
+            ) => {
+                return Err(OmniError::manifest_internal(
+                    "aggregate function disagrees with declared accumulator",
+                )
+                .into());
+            }
+        };
+        let aggregate = AggregateExprBuilder::new(udaf, vec![argument])
+            .schema(Arc::clone(input_schema))
+            .alias(name)
+            .with_distinct(*distinct)
+            .build()
+            .map(Arc::new)
+            .map_err(OmniError::datafusion)?;
+        if aggregate.field().data_type() != &result {
+            return Err(OmniError::manifest_internal(format!(
+                "aggregate result has {}, declared {result}",
+                aggregate.field().data_type()
+            ))
+            .into());
+        }
+        Ok(aggregate)
     }
 
     fn not_a_pipeline_node(name: &str) -> LowerError {
@@ -944,6 +1037,208 @@ impl Lower for Walk<'_, '_> {
         self.built(id, join)
     }
 
+    /// The read's group is an `AggregateExec` over the inner rows, built
+    /// here and fed from its own slot: grouped by the outer tag
+    /// (correlated), each key (a reference by its identity) and every
+    /// aggregate, with each group's first inner row, which carries a
+    /// reference key's columns.
+    fn correlate(
+        &mut self,
+        id: NodeId,
+        fields: CorrelateFields<'_>,
+        outer: Option<Plan>,
+        inner: Plan,
+    ) -> Lowers<Plan> {
+        let CorrelateFields {
+            outer_var,
+            read,
+            tiebreak,
+        } = fields;
+        let scope = match outer_var {
+            Some(_) => Some(self.outers.pop().ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "Correlate closed with no outer scope open".to_string(),
+                )
+            })?),
+            None => None,
+        };
+        let id_column = self.lowering.catalog.system_columns.id;
+        let inner_schema = inner.schema();
+        let group = match &read.group {
+            Some(items) => {
+                let row_column = fresh_column(&inner_schema, "~correlate_row");
+                let mut fields: Vec<arrow_schema::Field> = inner_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect();
+                fields.push(arrow_schema::Field::new(
+                    &row_column,
+                    DataType::UInt64,
+                    false,
+                ));
+                let rows_schema = Arc::new(Schema::new(fields));
+                let slot = Arc::new(OuterSlot::default());
+                let leaf: Plan = Arc::new(OuterReferenceExec::new(
+                    "correlated read".to_string(),
+                    Arc::clone(&slot),
+                    Arc::clone(&rows_schema),
+                ));
+                let mut groups: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::new();
+                if let Some(scope) = &scope {
+                    let index = rows_schema
+                        .index_of(&scope.tag_column)
+                        .map_err(OmniError::arrow_internal)?;
+                    groups.push((
+                        Arc::new(Column::new(&scope.tag_column, index)),
+                        scope.tag_column.clone(),
+                    ));
+                }
+                let first_column = fresh_column(&rows_schema, "~correlate_first");
+                let index = rows_schema
+                    .index_of(&row_column)
+                    .map_err(OmniError::arrow_internal)?;
+                let first = AggregateExprBuilder::new(
+                    min_udaf(),
+                    vec![Arc::new(Column::new(&row_column, index))],
+                )
+                .schema(Arc::clone(&rows_schema))
+                .alias(&first_column)
+                .build()
+                .map(Arc::new)
+                .map_err(OmniError::datafusion)?;
+                let mut aggregates = vec![first];
+                let mut carried = Vec::new();
+                let mut outputs = Vec::new();
+                let mut counts = Vec::new();
+                let mut keyed = false;
+                for item in items {
+                    let column = format!("{}.{}", read.values, item.column);
+                    match &item.expr {
+                        IRExpr::Aggregate {
+                            func, signature, ..
+                        } => {
+                            let spec = omnigraph_planner::plan_aggregate(*func, signature)
+                                .map_err(|e| OmniError::manifest_internal(e.to_string()))?;
+                            let name = format!("~correlate_{}", item.column);
+                            aggregates.push(self.aggregate_expr(
+                                &item.expr,
+                                spec,
+                                &rows_schema,
+                                name.clone(),
+                            )?);
+                            if *func == AggFunc::Count {
+                                counts.push(column.clone());
+                            }
+                            outputs.push((name, column));
+                        }
+                        IRExpr::Variable(binding, _) => {
+                            keyed = true;
+                            let identity = format!("{binding}.{id_column}");
+                            let index = rows_schema
+                                .index_of(&identity)
+                                .map_err(OmniError::arrow_internal)?;
+                            groups.push((
+                                Arc::new(Column::new(&identity, index)),
+                                format!("~correlate_key_{binding}"),
+                            ));
+                            carried.push(binding.clone());
+                        }
+                        expr => {
+                            keyed = true;
+                            let name = format!("~correlate_{}", item.column);
+                            groups.push((
+                                self.lowering.projection(
+                                    Projected::Expression(expr.clone(), item.ty.clone()),
+                                    &self.scope,
+                                ),
+                                name.clone(),
+                            ));
+                            outputs.push((name, column));
+                        }
+                    }
+                }
+                let filters = vec![None; aggregates.len()];
+                let plan = AggregateExec::try_new(
+                    AggregateMode::Single,
+                    PhysicalGroupBy::new_single(groups),
+                    aggregates,
+                    filters,
+                    leaf,
+                    rows_schema,
+                )
+                .map_err(OmniError::datafusion)?;
+                Some(CorrelateGroup {
+                    slot,
+                    plan: Arc::new(plan),
+                    row_column,
+                    first_column,
+                    carried,
+                    outputs,
+                    keyless: (!keyed).then_some(counts),
+                })
+            }
+            None => None,
+        };
+        let mut values = Vec::new();
+        let mut references = Vec::new();
+        for column in &read.columns {
+            match (&column.expr, column.ty.to_arrow()) {
+                (IRExpr::Variable(name, _), _) => references.push(name.clone()),
+                (expr, Some(data_type)) => values.push((
+                    format!("{}.{}", read.values, column.column),
+                    expr.clone(),
+                    data_type,
+                )),
+                (_, None) => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "the correlated read's column `{}` has no Arrow type",
+                        column.column
+                    ))
+                    .into());
+                }
+            }
+        }
+        let tiebreak = tiebreak
+            .iter()
+            .map(|key| match key.property.as_deref() {
+                Some(IDENTITY_MEMBER | EDGE_TYPE_MEMBER) => tiebreak_column(key, id_column),
+                Some(property) => Ok(format!("{}.{property}", key.binding)),
+                None => Err(OmniError::manifest_internal(format!(
+                    "the correlated read's tie-break `{key}` names no column"
+                ))),
+            })
+            .collect::<Result<Vec<String>>>()?;
+        let read = Arc::new(CorrelateRead {
+            group,
+            values,
+            order_by: read.order_by.clone(),
+            tiebreak,
+            limit: read
+                .limit
+                .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX)),
+            references,
+            params: Arc::clone(self.lowering.params()),
+        });
+        let outer = match (outer, scope, outer_var) {
+            (Some(plan), Some(scope), Some(outer_var)) => Some(CorrelateOuter {
+                plan,
+                outer_var: outer_var.to_string(),
+                tag_column: scope.tag_column,
+                slot: scope.slot,
+            }),
+            (None, None, None) => None,
+            _ => {
+                return Err(OmniError::manifest_internal(
+                    "a correlated read without its outer rows and scope".to_string(),
+                )
+                .into());
+            }
+        };
+        let exec = CorrelateExec::try_new(outer, inner, read)?;
+        self.built(id, exec)
+    }
+
     fn outer_reference(&mut self, id: NodeId, outer_var: &str) -> Lowers<Plan> {
         let scope = self.outers.last().ok_or_else(|| {
             OmniError::manifest_internal(
@@ -1085,84 +1380,8 @@ impl Lower for Walk<'_, '_> {
         for (proj, spec) in fields.return_exprs.iter().zip(fields.aggregates) {
             let name = return_name(proj);
             match (&proj.expr, spec) {
-                (
-                    IRExpr::Aggregate {
-                        func,
-                        distinct,
-                        arg,
-                        signature,
-                    },
-                    Some(spec),
-                ) => {
-                    let projected = aggregate_argument(func, arg, &signature.arg);
-                    let mut argument = self.lowering.projection(projected, &self.scope);
-                    let data_type = argument
-                        .data_type(&input_schema)
-                        .map_err(OmniError::datafusion)?;
-                    if let Some(expected) = signature.arg.to_arrow() {
-                        if data_type != expected {
-                            return Err(OmniError::manifest_internal(format!(
-                                "aggregate argument has {data_type}, declared {expected}"
-                            ))
-                            .into());
-                        }
-                    }
-                    let result = signature.result.to_arrow().ok_or_else(|| {
-                        OmniError::manifest_internal("aggregate result must be scalar")
-                    })?;
-                    let udaf = match (func, spec.accumulator) {
-                        (AggFunc::Count, Accumulator::Count) => count_udaf(),
-                        (AggFunc::Sum, Accumulator::ExactInteger) => {
-                            argument = Arc::new(CastExpr::new(argument, EXACT_CARRIER, None));
-                            Arc::new(datafusion::logical_expr::AggregateUDF::from(
-                                ExactIntegerUdaf::new(result.clone()),
-                            ))
-                        }
-                        (AggFunc::Sum | AggFunc::Avg, Accumulator::Float64) => {
-                            argument = Arc::new(CastExpr::new(argument, DataType::Float64, None));
-                            if *func == AggFunc::Sum {
-                                sum_udaf()
-                            } else {
-                                avg_udaf()
-                            }
-                        }
-                        (AggFunc::Min, Accumulator::Extremum) => min_udaf(),
-                        (AggFunc::Max, Accumulator::Extremum) => max_udaf(),
-                        (
-                            AggFunc::Count,
-                            Accumulator::ExactInteger
-                            | Accumulator::Float64
-                            | Accumulator::Extremum,
-                        )
-                        | (AggFunc::Sum, Accumulator::Count | Accumulator::Extremum)
-                        | (
-                            AggFunc::Avg,
-                            Accumulator::Count | Accumulator::ExactInteger | Accumulator::Extremum,
-                        )
-                        | (
-                            AggFunc::Min | AggFunc::Max,
-                            Accumulator::Count | Accumulator::ExactInteger | Accumulator::Float64,
-                        ) => {
-                            return Err(OmniError::manifest_internal(
-                                "aggregate function disagrees with declared accumulator",
-                            )
-                            .into());
-                        }
-                    };
-                    let aggregate = AggregateExprBuilder::new(udaf, vec![argument])
-                        .schema(Arc::clone(&input_schema))
-                        .alias(name)
-                        .with_distinct(*distinct)
-                        .build()
-                        .map(Arc::new)
-                        .map_err(OmniError::datafusion)?;
-                    if aggregate.field().data_type() != &result {
-                        return Err(OmniError::manifest_internal(format!(
-                            "aggregate result has {}, declared {result}",
-                            aggregate.field().data_type()
-                        ))
-                        .into());
-                    }
+                (IRExpr::Aggregate { .. }, Some(spec)) => {
+                    let aggregate = self.aggregate_expr(&proj.expr, *spec, &input_schema, name)?;
                     aggregates.push(aggregate);
                 }
                 (IRExpr::Aggregate { .. }, None) => {
@@ -1575,6 +1794,18 @@ fn tiebreak_column(key: &ColumnRef, id_column: &str) -> Result<String> {
         }
     };
     Ok(format!("{}.{}", key.binding, property))
+}
+
+/// A column name `schema` does not hold, from `base`.
+fn fresh_column(schema: &Schema, base: &str) -> String {
+    let mut n = 0usize;
+    loop {
+        let candidate = format!("{base}_{n}");
+        if schema.column_with_name(&candidate).is_none() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// The columns of `batch` in `names`' order, for a root whose operator emits

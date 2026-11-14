@@ -93,6 +93,20 @@ fn multi_input_samples(plan: &mut PhysicalPlan) -> Vec<PhysicalNode> {
             right: l,
             bindings: vec!["o".to_string()],
         },
+        PhysicalNode::Correlate {
+            input: Some(k),
+            inner: l,
+            outer_var: Some("o".to_string()),
+            read: Box::new(omnigraph_planner::InnerRead {
+                values: "v".to_string(),
+                group: None,
+                columns: Vec::new(),
+                order_by: Vec::new(),
+                limit: Some(1),
+                limit_param: None,
+            }),
+            tiebreak: Vec::new(),
+        },
         PhysicalNode::RankFuse {
             arms: [
                 arm(leaf(plan), RankKind::Nearest),

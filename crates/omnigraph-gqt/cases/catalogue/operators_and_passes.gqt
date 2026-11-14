@@ -45,6 +45,7 @@ query operators() {
 {"o.name":"AntiJoin","o.inputs":[2]}
 {"o.name":"Union","o.inputs":[2]}
 {"o.name":"OptionalJoin","o.inputs":[2]}
+{"o.name":"Correlate","o.inputs":[1,2]}
 {"o.name":"OuterReference","o.inputs":[0]}
 {"o.name":"RankFuse","o.inputs":[2]}
 {"o.name":"Projection","o.inputs":[1]}
@@ -101,6 +102,7 @@ query logical_kinds() {
 --- expect unordered
 {"k.name":"Aggregate","k.coverage":"refused_by_name"}
 {"k.name":"AntiJoin","k.coverage":"refused_by_name"}
+{"k.name":"Correlate","k.coverage":"refused_by_name"}
 {"k.name":"CsvSource","k.coverage":"refused_by_name"}
 {"k.name":"DeltaSource","k.coverage":"refused_by_name"}
 {"k.name":"Expand","k.coverage":"refused_by_name"}

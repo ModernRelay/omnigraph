@@ -548,6 +548,20 @@ query liked_d0_or_not() {
     match { $p: Person, optional { $p likes $d where $d.title = "d0" } }
     return { $p.name, $d.title }
 }
+query likes_per_person() {
+    match {
+        $p: Person,
+        from { match { $d: Doc, $p likes $d } return { count($d) as n, max($d.title) as last } },
+    }
+    return { $p.name, $n, $last }
+}
+query last_liked() {
+    match {
+        $p: Person,
+        from { match { $d: Doc, $p likes $d } return { $d } order { $d.title desc } limit 1 },
+    }
+    return { $p.name, $d.title }
+}
 "#;
 
 const DOC_SCHEMA: &str = r#"
@@ -1775,6 +1789,64 @@ async fn the_skip_shapes_and_the_aggregate_replay() {
             "{label}: {error}"
         );
     }
+}
+
+/// A `from` over an inline read with its own aggregate replays per outer
+/// row, a person liking nothing counting 0, and one with its own cut keeps
+/// each person's first row; a saved plan whose `Correlate` cuts to another
+/// count is refused at the door.
+#[tokio::test]
+async fn a_correlated_read_replays_and_an_edited_one_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = people(&dir).await;
+    let Replayed { result, rows, .. } =
+        replayed(&db, PEOPLE_QUERIES, "likes_per_person", &ParamMap::new()).await;
+    let mut counts: Vec<String> = result
+        .iter()
+        .map(|row| format!("{}:{}:{}", row["p.name"], row["n"], row["last"]))
+        .collect();
+    counts.sort();
+    assert_eq!(
+        counts,
+        ["\"ann\":2:\"d1\"", "\"bob\":1:\"d0\"", "\"cyd\":0:null"],
+        "{result:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["operator"] == "CorrelateExec" && row["status"] == "executed"),
+        "{rows:#?}"
+    );
+    let Replayed {
+        result,
+        plan,
+        envelope,
+        ..
+    } = replayed(&db, PEOPLE_QUERIES, "last_liked", &ParamMap::new()).await;
+    let mut liked: Vec<String> = result
+        .iter()
+        .map(|row| format!("{}:{}", row["p.name"], row["d.title"]))
+        .collect();
+    liked.sort();
+    assert_eq!(liked, ["\"ann\":\"d1\"", "\"bob\":\"d0\""], "{result:?}");
+    let mut altered = serde_json::to_value(plan).unwrap();
+    let node = altered["body"]["plan"]["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|node| node["node"] == "Correlate")
+        .unwrap();
+    node["read"]["limit"] = serde_json::json!(2);
+    let error = match db
+        .replay_bound_plan("main", &with_plan(&envelope, altered))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a correlated read with another cut replayed"),
+    };
+    assert!(
+        error.to_string().contains("no correlated read of the plan"),
+        "{error}"
+    );
 }
 
 /// An `optional` replays with its rows kept without a match, and a saved

@@ -40,6 +40,14 @@ pub struct RankFuseFields<'p> {
     pub row_tiebreak: &'p [ColumnRef],
 }
 
+/// The fields of [`PhysicalNode::Correlate`] beside its inputs.
+#[derive(Debug, Clone, Copy)]
+pub struct CorrelateFields<'p> {
+    pub outer_var: Option<&'p str>,
+    pub read: &'p crate::read_shape::InnerRead,
+    pub tiebreak: &'p [ColumnRef],
+}
+
 /// The fields of [`PhysicalNode::Expand`] beside its input.
 #[derive(Debug, Clone, Copy)]
 pub struct ExpandFields<'p> {
@@ -292,6 +300,16 @@ pub trait Lower {
         id: NodeId,
         outer_var: &str,
         outer: Self::Op,
+        inner: Self::Op,
+    ) -> Result<Self::Op, Self::Error>;
+
+    /// Called with the inner tree lowered, and with the outer input lowered
+    /// first (then [`Lower::correlate_outer`]) when the read correlates.
+    fn correlate(
+        &mut self,
+        id: NodeId,
+        fields: CorrelateFields<'_>,
+        outer: Option<Self::Op>,
         inner: Self::Op,
     ) -> Result<Self::Op, Self::Error>;
 
@@ -632,6 +650,35 @@ impl PhysicalPlan {
                 l.correlate_outer(id, outer_var, &outer)?;
                 let inner = self.lower_node(*inner, l)?;
                 l.optional_join(id, outer_var, outer, inner)
+            }
+            PhysicalNode::Correlate {
+                input,
+                inner,
+                outer_var,
+                read,
+                tiebreak,
+            } => {
+                let outer = match (input, outer_var) {
+                    (Some(input), Some(outer_var)) => {
+                        let outer = self.lower_node(*input, l)?;
+                        l.correlate_outer(id, outer_var, &outer)?;
+                        Some(outer)
+                    }
+                    (None, None) => None,
+                    _ => {
+                        return Err(PlanError::Internal(format!(
+                            "correlate {id} has an outer input without its correlation name, or one without the other"
+                        ))
+                        .into());
+                    }
+                };
+                let inner = self.lower_node(*inner, l)?;
+                let fields = CorrelateFields {
+                    outer_var: outer_var.as_deref(),
+                    read,
+                    tiebreak,
+                };
+                l.correlate(id, fields, outer, inner)
             }
             PhysicalNode::OuterReference { outer_var } => l.outer_reference(id, outer_var),
             PhysicalNode::RankFuse {

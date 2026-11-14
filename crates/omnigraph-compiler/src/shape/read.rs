@@ -140,6 +140,87 @@ pub enum PatternStep {
         name: String,
         value: IRExpr,
     },
+    /// `from` an inline read (or a declared read's call) with its own
+    /// aggregate, `distinct`, `order` or `limit`, the core's `Correlate`
+    /// over its `Group`, `Order` and `Cut`: `inner` is the read's pattern and
+    /// `read` what it returns. With `outer_var`, the inner pattern runs over
+    /// the rows of the steps before it, from its `OuterReference` to them,
+    /// and the read is evaluated per outer row, each outer row joined to the
+    /// rows its own read returns; without one it reads nothing of the
+    /// enclosing scope and runs once, joined to every outer row.
+    Correlate {
+        outer_var: Option<String>,
+        inner: Vec<PatternStep>,
+        read: InnerRead,
+    },
+}
+
+/// What a `from` over an inline read with its own aggregate, `distinct`,
+/// `order` or `limit` returns (docs/rfcs/2026-11-07-gq-3.md, section 3: an
+/// inner `order` and `limit` belong to the inner read, so an outer `where`
+/// never widens the inner cut and an outer `limit` never becomes it).
+///
+/// The read's rows are its pattern's rows, or with `group` one row per
+/// group; its columns are computed over those rows, which its `order`
+/// sorts, the tie rule breaking equal keys, and its `limit` cuts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InnerRead {
+    /// The binding whose properties hold the read's value columns in the
+    /// enclosing rows, and its group's key and aggregate columns in its own
+    /// rows: a value column `n` is `values.n` after the `from`. It names no
+    /// node or edge.
+    pub values: String,
+    /// `Some` when the read groups (an aggregate or `distinct`): its group
+    /// keys and aggregates over the pattern's rows, each a column of
+    /// `values` under its `column`. A key that is a reference
+    /// (`Variable`) groups by its identity and carries its binding's
+    /// columns; with no key, the read is one row, over no pattern row too.
+    pub group: Option<Vec<IRProjection>>,
+    /// The returned columns in written order, each `column` its name in the
+    /// enclosing scope: a reference is `Variable` of that name, which the
+    /// read's pattern binds; a value is its expression over the read's rows.
+    pub columns: Vec<IRProjection>,
+    /// The read's own `order` keys over its rows.
+    pub order_by: Vec<IROrdering>,
+    pub limit: Option<u64>,
+    /// `limit $param`: the parameter the cut reads, folded into `limit`
+    /// before planning as the read's own `limit $param` is.
+    pub limit_param: Option<String>,
+}
+
+impl InnerRead {
+    /// Every expression the read evaluates.
+    pub fn exprs(&self) -> impl Iterator<Item = &IRExpr> {
+        self.group
+            .iter()
+            .flatten()
+            .chain(&self.columns)
+            .map(|projection| &projection.expr)
+            .chain(self.order_by.iter().map(|ordering| &ordering.expr))
+    }
+
+    /// Every expression the read evaluates, mutably.
+    pub fn exprs_mut(&mut self) -> impl Iterator<Item = &mut IRExpr> {
+        self.group
+            .iter_mut()
+            .flatten()
+            .chain(&mut self.columns)
+            .map(|projection| &mut projection.expr)
+            .chain(self.order_by.iter_mut().map(|ordering| &mut ordering.expr))
+    }
+
+    /// The names of the reference columns, which the read's pattern binds.
+    pub fn references(&self) -> impl Iterator<Item = &str> {
+        self.columns
+            .iter()
+            .filter(|projection| {
+                matches!(
+                    projection.expr,
+                    IRExpr::Variable(_, ExprType::Node { .. } | ExprType::Edge { .. })
+                )
+            })
+            .map(|projection| projection.column.as_str())
+    }
 }
 
 impl ReadShape {
@@ -160,9 +241,9 @@ impl ReadShape {
                         return true;
                     }
                 }
-                PatternStep::AntiJoin { inner, .. } | PatternStep::Optional { inner, .. } => {
-                    pending.extend(inner)
-                }
+                PatternStep::AntiJoin { inner, .. }
+                | PatternStep::Optional { inner, .. }
+                | PatternStep::Correlate { inner, .. } => pending.extend(inner),
                 PatternStep::Union { arms, .. } => pending.extend(arms.iter().flatten()),
                 PatternStep::NodeScan { .. }
                 | PatternStep::Filter(_)
@@ -308,6 +389,9 @@ fn physical_names(pipeline: &[PatternStep]) -> HashSet<String> {
             PatternStep::Union { arms, .. } => arms
                 .iter()
                 .for_each(|arm| names.extend(physical_names(arm))),
+            PatternStep::Correlate { read, .. } => {
+                names.extend(read.references().map(str::to_string));
+            }
             PatternStep::Filter(_)
             | PatternStep::AntiJoin { .. }
             | PatternStep::Rank { .. }
@@ -335,6 +419,9 @@ struct Facts {
     optionals: Vec<OptionalFact>,
     /// The `from union(…)` elements, in written order.
     unions: Vec<UnionFact>,
+    /// The `from`s over an inline read with its own aggregate, `distinct`,
+    /// `order` or `limit`, in written order.
+    correlates: Vec<CorrelateFact>,
     /// The names the `optional`s introduce, which an element after them may
     /// not read: the steps place an `optional` after the scope's bindings
     /// and traversals.
@@ -360,6 +447,7 @@ struct Marks {
     blocks: usize,
     optionals: usize,
     unions: usize,
+    correlates: usize,
 }
 
 /// A `let` whose value can fail, at the point of the scope it was written.
@@ -380,6 +468,7 @@ impl Facts {
             blocks: self.blocks.len(),
             optionals: self.optionals.len(),
             unions: self.unions.len(),
+            correlates: self.correlates.len(),
         }
     }
 
@@ -393,6 +482,15 @@ impl Facts {
             blocks: self.blocks[from.blocks..to.blocks].to_vec(),
             optionals: self.optionals[from.optionals..to.optionals].to_vec(),
             unions: self.unions[from.unions..to.unions].to_vec(),
+            correlates: self.correlates[from.correlates..to.correlates]
+                .iter()
+                .cloned()
+                .map(|mut correlate| {
+                    correlate.optionals_before =
+                        correlate.optionals_before.saturating_sub(from.optionals);
+                    correlate
+                })
+                .collect(),
             optional_names: self.optional_names.clone(),
             types: self.types.clone(),
             lets: HashMap::new(),
@@ -416,8 +514,14 @@ impl Facts {
                     // traversals, filters and blocks.
                     optionals: at.optionals,
                     unions: at.unions,
+                    correlates: at.correlates + check.marks.correlates,
                 };
                 check
+            }));
+        self.correlates
+            .extend(other.correlates.into_iter().map(|mut correlate| {
+                correlate.optionals_before = at.optionals;
+                correlate
             }));
         self.bindings.extend(other.bindings);
         self.traversals.extend(other.traversals);
@@ -440,6 +544,9 @@ impl Facts {
         for union in &self.unions {
             out.extend(union.bindings.iter().map(|(name, _)| name.clone()));
             union.arms.iter().for_each(|arm| out.extend(arm.names()));
+        }
+        for correlate in &self.correlates {
+            out.extend(correlate.read.references().map(str::to_string));
         }
         out.retain(|name| name != "_");
         out
@@ -504,6 +611,25 @@ impl Facts {
             union.arms.iter_mut().for_each(|arm| arm.rename(renames));
             union.bindings.iter_mut().for_each(|(name, _)| rename(name));
         }
+        for correlate in &mut self.correlates {
+            correlate.inner.rename(renames);
+            correlate.outer = std::mem::take(&mut correlate.outer)
+                .into_iter()
+                .map(|mut name| {
+                    rename(&mut name);
+                    name
+                })
+                .collect();
+            for column in &mut correlate.read.columns {
+                if is_reference(&column.expr) {
+                    rename(&mut column.column);
+                }
+            }
+            correlate
+                .read
+                .exprs_mut()
+                .for_each(|e| rename_expr(e, &rename));
+        }
         self.optional_names = std::mem::take(&mut self.optional_names)
             .into_iter()
             .map(|mut name| {
@@ -529,6 +655,9 @@ impl Facts {
                 .iter()
                 .for_each(|arm| arm.optional_names_into(out));
         }
+        for correlate in &self.correlates {
+            correlate.inner.optional_names_into(out);
+        }
     }
 
     /// `f` over every expression the facts hold, a block's and an
@@ -552,6 +681,10 @@ impl Facts {
         }
         for union in &mut self.unions {
             union.arms.iter_mut().for_each(|arm| arm.each_expr(f));
+        }
+        for correlate in &mut self.correlates {
+            correlate.inner.each_expr(f);
+            correlate.read.exprs_mut().for_each(&mut *f);
         }
     }
 
@@ -577,6 +710,10 @@ impl Facts {
         }
         for optional in &mut self.optionals {
             optional.inner.substitute(lets);
+        }
+        for correlate in &mut self.correlates {
+            correlate.inner.substitute(lets);
+            correlate.read.exprs_mut().for_each(|e| substitute(e, lets));
         }
     }
 }
@@ -614,6 +751,17 @@ struct OptionalFact {
     inner: Facts,
 }
 
+/// A `from` over an inline read with its own aggregate, `distinct`, `order`
+/// or `limit`: the read's pattern facts, the outer names it reads, what it
+/// returns, and how many `optional`s of the scope were written before it.
+#[derive(Debug, Clone)]
+struct CorrelateFact {
+    inner: Facts,
+    outer: HashSet<String>,
+    read: InnerRead,
+    optionals_before: usize,
+}
+
 #[derive(Debug, Clone)]
 struct BlockFact {
     inner: Facts,
@@ -622,6 +770,14 @@ struct BlockFact {
     left: BlockAggregateExpr,
     op: CompOp,
     right: IRExpr,
+}
+
+/// Whether `expr` is a reference: a node or edge variable.
+fn is_reference(expr: &IRExpr) -> bool {
+    matches!(
+        expr,
+        IRExpr::Variable(_, ExprType::Node { .. } | ExprType::Edge { .. })
+    )
 }
 
 fn is_anon(name: &str) -> bool {
@@ -1771,6 +1927,9 @@ impl<'a> Shaper<'a> {
         bindings: &[(String, IRExpr)],
         facts: &mut Facts,
     ) -> Result<(), ShapeError> {
+        if groups_or_cuts(input) {
+            return self.correlate_read(input, items, bindings, facts);
+        }
         let outer: HashSet<String> = env_columns(input).into_iter().collect();
         let mut inner = Facts::default();
         self.facts(input, &mut inner)?;
@@ -1843,6 +2002,290 @@ impl<'a> Shaper<'a> {
             }
             facts.lets.insert(column, value);
         }
+        Ok(())
+    }
+
+    /// `from { match … return { … } order { … } limit n }` with an
+    /// aggregate, `distinct`, an `order` or a `limit` of its own: the core's
+    /// `Correlate` over the read's `Group`, `Order` and `Cut`, which the
+    /// outer rows are not flattened into. The read's pattern facts are its
+    /// own scope, every name it binds without returning renamed apart and a
+    /// returned reference bound under its column's name; a returned value
+    /// enters the enclosing scope as a column of the read's `values`
+    /// binding. A declared read's call is its body read the same way.
+    fn correlate_read(
+        &self,
+        input: &Term,
+        items: &[(String, IRExpr)],
+        bindings: &[(String, IRExpr)],
+        facts: &mut Facts,
+    ) -> Result<(), ShapeError> {
+        let at = || Construct::Element(FROM, None);
+        let mut outer: HashSet<String> = env_columns(input).into_iter().collect();
+        for (_, arg) in bindings {
+            let mut read = Vec::new();
+            arg.columns(&mut read);
+            outer.extend(read);
+        }
+        // The read's own cut, order and grouping, as the read's are.
+        let mut term = input;
+        let (mut limit, mut limit_param) = (None, None);
+        if let Term::Cut { input, k } = term {
+            match k {
+                Count::Literal(n) => limit = Some(*n),
+                Count::Param(p) => limit_param = Some(p.clone()),
+            }
+            term = input;
+        }
+        // A called read's `limit $k` reads the argument bound to `$k`.
+        if let Some(name) = limit_param.take() {
+            match bindings.iter().find(|(param, _)| *param == name) {
+                None => limit_param = Some(name),
+                Some((_, IRExpr::Param(caller, _))) => limit_param = Some(caller.clone()),
+                Some((_, IRExpr::Literal(Literal::Integer(n), _))) => {
+                    limit = Some(u64::try_from(*n).map_err(|_| {
+                        ShapeError::Internal(format!("`limit ${name}` is bound to {n}"))
+                    })?)
+                }
+                Some(_) => {
+                    return Err(self.refuse_at(
+                        "a called read's `limit` over an argument that is not a literal or a parameter",
+                        at(),
+                    ));
+                }
+            }
+        }
+        let mut order_keys: Vec<(IRExpr, bool)> = Vec::new();
+        if let Term::Order { input, keys } = term {
+            order_keys = keys.clone();
+            term = input;
+        }
+        let mut extended: Vec<(String, IRExpr)> = Vec::new();
+        let mut keys: Vec<(String, IRExpr)> = Vec::new();
+        let mut aggs: Vec<(String, Agg)> = Vec::new();
+        let mut grouped = false;
+        if let Term::Project {
+            input,
+            items,
+            keep: true,
+        } = term
+            && matches!(input.as_ref(), Term::Group { .. })
+        {
+            extended = items.clone();
+            term = input;
+        }
+        if let Term::Group {
+            input,
+            keys: group_keys,
+            aggs: group_aggs,
+        } = term
+        {
+            grouped = true;
+            keys = group_keys.clone();
+            aggs = group_aggs.clone();
+            term = input;
+        }
+        // An ungrouped read's computed items extend its pattern's rows.
+        if !grouped
+            && let Term::Project {
+                input,
+                items,
+                keep: true,
+            } = term
+            && items.iter().all(|(name, _)| name.starts_with('^'))
+        {
+            extended = items.clone();
+            term = input;
+        }
+        let mut ranked = Vec::new();
+        term.nodes(&mut ranked);
+        if ranked.iter().any(|node| {
+            matches!(
+                node,
+                CoreNode::ApproxTopK | CoreNode::Score | CoreNode::Fuse
+            )
+        }) {
+            return Err(self.refuse_at(
+                "a ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit`",
+                at(),
+            ));
+        }
+        let mut inner = Facts {
+            inlined: facts.inlined,
+            ..Facts::default()
+        };
+        self.facts(term, &mut inner)?;
+        let inner_lets = std::mem::take(&mut inner.lets);
+        inner.substitute(&inner_lets);
+        let read_lets = |mut e: IRExpr| {
+            substitute(&mut e, &inner_lets);
+            e
+        };
+        let extended: Vec<(String, IRExpr)> = extended
+            .into_iter()
+            .map(|(name, e)| (name, read_lets(e)))
+            .collect();
+        let keys: Vec<(String, IRExpr)> = keys
+            .into_iter()
+            .map(|(name, e)| (name, read_lets(e)))
+            .collect();
+        for (_, agg) in &mut aggs {
+            if let Some(arg) = &mut agg.arg {
+                substitute(arg, &inner_lets);
+            }
+        }
+        // What each hidden column is over the read's rows: an item over the
+        // pattern's rows, or a group's key or aggregate column.
+        let values = format!("{FRESH_PREFIX}r{}", inner.inlined);
+        inner.inlined += 1;
+        let mut rows: HashMap<String, IRExpr> = HashMap::new();
+        let mut group = None;
+        if grouped {
+            let mut columns = Vec::with_capacity(keys.len() + aggs.len());
+            for (hidden, key) in &keys {
+                rows.insert(
+                    hidden.clone(),
+                    if is_reference(key) {
+                        key.clone()
+                    } else {
+                        IRExpr::PropAccess {
+                            variable: values.clone(),
+                            property: hidden.clone(),
+                            ty: key.ty().clone(),
+                        }
+                    },
+                );
+                columns.push(IRProjection {
+                    expr: key.clone(),
+                    alias: None,
+                    column: hidden.clone(),
+                    ty: key.ty().clone(),
+                });
+            }
+            for (hidden, agg) in &aggs {
+                let aggregate = self.aggregate(agg, None).map_err(|e| e.at(at()))?;
+                let ty = aggregate.ty().clone();
+                rows.insert(
+                    hidden.clone(),
+                    IRExpr::PropAccess {
+                        variable: values.clone(),
+                        property: hidden.clone(),
+                        ty: ty.clone(),
+                    },
+                );
+                columns.push(IRProjection {
+                    expr: aggregate,
+                    alias: None,
+                    column: hidden.clone(),
+                    ty,
+                });
+            }
+            group = Some(columns);
+        }
+        for (hidden, e) in &extended {
+            let mut e = e.clone();
+            substitute(&mut e, &rows);
+            rows.insert(hidden.clone(), e);
+        }
+        // The returned columns: a reference binds its column's name.
+        let mut renames: HashMap<String, String> = HashMap::new();
+        let mut columns = Vec::with_capacity(items.len());
+        for (column, item) in items {
+            let mut expr = item.clone();
+            substitute(&mut expr, &rows);
+            if let IRExpr::Variable(variable, _) = &expr
+                && is_reference(&expr)
+            {
+                if variable != column {
+                    if outer.contains(variable) {
+                        return Err(self.refuse_at(
+                            "a `from` returning an outer variable under another name",
+                            at(),
+                        ));
+                    }
+                    renames.insert(variable.clone(), column.clone());
+                }
+                if let ExprType::Node { type_name } = expr.ty() {
+                    facts.types.insert(column.clone(), type_name.clone());
+                }
+            }
+            columns.push(IRProjection {
+                ty: expr.ty().clone(),
+                expr,
+                alias: None,
+                column: column.clone(),
+            });
+        }
+        let exposed: HashSet<String> = columns
+            .iter()
+            .filter(|c| is_reference(&c.expr))
+            .filter_map(|c| match &c.expr {
+                IRExpr::Variable(v, _) => Some(v.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut hidden: Vec<String> = inner
+            .names()
+            .into_iter()
+            .filter(|name| !outer.contains(name) && !exposed.contains(name) && !is_anon(name))
+            .collect();
+        hidden.sort();
+        hidden.dedup();
+        for name in hidden {
+            let fresh = format!("{FRESH_PREFIX}f{}_{name}", inner.inlined);
+            inner.inlined += 1;
+            renames.insert(name, fresh);
+        }
+        facts.inlined = inner.inlined;
+        inner.rename(&renames);
+        bind_arguments(&mut inner, bindings);
+        let rename = |variable: &mut String| {
+            if let Some(name) = renames.get(variable) {
+                *variable = name.clone();
+            }
+        };
+        let order_by = order_keys
+            .into_iter()
+            .map(|(key, descending)| {
+                let mut key = read_lets(key);
+                substitute(&mut key, &rows);
+                IROrdering {
+                    expr: key,
+                    descending,
+                }
+            })
+            .collect();
+        let mut read = InnerRead {
+            values: values.clone(),
+            group,
+            columns,
+            order_by,
+            limit,
+            limit_param,
+        };
+        for e in read.exprs_mut() {
+            rename_expr(e, &rename);
+            bind_params(e, bindings);
+        }
+        // A value column is read after the `from` as its column of `values`.
+        for column in &read.columns {
+            if !is_reference(&column.expr) {
+                facts.lets.insert(
+                    column.column.clone(),
+                    IRExpr::PropAccess {
+                        variable: values.clone(),
+                        property: column.column.clone(),
+                        ty: column.ty.clone(),
+                    },
+                );
+            }
+        }
+        facts.correlates.push(CorrelateFact {
+            inner,
+            outer,
+            read,
+            optionals_before: facts.optionals.len(),
+        });
         Ok(())
     }
 
@@ -2167,6 +2610,56 @@ impl<'a> Shaper<'a> {
         )
     }
 
+    /// A `from` over an inline read with its own group or cut, after the
+    /// steps already in `pipeline`: its pattern placed as its own scope from
+    /// the outer names it reads, which it correlates on when the steps
+    /// before it produce rows; its reference columns are bound after it.
+    fn place_correlate(
+        &self,
+        correlate: &CorrelateFact,
+        pipeline: &mut Vec<PatternStep>,
+        bound_vars: &mut HashSet<String>,
+        outer_physical_names: &HashSet<String>,
+        fresh: &mut FreshNames,
+    ) -> Result<(), ShapeError> {
+        let visible: HashSet<String> = bound_vars
+            .iter()
+            .filter(|name| correlate.outer.contains(*name))
+            .cloned()
+            .collect();
+        let mut names = outer_physical_names.clone();
+        names.extend(physical_names(pipeline));
+        let mut inner = Vec::new();
+        let mut inner_bound = visible.clone();
+        self.place(
+            &correlate.inner,
+            &[],
+            &mut inner,
+            &mut inner_bound,
+            &names,
+            fresh,
+        )?;
+        // With no row before it, the names it reads are values the type
+        // checker already read into it, and it reads no outer row.
+        let outer_var = (!correlate.outer.is_empty() && !pipeline.is_empty()).then(|| {
+            find_outer_var(&correlate.inner, &visible).unwrap_or_else(|| {
+                let mut outer: Vec<&String> = correlate.outer.iter().collect();
+                outer.sort();
+                outer
+                    .first()
+                    .map(|name| name.to_string())
+                    .unwrap_or_default()
+            })
+        });
+        bound_vars.extend(correlate.read.references().map(str::to_string));
+        pipeline.push(PatternStep::Correlate {
+            outer_var,
+            inner,
+            read: correlate.read.clone(),
+        });
+        Ok(())
+    }
+
     /// One segment of a scope's facts placed after the steps already in
     /// `pipeline`.
     fn place_scope(
@@ -2334,9 +2827,19 @@ impl<'a> Shaper<'a> {
         }
         // The steps place an `optional` after the scope's other traversals;
         // a traversal from a name it introduces expands after it.
+        // A `from` over an inline read with its own group or cut binds its
+        // reference columns where it is placed, beside the `optional`s.
+        let correlate_names: HashSet<&str> = facts
+            .correlates
+            .iter()
+            .flat_map(|correlate| correlate.read.references())
+            .collect();
         let (after_optional, before_optional): (Vec<&TraversalFact>, Vec<&TraversalFact>) =
             traversals.iter().partition(|t| {
-                facts.optional_names.contains(&t.src) || facts.optional_names.contains(&t.dst)
+                facts.optional_names.contains(&t.src)
+                    || facts.optional_names.contains(&t.dst)
+                    || correlate_names.contains(t.src.as_str())
+                    || correlate_names.contains(t.dst.as_str())
             });
         self.expand_traversals(
             &before_optional,
@@ -2346,7 +2849,13 @@ impl<'a> Shaper<'a> {
             fresh,
         )?;
         pipeline.extend(rebind_filters.into_iter().map(PatternStep::Filter));
-        for optional in &facts.optionals {
+        let mut correlates = facts.correlates.iter().peekable();
+        for (index, optional) in facts.optionals.iter().enumerate() {
+            while let Some(correlate) =
+                correlates.next_if(|correlate| correlate.optionals_before <= index)
+            {
+                self.place_correlate(correlate, pipeline, bound_vars, outer_physical_names, fresh)?;
+            }
             // The inner tree reads the whole outer row; a name it shares with
             // the scope is that outer column (a rebinding is `T68`).
             let mut visible_outer: HashSet<String> = bound_vars.clone();
@@ -2368,6 +2877,9 @@ impl<'a> Shaper<'a> {
                 outer_var: outer_var.unwrap_or_default(),
                 inner,
             });
+        }
+        for correlate in correlates {
+            self.place_correlate(correlate, pipeline, bound_vars, outer_physical_names, fresh)?;
         }
         self.expand_traversals(
             &after_optional,
@@ -2401,6 +2913,9 @@ impl<'a> Shaper<'a> {
                 }
                 PatternStep::Union { bindings, .. } => {
                     physical_names.extend(bindings.iter().cloned());
+                }
+                PatternStep::Correlate { read, .. } => {
+                    physical_names.extend(read.references().map(str::to_string));
                 }
                 PatternStep::Filter(_)
                 | PatternStep::AntiJoin { .. }
@@ -2524,6 +3039,19 @@ fn scan_root(
             .position(|var| searched.contains(*var))
     } else {
         inner_bindings.first().map(|_| 0)
+    }
+}
+
+/// Whether an inline read's body under its final projection groups, orders
+/// or cuts: an aggregate or `distinct` (a `Group`), an `order` or a
+/// `limit`.
+fn groups_or_cuts(term: &Term) -> bool {
+    match term {
+        Term::Cut { .. } | Term::Order { .. } | Term::Group { .. } => true,
+        Term::Project {
+            input, keep: true, ..
+        } => matches!(input.as_ref(), Term::Group { .. }),
+        _ => false,
     }
 }
 
@@ -2735,6 +3263,25 @@ fn rename_inner_bindings(
             PatternStep::Union { arms, bindings } => {
                 bindings.iter_mut().for_each(&rename);
                 pending.extend(arms.iter_mut().flatten());
+            }
+            PatternStep::Correlate {
+                outer_var,
+                inner,
+                read,
+            } => {
+                if let Some(outer_var) = outer_var {
+                    rename(outer_var);
+                }
+                for column in &mut read.columns {
+                    if matches!(
+                        column.expr,
+                        IRExpr::Variable(_, ExprType::Node { .. } | ExprType::Edge { .. })
+                    ) {
+                        rename(&mut column.column);
+                    }
+                }
+                expressions.extend(read.exprs_mut());
+                pending.extend(inner);
             }
         }
     }

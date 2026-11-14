@@ -71,8 +71,8 @@ pub use logical::{
     ValidateSpec,
 };
 pub use lower::{
-    AggregateFields, ContainsJoinFields, CsvSourceFields, DeltaSourceFields, ExpandFields,
-    FragmentWriteFields, HashJoinFields, Lower, RankFuseFields, SortMergeJoinFields,
+    AggregateFields, ContainsJoinFields, CorrelateFields, CsvSourceFields, DeltaSourceFields,
+    ExpandFields, FragmentWriteFields, HashJoinFields, Lower, RankFuseFields, SortMergeJoinFields,
     ValidateFields,
 };
 pub use operation::{
@@ -90,7 +90,7 @@ pub use physical::{
     validate_streams,
 };
 pub use ranking::{PlannedRanking, planned_ranking};
-pub use read_shape::{PatternStep, ReadShape};
+pub use read_shape::{InnerRead, PatternStep, ReadShape};
 pub use registry::{Coverage, Entry, Route, Shape};
 pub use route::RouteOverride;
 pub use source::{

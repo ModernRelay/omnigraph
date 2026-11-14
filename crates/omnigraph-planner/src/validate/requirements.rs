@@ -125,6 +125,42 @@ pub(crate) struct OptionalMatch {
     pub eligibility: Vec<IRExpr>,
 }
 
+/// A `from` over an inline read with its own group or cut: its correlation
+/// binding, what it returns, and the eligibility conjuncts of its own
+/// pattern, which the plan tests inside its inner tree, under its group and
+/// cut, and nowhere after it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CorrelateMatch {
+    pub outer_var: Option<String>,
+    pub read: crate::read_shape::InnerRead,
+    pub eligibility: Vec<IRExpr>,
+}
+
+/// The eligibility conjuncts of a nested scope's own steps.
+fn own_eligibility(inner: &[PatternStep]) -> Vec<IRExpr> {
+    let mut eligibility = Vec::new();
+    for own in inner {
+        match own {
+            PatternStep::NodeScan { filters, .. }
+            | PatternStep::Expand {
+                dst_filters: filters,
+                ..
+            } => push_conjuncts(&mut eligibility, filters),
+            PatternStep::Filter(filter) => {
+                push_conjuncts(&mut eligibility, std::slice::from_ref(filter))
+            }
+            PatternStep::Rank { .. }
+            | PatternStep::Score { .. }
+            | PatternStep::Let { .. }
+            | PatternStep::AntiJoin { .. }
+            | PatternStep::Optional { .. }
+            | PatternStep::Union { .. }
+            | PatternStep::Correlate { .. } => {}
+        }
+    }
+    eligibility
+}
+
 /// The steps of `steps` with each `optional`'s own steps in its place: the
 /// names an `optional` introduces are the scope's, so its bindings,
 /// traversals, conjuncts and blocks are the scope's requirements too, and
@@ -134,6 +170,7 @@ fn flatten<'p>(
     out: &mut Vec<&'p PatternStep>,
     optionals: &mut Vec<OptionalMatch>,
     unions: &mut Vec<Vec<String>>,
+    correlates: &mut Vec<CorrelateMatch>,
 ) {
     for step in steps {
         match step {
@@ -145,34 +182,30 @@ fn flatten<'p>(
                     unions.push(bindings.clone());
                 }
                 for arm in arms {
-                    flatten(arm, out, optionals, unions);
+                    flatten(arm, out, optionals, unions, correlates);
                 }
             }
+            // A correlated read's pattern binds its names and runs its
+            // traversals, conjuncts and blocks inside its inner tree.
+            PatternStep::Correlate {
+                outer_var,
+                inner,
+                read,
+            } => {
+                correlates.push(CorrelateMatch {
+                    outer_var: outer_var.clone(),
+                    read: read.clone(),
+                    eligibility: own_eligibility(inner),
+                });
+                flatten(inner, out, optionals, unions, correlates);
+            }
             PatternStep::Optional { outer_var, inner } => {
-                let mut eligibility = Vec::new();
-                for own in inner {
-                    match own {
-                        PatternStep::NodeScan { filters, .. }
-                        | PatternStep::Expand {
-                            dst_filters: filters,
-                            ..
-                        } => push_conjuncts(&mut eligibility, filters),
-                        PatternStep::Filter(filter) => {
-                            push_conjuncts(&mut eligibility, std::slice::from_ref(filter))
-                        }
-                        PatternStep::Rank { .. }
-                        | PatternStep::Score { .. }
-                        | PatternStep::Let { .. }
-                        | PatternStep::AntiJoin { .. }
-                        | PatternStep::Optional { .. }
-                        | PatternStep::Union { .. } => {}
-                    }
-                }
+                let eligibility = own_eligibility(inner);
                 optionals.push(OptionalMatch {
                     outer_var: outer_var.clone(),
                     eligibility,
                 });
-                flatten(inner, out, optionals, unions);
+                flatten(inner, out, optionals, unions, correlates);
             }
             other => out.push(other),
         }
@@ -193,6 +226,9 @@ pub struct Requirements {
     pub(crate) blocks: Vec<Block>,
     /// The `optional`s of the top-level scope, nested ones included.
     pub(crate) optionals: Vec<OptionalMatch>,
+    /// The correlated reads of the top-level scope, nested ones included,
+    /// each one `Correlate` node of the plan.
+    pub(crate) correlates: Vec<CorrelateMatch>,
     /// The names every `Union` node of the plan binds: one entry per arm
     /// after the first of each written `union`.
     pub(crate) unions: Vec<Vec<String>>,
@@ -248,7 +284,14 @@ impl Requirements {
         let mut unions = Vec::new();
         let mut scores = Vec::new();
         let mut lets = Vec::new();
-        flatten(&ir.pipeline, &mut steps, &mut optionals, &mut unions);
+        let mut correlates = Vec::new();
+        flatten(
+            &ir.pipeline,
+            &mut steps,
+            &mut optionals,
+            &mut unions,
+            &mut correlates,
+        );
         for op in steps {
             budget.visit(1)?;
             match op {
@@ -327,8 +370,12 @@ impl Requirements {
                     outer_var: outer_var.clone(),
                     predicate: predicate.clone(),
                 }),
-                PatternStep::Optional { .. } | PatternStep::Union { .. } => {
-                    unreachable!("flatten puts an optional's and a union's steps in their place")
+                PatternStep::Optional { .. }
+                | PatternStep::Union { .. }
+                | PatternStep::Correlate { .. } => {
+                    unreachable!(
+                        "flatten puts an optional's, a union's and a correlated read's steps in their place"
+                    )
                 }
             }
         }
@@ -388,6 +435,7 @@ impl Requirements {
             traversals,
             blocks,
             optionals,
+            correlates,
             unions,
             scores,
             lets,

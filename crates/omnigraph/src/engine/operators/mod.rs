@@ -28,6 +28,7 @@ use crate::error::{OmniError, Result};
 mod anti_join;
 mod catalogue;
 mod contains_join;
+mod correlate;
 mod cross_join;
 mod csv_source;
 mod expand;
@@ -64,6 +65,7 @@ pub(super) use anti_join::{
 };
 pub(super) use catalogue::CatalogueExec;
 pub(super) use contains_join::ContainsJoinExec;
+pub(super) use correlate::{CorrelateExec, CorrelateGroup, CorrelateOuter, CorrelateRead};
 pub(super) use cross_join::CrossJoinExec;
 pub(super) use csv_source::CsvSourceExec;
 pub(super) use expand::{

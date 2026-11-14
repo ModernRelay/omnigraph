@@ -4,8 +4,12 @@
 # notes: cut inside, that is the inner pattern joined on the outer variables it
 # notes: reads: a returned reference binds its name, a returned value is read
 # notes: by name, and a name the inner read binds without returning stays its
-# notes: own variable, so an outer binding of the same name is another one. An
-# notes: inline read with an aggregate is not lowered in this release (`T86`).
+# notes: own variable, so an outer binding of the same name is another one.
+# notes: An inline read with its own aggregate, `distinct`, `order` or `limit`
+# notes: is evaluated as written, per outer row when it reads the enclosing
+# notes: scope and once otherwise: an outer `where` never widens its cut, an
+# notes: outer `limit` never becomes it, and a read grouped by no key is one
+# notes: row per outer row, `count` 0 where nothing matches.
 
 --- runner
 timeout_ms: 10000
@@ -113,4 +117,175 @@ query from_over_a_grouped_read() {
     return { $c.slug, $n }
 }
 
---- expect error: T86: `from_over_a_grouped_read`: this release's planner does not lower an inline read with an aggregate or `distinct`
+--- expect unordered
+{"c.slug":"acme","n":2}
+{"c.slug":"bolt","n":1}
+
+--- expect shape
+c.slug: String
+n: I64?
+
+--- query
+query from_distinct() {
+    match { from { match { $p: Person } return distinct { $p.city as town } } }
+    return { $town }
+}
+
+--- expect unordered
+{"town":"London"}
+{"town":"Paris"}
+{}
+
+--- expect shape
+town: String?
+
+--- query
+query from_ordered_cut() {
+    match { from { match { $p: Person } return { $p } order { $p.age desc } limit 2 } }
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"cy"}
+{"p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query outer_where_does_not_widen_the_cut() {
+    match { from { match { $p: Person } return { $p } order { $p.age desc } limit 2 } }
+    where $p.city = "London"
+    return { $p.handle }
+}
+
+--- expect unordered
+{"p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query outer_limit_is_not_the_inner_cut() {
+    match { from { match { $p: Person } return { $p } order { $p.age desc } limit 3 } }
+    return { $p.handle }
+    order { $p.handle }
+    limit 1
+}
+
+--- expect ordered
+{"p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+
+--- query
+query friends_per_person() {
+    match { $p: Person, from { match { $q: Person, $p knows $q } return { count($q) as friends } } }
+    return { $p.handle, $friends }
+}
+
+--- expect unordered
+{"friends":3,"p.handle":"ada"}
+{"friends":1,"p.handle":"bob"}
+{"friends":0,"p.handle":"cy"}
+{"friends":0,"p.handle":"di"}
+
+--- expect shape
+p.handle: String
+friends: I64?
+
+--- query
+query friends_per_acquaintance() {
+    match {
+        $p: Person,
+        $p knows $x,
+        from { match { $q: Person, $p knows $q } return { count($q) as friends } },
+    }
+    return { $p.handle, $x.handle, $friends }
+}
+
+--- expect unordered
+{"friends":3,"p.handle":"ada","x.handle":"bob"}
+{"friends":3,"p.handle":"ada","x.handle":"cy"}
+{"friends":3,"p.handle":"ada","x.handle":"di"}
+{"friends":1,"p.handle":"bob","x.handle":"di"}
+
+--- expect shape
+p.handle: String
+x.handle: String
+friends: I64?
+
+--- query
+query oldest_beside_every_company() {
+    match {
+        $c: Company,
+        from { match { $p: Person } return { $p } order { $p.age desc } limit 1 },
+    }
+    return { $c.slug, $p.handle }
+}
+
+--- expect unordered
+{"c.slug":"acme","p.handle":"cy"}
+{"c.slug":"bolt","p.handle":"cy"}
+
+--- expect shape
+c.slug: String
+p.handle: String
+
+--- query
+query oldest_friend() {
+    match {
+        $p: Person,
+        from { match { $q: Person, $p knows $q } return { $q, $q.age as age } order { $q.age desc } limit 1 },
+    }
+    return { $p.handle, $q.handle, $age }
+}
+
+--- expect unordered
+{"age":41,"p.handle":"ada","q.handle":"cy"}
+{"age":19,"p.handle":"bob","q.handle":"di"}
+
+--- expect shape
+p.handle: String
+q.handle: String
+age: I32?
+
+--- query
+query staff_per_company() {
+    match {
+        $c: Company,
+        from { match { $p: Person, $p worksAt $c } return { $p.city as town, count($p) as n } },
+    }
+    return { $c.slug, $town, $n }
+}
+
+--- expect unordered
+{"c.slug":"acme","n":1,"town":"London"}
+{"c.slug":"acme","n":1,"town":"Paris"}
+{"c.slug":"bolt","n":1}
+
+--- expect shape
+c.slug: String
+town: String?
+n: I64?
+
+--- query
+query oldest($k: I64) {
+    match { $p: Person }
+    return { $p }
+    order { $p.age desc }
+    limit $k
+}
+query from_a_called_read_with_its_own_cut() {
+    match { from oldest(2), $p worksAt $c }
+    return { $p.handle, $c.slug }
+}
+
+--- expect unordered
+{"c.slug":"bolt","p.handle":"cy"}
+{"c.slug":"acme","p.handle":"ada"}
+
+--- expect shape
+p.handle: String
+c.slug: String

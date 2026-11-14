@@ -39,8 +39,7 @@ struct Row {
 /// owns it; this table's schema has no `Blob`).
 const B_IN_PROGRESS: &[&str] = &[
     "a node an optional introduces returned whole",
-    "an inline read with an aggregate in a from",
-    "an inline read with its own order and limit in a from",
+    "a ranking inside an inline read with its own order and limit",
     "a union arm returning a value",
     "a union whose arms read the enclosing scope",
     "distance as an rrf arm",
@@ -144,14 +143,29 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { from union({ match { $p: Person } return { $p } }, { match { $q: Person } return { $q as p } }) } return { $p.name } }",
                 Lowers,
             ),
-            // "an inline read with an aggregate in a from"
             (
                 "query q() { match { from { match { $p: Person, $c: Company, $p worksAt $c } return { $c, count($p) as n } } } return { $c.name, $n } }",
-                Refused("B"),
+                Lowers,
             ),
-            // "an inline read with its own order and limit in a from"
             (
                 "query q() { match { from { match { $p: Person } return { $p } order { $p.age desc } limit 2 } } return { $p.name } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $c: Company, from { match { $p: Person, $p worksAt $c } return { count($p) as n } } } return { $c.name, $n } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $c: Company, from { match { $p: Person, $p worksAt $c } return { $p } order { $p.age desc } limit 1 } } return { $c.name, $p.name } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { from { match { $p: Person } return distinct { $p.city as town } } } return { $town } }",
+                Lowers,
+            ),
+            // "a ranking inside an inline read with its own order and limit"
+            (
+                "query q($s: String) { match { from { match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.body, $s) as $score } return { $d } order { $score desc } limit 2 } } return { $d.title } }",
                 Refused("B"),
             ),
             // "a union arm returning a value"

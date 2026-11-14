@@ -261,6 +261,7 @@ macro_rules! logical_kinds {
 logical_kinds! {
     Aggregate => "Aggregate", RefusedByName;
     AntiJoin => "AntiJoin", RefusedByName;
+    Correlate => "Correlate", RefusedByName;
     CsvSource => "CsvSource", RefusedByName;
     DeltaSource => "DeltaSource", RefusedByName;
     Expand => "Expand", RefusedByName;
@@ -618,6 +619,23 @@ pub enum LogicalNode {
         inner: LogicalId,
         outer_var: String,
     },
+    /// `from` an inline read with its own aggregate, `distinct`, `order` or
+    /// `limit`: the read's pattern is the `inner` tree and `read` what it
+    /// returns. With an `input`, the inner tree's leaf is an
+    /// `OuterReference` to the input rows on `outer_var`, the read is
+    /// evaluated per input row and each input row leaves once per row of
+    /// its own read; without one the read runs once and its rows leave.
+    /// `tiebreak` breaks equal `order` keys: the identities of the read's
+    /// references, then its group's value keys, in column order; `reads`
+    /// what the read's expressions read.
+    Correlate {
+        input: Option<LogicalId>,
+        inner: LogicalId,
+        outer_var: Option<String>,
+        read: Box<crate::read_shape::InnerRead>,
+        tiebreak: Vec<ColumnRef>,
+        reads: Vec<ColumnRef>,
+    },
     /// `from union(a, b)`: every row of `left` and every row of `right`, a
     /// bag; each arm binds the reference columns `bindings`, and only their
     /// columns leave.
@@ -754,6 +772,7 @@ impl LogicalNode {
             Self::Expand { .. } => LogicalKind::Expand,
             Self::AntiJoin { .. } => LogicalKind::AntiJoin,
             Self::OptionalJoin { .. } => LogicalKind::OptionalJoin,
+            Self::Correlate { .. } => LogicalKind::Correlate,
             Self::Union { .. } => LogicalKind::Union,
             Self::OuterReference { .. } => LogicalKind::OuterReference,
             Self::Nearest { .. } => LogicalKind::Nearest,
@@ -788,6 +807,7 @@ impl LogicalNode {
             Self::AntiJoin { input, inner, .. } | Self::OptionalJoin { input, inner, .. } => {
                 vec![*input, *inner]
             }
+            Self::Correlate { input, inner, .. } => input.iter().copied().chain([*inner]).collect(),
             Self::MergeClassify {
                 base,
                 source,
@@ -826,6 +846,7 @@ impl LogicalNode {
             Self::AntiJoin { input, inner, .. } | Self::OptionalJoin { input, inner, .. } => {
                 vec![input, inner]
             }
+            Self::Correlate { input, inner, .. } => input.iter_mut().chain([inner]).collect(),
             Self::MergeClassify {
                 base,
                 source,
@@ -1136,6 +1157,19 @@ impl LogicalPlan {
                 "node": "OptionalJoin",
                 "outer_var": outer_var,
             }),
+            LogicalNode::Correlate {
+                outer_var,
+                read,
+                tiebreak,
+                reads,
+                ..
+            } => {
+                let mut value = crate::physical::inner_read_json(read, tiebreak);
+                value["node"] = json!("Correlate");
+                value["outer_var"] = json!(outer_var);
+                value["reads"] = json!(rendered(reads));
+                value
+            }
             LogicalNode::OuterReference { outer_var } => json!({
                 "node": "OuterReference",
                 "outer_var": outer_var,

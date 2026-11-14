@@ -42,6 +42,19 @@ A query runs against one resolved `ReadTarget`:
    logical and physical `Union` (a new node kind: no existing one emits the
    rows of two pipelines) folded from the left; each arm is a scope of its
    own for filter placement, and the union's columns are its bindings'.
+   A `from` over an inline read (or a call) with its own aggregate,
+   `distinct`, `order` or `limit` (the core's `Correlate` over its `Group`,
+   `Order` and `Cut`) is a `PatternStep::Correlate`, placed beside the
+   scope's `optional`s: its pattern placed as its own scope from the outer
+   names it reads, its unreturned names renamed apart, a returned reference
+   bound under its column's name and a returned value a column of the read's
+   `values` binding (`values.n`). The logical and physical `Correlate` are a
+   new node kind: no existing one groups, orders or cuts per outer row. With
+   an outer name read, its inner tree's leaf is an `OuterReference`;
+   without one it runs once and a `CrossJoin` joins it to the elements
+   before it. Filter placement treats its inner tree as a scope of its own,
+   and plan acceptance requires one `Correlate` per such read, returning the
+   same read and testing its pattern's conjuncts inside its inner tree.
    A `from name(args)` (`Call`) is its body read as an inline read: the
    body's own names are renamed apart first and only then each parameter is
    replaced by its argument, so an argument reading a caller's variable is
@@ -75,7 +88,7 @@ A query runs against one resolved `ReadTarget`:
    (`omnigraph_compiler::shape`), and the type checker runs it on every
    declaration it accepts: a term it does not lower (a `union` arm with a
    value or an outer name, `Fix`,
-   an inline read with a group, order or cut, a
+   a ranking inside an inline read with a group, order or cut, a
    computed order key no return item computes) is refused at type check with
    `T86`, at the construct and naming the programme stage that adds it, so
    the planner never refuses a checked read. A term that still arrives
@@ -558,6 +571,7 @@ by `engine/scan.rs`, `engine/graph.rs`, `engine/expr.rs` and
 | `Expand` | `ExpandExec`: an unbudgeted named unbound single hop uses one vectorized walk per input batch (`operators/single_hop.rs`); unbudgeted named multi-hop drains its input into the BFS breaker `execute_expand`. Budgeted expansions, including selected multi-hop, consume fixed source windows through `SourceWindows`. Bound edges use the bounded pair producer, spillable pair ordering and incremental hydration within each input batch or budgeted source window. Output chunks contain at most 256 rows (`expand_pairs` counts pairs handed on); dropping the stream at a downstream `Limit` cancels the producer | omnigraph |
 | `Union` | `UnionExec` over its two arms: both drained, every row of each kept under the columns of the union's bindings (`<binding>.<column>`) in the left arm's order, matched by name in the right arm; the arms' other columns stay behind | omnigraph |
 | `OptionalJoin` | `OptionalJoinExec` over the outer plan and the lowered inner plan, whose leaf is an `OuterReference`: the outer rows are drained and tagged, the inner plan runs over `OuterReferenceExec` under the same `TaskContext` as a correlated block's does, every inner row leaves without its tag, and each outer row no inner row names leaves once with every column the inner tree adds null (the core's `Union(Correlate(R, p), Project(Filter(R, ¬ exists p), nulls))`) | omnigraph |
+| `Correlate` | `CorrelateExec` over the lowered inner plan and, correlated, the outer plan, whose rows are drained and tagged for the inner plan's `OuterReference` as an `OptionalJoin`'s are; the read's group is a DataFusion `AggregateExec` the lowering builds over the inner rows (grouped by the outer tag, each key, a reference by its identity, with each group's first row, which carries a reference key's columns), fed from its own slot; each value column is evaluated on every row of the read, then the rows are sorted by the tag, the keys and the tie rule (the read's reference identities, then its group's value keys) and cut per tag; each outer row leaves once per row of its read, and a read grouped by no key adds its empty-input row (`count` 0, every other aggregate null) for an outer row it has none for | omnigraph |
 | `AntiJoin` | `AntiJoinMaskExec` over the outer plan and the lowered inner plan. `correlated`: the bulk CSR degree mask when the predicate counts rows and the inner is one single-hop, filter-free, unbound expand over the `OuterReference`; else the outer rows are tagged, the inner plan runs over `OuterReferenceExec` under the same `TaskContext`, and `SubqueryAggregate` folds the tagged inner rows per outer row and applies the predicate. `key_set`: the outer rows are drained, each distinct `<outer_var>.<id>` gets one `SubqueryAggregate` group, the inner plan (no outer leaf) streams and each batch folds into its key's group (an inner key no outer row holds into a discarded group) without being held, and each outer row takes its key's verdict, a null key that of no matches | omnigraph |
 | `Projection` | `ProjectionExec` over `GqProjectionExpr` per return expression, output charged as `projection output`; above an aggregate it evaluates Boolean expressions over aggregate leaves and group keys, resolving each `AliasRef` by its input column name and emitting the public return columns in written order; when a `Sort` consumes it, every column the sort reads and every declared tie-break metadata column follow the return columns under the hidden prefix `~`, which the sort drops; under a `HydrateColumns` it skips the deferred return items and carries each deferred binding's `_rowaddr` as `^binding` | omnigraph |
 | `HydrateColumns` | `HydrateExec` (`operators/hydrate.rs`): per input batch, in chunks planned from the costliest output row seen (its decoded row and its copy; four rows first), the distinct `^binding` addresses of each binding, sorted and grouped by fragment, read from its pinned table through `FileFragment::open` and `FragmentReader::take` with the deferred columns' projection and one row per decode task. Each decoded row is copied at its own size through `WorkMemory::take_once` (charged as `hydrate fetch`; Lance's row can slice a buffer of the whole read) before the fetch waits for the next, at most `ROWS_IN_FLIGHT` (8) rows decoding at once and `FRAGMENTS_AHEAD` (4) fragments' reads scheduled ahead. A fragment whose data files are in the table's own base is read in one coalesced request through an engine `ScanScheduler`, whose I/O buffer, a quarter of the bound, is reserved for the operator's life as `hydrate read-ahead`; a fragment holding a file Lance reaches through a `base_id`, for which Lance 13 opens its own scheduler unless a per-base cache is supplied, is read one row per request and counted as `single_row_reads` (only a table fork created before v11 holds one; a graph branch's writes stay in the table's own base). An address the table does not hold is an integrity error. The rows are copied to every output row that names them through `WorkMemory::interleave_once`, which admits each copy (one per output row, so a row a join repeats is copied per repetition; a null address costs a null row) as `hydrate output` before Arrow builds it. The bound is `hydrate_chunk_bytes(pool)` (an eighth of the query pool, the node's declared `retained_limit`): the read-ahead reservation, then the decoded rows and their copies within the rest. A fetch stops once its decoded rows pass half of that rest, and the window is planned again from the widest row decoded; a chunk whose copies would exceed it keeps a prefix halved until they fit, the rest starting the next chunk. So the operator holds at most the bound and the row that crosses it, with at most `ROWS_IN_FLIGHT` rows decoded and not yet charged, and Lance's read-ahead past its buffer is at most the request at the head of its queue, which Lance may coalesce from many rows' ranges (up to its maximum I/O size, 16 MiB by default), so the read-ahead share is soft. A chunk is charged as `hydrate chunk`, keeps only its output once built, and is sent as it is built; `hydrated_rows` counts the rows and the `peak_chunk_bytes` gauge records the most one chunk held, every decoded row included | omnigraph |
@@ -807,8 +821,8 @@ fields stay hand-written and are named in
 crate and refuses a default arm beside named kinds and a match over kinds at
 any other site; the `Lower` walk, the engine's lowering and the catalogue
 golden (`@Operator`) then report the behaviour the new kind still owes. Two calls are not one per node:
-`correlate_outer` runs between the outer and the inner tree of an `AntiJoin`
-or an `OptionalJoin`,
+`correlate_outer` runs between the outer and the inner tree of an `AntiJoin`,
+an `OptionalJoin` or a correlated `Correlate`,
 and `finish` runs once with the lowered root. A `RankFuse` has two input
 subtrees, one per arm, and the walk lowers each once; a subtree reached
 twice is refused before any method runs. The `hash_join` method receives the

@@ -330,8 +330,11 @@ pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
                 } => {
                     out.insert(dst_var.clone(), dst_type.clone());
                 }
-                // An `optional`'s names are in scope after it.
-                PatternStep::Optional { inner, .. } => bindings(inner, out),
+                // An `optional`'s names are in scope after it, and a
+                // correlated read's references.
+                PatternStep::Optional { inner, .. } | PatternStep::Correlate { inner, .. } => {
+                    bindings(inner, out)
+                }
                 PatternStep::Union { arms, .. } => arms.iter().for_each(|arm| bindings(arm, out)),
                 PatternStep::AntiJoin { .. }
                 | PatternStep::Filter(_)
@@ -419,6 +422,12 @@ pub fn full_text_targets(ir: &ReadShape) -> Vec<(String, String)> {
                     let mut inner_types = types.clone();
                     bindings(inner, &mut inner_types);
                     filter_calls(inner, &inner_types, out);
+                }
+                PatternStep::Correlate { inner, read, .. } => {
+                    let mut inner_types = types.clone();
+                    bindings(inner, &mut inner_types);
+                    filter_calls(inner, &inner_types, out);
+                    read.exprs().for_each(|expr| calls(expr, &inner_types, out));
                 }
                 PatternStep::Union { arms, .. } => {
                     for arm in arms {
@@ -900,6 +909,56 @@ fn resolve_pipeline(
                     }
                 }
             }
+            PatternStep::Correlate {
+                outer_var,
+                inner,
+                read,
+            } => {
+                let seed = match outer_var {
+                    Some(outer_var) => {
+                        let input = bound(current, "correlate")?;
+                        let schema = schema_of(plan, input)?;
+                        Some(plan.add(
+                            LogicalNode::OuterReference {
+                                outer_var: outer_var.clone(),
+                            },
+                            schema,
+                        ))
+                    }
+                    None => None,
+                };
+                let inner_root = resolve_pipeline(plan, inner, source, next_binding, seed)?;
+                let tiebreak = correlate_tiebreak(plan, inner_root, read, source)?;
+                let mut reads = Vec::new();
+                for expr in read.exprs() {
+                    reads_of_expr(expr, &mut reads);
+                }
+                let schema = schema_of(plan, inner_root)?;
+                let correlated = outer_var.is_some().then_some(()).and(current);
+                let node = plan.add(
+                    LogicalNode::Correlate {
+                        input: correlated,
+                        inner: inner_root,
+                        outer_var: outer_var.clone(),
+                        read: Box::new(read.clone()),
+                        tiebreak,
+                        reads,
+                    },
+                    schema,
+                );
+                match (current, outer_var) {
+                    (Some(left), None) => {
+                        let joined = join_schema(
+                            &schema_of(plan, left)?,
+                            None,
+                            &schema_of(plan, node)?,
+                            None,
+                        );
+                        plan.add(LogicalNode::CrossJoin { left, right: node }, joined)
+                    }
+                    _ => node,
+                }
+            }
             PatternStep::Optional { outer_var, inner } => {
                 let input = bound(current, "optional")?;
                 let schema = schema_of(plan, input)?;
@@ -924,6 +983,36 @@ fn resolve_pipeline(
         current = Some(node);
     }
     current.ok_or_else(|| PlanError::Internal("a GQ pipeline starts with a scan".to_string()))
+}
+
+/// The columns a correlated read's tie rule reads after its `order` keys:
+/// over its pattern's rows, every reference identity in scope; over its
+/// groups, each key in column order, a reference by its identity and a value
+/// by its column of the read's `values`.
+fn correlate_tiebreak(
+    plan: &LogicalPlan,
+    inner: LogicalId,
+    read: &crate::read_shape::InnerRead,
+    source: &dyn PlanSource,
+) -> Result<Vec<ColumnRef>, PlanError> {
+    let candidates = scope_tiebreaks(plan, inner, source)?;
+    let Some(group) = &read.group else {
+        return Ok(candidates.into_iter().map(|(column, _)| column).collect());
+    };
+    let mut out = Vec::new();
+    for key in group {
+        match &key.expr {
+            IRExpr::Aggregate { .. } => {}
+            IRExpr::Variable(name, _) => out.extend(
+                candidates
+                    .iter()
+                    .filter(|(column, _)| column.binding == *name)
+                    .map(|(column, _)| column.clone()),
+            ),
+            _ => out.push(ColumnRef::property(&read.values, &key.column)),
+        }
+    }
+    Ok(out)
 }
 
 fn bound(current: Option<LogicalId>, op: &str) -> Result<LogicalId, PlanError> {
@@ -1296,6 +1385,34 @@ fn visible_scope(plan: &LogicalPlan, id: LogicalId) -> Vec<&LogicalNode> {
     nodes
 }
 
+/// The names bound inside the inner trees of the correlated reads `id`
+/// sees that the reads do not return: their rows leave without them.
+fn correlated_hidden(plan: &LogicalPlan, id: LogicalId) -> HashSet<String> {
+    let mut hidden = HashSet::new();
+    for node in visible_scope(plan, id) {
+        let LogicalNode::Correlate { inner, read, .. } = node else {
+            continue;
+        };
+        let returned: HashSet<&str> = read.references().collect();
+        for inner_node in visible_scope(plan, *inner) {
+            let names: Vec<&String> = match inner_node {
+                LogicalNode::TableScan { spec, .. } => spec.binding.iter().collect(),
+                LogicalNode::Expand {
+                    dst, edge_binding, ..
+                } => std::iter::once(dst).chain(edge_binding).collect(),
+                _ => Vec::new(),
+            };
+            hidden.extend(
+                names
+                    .into_iter()
+                    .filter(|name| !returned.contains(name.as_str()))
+                    .cloned(),
+            );
+        }
+    }
+    hidden
+}
+
 /// Candidate identity keys: every binding the query declares in
 /// binding-name order, then the bindings the lowering made up (anonymous
 /// endpoints, cycle temps), whose identities only order rows a reader cannot
@@ -1330,7 +1447,11 @@ fn scope_tiebreaks(
             _ => {}
         }
     }
-    let mut bindings: Vec<_> = bindings.into_iter().collect();
+    let hidden = correlated_hidden(plan, id);
+    let mut bindings: Vec<_> = bindings
+        .into_iter()
+        .filter(|(binding, _)| !hidden.contains(binding))
+        .collect();
     bindings.sort_by_key(|(binding, _)| is_fresh_variable(binding));
     let mut out = Vec::new();
     for (binding, (id_column, selected_edge)) in bindings {
@@ -1360,7 +1481,11 @@ fn scope_bindings(plan: &LogicalPlan, id: LogicalId) -> Vec<String> {
             _ => {}
         }
     }
-    bindings.into_iter().collect()
+    let hidden = correlated_hidden(plan, id);
+    bindings
+        .into_iter()
+        .filter(|binding| !hidden.contains(binding))
+        .collect()
 }
 
 /// The metadata columns a sort appends after `keys` so its order is total;
@@ -2095,6 +2220,12 @@ fn place_query_filters(
                     scopes.push(*inner);
                     stack.push(*input);
                 }
+                // A correlated read's pattern is a scope of its own: a filter
+                // written after it never moves below its group or cut.
+                Some(LogicalNode::Correlate { input, inner, .. }) => {
+                    scopes.push(*inner);
+                    stack.extend(*input);
+                }
                 // Each arm of a union binds the union's names: a filter
                 // written after it stays above it, and each arm's own
                 // filters are its own scope's.
@@ -2522,6 +2653,16 @@ fn identity_reads(node: &LogicalNode) -> Vec<String> {
         } => spec.binding.iter().cloned().collect(),
         LogicalNode::Expand { src, dst, .. } => vec![src.clone(), dst.clone()],
         LogicalNode::AntiJoin { outer_var, .. } => vec![outer_var.clone()],
+        // A group keyed by a reference groups by its identity.
+        LogicalNode::Correlate { read, .. } => read
+            .group
+            .iter()
+            .flatten()
+            .filter_map(|key| match &key.expr {
+                IRExpr::Variable(name, _) => Some(name.clone()),
+                _ => None,
+            })
+            .collect(),
         LogicalNode::Nearest { binding, .. } | LogicalNode::TextSearch { binding, .. } => {
             vec![binding.clone()]
         }
@@ -2646,6 +2787,17 @@ fn node_reads(node: &LogicalNode) -> Vec<ColumnRef> {
             value: _,
             reads,
         } => out.extend(reads.iter().cloned()),
+        LogicalNode::Correlate {
+            input: _,
+            inner: _,
+            outer_var: _,
+            read: _,
+            tiebreak,
+            reads,
+        } => {
+            out.extend(reads.iter().cloned());
+            out.extend(tiebreak.iter().cloned());
+        }
         LogicalNode::MetadataCount {
             spec: _,
             return_exprs: _,
@@ -2768,6 +2920,7 @@ fn materialize_returns_late(
                 | PhysicalNode::OptionalJoin { .. }
                 | PhysicalNode::Score { .. }
                 | PhysicalNode::Let { .. }
+                | PhysicalNode::Correlate { .. }
         )
     }) {
         return Ok(false);
@@ -3668,6 +3821,25 @@ impl Lowering<'_> {
                     input: lowered,
                     inner,
                     outer_var: outer_var.clone(),
+                }))
+            }
+            LogicalNode::Correlate {
+                input,
+                inner,
+                outer_var,
+                read,
+                tiebreak,
+                ..
+            } => {
+                let lowered = input.map(|input| self.lower(input)).transpose()?;
+                let inner = self.lower(*inner)?;
+                self.tracer.record(&[Role::Projection], Rule::Lower, &[]);
+                Ok(self.physical.add(PhysicalNode::Correlate {
+                    input: lowered,
+                    inner,
+                    outer_var: outer_var.clone(),
+                    read: read.clone(),
+                    tiebreak: tiebreak.clone(),
                 }))
             }
             LogicalNode::OuterReference { outer_var } => {
@@ -4961,6 +5133,17 @@ fn derive_properties(
                     schema: input.schema.clone(),
                     ordering: ordering.clone(),
                     rows: input.rows,
+                    work_bytes: Estimate::Unknown,
+                    retained_limit: None,
+                    sources: Vec::new(),
+                }
+            }
+            PhysicalNode::Correlate { input, inner, .. } => {
+                let input = props(plan, input.unwrap_or(*inner))?;
+                Properties {
+                    schema: input.schema.clone(),
+                    ordering: ordering.clone(),
+                    rows: Estimate::Unknown,
                     work_bytes: Estimate::Unknown,
                     retained_limit: None,
                     sources: Vec::new(),

@@ -599,6 +599,18 @@ impl ChildSlots for ScanInput {
     }
 }
 
+impl ChildSlots for Option<NodeId> {
+    const COUNTS: &'static [usize] = &[0, 1];
+
+    fn ids(&self) -> Vec<NodeId> {
+        self.iter().copied().collect()
+    }
+
+    fn ids_mut(&mut self) -> Vec<&mut NodeId> {
+        self.iter_mut().collect()
+    }
+}
+
 impl ChildSlots for [RankArm; 2] {
     const COUNTS: &'static [usize] = &[2];
 
@@ -1008,8 +1020,28 @@ physical_nodes! {
         outer_var: String,
     } => "OptionalJoin" [input: NodeId, inner: NodeId]
         shape: PipelineShape::Breaker, sides: vec![*inner], cut: None, order: None;
-    /// The enclosing rows, the leaf of a correlated `AntiJoin` or
-    /// `OptionalJoin` inner tree.
+    /// `from` an inline read with its own aggregate, `distinct`, `order` or
+    /// `limit` (the core's `Correlate` over its `Group`, `Order` and `Cut`):
+    /// the read's pattern is the `inner` tree and `read` what it returns.
+    /// With an `input`, the inner tree's leaf is an `OuterReference` to the
+    /// input rows on `outer_var`; the read groups, orders and cuts each
+    /// input row's own inner rows, and each input row leaves once per row of
+    /// its read, its reference columns' and value columns' added. Without
+    /// one the read runs once over all the inner rows and its rows leave.
+    /// `tiebreak` follows the `order` keys so the order is total.
+    Correlate {
+        input: Option<NodeId>,
+        inner: NodeId,
+        outer_var: Option<String>,
+        read: Box<crate::read_shape::InnerRead>,
+        tiebreak: Vec<ColumnRef>,
+    } => "Correlate" [input: Option<NodeId>, inner: NodeId]
+        shape: PipelineShape::Breaker,
+        sides: if input.is_some() { vec![*inner] } else { vec![] },
+        cut: None,
+        order: None;
+    /// The enclosing rows, the leaf of a correlated `AntiJoin`,
+    /// `OptionalJoin` or `Correlate` inner tree.
     OuterReference {
         outer_var: String,
     } => "OuterReference" []
@@ -1575,6 +1607,17 @@ impl PhysicalPlan {
                 "node": node.name(),
                 "outer_var": outer_var,
             }),
+            PhysicalNode::Correlate {
+                outer_var,
+                read,
+                tiebreak,
+                ..
+            } => {
+                let mut value = inner_read_json(read, tiebreak);
+                value["node"] = json!(node.name());
+                value["outer_var"] = json!(outer_var);
+                value
+            }
             PhysicalNode::OuterReference { outer_var } => json!({
                 "node": node.name(),
                 "outer_var": outer_var,
@@ -1882,6 +1925,7 @@ impl PhysicalPlan {
             Some(PhysicalNode::ContainsJoin { .. }) => "ContainsJoin(build)".to_string(),
             Some(PhysicalNode::AntiJoin { .. }) => "AntiJoin(inner)".to_string(),
             Some(PhysicalNode::OptionalJoin { .. }) => "OptionalJoin(inner)".to_string(),
+            Some(PhysicalNode::Correlate { .. }) => "Correlate(inner)".to_string(),
             Some(PhysicalNode::Union { .. }) => "Union(right)".to_string(),
             Some(PhysicalNode::RankFuse { .. }) => "RankFuse(secondary)".to_string(),
             Some(node) => node.name().to_string(),
@@ -2080,4 +2124,32 @@ pub enum PipelineSink {
     /// seen all of its input ([`PipelineShape::Breaker`]); the node's
     /// output is the source of the pipeline that depends on this one.
     Breaker(NodeId),
+}
+
+/// What a `Correlate` evaluates, as explain prints it: the read's group,
+/// columns, order, tie-break and cut.
+pub(crate) fn inner_read_json(
+    read: &crate::read_shape::InnerRead,
+    tiebreak: &[ColumnRef],
+) -> Value {
+    let columns = |projections: &[IRProjection]| {
+        projections
+            .iter()
+            .map(|projection| format!("{} as {}", projection.expr, projection.column))
+            .collect::<Vec<String>>()
+    };
+    let mut value = json!({
+        "values": read.values,
+        "group": read.group.as_deref().map(columns),
+        "columns": columns(&read.columns),
+        "typed_columns": crate::typed::returns(&read.columns),
+        "keys": read.order_by.iter().map(ordering_text).collect::<Vec<String>>(),
+        "typed_keys": read.order_by.iter().map(|key| crate::typed::expr(&key.expr)).collect::<Vec<_>>(),
+        "tiebreak": tiebreak_text(tiebreak),
+        "limit": read.limit,
+    });
+    if let Some(group) = &read.group {
+        value["typed_group"] = json!(crate::typed::returns(group));
+    }
+    value
 }

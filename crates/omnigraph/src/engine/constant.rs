@@ -210,6 +210,14 @@ fn fold_pipeline(
                     fold_pipeline(arm, declared, params)?;
                 }
             }
+            // An inline read's own `limit $param` takes its bound count, as
+            // the read's does.
+            PatternStep::Correlate { inner, read, .. } => {
+                fold_pipeline(inner, declared, params)?;
+                if let Some(name) = &read.limit_param {
+                    read.limit = Some(bound_count(name, "limit", 0, declared, params)?);
+                }
+            }
             // A window `k: $param` takes its bound count; the ranking's query
             // binds at its scan.
             PatternStep::Rank {

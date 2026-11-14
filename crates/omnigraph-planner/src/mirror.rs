@@ -36,6 +36,7 @@ use crate::physical::{
     OrderKey, OverfetchRung, PhysicalNode, PhysicalPlan, Prefilter, Properties, RankArm, RankKind,
     RankScope, RankedAccess, ScanInput, StatisticSource,
 };
+use crate::read_shape::InnerRead;
 use crate::source::SideId;
 use omnigraph_compiler::types::{AggSignature, ExprType};
 
@@ -351,6 +352,13 @@ pub enum NodeMirror {
     OuterReference {
         outer_var: String,
     },
+    Correlate {
+        input: Option<NodeId>,
+        inner: NodeId,
+        outer_var: Option<String>,
+        read: InnerReadMirror,
+        tiebreak: Vec<ColumnRef>,
+    },
     #[serde(rename = "RankFuseWithTiebreak")]
     RankFuse {
         arms: [RankArm; 2],
@@ -587,6 +595,19 @@ impl From<&PhysicalNode> for NodeMirror {
                 predicate: SubqueryPredicateMirror::from(predicate),
                 aggregate: *aggregate,
                 strategy: *strategy,
+            },
+            PhysicalNode::Correlate {
+                input,
+                inner,
+                outer_var,
+                read,
+                tiebreak,
+            } => Self::Correlate {
+                input: *input,
+                inner: *inner,
+                outer_var: outer_var.clone(),
+                read: InnerReadMirror::from(read.as_ref()),
+                tiebreak: tiebreak.clone(),
             },
             PhysicalNode::OptionalJoin {
                 input,
@@ -868,6 +889,19 @@ impl TryFrom<NodeMirror> for PhysicalNode {
                 predicate: SubqueryPredicate::from(predicate),
                 aggregate,
                 strategy,
+            },
+            NodeMirror::Correlate {
+                input,
+                inner,
+                outer_var,
+                read,
+                tiebreak,
+            } => Self::Correlate {
+                input,
+                inner,
+                outer_var,
+                read: Box::new(InnerRead::from(read)),
+                tiebreak,
             },
             NodeMirror::OptionalJoin {
                 input,
@@ -2051,6 +2085,43 @@ impl From<ProjectionMirror> for IRProjection {
             alias: mirror.alias,
             column: mirror.column,
             ty: mirror.ty,
+        }
+    }
+}
+
+/// A `Correlate`'s read: its group, columns, order and cut.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InnerReadMirror {
+    pub values: String,
+    pub group: Option<Vec<ProjectionMirror>>,
+    pub columns: Vec<ProjectionMirror>,
+    pub order_by: Vec<OrderingMirror>,
+    pub limit: Option<u64>,
+    pub limit_param: Option<String>,
+}
+
+impl From<&InnerRead> for InnerReadMirror {
+    fn from(read: &InnerRead) -> Self {
+        Self {
+            values: read.values.clone(),
+            group: read.group.as_deref().map(projections),
+            columns: projections(&read.columns),
+            order_by: read.order_by.iter().map(OrderingMirror::from).collect(),
+            limit: read.limit,
+            limit_param: read.limit_param.clone(),
+        }
+    }
+}
+
+impl From<InnerReadMirror> for InnerRead {
+    fn from(mirror: InnerReadMirror) -> Self {
+        Self {
+            values: mirror.values,
+            group: mirror.group.map(projections_back),
+            columns: projections_back(mirror.columns),
+            order_by: mirror.order_by.into_iter().map(IROrdering::from).collect(),
+            limit: mirror.limit,
+            limit_param: mirror.limit_param,
         }
     }
 }

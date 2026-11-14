@@ -93,8 +93,11 @@ named relation: `let $cs = { match { $c: Company } return { $c } }, from $cs`.
 elements; a value that can fail (arithmetic) runs on every row before
 `where`, so it fails (`E1`, `E2`) on rows `where` removes: guard it with
 `if(cond, value, 0)` or write it in `return`, which runs after `where`.
-`from { match … return { … } }` joins an inline read's rows; one with an
-aggregate, `distinct`, `order` or `limit` is `T86`. `from union({ … }, { … })`
+`from { match … return { … } }` joins an inline read's rows; its own
+aggregate, `distinct`, `order` and `limit` run per outer row when it reads
+an outer name (once otherwise), so an outer `where` or `limit` never widens
+or replaces its cut, and `count` with no key is 0 where nothing matches; a
+ranking inside such a read is `T86`. `from union({ … }, { … })`
 joins the bag of its arms' rows, columns by position and named by the first
 arm (`return { $q as p }` in a later one); an arm returning a value or an
 edge, or reading an outer name, is `T86`. `from name(args)` runs a read

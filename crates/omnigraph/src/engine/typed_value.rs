@@ -563,7 +563,7 @@ pub(super) fn validate_plan_values(
         aliases: HashMap<&'a str, &'a ExprType>,
         /// The score columns ranked scans and fusions append, by their
         /// `(binding, column)`: `F32` from Lance, `F64` for the fused sum.
-        scores: HashMap<(&'a str, &'a str), DataType>,
+        scores: HashMap<(&'a str, &'a str), (DataType, bool)>,
     }
     // A name an `optional` introduces is null on an outer row with no
     // match, so its leaves may be typed nullable over a required property.
@@ -636,7 +636,7 @@ pub(super) fn validate_plan_values(
                         if let Some(binding) = &spec.binding {
                             owners.scores.insert(
                                 (binding.as_str(), ranked.kind.score().0),
-                                DataType::Float32,
+                                (DataType::Float32, false),
                             );
                         }
                     }
@@ -647,7 +647,7 @@ pub(super) fn validate_plan_values(
                             binding.as_str(),
                             omnigraph_compiler::query::value::DISTANCE_COLUMN,
                         ),
-                        DataType::Float32,
+                        (DataType::Float32, false),
                     );
                 }
                 PhysicalNode::RankFuse { arms, .. } => {
@@ -656,8 +656,22 @@ pub(super) fn validate_plan_values(
                             arms[0].binding.as_str(),
                             omnigraph_compiler::query::value::RRF_COLUMN,
                         ),
-                        DataType::Float64,
+                        (DataType::Float64, false),
                     );
+                }
+                // A correlated read's group columns and value columns are
+                // columns of its `values` binding, typed as computed.
+                PhysicalNode::Correlate { read, .. } => {
+                    for projection in read.group.iter().flatten().chain(&read.columns) {
+                        if let (Some(data_type), ExprType::Value { nullable, .. }) =
+                            (projection.ty.to_arrow(), &projection.ty)
+                        {
+                            owners.scores.insert(
+                                (read.values.as_str(), projection.column.as_str()),
+                                (data_type, *nullable),
+                            );
+                        }
+                    }
                 }
                 PhysicalNode::MetadataCount { spec, return_exprs } => {
                     if let (Some(binding), Some(type_name)) =
@@ -711,8 +725,8 @@ pub(super) fn validate_plan_values(
             scores,
         } = owners;
         let property_type = |variable: &str, property: &str| -> Result<(DataType, bool)> {
-            if let Some(data_type) = scores.get(&(variable, property)) {
-                return Ok((data_type.clone(), false));
+            if let Some((data_type, nullable)) = scores.get(&(variable, property)) {
+                return Ok((data_type.clone(), *nullable));
             }
             if let Some(type_name) = bindings.get(variable) {
                 let node = catalog.query_node_type(type_name).ok_or_else(|| {
@@ -805,6 +819,7 @@ pub(super) fn validate_plan_values(
                 PhysicalNode::RankFuse { k, .. } => pending.extend(k),
                 PhysicalNode::Score { query, .. } => pending.push(query),
                 PhysicalNode::Let { value, .. } => pending.push(value),
+                PhysicalNode::Correlate { read, .. } => pending.extend(read.exprs()),
                 PhysicalNode::Sort { order_by, .. } => {
                     pending.extend(order_by.iter().map(|ordering| &ordering.expr))
                 }

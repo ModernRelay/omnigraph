@@ -491,6 +491,7 @@ fn estimate_rows_over(
         LogicalNode::Limit { input, rows, .. } | LogicalNode::Page { input, rows, .. } => {
             Some(estimate_rows(plan, *input, source)?.min(*rows as u64))
         }
+        LogicalNode::Correlate { .. } => None,
         LogicalNode::Nearest { input, k, .. } => {
             let input_rows = estimate_rows(plan, *input, source)?;
             Some(k.map_or(input_rows, |k| k.min(input_rows)))

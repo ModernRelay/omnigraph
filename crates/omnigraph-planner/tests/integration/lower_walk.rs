@@ -212,6 +212,19 @@ impl Lower for Trace {
         self.call("optional_join", id, &[&outer, &inner])
     }
 
+    fn correlate(
+        &mut self,
+        id: NodeId,
+        _: omnigraph_planner::CorrelateFields<'_>,
+        outer: Option<String>,
+        inner: String,
+    ) -> Result<String, PlanError> {
+        match outer {
+            Some(outer) => self.call("correlate", id, &[&outer, &inner]),
+            None => self.call("correlate", id, &[&inner]),
+        }
+    }
+
     fn outer_reference(&mut self, id: NodeId, _: &str) -> Result<String, PlanError> {
         self.call("outer_reference", id, &[])
     }

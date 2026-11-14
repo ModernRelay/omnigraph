@@ -114,6 +114,7 @@ binary's rows.
 | AntiJoin | [2] |
 | ClassifyThreeWay | [1] |
 | ContainsJoin | [2] |
+| Correlate | [1, 2] |
 | CrossJoin | [2] |
 | CsvSource | [0] |
 | DeltaSource | [0] |
@@ -180,6 +181,7 @@ binary's rows.
 |---|---|
 | Aggregate | refused_by_name |
 | AntiJoin | refused_by_name |
+| Correlate | refused_by_name |
 | CsvSource | refused_by_name |
 | DeltaSource | refused_by_name |
 | Expand | refused_by_name |

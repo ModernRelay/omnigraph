@@ -286,6 +286,7 @@ impl Requirements {
         }
         let top = pipeline(plan, plan.root(), budget)?;
         self.check_optionals(plan, &top, budget)?;
+        self.check_correlates(plan, &top, budget)?;
         self.check_unions(plan, &top)?;
         self.check_scores(plan, &top)?;
         self.check_lets(plan, &top)?;
@@ -615,6 +616,104 @@ impl Requirements {
         Ok(())
     }
 
+    /// The plan runs one `Correlate` per written `from` over an inline read
+    /// with its own group or cut, on the same correlation binding and
+    /// returning the same read, each testing its pattern's conjuncts inside
+    /// its inner tree and never outside it, where they would run after the
+    /// read's group or cut.
+    fn check_correlates(
+        &self,
+        plan: &PhysicalPlan,
+        top: &[NodeId],
+        budget: &mut Budget,
+    ) -> Result<(), ValidationError> {
+        let mut planned: Vec<(&Option<String>, &crate::read_shape::InnerRead, Vec<NodeId>)> =
+            Vec::new();
+        for id in top {
+            if let Some(PhysicalNode::Correlate {
+                input,
+                inner,
+                outer_var,
+                read,
+                ..
+            }) = plan.node(*id)
+            {
+                if input.is_some() != outer_var.is_some() {
+                    return Err(ValidationError::violated(
+                        "plan shape",
+                        format!(
+                            "node {id} correlates without both its outer rows and its correlation binding"
+                        ),
+                    ));
+                }
+                planned.push((outer_var, read, pipeline(plan, *inner, budget)?));
+            }
+        }
+        if planned.len() != self.correlates.len() {
+            return Err(ValidationError::violated(
+                "plan shape",
+                format!(
+                    "the query draws {} inline reads with their own group or cut; the plan correlates {}",
+                    self.correlates.len(),
+                    planned.len()
+                ),
+            ));
+        }
+        let inside: HashSet<NodeId> = planned
+            .iter()
+            .flat_map(|(_, _, nodes)| nodes.iter().copied())
+            .collect();
+        let outside: Vec<NodeId> = top
+            .iter()
+            .copied()
+            .filter(|id| !inside.contains(id))
+            .collect();
+        let tested_outside: HashSet<IRExpr> = conjuncts(plan, &outside)
+            .into_iter()
+            .map(|(_, conjunct)| conjunct)
+            .collect();
+        let top_level: HashSet<&IRExpr> = self.eligibility.iter().collect();
+        for correlate in &self.correlates {
+            let found = planned.iter().position(|(outer_var, read, nodes)| {
+                let tested: HashSet<IRExpr> = conjuncts(plan, nodes)
+                    .into_iter()
+                    .map(|(_, conjunct)| conjunct)
+                    .collect();
+                **outer_var == correlate.outer_var
+                    && **read == correlate.read
+                    && correlate
+                        .eligibility
+                        .iter()
+                        .all(|conjunct| tested.contains(conjunct))
+            });
+            let Some(index) = found else {
+                return Err(ValidationError::violated(
+                    "predicate retention",
+                    format!(
+                        "no correlated read of the plan returns `{}` with the conjuncts the query's inline read writes",
+                        correlate
+                            .read
+                            .columns
+                            .iter()
+                            .map(|column| column.column.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            };
+            planned.remove(index);
+            if let Some(leaked) = correlate.eligibility.iter().find(|conjunct| {
+                tested_outside.contains(*conjunct) && !self.top_level_conjunct(conjunct, &top_level)
+            }) {
+                return Err(ValidationError::violated(
+                    "predicate origin",
+                    format!("the plan tests the inline read's `{leaked}` outside its read"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The plan runs one `Score` per written `distance`, over the same
     /// binding, vector property and query.
     fn check_scores(&self, plan: &PhysicalPlan, top: &[NodeId]) -> Result<(), ValidationError> {
@@ -744,6 +843,11 @@ impl Requirements {
             .optionals
             .iter()
             .flat_map(|optional| optional.eligibility.iter())
+            .chain(
+                self.correlates
+                    .iter()
+                    .flat_map(|correlate| correlate.eligibility.iter()),
+            )
             .filter(|own| *own == conjunct)
             .count();
         eligibility.contains(conjunct)
