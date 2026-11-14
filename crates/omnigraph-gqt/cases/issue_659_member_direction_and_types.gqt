@@ -1,6 +1,6 @@
 # issue: 659
 # red_on: 7f1233bb
-# notes: Each selected member resolves its own direction; bound metadata preserves stored orientation.
+# notes: Each selected member resolves its own direction, from either written end; bound metadata preserves stored orientation.
 
 --- runner
 timeout_ms: 10000
@@ -57,6 +57,21 @@ query cross_type_wildcard() {
 --- expect shape
 destination: String
 edge_type: String
+
+--- query
+query cross_type_wildcard_from_the_other_end() {
+    match { $p: Person, $d: Doc, $d $e:* $p } where $p.name = "p"
+    return { $d.name as source_doc, $e.@type as edge_type, $e.@src as source }
+}
+
+--- expect unordered
+{"source_doc":"d","edge_type":"Owns","source":"p"}
+{"source_doc":"d","edge_type":"OwnedBy","source":"d"}
+
+--- expect shape
+source_doc: String
+edge_type: String
+source: String
 
 --- query
 query distinct_cross_type_destination() {

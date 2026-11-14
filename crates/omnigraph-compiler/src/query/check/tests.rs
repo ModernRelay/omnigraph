@@ -1877,17 +1877,39 @@ fn a_triple_is_written_in_its_edges_declared_order() {
     );
     // Between ends of one type the written order already is the direction.
     assert!(outcome("query q() { match { $p: Person, $q knows $p } return { $q } }").is_ok());
-    // `<e>` reads either direction, and a wildcard selects by the end types.
+    // `<e>` reads either direction.
     assert!(outcome("query q() { match { $p: Person, $q <knows> $p } return { $q } }").is_ok());
-    assert!(
-        outcome("query q() { match { $c: Company, $p: Person, $c * $p } return { $p } }").is_ok()
+    // A selection matches each member in the direction its end types fix and
+    // is refused only when no member points along the written order. A
+    // wildcard's members are the edges between its end types, either way.
+    repaired(
+        "query q() { match { $c: Company, $p: Person, $c (worksAt | founded) $p } return { $p } }",
+        "query q() { match { $c: Company, $p: Person, $p (worksAt | founded) $c } return { $p } }",
     );
-    // An alternation whose members run both ways relative to the written
-    // ends has no swap that orients every member: it is not refused.
-    assert!(
-        outcome("query q() { match { $c: Company, $c (worksAt | employs) $p } return { $p } }")
-            .is_ok()
+    repaired(
+        "query q() { match { $p: Person, $d: Doc, $d * $p } return { $p } }",
+        "query q() { match { $p: Person, $d: Doc, $p * $d } return { $p } }",
     );
-    let d = outcome("query q() { match { $c: Company, $p (worksAt | employs) $c } return { $p } }");
-    assert!(d.is_ok(), "{d:?}");
+    repaired(
+        "query q() { match { $p: Person, $d: Doc, $d $k:* $p } return { $p, $k } }",
+        "query q() { match { $p: Person, $d: Doc, $p $k:* $d } return { $p, $k } }",
+    );
+    let d = outcome("query q() { match { $p: Person, $d: Doc, $d * $p } return { $p } }")
+        .expect_err("refused");
+    assert!(d.message.contains("no member of `$d * $p`"), "{d}");
+    // Members both ways: one along the written order admits the selection,
+    // and each member matches in its own declared direction.
+    for written in [
+        "query q() { match { $c: Company, $p: Person, $c * $p } return { $p } }",
+        "query q() { match { $c: Company, $p: Person, $p * $c } return { $p } }",
+        "query q() { match { $c: Company, $c (worksAt | employs) $p } return { $p } }",
+        "query q() { match { $c: Company, $p (worksAt | employs) $c } return { $p } }",
+    ] {
+        let d = outcome(written);
+        assert!(d.is_ok(), "{written}: {d:?}");
+    }
+    // Between ends of one type every member points along the written order.
+    assert!(
+        outcome("query q() { match { $p: Person, $q: Person, $q * $p } return { $q } }").is_ok()
+    );
 }

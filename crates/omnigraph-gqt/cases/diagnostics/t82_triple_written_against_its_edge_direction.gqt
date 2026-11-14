@@ -1,7 +1,8 @@
 # issue: none
 # notes: A triple is written in its edge's declared order, source first, so its written order is its direction. A triple
 # notes: written against it is `T82`, whatever the end types, whose fix swaps the two ends and keeps the edge binding and
-# notes: the alternation; the swapped triple reads the edge in its declared orientation. Nothing executes.
+# notes: the selector; the swapped triple reads the edge in its declared orientation. A selection, an alternation or `*`,
+# notes: is `T82` only when none of its members points along the written order. Nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -33,4 +34,9 @@ query staff($slug: String) { match { $c: Company, $c worksAt $p } where $c.slug 
 --- query
 query ties() { match { $c: Company } where exists { $p: Person, $c $k:(worksAt | founded) $p } return { $c.name } }
 
---- expect error: type error: T82: `$c $k:(worksAt | founded) $p` is written against the declared direction of `Founded: Person -> Company`, `WorksAt: Person -> Company`
+--- expect error: type error: T82: no member of `$c $k:(worksAt | founded) $p` points along its written order, which is against the declared direction of `Founded: Person -> Company`, `WorksAt: Person -> Company`
+
+--- query
+query everyone() { match { $c: Company, $p: Person, $c * $p } return { $p.name } }
+
+--- expect error: type error: T82: no member of `$c * $p` points along its written order, which is against the declared direction of `Founded: Person -> Company`, `WorksAt: Person -> Company`

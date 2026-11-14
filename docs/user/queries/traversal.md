@@ -63,11 +63,15 @@ Company`, `$c: Company, $c worksAt $p` is refused with `T82`, in every scope,
 and its fix swaps the ends, `$p worksAt $c`, keeping an edge binding, bounds
 and an alternation as written; the swapped triple reads the same edges from the
 same bound end. Between ends of one type, `Knows: Person -> Person`, the written
-order decides which end is the source. `<e>` reads either direction. A wildcard
-selects its edges by the end types, and an alternation whose members run in
-opposite directions between the written ends (`$c (worksAt | employs) $p` with
-`Employs: Company -> Person`) resolves each member's direction from the end
-types; neither is refused.
+order decides which end is the source. `<e>` reads either direction. A
+selection, `(a | b)` or `*`, matches each member in the direction its end types
+fix, in written order where both ends have one type, so an alternation whose
+members run in opposite directions between the written ends (`$c (worksAt |
+employs) $p` with `Employs: Company -> Person`) reads each member its own way.
+A wildcard's members are every edge between its two end types, either way. A
+selection is `T82` only when no member points along the written order, `$c *
+$p` where every edge between the two types is declared `Person -> Company`;
+the fix swaps the ends as for a single edge.
 
 Hop counts are shortest-path distances from the start node: `{2,2}` returns the
 nodes exactly two hops away. A node is never re-reached through its own

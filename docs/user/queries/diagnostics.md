@@ -91,7 +91,6 @@ edit to a source that has changed since the request.
 correction. `needs_review` means the caller must review the proposed change.
 Neither value guarantees that the corrected query will pass every check;
 validate it again. The compiler does not apply suggestions automatically.
-
 Incomplete or ambiguous input can receive textual guidance without
 `suggestion`; a missing suggestion does not mean there is no fix.
 
@@ -237,7 +236,8 @@ error[T82]: type error: T82: `$c worksAt $p` is written against the declared dir
 ```
 
 The machine-applicable suggestion swaps the two ends and leaves the rest as
-written.
+written. A selection, `(a | b)` or `*`, is `T82` only when none of its members
+points along the written order; each member matches in its own direction.
 
 ## Inner scopes
 

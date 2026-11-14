@@ -6338,22 +6338,24 @@ fn end_bindings(
     out
 }
 
-/// `T82` for a triple written against its edge's declared direction: every
-/// edge it selects resolved from the written ends to the reverse of its
-/// declared `from -> to`. The written order of a triple is its direction, so
-/// the fix swaps the two ends, keeping the edge binding, the hop bounds and
-/// the alternation, which reads the edge in its declared orientation as the
-/// end types did. `<e>` reads either direction, a wildcard selects by the end
-/// types, and an alternation whose members run both ways relative to the
-/// written ends has no swap that orients every member, so none of the three
-/// is refused here.
+/// `T82` for a triple written against its edge's declared direction, or a
+/// selection, `(a | b)` or `*`, none of whose members points along the
+/// written order: every edge it selects resolved from the written ends to the
+/// reverse of its declared `from -> to`. A selection matches each member in
+/// the direction its end types fix (the written order where both ends have
+/// one type), so one member along the written order admits it, whatever the
+/// others; a wildcard's members are every edge between its two end types,
+/// either way. The fix swaps the two ends, keeping the edge binding, the hop
+/// bounds and the selector, which reads every member in its declared
+/// orientation as the end types did. `<e>` reads either direction and is
+/// never refused, and a selection with no member has no order to restore.
 fn reversed_triple(
     catalog: &Catalog,
     written: &Traversal,
     resolved: &traversal::ResolvedTraversal,
     span: Option<&SourceSpan>,
 ) -> Option<QueryDiagnostic> {
-    if written.undirected || matches!(written.selector, EdgeSelector::Wildcard) {
+    if written.undirected {
         return None;
     }
     let members = resolved.edges.members();
@@ -6381,14 +6383,18 @@ fn reversed_triple(
         (min, None) => format!("{{{min},}}"),
     };
     let triple = |a: &str, b: &str| format!("${a} {edge}{bounds} ${b}");
-    let mut d = QueryDiagnostic::typecheck(
-        T82,
+    let message = if matches!(written.selector, EdgeSelector::Named(_)) {
         format!(
             "`{}` is written against the declared direction of {declared}: a triple is written in its edge's declared order, source first, so its written order is its direction",
             triple(&written.src, &written.dst)
-        ),
-    )
-    .with_fix(format!(
+        )
+    } else {
+        format!(
+            "no member of `{}` points along its written order, which is against the declared direction of {declared}: a selection matches each member in the direction its end types fix, and at least one member is written in its declared order, source first",
+            triple(&written.src, &written.dst)
+        )
+    };
+    let mut d = QueryDiagnostic::typecheck(T82, message).with_fix(format!(
         "write the source first: `{}`",
         triple(&written.dst, &written.src)
     ));

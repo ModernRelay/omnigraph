@@ -133,7 +133,9 @@ where $s.slug = $slug
 
 A triple is written in the edge's declared order, source first, whichever end
 is bound: `$p formsPattern $s` with `$p: Pattern` is `T82`, and the fix swaps
-the ends to `$s formsPattern $p`. `<e>` reads either direction.
+the ends to `$s formsPattern $p`. `<e>` reads either direction. A selection,
+`(a | b)` or `*`, matches each member in the direction its end types fix and
+is `T82` only when no member points along the written order.
 
 Inside `match` any word is an edge name, keywords included (`$d in $c` follows
 an edge `In`); a quoted name is accepted too.

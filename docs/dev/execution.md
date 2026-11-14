@@ -165,14 +165,15 @@ triple's ends introduced by the triple.
 
 A triple's written order is its direction (`check/mod.rs`, `reversed_triple`).
 `resolve_traversal` still resolves each member's `Direction` from the end
-types; when every member of a named edge or an alternation resolves to `In`,
-the triple is `T82` at its element span, whose two end ranges the parser
+types; when every member of a named edge or a selection (an alternation or a
+wildcard, whose members are every edge between its end types) resolves to
+`In`, the triple is `T82` at its element span, whose two end ranges the parser
 records (`element_span`), and the suggestion swaps them. The swapped triple
 types to the same edge selection from the same bound end, except where both
 ends are bound: the semi-join `Expand` then starts at the written source, so
 the core term's orientation flips while the shaper's plan stays the same. An
-undirected triple, a wildcard and an alternation whose members resolve both
-ways are not refused.
+undirected triple, a selection with at least one member resolved `Out` and a
+selection with no member are not refused.
 
 A ranked `from` names its score with `as` (`check/mod.rs`, `drawn_rel`). The
 ranking's term carries the written name as its `out` (`Score`, `ApproxTopK`,
