@@ -1,0 +1,1 @@
+[cw] baseline s3     same w=1   run=0:     2.75 writes/s     2.75 commits/s p50   362.1 ms p99    375.3 ms max+drain    390.8 ms req/write   13.1 reprep/write  0.00 per-writer [55]

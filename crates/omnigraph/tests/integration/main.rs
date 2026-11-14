@@ -14,6 +14,7 @@ mod changes;
 mod changes_cost;
 mod checkpoint_retention_cost;
 mod composite_flow;
+mod concurrent_write_throughput;
 mod consistency;
 mod durable_head_lookup_cost;
 mod end_to_end;
