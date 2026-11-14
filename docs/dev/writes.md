@@ -494,14 +494,15 @@ declared indexes the table lacks and a whole rebuild of each BTREE or vector
 index whose coverage lags (`TableStore::stage_index_reconciliation`), the two
 index links optimize chains after its compaction; full-text coverage stays
 with the explicit rebuild. The tables stage concurrently and share one
-budget (`MaintenanceBudget`): a BTREE build holds enough permits that at most
-`INDEX_BUILD_CONCURRENCY` (4) run at once, a full-text or vector build holds
-all of them and runs alone, and the batches join in table and specification
-order, so the publication is the one a serial pass makes. The pass owns the
-budget: one `ensure_indices` or full-text rebuild pass (width 4), or one
-optimize run across the tables it stages at once (width its rewrite
-concurrency, shared with every compaction task, which holds one permit),
-never one budget per table. In optimize, a full-text or vector build
+budget (`MaintenanceBudget`): a BTREE build holds `ceil(width / 4)` permits,
+so at most `INDEX_BUILD_CONCURRENCY` (4) run at once, and exactly 4 only when
+the width is a multiple of 4 (2 at width 5, 3 at 6, 7 or 9); a full-text or
+vector build holds all of them and runs alone; and the batches join in table
+and specification order, so the publication is the one a serial pass makes.
+The pass owns the budget: one `ensure_indices` or full-text rebuild pass
+(width 4), or one optimize run across the tables it stages at once (width
+its rewrite concurrency, shared with every compaction task, which holds one
+permit), never one budget per table. In optimize, a full-text or vector build
 therefore runs one at a time across the whole run, and no compaction task or
 other build runs beside it; a table waiting for its permit keeps its rewrite
 slot, so later tables wait too. No step waits for a permit while it holds

@@ -1101,8 +1101,9 @@ impl MaintenanceBudget {
     }
 
     /// The permits one build of `kind` holds while it runs: a share of the
-    /// width for a BTREE, so at most `INDEX_BUILD_CONCURRENCY` run at once,
-    /// and the whole width for any other kind, so a kind without a memory
+    /// width for a BTREE, so at most `INDEX_BUILD_CONCURRENCY` run at once
+    /// (exactly that many only when the width is a multiple of it), and the
+    /// whole width for any other kind, so a kind without a memory
     /// bound never overlaps another step. Every build acquires through here.
     pub(crate) async fn permit_for(&self, kind: IndexType) -> Result<BuildPermit<'_>> {
         let permits = if kind == IndexType::BTree {

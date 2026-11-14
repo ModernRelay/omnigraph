@@ -78,9 +78,11 @@ that many at once, so budget for that many Blob tables compacting together.
 
 One budget of that width bounds the heavy steps of a run across its tables:
 compaction tasks take one slot each (a Blob table's run one at a time), and
-index builds share it too. At most four BTREE builds run at once, and a
-full-text or vector build takes the whole budget, so nothing else in the run
-runs beside it. A served run rewrites one table at a time, so its steps run
+index builds share it too. A BTREE build takes a quarter of the width,
+rounded up, so four run at once at the default width of 8, and fewer when the
+width is not a multiple of four (two at 5; three at 6, 7 or 9). A full-text
+or vector build takes the whole budget, so nothing else in the run runs
+beside it. A served run rewrites one table at a time, so its steps run
 one after another.
 
 ### Bounding a run
