@@ -1,1 +1,1 @@
-- `optimize` runs one table's compaction tasks at the same time. The run's rewrite concurrency bounds its compaction tasks, index folds and index builds together.
+- A direct `optimize` compacts a table's fragments in parallel tasks, sharing `OMNIGRAPH_MAINTENANCE_CONCURRENCY` (8) with index work; served runs and Blob tables still run one task at a time.

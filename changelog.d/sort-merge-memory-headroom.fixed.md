@@ -1,1 +1,0 @@
-- A query that spills a sort no longer fails at one memory budget while it runs at smaller and larger ones: the sort's merge now keeps to half of `query_memory_bytes`.

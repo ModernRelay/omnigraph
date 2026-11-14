@@ -1,1 +1,1 @@
-- Reading a branch's commits one after another (`commit show`, `commit changes`, a diff or read pinned to a commit id) reads that branch alone after the first, not every live branch.
+- On a server or other long-running process, looking up one unmerged commit after another (history, review, `commit changes`) opens only the branch that holds it after the first, not every live branch.

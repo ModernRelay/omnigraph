@@ -1,1 +1,1 @@
-- Export copies each ordered chunk once instead of twice, hydration sizes each row once, and `not { }` blocks, bound edges and hash joins hash keys in one pass. Results are unchanged.
+- Export, the change feed, merges and key matching (`not`, `count` and `sum` blocks, bound edges, hash joins) use less CPU: one copy per chunk instead of two, and keys hashed a batch at a time.

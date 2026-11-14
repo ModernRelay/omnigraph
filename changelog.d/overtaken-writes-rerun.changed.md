@@ -1,3 +1,3 @@
-- An update, delete or overwrite load overtaken before it takes effect now reruns on the new head instead of returning `read_set_conflict`. See [mutations][overtaken-writes-mutations].
+- An update, delete or overwrite load overtaken by another commit reruns once on the new head, selecting its rows again, instead of returning `read_set_conflict`; `--if-commit` refuses. See [mutations][overtaken-writes-mutations].
 
 [overtaken-writes-mutations]: ../docs/user/mutations/index.md
