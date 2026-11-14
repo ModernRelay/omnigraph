@@ -1153,6 +1153,8 @@ pub(crate) struct CommittedMutation {
     /// that head, not the captured one. `None` when the captured authority
     /// was current.
     pub(crate) carried_txn: Option<crate::db::WriteTxn>,
+    /// When `commit_all` held every gate (research phase timer).
+    pub(crate) gates_acquired_at: std::time::Instant,
 }
 
 decide_seam! {
@@ -1215,6 +1217,9 @@ impl StagedMutation {
         // exclusive side excludes every writer, RFC
         // 2026-09-18-shared-schema-gate), branch gate, then sorted
         // per-table gates. Hold the full set through manifest publish.
+        let gate_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+            crate::instrumentation::phase_timers::WritePhase::GateWait,
+        );
         let branch_gates = match attempt.admitted_gates()? {
             Some(held) if held.branch_key() == branch => held,
             Some(held) => {
@@ -1228,6 +1233,11 @@ impl StagedMutation {
         };
         let table_guards = db.write_queue().acquire_many(&queue_keys).await?;
         let gates = branch_gates.with_tables(table_guards);
+        gate_timer.stop();
+        let gates_acquired_at = std::time::Instant::now();
+        let revalidate_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+            crate::instrumentation::phase_timers::WritePhase::Revalidate,
+        );
 
         // Re-capture manifest pins under the queue (PR 2 / MR-686).
         //
@@ -1253,6 +1263,7 @@ impl StagedMutation {
                 (txn.base.clone(), Some(txn), tables)
             }
         };
+        revalidate_timer.stop();
         let txn = carried_txn.as_deref().unwrap_or(txn);
         let pins = txn
             .unattached_base
@@ -1329,6 +1340,7 @@ impl StagedMutation {
                 detached: Vec::new(),
                 gates,
                 carried_txn: carried_txn.map(|txn| *txn),
+                gates_acquired_at,
             });
         }
 
@@ -1399,7 +1411,11 @@ impl StagedMutation {
             fail(&MUTATION_POST_TABLE_COMMIT)?;
             Ok::<_, OmniError>((table_key, detached, update))
         });
+        let detached_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+            crate::instrumentation::phase_timers::WritePhase::Detached,
+        );
         let committed = futures::future::join_all(commits).await;
+        detached_timer.stop();
         let mut updates: Vec<DatasetUpdate> = Vec::with_capacity(committed.len());
         let mut detached_tables = Vec::with_capacity(committed.len());
         for result in committed {
@@ -1414,6 +1430,7 @@ impl StagedMutation {
             detached: detached_tables,
             gates,
             carried_txn: carried_txn.map(|txn| *txn),
+            gates_acquired_at,
         })
     }
 }

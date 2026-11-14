@@ -1300,6 +1300,9 @@ impl Omnigraph {
             crate::db::reprepare::PreEffectReprepares::begin(self, Some(branch), "mutation");
         loop {
             let first_attempt = reprepares.is_first();
+            let attempt_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+                crate::instrumentation::phase_timers::WritePhase::Attempt,
+            );
             let result = crate::db::write_queue::preparing(self.mutate_one_attempt(
                 branch,
                 query_source,
@@ -1315,6 +1318,7 @@ impl Omnigraph {
                 reprepares.attempt(),
             ))
             .await;
+            attempt_timer.stop();
             match result {
                 Err(err) if reprepares.may_prepare_again(&err) => {
                     reprepares.prepare_again().await?;
@@ -1347,6 +1351,9 @@ impl Omnigraph {
         // all use this immutable attempt. `commit_all` revalidates the complete
         // token under the root-shared schema → branch → sorted-table gates
         // before its first detached commit.
+        let capture_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+            crate::instrumentation::phase_timers::WritePhase::Capture,
+        );
         let opened = match route {
             WriteRoute::UnattachedChild(base) => {
                 self.open_write_txn_on_unattached(requested.as_deref(), base)
@@ -1356,6 +1363,7 @@ impl Omnigraph {
                 self.open_write_txn(requested.as_deref()).await
             }
         };
+        capture_timer.stop();
         let mut txn = opened.map_err(|error| {
             if first_attempt {
                 error.before_effect()
@@ -1411,6 +1419,9 @@ impl Omnigraph {
         fill_declared_params(&mut resolved_params, &ir.params)?;
         validate_params(&resolved_params, &ir.params)?;
 
+        let execute_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+            crate::instrumentation::phase_timers::WritePhase::Execute,
+        );
         let exec_result = self
             .execute_named_mutation(
                 &ir,
@@ -1420,6 +1431,7 @@ impl Omnigraph {
                 &txn,
             )
             .await;
+        execute_timer.stop();
 
         match exec_result {
             Err(e) => Err(e),
@@ -1502,10 +1514,14 @@ impl Omnigraph {
         // effect is a fresh file or a detached version no manifest names: a
         // failure here is definite (`Unpublished`), whatever its cause, and a
         // server must not treat it as an outcome it cannot establish.
+        let stage_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+            crate::instrumentation::phase_timers::WritePhase::Stage,
+        );
         let (staged, early) = futures::join!(
             staging.stage_all_with_concurrency(self, requested, stage_write_concurrency),
             self.early_revalidation(txn),
         );
+        stage_timer.stop();
         let staged = staged.map_err(OmniError::unpublished)?;
         fail(&MUTATION_POST_STAGE_PRE_EFFECT_GATE).map_err(OmniError::unpublished)?;
         let lineage_intent = self
@@ -1540,6 +1556,7 @@ impl Omnigraph {
                     detached: _,
                     gates: _held_gates,
                     carried_txn,
+                    gates_acquired_at,
                 },
             lineage_intent,
             plans: _,
@@ -1563,16 +1580,22 @@ impl Omnigraph {
         // publish failure leaves the graph unchanged; the error is returned as
         // is (a moved head is `ReadSetChanged`). The publisher alone decides
         // between a definite loss and an outcome it could not read back.
-        self.commit_updates_on_branch_with_expected(
-            txn.branch.as_deref(),
-            &updates,
-            &expected_versions,
-            actor_id,
-            txn,
-            lineage_intent,
-            publication,
-        )
-        .await
+        let published = self
+            .commit_updates_on_branch_with_expected(
+                txn.branch.as_deref(),
+                &updates,
+                &expected_versions,
+                actor_id,
+                txn,
+                lineage_intent,
+                publication,
+            )
+            .await;
+        crate::instrumentation::phase_timers::record(
+            crate::instrumentation::phase_timers::WritePhase::GateHold,
+            gates_acquired_at.elapsed(),
+        );
+        published
     }
 
     /// Lower + validate a named mutation query into its IR.

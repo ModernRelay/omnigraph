@@ -1519,6 +1519,7 @@ async fn publish_staged_load(
         detached: _,
         gates: _held_gates,
         carried_txn,
+        gates_acquired_at: _,
     } = staged
         .commit_all(db, branch, txn, None, attempt)
         .await

@@ -54,7 +54,7 @@ use object_store::{
 
 use omnigraph::Session;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::instrumentation::{QueryIoProbes, with_query_io_probes};
+use omnigraph::instrumentation::{QueryIoProbes, phase_timers, with_query_io_probes};
 use omnigraph::loader::LoadMode;
 use omnigraph::settings::SessionSettings;
 use omnigraph_compiler::ir::ParamMap;
@@ -504,6 +504,7 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
     }
 
     tokio::time::sleep(cfg.warmup).await;
+    let phases_before = phase_timers::snapshot();
     let before = planes.snapshot();
     let reprepares_before = reprepares.load(Ordering::Relaxed);
     let carried_before = carried.load(Ordering::Relaxed);
@@ -513,6 +514,7 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
     phase.store(PHASE_STOP, Ordering::Release);
     let window = window_started.elapsed();
     let after = planes.snapshot();
+    let phases_after = phase_timers::snapshot();
     let reprepares_in_window = reprepares.load(Ordering::Relaxed) - reprepares_before;
     let carried_in_window = carried.load(Ordering::Relaxed) - carried_before;
 
@@ -577,6 +579,22 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
         false
     };
 
+    let mut phases = serde_json::Map::new();
+    for ((name, c0, t0), (_, c1, t1)) in phases_before.iter().zip(phases_after.iter()) {
+        let n = c1 - c0;
+        let us = t1 - t0;
+        if n == 0 {
+            continue;
+        }
+        phases.insert(
+            (*name).to_string(),
+            serde_json::json!({
+                "per_commit": round2(n as f64 / commits.max(1) as f64),
+                "ms_each": round2(us as f64 / n as f64 / 1000.0),
+                "ms_per_commit": round2(us as f64 / commits.max(1) as f64 / 1000.0),
+            }),
+        );
+    }
     let min_w = per_writer.iter().copied().min().unwrap_or(0);
     let max_w = per_writer.iter().copied().max().unwrap_or(0);
     let record = serde_json::json!({
@@ -603,6 +621,7 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
         "carried_per_commit": round2(carried_in_window as f64 / commits.max(1) as f64),
         "driver_retries": driver_retries,
         "requests_per_commit": before.delta_per_commit(&after, commits),
+        "phases": serde_json::Value::Object(phases),
         "verified": verified,
         "errors": errors.iter().take(3).collect::<Vec<_>>(),
         "driver": "closed-loop",

@@ -2061,6 +2061,7 @@ pub enum VersionResolution {
     At(u64),
 }
 
+pub mod phase_timers;
 mod small_manifest_reads;
 pub use small_manifest_reads::manifest_scan_dataset;
 mod control_dataset;

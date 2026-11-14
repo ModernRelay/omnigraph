@@ -1725,8 +1725,14 @@ impl GraphNamespacePublisher {
             // Route a retryable `load_publish_state` error through the SAME retry
             // path as a retryable `merge_rows` conflict below, so typed contention
             // composes with the publisher retry instead of aborting the publish.
+            let load_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+                crate::instrumentation::phase_timers::WritePhase::PublisherLoad,
+            );
             let loaded = match self.load_publish_state().await {
-                Ok(loaded) => loaded,
+                Ok(loaded) => {
+                    load_timer.stop();
+                    loaded
+                }
                 Err(err)
                     if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) =>
                 {
@@ -1923,7 +1929,12 @@ impl GraphNamespacePublisher {
             };
             let cold = next.registry.cold_push();
 
-            match self.merge_rows(dataset.clone(), &next, cold.as_ref()).await {
+            let overwrite_timer = crate::instrumentation::phase_timers::PhaseTimer::start(
+                crate::instrumentation::phase_timers::WritePhase::PublisherOverwrite,
+            );
+            let merged = self.merge_rows(dataset.clone(), &next, cold.as_ref()).await;
+            overwrite_timer.stop();
+            match merged {
                 Ok(new_dataset) => {
                     if new_dataset.version().version != new_manifest_version {
                         return Err(OmniError::manifest_internal(format!(
