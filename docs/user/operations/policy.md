@@ -273,7 +273,7 @@ For static token authentication:
 | Tokens | Policy | Startup and authorization |
 |---|---|---|
 | none | none | Requires explicit `--unauthenticated`; otherwise startup fails |
-| configured | none | Only the `read` action is allowed; all other actions are denied |
+| configured | none | Every action is denied, reads included; `OMNIGRAPH_ALLOW_READS_WITHOUT_POLICY=1` lets static tokens `read` ([authentication](server.md#authentication)) |
 | configured | configured | The policy decides each action |
 | none | configured | Startup fails because no request could establish an actor |
 

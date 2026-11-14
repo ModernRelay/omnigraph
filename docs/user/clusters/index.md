@@ -331,8 +331,9 @@ settings on the server.
 
 ## Operational boundaries
 
-- One mutation-capable process owns a cluster. Online deployment runs inside it;
-  direct maintenance requires an ownership handoff.
+- One mutation-capable process owns a cluster. Online deployment runs inside it,
+  and so can `optimize`, as a [recorded operation](../operations/recorded-operations.md);
+  other direct maintenance requires an ownership handoff.
 - Object-storage clusters may boot directly from `s3://bucket/prefix` or
   `az://container/prefix`; source files are not needed for serving or recovery.
 - Azure remains a qualification preview. Its running server retains the

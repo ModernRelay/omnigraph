@@ -3996,8 +3996,8 @@ impl Omnigraph {
     /// supported analyzer generation after an upgrade; it does not rewrite old
     /// history.
     ///
-    /// Requires `maintain` or `change` on the selected branch before any
-    /// effect and records the actor in the graph publication.
+    /// Requires `maintain` on the selected branch before any effect and
+    /// records the actor in the graph publication.
     pub async fn rebuild_full_text_indices_on_as(
         &self,
         branch: &str,
