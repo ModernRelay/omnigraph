@@ -5,7 +5,60 @@ on `main` at `2c0941e0` (2026-11-14). Angle: data structures, publication protoc
 primitives. Group commit and a write-ahead log are covered by other work and are not prototyped
 here. Raw numbers: `results/*.jsonl`. Running log with every intermediate measurement: `LOG.md`.
 
-<!-- SUMMARY -->
+## Summary
+
+**Headline numbers.** Final committed build vs main. Both are built at opt-level 2. Closed-loop
+writers each insert one row per mutation. S3 means RustFS behind toxiproxy at +30 ms per request.
+Baseline commits/s are the mean of two runs; p99 is in ms. All cells verified their rows exactly
+(`results/{baseline,final}-o2-*.jsonl`).
+
+| backend | branches | writers | baseline commits/s | final commits/s | gain | baseline p99 | final p99 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| S3 +30 ms | one | 16 | 2.13 | 9.60 | 4.5x | 7833 | 1958 |
+| S3 +30 ms | one | 64 | 2.33 | 9.33 | 4.0x | 17922 | 12831 |
+| S3 +30 ms | one per writer | 16 | 12.87 | 56.60 | 4.4x | 2184 | 299 |
+| S3 +30 ms | one per writer | 64 | 24.84 | 186.26 | 7.5x | 5626 | 3336 |
+| local | one | 16 | 22.27 | 60.60 | 2.7x | 915 | 431 |
+| local | one | 64 | 22.97 | 51.66 | 2.2x | 3240 | 2998 |
+| local | one per writer | 16 | 116.83 | 130.86 | 1.1x | 221 | 169 |
+| local | one per writer | 64 | 128.72 | 191.72 | 1.5x | 690 | 695 |
+
+One writer on S3 also gets faster: 2.80 → 4.07 commits/s on one branch, 1.60 → 3.67 on a named
+branch.
+
+**Three bottlenecks the measurements isolated:**
+
+1. **Coarse conflict detection on one branch.** Any publication on the branch invalidates every
+   other prepared write. The re-prepare then holds the branch's gates through a whole attempt, so
+   4 to 64 writers commit no faster than one: ~2 commits/s at +30 ms, ~21 locally.
+2. **Re-reading what the process just wrote.** Freshness probes and the publisher's `_versions`
+   listing re-read state this process had just written. A write made 13 requests (20.5 on a
+   named branch), about 7 of them serial under the branch gate.
+3. **A one-entry coordinator cache shared by every non-bound branch.** It thrashed across
+   branches, and a named-branch publish always reopened `__manifest` from the root.
+
+**What was built and kept.** Each step was measured with one fixed instrument:
+
+- **E.** Per-branch coordinator slots.
+- **A.** Commutative carry-over. An insert-only write is re-anchored over publications that cannot
+  affect it, and Lance's `TransactionRebase` refuses intersecting key filters. Chain walks are
+  served from an in-process log of the detached commits this process made.
+- **B.** The trusted in-process tip (#837). The version CAS stays the only authority.
+- **W.** A background warm-up that covers a Lance gap: detached commits leave nothing in the
+  session caches.
+- **C.** Pipelined publication. A writer stages against the predicted outcome of the publication
+  in flight and releases the gates before its CAS. Only the `.txn` + CAS chain stays serial.
+
+**What remains.** On one branch the floor is now two serial chains: a table's detached commits
+(~70–93 ms each) and the `__manifest` `.txn` + CAS (~70 ms). Moving past it needs batching (group
+commit, which multiplies with all of the above) or two Lance changes: cache population on
+detached commits, and a public opt-out of the separate `.txn` file.
+
+**Winning design.** Precise conflict detection (re-anchor commuting inserts with Lance's own
+rebase instead of re-preparing), plus pipelined publication against the process's own predicted
+tip. Together they shrink one branch's serialized section from a whole re-prepared attempt to the
+CAS chain.
+
 
 ## 1. Instrument
 
@@ -60,7 +113,8 @@ Revalidation compares the complete captured head. Any publication on the branch 
 invalidates every other prepared write, even a disjoint one. The write is sent back, and the
 re-prepare holds the branch's writer gates from capture through publication. Under contention
 each commit costs one failed attempt and one whole attempt under the gate, about 450-500 ms on
-S3. So 4 to 64 writers give a flat ~2.07 commits/s on S3 and ~14.5 locally.
+S3. So 4 to 64 writers give a flat ~2.07 commits/s on S3, and locally ~14.5 (opt-level 0) or
+~21 (opt-level 2).
 
 ### Why separate branches scale sublinearly
 
@@ -264,6 +318,12 @@ How to read these numbers:
 - **The O0 numbers tell the same story** (`results/best1-*.jsonl`, LOG.md): S3 same 16w
   2.07 → 9.40, separate 64w 26.67 → 122.06. Local was CPU-bound in the unoptimized engine.
 
+
+Final committed build (correctness fixes included; `results/final-o2-*.jsonl`):
+S3 one branch 16w 9.60 (p99 1958), 64w 9.33 (p99 12831); S3 separate branches 16w 56.60
+(p99 299), 64w 186.26 (p99 3336); local one branch 16w 60.60 (p99 431), 64w 51.66 (p99 2998);
+local separate branches 16w 130.86 (p99 169), 64w 191.72 (p99 695).
+
 ### Where the time goes now (S3, same branch, 16 writers, best)
 
 - Gate hold ~100 ms, almost all of it the chained detached table commit. That is a `.txn` PUT and
@@ -442,6 +502,27 @@ epoch already accepts for a holder ("Two changes by another process reach the ow
 a probe"). That is why §6 recommends that production B trust the view only while the process holds
 the branch's writer epoch.
 
-<!-- FINAL2 -->
+## 10. Reproduce
 
+```bash
+# Services: RustFS on :9000 and toxiproxy on :19000 (+15 ms each way); binaries under /opt/bench/bin
+research/write-throughput-structure/scripts/start-services.sh
+
+# Build the instrument (workspace crates at opt-level 2, dependencies unchanged)
+CARGO_PROFILE_DEV_OPT_LEVEL=2 cargo dev-test --test write_throughput --no-run
+cp target/debug/deps/write_throughput-<hash> /opt/bench/bins/wt-final-o2
+
+# Fixed sweep (writers 1,4,16,64 x same,separate), appends results/<label>-<backend>.jsonl
+research/write-throughput-structure/scripts/sweep.sh /opt/bench/bins/wt-final-o2 final-o2 s3
+research/write-throughput-structure/scripts/sweep.sh /opt/bench/bins/wt-final-o2 final-o2 file
+python3 research/write-throughput-structure/scripts/summarize.py research/write-throughput-structure/results/final-o2-*.jsonl
+
+# Arms: OMNIGRAPH_RESEARCH_NO_{TRUST_TIP,PIPELINE,COMMUTE,WARM_DETACHED}=1 turns a mechanism off.
+# Two publishers on one branch: WT_HANDLES=2. Disjoint tables: WT_TYPES=8.
+```
+
+The baseline binary is the same instrument at `1dfc121c`, built in a worktree that shares
+`target/`. Results labels: `baseline*` (main), `E`, `EA`, `EA2`, `EAB*` (E+A+B steps), `P1` (first
+pipeline), `best1` (all, opt-level 0), `best-o2*` and `final-o2` (all, opt-level 2; `final-o2`
+includes the correctness fixes).
 
