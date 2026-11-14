@@ -16,6 +16,30 @@ static STORE_REGISTRY: LazyLock<Arc<ObjectStoreRegistry>> = LazyLock::new(|| {
     Arc::new(registry)
 });
 
+const INDEX_CACHE_BYTES_ENV: &str = "OMNIGRAPH_LANCE_INDEX_CACHE_BYTES";
+const METADATA_CACHE_BYTES_ENV: &str = "OMNIGRAPH_LANCE_METADATA_CACHE_BYTES";
+
+/// The graph-scoped data session's index and metadata capacities: each
+/// variable's bytes, or the default when it is unset or not an integer. Zero is
+/// a valid capacity, as on the control session.
+fn data_cache_capacities(env: impl Fn(&str) -> Option<String>) -> (usize, usize) {
+    let bytes = |name, default| parse_cache_bytes(name, env(name).as_deref(), default);
+    (
+        bytes(INDEX_CACHE_BYTES_ENV, DEFAULT_INDEX_CACHE_SIZE),
+        bytes(METADATA_CACHE_BYTES_ENV, DEFAULT_METADATA_CACHE_SIZE),
+    )
+}
+
+fn parse_cache_bytes(env: &str, value: Option<&str>, default: usize) -> usize {
+    let Some(value) = value else {
+        return default;
+    };
+    value.parse().unwrap_or_else(|error| {
+        tracing::warn!(env, value, %error, default, "invalid env value, using default");
+        default
+    })
+}
+
 /// The split Lance access context for one graph handle.
 ///
 /// Data tables use a graph-scoped cached session. Control-plane metadata uses a
@@ -58,10 +82,12 @@ impl LanceAccessContext {
     }
 
     fn with_registry(registry: Arc<ObjectStoreRegistry>) -> Self {
+        let (index_cache_bytes, metadata_cache_bytes) =
+            data_cache_capacities(|name| std::env::var(name).ok());
         Self {
             data_session: Arc::new(Session::new(
-                DEFAULT_INDEX_CACHE_SIZE,
-                DEFAULT_METADATA_CACHE_SIZE,
+                index_cache_bytes,
+                metadata_cache_bytes,
                 Arc::clone(&registry),
             )),
             control_session: Arc::new(Session::new(0, 0, registry)),
@@ -395,6 +421,35 @@ pub mod object_store_seam {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_bytes_take_an_integer_and_otherwise_the_default() {
+        for (value, expected) in [
+            (None, 7),
+            (Some("268435456"), 268_435_456),
+            (Some("0"), 0),
+            (Some(""), 7),
+            (Some("-1"), 7),
+            (Some("256MiB"), 7),
+            (Some("18446744073709551616"), 7),
+        ] {
+            assert_eq!(parse_cache_bytes("TEST", value, 7), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn each_cache_reads_its_own_variable() {
+        let capacities = data_cache_capacities(|name| match name {
+            INDEX_CACHE_BYTES_ENV => Some("1".to_string()),
+            METADATA_CACHE_BYTES_ENV => Some("2".to_string()),
+            _ => None,
+        });
+        assert_eq!(capacities, (1, 2));
+        assert_eq!(
+            data_cache_capacities(|_| None),
+            (DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE)
+        );
+    }
 
     #[test]
     fn data_and_control_sessions_share_only_the_store_registry() {
