@@ -1228,7 +1228,11 @@ async fn graph_diff_of_diverged_heads_takes_the_exact_merge() {
         let window = between(&loaded.commit.graph_commit_id, "side-a");
         let mut lineage_io: Vec<(&str, IoCounts)> = Vec::new();
         for (value, expected_routes) in [("off", (0, 1)), ("on", (1, 0)), ("verify", (1, 0))] {
-            let session = helpers::with_setting(&db, "change_lineage", value);
+            // Each setting reads through a fresh handle, whose authority of
+            // `side-a` is cold: the handle that wrote `side-a` keeps it warm.
+            let cold =
+                helpers::session(Omnigraph::open(dir.path().to_str().unwrap()).await.unwrap());
+            let session = helpers::with_setting(&cold, "change_lineage", value);
             let (page, io) = measure(session.diff_page(&window)).await;
             let page = page.unwrap();
             let ids: Vec<&str> = page
@@ -1258,7 +1262,7 @@ async fn graph_diff_of_diverged_heads_takes_the_exact_merge() {
             off.internal_open_count < on.internal_open_count
                 && off.total_reads() < on.total_reads(),
             "`off` opens no coordinator for the ancestry answer, which `on` opens right after \
-             it into the cold merge-authority cache: off {} opens / {} reads, on {} opens / {} \
+             it into the cold branch-authority cache: off {} opens / {} reads, on {} opens / {} \
              reads",
             off.internal_open_count,
             off.total_reads(),

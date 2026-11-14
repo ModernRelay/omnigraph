@@ -1,3 +1,4 @@
+pub(crate) mod branch_authority;
 #[cfg(test)]
 mod catalog_tests;
 pub mod commit_graph;

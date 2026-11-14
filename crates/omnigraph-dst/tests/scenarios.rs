@@ -3725,13 +3725,21 @@ fn carried_write_cost_rows(replay: &str) -> String {
     )
 }
 
+/// A write on the named branch `feature` that follows writes on that branch
+/// alone, and one that follows writes on one and on four other named
+/// branches of the same handle. Each branch keeps its own writer state, so
+/// the three rows are equal.
 fn branch_write_cost_rows(replay: &str) -> String {
-    struct BranchWriteCost;
+    struct BranchWriteCost {
+        /// The named branches written after each warm-up write of `feature`.
+        others: u64,
+        label: &'static str,
+    }
 
     impl BranchWriteCost {
-        async fn set_age(db: &Session, age: i64) {
+        async fn set_age(db: &Session, branch: &str, age: i64) {
             db.mutate(
-                "feature",
+                branch,
                 MUTATION_QUERIES,
                 "set_age",
                 &mixed_params(&[("$name", "Alice")], &[("$age", age)]),
@@ -3762,10 +3770,20 @@ fn branch_write_cost_rows(replay: &str) -> String {
             );
             db.load_jsonl(TEST_DATA, LoadMode::Overwrite).await.unwrap();
             db.branch_create("feature").await.unwrap();
-            Self::set_age(&db, 31).await;
-            Self::set_age(&db, 32).await;
-            omnigraph_dst::cost::set_label("BranchWrite");
-            Self::set_age(&db, 33).await;
+            let others = (0..self.others)
+                .map(|other| format!("other-{other}"))
+                .collect::<Vec<_>>();
+            for other in &others {
+                db.branch_create(other).await.unwrap();
+            }
+            for age in [31, 32] {
+                Self::set_age(&db, "feature", age).await;
+                for other in &others {
+                    Self::set_age(&db, other, age).await;
+                }
+            }
+            omnigraph_dst::cost::set_label(self.label);
+            Self::set_age(&db, "feature", 33).await;
             omnigraph_dst::cost::set_label("_branch_write_verify");
             let alice = person_rows_on(&db, "feature")
                 .await
@@ -3776,11 +3794,19 @@ fn branch_write_cost_rows(replay: &str) -> String {
         }
     }
 
-    labeled_cost_rows(
-        format!("shared-memory://dst-branch-write-cost-{replay}"),
-        &BranchWriteCost,
-        "BranchWrite",
-    )
+    let mut rows = String::new();
+    for (others, label) in [
+        (0, "BranchWrite"),
+        (1, "BranchWriteAfterOthers1"),
+        (4, "BranchWriteAfterOthers4"),
+    ] {
+        rows.push_str(&labeled_cost_rows(
+            format!("shared-memory://dst-branch-write-cost-{replay}-{label}"),
+            &BranchWriteCost { others, label },
+            label,
+        ));
+    }
+    rows
 }
 
 /// The first claim of `main` on a reopened handle: one `__manifest` version
