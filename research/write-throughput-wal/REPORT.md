@@ -489,6 +489,23 @@ which is CPU. The `__manifest` fold costs what a publication cost before (three 
 ms) but off the acknowledgement path, one per record; per acknowledged write the requests
 fall from 9–13 (baseline) to 3.5 at 64 writers (`final-wal`, mem, same branch).
 
+Requests per acknowledged write (mem 20 ms; every request counted, the fold's included):
+
+| N | mode | baseline, epoch held: total (puts) | final: total (puts) |
+|---|---|---|---|
+| 1 | one branch | 9.2 (6.1) | 9.1 (7.1) |
+| 4 | one branch | 18.7 (7.8) | 12.8 (6.3) |
+| 16 | one branch | 31.6 (13.2) | 13.2 (1.2) |
+| 64 | one branch | no commit lands | 3.1 (0.3) |
+| 1 | branch each | 21.6 (6.2) | 9.0 (7.0) |
+| 16 | branch each | 47.2 (6.8) | 9.1 (7.1) |
+| 64 | branch each | 50.5 (6.5) | 10.3 (7.3) |
+
+A lone write costs about the same number of requests as today, one more put (the record,
+then the fold's three puts instead of the publication's three), but fewer of them are on its
+path: 6 sequential round trips instead of 10. Under load the batch amortizes everything but
+the id probe's reads.
+
 ### 6.6 Snapshots, branches, merges, change feeds, recovery
 
 - **Snapshots** are versions, as today; a version in the tail is read from its record
