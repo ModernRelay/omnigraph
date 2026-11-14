@@ -272,8 +272,14 @@ fn run() -> Result<(), String> {
     match invocation {
         Invocation::Replay(path) => omnigraph_gqt::replay_report(&path, &executable),
         Invocation::Check { paths, json } => {
-            let files = case_files(&paths)?;
-            omnigraph_gqt::check_cases(&files, json)
+            let named: Vec<_> = paths
+                .into_iter()
+                .map(|path| {
+                    let listed = case_files(std::slice::from_ref(&path));
+                    (path, listed)
+                })
+                .collect();
+            omnigraph_gqt::check_cases(&named, json)
         }
         Invocation::Case(selection) => {
             let bless = omnigraph_gqt::bless_from_env().map_err(refusal)?;

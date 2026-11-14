@@ -93,7 +93,7 @@ impl CaseErrorCode {
             }
             CaseErrorCode::MissingExpect => "every step is followed by its `--- expect` section",
             CaseErrorCode::CorpusTimeout => {
-                "a case under the required corpus (`crates/omnigraph-gqt/cases/`) declares `timeout_ms` of at most 10000"
+                "a case under the required corpus (the runner's `cases/`, not `cases_slow/`) declares `timeout_ms` of at most 10000"
             }
             CaseErrorCode::Other => "a rule the parser states in its message",
         }

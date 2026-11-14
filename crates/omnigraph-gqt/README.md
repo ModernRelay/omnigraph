@@ -877,9 +877,14 @@ prints every format error the case carries, one `path:line: code: message`
 line per error with the source line quoted under it and the fix under that,
 `ok <path>` for a clean case, and exits 1 when any file has an error. Beside
 the parser's rules it applies the corpus admission the runner would refuse on
-(`timeout_ms` above 10000 under `cases/`). `--json` prints one JSON object per
-file, `{"path", "errors": [{"code", "line", "source", "message", "fix"}]}`,
-for tools. The refusal of a run (`refused: …`) carries the same text, one
+(`timeout_ms` above 10000 under `cases/`, for a case named there or resolved
+there through a link). It reads a case as a run does, so a file the run
+refuses to read (not a regular file, over 256 MiB, not UTF-8) is one error
+under its path. A directory that holds no case is one error under its own
+path; the other paths are still checked, and the exit is 1. `--json` prints
+one JSON object per file or refused path,
+`{"path", "errors": [{"code", "line", "source", "message", "fix"}]}`, for
+tools. The refusal of a run (`refused: …`) carries the same text, one
 `invalid_case:` line per error.
 
 `--store` may precede or follow the case paths. External-store reports retain

@@ -1866,3 +1866,85 @@ fn clone_cases_run_against_a_bucket() {
             .unwrap();
     });
 }
+
+/// A case cannot name the paths and file kinds `--check` is handed.
+#[test]
+fn check_reports_a_path_that_names_no_case_and_checks_the_rest() {
+    const CLEAN: &str = r#"# issue: none
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- query
+branch list
+--- expect unordered
+{"name":"main"}
+--- expect shape
+name: String
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let clean = dir.path().join("clean.gqt");
+    std::fs::write(&clean, CLEAN).unwrap();
+    let refused_twice = dir.path().join("refused_twice.gqt");
+    std::fs::write(
+        &refused_twice,
+        CLEAN
+            .replace("timeout_ms: 10000", "timeout_ms: soon")
+            .replace("--- expect unordered", "--- expect sorted"),
+    )
+    .unwrap();
+    let check = |json: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omnigraph-gqt"));
+        command.arg("--check");
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .args([&empty, &clean, &refused_twice])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            "2 errors in 1 of 2 files; 1 path names no case"
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let text = check(false);
+    for line in [
+        format!("{0}: invalid_case: no .gqt case under {0}", empty.display()),
+        format!("ok {}", clean.display()),
+        format!("{}:2: invalid_case: ", refused_twice.display()),
+        format!("{}:10: unknown_expect_mode: ", refused_twice.display()),
+    ] {
+        assert!(text.contains(&line), "{line}: {text}");
+    }
+    let objects: Vec<serde_json::Value> = check(true)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let codes: Vec<Vec<&str>> = objects
+        .iter()
+        .map(|object| {
+            object["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|error| error["code"].as_str().unwrap())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            vec!["invalid_case"],
+            vec![],
+            vec!["invalid_case", "unknown_expect_mode"]
+        ]
+    );
+    assert_eq!(objects[0]["path"], empty.display().to_string());
+}
