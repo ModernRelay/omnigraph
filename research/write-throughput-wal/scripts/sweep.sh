@@ -16,5 +16,5 @@ for backend in $backends; do
   OG_WT_LABEL=$label OG_WT_BACKEND=$backend OG_WT_LATENCY_MS=$lat OG_WT_MODE=$modes \
     OG_WT_WRITERS=$writers OG_WT_DURATION_SECS=${OG_WT_DURATION_SECS:-10} \
     OG_WT_WARMUP_SECS=${OG_WT_WARMUP_SECS:-2} OG_WT_OUT=$out \
-    "$bin" --ignored --nocapture 2>&1 | grep -E "^\[|panicked|error|Error" || true
+    "$bin" --ignored --nocapture --exact concurrent_write_throughput 2>&1 | grep -E "^\[|panicked|error|Error" || true
 done
