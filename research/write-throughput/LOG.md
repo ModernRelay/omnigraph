@@ -338,3 +338,32 @@ repetition: `opt-baseline`, `opt-group`, and for same-branch cells
 `opt-baseline-claim`, `opt-group-claim` (writer epoch claimed on `main`),
 `opt-group-pipe`. 3 repetitions at 16 and 64 writers, 1 at 1 and 4.
 `scripts/summarize.py` prints medians.
+
+## Idea 8 — known keys for the absence probe (the writers' own cost)
+
+Hypothesis (from the matrix): locally every group variant tops out near 70
+w/s with ~2 writes/publication, so the limit is the writers' preparation. The
+absence probe of a keyed insert reads the id column of every fragment the id
+BTREE does not cover; each write adds one, so the per-write cost grows with
+history (no maintenance runs during a cell).
+
+Change: `table_store::known_keys`, a bounded process-wide map data-file path
+→ exact ids written (filled by `stage_absence_proven_strict_insert`); when
+every uncovered fragment is known (one data file, no deletion file), the
+probe scans the indexed part with `fast_search` and answers the tail from
+memory. Same commit: the group's published coordinator is installed into the
+handle's branch authority cache (fixes the one-named-branch-writer gap and the
+two `warm_read_cost` deltas; integration 703/703 on and off).
+
+A/B on group11-opt (group commit on), `OMNIGRAPH_KNOWN_KEYS=0` → default:
+
+| cell | w/s | p99 ms | req/write |
+|---|---|---|---|
+| local same 16 | 70.65 → 191.99 | 496 → 159 | 4.1 → 2.3 |
+| local same 64 | 68.10 → 249.32 | 2,732 → 510 | 4.1 → 2.1 |
+| s3 same 16 | 38.95 → 44.85 | 578 → 372 | 11.0 → 3.8 |
+| s3 same 64 | 68.60 → 152.74 | 2,012 → 485 | 7.7 → 3.2 |
+
+**Verdict: keep.** Also found: with group commit off the ordinary path still
+had the discarded insert carry on (0.9 w/s on S3 at 16 writers); made opt-in
+(`OMNIGRAPH_INSERT_CARRY=1`).

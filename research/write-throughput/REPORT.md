@@ -269,6 +269,44 @@ lost its `BeforeEffect` evidence (`lifecycle.rs`). Writers probe again; the
 supported probe-free capture is the writer epoch's holder skip (#1350),
 measured in §6 as the `claim` variants.
 
+### 5.9 Known keys for the absence probe, and one per-branch writer state — kept
+
+*Observation.* After group commit, every variant locally topped out near 70
+writes/s with ~2 writes per publication: the writers' preparation, not the
+publication, was the limit. An insert into a `@key` type first proves its keys
+absent (`existing_id_count` / `first_existing_id`): a Lance scan with `id IN
+(…)` that uses the id BTREE for indexed fragments and reads the id column of
+every fragment the index does not cover. Every write adds a fragment and the
+index is rebuilt only by explicit maintenance, so the probe's cost grows with
+the writes since the last build, per write.
+
+*Change.* A process-wide cache maps a data file's path to the exact ids this
+process wrote into it (`table_store::known_keys`, filled by the absence-proven
+insert writer, bounded at 4 M ids). A data file is immutable and its name
+random, so the entry holds for every version that lists the file. When every
+fragment outside the id index is known (exactly that one data file, no
+deletion file), the probe scans the indexed part only (Lance `fast_search`)
+and answers the rest from memory; otherwise it scans as before. A deleted or
+rewritten row always takes the scan, so a strict insert never reports a
+conflict that a scan would not. Switch `OMNIGRAPH_KNOWN_KEYS=0`.
+
+In the same build the group's published coordinator is installed into the
+handle's branch authority cache, so writers on a named branch capture a
+current view instead of refreshing a stale one (the gap the matrix showed for
+one named-branch writer); this also removed the two `warm_read_cost` deltas
+(integration 703/703 with group commit on and off).
+
+*A/B on the same optimized binary (group11, group commit on), known keys off → on:*
+
+| target | writers | writes/s | p99 ms | requests/write | writes/publication |
+|---|---:|---|---|---|---|
+| local | 16 | 70.65 → 191.99 | 496 → 159 | 4.1 → 2.3 | 1.9 → 7.9 |
+| local | 64 | 68.10 → 249.32 | 2,732 → 510 | 4.1 → 2.1 | 2.0 → 30.0 |
+| S3 +30 ms | 16 | 38.95 → 44.85 | 578 → 372 | 11.0 → 3.8 | 7.1 → 7.9 |
+| S3 +30 ms | 64 | 68.60 → 152.74 | 2,012 → 485 | 7.7 → 3.2 | 16.0 → 32.2 |
+
+<!-- KK-MORE -->
+
 ### 5.8 Ruled out by analysis
 
 - **Dropping the `.txn` PUTs.** Lance 13 inlines the transaction in the
@@ -292,7 +330,73 @@ measured in §6 as the `claim` variants.
 
 ## 6. Final comparison (optimized builds, interleaved repetitions)
 
-<!-- FINAL -->
+Optimized binaries (every crate at `opt-level=2`): `baseline-opt` is
+`origin/main` `ed09ee63` plus the instrument; `group10-opt` is this branch at
+`e6c809c5`. Variants: `opt-baseline`; `opt-baseline-claim` (writer epoch of
+`main` claimed: the existing holder skip of #1350); `opt-group`
+(`OMNIGRAPH_GROUP_COMMIT=1`: group commit, publisher trust, leader capture
+skip, index warm, named-branch warm state); `opt-group-claim`;
+`opt-group-pipe` (pipelined batches). Interleaved per repetition; medians of 3
+repetitions at 16 and 64 writers, 1 repetition at 1 and 4. Full table:
+[`results/final-matrix.md`](results/final-matrix.md).
+
+### Same branch (`main`), writes/s and p99 service time
+
+| target | writers | baseline | baseline+claim | group | group+claim | group+pipe | p99 ms: baseline → group |
+|---|---:|---:|---:|---:|---:|---:|---|
+| S3 +30 ms | 1 | 2.90 | 3.15 | 3.70 | **4.15** | 3.65 | 360 → 283 (claim 266) |
+| S3 +30 ms | 4 | 2.20 | 2.55 | **11.60** | 11.00 | 11.75 | 1,910 → 374 |
+| S3 +30 ms | 16 | 2.20 | 2.55 | 38.80 | **42.60** | 36.45 | 7,504 → 559 (claim 565) |
+| S3 +30 ms | 64 | 2.40 | 2.55 | **71.80** | 69.80 | 72.25 | 22,903 → 1,885 |
+| local | 1 | 25.65 | 23.70 | 24.25 | 23.75 | 22.55 | 64 → 67 |
+| local | 4 | 21.00 | 18.56 | 36.50 | 39.55 | **40.80** | 498 → 327 |
+| local | 16 | 21.75 | 22.10 | **69.70** | 69.10 | 69.65 | 1,106 → 538 |
+| local | 64 | 21.85 | 21.40 | 67.25 | **69.00** | 66.55 | 3,923 → 2,885 (claim 2,451) |
+
+Writes per publication (group, S3): 2.0 at 4 writers, 7.1 at 16, 15.6 at 64
+(24.5 with the claim). Engine re-prepares per write: ~1.0 for the baseline at
+4+ writers, 0 for every group variant. Requests per write on S3 at 16 writers:
+24.0 → 11.1 (group) → 8.9 (group+claim).
+
+### Separate branches (writer *i* on `w{i}`), writes/s and p99
+
+| target | writers | baseline | group | p99 ms: baseline → group | requests/write |
+|---|---:|---:|---:|---|---|
+| S3 +30 ms | 1 | 1.55 | 1.50 | 661 → 705 | 21.4 → 21.7 |
+| S3 +30 ms | 4 | 4.45 | 6.85 | 1,038 → 610 | 28.6 → 18.0 |
+| S3 +30 ms | 16 | 13.50 | 26.80 | 1,413 → 628 | 34.7 → 18.1 |
+| S3 +30 ms | 64 | 32.80 | 60.74 | 4,039 → 4,070 | 35.6 → 18.6 |
+| local | 16 | 122.55 | 143.53 | 496 → 192 | 20.9 → 10.0 |
+| local | 64 | 180.84 | 233.09 | 525 → 422 | 22.8 → 10.3 |
+
+The single named-branch writer shows no gain in this matrix: the group
+published through its own coordinator while writers captured through the
+handle's one-entry branch cache, which was therefore always one commit stale
+and refreshed on every capture. Fixed afterwards by installing the group's
+published coordinator into that cache (§5.9), which also removed the two
+`warm_read_cost` deltas.
+
+### Reading the numbers
+
+- **Same branch, object store:** throughput now grows with the number of
+  writers (19× at 16, 30× at 64) instead of staying at one write per
+  publication, p99 falls 13× at 16 writers and 12× at 64, and starvation is
+  gone (per-writer counts within a few percent). A single writer is 1.3–1.4×
+  faster from the round-trip trims.
+- **Same branch, local:** 3.2× at 16 and 64 writers, but every group variant
+  tops out near 70 writes/s with only ~2 writes per publication: the limit is
+  the writers' own preparation, not the publication (§5.9).
+- **Writer epoch claim:** worth +10 % at 16 writers on S3 (fewer probes), no
+  throughput change at 64; it raises writes per publication (fewer, bigger
+  batches).
+- **Pipelining:** publications/s rise (+64 % at 16 writers on S3, +68 % at
+  64) but writes/s do not: in a closed loop, throughput follows per-write
+  latency, and a batch's latency is unchanged. It would matter under open-loop
+  load beyond one batch per ~200 ms.
+- **Separate branches:** about 2× on S3 from 4 writers up and 1.2–1.3× locally,
+  from halving the named-branch requests per write; at 64 writers on S3 p99 is
+  unchanged (the client is CPU-bound there: ~60 writes in flight).
+
 
 ## 7. The winning design
 

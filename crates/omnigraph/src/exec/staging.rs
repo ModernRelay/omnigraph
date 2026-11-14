@@ -1267,7 +1267,11 @@ impl StagedMutation {
         // break (non-key uniqueness, bounded cardinality): its reads were key
         // absence, checked by Lance's resolver against each link's key
         // filter, and existence, which inserts keep.
+        // Research switch `OMNIGRAPH_INSERT_CARRY=1`, off by default: measured
+        // and discarded as a lever (each carry walks every commit since the
+        // capture under the branch gate; O(N) reads on an object store).
         let insert_carry = insert_only
+            && std::env::var("OMNIGRAPH_INSERT_CARRY").is_ok_and(|value| value == "1")
             && staged.iter().all(|entry| {
                 entry
                     .staged_write
