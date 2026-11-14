@@ -21,14 +21,36 @@ struct Selection {
 
 enum Invocation {
     Replay(PathBuf),
+    Check { paths: Vec<PathBuf>, json: bool },
     Case(Box<Selection>),
 }
 
-const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--store <URI> [--base <URI>] | --server <URL> --graph <ID> [--token <TOKEN>]] [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--trace] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json>";
+const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--store <URI> [--base <URI>] | --server <URL> --graph <ID> [--token <TOKEN>]] [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--trace] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json> | --check [--json] <case.gqt|dir>...";
 
 fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let mut args = args.iter().peekable();
     let first = args.peek().ok_or(USAGE)?;
+    if *first == "--check" {
+        args.next();
+        let mut paths = Vec::new();
+        let mut json = false;
+        for arg in args {
+            if arg == "--json" {
+                json = true;
+            } else if arg.to_string_lossy().starts_with("--") {
+                return Err(format!(
+                    "--check takes case paths and `--json` only, not `{}`",
+                    arg.to_string_lossy()
+                ));
+            } else {
+                paths.push(PathBuf::from(arg));
+            }
+        }
+        if paths.is_empty() {
+            return Err("--check requires a case or directory path".into());
+        }
+        return Ok(Invocation::Check { paths, json });
+    }
     if *first == "--replay" {
         args.next();
         let path = args
@@ -249,6 +271,10 @@ fn run() -> Result<(), String> {
     })?;
     match invocation {
         Invocation::Replay(path) => omnigraph_gqt::replay_report(&path, &executable),
+        Invocation::Check { paths, json } => {
+            let files = case_files(&paths)?;
+            omnigraph_gqt::check_cases(&files, json)
+        }
         Invocation::Case(selection) => {
             let bless = omnigraph_gqt::bless_from_env().map_err(refusal)?;
             let files = case_files(&selection.paths)

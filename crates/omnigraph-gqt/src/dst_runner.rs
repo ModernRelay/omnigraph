@@ -1572,13 +1572,7 @@ fn run_invocation(
         String::from_utf8(read_bounded(path)?).map_err(|e| format!("invalid_case: UTF-8: {e}"))?;
     let text: std::sync::Arc<str> = text.into();
     summary.case_digest = Some(digest(text.as_bytes()));
-    let case = parse_case(&stem_of(path), &text).map_err(|error| {
-        if error.starts_with("invalid_case:") {
-            error
-        } else {
-            format!("invalid_case: {error}")
-        }
-    })?;
+    let case = parse_case(&stem_of(path), &text).map_err(|errors| errors.to_string())?;
     summary.declared = Some(case.runner.environments.clone());
     for env in &case.runner.environments {
         if matches!(env.execution, Execution::ServerDst { .. }) {

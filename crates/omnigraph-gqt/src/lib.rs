@@ -22,11 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod check;
 mod concurrent;
 mod discovery;
 mod dst_runner;
 mod measure;
 mod trace;
+pub use check::check_cases;
 pub use discovery::list_cases;
 pub use dst_runner::{
     MeasureOptions, replay_report, report_cli_refusal, run_corpus_case, run_selected,

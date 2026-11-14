@@ -34,12 +34,15 @@ use omnigraph_planner::{BoundPlan, PhysicalNode};
 use serde_json::Value;
 
 pub mod concurrent;
+pub mod diagnostic;
 mod generate;
 mod host;
 pub mod runner_config;
 mod served;
 mod yaml;
 pub use concurrent::{ConcurrentStep, SessionExpect, SessionKind, SessionOp};
+pub use diagnostic::{CaseError, CaseErrorCode, CaseErrors};
+use diagnostic::{nearest, suggestion};
 pub use generate::{Generated, GeneratedParams, Seed};
 
 /// A step's `--- params`: a literal JSON body under the loop's substitution
@@ -633,50 +636,78 @@ fn canonical_header_line(key: &str, value: &str) -> String {
 }
 
 /// Splits a canonical header line, rejecting unknown keys and edge whitespace.
-fn split_header_line(line: &str) -> Result<(&str, &str), String> {
+fn split_header_line(line: &str) -> Result<(&str, &str), CaseError> {
+    let shape = || {
+        CaseError::new(
+            CaseErrorCode::HeaderShape,
+            "header line is not `# <key>: <value>`",
+        )
+        .fix("write `# <key>: <value>`, one space after `#` and one after the colon")
+    };
     let Some(rest) = line.strip_prefix("# ") else {
-        return Err("header line is not `# <key>: <value>`".into());
+        return Err(shape());
     };
     let Some((key, value)) = rest.split_once(": ") else {
-        return Err("header line is not `# <key>: <value>`".into());
+        return Err(shape());
     };
     if !HEADER_KEYS.contains(&key) {
-        return Err(format!(
-            "unknown header key `{key}`; keys are {}",
-            HEADER_KEYS.join(", ")
-        ));
+        return Err(CaseError::new(
+            CaseErrorCode::UnknownHeaderKey,
+            format!("unknown header key `{key}`"),
+        )
+        .fix(suggestion(key, "keys", &HEADER_KEYS)));
     }
     if value.trim().is_empty() {
-        return Err(format!("`# {key}:` needs a value"));
+        return Err(format!("`# {key}:` needs a value").into());
     }
     if value.trim() != value {
         return Err(format!(
             "header value carries leading or trailing whitespace; write `{}`",
             canonical_header_line(key, value.trim())
-        ));
+        )
+        .into());
     }
     debug_assert_eq!(canonical_header_line(key, value), line);
     Ok((key, value))
 }
 
-fn parse_header(lines: &[&str]) -> Result<Header, String> {
-    let mut issue: Option<IssueRef> = None;
+/// Every header problem at once, with the issue reference beside the
+/// errors when its line parsed, so the file-name rule still applies.
+fn parse_header(lines: &[&str]) -> Result<Header, (Option<IssueRef>, Vec<CaseError>)> {
+    let mut errors: Vec<CaseError> = Vec::new();
+    let mut issue: Option<(IssueRef, usize)> = None;
+    let mut issue_seen = false;
     let mut red_on = false;
     let mut traversal: Option<&'static str> = None;
     let mut csv_slice_bytes: Option<usize> = None;
     let mut overwrite_chunk_rows: Option<usize> = None;
     let mut writer_held = false;
     for (idx, line) in lines.iter().enumerate() {
+        let line_no = idx + 1;
         if line.trim().is_empty() {
             continue;
         }
         if !line.starts_with('#') {
-            return Err(format!(
-                "line {}: only `#` header lines may precede the first section",
-                idx + 1
-            ));
+            errors.push(
+                CaseError::new(
+                    CaseErrorCode::HeaderShape,
+                    "only `#` header lines may precede the first section",
+                )
+                .fix("move the line under a `--- <section>` header, or make it `# <key>: <value>`")
+                .at_line(line_no),
+            );
+            continue;
         }
-        let (key, value) = split_header_line(line).map_err(|e| format!("line {}: {e}", idx + 1))?;
+        let (key, value) = match split_header_line(line) {
+            Ok(parts) => parts,
+            Err(error) => {
+                errors.push(error.at_line(line_no));
+                let key = line[1..].split(':').next().unwrap_or("").trim();
+                red_on |= nearest(key, &["red_on"]).is_some();
+                issue_seen |= nearest(key, &["issue"]).is_some();
+                continue;
+            }
+        };
         let duplicate = match key {
             "issue" => issue.is_some(),
             "red_on" => red_on,
@@ -687,24 +718,35 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
             _ => false,
         };
         if duplicate {
-            return Err(format!("line {}: duplicate `# {key}:` header", idx + 1));
+            errors.push(
+                CaseError::new(
+                    CaseErrorCode::DuplicateHeader,
+                    format!("duplicate `# {key}:` header"),
+                )
+                .fix(format!("keep one `# {key}:` line"))
+                .at_line(line_no),
+            );
+            continue;
         }
+        let value_error = |message: String| CaseError::from(message).at_line(line_no);
         match key {
             "issue" => {
-                issue = Some(if value == "none" {
-                    IssueRef::None
-                } else {
-                    let n = value.parse::<u64>().map_err(|_| {
-                        format!("line {}: `# issue:` takes a number or `none`", idx + 1)
-                    })?;
-                    if value != n.to_string() {
-                        return Err(format!(
-                            "line {}: `# issue:` number carries no sign or leading zeros",
-                            idx + 1
-                        ));
-                    }
-                    IssueRef::Num(n)
-                });
+                issue_seen = true;
+                if value == "none" {
+                    issue = Some((IssueRef::None, line_no));
+                    continue;
+                }
+                let Ok(n) = value.parse::<u64>() else {
+                    errors.push(value_error("`# issue:` takes a number or `none`".into()));
+                    continue;
+                };
+                if value != n.to_string() {
+                    errors.push(value_error(
+                        "`# issue:` number carries no sign or leading zeros".into(),
+                    ));
+                    continue;
+                }
+                issue = Some((IssueRef::Num(n), line_no));
             }
             "red_on" => red_on = true,
             "notes" => {}
@@ -714,67 +756,101 @@ fn parse_header(lines: &[&str]) -> Result<Header, String> {
                     "indexed" => "indexed",
                     "csr" => "csr",
                     other => {
-                        return Err(format!(
-                            "line {}: `# traversal:` takes `auto`, `indexed` or `csr`, got `{other}`",
-                            idx + 1
-                        ));
+                        errors.push(value_error(format!(
+                            "`# traversal:` takes `auto`, `indexed` or `csr`, got `{other}`"
+                        )));
+                        continue;
                     }
                 });
             }
             "csv_slice_bytes" => {
-                let bytes = value
+                let Some(bytes) = value
                     .parse::<usize>()
                     .ok()
                     .filter(|bytes| *bytes > 0 && value == bytes.to_string())
-                    .ok_or_else(|| {
-                        format!(
-                            "line {}: `# csv_slice_bytes:` takes a positive byte count without sign or leading zeros, got `{value}`",
-                            idx + 1
-                        )
-                    })?;
+                else {
+                    errors.push(value_error(format!(
+                        "`# csv_slice_bytes:` takes a positive byte count without sign or leading zeros, got `{value}`"
+                    )));
+                    continue;
+                };
                 csv_slice_bytes = Some(bytes);
             }
             "overwrite_chunk_rows" => {
-                let rows = value
+                let Some(rows) = value
                     .parse::<usize>()
                     .ok()
                     .filter(|rows| *rows > 0 && value == rows.to_string())
-                    .ok_or_else(|| {
-                        format!(
-                            "line {}: `# overwrite_chunk_rows:` takes a positive row count without sign or leading zeros, got `{value}`",
-                            idx + 1
-                        )
-                    })?;
+                else {
+                    errors.push(value_error(format!(
+                        "`# overwrite_chunk_rows:` takes a positive row count without sign or leading zeros, got `{value}`"
+                    )));
+                    continue;
+                };
                 overwrite_chunk_rows = Some(rows);
             }
             "writer" => {
                 if value != "held" {
-                    return Err(format!(
-                        "line {}: `# writer:` takes `held`, got `{value}`",
-                        idx + 1
-                    ));
+                    errors.push(value_error(format!(
+                        "`# writer:` takes `held`, got `{value}`"
+                    )));
+                    continue;
                 }
                 writer_held = true;
             }
             other => unreachable!("split_header_line admits only HEADER_KEYS, got `{other}`"),
         }
     }
-    let Some(issue) = issue else {
-        return Err("missing required `# issue:` header".into());
+    let issue = match issue {
+        Some((issue, line_no)) => {
+            if matches!(issue, IssueRef::Num(_)) && !red_on {
+                errors.push(
+                    CaseError::new(
+                        CaseErrorCode::MissingRedOn,
+                        "`# red_on:` is required when `# issue:` names a number",
+                    )
+                    .fix("write `# red_on: <the CI run or local command where the red showed>` under the issue line")
+                    .at_line(line_no),
+                );
+            }
+            Some(issue)
+        }
+        None => {
+            if !issue_seen {
+                errors.push(
+                    CaseError::new(
+                        CaseErrorCode::MissingIssue,
+                        "missing required `# issue:` header",
+                    )
+                    .fix("write `# issue: none`, or `# issue: <N>` with `# red_on:` under it, as the first line")
+                    .at_line(1),
+                );
+            }
+            None
+        }
     };
-    if matches!(issue, IssueRef::Num(_)) && !red_on {
-        return Err("`# red_on:` is required when `# issue:` names a number".into());
+    match (issue, errors.is_empty()) {
+        (Some(issue), true) => Ok(Header {
+            issue,
+            traversal,
+            csv_slice_bytes,
+            overwrite_chunk_rows,
+            writer_held,
+        }),
+        (issue, _) => Err((issue, errors)),
     }
-    Ok(Header {
-        issue,
-        traversal,
-        csv_slice_bytes,
-        overwrite_chunk_rows,
-        writer_held,
+}
+
+fn check_file_name(stem: &str, issue: &IssueRef) -> Result<(), CaseError> {
+    file_name_rule(stem, issue).map_err(|message| {
+        CaseError::new(CaseErrorCode::FileName, message).fix(match issue {
+            IssueRef::Num(n) => format!("name the file `issue_{n}_<short_name>.gqt`"),
+            IssueRef::None => "name the file `<short_name>.gqt` over [a-z0-9_]".to_string(),
+        })
     })
 }
 
-fn check_file_name(stem: &str, issue: &IssueRef) -> Result<(), String> {
+fn file_name_rule(stem: &str, issue: &IssueRef) -> Result<(), String> {
     if let Some(rest) = stem.strip_prefix("issue_") {
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
         let tail = &rest[digits.len()..];
@@ -1051,18 +1127,37 @@ fn record_binding(
     }
 }
 
-fn parse_expect_header(rest: &str) -> Result<ExpectHeader, String> {
+/// The words an `--- expect` header may start with, for a near miss.
+const EXPECT_MODE_WORDS: [&str; 9] = [
+    "ok",
+    "unordered",
+    "ordered",
+    "error:",
+    "affected:",
+    "outcome:",
+    "shape",
+    "plan",
+    "same as v1",
+];
+
+fn parse_expect_header(rest: &str) -> Result<ExpectHeader, CaseError> {
     let rest = rest.trim();
     if rest.is_empty() {
-        return Err("a bare `--- expect` is refused; give a mode word".into());
+        return Err(CaseError::new(
+            CaseErrorCode::ExpectModeMissing,
+            "a bare `--- expect` is refused; give a mode word",
+        )
+        .fix(format!(
+            "write `--- expect <mode>`; modes: {}",
+            EXPECT_MODE_WORDS.join(" | ")
+        )));
     }
     if let Some(word) = rest.strip_prefix("outcome:") {
         let word = word.trim();
         if word.is_empty() {
-            return Err(format!(
-                "`expect outcome:` needs a word: {}",
-                merge_outcome_words()
-            ));
+            return Err(
+                format!("`expect outcome:` needs a word: {}", merge_outcome_words()).into(),
+            );
         }
         let Some(outcome) = MERGE_OUTCOMES
             .into_iter()
@@ -1071,7 +1166,8 @@ fn parse_expect_header(rest: &str) -> Result<ExpectHeader, String> {
             return Err(format!(
                 "`expect outcome:` takes {}, got `{word}`",
                 merge_outcome_words()
-            ));
+            )
+            .into());
         };
         return Ok(ExpectHeader::Outcome(outcome));
     }
@@ -1109,7 +1205,12 @@ fn parse_expect_header(rest: &str) -> Result<ExpectHeader, String> {
         };
         return Ok(ExpectHeader::Affected { nodes, edges });
     }
-    Err(format!("unknown expect mode `{rest}`"))
+    let first_word = rest.split_whitespace().next().unwrap_or(rest);
+    Err(CaseError::new(
+        CaseErrorCode::UnknownExpectMode,
+        format!("unknown expect mode `{rest}`"),
+    )
+    .fix(suggestion(first_word, "modes", &EXPECT_MODE_WORDS)))
 }
 
 /// Exact-spelling numeric token: digits only, no sign, no leading zeros.
@@ -2000,24 +2101,32 @@ fn complete_decl_step(
     }
 }
 
-pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
-    if text.contains('\r') {
-        return Err("case files are UTF-8 with `\\n` line endings; `\\r` found".into());
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let (header_lines, sections) = split_sections(&lines);
-    let header = parse_header(&header_lines)?;
-    check_file_name(stem, &header.issue)?;
+/// The section kinds a header may name, for a near miss.
+const SECTION_KINDS: [&str; 16] = [
+    "runner",
+    "schema",
+    "seed",
+    "csv",
+    "load",
+    "query",
+    "mutate",
+    "concurrent",
+    "params",
+    "expect",
+    "bind",
+    "restart",
+    "loop",
+    "foreach",
+    "endloop",
+    "seam",
+];
 
-    let (runner, sections) = if sections.first().is_some_and(|s| s.name == "runner") {
-        (parse_runner(&yaml_body(&sections[0].body))?, &sections[1..])
-    } else {
-        return Err(
-            "invalid_case: the first section must be `--- runner` with explicit configuration"
-                .into(),
-        );
-    };
-    let (fixture, sections) = match sections.first().map(|s| s.name.as_str()) {
+/// The optional `--- schema` + `--- seed` pair at the head of the step
+/// sections, and the sections after it.
+fn parse_fixture<'a>(
+    sections: &'a [Section<'a>],
+) -> Result<(Option<Fixture>, &'a [Section<'a>]), CaseError> {
+    match sections.first().map(|s| s.name.as_str()) {
         Some("schema") => {
             if !sections
                 .get(1)
@@ -2039,18 +2148,99 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
             }
             let seed = Seed::parse(&sections[1].name, yaml_body(&sections[1].body))?;
             refuse_embed_schema(&schema, sections[0].header_line + 1)?;
-            (Some(Fixture { schema, seed }), &sections[2..])
+            Ok((Some(Fixture { schema, seed }), &sections[2..]))
         }
-        Some(name) if name == "seed" || name.starts_with("seed ") => {
-            return Err(
-                "schema and seed are optional together; `--- schema` must precede `--- seed`"
-                    .into(),
+        Some(name) if name == "seed" || name.starts_with("seed ") => Err(
+            "schema and seed are optional together; `--- schema` must precede `--- seed`".into(),
+        ),
+        _ => Ok((None, sections)),
+    }
+}
+
+/// Every refusal the case carries, stage by stage: the header's problems
+/// together, the runner and fixture sections, then each step section on its
+/// own (a failed section drops its continuations, `--- expect` and
+/// `--- params`, so one mistake reports once), then the whole-case rules.
+pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
+    if text.contains('\r') {
+        return Err(CaseErrors::one(
+            CaseError::new(
+                CaseErrorCode::LineEndings,
+                "case files are UTF-8 with `\\n` line endings; `\\r` found",
+            )
+            .fix("convert the file to `\\n` line endings"),
+        ));
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut errors: Vec<CaseError> = Vec::new();
+    let (header_lines, sections) = split_sections(&lines);
+    let (header, header_issue) = match parse_header(&header_lines) {
+        Ok(header) => (Some(header), None),
+        Err((issue, found)) => {
+            errors.extend(found.into_iter().map(|error| error.located(1, &lines)));
+            (None, issue)
+        }
+    };
+    if let Some(issue) = header.as_ref().map(|h| &h.issue).or(header_issue.as_ref())
+        && let Err(error) = check_file_name(stem, issue)
+    {
+        errors.push(error.located(1, &lines));
+    }
+
+    let (runner, sections) = match sections.first() {
+        Some(first) if first.name == "runner" => {
+            let runner = match parse_runner(&yaml_body(&first.body)) {
+                Ok(runner) => Some(runner),
+                Err(error) => {
+                    errors.push(CaseError::from(error).located(first.header_line + 1, &lines));
+                    None
+                }
+            };
+            (runner, &sections[1..])
+        }
+        Some(first) if nearest(first.name.as_str(), &["runner"]).is_some() => {
+            errors.push(
+                CaseError::new(
+                    CaseErrorCode::MissingRunner,
+                    format!(
+                        "the first section must be `--- runner` with explicit configuration, not `--- {}`",
+                        first.name
+                    ),
+                )
+                .fix("did you mean `--- runner`?")
+                .located(first.header_line + 1, &lines),
             );
+            (None, &sections[1..])
         }
-        _ => (None, sections),
+        first => {
+            let line = first.map_or(header_lines.len() + 1, |s| s.header_line + 1);
+            errors.push(
+                CaseError::new(
+                    CaseErrorCode::MissingRunner,
+                    "the first section must be `--- runner` with explicit configuration",
+                )
+                .fix("write `--- runner` with `timeout_ms:` and `environments:` as the first section")
+                .located(line, &lines),
+            );
+            (None, &sections[..])
+        }
+    };
+    let (fixture, sections) = match parse_fixture(sections) {
+        Ok(parts) => parts,
+        Err(error) => {
+            let line = sections.first().map_or(1, |s| s.header_line + 1);
+            errors.push(error.located(line, &lines));
+            let fixture_sections = sections
+                .iter()
+                .take_while(|s| {
+                    s.name == "schema" || s.name == "seed" || s.name.starts_with("seed ")
+                })
+                .count();
+            (None, &sections[fixture_sections..])
+        }
     };
 
-    let mut needs_indices = header.traversal.is_some();
+    let mut needs_indices = header.as_ref().is_some_and(|h| h.traversal.is_some());
     let mut items: Vec<Item> = Vec::new();
     let mut open_loop: Option<(String, Vec<String>, Vec<Step>)> = None;
     let mut pending: Option<Pending> = None;
@@ -2102,839 +2292,950 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, String> {
                 push_step(items, open_loop, step);
                 Ok(())
             }
-            Some(step) => Err(missing_shape(&step)),
+            Some(step) => {
+                let refusal = missing_shape(&step);
+                push_step(items, open_loop, step);
+                Err(refusal)
+            }
             None => Ok(()),
         }
     }
 
+    /// The variable a refused loop head meant, so its body still binds.
+    fn placeholder_loop_var(rest: &str) -> String {
+        rest.split_whitespace()
+            .next()
+            .map(|token| token.trim_start_matches('$'))
+            .filter(|name| !name.is_empty())
+            .unwrap_or("_")
+            .to_string()
+    }
+
+    let mut skip_continuations = false;
+    let mut skip_endloop = false;
+    let mut placeholder_loop = false;
+    let mut refused_in_loop = false;
     for section in sections {
         let (kind, rest) = match section.name.split_once([' ', '\t']) {
             Some((k, rest)) => (k, rest),
             None => (section.name.as_str(), ""),
         };
+        if skip_continuations && matches!(kind, "expect" | "params") {
+            substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+            continue;
+        }
+        skip_continuations = false;
+        if skip_endloop && kind == "endloop" {
+            skip_endloop = false;
+            if placeholder_loop {
+                open_loop = None;
+                placeholder_loop = false;
+            }
+            continue;
+        }
         let expect_word = if kind == "expect" { rest.trim() } else { "" };
-        if !expect_word.starts_with("shape") {
-            settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
-        }
-        if expect_word != "plan" {
-            awaiting_load_plan = false;
-        }
-        if let Some(step) = awaiting_plan.take_if(|_| !matches!(expect_word, "plan" | SAME_AS_V1)) {
-            push_step(&mut items, &mut open_loop, step);
-        }
-        if let Some(step) = awaiting_same_as_v1.take_if(|_| expect_word != SAME_AS_V1) {
-            push_step(&mut items, &mut open_loop, step);
-        }
-        if awaiting_seam_step && !matches!(kind, "mutate" | "load" | "seam") {
-            return Err(
-                "invalid_case: a seam must directly precede its mutate step (a GQ mutation or a branch statement) or load step; no seam is crossed by a query step yet".into(),
+        let preamble: Result<(), CaseError> = (|| {
+            if !expect_word.starts_with("shape") {
+                settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
+            }
+            if expect_word != "plan" {
+                awaiting_load_plan = false;
+            }
+            if let Some(step) =
+                awaiting_plan.take_if(|_| !matches!(expect_word, "plan" | SAME_AS_V1))
+            {
+                push_step(&mut items, &mut open_loop, step);
+            }
+            if let Some(step) = awaiting_same_as_v1.take_if(|_| expect_word != SAME_AS_V1) {
+                push_step(&mut items, &mut open_loop, step);
+            }
+            if awaiting_seam_step && !matches!(kind, "mutate" | "load" | "seam") {
+                awaiting_seam_step = false;
+                return Err(
+                "invalid_case: a seam must directly precede its mutate step (a GQ mutation or a branch statement) or load step; no seam is crossed by a query step yet".into()
             );
+            }
+            Ok(())
+        })();
+        if let Err(error) = preamble {
+            errors.push(error.located(section.header_line + 1, &lines));
         }
-        if matches!(kind, "query" | "mutate" | "load" | "restart" | "concurrent") {
-            source_lines.insert(ordinal + 1, section.header_line + 1);
-            awaiting_seam_step = false;
-        }
-        match kind {
-            "seam" => {
-                if open_loop.is_some() {
-                    return Err(
-                        "invalid_case: seam directives inside loops are not supported".into(),
-                    );
-                }
-                if seams.values().map(Vec::len).sum::<usize>() >= 16 {
-                    return Err("invalid_case: a case admits at most 16 seam directives".into());
-                }
-                if !rest.is_empty() || pending.is_some() {
-                    return Err("invalid_case: seam takes no header arguments and must precede a complete step".into());
-                }
-                let seam = parse_seam(&yaml_body(&section.body))?;
-                let step_seams: &mut Vec<SeamDirective> = seams.entry(ordinal + 1).or_default();
-                if step_seams.iter().any(|earlier| earlier.at == seam.at) {
-                    return Err(format!(
+        let outcome: Result<(), CaseError> = (|| {
+            if matches!(kind, "query" | "mutate" | "load" | "restart" | "concurrent") {
+                source_lines.insert(ordinal + 1, section.header_line + 1);
+                awaiting_seam_step = false;
+            }
+            match kind {
+                "seam" => {
+                    if open_loop.is_some() {
+                        return Err(
+                            "invalid_case: seam directives inside loops are not supported".into(),
+                        );
+                    }
+                    if seams.values().map(Vec::len).sum::<usize>() >= 16 {
+                        return Err("invalid_case: a case admits at most 16 seam directives".into());
+                    }
+                    if !rest.is_empty() || pending.is_some() {
+                        return Err("invalid_case: seam takes no header arguments and must precede a complete step".into());
+                    }
+                    let seam = parse_seam(&yaml_body(&section.body))?;
+                    let step_seams: &mut Vec<SeamDirective> = seams.entry(ordinal + 1).or_default();
+                    if step_seams.iter().any(|earlier| earlier.at == seam.at) {
+                        return Err((format!(
                         "invalid_case: seam {} is declared twice before one step; one directive per seam per step",
                         seam.at
-                    ));
+                    )).into());
+                    }
+                    step_seams.push(seam);
+                    awaiting_seam_step = true;
                 }
-                step_seams.push(seam);
-                awaiting_seam_step = true;
-            }
-            "fault" => {
-                return Err(format!(
+                "fault" => {
+                    return Err((format!(
                     "line {}: there is no `--- fault` section; a code seam is a `--- seam` with the same `at`, `occurrence` and `scope` and `action: fail` (was `return_error`) or `action: skip`, and a store fault is a `--- seam` naming a store place with `subject:` or a decision seam with a store action",
                     section.header_line + 1
-                ));
-            }
-            "runner" | "schema" | "seed" => {
-                return Err(format!(
+                )).into());
+                }
+                "runner" | "schema" | "seed" => {
+                    return Err((format!(
                     "line {}: `--- {kind}` is out of position; schema then seed lead the file, once each",
                     section.header_line + 1
-                ));
-            }
-            "csv" => {
-                if pending.is_some() {
-                    return Err("the previous step is missing its `--- expect`".into());
+                )).into());
                 }
-                let name = rest.trim();
-                if name.is_empty()
-                    || name.contains(['/', '\\'])
-                    || name.contains("..")
-                    || name.chars().any(char::is_whitespace)
-                {
-                    return Err(format!(
+                "csv" => {
+                    if pending.is_some() {
+                        return Err("the previous step is missing its `--- expect`".into());
+                    }
+                    let name = rest.trim();
+                    if name.is_empty()
+                        || name.contains(['/', '\\'])
+                        || name.contains("..")
+                        || name.chars().any(char::is_whitespace)
+                    {
+                        return Err((format!(
                         "line {}: `--- csv <name>` names one file, a bare name without separators",
                         section.header_line + 1
-                    ));
-                }
-                let mut text = section
-                    .body
-                    .iter()
-                    .map(|(_, l)| *l)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                text.push('\n');
-                if csv_sections.insert(name.to_string(), text).is_some() {
-                    return Err(format!(
-                        "line {}: `--- csv {name}` is given twice",
-                        section.header_line + 1
-                    ));
-                }
-                continue;
-            }
-            "load" => {
-                if pending.is_some() {
-                    return Err("the previous step is missing its `--- expect`".into());
-                }
-                let (seed, mode, branch) = generate::parse_arguments(rest, true)?;
-                let generated = Generated::parse(seed, &yaml_body(&section.body))?;
-                if generated.call_count() == 0 {
-                    return Err("a generated load requires at least one nonempty batch; empty recipes are admitted only as seeds".into());
-                }
-                ordinal += 1;
-                pending = Some(Pending::Load {
-                    ordinal,
-                    branch,
-                    mode,
-                    generated,
-                });
-            }
-            "query" | "mutate" => {
-                let (branch, snapshot) = if kind == "query" {
-                    parse_query_target(rest)?
-                } else {
-                    (parse_step_branch(kind, rest)?, None)
-                };
-                if pending.is_some() {
-                    return Err(format!(
-                        "line {}: the previous step is missing its `--- expect`",
-                        section.header_line + 1
-                    ));
-                }
-                let source: String = section
-                    .body
-                    .iter()
-                    .map(|(_, l)| *l)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let file = parse_query(&source).map_err(|e| {
-                    format!(
-                        "`--- {kind}` section starting at line {} does not parse: {e}",
-                        section.header_line + 1
-                    )
-                })?;
-                refuse_process_settings(&file.settings, &section.body)?;
-                let empty = file.empty_kind();
-                if let Some(name) = &snapshot {
-                    if !bound_names.contains(name) {
-                        return Err(format!(
-                            "`snapshot: ${name}` is not bound; `--- bind commit ${name}` must precede this step"
-                        ));
+                    )).into());
                     }
-                    if !matches!(&file.body, FileBody::Queries(decls) if !decls.is_empty()) {
-                        return Err(
-                            "`snapshot:` selects a query declaration's read target; a statement takes no target"
-                                .into(),
-                        );
-                    }
-                }
-                let decls = match file.body {
-                    FileBody::Queries(_) if matches!(empty, Some(EmptyFile::SettingsOnly)) => {
-                        if kind == "query" {
-                            return Err(
-                                "a settings step is a `--- mutate` step; use `--- mutate`".into()
-                            );
-                        }
-                        if branch.is_some() {
-                            return Err(
-                                "a settings step changes the case session, not a branch; drop the `branch:` argument"
-                                    .into(),
-                            );
-                        }
-                        ordinal += 1;
-                        pending = Some(Pending::Settings {
-                            ordinal,
-                            statements: file.settings,
-                        });
-                        continue;
-                    }
-                    FileBody::Queries(decls) => decls,
-                    FileBody::Show(id) => {
-                        if kind == "mutate" {
-                            return Err(format!(
-                                "`{}` under `--- mutate` is refused; use `--- query`",
-                                show_statement_name(id)
-                            ));
-                        }
-                        if branch.is_some() {
-                            return Err(
-                                "`show` reads the case session, not a branch; drop the `branch:` argument"
-                                    .into(),
-                            );
-                        }
-                        ordinal += 1;
-                        pending = Some(Pending::Show {
-                            ordinal,
-                            id,
-                            prefix: file.settings,
-                        });
-                        continue;
-                    }
-                    FileBody::Branch(stmt) => {
-                        if kind == "query" && stmt.is_write() {
-                            return Err(
-                                "a control write under `--- query` is refused; use `--- mutate`"
-                                    .into(),
-                            );
-                        }
-                        if kind == "mutate" && !stmt.is_write() {
-                            return Err(format!(
-                                "`{}` under `--- mutate` is refused; use `--- query`",
-                                stmt.statement_name()
-                            ));
-                        }
-                        if branch.is_some() {
-                            return Err(
-                                "a branch statement names its branches itself; drop the `branch:` argument"
-                                    .into(),
-                            );
-                        }
-                        ordinal += 1;
-                        pending = Some(match stmt {
-                            BranchStmt::List => Pending::List { ordinal },
-                            BranchStmt::Read(read) => {
-                                for operand in branch_read_operands(&read) {
-                                    if let Some(name) = bound_operand(operand)
-                                        && !bound_names.contains(name)
-                                    {
-                                        return Err(format!(
-                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
-                                        ));
-                                    }
-                                }
-                                let bound = branch_read_operands(&read)
-                                    .into_iter()
-                                    .filter(|operand| bound_operand(operand).is_some())
-                                    .count();
-                                if bound > 0 && source.matches("${").count() == bound {
-                                    substitutable_lines
-                                        .extend(section.body.iter().map(|(i, _)| *i));
-                                }
-                                Pending::BranchRead {
-                                    ordinal,
-                                    read,
-                                    source: source.clone(),
-                                }
-                            }
-                            BranchStmt::Write(write) => {
-                                if let BranchWrite::Create {
-                                    from: Some(BranchCreateFrom::Commit(commit)),
-                                    ..
-                                } = &write
-                                    && let Some(name) = bound_operand(commit)
-                                {
-                                    if !bound_names.contains(name) {
-                                        return Err(format!(
-                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
-                                        ));
-                                    }
-                                    if source.matches("${").count() == 1 {
-                                        substitutable_lines
-                                            .extend(section.body.iter().map(|(i, _)| *i));
-                                    }
-                                }
-                                Pending::Control {
-                                    ordinal,
-                                    prefix: file.settings,
-                                    write: ControlSource::Branch(write),
-                                }
-                            }
-                        });
-                        continue;
-                    }
-                    FileBody::Commit(write) => {
-                        if kind == "query" {
-                            return Err(
-                                "a control write under `--- query` is refused; use `--- mutate`"
-                                    .into(),
-                            );
-                        }
-                        if branch.is_some() {
-                            return Err(
-                                "a commit statement acts on the commit's recorded target; drop the `branch:` argument"
-                                    .into(),
-                            );
-                        }
-                        if let Some(name) = bound_operand(write.graph_commit_id()) {
-                            if !bound_names.contains(name) {
-                                return Err(format!(
-                                    "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
-                                ));
-                            }
-                            substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
-                        }
-                        ordinal += 1;
-                        pending = Some(Pending::Control {
-                            ordinal,
-                            prefix: file.settings,
-                            write: ControlSource::Commit(write),
-                        });
-                        continue;
-                    }
-                    FileBody::Load(stmt) => {
-                        if kind == "query" {
-                            return Err(
-                                "a load statement under `--- query` is refused; use `--- mutate`"
-                                    .into(),
-                            );
-                        }
-                        ordinal += 1;
-                        pending = Some(Pending::Control {
-                            ordinal,
-                            prefix: file.settings,
-                            write: ControlSource::Load { stmt, branch },
-                        });
-                        continue;
-                    }
-                    FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
-                        return Err(format!(
-                            "an `explain` statement under `--- {kind}` is refused; assert the plan with `--- expect plan`"
-                        ));
-                    }
-                };
-                let [decl] = decls.as_slice() else {
-                    return Err(format!(
-                        "a `--- {kind}` section must hold exactly one declaration, got {}",
-                        decls.len()
-                    ));
-                };
-                let is_mutation = !decl.mutations.is_empty();
-                if kind == "query" && is_mutation {
-                    return Err(
-                        "a mutation declaration under `--- query` is refused; use `--- mutate`"
-                            .into(),
-                    );
-                }
-                if kind == "mutate" && !is_mutation {
-                    return Err(
-                        "a read declaration under `--- mutate` is refused; use `--- query`".into(),
-                    );
-                }
-                inspect_decl(decl, &mut needs_indices)?;
-                let base_binding = match &decl.write_mode {
-                    MutationWriteMode::Unattached {
-                        base: Some(UnattachedBase::Literal(text)),
-                    } => bound_operand(text),
-                    MutationWriteMode::Unattached { .. }
-                    | MutationWriteMode::Publish
-                    | MutationWriteMode::AsCommit => None,
-                };
-                if let Some(name) = base_binding {
-                    if !bound_names.contains(name) {
-                        return Err(format!(
-                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
-                        ));
-                    }
-                    if source.matches("${").count() == 1 {
-                        substitutable_lines.extend(
-                            section
-                                .body
-                                .iter()
-                                .filter(|(_, l)| l.contains("${"))
-                                .map(|(i, _)| *i),
-                        );
-                    }
-                }
-                ordinal += 1;
-                pending = Some(Pending::Decl(PendingStep {
-                    is_mutation,
-                    ordinal,
-                    source: source.clone(),
-                    name: decl.name.clone(),
-                    branch_spelled: branch.is_some(),
-                    branch: branch.unwrap_or_else(|| MAIN_BRANCH.to_string()),
-                    snapshot,
-                    decl: Box::new(decl.clone()),
-                    ordered_refusal: ordered_refusal(decl),
-                    expects_expand: expects_expand(&decl.match_clause),
-                    params_raw: None,
-                    base_binding: base_binding.map(str::to_string),
-                }));
-            }
-            "concurrent" => {
-                let line = section.header_line + 1;
-                if !rest.is_empty() {
-                    return Err(format!("line {line}: `--- concurrent` takes no arguments"));
-                }
-                if open_loop.is_some() {
-                    return Err(format!(
-                        "line {line}: invalid_case: a concurrent block inside a loop is not supported"
-                    ));
-                }
-                if pending.is_some() {
-                    return Err(format!(
-                        "line {line}: the previous step is missing its `--- expect`"
-                    ));
-                }
-                let (lines, order) = concurrent::parse_block(&section.body).map_err(|e| {
-                    if e.starts_with("line ") {
-                        e
-                    } else {
-                        format!("line {line}: {e}")
-                    }
-                })?;
-                let mut sessions = Vec::with_capacity(lines.len());
-                for session in lines {
-                    let file = parse_query(&session.text).map_err(|e| {
-                        format!(
-                            "line {}: session `{}` does not parse: {e}",
-                            session.line, session.label
-                        )
-                    })?;
-                    if !file.settings.is_empty() {
-                        return Err(format!(
-                            "line {}: session `{}` carries `set` or `reset` lines; a block session is one statement",
-                            session.line, session.label
-                        ));
-                    }
-                    let FileBody::Queries(decls) = file.body else {
-                        return Err(format!(
-                            "line {}: session `{}` must be a query or mutation declaration; show, branch and explain statements are not admitted in a block",
-                            session.line, session.label
-                        ));
-                    };
-                    let [decl] = decls.as_slice() else {
-                        return Err(format!(
-                            "line {}: session `{}` holds exactly one declaration, got {}",
-                            session.line,
-                            session.label,
-                            decls.len()
-                        ));
-                    };
-                    if !decl.params.is_empty() {
-                        return Err(format!(
-                            "line {}: session `{}` declares parameters; a block session takes none",
-                            session.line, session.label
-                        ));
-                    }
-                    inspect_decl(decl, &mut needs_indices)?;
-                    let kind = if decl.mutations.is_empty() {
-                        SessionKind::Query
-                    } else {
-                        SessionKind::Mutation
-                    };
-                    sessions.push(SessionOp {
-                        label: session.label,
-                        branch: session.branch,
-                        source: session.text,
-                        name: decl.name.clone(),
-                        kind,
-                        expect: SessionExpect::Ok,
-                    });
-                }
-                ordinal += 1;
-                pending = Some(Pending::Concurrent(ConcurrentStep {
-                    ordinal,
-                    sessions,
-                    order,
-                }));
-            }
-            "params" => {
-                if !rest.is_empty() && !rest.starts_with("generate:") {
-                    return Err(format!("unknown section `--- {}`", section.name));
-                }
-                let step = match pending.as_mut() {
-                    Some(Pending::Decl(step)) => step,
-                    Some(
-                        Pending::List { .. } | Pending::Control { .. } | Pending::BranchRead { .. },
-                    ) => {
-                        return Err("a branch statement takes no params".into());
-                    }
-                    Some(Pending::Settings { .. } | Pending::Show { .. }) => {
-                        return Err("a settings statement takes no params".into());
-                    }
-                    Some(Pending::Concurrent(_)) => {
-                        return Err("a concurrent block takes no params; its sessions are literal statements".into());
-                    }
-                    Some(Pending::Load { .. }) => {
-                        return Err("a generated load takes no params".into());
-                    }
-                    None => {
-                        return Err(format!(
-                            "line {}: `--- params` must directly follow a query or mutate section",
-                            section.header_line + 1
-                        ));
-                    }
-                };
-                if step.params_raw.is_some() {
-                    return Err(format!(
-                        "line {}: a second `--- params` for one step is refused",
-                        section.header_line + 1
-                    ));
-                }
-                if rest.is_empty() {
-                    let body: String = section
+                    let mut text = section
                         .body
                         .iter()
                         .map(|(_, l)| *l)
                         .collect::<Vec<_>>()
                         .join("\n");
-                    validate_subst_tokens(
-                        &body,
-                        open_loop.as_ref().map(|(v, _, _)| v.as_str()),
-                        &bound_names,
-                    )?;
-                    substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
-                    step.params_raw = Some(ParamsInput::Literal(body));
-                } else {
-                    // A recipe is not substituted: its lines stay outside
-                    // `substitutable_lines`, so a `${` in it is refused.
-                    step.params_raw = Some(ParamsInput::Generated(
-                        GeneratedParams::parse(rest, &yaml_body(&section.body))
-                            .map_err(|e| format!("line {}: {e}", section.header_line + 1))?,
-                    ));
+                    text.push('\n');
+                    if csv_sections.insert(name.to_string(), text).is_some() {
+                        return Err((format!(
+                            "line {}: `--- csv {name}` is given twice",
+                            section.header_line + 1
+                        ))
+                        .into());
+                    }
+                    return Ok(());
                 }
-            }
-            "expect" => {
-                if let Some(Pending::Concurrent(mut step)) =
-                    pending.take_if(|p| matches!(p, Pending::Concurrent(_)))
-                {
+                "load" => {
+                    if pending.is_some() {
+                        return Err("the previous step is missing its `--- expect`".into());
+                    }
+                    let (seed, mode, branch) = generate::parse_arguments(rest, true)?;
+                    let generated = Generated::parse(seed, &yaml_body(&section.body))?;
+                    if generated.call_count() == 0 {
+                        return Err("a generated load requires at least one nonempty batch; empty recipes are admitted only as seeds".into());
+                    }
+                    ordinal += 1;
+                    pending = Some(Pending::Load {
+                        ordinal,
+                        branch,
+                        mode,
+                        generated,
+                    });
+                }
+                "query" | "mutate" => {
+                    let (branch, snapshot) = if kind == "query" {
+                        parse_query_target(rest)?
+                    } else {
+                        (parse_step_branch(kind, rest)?, None)
+                    };
+                    if pending.is_some() {
+                        return Err((format!(
+                            "line {}: the previous step is missing its `--- expect`",
+                            section.header_line + 1
+                        ))
+                        .into());
+                    }
+                    let source: String = section
+                        .body
+                        .iter()
+                        .map(|(_, l)| *l)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let file = parse_query(&source).map_err(|e| {
+                        format!(
+                            "`--- {kind}` section starting at line {} does not parse: {e}",
+                            section.header_line + 1
+                        )
+                    })?;
+                    refuse_process_settings(&file.settings, &section.body)?;
+                    let empty = file.empty_kind();
+                    if let Some(name) = &snapshot {
+                        if !bound_names.contains(name) {
+                            return Err((format!(
+                            "`snapshot: ${name}` is not bound; `--- bind commit ${name}` must precede this step"
+                        )).into());
+                        }
+                        if !matches!(&file.body, FileBody::Queries(decls) if !decls.is_empty()) {
+                            return Err(
+                            "`snapshot:` selects a query declaration's read target; a statement takes no target"
+                                .into()
+                        );
+                        }
+                    }
+                    let decls = match file.body {
+                        FileBody::Queries(_) if matches!(empty, Some(EmptyFile::SettingsOnly)) => {
+                            if kind == "query" {
+                                return Err(
+                                    "a settings step is a `--- mutate` step; use `--- mutate`"
+                                        .into(),
+                                );
+                            }
+                            if branch.is_some() {
+                                return Err(
+                                "a settings step changes the case session, not a branch; drop the `branch:` argument"
+                                    .into()
+                            );
+                            }
+                            ordinal += 1;
+                            pending = Some(Pending::Settings {
+                                ordinal,
+                                statements: file.settings,
+                            });
+                            return Ok(());
+                        }
+                        FileBody::Queries(decls) => decls,
+                        FileBody::Show(id) => {
+                            if kind == "mutate" {
+                                return Err((format!(
+                                    "`{}` under `--- mutate` is refused; use `--- query`",
+                                    show_statement_name(id)
+                                ))
+                                .into());
+                            }
+                            if branch.is_some() {
+                                return Err(
+                                "`show` reads the case session, not a branch; drop the `branch:` argument"
+                                    .into()
+                            );
+                            }
+                            ordinal += 1;
+                            pending = Some(Pending::Show {
+                                ordinal,
+                                id,
+                                prefix: file.settings,
+                            });
+                            return Ok(());
+                        }
+                        FileBody::Branch(stmt) => {
+                            if kind == "query" && stmt.is_write() {
+                                return Err(
+                                "a control write under `--- query` is refused; use `--- mutate`"
+                                    .into()
+                            );
+                            }
+                            if kind == "mutate" && !stmt.is_write() {
+                                return Err((format!(
+                                    "`{}` under `--- mutate` is refused; use `--- query`",
+                                    stmt.statement_name()
+                                ))
+                                .into());
+                            }
+                            if branch.is_some() {
+                                return Err(
+                                "a branch statement names its branches itself; drop the `branch:` argument"
+                                    .into()
+                            );
+                            }
+                            ordinal += 1;
+                            pending = Some(match stmt {
+                                BranchStmt::List => Pending::List { ordinal },
+                                BranchStmt::Read(read) => {
+                                    for operand in branch_read_operands(&read) {
+                                        if let Some(name) = bound_operand(operand)
+                                            && !bound_names.contains(name)
+                                        {
+                                            return Err((format!(
+                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
+                                        )).into());
+                                        }
+                                    }
+                                    let bound = branch_read_operands(&read)
+                                        .into_iter()
+                                        .filter(|operand| bound_operand(operand).is_some())
+                                        .count();
+                                    if bound > 0 && source.matches("${").count() == bound {
+                                        substitutable_lines
+                                            .extend(section.body.iter().map(|(i, _)| *i));
+                                    }
+                                    Pending::BranchRead {
+                                        ordinal,
+                                        read,
+                                        source: source.clone(),
+                                    }
+                                }
+                                BranchStmt::Write(write) => {
+                                    if let BranchWrite::Create {
+                                        from: Some(BranchCreateFrom::Commit(commit)),
+                                        ..
+                                    } = &write
+                                        && let Some(name) = bound_operand(commit)
+                                    {
+                                        if !bound_names.contains(name) {
+                                            return Err((format!(
+                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
+                                        )).into());
+                                        }
+                                        if source.matches("${").count() == 1 {
+                                            substitutable_lines
+                                                .extend(section.body.iter().map(|(i, _)| *i));
+                                        }
+                                    }
+                                    Pending::Control {
+                                        ordinal,
+                                        prefix: file.settings,
+                                        write: ControlSource::Branch(write),
+                                    }
+                                }
+                            });
+                            return Ok(());
+                        }
+                        FileBody::Commit(write) => {
+                            if kind == "query" {
+                                return Err(
+                                "a control write under `--- query` is refused; use `--- mutate`"
+                                    .into()
+                            );
+                            }
+                            if branch.is_some() {
+                                return Err(
+                                "a commit statement acts on the commit's recorded target; drop the `branch:` argument"
+                                    .into()
+                            );
+                            }
+                            if let Some(name) = bound_operand(write.graph_commit_id()) {
+                                if !bound_names.contains(name) {
+                                    return Err((format!(
+                                    "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
+                                )).into());
+                                }
+                                substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+                            }
+                            ordinal += 1;
+                            pending = Some(Pending::Control {
+                                ordinal,
+                                prefix: file.settings,
+                                write: ControlSource::Commit(write),
+                            });
+                            return Ok(());
+                        }
+                        FileBody::Load(stmt) => {
+                            if kind == "query" {
+                                return Err(
+                                "a load statement under `--- query` is refused; use `--- mutate`"
+                                    .into()
+                            );
+                            }
+                            ordinal += 1;
+                            pending = Some(Pending::Control {
+                                ordinal,
+                                prefix: file.settings,
+                                write: ControlSource::Load { stmt, branch },
+                            });
+                            return Ok(());
+                        }
+                        FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
+                            return Err((format!(
+                            "an `explain` statement under `--- {kind}` is refused; assert the plan with `--- expect plan`"
+                        )).into());
+                        }
+                    };
+                    let [decl] = decls.as_slice() else {
+                        return Err((format!(
+                            "a `--- {kind}` section must hold exactly one declaration, got {}",
+                            decls.len()
+                        ))
+                        .into());
+                    };
+                    let is_mutation = !decl.mutations.is_empty();
+                    if kind == "query" && is_mutation {
+                        return Err(
+                            "a mutation declaration under `--- query` is refused; use `--- mutate`"
+                                .into(),
+                        );
+                    }
+                    if kind == "mutate" && !is_mutation {
+                        return Err(
+                            "a read declaration under `--- mutate` is refused; use `--- query`"
+                                .into(),
+                        );
+                    }
+                    inspect_decl(decl, &mut needs_indices)?;
+                    let base_binding = match &decl.write_mode {
+                        MutationWriteMode::Unattached {
+                            base: Some(UnattachedBase::Literal(text)),
+                        } => bound_operand(text),
+                        MutationWriteMode::Unattached { .. }
+                        | MutationWriteMode::Publish
+                        | MutationWriteMode::AsCommit => None,
+                    };
+                    if let Some(name) = base_binding {
+                        if !bound_names.contains(name) {
+                            return Err((format!(
+                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
+                        )).into());
+                        }
+                        if source.matches("${").count() == 1 {
+                            substitutable_lines.extend(
+                                section
+                                    .body
+                                    .iter()
+                                    .filter(|(_, l)| l.contains("${"))
+                                    .map(|(i, _)| *i),
+                            );
+                        }
+                    }
+                    ordinal += 1;
+                    pending = Some(Pending::Decl(PendingStep {
+                        is_mutation,
+                        ordinal,
+                        source: source.clone(),
+                        name: decl.name.clone(),
+                        branch_spelled: branch.is_some(),
+                        branch: branch.unwrap_or_else(|| MAIN_BRANCH.to_string()),
+                        snapshot,
+                        decl: Box::new(decl.clone()),
+                        ordered_refusal: ordered_refusal(decl),
+                        expects_expand: expects_expand(&decl.match_clause),
+                        params_raw: None,
+                        base_binding: base_binding.map(str::to_string),
+                    }));
+                }
+                "concurrent" => {
                     let line = section.header_line + 1;
-                    if !rest.trim().is_empty() {
-                        return Err(format!(
-                            "line {line}: after a concurrent block, `--- expect` is bare and its body names each session: `<label>: ok` or `<label>: error: <needle>`"
+                    if !rest.is_empty() {
+                        return Err(
+                            (format!("line {line}: `--- concurrent` takes no arguments")).into(),
+                        );
+                    }
+                    if open_loop.is_some() {
+                        return Err((format!(
+                        "line {line}: invalid_case: a concurrent block inside a loop is not supported"
+                    )).into());
+                    }
+                    if pending.is_some() {
+                        return Err((format!(
+                            "line {line}: the previous step is missing its `--- expect`"
+                        ))
+                        .into());
+                    }
+                    let (lines, order) = concurrent::parse_block(&section.body).map_err(|e| {
+                        if e.starts_with("line ") {
+                            e
+                        } else {
+                            format!("line {line}: {e}")
+                        }
+                    })?;
+                    let mut sessions = Vec::with_capacity(lines.len());
+                    for session in lines {
+                        let file = parse_query(&session.text).map_err(|e| {
+                            format!(
+                                "line {}: session `{}` does not parse: {e}",
+                                session.line, session.label
+                            )
+                        })?;
+                        if !file.settings.is_empty() {
+                            return Err((format!(
+                            "line {}: session `{}` carries `set` or `reset` lines; a block session is one statement",
+                            session.line, session.label
+                        )).into());
+                        }
+                        let FileBody::Queries(decls) = file.body else {
+                            return Err((format!(
+                            "line {}: session `{}` must be a query or mutation declaration; show, branch and explain statements are not admitted in a block",
+                            session.line, session.label
+                        )).into());
+                        };
+                        let [decl] = decls.as_slice() else {
+                            return Err((format!(
+                                "line {}: session `{}` holds exactly one declaration, got {}",
+                                session.line,
+                                session.label,
+                                decls.len()
+                            ))
+                            .into());
+                        };
+                        if !decl.params.is_empty() {
+                            return Err((format!(
+                            "line {}: session `{}` declares parameters; a block session takes none",
+                            session.line, session.label
+                        )).into());
+                        }
+                        inspect_decl(decl, &mut needs_indices)?;
+                        let kind = if decl.mutations.is_empty() {
+                            SessionKind::Query
+                        } else {
+                            SessionKind::Mutation
+                        };
+                        sessions.push(SessionOp {
+                            label: session.label,
+                            branch: session.branch,
+                            source: session.text,
+                            name: decl.name.clone(),
+                            kind,
+                            expect: SessionExpect::Ok,
+                        });
+                    }
+                    ordinal += 1;
+                    pending = Some(Pending::Concurrent(ConcurrentStep {
+                        ordinal,
+                        sessions,
+                        order,
+                    }));
+                }
+                "params" => {
+                    if !rest.is_empty() && !rest.starts_with("generate:") {
+                        return Err((format!("unknown section `--- {}`", section.name)).into());
+                    }
+                    let step = match pending.as_mut() {
+                        Some(Pending::Decl(step)) => step,
+                        Some(
+                            Pending::List { .. }
+                            | Pending::Control { .. }
+                            | Pending::BranchRead { .. },
+                        ) => {
+                            return Err("a branch statement takes no params".into());
+                        }
+                        Some(Pending::Settings { .. } | Pending::Show { .. }) => {
+                            return Err("a settings statement takes no params".into());
+                        }
+                        Some(Pending::Concurrent(_)) => {
+                            return Err("a concurrent block takes no params; its sessions are literal statements".into());
+                        }
+                        Some(Pending::Load { .. }) => {
+                            return Err("a generated load takes no params".into());
+                        }
+                        None => {
+                            return Err((format!(
+                            "line {}: `--- params` must directly follow a query or mutate section",
+                            section.header_line + 1
+                        )).into());
+                        }
+                    };
+                    if step.params_raw.is_some() {
+                        return Err((format!(
+                            "line {}: a second `--- params` for one step is refused",
+                            section.header_line + 1
+                        ))
+                        .into());
+                    }
+                    if rest.is_empty() {
+                        let body: String = section
+                            .body
+                            .iter()
+                            .map(|(_, l)| *l)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        validate_subst_tokens(
+                            &body,
+                            open_loop.as_ref().map(|(v, _, _)| v.as_str()),
+                            &bound_names,
+                        )?;
+                        substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+                        step.params_raw = Some(ParamsInput::Literal(body));
+                    } else {
+                        step.params_raw = Some(ParamsInput::Generated(
+                            GeneratedParams::parse(rest, &yaml_body(&section.body))
+                                .map_err(|e| format!("line {}: {e}", section.header_line + 1))?,
                         ));
                     }
-                    refuse_comment_lines(&section.body, "expect")?;
-                    let labels: Vec<&str> =
-                        step.sessions.iter().map(|s| s.label.as_str()).collect();
-                    let expects =
-                        concurrent::parse_expect_body(&section.body, &labels).map_err(|e| {
-                            if e.starts_with("line ") {
-                                e
-                            } else {
-                                format!("line {line}: {e}")
-                            }
-                        })?;
-                    for (op, expect) in step.sessions.iter_mut().zip(expects) {
-                        op.expect = expect;
-                    }
-                    push_step(&mut items, &mut open_loop, Step::Concurrent(step));
-                    continue;
                 }
-                if rest.trim() == "shape" {
-                    let Some(mut step) = awaiting_shape.take() else {
-                        return Err(format!(
+                "expect" => {
+                    if let Some(Pending::Concurrent(mut step)) =
+                        pending.take_if(|p| matches!(p, Pending::Concurrent(_)))
+                    {
+                        let line = section.header_line + 1;
+                        if !rest.trim().is_empty() {
+                            return Err((format!(
+                            "line {line}: after a concurrent block, `--- expect` is bare and its body names each session: `<label>: ok` or `<label>: error: <needle>`"
+                        )).into());
+                        }
+                        refuse_comment_lines(&section.body, "expect")?;
+                        let labels: Vec<&str> =
+                            step.sessions.iter().map(|s| s.label.as_str()).collect();
+                        let expects = concurrent::parse_expect_body(&section.body, &labels)
+                            .map_err(|e| {
+                                if e.starts_with("line ") {
+                                    e
+                                } else {
+                                    format!("line {line}: {e}")
+                                }
+                            })?;
+                        for (op, expect) in step.sessions.iter_mut().zip(expects) {
+                            op.expect = expect;
+                        }
+                        push_step(&mut items, &mut open_loop, Step::Concurrent(step));
+                        return Ok(());
+                    }
+                    if rest.trim() == "shape" {
+                        let Some(mut step) = awaiting_shape.take() else {
+                            return Err((format!(
                             "line {}: `--- expect shape` must directly follow a query step's unordered or ordered expect",
                             section.header_line + 1
-                        ));
-                    };
-                    let lines = parse_shape_body(&section.body)?;
-                    if matches!(step, Step::Show(_)) {
-                        refuse_unequal_show_shape(&lines, section.header_line + 1)?;
-                        push_step(&mut items, &mut open_loop, step);
-                        continue;
-                    }
-                    if let Step::BranchRead(read) = &step {
-                        return Err(format!(
+                        )).into());
+                        };
+                        let lines = parse_shape_body(&section.body)?;
+                        if matches!(step, Step::Show(_)) {
+                            refuse_unequal_show_shape(&lines, section.header_line + 1)?;
+                            push_step(&mut items, &mut open_loop, step);
+                            return Ok(());
+                        }
+                        if let Step::BranchRead(read) = &step {
+                            return Err((format!(
                             "line {}: `{}` answers its own columns; drop the `--- expect shape` section",
                             section.header_line + 1,
                             read.read.statement_name()
-                        ));
-                    }
-                    let Some(QueryExpect::Rows { shape, .. }) = step.read_expect_mut() else {
-                        return Err(format!(
+                        )).into());
+                        }
+                        let Some(QueryExpect::Rows { shape, .. }) = step.read_expect_mut() else {
+                            return Err((format!(
                             "line {}: internal: the step awaiting a shape section carries no rows expect",
                             section.header_line + 1
-                        ));
-                    };
-                    *shape = ShapeExpect {
-                        lines,
-                        span: BodySpan {
-                            start_line: section.header_line + 1,
-                            len: section.body.len(),
-                        },
-                    };
-                    awaiting_plan = Some(step);
-                    continue;
-                }
-                if rest.trim() == "plan" {
-                    let Some(mut step) = awaiting_plan.take() else {
-                        if !awaiting_load_plan {
-                            return Err(format!(
+                        )).into());
+                        };
+                        *shape = ShapeExpect {
+                            lines,
+                            span: BodySpan {
+                                start_line: section.header_line + 1,
+                                len: section.body.len(),
+                            },
+                        };
+                        awaiting_plan = Some(step);
+                        return Ok(());
+                    }
+                    if rest.trim() == "plan" {
+                        let Some(mut step) = awaiting_plan.take() else {
+                            if !awaiting_load_plan {
+                                return Err((format!(
                                 "line {}: `--- expect plan` must directly follow a query step's `--- expect shape`, or the `--- expect` of a `load csv`, `branch merge` or mutate step that succeeds",
                                 section.header_line + 1
-                            ));
-                        }
-                        awaiting_load_plan = false;
-                        let lines = parse_load_plan_body(&section.body)
-                            .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
-                        let last = match open_loop.as_mut() {
-                            Some((_, _, steps)) => steps.last_mut(),
-                            None => match items.last_mut() {
-                                Some(Item::Step(step)) => Some(step),
-                                _ => None,
-                            },
-                        };
-                        let slot = match last {
-                            Some(Step::Control(ControlStep {
-                                write:
-                                    ControlWrite::Load { plan, .. } | ControlWrite::Merge { plan, .. },
-                                ..
-                            })) => plan,
-                            Some(Step::Mutate(MutateStep { plan, .. })) => plan,
-                            _ => {
-                                return Err(format!(
+                            )).into());
+                            }
+                            awaiting_load_plan = false;
+                            let lines = parse_load_plan_body(&section.body)
+                                .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
+                            let last = match open_loop.as_mut() {
+                                Some((_, _, steps)) => steps.last_mut(),
+                                None => match items.last_mut() {
+                                    Some(Item::Step(step)) => Some(step),
+                                    _ => None,
+                                },
+                            };
+                            let slot = match last {
+                                Some(Step::Control(ControlStep {
+                                    write:
+                                        ControlWrite::Load { plan, .. }
+                                        | ControlWrite::Merge { plan, .. },
+                                    ..
+                                })) => plan,
+                                Some(Step::Mutate(MutateStep { plan, .. })) => plan,
+                                _ => {
+                                    return Err((format!(
                                     "line {}: internal: the step awaiting a write plan is not a `load csv`, `branch merge` or mutate step",
                                     section.header_line + 1
-                                ));
-                            }
+                                )).into());
+                                }
+                            };
+                            *slot = Some(LoadPlanExpect { lines });
+                            return Ok(());
                         };
-                        *slot = Some(LoadPlanExpect { lines });
-                        continue;
-                    };
-                    let lines = parse_plan_body(&section.body)
-                        .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
-                    let Step::Query(query) = &mut step else {
-                        return Err(format!(
-                            "line {}: `--- expect plan` is supported only on query steps",
-                            section.header_line + 1
-                        ));
-                    };
-                    query.plan = Some(PlanExpect { lines });
-                    awaiting_same_as_v1 = Some(step);
-                    continue;
-                }
-                if rest.trim() == SAME_AS_V1 {
-                    let line = section.header_line + 1;
-                    refuse_nonempty_body(&section.body, "an `expect same as v1` section")?;
-                    let Some(mut step) =
-                        awaiting_plan.take().or_else(|| awaiting_same_as_v1.take())
-                    else {
-                        return Err(same_as_v1_misplaced(
-                            line,
-                            pending.as_ref(),
-                            &items,
-                            open_loop.as_ref(),
-                        ));
-                    };
-                    let Step::Query(query) = &mut step else {
-                        return Err(format!(
+                        let lines = parse_plan_body(&section.body)
+                            .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
+                        let Step::Query(query) = &mut step else {
+                            return Err((format!(
+                                "line {}: `--- expect plan` is supported only on query steps",
+                                section.header_line + 1
+                            ))
+                            .into());
+                        };
+                        query.plan = Some(PlanExpect { lines });
+                        awaiting_same_as_v1 = Some(step);
+                        return Ok(());
+                    }
+                    if rest.trim() == SAME_AS_V1 {
+                        let line = section.header_line + 1;
+                        refuse_nonempty_body(&section.body, "an `expect same as v1` section")?;
+                        let Some(mut step) =
+                            awaiting_plan.take().or_else(|| awaiting_same_as_v1.take())
+                        else {
+                            return Err((same_as_v1_misplaced(
+                                line,
+                                pending.as_ref(),
+                                &items,
+                                open_loop.as_ref(),
+                            ))
+                            .into());
+                        };
+                        let Step::Query(query) = &mut step else {
+                            return Err((format!(
                             "line {line}: `--- expect same as v1` is supported only on a query declaration step"
-                        ));
+                        )).into());
+                        };
+                        query.same_as_v1 = true;
+                        push_step(&mut items, &mut open_loop, step);
+                        return Ok(());
+                    }
+                    let mode = parse_expect_header(rest)?;
+                    let loop_var = open_loop.as_ref().map(|(v, _, _)| v.as_str());
+                    let completed = match pending.take() {
+                        Some(Pending::Load {
+                            ordinal,
+                            branch,
+                            mode: load_mode,
+                            generated,
+                        }) => Step::Load(LoadStep {
+                            ordinal,
+                            branch,
+                            mode: load_mode,
+                            generated,
+                            expect: complete_write_expect("load", &mode, section)?,
+                        }),
+                        Some(Pending::Decl(step)) => {
+                            complete_decl_step(step, &mode, section, loop_var)?
+                        }
+                        Some(Pending::List { ordinal }) => {
+                            Step::List(complete_list_step(ordinal, &mode, section, loop_var)?)
+                        }
+                        Some(Pending::Control {
+                            ordinal,
+                            prefix,
+                            write,
+                        }) => Step::Control(complete_control_step(
+                            ordinal, prefix, write, &mode, section,
+                        )?),
+                        Some(Pending::Settings {
+                            ordinal,
+                            statements,
+                        }) => Step::Settings(complete_settings_step(
+                            ordinal, statements, &mode, section,
+                        )?),
+                        Some(Pending::Show {
+                            ordinal,
+                            id,
+                            prefix,
+                        }) => Step::Show(complete_show_step(
+                            ordinal, id, prefix, &mode, section, loop_var,
+                        )?),
+                        Some(Pending::Concurrent(_)) => {
+                            unreachable!("a pending concurrent block is completed above")
+                        }
+                        Some(Pending::BranchRead {
+                            ordinal,
+                            read,
+                            source,
+                        }) => Step::BranchRead(complete_branch_read_step(
+                            ordinal,
+                            read,
+                            source,
+                            &mode,
+                            section,
+                            loop_var,
+                            &bound_names,
+                        )?),
+                        None => {
+                            return Err((format!(
+                                "line {}: `--- expect` has no query or mutate step to bind to",
+                                section.header_line + 1
+                            ))
+                            .into());
+                        }
                     };
-                    query.same_as_v1 = true;
-                    push_step(&mut items, &mut open_loop, step);
-                    continue;
+                    awaiting_load_plan = match &completed {
+                        Step::Control(ControlStep {
+                            write:
+                                ControlWrite::Load {
+                                    expect: WriteExpect::Ok,
+                                    ..
+                                },
+                            ..
+                        }) => true,
+                        Step::Control(ControlStep {
+                            write: ControlWrite::Merge { expect, .. },
+                            ..
+                        }) => !matches!(expect, MergeExpect::Write(WriteExpect::Error { .. })),
+                        Step::Mutate(MutateStep {
+                            expect: MutateExpect::Ok | MutateExpect::Affected { .. },
+                            ..
+                        }) => true,
+                        _ => false,
+                    };
+                    if matches!(completed.read_expect(), Some(QueryExpect::Rows { .. })) {
+                        substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+                        awaiting_shape = Some(completed);
+                    } else {
+                        push_step(&mut items, &mut open_loop, completed);
+                    }
                 }
-                let mode = parse_expect_header(rest)?;
-                let loop_var = open_loop.as_ref().map(|(v, _, _)| v.as_str());
-                let completed = match pending.take() {
-                    Some(Pending::Load {
-                        ordinal,
-                        branch,
-                        mode: load_mode,
-                        generated,
-                    }) => Step::Load(LoadStep {
-                        ordinal,
-                        branch,
-                        mode: load_mode,
-                        generated,
-                        expect: complete_write_expect("load", &mode, section)?,
-                    }),
-                    Some(Pending::Decl(step)) => {
-                        complete_decl_step(step, &mode, section, loop_var)?
-                    }
-                    Some(Pending::List { ordinal }) => {
-                        Step::List(complete_list_step(ordinal, &mode, section, loop_var)?)
-                    }
-                    Some(Pending::Control {
-                        ordinal,
-                        prefix,
-                        write,
-                    }) => Step::Control(complete_control_step(
-                        ordinal, prefix, write, &mode, section,
-                    )?),
-                    Some(Pending::Settings {
-                        ordinal,
-                        statements,
-                    }) => {
-                        Step::Settings(complete_settings_step(ordinal, statements, &mode, section)?)
-                    }
-                    Some(Pending::Show {
-                        ordinal,
-                        id,
-                        prefix,
-                    }) => Step::Show(complete_show_step(
-                        ordinal, id, prefix, &mode, section, loop_var,
-                    )?),
-                    Some(Pending::Concurrent(_)) => {
-                        unreachable!("a pending concurrent block is completed above")
-                    }
-                    Some(Pending::BranchRead {
-                        ordinal,
-                        read,
-                        source,
-                    }) => Step::BranchRead(complete_branch_read_step(
-                        ordinal,
-                        read,
-                        source,
-                        &mode,
-                        section,
-                        loop_var,
-                        &bound_names,
-                    )?),
-                    None => {
-                        return Err(format!(
-                            "line {}: `--- expect` has no query or mutate step to bind to",
+                "bind" => {
+                    if pending.is_some() {
+                        return Err((format!(
+                            "line {}: the previous step is missing its `--- expect`",
                             section.header_line + 1
-                        ));
+                        ))
+                        .into());
                     }
-                };
-                awaiting_load_plan = match &completed {
-                    Step::Control(ControlStep {
-                        write:
-                            ControlWrite::Load {
-                                expect: WriteExpect::Ok,
-                                ..
-                            },
-                        ..
-                    }) => true,
-                    Step::Control(ControlStep {
-                        write: ControlWrite::Merge { expect, .. },
-                        ..
-                    }) => !matches!(expect, MergeExpect::Write(WriteExpect::Error { .. })),
-                    Step::Mutate(MutateStep {
-                        expect: MutateExpect::Ok | MutateExpect::Affected { .. },
-                        ..
-                    }) => true,
-                    _ => false,
-                };
-                if matches!(completed.read_expect(), Some(QueryExpect::Rows { .. })) {
-                    substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
-                    awaiting_shape = Some(completed);
-                } else {
-                    push_step(&mut items, &mut open_loop, completed);
-                }
-            }
-            "bind" => {
-                if pending.is_some() {
-                    return Err(format!(
-                        "line {}: the previous step is missing its `--- expect`",
-                        section.header_line + 1
-                    ));
-                }
-                refuse_nonempty_body(&section.body, "`--- bind`")?;
-                if open_loop.is_some() {
-                    return Err(
+                    refuse_nonempty_body(&section.body, "`--- bind`")?;
+                    if open_loop.is_some() {
+                        return Err(
                         "invalid_case: `--- bind` inside a loop is refused; a binding is one id for the case"
-                            .into(),
+                            .into()
                     );
+                    }
+                    let name = parse_bind_header(rest)?;
+                    if bound_names.contains(&name) {
+                        return Err((format!(
+                            "`--- bind commit ${name}` is declared twice; one binding per name"
+                        ))
+                        .into());
+                    }
+                    let Some(Item::Step(step)) = items.last_mut() else {
+                        return Err("`--- bind commit` has no write step to follow".into());
+                    };
+                    bind_commit(step, &name)?;
+                    bound_names.insert(name);
                 }
-                let name = parse_bind_header(rest)?;
-                if bound_names.contains(&name) {
-                    return Err(format!(
-                        "`--- bind commit ${name}` is declared twice; one binding per name"
-                    ));
+                "restart" => {
+                    if !rest.is_empty() {
+                        return Err("`--- restart` takes no arguments".into());
+                    }
+                    if pending.is_some() {
+                        return Err((format!(
+                            "line {}: the previous step is missing its `--- expect`",
+                            section.header_line + 1
+                        ))
+                        .into());
+                    }
+                    refuse_nonempty_body(&section.body, "`--- restart`")?;
+                    ordinal += 1;
+                    push_step(&mut items, &mut open_loop, Step::Restart { ordinal });
                 }
-                let Some(Item::Step(step)) = items.last_mut() else {
-                    return Err("`--- bind commit` has no write step to follow".into());
-                };
-                bind_commit(step, &name)?;
-                bound_names.insert(name);
+                "loop" | "foreach" => {
+                    if pending.is_some() {
+                        return Err((format!(
+                            "line {}: the previous step is missing its `--- expect`",
+                            section.header_line + 1
+                        ))
+                        .into());
+                    }
+                    if open_loop.is_some() {
+                        return Err("loops may not nest".into());
+                    }
+                    refuse_nonempty_body(&section.body, "a loop header")?;
+                    let (var, values) = if kind == "loop" {
+                        parse_loop_header(rest)?
+                    } else {
+                        parse_foreach_header(rest)?
+                    };
+                    open_loop = Some((var, values, Vec::new()));
+                }
+                "endloop" => {
+                    if !rest.is_empty() {
+                        return Err("`--- endloop` takes no arguments".into());
+                    }
+                    if pending.is_some() {
+                        return Err((format!(
+                            "line {}: the previous step is missing its `--- expect`",
+                            section.header_line + 1
+                        ))
+                        .into());
+                    }
+                    refuse_nonempty_body(&section.body, "`--- endloop`")?;
+                    let Some((var, values, steps)) = open_loop.take() else {
+                        return Err("`--- endloop` without an open loop".into());
+                    };
+                    if steps.is_empty() && !refused_in_loop {
+                        return Err("a loop enclosing no steps is refused".into());
+                    }
+                    refused_in_loop = false;
+                    items.push(Item::Loop { var, values, steps });
+                }
+                _ => {
+                    return Err(CaseError::new(
+                        CaseErrorCode::UnknownSection,
+                        format!("unknown section `--- {}`", section.name),
+                    )
+                    .fix(suggestion(kind, "sections", &SECTION_KINDS)));
+                }
             }
-            "restart" => {
-                if !rest.is_empty() {
-                    return Err("`--- restart` takes no arguments".into());
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            errors.push(error.located(section.header_line + 1, &lines));
+            substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
+            pending = None;
+            awaiting_shape = None;
+            awaiting_plan = None;
+            awaiting_same_as_v1 = None;
+            awaiting_load_plan = false;
+            awaiting_seam_step = false;
+            skip_continuations = true;
+            refused_in_loop |= open_loop.is_some() && !placeholder_loop;
+            if matches!(kind, "loop" | "foreach") {
+                skip_endloop = true;
+                if open_loop.is_none() {
+                    open_loop = Some((placeholder_loop_var(rest), Vec::new(), Vec::new()));
+                    placeholder_loop = true;
                 }
-                if pending.is_some() {
-                    return Err(format!(
-                        "line {}: the previous step is missing its `--- expect`",
-                        section.header_line + 1
-                    ));
-                }
-                refuse_nonempty_body(&section.body, "`--- restart`")?;
-                ordinal += 1;
-                push_step(&mut items, &mut open_loop, Step::Restart { ordinal });
             }
-            "loop" | "foreach" => {
-                if pending.is_some() {
-                    return Err(format!(
-                        "line {}: the previous step is missing its `--- expect`",
-                        section.header_line + 1
-                    ));
-                }
-                if open_loop.is_some() {
-                    return Err("loops may not nest".into());
-                }
-                refuse_nonempty_body(&section.body, "a loop header")?;
-                let (var, values) = if kind == "loop" {
-                    parse_loop_header(rest)?
-                } else {
-                    parse_foreach_header(rest)?
-                };
-                open_loop = Some((var, values, Vec::new()));
-            }
-            "endloop" => {
-                if !rest.is_empty() {
-                    return Err("`--- endloop` takes no arguments".into());
-                }
-                if pending.is_some() {
-                    return Err(format!(
-                        "line {}: the previous step is missing its `--- expect`",
-                        section.header_line + 1
-                    ));
-                }
-                refuse_nonempty_body(&section.body, "`--- endloop`")?;
-                let Some((var, values, steps)) = open_loop.take() else {
-                    return Err("`--- endloop` without an open loop".into());
-                };
-                if steps.is_empty() {
-                    return Err("a loop enclosing no steps is refused".into());
-                }
-                items.push(Item::Loop { var, values, steps });
-            }
-            _ => return Err(format!("unknown section `--- {}`", section.name)),
         }
     }
+    let last_line = lines.len().max(1);
     if awaiting_seam_step {
-        return Err("invalid_case: seam has no following operation".into());
+        errors.push(CaseError::from("seam has no following operation").located(last_line, &lines));
     }
     if pending.is_some() {
-        return Err("the final step is missing its `--- expect`".into());
+        errors.push(
+            CaseError::new(
+                CaseErrorCode::MissingExpect,
+                "the final step is missing its `--- expect`",
+            )
+            .fix("write `--- expect <mode>` after the last step")
+            .located(last_line, &lines),
+        );
     }
-    settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
+    if let Err(error) = settle_shape(&mut items, &mut open_loop, awaiting_shape.take()) {
+        errors.push(CaseError::from(error).located(last_line, &lines));
+    }
     if let Some(step) = awaiting_plan.take().or_else(|| awaiting_same_as_v1.take()) {
         push_step(&mut items, &mut open_loop, step);
     }
     if open_loop.is_some() {
-        return Err("a loop is not closed with `--- endloop`".into());
+        errors.push(
+            CaseError::from("a loop is not closed with `--- endloop`")
+                .fix("write `--- endloop` after the loop's last step")
+                .located(last_line, &lines),
+        );
     }
     for (idx, line) in lines.iter().enumerate() {
         if line.contains("${") && !substitutable_lines.contains(&idx) {
-            return Err(format!(
-                "line {}: `${{` may appear only inside a params or expect body",
-                idx + 1
-            ));
+            errors.push(
+                CaseError::from("`${` may appear only inside a params or expect body")
+                    .located(idx + 1, &lines),
+            );
         }
+    }
+    errors.sort_by_key(|error| error.line.unwrap_or(usize::MAX));
+    let (Some(runner), Some(header)) = (runner, header) else {
+        return Err(CaseErrors::new(errors));
+    };
+    if !errors.is_empty() {
+        return Err(CaseErrors::new(errors));
     }
     let case = Case {
         input_text: text.into(),

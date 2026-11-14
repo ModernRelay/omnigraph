@@ -868,7 +868,19 @@ cargo run --bin omnigraph-gqt -- --replay ../../target/gqt-artifacts/invocation-
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --measure
 cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --trace
 cargo run --bin omnigraph-gqt -- --store file:///path/to/graph /path/to/queries.gqt
+cargo run --bin omnigraph-gqt -- --check cases/dst_restart_preserves_rows.gqt
+cargo run --bin omnigraph-gqt -- --check --json cases/
 ```
+
+`--check <case.gqt|dir>...` parses every case named and runs nothing: it
+prints every format error the case carries, one `path:line: code: message`
+line per error with the source line quoted under it and the fix under that,
+`ok <path>` for a clean case, and exits 1 when any file has an error. Beside
+the parser's rules it applies the corpus admission the runner would refuse on
+(`timeout_ms` above 10000 under `cases/`). `--json` prints one JSON object per
+file, `{"path", "errors": [{"code", "line", "source", "message", "fix"}]}`,
+for tools. The refusal of a run (`refused: …`) carries the same text, one
+`invalid_case:` line per error.
 
 `--store` may precede or follow the case paths. External-store reports retain
 the URI and step evidence, but cannot replay: the report does not freeze the
