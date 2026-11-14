@@ -297,7 +297,6 @@ that calls itself.
 | `distance` as an `rrf` arm | B | none |
 | A `union` arm returning a value or an edge, or reading a name of the enclosing scope | B | none |
 | A node an `optional` introduces, returned whole | B | return its properties |
-| An order key no return item computes | B | return the key under an alias; the edit inserts it |
 | A ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit` | B | none |
 | A block compared with another block's value, a block of several aggregates | B | none |
 | Two `rrf` arm windows that differ | B | none |
@@ -305,16 +304,15 @@ that calls itself.
 | A read that calls itself (`Fix`) | Rec | none |
 
 ```text
-query q() { match { $p: Person } return { $p.handle } order { $p.age > 30 } }
+query q($v: Vector(3), $s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(distance($all, $d.embedding, $v), bm25($all, $d.body, $s)) as $score } return { $d.title } }
 ```
 
 ```text
-error[T86]: type error: T86: `q`: this release's planner does not lower an order key computed from columns no return item computes; stage B (the break) adds it
-  --> line 1, column 63
-  fix: return the key under an alias, which the sort reads: `$p.age > 30 as key`
+error[T86]: type error: T86: `q`: this release's planner does not lower an `rrf` arm over `distance`; stage B (the break) adds it
+  --> line 1, column 94
 ```
 
-Its suggestion inserts `$p.age > 30 as key, ` before the first return item.
+It prints no suggestion: no form this release runs has the same rows.
 `P006` is no longer a refusal: see [Planner codes](#planner-codes).
 
 ## Planner codes

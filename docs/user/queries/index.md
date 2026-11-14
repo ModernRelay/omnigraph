@@ -233,8 +233,8 @@ ties ascending; no identity tiebreak is added.
 For ordinary returns, explicit order is total: entity ids break ties only when
 they can change the visible order, and no id is read when every projection is a
 key. Ascending puts nulls first, descending last. On ungrouped, non-DISTINCT
-rows an order key need not be projected: `order { $p.age desc }` sorts by a
-property the return leaves out. Over grouped rows, an aggregated or DISTINCT
+rows an order key need not be projected: `order { $p.age > 30 }` sorts by a
+value the return leaves out. Over grouped rows, an aggregated or DISTINCT
 return, an order key must be a return item or its alias (`T42`), like
 `count($d)` after `return { count($d) as deals }`.
 

@@ -1284,16 +1284,6 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
 }"#,
         r#"query q() { match { $p: Person } return { $p.name } }"#,
     ),
-    (
-        r#"an order key no return item computes"#,
-        "T86",
-        r#"query q() {
-  match { $p: Person }
-  return { $p.handle }
-  order { $p.age > 30 desc }
-}"#,
-        r#"query q() { match { $p: Person } return { $p.age > 30 as key, $p.handle } order { $p.age > 30 desc } }"#,
-    ),
     // The two queries of `diagnostics/t81_pattern_components_share_no_variable.gqt`.
     (
         r#"two components one edge type joins"#,

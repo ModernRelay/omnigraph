@@ -1115,23 +1115,20 @@ impl<'a> Shaper<'a> {
                     | IRExpr::Call { .. }
                     | IRExpr::IsNull { .. }
             );
-            let expr = if computed {
-                let Some(item) = return_exprs.iter().find(|p| p.expr == expr) else {
-                    return Err(ShapeError::unlowered(
-                        Unlowered::new(
-                            self.name,
-                            "an order key computed from columns no return item computes",
-                            at,
-                        )
-                        .repair(Repair::ReturnTheOrderKey),
-                    ));
-                };
-                IRExpr::AliasRef(
+            // Over a read's rows a computed key no return item computes is
+            // evaluated beside the return items and sorted on; over groups
+            // the type checker binds every key to a return item.
+            let expr = match return_exprs.iter().find(|p| p.expr == expr) {
+                Some(item) if computed => IRExpr::AliasRef(
                     item.alias.clone().unwrap_or_else(|| item.column.clone()),
                     item.ty.clone(),
-                )
-            } else {
-                expr
+                ),
+                None if computed && grouped => {
+                    return Err(ShapeError::Internal(
+                        "an order key over groups that no return item computes, which the type checker refuses (T42)".to_string(),
+                    ));
+                }
+                _ => expr,
             };
             order_by.push(IROrdering {
                 expr,

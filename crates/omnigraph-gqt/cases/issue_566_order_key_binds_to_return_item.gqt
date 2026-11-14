@@ -5,7 +5,8 @@
 # notes: `count($d) as deals` column; an unaliased aggregate written the same way
 # notes: in return matches as a tree and sorts by its own column; a key that
 # notes: matches no return item is T42 with the key quoted as written. A Boolean
-# notes: key binds the same way to its aliased return item. Group rows have no
+# notes: key binds the same way to its aliased return item; one no return item
+# notes: computes is evaluated beside the return items. Group rows have no
 # notes: tie-break, so the sort direction is shown through `limit 1`.
 
 --- runner
@@ -140,4 +141,25 @@ query boolean_key_unbound() {
     order { $p.age > 30 }
 }
 
---- expect error: T86: `boolean_key_unbound`: this release's planner does not lower an order key computed from columns
+--- expect ordered
+{"p.slug": "carol"}
+{"p.slug": "bob"}
+{"p.slug": "alice"}
+
+--- expect shape
+p.slug: String
+
+--- query
+query computed_key_under_a_limit() {
+    match { $p: Person }
+    return { $p.slug }
+    order { $p.age > 30 desc, $p.slug }
+    limit 2
+}
+
+--- expect ordered
+{"p.slug": "alice"}
+{"p.slug": "bob"}
+
+--- expect shape
+p.slug: String

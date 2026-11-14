@@ -46,7 +46,6 @@ const B_IN_PROGRESS: &[&str] = &[
     "two rrf arm windows that differ",
     "an rrf of three arms",
     "a block compared with another block's value",
-    "an order key no return item computes",
     "a write group selecting over a table an earlier group changes",
 ];
 
@@ -289,11 +288,11 @@ const CLOSURE: &[Row] = &[
     Row {
         surface: "Expressions",
         texts: &[
-            // "an order key no return item computes"
             (
                 "query q() { match { $p: Person } return { $p.handle } order { $p.age > 30 } }",
-                Refused("B"),
+                Lowers,
             ),
+
             (
             "query q() { match { $p: Person } where $p.age + 1 > 30 and ($p.city is null or $p.city in [\"Berlin\"]) return { $p.name, -$p.age as neg, coalesce($p.city, \"none\") as city, if($p.age > 30, \"old\", \"young\") as band, concat($p.name, \"!\") as shout } }",
             Lowers,
@@ -393,19 +392,10 @@ fn every_row_marked_works_lowers_and_every_other_construct_names_its_stage() {
     assert_eq!(pending.len(), B_IN_PROGRESS.len(), "{pending:#?}");
 }
 
-/// `T86` points at the construct it refuses and prints the rewrite this
-/// release lowers where one exists.
+/// `T86` points at the construct it refuses.
 #[test]
-fn t86_is_at_the_construct_with_its_repair() {
-    use crate::query::syntax::parse::apply_edits;
+fn t86_is_at_the_construct() {
     let refused = |text: &str| outcome(text).expect_err("refused");
-    // An order key no return item computes: the edit returns it.
-    let text = "query q() { match { $p: Person } return { $p.handle } order { $p.age > 30 } }";
-    let d = refused(text);
-    assert_eq!(d.position.map(|p| p.column), Some(63), "{d}");
-    let suggestion = d.suggestion.expect("an edit");
-    let repaired = apply_edits(text, &suggestion.edits);
-    outcome(&repaired).unwrap_or_else(|e| panic!("{repaired}: {e}"));
     // A block compared with another block's value is refused at the
     // comparison.
     let d = refused(

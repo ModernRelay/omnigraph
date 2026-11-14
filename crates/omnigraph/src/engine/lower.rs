@@ -1357,6 +1357,23 @@ impl Lower for Walk<'_, '_> {
                     format!("{HIDDEN}{name}"),
                 ));
             }
+            // A computed key no return item computes is evaluated here, beside
+            // the return items, under its text.
+            let mut computed: Vec<String> = Vec::new();
+            for key in keys {
+                if computed_key(&key.expr) {
+                    let name = format!("{HIDDEN}{}", key.expr);
+                    if computed.contains(&name) {
+                        continue;
+                    }
+                    let projected = Projected::Expression(key.expr.clone(), key.expr.ty().clone());
+                    exprs.push((
+                        self.lowering.projection(projected, &self.scope),
+                        name.clone(),
+                    ));
+                    computed.push(name);
+                }
+            }
         }
         let projection = ProjectionExec::try_new(exprs, input).map_err(OmniError::datafusion)?;
         self.built(id, projection)
@@ -1497,6 +1514,14 @@ impl Lower for Walk<'_, '_> {
                         "the planned sort alias '{alias}' is not in the sort input"
                     ))
                 })?,
+                expr if computed_key(expr) => {
+                    let name = expr.to_string();
+                    carried(&name).ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "the planned computed sort key '{name}' is not in the sort input"
+                        ))
+                    })?
+                }
                 IRExpr::Nearest { .. }
                 | IRExpr::Search { .. }
                 | IRExpr::Fuzzy { .. }
@@ -1746,6 +1771,7 @@ fn hidden_columns(
                 }
             }
             IRExpr::AliasRef(_, _) => {}
+            expr if computed_key(expr) => {}
             IRExpr::Nearest { .. }
             | IRExpr::Search { .. }
             | IRExpr::Fuzzy { .. }
@@ -1794,6 +1820,20 @@ fn tiebreak_column(key: &ColumnRef, id_column: &str) -> Result<String> {
         }
     };
     Ok(format!("{}.{}", key.binding, property))
+}
+
+/// A sort key the projection below computes beside the return items: an
+/// expression over the read's columns, not a column or an alias.
+fn computed_key(expr: &IRExpr) -> bool {
+    matches!(
+        expr,
+        IRExpr::Binary { .. }
+            | IRExpr::Not(_, _)
+            | IRExpr::Cast { .. }
+            | IRExpr::Neg { .. }
+            | IRExpr::Call { .. }
+            | IRExpr::IsNull { .. }
+    )
 }
 
 /// A column name `schema` does not hold, from `base`.
