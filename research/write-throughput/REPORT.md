@@ -35,7 +35,7 @@ write path around it* (§7):
    exact ids this process wrote into those immutable data files, instead of
    reading every unindexed fragment (a cost that grew with every write).
 
-**Result** (optimized builds, closed-loop, medians of 3 interleaved runs; §6):
+**Result** (optimized builds, closed-loop, medians of 3 interleaved runs for one branch and 2 for separate branches; §5.9):
 
 | | writers | baseline writes/s | **best writes/s** | best graph commits/s | baseline p99 | **best p99** |
 |---|---:|---:|---:|---:|---:|---:|
@@ -333,7 +333,7 @@ lost its `BeforeEffect` evidence (`lifecycle.rs`). Writers probe again; the
 supported probe-free capture is the writer epoch's holder skip (#1350),
 measured in §6 as the `claim` variants.
 
-### 5.9 Known keys for the absence probe, and one per-branch writer state — kept
+### 5.8 Known keys for the absence probe, and one per-branch writer state — kept
 
 *Observation.* After group commit, every variant locally topped out near 70
 writes/s with ~2 writes per publication: the writers' preparation, not the
@@ -369,23 +369,7 @@ one named-branch writer); this also removed the two `warm_read_cost` deltas
 | S3 +30 ms | 16 | 38.95 → 44.85 | 578 → 372 | 11.0 → 3.8 | 7.1 → 7.9 |
 | S3 +30 ms | 64 | 68.60 → 152.74 | 2,012 → 485 | 7.7 → 3.2 | 16.0 → 32.2 |
 
-### 5.11 Scaling past 64 writers (group12, one branch, 1 run each)
-
-| writers | S3 writes/s | S3 commits/s | S3 p99 | local writes/s | local p99 |
-|---:|---:|---:|---:|---:|---:|
-| 64 | 153.5 | 4.75 | 504 ms | 247.5 | 534 ms |
-| 128 | 208.1 (claim 211.2) | 3.25 | 2,100 ms (claim 798) | 246.6 (claim 275.9) | 1,738 ms (claim 814) |
-| 256 | 244.5 (claim 230.4) | 2.05 | 2,070 ms (claim 1,542) | 260.7 (claim 281.1) | 1,698 ms (claim 1,465) |
-
-Throughput keeps rising with writers on S3 but flattens near 250 writes/s on
-both backends: batches grow to ~120 writes while publications fall to ~2/s,
-because a batch's own work grows with its size (one fragment per write to
-compose and list in the table manifest, plus the client CPU of 256 writers'
-preparation). The next levers there are fewer, larger fragments per batch
-(the leader writing one data file per table), pipelining (§5.5), and Lance's
-fragment tree.
-
-### 5.10 Final configuration (group12, every switch at its default)
+### 5.9 Final configuration (group12, every switch at its default)
 
 Same binary, `OMNIGRAPH_GROUP_COMMIT` off vs on, beside the original
 baseline (medians of 3; separate branches of 2):
@@ -405,7 +389,23 @@ locally the known-keys probe and the missing LIST alone give 2.2× on one
 branch. Batching is what moves the object-store numbers; the named-branch warm
 state (which only the group path uses) is what doubles separate branches.
 
-### 5.8 Ruled out by analysis
+### 5.10 Scaling past 64 writers (group12, one branch, 1 run each)
+
+| writers | S3 writes/s | S3 commits/s | S3 p99 | local writes/s | local p99 |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 153.5 | 4.75 | 504 ms | 247.5 | 534 ms |
+| 128 | 208.1 (claim 211.2) | 3.25 | 2,100 ms (claim 798) | 246.6 (claim 275.9) | 1,738 ms (claim 814) |
+| 256 | 244.5 (claim 230.4) | 2.05 | 2,070 ms (claim 1,542) | 260.7 (claim 281.1) | 1,698 ms (claim 1,465) |
+
+Throughput keeps rising with writers on S3 but flattens near 250 writes/s on
+both backends: batches grow to ~120 writes while publications fall to ~2/s,
+because a batch's own work grows with its size (one fragment per write to
+compose and list in the table manifest, plus the client CPU of 256 writers'
+preparation). The next levers there are fewer, larger fragments per batch
+(the leader writing one data file per table), pipelining (§5.5), and Lance's
+fragment tree.
+
+### 5.11 Ruled out by analysis
 
 - **Dropping the `.txn` PUTs.** Lance 13 inlines the transaction in the
   manifest and has `disable_transaction_file`, but only as
@@ -426,9 +426,11 @@ state (which only the group path uses) is what doubles separate branches.
   at 2 of 5 round trips per publication.
 
 
-## 6. Final comparison (optimized builds, interleaved repetitions)
+## 6. Matrix of the batching variants (group10, before known keys)
 
-Optimized binaries (every crate at `opt-level=2`): `baseline-opt` is
+This matrix compares the batching variants as they stood before the
+known-keys probe (§5.8); the final configuration's numbers are in the Summary
+and §5.9. Optimized binaries (every crate at `opt-level=2`): `baseline-opt` is
 `origin/main` `ed09ee63` plus the instrument; `group10-opt` is this branch at
 `e6c809c5`. Variants: `opt-baseline`; `opt-baseline-claim` (writer epoch of
 `main` claimed: the existing holder skip of #1350); `opt-group`
@@ -471,7 +473,7 @@ The single named-branch writer shows no gain in this matrix: the group
 published through its own coordinator while writers captured through the
 handle's one-entry branch cache, which was therefore always one commit stale
 and refreshed on every capture. Fixed afterwards by installing the group's
-published coordinator into that cache (§5.9), which also removed the two
+published coordinator into that cache (§5.8), which also removed the two
 `warm_read_cost` deltas.
 
 ### Reading the numbers
@@ -483,7 +485,7 @@ published coordinator into that cache (§5.9), which also removed the two
   faster from the round-trip trims.
 - **Same branch, local:** 3.2× at 16 and 64 writers, but every group variant
   tops out near 70 writes/s with only ~2 writes per publication: the limit is
-  the writers' own preparation, not the publication (§5.9).
+  the writers' own preparation, not the publication (§5.8).
 - **Writer epoch claim:** worth +10 % at 16 writers on S3 (fewer probes), no
   throughput change at 64; it raises writes per publication (fewer, bigger
   batches).
@@ -539,10 +541,12 @@ one gated critical section per write becomes one per batch. Concretely:
    the publication; on a named branch the group keeps its coordinator and the
    publisher its acknowledged image.
 
-What the numbers say it buys (§6): on one branch, throughput scales with the
-number of concurrent writers instead of staying flat, latency stops growing
-with N, and starvation disappears; a single writer is ~45 % faster on S3 from
-the round-trip trims alone; a named-branch writer is ~2.3× faster.
+What the numbers say it buys (Summary, §5.9, §5.10): on one branch,
+throughput scales with the number of concurrent writers instead of staying
+flat (20× at 16 and 65× at 64 writers on S3; 10–11× locally), p99 falls 20×
+and 45× on S3, and starvation disappears; a single writer is 1.4× faster on S3
+and 2.2× locally; separate branches go 2.1–2.2× faster on S3 (a single
+named-branch writer 2.1×: 1.55 → 3.30 writes/s).
 
 Pipelining (5.5) is kept behind its switch as the next step for publisher
 saturation, pending the collector-witness change it needs.
