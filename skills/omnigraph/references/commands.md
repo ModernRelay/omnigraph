@@ -46,7 +46,6 @@ prints the exact flags of the installed binary.
 | `upgrade` | — | Convert a standalone graph's storage offline |
 | `optimize` | — | Compact data and reconcile declared indexes on `main` |
 | `index` | `build` `rebuild` | Build a branch's missing or lagging indexes; replace its full-text indexes |
-| `repair` | — | Report foreign Lance history without adopting it |
 | `cleanup` | — | Delete table versions no retained graph commit pins (destructive) |
 | `lint` | — | Validate `.gq` source against a schema or a graph |
 | `queries` | `validate` `list` | Check a cluster's stored queries; list a cluster's or a served graph's |
@@ -503,7 +502,7 @@ identities use different targets. There is no `--auth` selector or last-used ide
 
 Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
-`optimize`/`index build`/`index rebuild`/`cleanup`/`repair --graph`, with region
+`optimize`/`index build`/`index rebuild`/`cleanup --graph`, with region
 and endpoint captured from the environment
 ([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
 Each direct writer keeps its admission lock; `cluster force-unlock` it before

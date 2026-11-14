@@ -11,6 +11,7 @@ struct Selection {
     target: Option<String>,
     storage: Option<String>,
     store: Option<String>,
+    base: Option<String>,
     server: Option<ServerTarget>,
     seed: Option<u64>,
     measure: Option<MeasureOptions>,
@@ -23,7 +24,7 @@ enum Invocation {
     Case(Box<Selection>),
 }
 
-const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--store <URI> | --server <URL> --graph <ID> [--token <TOKEN>]] [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--trace] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json>";
+const USAGE: &str = "usage: omnigraph-gqt <case.gqt|dir>... [--store <URI> [--base <URI>] | --server <URL> --graph <ID> [--token <TOKEN>]] [--target <target>] [--storage <storage>] [--seed <u64>] [--artifacts <dir>] [--trace] [--measure [--model <name>] [--baseline <path>] [--write-baseline]] | --replay <report.json>";
 
 fn parse(args: &[OsString]) -> Result<Invocation, String> {
     let mut args = args.iter().peekable();
@@ -44,6 +45,7 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         target: None,
         storage: None,
         store: None,
+        base: None,
         server: None,
         seed: None,
         measure: None,
@@ -68,6 +70,9 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
         match arg.to_str() {
             Some("--store") if selection.store.is_none() => {
                 selection.store = Some(value(&mut args, "--store requires a URI")?);
+            }
+            Some("--base") if selection.base.is_none() => {
+                selection.base = Some(value(&mut args, "--base requires a URI")?);
             }
             Some("--server") if server.is_none() => {
                 server = Some(value(&mut args, "--server requires a URL")?);
@@ -152,6 +157,11 @@ fn parse(args: &[OsString]) -> Result<Invocation, String> {
     }
     if write_baseline && baseline.is_none() {
         return Err("--write-baseline needs --baseline <path>, the file to write".into());
+    }
+    if selection.base.is_some() && selection.store.is_none() {
+        return Err(
+            "--base needs --store <URI>, the clone root opened over the base it names".into(),
+        );
     }
     match (server, graph) {
         (Some(url), Some(graph)) => {
@@ -259,6 +269,7 @@ fn run() -> Result<(), String> {
                     selection.measure.clone(),
                     selection.artifacts.clone(),
                     selection.store.as_deref(),
+                    selection.base.as_deref(),
                     selection.server.as_ref(),
                     selection.trace,
                 );

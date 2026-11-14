@@ -38,7 +38,6 @@ mod export;
 pub(crate) mod optimize;
 mod prepared_create;
 pub(crate) mod promotion;
-mod repair;
 mod resolution;
 pub(crate) mod schema_apply;
 pub(crate) mod system_column_upgrade;
@@ -59,11 +58,10 @@ pub use optimize::{
     ConfigurationClear, DatasetCleanupStats, DatasetOptimizeStats, DeferReason,
     OptimizeBeforePublish, OptimizeCancellation, OptimizeConcurrency, OptimizeLimits,
     OptimizePublication, OptimizeReport, OptimizeRequest, ResourceExceeded, ResourceMeasure,
-    RunCancellation, SkipReason, TableCeilings, TableOptimizeOutcome,
+    RunCancellation, TableCeilings, TableOptimizeOutcome,
 };
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
-pub use repair::{DatasetRepairStats, RepairAction, RepairClassification, RepairStats};
 pub use resolution::PublicationLookup;
 pub use schema_apply::{
     PreparedSchemaApply, PreparedSchemaSettlement, SchemaApplyReconciliation,
@@ -827,8 +825,8 @@ impl Omnigraph {
     /// (`docs/rfcs/2026-11-10-graph-shallow-clone.md`): the clone starts with
     /// every branch, version, commit and index of the base, every write lands
     /// under `root_uri`, and the base is never written. Both are local
-    /// directories in this phase, and `root_uri` is an empty directory or a
-    /// clone root a previous open built. A caller that wraps storage builds
+    /// directories or `s3://` prefixes of one endpoint, and `root_uri` is an
+    /// empty root or a clone root a previous open built. A caller that wraps storage builds
     /// it with [`crate::storage::storage_read_through`] and opens with
     /// [`Self::open_with_storage`], as the benchmark harness does to count
     /// store calls.
@@ -4035,14 +4033,6 @@ impl Omnigraph {
         request: optimize::OptimizeRequest,
     ) -> Result<optimize::OptimizeReport> {
         optimize::optimize_all_datasets(self, actor, request).await
-    }
-
-    /// Report, per table on `main`, how its Lance linear history stands
-    /// against its registration. See [`repair`] for the classifications. The
-    /// report publishes nothing and adopts no drift. Requires `maintain` on
-    /// `main`.
-    pub async fn repair_report_as(&self, actor: Option<&str>) -> Result<repair::RepairStats> {
-        repair::repair_report(self, actor).await
     }
 
     /// Remove Lance manifests (and the fragments they uniquely own) per the

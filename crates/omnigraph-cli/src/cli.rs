@@ -17,7 +17,7 @@ pub(crate) use crate::commands::history::{BranchCommand, ChangesCommand, CommitC
 use crate::commands::history::{DiffArgs, SnapshotArgs};
 pub(crate) use crate::commands::maintenance::IndexCommand;
 use crate::commands::maintenance::{
-    CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, RepairArgs, UpgradeArgs,
+    CleanupArgs, OptimizeArgs, RebuildFullTextIndexesArgs, UpgradeArgs,
 };
 use crate::commands::query::{AliasArgs, CatalogueArgs, MutateArgs, QueryArgs};
 pub(crate) use crate::commands::schema::SchemaCommand;
@@ -157,8 +157,6 @@ pub(crate) enum Command {
     /// Deprecated spelling of `index rebuild --kind full-text`
     #[command(hide = true)]
     RebuildFullTextIndexes(RebuildFullTextIndexesArgs),
-    /// Diagnose foreign Lance HEAD movement without adopting it.
-    Repair(RepairArgs),
     /// Remove old Lance versions from every backing dataset of the graph (destructive)
     Cleanup(CleanupArgs),
     /// Validate queries against a schema (offline) or repo (repo-backed).

@@ -73,6 +73,25 @@ such a run still does not replay, since the root is not frozen by the report.
 Direct-engine memory storage and cloud fixture initialization fail admission
 explicitly.
 
+`--base <URI>` beside `--store` opens the store root as a shallow clone of the
+graph at the base (`Omnigraph::open_clone`, the graph shallow clone RFC): the
+root starts empty, or as the clone an earlier run left there, every read of an
+object it does not hold falls through to the base, every write and every
+delete marker lands under the root, and the base is never written. Both are
+roots of one backend, `file://` directories or `s3://` prefixes of one
+endpoint. The root is the caller's to get right: a root that holds another
+graph, or a clone root built over another base, is not detected (the RFC,
+What a caller observes) and answers from what it holds. It is admitted on the
+direct engine only: `--base` without `--store`,
+beside `--server`, or with a DST environment selected is refused. A
+`--- restart` reopens the root over the same base. The cases under
+`tests/fixtures/runner/clone/` are the RFC's first four observations run with
+both options over a base that holds a branch beside `main` (the first case,
+run with `--store` alone, gives it that branch): a clone reads the branch,
+deletes it, and after a restart still lacks it, while the base and a second
+clone keep it; `runner_dispatch` runs them over a local base and, with
+`OMNIGRAPH_S3_TEST_BUCKET`, against a bucket.
+
 With `--server <URL> --graph <ID>` (plus `--token <TOKEN>` on a
 token-protected deployment), the declared `omnigraph-server` environments run
 against that server and nothing else is selected: each step travels to the

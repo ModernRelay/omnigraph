@@ -1,0 +1,25 @@
+# issue: none
+# notes: The base of the clone cases, run with --store <base> and no --base before them: beside alice on main the base gets a branch feature holding dave, so the cases read a branch of the base, delete it in one clone, and find it kept in the base and in another clone.
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+  - target: omnigraph-engine
+    storage: s3-compatible
+
+--- mutate
+branch create feature
+--- expect ok
+
+--- mutate branch: feature
+query add() { insert Person { name: "dave" } }
+--- expect affected: nodes=1 edges=0
+
+--- query
+branch list
+--- expect unordered
+{"name":"feature"}
+{"name":"main"}
+--- expect shape
+name: String

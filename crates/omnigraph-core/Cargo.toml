@@ -10,8 +10,11 @@ repository = "https://github.com/ModernRelay/omnigraph"
 default = []
 failpoints = ["omnigraph-seams/decide"]
 dst = ["omnigraph-storage/dst", "omnigraph-seams/install"]
-# test helpers other crates' tests reach across the boundary (cfg(test) is crate-local)
-test-util = []
+# test helpers other crates' tests reach across the boundary (cfg(test) is crate-local).
+# `lance-io/test-util` rides on it so every graph that enables test-util (the workspace
+# gate through dev-dependencies, `-p omnigraph-gqt` through the engine's feature) resolves
+# one lance-io feature set, hence one Lance dependency world.
+test-util = ["lance-io/test-util"]
 
 [dependencies]
 globset = { workspace = true }

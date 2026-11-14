@@ -36,6 +36,8 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 datatest-stable = "0.3"
+# tests/runner_dispatch.rs lists an `s3://` base's objects through the storage crate's test helper.
+omnigraph-storage = { path = "../omnigraph-storage", version = "0.15.1", features = ["test-util"] }
 
 # One libtest test per `cases/**/*.gqt`; mechanism and flags: tests/gq_logic_tests.rs.
 [[test]]

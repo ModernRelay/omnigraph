@@ -125,7 +125,6 @@ omnigraph snapshot --target ./graph.omni --json
 omnigraph commit list --target ./graph.omni --json
 omnigraph schema show --target ./graph.omni
 omnigraph optimize --target ./graph.omni
-omnigraph repair --target ./graph.omni
 omnigraph cleanup --target ./graph.omni --keep 10 --older-than 7d
 omnigraph cleanup --target ./graph.omni --keep 10 --older-than 7d --confirm
 ```
@@ -133,7 +132,7 @@ omnigraph cleanup --target ./graph.omni --keep 10 --older-than 7d --confirm
 Maintenance uses direct storage. For a graph in a direct root, use
 `--target ./cluster-root --graph knowledge`. Recovery effects that require an
 explicit destination refuse a default-only selection. Read the
-[maintenance guide](../operations/maintenance.md) before repair or cleanup.
+[maintenance guide](../operations/maintenance.md) before cleanup.
 
 ## Use a server
 

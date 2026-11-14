@@ -322,8 +322,8 @@ What a converted 0.11.x root (stamp 8 or 9) does not carry over:
   is planned against the live contract, as 0.11.x did.
 - Lance table versions above a pin, left by an interrupted 0.11.x write, are
   not detected: the upgrade opens each table of main's head at its pinned
-  version only, for the column comparison. `omnigraph repair` reports them
-  as `foreign_drift` and `cleanup` lists them as foreign versions.
+  version only, for the column comparison. `cleanup` lists them under
+  `foreign_versions`.
 - 0.11.x `cleanup`, and 0.11.x `schema apply --allow-data-loss` (which ran
   the same version removal on the tables it changed), removed table versions
   and no `__manifest` version, so a retained pre-upgrade `__manifest` version

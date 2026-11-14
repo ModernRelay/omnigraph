@@ -1,0 +1,1 @@
+- `optimize` runs one table's compaction tasks at the same time. The run's rewrite concurrency bounds its compaction tasks, index folds and index builds together.

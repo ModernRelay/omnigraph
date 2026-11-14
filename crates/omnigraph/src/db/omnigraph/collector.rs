@@ -67,7 +67,7 @@ decide_seam! {
 }
 
 /// Requests the collector made while planning a cleanup.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CollectorCost {
     /// `__manifest` reads: one per live branch at HEAD plus one per retained
     /// version below HEAD.
