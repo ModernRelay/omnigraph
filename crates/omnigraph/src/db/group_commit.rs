@@ -57,6 +57,12 @@ pub(crate) fn enabled() -> bool {
     std::env::var("OMNIGRAPH_GROUP_COMMIT").is_ok_and(|value| value == "1")
 }
 
+/// Whether a publishing writer captures its bound branch with no probe
+/// (research switch, on by default with group commit).
+pub(crate) fn writer_capture_skip_enabled() -> bool {
+    std::env::var("OMNIGRAPH_GROUP_COMMIT_WRITER_CAPTURE_SKIP").map_or(true, |value| value != "0")
+}
+
 /// One write's staged effects, submitted for a batch.
 pub(crate) struct GroupEntry {
     pub(crate) txn: WriteTxn,
@@ -137,7 +143,27 @@ struct Group {
     queue: VecDeque<Waiting>,
     leading: bool,
     log: VecDeque<BatchEffect>,
+    /// Entries the last batch admitted: the cohort a closed loop of writers
+    /// sends back once its answers arrive.
+    last_batch: usize,
+    /// Pipelining: the batch whose publication is in flight, which the next
+    /// batch may compose on.
+    in_flight: Option<std::sync::Arc<InFlight>>,
 }
+
+/// A batch whose publication is in flight: the head it builds on, the keys it
+/// inserts, the pins it will publish, and its outcome once known (`Some(head)`
+/// published, `None` not).
+struct InFlight {
+    parent: Option<String>,
+    tables: HashMap<String, KeySet>,
+    pins: HashMap<String, crate::db::DatasetEntry>,
+    done: tokio::sync::watch::Receiver<Option<Option<String>>>,
+}
+
+/// The head a pipelined batch builds on before its predecessor's commit id
+/// exists: no capture can carry it.
+const PENDING_HEAD: &str = "\u{0}pending";
 
 /// Every group of one handle, keyed by branch and actor.
 #[derive(Default)]
@@ -165,6 +191,29 @@ fn follower_error(error: &OmniError, txn: &WriteTxn) -> OmniError {
     } else {
         OmniError::manifest_internal(format!("group commit failed: {error}"))
     }
+}
+
+/// What stage A of a pipelined batch hands stage B.
+struct StagedBatch {
+    admitted: Vec<Waiting>,
+    updates: Vec<crate::db::DatasetUpdate>,
+    detached: Vec<crate::storage_layer::SnapshotHandle>,
+    expected: ExpectedTableVersions,
+    keys: HashMap<String, KeySet>,
+    /// The pin of every composed table this batch was committed on.
+    assumed: HashMap<String, crate::db::DatasetEntry>,
+    /// The in-flight batch this one composed on.
+    predecessor: Option<std::sync::Arc<InFlight>>,
+    branch: Option<String>,
+    actor: Option<String>,
+    history_release_bytes: HistoryReleaseBytes,
+    /// The pins this batch will publish, for the batch after it.
+    new_pins: HashMap<String, crate::db::DatasetEntry>,
+}
+
+/// Research switch: pipelined batches (`OMNIGRAPH_GROUP_COMMIT_PIPELINE=1`).
+fn pipeline_enabled() -> bool {
+    std::env::var("OMNIGRAPH_GROUP_COMMIT_PIPELINE").is_ok_and(|value| value == "1")
 }
 
 /// The outcome a leader hands back: every entry's answer and how the effect
@@ -198,12 +247,12 @@ impl Omnigraph {
             }
         };
         if lead_now {
-            self.lead_group(&key).await;
+            self.lead(&key).await;
         }
         loop {
             match signals.recv().await {
                 Some(Signal::Done(result)) => return result,
-                Some(Signal::Lead) => self.lead_group(&key).await,
+                Some(Signal::Lead) => self.lead(&key).await,
                 None => {
                     return Err(OmniError::manifest_internal(
                         "a group commit leader went away without answering",
@@ -213,10 +262,292 @@ impl Omnigraph {
         }
     }
 
+    async fn lead(&self, key: &str) {
+        if pipeline_enabled() {
+            self.lead_pipelined(key).await;
+        } else {
+            self.lead_group(key).await;
+        }
+    }
+
+    /// Hand the composing lead to the first queued entry whose writer is
+    /// still waiting, or end it.
+    fn hand_lead(group: &mut Group) {
+        while let Some(next) = group.queue.front() {
+            if next.reply.send(Signal::Lead).is_ok() {
+                return;
+            }
+            group.queue.pop_front();
+        }
+        group.leading = false;
+    }
+
+    /// Pipelined lead (research): stage A, with no gate, captures the
+    /// handle's view, admits the queued entries and composes and commits
+    /// each table's inserts detached on the pins the in-flight batch will
+    /// publish (or the current ones); stage B waits for that batch, checks
+    /// that it published exactly the pins stage A assumed, takes the branch
+    /// gates and publishes. The composing lead passes to the next batch as
+    /// soon as this one enters stage B, so the next batch's detached commits
+    /// overlap this batch's publication. A predecessor that did not publish
+    /// refuses every entry of this batch before its publication: its
+    /// detached commits stay unreachable (invariant 5).
+    async fn lead_pipelined(&self, key: &str) {
+        let (batch, log, in_flight) = {
+            let mut groups = self.group_commits().groups.lock().unwrap();
+            let group = groups.get_mut(key).expect("a leading group exists");
+            let take = group.queue.len().min(MAX_BATCH_ENTRIES);
+            let batch: Vec<Waiting> = group.queue.drain(..take).collect();
+            (
+                batch,
+                group.log.iter().cloned().collect::<Vec<_>>(),
+                group.in_flight.clone(),
+            )
+        };
+        if batch.is_empty() {
+            let mut groups = self.group_commits().groups.lock().unwrap();
+            let group = groups.get_mut(key).expect("a leading group exists");
+            Self::hand_lead(group);
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mut replies = Vec::new();
+        let staged = self.stage_batch(batch, &log, in_flight, &mut replies).await;
+        let staged_at = started.elapsed();
+        let Some(staged) = staged else {
+            // Nothing admitted (or stage A failed): answer and pass the lead.
+            for (reply, result) in replies {
+                let _ = reply.send(Signal::Done(result));
+            }
+            let mut groups = self.group_commits().groups.lock().unwrap();
+            let group = groups.get_mut(key).expect("a leading group exists");
+            Self::hand_lead(group);
+            return;
+        };
+        let StagedBatch {
+            admitted,
+            updates,
+            detached,
+            expected,
+            keys,
+            assumed,
+            predecessor,
+            branch,
+            actor,
+            history_release_bytes,
+            new_pins,
+        } = staged;
+
+        // Stage B: the predecessor's outcome first.
+        let mut refusal: Option<OmniError> = None;
+        let mut expected_head: Option<Option<String>> = None;
+        if let Some(prev) = &predecessor {
+            let mut done = prev.done.clone();
+            let outcome = loop {
+                if let Some(outcome) = done.borrow().clone() {
+                    break outcome;
+                }
+                if done.changed().await.is_err() {
+                    break None;
+                }
+            };
+            match outcome {
+                Some(head) => expected_head = Some(Some(head)),
+                None => {
+                    refusal = Some(OmniError::manifest_read_set_changed(
+                        "group_predecessor_not_published".to_string(),
+                        prev.parent.clone(),
+                        None,
+                    ))
+                }
+            }
+        }
+        let gates = match refusal {
+            Some(_) => None,
+            None => match self
+                .write_queue()
+                .acquire_branch_write_gates(branch.as_deref())
+                .await
+            {
+                Ok(gates) => Some(gates),
+                Err(error) => {
+                    refusal = Some(error);
+                    None
+                }
+            },
+        };
+        let current = match refusal {
+            Some(_) => None,
+            None => match self.open_write_txn_probed(branch.as_deref(), false).await {
+                Ok(txn) => Some(txn),
+                Err(error) => {
+                    refusal = Some(error);
+                    None
+                }
+            },
+        };
+        // The published state must be exactly the one stage A composed on.
+        if refusal.is_none()
+            && let Some(current) = &current
+        {
+            let head_ok = expected_head
+                .as_ref()
+                .is_none_or(|head| &current.authority.graph_head == head);
+            let pins_ok = assumed.iter().all(|(table, pin)| {
+                current.base.dataset(table).is_some_and(|entry| {
+                    entry.identity == pin.identity
+                        && entry.published_dataset_version == pin.published_dataset_version
+                        && entry.version_metadata.staged_version()
+                            == pin.version_metadata.staged_version()
+                })
+            }) && expected.values().all(|expectation| {
+                current
+                    .base
+                    .dataset(&expectation.table_key)
+                    .is_some_and(|entry| {
+                        entry.published_dataset_version == expectation.table_version
+                    })
+            });
+            if !head_ok || !pins_ok {
+                refusal = Some(OmniError::manifest_read_set_changed(
+                    "group_pipeline_base_moved".to_string(),
+                    None,
+                    current.authority.graph_head.clone(),
+                ));
+            }
+        }
+        if let Some(error) = refusal {
+            if debug_enabled() {
+                eprintln!("[group] pipelined batch of {} refused: {error}", admitted.len());
+            }
+            drop(gates);
+            for waiting in admitted {
+                let error = follower_error(&error, &waiting.entry.txn);
+                replies.push((waiting.reply, Err(error)));
+            }
+            for (reply, result) in replies {
+                let _ = reply.send(Signal::Done(result));
+            }
+            let mut groups = self.group_commits().groups.lock().unwrap();
+            let group = groups.get_mut(key).expect("a leading group exists");
+            group.log.clear();
+            Self::hand_lead(group);
+            return;
+        }
+        let current = current.expect("captured above");
+        let head = current.authority.graph_head.clone();
+        // Become the in-flight batch and pass the composing lead on.
+        let (done_tx, done_rx) = tokio::sync::watch::channel(None);
+        let mine = std::sync::Arc::new(InFlight {
+            parent: head.clone(),
+            tables: keys.clone(),
+            pins: new_pins,
+            done: done_rx,
+        });
+        {
+            let mut groups = self.group_commits().groups.lock().unwrap();
+            let group = groups.get_mut(key).expect("a leading group exists");
+            group.in_flight = Some(std::sync::Arc::clone(&mine));
+            Self::hand_lead(group);
+        }
+        let published = self
+            .publish_staged(
+                &current,
+                updates,
+                detached,
+                &expected,
+                actor.as_deref(),
+                history_release_bytes,
+            )
+            .await;
+        drop(gates);
+        let _ = done_tx.send(Some(
+            published
+                .as_ref()
+                .ok()
+                .map(|commit| commit.graph_commit_id.clone()),
+        ));
+        if timing_enabled() {
+            eprintln!(
+                "[group-timing] pipelined entries {} stage-a {:.1} total {:.1} ms (pipelined on predecessor {})",
+                admitted.len(),
+                staged_at.as_secs_f64() * 1000.0,
+                started.elapsed().as_secs_f64() * 1000.0,
+                predecessor.is_some(),
+            );
+        }
+        let admitted_count = admitted.len();
+        match &published {
+            Ok(commit) => {
+                for waiting in admitted {
+                    replies.push((waiting.reply, Ok(commit.clone())));
+                }
+            }
+            Err(error) => {
+                if debug_enabled() {
+                    eprintln!("[group] pipelined batch of {admitted_count} failed: {error}");
+                }
+                for waiting in admitted {
+                    let error = follower_error(error, &waiting.entry.txn);
+                    replies.push((waiting.reply, Err(error)));
+                }
+            }
+        }
+        {
+            let mut groups = self.group_commits().groups.lock().unwrap();
+            let group = groups.get_mut(key).expect("a leading group exists");
+            if group
+                .in_flight
+                .as_ref()
+                .is_some_and(|flight| std::sync::Arc::ptr_eq(flight, &mine))
+            {
+                group.in_flight = None;
+            }
+            match &published {
+                Ok(commit) => {
+                    group.log.push_back(BatchEffect {
+                        parent: head,
+                        head: commit.graph_commit_id.clone(),
+                        tables: keys,
+                    });
+                    while group.log.len() > EFFECT_LOG_BATCHES {
+                        group.log.pop_front();
+                    }
+                    group.last_batch = admitted_count;
+                }
+                Err(_) => group.log.clear(),
+            }
+        }
+        for (reply, result) in replies {
+            let _ = reply.send(Signal::Done(result));
+        }
+    }
+
     /// Lead one batch: everything queued now, the leader's own entry among
     /// it. Answers every entry, applies the log change, then hands the lead
     /// to the next queued entry or ends the group's lead.
     async fn lead_group(&self, key: &str) {
+        // Linger: when far fewer entries are queued than the last batch
+        // admitted, the rest of that cohort is still preparing its next
+        // write; wait a bounded moment so it joins this batch instead of
+        // the one after (a lone entry would otherwise publish alone and the
+        // cohort queue behind it). Never at low load: a last batch of one,
+        // or a queue at least half its size, leads at once.
+        let linger = linger_budget();
+        if !linger.is_zero() {
+            let deadline = std::time::Instant::now() + linger;
+            loop {
+                let (queued, cohort) = {
+                    let groups = self.group_commits().groups.lock().unwrap();
+                    let group = groups.get(key).expect("a leading group exists");
+                    (group.queue.len(), group.last_batch)
+                };
+                if cohort <= 1 || queued * 2 >= cohort || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
         let (batch, log) = {
             let mut groups = self.group_commits().groups.lock().unwrap();
             let group = groups.get_mut(key).expect("a leading group exists");
@@ -232,11 +563,17 @@ impl Omnigraph {
         } else {
             self.run_batch(batch, &log).await
         };
+        let admitted = outcome
+            .replies
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .count();
         for (reply, result) in outcome.replies {
             let _ = reply.send(Signal::Done(result));
         }
         let mut groups = self.group_commits().groups.lock().unwrap();
         let group = groups.get_mut(key).expect("a leading group exists");
+        group.last_batch = admitted;
         match outcome.log {
             LogChange::Keep => {}
             LogChange::Clear => group.log.clear(),
@@ -258,6 +595,291 @@ impl Omnigraph {
         group.leading = false;
     }
 
+    /// Stage A of a pipelined batch: capture the handle's view (with no probe
+    /// when it is this group's own last publication), admit the batch
+    /// against the effect log and the in-flight batch's pending effect, and
+    /// compose and commit each table's inserts detached on the pin the
+    /// in-flight batch will publish, or the current one. `None` when nothing
+    /// was admitted; every refused entry's answer goes to `replies`.
+    async fn stage_batch(
+        &self,
+        batch: Vec<Waiting>,
+        log: &[BatchEffect],
+        in_flight: Option<std::sync::Arc<InFlight>>,
+        replies: &mut Vec<(mpsc::UnboundedSender<Signal>, Result<GraphCommit>)>,
+    ) -> Option<StagedBatch> {
+        let branch = batch[0].entry.txn.branch.clone();
+        let mut log = log.to_vec();
+        let mut in_flight = in_flight;
+        let mut attempts = 0;
+        let (current, predecessor) = loop {
+            attempts += 1;
+            let (bound, installed) = self.installed_head();
+            let own_view = capture_skip_enabled()
+                && bound == branch
+                && installed.is_some()
+                && log.last().map(|effect| Some(&effect.head)) == Some(installed.as_ref());
+            let current = match self.open_write_txn_probed(branch.as_deref(), !own_view).await {
+                Ok(txn) => txn,
+                Err(error) => {
+                    for waiting in batch {
+                        let error = follower_error(&error, &waiting.entry.txn);
+                        replies.push((waiting.reply, Err(error)));
+                    }
+                    return None;
+                }
+            };
+            match in_flight.take() {
+                Some(flight) if flight.parent == current.authority.graph_head => {
+                    break (current, Some(flight));
+                }
+                Some(flight) if attempts < 3 => {
+                    // The in-flight batch published (or failed) between the
+                    // read of the group and this capture: wait for it, then
+                    // read the log it left and capture again.
+                    let mut done = flight.done.clone();
+                    while done.borrow().is_none() {
+                        if done.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = done;
+                    let key = group_key(branch.as_deref(), batch[0].entry.actor.as_deref());
+                    let groups = self.group_commits().groups.lock().unwrap();
+                    if let Some(group) = groups.get(&key) {
+                        log = group.log.iter().cloned().collect();
+                        in_flight = group.in_flight.clone();
+                    }
+                    continue;
+                }
+                _ => break (current, None),
+            }
+        };
+        let head = current.authority.graph_head.clone();
+        let log_reaches_head = log
+            .last()
+            .is_some_and(|effect| Some(&effect.head) == head.as_ref());
+        let mut admission_log: Vec<BatchEffect> = if log_reaches_head {
+            log
+        } else {
+            Vec::new()
+        };
+        let batch_head = match &predecessor {
+            Some(flight) => {
+                admission_log.push(BatchEffect {
+                    parent: flight.parent.clone(),
+                    head: PENDING_HEAD.to_string(),
+                    tables: flight.tables.clone(),
+                });
+                Some(PENDING_HEAD.to_string())
+            }
+            None => head.clone(),
+        };
+
+        let mut admitted: Vec<Waiting> = Vec::new();
+        let mut keys: HashMap<String, KeySet> = HashMap::new();
+        for waiting in batch {
+            match admit(&waiting.entry, &current, &batch_head, &admission_log, &keys) {
+                Ok(()) => {
+                    for write in &waiting.entry.writes {
+                        match keys.get_mut(&write.table_key) {
+                            None => {
+                                keys.insert(write.table_key.clone(), KeySet::of(write));
+                            }
+                            Some(existing) => {
+                                let _ = existing.absorb(write);
+                            }
+                        }
+                    }
+                    admitted.push(waiting);
+                }
+                Err(error) => replies.push((waiting.reply, Err(error))),
+            }
+        }
+        if admitted.is_empty() {
+            return None;
+        }
+        let base_pin = |table: &str| -> Option<crate::db::DatasetEntry> {
+            predecessor
+                .as_ref()
+                .and_then(|flight| flight.pins.get(table).cloned())
+                .or_else(|| current.base.dataset(table).cloned())
+        };
+        let mut by_table: BTreeMap<String, (String, Vec<StagedHandle>)> = BTreeMap::new();
+        let mut expected: ExpectedTableVersions = HashMap::new();
+        let mut missing = None;
+        for waiting in &admitted {
+            for write in &waiting.entry.writes {
+                by_table
+                    .entry(write.table_key.clone())
+                    .or_insert_with(|| (write.full_path.clone(), Vec::new()))
+                    .1
+                    .push(write.staged.clone());
+            }
+            for (identity, expectation) in &waiting.entry.expected {
+                match base_pin(&expectation.table_key) {
+                    Some(pin) => {
+                        expected.insert(
+                            *identity,
+                            TableVersionExpectation {
+                                table_key: expectation.table_key.clone(),
+                                table_version: pin.published_dataset_version,
+                                native_ref: expectation.native_ref.clone(),
+                            },
+                        );
+                    }
+                    None => missing = Some(expectation.table_key.clone()),
+                }
+            }
+        }
+        let fail = |admitted: Vec<Waiting>,
+                    error: OmniError,
+                    replies: &mut Vec<(mpsc::UnboundedSender<Signal>, Result<GraphCommit>)>| {
+            for waiting in admitted {
+                let error = follower_error(&error, &waiting.entry.txn);
+                replies.push((waiting.reply, Err(error)));
+            }
+            None
+        };
+        if let Some(table) = missing {
+            return fail(
+                admitted,
+                OmniError::manifest_read_set_changed(format!("table:{table}"), None, None),
+                replies,
+            );
+        }
+        let witness = match current.authority.staging_witness() {
+            Ok(witness) => witness,
+            Err(error) => return fail(admitted, error, replies),
+        };
+        let table_fork_owner = match current.branch.as_deref() {
+            None => None,
+            Some(_) => current.base.native_branch(),
+        };
+        let witness = &witness;
+        let current_ref = &current;
+        let base_pin = &base_pin;
+        let commits = by_table.into_iter().map(|(table_key, (full_path, writes))| async move {
+            let pin = base_pin(&table_key).ok_or_else(|| {
+                OmniError::manifest_read_set_changed(format!("table:{table_key}"), None, None)
+            })?;
+            let base = self.open_pinned_for_write(&full_path, &pin).await?;
+            let composed = StagedHandle::compose_insert_only(&base, writes)?;
+            let declared_full_text = crate::db::omnigraph::table_ops::declared_full_text_columns(
+                &current_ref.catalog,
+                &table_key,
+            );
+            let (detached, identity) = self
+                .storage()
+                .commit_staged_detached(base, composed, witness, &declared_full_text)
+                .await?;
+            let state = self.storage().table_state(&full_path, &detached).await?;
+            let target = pin.published_dataset_version + 1;
+            let version_metadata = state
+                .version_metadata
+                .with_table_fork_owner(table_fork_owner)
+                .with_staged(state.version, identity.uuid.clone())
+                .with_last_linear_version(pin.version_metadata.last_linear_version());
+            self.read_caches()
+                .handles
+                .insert(
+                    &pin.dataset_path,
+                    pin.native_dataset_branch.as_deref(),
+                    target,
+                    Some(state.version),
+                    version_metadata.e_tag(),
+                    detached.dataset().clone(),
+                )
+                .await;
+            let update = crate::db::DatasetUpdate {
+                identity: pin.identity,
+                type_key: table_key.clone(),
+                published_dataset_version: target,
+                native_dataset_branch: pin.native_dataset_branch.clone(),
+                entity_count: state.row_count,
+                version_metadata,
+            };
+            Ok::<_, OmniError>((table_key, pin, update, detached))
+        });
+        let committed = match futures::future::try_join_all(commits).await {
+            Ok(committed) => committed,
+            Err(error) => return fail(admitted, error, replies),
+        };
+        let mut updates = Vec::with_capacity(committed.len());
+        let mut detached = Vec::with_capacity(committed.len());
+        let mut assumed = HashMap::new();
+        let mut new_pins = HashMap::new();
+        for (table_key, pin, update, handle) in committed {
+            new_pins.insert(
+                table_key.clone(),
+                crate::db::DatasetEntry {
+                    identity: update.identity,
+                    type_key: update.type_key.clone(),
+                    dataset_path: pin.dataset_path.clone(),
+                    published_dataset_version: update.published_dataset_version,
+                    native_dataset_branch: update.native_dataset_branch.clone(),
+                    entity_count: update.entity_count,
+                    version_metadata: update.version_metadata.clone(),
+                    manifest_version: 0,
+                },
+            );
+            assumed.insert(table_key, pin);
+            updates.push(update);
+            detached.push(handle);
+        }
+        let first = &admitted[0].entry;
+        Some(StagedBatch {
+            actor: first.actor.clone(),
+            history_release_bytes: first.history_release_bytes,
+            admitted,
+            updates,
+            detached,
+            expected,
+            keys,
+            assumed,
+            predecessor,
+            branch,
+            new_pins,
+        })
+    }
+
+    /// Stage B's publication: one compare-and-swap of every pin, with the
+    /// new versions' index metadata read meanwhile.
+    async fn publish_staged(
+        &self,
+        current: &WriteTxn,
+        updates: Vec<crate::db::DatasetUpdate>,
+        detached: Vec<crate::storage_layer::SnapshotHandle>,
+        expected: &ExpectedTableVersions,
+        actor: Option<&str>,
+        history_release_bytes: HistoryReleaseBytes,
+    ) -> Result<GraphCommit> {
+        let lineage_intent = self
+            .new_lineage_intent_for_branch(current.branch.as_deref(), actor, history_release_bytes)
+            .await
+            .map_err(OmniError::unpublished)?;
+        let publish = self.commit_updates_on_branch_with_expected(
+            current.branch.as_deref(),
+            &updates,
+            expected,
+            actor,
+            current,
+            lineage_intent,
+            crate::db::omnigraph::Publication::Publish,
+        );
+        let warm = async {
+            if index_warm_enabled() {
+                futures::future::join_all(detached.iter().map(|handle| async move {
+                    use lance::index::DatasetIndexExt as _;
+                    let _ = handle.dataset().load_indices().await;
+                }))
+                .await;
+            }
+        };
+        let (published, ()) = futures::join!(publish, warm);
+        published
+    }
+
     async fn run_batch(&self, batch: Vec<Waiting>, log: &[BatchEffect]) -> BatchOutcome {
         let fail_all = |batch: Vec<Waiting>, error: OmniError, log: LogChange| BatchOutcome {
             replies: batch
@@ -270,6 +892,7 @@ impl Omnigraph {
             log,
         };
         let branch = batch[0].entry.txn.branch.clone();
+        let started = std::time::Instant::now();
         let _gates = match self
             .write_queue()
             .acquire_branch_write_gates(branch.as_deref())
@@ -278,11 +901,24 @@ impl Omnigraph {
             Ok(gates) => gates,
             Err(error) => return fail_all(batch, error, LogChange::Keep),
         };
-        // One capture of the current authority for the whole batch.
-        let current = match self.open_write_txn(branch.as_deref()).await {
+        let gated = started.elapsed();
+        // One capture of the current authority for the whole batch. When the
+        // handle's installed view is this group's own last publication, it is
+        // the capture, with no probe: a commit by another writer since makes
+        // the publication's compare-and-swap refuse the batch, as a stale
+        // view does on every write path, and its detached commits stay
+        // unreachable (invariant 5).
+        let own_view = capture_skip_enabled() && {
+            let (bound, installed) = self.installed_head();
+            bound == branch
+                && installed.is_some()
+                && log.last().map(|effect| Some(&effect.head)) == Some(installed.as_ref())
+        };
+        let current = match self.open_write_txn_probed(branch.as_deref(), !own_view).await {
             Ok(txn) => txn,
             Err(error) => return fail_all(batch, error, LogChange::Clear),
         };
+        let captured = started.elapsed();
         let head = current.authority.graph_head.clone();
         let log_reaches_head = log
             .last()
@@ -301,7 +937,13 @@ impl Omnigraph {
         let mut replies = Vec::new();
         let mut batch_filters: HashMap<String, KeySet> = HashMap::new();
         for waiting in batch {
-            match admit(&waiting.entry, &current, log, &batch_filters) {
+            match admit(
+                &waiting.entry,
+                &current,
+                &current.authority.graph_head,
+                log,
+                &batch_filters,
+            ) {
                 Ok(()) => {
                     for write in &waiting.entry.writes {
                         match batch_filters.get_mut(&write.table_key) {
@@ -330,7 +972,17 @@ impl Omnigraph {
             };
         }
 
-        match self.publish_batch(&current, &admitted).await {
+        let admitted_count = admitted.len();
+        let published = self.publish_batch(&current, &admitted).await;
+        if timing_enabled() {
+            eprintln!(
+                "[group-timing] entries {admitted_count} gates {:.1} capture {:.1} commit+publish {:.1} ms (own view {own_view})",
+                gated.as_secs_f64() * 1000.0,
+                (captured - gated).as_secs_f64() * 1000.0,
+                (started.elapsed() - captured).as_secs_f64() * 1000.0,
+            );
+        }
+        match published {
             Ok(commit) => {
                 let effect = BatchEffect {
                     parent: head,
@@ -438,18 +1090,29 @@ impl Omnigraph {
                     detached.dataset().clone(),
                 )
                 .await;
-            Ok::<_, OmniError>(crate::db::DatasetUpdate {
-                identity: entry.identity,
-                type_key: table_key.clone(),
-                published_dataset_version: target,
-                native_dataset_branch: entry.native_dataset_branch.clone(),
-                entity_count: state.row_count,
-                version_metadata,
-            })
+            Ok::<_, OmniError>((
+                crate::db::DatasetUpdate {
+                    identity: entry.identity,
+                    type_key: table_key.clone(),
+                    published_dataset_version: target,
+                    native_dataset_branch: entry.native_dataset_branch.clone(),
+                    entity_count: state.row_count,
+                    version_metadata,
+                },
+                detached,
+            ))
         });
-        let updates = futures::future::try_join_all(commits)
+        let commit_started = std::time::Instant::now();
+        let committed = futures::future::try_join_all(commits)
             .await
             .map_err(OmniError::unpublished)?;
+        let (updates, detached): (Vec<_>, Vec<_>) = committed.into_iter().unzip();
+        if timing_enabled() {
+            eprintln!(
+                "[group-timing]   detached commits {:.1} ms",
+                commit_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let first = &admitted[0].entry;
         let lineage_intent = self
             .new_lineage_intent_for_branch(
@@ -459,7 +1122,7 @@ impl Omnigraph {
             )
             .await
             .map_err(OmniError::unpublished)?;
-        self.commit_updates_on_branch_with_expected(
+        let publish = self.commit_updates_on_branch_with_expected(
             current.branch.as_deref(),
             &updates,
             &expected,
@@ -467,13 +1130,54 @@ impl Omnigraph {
             current,
             lineage_intent,
             crate::db::omnigraph::Publication::Publish,
-        )
-        .await
+        );
+        // While the publication is in flight, read each new version's index
+        // metadata into the shared Lance session: the next writer's
+        // validation plans against that version and would otherwise read
+        // the index section itself, one request before its staging.
+        let warm = async {
+            if index_warm_enabled() {
+                futures::future::join_all(detached.iter().map(|handle| async move {
+                    use lance::index::DatasetIndexExt as _;
+                    let _ = handle.dataset().load_indices().await;
+                }))
+                .await;
+            }
+        };
+        let (published, ()) = futures::join!(publish, warm);
+        published
     }
 }
 
 /// Whether `entry` may publish in a batch forming at `current`'s head, given
 /// this group's effect log since and the batch's keys so far.
+/// Research switch: warm each new version's index metadata during the
+/// publication (on by default with group commit).
+fn index_warm_enabled() -> bool {
+    std::env::var("OMNIGRAPH_GROUP_COMMIT_INDEX_WARM").map_or(true, |value| value != "0")
+}
+
+/// Research switch: the most a leader lingers for the rest of the last
+/// batch's cohort (`OMNIGRAPH_GROUP_COMMIT_LINGER_MS`, default 0 = off).
+fn linger_budget() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("OMNIGRAPH_GROUP_COMMIT_LINGER_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+    )
+}
+
+fn timing_enabled() -> bool {
+    std::env::var("OMNIGRAPH_GROUP_COMMIT_TIMING").is_ok_and(|value| value == "1")
+}
+
+/// Whether a leader may capture from its own last publication without a
+/// probe (research switch, on by default with group commit).
+fn capture_skip_enabled() -> bool {
+    std::env::var("OMNIGRAPH_GROUP_COMMIT_CAPTURE_SKIP").map_or(true, |value| value != "0")
+}
+
 fn debug_enabled() -> bool {
     std::env::var("OMNIGRAPH_GROUP_COMMIT_DEBUG").is_ok_and(|value| value == "1")
 }
@@ -481,10 +1185,11 @@ fn debug_enabled() -> bool {
 fn admit(
     entry: &GroupEntry,
     current: &WriteTxn,
+    batch_head: &Option<String>,
     log: &[BatchEffect],
     batch_filters: &HashMap<String, KeySet>,
 ) -> Result<()> {
-    let result = admit_inner(entry, current, log, batch_filters);
+    let result = admit_inner(entry, current, batch_head, log, batch_filters);
     if debug_enabled()
         && let Err(reason) = &result
     {
@@ -501,6 +1206,7 @@ fn admit(
 fn admit_inner(
     entry: &GroupEntry,
     current: &WriteTxn,
+    batch_head: &Option<String>,
     log: &[BatchEffect],
     batch_filters: &HashMap<String, KeySet>,
 ) -> Result<()> {
@@ -522,7 +1228,7 @@ fn admit_inner(
             return Err(moved(&entry.txn, &now.graph_head));
         }
     }
-    if authority.graph_head != now.graph_head {
+    if &authority.graph_head != batch_head {
         // Walk this group's batches back from the current head to the
         // entry's capture; every one of them must be ours and insert keys
         // disjoint from the entry's on every table the entry writes.

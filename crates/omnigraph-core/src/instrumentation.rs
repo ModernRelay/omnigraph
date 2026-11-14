@@ -2064,7 +2064,7 @@ pub enum VersionResolution {
 mod small_manifest_reads;
 pub use small_manifest_reads::manifest_scan_dataset;
 mod control_dataset;
-pub use control_dataset::{current_control_dataset, retain_control_dataset};
+pub use control_dataset::{current_control_dataset, rebind_control_dataset, retain_control_dataset};
 
 /// Open a table pin (RFC 0067): a pin without a staged version opens its
 /// target, a staged pin above `last_linear_version` opens its detached

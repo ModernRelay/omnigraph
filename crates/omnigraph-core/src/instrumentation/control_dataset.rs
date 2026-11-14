@@ -65,6 +65,27 @@ pub async fn retain_control_dataset(dataset: &Dataset, budget: usize) -> Option<
     rebind(dataset, None).await.ok()
 }
 
+/// Research (write throughput): rebind a retained main control image for a
+/// publish attempt without qualifying it against storage. The caller relies
+/// on the attempt's own put-if-absent of the next version to refuse a stale
+/// image. Same eligibility as [`current_control_dataset`].
+pub async fn rebind_control_dataset(
+    dataset: &Dataset,
+    wrapper: Option<Arc<dyn WrappingObjectStore>>,
+) -> Result<Option<Dataset>> {
+    if dataset.manifest().branch.is_some()
+        || !dataset.manifest().base_paths.is_empty()
+        || dataset
+            .manifest_location()
+            .e_tag
+            .as_ref()
+            .is_none_or(String::is_empty)
+    {
+        return Ok(None);
+    }
+    rebind(dataset, wrapper).await.map(Some)
+}
+
 /// Qualify a retained main control image against fresh storage metadata.
 /// Missing or changed ETags, or changed commit-store identities, return a cache miss
 /// without consulting session metadata caches.

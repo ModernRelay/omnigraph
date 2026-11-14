@@ -601,7 +601,7 @@ impl GraphNamespacePublisher {
         }
     }
 
-    async fn dataset(&self) -> Result<Dataset> {
+    async fn dataset(&self, trust_acknowledged: bool) -> Result<Dataset> {
         if self.branch.is_none() {
             let held = self
                 .published_rows
@@ -609,6 +609,23 @@ impl GraphNamespacePublisher {
                 .expect("published rows cache lock poisoned")
                 .as_ref()
                 .and_then(|rows| rows.acknowledged.clone());
+            // Research (write throughput): this publisher's own last
+            // acknowledged version is the base of the next attempt with no
+            // listing. The publish is a put-if-absent of `read_version + 1`
+            // and versions have no holes, so a version another writer
+            // published since makes that put fail; the retry then qualifies
+            // the held image against storage as before.
+            if trust_acknowledged
+                && trust_acknowledged_enabled()
+                && let Some(held) = held.as_ref()
+                && let Some(rebound) = crate::instrumentation::rebind_control_dataset(
+                    held,
+                    crate::instrumentation::manifest_wrapper(),
+                )
+                .await?
+            {
+                return Ok(rebound);
+            }
             if let Some(held) = held
                 && let Some(current) = crate::instrumentation::current_control_dataset(
                     &held,
@@ -627,12 +644,12 @@ impl GraphNamespacePublisher {
         .await
     }
 
-    async fn load_publish_state(&self) -> Result<LoadedPublishState> {
+    async fn load_publish_state(&self, trust_acknowledged: bool) -> Result<LoadedPublishState> {
         // Test seam: inject a retryable contention here to exercise the outer
         // retry loop's re-run-on-retryable-load-error path (no-op without the
         // `failpoints` feature). The migration surfaces the same typed error.
         contention(&PUBLISH_LOAD_STATE)?;
-        let dataset = self.dataset().await?;
+        let dataset = self.dataset(trust_acknowledged).await?;
         guard_stamp(&dataset)?;
         let rows = match self.cached_rows(&dataset) {
             Some(batch) => super::state::rows_of_batch(&batch)?,
@@ -1253,7 +1270,7 @@ impl GraphNamespacePublisher {
         &self,
         requests: &[CreateTableVersionRequest],
     ) -> Result<Dataset> {
-        let tables = self.load_publish_state().await?.rows.tables;
+        let tables = self.load_publish_state(false).await?.rows.tables;
         let changes = requests
             .iter()
             .map(|request| {
@@ -1591,7 +1608,7 @@ impl GraphNamespacePublisher {
                     writer_epoch,
                     ..
                 },
-        } = self.load_publish_state().await?;
+        } = self.load_publish_state(false).await?;
         let stamp = read_stamp(&dataset).ok_or_else(|| {
             OmniError::manifest_internal("the loaded `__manifest` carries no stamp")
         })?;
@@ -1725,7 +1742,7 @@ impl GraphNamespacePublisher {
             // Route a retryable `load_publish_state` error through the SAME retry
             // path as a retryable `merge_rows` conflict below, so typed contention
             // composes with the publisher retry instead of aborting the publish.
-            let loaded = match self.load_publish_state().await {
+            let loaded = match self.load_publish_state(attempt == 0).await {
                 Ok(loaded) => loaded,
                 Err(err)
                     if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) =>
@@ -2120,7 +2137,7 @@ impl GraphNamespacePublisher {
     /// writer epoch against what the claim first read, and the incarnation.
     async fn prepare_claim(&self, claim: &mut ClaimIntent) -> Result<PreparedClaim> {
         self.holder_key()?;
-        let LoadedPublishState { dataset, mut rows } = self.load_publish_state().await?;
+        let LoadedPublishState { dataset, mut rows } = self.load_publish_state(false).await?;
         require_control_facts(guard_stamp(&dataset)?)?;
         let native = dataset.manifest().branch.clone();
         let current = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native.as_deref());
@@ -2327,7 +2344,7 @@ impl GraphNamespacePublisher {
         let LoadedPublishState {
             dataset,
             rows: live,
-        } = self.load_publish_state().await?;
+        } = self.load_publish_state(false).await?;
         let stamp = read_stamp(&dataset).ok_or_else(|| {
             OmniError::manifest_internal("the loaded `__manifest` carries no stamp")
         })?;
@@ -2622,4 +2639,12 @@ pub fn is_retryable_publish_conflict(err: &OmniError) -> bool {
                 Some(crate::error::ManifestConflictDetails::RowLevelCasContention)
             )
     )
+}
+
+
+/// Research switch (write throughput): whether the first publish attempt
+/// trusts this publisher's own last acknowledged version without listing
+/// `_versions/`. On unless `OMNIGRAPH_PUBLISH_TRUST_ACKNOWLEDGED=0`.
+fn trust_acknowledged_enabled() -> bool {
+    std::env::var("OMNIGRAPH_PUBLISH_TRUST_ACKNOWLEDGED").map_or(true, |value| value != "0")
 }

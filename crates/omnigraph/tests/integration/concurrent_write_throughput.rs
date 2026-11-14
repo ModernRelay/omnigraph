@@ -235,7 +235,25 @@ type TraceEntry = (Instant, Instant, &'static str, &'static str, String);
 static TRACE: std::sync::LazyLock<Option<Mutex<Vec<TraceEntry>>>> =
     std::sync::LazyLock::new(|| (env_or("OG_CW_TRACE", "0") == "1").then(|| Mutex::new(Vec::new())));
 
+static BT_PATTERN: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var("OG_CW_BT_PATTERN").ok());
+static BT_PRINTED: AtomicU64 = AtomicU64::new(0);
+
 fn trace(start: Instant, plane: &'static str, method: &'static str, path: &Path) {
+    if let Some(pattern) = BT_PATTERN.as_ref()
+        && method.starts_with("get")
+        && path.as_ref().contains(pattern.as_str())
+        && { let n = BT_PRINTED.fetch_add(1, Ordering::Relaxed); n >= env_num("OG_CW_BT_SKIP", 0) && n < env_num("OG_CW_BT_SKIP", 0) + 2 }
+    {
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let frames: Vec<&str> = bt
+            .lines()
+            .filter(|line| line.contains("omnigraph") || line.contains("lance"))
+            .filter(|line| !line.contains("concurrent_write_throughput"))
+            .take(40)
+            .collect();
+        eprintln!("[bt] {method} {path}\n{}", frames.join("\n"));
+    }
     if let Some(log) = TRACE.as_ref() {
         log.lock()
             .unwrap()

@@ -1555,6 +1555,16 @@ impl Omnigraph {
         &self.group_commits
     }
 
+    /// The bound branch and the materialized head of the handle's installed
+    /// view (research: group commit).
+    pub(crate) fn installed_head(&self) -> (Option<String>, Option<String>) {
+        let coord = self.coordinator.load_full();
+        (
+            coord.current_branch().map(str::to_string),
+            coord.exact_graph_head(),
+        )
+    }
+
     pub(crate) fn write_queue(&self) -> Arc<crate::db::write_queue::WriteQueueManager> {
         Arc::clone(&self.write_queue)
     }
@@ -1666,11 +1676,23 @@ impl Omnigraph {
     /// per-graph `Session` (the dataset-opener unification); the S3 cost gate
     /// for that term is still owed (handoff §1d).
     pub(crate) async fn open_write_txn(&self, branch: Option<&str>) -> Result<WriteTxn> {
+        self.open_write_txn_probed(branch, true).await
+    }
+
+    /// [`Self::open_write_txn`]; with `fresh` unset the handle's bound branch
+    /// is captured from its installed view with no probe (research: a group
+    /// commit leader whose installed view is its own last publication; the
+    /// publication's compare-and-swap refuses a view another writer moved).
+    pub(crate) async fn open_write_txn_probed(
+        &self,
+        branch: Option<&str>,
+        fresh: bool,
+    ) -> Result<WriteTxn> {
         let branch = normalize_branch_name(branch.unwrap_or("main"))?;
 
         let head_on_record = self.holds_head_of(branch.as_deref());
         let (branch_identifier, graph_head, effective_graph_head, snapshot, manifest_probe) = self
-            .write_authority_for_known_branch(branch.as_deref(), true)
+            .write_authority_for_known_branch(branch.as_deref(), fresh)
             .await?;
         let (catalog, identity) = self.accepted_catalog_for_snapshot(&snapshot).await?;
         validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;

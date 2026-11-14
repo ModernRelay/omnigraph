@@ -183,3 +183,93 @@ Zero re-prepares, per-writer counts within a few percent (S3 64 writers:
 20–24 each). **Verdict: keep — 12× at 16 and 30× at 64 writers on S3.**
 Publications stay at ~3/s on S3 (≈300 ms per batch): next lever is the
 batch's critical path.
+
+## Idea 3 — trim round trips from the batch and the writer (group4)
+
+Phase timing of a batch at 16 writers, S3 (`OMNIGRAPH_GROUP_COMMIT_TIMING=1`),
+before: capture probe 33 ms, LIST of `__manifest/_versions` ~45 ms, detached
+commits ~107 ms, publish ~115 ms. Three trims:
+
+1. **Publisher trusts its own acknowledged version on the first attempt**
+   (`GraphNamespacePublisher::dataset(trust_acknowledged)`,
+   `instrumentation::rebind_control_dataset`). The publish is a put-if-absent
+   of `read_version + 1` and versions have no holes, so a stale held view loses
+   the CAS; the retry (attempt > 0) qualifies the view with the listing as
+   before. Removes the LIST from every publish (the audit's
+   L-publisher-load-probe, #837). Switch `OMNIGRAPH_PUBLISH_TRUST_ACKNOWLEDGED`.
+2. **Capture from the handle's installed view without a probe** when that view
+   is this group's own last publication (leader), and for every publishing
+   writer under group commit (`open_write_txn_probed(.., fresh=false)`): the
+   group's admission refuses a capture another writer made stale, the
+   ordinary path's revalidation re-probes under the gates, and the CAS refuses
+   it in every case. Removes 1 RTT from the writer and 1 from the batch.
+3. **Warm the next version's index metadata during the publication.** Every
+   write's validation (`plan_write → load_index_facts → load_indices`) read
+   the index section of the table version the previous batch had just
+   committed (backtrace via `OG_CW_BT_PATTERN`): one GET per write. The
+   leader now loads it in parallel with its publish, into the shared session.
+
+Single writer, S3: 352 ms → 248 ms per write (10 → 8 requests), trace:
+key-check GET → data PUT → table txn PUT → table manifest PUT → manifest data
+PUT (∥ index warm GET) → manifest txn PUT → CAS.
+
+| target | writers | baseline | group | group4 | group4 commits/s |
+|---|---:|---:|---:|---:|---:|
+| s3 | 1 | 2.75 | 2.60 | 4.05 | 4.05 |
+| s3 | 4 | 2.15 | 6.80 | 10.80 | 5.40 |
+| s3 | 16 | 2.15 | 26.45 | 38.95 | 4.85 |
+| s3 | 64 | 2.35 | 69.45 | 58.50 (repeat 81–88) | 2.0–2.8 |
+| local | 1 | 17.65 | 18.10 | 14.35 (repeat 19.55) | |
+| local | 16 | 15.35 | 68.50 | 66.45 | |
+| local | 64 | 15.35 | 74.55 | 66.70 | |
+
+Local single-writer cells are noisy run to run on this box (14.35 vs 19.55
+for the same binary and cell); local comparisons need repetitions. Removing
+the LIST matters locally too: `_versions/` listing grows with history, which
+is why local throughput decays over a 20 s window.
+
+At 64 writers on S3 the benchmark process is CPU-bound: 6.8 of 8 runtime
+threads busy, RustFS 0.4 cores, toxiproxy 0.1 (workspace crates are
+`opt-level = 0` in the dev profile). Optimized builds started for the final
+numbers (`scripts/build-opt.sh`, separate target dir).
+
+## Idea 4 — leader linger for the returning cohort
+
+Hypothesis: batches alternate 1 / 15 entries because the first writer back
+leads alone. A bounded linger (wait ≤ L ms while queued < last batch / 2).
+
+| linger | w/s (S3, 16 writers) | commits/s |
+|---:|---:|---:|
+| 0 | 39.75 | 5.00 |
+| 10 ms | 36.00 | 4.50 |
+| 25 ms | 36.00 | 4.50 |
+
+**Verdict: discard.** The writers settle into two cohorts that alternate (a
+cohort prepares, ~67 ms, faster than the other cohort's batch, ~200 ms); the
+linger rule never fires usefully and merging the cohorts would idle the
+publisher.
+
+## Idea 5 — pipelined batches (stage A overlaps the predecessor's publication)
+
+Stage A (no gate): capture, admit against the effect log plus the in-flight
+batch's pending effect, compose and commit detached on the pins the
+in-flight batch will publish. Stage B (branch gate): wait for the
+predecessor, check it published exactly the pins stage A assumed, publish.
+The composing lead passes on as soon as a batch enters stage B. A failed
+predecessor refuses the whole successor before its publication.
+
+S3, 16 writers: commits/s 4.85 → 8.25 (publication capacity ×1.7), writes/s
+37.25 (unchanged), p50 449 ms. Batch latency is unchanged (~230 ms: stage A
+~107 ms + stage B ~115 ms) and closed-loop throughput follows per-write
+latency (X = N / R), so at 16 writers batches just got smaller. To be
+re-measured at 64 writers on the optimized build, where the publisher
+saturates.
+
+Invariant cost of pipelining: stage A's detached commits record the staging
+witness of the head they were composed at (the predecessor's parent). Between
+the predecessor's publication and this batch's, the collector's staging rule
+("dead once the branch head moved past the recorded head") would judge them
+dead; a concurrent `cleanup` could reclaim them before they publish. A
+production version needs the witness to name the head they will publish on
+(e.g. the predecessor's pre-minted nonce, which its commit id carries) and the
+collector rule extended accordingly — RFC-level.
