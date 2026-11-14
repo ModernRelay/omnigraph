@@ -16580,6 +16580,17 @@
             "type": "string",
             "description": "Registry key / invoke path segment (`POST /queries/{name}`)."
           },
+          "operation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/QueryOperationDescriptor",
+                "description": "Compiled result fields and graph types read or written, when available."
+              }
+            ]
+          },
           "params": {
             "type": "array",
             "items": {
@@ -16589,6 +16600,57 @@
           "tool_name": {
             "type": "string",
             "description": "MCP tool id (the `tool_name` override, else `name`)."
+          }
+        }
+      },
+      "QueryGraphFact": {
+        "type": "object",
+        "required": [
+          "kind",
+          "type_name"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/QueryGraphFactKind"
+          },
+          "type_name": {
+            "type": "string"
+          }
+        }
+      },
+      "QueryGraphFactKind": {
+        "type": "string",
+        "enum": [
+          "node",
+          "edge"
+        ]
+      },
+      "QueryOperationDescriptor": {
+        "type": "object",
+        "description": "A compiled query's conservative graph access set and result shape.\n\n`reads` is conservative: every graph type the supported execution path may\ninspect is present. `writes` is the exact set of graph types the mutation\nmay change. Both sets are sorted and deduplicated for deterministic consumers.",
+        "required": [
+          "result",
+          "reads",
+          "writes"
+        ],
+        "properties": {
+          "reads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryGraphFact"
+            }
+          },
+          "result": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryResultFieldDescriptor"
+            }
+          },
+          "writes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryGraphFact"
+            }
           }
         }
       },
@@ -16641,6 +16703,60 @@
           }
         },
         "additionalProperties": false
+      },
+      "QueryResultFieldDescriptor": {
+        "type": "object",
+        "description": "One field in a compiled query result.\n\nKinds are decomposed so clients never have to parse Arrow display strings\nsuch as `Vector(3)` or `[Date]`.",
+        "required": [
+          "name",
+          "kind",
+          "nullable"
+        ],
+        "properties": {
+          "item_kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/QueryValueKind"
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/QueryValueKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "nullable": {
+            "type": "boolean"
+          },
+          "vector_dim": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "QueryValueKind": {
+        "type": "string",
+        "enum": [
+          "string",
+          "bool",
+          "int",
+          "bigint",
+          "float",
+          "date",
+          "datetime",
+          "blob",
+          "vector",
+          "list",
+          "object"
+        ]
       },
       "RankOrder": {
         "type": "string",

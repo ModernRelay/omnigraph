@@ -226,7 +226,7 @@ describes sign-in, which resource identifier to choose, and the endpoint's tools
 | `/mcp` | The [MCP endpoint](mcp.md); when static tokens, signed data tokens or OIDC trust are configured |
 | `/graphs/{graph_id}/query`, `/mutate` | Run inline GQ source |
 | `/graphs/{graph_id}/mutate/if-graph-commit` | Run an inline conditional mutation |
-| `/graphs/{graph_id}/queries` | List and invoke stored queries, including conditional mutations |
+| `/graphs/{graph_id}/queries` | List stored queries with optional [operation descriptors](../queries/index.md#linting); invoke reads and mutations, including conditional mutations |
 | `/graphs/{graph_id}/load`, `/load/ndjson` | Bounded batch loading |
 | `/graphs/{graph_id}/blob` | GET/HEAD one Blob cell; PUT/DELETE to replace or clear it |
 | `/graphs/{graph_id}/branches` | Branch management and merge, a detailed listing (`GET /branches?detailed=true`), a merge dry run (`dry_run: true`), a branch's diff against its merge base (`GET /branches/diff`) and that merge base (`GET /branches/merge-base`) |

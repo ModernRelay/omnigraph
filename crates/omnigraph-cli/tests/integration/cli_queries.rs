@@ -16,7 +16,17 @@ const STATEMENT_GRAPH_ID: &str = "knowledge";
 #[test]
 fn managed_query_catalog_uses_issued_identity_without_local_source() {
     use crate::support::managed_http::{IntentApiFixture, IntentReply};
-    let catalog = serde_json::json!({"queries":[]});
+    let catalog = serde_json::json!({"queries":[
+        {"name":"people", "tool_name":"people", "mutation":false, "params":[]},
+        {
+            "name":"locations", "tool_name":"locations", "mutation":false, "params":[],
+            "operation":{
+                "result":[{"name":"position","kind":"point","nullable":false}],
+                "reads":[{"kind":"region","type_name":"Place"}],
+                "writes":[]
+            }
+        }
+    ]});
     let data = IntentApiFixture::graph(vec![IntentReply::json(200, catalog.clone())]);
     let (api, tokens) = IntentApiFixture::identity_issuer(&data.origin, 1);
     let config = tempdir().unwrap();

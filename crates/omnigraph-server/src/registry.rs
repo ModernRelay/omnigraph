@@ -661,9 +661,8 @@ impl GraphRegistry {
                     return Err(ServingTransitionError::SchemaChanged);
                 }
                 if let Some(queries) = &handle.queries {
-                    crate::validate_registry_against_catalog(
-                        queries,
-                        &handle.engine.catalog(),
+                    crate::validate_registry_report(
+                        crate::queries::check(queries, &handle.engine.catalog()),
                         handle.key.graph_id.as_str(),
                     )
                     .map_err(|error| ServingTransitionError::InvalidQueries(error.to_string()))?;

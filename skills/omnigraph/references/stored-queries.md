@@ -88,6 +88,8 @@ are omitted from JSON rows, and DateTime strings are UTC without a trailing
 
 Every applied query is listed in `GET /graphs/{graph_id}/queries`, which the
 MCP `queries` tool returns whole (`mutation: true` marks a stored mutation).
+When present, an entry's `operation` gives its result fields in return order
+and the graph types it reads and writes. Treat a missing descriptor as unknown.
 MCP's `query` tool takes either a stored read's `name` (gated `invoke_query`,
 then `read`) or GQ source in `query` (gated `read`, like `POST /query`), and
 refuses a stored mutation. `mutate` runs a stored mutation when given its

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use arrow_schema::DataType;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
 use crate::error::{CompilerError, Result};
@@ -17,7 +17,8 @@ use super::typecheck::{
 /// `reads` is conservative: every graph type the supported execution path may
 /// inspect is present. `writes` is the exact set of graph types the mutation
 /// may change. Both sets are sorted and deduplicated for deterministic consumers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct QueryOperationDescriptor {
     pub result: Vec<QueryResultFieldDescriptor>,
     pub reads: Vec<QueryGraphFact>,
@@ -28,7 +29,8 @@ pub struct QueryOperationDescriptor {
 ///
 /// Kinds are decomposed so clients never have to parse Arrow display strings
 /// such as `Vector(3)` or `[Date]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct QueryResultFieldDescriptor {
     pub name: String,
     pub kind: QueryValueKind,
@@ -39,7 +41,8 @@ pub struct QueryResultFieldDescriptor {
     pub nullable: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum QueryValueKind {
     String,
@@ -57,13 +60,15 @@ pub enum QueryValueKind {
     Object,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct QueryGraphFact {
     pub kind: QueryGraphFactKind,
     pub type_name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum QueryGraphFactKind {
     Node,
@@ -72,9 +77,8 @@ pub enum QueryGraphFactKind {
 
 /// Compile one parsed query into the shared operation descriptor.
 ///
-/// This is the single compiler owner used by lint today and by future server
-/// and SDK projections. An invalid query returns an error rather than a
-/// partial descriptor.
+/// Lint and the served query catalog share this descriptor. An invalid query
+/// returns an error rather than a partial descriptor.
 pub fn describe_query_operation(
     catalog: &Catalog,
     query: &QueryDecl,
@@ -83,7 +87,8 @@ pub fn describe_query_operation(
     describe_checked_query_operation(catalog, &checked)
 }
 
-fn describe_checked_query_operation(
+/// Describe a declaration the caller has already checked against this catalog.
+pub fn describe_checked_query_operation(
     catalog: &Catalog,
     checked: &CheckedQuery,
 ) -> Result<QueryOperationDescriptor> {
