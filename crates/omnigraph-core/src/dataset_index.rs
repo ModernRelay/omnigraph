@@ -229,6 +229,34 @@ pub async fn key_column_index_coverage(ds: &Dataset, column: &str) -> Result<Ind
 /// without `physical_rows`, or no fragment), else the widest tail one index
 /// on the column leaves uncovered. Lance plans the filter once per uncovered
 /// fragment, so `fragments` counts the copies of the IN list a probe holds.
+/// Research (write throughput): the fragments of `ds` that the one BTREE
+/// index on `column` leaves uncovered, when exactly one index keys the column
+/// and reports its coverage; `None` otherwise.
+pub async fn key_column_uncovered_fragments(
+    ds: &Dataset,
+    column: &str,
+) -> Result<Option<BTreeSet<u64>>> {
+    let Some(field_id) = ds.schema().field(column).map(|field| field.id) else {
+        return Ok(None);
+    };
+    let indices = ds.load_indices().await.map_err(OmniError::storage)?;
+    let Ok(mut tails) = key_column_tails(
+        &indices,
+        field_id,
+        column,
+        &current_fragments(ds),
+        ds.fragments()
+            .iter()
+            .all(|fragment| fragment.physical_rows.is_some()),
+    ) else {
+        return Ok(None);
+    };
+    if tails.len() != 1 {
+        return Ok(None);
+    }
+    Ok(tails.pop().and_then(|(_, tail)| tail.ok()))
+}
+
 pub async fn key_column_uncovered_tail(
     ds: &Dataset,
     column: &str,

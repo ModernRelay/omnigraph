@@ -642,6 +642,7 @@ async fn run_cell(cfg: &Config, writers: usize, mode: &str, run: u64) -> serde_j
         })
     };
     tokio::time::sleep(cfg.warmup).await;
+    let known_before = omnigraph::instrumentation::KNOWN_TAIL_PROBES.load(Ordering::Relaxed);
     let before = planes.snapshot();
     let window_start = Instant::now();
     phase.store(PHASE_MEASURED, Ordering::Release);
@@ -649,6 +650,7 @@ async fn run_cell(cfg: &Config, writers: usize, mode: &str, run: u64) -> serde_j
     phase.store(PHASE_STOP, Ordering::Release);
     let window = window_start.elapsed();
     let after = planes.snapshot();
+    let known_after = omnigraph::instrumentation::KNOWN_TAIL_PROBES.load(Ordering::Relaxed);
 
     let drain_start = Instant::now();
     let mut per_writer = Vec::with_capacity(writers);
@@ -774,6 +776,7 @@ async fn run_cell(cfg: &Config, writers: usize, mode: &str, run: u64) -> serde_j
         "per_writer_max_over_min": max_over_min,
         "engine_reprepares_per_write": (after.reprepares - before.reprepares) as f64 / per.max(1.0),
         "carried_per_write": (after.carried - before.carried) as f64 / per.max(1.0),
+        "known_tail_probes_per_write": (known_after - known_before) as f64 / per.max(1.0),
         "driver_retries": driver_retries,
         "drain_secs": drain.as_secs_f64(),
         "requests_per_write": {

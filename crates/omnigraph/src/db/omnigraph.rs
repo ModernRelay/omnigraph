@@ -1578,6 +1578,18 @@ impl Omnigraph {
         })
     }
 
+    /// Research (group commit): make `coordinator`, which just published on
+    /// a branch other than the bound one, the handle's cached authority for
+    /// that branch, so the next capture there finds the current view.
+    pub(crate) async fn install_branch_authority(&self, coordinator: &GraphCoordinator) {
+        let Some(branch) = coordinator.current_branch() else {
+            return;
+        };
+        // forbidden-api-allow: a cache held across no round trip, not a gate
+        *self.merge_authority_cache.lock().await =
+            Some((branch.to_string(), GraphCoordinator::clone(coordinator)));
+    }
+
     /// Research (group commit): publish through a caller-owned coordinator of
     /// a branch other than the bound one.
     pub(crate) async fn commit_updates_with_coordinator(

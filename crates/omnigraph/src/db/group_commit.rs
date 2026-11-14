@@ -485,7 +485,8 @@ impl Omnigraph {
             )
             .await;
         if publish_coordinator.is_some() {
-            self.keep_coordinator(key, published.as_ref().ok().and(publish_coordinator));
+            self.keep_coordinator(key, published.as_ref().ok().and(publish_coordinator))
+                .await;
         }
         drop(gates);
         let _ = done_tx.send(Some(
@@ -700,11 +701,16 @@ impl Omnigraph {
         Some(self.write_txn_from_coordinator(&held).await)
     }
 
-    fn keep_coordinator(
+    async fn keep_coordinator(
         &self,
         key: &str,
         coordinator: Option<crate::db::graph_coordinator::GraphCoordinator>,
     ) {
+        // One per-branch writer state: the handle's branch authority cache,
+        // which writers capture through, gets the view this group published.
+        if let Some(coordinator) = &coordinator {
+            self.install_branch_authority(coordinator).await;
+        }
         let mut groups = self.group_commits().groups.lock().unwrap();
         if let Some(group) = groups.get_mut(key) {
             group.coordinator = coordinator;
@@ -1103,7 +1109,8 @@ impl Omnigraph {
             .publish_batch(&current, &admitted, publish_coordinator.as_mut())
             .await;
         if publish_coordinator.is_some() {
-            self.keep_coordinator(&key, published.as_ref().ok().and(publish_coordinator));
+            self.keep_coordinator(&key, published.as_ref().ok().and(publish_coordinator))
+                .await;
         }
         if timing_enabled() {
             eprintln!(

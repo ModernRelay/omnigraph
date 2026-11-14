@@ -325,6 +325,12 @@ impl ScanTuning<'_> {
         self
     }
 
+    /// Search only the indexed fragments (Lance's `fast_search`).
+    pub(crate) fn fast_search(&mut self) -> &mut Self {
+        self.scanner.fast_search();
+        self
+    }
+
     pub(crate) fn limit(&mut self, rows: i64) -> Result<&mut Self> {
         self.scanner
             .limit(Some(rows), None)
@@ -1384,6 +1390,102 @@ pub(crate) fn key_filters_may_overlap(
     b: &lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilter,
 ) -> bool {
     a.field_ids != b.field_ids || a.intersects(b).map_or(true, |(overlap, _)| overlap)
+}
+
+/// Research (write throughput): the exact ids of the rows this process wrote
+/// into each data file of an absence-proven insert, keyed by the file's path.
+/// A data file is immutable and its name random, so the entry is true for
+/// every version that lists the file. A key-absence probe checks a fragment
+/// the id index does not cover against it instead of reading the fragment,
+/// when the fragment has that one data file and no deletion file; anything
+/// else is read as before. Bounded; an evicted entry only costs the read.
+pub(crate) mod known_keys {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    const MAX_IDS: usize = 4_000_000;
+
+    #[derive(Default)]
+    struct Cache {
+        files: HashMap<String, Arc<HashSet<String>>>,
+        order: VecDeque<String>,
+        ids: usize,
+    }
+
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Mutex::default);
+
+    /// Research switch, on unless `OMNIGRAPH_KNOWN_KEYS=0`.
+    pub(crate) fn enabled() -> bool {
+        std::env::var("OMNIGRAPH_KNOWN_KEYS").map_or(true, |value| value != "0")
+    }
+
+    pub(crate) fn record(path: &str, ids: &[String]) {
+        if !enabled() || ids.is_empty() {
+            return;
+        }
+        let mut cache = CACHE.lock().unwrap();
+        if cache.files.contains_key(path) {
+            return;
+        }
+        cache.ids += ids.len();
+        cache
+            .files
+            .insert(path.to_string(), Arc::new(ids.iter().cloned().collect()));
+        cache.order.push_back(path.to_string());
+        while cache.ids > MAX_IDS {
+            let Some(oldest) = cache.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = cache.files.remove(&oldest) {
+                cache.ids -= evicted.len();
+            }
+        }
+    }
+
+    pub(crate) fn get(path: &str) -> Option<Arc<HashSet<String>>> {
+        CACHE.lock().unwrap().files.get(path).cloned()
+    }
+}
+
+/// The members of `source_ids` in the fragments the id index does not cover,
+/// answered from [`known_keys`] when every such fragment is known; `None`
+/// when one is not (the caller then scans as before).
+async fn known_tail_members(
+    ds: &Dataset,
+    source_ids: &[String],
+    system_columns: SystemColumns,
+) -> Result<Option<HashSet<String>>> {
+    if !known_keys::enabled() {
+        return Ok(None);
+    }
+    let Some(uncovered) =
+        crate::dataset_index::key_column_uncovered_fragments(ds, system_columns.id).await?
+    else {
+        return Ok(None);
+    };
+    if uncovered.is_empty() {
+        return Ok(None);
+    }
+    let mut present = HashSet::new();
+    for fragment in ds
+        .fragments()
+        .iter()
+        .filter(|fragment| uncovered.contains(&fragment.id))
+    {
+        if fragment.deletion_file.is_some() || fragment.files.len() != 1 {
+            return Ok(None);
+        }
+        let Some(ids) = known_keys::get(&fragment.files[0].path) else {
+            return Ok(None);
+        };
+        for id in source_ids {
+            if ids.contains(id) {
+                present.insert(id.clone());
+            }
+        }
+    }
+    crate::instrumentation::record_known_tail_probe();
+    Ok(Some(present))
 }
 
 /// Compose insert-only staged writes of one table into one transaction read
@@ -4387,6 +4489,7 @@ impl TableStore {
         // The transaction keeps Lance's temporary fragment ids and lets commit
         // assign target-local stable row ids. Only the read-your-writes copy is
         // normalized now, exactly as in the test-only staged Append adapter.
+        let transaction_fragments_for_cache = transaction_fragments.clone();
         let mut visible_fragments = transaction_fragments;
         let next_id_base = ds.manifest.max_fragment_id.unwrap_or(0) as u64 + 1;
         assign_fragment_ids(&mut visible_fragments, next_id_base);
@@ -4395,6 +4498,11 @@ impl TableStore {
         }
 
         crate::instrumentation::record_stage_fenced_insert(source_ids.len() as u64);
+        if let [fragment] = transaction_fragments_for_cache.as_slice()
+            && let [file] = fragment.files.as_slice()
+        {
+            known_keys::record(&file.path, &source_ids);
+        }
         Ok(StagedWrite::with_commit_metadata(
             transaction,
             StagedCommitMetadata::affected_rows(Some(RowAddrTreeMap::new())),
@@ -4529,7 +4637,15 @@ impl TableStore {
         if source_ids.is_empty() {
             return Ok(None);
         }
-        let mut target_ids = Self::exact_id_scan(ds, source_ids, system_columns).await?;
+        let mut target_ids = match known_tail_members(ds, source_ids, system_columns).await? {
+            Some(known) => {
+                if let Some(id) = source_ids.iter().find(|id| known.contains(*id)) {
+                    return Ok(Some(id.clone()));
+                }
+                Self::exact_id_scan_indexed(ds, source_ids, system_columns).await?
+            }
+            None => Self::exact_id_scan(ds, source_ids, system_columns).await?,
+        };
         while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
             let ids =
                 string_id_column(&batch, system_columns, "stage_keyed_write strict preflight")?;
@@ -4569,6 +4685,32 @@ impl TableStore {
         .await
     }
 
+    /// [`Self::exact_id_scan`] over the fragments the id index covers only
+    /// (research: the rest are answered by [`known_tail_members`]).
+    async fn exact_id_scan_indexed(
+        ds: &Dataset,
+        source_ids: &[String],
+        system_columns: SystemColumns,
+    ) -> Result<DatasetRecordBatchStream> {
+        use datafusion::prelude::{col, lit};
+
+        let filter = col(system_columns.id)
+            .in_list(source_ids.iter().map(|id| lit(id.clone())).collect(), false);
+        Self::scan_stream_with(
+            ds,
+            Some(&[system_columns.id]),
+            None,
+            None,
+            false,
+            |scanner| {
+                scanner.filter_expr(filter);
+                scanner.fast_search();
+                Ok(())
+            },
+        )
+        .await
+    }
+
     /// How many members of `source_ids` the pinned table holds, through the
     /// same exact-id predicate as [`Self::first_existing_id`].
     async fn existing_id_count(
@@ -4579,8 +4721,17 @@ impl TableStore {
         if source_ids.is_empty() {
             return Ok(0);
         }
-        let mut target_ids = Self::exact_id_scan(ds, source_ids, system_columns).await?;
-        let mut present = HashSet::new();
+        let (mut target_ids, mut present) =
+            match known_tail_members(ds, source_ids, system_columns).await? {
+                Some(known) => (
+                    Self::exact_id_scan_indexed(ds, source_ids, system_columns).await?,
+                    known,
+                ),
+                None => (
+                    Self::exact_id_scan(ds, source_ids, system_columns).await?,
+                    HashSet::new(),
+                ),
+            };
         while let Some(batch) = target_ids.try_next().await.map_err(OmniError::storage)? {
             let ids = string_id_column(&batch, system_columns, "stage_keyed_write upsert probe")?;
             for row in 0..ids.len() {

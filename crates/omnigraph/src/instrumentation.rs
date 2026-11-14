@@ -4,7 +4,8 @@
 pub use omnigraph_core::instrumentation::with_rrf_gate_subset_drop;
 pub(crate) use omnigraph_core::instrumentation::*;
 pub use omnigraph_core::instrumentation::{
-    CountingStorageAdapter, ExternalPayloadReadHold, MergeTimingReading, MergeWriteProbes,
+    CountingStorageAdapter, ExternalPayloadReadHold, KNOWN_TAIL_PROBES, MergeTimingReading,
+    MergeWriteProbes,
     ProbedStores, QueryBlockingPauseGuard, QueryExecutionMetrics, QueryIoProbes, QueryLadderReport,
     QueryMemoryProbes, RrfGateFallback, RrfGatePlan, RrfGateVerdict, StageWriteProbes,
     StorageReadCounts, capture_query_io_probes, with_csv_slice_bytes,

@@ -1110,6 +1110,14 @@ pub fn record_probed_store(
 }
 
 /// Record one pre-effect mutation reprepare. No-op unless a cost probe is active.
+/// Research (write throughput): key-absence probes answered for the
+/// unindexed tail from known keys. Counted only, no probe field.
+pub fn record_known_tail_probe() {
+    KNOWN_TAIL_PROBES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub static KNOWN_TAIL_PROBES: AtomicU64 = AtomicU64::new(0);
+
 pub fn record_mutation_reprepare() {
     let _ = current(|p| {
         p.mutation_reprepares.fetch_add(1, Ordering::Relaxed);
