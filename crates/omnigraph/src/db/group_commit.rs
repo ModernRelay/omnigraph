@@ -3,8 +3,7 @@
 //! Not a production path. Enabled per process by `OMNIGRAPH_GROUP_COMMIT=1`
 //! (read once). Several insertion-only mutations on one branch publish with
 //! one `__manifest` publication (or, with `OMNIGRAPH_WAL=1`, one log record)
-//! as one graph commit, following the shape of the group-commit RFC draft in
-//! PR #785:
+//! as one graph commit, following the shape of the group-commit RFC draft:
 //!
 //! - A writer prepares as today (capture, execute, validate at its pinned base,
 //!   stage its data files) and then submits an entry instead of taking the

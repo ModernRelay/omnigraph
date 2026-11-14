@@ -8185,8 +8185,9 @@ pub(crate) fn compaction_blob_batch_rows(max_row_blob_bytes: u64) -> usize {
 /// filter-bearing insertion-only `Update` whose key filter holds every id,
 /// re-certified for `base`. The caller proves the ids pairwise disjoint and
 /// absent from every commit between each component's pin and `base`; this is
-/// the shape `group_commit_composes_inserts_staged_against_older_pins_onto_a_later_pin`
-/// (PR #785) pins on Lance 13.
+/// the shape the group-commit RFC draft's Lance composition guard
+/// (`group_commit_composes_inserts_staged_against_older_pins_onto_a_later_pin`) pins
+/// on Lance 13.
 pub(crate) fn compose_pure_inserts(
     base: &Dataset,
     parts: Vec<StagedWrite>,

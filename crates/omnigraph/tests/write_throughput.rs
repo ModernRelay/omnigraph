@@ -591,7 +591,7 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
             session.db().branch_create(branch).await.unwrap();
         }
     }
-    // Hold the writer epoch (PR #1350) of every branch written, so the
+    // Hold the writer epoch of every branch written, so the
     // process's own view is authoritative and its head probes are skipped.
     if config.claim {
         let mut claimed = std::collections::BTreeSet::new();

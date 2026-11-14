@@ -2113,7 +2113,8 @@ impl Omnigraph {
         if let Some((_, coord)) = cache.as_mut() {
             // WAL research prototype: a branch this process holds, at the
             // version of the process's own last publication there, is current
-            // with no probe (PR #1350's rule, here for a non-bound branch).
+            // with no probe (the writer-epoch holder's rule, here for a non-bound
+            // branch).
             let current = match coord.head_is_current().await {
                 Ok(current) => current,
                 Err(error) => {
@@ -2255,7 +2256,7 @@ impl Omnigraph {
             });
         // WAL research prototype: a non-bound branch this process holds, still
         // at the version of the process's own last publication there, is
-        // current with no probe (PR #1350's rule, extended).
+        // current with no probe (the writer-epoch holder's rule, extended).
         let held_current = !bound && {
             let key = txn.branch.as_deref().unwrap_or("main");
             let slot = self.merge_authority_cache.lock_for(key).await;
