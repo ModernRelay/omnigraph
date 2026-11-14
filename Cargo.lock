@@ -5605,6 +5605,7 @@ dependencies = [
  "omnigraph-engine",
  "omnigraph-gqt-core",
  "omnigraph-reference-engine",
+ "omnigraph-storage",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -1,0 +1,1 @@
+- `Omnigraph::open_clone` accepts two `s3://` prefixes of one endpoint as base and clone root, as it accepts two local directories; `omnigraph-gqt` gains `--base <URI>` beside `--store <URI>`.

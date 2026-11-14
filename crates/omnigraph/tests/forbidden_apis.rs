@@ -164,13 +164,9 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "engine/plan_source/scan_access/planning_cost.rs",
 ];
 
-/// Out-of-line modules are parsed as standalone files, so the walker cannot see
-/// their parent's `mod` gate: `#[cfg(test)]` for each entry but
-/// `omnigraph-catalog/namespace.rs`, gated `#[cfg(any(test, feature = "test-util"))]`.
-/// Production gateway and primitive-definition files are deliberately *not*
-/// excluded: their current durable calls are exact-registered below, so adding
-/// a new call inside a trusted implementation still requires an explicit
-/// protocol disposition.
+/// Out-of-line modules are parsed standalone, so the walker cannot see their parent's
+/// `mod` gate: `cfg(test)`, or `any(test, feature = "test-util")` for `namespace.rs` and
+/// `read_through_contract.rs`; gateway and primitive files stay in, exact-registered below.
 const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
     "engine/plan_source/key_tests.rs",
     "engine/plan_source/scan_access/tests.rs",
@@ -178,6 +174,7 @@ const PROTOCOL_SCAN_EXCLUDED_FILES: &[&str] = &[
     "table_store/staged_tests.rs",
     "omnigraph-catalog/namespace.rs",
     "omnigraph-catalog/tests.rs",
+    "omnigraph-storage/read_through_contract.rs",
     "db/upgrade/tests.rs",
     "db/catalog_tests.rs",
     "core_tests.rs",
@@ -1900,7 +1897,11 @@ fn call_inventory(ast: &syn::File) -> CallInventory {
 
 fn durable_protocol_scan_files(engine_src: &Path) -> Vec<(String, PathBuf)> {
     let mut files = labeled_scan_files(engine_src, true);
-    files.extend(sibling_crate_files(engine_src, STORAGE_CRATE));
+    files.extend(
+        sibling_crate_files(engine_src, STORAGE_CRATE)
+            .into_iter()
+            .filter(|(relative, _)| !PROTOCOL_SCAN_EXCLUDED_FILES.contains(&relative.as_str())),
+    );
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
 }

@@ -12,6 +12,7 @@ use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
+use object_store::prefix::PrefixStore;
 use object_store::{DynObjectStore, GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutPayload};
 use url::Url;
 
@@ -28,6 +29,8 @@ use conditional::{Answer, ConditionalRequest, Resolution, Step};
 pub use conditional::{CONDITIONAL_REQUEST_REISSUES, RequestClient};
 
 mod read_through;
+#[cfg(any(test, feature = "test-util"))]
+pub mod read_through_contract;
 pub use read_through::{FrozenDirectory, ReadThroughMount, ReadThroughStore};
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -1378,53 +1381,7 @@ impl ObjectStorageAdapter {
 
     fn s3_from_root_uri_with_scope(root_uri: &str, scope: Option<StorageIoScope>) -> Result<Self> {
         let location = parse_s3_uri(root_uri)?;
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(&location.bucket);
-
-        if let Some(endpoint) = env::var("AWS_ENDPOINT_URL_S3")
-            .ok()
-            .or_else(|| env::var("AWS_ENDPOINT_URL").ok())
-        {
-            builder = builder.with_endpoint(&endpoint);
-            if endpoint.starts_with("http://") || env_var_truthy("AWS_ALLOW_HTTP") {
-                builder = builder.with_allow_http(true);
-            }
-        }
-
-        if env_var_truthy("AWS_S3_FORCE_PATH_STYLE") {
-            builder = builder.with_virtual_hosted_style_request(false);
-        }
-
-        let build = |builder: AmazonS3Builder| {
-            builder.build().map_err(|err| {
-                let kind = classify_object_store_error(&err);
-                StorageError::backend(
-                    kind,
-                    format!(
-                        "failed to initialize s3 storage for '{}': {}",
-                        root_uri, err
-                    ),
-                )
-            })
-        };
-        let retrying = match scope {
-            Some(_) => Some(build(
-                builder.clone().with_retry(scoped_read_retry_config()),
-            )?),
-            None => None,
-        };
-        if scope.is_some() {
-            builder = builder.with_retry(single_attempt_retry_config());
-        }
-        let store = builder.build().map_err(|err| {
-            let kind = classify_object_store_error(&err);
-            StorageError::backend(
-                kind,
-                format!(
-                    "failed to initialize s3 storage for '{}': {}",
-                    root_uri, err
-                ),
-            )
-        })?;
+        let (store, retrying) = s3_clients(&location.bucket, root_uri, scope.is_some())?;
 
         let adapter = Self {
             store: Arc::new(store),
@@ -1601,18 +1558,27 @@ impl ObjectStorageAdapter {
     /// Storage for the graph root `root_uri` read through the base `base_uri`:
     /// an object the root does not hold is read from the base, every write
     /// and every delete marker lands under the root, and the base is never
-    /// written. Both are root URIs of one backend; this phase wires the local
-    /// instance, so both name local directories. The root is the layer of a
-    /// [`ReadThroughMount`], so a later adapter over the same root finds the
-    /// same graph, and [`StorageAdapter::read_through_mount`] hands the mount
-    /// to the other stores of the root.
+    /// written. Both are root URIs of one backend: two local directories, or
+    /// two `s3://` prefixes of one endpoint (the base may be another bucket).
+    /// The root is the layer of a [`ReadThroughMount`], so a later adapter
+    /// over the same root finds the same graph, and
+    /// [`StorageAdapter::read_through_mount`] hands the mount to the other
+    /// stores of the root.
     ///
     /// # Errors
-    /// When the two roots are not of one kind, when that kind is not local,
-    /// when the root and the base are one directory or one lies inside the
-    /// other, when the base cannot be listed or holds a symlink, or when the
-    /// root's delete markers cannot be listed.
+    /// When the two roots are not of one kind, when that kind is neither
+    /// local nor S3, when the root and the base are one directory or prefix
+    /// or one lies inside the other, when the base cannot be listed or holds
+    /// a symlink, or when the root's delete markers cannot be listed.
     pub async fn durable_read_through(base_uri: &str, root_uri: &str) -> Result<Self> {
+        Self::durable_read_through_with_scope(base_uri, root_uri, None).await
+    }
+
+    async fn durable_read_through_with_scope(
+        base_uri: &str,
+        root_uri: &str,
+        scope: Option<StorageIoScope>,
+    ) -> Result<Self> {
         let kind = storage_kind_for_uri(root_uri)?;
         if storage_kind_for_uri(base_uri)? != kind {
             return Err(StorageError::backend(
@@ -1622,12 +1588,76 @@ impl ObjectStorageAdapter {
                 ),
             ));
         }
-        if kind != StorageKind::Local {
+        match kind {
+            StorageKind::Local => {
+                let adapter = Self::local_read_through(base_uri, root_uri).await?;
+                Ok(match scope {
+                    Some(scope) => adapter.with_scope(scope),
+                    None => adapter,
+                })
+            }
+            StorageKind::S3 => Self::s3_read_through(base_uri, root_uri, scope).await,
+            StorageKind::Azure => Err(StorageError::backend(
+                StorageFailureKind::Configuration,
+                format!("read-through storage needs a local or s3 clone root, got '{root_uri}'"),
+            )),
+        }
+    }
+
+    /// The S3 instance of [`Self::durable_read_through`]: both clients from the
+    /// standard `AWS_*` environment (one endpoint by construction), the base's
+    /// index from one listing, the mount named by the clone root's bucket and prefix.
+    async fn s3_read_through(
+        base_uri: &str,
+        root_uri: &str,
+        scope: Option<StorageIoScope>,
+    ) -> Result<Self> {
+        let root = parse_s3_uri(root_uri)?;
+        let base = parse_s3_uri(base_uri)?;
+        let root_key = ObjectPath::from(root.key.as_str());
+        let base_key = ObjectPath::from(base.key.as_str());
+        if root.bucket == base.bucket && s3_prefixes_overlap(root_key.as_ref(), base_key.as_ref()) {
             return Err(StorageError::backend(
                 StorageFailureKind::Configuration,
-                format!("read-through storage needs a local clone root, got '{root_uri}'"),
+                format!(
+                    "read-through storage needs a clone root and a base that do not contain each other, got '{root_uri}' and '{base_uri}'"
+                ),
             ));
         }
+        let base_store = build_s3_store(s3_bucket_builder(&base.bucket), base_uri)?;
+        let frozen = FrozenDirectory::over(Arc::new(PrefixStore::new(base_store, base_key)))
+            .await
+            .map_err(|err| storage_backend_error("read_through_open", base_uri, err))?;
+        let (layer, retrying) = s3_clients(&root.bucket, root_uri, scope.is_some())?;
+        let layer: Arc<DynObjectStore> = Arc::new(layer);
+        let mount = ReadThroughMount::open(layer.as_ref(), frozen, root_key)
+            .await
+            .map_err(|err| storage_backend_error("read_through_open", root_uri, err))?
+            .in_bucket(root.bucket.as_str());
+        let adapter = Self {
+            store: Arc::new(mount.store(layer)),
+            scope: None,
+            codec: UriCodec::S3 {
+                bucket: root.bucket,
+            },
+            supports_conditional_update: true,
+            #[cfg(test)]
+            omit_read_etag: false,
+            #[cfg(test)]
+            omit_write_etag: false,
+            read_through: Some(mount.clone()),
+        };
+        Ok(match (scope, retrying) {
+            (Some(scope), Some(retrying)) => {
+                let retrying: Arc<dyn ObjectStore> = Arc::new(mount.store(Arc::new(retrying)));
+                adapter.with_scope_and_retrying(scope, retrying)
+            }
+            _ => adapter,
+        })
+    }
+
+    /// The local instance of [`Self::durable_read_through`].
+    async fn local_read_through(base_uri: &str, root_uri: &str) -> Result<Self> {
         let root = absolutize_lexically(local_path_from_uri(root_uri)?)?;
         let base = absolutize_lexically(local_path_from_uri(base_uri)?)?;
         let held = resolve_existing(&root);
@@ -1668,15 +1698,13 @@ impl ObjectStorageAdapter {
 
     /// [`Self::durable_read_through`] whose mutations belong to the supplied
     /// owner, the scope sitting above the mount as it sits above a plain
-    /// local store.
+    /// store of the same backend.
     pub async fn durable_read_through_scoped(
         base_uri: &str,
         root_uri: &str,
         scope: StorageIoScope,
     ) -> Result<Self> {
-        Ok(Self::durable_read_through(base_uri, root_uri)
-            .await?
-            .with_scope(scope))
+        Self::durable_read_through_with_scope(base_uri, root_uri, Some(scope)).await
     }
 
     /// Shared body of the bounded existence-tolerant reads: one ranged GET of
@@ -3048,6 +3076,72 @@ fn local_path_from_file_uri(uri: &str) -> Result<PathBuf> {
             format!("invalid file uri '{}'", uri),
         )
     })
+}
+
+/// An S3 client builder for `bucket` from the standard `AWS_*` environment:
+/// the endpoint override, plain HTTP where the endpoint or `AWS_ALLOW_HTTP`
+/// asks for it, and path-style requests under `AWS_S3_FORCE_PATH_STYLE`.
+fn s3_bucket_builder(bucket: &str) -> AmazonS3Builder {
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    if let Some(endpoint) = env::var("AWS_ENDPOINT_URL_S3")
+        .ok()
+        .or_else(|| env::var("AWS_ENDPOINT_URL").ok())
+    {
+        builder = builder.with_endpoint(&endpoint);
+        if endpoint.starts_with("http://") || env_var_truthy("AWS_ALLOW_HTTP") {
+            builder = builder.with_allow_http(true);
+        }
+    }
+    if env_var_truthy("AWS_S3_FORCE_PATH_STYLE") {
+        builder = builder.with_virtual_hosted_style_request(false);
+    }
+    builder
+}
+
+fn build_s3_store(builder: AmazonS3Builder, root_uri: &str) -> Result<object_store::aws::AmazonS3> {
+    builder.build().map_err(|err| {
+        let kind = classify_object_store_error(&err);
+        StorageError::backend(
+            kind,
+            format!("failed to initialize s3 storage for '{root_uri}': {err}"),
+        )
+    })
+}
+
+/// The clients of one `s3://` root: the store its reads and writes go to and,
+/// when `scoped`, a second client with bounded retries for its reads, the
+/// first then single-attempt (`ObjectStorageAdapter::with_scope_and_retrying`).
+fn s3_clients(
+    bucket: &str,
+    root_uri: &str,
+    scoped: bool,
+) -> Result<(
+    object_store::aws::AmazonS3,
+    Option<object_store::aws::AmazonS3>,
+)> {
+    let mut builder = s3_bucket_builder(bucket);
+    let retrying = match scoped {
+        true => Some(build_s3_store(
+            builder.clone().with_retry(scoped_read_retry_config()),
+            root_uri,
+        )?),
+        false => None,
+    };
+    if scoped {
+        builder = builder.with_retry(single_attempt_retry_config());
+    }
+    Ok((build_s3_store(builder, root_uri)?, retrying))
+}
+
+/// Whether two canonical key prefixes of one bucket (object-store paths: no
+/// empty or trailing segment) name one set of objects or one lies inside the
+/// other; the empty prefix is the bucket itself.
+fn s3_prefixes_overlap(a: &str, b: &str) -> bool {
+    a == b
+        || a.is_empty()
+        || b.is_empty()
+        || a.starts_with(&format!("{b}/"))
+        || b.starts_with(&format!("{a}/"))
 }
 
 fn parse_s3_uri(uri: &str) -> Result<S3Location> {
@@ -6489,15 +6583,42 @@ mod tests {
 
     #[tokio::test]
     async fn read_through_storage_refuses_a_remote_clone_root() {
-        let err =
-            ObjectStorageAdapter::durable_read_through("s3://bucket/base", "s3://bucket/root")
-                .await
-                .expect_err("a clone root is a local directory in this phase");
+        let err = ObjectStorageAdapter::durable_read_through(
+            "az://container/base",
+            "az://container/root",
+        )
+        .await
+        .expect_err("a clone root is a local directory or an s3 prefix");
         let text = err.to_string();
         assert!(
-            text.contains("read-through storage needs a local clone root"),
+            text.contains("read-through storage needs a local or s3 clone root"),
             "{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_through_storage_refuses_s3_prefixes_that_contain_each_other() {
+        for (base, root) in [
+            ("s3://bucket/graph", "s3://bucket/graph"),
+            ("s3://bucket/graph", "s3://bucket/graph/clone"),
+            ("s3://bucket/graph/sub", "s3://bucket/graph"),
+            ("s3://bucket", "s3://bucket/clone"),
+            ("s3://bucket/graph/", "s3://bucket/graph"),
+            ("s3://bucket/graph//sub", "s3://bucket/graph/sub"),
+            ("s3://bucket/graph/sub", "s3://bucket/graph//sub/"),
+            ("s3://bucket//graph", "s3://bucket/graph/clone"),
+        ] {
+            let text = ObjectStorageAdapter::durable_read_through(base, root)
+                .await
+                .expect_err("one prefix inside the other")
+                .to_string();
+            assert!(
+                text.contains("do not contain each other"),
+                "{base} and {root}: {text}"
+            );
+        }
+        assert!(!s3_prefixes_overlap("graph", "graphs"));
+        assert!(!s3_prefixes_overlap("a/graph", "b/graph"));
     }
 
     #[tokio::test]
