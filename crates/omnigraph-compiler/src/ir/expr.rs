@@ -123,6 +123,35 @@ impl std::fmt::Display for BlockAggregateExpr {
     }
 }
 
+/// Whether `expr` holds an aggregate, a ranking or a result alias, which no
+/// scalar of the outer row does.
+fn contains_aggregate_or_search(expr: &IRExpr) -> bool {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            IRExpr::Aggregate { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Bm25 { .. }
+            | IRExpr::Rrf { .. }
+            | IRExpr::AliasRef(_, _) => return true,
+            IRExpr::Not(arg, _)
+            | IRExpr::IsNull { expr: arg, .. }
+            | IRExpr::Neg { expr: arg, .. }
+            | IRExpr::Cast { expr: arg, .. } => pending.push(arg),
+            IRExpr::Binary { left, right, .. } => pending.extend([left.as_ref(), right.as_ref()]),
+            IRExpr::Call { args, .. } => pending.extend(args),
+            IRExpr::Search { .. }
+            | IRExpr::MatchText { .. }
+            | IRExpr::Fuzzy { .. }
+            | IRExpr::PropAccess { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::Param(_, _)
+            | IRExpr::Literal(_, _) => {}
+        }
+    }
+    false
+}
+
 /// The HAVING predicate of one correlated block, with both conversions stored.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SubqueryPredicate {
@@ -150,14 +179,12 @@ impl SubqueryPredicate {
 
     pub fn check_types(&self) -> Result<()> {
         self.left.check_types()?;
+        // The bound is any scalar of the enclosing row: a constant, or an
+        // expression over the outer row's columns evaluated per outer row.
         self.right.check_types()?;
-        let mut bound = &self.right;
-        while let IRExpr::Cast { expr, .. } = bound {
-            bound = expr;
-        }
-        if !matches!(bound, IRExpr::Literal(_, _) | IRExpr::Param(_, _)) {
+        if contains_aggregate_or_search(&self.right) {
             return Err(CompilerError::Plan(
-                "block comparison bound must be a literal or parameter with explicit casts".into(),
+                "block comparison bound must be a scalar of the outer row".into(),
             ));
         }
         let (left, right) =
@@ -1876,7 +1903,7 @@ mod block_type_tests {
     }
 
     #[test]
-    fn block_validation_refuses_forged_signatures_casts_and_nonconstant_bounds() {
+    fn block_validation_refuses_forged_signatures_casts_and_aggregate_bounds() {
         for op in [CompOp::Contains, CompOp::StringContains, CompOp::StartsWith] {
             let predicate = SubqueryPredicate {
                 left: aggregate(AggFunc::Max, ScalarType::String, ScalarType::String),
@@ -1908,11 +1935,24 @@ mod block_type_tests {
         };
         signature.result = value(ScalarType::I64, false);
         assert!(forged.check_types().is_err());
-        let mut forged = base.clone();
-        forged.right = IRExpr::PropAccess {
+        // A bound read from the outer row is a scalar of the row; one
+        // holding an aggregate is not.
+        let mut outer = base.clone();
+        outer.right = IRExpr::PropAccess {
             variable: "outer".into(),
             property: "amount".into(),
             ty: value(ScalarType::I64, false),
+        };
+        assert!(outer.check_types().is_ok());
+        let mut forged = base.clone();
+        forged.right = IRExpr::Aggregate {
+            func: AggFunc::Sum,
+            distinct: false,
+            arg: Box::new(outer.right.clone()),
+            signature: AggSignature {
+                arg: value(ScalarType::I64, false),
+                result: value(ScalarType::I64, true),
+            },
         };
         assert!(forged.check_types().is_err());
         let mut forged = base.clone();

@@ -382,7 +382,18 @@ impl ExecutionPlan for AntiJoinMaskExec {
                             &|batch, arg| crate::engine::expr::evaluate_expr(batch, arg, &params),
                         )
                         .map_err(external)?;
-                        let keep = aggregate.keep_mask().map_err(external)?;
+                        let keep = if aggregate.reads_outer_row() {
+                            let right = crate::engine::expr::evaluate_expr(
+                                &wide,
+                                &predicate.right,
+                                &params,
+                            )
+                            .map_err(external)?;
+                            aggregate.keep_mask_against(&right)
+                        } else {
+                            aggregate.keep_mask()
+                        }
+                        .map_err(external)?;
                         reservation.filter(&wide, &keep)
                     })
                     .await
@@ -436,6 +447,18 @@ async fn key_set_mask(
             .transpose()
             .map_err(external)?;
         aggregate.absorb(&tags, values.as_ref()).map_err(external)?;
+    }
+    if aggregate.reads_outer_row() {
+        let right =
+            crate::engine::expr::evaluate_expr(wide, &predicate.right, params).map_err(external)?;
+        let groups = UInt32Array::from_iter_values(
+            row_groups
+                .into_iter()
+                .map(|group| group.unwrap_or(unmatched)),
+        );
+        return aggregate
+            .keep_rows_against(&groups, &right)
+            .map_err(external);
     }
     let verdicts = aggregate.keep_mask().map_err(external)?;
     Ok(row_groups

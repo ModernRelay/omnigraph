@@ -107,10 +107,10 @@ its own `where`, `count { $q: Person, $p knows $q where $q.age > 30 }`, reads
 an outer variable (`T39`, `T9` under `not`) and binds every name new to it
 (`T84`, [inner scopes](traversal.md#inner-scopes)). The row is kept when the
 aggregate comparison is true: `not exists` means `count = 0`, and `exists`
-means `count > 0`. The right side is a literal, `now()` or typed parameter; a
-column, `$p.quota`, is not lowered yet (`T86`). Numeric bounds follow the
-[comparison rules](#boolean-expressions-and-nulls) for the aggregate's result
-type. Its argument is a scalar expression in the block's scope: numeric for
+means `count > 0`. The right side is any scalar of the outer row, evaluated
+for each row (`count { … } >= $p.quota`; another block's value is `T86`), its
+bounds by the [comparison rules](#boolean-expressions-and-nulls) for the
+aggregate's result type. Its argument is a scalar expression in the block's scope: numeric for
 `sum` and `avg`; numeric, `String`, `Bool`, `Date` or `DateTime` for `min` and
 `max`, as in `return`. With no matches, `sum`, `min`, `max` and `avg` satisfy
 no comparison; `count` is `0`.

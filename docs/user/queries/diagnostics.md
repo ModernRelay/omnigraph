@@ -299,7 +299,7 @@ that calls itself.
 | A node an `optional` introduces, returned whole | B | return its properties |
 | An order key no return item computes | B | return the key under an alias; the edit inserts it |
 | A ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit` | B | none |
-| A block compared with a column, a block of several aggregates | B | none |
+| A block compared with another block's value, a block of several aggregates | B | none |
 | Two `rrf` arm windows that differ | B | none |
 | A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B | none |
 | A read that calls itself (`Fix`) | Rec | none |

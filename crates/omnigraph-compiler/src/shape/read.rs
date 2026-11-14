@@ -2403,10 +2403,15 @@ impl<'a> Shaper<'a> {
                 Some(found) => found,
                 None => return Err(self.refuse_at("a filter over block values", Construct::Block)),
             };
-            if !right.columns_empty() {
-                return Err(
-                    self.refuse_at("a block value compared with a column", Construct::Block)
-                );
+            // The right side is evaluated over the outer rows: it may read
+            // their columns, not another block's value.
+            let mut read = Vec::new();
+            right.columns(&mut read);
+            if read.iter().any(|c| is_block_column(c)) {
+                return Err(self.refuse_at(
+                    "a block value compared with another block's value",
+                    Construct::Block,
+                ));
             }
             let mut inner_facts = Facts::default();
             self.facts(inner, &mut inner_facts)?;

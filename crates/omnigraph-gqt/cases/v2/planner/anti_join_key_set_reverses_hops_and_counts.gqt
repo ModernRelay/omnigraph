@@ -3,7 +3,8 @@
 # notes: outer binding is reversed. Exact and ranged hop counts and a block written from the
 # notes: bound binding keep their rows. An unbound traversal counts
 # notes: distinct neighbours and a bound edge counts edge rows in either direction: d's two
-# notes: parallel edges to e count once unbound and twice bound.
+# notes: parallel edges to e count once unbound and twice bound. A bound read from the outer
+# notes: row is evaluated for each outer row against its key's count.
 
 --- runner
 timeout_ms: 10000
@@ -149,6 +150,29 @@ query two_edge_rows_to_e() {
 
 --- expect unordered
 {"p.name": "d"}
+
+--- expect shape
+p.name: String
+
+--- expect plan
+anti join $p: key_set
+
+--- query
+query edge_rows_to_e_against_an_outer_bound() {
+    match { $p: Person }
+    where count {
+        $p $k:knows $x,
+        $x: Person
+        where $x.name = "e"
+    } = if($p.name = "d", 1, 0)
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "a"}
+{"p.name": "b"}
+{"p.name": "c"}
+{"p.name": "e"}
 
 --- expect shape
 p.name: String

@@ -1046,13 +1046,10 @@ fn saved_blocks_refuse_spec_signature_and_cast_drift_before_reading_rows() {
         ty: value_type(ScalarType::F64, false),
     };
     refuses_block_before_execution(&bound);
+    // A bound read from the outer row (`$p.amount`) is a scalar of the row
+    // the block compares with; a result alias is not.
     for right in [
         IRExpr::Literal(Literal::Integer(0), value_type(ScalarType::I64, false)),
-        IRExpr::PropAccess {
-            variable: "p".into(),
-            property: "amount".into(),
-            ty: value_type(ScalarType::F64, false),
-        },
         IRExpr::AliasRef("bound".into(), value_type(ScalarType::F64, false)),
     ] {
         let mut bound = signed_sum_block();

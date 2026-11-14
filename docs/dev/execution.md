@@ -435,6 +435,10 @@ outer binding (the correlation binding included: its identity is the key,
 never a read column), when no binding is bounded, and under a
 `traversal_work_limit`. The bulk CSR degree check needs a filter-free
 destination, so its shapes never have a bounded binding and stay correlated.
+A block's right side may read the outer row's columns: the operator evaluates
+it over the outer batch and compares each outer row's aggregate (its key's,
+under `key_set`) with its own value; the bulk CSR check takes only a constant
+right side.
 
 ## Filters and pushdown
 

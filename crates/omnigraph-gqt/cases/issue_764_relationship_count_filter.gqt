@@ -4,7 +4,7 @@
 # notes: The bare aggregate in match stays rejected: it names no key.
 # notes: `count { … } = 0` must agree with `not { … }`.
 # notes: An unbound block counts distinct neighbours (a4 → three is seeded twice); a bound edge counts edge rows.
-# notes: The right side is a literal, now() or a parameter; an outer property is refused at typecheck.
+# notes: The right side is a literal, now(), a parameter or an expression over the outer row's columns.
 # notes: Shared row/error steps inherit the CI engine baseline; only plan assertions select v2.
 
 --- runner
@@ -157,14 +157,34 @@ query undirected_existence_reads_both_directions() {
 n.slug: String
 
 --- query
-query outer_property_as_the_bound_is_refused() {
+query outer_property_as_the_bound() {
     match { $n: Actor }
     where count {
-        $m: Artifact, $m artifactOwnedByActor $n
+        $m: Actor, $n knows $m
     } >= $n.followers
     return { $n.slug }
 }
---- expect error: T86: `outer_property_as_the_bound_is_refused`: this release's planner does not lower a block value compared with a column
+--- expect unordered
+{"n.slug":"zero"}
+{"n.slug":"one"}
+--- expect shape
+n.slug: String
+
+--- query
+query outer_property_bounds_the_artifact_count() {
+    match { $n: Actor }
+    where count {
+        $m: Artifact, $m artifactOwnedByActor $n
+    } > $n.followers - 1
+    return { $n.slug }
+}
+--- expect unordered
+{"n.slug":"zero"}
+{"n.slug":"one"}
+{"n.slug":"two"}
+{"n.slug":"three"}
+--- expect shape
+n.slug: String
 
 --- query
 query not_equal_to_a_parameter($bound: I64) {

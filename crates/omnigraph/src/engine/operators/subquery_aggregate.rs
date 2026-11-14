@@ -142,11 +142,13 @@ fn fold_extremum(
     Ok(())
 }
 
-/// Bound once, retaining the left recipe and the right Arrow scalar domain.
+/// Bound once, retaining the left recipe and the right Arrow scalar domain:
+/// a constant right side evaluated once, or one reading an outer row's
+/// columns evaluated over the outer rows by the caller.
 struct BoundComparison {
     left: BlockAggregateExpr,
     op: CompOp,
-    right: ArrayRef,
+    right: Option<ArrayRef>,
 }
 
 impl BoundComparison {
@@ -155,21 +157,35 @@ impl BoundComparison {
         Ok(Self {
             left: predicate.left.clone(),
             op: predicate.op,
-            right: evaluate_constant_array(&predicate.right, params)?,
+            right: if predicate.right.columns_empty() {
+                Some(evaluate_constant_array(&predicate.right, params)?)
+            } else {
+                None
+            },
         })
     }
 
     /// Whether the predicate holds for each of `values`, the block
     /// aggregate's results in the leaf's declared type: one cast chain and
     /// one comparison over the whole column, a null verdict reading `false`.
-    fn holds_all(&self, values: &ArrayRef) -> Result<BooleanArray> {
+    /// `rows` is the right side for each value when it reads the outer
+    /// row's columns.
+    fn holds_all(&self, values: &ArrayRef, rows: Option<&ArrayRef>) -> Result<BooleanArray> {
         let value = cast_left(&self.left, values)?;
-        let right = arrow_select::take::take(
-            self.right.as_ref(),
-            &UInt32Array::from(vec![0u32; value.len()]),
-            None,
-        )
-        .map_err(OmniError::arrow_internal)?;
+        let right = match (&self.right, rows) {
+            (_, Some(rows)) if rows.len() == value.len() => Arc::clone(rows),
+            (Some(constant), None) => arrow_select::take::take(
+                constant.as_ref(),
+                &UInt32Array::from(vec![0u32; value.len()]),
+                None,
+            )
+            .map_err(OmniError::arrow_internal)?,
+            _ => {
+                return Err(OmniError::manifest_internal(
+                    "a block's right side reads the outer row and was given none",
+                ));
+            }
+        };
         let mask = compare_arrays(&value, self.op, &right)?;
         Ok(if mask.null_count() == 0 {
             mask
@@ -232,7 +248,8 @@ impl RowCountPredicate {
         predicate: &SubqueryPredicate,
         params: &ParamMap,
     ) -> Result<Option<Self>> {
-        if !predicate.is_row_count() {
+        // A right side read from the outer row takes the tagged path.
+        if !predicate.is_row_count() || !predicate.right.columns_empty() {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -247,7 +264,7 @@ impl RowCountPredicate {
 
     /// The verdict of every outer row from its neighbour count.
     pub(crate) fn holds_all(&self, counts: &[u64]) -> Result<BooleanArray> {
-        self.comparison.holds_all(&count_values(counts)?)
+        self.comparison.holds_all(&count_values(counts)?, None)
     }
 
     #[cfg(test)]
@@ -430,6 +447,35 @@ impl SubqueryAggregate {
     /// the block counts rows, else each row's finalized aggregate gathered
     /// into one column, then one comparison.
     pub(crate) fn keep_mask(&self) -> Result<BooleanArray> {
+        self.comparison.holds_all(&self.values()?, None)
+    }
+
+    /// Whether the right side reads the outer row's columns.
+    pub(crate) fn reads_outer_row(&self) -> bool {
+        self.comparison.right.is_none()
+    }
+
+    /// Each group's verdict against `right`, the right side evaluated for
+    /// the outer row each group stands for.
+    pub(crate) fn keep_mask_against(&self, right: &ArrayRef) -> Result<BooleanArray> {
+        self.comparison.holds_all(&self.values()?, Some(right))
+    }
+
+    /// The verdict of each outer row against `right`, evaluated over the
+    /// outer rows, its aggregate the one of the group `groups` names for it.
+    pub(crate) fn keep_rows_against(
+        &self,
+        groups: &UInt32Array,
+        right: &ArrayRef,
+    ) -> Result<BooleanArray> {
+        let values = arrow_select::take::take(self.values()?.as_ref(), groups, None)
+            .map_err(OmniError::arrow_internal)?;
+        self.comparison.holds_all(&values, Some(right))
+    }
+
+    /// Every group's finalized aggregate as one column: the row counts as
+    /// `I64` when the block counts rows.
+    fn values(&self) -> Result<ArrayRef> {
         let leaf = self.comparison.left.leaf();
         let values = match (leaf, &self.values) {
             (BlockAggregateExpr::CountRows { .. }, None)
@@ -447,7 +493,7 @@ impl SubqueryAggregate {
                 ScalarValue::iter_to_array(values).map_err(OmniError::datafusion)?
             }
         };
-        self.comparison.holds_all(&values)
+        Ok(values)
     }
 }
 

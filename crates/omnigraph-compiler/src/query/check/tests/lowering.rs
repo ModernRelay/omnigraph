@@ -45,7 +45,7 @@ const B_IN_PROGRESS: &[&str] = &[
     "distance as an rrf arm",
     "two rrf arm windows that differ",
     "an rrf of three arms",
-    "a block compared with a column",
+    "a block compared with another block's value",
     "an order key no return item computes",
     "a write group selecting over a table an earlier group changes",
 ];
@@ -98,9 +98,13 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { $p: Person } where not exists { $c: Company, $p worksAt $c } return { $p.name } }",
                 Lowers,
             ),
-            // "a block compared with a column"
             (
                 "query q() { match { $p: Person } where count { $f: Person, $p knows $f } >= $p.age return { $p.name } }",
+                Lowers,
+            ),
+            // "a block compared with another block's value"
+            (
+                "query q() { match { $p: Person } where count { $f: Person, $p knows $f } > count { $c: Company, $p worksAt $c } return { $p.name } }",
                 Refused("B"),
             ),
             (
@@ -402,9 +406,10 @@ fn t86_is_at_the_construct_with_its_repair() {
     let suggestion = d.suggestion.expect("an edit");
     let repaired = apply_edits(text, &suggestion.edits);
     outcome(&repaired).unwrap_or_else(|e| panic!("{repaired}: {e}"));
-    // A block compared with a column is refused at the comparison.
+    // A block compared with another block's value is refused at the
+    // comparison.
     let d = refused(
-        "query q() { match { $p: Person } where count { $f: Person, $p knows $f } >= $p.age return { $p.name } }",
+        "query q() { match { $p: Person } where count { $f: Person, $p knows $f } > count { $c: Company, $p worksAt $c } return { $p.name } }",
     );
     assert_eq!(d.position.map(|p| p.column), Some(40), "{d}");
     // A write group whose selection reads a table an earlier group changes
