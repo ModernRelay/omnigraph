@@ -3519,7 +3519,15 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
         ("bind_shape_bind_before_any_write", &[(BindShape, 14)]),
         ("body_shape_recipe_rows_above_the_limit", &[(BodyShape, 12)]),
         ("body_shape_restart_with_an_argument", &[(BodyShape, 20)]),
+        (
+            "body_shape_row_above_the_batch_byte_bound",
+            &[(BodyShape, 12)],
+        ),
         ("corpus_timeout_budget_above_the_cap", &[(CorpusTimeout, 3)]),
+        (
+            "corpus_timeout_quoted_key_above_the_cap",
+            &[(CorpusTimeout, 3)],
+        ),
         ("duplicate_header_issue_twice", &[(DuplicateHeader, 2)]),
         (
             "expect_mode_for_step_ok_on_a_query",
@@ -3553,6 +3561,10 @@ fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
         (
             "params_placement_params_before_any_step",
             &[(ParamsPlacement, 14)],
+        ),
+        (
+            "query_parse_bound_operand_beside_a_syntax_error",
+            &[(QueryParse, 19)],
         ),
         (
             "query_parse_schema_beside_a_seed_comment",

@@ -1070,6 +1070,20 @@ fn bound_operand(operand: &str) -> Option<&str> {
         .and_then(|rest| rest.strip_suffix('}'))
 }
 
+/// Whether the `${` at `pos` opens a whole quoted bound operand in one of
+/// the forms the statements admit: `commit publish "${n}"`, `commit drop
+/// "${n}"`, `from commit "${n}"`, `on "${n}"`.
+fn admitted_operand_at(line: &str, pos: usize) -> bool {
+    let Some(before) = line[..pos].trim_end().strip_suffix('"') else {
+        return false;
+    };
+    let word = before.trim_end().rsplit(char::is_whitespace).next();
+    let closed = line[pos..]
+        .find('}')
+        .is_some_and(|end| line[pos + end + 1..].starts_with('"'));
+    matches!(word, Some("commit" | "publish" | "drop" | "on")) && closed
+}
+
 /// A commit statement's operand with its bound name replaced by the id.
 pub fn resolve_operand(operand: &str, bindings: &Bindings) -> Result<String, String> {
     match bound_operand(operand) {
@@ -2435,9 +2449,29 @@ pub fn parse_case_runner(text: &str) -> Option<RunnerConfig> {
     parse_runner(&yaml_body(&first.body)).ok()
 }
 
+/// The 1-based line of the runner section's `timeout_ms` key, quoted or
+/// bare, else the runner header's.
+fn timeout_line(lines: &[&str]) -> usize {
+    let (_, sections) = split_sections(lines);
+    let Some(runner) = sections.first().filter(|section| section.name == "runner") else {
+        return 1;
+    };
+    runner
+        .body
+        .iter()
+        .find(|(_, line)| {
+            let key = line.trim_start();
+            let key = key.strip_prefix(['"', '\'']).unwrap_or(key);
+            key.strip_prefix("timeout_ms")
+                .map(|rest| rest.trim_start_matches(['"', '\'']).trim_start())
+                .is_some_and(|rest| rest.starts_with(':'))
+        })
+        .map_or(runner.header_line + 1, |(idx, _)| idx + 1)
+}
+
 /// Every refusal `--check` reports for one case text, in line order: the
 /// parser's, then the corpus admission when `corpus` reads the case as a
-/// member of the required corpus, located at its `timeout_ms:` line.
+/// member of the required corpus, located at its `timeout_ms` line.
 pub fn check_text(stem: &str, text: &str, corpus: bool) -> Vec<CaseError> {
     let mut errors = match parse_case(stem, text) {
         Ok(_) => Vec::new(),
@@ -2448,11 +2482,7 @@ pub fn check_text(stem: &str, text: &str, corpus: bool) -> Vec<CaseError> {
         && let Err(error) = corpus_admission(&runner)
     {
         let lines: Vec<&str> = text.lines().collect();
-        let line = lines
-            .iter()
-            .position(|line| line.trim_start().starts_with("timeout_ms:"))
-            .map_or(1, |idx| idx + 1);
-        errors.push(error.located(line, &lines));
+        errors.push(error.located(timeout_line(&lines), &lines));
     }
     errors.sort_by_key(|error| error.line.unwrap_or(usize::MAX));
     errors
@@ -2746,7 +2776,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                     let file = parse_query(&source).map_err(|e| {
                         let misplaced = section.body.iter().find(|(_, l)| {
                             l.match_indices("${")
-                                .any(|(pos, _)| !l[..pos].trim_end().ends_with("commit"))
+                                .any(|(pos, _)| !admitted_operand_at(l, pos))
                         });
                         if let Some((idx, _)) = misplaced {
                             return CaseError::new(

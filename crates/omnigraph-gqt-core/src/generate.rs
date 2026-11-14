@@ -568,12 +568,19 @@ impl Table {
     /// The byte bound of one row, with every batch bound checked.
     fn validate(&self) -> Result<u64, CaseError> {
         let bytes = self.row_bytes().map_err(recipe)?;
+        let limit = u64::try_from(MAX_BATCH_BYTES).map_err(|_| recipe("invalid batch limit"))?;
+        if bytes > limit {
+            return Err(recipe(format!(
+                "generated row byte bound {bytes} exceeds the 16 MiB batch limit on its own; no batch_rows fits one row"
+            ))
+            .fix(
+                "shrink the row: a `blob` column's `length`, a `vector` column's `dimensions` or a `repeat` column's `count`, so one row stays within 16 MiB",
+            ));
+        }
         let batch_bytes = bytes
             .checked_mul(self.batch_rows()?)
             .ok_or_else(|| recipe("generated batch size overflow"))?;
-        if batch_bytes
-            > u64::try_from(MAX_BATCH_BYTES).map_err(|_| recipe("invalid batch limit"))?
-        {
+        if batch_bytes > limit {
             return Err(batch_bound(
                 "generated batch byte bound exceeds 16 MiB; reduce batch_rows",
                 format!(
@@ -1042,6 +1049,17 @@ mod tests {
         let error = Generated::parse(0, &over_the_recipe_limit).unwrap_err();
         assert_eq!(error.code, CaseErrorCode::BodyShape);
         assert!(error.fix.is_some());
+        let one_row_over = RECIPE.replace(
+            "kind: vector, dimensions: 3",
+            "kind: blob, byte: 0, length: 16777216",
+        );
+        let error = Generated::parse(0, &one_row_over).unwrap_err();
+        assert_eq!(error.code, CaseErrorCode::BodyShape);
+        let fix = error.fix.unwrap();
+        assert!(
+            fix.contains("shrink the row") && !fix.contains("batch_rows"),
+            "{fix}"
+        );
     }
 
     /// A `blob` column is the `base64:` input text of `length` repeated
