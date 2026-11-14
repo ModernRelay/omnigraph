@@ -198,7 +198,8 @@ query employers() {
 A traversal written after the optional may start from a name it introduces;
 a row where that name is null has no match there. Returning a node the
 optional introduces whole, `return { $c }`, is not lowered in this release
-(`T86`): return its properties.
+(`T86`). It prints no fix: returning the node's properties instead runs, but
+with other result columns.
 
 ## Values and inline reads
 

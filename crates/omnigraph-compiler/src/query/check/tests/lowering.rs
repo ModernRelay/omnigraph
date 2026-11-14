@@ -390,6 +390,13 @@ fn every_row_marked_works_lowers_and_every_other_construct_names_its_stage() {
                         .find(|s| d.message.contains(&format!("stage {s} ")))
                         .unwrap_or_else(|| panic!("{}: no stage named: {d}", row.surface));
                     assert!(d.position.is_some(), "{}: no position: {d}", row.surface);
+                    // A suggestion must keep the rows and the result
+                    // columns; no refused term of this release has one.
+                    assert!(
+                        d.fix.is_none() && d.suggestion.is_none(),
+                        "{}: a T86 that prints a rewrite: {d}",
+                        row.surface
+                    );
                     Refused(stage)
                 }
             };

@@ -33,7 +33,7 @@ use crate::query::value::{
 use crate::traversal::{EdgeMember, EdgeSelection};
 use crate::types::{AggSignature, Direction, ExprType, PropType, ScalarType};
 
-use super::{Construct, ElementKind, ProgrammeStage, Repair, ShapeError, Unlowered};
+use super::{Construct, ElementKind, ProgrammeStage, ShapeError, Unlowered};
 
 /// A core read's top-level shape: the pattern's steps in run order, then
 /// what the read returns.
@@ -1102,13 +1102,8 @@ impl<'a> Shaper<'a> {
                         None => self
                             .item(
                                 items.get(hidden).ok_or_else(|| {
-                                    ShapeError::unlowered(
-                                        Unlowered::new(
-                                            self.name,
-                                            "an order key over an aggregate no return item computes",
-                                            at.clone(),
-                                        )
-                                        .repair(Repair::ReturnTheOrderKey),
+                                    ShapeError::Internal(
+                                        "an aggregate order key no return item repeats, which the type checker refuses (T42)".to_string(),
                                     )
                                 })?,
                                 &aggs,

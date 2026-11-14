@@ -292,16 +292,16 @@ message names the stage of the language programme that adds it: `B` for a
 construct of edition 3 that this release does not run yet, `Rec` for a read
 that calls itself.
 
-| Refused | Stage | Rewrite this release runs |
-|---|---|---|
-| `distance` as an `rrf` arm | B | none |
-| A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope | B | none |
-| A node an `optional` introduces, returned whole | B | return its properties |
-| A ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit` | B | none |
-| A block compared with another block's value, a block of several aggregates | B | none |
-| Two `rrf` arm windows that differ | B | none |
-| A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B | none |
-| A read that calls itself (`Fix`) | Rec | none |
+| Refused | Stage |
+|---|---|
+| `distance` as an `rrf` arm | B |
+| A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope | B |
+| A node an `optional` introduces, returned whole | B |
+| A ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit` | B |
+| A block compared with another block's value, a block of several aggregates | B |
+| Two `rrf` arm windows that differ | B |
+| A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B |
+| A read that calls itself (`Fix`) | Rec |
 
 ```text
 query q($v: Vector(3), $s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(distance($all, $d.embedding, $v), bm25($all, $d.body, $s)) as $score } return { $d.title } }
@@ -312,7 +312,10 @@ error[T86]: type error: T86: `q`: this release's planner does not lower an `rrf`
   --> line 1, column 94
 ```
 
-It prints no suggestion: no form this release runs has the same rows.
+`T86` prints a suggestion only where a form this release runs has the same
+rows and the same result columns. None of the refusals above has one, so
+none prints a fix: returning an `optional` node's properties instead of the
+node, for example, changes the result columns.
 `P006` is no longer a refusal: see [Planner codes](#planner-codes).
 
 ## Planner codes

@@ -2,20 +2,20 @@
 //! 5): a declaration the type checker accepts must lower. The shapers in
 //! [`crate::shape`] are the one statement of what lowers; a term they do not
 //! lower is refused here with `T86` at the construct it was written as,
-//! naming the stage that adds it, with the rewrite that this release lowers
-//! where one with the same rows exists.
+//! naming the stage that adds it. A suggestion would have to write a lowered
+//! form with the same rows and the same result columns; no term refused in
+//! this release has one, so `T86` prints none.
 
 use crate::catalog::Catalog;
 use crate::ir::core::CoreDecl;
 use crate::query::codes::T86;
-use crate::query::diagnostic::{Applicability, QueryDiagnostic, Suggestion, TextEdit};
-use crate::query::syntax::print;
+use crate::query::diagnostic::QueryDiagnostic;
 use crate::query::syntax::{
     Decl, DeclBody, Element, Expr, LetValue, Pattern, ReadBody, RelExpr, SourceSpan,
 };
 use crate::shape::read::ReadShape;
 use crate::shape::write::WriteShape;
-use crate::shape::{Construct, ElementKind, Repair, ShapeError, Unlowered};
+use crate::shape::{Construct, ElementKind, ShapeError, Unlowered};
 
 /// `T86` for the first term of `core` that this release's planner does not
 /// lower. A shaping defect is not the author's refusal: the planner reports
@@ -41,15 +41,6 @@ fn refusal(decl: &Decl, u: &Unlowered) -> QueryDiagnostic {
     let span = construct_span(decl, u);
     d.position = span.map(|s| s.position);
     d.end = span.map(|s| s.end_position);
-    match &u.repair {
-        Some(Repair::ReturnTheOrderKey) => {
-            if let Some((fix, suggestion)) = return_the_order_key(decl, &u.construct) {
-                d.fix = Some(fix);
-                d.suggestion = suggestion.map(Box::new);
-            }
-        }
-        None => {}
-    }
     d
 }
 
@@ -201,42 +192,4 @@ fn compared_block(e: &Expr) -> Option<&SourceSpan> {
         } => compared_block(l).or_else(|| compared_block(r)),
         _ => None,
     }
-}
-
-/// A computed order key the sort cannot read: return it under an alias,
-/// which the sort reads as the item's column. The edit inserts the item
-/// before the first return item.
-fn return_the_order_key(
-    decl: &Decl,
-    construct: &Construct,
-) -> Option<(String, Option<Suggestion>)> {
-    let Construct::OrderKey(k) = construct else {
-        return None;
-    };
-    let body = read_body(decl)?;
-    let key = &body.order.get(*k)?.expr;
-    let names: Vec<String> = body
-        .projections
-        .iter()
-        .map(|p| super::item_name(&p.expr, p.alias.as_deref()))
-        .collect();
-    let alias = std::iter::once("key".to_string())
-        .chain((2..).map(|n| format!("key{n}")))
-        .find(|candidate| !names.contains(candidate))?;
-    let item = format!("{} as {alias}", print::expr(key));
-    let fix = format!("return the key under an alias, which the sort reads: `{item}`");
-    let suggestion = body
-        .spans
-        .items
-        .first()
-        .and_then(parsed)
-        .map(|first| Suggestion {
-            applicability: Applicability::MachineApplicable,
-            edits: vec![TextEdit {
-                start: first.start,
-                end: first.start,
-                replacement: format!("{item}, "),
-            }],
-        });
-    Some((fix, suggestion))
 }

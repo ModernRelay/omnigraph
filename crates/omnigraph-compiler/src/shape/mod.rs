@@ -83,17 +83,11 @@ pub enum Construct {
     Assignment(usize, usize, String),
 }
 
-/// A rewrite with the same rows that this release lowers, where one exists;
-/// the type checker writes it against the declaration's syntax.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Repair {
-    /// A computed order key: return it under an alias, which the sort reads.
-    ReturnTheOrderKey,
-}
-
 /// A term this release's planner does not lower: the declaration, what the
-/// term is, the construct it was written as, the stage that adds it and the
-/// repair, where one exists.
+/// term is, the construct it was written as and the stage that adds it. It
+/// carries no rewrite: a suggestion must keep the rows and the result
+/// columns, and no term refused in this release has a lowered form that
+/// does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unlowered {
     pub name: String,
@@ -103,7 +97,6 @@ pub struct Unlowered {
     /// a read.
     pub group: Option<usize>,
     pub stage: ProgrammeStage,
-    pub repair: Option<Repair>,
 }
 
 impl Unlowered {
@@ -115,17 +108,11 @@ impl Unlowered {
             construct,
             group: None,
             stage: ProgrammeStage::B,
-            repair: None,
         }
     }
 
     pub fn stage(mut self, stage: ProgrammeStage) -> Self {
         self.stage = stage;
-        self
-    }
-
-    pub fn repair(mut self, repair: Repair) -> Self {
-        self.repair = Some(repair);
         self
     }
 
