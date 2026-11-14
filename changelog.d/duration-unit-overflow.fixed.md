@@ -1,1 +1,1 @@
-- Cleanup and optimize reject duration arguments whose unit conversion would overflow seconds.
+- Cleanup and optimize reject duration arguments whose unit conversion would overflow seconds, and cleanup refuses an `--older-than` age that reaches before the earliest representable time.

@@ -5074,6 +5074,11 @@ fn cleanup_against_local_scope_executes_with_confirm() {
             "invalid duration '307445734561825861m'",
         ),
         (
+            vec!["--older-than", "18446744073709551615s", "--confirm"],
+            false,
+            "earliest representable time",
+        ),
+        (
             vec!["--older-than", "invalid", "--confirm"],
             false,
             "invalid duration 'invalid'",
