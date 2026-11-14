@@ -3,11 +3,11 @@ rfc: "2026-11-09-writer-epoch-fence"
 title: "Writer epoch fence on the branch manifest"
 track: maintainer
 status: draft
-implementation: not-started
+implementation: in-progress
 authors:
   - azimafroozeh
 created: 2026-11-09
-updated: 2026-11-09
+updated: 2026-11-13
 discussion: null
 supersedes: []
 superseded_by: []
@@ -194,6 +194,8 @@ Acceptance: every test green; on an unheld branch a write's request delta exactl
 4. **Consumers.** The graph-access RFC's registration, tombstone and drop record publish through the control-fact kind under the same assertion; the merger's takeover of abandoned branches follows in its own change.
 
 `implementation` moves to `in-progress` at phase 1 and to `complete` at phase 3.
+
+Implementation note, 2026-11-13: phase 1 and, from phase 2, the `branch_claim` action and the owner's probe skip shipped in 0.16.0 (#1350). No command or route claims a branch yet, so only a program embedding the engine can claim one, and once it does, `omnigraph-server` and the CLI are refused there with `writer_fenced` until another claim.
 
 ## Unresolved questions
 

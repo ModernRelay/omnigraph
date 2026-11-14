@@ -322,7 +322,12 @@ traversal startup; it does not collect unused forks (that is `cleanup`). It
 works on `main`; use `index build` for another branch. Writes running beside
 it are not refused by its publication: a write it overtook commits over the
 compaction, or prepares again once, holding writes off, when it changes a row
-the run moved. None returns `read_set_conflict` for it. Against a server
+the run moved. None returns `read_set_conflict` for it. Writes to `main` wait
+while it holds main's writer gates: `--max-gate-hold 30s` starts no table after
+that long except the first, so a write waits about the bound plus one table,
+and `--tables node:Person,edge:Knows` runs only those tables, in that order.
+Each table reports `optimized`, `unchanged`, `deferred` or `failed`; one
+table's failure does not stop the others, so read the report. Against a server
 target it runs as a recorded operation: it prints an operation id, waits for
 the operation's record (`--no-wait`, `--timeout`), and `--operation <id>`
 observes one; after a lost response it looks the id up and never resubmits.
