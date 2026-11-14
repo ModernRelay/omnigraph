@@ -106,16 +106,17 @@ fn render_kv(output: &ReadOutput) -> Result<String> {
         return Ok(lines.join("\n"));
     }
 
+    let columns = columns(output, &rows);
     for (idx, row) in rows.iter().enumerate() {
         if idx > 0 {
             lines.push(String::new());
         }
         lines.push(format!("row {}", idx + 1));
-        for column in columns(output, &rows) {
+        for column in &columns {
             lines.push(format!(
                 "{}: {}",
                 column,
-                stringify_value(row.get(&column).unwrap_or(&Value::Null))
+                stringify_value(row.get(column).unwrap_or(&Value::Null))
             ));
         }
     }
