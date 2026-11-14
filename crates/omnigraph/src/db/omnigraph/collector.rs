@@ -1578,8 +1578,9 @@ async fn trace_published(
             if plan.roots.contains(&version) {
                 trace_root(plan, &handle, cost).await?;
             } else {
-                let indices = read_indices(handle.dataset(), cost).await?;
-                let paths = referenced_paths(&handle, &indices, cost).await?;
+                let dataset = handle.dataset();
+                let indices = read_indices(dataset, cost).await?;
+                let paths = referenced_paths(dataset, &indices, cost).await?;
                 plan.referenced_paths.extend(paths.iter().cloned());
                 plan.sweep_paths.extend(paths);
                 walk.push(version);
@@ -1599,12 +1600,13 @@ async fn trace_root(
     handle: &SnapshotHandle,
     cost: &mut CollectorCost,
 ) -> Result<()> {
-    let indices = read_indices(handle.dataset(), cost).await?;
-    let paths = referenced_paths(handle, &indices, cost).await?;
+    let dataset = handle.dataset();
+    let indices = read_indices(dataset, cost).await?;
+    let paths = referenced_paths(dataset, &indices, cost).await?;
     plan.referenced_paths.extend(paths.iter().cloned());
     plan.marked_paths.extend(paths);
     plan.borrowed_origins
-        .extend(borrowed_origins(handle.dataset(), &indices)?);
+        .extend(borrowed_origins(dataset, &indices)?);
     Ok(())
 }
 
@@ -1695,8 +1697,9 @@ async fn judge_outside(
             continue;
         };
         cost.table_opens += 1;
-        let indices = read_indices(handle.dataset(), cost).await?;
-        let paths = referenced_paths(&handle, &indices, cost).await?;
+        let dataset = handle.dataset();
+        let indices = read_indices(dataset, cost).await?;
+        let paths = referenced_paths(dataset, &indices, cost).await?;
         plan.referenced_paths.extend(paths.iter().cloned());
         if linear_swept(plan, rows, *version) {
             plan.linear_sweep.push(*version);
@@ -1705,7 +1708,7 @@ async fn judge_outside(
         }
         outside.linear.extend(paths);
         plan.borrowed_origins
-            .extend(borrowed_origins(handle.dataset(), &indices)?);
+            .extend(borrowed_origins(dataset, &indices)?);
     }
     for (version, bytes) in present {
         if plan.published_set.contains(version) || plan.roots.contains(version) {
@@ -1715,12 +1718,12 @@ async fn judge_outside(
             continue;
         };
         cost.table_opens += 1;
-        let indices = read_indices(handle.dataset(), cost).await?;
-        let paths = referenced_paths(&handle, &indices, cost).await?;
+        let dataset = handle.dataset();
+        let indices = read_indices(dataset, cost).await?;
+        let paths = referenced_paths(dataset, &indices, cost).await?;
         plan.referenced_paths.extend(paths.iter().cloned());
         outside.unpublished.insert(*version, paths);
-        let transaction = handle
-            .dataset()
+        let transaction = dataset
             .read_transaction()
             .await
             .map_err(OmniError::storage)?;
@@ -1736,7 +1739,7 @@ async fn judge_outside(
         };
         if !matches!(verdict, StagingVerdict::Dead(_)) {
             plan.borrowed_origins
-                .extend(borrowed_origins(handle.dataset(), &indices)?);
+                .extend(borrowed_origins(dataset, &indices)?);
         }
         plan.unpublished.push(UnpublishedManifest {
             version: *version,
@@ -1855,8 +1858,9 @@ async fn auxiliary_native_origins(
                 ));
             };
             cost.table_opens += 1;
-            let indices = read_indices(native.dataset(), &mut cost).await?;
-            origins.extend(borrowed_origins(native.dataset(), &indices)?);
+            let dataset = native.dataset();
+            let indices = read_indices(dataset, &mut cost).await?;
+            origins.extend(borrowed_origins(dataset, &indices)?);
         }
     }
     Ok((origins, cost))
@@ -1968,11 +1972,10 @@ async fn read_indices(
 
 /// Every path under the location a manifest references, relative to it.
 async fn referenced_paths(
-    handle: &SnapshotHandle,
+    dataset: &lance::Dataset,
     indices: &[IndexMetadata],
     cost: &mut CollectorCost,
 ) -> Result<BTreeSet<String>> {
-    let dataset = handle.dataset();
     let manifest = dataset.manifest();
     let mut paths = BTreeSet::new();
     for fragment in manifest.fragments.iter() {

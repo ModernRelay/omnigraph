@@ -1205,7 +1205,7 @@ durable_calls! {
     // candidate scan + parent before-image probe and the full-merge fallback.
     // Read-only — it stages and publishes nothing.
     ("changes/candidate_scan.rs", ".dataset()", 5, WriteProtocol::ReadOnlyAccess),
-    ("db/omnigraph/collector.rs", ".dataset()", 17, WriteProtocol::ReadOnlyAccess),
+    ("db/omnigraph/collector.rs", ".dataset()", 16, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".delete(", 1, WriteProtocol::Composed("detached-only sweep through the table's own Lance store: freed files, then the published manifests no retained `__manifest` version pins (links before tips) and the dead stagings; an interrupted pass is re-swept by the next")),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
     // The sixth accessor reports deferred FTS coverage from an immutable
