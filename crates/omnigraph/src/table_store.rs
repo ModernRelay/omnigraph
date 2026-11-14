@@ -194,9 +194,18 @@ pub(crate) fn cap_sort_inputs_and_merge_partitions(
     })
 }
 
-/// DataFusion's sort spill reservation under a pool of `memory_limit` bytes.
+/// DataFusion's sort spill reservation under a pool of `memory_limit` bytes:
+/// what a sort's merge holds from the sort's first input batch on, and the
+/// headroom DataFusion frees for the in-memory sort at every spill. A
+/// sixteenth of the pool, at least a third of it up to 512 KiB, at most
+/// DataFusion's own default of 10 MiB: a third (at most 40 MiB) sat idle
+/// beside the batches' half and left the graph work producing the sort's
+/// input a sixth (#1361), and under 1.5 MiB a sixteenth is less headroom
+/// than a spill's in-memory sort needs beside a second spilling consumer.
 pub(crate) fn sort_spill_reservation_bytes(memory_limit: u64) -> usize {
-    (memory_limit / 3).min(40 * 1024 * 1024) as usize
+    (memory_limit / 16)
+        .max((memory_limit / 3).min(512 * 1024))
+        .min(10 * 1024 * 1024) as usize
 }
 
 /// The codec of every spill file the engine writes, in a query's session and
@@ -518,7 +527,7 @@ pub(crate) fn has_insert_absence_certificate(transaction: &Transaction) -> bool 
 /// instead, which consumers accept as the same no-delete proof. It is
 /// read-advisory: a missing marker only forces a fall-back, never a
 /// correctness change. A persisted `Update` from an external Lance merge
-/// (e.g. adopted via `repair --force`) carries no marker and cannot be pruned.
+/// carries no marker and cannot be pruned.
 pub(crate) const NO_BY_SOURCE_DELETE_PROPERTY: &str = "omnigraph.no_by_source_delete";
 pub(crate) const NO_BY_SOURCE_DELETE_V1: &str = "v1";
 
@@ -1105,6 +1114,48 @@ impl IndexBatch {
             .build();
             StagedWrite::new(transaction, Vec::new(), Vec::new())
         })
+    }
+}
+
+/// The heavy steps one optimize run may execute at once, shared by every
+/// table it stages (#1384): each compaction task, index fold and index build
+/// holds one permit while it runs. A table runs its compaction tasks side by
+/// side, as Lance's `compact_files` does, so a run with one large table uses
+/// the slots its idle tables would have, and the run never has more heavy
+/// steps in flight than its rewrite concurrency, the same peak as one step
+/// per staged table. A Blob table still runs its compaction tasks one at a
+/// time: its batch bound holds per task, not across tasks.
+#[derive(Debug, Clone)]
+pub struct OptimizeStepLimit {
+    permits: Arc<tokio::sync::Semaphore>,
+    width: usize,
+}
+
+impl OptimizeStepLimit {
+    /// A budget of `width` concurrent steps; `1` runs them one after another.
+    pub fn new(width: usize) -> Self {
+        let width = width.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(width)),
+            width,
+        }
+    }
+
+    /// The number of steps that may be in flight.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Run one heavy step holding one permit. The step must not wait on
+    /// another permit of this budget, so permits cannot deadlock.
+    pub async fn run<T>(&self, step: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| OmniError::manifest_internal("optimize step budget closed"))?;
+        let _probe = crate::instrumentation::enter_optimize_step_probe().await;
+        step.await
     }
 }
 
@@ -4933,14 +4984,16 @@ impl TableStore {
     /// index's coverage over to the new fragments when Lance applies it.
     /// `None` when the plan has no task. Every task of a Blob table is sized
     /// before any executes, so a sizing refusal leaves no rewritten file
-    /// behind.
+    /// behind. The tasks run side by side, each holding one permit of `limit`
+    /// ([`OptimizeStepLimit`]), the run's budget of heavy steps.
     pub async fn stage_compaction(
         &self,
         ds: &Dataset,
         options: &CompactionOptions,
+        limit: &OptimizeStepLimit,
     ) -> Result<Option<StagedCompaction>> {
         let plan = Self::plan_table_compaction(ds, options).await?;
-        Self::stage_compaction_plan(ds, plan).await
+        Self::stage_compaction_plan(ds, plan, limit).await
     }
 
     /// #721: rewrite exactly the fragments `fragment_ids` names, one
@@ -4980,7 +5033,7 @@ impl TableStore {
             read_version: ds.manifest.version,
             options: CompactionOptions::default(),
         };
-        Self::stage_compaction_plan(ds, plan).await
+        Self::stage_compaction_plan(ds, plan, &OptimizeStepLimit::new(1)).await
     }
 
     /// Execute a compaction plan against `ds` and stage its result as one
@@ -4988,6 +5041,7 @@ impl TableStore {
     async fn stage_compaction_plan(
         ds: &Dataset,
         plan: CompactionPlan,
+        limit: &OptimizeStepLimit,
     ) -> Result<Option<StagedCompaction>> {
         if plan.num_tasks() == 0 {
             return Ok(None);
@@ -5008,13 +5062,29 @@ impl TableStore {
                 task.options.batch_size = Some(rows);
             }
         }
-        let mut results = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            if let (true, Some(rows)) = (has_blob_columns, task.options.batch_size) {
-                crate::instrumentation::record_compaction_blob_batch(rows);
-            }
-            results.push(task.execute(ds).await.map_err(OmniError::storage)?);
-        }
+        // Unordered, as Lance's `compact_files` runs them, so a slow task
+        // does not keep finished slots empty; sorting by task index puts the
+        // results, and the fragment ids assigned from them below, back in
+        // task order however the tasks interleave.
+        let width = if has_blob_columns { 1 } else { limit.width() };
+        let mut results = futures::stream::iter(tasks.into_iter().enumerate())
+            .map(|(index, task)| {
+                limit.run(async move {
+                    if let (true, Some(rows)) = (has_blob_columns, task.options.batch_size) {
+                        crate::instrumentation::record_compaction_blob_batch(rows);
+                    }
+                    let result = task.execute(ds).await.map_err(OmniError::storage)?;
+                    Ok((index, result))
+                })
+            })
+            .buffer_unordered(width)
+            .try_collect::<Vec<_>>()
+            .await?;
+        results.sort_unstable_by_key(|(index, _)| *index);
+        let results = results
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<Vec<_>>();
         if results.iter().any(|result| result.row_addrs.is_some()) {
             return Err(OmniError::manifest_internal(format!(
                 "compaction of {} produced an address-style rewrite; graph tables use stable row ids",
@@ -8920,7 +8990,7 @@ fn staged_keyed_merge_result(
     // insert), none of which use a by-source-delete arm. Stamp the durable
     // no-by-source-delete marker before the transaction is committed, so the CDC
     // candidate-pruning classifier can trust this persisted `Update` removed no
-    // rows (an external merge adopted via `repair --force` carries no marker).
+    // rows (an external Lance merge carries no marker).
     stamp_no_by_source_delete(&mut uncommitted.transaction);
     Ok(StagedWrite::with_commit_metadata(
         uncommitted.transaction,

@@ -4008,3 +4008,161 @@ async fn segments_of_one_btree_cover_together_issue_1298() {
             .unwrap()
     );
 }
+
+/// #1384: a table's compaction tasks run at once, as Lance's own
+/// `compact_files` runs them, instead of one after another. Each task waits
+/// at a two-party rendezvous inside its execution, so tasks that never
+/// overlap time out instead of passing on equal results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compaction_runs_a_tables_tasks_concurrently_issue_1384() {
+    use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
+    use crate::table_store::OptimizeStepLimit;
+    use lance::dataset::optimize::CompactionOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let mut ds = TableStore::write_dataset(&uri, person_batch(&[("p0", Some(0))]))
+        .await
+        .unwrap();
+    for id in 1..4 {
+        lance_append_inline_local(&mut ds, person_batch(&[(&format!("p{id}"), Some(id))])).await;
+    }
+    assert_eq!(ds.get_fragments().len(), 4);
+    let store = TableStore::new(dir.path().to_str().unwrap(), test_session());
+    // Two rows per output fragment: Lance plans two tasks of two fragments.
+    let options = CompactionOptions {
+        target_rows_per_fragment: 2,
+        ..CompactionOptions::default()
+    };
+    let plan = TableStore::plan_table_compaction(&ds, &options)
+        .await
+        .unwrap();
+    assert_eq!(plan.num_tasks(), 2, "the layout plans two tasks");
+
+    let probes = OptimizeStepProbes::rendezvous(2);
+    let staged = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        with_optimize_step_probes(
+            probes.clone(),
+            store.stage_compaction(&ds, &options, &OptimizeStepLimit::new(2)),
+        ),
+    )
+    .await
+    .expect("a table's two compaction tasks never ran at the same time")
+    .unwrap()
+    .expect("the plan has work");
+    assert_eq!(probes.entered(), 2);
+    assert_eq!(probes.peak_in_flight(), 2);
+
+    // Fragment ids follow task order, as when the tasks ran one by one.
+    let Operation::Rewrite { groups, .. } = &staged.staged.transaction.operation else {
+        panic!("compaction stages a Rewrite");
+    };
+    let old = groups
+        .iter()
+        .map(|group| group.old_fragments.iter().map(|f| f.id).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let new = groups
+        .iter()
+        .map(|group| group.new_fragments.iter().map(|f| f.id).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(old, vec![vec![0, 1], vec![2, 3]]);
+    assert_eq!(new, vec![vec![4], vec![5]]);
+
+    // A budget of one, the served path's, still runs them one at a time.
+    let probes = OptimizeStepProbes::rendezvous(1);
+    with_optimize_step_probes(
+        probes.clone(),
+        store.stage_compaction(&ds, &options, &OptimizeStepLimit::new(1)),
+    )
+    .await
+    .unwrap()
+    .expect("the plan has work");
+    assert_eq!(probes.entered(), 2);
+    assert_eq!(probes.peak_in_flight(), 1);
+}
+
+/// #1384: the tables of one optimize run share one budget for every heavy
+/// step, not only for compaction tasks. Two tables' compaction tasks (two
+/// each) and two other tables' index folds run within one budget of two, as
+/// `apply_optimize_table_effects` runs them, and the run never has more than
+/// two steps executing at once. Each step waits at a two-party rendezvous, so
+/// a budget that serialized the steps would time out, and a step outside the
+/// budget (or a budget per table) would raise the peak above two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn optimize_steps_of_several_tables_share_one_budget_issue_1384() {
+    use crate::instrumentation::{OptimizeStepProbes, with_optimize_step_probes};
+    use crate::table_store::OptimizeStepLimit;
+    use lance::dataset::optimize::CompactionOptions;
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let store = TableStore::new(root, test_session());
+    // Four one-row fragments: two compaction tasks of two fragments each.
+    let compactable = |name: &'static str| async move {
+        let uri = format!("{root}/{name}.lance");
+        let mut ds = TableStore::write_dataset(&uri, person_batch(&[("p0", Some(0))]))
+            .await
+            .unwrap();
+        for id in 1..4 {
+            lance_append_inline_local(&mut ds, person_batch(&[(&format!("p{id}"), Some(id))]))
+                .await;
+        }
+        ds
+    };
+    // An id BTREE over the first fragment, then an appended fragment it does
+    // not cover: the fold rebuilds it.
+    let lagging = |name: &'static str| async move {
+        let uri = format!("{root}/{name}.lance");
+        let mut ds = TableStore::write_dataset(&uri, person_pk_batch(&[("alice", Some(30))]))
+            .await
+            .unwrap();
+        ds.create_index_builder(&["id"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("id_idx".to_string())
+            .await
+            .unwrap();
+        let ds = Dataset::open(&uri).await.unwrap();
+        TableStore::append_or_create_batch(&uri, Some(ds), person_pk_batch(&[("bob", None)]))
+            .await
+            .unwrap()
+    };
+    let (first, second) = (compactable("first").await, compactable("second").await);
+    let (third, fourth) = (lagging("third").await, lagging("fourth").await);
+    let options = CompactionOptions {
+        target_rows_per_fragment: 2,
+        ..CompactionOptions::default()
+    };
+    for ds in [&first, &second] {
+        let plan = TableStore::plan_table_compaction(ds, &options)
+            .await
+            .unwrap();
+        assert_eq!(plan.num_tasks(), 2, "the layout plans two tasks");
+    }
+
+    let limit = OptimizeStepLimit::new(2);
+    let probes = OptimizeStepProbes::rendezvous(2);
+    let (first, second, third, fourth) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        with_optimize_step_probes(probes.clone(), async {
+            tokio::join!(
+                store.stage_compaction(&first, &options, &limit),
+                store.stage_compaction(&second, &options, &limit),
+                limit.run(store.stage_index_fold(&third)),
+                limit.run(store.stage_index_fold(&fourth)),
+            )
+        }),
+    )
+    .await
+    .expect("the run's steps never ran two at a time");
+    assert!(first.unwrap().is_some() && second.unwrap().is_some());
+    assert!(third.unwrap().staged.is_some() && fourth.unwrap().staged.is_some());
+    assert_eq!(probes.entered(), 6, "four compaction tasks and two folds");
+    assert_eq!(
+        probes.peak_in_flight(),
+        2,
+        "the steps of every table share the budget of two"
+    );
+}

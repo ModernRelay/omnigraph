@@ -1,11 +1,10 @@
 # Maintenance
 
-OmniGraph provides five direct-storage maintenance commands:
+OmniGraph provides four direct-storage maintenance commands:
 
 - `optimize` compacts data and reconciles declared indexes on `main`.
 - `index build` brings one branch's declared indexes up to its rows.
 - `index rebuild --kind full-text` replaces full-text indexes on one branch.
-- `repair` diagnoses foreign storage drift without adopting it.
 - `cleanup` permanently removes unretained table versions and unused table
   forks left by branches created before storage format v11.
 
@@ -28,7 +27,7 @@ accept `--as` in its place. Direct CLI access, including `--target`, does not
 load the server's Cedar policy; storage permissions are its trust boundary. An
 embedded host that installs a policy checker enforces the
 [policy actions](policy.md#actions) before any effect: `maintain` for optimize,
-index builds, the full-text rebuild and repair, and `reclaim` for cleanup.
+index builds and the full-text rebuild, and `reclaim` for cleanup.
 
 ## Optimize
 
@@ -75,7 +74,8 @@ Blob payload; a larger row is read whole, external references are not read,
 and the writer's own copies come on top. A Blob descriptor the decoder rejects
 refuses the compaction before that table is rewritten. Optimize plans up to
 `OMNIGRAPH_MAINTENANCE_CONCURRENCY` tables ahead (default 8) and rewrites up to
-that many at once, so budget for that many Blob tables compacting together.
+that many at once, with that many compaction tasks, index folds and builds in
+all (a Blob table's tasks one at a time): budget for that many Blob tables.
 
 ### Bounding a run
 
@@ -84,7 +84,7 @@ Writes to `main` wait while optimize holds its writer gates. A run given
 rest are `deferred`, finished tables publish, and a writer waits at most the
 bound plus one rewrite. Tables run in type-key order; `resume_at` names the
 first deferred one, and `--tables` runs only the listed tables, in order. Each
-table's `outcome` is `optimized`, `unchanged`, `deferred`, `skipped` or
+table's `outcome` is `optimized`, `unchanged`, `deferred` or
 `failed` (with its `error`; the other tables still publish). The report adds
 `input_commit`, `graph_commit_id`, `gate_hold_ms` and the `configuration_clear`
 and `artifact` outcomes, which never fail a published run.
@@ -161,36 +161,6 @@ values. Stop overlapping writers and preserve a backup before an upgrade; see
 [full-text upgrades](upgrade.md#full-text-index-upgrade).
 Unknown legacy or external index kinds require a controlled migration, not a
 guessed replacement; see [unsupported inventory](upgrade.md#unsupported-index-inventory).
-
-## Repair
-
-Repair reports, per node or edge type, how the backing dataset's Lance linear
-history stands against the graph's registration. Preview:
-
-```bash
-omnigraph repair --target ./graph.omni --json
-```
-
-Every OmniGraph table write is a detached Lance commit that a graph commit
-pins, so a table's linear history ends where it was created, and the
-registration records that point as its last linear version
-(`omnigraph.last_linear_version`; `1` for a table created under storage
-format v11). A graph table is classified `no_drift` when its linear HEAD
-equals that version and `foreign_drift` when linear commits sit above it. A
-foreign commit came from something other than OmniGraph writing the table
-directory; no read or write of the graph resolves the linear HEAD, so
-foreign drift changes no query result and blocks no writer. For a
-`foreign_drift` table `repair` prints the last linear version, the HEAD and
-the number of foreign versions in `operations`, takes no action (`no_op`)
-and exits 0. It never adopts the foreign commit. `cleanup` leaves foreign versions and their files in
-place and lists them per table under `foreign_versions`. A HEAD below the
-recorded last linear version is reported as an internal manifest error.
-Each `repair --json` row carries `type_key`, `published_dataset_version`,
-`lance_head_version`, `classification`, `action`, `operations` and `error`.
-
-The removed `--confirm` and `--force` options are rejected. To discard foreign commits,
-export the graph and load it into a new one; see
-[Troubleshooting](troubleshooting.md#foreign-drift).
 
 ## Cleanup
 
@@ -336,12 +306,28 @@ Exit 0 means every table was visited and that nothing a retained graph
 commit pins, and no file such a commit references, was removed. It does not mean every table was collected: read the result rows
 for tables with an `error`.
 
+### Foreign versions
+
+Every Omnigraph table write is a detached Lance commit that a graph commit
+pins, so a table's linear Lance history ends where the table was created. The
+registration records that point as its last linear version
+(`omnigraph.last_linear_version`). A linear commit above it came from
+something other than Omnigraph writing the table directory, such as a Lance
+client pointed at it. No read or write of the graph resolves the linear
+HEAD, so a foreign version changes no query result and blocks no writer, and
+no command adopts it. A confirmed cleanup run (`cleanup --keep N --confirm`,
+which also removes what its policy does not retain) lists these versions per
+table, under `foreign_versions` with `--json` and by name in the human report,
+and leaves them and their files in place. The preview without `--confirm`
+does not open the graph and lists nothing. Embedded hosts can read the same
+list from the read-only `Omnigraph::cleanup_plan`. To discard them,
+export the graph and load it into a new one; see
+[Troubleshooting](troubleshooting.md#foreign-versions).
+
 ## Suggested cadence
 
 - Run `optimize` after large loads or on a regular cadence for write-heavy
   graphs.
-- Run `repair` when you want to know whether something outside OmniGraph
-  committed to a table's Lance history.
 - Run `cleanup` from an explicit retention policy after backups and rollback
   requirements have been reviewed.
 

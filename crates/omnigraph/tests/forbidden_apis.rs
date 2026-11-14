@@ -297,9 +297,6 @@ const READ_ONLY_SURFACES: &[(&str, &str)] = &[
     ("db/omnigraph.rs", "open_read_only"),
     ("db/omnigraph.rs", "refresh"),
     ("db/omnigraph.rs", "cleanup_plan"),
-    // The repair report: it publishes nothing, but `maintain` gates it like
-    // the maintenance writers (`maintenance_entry_points_take_an_actor`).
-    ("db/omnigraph.rs", "repair_report_as"),
     ("db/omnigraph.rs", "cleanup_plan_missing_paths"),
     ("db/omnigraph.rs", "cleanup_plan_path_snapshot"),
     ("db/omnigraph.rs", "open_read_only_with_storage"),
@@ -1214,8 +1211,6 @@ durable_calls! {
     ("db/omnigraph/collector.rs", ".dataset()", 17, WriteProtocol::ReadOnlyAccess),
     ("db/omnigraph/collector.rs", ".delete(", 1, WriteProtocol::Composed("detached-only sweep through the table's own Lance store: freed files, then the published manifests no retained `__manifest` version pins (links before tips) and the dead stagings; an interrupted pass is re-swept by the next")),
     ("db/omnigraph/schema_apply.rs", ".dataset()", 1, SCHEMA_V9),
-    // The repair report reads raw transaction history; it publishes nothing.
-    ("db/omnigraph/repair.rs", ".dataset()", 1, WriteProtocol::ReadOnlyAccess),
     // The sixth accessor reports deferred FTS coverage from an immutable
     // snapshot; it only reads index metadata and never stages or publishes.
     ("db/omnigraph/optimize.rs", ".dataset()", 11, WriteProtocol::Composed("Optimize planning, including each plan's measure against its table ceilings, + read-only coverage and native-fork inventory + the configuration clear's read-back after a failed removal + physical cleanup, including the release of expired proposal tags and of expired unattached tags descendants first, each confirmed by a readback")),
@@ -2246,15 +2241,13 @@ fn graph_write_surfaces_are_registered() {
 }
 
 /// The public surfaces of maintenance: the graph writers registered under
-/// these protocols, plus the read-only repair report the same gate covers.
+/// these protocols.
 fn is_maintenance_protocol(protocol: WriteProtocol) -> bool {
     protocol == INDICES_V9 || protocol == OPTIMIZE_V9 || protocol == WriteProtocol::PhysicalOnly
 }
 
-const READ_ONLY_MAINTENANCE_SURFACES: &[(&str, &str)] = &[("db/omnigraph.rs", "repair_report_as")];
-
 /// Maintenance has no actor-less public form (invariant 10). Every public
-/// optimize, cleanup, index or repair entry point is an `_as` method taking the
+/// optimize, cleanup or index entry point is an `_as` method taking the
 /// `actor: Option<&str>` its policy check judges, so neither an embedded nor a
 /// direct caller reaches maintenance around the gate; with a policy installed,
 /// a `None` actor is refused. `policy_engine_chassis.rs` owns which action and
@@ -2262,18 +2255,10 @@ const READ_ONLY_MAINTENANCE_SURFACES: &[(&str, &str)] = &[("db/omnigraph.rs", "r
 #[test]
 fn maintenance_entry_points_take_an_actor() {
     let src = engine_src_root();
-    let read_only = READ_ONLY_SURFACES.iter().copied().collect::<BTreeSet<_>>();
-    for surface in READ_ONLY_MAINTENANCE_SURFACES {
-        assert!(
-            read_only.contains(surface),
-            "{surface:?} must stay a registered read-only surface"
-        );
-    }
     let surfaces = WRITE_SURFACES
         .iter()
         .filter(|surface| is_maintenance_protocol(surface.protocol))
         .map(|surface| (surface.file, surface.function))
-        .chain(READ_ONLY_MAINTENANCE_SURFACES.iter().copied())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         surfaces,
@@ -2283,7 +2268,6 @@ fn maintenance_entry_points_take_an_actor() {
             ("db/omnigraph.rs", "ensure_indices_on_as"),
             ("db/omnigraph.rs", "optimize_as"),
             ("db/omnigraph.rs", "rebuild_full_text_indices_on_as"),
-            ("db/omnigraph.rs", "repair_report_as"),
         ]),
         "a maintenance surface was added or removed; give it an actor and a policy case"
     );

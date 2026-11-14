@@ -86,41 +86,6 @@ impl CleanupPolicyOptions {
     }
 }
 
-/// Why `optimize` did not compact a dataset. Typed so callers branch on the
-/// reason rather than sniffing a string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SkipReason {
-    /// The Lance dataset HEAD is ahead of the version recorded in
-    /// `__manifest`, and no pending pin explains that movement. `optimize`
-    /// cannot infer whether the drift is benign maintenance or an external
-    /// semantic write, so it leaves the dataset untouched and points operators at
-    /// explicit `repair`.
-    DriftNeedsRepair,
-}
-
-impl SkipReason {
-    /// Stable machine-readable token for serialized output (e.g. CLI `--json`).
-    /// Once emitted this is part of the output contract — keep it stable.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SkipReason::DriftNeedsRepair => "drift_needs_repair",
-        }
-    }
-}
-
-impl std::fmt::Display for SkipReason {
-    /// Human-readable reason for CLI and log output.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let msg = match self {
-            SkipReason::DriftNeedsRepair => {
-                "published dataset/Lance HEAD drift — run omnigraph repair"
-            }
-        };
-        f.write_str(msg)
-    }
-}
-
 /// What one optimize run did to one table. A run reports exactly one outcome
 /// for every table it considered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,8 +97,6 @@ pub enum TableOptimizeOutcome {
     Unchanged,
     /// Not started: nothing was written for the table.
     Deferred(DeferReason),
-    /// Deliberately left alone.
-    Skipped(SkipReason),
     /// A failure of this table's own planning or staging, with definite
     /// evidence: its staging is unreachable and the other tables still
     /// publish. [`DatasetOptimizeStats::failure`] holds the error.
@@ -148,7 +111,6 @@ impl TableOptimizeOutcome {
             TableOptimizeOutcome::Optimized => "optimized",
             TableOptimizeOutcome::Unchanged => "unchanged",
             TableOptimizeOutcome::Deferred(_) => "deferred",
-            TableOptimizeOutcome::Skipped(_) => "skipped",
             TableOptimizeOutcome::Failed => "failed",
         }
     }
@@ -333,14 +295,6 @@ impl DatasetOptimizeStats {
     /// materialization.
     pub fn committed(&self) -> bool {
         self.outcome == TableOptimizeOutcome::Optimized
-    }
-
-    /// `Some(reason)` if this table was deliberately not compacted.
-    pub fn skipped(&self) -> Option<SkipReason> {
-        match self.outcome {
-            TableOptimizeOutcome::Skipped(reason) => Some(reason),
-            _ => None,
-        }
     }
 }
 
@@ -536,7 +490,11 @@ impl OptimizeCancellation {
 }
 
 /// How many tables a run plans ahead of the ones it rewrites, and how many it
-/// rewrites at once. Planning only reads.
+/// rewrites at once. Planning only reads. `rewrite` also bounds the heavy
+/// steps in flight across those tables (compaction tasks, index folds and
+/// index builds, one permit each), so a lone table may run that many of its
+/// compaction tasks at once and the run never runs more steps at once than
+/// `rewrite` (#1384).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OptimizeConcurrency {
     pub planning: usize,
@@ -1243,10 +1201,17 @@ async fn run_table_pipeline(
             (index, started, result)
         }
     };
+    // #1384: the tables being rewritten share one budget of the rewrite
+    // concurrency for their heavy steps (compaction tasks, index folds, index
+    // builds), so a run never has more steps in flight than tables it may
+    // rewrite, and a lone large table uses the idle slots.
+    let step_limit = crate::table_store::OptimizeStepLimit::new(concurrency.rewrite);
     let stage = |index: usize, started: Instant, work: PreparedOptimizeTable| {
         let catalog = std::sync::Arc::clone(catalog);
+        let step_limit = step_limit.clone();
         async move {
-            let result = apply_optimize_table_effects(db, catalog.as_ref(), work).await;
+            let result =
+                apply_optimize_table_effects(db, catalog.as_ref(), work, &step_limit).await;
             (index, started, result)
         }
     };
@@ -1810,11 +1775,14 @@ decide_seam! {
 /// of every foldable index whose coverage lags the rewritten layout (Lance 11
 /// folds only through a linear commit, so `stage_index_fold` rebuilds instead
 /// of merging), then any declared-but-unbuilt index. The rewrite comes first
-/// so an index is rebuilt once, over the settled layout.
+/// so an index is rebuilt once, over the settled layout. Each compaction
+/// task, the fold and the index build hold one permit of `step_limit`, the
+/// run's budget, while they run.
 async fn apply_optimize_table_effects(
     db: &Omnigraph,
     catalog: &omnigraph_compiler::catalog::Catalog,
     work: PreparedOptimizeTable,
+    step_limit: &crate::table_store::OptimizeStepLimit,
 ) -> Result<OptimizeEffectOutcome> {
     let table_key = work.table_key;
     let full_path = work.full_path;
@@ -1828,8 +1796,10 @@ async fn apply_optimize_table_effects(
     let mut tip = base.clone();
     let mut tip_identity = None;
     let mut metrics = CompactionMetrics::default();
-    if let Some((staged, compaction_metrics)) =
-        db.storage().stage_compaction(&base, &options).await?
+    if let Some((staged, compaction_metrics)) = db
+        .storage()
+        .stage_compaction(&base, &options, step_limit)
+        .await?
     {
         let (rewrite, identity) = db
             .storage()
@@ -1845,7 +1815,7 @@ async fn apply_optimize_table_effects(
     // Lance 13 carries a row-id-domain index's coverage to the new fragments,
     // the engine builds no address-domain index, and no engine writer creates
     // the data overlays that would also drop coverage.
-    let (fold, skipped_folds) = db.storage().stage_index_fold(&tip).await?;
+    let (fold, skipped_folds) = step_limit.run(db.storage().stage_index_fold(&tip)).await?;
     if let Some(staged) = fold {
         if tip_identity.is_some() {
             chain.push(tip.clone());
@@ -1871,9 +1841,8 @@ async fn apply_optimize_table_effects(
         });
     }
     if !index_work.specs.is_empty() {
-        let staged = db
-            .storage()
-            .stage_create_indices(&tip, &index_work.specs)
+        let staged = step_limit
+            .run(db.storage().stage_create_indices(&tip, &index_work.specs))
             .await
             .map_err(|error| {
                 error.with_context(format!(
