@@ -1456,6 +1456,70 @@ impl Omnigraph {
                     plans: Vec::new(),
                 })
             }
+            Ok(total)
+                if crate::db::group_commit::enabled()
+                    && matches!(route, WriteRoute::Publish)
+                    && txn.caller_expected_graph_head.is_none()
+                    && txn.unattached_base.is_none()
+                    && !attempt.holds_gates() =>
+            {
+                // WAL research prototype: an insertion-only mutation joins its
+                // branch's group commit instead of taking the gates itself.
+                let requested = txn.branch.as_deref();
+                let plans = self.validate_staged_mutation(&staging, &txn).await?;
+                let staged = staging
+                    .stage_all_with_concurrency(self, requested, stage_write_concurrency)
+                    .await
+                    .map_err(OmniError::unpublished)?;
+                let lineage_intent = self
+                    .new_lineage_intent_for_branch(requested, actor_id, history_release_bytes)
+                    .await
+                    .map_err(OmniError::unpublished)?;
+                if staged.is_group_eligible() {
+                    // Ends the preparation scope; a first attempt holds no gates.
+                    let _ = attempt.admitted_gates()?;
+                    let entry = crate::db::group_commit::Entry {
+                        staged,
+                        txn: txn.clone(),
+                        lineage_intent,
+                        actor: actor_id.map(str::to_string),
+                    };
+                    let commit = self
+                        .write_queue()
+                        .group_committer()
+                        .submit(self, requested, entry)
+                        .await?;
+                    return Ok(crate::MutationReceipt {
+                        result: total,
+                        commit: Some(commit),
+                        branch: addressed,
+                        plans,
+                    });
+                }
+                let committed = staged
+                    .commit_all(self, requested, &txn, None, attempt)
+                    .await
+                    .map_err(OmniError::unpublished)?;
+                let publication = route.publication(&txn).map_err(OmniError::unpublished)?;
+                let commit = self
+                    .publish_committed_mutation(
+                        CommittedStagedMutation {
+                            committed,
+                            lineage_intent,
+                            plans: Vec::new(),
+                        },
+                        &txn,
+                        actor_id,
+                        publication,
+                    )
+                    .await?;
+                Ok(crate::MutationReceipt {
+                    result: total,
+                    commit: Some(commit),
+                    branch: addressed,
+                    plans,
+                })
+            }
             Ok(total) => {
                 let mut committed = self
                     .commit_staged_mutation(

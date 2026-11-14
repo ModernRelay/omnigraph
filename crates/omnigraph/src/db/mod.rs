@@ -2,6 +2,7 @@
 mod catalog_tests;
 pub mod commit_graph;
 pub(crate) mod graph_coordinator;
+pub mod group_commit;
 pub(crate) mod legacy_sidecars;
 pub mod manifest;
 pub(crate) mod omnigraph;

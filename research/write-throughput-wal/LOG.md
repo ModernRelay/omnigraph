@@ -85,3 +85,80 @@ branch is ~7/s with one commit per CAS, before any preparation is put under the 
   is >= 2 dependent round trips and the `__manifest` publish is 3 (hot-row data
   file, txn, manifest). Only a self-contained one-object record makes the commit point
   one round trip.
+
+## Baseline with the writer epoch claimed (`OG_WT_CLAIM=1`), 2026-11-14
+
+Raw: `results/baseline-claim.jsonl`. Holding the epoch (PR #1350) skips the bound
+branch's head probes: same-branch requests per commit 13.2 -> 9.2, latency 230 -> 208 ms
+at N=1 (the probes overlapped other requests). Named branches are not the handle's bound
+branch, so nothing changes there. Same branch still collapses: 4.7 / 2.9 / 1.7 / 0.0
+commits/s at N = 1/4/16/64 (mem 20 ms). This is the bar for every prototype below (all
+prototypes run claimed).
+
+## Prototype 1: group commit (`OMNIGRAPH_GROUP_COMMIT=1`), 2026-11-14
+
+`crates/omnigraph/src/db/group_commit.rs` + `table_store::compose_pure_inserts`. A write
+group per (root, branch) in the root's `WriteQueueManager` (no spawned task): writers
+prepare and stage as today, submit an entry, and whoever holds the branch's leader lock
+publishes everything queued as one batch (PR #785's shape): gates once, capture once,
+admit by identity + effect-log horizon + disjoint ids, compose each table's raw staged
+fragments into one insertion-only `Update` on the current pin (re-certified insert
+absence), one detached commit per table, one publication, one graph commit per batch.
+Only insertion-only effects with exact ids join; anything else takes the ordinary path.
+
+## Prototype 2: group commit + record log in front of `__manifest` (`OMNIGRAPH_WAL=1`)
+
+`crates/omnigraph-catalog/src/wal.rs` + hooks in `publisher.rs` and the coordinator.
+On a branch whose writer epoch the process holds, a head-advancing publication writes
+`{root}/__wal/{native ref|main}/{V:020}.rec` with one conditional create: the complete
+row set of `__manifest` version V (Arrow IPC). Version numbers are unchanged (record V
+*is* manifest version V, unfolded), so contention semantics are today's. The process
+keeps the tail (tip version, tip rows, folded dataset, unfolded records) in memory; the
+publisher builds V+1 from it with no `__manifest` read; the coordinator installs V at
+once (`ManifestCoordinator::version()` = max(known_state.version, dataset version); opens
+overlay the in-process tip). A background fold writes `__manifest` V from record V with
+the ordinary `commit::overwrite`, in order; appends wait when 64 records are unfolded.
+A new tail adopts records storage holds above `__manifest` (crash recovery). Any other
+kind of publication on the branch first folds the log (`quiesce`).
+
+Verification after every cell (all `true`): fold everything, forget the tails, reopen a
+fresh handle, and check every acknowledged insert is present exactly once per branch.
+
+### Results (raw: `results/gc.jsonl`, `results/gc-wal.jsonl`)
+
+Same branch, commits/s (p50 ms):
+
+| backend | N | baseline-claim | group commit | group commit + log |
+|---|---|---|---|---|
+| mem 20 ms | 1 | 4.7 (208) | 4.7 (208) | **7.0 (140)** |
+| mem 20 ms | 4 | 2.9 (1183) | 12.0 (323) | **17.9 (189)** |
+| mem 20 ms | 16 | 1.7 (4858) | 46.4 (330) | **56.6 (286)** |
+| mem 20 ms | 64 | 0.0 | 58.3 (823) | 60.4 (925) |
+| file | 1 | 30.7 (33) | 29.3 (34) | **40.4 (25)** |
+| file | 4 | 24.7 (152) | 57.3 (66) | 54.6 (68) |
+| file | 16 | 24.6 (613) | 77.1 (198) | 75.9 (197) |
+| file | 64 | 19.9 (2494) | 55.6 (944) | 55.2 (1039) |
+
+Separate branches: no change from either (one writer per branch -> batches of one); the
+log is slightly worse there (non-bound branch captures still probe `__manifest`, which
+now lags the tail).
+
+Per-batch phases (mem 20 ms): the table detached commits take 45 ms at batch size 1
+(2 RTT: txn + manifest) and grow with batch size; the publication takes 91 ms (group
+commit, 3 dependent puts + CPU) vs 23 ms (one record put). Single-commit trace with the
+log: 6 sequential RTT (table manifest GET, key-probe GET, data PUT | table txn PUT,
+table manifest PUT-IF-ABSENT, record PUT-IF-ABSENT), 140 ms, vs 10 RTT / 232 ms baseline;
+the previous record's fold overlaps the next write.
+
+### The 64-writer plateau is CPU in preparation, not the commit point
+
+At N=64 both prototypes sit at ~60 commits/s with p50 ~0.9 s; batches are only 11-23
+entries, so most writers are still preparing. The process is CPU-bound: 6.3 cores busy
+at 62 commits/s (~100 ms CPU per one-row insert). CPU per commit grows with the table's
+fragment count within a run: 16 writers, 1.7 cores at ~3 s (31 ms/commit) vs 5.8 cores at
+~18 s (110 ms/commit). Every insert adds a fragment and every insert's id probe
+(`first_existing_id` / the upsert merge join) scans every fragment no BTREE covers, and
+every Lance commit serializes a manifest listing every fragment. The benchmark table has
+no id index and no live maintenance, so this grows without bound; it penalizes the faster
+designs (they create more fragments per second). Next: stage one merged fragment per
+batch in the leader.

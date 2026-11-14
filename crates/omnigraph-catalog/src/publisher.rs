@@ -627,6 +627,50 @@ impl GraphNamespacePublisher {
         .await
     }
 
+    /// WAL research prototype: the branch's record log when this
+    /// publication goes through it (`OMNIGRAPH_WAL=1`, a head-advancing or
+    /// unconditional publish, and this process holds the branch's writer
+    /// epoch); otherwise `None`, after folding any log the process holds for
+    /// the branch so the publication builds on its latest version.
+    async fn wal_tail(
+        &self,
+        precondition: &PublishPrecondition,
+    ) -> Result<Option<Arc<crate::wal::Tail>>> {
+        if !crate::wal::enabled() {
+            return Ok(None);
+        }
+        let head_advancing = matches!(
+            precondition,
+            PublishPrecondition::ExactGraphHead(_) | PublishPrecondition::Any
+        );
+        if let Some(tail) = crate::wal::existing_tail(&self.root_uri, self.branch.as_deref()) {
+            if head_advancing && self.held_writer_version(tail.native()).is_some() {
+                return Ok(Some(tail));
+            }
+            tail.quiesce().await?;
+            return Ok(None);
+        }
+        if !head_advancing {
+            return Ok(None);
+        }
+        let loaded = self.load_publish_state().await?;
+        let native = loaded.dataset.manifest().branch.clone();
+        if self.held_writer_version(native.as_deref()).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(
+            crate::wal::tail_for(
+                &self.root_uri,
+                self.branch.as_deref(),
+                native.as_deref(),
+                &self.control_session,
+                &loaded.dataset,
+                &loaded.rows,
+            )
+            .await?,
+        ))
+    }
+
     async fn load_publish_state(&self) -> Result<LoadedPublishState> {
         // Test seam: inject a retryable contention here to exercise the outer
         // retry loop's re-run-on-retryable-load-error path (no-op without the
@@ -1721,18 +1765,38 @@ impl GraphNamespacePublisher {
         precondition: &PublishPrecondition,
         held: &mut HeldVersion<'_>,
     ) -> Result<PublishOutcome> {
+        // WAL research prototype: a head-advancing publication on a branch
+        // this process holds writes the next version as a record of the
+        // branch's log; any other publication first folds the log.
+        let wal = self.wal_tail(precondition).await?;
         for attempt in 0..=PUBLISHER_RETRY_BUDGET {
             // Route a retryable `load_publish_state` error through the SAME retry
             // path as a retryable `merge_rows` conflict below, so typed contention
             // composes with the publisher retry instead of aborting the publish.
-            let loaded = match self.load_publish_state().await {
-                Ok(loaded) => loaded,
-                Err(err)
-                    if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) =>
-                {
-                    continue;
+            let (loaded, base_version) = match &wal {
+                Some(tail) => {
+                    let (version, rows, folded) = tail.snapshot();
+                    (
+                        LoadedPublishState {
+                            dataset: folded,
+                            rows: (*rows).clone(),
+                        },
+                        version,
+                    )
                 }
-                Err(err) => return Err(err),
+                None => match self.load_publish_state().await {
+                    Ok(loaded) => {
+                        let version = loaded.dataset.version().version;
+                        (loaded, version)
+                    }
+                    Err(err)
+                        if attempt < PUBLISHER_RETRY_BUDGET
+                            && is_retryable_publish_conflict(&err) =>
+                    {
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                },
             };
             let LoadedPublishState {
                 dataset,
@@ -1766,7 +1830,7 @@ impl GraphNamespacePublisher {
             // surfaced as `PublishedDatasetVersionMismatch` rather than retried.
             Self::check_expected_table_versions(&tables, expected_table_versions)?;
 
-            let new_manifest_version = dataset.version().version + 1;
+            let new_manifest_version = base_version + 1;
             let (next_tables, mut wrote) =
                 Self::apply_changes(changes, &tables, new_manifest_version)?;
             let mut next_contract = schema_contract;
@@ -1923,7 +1987,29 @@ impl GraphNamespacePublisher {
             };
             let cold = next.registry.cold_push();
 
-            match self.merge_rows(dataset.clone(), &next, cold.as_ref()).await {
+            let committed = match &wal {
+                Some(tail) => tail
+                    .append(new_manifest_version, &next, cold.as_ref())
+                    .await
+                    .map_err(PublishAttemptFailure::BeforeAck),
+                None => self.merge_rows(dataset.clone(), &next, cold.as_ref()).await,
+            };
+            match committed {
+                Ok(new_dataset) if wal.is_some() => {
+                    known_state.version = new_manifest_version;
+                    held.record_landed(native_branch.as_deref(), new_manifest_version);
+                    return Ok(PublishOutcome {
+                        dataset: new_dataset,
+                        parent_commit_id,
+                        known_state,
+                        head: next.head,
+                        tables: next.tables,
+                        buffer: next.buffer,
+                        schema_contract: next.schema_contract,
+                        registry: next.registry,
+                        writer_epoch: next.writer_epoch,
+                    });
+                }
                 Ok(new_dataset) => {
                     if new_dataset.version().version != new_manifest_version {
                         return Err(OmniError::manifest_internal(format!(

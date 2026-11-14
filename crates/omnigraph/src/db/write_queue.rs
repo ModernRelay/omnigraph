@@ -630,11 +630,19 @@ pub(crate) struct WriteQueueManager {
     /// The graph-global shared/exclusive schema gate; see
     /// [`SchemaGateSlot`].
     schema_gate: Arc<SchemaGateSlot>,
+    /// WAL research prototype: the per-branch group-commit write groups,
+    /// shared by every handle on this root in the process.
+    group_committer: crate::db::group_commit::GroupCommitter,
 }
 
 impl WriteQueueManager {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// WAL research prototype: the root's group committer.
+    pub(crate) fn group_committer(&self) -> &crate::db::group_commit::GroupCommitter {
+        &self.group_committer
     }
 
     /// Return the process-wide queue manager for one canonical graph-root

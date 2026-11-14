@@ -439,6 +439,12 @@ impl StagedHandle {
         self.inner
     }
 
+    /// WAL research prototype: the ids of an insertion-only effect group
+    /// commit may compose (`StagedWrite::pure_insert_ids`).
+    pub(crate) fn pure_insert_ids(&self) -> Option<&Arc<Vec<String>>> {
+        self.inner.pure_insert_ids()
+    }
+
     /// Lance transaction identity captured when this effect was staged.
     pub fn transaction_identity(&self) -> StagedTransactionIdentity {
         self.inner.transaction_identity()

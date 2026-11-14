@@ -136,6 +136,9 @@ impl Counters {
 /// Object class from the key: which dataset (`__manifest`, `__history`, or a
 /// node/edge table) and which part of it.
 fn classify(path: &str) -> &'static str {
+    if path.contains("__wal") {
+        return "wal";
+    }
     let dataset = if path.contains("__manifest") {
         "manifest"
     } else if path.contains("__history") {
@@ -408,6 +411,7 @@ struct Config {
     out: Option<String>,
     trace: bool,
     label: String,
+    claim: bool,
 }
 
 fn env(name: &str, default: &str) -> String {
@@ -433,6 +437,7 @@ impl Config {
             out: std::env::var("OG_WT_OUT").ok(),
             trace: env("OG_WT_TRACE", "0") == "1",
             label: env("OG_WT_LABEL", "baseline"),
+            claim: env("OG_WT_CLAIM", "0") == "1",
         }
     }
 }
@@ -475,6 +480,8 @@ struct CellResult {
     reprepares: u64,
     requests: BTreeMap<(&'static str, &'static str), u64>,
     control_calls: u64,
+    verified: bool,
+    phases: [u64; 7],
 }
 
 fn percentile(sorted: &[u64], q: f64) -> u64 {
@@ -485,20 +492,31 @@ fn percentile(sorted: &[u64], q: f64) -> u64 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
-async fn open_graph(config: &Config, cell: &str) -> (Session, Option<tempfile::TempDir>, Arc<omnigraph::instrumentation::StorageReadCounts>) {
+async fn open_graph(
+    config: &Config,
+    cell: &str,
+) -> (
+    Session,
+    Option<tempfile::TempDir>,
+    Arc<omnigraph::instrumentation::StorageReadCounts>,
+    String,
+    Arc<dyn StorageAdapter>,
+) {
     match config.backend.as_str() {
         "file" => {
             let dir = tempfile::tempdir().unwrap();
             let uri = dir.path().to_str().unwrap().to_string();
             let inner: Arc<dyn StorageAdapter> = omnigraph::storage::storage_for_uri(&uri).unwrap();
             let (adapter, counts) = CountingStorageAdapter::new(inner);
-            let db = Omnigraph::init_with_storage(&uri, SCHEMA, adapter, InitOptions::default())
+            let db = Omnigraph::init_with_storage(&uri, SCHEMA, Arc::clone(&adapter), InitOptions::default())
                 .await
                 .unwrap();
             (
                 Session::from_defaults(Arc::new(db), SessionSettings::default()),
                 Some(dir),
                 counts,
+                uri,
+                adapter,
             )
         }
         "mem" => {
@@ -509,13 +527,15 @@ async fn open_graph(config: &Config, cell: &str) -> (Session, Option<tempfile::T
             );
             let inner: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
             let (adapter, counts) = CountingStorageAdapter::new(inner);
-            let db = Omnigraph::init_with_storage(&uri, SCHEMA, adapter, InitOptions::default())
+            let db = Omnigraph::init_with_storage(&uri, SCHEMA, Arc::clone(&adapter), InitOptions::default())
                 .await
                 .unwrap();
             (
                 Session::from_defaults(Arc::new(db), SessionSettings::default()),
                 None,
                 counts,
+                uri,
+                adapter,
             )
         }
         other => panic!("unknown backend {other}"),
@@ -525,7 +545,8 @@ async fn open_graph(config: &Config, cell: &str) -> (Session, Option<tempfile::T
 async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
     let counters = counters(Duration::from_millis(config.latency_ms));
     let cell = format!("{mode}-{writers}-{}", now_us());
-    let (session, _dir, control) = open_graph(config, &cell).await;
+    let (session, _dir, control, uri, adapter) = open_graph(config, &cell).await;
+    let acked: Arc<Vec<AtomicU64>> = Arc::new((0..writers).map(|_| AtomicU64::new(0)).collect());
 
     // Branches for the separate-branch mode, and the tag the edge shape needs.
     let branches: Vec<String> = (0..writers)
@@ -557,12 +578,23 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
             session.db().branch_create(branch).await.unwrap();
         }
     }
+    // Hold the writer epoch (PR #1350) of every branch written, so the
+    // process's own view is authoritative and its head probes are skipped.
+    if config.claim {
+        let mut claimed = std::collections::BTreeSet::new();
+        for branch in &branches {
+            if claimed.insert(branch.clone()) {
+                session.db().claim_branch_writer(branch).await.unwrap();
+            }
+        }
+    }
 
     let phase = Arc::new(AtomicU64::new(0)); // 0 warmup, 1 measured, 2 stop
     let stop = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
     for (w, branch) in branches.iter().cloned().enumerate() {
         let session = session.clone();
+        let acked = Arc::clone(&acked);
         let phase = Arc::clone(&phase);
         let stop = Arc::clone(&stop);
         let shape = config.shape.clone();
@@ -591,7 +623,10 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
                             ("put", params(&slug, seq as i64, None))
                         };
                         match session.mutate(&branch, QUERIES, name, &p).await {
-                            Ok(_) => break,
+                            Ok(_) => {
+                                acked[w].fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
                             Err(e) => {
                                 let debug = format!("{e:?}");
                                 if debug.contains("ReadSetChanged") {
@@ -622,6 +657,7 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
     }
 
     tokio::time::sleep(config.warmup).await;
+    let _ = omnigraph::db::group_commit::stats::take();
     let before = counters.snapshot();
     let control_before = control.mutation_calls.load(Ordering::Relaxed)
         + control.read_text.load(Ordering::Relaxed)
@@ -635,6 +671,7 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
     phase.store(2, Ordering::SeqCst);
     let elapsed = started.elapsed();
     let after = counters.snapshot();
+    let phases = omnigraph::db::group_commit::stats::take();
     let control_after = control.mutation_calls.load(Ordering::Relaxed)
         + control.read_text.load(Ordering::Relaxed)
         + control.read_text_if_exists.load(Ordering::Relaxed)
@@ -652,6 +689,8 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
         reprepares: 0,
         requests: BTreeMap::new(),
         control_calls: control_after - control_before,
+        verified: false,
+        phases,
     };
     for handle in handles {
         let (commits, latencies, conflicts, errors, reprepares) = handle.await.unwrap();
@@ -691,6 +730,32 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
             );
         }
     }
+    // Verification: every acknowledged insert is present exactly once, read
+    // by a fresh handle over durable `__manifest` state after every log is
+    // folded (the handle opens with no in-process log).
+    omnigraph_catalog::wal::forget_all().await.unwrap();
+    let fresh = Omnigraph::open_with_storage(&uri, Arc::clone(&adapter)).await.unwrap();
+    let mut expected: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for (w, branch) in branches.iter().enumerate() {
+        *expected.entry(branch.clone()).or_default() += acked[w].load(Ordering::Relaxed);
+    }
+    if config.trace {
+        *expected.entry(branches[0].clone()).or_default() += 1;
+    }
+    let mut verified = true;
+    for (branch, want) in &expected {
+        let snapshot = fresh
+            .snapshot_of(omnigraph::db::ReadTarget::branch(branch.as_str()))
+            .await
+            .unwrap();
+        let dataset = snapshot.open_dataset("node:Item").await.unwrap();
+        let got = dataset.count_rows(None).await.unwrap() as u64;
+        if got != *want {
+            verified = false;
+            eprintln!("VERIFY FAILED on {branch}: {got} rows, {want} acknowledged inserts");
+        }
+    }
+    result.verified = verified;
     result
 }
 
@@ -706,6 +771,7 @@ fn report(config: &Config, mode: &str, writers: usize, mut result: CellResult) -
     }
     let value = serde_json::json!({
         "label": config.label,
+        "claim": config.claim,
         "backend": config.backend,
         "latency_ms": config.latency_ms,
         "mode": mode,
@@ -724,10 +790,25 @@ fn report(config: &Config, mode: &str, writers: usize, mut result: CellResult) -
         "client_conflicts": result.client_conflicts,
         "control_plane_calls": result.control_calls,
         "errors": result.other_errors.len(),
+        "verified": result.verified,
+        "batches": result.phases[0],
+        "mean_batch": result.phases[1] as f64 / result.phases[0].max(1) as f64,
+        "batch_ms": {
+            "gates": result.phases[2] as f64 / 1000.0 / result.phases[0].max(1) as f64,
+            "capture": result.phases[3] as f64 / 1000.0 / result.phases[0].max(1) as f64,
+            "tables": result.phases[4] as f64 / 1000.0 / result.phases[0].max(1) as f64,
+            "publish": result.phases[5] as f64 / 1000.0 / result.phases[0].max(1) as f64,
+            "queue_per_entry": result.phases[6] as f64 / 1000.0 / result.phases[1].max(1) as f64,
+        },
+        "group_commit": std::env::var("OMNIGRAPH_GROUP_COMMIT").unwrap_or_default(),
+        "wal": std::env::var("OMNIGRAPH_WAL").unwrap_or_default(),
         "first_error": result.other_errors.first(),
     });
+    if result.phases[0] > 0 {
+        eprintln!("    batches {} mean size {:.1} per-batch ms {}", value["batches"], value["mean_batch"].as_f64().unwrap(), value["batch_ms"]);
+    }
     eprintln!(
-        "[{}] {} {}ms {} w={:>2}: {:>7.1} commits/s  p50 {:>8.1} ms  p99 {:>8.1} ms  req/commit {:>6.1}  reprep/commit {:.2}  conflicts {}  errors {}",
+        "[{}] {} {}ms {} w={:>2}: {:>7.1} commits/s  p50 {:>8.1} ms  p99 {:>8.1} ms  req/commit {:>6.1}  reprep/commit {:.2}  conflicts {}  errors {}  verified {}",
         config.label,
         config.backend,
         config.latency_ms,
@@ -740,6 +821,7 @@ fn report(config: &Config, mode: &str, writers: usize, mut result: CellResult) -
         value["reprepares_per_commit"].as_f64().unwrap(),
         result.client_conflicts,
         result.other_errors.len(),
+        result.verified,
     );
     value
 }

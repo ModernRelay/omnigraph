@@ -124,6 +124,13 @@ pub(crate) struct WriteAttempt {
 }
 
 impl WriteAttempt {
+    /// WAL research prototype: whether this attempt was prepared under the
+    /// writer gates (a re-preparation), which group commit leaves on the
+    /// ordinary path.
+    pub(crate) fn holds_gates(&self) -> bool {
+        self.gates.is_some()
+    }
+
     /// The schema permit and branch gate this attempt prepared under, for
     /// its commit point to complete with the table gates; `None` on a first
     /// attempt, which takes them at its revalidation. An attempt that never

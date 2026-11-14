@@ -869,6 +869,7 @@ pub(crate) async fn rebase_staged_write(
         new_fragments,
         removed_fragment_ids,
         deleted_rows,
+        inserted_ids,
     } = staged;
     let mut rebase = lance::io::commit::conflict_resolver::TransactionRebase::try_new(
         base,
@@ -903,6 +904,7 @@ pub(crate) async fn rebase_staged_write(
         new_fragments,
         removed_fragment_ids,
         deleted_rows,
+        inserted_ids,
     }))
 }
 
@@ -1263,6 +1265,10 @@ pub struct StagedWrite {
     /// staging. `None` for every other effect, including `stage_delete_rows`,
     /// whose rows the caller supplies and Lance does not count.
     deleted_rows: Option<u64>,
+    /// WAL research prototype (group commit): the exact ids of a staged
+    /// insertion-only effect, set only where the writer proved every id new at
+    /// its pinned parent. `None` for every other effect.
+    inserted_ids: Option<Arc<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1390,6 +1396,7 @@ impl StagedWrite {
             new_fragments,
             removed_fragment_ids,
             deleted_rows: None,
+            inserted_ids: None,
         }
     }
 
@@ -1405,6 +1412,41 @@ impl StagedWrite {
             new_fragments,
             removed_fragment_ids,
             deleted_rows: None,
+            inserted_ids: None,
+        }
+    }
+
+    fn with_inserted_ids(mut self, ids: Vec<String>) -> Self {
+        self.inserted_ids = Some(Arc::new(ids));
+        self
+    }
+
+    /// WAL research prototype: the ids of an insertion-only effect whose
+    /// staged transaction adds fragments and removes or rewrites none, and
+    /// whose writer proved every id absent at its pin; `None` otherwise.
+    pub(crate) fn pure_insert_ids(&self) -> Option<&Arc<Vec<String>>> {
+        let ids = self.inserted_ids.as_ref()?;
+        match &self.transaction.operation {
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                fields_modified,
+                update_mode,
+                inserted_rows_filter,
+                updated_fragment_offsets,
+                ..
+            } if removed_fragment_ids.is_empty()
+                && updated_fragments.is_empty()
+                && !new_fragments.is_empty()
+                && fields_modified.is_empty()
+                && update_mode == &Some(UpdateMode::RewriteRows)
+                && inserted_rows_filter.is_some()
+                && updated_fragment_offsets.is_none() =>
+            {
+                Some(ids)
+            }
+            _ => None,
         }
     }
 
@@ -3929,27 +3971,31 @@ impl TableStore {
                 "stage_keyed_write",
             )
             .await?;
-        if merge_stats_prove_pure_insert(&stats, merged_rows)
-            && let Err(error) = certify_insert_absence(
+        if merge_stats_prove_pure_insert(&stats, merged_rows) {
+            match certify_insert_absence(
                 &mut staged.transaction,
                 expected_read_version,
                 id_field_id,
                 &expected_schema_preorder_ids,
                 &source_ids,
                 "stage_keyed_write",
-            )
-        {
-            // The certificate is an optional optimization for Upsert. Lance's
-            // completed statistics prove this execution inserted every row,
-            // but an unfamiliar future transaction shape must disable the
-            // history shortcut rather than fail an otherwise valid logical
-            // write. StrictInsert returned above; its writer certifies every
-            // insertion unconditionally.
-            tracing::debug!(
-                type_key,
-                error = %error,
-                "all-new upsert is not eligible for the insertion-absence certificate"
-            );
+            ) {
+                // WAL research prototype: an all-new upsert Lance proved
+                // inserted every row is an insertion-only effect that group
+                // commit may compose.
+                Ok(()) => staged.inserted_ids = Some(Arc::new(source_ids)),
+                // The certificate is an optional optimization for Upsert.
+                // Lance's completed statistics prove this execution inserted
+                // every row, but an unfamiliar future transaction shape must
+                // disable the history shortcut rather than fail an otherwise
+                // valid logical write. StrictInsert returned above; its writer
+                // certifies every insertion unconditionally.
+                Err(error) => tracing::debug!(
+                    type_key,
+                    error = %error,
+                    "all-new upsert is not eligible for the insertion-absence certificate"
+                ),
+            }
         }
         Ok(staged)
     }
@@ -4157,7 +4203,8 @@ impl TableStore {
             StagedCommitMetadata::affected_rows(Some(RowAddrTreeMap::new())),
             visible_fragments,
             Vec::new(),
-        ))
+        )
+        .with_inserted_ids(source_ids))
     }
 
     /// Resolve any URI-bearing logical blobs into a bounded in-memory keyed
@@ -8128,6 +8175,108 @@ pub(crate) fn compaction_blob_batch_rows(max_row_blob_bytes: u64) -> usize {
     usize::try_from(COMPACTION_BLOB_BATCH_BYTES / max_row_blob_bytes)
         .unwrap_or(1)
         .clamp(1, COMPACTION_MAX_BATCH_ROWS)
+}
+
+/// WAL research prototype (group commit): compose the insertion-only staged
+/// effects of several writes on one table into one staged effect read from
+/// `base`, the table's pin at the batch's head. The union of the components'
+/// raw fragments (Lance's temporary fragment ids; commit assigns ids, stable
+/// row ids and row-version stamps from `base`) is committed under one
+/// filter-bearing insertion-only `Update` whose key filter holds every id,
+/// re-certified for `base`. The caller proves the ids pairwise disjoint and
+/// absent from every commit between each component's pin and `base`; this is
+/// the shape `group_commit_composes_inserts_staged_against_older_pins_onto_a_later_pin`
+/// (PR #785) pins on Lance 13.
+pub(crate) fn compose_pure_inserts(
+    base: &Dataset,
+    parts: Vec<StagedWrite>,
+    system_columns: SystemColumns,
+) -> Result<StagedWrite> {
+    const CONTEXT: &str = "compose_pure_inserts";
+    let id_field_id = exact_id_primary_key_field_id(base, system_columns, CONTEXT)?;
+    let schema_ids = schema_preorder_field_ids(base, CONTEXT)?;
+    let mut fragments = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut all_no_by_source_delete = true;
+    for part in parts {
+        let part_ids = part.pure_insert_ids().cloned().ok_or_else(|| {
+            OmniError::manifest_internal(format!("{CONTEXT}: a component is not a pure insert"))
+        })?;
+        all_no_by_source_delete &= has_no_by_source_delete_marker(&part.transaction);
+        match part.transaction.operation {
+            Operation::Update {
+                new_fragments,
+                fields_for_preserving_frag_bitmap,
+                ..
+            } => {
+                if fields_for_preserving_frag_bitmap != schema_ids {
+                    return Err(OmniError::manifest_read_set_changed(
+                        format!("{CONTEXT}:schema"),
+                        None,
+                        None,
+                    ));
+                }
+                fragments.extend(new_fragments);
+            }
+            _ => unreachable!("pure_insert_ids checked the operation"),
+        }
+        ids.extend(part_ids.iter().cloned());
+    }
+    let mut filter = KeyExistenceFilterBuilder::new(vec![id_field_id]);
+    for id in &ids {
+        filter
+            .insert(KeyValue::String(id.clone()))
+            .map_err(OmniError::lance_internal)?;
+    }
+    if filter.len() != ids.len() {
+        return Err(OmniError::manifest_internal(format!(
+            "{CONTEXT}: composed ids are not disjoint"
+        )));
+    }
+    let mut properties = HashMap::new();
+    if all_no_by_source_delete {
+        properties.insert(
+            NO_BY_SOURCE_DELETE_PROPERTY.to_string(),
+            NO_BY_SOURCE_DELETE_V1.to_string(),
+        );
+    }
+    let mut transaction = TransactionBuilder::new(
+        base.version().version,
+        Operation::Update {
+            removed_fragment_ids: Vec::new(),
+            updated_fragments: Vec::new(),
+            new_fragments: fragments.clone(),
+            fields_modified: Vec::new(),
+            compacted_sstables: Vec::new(),
+            fields_for_preserving_frag_bitmap: schema_ids.clone(),
+            update_mode: Some(UpdateMode::RewriteRows),
+            inserted_rows_filter: Some(filter.build()),
+            updated_fragment_offsets: None,
+        },
+    )
+    .transaction_properties(Some(Arc::new(properties)))
+    .build();
+    certify_insert_absence(
+        &mut transaction,
+        base.version().version,
+        id_field_id,
+        &schema_ids,
+        &ids,
+        CONTEXT,
+    )?;
+    let mut visible = fragments;
+    let next_id_base = base.manifest.max_fragment_id.unwrap_or(0) as u64 + 1;
+    assign_fragment_ids(&mut visible, next_id_base);
+    if base.manifest.uses_stable_row_ids() {
+        assign_row_id_meta(&mut visible, base.manifest.next_row_id)?;
+    }
+    Ok(StagedWrite::with_commit_metadata(
+        transaction,
+        StagedCommitMetadata::affected_rows(Some(RowAddrTreeMap::new())),
+        visible,
+        Vec::new(),
+    )
+    .with_inserted_ids(ids))
 }
 
 pub(crate) fn exact_id_primary_key_field_id(

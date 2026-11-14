@@ -5256,6 +5256,12 @@ impl Omnigraph {
 /// A caller's branch name as the engine addresses it: `None` for main, the
 /// name itself otherwise. The name is taken as written, the spelling a policy
 /// decision judged; one that is not canonical is refused, never corrected.
+/// WAL research prototype: whether publications go through the branch's
+/// record log (`OMNIGRAPH_WAL=1`, read once).
+pub(crate) fn wal_enabled() -> bool {
+    omnigraph_catalog::wal::enabled()
+}
+
 pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
     ensure_canonical_branch_name(branch)?;
     if branch == "main" {

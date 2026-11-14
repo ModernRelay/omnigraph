@@ -1117,6 +1117,61 @@ impl StagedMutation {
             .map(|entry| entry.table_key.as_str())
             .collect()
     }
+
+    /// WAL research prototype: whether every staged effect is an
+    /// insertion-only write with exact ids, and every touched table carries
+    /// one, so group commit may compose the mutation into a batch.
+    pub(crate) fn is_group_eligible(&self) -> bool {
+        !self.staged.is_empty()
+            && self.staged.len() == self.expected_versions.len()
+            && self.staged.iter().all(|entry| {
+                entry
+                    .staged_write
+                    .as_ref()
+                    .is_some_and(|staged| staged.pure_insert_ids().is_some())
+            })
+    }
+
+    /// WAL research prototype: the ids each table's staged effect inserts.
+    pub(crate) fn pure_insert_ids_by_table(&self) -> HashMap<String, Arc<Vec<String>>> {
+        self.staged
+            .iter()
+            .filter_map(|entry| {
+                let ids = entry.staged_write.as_ref()?.pure_insert_ids()?;
+                Some((entry.table_key.clone(), Arc::clone(ids)))
+            })
+            .collect()
+    }
+
+    /// WAL research prototype: take every table's staged effect and the
+    /// expected pins, leaving this mutation empty.
+    pub(crate) fn take_group_components(
+        &mut self,
+    ) -> Result<(Vec<GroupComponent>, crate::db::manifest::ExpectedTableVersions)> {
+        let mut components = Vec::with_capacity(self.staged.len());
+        for entry in std::mem::take(&mut self.staged) {
+            let staged = entry.staged_write.ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "table '{}' reached group commit without a staged transaction",
+                    entry.table_key
+                ))
+            })?;
+            components.push(GroupComponent {
+                table_key: entry.table_key,
+                path: entry.path,
+                staged: staged.into_staged(),
+            });
+        }
+        Ok((components, std::mem::take(&mut self.expected_versions)))
+    }
+}
+
+/// WAL research prototype: one table's staged effect of one group-commit
+/// entry.
+pub(crate) struct GroupComponent {
+    pub(crate) table_key: String,
+    pub(crate) path: StagedTablePath,
+    pub(crate) staged: crate::table_store::StagedWrite,
 }
 
 /// Per-table state from `stage_all` for `commit_all`: the opened snapshot and

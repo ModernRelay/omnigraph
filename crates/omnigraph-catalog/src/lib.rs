@@ -64,6 +64,7 @@ pub mod retention;
 pub mod state;
 pub mod unattached;
 pub mod unpublished;
+pub mod wal;
 mod writer_epoch;
 pub use branch_detail::{GraphBranchDetail, GraphBranchListing, list_graph_branches_detailed};
 pub use branch_names::is_merge_input_tag;
@@ -1508,11 +1509,21 @@ impl ManifestCoordinator {
     fn from_opened(root_uri: &str, opened: OpenedManifest, active_branch: Option<String>) -> Self {
         let OpenedManifest {
             dataset,
-            known_state,
-            rows,
+            mut known_state,
+            mut rows,
             branch_identifier,
             native_branch,
         } = opened;
+        // WAL research prototype: this process's log of the branch holds
+        // versions above the latest folded one; open at its tip.
+        if let Some(tail) = crate::wal::existing_tail(root_uri, active_branch.as_deref())
+            && tail.native() == native_branch.as_deref()
+            && let Some((version, tip)) = tail.above(dataset.version().version)
+            && let Ok(state) = tip.state(version, native_branch.as_deref())
+        {
+            known_state = state;
+            rows = (*tip).clone();
+        }
         let publisher =
             Self::default_batch_publisher(root_uri, active_branch.as_deref(), dataset.session());
         let ManifestRows {
@@ -2661,7 +2672,9 @@ impl ManifestCoordinator {
 
     /// Current graph-manifest version.
     pub fn version(&self) -> u64 {
-        self.dataset.version().version
+        // WAL research prototype: the installed view can be a record of the
+        // branch's log above the latest folded `__manifest` version.
+        self.known_state.version.max(self.dataset.version().version)
     }
 
     #[cfg(test)]
