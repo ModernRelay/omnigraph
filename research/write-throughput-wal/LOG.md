@@ -162,3 +162,31 @@ every Lance commit serializes a manifest listing every fragment. The benchmark t
 no id index and no live maintenance, so this grows without bound; it penalizes the faster
 designs (they create more fragments per second). Next: stage one merged fragment per
 batch in the leader.
+
+## Prototype 3: the leader stages the batch (`OMNIGRAPH_GROUP_STAGE=leader`), 2026-11-14
+
+Writers prepare and validate (capture, execute, `validate_staged_mutation`) but do not
+stage; they submit their pending rows. The leader absorbs every entry's rows into one
+`MutationStaging` pinned at the batch's head (`MutationStaging::absorb_pending`) and runs
+the ordinary `stage_all` + `commit_all` under the gates it holds
+(`WriteAttempt::with_admitted_gates`), then one publication. Effect: the id probe (merge
+join over uncovered fragments) runs once per batch instead of once per write, and a batch
+adds one fragment per table instead of one per write.
+
+Raw: `results/gc-wal-leader.jsonl` (cells run by hand, see commands in this log),
+`results/gc-leader.jsonl`. Same branch, mem 20 ms, claimed:
+
+| N | gc (compose) | gc + log (compose) | gc + leader staging | **gc + log + leader staging** |
+|---|---|---|---|---|
+| 1 | 4.7 (208) | 7.0 (140) | 4.7 (208) | 7.0 (140) |
+| 4 | 12.0 (323) | 17.9 (189) | 9.2 (417) | 13.9 (281) |
+| 16 | 46.4 (330) | 56.6 (286) | 36.8 (413) | 55.9 (280) |
+| 64 | 58.3 (823) | 60.4 (925) | 147.2 (416) | **217.4 (281), p99 332** |
+
+CPU at N=64 fell from 6.3 cores (compose) to 0.3 cores (leader staging). Per batch:
+tables ~115 ms (probe GET of the previous batch's fragment, data PUT, Lance txn PUT,
+Lance manifest PUT) + publication 23 ms (record) vs 91 ms (`__manifest` commit). The
+record's contribution in this regime: +48% commits/s, -32% p50 at N=64. In a closed
+loop a writer waits ~2 batch cycles (queue ~120 ms + its own batch ~140 ms), so
+commits/s ~= N / 280 ms: latency, not capacity, is now the limit. Single-batch trace: 5
+sequential RTT in the batch + 1 RTT preparation (table manifest GET).

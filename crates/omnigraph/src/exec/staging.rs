@@ -192,6 +192,98 @@ impl MutationStaging {
         self.write_budget
     }
 
+    /// WAL research prototype: whether a group-commit leader may stage this
+    /// mutation with others: only keyed inserts and upserts, no delete, no
+    /// overwrite and no column patch.
+    pub(crate) fn is_leader_stageable(&self) -> bool {
+        !self.pending.is_empty()
+            && self.delete_predicates.is_empty()
+            && self.deleted_ids.is_empty()
+            && self.pending.len() == self.expected_versions.len()
+            && self
+                .pending
+                .values()
+                .all(|table| matches!(table.mode, PendingMode::StrictInsert | PendingMode::Upsert))
+    }
+
+    /// WAL research prototype: the ids each table's pending batches write.
+    pub(crate) fn pending_ids_by_table(
+        &self,
+        system_columns: SystemColumns,
+    ) -> Result<HashMap<String, Arc<Vec<String>>>> {
+        let mut out = HashMap::new();
+        for (table_key, table) in &self.pending {
+            let mut ids = Vec::new();
+            for batch in &table.batches {
+                ids.extend(crate::table_store::validate_keyed_write_batch_ids(
+                    batch,
+                    system_columns,
+                    table_key,
+                    "group commit admission",
+                )?);
+            }
+            out.insert(table_key.clone(), Arc::new(ids));
+        }
+        Ok(out)
+    }
+
+    /// WAL research prototype: add `other`'s pending batches to this staging,
+    /// each table pinned at `base`'s registration, for a group-commit leader
+    /// that stages one write per table for a whole batch.
+    pub(crate) fn absorb_pending(
+        &mut self,
+        other: MutationStaging,
+        base: &crate::db::Snapshot,
+    ) -> Result<()> {
+        let MutationStaging {
+            paths,
+            pending,
+            op_kinds,
+            ..
+        } = other;
+        for (table_key, table) in pending {
+            let path = paths.get(&table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!("pending table '{table_key}' has no path"))
+            })?;
+            let entry = base.dataset(&table_key).cloned().ok_or_else(|| {
+                OmniError::manifest_read_set_changed(
+                    format!("group_commit:table:{table_key}"),
+                    None,
+                    None,
+                )
+            })?;
+            if entry.identity != path.identity {
+                return Err(OmniError::manifest_read_set_changed(
+                    format!("group_commit:identity:{table_key}"),
+                    None,
+                    None,
+                ));
+            }
+            let pinned = match &path.pinned_native_ref {
+                crate::db::manifest::NativeRefPin::Exact(native) => native.clone(),
+                crate::db::manifest::NativeRefPin::Unchecked => entry.native_dataset_branch.clone(),
+            };
+            let version = entry.published_dataset_version;
+            self.ensure_path(
+                &table_key,
+                path.identity,
+                path.full_path.clone(),
+                path.table_branch.clone(),
+                pinned,
+                entry,
+                version,
+                op_kinds
+                    .get(&table_key)
+                    .copied()
+                    .unwrap_or(MutationOpKind::Merge),
+            )?;
+            for batch in table.batches {
+                self.append_batch(&table_key, table.schema.clone(), table.mode, batch)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Capture pre-write metadata on first touch of a table. Subsequent
     /// touches preserve the original `paths` and `expected_versions`
     /// entries; `op_kinds` upgrades to the strictest kind seen so far so

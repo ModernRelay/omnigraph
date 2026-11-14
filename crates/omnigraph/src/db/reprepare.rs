@@ -131,6 +131,17 @@ impl WriteAttempt {
         self.gates.is_some()
     }
 
+    /// WAL research prototype: an admitted attempt that commits under gates a
+    /// group-commit leader already holds.
+    pub(crate) fn with_admitted_gates(gates: BranchWriteGates) -> Self {
+        Self {
+            gates: Some(gates),
+            first: None,
+            admitted: true,
+            identity_changed: false,
+        }
+    }
+
     /// The schema permit and branch gate this attempt prepared under, for
     /// its commit point to complete with the table gates; `None` on a first
     /// attempt, which takes them at its revalidation. An attempt that never

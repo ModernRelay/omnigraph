@@ -8340,7 +8340,7 @@ fn string_id_column<'a>(
         })
 }
 
-fn validate_keyed_write_batch_ids(
+pub(crate) fn validate_keyed_write_batch_ids(
     batch: &RecordBatch,
     system_columns: SystemColumns,
     table_key: &str,

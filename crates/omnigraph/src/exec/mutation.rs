@@ -1467,6 +1467,30 @@ impl Omnigraph {
                 // branch's group commit instead of taking the gates itself.
                 let requested = txn.branch.as_deref();
                 let plans = self.validate_staged_mutation(&staging, &txn).await?;
+                if crate::db::group_commit::leader_stages() && staging.is_leader_stageable() {
+                    let lineage_intent = self
+                        .new_lineage_intent_for_branch(requested, actor_id, history_release_bytes)
+                        .await
+                        .map_err(OmniError::unpublished)?;
+                    let _ = attempt.admitted_gates()?;
+                    let entry = crate::db::group_commit::Entry {
+                        work: crate::db::group_commit::Work::Pending(staging),
+                        txn: txn.clone(),
+                        lineage_intent,
+                        actor: actor_id.map(str::to_string),
+                    };
+                    let commit = self
+                        .write_queue()
+                        .group_committer()
+                        .submit(self, requested, entry)
+                        .await?;
+                    return Ok(crate::MutationReceipt {
+                        result: total,
+                        commit: Some(commit),
+                        branch: addressed,
+                        plans,
+                    });
+                }
                 let staged = staging
                     .stage_all_with_concurrency(self, requested, stage_write_concurrency)
                     .await
@@ -1479,7 +1503,7 @@ impl Omnigraph {
                     // Ends the preparation scope; a first attempt holds no gates.
                     let _ = attempt.admitted_gates()?;
                     let entry = crate::db::group_commit::Entry {
-                        staged,
+                        work: crate::db::group_commit::Work::Staged(staged),
                         txn: txn.clone(),
                         lineage_intent,
                         actor: actor_id.map(str::to_string),

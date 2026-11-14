@@ -77,9 +77,24 @@ pub(crate) fn enabled() -> bool {
     })
 }
 
+/// Whether the leader stages one write per table for a whole batch
+/// (`OMNIGRAPH_GROUP_STAGE=leader`) instead of composing the files each
+/// writer staged.
+pub(crate) fn leader_stages() -> bool {
+    static LEADER: OnceLock<bool> = OnceLock::new();
+    *LEADER.get_or_init(|| std::env::var("OMNIGRAPH_GROUP_STAGE").is_ok_and(|value| value == "leader"))
+}
+
+/// What an entry brings: the effects its writer staged, or the rows its
+/// writer validated for the leader to stage with the rest of the batch.
+pub(crate) enum Work {
+    Staged(StagedMutation),
+    Pending(crate::exec::staging::MutationStaging),
+}
+
 /// One prepared write waiting for its batch.
 pub(crate) struct Entry {
-    pub(crate) staged: StagedMutation,
+    pub(crate) work: Work,
     pub(crate) txn: WriteTxn,
     pub(crate) lineage_intent: crate::db::manifest::LineageIntent,
     pub(crate) actor: Option<String>,
@@ -292,7 +307,16 @@ async fn run_batch(
             let _ = queued.reply.send(Err(refused("horizon")));
             continue;
         };
-        let ids = queued.entry.staged.pure_insert_ids_by_table();
+        let ids = match &queued.entry.work {
+            Work::Staged(staged) => staged.pure_insert_ids_by_table(),
+            Work::Pending(staging) => match staging.pending_ids_by_table(base.catalog.system_columns) {
+                Ok(ids) => ids,
+                Err(error) => {
+                    let _ = queued.reply.send(Err(error));
+                    continue;
+                }
+            },
+        };
         let conflicts = ids.iter().any(|(table, ids)| {
             since.get(table).is_some_and(|landed| {
                 landed
@@ -330,8 +354,7 @@ async fn run_batch(
         return;
     }
 
-    let outcome = publish_batch(db, branch, &base, &mut admitted).await;
-    drop(gates);
+    let outcome = publish_batch(db, branch, &base, &mut admitted, gates).await;
     match outcome {
         Ok(commit) => {
             log.record(
@@ -365,12 +388,25 @@ async fn publish_batch(
     branch: Option<&str>,
     base: &WriteTxn,
     admitted: &mut [Queued],
+    gates: crate::db::write_queue::BranchWriteGates,
 ) -> Result<GraphCommit> {
+    if admitted
+        .iter()
+        .all(|queued| matches!(queued.entry.work, Work::Pending(_)))
+    {
+        return stage_and_publish_batch(db, branch, base, admitted, gates).await;
+    }
+    let _gates = gates;
     // Group each table's components, in arrival order.
     let mut tables: Vec<(String, Vec<crate::exec::staging::GroupComponent>)> = Vec::new();
     let mut expected: crate::db::manifest::ExpectedTableVersions = HashMap::new();
     for queued in admitted.iter_mut() {
-        let (components, entry_expected) = queued.entry.staged.take_group_components()?;
+        let Work::Staged(staged) = &mut queued.entry.work else {
+            return Err(OmniError::manifest_internal(
+                "a batch mixes staged and pending group-commit entries",
+            ));
+        };
+        let (components, entry_expected) = staged.take_group_components()?;
         for component in components {
             match tables
                 .iter_mut()
@@ -478,6 +514,61 @@ async fn publish_batch(
             Publication::Publish,
         )
         .await;
+    stats::add(&stats::PUBLISH_US, publish_started);
+    published
+}
+
+/// The leader-staged batch: every entry's validated rows become one staged
+/// write per table read from the table's pin at the batch's head (the
+/// ordinary `stage_all` keyed writer, so the id probe runs once per batch and
+/// the batch adds one fragment per table), committed detached by the ordinary
+/// `commit_all` under the gates the leader holds, and published once.
+async fn stage_and_publish_batch(
+    db: &Omnigraph,
+    branch: Option<&str>,
+    base: &WriteTxn,
+    admitted: &mut [Queued],
+    gates: crate::db::write_queue::BranchWriteGates,
+) -> Result<GraphCommit> {
+    let mut staging: Option<crate::exec::staging::MutationStaging> = None;
+    for queued in admitted.iter_mut() {
+        let work = std::mem::replace(
+            &mut queued.entry.work,
+            Work::Pending(crate::exec::staging::MutationStaging::default()),
+        );
+        let Work::Pending(pending) = work else {
+            return Err(OmniError::manifest_internal(
+                "a batch mixes staged and pending group-commit entries",
+            ));
+        };
+        let batch = staging.get_or_insert_with(|| {
+            crate::exec::staging::MutationStaging::new(pending.write_budget())
+        });
+        batch.absorb_pending(pending, &base.base)?;
+    }
+    let staging = staging
+        .ok_or_else(|| OmniError::manifest_internal("an empty batch reached publication"))?;
+    let tables_started = std::time::Instant::now();
+    let staged = staging.stage_all_with_concurrency(db, branch, 8).await?;
+    let mut attempt = crate::db::reprepare::WriteAttempt::with_admitted_gates(gates);
+    let committed = staged.commit_all(db, branch, base, None, &mut attempt).await?;
+    stats::add(&stats::TABLES_US, tables_started);
+    let publish_started = std::time::Instant::now();
+    let first = admitted
+        .first()
+        .ok_or_else(|| OmniError::manifest_internal("an empty batch reached publication"))?;
+    let published = db
+        .commit_updates_on_branch_with_expected(
+            branch,
+            &committed.updates,
+            &committed.expected_versions,
+            first.entry.actor.as_deref(),
+            committed.carried_txn.as_ref().unwrap_or(base),
+            first.entry.lineage_intent.clone(),
+            Publication::Publish,
+        )
+        .await;
+    drop(committed.gates);
     stats::add(&stats::PUBLISH_US, publish_started);
     published
 }
