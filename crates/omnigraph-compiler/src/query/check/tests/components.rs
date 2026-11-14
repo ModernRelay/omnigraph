@@ -46,6 +46,9 @@ fn a_key_pinned_product_is_accepted_and_an_unpinned_one_refused() {
         r#"query q($s: String) { match { $p: Person, $c: Company } where $s = $c.slug and $p.age > 3 return { $p.name } }"#,
         r#"query q() { match { $c: Company, $p: Person, $p knows $q } where $c.slug = "acme" return { $q.name } }"#,
         r#"query q() { match { $p: Person, $c: Company, $d: Doc } where $p.handle = "a" and $d.id = "d" return { $c.name } }"#,
+        // `@id` pins as the key does, against a literal or a parameter.
+        r#"query q() { match { $p: Person, $c: Company } where $c.@id = "acme" return { $p.name } }"#,
+        r#"query q($i: String) { match { $p: Person, $d: Doc } where $i = $d.@id return { $p.name } }"#,
     ] {
         ok(pinned);
     }
@@ -63,6 +66,15 @@ fn a_key_pinned_product_is_accepted_and_an_unpinned_one_refused() {
         r#"query q() { match { $p: Person, $p knows $q, $c: Company } where $p.handle = "a" return { $q.name } }"#,
         // Under `or` a conjunct pins nothing.
         r#"query q() { match { $p: Person, $c: Company } where $c.slug = "a" or $p.age > 3 return { $p.name } }"#,
+        // `@id` compared by another operator, or with another component's
+        // column, pins nothing.
+        r#"query q() { match { $p: Person, $c: Company } where $c.@id != "acme" return { $p.name } }"#,
+        "query q() { match { $p: Person, $c: Company } where $c.@id = $p.handle return { $p.name } }",
+        // A component of two elements is never pinned, whatever its
+        // binding's key and `@id` equate.
+        r#"query q() { match { $p: Person, $p knows $q, $d: Doc } where $p.@id = "a" and $p.handle = "a" return { $q.name } }"#,
+        // A triple between two outer names is a component, not a pin.
+        r#"query q() { match { $p: Person, $q: Person, $p knows $q } where count { $p knows $q, $d: Doc } > 1 return { $p.name } }"#,
     ] {
         t81(unpinned);
     }
@@ -103,7 +115,7 @@ fn the_refusal_is_at_the_second_component_and_one_edge_joins_them() {
     assert_eq!((at.line, at.column), (2, 24));
     assert_eq!(
         d.message,
-        "`$p: Person` shares no variable with `$c: Company`, so the pattern multiplies their rows by a product; a product is written only when every component but one is pinned to one row by a `@key` equality in `where`"
+        "`$p: Person` shares no variable with `$c: Company`, so the pattern multiplies their rows by a product; a product is written only when every component but one is key-pinned, one node binding whose every `@key` property, or whose `@id`, `where` equates with a literal or a parameter"
     );
     assert_eq!(
         d.fix.as_deref(),

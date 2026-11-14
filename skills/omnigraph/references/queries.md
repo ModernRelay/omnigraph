@@ -84,8 +84,8 @@ return items, order keys, call arguments and assignments.
 Elements that share no variable multiply their rows. A binding, triple,
 `optional` or `from` joins the variables it binds or reads; `where` joins
 nothing. Such a product is refused (`T81`, at the second component) unless
-every component but one is a single binding whose `@key` a top-level `where`
-conjunct equates with a literal or parameter, as in a write that links two
+every component but one is a single node binding whose `@key`, or `@id`, a
+top-level `where` conjunct equates with a literal or parameter, as in a write that links two
 nodes (`match { $p: Person, $c: Company } where $p.handle = $h and $c.slug = $s`).
 Otherwise join the components with a triple, which the diagnostic inserts
 when exactly one edge type connects them, or write the intended product as a

@@ -132,10 +132,12 @@ The elements form components: a binding, a triple, an `optional` or a `from`
 joins the component of every variable it binds or reads, and a `let` value
 counts as the variables it reads. Two components that share no variable
 multiply their rows, every row of one with every row of the other. A pattern
-holds such a product only when every component but one is pinned to at most
-one row: a single binding whose `@key` (every column of a composite key) a
-top-level conjunct of `where` equates with a literal or a parameter.
-Otherwise the type checker refuses it with `T81` at the second component. The
+holds such a product only when every component but one is key-pinned: a
+single node binding whose `@key` (every column of a composite key), or whose
+`@id`, a top-level conjunct of `where` equates with a literal or a parameter.
+A component of two or more elements is never pinned, nor is a triple between
+two names of the enclosing scope. Otherwise the type checker refuses it with
+`T81` at the second component. The
 `where` and its blocks do not join components, so `where $p.name = $c.name`
 is a filtered product and is refused too. The rule holds in every scope: a
 read's or a write group's `match`, an inline read, a block and an `optional`.

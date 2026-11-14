@@ -48,8 +48,8 @@ A read is `match { ... }`, an optional `where`, then `return`, `order` and
 `optional { ... }`, `let` and `from`), separated by commas; `where` holds one
 Boolean expression, evaluated after every element, that removes rows. A triple
 is written source first (`T82`). Elements that share no variable are a
-product, refused (`T81`) unless all but one are pinned to a row by their
-`@key`. For the elements, edges, hops, products and inner scopes, with their
+product, refused (`T81`) unless all but one are single bindings pinned to a
+row by their `@key` or `@id`. For the elements, edges, hops, products and inner scopes, with their
 refusals and fixes, see [Traversal and match patterns](traversal.md). `from`
 draws a ranking's rows in, and `let` names a relation; see [Search](../search/index.md).
 

@@ -1,6 +1,6 @@
 # issue: none
 # notes: Two patterns that share no variable run as a product when every component but one is pinned to one row by an equality of its
-# notes: `@key` with a literal or a parameter: the pinned binding contributes one row, or none. A write selects a pair of pinned nodes the
+# notes: `@key`, or of its `@id`, with a literal or a parameter: the pinned binding contributes one row, or none. A write selects a pair of pinned nodes the
 # notes: same way. An unpinned product is written as a named relation, `let $r = { match { … } return { … } }, from $r`.
 
 --- runner
@@ -52,6 +52,38 @@ query beside($slug: String) {
 {"slug": "nowhere"}
 
 --- expect unordered
+
+--- expect shape
+p.name: String
+c.name: String
+
+--- query
+query beside_by_id($id: String) {
+    match { $p: Person, $c: Company }
+    where $c.@id = $id and $p.@id = "ada"
+    return { $p.name, $c.name }
+}
+
+--- params
+{"id": "initech"}
+
+--- expect unordered
+{"p.name":"Ada","c.name":"Initech"}
+
+--- expect shape
+p.name: String
+c.name: String
+
+--- query
+query everyone_beside_acme() {
+    match { $p: Person, $c: Company }
+    where $c.@id = "acme"
+    return { $p.name, $c.name }
+}
+
+--- expect unordered
+{"p.name":"Ada","c.name":"Acme"}
+{"p.name":"Bob","c.name":"Acme"}
 
 --- expect shape
 p.name: String

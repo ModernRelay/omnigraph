@@ -202,7 +202,7 @@ Type codes are listed where the construct they guard is described, in
 ## Patterns that share no variable
 
 Two components of a pattern that share no variable are `T81` at the second
-component unless every component but one is pinned by a `@key` equality; see
+component unless every component but one is key-pinned by `@key` or `@id`; see
 [Traversal and match patterns](traversal.md#patterns-that-share-no-variable).
 
 ```text
@@ -210,7 +210,7 @@ query staff() { match { $c: Company, $p: Person } return { $p.name, $c.name } }
 ```
 
 ```text
-error[T81]: type error: T81: `$p: Person` shares no variable with `$c: Company`, so the pattern multiplies their rows by a product; a product is written only when every component but one is pinned to one row by a `@key` equality in `where`
+error[T81]: type error: T81: `$p: Person` shares no variable with `$c: Company`, so the pattern multiplies their rows by a product; a product is written only when every component but one is key-pinned, one node binding whose every `@key` property, or whose `@id`, `where` equates with a literal or a parameter
   --> line 1, column 38
   fix: join them through the edge, `$p worksAt $c`, or write the intended product as a named relation, `let $ps = { match { $p: Person } return { $p } }, from $ps`
 ```

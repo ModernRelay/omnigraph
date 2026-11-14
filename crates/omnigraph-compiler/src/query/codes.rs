@@ -111,7 +111,7 @@ codes! {
     T78 = "an endpoint assignment is neither a key of the endpoint type nor a bound reference of it";
     T79 = "a ranked column is not a node column of its population";
     T80 = "an annotation the language does not read";
-    T81 = "a pattern whose components share no variable and are not pinned to one row by a `@key` equality";
+    T81 = "a pattern whose components share no variable and are not key-pinned by a `@key` or `@id` equality with a literal or a parameter";
     T82 = "a triple written against its edge's declared direction, or a selection none of whose members points along the written order; the fix swaps its ends, source first";
     T83 = "two declarations of one name in a source unit";
     T84 = "a name an inner scope, a block, an optional or an inline read, uses in a triple without binding it";

@@ -130,9 +130,11 @@ triple, an `optional` or a `from` joins the components of every variable it
 binds or reads; a `let` value stands for the variables it reads, and the
 `where` with its blocks joins nothing. Two components multiply their rows by
 the `Correlate` of an inner term with no free variables, a product, which the
-type checker admits only when every component but one is a single node
-binding whose `@key` columns a top-level `where` conjunct equates with a
-literal or a parameter; otherwise it refuses with `T81`, whose suggestion is
+type checker admits only when every component but one is key-pinned, a
+single node binding whose `@key` columns, or whose `@id`, a top-level `where`
+conjunct equates with a literal or a parameter (a component of two or more
+elements, or of a triple, an `optional` or a correlated `from`, never is);
+otherwise it refuses with `T81`, whose suggestion is
 the triple when exactly one edge type joins the two, or the second component
 as a named relation drawn with `from`. A `from` that reads nothing of its
 scope is that product written out and admitted. The rule is the type

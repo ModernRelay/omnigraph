@@ -1,8 +1,9 @@
 //! The components of one scope's pattern and the product rule
 //! (docs/rfcs/2026-11-07-gq-3.md, the derived forms and "Added: two elements
 //! of `match`"): two patterns that share no variable multiply their rows by a
-//! product, which a scope admits only when every component but one is pinned
-//! to at most one row by a `@key` equality in its `where`; otherwise `T81`.
+//! product, which a scope admits only when every component but one is
+//! key-pinned, a single node binding whose every `@key` property, or whose
+//! `@id`, its `where` equates with a literal or a parameter; otherwise `T81`.
 //!
 //! A component is a set of elements that produce rows, connected through
 //! the variables they bind or read: a binding, a triple, an `optional` and a
@@ -194,10 +195,11 @@ impl Parts {
         Some(self.diagnose(first, second, catalog, sc, pattern))
     }
 
-    /// A component reads at most one row per outer row: it binds no column
-    /// of its own scope (a triple between two outer variables, which only
-    /// filters), or it is one node binding whose every `@key` column is
-    /// equated with a literal or a parameter.
+    /// A component is key-pinned when it is one node binding whose every
+    /// `@key` property, or whose `@id`, a top-level conjunct of the scope's
+    /// `where` equates with a literal or a parameter. A component of two or
+    /// more elements is never pinned, nor is a triple, an `optional` or a
+    /// correlated `from`, whatever it reads.
     fn pinned(
         &self,
         component: &[usize],
@@ -205,12 +207,6 @@ impl Parts {
         sc: &Scope,
         pins: &HashMap<String, HashSet<String>>,
     ) -> bool {
-        let outer_only = component
-            .iter()
-            .all(|&p| self.producers[p].vars.iter().all(|v| sc.local(v).is_none()));
-        if outer_only {
-            return true;
-        }
         let [only] = component else {
             return false;
         };
@@ -220,14 +216,19 @@ impl Parts {
         let Some(Ty::Node { type_name, .. }) = sc.local(var).map(|c| &c.ty) else {
             return false;
         };
+        let Some(equated) = pins.get(var) else {
+            return false;
+        };
+        if equated.contains("@id") {
+            return true;
+        }
         let Some(key) = catalog
             .query_node_type(type_name)
             .and_then(|n| n.key.as_ref())
         else {
             return false;
         };
-        let equated = pins.get(var);
-        !key.is_empty() && key.iter().all(|k| equated.is_some_and(|e| e.contains(k)))
+        !key.is_empty() && key.iter().all(|k| equated.contains(k))
     }
 
     fn diagnose(
@@ -249,7 +250,7 @@ impl Parts {
         let mut d = QueryDiagnostic::typecheck(
             T81,
             format!(
-                "`{other}` shares no variable with `{one}`, so the pattern multiplies their rows by a product; a product is written only when every component but one is pinned to one row by a `@key` equality in `where`"
+                "`{other}` shares no variable with `{one}`, so the pattern multiplies their rows by a product; a product is written only when every component but one is key-pinned, one node binding whose every `@key` property, or whose `@id`, `where` equates with a literal or a parameter"
             ),
         );
         let spans = &pattern.spans.elements;
@@ -462,8 +463,8 @@ fn edge_word(name: &str) -> String {
     }
 }
 
-/// The properties each variable's top-level `where` conjuncts equate with a
-/// literal or a parameter.
+/// The properties, `@id` included, each variable's top-level `where`
+/// conjuncts equate with a literal or a parameter.
 fn key_pins(pattern: &Pattern, sc: &Scope) -> HashMap<String, HashSet<String>> {
     let mut out: HashMap<String, HashSet<String>> = HashMap::new();
     let Some(predicate) = &pattern.predicate else {

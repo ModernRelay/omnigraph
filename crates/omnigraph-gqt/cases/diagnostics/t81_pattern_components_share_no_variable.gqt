@@ -1,7 +1,8 @@
 # issue: none
 # notes: Two patterns that share no variable multiply their rows by a product, which the compiler refuses with `T81` at the second
-# notes: unless every component but one is pinned to one row by a `@key` equality in `where`: the fix joins them through the triple
-# notes: one edge type writes between them, or writes the intended product as a named relation; nothing executes.
+# notes: unless every component but one is key-pinned, one node binding whose `@key` or `@id` `where` equates with a literal or a
+# notes: parameter: the fix joins them through the triple one edge type writes between them, or writes the intended product as a
+# notes: named relation. A component of two elements is never pinned, whatever its binding's key equates; nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -31,9 +32,14 @@ edge WorksAt: Person -> Company @card(0..1)
 --- query
 query staff() { match { $c: Company, $p: Person } return { $p.name, $c.name } }
 
---- expect error: type error: T81: `$p: Person` shares no variable with `$c: Company`, so the pattern multiplies their rows by a product; a product is written only when every component but one is pinned to one row by a `@key` equality in `where`
+--- expect error: type error: T81: `$p: Person` shares no variable with `$c: Company`, so the pattern multiplies their rows by a product; a product is written only when every component but one is key-pinned, one node binding whose every `@key` property, or whose `@id`, `where` equates with a literal or a parameter
 
 --- query
 query shelved() { match { $p: Person, $s: Collection } where $p.name = "Ada" return { $p.name, $s.slug } }
 
---- expect error: type error: T81: `$s: Collection` shares no variable with `$p: Person`, so the pattern multiplies their rows by a product; a product is written only when every component but one is pinned to one row by a `@key` equality in `where`
+--- expect error: type error: T81: `$s: Collection` shares no variable with `$p: Person`, so the pattern multiplies their rows by a product; a product is written only when every component but one is key-pinned, one node binding whose every `@key` property, or whose `@id`, `where` equates with a literal or a parameter
+
+--- query
+query employer_beside() { match { $p: Person, $p worksAt $w, $s: Collection } where $p.handle = "ada" return { $w.name, $s.slug } }
+
+--- expect error: type error: T81: `$s: Collection` shares no variable with `$p: Person, $p worksAt $w`, so the pattern multiplies their rows by a product; a product is written only when every component but one is key-pinned, one node binding whose every `@key` property, or whose `@id`, `where` equates with a literal or a parameter
