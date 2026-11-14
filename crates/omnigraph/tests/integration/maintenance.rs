@@ -5230,10 +5230,10 @@ async fn cleanup_on_a_detached_only_graph_counts_manifest_versions_for_keep() {
     );
 }
 
-/// The detached-only collector's two ceilings (RFC Acceptance thresholds), on
-/// its own cost counters over two live branches and a forked table.
+/// Two live branches share table history. A version pinned by either branch
+/// contributes one open even when both published chains reach it.
 #[tokio::test]
-async fn collector_cost_is_bounded_by_retained_versions_and_garbage_examined() {
+async fn collector_planning_cost_is_bounded_by_listed_versions_issue_1095() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
     insert_person(&db, "main", "Eve").await;
@@ -5317,23 +5317,15 @@ async fn collector_cost_is_bounded_by_retained_versions_and_garbage_examined() {
         2 * (report.tables.len() as u64 + physical_tables),
         "discovery lists manifests and objects per location, and captures and revalidates tags per physical table"
     );
-    let examined: u64 = report
+    let listed: u64 = report
         .tables
         .iter()
-        .map(|plan| {
-            (plan.published_set.len()
-                + plan.roots.len()
-                + plan.linear_roots.len()
-                + plan.linear_present.len()
-                + plan.unpublished.len()
-                + plan.sweep.len()) as u64
-        })
+        .map(|plan| (plan.present_manifests.len() + plan.linear_present.len()) as u64)
         .sum();
     assert!(
-        report.cost.table_opens <= examined,
-        "every open is a chain link, a root, a frozen linear version, an unpublished manifest or a sweep candidate; {} opens exceed the {examined} examined: {:?}",
-        report.cost.table_opens,
-        report.cost
+        report.cost.table_opens <= listed,
+        "planning opened {} table versions across {listed} listed manifests",
+        report.cost.table_opens
     );
     assert!(
         report.cost.index_reads <= report.cost.table_opens,
