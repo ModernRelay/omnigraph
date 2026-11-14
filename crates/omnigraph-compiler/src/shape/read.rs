@@ -1227,8 +1227,9 @@ impl<'a> Shaper<'a> {
         arg.columns(&mut read);
         let mut arg = arg.clone();
         match ranking {
-            // `distance`'s score is a column of every scored row.
-            Some(r) if r.exact.is_some() && read.contains(&r.out) => {
+            // A ranking's score is a column of every row it keeps, which the
+            // aggregate reads like any other.
+            Some(r) if read.contains(&r.out) => {
                 let mut score = HashMap::new();
                 score.insert(
                     r.out.clone(),
@@ -1239,9 +1240,6 @@ impl<'a> Shaper<'a> {
                     },
                 );
                 substitute(&mut arg, &score);
-            }
-            Some(r) if read.contains(&r.out) => {
-                return Err(self.refuse("an aggregate over a ranking's score"));
             }
             _ => {}
         }

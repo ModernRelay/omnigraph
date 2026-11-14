@@ -179,8 +179,9 @@ the result column takes the score's name, `$score` giving `score` and
 `$distance` giving `distance`; write `$score as _score` or
 `$distance as _distance` for those names. A search
 predicate, `search(...)`, `fuzzy(...)` or `match_text(...)`, stands alone as a
-filter and is not a return item (`T38`). An aggregate over the score, such
-as `max($score)`, is not lowered in this release (`T86`).
+filter and is not a return item (`T38`). An aggregate reads the score as a
+column of every row the ranking keeps: `return { max($score) as best }` is
+the best score among them, and over a `nearest` window, among its targets.
 
 Exact String predicates remain correct without an index. A free-text index does
 not accelerate equality, `starts_with(...)`, or literal substring `contains(...)`.

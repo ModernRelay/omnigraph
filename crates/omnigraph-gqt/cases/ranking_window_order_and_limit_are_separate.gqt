@@ -5,8 +5,8 @@
 # notes: step over its population: `nearest` keeps every row of its `k` nearest targets (a cut by target,
 # notes: not by row), the elements and `where` after it run over the selected rows and nothing refills a
 # notes: target they remove (law 2), and the `order` is a plain sort that may read the score anywhere.
-# notes: `bm25` has no window; `rrf` windows each `nearest` arm at its own `k`. An aggregate over the
-# notes: score is not lowered in this release (`T86`).
+# notes: `bm25` has no window; `rrf` windows each `nearest` arm at its own `k`. An aggregate reads the
+# notes: score as a column of every row the ranking keeps.
 
 --- runner
 timeout_ms: 10000
@@ -258,4 +258,38 @@ query aggregate_over_the_score() {
     return { max($score) as best }
 }
 
---- expect error: T86: `aggregate_over_the_score`: this release's planner does not lower an aggregate over a ranking's score
+--- expect unordered
+{"best":0.52354836}
+
+--- expect shape
+best: F32?
+
+--- query
+query aggregate_over_a_window() {
+    match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, [0.0, 1.0], k: 2) as $distance }
+    return { count($d) as n, max($distance) as farthest, min($distance) as nearest }
+}
+
+--- expect unordered
+{"n":2,"farthest":1.0,"nearest":0.0}
+
+--- expect shape
+n: I64
+farthest: F32?
+nearest: F32?
+
+--- query
+query aggregate_over_a_fusion() {
+    match {
+        let $all = { match { $d: Doc } return { $d } },
+        from rrf(nearest($all, $d.embedding, [0.0, 1.0], k: 2), bm25($all, $d.text, "needle")) as $score,
+    }
+    return { count($d) as n, max($score) as best }
+}
+
+--- expect unordered
+{"n":3,"best":0.032786885246}
+
+--- expect shape
+n: I64
+best: F64?

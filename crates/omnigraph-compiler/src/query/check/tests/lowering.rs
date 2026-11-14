@@ -175,6 +175,10 @@ const CLOSURE: &[Row] = &[
                 "query q($v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from distance($pop, $d.embedding, $v) as $dist } return { min($dist) as closest } }",
                 Lowers,
             ),
+            (
+                "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } return { max($score) as best, count($d) as n } }",
+                Lowers,
+            ),
             // "distance as an rrf arm"
             (
                 "query q($v: Vector(3), $s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(distance($all, $d.embedding, $v), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",

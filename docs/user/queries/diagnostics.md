@@ -300,7 +300,7 @@ that calls itself.
 | An order key no return item computes | B | return the key under an alias; the edit inserts it |
 | An inline read with an aggregate, `distinct`, `order` or `limit` | B | none |
 | A block compared with a column, a block of several aggregates | B | none |
-| An aggregate over a ranking's score; a `nearest` window read from a parameter outside the read's `limit`; two `rrf` arm windows that differ | B | none |
+| A `nearest` window read from a parameter outside the read's `limit`; two `rrf` arm windows that differ | B | none |
 | A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B | none |
 | A read that calls itself (`Fix`) | Rec | none |
 
