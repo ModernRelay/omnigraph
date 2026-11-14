@@ -245,3 +245,49 @@ plus hand-over-hand batch formation (next batch forms when this one enters stage
 Stage 2 measures ~66 ms = 3 RTT, not 2: Lance's commit loads the base version's index
 metadata (`load_all_indices`, a ranged GET of the tip manifest) and a fresh detached tip is
 not in the session cache. No public Lance API avoids it.
+
+## Final sweep and ablations, 2026-11-14
+
+A first attempt of the final sweep was contaminated: `sweep.sh` ran the binary without a
+test filter, so the recovery test (added just before) ran in the same process, installed
+the object-store decorator with zero latency and dropped every in-process log mid-run. Its
+output was deleted; `sweep.sh` now runs `--exact concurrent_write_throughput`. Earlier
+sweeps predate the recovery test and are unaffected.
+
+Raw: `results/final-wal.jsonl`, `gc-wal-leader-final.jsonl`, `gc-leader-final.jsonl`,
+`baseline-claim-lat{5,50}.jsonl`, `final-wal-lat{5,50}.jsonl`, `final-wal-recheck.jsonl`,
+`pipeline-nowal*.jsonl`, `pipeline-wal-d{2,3}.jsonl`, `baseline-claim-indexed.jsonl`,
+`final-wal-indexed.jsonl`; printed lines in `results/final-sweep.log`. Tables: REPORT.md
+section 5.1. Highlights (commits/s, p50/p99 ms):
+
+- mem 20 ms, one branch, final-wal: N=16 64.1 (220/379), N=64 279.6 (212/366); baseline
+  claimed 1.7 (4858/5214) and 0.
+- mem 20 ms, branches, final-wal: N=16 110.5 (142/155), N=64 197.3 (308/527); baseline 16.5
+  and 60.0. Indexed table: 115.6 and 297.2.
+- file, one branch, final-wal: N=16 315.5 (49/98), N=64 1181.9 (51/93); baseline 24.5 and
+  21.4 (p99 826 / 2808). Locally the fastest is group commit + leader staging without the
+  log (1361.7 at N=64): CPU-bound, the fold repeats each publication's work.
+- 5 ms: final-wal 183.1 and 699.7 at N=16/64 (p99 137/139) vs 7.4 and 2.7 claimed.
+- 50 ms: final-wal 27.8 and 129.7 (p99 791) vs 0 and 0 claimed.
+- Pipeline ablation (mem 20 ms, one branch): without the log the hand-over-hand formation
+  rule is pathological (stage 3, a ~104 ms `__manifest` publish, becomes the bottleneck and
+  batches of 1.1 pile up in front of it: 9.8/s at N=16); with depth 2 it reaches 53.5 and
+  211.2 at N=16/64 (p50 310 at 64). With the log, depth 3: 64.9 and 279.4 (p50 208). The
+  log's share in the pipelined configuration: +32% commits/s, -33% p50 at N=64.
+
+## Mixed workload test and a routing bug, 2026-11-14
+
+`group_commit_mixed_workload_is_consistent`: 20 writers upserting 120 colliding keys
+beside 4 updaters on one branch (5 ms). First run with the final configuration failed in
+the final fold: after any failed publish attempt the writer-epoch holder withdraws its
+recorded version, and `wal_tail` then routed the next head-advancing publication around
+the log straight to `__manifest`, while the tail kept its stale tip; the next record
+collided with that version in the fold (and its rows missed the direct publication's
+changes). Fix: once the process holds a log of a branch, every head-advancing publication
+goes through it; any other publication folds the log and drops it. After the fix: 5 of 5
+runs pass (every acknowledged key exactly once, no errors beyond bounded conflicts). The
+benchmark cells never hit a failed attempt; the final numbers were re-measured with the
+fixed binary (`final-wal-recheck`: 63.1 and 279.0 at N=16/64).
+
+Also fixed: a pipelined batch whose merged write is not insertion-only (an upsert met an
+existing key) is refused before any chain tip moves, instead of failing in composition.

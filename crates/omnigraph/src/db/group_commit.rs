@@ -92,10 +92,12 @@ pub(crate) fn leader_stages() -> bool {
 /// so batch `j + 1` stages while batch `j` commits and logs.
 pub(crate) fn pipelined() -> bool {
     static PIPELINE: OnceLock<bool> = OnceLock::new();
+    // Without the record log the log stage is an ordinary `__manifest`
+    // publication: the ablation that isolates the record's contribution.
     *PIPELINE.get_or_init(|| {
         std::env::var("OMNIGRAPH_GROUP_PIPELINE").is_ok_and(|value| value == "1")
             && leader_stages()
-            && crate::db::omnigraph::wal_enabled()
+            && enabled()
     })
 }
 
@@ -857,6 +859,16 @@ async fn run_pipelined_batch(
     {
         let mut chain = group.chain.lock().await;
         generation = chain.generation;
+        // A batch whose merged write is not insertion-only (an upsert met an
+        // existing key) cannot be recomposed onto the tip: refuse it before any
+        // tip moves; its writers prepare again on the ordinary path.
+        if failure.is_none()
+            && components
+                .iter()
+                .any(|component| component.staged.pure_insert_ids().is_none())
+        {
+            failure = Some(refused("not_insertion_only"));
+        }
         if failure.is_none() {
             let committed = async {
                 let witness = base.authority.staging_witness()?;

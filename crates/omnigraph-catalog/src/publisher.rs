@@ -644,10 +644,19 @@ impl GraphNamespacePublisher {
             PublishPrecondition::ExactGraphHead(_) | PublishPrecondition::Any
         );
         if let Some(tail) = crate::wal::existing_tail(&self.root_uri, self.branch.as_deref()) {
-            if head_advancing && self.held_writer_version(tail.native()).is_some() {
+            // Once the process holds a log of the branch, every head-advancing
+            // publication goes through it: the record's conditional create is
+            // what orders them. (The holder's recorded version is withdrawn
+            // after any failed attempt; that only says the process should
+            // probe, not that another process may publish.)
+            if head_advancing {
                 return Ok(Some(tail));
             }
+            // Any other publication is ordered after the log: fold it, then
+            // forget it, so the next record starts from the version this
+            // publication writes.
             tail.quiesce().await?;
+            crate::wal::forget(&self.root_uri, self.branch.as_deref());
             return Ok(None);
         }
         if !head_advancing {
@@ -1228,12 +1237,8 @@ impl GraphNamespacePublisher {
         // again on every publication. A delete by another process is not
         // fenced by the epoch either way (see writes.md); the fold then fails.
         let wal_held = crate::wal::enabled()
-            && crate::wal::existing_tail(&self.root_uri, self.branch.as_deref()).is_some_and(
-                |tail| {
-                    tail.native() == dataset.manifest().branch.as_deref()
-                        && self.held_writer_version(tail.native()).is_some()
-                },
-            );
+            && crate::wal::existing_tail(&self.root_uri, self.branch.as_deref())
+                .is_some_and(|tail| tail.native() == dataset.manifest().branch.as_deref());
         let observed_identifier = match dataset.manifest().branch.as_deref() {
             Some(_) if wal_held => Ok(branch_identifier.clone()),
             Some(native) => {

@@ -189,6 +189,19 @@ pub async fn forget_all() -> Result<()> {
     Ok(())
 }
 
+/// Forget the log of `(root, branch)` (already folded): the next head-advancing
+/// publication opens a new one over the latest `__manifest` version.
+pub fn forget(root_uri: &str, branch: Option<&str>) {
+    if let Some(tail) = TAILS
+        .lock()
+        .expect("wal tails poisoned")
+        .remove(&key(root_uri, branch))
+    {
+        tail.dead.store(true, std::sync::atomic::Ordering::SeqCst);
+        tail.wake.notify_one();
+    }
+}
+
 /// The tail of the logical branch `(root, branch)` when this process has one.
 pub fn existing_tail(root_uri: &str, branch: Option<&str>) -> Option<Arc<Tail>> {
     TAILS

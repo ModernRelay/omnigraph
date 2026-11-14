@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use arrow_array::Array as _;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -412,6 +413,7 @@ struct Config {
     trace: bool,
     label: String,
     claim: bool,
+    indexed: bool,
 }
 
 fn env(name: &str, default: &str) -> String {
@@ -438,6 +440,7 @@ impl Config {
             trace: env("OG_WT_TRACE", "0") == "1",
             label: env("OG_WT_LABEL", "baseline"),
             claim: env("OG_WT_CLAIM", "0") == "1",
+            indexed: env("OG_WT_INDEXED", "0") == "1",
         }
     }
 }
@@ -572,6 +575,16 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
             )
             .await
             .unwrap();
+    }
+    // An indexed table (`OG_WT_INDEXED=1`): one seed row, then the id BTREE
+    // `ensure_indices` builds for every non-empty node table, as a production
+    // graph has after its first index build.
+    if config.indexed {
+        session
+            .mutate("main", QUERIES, "put", &params("seed-0", 0, None))
+            .await
+            .unwrap();
+        session.ensure_indices_as(None).await.unwrap();
     }
     if mode == "branches" {
         for branch in &branches {
@@ -742,6 +755,11 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
     if config.trace {
         *expected.entry(branches[0].clone()).or_default() += 1;
     }
+    if config.indexed {
+        for want in expected.values_mut() {
+            *want += 1;
+        }
+    }
     let mut verified = true;
     for (branch, want) in &expected {
         let snapshot = fresh
@@ -772,6 +790,7 @@ fn report(config: &Config, mode: &str, writers: usize, mut result: CellResult) -
     let value = serde_json::json!({
         "label": config.label,
         "claim": config.claim,
+        "indexed": config.indexed,
         "backend": config.backend,
         "latency_ms": config.latency_ms,
         "mode": mode,
@@ -924,4 +943,118 @@ async fn wal_recovery_and_cold_reads() {
     let recovered = count(&adapter, &uri).await;
     eprintln!("after recovery and one more write: {recovered} rows (expect 13)");
     assert_eq!(recovered, 13);
+}
+
+/// Group commit under a mixed workload on one branch (run with the prototype
+/// switches): upserts whose keys collide (a second insert of a key is an
+/// update) beside updates of existing keys. Every acknowledged key is present
+/// exactly once afterwards, and nothing fails but bounded conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "instrument: group commit under colliding upserts and updates (WAL research)"]
+async fn group_commit_mixed_workload_is_consistent() {
+    let _counters = counters(Duration::from_millis(
+        env("OG_WT_LATENCY_MS", "5").parse().unwrap(),
+    ));
+    let uri = format!("shared-memory://wt-mixed-{}/graph", std::process::id());
+    let adapter: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
+    let db = Omnigraph::init_with_storage(&uri, SCHEMA, Arc::clone(&adapter), InitOptions::default())
+        .await
+        .unwrap();
+    let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+    session.db().claim_branch_writer("main").await.unwrap();
+    const UPDATE: &str = "query set_value($slug: String, $value: I64) { update Item set { value: $value } where slug = $slug }";
+    let keys: u64 = 120;
+    let stop = Arc::new(AtomicBool::new(false));
+    let acked: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
+    let errors: Arc<Mutex<Vec<String>>> = Arc::default();
+    let mut handles = Vec::new();
+    for w in 0..24u64 {
+        let session = session.clone();
+        let stop = Arc::clone(&stop);
+        let acked = Arc::clone(&acked);
+        let errors = Arc::clone(&errors);
+        handles.push(tokio::spawn(async move {
+            let mut seed = w.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut ops = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let slug = format!("k{}", seed % keys);
+                let result = if w < 20 {
+                    session
+                        .mutate("main", QUERIES, "put", &params(&slug, ops as i64, None))
+                        .await
+                        .map(|_| true)
+                } else {
+                    let mut p = ParamMap::new();
+                    p.insert("slug".into(), Literal::String(slug.clone()));
+                    p.insert("value".into(), Literal::Integer(-(ops as i128)));
+                    session.mutate("main", UPDATE, "set_value", &p).await.map(|_| false)
+                };
+                match result {
+                    Ok(true) => {
+                        acked.lock().unwrap().insert(slug);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        let text = format!("{error:?}");
+                        if !text.contains("ReadSetChanged") {
+                            errors.lock().unwrap().push(format!("{error}"));
+                        }
+                    }
+                }
+                ops += 1;
+            }
+            ops
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(
+        env("OG_WT_DURATION_SECS", "6").parse().unwrap(),
+    ))
+    .await;
+    stop.store(true, Ordering::SeqCst);
+    let mut ops = 0;
+    for handle in handles {
+        ops += handle.await.unwrap();
+    }
+    omnigraph_catalog::wal::forget_all().await.unwrap();
+    let fresh = Omnigraph::open_with_storage(&uri, Arc::clone(&adapter)).await.unwrap();
+    let snapshot = fresh
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let dataset = snapshot.open_dataset("node:Item").await.unwrap();
+    let rows = dataset.count_rows(None).await.unwrap();
+    let mut stream = dataset.scan().try_into_stream().await.unwrap();
+    let mut seen = std::collections::BTreeMap::<String, usize>::new();
+    use futures::TryStreamExt as _;
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        let column = batch
+            .column_by_name("slug")
+            .expect("slug column")
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("slug is a string column")
+            .clone();
+        for i in 0..column.len() {
+            *seen.entry(column.value(i).to_string()).or_default() += 1;
+        }
+    }
+    let acked = acked.lock().unwrap().clone();
+    let errors = errors.lock().unwrap().clone();
+    eprintln!(
+        "mixed: {ops} operations, {} distinct acknowledged keys, {rows} rows, {} distinct slugs, {} errors",
+        acked.len(),
+        seen.len(),
+        errors.len()
+    );
+    assert!(errors.is_empty(), "unexpected errors: {:?}", &errors[..errors.len().min(5)]);
+    assert!(seen.values().all(|count| *count == 1), "a key is present twice");
+    assert_eq!(rows, seen.len());
+    assert!(
+        acked.iter().all(|slug| seen.contains_key(slug)),
+        "an acknowledged key is missing"
+    );
+    assert_eq!(seen.len(), acked.len(), "a key is present that no acknowledged insert wrote");
 }

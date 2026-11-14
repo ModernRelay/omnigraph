@@ -8,7 +8,52 @@
 
 ## Summary
 
-<!-- SUMMARY -->
+**Headline.** On one branch at 20 ms per object-store request, the best existing path
+(writer epoch held) lands 1.7 commits/s with 16 writers (p99 5.2 s) and none at all with 64.
+The prototype here lands **64 commits/s at 16 writers (p99 379 ms) and 280/s at 64 (p99
+366 ms)**. On local files, one branch goes from 24.6 and 19.9 commits/s (p99 0.8 s and
+3.2 s) to **316 and 1182 (p99 98 and 93 ms)**. With one branch per writer at 20 ms, 16.6 and
+59.8 commits/s become **111 and 197** (p99 155 and 527 ms). Every cell is verified: after the
+run a fresh handle finds every acknowledged insert exactly once.
+
+**Cost model.** A commit today is about 10 sequential object-store round trips, 6 of them
+under the branch gate; its commit point is three dependent puts (the `__manifest` hot-row
+data file, the transaction file Lance always writes first, then `_versions/V.manifest`). On
+one branch every publication sends the other prepared writes back, and the second attempt
+prepares under the gate, so throughput falls as writers are added (section 2).
+
+**What won, in two parts.** (1) *Group commit with the leader staging the batch*: a write
+group per branch takes every queued insertion-only mutation, stages one write per table for
+the whole batch (one id probe, one fragment per batch instead of per write) and publishes
+once; this alone takes 64 writers from 0 to 147 commits/s and fixes a CPU plateau the
+writer-staged form hits. (2) *A record log in front of `__manifest`*: the publication of
+version V becomes one conditional put of a record holding V's complete row set, read by
+every log-aware reader at once and folded into `__manifest` V in the background; with
+pipelined batches it adds +32% commits/s and −33% median latency at 64 writers (211 → 280
+commits/s) and cuts a single writer from 208 to 140 ms. A per-branch authority cache plus
+PR #1350's probe skip extended to held named branches is what makes separate branches scale.
+
+**Where the log does not help.** On a local disk the system is CPU-bound and I/O is
+sub-millisecond: group commit with leader staging alone is fastest there (1362 commits/s at
+64 writers); the log and the pipeline add CPU (each record is also folded) and land 1318 and
+1182. The log pays off in proportion to the object-store round-trip time.
+
+**Visibility and invariants.** An acknowledged write is visible the moment its record is
+durable: in the process through the installed view, and to other readers because opens,
+refreshes and freshness probes read the records above `__manifest` (one GET when caught up).
+A crash test shows 7 acknowledged, unfolded writes visible to a fresh reader and folded by
+the next owner. The design keeps every hard invariant's contract but changes the text of
+three (the publication door is "version V's record or `__manifest` V", the fold is derived
+state that follows the publication, and the bounded tail is a second place versions live),
+and it needs a fencing record SlateDB-style before production; argued RFC-style in
+section 7. It overlaps RFC 0068 (records as the door) and is a migration path to it that
+keeps `__manifest` as the checkpoint every history surface already reads.
+
+**MemWAL.** Omnigraph removed RFC 0018/0026 because per-dataset MemWAL added a second
+coordinator in front of the graph commit and acknowledged writes before graph validation.
+This design validates before acknowledging and keeps one graph commit per batch. Lance 13's
+per-table MemWAL still does not fit a multi-dataset commit, but its dataset-free
+`WalAppender` is the right primitive for the record log (section 8).
 
 ## 1. The question and the angle
 
@@ -102,7 +147,8 @@ Reported: commits/s, p50/p99/max service time, requests per commit by class and
 operation, engine re-prepares, client conflicts, and per-batch phase times. Runner:
 `research/write-throughput-wal/scripts/sweep.sh`; every number below has a JSONL record.
 Caveats: closed loop (coordinated omission), injected constant latency (no tail, no
-throttling), one process, and a table with no id index and no maintenance (section 6.3).
+throttling), one process, and a table with no id index and no maintenance unless stated
+(the CPU plateau in section 5 and the indexed variant in 5.1).
 
 ## 4. Baseline
 
@@ -157,13 +203,103 @@ in each row.
 | 4 | Leader stages the batch (one write per table per batch) | without log N=64: 147 (416 ms); with log N=64: **217 (281 ms)**, 0.3 cores (`gc-leader`, `gc-wal-leader`) | Keep: fixes the CPU plateau; the log adds +48% here |
 | 5 | Per-branch authority cache + held-branch probe skip (non-WAL) | branches N=64: 60 → 148 (400 ms) (`branchcache`) | Keep: independent cross-branch win |
 | 6 | + log and leader staging on named branches | branches N=1: 2.3 → 7.0 (423 → 140 ms); N=16: 16.5 → 111; N=64: 60 → **207** (`gc-wal-leader`) | Keep |
-| 7 | Pipeline the batch: stage / commit-on-tip / record | same branch N=64: 217 → **286–292 (205 ms, p99 366)**; N=16: 56 → 66 (LOG.md) | Keep |
+| 7 | Pipeline the batch: stage / commit-on-tip / record | same branch N=64: 217 → **280–292 (205–212 ms, p99 366)**; N=16: 56 → 64–66; without the log the best pipeline is 211 at N=64 (`final-wal`, `pipeline-*`) | Keep |
 | 8 | Pipeline with ticket order and a depth semaphore | depth 2: 246, 3: 253, 4: 192 at N=64 | Discard: smaller batches; hand-over-hand batch formation is better |
 | 9 | Crash recovery and cold reads from the log tail | test passes: 12 of 12 acknowledged rows visible to a fresh reader with 7 unfolded; the next owner folds them | Keep (correctness evidence) |
 
-<!-- FINAL_TABLES -->
+### 5.1 Final measurements
 
-### 5.1 Ideas considered and not built, with the reason
+`final-wal` = group commit + leader staging + record log + pipeline (+ the per-branch
+cache, always on in this branch). Commits/s (p50 ms, p99 ms); every cell verified.
+
+**One branch, mem 20 ms**
+
+| N | baseline | baseline, epoch claimed | final-wal |
+|---|---|---|---|
+| 1 | 4.3 (230, 233) | 4.7 (208, 212) | 6.9 (141, 145) |
+| 4 | 2.4 (1391, 1609) | 2.9 (1183, 1356) | 13.9 (276, 302) |
+| 16 | 1.3 (5621, 5912) | 1.7 (4858, 5214) | **64.1 (220, 379)** |
+| 64 | 0 in 10 s | 0 in 10 s | **279.6 (212, 366)** |
+
+**One branch per writer, mem 20 ms**
+
+| N | baseline | baseline, epoch claimed | final-wal |
+|---|---|---|---|
+| 1 | 2.3 (423, 426) | 2.3 (423, 427) | 7.0 (141, 145) |
+| 4 | 5.6 (725, 813) | 5.5 (724, 919) | 26.6 (143, 186) |
+| 16 | 16.5 (922, 1010) | 16.6 (915, 972) | **110.5 (142, 155)** |
+| 64 | 60.0 (1023, 1102) | 59.8 (1022, 1094) | **197.3 (308, 527)** |
+
+**One branch, local files**
+
+| N | baseline | baseline, epoch claimed | final-wal | best local: group commit + leader staging, no log |
+|---|---|---|---|---|
+| 1 | 30.8 (33, 50) | 30.7 (33, 47) | 38.3 (27, 38) | 33.8 (29, 39) |
+| 4 | 24.5 (155, 220) | 24.7 (152, 281) | 67.0 (58, 98) | 84.3 (40, 97) |
+| 16 | 24.5 (638, 825) | 24.6 (613, 836) | **315.5 (49, 98)** | 361.2 (38, 80) |
+| 64 | 21.4 (2487, 2808) | 19.9 (2494, 3167) | **1181.9 (51, 93)** | 1361.7 (41, 86) |
+
+**One branch per writer, local files**
+
+| N | baseline | baseline, epoch claimed | final-wal |
+|---|---|---|---|
+| 1 | 29.7 (34, 57) | 28.7 (36, 50) | 36.3 (27, 38) |
+| 4 | 78.6 (52, 84) | 75.7 (52, 84) | 102.6 (38, 65) |
+| 16 | 169.2 (91, 190) | 154.2 (101, 175) | 174.7 (90, 125) |
+| 64 | 175.7 (353, 502) | 170.7 (372, 435) | 238.5 (253, 359) |
+
+**Latency sensitivity (one branch; one branch per writer in the last column)**
+
+| N | 5 ms: epoch claimed | 5 ms: final-wal | 50 ms: epoch claimed | 50 ms: final-wal | 50 ms branches: final-wal |
+|---|---|---|---|---|---|
+| 1 | 13.5 (73, 78) | 19.2 (51, 58) | 2.0 (477, 479) | 3.0 (321, 323) | 3.0 (320, 322) |
+| 4 | 8.6 (449, 465) | 38.1 (103, 135) | 1.0 (2736, 2738) | 6.0 (629, 635) | 12.0 (320, 323) |
+| 16 | 7.4 (1796, 1935) | 183.1 (84, 137) | 0 in 10 s | 27.8 (473, 791) | 48.4 (319, 331) |
+| 64 | 2.7 (7123, 7159) | 699.7 (92, 139) | 0 in 10 s | 129.7 (474, 792) | 181.4 (324, 558) |
+
+**Ablation: what each piece contributes (one branch, mem 20 ms)**
+
+| N | group commit (writers stage) | + log | leader staging | + log | pipeline, no log (depth 2) | pipeline + log |
+|---|---|---|---|---|---|---|
+| 1 | 4.7 (208, 215) | 7.0 (140, 144) | 4.7 (206, 209) | 7.0 (141, 144) | - | 6.9 (141, 145) |
+| 4 | 12.0 (323, 329) | 17.9 (189, 288) | 9.2 (416, 426) | 13.4 (280, 326) | - | 13.9 (276, 302) |
+| 16 | 46.4 (330, 512) | 56.6 (286, 306) | 36.8 (417, 422) | 52.8 (282, 326) | 53.5 (303, 468) | 64.1 (220, 379) |
+| 64 | 58.3 (823, 1799) | 60.4 (925, 1593) | 147.2 (416, 422) | 217.6 (283, 294) | 211.2 (310, 468) | 279.6 (212, 366) |
+
+The log's own share: −33% latency for a lone writer; +22% (writers stage), +48% (leader
+staging) and +32% (pipelined) commits/s at the concurrency where each configuration peaks.
+Leader staging trades latency at low concurrency (N=4: 17.9 → 13.9 with the log) for the
+CPU headroom that makes N=64 possible; an adaptive choice (writers stage when the group is
+idle) is future work.
+
+**Indexed table** (`OG_WT_INDEXED=1`: one seed row and the id BTREE `ensure_indices` builds,
+the production shape): one branch is unchanged (final-wal 7.2 / 14.1 / 63.3 / 279.6
+commits/s at N = 1/4/16/64); one branch per writer improves to 115.6 at 16 and **297.2 at
+64** (p99 376 ms): the BTREE probe is cheaper than the merge join each named-branch write
+pays alone.
+
+**Correctness instruments (all pass):** per-cell verification; `wal_recovery_and_cold_reads`
+(crash between records and fold); `group_commit_mixed_workload_is_consistent` (20 writers
+upserting 120 colliding keys beside 4 updaters, 5 ms latency, 5 of 5 runs: every
+acknowledged key present exactly once, no errors beyond bounded conflicts). The mixed test
+found one real bug, now fixed: after a failed publish attempt the writer-epoch holder
+withdraws its recorded version, and the prototype then sent the next publication around
+the log, which a later record collided with in the fold. Once a branch has a log in the
+process, every head-advancing publication now goes through it.
+
+### 5.2 Findings outside the log
+
+- Each writer's preparation reads the pinned table manifest's index metadata (one ranged
+  GET) even on a handle-cache hit; with leader staging the writer does not need it.
+- Lance caches a committed version's index metadata only when the list is non-empty
+  (`io/commit.rs` ~1556); an index-less table pays one GET per commit for its successor.
+- Under load, the pipeline's commit stage measures ~66 ms against 45 ms at one writer: the
+  ceiling at ~15 batches/s is CPU in composing and serializing the table manifest, plus
+  that GET on index-less tables.
+- The non-bound branch cache serializing all branches behind one mutex held across a probe
+  (section 6.4) is a cross-branch bottleneck worth fixing regardless of the log.
+
+### 5.3 Ideas considered and not built, with the reason
 
 - **A logical WAL with an in-memory row overlay (SlateDB/turbopuffer memtable).** It would
   make the acknowledgement one put with no table work, but every read path (scans, the
@@ -259,9 +395,14 @@ the cold registry rows the publication pushes, if any. Properties:
   holds above `__manifest`, then claims (the test `wal_recovery_and_cold_reads`: 7
   acknowledged, unfolded writes survive a crash, a fresh reader sees all 12 rows, the next
   owner folds them and continues).
+- **One path per branch.** Once the process holds a log of a branch, every head-advancing
+  publication on it goes through the log, the group's batches and the ordinary path alike:
+  the record's conditional create is what orders them (the mixed-workload test found the
+  bug of letting one through around the log).
 - **Everything else folds first.** A publication that is not head-advancing (schema apply
   with its exact-version precondition, proposals, unattached snapshots, claims) first waits
-  for the process's log to fold (`quiesce`), then publishes the ordinary way.
+  for the process's log to fold (`quiesce`), drops it, then publishes the ordinary way; the
+  next head-advancing publication opens a new log over that version.
 
 ### 6.3 Pipelined batches
 
@@ -286,13 +427,17 @@ branches). These are independent of the log and help without it.
 ### 6.5 What the record costs and how many land per second
 
 Per batch on one branch at 20 ms per request (measured): stage 1 ≈ 2 round trips (the id
-probe's read of the newest fragment, the data put); stage 2 ≈ 3 (Lance reads the tip's
-index metadata, then the transaction file and the manifest); stage 3 = 1 (the record). The
-serialized part per batch is stage 2 + stage 3 without pipelining, and stage 2 with it.
-Lance caches a committed version's index metadata only when the list is non-empty
-(`io/commit.rs` ~line 1556), so on a table with any index stage 2 is 2 round trips; the
-benchmark table has none. The `__manifest` fold costs what a publication cost before
-(three puts, ~70–90 ms) but off the acknowledgement path, one per record.
+probe's read of the newest fragment, the data put); stage 2 = 2 round trips at one writer
+(the transaction file, then the manifest: 45 ms in the trace) and ~66 ms under load; stage 3
+= 1 (the record, 23 ms). The serialized part per batch is stage 2 + stage 3 without
+pipelining (~90 ms) and stage 2 with it, so one branch takes ~15 batches/s; throughput then
+scales with the batch size, which grows with the writers (21 entries per batch at 64
+writers). Lance caches a committed version's index metadata only when the list is non-empty
+(`io/commit.rs` ~line 1556), so an index-less table also pays one ranged GET per commit for
+its successor; the indexed variant removes it at one writer but not the ~66 ms under load,
+which is CPU. The `__manifest` fold costs what a publication cost before (three puts, ~70–90
+ms) but off the acknowledgement path, one per record; per acknowledged write the requests
+fall from 9–13 (baseline) to 3.5 at 64 writers (`final-wal`, mem, same branch).
 
 ### 6.6 Snapshots, branches, merges, change feeds, recovery
 
