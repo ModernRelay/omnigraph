@@ -215,3 +215,33 @@ Raw: `results/branchcache.jsonl` (cache + probe skip only), `results/gc-wal-lead
 A named-branch write with the log costs 9.2 requests (vs 21.6 baseline), the same as main.
 Note: a shell pitfall cost one run: zsh does not word-split `$env` in `env $env cmd`; the
 sweep script (bash) is the reliable runner.
+
+## Crash recovery and cold reads (test `wal_recovery_and_cold_reads`), 2026-11-14
+
+Prototype additions: a claim first folds every record storage holds above `__manifest`
+(`wal::fold_storage_tail`, called from `prepare_claim`); a coordinator open, refresh and
+freshness probe with no in-process log read the records storage holds above the latest
+folded version (`read_storage_tail`: one GET per record plus one for the first absent;
+`latest_version_with_log`). Test (mem, `OMNIGRAPH_WAL=1`): 5 writes folded, then 7 writes
+with the fold paused (records only), then a "crash" (`crash_forget_all`: tails dropped
+unfolded). A fresh handle sees 12 rows (5 folded + 7 from the log tail); the next owner's
+claim folds the 7 records, then one more write gives 13. Passes, also with the pipeline.
+
+## Prototype 4: pipelined batches (`OMNIGRAPH_GROUP_PIPELINE=1`), 2026-11-14
+
+Three stages per batch, each in batch (ticket) order: (1) admission + one staged write per
+table at the published head (probe + data PUT); (2) each table's staged insert recomposed
+onto the previous batch's detached tip (`compose_pure_inserts` on the chain tip, held in
+memory) and committed detached; (3) the record. Batch j+1 stages while batch j commits and
+logs. No branch gate on this path (the schema permit is shared, held through the log
+stage); the record's conditional create orders everything else. A failure in stage 2 or 3
+starts a new chain generation and refuses every batch built on the old one. Admission
+also checks ids of batches in flight.
+
+Mem 20 ms, same branch, claimed: first version (hand-over-hand locks) 279/s p50 208 at
+N=64; ticket order with a depth semaphore was worse (d2 246, d3 253, d4 192); ticket order
+plus hand-over-hand batch formation (next batch forms when this one enters stage 2):
+**N=64 291.6 and 285.6 commits/s (p50 205, p99 366), N=16 66.0 and 66.2 (p50 213)**.
+Stage 2 measures ~66 ms = 3 RTT, not 2: Lance's commit loads the base version's index
+metadata (`load_all_indices`, a ranged GET of the tip manifest) and a fresh detached tip is
+not in the session cache. No public Lance API avoids it.
