@@ -8,7 +8,6 @@ use omnigraph::db::{
 };
 use omnigraph::error::{MergeConflict, MergeConflictKind as EngineMergeConflictKind};
 use omnigraph::loader::{LoadExecuted, LoadMode, LoadOperatorExecuted, LoadReceipt, LoadResult};
-use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Param;
@@ -17,6 +16,7 @@ use omnigraph_compiler::settings::{
     ChangeLineage, Engine, MergeLineage, SettingId, SettingKind, SettingRow, SettingValue,
 };
 use omnigraph_compiler::types::{PropType, ScalarType};
+use omnigraph_compiler::{QueryOperationDescriptor, SchemaMigrationStep};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -1870,7 +1870,7 @@ pub struct ParamDescriptor {
 
 /// One entry in the stored-query catalog (`GET /queries`).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct QueryCatalogEntry {
+pub struct QueryCatalogEntry<Operation = QueryOperationDescriptor> {
     /// Registry key / invoke path segment (`POST /queries/{name}`).
     pub name: String,
     /// MCP tool id (the `tool_name` override, else `name`).
@@ -1884,14 +1884,16 @@ pub struct QueryCatalogEntry {
     pub params: Vec<ParamDescriptor>,
     /// Compiled result fields and graph types read or written, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<omnigraph_compiler::QueryOperationDescriptor>,
+    #[schema(value_type = Option<QueryOperationDescriptor>)]
+    pub operation: Option<Operation>,
 }
 
 /// Response for `GET /queries`: every stored query in a graph's
 /// registry, each with typed parameters.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct QueriesCatalogOutput {
-    pub queries: Vec<QueryCatalogEntry>,
+pub struct QueriesCatalogOutput<Operation = QueryOperationDescriptor> {
+    #[schema(value_type = Vec<QueryCatalogEntry>)]
+    pub queries: Vec<QueryCatalogEntry<Operation>>,
 }
 
 /// Total map from a resolved scalar to its catalog kind. Exhaustive on

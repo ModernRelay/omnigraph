@@ -729,9 +729,9 @@ impl GraphClient {
     }
 
     /// A served graph's stored-query catalog, the body of `GET …/queries`.
-    /// A direct root reads its registry from the applied cluster state
-    /// instead, so only a server or managed target reaches this.
-    pub(crate) async fn list_queries(&self) -> Result<QueriesCatalogOutput> {
+    /// Keep operation descriptors as JSON so `queries list --json` can
+    /// forward kinds introduced by newer servers.
+    pub(crate) async fn list_queries(&self) -> Result<QueriesCatalogOutput<Value>> {
         match self {
             GraphClient::Remote {
                 http,

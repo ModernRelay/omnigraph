@@ -158,7 +158,7 @@ pub(super) fn write_queries_list(
 /// `queries list` on a server target: the route's body under `--json`, else
 /// the direct form's layout with each parameter typed as the body spells it.
 pub(super) fn write_queries_catalog(
-    catalog: &QueriesCatalogOutput,
+    catalog: &QueriesCatalogOutput<serde_json::Value>,
     json: bool,
     stdout: &mut dyn Write,
 ) -> Result<()> {
