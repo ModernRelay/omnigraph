@@ -106,6 +106,7 @@ struct MethodCounts {
     list_paginated: AtomicU64,
     delete: AtomicU64,
     copy: AtomicU64,
+    put_bytes: AtomicU64,
 }
 
 impl MethodCounts {
@@ -121,6 +122,7 @@ impl MethodCounts {
         m.insert("list_paginated", self.list_paginated.load(Ordering::Relaxed));
         m.insert("delete", self.delete.load(Ordering::Relaxed));
         m.insert("copy", self.copy.load(Ordering::Relaxed));
+        m.insert("put_bytes", self.put_bytes.load(Ordering::Relaxed));
         m
     }
 }
@@ -191,6 +193,9 @@ impl ObjectStore for CountingStore {
             PutMode::Update(_) => &self.counts.put_update,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+        self.counts
+            .put_bytes
+            .fetch_add(payload.content_length() as u64, Ordering::Relaxed);
         self.target.put_opts(location, payload, opts).await
     }
 
@@ -293,7 +298,9 @@ impl PlaneSnapshot {
             let mut total = 0u64;
             for (k, v) in b {
                 let d = v - a.get(k).copied().unwrap_or(0);
-                total += d;
+                if *k != "put_bytes" {
+                    total += d;
+                }
                 if d > 0 {
                     out.insert(
                         (*k).to_string(),
@@ -342,6 +349,7 @@ struct Config {
     history: usize,
     label: String,
     rep: usize,
+    handles: usize,
 }
 
 struct Op {
@@ -440,13 +448,22 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
 
     let planes = Planes::new();
     let probes = planes.probes();
-    let db = with_query_io_probes(probes.clone(), async {
-        Session::from_defaults(
-            Arc::new(Omnigraph::open(&uri).await.expect("open")),
-            SessionSettings::default(),
-        )
-    })
-    .await;
+    // `WT_HANDLES` > 1 opens independent handles (each its own coordinator
+    // and publisher, as separate processes have): their publications are
+    // foreign to each other, which exercises the version-CAS fence.
+    let mut handles_open = Vec::with_capacity(cfg.handles);
+    for _ in 0..cfg.handles {
+        handles_open.push(
+            with_query_io_probes(probes.clone(), async {
+                Session::from_defaults(
+                    Arc::new(Omnigraph::open(&uri).await.expect("open")),
+                    SessionSettings::default(),
+                )
+            })
+            .await,
+        );
+    }
+    let db = handles_open[0].clone();
 
     let reprepares = probes.mutation_reprepares.clone();
     let carried = probes.writes_carried_over_row_preserving.clone();
@@ -455,7 +472,7 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
 
     let mut handles = Vec::with_capacity(cfg.writers);
     for w in 0..cfg.writers {
-        let db = db.clone();
+        let db = handles_open[w % cfg.handles].clone();
         let phase = phase.clone();
         let failed = failed.clone();
         let probes = probes.clone();
@@ -612,6 +629,7 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
         "mode": cfg.mode,
         "types": cfg.types,
         "rep": cfg.rep,
+        "handles": cfg.handles,
         "history": cfg.history,
         "window_s": round2(window.as_secs_f64()),
         "drain_s": round2(drain.as_secs_f64()),
@@ -637,6 +655,7 @@ async fn run_cell(cfg: Config) -> serde_json::Value {
         "claim_grade": false,
     });
     drop(db);
+    drop(handles_open);
     if cfg.backend == "s3" {
         // Leave the prefix; RustFS data lives on a scratch disk.
     }
@@ -662,6 +681,7 @@ async fn write_throughput_sweep() {
     let history: usize = env_or("WT_HISTORY", "32").parse().unwrap();
     let reps: usize = env_or("WT_REPS", "1").parse().unwrap();
     let label = env_or("WT_LABEL", "unlabeled");
+    let handles: usize = env_or("WT_HANDLES", "1").parse().expect("WT_HANDLES");
     let out = std::env::var("WT_OUT").ok();
 
     for rep in 0..reps {
@@ -677,6 +697,7 @@ async fn write_throughput_sweep() {
                     history,
                     label: label.clone(),
                     rep,
+                    handles,
                 };
                 let record = run_cell(cfg).await;
                 let line = serde_json::to_string(&record).unwrap();
