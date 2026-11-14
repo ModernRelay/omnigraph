@@ -1018,15 +1018,36 @@ async fn latest_attached_version(dataset: &Dataset) -> lance::Result<u64> {
     dataset.latest_version_id().await
 }
 
+/// WAL research prototype: the newest version of `dataset`'s branch counting
+/// its log, the records storage holds above the latest folded `__manifest`
+/// version (a process's own tail when it holds one).
+async fn latest_version_with_log(dataset: &Dataset) -> Result<u64> {
+    let folded = latest_attached_version(dataset)
+        .await
+        .map_err(OmniError::storage)?;
+    if !crate::wal::enabled() {
+        return Ok(folded);
+    }
+    let native = dataset.manifest().branch.as_deref();
+    let root = dataset
+        .uri()
+        .trim_end_matches('/')
+        .split("/__manifest")
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let records =
+        crate::wal::read_storage_tail(&root, native, &dataset.session(), folded).await?;
+    Ok(records.last().map_or(folded, |(version, _)| *version))
+}
+
 async fn probe_dataset_latest_incarnation(
     dataset: &Dataset,
     active_branch: Option<&str>,
 ) -> Result<ManifestIncarnation> {
     if active_branch.is_none() {
         return Ok(ManifestIncarnation {
-            version: latest_attached_version(dataset)
-                .await
-                .map_err(OmniError::storage)?,
+            version: latest_version_with_log(dataset).await?,
             e_tag: dataset.manifest_location().e_tag.clone(),
             timestamp_nanos: Some(dataset.manifest().timestamp_nanos),
             branch_identifier: lance::dataset::refs::BranchIdentifier::main(),
@@ -1041,9 +1062,7 @@ async fn probe_dataset_latest_incarnation(
     // yields the replacement identifier rather than a false match to the held
     // lifetime.
     let held = async {
-        let version = latest_attached_version(dataset)
-            .await
-            .map_err(|error| branch_ref_error(error, branch))?;
+        let version = latest_version_with_log(dataset).await?;
         let native = dataset.manifest().branch.as_deref().ok_or_else(|| {
             OmniError::manifest_internal("named coordinator has no native manifest ref")
         })?;
@@ -1858,8 +1877,25 @@ impl ManifestCoordinator {
         Vec<GraphLineageRow>,
         Option<Result<SchemaContractRow>>,
     )> {
-        let (rows, contract) = state::read_manifest_rows_with_contract(&dataset).await?;
-        let known_state = rows.state(dataset.version().version, native_branch.as_deref())?;
+        let (mut rows, contract) = state::read_manifest_rows_with_contract(&dataset).await?;
+        let mut known_state = rows.state(dataset.version().version, native_branch.as_deref())?;
+        // WAL research prototype: a reader with no log of this branch in its
+        // process reads the records storage holds above the latest folded
+        // version (one GET for the first absent one when caught up) and opens
+        // at the newest, so an acknowledged write is visible to it.
+        if crate::wal::enabled() && crate::wal::existing_tail(root, branch).is_none() {
+            let records = crate::wal::read_storage_tail(
+                root,
+                native_branch.as_deref(),
+                &dataset.session(),
+                dataset.version().version,
+            )
+            .await?;
+            if let Some((version, tip)) = records.into_iter().last() {
+                known_state = tip.state(version, native_branch.as_deref())?;
+                rows = tip;
+            }
+        }
         let opened = OpenedManifest {
             dataset,
             known_state,
@@ -2128,8 +2164,31 @@ impl ManifestCoordinator {
             );
             replaced_root = true;
         }
-        let rows = state::read_manifest_rows_with_contract(&dataset).await?.0;
-        let known_state = rows.state(dataset.version().version, native_branch.as_deref())?;
+        let mut rows = state::read_manifest_rows_with_contract(&dataset).await?.0;
+        let mut known_state = rows.state(dataset.version().version, native_branch.as_deref())?;
+        // WAL research prototype: the branch's log tail, from this process's
+        // log or from storage, stands above the latest folded version.
+        if crate::wal::enabled() {
+            let tip = match crate::wal::existing_tail(&self.root_uri, self.active_branch.as_deref())
+            {
+                Some(tail) if tail.native() == native_branch.as_deref() => tail
+                    .above(dataset.version().version)
+                    .map(|(version, rows)| (version, (*rows).clone())),
+                _ => crate::wal::read_storage_tail(
+                    &self.root_uri,
+                    native_branch.as_deref(),
+                    &control_session,
+                    dataset.version().version,
+                )
+                .await?
+                .into_iter()
+                .last(),
+            };
+            if let Some((version, tip)) = tip {
+                known_state = tip.state(version, native_branch.as_deref())?;
+                rows = tip;
+            }
+        }
         fail(&READ_REFRESH_POST_STATE_PRE_LINEAGE)?;
         self.dataset = dataset;
         self.known_state = known_state;

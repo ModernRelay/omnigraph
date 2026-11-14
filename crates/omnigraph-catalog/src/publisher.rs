@@ -2219,7 +2219,31 @@ impl GraphNamespacePublisher {
     /// writer epoch against what the claim first read, and the incarnation.
     async fn prepare_claim(&self, claim: &mut ClaimIntent) -> Result<PreparedClaim> {
         self.holder_key()?;
-        let LoadedPublishState { dataset, mut rows } = self.load_publish_state().await?;
+        let LoadedPublishState { dataset, rows } = self.load_publish_state().await?;
+        // WAL research prototype: a claim takes the branch over, so it first
+        // folds the records a previous owner acknowledged and did not fold
+        // (SlateDB-style recovery; the fencing record that would also stop a
+        // live previous owner is not prototyped).
+        let (dataset, mut rows) = if crate::wal::enabled() {
+            let native = dataset.manifest().branch.clone();
+            let before = dataset.version().version;
+            let folded = crate::wal::fold_storage_tail(
+                &self.root_uri,
+                self.branch.as_deref(),
+                native.as_deref(),
+                &self.control_session,
+                dataset,
+            )
+            .await?;
+            if folded.version().version == before {
+                (folded, rows)
+            } else {
+                let rows = crate::state::read_manifest_rows(&folded).await?;
+                (folded, rows)
+            }
+        } else {
+            (dataset, rows)
+        };
         require_control_facts(guard_stamp(&dataset)?)?;
         let native = dataset.manifest().branch.clone();
         let current = WriterEpochRow::resolved(rows.writer_epoch.as_ref(), native.as_deref());

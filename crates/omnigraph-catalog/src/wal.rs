@@ -97,6 +97,7 @@ struct TailState {
 /// One branch's record log in this process.
 pub struct Tail {
     native: Option<String>,
+    dead: std::sync::atomic::AtomicBool,
     store: Arc<ObjectStore>,
     base: Path,
     state: Mutex<TailState>,
@@ -113,6 +114,57 @@ fn key(root_uri: &str, branch: Option<&str>) -> TailKey {
         root_uri.trim_end_matches('/').to_string(),
         branch.filter(|name| *name != "main").map(str::to_string),
     )
+}
+
+/// Research instrument: while set, folds do not run (a crash between the
+/// records and their fold).
+pub static FOLD_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Research instrument: forget every log this process holds WITHOUT folding
+/// it, as a crash would: the unfolded records stay in storage only, and the
+/// forgotten tails' folds stop.
+pub fn crash_forget_all() {
+    let tails: Vec<Arc<Tail>> = TAILS
+        .lock()
+        .expect("wal tails poisoned")
+        .drain()
+        .map(|(_, tail)| tail)
+        .collect();
+    for tail in tails {
+        tail.dead.store(true, std::sync::atomic::Ordering::SeqCst);
+        tail.wake.notify_one();
+    }
+}
+
+/// Fold, before a publication that does not go through a log (a writer
+/// epoch claim taking a branch over), every record storage holds above
+/// `dataset`, the latest folded `__manifest` version: a previous owner's
+/// acknowledged, unfolded writes. Answers the folded dataset. A log this
+/// process holds is folded instead.
+pub(crate) async fn fold_storage_tail(
+    root_uri: &str,
+    branch: Option<&str>,
+    native: Option<&str>,
+    session: &Arc<lance::session::Session>,
+    dataset: Dataset,
+) -> Result<Dataset> {
+    if let Some(tail) = existing_tail(root_uri, branch) {
+        tail.quiesce().await?;
+        return Ok(tail.snapshot().2);
+    }
+    let records = read_storage_tail(root_uri, native, session, dataset.version().version).await?;
+    let mut folded = dataset;
+    for (version, rows) in records {
+        let (next, _) = crate::commit::overwrite(folded, &rows, None).await?;
+        if next.version().version != version {
+            return Err(OmniError::manifest_internal(format!(
+                "recovered record {version} folded as __manifest version {}",
+                next.version().version
+            )));
+        }
+        folded = next;
+    }
+    Ok(folded)
 }
 
 /// Research instrument: wait until every log this process holds is folded.
@@ -159,9 +211,12 @@ async fn open_store(
 }
 
 fn encode(rows: &ManifestRows, cold: Option<&LineageRegistry>) -> Result<Bytes> {
-    let mut batches = vec![rows.to_batch()?];
+    // The stored (packed `record`) form, the one the publisher's row cache
+    // decodes (`state::rows_of_batch`).
+    let storage = crate::record::manifest_storage_schema(HashMap::new());
+    let mut batches = vec![crate::record::compact_to_storage(&rows.to_batch()?, &storage)?];
     if let Some(cold) = cold {
-        batches.push(cold.to_batch()?);
+        batches.push(crate::record::compact_to_storage(&cold.to_batch()?, &storage)?);
     }
     let schema = batches[0].schema();
     let mut out = Vec::new();
@@ -247,6 +302,7 @@ pub(crate) async fn tail_for(
     }
     let tail = Arc::new(Tail {
         native: native.map(str::to_string),
+        dead: std::sync::atomic::AtomicBool::new(false),
         store,
         base,
         state: Mutex::new(TailState {
@@ -387,6 +443,13 @@ impl Tail {
 async fn fold_loop(tail: Arc<Tail>) {
     let mut failures = 0u32;
     loop {
+        if tail.dead.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if FOLD_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            continue;
+        }
         let next = {
             let state = tail.state.lock().expect("wal tail poisoned");
             state

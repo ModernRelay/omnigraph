@@ -850,3 +850,78 @@ async fn concurrent_write_throughput() {
         }
     }
 }
+
+/// The log's correctness evidence (run with `OMNIGRAPH_WAL=1`): acknowledged
+/// writes whose records were never folded survive a crash, a reader in a new
+/// process sees them by reading the log tail, and the next owner's claim folds
+/// them before it publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "instrument: WAL crash recovery and cold reads (WAL research); run with OMNIGRAPH_WAL=1 --ignored"]
+async fn wal_recovery_and_cold_reads() {
+    assert!(
+        omnigraph_catalog::wal::enabled(),
+        "run with OMNIGRAPH_WAL=1"
+    );
+    let _counters = counters(Duration::ZERO);
+    let uri = format!("shared-memory://wt-recovery-{}/graph", std::process::id());
+    let adapter: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
+    let db = Omnigraph::init_with_storage(&uri, SCHEMA, Arc::clone(&adapter), InitOptions::default())
+        .await
+        .unwrap();
+    let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+    session.db().claim_branch_writer("main").await.unwrap();
+
+    async fn count(adapter: &Arc<dyn StorageAdapter>, uri: &str) -> u64 {
+        let fresh = Omnigraph::open_with_storage(uri, Arc::clone(adapter)).await.unwrap();
+        let snapshot = fresh
+            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        snapshot
+            .open_dataset("node:Item")
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap() as u64
+    }
+
+    for i in 0..5 {
+        session
+            .mutate("main", QUERIES, "put", &params(&format!("folded-{i}"), i, None))
+            .await
+            .unwrap();
+    }
+    omnigraph_catalog::wal::quiesce_all().await.unwrap();
+
+    // Records only: the fold is paused, then the process "crashes".
+    omnigraph_catalog::wal::FOLD_PAUSED.store(true, Ordering::SeqCst);
+    for i in 0..7 {
+        session
+            .mutate("main", QUERIES, "put", &params(&format!("unfolded-{i}"), i, None))
+            .await
+            .unwrap();
+    }
+    omnigraph_catalog::wal::crash_forget_all();
+    drop(session);
+    omnigraph_catalog::wal::FOLD_PAUSED.store(false, Ordering::SeqCst);
+
+    // A reader in a new process: 5 folded + 7 acknowledged in the log tail.
+    let cold = count(&adapter, &uri).await;
+    eprintln!("cold reader sees {cold} rows (expect 12)");
+    assert_eq!(cold, 12, "a cold reader must see every acknowledged write");
+
+    // The next owner claims: the claim folds the 7 records, then publishes.
+    let db = Omnigraph::open_with_storage(&uri, Arc::clone(&adapter)).await.unwrap();
+    let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+    session.db().claim_branch_writer("main").await.unwrap();
+    session
+        .mutate("main", QUERIES, "put", &params("after-recovery", 99, None))
+        .await
+        .unwrap();
+    omnigraph_catalog::wal::forget_all().await.unwrap();
+    drop(session);
+    let recovered = count(&adapter, &uri).await;
+    eprintln!("after recovery and one more write: {recovered} rows (expect 13)");
+    assert_eq!(recovered, 13);
+}
