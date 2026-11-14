@@ -51,9 +51,21 @@ async fn rebind(
 /// Retain bounded acknowledged control metadata without retaining a query's IO scope.
 /// Shared session/provider resources remain owned by their existing owners.
 pub async fn retain_control_dataset(dataset: &Dataset, budget: usize) -> Option<Dataset> {
+    retain_control_dataset_of(dataset, budget, false).await
+}
+
+/// [`retain_control_dataset`]; with `branches` set, a named branch's image is
+/// retained too (research: its publisher's first attempt reuses it, and the
+/// publish precondition reads the exact native ref the image names, which a
+/// retired branch no longer has).
+pub async fn retain_control_dataset_of(
+    dataset: &Dataset,
+    budget: usize,
+    branches: bool,
+) -> Option<Dataset> {
     let manifest = dataset.manifest();
-    if manifest.branch.is_some()
-        || !manifest.base_paths.is_empty()
+    if (manifest.branch.is_some() && !branches)
+        || (!manifest.base_paths.is_empty() && !branches)
         || manifest
             .schema
             .fields_pre_order()
@@ -73,9 +85,7 @@ pub async fn rebind_control_dataset(
     dataset: &Dataset,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
 ) -> Result<Option<Dataset>> {
-    if dataset.manifest().branch.is_some()
-        || !dataset.manifest().base_paths.is_empty()
-        || dataset
+    if dataset
             .manifest_location()
             .e_tag
             .as_ref()

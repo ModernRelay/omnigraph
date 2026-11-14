@@ -431,9 +431,10 @@ impl PublishedRows {
         {
             return None;
         }
-        let acknowledged = crate::instrumentation::retain_control_dataset(
+        let acknowledged = crate::instrumentation::retain_control_dataset_of(
             dataset,
             PUBLISHED_ROWS_CACHE_BYTES - bytes,
+            trust_acknowledged_enabled(),
         )
         .await;
         Some(Self {
@@ -602,30 +603,47 @@ impl GraphNamespacePublisher {
     }
 
     async fn dataset(&self, trust_acknowledged: bool) -> Result<Dataset> {
+        let held = self
+            .published_rows
+            .lock()
+            .expect("published rows cache lock poisoned")
+            .as_ref()
+            .and_then(|rows| rows.acknowledged.clone());
+        // Research (write throughput): this publisher's own last
+        // acknowledged version is the base of the next attempt with no
+        // listing, on main and on a named branch. The publish is a
+        // put-if-absent of `read_version + 1` and versions have no holes, so
+        // a version another writer published since makes that put fail; the
+        // retry then opens the branch as before. On a named branch the
+        // precondition check reads the exact native ref the image names, so
+        // a branch deleted (and perhaps created again under its name) since
+        // is refused as it is after a fresh open.
+        if trust_acknowledged
+            && trust_acknowledged_enabled()
+            && let Some(held) = held.as_ref()
+            && (held.manifest().branch.as_deref() == self.branch.as_deref()
+                || held
+                    .manifest()
+                    .branch
+                    .as_deref()
+                    .map(crate::branch_names::logical_branch_name)
+                    == self.branch.as_deref())
+            && let Some(rebound) = crate::instrumentation::rebind_control_dataset(
+                held,
+                crate::instrumentation::manifest_wrapper(),
+            )
+            .await?
+        {
+            return Ok(rebound);
+        }
+        if std::env::var("OMNIGRAPH_GROUP_COMMIT_DEBUG").is_ok_and(|value| value == "1") {
+            eprintln!(
+                "[publisher] fresh open of {:?} (trust {trust_acknowledged}, held {:?})",
+                self.branch,
+                held.as_ref().map(|held| held.manifest().branch.clone())
+            );
+        }
         if self.branch.is_none() {
-            let held = self
-                .published_rows
-                .lock()
-                .expect("published rows cache lock poisoned")
-                .as_ref()
-                .and_then(|rows| rows.acknowledged.clone());
-            // Research (write throughput): this publisher's own last
-            // acknowledged version is the base of the next attempt with no
-            // listing. The publish is a put-if-absent of `read_version + 1`
-            // and versions have no holes, so a version another writer
-            // published since makes that put fail; the retry then qualifies
-            // the held image against storage as before.
-            if trust_acknowledged
-                && trust_acknowledged_enabled()
-                && let Some(held) = held.as_ref()
-                && let Some(rebound) = crate::instrumentation::rebind_control_dataset(
-                    held,
-                    crate::instrumentation::manifest_wrapper(),
-                )
-                .await?
-            {
-                return Ok(rebound);
-            }
             if let Some(held) = held
                 && let Some(current) = crate::instrumentation::current_control_dataset(
                     &held,

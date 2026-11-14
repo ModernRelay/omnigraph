@@ -149,6 +149,10 @@ struct Group {
     /// Pipelining: the batch whose publication is in flight, which the next
     /// batch may compose on.
     in_flight: Option<std::sync::Arc<InFlight>>,
+    /// For a branch other than the handle's bound branch: the coordinator
+    /// this group last published through, whose view is that publication
+    /// and whose publisher holds its acknowledged rows.
+    coordinator: Option<crate::db::graph_coordinator::GraphCoordinator>,
 }
 
 /// A batch whose publication is in flight: the head it builds on, the keys it
@@ -376,15 +380,28 @@ impl Omnigraph {
                 }
             },
         };
+        let mut publish_coordinator = None;
         let current = match refusal {
             Some(_) => None,
-            None => match self.open_write_txn_probed(branch.as_deref(), false).await {
-                Ok(txn) => Some(txn),
-                Err(error) => {
-                    refusal = Some(error);
-                    None
+            None => {
+                let log_now: Vec<BatchEffect> = {
+                    let groups = self.group_commits().groups.lock().unwrap();
+                    groups
+                        .get(key)
+                        .map(|group| group.log.iter().cloned().collect())
+                        .unwrap_or_default()
+                };
+                match self.batch_capture(key, &branch, &log_now).await {
+                    Ok((txn, coordinator)) => {
+                        publish_coordinator = coordinator;
+                        Some(txn)
+                    }
+                    Err(error) => {
+                        refusal = Some(error);
+                        None
+                    }
                 }
-            },
+            }
         };
         // The published state must be exactly the one stage A composed on.
         if refusal.is_none()
@@ -458,8 +475,12 @@ impl Omnigraph {
                 &expected,
                 actor.as_deref(),
                 history_release_bytes,
+                publish_coordinator.as_mut(),
             )
             .await;
+        if publish_coordinator.is_some() {
+            self.keep_coordinator(key, published.as_ref().ok().and(publish_coordinator));
+        }
         drop(gates);
         let _ = done_tx.send(Some(
             published
@@ -595,6 +616,83 @@ impl Omnigraph {
         group.leading = false;
     }
 
+    /// Capture a batch's authority. On the handle's bound branch, from the
+    /// installed view, with no probe when it is this group's own last
+    /// publication. On another branch, from the coordinator this group last
+    /// published through under the same rule, else from a fresh open; the
+    /// coordinator to publish through comes back beside the capture.
+    async fn batch_capture(
+        &self,
+        key: &str,
+        branch: &Option<String>,
+        log: &[BatchEffect],
+    ) -> Result<(
+        WriteTxn,
+        Option<crate::db::graph_coordinator::GraphCoordinator>,
+    )> {
+        let (bound, installed) = self.installed_head();
+        let last = log.last().map(|effect| effect.head.clone());
+        if bound == *branch {
+            let own_view =
+                capture_skip_enabled() && installed.is_some() && last.as_ref() == installed.as_ref();
+            let txn = self.open_write_txn_probed(branch.as_deref(), !own_view).await?;
+            return Ok((txn, None));
+        }
+        let held = {
+            let groups = self.group_commits().groups.lock().unwrap();
+            groups
+                .get(key)
+                .and_then(|group| group.coordinator.clone())
+        };
+        if debug_enabled() {
+            eprintln!(
+                "[group] capture {:?}: held head {:?}, log head {:?}",
+                branch,
+                held.as_ref().map(|coordinator| coordinator.exact_graph_head()),
+                last
+            );
+        }
+        let coordinator = match held {
+            Some(coordinator)
+                if capture_skip_enabled()
+                    && last.is_some()
+                    && coordinator.exact_graph_head() == last =>
+            {
+                coordinator
+            }
+            _ => self.open_coordinator_for_branch(branch.as_deref()).await?,
+        };
+        let txn = self.write_txn_from_coordinator(&coordinator).await?;
+        Ok((txn, Some(coordinator)))
+    }
+
+    /// Research (group commit): a writer's capture of a branch other than the
+    /// handle's bound branch from the coordinator its group last published
+    /// through, with no probe; `None` when the group holds none.
+    pub(crate) async fn group_view_txn(
+        &self,
+        branch: Option<&str>,
+        actor: Option<&str>,
+    ) -> Option<Result<WriteTxn>> {
+        let key = group_key(branch, actor);
+        let held = {
+            let groups = self.group_commits().groups.lock().unwrap();
+            groups.get(&key).and_then(|group| group.coordinator.clone())
+        }?;
+        Some(self.write_txn_from_coordinator(&held).await)
+    }
+
+    fn keep_coordinator(
+        &self,
+        key: &str,
+        coordinator: Option<crate::db::graph_coordinator::GraphCoordinator>,
+    ) {
+        let mut groups = self.group_commits().groups.lock().unwrap();
+        if let Some(group) = groups.get_mut(key) {
+            group.coordinator = coordinator;
+        }
+    }
+
     /// Stage A of a pipelined batch: capture the handle's view (with no probe
     /// when it is this group's own last publication), admit the batch
     /// against the effect log and the in-flight batch's pending effect, and
@@ -612,15 +710,11 @@ impl Omnigraph {
         let mut log = log.to_vec();
         let mut in_flight = in_flight;
         let mut attempts = 0;
+        let key = group_key(branch.as_deref(), batch[0].entry.actor.as_deref());
         let (current, predecessor) = loop {
             attempts += 1;
-            let (bound, installed) = self.installed_head();
-            let own_view = capture_skip_enabled()
-                && bound == branch
-                && installed.is_some()
-                && log.last().map(|effect| Some(&effect.head)) == Some(installed.as_ref());
-            let current = match self.open_write_txn_probed(branch.as_deref(), !own_view).await {
-                Ok(txn) => txn,
+            let current = match self.batch_capture(&key, &branch, &log).await {
+                Ok((txn, _)) => txn,
                 Err(error) => {
                     for waiting in batch {
                         let error = follower_error(&error, &waiting.entry.txn);
@@ -644,7 +738,6 @@ impl Omnigraph {
                         }
                     }
                     let _ = done;
-                    let key = group_key(branch.as_deref(), batch[0].entry.actor.as_deref());
                     let groups = self.group_commits().groups.lock().unwrap();
                     if let Some(group) = groups.get(&key) {
                         log = group.log.iter().cloned().collect();
@@ -853,20 +946,38 @@ impl Omnigraph {
         expected: &ExpectedTableVersions,
         actor: Option<&str>,
         history_release_bytes: HistoryReleaseBytes,
+        coordinator: Option<&mut crate::db::graph_coordinator::GraphCoordinator>,
     ) -> Result<GraphCommit> {
         let lineage_intent = self
             .new_lineage_intent_for_branch(current.branch.as_deref(), actor, history_release_bytes)
             .await
             .map_err(OmniError::unpublished)?;
-        let publish = self.commit_updates_on_branch_with_expected(
-            current.branch.as_deref(),
-            &updates,
-            expected,
-            actor,
-            current,
-            lineage_intent,
-            crate::db::omnigraph::Publication::Publish,
-        );
+        let publish = async {
+            match coordinator {
+                Some(coordinator) => {
+                    self.commit_updates_with_coordinator(
+                        coordinator,
+                        &updates,
+                        expected,
+                        current,
+                        lineage_intent,
+                    )
+                    .await
+                }
+                None => {
+                    self.commit_updates_on_branch_with_expected(
+                        current.branch.as_deref(),
+                        &updates,
+                        expected,
+                        actor,
+                        current,
+                        lineage_intent,
+                        crate::db::omnigraph::Publication::Publish,
+                    )
+                    .await
+                }
+            }
+        };
         let warm = async {
             if index_warm_enabled() {
                 futures::future::join_all(detached.iter().map(|handle| async move {
@@ -908,16 +1019,13 @@ impl Omnigraph {
         // the publication's compare-and-swap refuse the batch, as a stale
         // view does on every write path, and its detached commits stay
         // unreachable (invariant 5).
-        let own_view = capture_skip_enabled() && {
-            let (bound, installed) = self.installed_head();
-            bound == branch
-                && installed.is_some()
-                && log.last().map(|effect| Some(&effect.head)) == Some(installed.as_ref())
-        };
-        let current = match self.open_write_txn_probed(branch.as_deref(), !own_view).await {
-            Ok(txn) => txn,
-            Err(error) => return fail_all(batch, error, LogChange::Clear),
-        };
+        let key = group_key(branch.as_deref(), batch[0].entry.actor.as_deref());
+        let (current, mut publish_coordinator) =
+            match self.batch_capture(&key, &branch, log).await {
+                Ok(captured) => captured,
+                Err(error) => return fail_all(batch, error, LogChange::Clear),
+            };
+        let own_view = true;
         let captured = started.elapsed();
         let head = current.authority.graph_head.clone();
         let log_reaches_head = log
@@ -973,7 +1081,12 @@ impl Omnigraph {
         }
 
         let admitted_count = admitted.len();
-        let published = self.publish_batch(&current, &admitted).await;
+        let published = self
+            .publish_batch(&current, &admitted, publish_coordinator.as_mut())
+            .await;
+        if publish_coordinator.is_some() {
+            self.keep_coordinator(&key, published.as_ref().ok().and(publish_coordinator));
+        }
         if timing_enabled() {
             eprintln!(
                 "[group-timing] entries {admitted_count} gates {:.1} capture {:.1} commit+publish {:.1} ms (own view {own_view})",
@@ -1015,7 +1128,12 @@ impl Omnigraph {
 
     /// Compose each table's admitted inserts on its current pin, commit
     /// them detached, and publish every pin in one compare-and-swap.
-    async fn publish_batch(&self, current: &WriteTxn, admitted: &[Waiting]) -> Result<GraphCommit> {
+    async fn publish_batch(
+        &self,
+        current: &WriteTxn,
+        admitted: &[Waiting],
+        coordinator: Option<&mut crate::db::graph_coordinator::GraphCoordinator>,
+    ) -> Result<GraphCommit> {
         // Each table's effects, in admission order.
         let mut by_table: BTreeMap<String, (String, Vec<StagedHandle>)> = BTreeMap::new();
         let mut expected: ExpectedTableVersions = HashMap::new();
@@ -1122,15 +1240,32 @@ impl Omnigraph {
             )
             .await
             .map_err(OmniError::unpublished)?;
-        let publish = self.commit_updates_on_branch_with_expected(
-            current.branch.as_deref(),
-            &updates,
-            &expected,
-            first.actor.as_deref(),
-            current,
-            lineage_intent,
-            crate::db::omnigraph::Publication::Publish,
-        );
+        let publish = async {
+            match coordinator {
+                Some(coordinator) => {
+                    self.commit_updates_with_coordinator(
+                        coordinator,
+                        &updates,
+                        &expected,
+                        current,
+                        lineage_intent,
+                    )
+                    .await
+                }
+                None => {
+                    self.commit_updates_on_branch_with_expected(
+                        current.branch.as_deref(),
+                        &updates,
+                        &expected,
+                        first.actor.as_deref(),
+                        current,
+                        lineage_intent,
+                        crate::db::omnigraph::Publication::Publish,
+                    )
+                    .await
+                }
+            }
+        };
         // While the publication is in flight, read each new version's index
         // metadata into the shared Lance session: the next writer's
         // validation plans against that version and would otherwise read

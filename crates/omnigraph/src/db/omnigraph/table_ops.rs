@@ -1744,6 +1744,46 @@ pub(super) async fn commit_updates_on_branch_with_expected(
     Ok(published)
 }
 
+/// Research (group commit): publish `updates` through a coordinator the
+/// caller owns for a branch other than the handle's bound branch, as
+/// [`commit_updates_on_branch_with_expected`] does through its one-entry
+/// cache. The coordinator carries the publisher whose acknowledged rows the
+/// next publish reuses.
+pub(crate) async fn commit_updates_with_coordinator(
+    db: &Omnigraph,
+    coordinator: &mut crate::db::graph_coordinator::GraphCoordinator,
+    updates: &[crate::db::DatasetUpdate],
+    expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
+    txn: &crate::db::WriteTxn,
+    lineage_intent: crate::db::manifest::LineageIntent,
+) -> Result<crate::db::GraphCommit> {
+    let branch = txn.branch.as_deref();
+    let prepared = prepare_updates_for_commit(db, branch, updates, Some(txn))
+        .await
+        .map_err(OmniError::unpublished)?;
+    let changes = prepared
+        .iter()
+        .cloned()
+        .map(ManifestChange::Update)
+        .collect::<Vec<_>>();
+    let expectation = crate::db::manifest::GraphHeadExpectation::new(
+        branch,
+        txn.authority.branch_identifier.clone(),
+        txn.authority.graph_head.clone(),
+    );
+    let published = publish_prepared(
+        coordinator,
+        &changes,
+        expected_table_versions,
+        lineage_intent,
+        expectation,
+        Publication::Publish,
+    )
+    .await?;
+    demote_superseded_handles(db, &txn.base, updates).await;
+    Ok(published)
+}
+
 /// The publisher's refusal on the branch head is the caller's `--if-commit`
 /// miss when the write carries one: terminal `PreconditionFailed` naming the
 /// head the publisher read, as the under-gate revalidation answers it.

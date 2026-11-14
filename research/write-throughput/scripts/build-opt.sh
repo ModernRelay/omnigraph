@@ -10,6 +10,9 @@ export CARGO_TARGET_DIR=/srv/target-opt CARGO_PROFILE_DEV_OPT_LEVEL=2
 cargo test --workspace --exclude omnigraph-gqt --exclude omnigraph-gqt-served --exclude omnigraph-dst \
   --locked --features omnigraph-engine/failpoints,omnigraph-cluster/failpoints \
   -p omnigraph-engine --test integration --no-run 2>&1 | tail -3
-BIN=$(ls -t /srv/target-opt/debug/deps/integration-* | grep -v '\.d$' | while read b; do "$b" --list 2>/dev/null | grep -q concurrent_write_throughput && echo "$b" && break; done)
+BIN=""
+for b in $(ls -t /srv/target-opt/debug/deps/integration-* | grep -v '\.d$'); do
+  if "$b" --list 2>/dev/null | grep -q concurrent_write_throughput; then BIN=$b; break; fi
+done
 cp "$BIN" "/srv/bins/$NAME"
 echo "built /srv/bins/$NAME from $BIN"

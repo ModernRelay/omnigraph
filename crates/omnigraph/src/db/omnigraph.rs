@@ -1555,6 +1555,50 @@ impl Omnigraph {
         &self.group_commits
     }
 
+    /// Research (group commit): a write transaction captured from `coord`,
+    /// a coordinator the caller owns, with no probe.
+    pub(crate) async fn write_txn_from_coordinator(
+        &self,
+        coord: &GraphCoordinator,
+    ) -> Result<WriteTxn> {
+        let snapshot = coord.snapshot();
+        let (catalog, identity) = self.accepted_catalog_for_snapshot(&snapshot).await?;
+        validate_bound_catalog_against_snapshot(&catalog, &snapshot)?;
+        Ok(WriteTxn {
+            branch: coord.current_branch().map(str::to_string),
+            authority: identity
+                .write_authority(coord.branch_identifier().await?, coord.exact_graph_head()),
+            effective_graph_head: coord.effective_graph_head().await?,
+            caller_expected_graph_head: None,
+            catalog,
+            manifest_probe: coord.captured_manifest_probe(),
+            head_on_record: false,
+            unattached_base: None,
+            base: snapshot,
+        })
+    }
+
+    /// Research (group commit): publish through a caller-owned coordinator of
+    /// a branch other than the bound one.
+    pub(crate) async fn commit_updates_with_coordinator(
+        &self,
+        coordinator: &mut GraphCoordinator,
+        updates: &[crate::db::DatasetUpdate],
+        expected_table_versions: &crate::db::manifest::ExpectedTableVersions,
+        txn: &WriteTxn,
+        lineage_intent: crate::db::manifest::LineageIntent,
+    ) -> Result<crate::db::GraphCommit> {
+        table_ops::commit_updates_with_coordinator(
+            self,
+            coordinator,
+            updates,
+            expected_table_versions,
+            txn,
+            lineage_intent,
+        )
+        .await
+    }
+
     /// The bound branch and the materialized head of the handle's installed
     /// view (research: group commit).
     pub(crate) fn installed_head(&self) -> (Option<String>, Option<String>) {

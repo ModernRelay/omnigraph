@@ -1362,7 +1362,10 @@ impl Omnigraph {
                     && crate::db::group_commit::enabled()
                     && crate::db::group_commit::writer_capture_skip_enabled() =>
             {
-                self.open_write_txn_probed(requested.as_deref(), false).await
+                match self.group_view_txn(requested.as_deref(), actor_id).await {
+                    Some(captured) => captured,
+                    None => self.open_write_txn_probed(requested.as_deref(), false).await,
+                }
             }
             WriteRoute::Publish | WriteRoute::AsCommit | WriteRoute::UnattachedRoot => {
                 self.open_write_txn(requested.as_deref()).await
