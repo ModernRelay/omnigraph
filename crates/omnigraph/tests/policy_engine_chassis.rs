@@ -1151,8 +1151,16 @@ async fn cleanup_as_enforces_reclaim_before_effects() {
     let files_before = physical_tree(dir.path());
     for actor in ["act-denied", "act-writer", "act-maintainer"] {
         assert_denied(db.cleanup_as(keep_one(), Some(actor)).await, "cleanup_as");
+        assert_denied(
+            db.cleanup_report_as(keep_one(), Some(actor)).await,
+            "cleanup_report_as",
+        );
     }
     assert_no_actor(db.cleanup_as(keep_one(), None).await, "cleanup_as");
+    assert_no_actor(
+        db.cleanup_report_as(keep_one(), None).await,
+        "cleanup_report_as",
+    );
     assert_eq!(
         physical_tree(dir.path()),
         files_before,

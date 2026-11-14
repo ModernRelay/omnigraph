@@ -292,7 +292,9 @@ Files no listed manifest references follow Lance's seven-day unverified-file
 rule, including temporary manifests. Each orphan Blob sidecar must satisfy
 that age rule itself, even when its parent data file is older.
 
-Each table's result row (under `--json`) carries `bytes_removed`,
+With `--json`, a completed run reports its planning requests under
+`planning_cost`. The `table_opens` counter counts table manifests opened.
+Each table's result row carries `bytes_removed`,
 `manifests_removed` (table versions deleted: published ones no retained
 graph commit names, and dead staging), `unpublished_manifests` and
 `unpublished_bytes` (the staging the run found, dead ones included),

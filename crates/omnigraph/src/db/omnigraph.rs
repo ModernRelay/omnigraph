@@ -54,11 +54,11 @@ pub(crate) use export::{
     LogicalBlobValue, RangedExternalBlobs, logical_row_image, row_blob_values,
 };
 pub use optimize::{
-    ArtifactRefresh, ArtifactSkip, AuthorityCapture, CleanupPolicyOptions, ConfigurationClear,
-    DatasetCleanupStats, DatasetOptimizeStats, DeferReason, OptimizeBeforePublish,
-    OptimizeCancellation, OptimizeConcurrency, OptimizeLimits, OptimizePublication, OptimizeReport,
-    OptimizeRequest, ResourceExceeded, ResourceMeasure, RunCancellation, TableCeilings,
-    TableOptimizeOutcome,
+    ArtifactRefresh, ArtifactSkip, AuthorityCapture, CleanupPolicyOptions, CleanupReport,
+    ConfigurationClear, DatasetCleanupStats, DatasetOptimizeStats, DeferReason,
+    OptimizeBeforePublish, OptimizeCancellation, OptimizeConcurrency, OptimizeLimits,
+    OptimizePublication, OptimizeReport, OptimizeRequest, ResourceExceeded, ResourceMeasure,
+    RunCancellation, TableCeilings, TableOptimizeOutcome,
 };
 use prepared_create::initial_schema_ir;
 pub use prepared_create::{GraphCreateReconciliation, PreparedGraphCreate};
@@ -4044,6 +4044,15 @@ impl Omnigraph {
         options: optimize::CleanupPolicyOptions,
         actor: Option<&str>,
     ) -> Result<Vec<optimize::DatasetCleanupStats>> {
+        Ok(self.cleanup_report_as(options, actor).await?.datasets)
+    }
+
+    /// Run [`Self::cleanup_as`] and also report the cost of planning its sweep.
+    pub async fn cleanup_report_as(
+        &self,
+        options: optimize::CleanupPolicyOptions,
+        actor: Option<&str>,
+    ) -> Result<CleanupReport> {
         optimize::cleanup_all_datasets(self, options, actor).await
     }
 

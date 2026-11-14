@@ -268,7 +268,7 @@ write_surfaces! {
     ],
     "db/omnigraph.rs" => WriteProtocol::TestOnly => ["failpoint_publish_table_head_without_index_rebuild_for_test", "init_with_legacy_system_columns_for_tests"],
     "db/omnigraph.rs" => OPTIMIZE_V9 => ["optimize_as"],
-    "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup_as"],
+    "db/omnigraph.rs" => WriteProtocol::PhysicalOnly => ["cleanup_as", "cleanup_report_as"],
     "db/omnigraph.rs" => WriteProtocol::NativeRefControl => ["branch_create", "branch_create_as", "branch_create_from", "branch_create_from_as", "branch_delete", "branch_delete_as"],
 }
 
@@ -2265,6 +2265,7 @@ fn maintenance_entry_points_take_an_actor() {
         surfaces,
         BTreeSet::from([
             ("db/omnigraph.rs", "cleanup_as"),
+            ("db/omnigraph.rs", "cleanup_report_as"),
             ("db/omnigraph.rs", "ensure_indices_as"),
             ("db/omnigraph.rs", "ensure_indices_on_as"),
             ("db/omnigraph.rs", "optimize_as"),
