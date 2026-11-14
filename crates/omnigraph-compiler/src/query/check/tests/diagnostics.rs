@@ -47,7 +47,7 @@ fn every_independent_refusal_is_returned_in_one_pass_with_its_span() {
         [
             ("T1", "$p: Persn"),
             ("T6", r#"$c.nmae = "x""#),
-            ("T7", "$c.slug = 3"),
+            ("T3", "$c.slug = 3"),
             ("T6", "$c.nme"),
         ]
         .map(|(c, t)| (c.to_string(), t.to_string())),

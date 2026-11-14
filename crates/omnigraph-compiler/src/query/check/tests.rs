@@ -1650,7 +1650,7 @@ fn t3_refuses_a_literal_outside_its_property_with_the_nearest_value() {
     use crate::query::diagnostic::Applicability;
     use crate::query::syntax::parse::apply_edits;
     const LITERAL_SCHEMA: &str = r#"
-node Person { slug: String @key  status: enum(active, retired)  former: enum(active, retired)?  tags: [String]  age: I32  rank: U32  weight: F32  score: F64?  born: Date  seen: DateTime }
+node Person { slug: String @key  status: enum(active, retired)  former: enum(active, retired)?  tags: [String]  age: I32  rank: U32  weight: F32  score: F64?  born: Date  seen: DateTime  done: Bool }
 edge Knows: Person -> Person
 "#;
     let catalog = build_catalog(&parse_schema(LITERAL_SCHEMA).unwrap()).unwrap();
@@ -1694,10 +1694,29 @@ edge Knows: Person -> Person
             "$p.rank > 0",
             "has type U32 but got -1, outside its range 0 to 4294967295",
         ),
+        // A number against a property that is not numeric: the nearest
+        // allowed value is its text as a String, the enum value nearest that
+        // text, or a Bool.
         (
-            "$p.weight < 1.0e39",
-            "$p.weight < 340282346638528860000000000000000000000.0",
-            "has type F32 but got",
+            "$p.slug = 3",
+            "$p.slug = \"3\"",
+            "has type String, which is not numeric, but got the number 3",
+        ),
+        (
+            "2.5 != $p.status",
+            "\"active\" != $p.status",
+            "has type enum(active, retired), which is not numeric, but got the number 2.5",
+        ),
+        (
+            "$p.done = 0",
+            "$p.done = false",
+            "has type Bool, which is not numeric, but got the number 0",
+        ),
+        ("$p.slug in [7]", "$p.slug in [\"7\"]", "got the number 7"),
+        (
+            "1 in $p.tags",
+            "\"1\" in $p.tags",
+            "has type String, which is not numeric, but got the number 1",
         ),
         (
             "$p.born > date(\"1970-13-32\")",
@@ -1765,6 +1784,8 @@ edge Knows: Person -> Person
             read("$p.seen > datetime(\"2024-01-01T25:00:00Z\")"),
             "datetime(\"YYYY-MM-DDTHH:MM:SSZ\")",
         ),
+        (read("$p.born > 2024"), "date(\"YYYY-MM-DD\")"),
+        (read("$p.seen < 1.5"), "datetime(\"YYYY-MM-DDTHH:MM:SSZ\")"),
         (read("starts_with($p.status, \"ret_\")"), "\"retired\""),
         (read("contains($p.status, \"xyz\")"), "\"active\""),
     ] {
@@ -1784,6 +1805,9 @@ edge Knows: Person -> Person
         "$p.status in [\"active\", \"retired\"] and \"anything\" in $p.tags",
         "$p.age > -2147483648 and $p.age < 2147483647 and $p.rank >= 0",
         "$p.weight > 1 and $p.score > 2 and $p.score < 2.5 and $p.weight < 0.5",
+        // A float against an `F32` compares as `F64`, outside `F32`'s range
+        // too.
+        "$p.weight < 1.0e39 and $p.weight > -1.0e39",
         "$p.age > 2.5 and $p.rank in [1, 2.5] and 9007199254740992.0 = $p.age",
         "$p.born > date(\"1970-01-01\") and $p.seen < datetime(\"2024-01-01T00:00:00Z\")",
         "starts_with($p.status, \"ret\") and contains($p.status, \"tiv\")",
@@ -1795,6 +1819,16 @@ edge Knows: Person -> Person
         "query q($s: String, $n: I64) { match { $p: Person } where $p.status = $s and $p.age < $n return { $p.slug } }",
     )
     .expect("a parameter keeps its declared type");
+    // A fractional float against an integer property compares as `F64`
+    // through a `Cast` of the property, whose fraction it keeps.
+    let checked = outcome(&read("$p.age > 2.5")).expect("admitted");
+    let rendered = format!("{:?}", checked.core);
+    assert!(
+        rendered.contains(
+            "left: Cast { expr: PropAccess { variable: \"p\", property: \"age\", ty: Value { scalar: I32, list: false, nullable: false } }, ty: Value { scalar: F64, list: false, nullable: false } }, op: Compare(Gt), right: Literal(Float(2.5), Value { scalar: F64"
+        ),
+        "{rendered}"
+    );
 }
 
 /// The checked-literal example of the diagnostics guide

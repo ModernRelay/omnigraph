@@ -1931,8 +1931,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "  --> line 1, column 41",
-                "error[T7]: cannot compare String with I64",
+                "error[T3]: property `slug` has type String, which is not numeric, but got the number 3",
                 "  --> line 1, column 60",
+                "  fix: \"3\"",
             ]
         );
     }

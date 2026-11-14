@@ -1,10 +1,9 @@
 # Diagnostics
 
 Every refusal of a query carries four things: a stable code, where the failure
-is, what was expected or violated, and one concrete fix. The reader is often
-an agent that treats an error as the documentation it acts on, so the fix
-names the construct to use, not the rule that was broken. A refusal with no
-fix names the decision instead.
+is, what was expected or violated, and one concrete fix. The reader is often an
+agent that treats an error as the documentation it acts on, so the fix names
+the construct to use, not the rule broken; with no fix, the decision is named.
 
 | Field | Meaning |
 |---|---|
@@ -25,16 +24,16 @@ fields travel beside it.
 ## Every refusal in one pass
 
 A compile returns every independent refusal of its earliest refusing stage
-in one pass, in source order, each with its span; the first is the
-diagnostic and the `error` line, the others its `further` list. The stages
-are parsing, then name resolution and typing (`T83`, `T81` and `T86`
-included). After a parse refusal the parser resumes at the next element,
-return item or order key, assignment, argument, parameter, `where`,
-statement or declaration. The type checker checks every element, conjunct,
-item, key, statement, assignment and operand, in blocks, `optional`s and
-inline reads too, and gives a refused construct an error type that passes
-every check: what reads a name a refused construct would bind is not
-reported, and a block or inline read holding a refusal is of that type.
+in one pass, in source order, each with its span; the first is the diagnostic
+and the `error` line, the others its `further` list. The stages are parsing,
+then name resolution and typing (`T83`, `T81` and `T86` included). After a
+parse refusal the parser resumes at the next element, return item or order
+key, assignment, argument, parameter, `where`, statement or declaration. The
+type checker checks every element, conjunct, item, key, statement,
+assignment and operand, in blocks, `optional`s and inline reads too, and
+gives a refused construct an error type that passes every check: what reads
+a name a refused construct would bind is not reported, and a block or inline
+read holding a refusal is of that type.
 
 ```text
 query q() { match { $c: Company } where $c.names = "x" and $c.slug = 3 return { $c } }
@@ -43,8 +42,9 @@ query q() { match { $c: Company } where $c.names = "x" and $c.slug = 3 return { 
 ```text
 error[T6]: type error: T6: type `Company` has no property `names`; nearest: name (String), slug (String)
   --> line 1, column 41
-error[T7]: cannot compare String with I64
+error[T3]: property `slug` has type String, which is not numeric, but got the number 3
   --> line 1, column 60
+  fix: "3"
 ```
 
 An unknown type, property, edge, variable, return alias, option or parameter
@@ -99,19 +99,19 @@ Incomplete or ambiguous input can receive textual guidance without
 A literal compared with a property, or listed in an `in` against one, is
 checked against the property's type wherever it is written: a `where`, a
 block's or an `optional`'s `where`, a write group's `where` and a `let`, in
-either operand order. An enum value outside the declared set, an integer
-outside the property's range, a float outside the `F32` range and a `date(…)`
-or `datetime(…)` that does not parse are `T3`, so a misspelled enum value is
-refused instead of matching no rows. A float against an integer property is
-admitted: it compares through a cast and keeps its fraction. `contains(…)` and
-`starts_with(…)` over an enum property refuse a literal that no declared value
-passes. A parameter keeps its declared type and is not checked against the
-property's domain.
+either operand order. An enum value outside the declared set, a number against
+a property that is not numeric, an integer outside an integer property's range
+and a `date(…)` or `datetime(…)` that does not parse are `T3`, so a misspelled
+enum value is refused instead of matching no rows. A float against an integer
+or `F32` property is admitted: it compares through a cast and keeps its
+fraction. `contains(…)` and `starts_with(…)` over an enum property refuse a
+literal that no declared value passes. A parameter is not checked.
 
 The fix names the nearest allowed value: the closest enum value by edit
-distance, the range bound or the nearest calendar day. Where the literal was
-written in a comparison or an `in`, `suggestion` writes that value in its place
-as `needs_review`, since the intended value is a guess. This source:
+distance, the range bound, the nearest calendar day, or a number's text as a
+String (`true` or `false` for a Bool). Where the literal was written in a
+comparison or an `in`, `suggestion` writes that value in its place as
+`needs_review`, since the intended value is a guess. This source:
 
 ```text
 query open_prs() { match { $pr: PullRequest } where $pr.status = "Closed" return { $pr.title } }

@@ -211,12 +211,15 @@ pub(crate) struct LiteralMismatch {
 
 /// A literal compared with a property, or listed in an `in` against one,
 /// checked against the property's scalar type `expected`: an enum value
-/// outside the declared set, an integer outside the type's range, a float
-/// outside `F32`'s range, and a `Date` or `DateTime` that does not parse.
-/// Edition 2 checked these inside property braces; without the check a
-/// misspelled enum value returns no rows. A literal of an incompatible type
-/// is left to the comparison's own refusal, and every other pairing is
-/// admitted as before.
+/// outside the declared set, a number against a property that is not
+/// numeric (a String, an enum, a Bool, a Date or a DateTime), an integer
+/// outside an integer property's range, and a `Date` or `DateTime` that
+/// does not parse. Edition 2 checked these inside property braces; without
+/// the check a misspelled enum value returns no rows. A float against an
+/// integer property is not refused: the comparison casts it (section 2's
+/// numeric comparison), and so is a float against an `F32`, compared as
+/// `F64`. A literal of another incompatible type is left to the
+/// comparison's own refusal, and every other pairing is admitted as before.
 pub(crate) fn compared_literal(
     lit: &Literal,
     expected: &PropType,
@@ -242,7 +245,7 @@ pub(crate) fn compared_literal(
                 replacement: Some(nearest),
             })
         }
-        (Literal::Integer(n), scalar) => {
+        (Literal::Integer(n), scalar) if scalar.is_numeric() => {
             let (low, high) = integer_range(scalar)?;
             if (low..=high).contains(n) {
                 return None;
@@ -256,22 +259,9 @@ pub(crate) fn compared_literal(
                 replacement: Some(bound),
             })
         }
-        // A float against an integer property compares through a cast to
-        // `F64`, which keeps the fraction (`$p.age > 2.5`), so it is not
-        // refused; only an `F32` property bounds a float literal.
-        (Literal::Float(f), ScalarType::F32) => {
-            let max = f64::from(f32::MAX);
-            if f.abs() <= max {
-                return None;
-            }
-            let bound = Literal::Float(max.copysign(*f)).to_string();
-            Some(LiteralMismatch {
-                message: format!(
-                    "property `{prop}` has type {ty} but got {lit}, outside its range -{max:e} to {max:e}"
-                ),
-                fix: bound.clone(),
-                replacement: Some(bound),
-            })
+        // A number against a property that is not numeric.
+        (Literal::Integer(_) | Literal::Float(_), scalar) if !scalar.is_numeric() => {
+            number_against(lit, expected, prop)
         }
         (Literal::Date(value), ScalarType::Date) => {
             let reason = date_literal_days(value).err()?;
@@ -298,6 +288,47 @@ pub(crate) fn compared_literal(
         }
         _ => None,
     }
+}
+
+/// `T3` for a number compared with a property that is not numeric. The
+/// nearest allowed value is the number's text as a String, the enum value
+/// nearest that text, or `false` for zero and `true` otherwise for a Bool; a
+/// Date or DateTime has none, and the fix names its literal form. A Vector or
+/// a Blob is no comparable value, which the comparison refuses itself.
+fn number_against(lit: &Literal, expected: &PropType, prop: &str) -> Option<LiteralMismatch> {
+    let ty = expected.display_name();
+    let text = lit.to_string();
+    let (fix, replacement) = match expected.scalar {
+        ScalarType::String => match expected.enum_values.as_deref() {
+            Some(allowed) => {
+                let nearest = Literal::String(nearest_value(&text, allowed)?.clone()).to_string();
+                (nearest.clone(), Some(nearest))
+            }
+            None => {
+                let quoted = Literal::String(text.clone()).to_string();
+                (quoted.clone(), Some(quoted))
+            }
+        },
+        ScalarType::Bool => {
+            let zero = match lit {
+                Literal::Integer(n) => *n == 0,
+                Literal::Float(f) => *f == 0.0,
+                _ => false,
+            };
+            let nearest = if zero { "false" } else { "true" }.to_string();
+            (nearest.clone(), Some(nearest))
+        }
+        ScalarType::Date => ("date(\"YYYY-MM-DD\")".to_string(), None),
+        ScalarType::DateTime => ("datetime(\"YYYY-MM-DDTHH:MM:SSZ\")".to_string(), None),
+        _ => return None,
+    };
+    Some(LiteralMismatch {
+        message: format!(
+            "property `{prop}` has type {ty}, which is not numeric, but got the number {text}"
+        ),
+        fix,
+        replacement,
+    })
 }
 
 /// A literal a string function tests an enum property with (`contains`,

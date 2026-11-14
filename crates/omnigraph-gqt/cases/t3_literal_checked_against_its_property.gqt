@@ -3,8 +3,9 @@
 # notes: A literal compared with a property, or listed in an `in` against one, is checked against the property's type wherever it is written: a
 # notes: read's `where` (either operand order), an `in` list, a block's `where`, an `optional`'s `where`, a write group's `where` and a `let`. An
 # notes: enum value outside the declared set (also as a `starts_with` argument), an integer outside an I32's range and a malformed date
-# notes: are `T3`, where they used to type-check and return no rows (or fail at execution); valid literals of each kind still run, a
-# notes: fractional float against an integer property among them (it compares through a cast and keeps the fraction).
+# notes: are `T3`, where they used to type-check and return no rows (or fail at execution), and so is a number against a property that
+# notes: is not numeric (a String, an enum, a Date). Valid literals of each kind still run, a fractional float against an integer
+# notes: property among them: it is not `T3`, and compares as `F64` through a cast of the property, keeping the fraction.
 
 --- runner
 timeout_ms: 10000
@@ -96,6 +97,41 @@ query malformed_date() {
     return { $p.slug }
 }
 --- expect error: T3: property `born` has type Date but got the malformed date "1970-13-01"
+
+--- query
+query number_against_a_string() {
+    match { $p: Person } where $p.slug = 3
+    return { $p.slug }
+}
+--- expect error: T3: property `slug` has type String, which is not numeric, but got the number 3
+
+--- query
+query number_against_an_enum() {
+    match { $p: Person } where 1 != $p.status
+    return { $p.slug }
+}
+--- expect error: T3: property `status` has type enum(active, retired), which is not numeric, but got the number 1
+
+--- query
+query number_against_a_date() {
+    match { $p: Person } where $p.born > 1985
+    return { $p.slug }
+}
+--- expect error: T3: property `born` has type Date, which is not numeric, but got the number 1985
+
+--- query
+query float_against_an_integer_compares_as_f64() {
+    match { $p: Person } where $p.age > 39.5
+    return { $p.slug }
+}
+--- expect unordered
+{"p.slug":"a"}
+{"p.slug":"b"}
+--- expect shape
+p.slug: String
+--- expect plan
+cast $p.age: I32 -> F64
+type 39.5: F64
 
 --- query
 query valid_literals_still_run() {
