@@ -321,8 +321,11 @@ query vector_search($q: Vector(3072)) {
 first argument is the population (named with `let` before the ranking, its
 `return` listing the bindings the query reads on), the second the ranked
 property, and `from` adds the score column under the name its `as` writes,
-`as $distance` for `nearest` and `as $score` for `bm25` and `rrf`; a ranked
-`from` without `as` is `T85`, and so is an `as` on a `from` that ranks nothing.
+for example `as $distance` for `nearest` and `as $score` for `bm25` and
+`rrf`; no score column has a fixed name. A `from` whose relation carries an
+unnamed score (a ranking function, or a `let` name bound to one) without `as`
+is `T85`, and so is an `as` on any other `from`, an inline read returning a
+named score included.
 Order by it (`order { $distance }`, `order { $score desc }`), at any position
 of `order`; elements and `where` after the `from` run over the selected rows,
 which nothing refills; a ranking written as a call in `order` or `return` is `T65`, with the `from`
@@ -332,8 +335,8 @@ of its arms' candidates. `nearest` requires its window `k` (`T17`), the number
 of nearest targets it keeps with all their rows; the `limit` is a separate cut.
 BM25 needs neither, though a limit is recommended for bounded output.
 
-Return the score by its name, `$distance`/`$score` (column `distance`/`score`), or alias
-it; see [`search.md`](search.md#projecting-scores). Search predicates
+Return the score by the name `as` gave it (`as $near` returns the column
+`near`), or alias it; see [`search.md`](search.md#projecting-scores). Search predicates
 (`search`, `fuzzy`, `match_text`) are Boolean operands in `where`, under
 `not` and `or` too, and are not return items in this release (`T86`). A ranked read's JSON carries a `ranking` object; see
 [`search.md`](search.md#what-a-ranked-read-reports).

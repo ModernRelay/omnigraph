@@ -340,22 +340,33 @@ fn infix_string(op: InfixStringOp, at: &SourceSpan, list: bool) -> QueryDiagnost
 
 /// The score column a ranking term appends: the term is a ranking, drawn
 /// directly or through a named relation.
-fn score_column(term: &Term) -> Option<&str> {
-    match term {
-        Term::Score { out, .. } | Term::ApproxTopK { out, .. } | Term::Fuse { out, .. } => {
-            Some(out)
-        }
-        _ => None,
+/// The name `T85`'s fix gives a ranking function's score.
+fn default_score_name(function: &str) -> &'static str {
+    match function {
+        "bm25" | "rrf" => "score",
+        _ => "distance",
     }
 }
 
-/// A ranking drawn by a `from` whose `as` names its score: the score column
-/// takes the written name.
+/// `base`, or its first numbered variant, that no column of `ty` has.
+fn unused_column(base: &str, ty: &RelTy) -> String {
+    let mut name = base.to_string();
+    let mut n = 2;
+    while ty.get(&name).is_some() {
+        name = format!("{base}{n}");
+        n += 1;
+    }
+    name
+}
+
+/// A relation carrying an unnamed score, drawn by a `from` whose `as` names
+/// it: the score column takes the written name, and the relation then
+/// carries a named score.
 fn rename_score(r: &mut Rel, name: &str) -> R<()> {
-    let at = match &r.term {
-        Term::Fuse { .. } => 1,
-        _ => r.ty.cols.len() - 1,
-    };
+    let at = r
+        .score
+        .take()
+        .expect("the relation carries an unnamed score");
     if r.ty.cols[at].name == name {
         return Ok(());
     }
@@ -367,25 +378,27 @@ fn rename_score(r: &mut Rel, name: &str) -> R<()> {
         ));
     }
     r.ty.cols[at].name = name.to_string();
-    match &mut r.term {
+    rename_score_term(&mut r.term, name);
+    Ok(())
+}
+
+/// The term that computes a relation's unnamed score writes it under
+/// `name`: the ranking itself, or the ranking a named relation is bound to.
+fn rename_score_term(term: &mut Term, name: &str) {
+    match term {
         Term::Score { out, .. } | Term::ApproxTopK { out, .. } | Term::Fuse { out, .. } => {
             *out = name.to_string()
         }
-        _ => unreachable!("score_column holds"),
+        other => unreachable!("an unnamed score is a ranking's: {other:?}"),
     }
-    Ok(())
 }
 
 /// A ranking in a relation function's argument: its score has no name, so
 /// the relation keeps only its population's columns (an `rrf` arm is read
 /// whole, since fusion keeps only the target and the fused score).
 fn unnamed_score(r: Rel) -> Rel {
-    if score_column(&r.term).is_none() {
+    let Some(at) = r.score else {
         return r;
-    }
-    let at = match &r.term {
-        Term::Fuse { .. } => 1,
-        _ => r.ty.cols.len() - 1,
     };
     let mut cols = r.ty.cols;
     cols.remove(at);
@@ -408,7 +421,20 @@ fn unnamed_score(r: Rel) -> Rel {
         ty: RelTy { cols },
         shaped,
         ranked: None,
+        score: None,
         free: r.free,
+    }
+}
+
+/// The name `T85`'s fix gives the unnamed score `term` computes.
+fn ranking_function(term: &Term) -> &'static str {
+    match term {
+        Term::Score {
+            kind: ScoreKind::Bm25,
+            ..
+        }
+        | Term::Fuse { .. } => default_score_name("rrf"),
+        _ => default_score_name("distance"),
     }
 }
 
@@ -421,9 +447,9 @@ fn relation_text(rel: &RelExpr) -> String {
     }
 }
 
-/// `T85` for a ranked `from` without `as`; the fix names the score as the
-/// column it was before names were written (`distance`, `score`), or a fresh
-/// variant of it.
+/// `T85` for a `from` whose relation carries an unnamed score and that has
+/// no `as`; the fix names the score `$distance` for a distance and `$score`
+/// for a relevance or fused score, or a fresh variant of it.
 fn unnamed_ranking(rel: &RelExpr, name: &str, span: Option<&SourceSpan>) -> QueryDiagnostic {
     let mut d = QueryDiagnostic::typecheck(
         T85,
@@ -450,13 +476,14 @@ fn unnamed_ranking(rel: &RelExpr, name: &str, span: Option<&SourceSpan>) -> Quer
     d
 }
 
-/// `T85` for an `as` on a `from` that ranks nothing: its columns are named
+/// `T85` for an `as` on a `from` whose relation carries no unnamed score
+/// (it ranks nothing, or returns its score named): its columns are named
 /// by its relation, so the fix removes the `as`.
 fn named_non_ranking(rel: &RelExpr, name: &str, span: Option<&SourceSpan>) -> QueryDiagnostic {
     let mut d = QueryDiagnostic::typecheck(
         T85,
         format!(
-            "`from {} as ${name}`: `as` names a ranking's score, and this `from` ranks nothing; its columns are named by its relation",
+            "`from {} as ${name}`: `as` names an unnamed score, and this `from`'s relation carries none; its columns are named by its relation",
             relation_text(rel)
         ),
     )
@@ -897,6 +924,12 @@ struct Rel {
     /// item as written, which the refusal names.
     shaped: Vec<Option<String>>,
     ranked: Option<Ranked>,
+    /// The column of the unnamed score the relation carries: a ranking
+    /// function's result, and so a named relation bound to one. A `from`
+    /// drawing it names the score with `as` (`T85`), and a relation
+    /// function's argument drops it. Any other relation, an inline read
+    /// returning a named score included, carries none.
+    score: Option<usize>,
     /// The outer columns the relation reads.
     free: Vec<String>,
 }
@@ -1948,6 +1981,7 @@ impl Ctx<'_> {
             ty: RelTy { cols: out_cols },
             shaped,
             ranked: ordered_ranked,
+            score: None,
             free: sc.free.clone(),
         })
     }
@@ -3020,31 +3054,43 @@ impl Ctx<'_> {
 
     /// The relation a `from` draws. A ranking's score enters scope under the
     /// name its `as` writes, and only there: `as` is required on a `from`
-    /// whose relation ranks, a ranking function or a named relation bound to
-    /// one, and refused on any other (`T85`).
+    /// whose relation's type carries an unnamed score, a ranking function's
+    /// result or a named relation bound to one, and refused on any other
+    /// (`T85`), an inline read that returns a named score included.
     fn drawn_rel(&mut self, sc: &mut Scope, rel: &RelExpr, score: Option<&str>) -> R<Rel> {
         // Typing the relation checks its own elements, so the `from`'s span
         // is taken first.
         let span = self.element_span.clone();
+        // A ranking function written in the `from` names its score as it
+        // ranks.
+        let mut named_here = false;
         let mut r = match rel {
             RelExpr::Call(c) if matches!(c.name.as_str(), "distance" | "bm25" | "nearest") => {
+                named_here = score.is_some();
                 self.ranking(sc, c, score)?
             }
-            RelExpr::Call(c) if c.name == "rrf" => self.rrf(sc, c, score)?,
+            RelExpr::Call(c) if c.name == "rrf" => {
+                named_here = score.is_some();
+                self.rrf(sc, c, score)?
+            }
             _ => self.rel_expr(sc, &RelArg::Rel(rel))?,
         };
         let span = span.as_ref();
-        match (score_column(&r.term), score) {
+        match (r.score, score) {
             (None, None) => {}
+            (None, Some(_)) if named_here => {}
             (Some(_), Some(name)) => rename_score(&mut r, name)?,
-            (Some(column), None) => {
-                let base = column.to_string();
-                let mut name = base.clone();
+            (Some(at), None) => {
+                let base = ranking_function(&r.term);
+                let mut name = base.to_string();
                 let mut n = 2;
                 while sc.in_scope(&name)
                     || sc.future.contains(&name)
-                    || r.ty.cols.iter().filter(|c| c.name == name).count()
-                        > usize::from(name == base)
+                    || r.ty
+                        .cols
+                        .iter()
+                        .enumerate()
+                        .any(|(i, c)| i != at && c.name == name)
                 {
                     name = format!("{base}{n}");
                     n += 1;
@@ -3179,6 +3225,7 @@ impl Ctx<'_> {
                 ty: RelTy { cols },
                 shaped: acc.shaped,
                 ranked: None,
+                score: None,
                 free,
             };
         }
@@ -3309,25 +3356,28 @@ impl Ctx<'_> {
                 ));
             }
         };
-        let (kind, out) = match name {
-            "bm25" => (ScoreKind::Bm25, named.unwrap_or("score")),
-            _ => (ScoreKind::Distance, named.unwrap_or("distance")),
+        let kind = match name {
+            "bm25" => ScoreKind::Bm25,
+            _ => ScoreKind::Distance,
         };
-        if pop.ty.get(out).is_some() {
-            return Err(err_fix(
-                T68,
-                match named {
-                    Some(_) => format!(
-                        "`as ${out}` names the score after a column `{name}`'s population already has"
-                    ),
-                    None => format!("`{name}`'s population already has a `{out}` column"),
-                },
-                match named {
-                    Some(_) => "name the score another way: `as $<name>`".to_string(),
-                    None => format!("alias it on the population's `return`: `${out} as {out}0`"),
-                },
-            ));
-        }
+        // An unnamed score is read by no expression, so its column takes a
+        // name no population column has.
+        let out = match named {
+            Some(out) => {
+                if pop.ty.get(out).is_some() {
+                    return Err(err_fix(
+                        T68,
+                        format!(
+                            "`as ${out}` names the score after a column `{name}`'s population already has"
+                        ),
+                        "name the score another way: `as $<name>`",
+                    ));
+                }
+                out.to_string()
+            }
+            None => unused_column(default_score_name(name), &pop.ty),
+        };
+        let out = out.as_str();
         let query = if name == "bm25" {
             if !matches!(prop.scalar, ScalarType::String) || prop.list {
                 return Err(err(
@@ -3398,6 +3448,7 @@ impl Ctx<'_> {
         // does not yet run.
         let out_ty = Ty::scalar(ScalarType::F32, false);
         let _ = kind;
+        let score_at = pop.ty.cols.len();
         let mut cols = pop.ty.cols.clone();
         cols.push(Col {
             name: out.to_string(),
@@ -3457,6 +3508,7 @@ impl Ctx<'_> {
             ty: RelTy { cols },
             shaped,
             ranked: Some(Ranked { column, identity }),
+            score: named.is_none().then_some(score_at),
             free: pop.free,
         })
     }
@@ -3659,14 +3711,25 @@ impl Ctx<'_> {
             }
         }
         let target = first_ranked.column.clone();
-        let out = named.unwrap_or("score").to_string();
-        if out == target {
-            return Err(err_fix(
-                T68,
-                format!("`rrf`'s score is named `${out}`, its target column's name"),
-                "name the score another way: `as $<name>`",
-            ));
-        }
+        let out = match named {
+            Some(out) if out == target => {
+                return Err(err_fix(
+                    T68,
+                    format!("`rrf`'s score is named `${out}`, its target column's name"),
+                    "name the score another way: `as $<name>`",
+                ));
+            }
+            Some(out) => out.to_string(),
+            None => unused_column(
+                default_score_name("rrf"),
+                &RelTy {
+                    cols: vec![Col {
+                        name: target.clone(),
+                        ty: target_ty.clone(),
+                    }],
+                },
+            ),
+        };
         let mut free = Vec::new();
         for (r, _) in &arms {
             for f in &r.free {
@@ -3700,6 +3763,7 @@ impl Ctx<'_> {
                 column: target,
                 identity: None,
             }),
+            score: named.is_none().then_some(1),
             free,
         })
     }
@@ -3828,6 +3892,7 @@ impl Ctx<'_> {
                 ty,
                 shaped: vec![None; n],
                 ranked: None,
+                score: None,
                 free: Vec::new(),
             });
         }
@@ -3864,6 +3929,7 @@ impl Ctx<'_> {
             ty,
             shaped,
             ranked: None,
+            score: None,
             free: Vec::new(),
         })
     }

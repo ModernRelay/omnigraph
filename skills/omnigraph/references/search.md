@@ -77,8 +77,9 @@ with `as`: `from nearest(rel, $c.embedding, $q, k: n) as $distance`,
 named with `let` before the ranking, `let $pop = { match { … } where … return { $c } }`,
 whose `return` lists every binding the rest of the query reads (an inline read
 in its place also works). `from` adds the population's columns and the score
-under the name `as` writes; a ranked `from` without `as`, or an `as` on a
-`from` that ranks nothing, is refused (`T85`) with the fix printed. Inside an
+under the name `as` writes; a `from` over a ranking (or a `let` name bound to
+one) without `as`, or an `as` on any other `from`, is refused (`T85`) with the
+fix printed. Inside an
 `rrf` arm a score has no name. A ranking written as a call in `order` or
 `return` (`order { nearest($c.embedding, $q) }`) is refused (`T65`), and the
 diagnostic prints the let-first `from` form as a machine-applicable fix.
@@ -168,11 +169,13 @@ query scored_titles($q: String) {
 }
 ```
 
-`$distance as distance` works the same way and returns squared L2
-distance, and an `rrf` score is the fused score as `F64`. Without an alias,
-the result column is the score's name (`$score` gives `score`, `$distance`
-gives `distance`); `$score as _score` and `$distance as _distance` give those
-names. Full-text predicates are not return
+A distance drawn `as $distance` works the same way and returns squared L2
+distance, and an `rrf` score is the fused score as `F64`. No score column has
+a fixed name: it is the name the `from`'s `as` writes (`as $relevance`
+returns the column `relevance`), and an alias in `return` renames it like any
+column. A `let` name bound to a ranking carries an unnamed score too, so its
+`from` takes `as`; an inline read that returns a named score takes none
+(`T85`). Full-text predicates are not return
 items in this release (`T86`).
 
 A ranking may feed aggregates, but it only selects the rows that are
@@ -195,7 +198,8 @@ line, `POST /query`, stored-query calls):
 or fused score. `exhaustive: false` means the `ann_nprobes` cap left
 partitions unsearched, so a nearer row may exist (raise `ann_nprobes`); `bm25`
 is always exhaustive, and `rrf` is when every `nearest` arm is. `score_columns`
-lists the returned columns that hold the ranking's own score. A read that
+lists the returned columns that hold the ranking's own score, by the names
+the read returns them under (`["score"]` above for `$score as score`). A read that
 draws from no ranking has no `ranking`.
 
 ### Text filter (not ranking — no `limit` required)

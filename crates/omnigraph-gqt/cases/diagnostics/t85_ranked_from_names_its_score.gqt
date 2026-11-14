@@ -1,8 +1,8 @@
 # issue: none
 # notes: A ranked `from` names its score with `as`, and the score enters scope only under that name: `as` is required on a
-# notes: `from` whose relation is a ranking function, and refused on any other, whose columns its relation names. Both are
-# notes: `T85` at the `from`, the fix writing `as $distance` (the column the score was) or removing the `as`. Nothing
-# notes: executes.
+# notes: `from` whose relation's type carries an unnamed score, a ranking function's result or a `let` name bound to one, and
+# notes: refused on any other, an inline read that returns a named score included, whose columns its relation names. Both
+# notes: are `T85` at the `from`, the fix writing `as $distance` or removing the `as`. Nothing executes.
 
 --- runner
 timeout_ms: 10000
@@ -28,4 +28,14 @@ query near($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d }
 --- query
 query docs() { match { let $docs = { match { $d: Doc } return { $d } }, from $docs as $s } return { $d.slug } }
 
---- expect error: type error: T85: `from $docs as $s`: `as` names a ranking's score, and this `from` ranks nothing
+--- expect error: type error: T85: `from $docs as $s`: `as` names an unnamed score, and this `from`'s relation carries none
+
+--- query
+query near_by_name($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, let $near = nearest($pop, $d.embedding, $q, k: 2), from $near } return { $d.slug } }
+
+--- expect error: type error: T85: `from $near` ranks without naming its score
+
+--- query
+query wrapped($q: Vector(3)) { match { from { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $dist } return { $d, $dist } } as $s } return { $d.slug } }
+
+--- expect error: type error: T85: `from { … } as $s`: `as` names an unnamed score, and this `from`'s relation carries none

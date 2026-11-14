@@ -12,7 +12,7 @@ with `as`.
 | `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by L2 distance, with the distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
 | `distance(rel, $d.embedding, $q)` | Every row of `rel` with the exact squared L2 distance of its vector to `$q` as the score; a row whose vector is null is dropped. `$q` may be a vector or text, as for `nearest`. |
 | `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their BM25 relevance as the score. |
-| `rrf(ranking, ranking, k: 60)` | Two rankings of one population fused with Reciprocal Rank Fusion, the fused score as the score. The default `k` is 60. |
+| `rrf(ranking, ranking, k: 60)` | Two rankings of one population fused with Reciprocal Rank Fusion: the result has the ranked node column and the fused score, named by the `as` of the `from` that draws it, and nothing else. The default `k` is 60. |
 | `search($d.body, $q)` | Full-text token search. |
 | `fuzzy($d.body, $q, max_edits: n)` | Full-text search with edit-distance tolerance. |
 | `match_text($d.body, $q)` | Match a full-text query in a `match` block. |
@@ -22,12 +22,17 @@ The first argument of a ranking is the population it ranks: a relation a
 whose `return` names the bindings the rest of the query reads, or the same
 inline read in its place. The second is the ranked property of a node binding
 of that population. `from` adds the population's columns and the score column
-to the query, and `as` names the score: `from nearest($pop, $d.embedding, $q,
-k: 10) as $distance`. A `from` that ranks without `as`, or an `as` on a `from`
-that ranks nothing, is refused (`T85`), so a score enters scope only under the
-name written; inside a relation function's argument, such as an `rrf` arm, a
-score has no name. Return the score (`$distance`, or aliased,
-`$score as score`) and order by it, `order { $distance }` for a distance and
+to the query, under the name its `as` writes: `from nearest($pop, $d.embedding,
+$q, k: 10) as $distance` names it `$distance`, and `as $near` would name it
+`$near`; no score column has a fixed name. The rule reads the relation's type:
+a ranking function's result carries an unnamed score, and so does a `let` name
+bound to one, so `let $r = nearest(...)` then `from $r` needs `as`, while an
+inline read that returns a named score carries none. A `from` over an unnamed
+score without `as`, or an `as` on any other `from`, is refused (`T85`), so a
+score enters scope only under the name written. Inside a relation function's
+argument, such as an `rrf` arm, a score stays unnamed: nothing reads it, and
+`rrf` consumes it as the arm's ranking. Return the score by the name `as` gave
+it, aliased or not, and order by it, `order { $distance }` for a distance and
 `order { $score desc }` for a relevance score. The score is an ordinary
 column: it may be any `order` key, in either direction, or none.
 Elements and a `where` written after the `from` run over the rows the ranking
@@ -178,12 +183,12 @@ query relevant($q: String) {
 }
 ```
 
-`score` is the relevance the ranking used, the one value the `$score` column
-holds. `nearest` gives its distance the same way, the squared L2 distance
-Lance ranks by, and `rrf` gives the fused score as an `F64`. Without an alias
-the result column takes the score's name, `$score` giving `score` and
-`$distance` giving `distance`; write `$score as _score` or
-`$distance as _distance` for those names. A search
+The column `as` names, `$score` here, holds the relevance the ranking used.
+`nearest` and `distance` give the squared L2 distance Lance ranks by, and
+`rrf` gives the fused score as an `F64`. Without an alias the result column
+takes the name `as` gave the score (`as $relevance`, returned as
+`$relevance`, is the column `relevance`); an alias in `return` renames it like
+any column. A search
 predicate, `search(...)`, `fuzzy(...)` or `match_text(...)`, is a filter and
 not a return item in this release (`T86`). An aggregate reads the score as a
 column of every row the ranking keeps: `return { max($score) as best }` is
@@ -196,8 +201,8 @@ not accelerate equality, `starts_with(...)`, or literal substring `contains(...)
 
 Reciprocal Rank Fusion combines rankings without assuming their raw scores use
 the same scale. Name the population once with `let` and rank it in both arms;
-`from rrf(...) as $score` draws one row per target with the fused score as
-`$score`:
+`from rrf(...) as $score` draws one row per target with the fused score under
+the name its `as` writes, `$score` here:
 
 ```gq
 query hybrid($vector: Vector(4), $text: String) {
@@ -218,8 +223,8 @@ bindings: the fused target would be a pair.
 Ranking order is a contract, not a side effect: search-ordered results are
 sorted on the search score itself, including through multi-hop traversals, with
 secondary keys and the entity-id tie-break applied after the score. A fused
-order sorts every row by the fused score, then the keys written after
-`$score`, then every binding's id, and `limit` counts rows after that order;
+order sorts every row by the fused score, then the keys written after it,
+then every binding's id, and `limit` counts rows after that order;
 an entity that fans out to several rows contributes each of them. The full
 ordering contract lives on the [queries page](../queries/index.md).
 

@@ -197,7 +197,7 @@ limit 20
 Return expressions include variables, properties, literals, `now()`, `count`,
 `sum`, `avg`, `min`, `max`, and a [ranking](../search/index.md)'s score, named
 by its `from`'s `as` (`T85`). Each gives one column named by its alias or
-expression (`$p.name` gives `p.name`, `$score` gives `score`); duplicates are
+expression (`$p.name` gives `p.name`; a score drawn `as $s` gives `s`); duplicates are
 refused (`T25`).
 
 Integer `sum` accumulates exactly in 128 bits and rounds once to `F64`; `avg`

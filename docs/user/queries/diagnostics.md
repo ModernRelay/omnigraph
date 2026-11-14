@@ -262,8 +262,8 @@ there too.
 
 ## A ranked `from` names its score
 
-A `from` whose relation is a ranking, a ranking function or a `let` bound to
-one, names the score with `as`; see [Search](../search/index.md). Without it
+A `from` whose relation carries an unnamed score, a ranking function or a
+`let` bound to one, names the score with `as`; see [Search](../search/index.md). Without it
 the `from` is `T85`:
 
 ```text
@@ -278,8 +278,8 @@ error[T85]: type error: T85: `from nearest(…)` ranks without naming its score:
 
 The machine-applicable suggestion writes `as $distance` after the ranking
 (`as $score` for `bm25` and `rrf`), or a fresh variant when the name is taken.
-An `as` on a `from` that ranks nothing is `T85` too, and the suggestion
-removes it.
+An `as` on any other `from`, an inline read returning a named score
+included, is `T85` too, and the suggestion removes it.
 
 ## Terms this release does not lower
 

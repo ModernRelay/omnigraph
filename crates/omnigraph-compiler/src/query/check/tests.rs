@@ -1308,7 +1308,7 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
 }"#,
         r#"query q() { match { $p: Person } return { $p.name } }"#,
     ),
-    // The two queries of `diagnostics/t81_pattern_components_share_no_variable.gqt`.
+    // The three queries of `diagnostics/t81_pattern_components_share_no_variable.gqt`.
     (
         r#"two components one edge type joins"#,
         "T81",
@@ -1320,6 +1320,12 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         "T81",
         r#"query shelved() { match { $p: Person, $s: Collection } where $p.name = "Ada" return { $p.name, $s.slug } }"#,
         r#"query shelved() { match { $p: Person, let $ss = { match { $s: Collection } return { $s } }, from $ss } where $p.name = "Ada" return { $p.name, $s.slug } }"#,
+    ),
+    (
+        r#"a component of two elements is never pinned"#,
+        "T81",
+        r#"query employer_beside() { match { $p: Person, $p worksAt $w, $s: Collection } where $p.handle = "ada" return { $w.name, $s.slug } }"#,
+        r#"query employer_beside() { match { $p: Person, $p worksAt $w, let $ss = { match { $s: Collection } return { $s } }, from $ss } where $p.handle = "ada" return { $w.name, $s.slug } }"#,
     ),
     // The three queries of `diagnostics/t84_triple_names_a_name_no_binding_introduces.gqt`.
     (
@@ -1340,16 +1346,16 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query employers() { match { $p: Person, optional { $p worksAt $c } } return { $p.name, $c.name } }"#,
         r#"query employers() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c.name } }"#,
     ),
-    // The two queries of `diagnostics/t82_triple_written_against_its_edge_direction.gqt`
-    // (its schema adds `Founded: Person -> Company`; the second is checked in
-    // `a_triple_is_written_in_its_edges_declared_order`).
+    // The three queries of `diagnostics/t82_triple_written_against_its_edge_direction.gqt`
+    // (its schema adds `Founded: Person -> Company`; the second and third are
+    // checked in `a_triple_is_written_in_its_edges_declared_order`).
     (
         r#"a triple written against its edge's declared direction"#,
         "T82",
         r#"query staff($slug: String) { match { $c: Company, $c worksAt $p } where $c.slug = $slug return { $p.name } }"#,
         r#"query staff($slug: String) { match { $c: Company, $p worksAt $c } where $c.slug = $slug return { $p.name } }"#,
     ),
-    // The two queries of `diagnostics/t85_ranked_from_names_its_score.gqt`.
+    // The four queries of `diagnostics/t85_ranked_from_names_its_score.gqt`.
     (
         r#"a ranked from without as"#,
         "T85",
@@ -1357,10 +1363,22 @@ const TYPE_REPAIRS: &[(&str, &str, &str, &str)] = &[
         r#"query near($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $distance } return { $d.id, $distance } order { $distance } }"#,
     ),
     (
-        r#"an as on a from that ranks nothing"#,
+        r#"an as on a from whose relation carries no unnamed score"#,
         "T85",
         r#"query docs() { match { let $docs = { match { $d: Doc } return { $d } }, from $docs as $s } return { $d.id } }"#,
         r#"query docs() { match { let $docs = { match { $d: Doc } return { $d } }, from $docs } return { $d.id } }"#,
+    ),
+    (
+        r#"a let bound to a ranking drawn without as"#,
+        "T85",
+        r#"query near_by_name($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, let $near = nearest($pop, $d.embedding, $q, k: 2), from $near } return { $d.id } }"#,
+        r#"query near_by_name($q: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, let $near = nearest($pop, $d.embedding, $q, k: 2), from $near as $distance } return { $d.id } }"#,
+    ),
+    (
+        r#"an as on an inline read returning a named score"#,
+        "T85",
+        r#"query wrapped($q: Vector(3)) { match { from { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $dist } return { $d, $dist } } as $s } return { $d.id } }"#,
+        r#"query wrapped($q: Vector(3)) { match { from { match { let $pop = { match { $d: Doc } return { $d } }, from nearest($pop, $d.embedding, $q, k: 2) as $dist } return { $d, $dist } } } return { $d.id } }"#,
     ),
     // The three queries of `diagnostics/t68_block_binds_an_outer_name.gqt`.
     (
@@ -1458,9 +1476,11 @@ fn t8_prints_the_block_an_aggregate_filter_means() {
 }
 
 /// A ranked `from` names its score with `as` (`T85`): the score enters
-/// scope under the written name and no other, through a ranking function
-/// or a named relation bound to one; a `from` that ranks nothing takes no
-/// `as`, and in a relation function's argument a score has no name.
+/// scope under the written name and no other. The rule reads the relation's
+/// type: a ranking function's result and a named relation bound to one
+/// carry an unnamed score; any other relation, an inline read returning a
+/// named score included, takes no `as`, and in a relation function's
+/// argument a score has no name.
 #[test]
 fn a_ranked_from_names_its_score() {
     let pop = "let $pop = { match { $d: Doc } return { $d } }";
@@ -1521,6 +1541,46 @@ fn a_ranked_from_names_its_score() {
             "T85",
         );
     }
+    // The rule reads the relation's type, not its spelling: an inline read
+    // that returns a named score carries none, written in place or bound to
+    // a name, and a `union` of rankings carries none either.
+    let wrapped = format!(
+        "{{ match {{ {pop}, from nearest($pop, $d.embedding, $v, k: 3) as $near }} return {{ $d, $near }} }}"
+    );
+    let c = ok(&format!(
+        "query q($v: Vector(3)) {{ match {{ from {wrapped} }} return {{ $d.title, $near }} }}"
+    ));
+    assert_eq!(cols(&c)[1], ("near".into(), "F32".into()));
+    ok(&format!(
+        "query q($v: Vector(3)) {{ match {{ let $w = {wrapped}, from $w }} return {{ $d.title, $near }} }}"
+    ));
+    refused_with(
+        &format!(
+            "query q($v: Vector(3)) {{ match {{ let $w = {wrapped}, from $w as $s }} return {{ $d.title }} }}"
+        ),
+        "T85",
+    );
+    ok(&format!(
+        "query q($v: Vector(3), $s: String) {{ match {{ {pop}, let $a = nearest($pop, $d.embedding, $v, k: 3), let $b = bm25($pop, $d.body, $s), from union($a, $b) }} return {{ $d.title }} }}"
+    ));
+    // An unnamed score has no name a population column can collide with:
+    // a ranking over a population with a `distance` column is admitted, as
+    // an `rrf` arm and bound to a name, and the fix names the score afresh.
+    let wide =
+        "let $wide = { match { $d: Doc } return { $d, $d.year as distance, $d.title as score } }";
+    ok(&format!(
+        "query q($v: Vector(3)) {{ match {{ {wide}, let $near = nearest($wide, $d.embedding, $v, k: 3), from $near as $dd }} return {{ $d.title, $distance, $dd }} }}"
+    ));
+    ok(&format!(
+        "query q($v: Vector(3), $s: String) {{ match {{ {wide}, from rrf(nearest($wide, $d.embedding, $v, k: 3), bm25($wide, $d.body, $s)) as $fused }} return {{ $d.title, $fused }} }}"
+    ));
+    let d = refused_with(
+        &format!(
+            "query q($v: Vector(3)) {{ match {{ {wide}, from nearest($wide, $d.embedding, $v, k: 3) }} return {{ $d.title }} }}"
+        ),
+        "T85",
+    );
+    assert_eq!(d.suggestion.unwrap().edits[0].replacement, " as $distance2");
     // The written name may not repeat a column of the population.
     refused_with(
         &format!(

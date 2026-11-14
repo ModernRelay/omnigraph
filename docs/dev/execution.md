@@ -180,12 +180,16 @@ selection with no member are not refused.
 A ranked `from` names its score with `as` (`check/mod.rs`, `drawn_rel`). The
 ranking's term carries the written name as its `out` (`Score`, `ApproxTopK`,
 and `Fuse`, whose `out` the core added for it), and the shaper reads the score
-through that name, so a renamed score plans as `$distance` did. A `from` ranks
-when its relation's term is one of the three, written as a ranking function or
-drawn from a `let` bound to one; without `as` it is `T85`, the suggestion
+through that name, so a score plans the same under any name. The rule reads
+the relation's type, not its term: the checker's `Rel` records the column of
+the unnamed score it carries (`score`), which a ranking function's result sets
+and a `let` bound to one keeps, and which every other relation, an inline read
+returning a named score included, leaves empty. An unnamed score's column
+takes a name no population column has, so it never collides with one. A `from`
+over a relation carrying one without `as` is `T85`, the suggestion
 inserting `as $distance` or `as $score` after the relation, whose byte range
-the parser records on the `from`'s element span, and an `as` on a `from` that
-ranks nothing is `T85` with the `as` removed. A ranking in a `union` arm or a
+the parser records on the `from`'s element span, and an `as` on a `from` whose
+relation carries none is `T85` with the `as` removed. A ranking in a `union` arm or a
 ranking's population is projected to its population's columns, since a score
 there has no name; an `rrf` arm is read whole, as fusion keeps only the target
 and the fused score.
