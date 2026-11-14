@@ -1218,13 +1218,7 @@ impl Lower for Walk<'_, '_> {
         }
         let tiebreak = tiebreak
             .iter()
-            .map(|key| match key.property.as_deref() {
-                Some(IDENTITY_MEMBER | EDGE_TYPE_MEMBER) => tiebreak_column(key, id_column),
-                Some(property) => Ok(format!("{}.{property}", key.binding)),
-                None => Err(OmniError::manifest_internal(format!(
-                    "the correlated read's tie-break `{key}` names no column"
-                ))),
-            })
+            .map(|key| tiebreak_column(key, id_column))
             .collect::<Result<Vec<String>>>()?;
         let read = Arc::new(CorrelateRead {
             group,
@@ -1825,14 +1819,17 @@ fn hidden_columns(
     Ok(hidden)
 }
 
-/// Resolve the metadata key declared by the plan to its runtime column.
+/// Resolve a tie-break key declared by the plan to its runtime column: an
+/// identity or edge type, or a value column a correlated read or a union
+/// carries (`values.column`).
 fn tiebreak_column(key: &ColumnRef, id_column: &str) -> Result<String> {
     let property = match key.property.as_deref() {
         Some(IDENTITY_MEMBER) => id_column,
         Some(EDGE_TYPE_MEMBER) => EDGE_TYPE_COLUMN,
-        _ => {
+        Some(value) => value,
+        None => {
             return Err(OmniError::manifest_internal(format!(
-                "the planned tie-break '{key}' is not an identity or edge type column"
+                "the planned tie-break '{key}' names no column"
             )));
         }
     };

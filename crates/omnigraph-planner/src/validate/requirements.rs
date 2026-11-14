@@ -9,7 +9,7 @@
 //! and types intact. A return item that reads the leading ranking's score
 //! column projects that ranking.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use crate::read_shape::PatternStep;
 use omnigraph_compiler::ir::is_fresh_variable;
@@ -212,14 +212,123 @@ fn flatten<'p>(
     }
 }
 
+/// One column of the read's rows as the tie rule orders it, in column
+/// order (see `optimizer::tie_rule`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TieColumn {
+    /// A reference: its `@id`, after its `@type` when it is a selected edge.
+    Identity { binding: String, selected: bool },
+    /// A value column of a correlated read or a union, `binding.column`.
+    Value { binding: String, column: String },
+}
+
+impl TieColumn {
+    fn binding(&self) -> &str {
+        match self {
+            Self::Identity { binding, .. } | Self::Value { binding, .. } => binding,
+        }
+    }
+
+    /// A reference the query names, which leads the rule.
+    pub(crate) fn is_named(&self) -> bool {
+        matches!(self, Self::Identity { binding, .. } if !is_fresh_variable(binding))
+    }
+}
+
+/// The columns `steps` add to the rows, in the order the pattern introduces
+/// them, each once: a block adds none, an `optional` the names its pattern
+/// binds, a correlated read only what it returns, a union its first arm's
+/// reference and value columns.
+pub(crate) fn tie_columns(steps: &[PatternStep], out: &mut Vec<TieColumn>) {
+    fn push(out: &mut Vec<TieColumn>, column: TieColumn) {
+        if !out.contains(&column) {
+            out.push(column);
+        }
+    }
+    for step in steps {
+        match step {
+            PatternStep::NodeScan { variable, .. } => push(
+                out,
+                TieColumn::Identity {
+                    binding: variable.clone(),
+                    selected: false,
+                },
+            ),
+            PatternStep::Expand {
+                dst_var,
+                edges,
+                edge_binding,
+                ..
+            } => {
+                push(
+                    out,
+                    TieColumn::Identity {
+                        binding: dst_var.clone(),
+                        selected: false,
+                    },
+                );
+                if let Some(edge) = edge_binding {
+                    push(
+                        out,
+                        TieColumn::Identity {
+                            binding: edge.clone(),
+                            selected: edges.named().is_none(),
+                        },
+                    );
+                }
+            }
+            PatternStep::Optional { inner, .. } => tie_columns(inner, out),
+            PatternStep::Correlate { inner, read, .. } => {
+                let mut own = Vec::new();
+                tie_columns(inner, &mut own);
+                for column in &read.columns {
+                    match &column.expr {
+                        IRExpr::Variable(name, _) => {
+                            if let Some(entry) = own.iter().find(|entry| entry.binding() == name) {
+                                push(out, entry.clone());
+                            }
+                        }
+                        _ => push(
+                            out,
+                            TieColumn::Value {
+                                binding: read.values.clone(),
+                                column: column.column.clone(),
+                            },
+                        ),
+                    }
+                }
+            }
+            PatternStep::Union { arms, bindings, .. } => {
+                let mut arm = Vec::new();
+                if let Some(first) = arms.first() {
+                    tie_columns(first, &mut arm);
+                }
+                for entry in arm {
+                    let leaves = match &entry {
+                        TieColumn::Identity { binding, .. } => bindings.contains(binding),
+                        TieColumn::Value { .. } => true,
+                    };
+                    if leaves {
+                        push(out, entry);
+                    }
+                }
+            }
+            PatternStep::Filter(_)
+            | PatternStep::Rank { .. }
+            | PatternStep::Score { .. }
+            | PatternStep::Let { .. }
+            | PatternStep::AntiJoin { .. } => {}
+        }
+    }
+}
+
 /// What every plan for one checked declaration must preserve.
 #[derive(Debug, Clone)]
 pub struct Requirements {
     /// The named bindings of the top-level scope and their types.
     pub(crate) bindings: BTreeMap<String, BoundVariable>,
-    /// Edge bindings of a traversal over more than one edge type, whose
-    /// identity is the pair (`@type`, `@id`).
-    pub(crate) selected_edges: HashSet<String>,
+    /// The columns of the top-level rows in column order, for the tie rule.
+    pub(crate) tie_columns: Vec<TieColumn>,
     /// Traversals of the top-level scope, in written order.
     pub(crate) traversals: Vec<Traversal>,
     /// Correlated blocks of the top-level scope, in written order.
@@ -277,7 +386,6 @@ impl Requirements {
         let mut traversals = Vec::new();
         let mut blocks = Vec::new();
         let mut bindings: BTreeMap<String, BoundVariable> = BTreeMap::new();
-        let mut selected_edges = HashSet::new();
         let mut rank_step: Option<(&IRExpr, Option<u64>)> = None;
         let mut steps = Vec::new();
         let mut optionals = Vec::new();
@@ -346,9 +454,6 @@ impl Requirements {
                             .collect();
                         type_names.dedup();
                         bindings.insert(edge.clone(), BoundVariable::Edge { type_names });
-                        if edges.named().is_none() {
-                            selected_edges.insert(edge.clone());
-                        }
                     }
                     traversals.push(Traversal {
                         src: src_var.clone(),
@@ -429,9 +534,11 @@ impl Requirements {
                 .collect(),
             None => Vec::new(),
         };
+        let mut columns = Vec::new();
+        tie_columns(&ir.pipeline, &mut columns);
         Ok(Self {
             bindings,
-            selected_edges,
+            tie_columns: columns,
             traversals,
             blocks,
             optionals,

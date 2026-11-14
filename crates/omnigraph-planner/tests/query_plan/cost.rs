@@ -341,7 +341,7 @@ fn access_path_follows_the_frontier_estimate_and_the_table_row_count() {
     assert_eq!(json, "id_lookup");
     assert!(fired.contains(&"access_path"), "{fired:?}");
     let json = plan.to_json();
-    let root = &json["inputs"][0]["inputs"][0]["inputs"][0]["inputs"][0];
+    let root = &under_cut(&json)["inputs"][0]["inputs"][0]["inputs"][0];
     assert_eq!(root["node"], "Scan");
     assert!(root.get("access").is_none());
 }
@@ -1222,7 +1222,8 @@ fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
     );
     let json = optimized.physical.to_json();
     assert_eq!(
-        json["inputs"][0]["inputs"][0]["strategy"], "key_set",
+        under_cut(&json)["inputs"][0]["strategy"],
+        "key_set",
         "{json}"
     );
 }

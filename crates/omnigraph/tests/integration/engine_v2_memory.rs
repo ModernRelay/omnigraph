@@ -1261,8 +1261,10 @@ fn join_counter(probes: &QueryMemoryProbes, name: &str) -> Vec<usize> {
     counter(probes, "ContainsJoinExec", name)
 }
 
-/// 16 MiB of payload under a 4 MiB pool: a `limit 1` and a top-k `limit 1`
-/// each stop the narrow scan early and fetch one payload by row address.
+/// 16 MiB of payload under a 4 MiB pool: a `limit 1` with no `order`, which
+/// cuts the tie rule's order (a top-k by `$p`'s id), and a top-k `limit 1`
+/// each read the narrow columns of every row and fetch one payload by row
+/// address.
 /// GQT cannot set the pool; scale twin `cases_slow/v2/wide_column_scan_limit_answers.gqt`.
 #[tokio::test]
 #[serial]
@@ -1291,8 +1293,8 @@ async fn a_wide_column_read_under_a_limit_follows_its_result() {
         .map(|metric| metric.output_rows)
         .sum();
     assert!(
-        emitted < 4_097,
-        "the limit must stop the scan before it reads the type: {emitted} rows"
+        emitted >= 4_096,
+        "the tie rule's top-k reads every row's narrow columns: {emitted} rows"
     );
     assert_eq!(counter(&probes, "HydrateExec", "hydrated_rows"), [1]);
     assert_released(&probes);
@@ -2018,11 +2020,13 @@ async fn a_contains_join_and_its_cross_join_agree_on_generated_texts_over_severa
     }
 }
 
-/// GQT reads no operator counter, so the pairs the multi-hop BFS handed on
-/// before a trailing `limit` dropped its stream are visible only here.
+/// A trailing `limit` with no `order` cuts the tie rule's order, so the
+/// multi-hop BFS below it hands on every pair to the top-k, which keeps the
+/// first by `$p` then `$f`. GQT reads no operator counter, so the pairs the
+/// walk handed on are visible only here.
 #[tokio::test]
 #[serial]
-async fn multi_hop_expand_stops_at_the_limit_it_feeds() {
+async fn multi_hop_expand_hands_every_pair_to_the_tie_rule_cut() {
     let dir = tempfile::tempdir().unwrap();
     let db = session(
         Omnigraph::init(
@@ -2080,17 +2084,9 @@ query all() {
     )
     .await
     .unwrap();
-    assert_eq!(first_column_sorted(&result).len(), 1);
-    let stopped = emitted(&probes);
-    let chunks_per_producer_stage = 2 + 1;
-    let stopped_bound = (1 + 2 * chunks_per_producer_stage) * 256;
-    assert!(
-        (1..=stopped_bound).contains(&stopped),
-        "the walk handed on {stopped} of {pairs} pairs before the limit dropped its stream; \
-         at most {stopped_bound} fit under any schedule: one 256-pair chunk consumed by the \
-         limit, and for each of the two producer stages between them (expand, hydrate) two \
-         chunks queued in its capacity-2 channel plus one blocked at send"
-    );
+    // `hub` is the smallest source and `t000` its smallest destination.
+    assert_eq!(first_column_sorted(&result), ["t000"]);
+    assert_eq!(emitted(&probes), pairs, "the cut reads every pair");
     let probes = QueryMemoryProbes::default();
     with_query_memory_probes(
         probes.clone(),

@@ -56,7 +56,7 @@ fn expand_destination_filters_and_projection_belong_to_its_dependent_scan() {
     );
     assert!(matches!(plan.node(input), Some(LogicalNode::Expand { .. })));
     let json = plan.to_json();
-    let destination = &json["inputs"][0]["inputs"][0];
+    let destination = &under_cut(&json)["inputs"][0];
     assert_eq!(destination["node"], "TableScan");
     assert_eq!(destination["id_restriction"], "input");
     assert_eq!(destination["version"], 7);
@@ -70,11 +70,12 @@ fn the_explain_document_names_the_binding_and_the_projection() {
     let op = ir(vec![scan("c")], vec![prop("c", "slug")], vec![]);
     let (plan, _) = planned(&op);
     let json = plan.to_json();
-    let scan = json["inputs"][0]["inputs"][0].clone();
+    let scan = under_cut(&json)["inputs"][0].clone();
     assert_eq!(scan["node"], "TableScan");
     assert_eq!(scan["binding"], "c");
     assert_eq!(scan["table"], "node:T");
-    assert_eq!(scan["projection"], serde_json::json!(["slug"]));
+    // The `limit` cuts the tie rule's order, which reads the id.
+    assert_eq!(scan["projection"], serde_json::json!(["__id", "slug"]));
 }
 
 #[test]
@@ -122,7 +123,7 @@ fn physical_destination_scan_retains_its_input_and_does_not_claim_table_cardinal
             .is_empty()
     );
     let json = physical.to_json();
-    let destination = &json["inputs"][0]["inputs"][0];
+    let destination = &under_cut(&json)["inputs"][0];
     assert_eq!(destination["node"], "Scan");
     assert_eq!(destination["id_restriction"], "input");
     assert_eq!(destination["inputs"][0]["node"], "Expand");
@@ -148,7 +149,7 @@ fn physical_expand_carries_its_pinned_edge_version() {
         } if versions.get("knows") == Some(&Some(5))
     )));
     let json = physical.to_json();
-    let expand = &json["inputs"][0]["inputs"][0]["inputs"][0];
+    let expand = &under_cut(&json)["inputs"][0]["inputs"][0];
     assert_eq!(expand["node"], "Expand");
     assert_eq!(expand["versions"]["knows"], 5);
     let bound = omnigraph_planner::BoundPlan {
@@ -489,8 +490,8 @@ fn a_cross_join_left_side_is_a_build_pipeline_and_a_query_explain_has_pipelines(
             .pipelines
             .as_ref()
             .map(|p| p.as_array().map(Vec::len)),
-        Some(Some(2)),
-        "the collected left side is drained first, the right side streams through the join"
+        Some(Some(3)),
+        "the collected left side is drained first, the right side streams through the join into the sort the `limit` cuts"
     );
     assert_eq!(
         explain.to_value()["pipelines"][1]["operators"][0]["name"],

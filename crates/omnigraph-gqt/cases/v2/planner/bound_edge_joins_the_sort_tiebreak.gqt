@@ -38,4 +38,4 @@ query weights_by_name() {
 p.name: String
 e.weight: I64
 --- expect plan
-sort tiebreak [$d, $e, $p]
+sort tiebreak [$p, $d, $e]

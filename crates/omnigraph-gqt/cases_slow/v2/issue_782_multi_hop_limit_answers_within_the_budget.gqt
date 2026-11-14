@@ -3,14 +3,17 @@
 # notes: 1024 sources know one hub and the hub knows 1024 targets: 1,050,624
 # notes: one-or-two-hop pairs, more than the default 150 MiB query budget admits when
 # notes: the expand keeps every pair (about 214 bytes each on the red commit, 225 MB
-# notes: for the set). Step 1 pins that an unordered trailing limit answers under
-# notes: that budget: the pairs leave a chunk at a time, and every destination is
-# notes: `reached`, so any one row is right. Step 2 counts the pairs, so a chunk
-# notes: dropped or duplicated is a wrong count. Seed names: s0000..s1023 know
+# notes: for the set). Step 1 pins that a trailing limit with no order answers
+# notes: under that budget: it cuts the tie rule's order (`$p`, then `$f`), a top-k
+# notes: of one row that reads every pair a chunk at a time and keeps one, and every
+# notes: destination is `reached`, so the row is the same whichever pair wins. Step 2
+# notes: counts the pairs, so a chunk dropped or duplicated is a wrong count.
+# notes: Reading every pair takes most of the corpus budget on a debug build, so
+# notes: the case declares more. Seed names: s0000..s1023 know
 # notes: `hub`, `hub` knows t0000..t1023; resize by regenerating both ranges.
 
 --- runner
-timeout_ms: 10000
+timeout_ms: 30000
 environments:
   - target: omnigraph-engine
     storage: local-filesystem

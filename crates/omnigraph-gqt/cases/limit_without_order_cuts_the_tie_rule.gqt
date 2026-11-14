@@ -1,0 +1,110 @@
+# issue: none
+# notes: A `limit` with no `order` cuts the tie rule's order, not the scan's: the identity of every
+# notes: reference column in column order (the order the pattern binds them, `$z` before `$a` here,
+# notes: whatever their names), then every other column's value in column order. Group rows follow
+# notes: the same rule over their keys, references first. The seed is out of key order, so the scan's
+# notes: first rows are not the answer.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Person {
+    name: String @key
+    city: String
+}
+
+edge Knows: Person -> Person
+
+--- seed
+{"type":"Person","data":{"name":"zed","city":"b"}}
+{"type":"Person","data":{"name":"amy","city":"a"}}
+{"type":"Person","data":{"name":"kim","city":"b"}}
+{"type":"Person","data":{"name":"bob","city":"a"}}
+{"edge":"Knows","from":"zed","to":"amy"}
+{"edge":"Knows","from":"amy","to":"kim"}
+{"edge":"Knows","from":"zed","to":"bob"}
+
+--- query
+query first_two() {
+    match { $p: Person }
+    return { $p.name }
+    limit 2
+}
+
+--- expect unordered
+{"p.name":"amy"}
+{"p.name":"bob"}
+
+--- expect shape
+p.name: String
+
+--- expect plan
+sort tiebreak [$p]
+
+--- query
+query pairs_in_column_order() {
+    match { $z: Person, $z knows $a }
+    return { $z.name, $a.name }
+    limit 2
+}
+
+--- expect unordered
+{"z.name":"amy","a.name":"kim"}
+{"z.name":"zed","a.name":"amy"}
+
+--- expect shape
+z.name: String
+a.name: String
+
+--- expect plan
+sort tiebreak [$z, $a]
+
+--- query
+query first_city() {
+    match { $p: Person }
+    return distinct { $p.city }
+    limit 1
+}
+
+--- expect unordered
+{"p.city":"a"}
+
+--- expect shape
+p.city: String
+
+--- query
+query references_before_values() {
+    match { $p: Person, $p knows $f }
+    return distinct { $f.city, $p }
+    limit 1
+}
+
+--- expect unordered
+{"f.city":"b","p":{"@id":"amy","name":"amy","city":"a"}}
+
+--- expect shape
+f.city: String
+p: Person
+
+--- query
+query values_after_references() {
+    match {
+      $p: Person,
+      from { match { $q: Person } return distinct { $q.city as c } },
+    }
+    return { $p.name, $c }
+    limit 3
+}
+
+--- expect unordered
+{"p.name":"amy","c":"a"}
+{"p.name":"amy","c":"b"}
+{"p.name":"bob","c":"a"}
+
+--- expect shape
+p.name: String
+c: String

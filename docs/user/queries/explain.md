@@ -184,8 +184,10 @@ ordering names `$p._distance asc` or `$p._score desc`, and the physical
 the query's plain keys; a fusion's ordering is `rrf($a, $b) desc` and it
 plans no `Sort`. A `Sort` row's `tiebreak` lists the metadata keys it appends after
 `keys` (`$p.@id`, and `$e.@type` plus `$e.@id` for selected bound edges, the
-bindings the query declares in name order, then any binding the query does not
-name), empty where equal rows are indistinguishable; its `ordering` property
+bindings the query declares in the order its pattern binds them, then a
+`from`'s value columns and any binding the query does not name), empty where
+equal rows are indistinguishable; a `limit` with no `order` plans a `Sort` of
+these keys alone; its `ordering` property
 is its whole comparator, those keys included as `$p.@id asc`, and a `Filter`
 keeps its input's ordering.
 

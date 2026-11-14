@@ -546,8 +546,9 @@ pub enum LogicalNode {
         return_exprs: Vec<IRProjection>,
     },
     /// `keys` for the passes; `order_by`, `fetch` and `tiebreak` for the
-    /// engine's sort. `tiebreak` declares metadata columns in binding order;
-    /// a selected edge's concrete type precedes its id.
+    /// engine's sort. `tiebreak` declares the tie rule's columns in column
+    /// order (`optimizer::tie_rule`); a selected edge's concrete type
+    /// precedes its id.
     Sort {
         input: LogicalId,
         keys: Vec<String>,

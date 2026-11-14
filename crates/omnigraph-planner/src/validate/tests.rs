@@ -1002,6 +1002,56 @@ fn an_edge_scan_ties_by_its_edge_before_its_fresh_ends() {
     assert_eq!(check, "order", "{detail}");
 }
 
+/// A `limit` with no `order` cuts the tie rule's order: the plan sorts by
+/// every reference's identity in column order (`$z`, bound first, before
+/// `$a`), and a plan that sorts them in name order, or by no key at all
+/// (leaving the scan's order), is refused.
+#[test]
+fn a_limit_with_no_order_cuts_the_tie_rule_order() {
+    let fixture = Fixture::new(
+        r#"query q() {
+    match { $z: Doc, $z cites $a }
+    return { $z.slug, $a.slug }
+    limit 2
+}"#,
+        &[],
+    );
+    let plan = fixture.plan();
+    fixture.accept(plan.clone()).expect("the planned tie rule");
+    let sorts = node_ids(&plan, |node| matches!(node, PhysicalNode::Sort { .. }));
+    let [sort] = sorts[..] else {
+        panic!("one sort: {sorts:?}");
+    };
+    let Some(PhysicalNode::Sort {
+        order_by, tiebreak, ..
+    }) = plan.node(sort).cloned()
+    else {
+        unreachable!("the id names a sort");
+    };
+    assert!(order_by.is_empty(), "{order_by:?}");
+    assert_eq!(
+        tiebreak,
+        [
+            ColumnRef::property("z", IDENTITY_MEMBER),
+            ColumnRef::property("a", IDENTITY_MEMBER)
+        ]
+    );
+
+    let mut name_order = plan.clone();
+    if let Some(PhysicalNode::Sort { tiebreak, .. }) = name_order.node_mut(sort) {
+        tiebreak.reverse();
+    }
+    let (check, detail) = fixture.refused(name_order);
+    assert_eq!(check, "order", "{detail}");
+
+    let mut unsorted = plan;
+    if let Some(PhysicalNode::Sort { tiebreak, .. }) = unsorted.node_mut(sort) {
+        tiebreak.clear();
+    }
+    let (check, detail) = fixture.refused(unsorted);
+    assert_eq!(check, "order", "{detail}");
+}
+
 #[test]
 fn another_alias_or_item_fails_the_projection() {
     let fixture = filtered();

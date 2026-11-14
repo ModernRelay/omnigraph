@@ -1,8 +1,8 @@
-//! Issue #1335: a `limit` directly over an unfiltered table scan reaches
-//! Lance as `Scanner::limit`, so Lance plans only the fragments that hold the
-//! first rows from manifest row counts. Without it the engine stops by
-//! dropping the stream, after Lance has already opened and scheduled reads on
-//! up to `fragment_readahead` fragments.
+//! A `limit` with no `order` cuts the tie rule's order (the RFC's `Cut`):
+//! the plan sorts an unfiltered scan's rows by `$p`'s id under the `limit`,
+//! so it reads every fragment and keeps the smallest ids, deleted rows
+//! skipped. The scan's own early stop and Lance's `Scanner::limit` apply only
+//! to a `Limit` directly over a scan's projection, which no read plan has.
 //!
 //! Measured at the table stores' own trackers, which also see Lance's direct
 //! local reader (a `file://` read never reaches a `WrappingObjectStore`).
@@ -20,7 +20,7 @@ use crate::helpers::{
 };
 
 /// Single-row inserts, one Lance fragment each: more than the local store's
-/// fragment read-ahead, so an unpushed limit visibly reads past the first.
+/// fragment read-ahead, so a read that stopped early would visibly read fewer.
 const INSERTS: usize = 24;
 
 /// Run `query` on a fresh handle (so its table open carries the probes) and
@@ -52,7 +52,7 @@ async fn person_data_files_read(uri: &str, query: &str, name: &str) -> (usize, B
 }
 
 #[tokio::test]
-async fn unfiltered_limit_reads_only_the_first_fragment_issue_1335() {
+async fn limit_with_no_order_reads_every_fragment_for_its_tie_rule() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     let db = init_and_load(&dir).await;
@@ -86,19 +86,16 @@ async fn unfiltered_limit_reads_only_the_first_fragment_issue_1335() {
     .await;
     assert_eq!(rows, 1);
     assert_eq!(
-        files.len(),
-        1,
-        "a `limit 1` over an unfiltered scan reads only the fragment holding the first row, read {} of {}: {files:?}",
-        files.len(),
-        all_files.len()
+        files, all_files,
+        "a `limit 1` with no `order` reads every fragment to find the smallest id"
     );
 }
 
-/// The pushed limit counts live rows only and may span fragments: deleted
-/// rows at the head of the inserts are skipped, and a filtered limit (which
-/// Lance does not push) still finds a row in the last fragment.
+/// The limit counts live rows only and spans fragments: deleted rows among
+/// the smallest ids are skipped, and a filtered limit finds a row in the last
+/// fragment.
 #[tokio::test]
-async fn pushed_limit_skips_deleted_rows_and_spans_fragments_issue_1335() {
+async fn limit_skips_deleted_rows_and_spans_fragments_issue_1335() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     let db = init_and_load(&dir).await;
@@ -123,7 +120,7 @@ async fn pushed_limit_skips_deleted_rows_and_spans_fragments_issue_1335() {
     drop(db);
 
     let db: Session = helpers::session(Omnigraph::open(&uri).await.unwrap());
-    // The four loaded people, then the first two live inserts.
+    // The four loaded people, then the two smallest live inserts by id.
     let six = db
         .query(
             ReadTarget::branch("main"),

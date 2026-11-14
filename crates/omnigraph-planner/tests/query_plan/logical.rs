@@ -409,11 +409,8 @@ fn rejected_scalar_filters_stay_above_root_and_dependent_scans() {
                     assert!(spec.filter.is_none());
                 }
             }
-            let expected: &[&str] = if dependent {
-                &["__id", "slug", "state"]
-            } else {
-                &["slug", "state"]
-            };
+            // The `limit` cuts the tie rule's order, which reads the id.
+            let expected: &[&str] = &["__id", "slug", "state"];
             assert_eq!(projection_of(&plan, binding), set(expected));
         }
     }

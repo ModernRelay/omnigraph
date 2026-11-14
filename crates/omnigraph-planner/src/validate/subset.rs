@@ -717,7 +717,8 @@ fn canonical(
         },
         _ => None,
     };
-    let sorted = search.is_some() || !ir.order_by.is_empty();
+    // A `limit` with no `order` cuts the tie rule's order: a sort too.
+    let sorted = search.is_some() || !ir.order_by.is_empty() || ir.limit.is_some();
     let mut nodes = vec![ChainNode::Scan {
         type_key,
         version,

@@ -76,8 +76,9 @@ async fn incomplete_rank_fuse_row_tiebreak_refuses_replay_issue_659() {
         .query_inspected("main", query, "selected_page", &ParamMap::new())
         .await
         .unwrap();
+    // Both rows are the hub's: the tie rule orders them by `$q` before `$e`.
     let expected =
-        vec![serde_json::json!({"edge_type":"Knows","edge_id":"shared","target":larger})];
+        vec![serde_json::json!({"edge_type":"Likes","edge_id":"shared","target":smaller})];
     assert_eq!(rows_of(&first.result), expected);
     let encoded: Value =
         serde_json::from_slice(&first.replay_envelope(query, "selected_page")).unwrap();
@@ -341,8 +342,12 @@ async fn selected_cold_indexed_route_uses_persisted_members_without_building_csr
     assert_eq!(builds.load(Ordering::Relaxed), 0);
 }
 
+/// A `limit` with no `order` cuts the tie rule's order, so a selected
+/// traversal under it admits every source window and the work limit refuses
+/// it as it refuses the read without the `limit`, every worker stopped and
+/// the pool released.
 #[tokio::test]
-async fn limit_stops_selected_traversal_before_admitting_later_source_windows_issue_659() {
+async fn limit_reads_every_source_window_of_a_selected_traversal_issue_659() {
     use omnigraph::instrumentation::{QueryMemoryProbes, with_query_memory_probes};
     let dir = tempfile::tempdir().unwrap();
     let db = session(
@@ -375,33 +380,19 @@ async fn limit_stops_selected_traversal_before_admitting_later_source_windows_is
         probes.clone(),
         db.query_inspected("main", &query, "selected", &ParamMap::new()),
     )
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        matches!(limited, Err(OmniError::ResourceLimitExceeded { ref resource, limit, .. }) if resource == "traversal_work_limit" && limit == cap as u64),
+        "{:?}",
+        limited.err()
+    );
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while probes.active_blocking_work() != 0 || probes.reserved_bytes() != 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("limited traversal stops every worker and releases the pool");
-    let metrics = probes.execution_metrics();
-    let expand_metrics: Vec<_> = metrics
-        .iter()
-        .filter(|metric| metric.operator == "ExpandExec")
-        .collect();
-    assert_eq!(expand_metrics.len(), 1, "{metrics:#?}");
-    assert_eq!(
-        expand_metrics[0].values.get("input_rows"),
-        Some(&8192),
-        "only the first source window was admitted: {metrics:#?}"
-    );
-    assert_eq!(limited.result.num_rows(), 1);
-    let report = report_rows(&limited.report);
-    let expand = report
-        .iter()
-        .find(|row| row["operator"] == "ExpandExec")
-        .expect("selected Expand report");
-    assert_eq!(expand["attempts"][0]["drained"], false, "{report:#?}");
+    .expect("the refused traversal stops every worker and releases the pool");
     let full = query.replace(" limit 1", "");
     let error = query_main(&db, &full, "selected", &ParamMap::new())
         .await
@@ -2047,8 +2038,10 @@ async fn metadata_count_with_an_aggregate_signature_refuses_replay_issue_858() {
     );
 }
 
+/// A `limit` with no `order` cuts the tie rule's sort, which drains every
+/// producer below it, so the replay repeats every count.
 #[tokio::test]
-async fn a_limit_leaves_the_producer_below_it_undrained_and_the_replay_still_matches() {
+async fn a_limit_cuts_the_tie_rule_sort_and_the_replay_repeats_every_count() {
     let dir = tempfile::tempdir().unwrap();
     let db = people(&dir).await;
     let Replayed { result, rows, .. } =
@@ -2061,14 +2054,10 @@ async fn a_limit_leaves_the_producer_below_it_undrained_and_the_replay_still_mat
             .unwrap_or_else(|| panic!("no {operator} row: {rows:#?}"));
         row["attempts"][0]["drained"] == true
     };
-    assert!(
-        drained("LimitExec"),
-        "the limit ran to its own end: {rows:#?}"
-    );
-    for operator in ["HashJoinExec", "ProjectionExec"] {
+    for operator in ["LimitExec", "HashJoinExec", "ProjectionExec"] {
         assert!(
-            !drained(operator),
-            "the limit stopped {operator} after its first batch: {rows:#?}"
+            drained(operator),
+            "the sort under the limit drains {operator}: {rows:#?}"
         );
     }
 }

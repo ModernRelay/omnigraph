@@ -1140,7 +1140,6 @@ async fn an_overfetch_rerun_appends_an_attempt_to_every_row() {
 /// itself, outside the tree, so that sort's spills reach the report only
 /// through the Expand's own row: a pass that spilled adds one `spill` entry
 /// for the node, and its row and attempts stay what they are without one.
-/// The entry is there as well when a `Limit` stops the Expand early.
 /// The sort writes zstd files, so the bytes spilled are fewer than the
 /// payload bytes of the rows spilled even though every payload is noise that
 /// compresses only to about four fifths.
@@ -1245,38 +1244,4 @@ query pairs() {
             assert!(run.report.spills(row.id).is_empty(), "{row:?}");
         }
     }
-
-    // A `Limit` above the Expand stops it once one row is out. The sort
-    // spilled all its input before it emitted that row, and the report is
-    // read while the Expand's cancelled worker may still be winding down, so
-    // the spill must already be on the row then.
-    let limited = r#"
-query first() {
-    match { $p: Person, $p $e:knows $q }
-    where $p.name = "a"
-    return { $e.payload }
-    limit 1
-}
-"#;
-    let (rows, stopped) = crate::instrumentation::with_query_memory_limit(
-        16 * MIB,
-        self::run(&db, limited, "first", &ParamMap::new()),
-    )
-    .await;
-    assert_eq!(rows, 1);
-    let expand = node_id(&stopped.plan, |node| {
-        matches!(node, PhysicalNode::Expand { .. })
-    });
-    assert_eq!(row(&stopped, expand).attempts[0].drained, Some(false));
-    let spills = stopped.report.spills(expand);
-    let [(0, spilled)] = spills.as_slice() else {
-        panic!(
-            "one spill entry for the Expand below the Limit: {:#?}",
-            stopped.report
-        );
-    };
-    assert!(
-        spilled.spill_count > 0 && spilled.spilled_rows > 0 && spilled.spilled_bytes > 0,
-        "{spilled:?}"
-    );
 }

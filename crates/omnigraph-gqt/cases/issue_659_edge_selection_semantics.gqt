@@ -63,7 +63,7 @@ edge_id: String
 
 --- expect plan
 expand $from $to: selection alternation [Knows out, Likes out]
-sort tiebreak [$edge.@type, $edge.@id, $from.@id, $to.@id]
+sort tiebreak [$from.@id, $to.@id, $edge.@type, $edge.@id]
 
 --- query
 query same_id_order_keeps_type_tiebreak() {
@@ -82,7 +82,7 @@ edge_type: String
 edge_id: String
 
 --- expect plan
-sort tiebreak [$edge.@type, $from.@id, $to.@id]
+sort tiebreak [$from.@id, $to.@id, $edge.@type]
 
 --- query
 query same_id_alias_order_keeps_wildcard_type_tiebreak() {
@@ -102,7 +102,7 @@ edge_id: String
 
 --- expect plan
 expand $from $to: selection wildcard [Knows out, Likes out]
-sort tiebreak [$edge.@type, $from.@id, $to.@id]
+sort tiebreak [$from.@id, $to.@id, $edge.@type]
 
 --- query
 query union_explicit_one() {

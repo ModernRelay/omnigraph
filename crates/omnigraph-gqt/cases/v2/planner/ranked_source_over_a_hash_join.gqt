@@ -45,4 +45,4 @@ d.slug: String
 --- expect plan
 scan Person as $p: ranked nearest fetch 2
 hash join $d
-sort tiebreak [$d, $p]
+sort tiebreak [$p, $d]

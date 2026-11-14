@@ -516,8 +516,7 @@ fn resolve_query(
     let mut current = resolve_pipeline(plan, pipeline, source, &mut next_binding, None)?;
     let schema = schema_of(plan, current)?;
     let mut orderings: &[IROrdering] = order_by;
-    // A ranking drawn as a pattern step leads no sort; a `limit` over its
-    // rows still cuts a total order, the identities' when nothing is written.
+    // A ranking drawn as a pattern step leads no sort.
     let windowed = pipeline
         .iter()
         .any(|step| matches!(step, PatternStep::Rank { .. }));
@@ -525,7 +524,7 @@ fn resolve_query(
         .iter()
         .any(|projection| contains_aggregate(&projection.expr));
     let grouped = has_aggregates || *distinct;
-    let mut ranked = windowed && limit.is_some() && !grouped;
+    let mut ranked = false;
     if let Some(leading) = orderings.first().filter(|_| !windowed) {
         if let Some(mut node) = search_node(current, &leading.expr, *limit, true) {
             if let LogicalNode::RankFuse {
@@ -585,7 +584,9 @@ fn resolve_query(
             schema.clone(),
         )
     };
-    if ranked || !orderings.is_empty() {
+    // A `limit` cuts a total order: with no key written it is the tie
+    // rule's alone (RFC, `Cut`), over pattern rows and group rows alike.
+    if ranked || !orderings.is_empty() || limit.is_some() {
         let bound: Vec<IROrdering> = orderings
             .iter()
             .map(|ordering| IROrdering {
@@ -599,7 +600,7 @@ fn resolve_query(
             order_keys(&ordering.expr, &mut keys);
         }
         let tiebreak = sort_tiebreak(
-            &scope_tiebreaks(plan, current, source)?,
+            &tie_rule(plan, current, source, false)?,
             order_by,
             return_exprs,
             grouped,
@@ -1010,29 +1011,35 @@ fn resolve_pipeline(
 }
 
 /// The columns a correlated read's tie rule reads after its `order` keys:
-/// over its pattern's rows, every reference identity in scope; over its
-/// groups, each key in column order, a reference by its identity and a value
-/// by its column of the read's `values`.
+/// over its pattern's rows, every column of its pattern in column order
+/// ([`tie_rule`], its own unreturned bindings counting where they are
+/// bound, since its rows hold them until its projection); over its groups,
+/// each reference key by its identity, then each value key by its column of
+/// the read's `values`, each in column order.
 fn correlate_tiebreak(
     plan: &LogicalPlan,
     inner: LogicalId,
     read: &crate::read_shape::InnerRead,
     source: &dyn PlanSource,
 ) -> Result<Vec<ColumnRef>, PlanError> {
-    let candidates = scope_tiebreaks(plan, inner, source)?;
+    let candidates = tie_rule(plan, inner, source, true)?;
     let Some(group) = &read.group else {
         return Ok(candidates.into_iter().map(|(column, _)| column).collect());
     };
     let mut out = Vec::new();
     for key in group {
-        match &key.expr {
-            IRExpr::Aggregate { .. } => {}
-            IRExpr::Variable(name, _) => out.extend(
+        if let IRExpr::Variable(name, _) = &key.expr {
+            out.extend(
                 candidates
                     .iter()
                     .filter(|(column, _)| column.binding == *name)
                     .map(|(column, _)| column.clone()),
-            ),
+            );
+        }
+    }
+    for key in group {
+        match &key.expr {
+            IRExpr::Aggregate { .. } | IRExpr::Variable(_, _) => {}
             _ => out.push(ColumnRef::property(&read.values, &key.column)),
         }
     }
@@ -1328,17 +1335,24 @@ fn hoist_aggregates(expr: &IRExpr, grouped: &mut Vec<IRProjection>) -> IRExpr {
     }
 }
 
-/// The user's keys, then every group key the user did not write, ascending.
+/// The user's keys, then the tie rule over group rows: every group key the
+/// user did not write, ascending, the references (by identity) first and
+/// the values after them, each in column order. An aggregate column follows
+/// nothing, since the keys already tell two groups apart.
 fn with_group_keys(
     order_by: &[IROrdering],
     return_exprs: &[IRProjection],
     aggregates: &[Option<crate::aggregate::AggregateSpec>],
 ) -> Vec<IROrdering> {
     let mut keys = order_by.to_vec();
-    for (projection, aggregate) in return_exprs.iter().zip(aggregates) {
-        if aggregate.is_some() {
-            continue;
-        }
+    let groups = return_exprs
+        .iter()
+        .zip(aggregates)
+        .filter(|(_, aggregate)| aggregate.is_none())
+        .map(|(projection, _)| projection);
+    let (references, values): (Vec<_>, Vec<_>) =
+        groups.partition(|projection| is_reference_expr(&projection.expr));
+    for projection in references.into_iter().chain(values) {
         let column = result_column(projection);
         let written = keys.iter().any(|key| match &key.expr {
             IRExpr::AliasRef(alias, _) => *alias == column,
@@ -1352,6 +1366,18 @@ fn with_group_keys(
         }
     }
     keys
+}
+
+/// Whether `expr` is a reference column: a node or edge variable.
+pub(crate) fn is_reference_expr(expr: &IRExpr) -> bool {
+    matches!(
+        expr,
+        IRExpr::Variable(
+            _,
+            omnigraph_compiler::types::ExprType::Node { .. }
+                | omnigraph_compiler::types::ExprType::Edge { .. }
+        )
+    )
 }
 
 /// A key the type checker bound to a `return` item (T42, RFC
@@ -1490,6 +1516,192 @@ fn scope_tiebreaks(
     Ok(out)
 }
 
+/// The tie rule's columns over the rows `id` produces (RFC, `Order`): the
+/// identity of every reference column the read names, in column order, the
+/// order its pattern introduces them (a traversal's destination, then its
+/// edge; a selected edge's `@type` before its `@id`), then every other
+/// column in column order: a correlated read's or a union's value columns
+/// by value, and the names the lowering made up by identity. Those are an
+/// anonymous end, which declares no column, and an inlined read's
+/// unreturned bindings, which stand for the values the read computes from
+/// them. With `own`, the rows are an inline read's own, which hold its
+/// unreturned bindings as columns until its projection, so every name
+/// counts where it is bound. Each entry carries the physical column that
+/// recognizes a user key over it.
+fn tie_rule(
+    plan: &LogicalPlan,
+    id: LogicalId,
+    source: &dyn PlanSource,
+    own: bool,
+) -> Result<Vec<(ColumnRef, String)>, PlanError> {
+    let mut columns = TieColumns::default();
+    columns.walk(plan, id, source)?;
+    let (mut named, rest): (Vec<_>, Vec<_>) = columns
+        .entries
+        .into_iter()
+        .partition(|entry| own || entry.is_named());
+    named.extend(rest);
+    let mut out = Vec::new();
+    for entry in named {
+        match entry {
+            TieColumn::Identity {
+                binding,
+                id_column,
+                selected,
+            } => {
+                if selected {
+                    out.push((
+                        ColumnRef::property(&binding, EDGE_TYPE_MEMBER),
+                        EDGE_TYPE_COLUMN.to_string(),
+                    ));
+                }
+                out.push((ColumnRef::property(&binding, IDENTITY_MEMBER), id_column));
+            }
+            TieColumn::Value { binding, column } => {
+                out.push((ColumnRef::property(&binding, &column), column));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One column of a read's rows as the tie rule orders it.
+#[derive(Debug, Clone)]
+enum TieColumn {
+    Identity {
+        binding: String,
+        id_column: String,
+        selected: bool,
+    },
+    /// A value column of a correlated read or a union, `binding.column`.
+    Value { binding: String, column: String },
+}
+
+impl TieColumn {
+    /// A reference the query names, which leads the rule.
+    fn is_named(&self) -> bool {
+        matches!(self, Self::Identity { binding, .. } if !is_fresh_variable(binding))
+    }
+
+    fn binding(&self) -> &str {
+        match self {
+            Self::Identity { binding, .. } | Self::Value { binding, .. } => binding,
+        }
+    }
+}
+
+/// The columns of a subtree's rows in column order, each name once.
+#[derive(Default)]
+struct TieColumns {
+    entries: Vec<TieColumn>,
+    seen: HashSet<String>,
+}
+
+impl TieColumns {
+    fn push(&mut self, entry: TieColumn) {
+        let key = match &entry {
+            TieColumn::Identity { binding, .. } => binding.clone(),
+            TieColumn::Value { binding, column } => format!("{binding}.{column}"),
+        };
+        if self.seen.insert(key) {
+            self.entries.push(entry);
+        }
+    }
+
+    fn identity(&mut self, binding: &str, id_column: &str, selected: bool) {
+        self.push(TieColumn::Identity {
+            binding: binding.to_string(),
+            id_column: id_column.to_string(),
+            selected,
+        });
+    }
+
+    /// Inputs before the node, so a name enters where the pattern binds it;
+    /// a correlated block adds no column, a correlated read only what it
+    /// returns, a union only its reference and value columns.
+    fn walk(
+        &mut self,
+        plan: &LogicalPlan,
+        id: LogicalId,
+        source: &dyn PlanSource,
+    ) -> Result<(), PlanError> {
+        let Some(node) = plan.node(id) else {
+            return Ok(());
+        };
+        match node {
+            LogicalNode::TableScan { input, spec } => {
+                if let Some(input) = input {
+                    self.walk(plan, *input, source)?;
+                }
+                if let Some(binding) = &spec.binding {
+                    self.identity(binding, spec.columns.id, false);
+                }
+            }
+            LogicalNode::Expand {
+                input,
+                dst,
+                dst_type,
+                edges,
+                edge_binding,
+                ..
+            } => {
+                self.walk(plan, *input, source)?;
+                let id_column = source.node_type(dst_type)?.columns.id;
+                self.identity(dst, id_column, false);
+                if let Some(edge) = edge_binding {
+                    self.identity(edge, id_column, edges.named().is_none());
+                }
+            }
+            LogicalNode::AntiJoin { input, .. } => self.walk(plan, *input, source)?,
+            LogicalNode::Correlate {
+                input, inner, read, ..
+            } => {
+                if let Some(input) = input {
+                    self.walk(plan, *input, source)?;
+                }
+                let mut own = TieColumns::default();
+                own.walk(plan, *inner, source)?;
+                for column in &read.columns {
+                    match &column.expr {
+                        IRExpr::Variable(name, _) => {
+                            if let Some(entry) =
+                                own.entries.iter().find(|entry| entry.binding() == name)
+                            {
+                                self.push(entry.clone());
+                            }
+                        }
+                        _ => self.push(TieColumn::Value {
+                            binding: read.values.clone(),
+                            column: column.column.clone(),
+                        }),
+                    }
+                }
+            }
+            LogicalNode::Union { left, bindings, .. } => {
+                // Every arm binds the same columns under the first arm's
+                // names: the leftmost arm's give their kind and order.
+                let mut arm = TieColumns::default();
+                arm.walk(plan, *left, source)?;
+                for entry in arm.entries {
+                    let leaves = match &entry {
+                        TieColumn::Identity { binding, .. } => bindings.contains(binding),
+                        TieColumn::Value { .. } => true,
+                    };
+                    if leaves {
+                        self.push(entry);
+                    }
+                }
+            }
+            other => {
+                for input in other.inputs() {
+                    self.walk(plan, input, source)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Bindings visible to a filter, excluding correlated inner scopes.
 fn scope_bindings(plan: &LogicalPlan, id: LogicalId) -> Vec<String> {
     let mut bindings = BTreeSet::new();
@@ -1516,7 +1728,7 @@ fn scope_bindings(plan: &LogicalPlan, id: LogicalId) -> Vec<String> {
 /// none for group rows, when every returned expression is a key (equal rows
 /// are indistinguishable), or for an individual column already used as a key.
 fn sort_tiebreak(
-    candidates: &[(ColumnRef, &'static str)],
+    candidates: &[(ColumnRef, String)],
     keys: &[IROrdering],
     returns: &[IRProjection],
     aggregate: bool,
@@ -1554,7 +1766,7 @@ fn sort_tiebreak(
                 matches!(
                     expr,
                     IRExpr::PropAccess { variable, property , ty: _}
-                        if variable == &column.binding && property.as_str() == *physical
+                        if variable == &column.binding && property == physical
                 )
             })
         })
@@ -3643,9 +3855,15 @@ impl Lowering<'_> {
     }
 
     /// The `Sort` a query's return runs under (RFC 0047 §One total order): the
-    /// ranking's score keys then the user's; over an aggregate, or a `distinct`
-    /// return with or without a ranking, the user's keys then every group key.
-    fn sort_keys(&self, input: NodeId, order_by: &[IROrdering]) -> Option<Vec<IROrdering>> {
+    /// ranking's score keys then the user's; over group rows (an aggregate or
+    /// a `distinct` return, with or without a ranking), the user's keys then
+    /// the tie rule's group keys ([`with_group_keys`]).
+    fn sort_keys(
+        &self,
+        input: NodeId,
+        order_by: &[IROrdering],
+        fetch: Option<usize>,
+    ) -> Option<Vec<IROrdering>> {
         let aggregate_at = |id: NodeId| match self.physical.node(id) {
             Some(PhysicalNode::Aggregate {
                 return_exprs,
@@ -3658,20 +3876,17 @@ impl Lowering<'_> {
             Some(PhysicalNode::Projection { input: below, .. }) => aggregate_at(*below),
             _ => None,
         });
-        let Some(ranking) = &self.ranking else {
-            return Some(match grouped {
-                Some((return_exprs, aggregates)) if aggregates.iter().all(Option::is_none) => {
-                    with_group_keys(order_by, return_exprs, aggregates)
-                }
-                _ => order_by.to_vec(),
-            });
-        };
         if let Some((return_exprs, aggregates)) = grouped {
-            if order_by.is_empty() {
+            // A search leads no sort of groups: with nothing written and no
+            // `limit` they leave unordered.
+            if self.ranking.is_some() && order_by.is_empty() && fetch.is_none() {
                 return None;
             }
             return Some(with_group_keys(order_by, return_exprs, aggregates));
         }
+        let Some(ranking) = &self.ranking else {
+            return Some(order_by.to_vec());
+        };
         let mut keys = match ranking {
             Ranking::Scores(scores) => scores.clone(),
             Ranking::Fused(fused) => vec![fused.clone()],
@@ -3734,7 +3949,7 @@ impl Lowering<'_> {
                 ..
             } => {
                 let lowered = self.lower(*input)?;
-                let Some(order_by) = self.sort_keys(lowered, order_by) else {
+                let Some(order_by) = self.sort_keys(lowered, order_by, *fetch) else {
                     return Ok(lowered);
                 };
                 self.tracer.record(&[Role::Sort], Rule::Lower, &[]);

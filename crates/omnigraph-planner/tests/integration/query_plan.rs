@@ -171,6 +171,17 @@ fn projection(expr: IRExpr, pipeline: &[PatternStep]) -> IRProjection {
     }
 }
 
+/// The explain node below a plan's root cut: its `Limit` (a physical
+/// `Page`) and the `Sort` the tie rule (or the query's `order`) puts under
+/// it.
+fn under_cut(json: &serde_json::Value) -> &serde_json::Value {
+    let mut node = json;
+    while matches!(node["node"].as_str(), Some("Limit" | "Page" | "Sort")) {
+        node = &node["inputs"][0];
+    }
+    node
+}
+
 fn ir(pipeline: Vec<PatternStep>, returns: Vec<IRExpr>, order_by: Vec<IRExpr>) -> Operation {
     Operation::Query(Box::new(ReadShape {
         name: "q".to_string(),
@@ -312,7 +323,7 @@ fn access_paths(plan: &PhysicalPlan) -> (Vec<AccessPath>, serde_json::Value) {
         })
         .collect();
     let json = plan.to_json();
-    let destination = &json["inputs"][0]["inputs"][0];
+    let destination = &under_cut(&json)["inputs"][0];
     let access = if destination["node"] == "HashJoin" {
         assert_eq!(destination["fallback"], "id_lookup");
         serde_json::json!("hash_join")

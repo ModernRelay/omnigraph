@@ -16,8 +16,8 @@
 
 use std::collections::HashSet;
 
-use super::requirements::BoundVariable;
-use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, is_fresh_variable};
+use super::requirements::{BoundVariable, TieColumn};
+use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection};
 use omnigraph_compiler::query::value::RRF_COLUMN;
 use omnigraph_compiler::types::{ExprType, ScalarType};
 
@@ -1278,85 +1278,32 @@ impl Requirements {
     }
 
     /// The final sort's comparator as RFC 0047 defines it: a ranking's score
-    /// (a fused ranking's `_rrf` descending) then the written keys; over a
-    /// search-led aggregate or a `return distinct` the written keys then every
-    /// group key not written, ascending; no sort where the query orders nothing.
+    /// (a fused ranking's `_rrf` descending) then the written keys; over
+    /// group rows (an aggregate or a `return distinct`) the written keys then
+    /// the tie rule's group keys ([`Self::with_group_keys`]); no sort where
+    /// the query neither orders nor cuts its rows. A `limit` with no `order`
+    /// cuts the tie rule's order alone (RFC, `Cut`).
     fn required_keys(&self) -> Option<Vec<IROrdering>> {
+        let cut_or_ordered = self.ordered || self.limit.is_some();
+        if self.aggregate {
+            // A search leads no sort of groups: with no key after it and no
+            // `limit` they leave unordered.
+            let led = self.search.is_some() && self.window.is_none();
+            if !cut_or_ordered || (led && self.order.is_empty() && self.limit.is_none()) {
+                return None;
+            }
+            return Some(self.with_group_keys(self.order.clone()));
+        }
         if self.window.is_some() {
             // A ranking drawn as a pattern step leads nothing: the written
-            // keys order the rows (group keys made total for `distinct` as
-            // for any read), and a `limit` over ungrouped rows with none
-            // written cuts the identities' order.
-            if self.aggregate {
-                if !self.ordered {
-                    return None;
-                }
-                let distinct = !self
-                    .returns
-                    .iter()
-                    .any(|projection| contains_aggregate(&projection.expr));
-                let mut keys = self.order.clone();
-                if distinct {
-                    for projection in &self.returns {
-                        let written = keys.iter().any(|key| match &key.expr {
-                            IRExpr::AliasRef(alias, _) => *alias == projection.column,
-                            expr => *expr == projection.expr,
-                        });
-                        if !written {
-                            keys.push(IROrdering {
-                                expr: IRExpr::AliasRef(
-                                    projection.column.clone(),
-                                    projection.ty.clone(),
-                                ),
-                                descending: false,
-                            });
-                        }
-                    }
-                }
-                return Some(keys);
-            }
-            if !self.ordered && self.limit.is_none() {
+            // keys order the rows.
+            if !cut_or_ordered {
                 return None;
             }
             return Some(self.order.clone());
         }
-        if self.aggregate {
-            // Under a search, groups have no order unless a key remains
-            // after the score; otherwise any written clause sorts them.
-            if !self.ordered || (self.search.is_some() && self.order.is_empty()) {
-                return None;
-            }
-            // A search-led sort, or a `return distinct` (groups without an
-            // aggregate), is total through every group key it did not write.
-            let distinct = !self
-                .returns
-                .iter()
-                .any(|projection| contains_aggregate(&projection.expr));
-            let mut keys = self.order.clone();
-            if self.search.is_some() || distinct {
-                for projection in &self.returns {
-                    if contains_aggregate(&projection.expr) {
-                        continue;
-                    }
-                    let written = keys.iter().any(|key| match &key.expr {
-                        IRExpr::AliasRef(alias, _) => *alias == projection.column,
-                        expr => *expr == projection.expr,
-                    });
-                    if !written {
-                        keys.push(IROrdering {
-                            expr: IRExpr::AliasRef(
-                                projection.column.clone(),
-                                projection.ty.clone(),
-                            ),
-                            descending: false,
-                        });
-                    }
-                }
-            }
-            return Some(keys);
-        }
         let lead = match &self.search {
-            None if !self.ordered => return None,
+            None if !cut_or_ordered => return None,
             None => Vec::new(),
             Some(Search::Rank(retrieval)) => {
                 let (column, descending) = retrieval.kind.score();
@@ -1381,6 +1328,31 @@ impl Requirements {
                 .chain(self.order.iter().cloned())
                 .collect(),
         )
+    }
+
+    /// `keys`, then every group key not written, ascending: each reference
+    /// (by its identity) first, then each value, in column order. An
+    /// aggregate column breaks no tie between groups.
+    fn with_group_keys(&self, mut keys: Vec<IROrdering>) -> Vec<IROrdering> {
+        let groups = self
+            .returns
+            .iter()
+            .filter(|projection| !contains_aggregate(&projection.expr));
+        let (references, values): (Vec<_>, Vec<_>) =
+            groups.partition(|projection| crate::optimizer::is_reference_expr(&projection.expr));
+        for projection in references.into_iter().chain(values) {
+            let written = keys.iter().any(|key| match &key.expr {
+                IRExpr::AliasRef(alias, _) => *alias == projection.column,
+                expr => *expr == projection.expr,
+            });
+            if !written {
+                keys.push(IROrdering {
+                    expr: IRExpr::AliasRef(projection.column.clone(), projection.ty.clone()),
+                    descending: false,
+                });
+            }
+        }
+        keys
     }
 
     /// The plan's rows leave in the order the query requires and are cut
@@ -1497,14 +1469,16 @@ impl Requirements {
         Ok(())
     }
 
-    /// The sort's metadata keys complete its comparator as RFC 0047 defines:
-    /// every written binding's identity (`@type` then `@id` for a selected
-    /// edge) in binding-name order, ascending, nulls first. Three planner
-    /// omissions are comparator equivalences and accepted: a key the
-    /// comparator already holds, every key when the query returns only order
-    /// keys or constants (rows that tie are indistinguishable), and identities of
-    /// bindings the query does not name (anonymous traversal endpoints)
-    /// after every named one. A sort of group rows appends none.
+    /// The sort's metadata keys complete its comparator as the tie rule
+    /// defines (RFC, `Order`): the identity of every reference column the
+    /// query names, in column order (`@type` then `@id` for a selected edge),
+    /// then every other column in column order, a correlated read's or a
+    /// union's value by value and a name the lowering made up (an anonymous
+    /// end, an inlined read's unreturned binding) by identity; ascending,
+    /// nulls first. Two omissions are comparator equivalences and accepted: a
+    /// key the comparator already holds, and every key when the query
+    /// returns only order keys or constants (rows that tie are
+    /// indistinguishable). A sort of group rows appends none.
     fn check_tiebreak(
         &self,
         order_by: &[IROrdering],
@@ -1543,36 +1517,38 @@ impl Requirements {
             let physical = match column.property.as_deref() {
                 Some(IDENTITY_MEMBER) => columns.id,
                 Some(EDGE_TYPE_MEMBER) => omnigraph_compiler::traversal::EDGE_TYPE_COLUMN,
-                _ => return false,
+                Some(value) => value,
+                None => return false,
             };
             order_by.iter().any(|key| {
                 matches!(named_expr(&self.returns, &key.expr), IRExpr::PropAccess { variable, property, .. }
                     if *variable == column.binding && property == physical)
             })
         };
-        // A fresh name (an inline read's hidden binding, an edge scan's
-        // ends) is no binding the query names: its identity ties after
-        // every named one, as an anonymous endpoint's does.
-        let named_binding =
-            |name: &String| self.bindings.contains_key(name) && !is_fresh_variable(name);
+        let (named, rest): (Vec<_>, Vec<_>) = self
+            .tie_columns
+            .iter()
+            .partition(|column| column.is_named());
         let mut expected = Vec::new();
-        for name in self.bindings.keys().filter(|name| !is_fresh_variable(name)) {
-            if self.selected_edges.contains(name) {
-                expected.push(ColumnRef::property(name, EDGE_TYPE_MEMBER));
+        for column in named.into_iter().chain(rest) {
+            match column {
+                TieColumn::Identity { binding, selected } => {
+                    if *selected {
+                        expected.push(ColumnRef::property(binding, EDGE_TYPE_MEMBER));
+                    }
+                    expected.push(ColumnRef::property(binding, IDENTITY_MEMBER));
+                }
+                TieColumn::Value { binding, column } => {
+                    expected.push(ColumnRef::property(binding, column));
+                }
             }
-            expected.push(ColumnRef::property(name, IDENTITY_MEMBER));
         }
         expected.retain(|column| !keyed(column));
-        let planned: Vec<&ColumnRef> = tiebreak.iter().filter(|column| !keyed(column)).collect();
-        let named = planned.len().min(expected.len());
-        let (head, tail) = planned.split_at(named);
-        let head_ok = head.iter().copied().eq(expected.iter());
-        let tail_ok = tail.iter().all(|column| !named_binding(&column.binding));
-        if !head_ok || named != expected.len() || !tail_ok {
+        if tiebreak != expected.as_slice() {
             return Err(ValidationError::violated(
                 "order",
                 format!(
-                    "the final sort breaks ties by {:?}; the query's comparator requires {:?} first",
+                    "the final sort breaks ties by {:?}; the query's comparator requires {:?}",
                     tiebreak.iter().map(ToString::to_string).collect::<Vec<_>>(),
                     expected.iter().map(ToString::to_string).collect::<Vec<_>>()
                 ),

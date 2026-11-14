@@ -227,31 +227,31 @@ nulls compare equal. Every projection is a key, including comparisons, and
 bare nodes deduplicate by identity. Deduplication follows `match` and precedes
 ordering and limiting, so the limit counts distinct rows. Aggregates with
 `distinct` are refused (`T56`). DISTINCT order keys must be projected values
-or aliases, including property keys (`T42`). Remaining projected columns break
-ties ascending; no identity tiebreak is added.
+or aliases, including property keys (`T42`).
 
-For ordinary returns, explicit order is total: entity ids break ties only when
-they can change the visible order, and no id is read when every projection is a
-key. Ascending puts nulls first, descending last. On ungrouped, non-DISTINCT
-rows an order key need not be projected: `order { $p.age > 30 }` sorts by a
-value the return leaves out. Over grouped rows, an aggregated or DISTINCT
-return, an order key must be a return item or its alias (`T42`), like
-`count($d)` after `return { count($d) as deals }`.
+Order is total under the tie rule: after the written keys (ascending puts nulls
+first, descending last), each entity id in the order the pattern binds it (a
+traversal's destination before its edge), then a `from`'s value columns, all
+ascending; group rows use their keys, bare nodes (by id) first. Ids are read
+only when they can change the visible order. A `limit` with no `order` cuts this
+order alone: `limit 2` returns the two smallest ids, not a scan's first rows,
+and reads every match. On ungrouped, non-DISTINCT rows an order key need not be
+projected: `order { $p.age > 30 }` sorts by a value the return leaves out. Over
+grouped rows, an aggregated or DISTINCT return, an order key must be a return
+item or its alias (`T42`): `count($d)` after `return { count($d) as deals }`.
 
 A read that draws from a [ranking](../search/index.md) orders by its score
 column like any other: `order { $distance }` for `nearest`, by ascending
 distance, and `order { $score desc }` for `bm25` and `rrf`, by descending
 score, including through traversals, ranking the binding the ranking names
 whichever binding its population declares first
-([details](../search/index.md#ranking-a-traversal-reached-binding)). Later
-keys precede the identity tiebreak. A `nearest` window `k` and the `limit` are
-separate values. `limit` takes an integer literal or parameter, `limit $k`, bound to a non-negative count when the read runs. A ranking written as a call in `order` or `return` is refused (`T65`); a search
+([details](../search/index.md#ranking-a-traversal-reached-binding)). A
+`nearest` window `k` and the `limit` are separate values. `limit` takes an integer literal or parameter, `limit $k`, bound to a non-negative count when the read runs. A ranking written as a call in `order` or `return` is refused (`T65`); a search
 predicate in `return` is not lowered in this release (`T86`).
 
 For aggregate or DISTINCT returns, the ranking selects the input population;
-it does not order the output, and its score is not an order key (`T42`). The
-written keys order output rows, followed by every group or DISTINCT key
-ascending. Without keys, output is unordered. DISTINCT uses the selected
+it does not order the output, and its score is not an order key (`T42`); with
+neither keys nor a `limit`, output is unordered. DISTINCT uses the selected
 nearest population without retry overfetch, so duplicates can leave fewer rows
 than the limit. BM25 reads every matching entity before the final limit.
 

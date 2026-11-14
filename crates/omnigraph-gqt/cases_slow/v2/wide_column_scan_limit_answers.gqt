@@ -4,9 +4,10 @@
 # notes: 0123456789abcdef repeated 2,500 times): 200 MB of `body` decoded, more than
 # notes: the default 150 MiB query budget, while each answer is one 40 KB row.
 # notes: Step 1 writes them: 100 loop iterations of 50 inserts, slugs d<i>_<kk> with
-# notes: i in 0..100 and kk in 00..49. Step 2 counts them. Step 3 pins that an
-# notes: unordered `limit 1` projecting the wide column answers under the budget;
-# notes: every row carries the same body, so any one row is right. Step 4 pins the
+# notes: i in 0..100 and kk in 00..49. Step 2 counts them. Step 3 pins that a
+# notes: `limit 1` with no order projecting the wide column answers under the
+# notes: budget: it cuts the tie rule's order, a top-k by `$d`'s id (d0_00), and
+# notes: every row carries the same body, so the row is known. Step 4 pins the
 # notes: same for a top-k (`order ... desc limit 1`): its winner is d9_49, the
 # notes: greatest slug in byte order (`_` sorts after the digits), written in the
 # notes: tenth of the 100 commits, so a sort that stopped early would miss it.
