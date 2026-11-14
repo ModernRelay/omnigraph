@@ -46,6 +46,7 @@ mod exact_aggregate;
 mod explain;
 mod expr;
 mod graph;
+mod lexical;
 mod lower;
 mod operators;
 pub(crate) mod plan_source;
@@ -597,7 +598,17 @@ async fn execute_with_context(
 ) -> Result<(PlanRun, ScanReports)> {
     let mut executed = ExecutionReport::default();
     let policy = bound.plan.assumptions().gate_policy;
-    let lowering = Lowering::new(&bound, context);
+    let mut lowering = Lowering::new(&bound, context);
+    let membership = operators::memory::WorkMemory::new(ctx.task_ctx(), "full-text membership")
+        .map_err(|error| ctx.classify(error))?;
+    lowering.lexical = lexical::LexicalMembers::resolve(
+        &bound.plan,
+        &bound.values.params,
+        context.snapshot,
+        context.catalog,
+        membership,
+    )
+    .await?;
     let RankedScans { nearest, fusion } = ranked_scans(&bound.plan);
     if let Some(Fusion { id, prefilter }) = fusion {
         let (eligible, verdict) = Box::pin(rrf_prefilter_gate(context, prefilter, policy)).await;

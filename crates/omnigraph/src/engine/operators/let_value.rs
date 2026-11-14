@@ -20,12 +20,15 @@ use omnigraph_compiler::ir::{IRExpr, ParamMap};
 use super::external;
 use super::shape::{Mapped, Streaming};
 use crate::engine::expr::evaluate_expr;
+use crate::engine::lexical::LexicalColumns;
 
 pub(crate) struct LetExec {
     input: Arc<dyn ExecutionPlan>,
     name: String,
     value: IRExpr,
     params: Arc<ParamMap>,
+    /// The membership columns the value reads full-text calls as.
+    lexical: Option<Arc<LexicalColumns>>,
     shape: Streaming,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -36,6 +39,7 @@ impl LetExec {
         name: String,
         value: IRExpr,
         params: Arc<ParamMap>,
+        lexical: Option<Arc<LexicalColumns>>,
     ) -> Self {
         let shape = Streaming::new(input.schema());
         Self {
@@ -43,6 +47,7 @@ impl LetExec {
             name,
             value,
             params,
+            lexical,
             shape,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -91,6 +96,7 @@ impl ExecutionPlan for LetExec {
             self.name.clone(),
             self.value.clone(),
             Arc::clone(&self.params),
+            self.lexical.clone(),
         )))
     }
 
@@ -103,8 +109,17 @@ impl ExecutionPlan for LetExec {
         let input = self.input.execute(0, ctx)?;
         let value = self.value.clone();
         let params = Arc::clone(&self.params);
+        let lexical = self.lexical.clone();
         Ok(self.shape.map(&self.metrics, input, move |batch| {
-            evaluate_expr(&batch, &value, &params).map_err(external)?;
+            match &lexical {
+                Some(lexical) => {
+                    let widened = lexical.widen(&batch).map_err(external)?;
+                    evaluate_expr(&widened, &value, &params).map_err(external)?;
+                }
+                None => {
+                    evaluate_expr(&batch, &value, &params).map_err(external)?;
+                }
+            }
             Ok(Mapped::Batch { batch, lease: None })
         }))
     }

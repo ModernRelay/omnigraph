@@ -173,7 +173,7 @@ distance, and an `rrf` score is the fused score as `F64`. Without an alias,
 the result column is the score's name (`$score` gives `score`, `$distance`
 gives `distance`); `$score as _score` and `$distance as _distance` give those
 names. Full-text predicates are not return
-items (`T38`).
+items in this release (`T86`).
 
 A ranking may feed aggregates, but it only selects the rows that are
 aggregated: the `k` window under `nearest`, every text match under
@@ -212,11 +212,11 @@ index on its property: a one-column `@index` or `@key` on a free-text String
 node property. A call on any other property, an enum included, is refused at
 type checking (`T27`); compare enums with `=`. The analyzer folds case and
 stems, so `"deep"` matches `"Deep Learning"`. `search`, `fuzzy` and
-`match_text` must stand alone as a conjunct of `where` or be compared
-`= true`, joined only by `and`; `= false`, `not search(...)` and `or` are
-refused (`T38`). Negate with a block that re-mentions the binding, the one
-block that may bind an outer name:
-`not exists { $d: Doc where search($d.title, $q) }`.
+`match_text` are Boolean operands like any other in a `where`: true where the
+row is among the call's matches, false elsewhere, never null. Write
+`not search($d.title, $q)`, `search(...) or ...` or `search(...) = false`;
+the rows are the same whether or not the index covers them yet. Read as a
+value in `return`, `order` or a block's aggregate, a call is `T86`.
 
 ## The Key Pattern: Scope First, Rank Second
 

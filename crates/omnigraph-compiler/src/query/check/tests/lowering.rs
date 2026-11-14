@@ -47,6 +47,7 @@ const B_IN_PROGRESS: &[&str] = &[
     "an rrf of three arms",
     "a block compared with another block's value",
     "a write group selecting over a table an earlier group changes",
+    "a full-text call read as a value",
 ];
 
 const CLOSURE: &[Row] = &[
@@ -245,6 +246,22 @@ const CLOSURE: &[Row] = &[
             // "distance as an rrf arm"
             (
                 "query q($v: Vector(3), $s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(distance($all, $d.embedding, $v), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",
+                Refused("B"),
+            ),
+            // A lexical predicate is a Boolean operand like any other: under
+            // `not` and `or`, compared with a value, inside `coalesce`, in a
+            // filter over two bindings and in a block's `where`.
+            (
+                "query q($s: String) { match { $d: Doc, $p: Person, $p authored $d } where not search($d.body, $s) or $p.age > 30 or fuzzy($d.body, $s, max_edits: 1) = false or not coalesce(match_text($d.body, $s), false) return { $d.title } }",
+                Lowers,
+            ),
+            (
+                "query q($s: String) { match { $p: Person } where not exists { $d: Doc, $p authored $d where not search($d.body, $s) } return { $p.name } }",
+                Lowers,
+            ),
+            // "a full-text call read as a value"
+            (
+                "query q($s: String) { match { $d: Doc } return { $d.title, search($d.body, $s) as hit } }",
                 Refused("B"),
             ),
         ],

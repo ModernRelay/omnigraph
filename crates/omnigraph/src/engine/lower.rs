@@ -66,6 +66,9 @@ pub(super) struct Lowering<'a> {
     pub(super) graph_index: &'a Arc<GraphIndexHandle>,
     pub(super) catalog: &'a Arc<Catalog>,
     pub(super) load: Option<&'a LoadFacts>,
+    /// The full-text calls the plan evaluates as Boolean operands, answered
+    /// before the run; empty for a lowering that does not run.
+    pub(super) lexical: super::lexical::LexicalMembers,
 }
 
 pub(super) struct Lowered {
@@ -115,7 +118,18 @@ impl<'a> Lowering<'a> {
             graph_index: &context.graph_index,
             catalog: context.catalog,
             load: context.load,
+            lexical: super::lexical::LexicalMembers::default(),
         }
+    }
+
+    /// The expressions of node `id` with their full-text calls read as
+    /// membership columns, and those columns.
+    fn lexical(
+        &self,
+        id: NodeId,
+        exprs: &[IRExpr],
+    ) -> (Vec<IRExpr>, Option<Arc<super::lexical::LexicalColumns>>) {
+        self.lexical.columns(self.plan, id, exprs, self.catalog)
     }
 
     fn node(&self, id: NodeId) -> Result<&'a PhysicalNode> {
@@ -851,11 +865,13 @@ impl Lower for Walk<'_, '_> {
     }
 
     fn let_value(&mut self, id: NodeId, name: &str, value: &IRExpr, input: Plan) -> Lowers<Plan> {
+        let (mut value, lexical) = self.lowering.lexical(id, std::slice::from_ref(value));
         let exec = LetExec::new(
             input,
             name.to_string(),
-            value.clone(),
+            value.pop().expect("one value"),
             Arc::clone(self.lowering.params()),
+            lexical,
         );
         self.built(id, exec)
     }
@@ -932,7 +948,8 @@ impl Lower for Walk<'_, '_> {
         if !self.proven_empty {
             self.in_memory_filters += filters.len();
         }
-        let filter = FilterExec::new(input, filters.to_vec(), Arc::clone(self.lowering.params()));
+        let (filters, lexical) = self.lowering.lexical(id, filters);
+        let filter = FilterExec::new(input, filters, Arc::clone(self.lowering.params()), lexical);
         self.built(id, filter)
     }
 

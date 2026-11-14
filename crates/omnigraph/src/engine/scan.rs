@@ -672,7 +672,7 @@ fn search_filter_is_ranking(
 }
 
 /// Filter membership without adding the filter's score to the BM25 ranking.
-async fn search_filter_member_ids(
+pub(super) async fn search_filter_member_ids(
     dataset: &Dataset,
     filter: Option<&Expr>,
     query: FullTextSearchQuery,

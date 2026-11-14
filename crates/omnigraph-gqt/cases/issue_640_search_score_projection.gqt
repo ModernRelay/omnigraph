@@ -182,7 +182,7 @@ query search_projected($q: String) {
 --- params
 {"q": "needle"}
 
---- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
+--- expect error: T86: `search_projected`: this release's planner does not lower a full-text call read as a value in `return`
 
 --- query
 query alias_projected_again() {

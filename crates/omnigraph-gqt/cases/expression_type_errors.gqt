@@ -1,6 +1,6 @@
 # issue: none
 # notes: The context rules of the shared expression model as typed errors: a non-Boolean operand of `and`/`or`/`not`, a non-Boolean filter or
-# notes: mutation `where` (T41), an aggregate in a filter (T7), a Boolean item in an aggregate return (T9), a search call under `or` (T38), an unaliased comparison in return (T43), an aggregate or search call in an assignment (T44), and a bare property name in an assignment or a `where` (Q018);
+# notes: mutation `where` (T41), an aggregate in a filter (T7), a Boolean item in an aggregate return (T9), an unaliased comparison in return (T43), an aggregate or search call in an assignment (T44), and a bare property name in an assignment or a `where` (Q018);
 # notes: a search predicate in a write's `where` is no error: the group's selection runs it as a read does.
 
 --- runner
@@ -47,15 +47,6 @@ query aggregate_in_a_filter() {
 }
 
 --- expect error: T8: `count($p)` is an aggregate over the read's own rows; it belongs in `return`
-
---- query
-set engine = v2;
-query search_under_or() {
-    match { $p: Person } where (search($p.text, "hello") or $p.age > 30)
-    return { $p.slug }
-}
-
---- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
 
 --- query
 set engine = v2;

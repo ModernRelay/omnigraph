@@ -330,8 +330,8 @@ BM25 needs neither, though a limit is recommended for bounded output.
 
 Return the score by its name, `$distance`/`$score` (column `distance`/`score`), or alias
 it; see [`search.md`](search.md#projecting-scores). Search predicates
-(`search`, `fuzzy`, `match_text`) stand alone as filters and are not return
-items (`T38`). A ranked read's JSON carries a `ranking` object; see
+(`search`, `fuzzy`, `match_text`) are Boolean operands in `where`, under
+`not` and `or` too, and are not return items in this release (`T86`). A ranked read's JSON carries a `ranking` object; see
 [`search.md`](search.md#what-a-ranked-read-reports).
 
 ### Hybrid (reciprocal rank fusion)

@@ -218,7 +218,7 @@ impl PairBuffer {
         let bytes = std::mem::take(&mut self.bytes);
         let output = hconcat_batches(&left_rows, &right_rows).map_err(external)?;
         let output = conform(output, &self.declared).map_err(external)?;
-        let kept = match conjoined_mask(&output, &self.filters, &self.params)? {
+        let kept = match conjoined_mask(&output, &self.filters, &self.params, None)? {
             None => output,
             Some(mask) => {
                 work.grow(bytes)?;

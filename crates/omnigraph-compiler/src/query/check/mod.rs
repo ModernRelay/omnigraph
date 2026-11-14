@@ -2343,7 +2343,7 @@ impl Ctx<'_> {
                             continue;
                         }
                         let typed = self
-                            .expr(sc, conj, At::Filter { top: true })
+                            .expr(sc, conj, At::Filter)
                             .and_then(|pred| require_bool(&pred, "a filter").map(|()| pred));
                         let Some(pred) = self.guard(sc.recover, typed)? else {
                             sc.block_buf.clear();
@@ -2843,14 +2843,11 @@ impl Ctx<'_> {
     /// row that `not ( … )` drops; the fix writes `coalesce(…, false)` there,
     /// which keeps every row. The block is typed with the re-mention
     /// correlating to learn that; a refusal inside it is returned first,
-    /// since it is the block's own.
-    ///
-    /// A predicate holding a search predicate (`search`, `fuzzy`,
-    /// `match_text`, `match_terms`) has no such conjunct: a search predicate
-    /// stands alone as a conjunct (`T38`), so `not search(…)` is refused, and
-    /// this block is how a search is negated. That block keeps correlating
-    /// by re-mention: `Ok(true)`.
-    fn re_mention_only(&mut self, sc: &Scope, block: &Block, outer: &[Col]) -> R<bool> {
+    /// since it is the block's own. A lexical predicate (`search`, `fuzzy`,
+    /// `match_text`, `match_terms`) is a Boolean operand like any other, so a
+    /// block filtering on one is written the same way,
+    /// `not (search($d.title, $q))`.
+    fn re_mention_only(&mut self, sc: &Scope, block: &Block, outer: &[Col]) -> R<()> {
         let pattern = &block.pattern;
         let [
             Element::Binding {
@@ -2859,17 +2856,14 @@ impl Ctx<'_> {
             },
         ] = pattern.elements.as_slice()
         else {
-            return Ok(false);
+            return Ok(());
         };
         let Some(outer_ty) = outer.iter().find(|c| c.name == *variable).map(|c| &c.ty) else {
-            return Ok(false);
+            return Ok(());
         };
         match self.binding_type(type_name) {
             Ok(ty) if outer_ty.same_base(&ty) => {}
-            _ => return Ok(false),
-        }
-        if pattern.predicate.as_ref().is_some_and(has_search_predicate) {
-            return Ok(true);
+            _ => return Ok(()),
         }
         let first = pattern.spans.elements.first();
         let at = first.map(|s| s.position);
@@ -2962,11 +2956,10 @@ impl Ctx<'_> {
                 .collect(),
             None => sc.visible(),
         };
-        let re_mention = self.re_mention_only(sc, block, &outer)?;
+        self.re_mention_only(sc, block, &outer)?;
         let mut inner = Scope::new(sc.params.clone(), outer, sc.rels.clone());
         inner.inner = false;
-        inner.block = !re_mention;
-        inner.correlates = re_mention;
+        inner.block = true;
         self.pattern(&mut inner, pattern)?;
         self.flush(&mut inner, true)?;
         let arg = match arg {
@@ -4345,12 +4338,7 @@ impl Ctx<'_> {
     }
 
     fn expr(&mut self, sc: &mut Scope, e: &Expr, at: At) -> R<SExpr> {
-        let top = matches!(at, At::Filter { top: true });
-        let sub = if matches!(at, At::Filter { .. }) {
-            At::Filter { top: false }
-        } else {
-            at
-        };
+        let sub = at;
         let boolean = Ty::scalar(ScalarType::Bool, false);
         Ok(match e {
             Expr::InfixString {
@@ -4471,7 +4459,7 @@ impl Ctx<'_> {
                     format!("a bare identifier `{i}` is not a value in a read"),
                 ));
             }
-            Expr::Call(c) => return self.call_scalar(sc, c, at, top),
+            Expr::Call(c) => return self.call_scalar(sc, c, at),
             Expr::AggDistinct { func, .. } => {
                 return Err(err(
                     T8,
@@ -4676,7 +4664,7 @@ impl Ctx<'_> {
         })
     }
 
-    fn call_scalar(&mut self, sc: &mut Scope, c: &Call, at: At, top: bool) -> R<SExpr> {
+    fn call_scalar(&mut self, sc: &mut Scope, c: &Call, at: At) -> R<SExpr> {
         let name = c.name.as_str();
         if matches!(name, "nearest" | "bm25" | "rrf" | "distance") {
             return Err(E::D(ranking_as_scalar(name)));
@@ -4806,14 +4794,6 @@ impl Ctx<'_> {
                 )
             }
             "search" | "match_text" | "fuzzy" => {
-                if !top {
-                    return Err(err(
-                        T38,
-                        format!(
-                            "`{name}` is a search predicate; it must stand alone as a conjunct of `where`"
-                        ),
-                    ));
-                }
                 if args.len() != 2 {
                     return Err(err(
                         T71,
@@ -4861,12 +4841,6 @@ impl Ctx<'_> {
                 )
             }
             "match_terms" => {
-                if !top {
-                    return Err(err(
-                        T38,
-                        "`match_terms` is a predicate; it must stand alone as a conjunct of `where`",
-                    ));
-                }
                 no_options(c)?;
                 search_field(self, &args)?;
                 let Some(Arg::Expr(Expr::Call(t))) = c.args.get(1) else {
@@ -4991,7 +4965,7 @@ impl Ctx<'_> {
 
 #[derive(Clone, Copy)]
 enum At {
-    Filter { top: bool },
+    Filter,
     Value,
 }
 
@@ -6336,35 +6310,6 @@ fn end_bindings(
         }
     }
     out
-}
-
-/// Whether `e` calls a search predicate, which stands alone as a conjunct
-/// (`T38`).
-fn has_search_predicate(e: &Expr) -> bool {
-    match e {
-        Expr::Call(c) => {
-            matches!(
-                c.name.as_str(),
-                "search" | "fuzzy" | "match_text" | "match_terms"
-            ) || c
-                .args
-                .iter()
-                .any(|a| matches!(a, Arg::Expr(x) if has_search_predicate(x)))
-        }
-        Expr::Compare { left, right, .. }
-        | Expr::Arith { left, right, .. }
-        | Expr::InfixString { left, right, .. }
-        | Expr::And(left, right)
-        | Expr::Or(left, right)
-        | Expr::In {
-            needle: left,
-            list: right,
-            ..
-        } => has_search_predicate(left) || has_search_predicate(right),
-        Expr::Not(x) | Expr::Neg(x) => has_search_predicate(x),
-        Expr::IsNull { expr, .. } => has_search_predicate(expr),
-        _ => false,
-    }
 }
 
 /// `T82` for a triple written against its edge's declared direction: every

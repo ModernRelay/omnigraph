@@ -72,7 +72,8 @@ codes! {
     T33 = "a projected rank must repeat the executed retrieval";
     T35 = "a search predicate cannot be projected";
     T36 = "an alias cannot be projected";
-    T38 ="a search predicate must stand alone or be compared with true";
+    // T38 is withdrawn: a lexical predicate is a Boolean operand like any
+    // other (docs/rfcs/2026-11-07-gq-3.md, section 5).
     T39 = "an exists or aggregate block must reference an outer-bound variable";
     T40 = "an aggregate block argument or comparison value is invalid";
     T41 = "a filter or Boolean expression has invalid operands";

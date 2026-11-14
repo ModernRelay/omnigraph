@@ -1,0 +1,247 @@
+# issue: none
+# notes: A full-text call (`search`, `match_text`, `fuzzy`) is a Boolean operand like any other
+# notes: (docs/rfcs/2026-11-07-gq-3.md, section 5): under `not`, under `or`, compared with a
+# notes: value, inside `coalesce`, in a filter reading two bindings, inside a block and in a
+# notes: write's selection. It is true where the row is among the call's matches, so a null
+# notes: title is false, and `not search(…)` keeps exactly the rows `search(…)` drops. The seed
+# notes: is indexed; the twins `t1`, `t3` and `t4` are inserted after the index was built, into
+# notes: a fragment no full-text segment covers, and every step after the insert answers them
+# notes: as it answers their indexed originals: index coverage never changes the rows.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    title: String? @index
+    year: I64
+}
+node Person {
+    name: String @key
+}
+edge Wrote: Person -> Doc
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","title":"Graph Engines","year":2020}}
+{"type":"Doc","data":{"slug":"d2","title":"graph search","year":2021}}
+{"type":"Doc","data":{"slug":"d3","title":"Databases","year":1999}}
+{"type":"Doc","data":{"slug":"d4","year":2022}}
+{"type":"Person","data":{"name":"ada"}}
+{"type":"Person","data":{"name":"bob"}}
+{"type":"Person","data":{"name":"cy"}}
+{"edge":"Wrote","from":"ada","to":"d1","data":{}}
+{"edge":"Wrote","from":"bob","to":"d3","data":{}}
+
+--- query
+query not_searched() {
+    match { $d: Doc }
+    where not search($d.title, "graph")
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d3"}
+{"d.slug": "d4"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query searched_or_old() {
+    match { $d: Doc }
+    where search($d.title, "graph") or $d.year < 2000
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "d2"}
+{"d.slug": "d3"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query searched_compared_with_false() {
+    match { $d: Doc }
+    where search($d.title, "graph") = false
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d3"}
+{"d.slug": "d4"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query not_matched_text() {
+    match { $d: Doc }
+    where not match_text($d.title, "engines")
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d2"}
+{"d.slug": "d3"}
+{"d.slug": "d4"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query fuzzed() {
+    match { $d: Doc }
+    where fuzzy($d.title, "grph", max_edits: 1)
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "d2"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query not_fuzzed() {
+    match { $d: Doc }
+    where not fuzzy($d.title, "grph", max_edits: 1)
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d3"}
+{"d.slug": "d4"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query not_coalesced() {
+    match { $d: Doc }
+    where not coalesce(search($d.title, "graph"), false)
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d3"}
+{"d.slug": "d4"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query searched_or_another_binding() {
+    match { $p: Person, $d: Doc, $p wrote $d }
+    where search($d.title, "graph") or $p.name = "bob"
+    return { $p.name, $d.slug }
+}
+
+--- expect unordered
+{"p.name": "ada", "d.slug": "d1"}
+{"p.name": "bob", "d.slug": "d3"}
+
+--- expect shape
+p.name: String
+d.slug: String
+
+--- query
+query wrote_nothing_else() {
+    match { $p: Person }
+    where not exists { $d: Doc, $p wrote $d where not search($d.title, "graph") }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "ada"}
+{"p.name": "cy"}
+
+--- expect shape
+p.name: String
+
+--- mutate
+query twins() {
+    insert Doc { slug: "t1", title: "Graph Engines", year: 2020 }
+    insert Doc { slug: "t3", title: "Databases", year: 1999 }
+    insert Doc { slug: "t4", year: 2022 }
+}
+
+--- expect ok
+
+--- query
+query not_searched_after_insert() {
+    match { $d: Doc }
+    where not search($d.title, "graph")
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d3"}
+{"d.slug": "d4"}
+{"d.slug": "t3"}
+{"d.slug": "t4"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query searched_or_old_after_insert() {
+    match { $d: Doc }
+    where search($d.title, "graph") or $d.year < 2000
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d1"}
+{"d.slug": "d2"}
+{"d.slug": "d3"}
+{"d.slug": "t1"}
+{"d.slug": "t3"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query not_matched_text_after_insert() {
+    match { $d: Doc }
+    where not match_text($d.title, "engines")
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d2"}
+{"d.slug": "d3"}
+{"d.slug": "d4"}
+{"d.slug": "t3"}
+{"d.slug": "t4"}
+
+--- expect shape
+d.slug: String
+
+--- mutate
+query backdate_unsearched() {
+    match { $d: Doc } where not search($d.title, "graph") and $d.year < 2000
+    update $d set { year: 1990 }
+}
+
+--- expect ok
+
+--- query
+query backdated() {
+    match { $d: Doc }
+    where $d.year = 1990
+    return { $d.slug }
+}
+
+--- expect unordered
+{"d.slug": "d3"}
+{"d.slug": "t3"}
+
+--- expect shape
+d.slug: String

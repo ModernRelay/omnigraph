@@ -1034,6 +1034,12 @@ impl<'a> Shaper<'a> {
                     )));
                 }
             };
+            if holds_lexical_call(&item) {
+                return Err(self.refuse_at(
+                    "a full-text call read as a value in `return`",
+                    Construct::ReturnItem(i),
+                ));
+            }
             let alias = self.alias(column, &item);
             return_exprs.push(IRProjection {
                 ty: if item.ty() == ty {
@@ -1116,6 +1122,9 @@ impl<'a> Shaper<'a> {
                     .item(other, &aggs, ranking.as_ref())
                     .map_err(|e| e.at(at.clone()))?,
             };
+            if holds_lexical_call(&expr) {
+                return Err(self.refuse_at("a full-text call read as a value in `order`", at));
+            }
             // The sort reads columns: a computed key reads the first return
             // item that computes it; one no item computes is not lowered yet.
             let computed = matches!(
@@ -2628,6 +2637,12 @@ impl<'a> Shaper<'a> {
                 substitute(arg, &inner_lets);
             }
             let agg = &agg;
+            if agg.arg.as_ref().is_some_and(holds_lexical_call) || holds_lexical_call(&right) {
+                return Err(self.refuse_at(
+                    "a full-text call read as a value in a block's aggregate or comparison",
+                    Construct::Block,
+                ));
+            }
             let left = match &agg.arg {
                 // Counting a node binding counts its rows.
                 None => BlockAggregateExpr::count_rows(),
@@ -3233,6 +3248,38 @@ fn block_comparison(pred: &IRExpr, column: &str) -> Option<(CompOp, IRExpr)> {
         }
     }
     None
+}
+
+/// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`):
+/// a filter or a `let` reads one as membership of the row in its matches,
+/// which a return item, an order key or a block's aggregate does not lower
+/// yet.
+fn holds_lexical_call(expr: &IRExpr) -> bool {
+    let mut found = false;
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. } => {
+                found = true;
+            }
+            IRExpr::Binary { left, right, .. } => pending.extend([left.as_ref(), right.as_ref()]),
+            IRExpr::Not(inner, _)
+            | IRExpr::Cast { expr: inner, .. }
+            | IRExpr::Neg { expr: inner, .. }
+            | IRExpr::IsNull { expr: inner, .. } => pending.push(inner),
+            IRExpr::Aggregate { arg, .. } => pending.push(arg),
+            IRExpr::Call { args, .. } => pending.extend(args),
+            IRExpr::PropAccess { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Bm25 { .. }
+            | IRExpr::Rrf { .. }
+            | IRExpr::Variable(..)
+            | IRExpr::Param(..)
+            | IRExpr::Literal(..)
+            | IRExpr::AliasRef(..) => {}
+        }
+    }
+    found
 }
 
 /// The variable a search predicate filter searches.

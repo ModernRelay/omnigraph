@@ -11,7 +11,7 @@ use omnigraph_compiler::ir::expr::ScalarFunc;
 use omnigraph_compiler::ir::{IRExpr, IROrdering, IRProjection, is_fresh_variable};
 use omnigraph_compiler::query::codes::{P002, P004};
 use omnigraph_compiler::query::file::LoadStmtMode;
-use omnigraph_compiler::query::value::AggFunc;
+use omnigraph_compiler::query::value::{AggFunc, CompOp, Literal};
 use omnigraph_compiler::settings::Traversal;
 use omnigraph_compiler::traversal::{EDGE_TYPE_COLUMN, EdgeSelection};
 use omnigraph_compiler::types::Direction;
@@ -2391,7 +2391,7 @@ fn placement_target(
 /// binding a scalar `conjunct` reads; `None` for any other conjunct, one that
 /// also reads an `Expand` destination above that join included.
 fn join_target(plan: &LogicalPlan, mut id: LogicalId, conjunct: &IRExpr) -> Option<LogicalId> {
-    if search_filter_field(conjunct).is_some() {
+    if has_lexical_call(conjunct) {
         return None;
     }
     let mut reads = Vec::new();
@@ -2506,19 +2506,34 @@ fn dependent_scan_filter_pushable(filter: &IRExpr, binding: &str, source: &dyn P
     if reads.iter().any(|read| read.binding != binding) {
         return false;
     }
-    match filter.comparison_parts().map(|(left, _, _)| left) {
+    match search_filter_call(filter) {
         Some(IRExpr::Search { field, .. } | IRExpr::MatchText { field, .. }) => {
             matches!(field.as_ref(), IRExpr::PropAccess { variable, .. } if variable == binding)
         }
-        Some(IRExpr::Fuzzy { .. }) => false,
-        _ => source.filter_pushable(filter),
+        Some(_) => false,
+        None => source.filter_pushable(filter),
     }
 }
 
-/// The field of a full-text conjunct (`search`, `fuzzy`, `match_text`), the
-/// call as the left operand of the `= true` comparison the compiler builds.
+/// The full-text call of a membership conjunct (`search`, `fuzzy`,
+/// `match_text`): the left operand of the `= true` comparison the compiler
+/// builds for a call standing alone, which a scan answers by its matches.
+/// Any other use of a call, under `not` or `or` or compared with anything
+/// else, is an ordinary Boolean operand that a `Filter` evaluates.
+fn search_filter_call(filter: &IRExpr) -> Option<&IRExpr> {
+    match filter.comparison_parts()? {
+        (
+            call @ (IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }),
+            CompOp::Eq,
+            IRExpr::Literal(Literal::Bool(true), _),
+        ) => Some(call),
+        _ => None,
+    }
+}
+
+/// The field of a full-text membership conjunct ([`search_filter_call`]).
 fn search_filter_field(filter: &IRExpr) -> Option<&IRExpr> {
-    match filter.comparison_parts()?.0 {
+    match search_filter_call(filter)? {
         IRExpr::Search { field, .. }
         | IRExpr::Fuzzy { field, .. }
         | IRExpr::MatchText { field, .. } => Some(field.as_ref()),
@@ -2690,7 +2705,62 @@ fn identity_reads(node: &LogicalNode) -> Vec<String> {
         LogicalNode::Nearest { binding, .. } | LogicalNode::TextSearch { binding, .. } => {
             vec![binding.clone()]
         }
+        // A full-text call a `Filter` or a `let` evaluates is membership of
+        // the row's identity in the call's matches.
+        LogicalNode::Filter { conjuncts, .. } => {
+            let mut out = Vec::new();
+            conjuncts
+                .iter()
+                .for_each(|conjunct| lexical_bindings(conjunct, &mut out));
+            out
+        }
+        LogicalNode::Let { value, .. } => {
+            let mut out = Vec::new();
+            lexical_bindings(value, &mut out);
+            out
+        }
         _ => Vec::new(),
+    }
+}
+
+/// Whether `expr` holds a full-text call (`search`, `fuzzy`, `match_text`).
+fn has_lexical_call(expr: &IRExpr) -> bool {
+    let mut bindings = Vec::new();
+    lexical_bindings(expr, &mut bindings);
+    !bindings.is_empty()
+}
+
+/// The binding of every full-text call (`search`, `fuzzy`, `match_text`) in
+/// `expr`, whose field is that binding's property.
+fn lexical_bindings(expr: &IRExpr, out: &mut Vec<String>) {
+    match expr {
+        IRExpr::Search { field, .. }
+        | IRExpr::Fuzzy { field, .. }
+        | IRExpr::MatchText { field, .. } => {
+            if let IRExpr::PropAccess { variable, .. } = field.as_ref()
+                && !out.contains(variable)
+            {
+                out.push(variable.clone());
+            }
+        }
+        IRExpr::Binary { left, right, .. } => {
+            lexical_bindings(left, out);
+            lexical_bindings(right, out);
+        }
+        IRExpr::Not(inner, _)
+        | IRExpr::Cast { expr: inner, .. }
+        | IRExpr::Neg { expr: inner, .. }
+        | IRExpr::IsNull { expr: inner, .. } => lexical_bindings(inner, out),
+        IRExpr::Call { args, .. } => args.iter().for_each(|arg| lexical_bindings(arg, out)),
+        IRExpr::PropAccess { .. }
+        | IRExpr::Nearest { .. }
+        | IRExpr::Bm25 { .. }
+        | IRExpr::Rrf { .. }
+        | IRExpr::Variable(..)
+        | IRExpr::Param(..)
+        | IRExpr::Literal(..)
+        | IRExpr::Aggregate { .. }
+        | IRExpr::AliasRef(..) => {}
     }
 }
 
@@ -3686,11 +3756,24 @@ impl Lowering<'_> {
             }
             LogicalNode::Filter { input, conjuncts } => {
                 if let Some(LogicalNode::CrossJoin { left, right }) = logical.node(*input) {
+                    // A conjunct holding a full-text operand stays in a
+                    // `Filter` above the join, the one operator that reads
+                    // full-text calls as membership.
+                    let (lexical, joined): (Vec<IRExpr>, Vec<IRExpr>) =
+                        conjuncts.iter().cloned().partition(has_lexical_call);
                     let (left, right) =
-                        searched_side_right(logical, self.source, *left, *right, conjuncts);
+                        searched_side_right(logical, self.source, *left, *right, &joined);
                     let left_lowered = self.lower(left)?;
                     let right_lowered = self.lower(right)?;
-                    return self.filtered_cross_join(left_lowered, right_lowered, conjuncts);
+                    let join = self.filtered_cross_join(left_lowered, right_lowered, &joined)?;
+                    if lexical.is_empty() {
+                        return Ok(join);
+                    }
+                    self.tracer.record(&[Role::Filter], Rule::Lower, &[]);
+                    return Ok(self.physical.add(PhysicalNode::Filter {
+                        input: join,
+                        filters: lexical,
+                    }));
                 }
                 let lowered = self.lower(*input)?;
                 self.tracer.record(&[Role::Filter], Rule::Lower, &[]);

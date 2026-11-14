@@ -1,6 +1,8 @@
 # issue: none
-# notes: Search membership calls accept only the positive predicate form; the accepted form joined
-# notes: by `and` returns rows.
+# notes: A full-text call is a Boolean operand like any other: compared with `false`, `true` or a
+# notes: parameter, on either side of the comparison, it is the row's membership in the call's
+# notes: matches, true for `d` and false for `e`; the call standing alone joined by `and` is the
+# notes: membership the scan answers.
 
 --- runner
 timeout_ms: 10000
@@ -16,37 +18,50 @@ node Doc {
 
 --- seed
 {"type":"Doc","data":{"slug":"d","text":"needle"}}
+{"type":"Doc","data":{"slug":"e","text":"haystack"}}
 
 --- query
 set engine = v2;
-query refused_0() {
+query compared_with_false() {
     match { $d: Doc } where search($d.text, "needle") = false
     return { $d.slug }
 }
 
---- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
+--- expect unordered
+{"d.slug": "e"}
+
+--- expect shape
+d.slug: String
 
 --- query
 set engine = v2;
-query refused_1() {
+query not_equal_to_true() {
     match { $d: Doc } where search($d.text, "needle") != true
     return { $d.slug }
 }
 
---- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
+--- expect unordered
+{"d.slug": "e"}
+
+--- expect shape
+d.slug: String
 
 --- query
 set engine = v2;
-query refused_2() {
+query less_than_true() {
     match { $d: Doc } where search($d.text, "needle") < true
     return { $d.slug }
 }
 
---- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
+--- expect unordered
+{"d.slug": "e"}
+
+--- expect shape
+d.slug: String
 
 --- query
 set engine = v2;
-query refused_3($enabled: Bool) {
+query compared_with_a_parameter($enabled: Bool) {
     match { $d: Doc } where search($d.text, "needle") = $enabled
     return { $d.slug }
 }
@@ -54,34 +69,50 @@ query refused_3($enabled: Bool) {
 --- params
 {"enabled":true}
 
---- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
+--- expect unordered
+{"d.slug": "d"}
+
+--- expect shape
+d.slug: String
 
 --- query
 set engine = v2;
-query refused_4() {
+query true_compared_with_it() {
     match { $d: Doc } where true = search($d.text, "needle")
     return { $d.slug }
 }
 
---- expect error: T38: `search` is a search predicate; it must stand alone as a conjunct of `where`
+--- expect unordered
+{"d.slug": "d"}
+
+--- expect shape
+d.slug: String
 
 --- query
 set engine = v2;
-query refused_5() {
+query match_text_compared_with_false() {
     match { $d: Doc } where match_text($d.text, "needle") = false
     return { $d.slug }
 }
 
---- expect error: T38: `match_text` is a search predicate; it must stand alone as a conjunct of `where`
+--- expect unordered
+{"d.slug": "e"}
+
+--- expect shape
+d.slug: String
 
 --- query
 set engine = v2;
-query refused_6() {
+query fuzzy_compared_with_false() {
     match { $d: Doc } where fuzzy($d.text, "needle") = false
     return { $d.slug }
 }
 
---- expect error: T38: `fuzzy` is a search predicate; it must stand alone as a conjunct of `where`
+--- expect unordered
+{"d.slug": "e"}
+
+--- expect shape
+d.slug: String
 
 --- query
 set engine = v2;

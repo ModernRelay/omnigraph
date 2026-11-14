@@ -154,10 +154,16 @@ analyzer folds case and stems, so `"deep"` matches `"Deep Learning"`. A call
 on any other String property is refused at type checking (`T27`); for an
 enum, compare its values with `=` instead. The check reads only the schema.
 
-`search`, `match_text`, and `fuzzy` are positive predicates in `match`: use
-a standalone call or compare the call to literal `true` with `=`. Other
-comparisons, including `= false`, `!= true`, a Boolean parameter, and a
-call on the right side, are refused at type checking (`T38`).
+`search`, `match_text`, and `fuzzy` are Boolean operands like any other in a
+`where`: true where the row is among the call's matches, false elsewhere,
+and never null, so a row whose property is null is false. `not search(...)`,
+`search(...) or ...`, `search(...) = false` and
+`not coalesce(search(...), false)` all run, inside blocks too, and keep
+exactly the rows the call's matches decide: a call standing alone is answered
+by its binding's scan, and any other use by the same full-text query over the
+whole table, so a row an index has not covered yet answers as an indexed one
+does. A full-text call read as a value, in `return`, `order` or a block's
+aggregate, is not lowered in this release (`T86`).
 
 Separate `not` blocks may reuse a local variable name for different node
 types. Each full-text call uses the index on the type and property bound
@@ -178,8 +184,8 @@ Lance ranks by, and `rrf` gives the fused score as an `F64`. Without an alias
 the result column takes the score's name, `$score` giving `score` and
 `$distance` giving `distance`; write `$score as _score` or
 `$distance as _distance` for those names. A search
-predicate, `search(...)`, `fuzzy(...)` or `match_text(...)`, stands alone as a
-filter and is not a return item (`T38`). An aggregate reads the score as a
+predicate, `search(...)`, `fuzzy(...)` or `match_text(...)`, is a filter and
+not a return item in this release (`T86`). An aggregate reads the score as a
 column of every row the ranking keeps: `return { max($score) as best }` is
 the best score among them, and over a `nearest` window, among its targets.
 

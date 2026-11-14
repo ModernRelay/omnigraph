@@ -300,6 +300,7 @@ that calls itself.
 | A ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit` | B |
 | A block compared with another block's value, a block of several aggregates | B |
 | Two `rrf` arm windows that differ | B |
+| A full-text call (`search`, `fuzzy`, `match_text`) read as a value in `return`, `order` or a block's aggregate | B |
 | A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B |
 | A read that calls itself (`Fix`) | Rec |
 
@@ -312,10 +313,9 @@ error[T86]: type error: T86: `q`: this release's planner does not lower an `rrf`
   --> line 1, column 94
 ```
 
-`T86` prints a suggestion only where a form this release runs has the same
-rows and the same result columns. None of the refusals above has one, so
-none prints a fix: returning an `optional` node's properties instead of the
-node, for example, changes the result columns.
+`T86` prints a fix only where a form this release runs has the same rows and
+result columns, and none above has one: returning an `optional` node's
+properties instead of the node, for example, changes the result columns.
 `P006` is no longer a refusal: see [Planner codes](#planner-codes).
 
 ## Planner codes

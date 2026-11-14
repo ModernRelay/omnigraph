@@ -287,10 +287,16 @@ fn an_inner_scope_binds_a_name_new_to_it_and_reads_an_outer_one() {
         "query q() { match { $p: Person, $p $k:knows $q } where exists { $q $k:knows $r, $r: Person } return { $p } }",
         "T68",
     );
-    // A search predicate stands alone (`T38`), so a negated search keeps
-    // the block that re-mentions the binding.
-    ok(
+    // A lexical predicate is a Boolean operand like any other: a block that
+    // only re-mentions the binding to search it is that search, negated. A
+    // full-text call is never null, so no `coalesce` is needed.
+    repaired(
         "query q($s: String) { match { $d: Doc } where not exists { $d: Doc where search($d.body, $s) } return { $d } }",
+        "T68",
+        "query q($s: String) { match { $d: Doc } where not (search($d.body, $s)) return { $d } }",
+    );
+    ok(
+        "query q($s: String) { match { $d: Doc } where not search($d.body, $s) or $d.year > 1 return { $d } }",
     );
     // An inline read may not rebind an outer name.
     refused(

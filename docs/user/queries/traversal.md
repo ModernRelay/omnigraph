@@ -173,9 +173,8 @@ that only binds an outer name to filter its row, `not exists { $p: Person
 where $p.name = "bob" }`, is that filter, and the fix writes it in the
 block's place, `not ($p.name = "bob")`, or `not coalesce($p.age > 30, false)`
 where the predicate can be null, which keeps the rows whose test is null. A
-text search is the exception: it stands alone as a conjunct (`T38`), so
-`not exists { $d: Doc where search($d.title, $q) }` stays the way to negate
-one. `match` itself is not an inner scope, and neither is `optional { ... }`:
+text search is written the same way, `not (search($d.title, $q))`: a
+full-text call is a Boolean operand, never null. `match` itself is not an inner scope, and neither is `optional { ... }`:
 a triple there binds its ends.
 
 ## Optional elements
