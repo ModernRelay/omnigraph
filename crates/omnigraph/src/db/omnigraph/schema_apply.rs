@@ -420,9 +420,9 @@ where
             // touched — the accepted catalog update alone makes the unified
             // validator accept the new variants on all three write surfaces.
             // RelaxCardinality likewise only widens a `@card` range (#1403):
-            // every stored edge count met the accepted range, so it meets the
-            // wider one, and writes validate against the new range from the
-            // accepted catalog on.
+            // a count that met the accepted range also meets the wider one,
+            // so no valid stored count becomes invalid, and writes validate
+            // against the new range from the accepted catalog on.
             SchemaMigrationStep::AddConstraint {
                 type_kind,
                 type_name,

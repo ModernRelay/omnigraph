@@ -185,7 +185,7 @@ changing edge endpoints, raising an edge's `@card` minimum or lowering its
 maximum, and adding an edge type with a non-zero `@card` minimum from an
 existing node type (OG-MF-107) are refused as unsupported. Widening a `@card`
 range (`@card(1..1)` to `@card(0..1)`, or lifting the maximum) is metadata
-only: every stored count already fits the wider range. Dropping a
+only: a count that met the old range also meets the new one. Dropping a
 property drops every constraint that names only dropped properties (its own
 `@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
 or a constraint that also names a field that stays, is refused. In-place
