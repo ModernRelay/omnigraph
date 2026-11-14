@@ -190,6 +190,32 @@ fn now_us() -> u64 {
     epoch().elapsed().as_micros() as u64
 }
 
+enum Fault {
+    None,
+    Before,
+    LostAck,
+}
+
+fn fault_roll() -> Fault {
+    static PCT: OnceLock<u64> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let pct = *PCT.get_or_init(|| env("OG_WT_FAULT_PCT", "0").parse().unwrap());
+    if pct == 0 {
+        return Fault::None;
+    }
+    let mut x = NEXT.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    if x % 100 >= pct {
+        Fault::None
+    } else if x % 2 == 0 {
+        Fault::Before
+    } else {
+        Fault::LostAck
+    }
+}
+
 struct LatencyDecorator {
     latency: Duration,
     counters: Arc<Counters>,
@@ -262,7 +288,32 @@ impl ObjectStore for LatencyStore {
             PutMode::Update(_) => "put_if_match",
         };
         let start = self.charge(op, location).await;
-        let result = self.inner.put_opts(location, payload, opts).await;
+        // Fault injection (`OG_WT_FAULT_PCT`): a share of the conditional
+        // creates of log records and `__manifest` versions fail, half before
+        // the write and half after it with the answer lost.
+        let fault = match op {
+            "put_if_absent"
+                if location.as_ref().contains("__wal")
+                    || location.as_ref().contains("__manifest/_versions") =>
+            {
+                fault_roll()
+            }
+            _ => Fault::None,
+        };
+        let result = match fault {
+            Fault::Before => Err(object_store::Error::Generic {
+                store: "fault",
+                source: "injected failure before the write".into(),
+            }),
+            Fault::LostAck => {
+                let _ = self.inner.put_opts(location, payload, opts).await;
+                Err(object_store::Error::Generic {
+                    store: "fault",
+                    source: "injected lost acknowledgement".into(),
+                })
+            }
+            Fault::None => self.inner.put_opts(location, payload, opts).await,
+        };
         self.finish(start, op, location);
         result
     }
@@ -422,6 +473,7 @@ struct Config {
     label: String,
     claim: bool,
     indexed: bool,
+    maintain_secs: f64,
 }
 
 fn env(name: &str, default: &str) -> String {
@@ -449,6 +501,7 @@ impl Config {
             label: env("OG_WT_LABEL", "baseline"),
             claim: env("OG_WT_CLAIM", "0") == "1",
             indexed: env("OG_WT_INDEXED", "0") == "1",
+            maintain_secs: env("OG_WT_MAINTAIN_SECS", "0").parse().unwrap(),
         }
     }
 }
@@ -678,6 +731,41 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
         }));
     }
 
+    // Live maintenance (`OG_WT_MAINTAIN_SECS`): an index build on every
+    // written branch at that interval, beside the writers.
+    let maintenance = (config.maintain_secs > 0.0).then(|| {
+        let session = session.clone();
+        let stop = Arc::clone(&stop);
+        let every = Duration::from_secs_f64(config.maintain_secs);
+        let targets: Vec<String> = branches
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        tokio::spawn(async move {
+            let (mut builds, mut failures) = (0u64, Vec::new());
+            while !stop.load(Ordering::Relaxed) {
+                tokio::time::sleep(every).await;
+                for branch in &targets {
+                    let result = if branch == "main" {
+                        session.ensure_indices_as(None).await.map(|_| ())
+                    } else {
+                        session
+                            .db()
+                            .ensure_indices_on_as(branch, None)
+                            .await
+                            .map(|_| ())
+                    };
+                    match result {
+                        Ok(()) => builds += 1,
+                        Err(error) => failures.push(format!("{error}")),
+                    }
+                }
+            }
+            (builds, failures)
+        })
+    });
     tokio::time::sleep(config.warmup).await;
     let _ = omnigraph::db::group_commit::stats::take();
     let _ = omnigraph_catalog::wal::lag::take();
@@ -704,6 +792,14 @@ async fn run_cell(config: &Config, mode: &str, writers: usize) -> CellResult {
         + control.list_dir.load(Ordering::Relaxed);
     stop.store(true, Ordering::SeqCst);
 
+    if let Some(maintenance) = maintenance {
+        let (builds, failures) = maintenance.await.unwrap();
+        eprintln!(
+            "    maintenance: {builds} index builds, {} failed{}",
+            failures.len(),
+            failures.first().map(|f| format!(" (first: {f})")).unwrap_or_default()
+        );
+    }
     let mut result = CellResult {
         commits: 0,
         elapsed,
@@ -1194,4 +1290,113 @@ async fn wal_claim_record_fences_the_previous_owner() {
         .unwrap();
     eprintln!("rows after the takeover: {rows} (expect 3)");
     assert_eq!(rows, 3);
+}
+
+/// Faults on the log and the fold (run with the prototype switches and
+/// `OG_WT_FAULT_PCT`): conditional creates of records and `__manifest`
+/// versions fail before the write or lose their answer after it. Every
+/// acknowledged key is present exactly once afterwards, and every present key
+/// was written by an acknowledged or a failed (in-doubt) attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "instrument: WAL under injected record and fold faults (WAL research)"]
+async fn wal_faults_keep_every_acknowledged_write() {
+    let _counters = counters(Duration::from_millis(
+        env("OG_WT_LATENCY_MS", "5").parse().unwrap(),
+    ));
+    let uri = format!("shared-memory://wt-faults-{}/graph", std::process::id());
+    let adapter: Arc<dyn StorageAdapter> = Arc::new(ObjectStorageAdapter::in_memory());
+    let db = Omnigraph::init_with_storage(&uri, SCHEMA, Arc::clone(&adapter), InitOptions::default())
+        .await
+        .unwrap();
+    let session = Session::from_defaults(Arc::new(db), SessionSettings::default());
+    // The claim may meet an injected fault too; a real client retries it.
+    let mut claimed = false;
+    for _ in 0..20 {
+        if session.db().claim_branch_writer("main").await.is_ok() {
+            claimed = true;
+            break;
+        }
+    }
+    assert!(claimed, "the claim never landed");
+    let stop = Arc::new(AtomicBool::new(false));
+    let acked: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
+    let failed: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
+    let mut handles = Vec::new();
+    for w in 0..32u64 {
+        let session = session.clone();
+        let stop = Arc::clone(&stop);
+        let acked = Arc::clone(&acked);
+        let failed = Arc::clone(&failed);
+        handles.push(tokio::spawn(async move {
+            let mut seq = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                seq += 1;
+                let slug = format!("w{w}-{seq}");
+                loop {
+                    match session
+                        .mutate("main", QUERIES, "put", &params(&slug, seq as i64, None))
+                        .await
+                    {
+                        Ok(_) => {
+                            acked.lock().unwrap().insert(slug.clone());
+                            break;
+                        }
+                        Err(error) if format!("{error:?}").contains("ReadSetChanged") => continue,
+                        Err(_) => {
+                            failed.lock().unwrap().insert(slug.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(
+        env("OG_WT_DURATION_SECS", "8").parse().unwrap(),
+    ))
+    .await;
+    stop.store(true, Ordering::SeqCst);
+    for handle in handles {
+        handle.await.unwrap();
+    }
+    omnigraph_catalog::wal::forget_all().await.unwrap();
+    let fresh = Omnigraph::open_with_storage(&uri, Arc::clone(&adapter)).await.unwrap();
+    let snapshot = fresh
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let dataset = snapshot.open_dataset("node:Item").await.unwrap();
+    let mut stream = dataset.scan().try_into_stream().await.unwrap();
+    let mut seen = std::collections::BTreeMap::<String, usize>::new();
+    use futures::TryStreamExt as _;
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        let column = batch
+            .column_by_name("slug")
+            .expect("slug column")
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("slug is a string column")
+            .clone();
+        for i in 0..column.len() {
+            *seen.entry(column.value(i).to_string()).or_default() += 1;
+        }
+    }
+    let acked = acked.lock().unwrap().clone();
+    let failed = failed.lock().unwrap().clone();
+    let in_doubt_present = failed.iter().filter(|slug| seen.contains_key(*slug)).count();
+    eprintln!(
+        "faults: {} acknowledged, {} failed ({} of them present: in doubt, landed), {} rows",
+        acked.len(),
+        failed.len(),
+        in_doubt_present,
+        seen.len()
+    );
+    assert!(seen.values().all(|count| *count == 1), "a key is present twice");
+    let missing: Vec<_> = acked.iter().filter(|slug| !seen.contains_key(*slug)).collect();
+    assert!(missing.is_empty(), "acknowledged keys missing: {:?}", &missing[..missing.len().min(5)]);
+    let phantom: Vec<_> = seen
+        .keys()
+        .filter(|slug| !acked.contains(*slug) && !failed.contains(*slug))
+        .collect();
+    assert!(phantom.is_empty(), "keys no attempt wrote: {:?}", &phantom[..phantom.len().min(5)]);
 }

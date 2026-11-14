@@ -273,6 +273,30 @@ pub(crate) struct GroupCommitter {
 }
 
 impl GroupCommitter {
+    /// Whether a writer on `branch` stages its own effects: with
+    /// `OMNIGRAPH_GROUP_ADAPTIVE=<n>`, while fewer than `n` entries wait and
+    /// batches are in flight (an idle group, where a leader-staged batch would
+    /// put the probe and the data put on the critical path); otherwise the
+    /// leader stages the batch.
+    pub(crate) fn writer_stages(&self, branch: Option<&str>) -> bool {
+        static THRESHOLD: OnceLock<Option<usize>> = OnceLock::new();
+        let Some(threshold) = *THRESHOLD.get_or_init(|| {
+            std::env::var("OMNIGRAPH_GROUP_ADAPTIVE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        }) else {
+            return false;
+        };
+        let group = self.group(branch);
+        let waiting = group.queue.lock().expect("group commit queue poisoned").len();
+        let flying = group
+            .in_flight
+            .lock()
+            .expect("group commit in-flight poisoned")
+            .len();
+        waiting + flying < threshold
+    }
+
     fn group(&self, branch: Option<&str>) -> Arc<BranchGroup> {
         let mut branches = self.branches.lock().expect("group commit registry poisoned");
         Arc::clone(
@@ -784,10 +808,7 @@ async fn run_pipelined_batch(
                         }
                     }
                 }
-                Work::Staged(_) => {
-                    let _ = queued.reply.send(Err(refused("pipeline_needs_pending")));
-                    continue;
-                }
+                Work::Staged(staged) => staged.pure_insert_ids_by_table(),
             };
             let conflicts = ids.iter().any(|(table, ids)| {
                 since.get(table).is_some_and(|landed| {
@@ -835,24 +856,28 @@ async fn run_pipelined_batch(
     // batches' stages.
     let staged = async {
         let mut staging: Option<crate::exec::staging::MutationStaging> = None;
+        let mut components = Vec::new();
         for queued in admitted.iter_mut() {
             let work = std::mem::replace(
                 &mut queued.entry.work,
                 Work::Pending(crate::exec::staging::MutationStaging::default()),
             );
-            let Work::Pending(pending) = work else {
-                unreachable!("admission checked the kind");
-            };
-            staging
-                .get_or_insert_with(|| {
-                    crate::exec::staging::MutationStaging::new(pending.write_budget())
-                })
-                .absorb_pending(pending, &base.base)?;
+            match work {
+                // Effects this writer staged itself (an idle group): composed
+                // onto the tip in stage 2 with the rest.
+                Work::Staged(mut staged) => components.extend(staged.take_group_components()?.0),
+                Work::Pending(pending) => staging
+                    .get_or_insert_with(|| {
+                        crate::exec::staging::MutationStaging::new(pending.write_budget())
+                    })
+                    .absorb_pending(pending, &base.base)?,
+            }
         }
-        let staging = staging
-            .ok_or_else(|| OmniError::manifest_internal("an empty batch reached staging"))?;
-        let mut staged = staging.stage_all_with_concurrency(db, branch, 8).await?;
-        Ok::<_, OmniError>(staged.take_group_components()?.0)
+        if let Some(staging) = staging {
+            let mut staged = staging.stage_all_with_concurrency(db, branch, 8).await?;
+            components.extend(staged.take_group_components()?.0);
+        }
+        Ok::<_, OmniError>(components)
     }
     .await;
     let components = match staged {
@@ -890,31 +915,39 @@ async fn run_pipelined_batch(
                 let witness = base.authority.staging_witness()?;
                 let table_fork_owner =
                     base.branch.as_deref().and_then(|_| base.base.native_branch());
+                let mut tables: Vec<(String, crate::exec::staging::StagedTablePath, Vec<crate::table_store::StagedWrite>)> =
+                    Vec::new();
                 for component in components {
-                    let entry = base.base.dataset(&component.table_key).cloned().ok_or_else(|| {
-                        refused(&format!("table '{}' left the manifest", component.table_key))
+                    match tables.iter_mut().find(|(table, _, _)| *table == component.table_key) {
+                        Some((_, _, parts)) => parts.push(component.staged),
+                        None => tables.push((component.table_key, component.path, vec![component.staged])),
+                    }
+                }
+                for (table_key, path, parts) in tables {
+                    let entry = base.base.dataset(&table_key).cloned().ok_or_else(|| {
+                        refused(&format!("table '{table_key}' left the manifest"))
                     })?;
-                    let (tip, logical, last_linear) = match chain.tips.get(&component.table_key) {
+                    let (tip, logical, last_linear) = match chain.tips.get(&table_key) {
                         Some(tip) if tip.logical_version > entry.published_dataset_version => (
                             tip.snapshot.clone(),
                             tip.logical_version,
                             tip.version_metadata.last_linear_version(),
                         ),
                         _ => (
-                            db.open_pinned_for_write(&component.path.full_path, &entry).await?,
+                            db.open_pinned_for_write(&path.full_path, &entry).await?,
                             entry.published_dataset_version,
                             entry.version_metadata.last_linear_version(),
                         ),
                     };
                     let composed = crate::table_store::compose_pure_inserts(
                         tip.dataset(),
-                        vec![component.staged],
+                        parts,
                         base.catalog.system_columns,
                     )?;
                     let declared_full_text =
                         crate::db::omnigraph::table_ops::declared_full_text_columns(
                             &base.catalog,
-                            &component.table_key,
+                            &table_key,
                         );
                     let (detached, identity) = db
                         .storage()
@@ -927,7 +960,7 @@ async fn run_pipelined_batch(
                         .await?;
                     let state = db
                         .storage()
-                        .table_state(&component.path.full_path, &detached)
+                        .table_state(&path.full_path, &detached)
                         .await?;
                     let target = logical + 1;
                     let version_metadata = state
@@ -939,7 +972,7 @@ async fn run_pipelined_batch(
                         .handles
                         .insert(
                             &entry.dataset_path,
-                            component.path.table_branch.as_deref(),
+                            path.table_branch.as_deref(),
                             target,
                             Some(state.version),
                             version_metadata.e_tag(),
@@ -957,19 +990,19 @@ async fn run_pipelined_batch(
                         });
                     }
                     chain.tips.insert(
-                        component.table_key.clone(),
+                        table_key.clone(),
                         ChainTip {
                             snapshot: detached,
                             logical_version: target,
                             version_metadata: version_metadata.clone(),
                         },
                     );
-                    paths.push(component.path.clone());
+                    paths.push(path.clone());
                     updates.push(DatasetUpdate {
-                        identity: component.path.identity,
-                        type_key: component.table_key,
+                        identity: path.identity,
+                        type_key: table_key,
                         published_dataset_version: target,
-                        native_dataset_branch: component.path.table_branch,
+                        native_dataset_branch: path.table_branch,
                         entity_count: state.row_count,
                         version_metadata,
                     });

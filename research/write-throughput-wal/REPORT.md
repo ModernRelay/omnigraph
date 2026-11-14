@@ -214,6 +214,9 @@ in each row.
 | 10 | Fencing by making the claim the next record | the old owner's next write is refused `WriterFenced`; throughput unchanged (285 at N=64) | Keep |
 | 11 | Cold reads: newest record only, exponential + binary probe | 63 unfolded records: 2.98 s / 138 requests → 0.77 s / 36; caught up: as today | Keep |
 | 12 | Prefetch each new tip's index metadata once per batch | N=1: 140 → 119 ms; N=16: 66 → 82; N=64: 279 → **352 (p99 331)** (`final-wal-pf`) | Keep |
+| 13 | Adaptive staging: a writer stages itself while its group is idle | threshold 2: N=4 16.1 → 14.7, N=64 350 → 266; threshold 4: N=64 → 63 | Discard: brings the per-write probe CPU back |
+| 14 | Multi-table writes (node + edge per mutation) | N=1/16/64: 4.6 / 1.6 / 0 → 5.9 / 50.0 / **215.9** (`edge-*`) | Works; batches compose per table |
+| 15 | Faults on records and folds (2% and 10% of conditional creates fail, half after writing) | 961 and 293 acknowledged, all present once; 4 and 23 failed, none landed; no phantom keys | Keep (correctness evidence) |
 
 ### 5.1 Final measurements
 
@@ -289,7 +292,9 @@ commits/s at N = 1/4/16/64); one branch per writer improves to 115.6 at 16 and *
 64** (p99 376 ms): the BTREE probe is cheaper than the merge join each named-branch write
 pays alone.
 
-**Correctness instruments (all pass):** per-cell verification; `wal_recovery_and_cold_reads`
+**Correctness instruments (all pass):** per-cell verification; `wal_faults_keep_every_acknowledged_write`
+(2% and 10% of record and `__manifest` conditional creates fail, half after writing: every
+acknowledged key present exactly once, failed ones never landed, no phantom keys); `wal_recovery_and_cold_reads`
 (crash between records and fold); `wal_claim_record_fences_the_previous_owner` (a takeover
 fences the old owner's next write); `wal_cold_read_cost` (a reader in another process sees
 every acknowledged write over an unfolded tail of 0–63 records); `group_commit_mixed_workload_is_consistent` (20 writers
@@ -315,7 +320,23 @@ process, every head-advancing publication now goes through it.
 - The non-bound branch cache serializing all branches behind one mutex held across a probe
   (section 6.4) is a cross-branch bottleneck worth fixing regardless of the log.
 
-### 5.3 Ideas considered and not built, with the reason
+### 5.3 Long runs and live maintenance
+
+Nothing in the benchmark compacts or indexes the table while it runs, and a batch adds one
+fragment per table. Over longer windows at 64 writers (final, mem 20 ms) throughput falls
+from 351.5 commits/s (10 s) to 291.8 (30 s) and 234.0 (60 s, p99 494 ms) while requests per
+commit rise from 3.1 to 8.0 and the process stays under one core: the id probe reads ever
+more uncovered fragments. That is RFC 0067's first throughput step, live maintenance. Run
+alongside (an index build every 5 s on an indexed table, `OG_WT_MAINTAIN_SECS=5`), only 1 of
+13 index builds landed: the others failed with "write authority 'graph_head:main' changed
+during preparation", because the head moves several times a second and an index build
+neither re-prepares nor is carried over. At this write rate maintenance must be carried over
+insertion-only commits (a `CreateIndex` rebases over appends in Lance, the index simply
+covering fewer fragments, which the coverage rules already allow), or be admitted by the
+group as an exclusive entry that rebases at the head of the queue. Without it the design's
+steady state is bounded by the growth of uncovered fragments.
+
+### 5.4 Ideas considered and not built, with the reason
 
 - **A logical WAL with an in-memory row overlay (SlateDB/turbopuffer memtable).** It would
   make the acknowledgement one put with no table work, but every read path (scans, the
@@ -634,7 +655,9 @@ In order of dependency:
    running mid-pipeline could judge the staging dead), and a stage-2 failure path proven by
    failpoints.
 5. **Live maintenance** (RFC 0067 step 1): the id probe still scans every uncovered fragment
-   once per batch; an index build or compaction that keeps up bounds it. These publications
+   once per batch; an index build or compaction that keeps up bounds it. Measured (5.3): at
+   this write rate an index build almost never lands, because it is refused whenever the head
+   moved during its preparation; it must be carried over insertion-only commits. These publications
    are row-preserving, so batches can be carried over them (the carry rule of
    [RFC: writes carried over row-preserving publications](../../docs/rfcs/2026-11-10-writes-carried-over-row-preserving-publications.md))
    instead of being refused by the effect-log horizon as the prototype does.

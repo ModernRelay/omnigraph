@@ -324,3 +324,21 @@ one branch: N=1 7.0 → 8.4 (140 → 118 ms), N=16 66.0 → 81.8, N=64 279.3 →
 332). Full sweep `final-wal-pf` (+ `-lat5`, `-lat50`): one branch 8.3 / 16.2 / 81.5 / 351.5,
 branches 8.3 / 32.8 / 128.2 / 187.2, local one branch 37.2 / 63.3 / 295.6 / 1158.9, 5 ms
 188.7 / 751.2 at N=16/64, 50 ms 29.0 / 126.3. All verified.
+
+## More evidence and two discards, 2026-11-14
+
+- Adaptive staging (`OMNIGRAPH_GROUP_ADAPTIVE=<n>`: a writer stages its own effects while
+  fewer than n entries wait and batches are in flight; the pipeline composes writer-staged
+  and leader-staged parts per table): threshold 2 N=4 14.7 (vs 16.1), N=64 266 (vs 350);
+  threshold 4 N=64 62.8. Discarded: writer staging brings back the per-write probe CPU.
+- Multi-table writes (`OG_WT_SHAPE=edge`: node + edge per mutation, `results/edge-*.jsonl`):
+  baseline 4.6 / 1.6 / 0 at N=1/16/64; final 5.9 / 50.0 / 215.9. Verified.
+- Fault injection (`OG_WT_FAULT_PCT`, `wal_faults_keep_every_acknowledged_write`, 32 writers,
+  5 ms): 2%: 961 acknowledged (all present once), 4 failed (none landed); 10%: 293
+  acknowledged, 23 failed (none landed); no phantom keys. Lost acknowledgements on records
+  resolve by the byte-comparing read-back; fold faults are retried by the fold.
+- Long runs (`results/long.jsonl`, final, N=64): 10 s 351.5, 30 s 291.8, 60 s 234.0 commits/s;
+  requests/commit 3.1 → 5.5 → 8.0; CPU 0.4-0.7 cores. Fragment growth (one per batch, no
+  maintenance). With `OG_WT_MAINTAIN_SECS=5` on an indexed table: 1 of 13 index builds landed,
+  12 refused ("write authority 'graph_head:main' changed during preparation"); 238.0 commits/s.
+  Maintenance must be carried over insertion-only commits at this write rate.

@@ -1467,7 +1467,10 @@ impl Omnigraph {
                 // branch's group commit instead of taking the gates itself.
                 let requested = txn.branch.as_deref();
                 let plans = self.validate_staged_mutation(&staging, &txn).await?;
-                if crate::db::group_commit::leader_stages() && staging.is_leader_stageable() {
+                if crate::db::group_commit::leader_stages()
+                    && staging.is_leader_stageable()
+                    && !self.write_queue().group_committer().writer_stages(requested)
+                {
                     let lineage_intent = self
                         .new_lineage_intent_for_branch(requested, actor_id, history_release_bytes)
                         .await
