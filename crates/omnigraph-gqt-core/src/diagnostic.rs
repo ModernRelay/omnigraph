@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 /// One rule the case format refuses on. `name()` is the stable spelling a
 /// log, a golden and a README anchor use; `rule()` states the rule itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CaseErrorCode {
     LineEndings,
     HeaderShape,
@@ -17,16 +17,31 @@ pub enum CaseErrorCode {
     MissingRedOn,
     FileName,
     MissingRunner,
+    RunnerConfig,
+    SectionOrder,
     UnknownSection,
+    BodyShape,
+    QueryParse,
+    StepKind,
     ExpectModeMissing,
     UnknownExpectMode,
+    ExpectModeForStep,
+    ExpectWithoutStep,
     MissingExpect,
+    MissingShape,
+    ParamsPlacement,
+    LoopHeader,
+    LoopStructure,
+    BindShape,
+    UnboundName,
+    SubstitutionPlacement,
+    BatchBound,
     CorpusTimeout,
     Other,
 }
 
 impl CaseErrorCode {
-    pub const ALL: [CaseErrorCode; 14] = [
+    pub const ALL: [CaseErrorCode; 29] = [
         CaseErrorCode::LineEndings,
         CaseErrorCode::HeaderShape,
         CaseErrorCode::UnknownHeaderKey,
@@ -35,10 +50,25 @@ impl CaseErrorCode {
         CaseErrorCode::MissingRedOn,
         CaseErrorCode::FileName,
         CaseErrorCode::MissingRunner,
+        CaseErrorCode::RunnerConfig,
+        CaseErrorCode::SectionOrder,
         CaseErrorCode::UnknownSection,
+        CaseErrorCode::BodyShape,
+        CaseErrorCode::QueryParse,
+        CaseErrorCode::StepKind,
         CaseErrorCode::ExpectModeMissing,
         CaseErrorCode::UnknownExpectMode,
+        CaseErrorCode::ExpectModeForStep,
+        CaseErrorCode::ExpectWithoutStep,
         CaseErrorCode::MissingExpect,
+        CaseErrorCode::MissingShape,
+        CaseErrorCode::ParamsPlacement,
+        CaseErrorCode::LoopHeader,
+        CaseErrorCode::LoopStructure,
+        CaseErrorCode::BindShape,
+        CaseErrorCode::UnboundName,
+        CaseErrorCode::SubstitutionPlacement,
+        CaseErrorCode::BatchBound,
         CaseErrorCode::CorpusTimeout,
         CaseErrorCode::Other,
     ];
@@ -53,13 +83,35 @@ impl CaseErrorCode {
             CaseErrorCode::MissingRedOn => "missing_red_on",
             CaseErrorCode::FileName => "file_name",
             CaseErrorCode::MissingRunner => "missing_runner",
+            CaseErrorCode::RunnerConfig => "runner_config",
+            CaseErrorCode::SectionOrder => "section_order",
             CaseErrorCode::UnknownSection => "unknown_section",
+            CaseErrorCode::BodyShape => "body_shape",
+            CaseErrorCode::QueryParse => "query_parse",
+            CaseErrorCode::StepKind => "step_kind",
             CaseErrorCode::ExpectModeMissing => "expect_mode_missing",
             CaseErrorCode::UnknownExpectMode => "unknown_expect_mode",
+            CaseErrorCode::ExpectModeForStep => "expect_mode_for_step",
+            CaseErrorCode::ExpectWithoutStep => "expect_without_step",
             CaseErrorCode::MissingExpect => "missing_expect",
+            CaseErrorCode::MissingShape => "missing_shape",
+            CaseErrorCode::ParamsPlacement => "params_placement",
+            CaseErrorCode::LoopHeader => "loop_header",
+            CaseErrorCode::LoopStructure => "loop_structure",
+            CaseErrorCode::BindShape => "bind_shape",
+            CaseErrorCode::UnboundName => "unbound_name",
+            CaseErrorCode::SubstitutionPlacement => "substitution_placement",
+            CaseErrorCode::BatchBound => "batch_bound",
             CaseErrorCode::CorpusTimeout => "corpus_timeout",
             CaseErrorCode::Other => "invalid_case",
         }
+    }
+
+    /// The code whose `name()` is `name`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        CaseErrorCode::ALL
+            .into_iter()
+            .find(|code| code.name() == name)
     }
 
     pub fn rule(&self) -> &'static str {
@@ -84,14 +136,59 @@ impl CaseErrorCode {
             CaseErrorCode::MissingRunner => {
                 "the first section is `--- runner` with explicit configuration"
             }
+            CaseErrorCode::RunnerConfig => {
+                "the runner section is YAML with `timeout_ms` in 1..=600000 and 1 to 16 distinct `environments`, each a known `target` with its `storage` and, under DST, 1 to 64 distinct `seeds`"
+            }
+            CaseErrorCode::SectionOrder => {
+                "`--- runner` leads the file; `--- schema` then `--- seed` follow it together, once each; no later section repeats them; a `--- seam` is followed by the step it arms"
+            }
             CaseErrorCode::UnknownSection => "a section header names a known section kind",
+            CaseErrorCode::BodyShape => {
+                "a section's body has the shape its kind takes: a header-only section carries none, a seed or expect body carries no `#` lines, `--- csv <name>` names one bare file, a generator recipe is YAML within its limits"
+            }
+            CaseErrorCode::QueryParse => {
+                "a query, mutate, schema or concurrent-session body parses under its grammar"
+            }
+            CaseErrorCode::StepKind => {
+                "a `--- query` holds one read declaration or read statement and a `--- mutate` one mutation declaration or write statement, each with the arguments its kind takes"
+            }
             CaseErrorCode::ExpectModeMissing => {
                 "every `--- expect` names its mode; the modes depend on the step kind"
             }
             CaseErrorCode::UnknownExpectMode => {
                 "an expect mode is ok, unordered, ordered, error: <needle>, affected: nodes=<N> edges=<M> or outcome: <word>"
             }
+            CaseErrorCode::ExpectModeForStep => {
+                "an expect mode fits its step: rows modes on a read, `ok`, `error:` and `affected:` on a write, `outcome:` on a merge, `shape`, `plan` and `same as v1` on a read's rows expect"
+            }
+            CaseErrorCode::ExpectWithoutStep => {
+                "every `--- expect` follows the step it completes, and `shape`, `plan` and `same as v1` follow the expect they extend"
+            }
             CaseErrorCode::MissingExpect => "every step is followed by its `--- expect` section",
+            CaseErrorCode::MissingShape => {
+                "a rows expect (`unordered` or `ordered`) is followed by its `--- expect shape` section"
+            }
+            CaseErrorCode::ParamsPlacement => {
+                "`--- params` follows a query or mutate declaration step, once, and no other step kind"
+            }
+            CaseErrorCode::LoopHeader => {
+                "`--- loop $var <start> <end>` names a `$[a-z][a-z0-9_]*` variable and plain bounds with start below end, at most 10000 apart; `--- foreach $var <v1> [<v2> ...]` lists values over [A-Za-z0-9_.-]"
+            }
+            CaseErrorCode::LoopStructure => {
+                "a loop holds at least one step, closes with a bare `--- endloop`, and nests no loop, bind, seam or concurrent block"
+            }
+            CaseErrorCode::BindShape => {
+                "`--- bind commit $name` follows a write expected to succeed, once per name, with no body"
+            }
+            CaseErrorCode::UnboundName => {
+                "a `${name}` operand, a `snapshot: $name` or a `from commit ${name}` names a commit bound by an earlier `--- bind commit $name`"
+            }
+            CaseErrorCode::SubstitutionPlacement => {
+                "`${...}` appears only in a params or expect body and names the enclosing loop's variable or a bound commit"
+            }
+            CaseErrorCode::BatchBound => {
+                "a generated load's batch stays within 16 MiB and 4096 rows, with `commits` in 1..=rows and `batch_rows` producing exactly `commits` nonempty batches"
+            }
             CaseErrorCode::CorpusTimeout => {
                 "a case under the required corpus (the runner's `cases/`, not `cases_slow/`) declares `timeout_ms` of at most 10000"
             }
@@ -122,8 +219,20 @@ impl CaseError {
         }
     }
 
+    /// The code a message written as text belongs to.
+    pub fn code(mut self, code: CaseErrorCode) -> Self {
+        self.code = code;
+        self
+    }
+
     pub fn at_line(mut self, line: usize) -> Self {
         self.line = Some(line);
+        self
+    }
+
+    /// The line for an error that did not name one of its own.
+    pub fn line_or(mut self, line: usize) -> Self {
+        self.line.get_or_insert(line);
         self
     }
 
@@ -197,6 +306,12 @@ impl From<String> for CaseError {
 impl From<&str> for CaseError {
     fn from(message: &str) -> Self {
         CaseError::from(message.to_string())
+    }
+}
+
+impl From<CaseError> for String {
+    fn from(error: CaseError) -> Self {
+        error.to_string()
     }
 }
 
@@ -369,5 +484,9 @@ mod tests {
                 .iter()
                 .all(|code| !code.rule().is_empty())
         );
+        for code in CaseErrorCode::ALL {
+            assert_eq!(CaseErrorCode::from_name(code.name()), Some(code));
+        }
+        assert_eq!(CaseErrorCode::from_name("no_such_code"), None);
     }
 }

@@ -54,7 +54,14 @@ pub enum ParamsInput {
 }
 pub use host::{ExecutionHost, PlainHost};
 use omnigraph::storage::StorageAdapter;
-pub use runner_config::{Execution, RunnerConfig, SeamDirective, parse_runner, parse_seam};
+pub use runner_config::{
+    CORPUS_TIMEOUT_MS, Execution, RunnerConfig, SeamDirective, corpus_admission, parse_runner,
+    parse_seam,
+};
+
+/// The case format's version: one number, bumped whenever `grammar_text()`
+/// changes, pinned by the grammar golden under `tests/grammar/`.
+pub const GQT_FORMAT_VERSION: u32 = 1;
 pub use served::{ServerTarget, admit_served, execute_steps_served};
 
 mod load_plan;
@@ -497,7 +504,7 @@ fn complete_branch_read_step(
     section: &Section<'_>,
     loop_var: Option<&str>,
     bound_names: &HashSet<String>,
-) -> Result<BranchReadStep, String> {
+) -> Result<BranchReadStep, CaseError> {
     let expect = match mode {
         ExpectHeader::Unordered | ExpectHeader::Ordered => {
             refuse_comment_lines(&section.body, "expect")?;
@@ -531,10 +538,10 @@ fn complete_branch_read_step(
             }
         }
         ExpectHeader::Ok | ExpectHeader::Affected { .. } | ExpectHeader::Outcome(_) => {
-            return Err(format!(
+            return Err(mode_for_step(format!(
                 "`{}` takes `unordered`, `ordered`, or `error:`",
                 read.statement_name()
-            ));
+            )));
         }
     };
     Ok(BranchReadStep {
@@ -658,14 +665,20 @@ fn split_header_line(line: &str) -> Result<(&str, &str), CaseError> {
         .fix(suggestion(key, "keys", &HEADER_KEYS)));
     }
     if value.trim().is_empty() {
-        return Err(format!("`# {key}:` needs a value").into());
+        return Err(CaseError::new(
+            CaseErrorCode::HeaderShape,
+            format!("`# {key}:` needs a value"),
+        )
+        .fix(format!("write `# {key}: <value>`")));
     }
     if value.trim() != value {
-        return Err(format!(
-            "header value carries leading or trailing whitespace; write `{}`",
-            canonical_header_line(key, value.trim())
-        )
-        .into());
+        return Err(CaseError::new(
+            CaseErrorCode::HeaderShape,
+            format!(
+                "header value carries leading or trailing whitespace; write `{}`",
+                canonical_header_line(key, value.trim())
+            ),
+        ));
     }
     debug_assert_eq!(canonical_header_line(key, value), line);
     Ok((key, value))
@@ -737,13 +750,25 @@ fn parse_header(lines: &[&str]) -> Result<Header, (Option<IssueRef>, Vec<CaseErr
                     continue;
                 }
                 let Ok(n) = value.parse::<u64>() else {
-                    errors.push(value_error("`# issue:` takes a number or `none`".into()));
+                    errors.push(
+                        CaseError::new(
+                            CaseErrorCode::MissingIssue,
+                            "`# issue:` takes a number or `none`",
+                        )
+                        .fix("write `# issue: <N>` for an issue case, or `# issue: none`")
+                        .at_line(line_no),
+                    );
                     continue;
                 };
                 if value != n.to_string() {
-                    errors.push(value_error(
-                        "`# issue:` number carries no sign or leading zeros".into(),
-                    ));
+                    errors.push(
+                        CaseError::new(
+                            CaseErrorCode::MissingIssue,
+                            "`# issue:` number carries no sign or leading zeros",
+                        )
+                        .fix(format!("write `# issue: {n}`"))
+                        .at_line(line_no),
+                    );
                     continue;
                 }
                 issue = Some((IssueRef::Num(n), line_no));
@@ -1155,19 +1180,23 @@ fn parse_expect_header(rest: &str) -> Result<ExpectHeader, CaseError> {
     if let Some(word) = rest.strip_prefix("outcome:") {
         let word = word.trim();
         if word.is_empty() {
-            return Err(
-                format!("`expect outcome:` needs a word: {}", merge_outcome_words()).into(),
-            );
+            return Err(CaseError::new(
+                CaseErrorCode::UnknownExpectMode,
+                format!("`expect outcome:` needs a word: {}", merge_outcome_words()),
+            )
+            .fix("write `--- expect outcome: <word>`"));
         }
         let Some(outcome) = MERGE_OUTCOMES
             .into_iter()
             .find(|o| merge_outcome_word(*o) == word)
         else {
-            return Err(format!(
-                "`expect outcome:` takes {}, got `{word}`",
-                merge_outcome_words()
-            )
-            .into());
+            return Err(CaseError::new(
+                CaseErrorCode::UnknownExpectMode,
+                format!(
+                    "`expect outcome:` takes {}, got `{word}`",
+                    merge_outcome_words()
+                ),
+            ));
         };
         return Ok(ExpectHeader::Outcome(outcome));
     }
@@ -1183,9 +1212,11 @@ fn parse_expect_header(rest: &str) -> Result<ExpectHeader, CaseError> {
     if let Some(needle) = rest.strip_prefix("error:") {
         let needle = needle.trim();
         if needle.is_empty() {
-            return Err(
-                "`expect error:` needs a substring; a bare any-error expectation is refused".into(),
-            );
+            return Err(CaseError::new(
+                CaseErrorCode::UnknownExpectMode,
+                "`expect error:` needs a substring; a bare any-error expectation is refused",
+            )
+            .fix("write `--- expect error: <a substring of the error text>`"));
         }
         return Ok(ExpectHeader::Error(needle.to_string()));
     }
@@ -1199,9 +1230,11 @@ fn parse_expect_header(rest: &str) -> Result<ExpectHeader, CaseError> {
             _ => None,
         };
         let Some((nodes, edges)) = parsed else {
-            return Err(
-                "`expect affected:` must be exactly `affected: nodes=<N> edges=<M>`".into(),
-            );
+            return Err(CaseError::new(
+                CaseErrorCode::UnknownExpectMode,
+                "`expect affected:` must be exactly `affected: nodes=<N> edges=<M>`",
+            )
+            .fix("write `--- expect affected: nodes=<N> edges=<M>`"));
         };
         return Ok(ExpectHeader::Affected { nodes, edges });
     }
@@ -1307,22 +1340,31 @@ fn yaml_body(body: &[(usize, &str)]) -> String {
     text
 }
 
-fn refuse_comment_lines(body: &[(usize, &str)], section: &str) -> Result<(), String> {
+fn refuse_comment_lines(body: &[(usize, &str)], section: &str) -> Result<(), CaseError> {
     for (idx, line) in body {
         if line.trim_start().starts_with('#') {
-            return Err(format!(
-                "line {}: `#` lines are refused inside the {section} section; comments live in the header",
-                idx + 1
-            ));
+            return Err(CaseError::new(
+                CaseErrorCode::BodyShape,
+                format!(
+                    "`#` lines are refused inside the {section} section; comments live in the header"
+                ),
+            )
+            .fix("move the comment to a `# notes:` header line")
+            .at_line(idx + 1));
         }
     }
     Ok(())
 }
 
-fn refuse_nonempty_body(body: &[(usize, &str)], what: &str) -> Result<(), String> {
+fn refuse_nonempty_body(body: &[(usize, &str)], what: &str) -> Result<(), CaseError> {
     for (idx, line) in body {
         if !line.trim().is_empty() {
-            return Err(format!("line {}: {what} carries no body", idx + 1));
+            return Err(CaseError::new(
+                CaseErrorCode::BodyShape,
+                format!("{what} carries no body"),
+            )
+            .fix("drop the lines under the header")
+            .at_line(idx + 1));
         }
     }
     Ok(())
@@ -1334,24 +1376,32 @@ fn validate_subst_tokens(
     body: &str,
     loop_var: Option<&str>,
     bound_names: &HashSet<String>,
-) -> Result<(), String> {
+) -> Result<(), CaseError> {
+    let placement = |message: String| CaseError::new(CaseErrorCode::SubstitutionPlacement, message);
     let mut rest = body;
     while let Some(pos) = rest.find("${") {
         let after = &rest[pos + 2..];
         let Some(close) = after.find('}') else {
-            return Err("unterminated `${` substitution".into());
+            return Err(placement("unterminated `${` substitution".into())
+                .fix("close the substitution with `}`"));
         };
         let name = &after[..close];
         match loop_var {
             _ if bound_names.contains(name) => {}
             None => {
-                return Err("`${` in a params or expect body is refused outside a loop".into());
+                return Err(placement(
+                    "`${` in a params or expect body is refused outside a loop".into(),
+                )
+                .fix(
+                    "write the value itself, or put the step inside a `--- loop` or `--- foreach`",
+                ));
             }
             Some(var) if name == var => {}
             Some(var) => {
-                return Err(format!(
+                return Err(placement(format!(
                     "`${{{name}}}` does not name the enclosing loop's variable `${var}`"
-                ));
+                ))
+                .fix(format!("write `${{{var}}}`")));
             }
         }
         rest = &after[close + 1..];
@@ -1593,20 +1643,27 @@ fn anns_use_embed(annotations: &[Annotation]) -> bool {
     annotations.iter().any(|a| a.name == "embed")
 }
 
-fn refuse_embed_schema(schema: &str, start_line: usize) -> Result<(), String> {
-    let file = parse_schema(schema)
-        .map_err(|e| format!("schema section starting at line {start_line} does not parse: {e}"))?;
+fn refuse_embed_schema(schema: &str, start_line: usize) -> Result<(), CaseError> {
+    let file = parse_schema(schema).map_err(|e| {
+        CaseError::new(
+            CaseErrorCode::QueryParse,
+            format!("schema section starting at line {start_line} does not parse: {e}"),
+        )
+        .fix("rewrite the schema body so it parses; the message names where the grammar stopped")
+        .at_line(start_line)
+    })?;
     let uses_embed = file.declarations.iter().any(|decl| match decl {
         SchemaDecl::Interface(i) => props_use_embed(&i.properties),
         SchemaDecl::Node(n) => anns_use_embed(&n.annotations) || props_use_embed(&n.properties),
         SchemaDecl::Edge(e) => anns_use_embed(&e.annotations) || props_use_embed(&e.properties),
     });
     if uses_embed {
-        return Err(
+        return Err(CaseError::new(
+            CaseErrorCode::BodyShape,
             "schemas using `@embed` resolve an embedding provider from process environment \
-             and stay Rust tests"
-                .into(),
-        );
+             and stay Rust tests",
+        )
+        .at_line(start_line));
     }
     Ok(())
 }
@@ -1661,7 +1718,7 @@ fn line_holds_statement(text: &str, statement: &str, name: &str) -> bool {
 fn refuse_process_settings(
     statements: &[SettingStmt],
     body: &[(usize, &str)],
-) -> Result<(), String> {
+) -> Result<(), CaseError> {
     for stmt in statements {
         let Some(id) = stmt.id() else {
             continue;
@@ -1674,7 +1731,7 @@ fn refuse_process_settings(
             .find(|(_, text)| line_holds_statement(text, stmt.statement_name(), id.name()))
             .or(body.first())
             .map_or(0, |(idx, _)| idx + 1);
-        return Err(format!("line {line}: {error}"));
+        return Err(CaseError::new(CaseErrorCode::StepKind, error.to_string()).at_line(line));
     }
     Ok(())
 }
@@ -1700,7 +1757,7 @@ fn rows_expect(
     ordered: bool,
     section: &Section<'_>,
     loop_var: Option<&str>,
-) -> Result<QueryExpect, String> {
+) -> Result<QueryExpect, CaseError> {
     refuse_comment_lines(&section.body, "expect")?;
     let body: String = section
         .body
@@ -1733,7 +1790,7 @@ fn complete_list_step(
     mode: &ExpectHeader,
     section: &Section<'_>,
     loop_var: Option<&str>,
-) -> Result<ListStep, String> {
+) -> Result<ListStep, CaseError> {
     let expect = match mode {
         ExpectHeader::Unordered | ExpectHeader::Ordered => {
             rows_expect(matches!(mode, ExpectHeader::Ordered), section, loop_var)?
@@ -1745,7 +1802,9 @@ fn complete_list_step(
             }
         }
         ExpectHeader::Ok | ExpectHeader::Affected { .. } | ExpectHeader::Outcome(_) => {
-            return Err("`branch list` takes `unordered`, `ordered`, or `error:`".into());
+            return Err(mode_for_step(
+                "`branch list` takes `unordered`, `ordered`, or `error:`",
+            ));
         }
     };
     Ok(ListStep { ordinal, expect })
@@ -1772,7 +1831,7 @@ fn derived_show_shape() -> ShapeExpect {
 /// A `show` step's explicit `--- expect shape`: the only shape `show` rows
 /// can have is the derived one, so any other spelling is refused and the
 /// refusal names the derivable shape.
-fn refuse_unequal_show_shape(lines: &[ShapeLine], line: usize) -> Result<(), String> {
+fn refuse_unequal_show_shape(lines: &[ShapeLine], line: usize) -> Result<(), CaseError> {
     let want: Vec<String> = derived_show_shape()
         .lines
         .iter()
@@ -1781,10 +1840,14 @@ fn refuse_unequal_show_shape(lines: &[ShapeLine], line: usize) -> Result<(), Str
     if lines.iter().map(spell_shape_line).eq(want.iter().cloned()) {
         return Ok(());
     }
-    Err(format!(
-        "line {line}: `show` derives its shape; drop the `--- expect shape` section, or write exactly `{}`",
-        want.join("`, `")
-    ))
+    Err(CaseError::new(
+        CaseErrorCode::BodyShape,
+        format!(
+            "`show` derives its shape; drop the `--- expect shape` section, or write exactly `{}`",
+            want.join("`, `")
+        ),
+    )
+    .at_line(line))
 }
 
 /// The step a `show` section becomes under `mode`. The rows are total in
@@ -1797,7 +1860,7 @@ fn complete_show_step(
     mode: &ExpectHeader,
     section: &Section<'_>,
     loop_var: Option<&str>,
-) -> Result<ShowStep, String> {
+) -> Result<ShowStep, CaseError> {
     let expect = match mode {
         ExpectHeader::Unordered | ExpectHeader::Ordered => {
             rows_expect(matches!(mode, ExpectHeader::Ordered), section, loop_var)?
@@ -1806,10 +1869,10 @@ fn complete_show_step(
         | ExpectHeader::Ok
         | ExpectHeader::Affected { .. }
         | ExpectHeader::Outcome(_) => {
-            return Err(format!(
+            return Err(mode_for_step(format!(
                 "`{}` takes `unordered` or `ordered`; it returns the settings rows and does not fail",
                 show_statement_name(id)
-            ));
+            )));
         }
     };
     let mut step = ShowStep {
@@ -1830,7 +1893,7 @@ fn complete_settings_step(
     statements: Vec<SettingStmt>,
     mode: &ExpectHeader,
     section: &Section<'_>,
-) -> Result<SettingsStep, String> {
+) -> Result<SettingsStep, CaseError> {
     match mode {
         ExpectHeader::Ok => {
             refuse_nonempty_body(&section.body, "an `expect ok` section")?;
@@ -1843,9 +1906,9 @@ fn complete_settings_step(
         | ExpectHeader::Ordered
         | ExpectHeader::Error(_)
         | ExpectHeader::Affected { .. }
-        | ExpectHeader::Outcome(_) => {
-            Err("a settings step takes `ok`; `set` and `reset` return no rows and no counts".into())
-        }
+        | ExpectHeader::Outcome(_) => Err(mode_for_step(
+            "a settings step takes `ok`; `set` and `reset` return no rows and no counts",
+        )),
     }
 }
 
@@ -1863,7 +1926,7 @@ fn complete_write_expect(
     name: &str,
     mode: &ExpectHeader,
     section: &Section<'_>,
-) -> Result<WriteExpect, String> {
+) -> Result<WriteExpect, CaseError> {
     match mode {
         ExpectHeader::Ok => {
             refuse_nonempty_body(&section.body, "an `expect ok` section")?;
@@ -1875,11 +1938,11 @@ fn complete_write_expect(
                 needle: needle.clone(),
             })
         }
-        ExpectHeader::Outcome(_) => {
-            Err("`expect outcome:` is accepted on a `branch merge` step only".into())
-        }
-        ExpectHeader::Affected { .. } => Err(affected_refusal(name)),
-        ExpectHeader::Unordered | ExpectHeader::Ordered => Err(rows_refusal(name)),
+        ExpectHeader::Outcome(_) => Err(mode_for_step(
+            "`expect outcome:` is accepted on a `branch merge` step only",
+        )),
+        ExpectHeader::Affected { .. } => Err(mode_for_step(affected_refusal(name))),
+        ExpectHeader::Unordered | ExpectHeader::Ordered => Err(mode_for_step(rows_refusal(name))),
     }
 }
 
@@ -1888,7 +1951,7 @@ fn complete_write_expect(
 fn complete_merge_expect(
     mode: &ExpectHeader,
     section: &Section<'_>,
-) -> Result<MergeExpect, String> {
+) -> Result<MergeExpect, CaseError> {
     if let ExpectHeader::Outcome(outcome) = mode {
         refuse_nonempty_body(&section.body, "an `expect outcome:` section")?;
         return Ok(MergeExpect::Outcome(*outcome));
@@ -1907,7 +1970,7 @@ fn complete_control_step(
     write: ControlSource,
     mode: &ExpectHeader,
     section: &Section<'_>,
-) -> Result<ControlStep, String> {
+) -> Result<ControlStep, CaseError> {
     let name = match &write {
         ControlSource::Branch(write) => write.statement_name(),
         ControlSource::Commit(write) => write.statement_name(),
@@ -1965,11 +2028,10 @@ const SAME_AS_V1: &str = "same as v1";
 /// Why a `--- expect same as v1` section has no step to attach to; a mutate
 /// step, pending or just completed, gets its own refusal.
 fn same_as_v1_misplaced(
-    line: usize,
     pending: Option<&Pending>,
     items: &[Item],
     open_loop: Option<&(String, Vec<String>, Vec<Step>)>,
-) -> String {
+) -> CaseError {
     let last = match open_loop {
         Some((_, _, steps)) => steps.last(),
         None => match items.last() {
@@ -1980,13 +2042,15 @@ fn same_as_v1_misplaced(
     let on_mutate = matches!(pending, Some(Pending::Decl(step)) if step.is_mutation)
         || (pending.is_none() && matches!(last, Some(Step::Mutate(_))));
     if on_mutate {
-        return format!(
-            "invalid_case: line {line}: `--- expect same as v1` is refused on a mutate step; the reference engine only reads, and a mutation returns no rows to compare"
+        return mode_for_step(
+            "`--- expect same as v1` is refused on a mutate step; the reference engine only reads, and a mutation returns no rows to compare",
         );
     }
-    format!(
-        "line {line}: `--- expect same as v1` must directly follow a query step's `--- expect shape` or `--- expect plan`; it adds the reference-engine comparison to the step's own rows expect"
+    CaseError::new(
+        CaseErrorCode::ExpectWithoutStep,
+        "`--- expect same as v1` must directly follow a query step's `--- expect shape` or `--- expect plan`; it adds the reference-engine comparison to the step's own rows expect",
     )
+    .fix("move `--- expect same as v1` directly under the query step's `--- expect shape` or `--- expect plan`")
 }
 
 /// The step a declaration section becomes under `mode`, or why the mode is
@@ -1996,22 +2060,23 @@ fn complete_decl_step(
     mode: &ExpectHeader,
     section: &Section<'_>,
     loop_var: Option<&str>,
-) -> Result<Step, String> {
+) -> Result<Step, CaseError> {
     match (mode, step.is_mutation) {
-        (ExpectHeader::Outcome(_), _) => {
-            Err("`expect outcome:` is accepted on a `branch merge` step only".into())
-        }
-        (ExpectHeader::Unordered | ExpectHeader::Ordered, true) => Err(
-            "a mutate step takes `ok`, `affected:`, or `error:`; mutation results carry no rows"
-                .into(),
-        ),
-        (ExpectHeader::Ok | ExpectHeader::Affected { .. }, false) => {
-            Err("a query step takes `unordered`, `ordered`, or `error:`".into())
-        }
+        (ExpectHeader::Outcome(_), _) => Err(mode_for_step(
+            "`expect outcome:` is accepted on a `branch merge` step only",
+        )),
+        (ExpectHeader::Unordered | ExpectHeader::Ordered, true) => Err(mode_for_step(
+            "a mutate step takes `ok`, `affected:`, or `error:`; mutation results carry no rows",
+        )
+        .fix("write `--- expect ok`, `--- expect affected: nodes=<N> edges=<M>` or `--- expect error: <needle>`")),
+        (ExpectHeader::Ok | ExpectHeader::Affected { .. }, false) => Err(mode_for_step(
+            "a query step takes `unordered`, `ordered`, or `error:`",
+        )
+        .fix("write `--- expect unordered` with the rows, then `--- expect shape`")),
         (ExpectHeader::Unordered | ExpectHeader::Ordered, false) => {
             let ordered = matches!(mode, ExpectHeader::Ordered);
             if ordered && let Some(reason) = step.ordered_refusal {
-                return Err(reason);
+                return Err(mode_for_step(reason));
             }
             Ok(Step::Query(QueryStep {
                 ordinal: step.ordinal,
@@ -2122,20 +2187,24 @@ const SECTION_KINDS: [&str; 16] = [
 ];
 
 /// The optional `--- schema` + `--- seed` pair at the head of the step
-/// sections, and the sections after it.
+/// sections, and the sections after it; the schema's refusal and the
+/// seed's report together, neither hiding the other.
 fn parse_fixture<'a>(
     sections: &'a [Section<'a>],
-) -> Result<(Option<Fixture>, &'a [Section<'a>]), CaseError> {
+) -> Result<(Option<Fixture>, &'a [Section<'a>]), Vec<CaseError>> {
     match sections.first().map(|s| s.name.as_str()) {
         Some("schema") => {
             if !sections
                 .get(1)
                 .is_some_and(|s| s.name == "seed" || s.name.starts_with("seed "))
             {
-                return Err(
-                    "schema and seed are optional together; the second section must be `--- seed`"
-                        .into(),
-                );
+                return Err(vec![
+                    CaseError::new(
+                        CaseErrorCode::SectionOrder,
+                        "schema and seed are optional together; the second section must be `--- seed`",
+                    )
+                    .fix("write `--- seed` directly after `--- schema`, or drop both"),
+                ]);
             }
             let schema = sections[0]
                 .body
@@ -2143,17 +2212,211 @@ fn parse_fixture<'a>(
                 .map(|(_, l)| *l)
                 .collect::<Vec<_>>()
                 .join("\n");
-            if sections[1].name == "seed" {
-                refuse_comment_lines(&sections[1].body, "seed")?;
+            let mut errors = Vec::new();
+            if let Err(error) = refuse_embed_schema(&schema, sections[0].header_line + 1) {
+                errors.push(error);
             }
-            let seed = Seed::parse(&sections[1].name, yaml_body(&sections[1].body))?;
-            refuse_embed_schema(&schema, sections[0].header_line + 1)?;
-            Ok((Some(Fixture { schema, seed }), &sections[2..]))
+            let seed = (|| {
+                if sections[1].name == "seed" {
+                    refuse_comment_lines(&sections[1].body, "seed")?;
+                }
+                Seed::parse(&sections[1].name, yaml_body(&sections[1].body))
+                    .map_err(|error| error.line_or(sections[1].header_line + 1))
+            })();
+            let seed = match seed {
+                Ok(seed) => seed,
+                Err(error) => {
+                    errors.push(error);
+                    return Err(errors);
+                }
+            };
+            if errors.is_empty() {
+                Ok((Some(Fixture { schema, seed }), &sections[2..]))
+            } else {
+                Err(errors)
+            }
         }
-        Some(name) if name == "seed" || name.starts_with("seed ") => Err(
-            "schema and seed are optional together; `--- schema` must precede `--- seed`".into(),
-        ),
+        Some(name) if name == "seed" || name.starts_with("seed ") => Err(vec![
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "schema and seed are optional together; `--- schema` must precede `--- seed`",
+            )
+            .fix("write `--- schema` before `--- seed`, or drop both"),
+        ]),
         _ => Ok((None, sections)),
+    }
+}
+
+/// A message written as text, under the code of the rule it states.
+fn coded(code: CaseErrorCode) -> impl Fn(String) -> CaseError {
+    move |message| CaseError::from(message).code(code)
+}
+
+/// A mode the step kind refuses, with the rule's fix unless the site names
+/// a closer one.
+fn mode_for_step(message: impl Into<String>) -> CaseError {
+    CaseError::new(CaseErrorCode::ExpectModeForStep, message).fix(
+        "write the mode the step kind takes: `unordered` or `ordered` on a read, `ok`, `error:` or `affected:` on a write, `outcome:` on a merge",
+    )
+}
+
+/// A step that opened before the previous one got its `--- expect`.
+fn missing_previous_expect() -> CaseError {
+    CaseError::new(
+        CaseErrorCode::MissingExpect,
+        "the previous step is missing its `--- expect`",
+    )
+    .fix("write `--- expect <mode>` after the previous step")
+}
+
+/// A `${name}` operand with no `--- bind commit $name` before it.
+fn unbound(name: &str) -> CaseError {
+    CaseError::new(
+        CaseErrorCode::UnboundName,
+        format!("`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"),
+    )
+    .fix(format!(
+        "write `--- bind commit ${name}` after the write step whose commit this names"
+    ))
+}
+
+/// The refusal for a rows step whose `--- expect shape` did not arrive
+/// next: any other section, or the end of the file, ends the case here.
+fn missing_shape(step: &Step) -> CaseError {
+    let line = match step.read_expect() {
+        Some(QueryExpect::Rows { span, .. }) => span.start_line,
+        Some(QueryExpect::Error { .. }) | None => 0,
+    };
+    CaseError::new(
+        CaseErrorCode::MissingShape,
+        "the rows expect needs an `--- expect shape` section directly after it; write it from the .pg schema, or fill it with OMNIGRAPH_GQ_BLESS=1 and review the diff",
+    )
+    .fix("write `--- expect shape` under the rows, one `<column>: <Type>` line per returned column")
+    .at_line(line)
+}
+
+/// The variable a refused loop head meant, so its body still binds.
+fn placeholder_loop_var(rest: &str) -> String {
+    rest.split_whitespace()
+        .next()
+        .map(|token| token.trim_start_matches('$'))
+        .filter(|name| !name.is_empty())
+        .unwrap_or("_")
+        .to_string()
+}
+
+/// The step under construction and the sections it still waits for. A
+/// refused section abandons all of it at once, so one mistake reports once
+/// and the sections that would have completed the step are skipped.
+#[derive(Default)]
+struct StepCursor {
+    pending: Option<Pending>,
+    awaiting_shape: Option<Step>,
+    awaiting_plan: Option<Step>,
+    awaiting_same_as_v1: Option<Step>,
+    awaiting_load_plan: bool,
+    awaiting_seam_step: bool,
+    skip_continuations: bool,
+}
+
+impl StepCursor {
+    fn abandon(&mut self) {
+        *self = StepCursor {
+            skip_continuations: true,
+            ..StepCursor::default()
+        };
+    }
+
+    /// Whether `kind` continues the step a refusal abandoned.
+    fn skips(&mut self, kind: &str) -> bool {
+        if self.skip_continuations && matches!(kind, "expect" | "params") {
+            return true;
+        }
+        self.skip_continuations = false;
+        false
+    }
+}
+
+/// The open loop and what recovery knows about it: a refused section leaves
+/// the parser where an accepted one would (`abandon`), so one mistake in a
+/// loop reports once and the loop still closes.
+#[derive(Default)]
+struct LoopCursor {
+    open: Option<(String, Vec<String>, Vec<Step>)>,
+    header_line: usize,
+    placeholder: bool,
+    refused_inside: bool,
+    skip_endloop: bool,
+}
+
+impl LoopCursor {
+    fn var(&self) -> Option<&str> {
+        self.open.as_ref().map(|(var, _, _)| var.as_str())
+    }
+
+    fn close(&mut self) -> Option<(String, Vec<String>, Vec<Step>)> {
+        self.placeholder = false;
+        self.open.take()
+    }
+
+    /// Whether `kind` closes the loop a refused head opened.
+    fn skips(&mut self, kind: &str) -> bool {
+        if self.skip_endloop && kind == "endloop" {
+            self.skip_endloop = false;
+            if self.placeholder {
+                self.close();
+            }
+            return true;
+        }
+        false
+    }
+
+    fn abandon(&mut self, kind: &str, rest: &str, line: usize) {
+        self.refused_inside |= self.open.is_some() && !self.placeholder;
+        match kind {
+            "loop" | "foreach" => {
+                self.skip_endloop = true;
+                if self.open.is_none() {
+                    self.open = Some((placeholder_loop_var(rest), Vec::new(), Vec::new()));
+                    self.header_line = line;
+                    self.placeholder = true;
+                }
+            }
+            "endloop" => {
+                self.close();
+                self.refused_inside = false;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn push_step(items: &mut Vec<Item>, loops: &mut LoopCursor, step: Step) {
+    match &mut loops.open {
+        Some((_, _, steps)) => steps.push(step),
+        None => items.push(Item::Step(step)),
+    }
+}
+
+/// A rows step whose `--- expect shape` did not arrive next: a `show`
+/// step derives its shape and is complete, any other rows step is
+/// refused.
+fn settle_shape(
+    items: &mut Vec<Item>,
+    loops: &mut LoopCursor,
+    awaiting: Option<Step>,
+) -> Result<(), CaseError> {
+    match awaiting {
+        Some(step) if matches!(step, Step::Show(_) | Step::BranchRead(_)) => {
+            push_step(items, loops, step);
+            Ok(())
+        }
+        Some(step) => {
+            let refusal = missing_shape(&step);
+            push_step(items, loops, step);
+            Err(refusal)
+        }
+        None => Ok(()),
     }
 }
 
@@ -2161,6 +2424,58 @@ fn parse_fixture<'a>(
 /// together, the runner and fixture sections, then each step section on its
 /// own (a failed section drops its continuations, `--- expect` and
 /// `--- params`, so one mistake reports once), then the whole-case rules.
+/// The runner section of a case text on its own, for a rule that needs the
+/// declared configuration of a case the parser may otherwise refuse.
+pub fn parse_case_runner(text: &str) -> Option<RunnerConfig> {
+    let lines: Vec<&str> = text.lines().collect();
+    let (_, sections) = split_sections(&lines);
+    let first = sections
+        .first()
+        .filter(|section| section.name == "runner")?;
+    parse_runner(&yaml_body(&first.body)).ok()
+}
+
+/// Every refusal `--check` reports for one case text, in line order: the
+/// parser's, then the corpus admission when `corpus` reads the case as a
+/// member of the required corpus, located at its `timeout_ms:` line.
+pub fn check_text(stem: &str, text: &str, corpus: bool) -> Vec<CaseError> {
+    let mut errors = match parse_case(stem, text) {
+        Ok(_) => Vec::new(),
+        Err(errors) => errors.into_vec(),
+    };
+    if corpus
+        && let Some(runner) = parse_case_runner(text)
+        && let Err(error) = corpus_admission(&runner)
+    {
+        let lines: Vec<&str> = text.lines().collect();
+        let line = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("timeout_ms:"))
+            .map_or(1, |idx| idx + 1);
+        errors.push(error.located(line, &lines));
+    }
+    errors.sort_by_key(|error| error.line.unwrap_or(usize::MAX));
+    errors
+}
+
+/// The surface of the case format at [`GQT_FORMAT_VERSION`], derived from
+/// the tables the parser dispatches on: the header keys, the runner rule,
+/// the section kinds, the expect modes, the corpus cap, and every rule under
+/// its code. `tests/grammar/v<N>.txt` pins it, so a change to the surface is
+/// a diff in review and a new version when it is not compatible.
+pub fn grammar_text() -> String {
+    let mut out = format!("gqt format {GQT_FORMAT_VERSION}\n");
+    out.push_str(&format!("header keys: {}\n", HEADER_KEYS.join(", ")));
+    out.push_str(&format!("sections: {}\n", SECTION_KINDS.join(", ")));
+    out.push_str(&format!("expect modes: {}\n", EXPECT_MODE_WORDS.join(", ")));
+    out.push_str(&format!("corpus timeout_ms: at most {CORPUS_TIMEOUT_MS}\n"));
+    out.push_str("rules:\n");
+    for code in CaseErrorCode::ALL {
+        out.push_str(&format!("  {}: {}\n", code.name(), code.rule()));
+    }
+    out
+}
+
 pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
     if text.contains('\r') {
         return Err(CaseErrors::one(
@@ -2192,7 +2507,12 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             let runner = match parse_runner(&yaml_body(&first.body)) {
                 Ok(runner) => Some(runner),
                 Err(error) => {
-                    errors.push(CaseError::from(error).located(first.header_line + 1, &lines));
+                    errors.push(
+                        CaseError::from(error)
+                            .code(CaseErrorCode::RunnerConfig)
+                            .fix("write `timeout_ms: <ms>` and `environments:` as a list of `- target: <target>` with `storage: <storage>` (and `seeds:` under DST)")
+                            .located(first.header_line + 1, &lines),
+                    );
                     None
                 }
             };
@@ -2227,9 +2547,13 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
     };
     let (fixture, sections) = match parse_fixture(sections) {
         Ok(parts) => parts,
-        Err(error) => {
+        Err(fixture_errors) => {
             let line = sections.first().map_or(1, |s| s.header_line + 1);
-            errors.push(error.located(line, &lines));
+            errors.extend(
+                fixture_errors
+                    .into_iter()
+                    .map(|error| error.located(line, &lines)),
+            );
             let fixture_sections = sections
                 .iter()
                 .take_while(|s| {
@@ -2242,115 +2566,49 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
 
     let mut needs_indices = header.as_ref().is_some_and(|h| h.traversal.is_some());
     let mut items: Vec<Item> = Vec::new();
-    let mut open_loop: Option<(String, Vec<String>, Vec<Step>)> = None;
-    let mut pending: Option<Pending> = None;
-    let mut awaiting_shape: Option<Step> = None;
-    let mut awaiting_plan: Option<Step> = None;
-    let mut awaiting_same_as_v1: Option<Step> = None;
-    let mut awaiting_load_plan = false;
+    let mut loops = LoopCursor::default();
+    let mut cursor = StepCursor::default();
     let mut ordinal = 0usize;
     let mut seams = BTreeMap::new();
     let mut source_lines = BTreeMap::new();
     let mut csv_sections: BTreeMap<String, String> = BTreeMap::new();
-    let mut awaiting_seam_step = false;
     let mut substitutable_lines: HashSet<usize> = HashSet::new();
     let mut bound_names: HashSet<String> = HashSet::new();
 
-    /// The refusal for a rows step whose `--- expect shape` did not arrive
-    /// next: any other section, or the end of the file, ends the case here.
-    fn missing_shape(step: &Step) -> String {
-        let line = match step.read_expect() {
-            Some(QueryExpect::Rows { span, .. }) => span.start_line,
-            Some(QueryExpect::Error { .. }) | None => 0,
-        };
-        format!(
-            "line {line}: the rows expect needs an `--- expect shape` section directly after it; write it from the .pg schema, or fill it with OMNIGRAPH_GQ_BLESS=1 and review the diff"
-        )
-    }
-
-    fn push_step(
-        items: &mut Vec<Item>,
-        open_loop: &mut Option<(String, Vec<String>, Vec<Step>)>,
-        step: Step,
-    ) {
-        match open_loop {
-            Some((_, _, steps)) => steps.push(step),
-            None => items.push(Item::Step(step)),
-        }
-    }
-
-    /// A rows step whose `--- expect shape` did not arrive next: a `show`
-    /// step derives its shape and is complete, any other rows step is
-    /// refused.
-    fn settle_shape(
-        items: &mut Vec<Item>,
-        open_loop: &mut Option<(String, Vec<String>, Vec<Step>)>,
-        awaiting: Option<Step>,
-    ) -> Result<(), String> {
-        match awaiting {
-            Some(step) if matches!(step, Step::Show(_) | Step::BranchRead(_)) => {
-                push_step(items, open_loop, step);
-                Ok(())
-            }
-            Some(step) => {
-                let refusal = missing_shape(&step);
-                push_step(items, open_loop, step);
-                Err(refusal)
-            }
-            None => Ok(()),
-        }
-    }
-
-    /// The variable a refused loop head meant, so its body still binds.
-    fn placeholder_loop_var(rest: &str) -> String {
-        rest.split_whitespace()
-            .next()
-            .map(|token| token.trim_start_matches('$'))
-            .filter(|name| !name.is_empty())
-            .unwrap_or("_")
-            .to_string()
-    }
-
-    let mut skip_continuations = false;
-    let mut skip_endloop = false;
-    let mut placeholder_loop = false;
-    let mut refused_in_loop = false;
     for section in sections {
         let (kind, rest) = match section.name.split_once([' ', '\t']) {
             Some((k, rest)) => (k, rest),
             None => (section.name.as_str(), ""),
         };
-        if skip_continuations && matches!(kind, "expect" | "params") {
+        if cursor.skips(kind) {
             substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
             continue;
         }
-        skip_continuations = false;
-        if skip_endloop && kind == "endloop" {
-            skip_endloop = false;
-            if placeholder_loop {
-                open_loop = None;
-                placeholder_loop = false;
-            }
+        if loops.skips(kind) {
             continue;
         }
         let expect_word = if kind == "expect" { rest.trim() } else { "" };
         let preamble: Result<(), CaseError> = (|| {
             if !expect_word.starts_with("shape") {
-                settle_shape(&mut items, &mut open_loop, awaiting_shape.take())?;
+                settle_shape(&mut items, &mut loops, cursor.awaiting_shape.take())?;
             }
             if expect_word != "plan" {
-                awaiting_load_plan = false;
+                cursor.awaiting_load_plan = false;
             }
-            if let Some(step) =
-                awaiting_plan.take_if(|_| !matches!(expect_word, "plan" | SAME_AS_V1))
+            if let Some(step) = cursor
+                .awaiting_plan
+                .take_if(|_| !matches!(expect_word, "plan" | SAME_AS_V1))
             {
-                push_step(&mut items, &mut open_loop, step);
+                push_step(&mut items, &mut loops, step);
             }
-            if let Some(step) = awaiting_same_as_v1.take_if(|_| expect_word != SAME_AS_V1) {
-                push_step(&mut items, &mut open_loop, step);
+            if let Some(step) = cursor
+                .awaiting_same_as_v1
+                .take_if(|_| expect_word != SAME_AS_V1)
+            {
+                push_step(&mut items, &mut loops, step);
             }
-            if awaiting_seam_step && !matches!(kind, "mutate" | "load" | "seam") {
-                awaiting_seam_step = false;
+            if cursor.awaiting_seam_step && !matches!(kind, "mutate" | "load" | "seam") {
+                cursor.awaiting_seam_step = false;
                 return Err(
                 "invalid_case: a seam must directly precede its mutate step (a GQ mutation or a branch statement) or load step; no seam is crossed by a query step yet".into()
             );
@@ -2363,20 +2621,26 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
         let outcome: Result<(), CaseError> = (|| {
             if matches!(kind, "query" | "mutate" | "load" | "restart" | "concurrent") {
                 source_lines.insert(ordinal + 1, section.header_line + 1);
-                awaiting_seam_step = false;
+                cursor.awaiting_seam_step = false;
             }
             match kind {
                 "seam" => {
-                    if open_loop.is_some() {
-                        return Err(
-                            "invalid_case: seam directives inside loops are not supported".into(),
-                        );
+                    if loops.open.is_some() {
+                        return Err(CaseError::new(
+                            CaseErrorCode::LoopStructure,
+                            "seam directives inside loops are not supported",
+                        )
+                        .fix("close the loop with `--- endloop` and arm the seam on a step outside it"));
                     }
                     if seams.values().map(Vec::len).sum::<usize>() >= 16 {
                         return Err("invalid_case: a case admits at most 16 seam directives".into());
                     }
-                    if !rest.is_empty() || pending.is_some() {
-                        return Err("invalid_case: seam takes no header arguments and must precede a complete step".into());
+                    if !rest.is_empty() || cursor.pending.is_some() {
+                        return Err(CaseError::new(
+                            CaseErrorCode::SectionOrder,
+                            "seam takes no header arguments and must precede a complete step",
+                        )
+                        .fix("write `--- seam` bare, after the previous step's `--- expect` and directly above the `--- mutate` or `--- load` step it arms"));
                     }
                     let seam = parse_seam(&yaml_body(&section.body))?;
                     let step_seams: &mut Vec<SeamDirective> = seams.entry(ordinal + 1).or_default();
@@ -2387,23 +2651,29 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                     )).into());
                     }
                     step_seams.push(seam);
-                    awaiting_seam_step = true;
+                    cursor.awaiting_seam_step = true;
                 }
                 "fault" => {
-                    return Err((format!(
-                    "line {}: there is no `--- fault` section; a code seam is a `--- seam` with the same `at`, `occurrence` and `scope` and `action: fail` (was `return_error`) or `action: skip`, and a store fault is a `--- seam` naming a store place with `subject:` or a decision seam with a store action",
-                    section.header_line + 1
-                )).into());
+                    return Err(CaseError::new(
+                        CaseErrorCode::UnknownSection,
+                        "there is no `--- fault` section; a code seam is a `--- seam` with the same `at`, `occurrence` and `scope` and `action: fail` (was `return_error`) or `action: skip`, and a store fault is a `--- seam` naming a store place with `subject:` or a decision seam with a store action",
+                    )
+                    .fix("write `--- seam` with `at:`, `occurrence:`, `scope:` and `action:` lines"));
                 }
                 "runner" | "schema" | "seed" => {
-                    return Err((format!(
-                    "line {}: `--- {kind}` is out of position; schema then seed lead the file, once each",
-                    section.header_line + 1
-                )).into());
+                    return Err(CaseError::new(
+                        CaseErrorCode::SectionOrder,
+                        format!(
+                            "`--- {kind}` is out of position; schema then seed lead the file, once each"
+                        ),
+                    )
+                    .fix(format!(
+                        "move the `--- {kind}` section to the head of the file, after `--- runner`, or drop it"
+                    )));
                 }
                 "csv" => {
-                    if pending.is_some() {
-                        return Err("the previous step is missing its `--- expect`".into());
+                    if cursor.pending.is_some() {
+                        return Err(missing_previous_expect());
                     }
                     let name = rest.trim();
                     if name.is_empty()
@@ -2411,10 +2681,11 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         || name.contains("..")
                         || name.chars().any(char::is_whitespace)
                     {
-                        return Err((format!(
-                        "line {}: `--- csv <name>` names one file, a bare name without separators",
-                        section.header_line + 1
-                    )).into());
+                        return Err(CaseError::new(
+                            CaseErrorCode::BodyShape,
+                            "`--- csv <name>` names one file, a bare name without separators",
+                        )
+                        .fix("write `--- csv <file.csv>` with a bare file name"));
                     }
                     let mut text = section
                         .body
@@ -2424,25 +2695,29 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         .join("\n");
                     text.push('\n');
                     if csv_sections.insert(name.to_string(), text).is_some() {
-                        return Err((format!(
-                            "line {}: `--- csv {name}` is given twice",
-                            section.header_line + 1
-                        ))
-                        .into());
+                        return Err(CaseError::new(
+                            CaseErrorCode::BodyShape,
+                            format!("`--- csv {name}` is given twice"),
+                        )
+                        .fix("keep one `--- csv` section per file name"));
                     }
                     return Ok(());
                 }
                 "load" => {
-                    if pending.is_some() {
-                        return Err("the previous step is missing its `--- expect`".into());
+                    if cursor.pending.is_some() {
+                        return Err(missing_previous_expect());
                     }
                     let (seed, mode, branch) = generate::parse_arguments(rest, true)?;
                     let generated = Generated::parse(seed, &yaml_body(&section.body))?;
                     if generated.call_count() == 0 {
-                        return Err("a generated load requires at least one nonempty batch; empty recipes are admitted only as seeds".into());
+                        return Err(CaseError::new(
+                            CaseErrorCode::BatchBound,
+                            "a generated load requires at least one nonempty batch; empty recipes are admitted only as seeds",
+                        )
+                        .fix("give a table `rows:` and `commits:` of at least 1, or make the recipe a `--- seed` section"));
                     }
                     ordinal += 1;
-                    pending = Some(Pending::Load {
+                    cursor.pending = Some(Pending::Load {
                         ordinal,
                         branch,
                         mode,
@@ -2451,16 +2726,16 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                 }
                 "query" | "mutate" => {
                     let (branch, snapshot) = if kind == "query" {
-                        parse_query_target(rest)?
+                        parse_query_target(rest).map_err(coded(CaseErrorCode::StepKind))?
                     } else {
-                        (parse_step_branch(kind, rest)?, None)
+                        (
+                            parse_step_branch(kind, rest)
+                                .map_err(coded(CaseErrorCode::StepKind))?,
+                            None,
+                        )
                     };
-                    if pending.is_some() {
-                        return Err((format!(
-                            "line {}: the previous step is missing its `--- expect`",
-                            section.header_line + 1
-                        ))
-                        .into());
+                    if cursor.pending.is_some() {
+                        return Err(missing_previous_expect());
                     }
                     let source: String = section
                         .body
@@ -2469,42 +2744,69 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         .collect::<Vec<_>>()
                         .join("\n");
                     let file = parse_query(&source).map_err(|e| {
-                        format!(
-                            "`--- {kind}` section starting at line {} does not parse: {e}",
-                            section.header_line + 1
+                        let misplaced = section.body.iter().find(|(_, l)| {
+                            l.match_indices("${")
+                                .any(|(pos, _)| !l[..pos].trim_end().ends_with("commit"))
+                        });
+                        if let Some((idx, _)) = misplaced {
+                            return CaseError::new(
+                                CaseErrorCode::SubstitutionPlacement,
+                                format!(
+                                    "`${{...}}` is refused in a `--- {kind}` body except as a `from commit ${{name}}` operand; a step's values come from its `--- params` body"
+                                ),
+                            )
+                            .fix("declare a `$name` parameter in the statement and write `${...}` in the step's `--- params` body")
+                            .at_line(idx + 1);
+                        }
+                        CaseError::new(
+                            CaseErrorCode::QueryParse,
+                            format!(
+                                "`--- {kind}` section starting at line {} does not parse: {e}",
+                                section.header_line + 1
+                            ),
                         )
+                        .fix(format!(
+                            "rewrite the `--- {kind}` body so it parses; the message names where the grammar stopped"
+                        ))
                     })?;
                     refuse_process_settings(&file.settings, &section.body)?;
                     let empty = file.empty_kind();
                     if let Some(name) = &snapshot {
                         if !bound_names.contains(name) {
-                            return Err((format!(
-                            "`snapshot: ${name}` is not bound; `--- bind commit ${name}` must precede this step"
-                        )).into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::UnboundName,
+                                format!(
+                                    "`snapshot: ${name}` is not bound; `--- bind commit ${name}` must precede this step"
+                                ),
+                            )
+                            .fix(format!(
+                                "write `--- bind commit ${name}` after the write step whose commit this names"
+                            )));
                         }
                         if !matches!(&file.body, FileBody::Queries(decls) if !decls.is_empty()) {
-                            return Err(
-                            "`snapshot:` selects a query declaration's read target; a statement takes no target"
-                                .into()
-                        );
+                            return Err(CaseError::new(
+                                CaseErrorCode::StepKind,
+                                "`snapshot:` selects a query declaration's read target; a statement takes no target",
+                            ));
                         }
                     }
                     let decls = match file.body {
                         FileBody::Queries(_) if matches!(empty, Some(EmptyFile::SettingsOnly)) => {
                             if kind == "query" {
-                                return Err(
-                                    "a settings step is a `--- mutate` step; use `--- mutate`"
-                                        .into(),
-                                );
+                                return Err(CaseError::new(
+                                    CaseErrorCode::StepKind,
+                                    "a settings step is a `--- mutate` step; use `--- mutate`",
+                                )
+                                .fix("write `--- mutate` as the section header"));
                             }
                             if branch.is_some() {
-                                return Err(
-                                "a settings step changes the case session, not a branch; drop the `branch:` argument"
-                                    .into()
-                            );
+                                return Err(CaseError::new(
+                                    CaseErrorCode::StepKind,
+                                    "a settings step changes the case session, not a branch; drop the `branch:` argument",
+                                ));
                             }
                             ordinal += 1;
-                            pending = Some(Pending::Settings {
+                            cursor.pending = Some(Pending::Settings {
                                 ordinal,
                                 statements: file.settings,
                             });
@@ -2513,20 +2815,23 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         FileBody::Queries(decls) => decls,
                         FileBody::Show(id) => {
                             if kind == "mutate" {
-                                return Err((format!(
-                                    "`{}` under `--- mutate` is refused; use `--- query`",
-                                    show_statement_name(id)
-                                ))
-                                .into());
+                                return Err(CaseError::new(
+                                    CaseErrorCode::StepKind,
+                                    format!(
+                                        "`{}` under `--- mutate` is refused; use `--- query`",
+                                        show_statement_name(id)
+                                    ),
+                                )
+                                .fix("write `--- query` as the section header"));
                             }
                             if branch.is_some() {
-                                return Err(
-                                "`show` reads the case session, not a branch; drop the `branch:` argument"
-                                    .into()
-                            );
+                                return Err(CaseError::new(
+                                    CaseErrorCode::StepKind,
+                                    "`show` reads the case session, not a branch; drop the `branch:` argument",
+                                ));
                             }
                             ordinal += 1;
-                            pending = Some(Pending::Show {
+                            cursor.pending = Some(Pending::Show {
                                 ordinal,
                                 id,
                                 prefix: file.settings,
@@ -2535,35 +2840,37 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         }
                         FileBody::Branch(stmt) => {
                             if kind == "query" && stmt.is_write() {
-                                return Err(
-                                "a control write under `--- query` is refused; use `--- mutate`"
-                                    .into()
-                            );
+                                return Err(CaseError::new(
+                                    CaseErrorCode::StepKind,
+                                    "a control write under `--- query` is refused; use `--- mutate`",
+                                )
+                                .fix("write `--- mutate` as the section header"));
                             }
                             if kind == "mutate" && !stmt.is_write() {
-                                return Err((format!(
-                                    "`{}` under `--- mutate` is refused; use `--- query`",
-                                    stmt.statement_name()
-                                ))
-                                .into());
+                                return Err(CaseError::new(
+                                    CaseErrorCode::StepKind,
+                                    format!(
+                                        "`{}` under `--- mutate` is refused; use `--- query`",
+                                        stmt.statement_name()
+                                    ),
+                                )
+                                .fix("write `--- query` as the section header"));
                             }
                             if branch.is_some() {
-                                return Err(
-                                "a branch statement names its branches itself; drop the `branch:` argument"
-                                    .into()
-                            );
+                                return Err(CaseError::new(
+                                    CaseErrorCode::StepKind,
+                                    "a branch statement names its branches itself; drop the `branch:` argument",
+                                ));
                             }
                             ordinal += 1;
-                            pending = Some(match stmt {
+                            cursor.pending = Some(match stmt {
                                 BranchStmt::List => Pending::List { ordinal },
                                 BranchStmt::Read(read) => {
                                     for operand in branch_read_operands(&read) {
                                         if let Some(name) = bound_operand(operand)
                                             && !bound_names.contains(name)
                                         {
-                                            return Err((format!(
-                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
-                                        )).into());
+                                            return Err(unbound(name));
                                         }
                                     }
                                     let bound = branch_read_operands(&read)
@@ -2588,9 +2895,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                                         && let Some(name) = bound_operand(commit)
                                     {
                                         if !bound_names.contains(name) {
-                                            return Err((format!(
-                                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
-                                        )).into());
+                                            return Err(unbound(name));
                                         }
                                         if source.matches("${").count() == 1 {
                                             substitutable_lines
@@ -2608,27 +2913,26 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         }
                         FileBody::Commit(write) => {
                             if kind == "query" {
-                                return Err(
-                                "a control write under `--- query` is refused; use `--- mutate`"
-                                    .into()
-                            );
+                                return Err(CaseError::new(
+                                    CaseErrorCode::StepKind,
+                                    "a control write under `--- query` is refused; use `--- mutate`",
+                                )
+                                .fix("write `--- mutate` as the section header"));
                             }
                             if branch.is_some() {
-                                return Err(
-                                "a commit statement acts on the commit's recorded target; drop the `branch:` argument"
-                                    .into()
-                            );
+                                return Err(CaseError::new(
+                                    CaseErrorCode::StepKind,
+                                    "a commit statement acts on the commit's recorded target; drop the `branch:` argument",
+                                ));
                             }
                             if let Some(name) = bound_operand(write.graph_commit_id()) {
                                 if !bound_names.contains(name) {
-                                    return Err((format!(
-                                    "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
-                                )).into());
+                                    return Err(unbound(name));
                                 }
                                 substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
                             }
                             ordinal += 1;
-                            pending = Some(Pending::Control {
+                            cursor.pending = Some(Pending::Control {
                                 ordinal,
                                 prefix: file.settings,
                                 write: ControlSource::Commit(write),
@@ -2637,13 +2941,14 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         }
                         FileBody::Load(stmt) => {
                             if kind == "query" {
-                                return Err(
-                                "a load statement under `--- query` is refused; use `--- mutate`"
-                                    .into()
-                            );
+                                return Err(CaseError::new(
+                                    CaseErrorCode::StepKind,
+                                    "a load statement under `--- query` is refused; use `--- mutate`",
+                                )
+                                .fix("write `--- mutate` as the section header"));
                             }
                             ordinal += 1;
-                            pending = Some(Pending::Control {
+                            cursor.pending = Some(Pending::Control {
                                 ordinal,
                                 prefix: file.settings,
                                 write: ControlSource::Load { stmt, branch },
@@ -2651,30 +2956,39 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                             return Ok(());
                         }
                         FileBody::Explain(_) | FileBody::ExplainLoad(_) => {
-                            return Err((format!(
-                            "an `explain` statement under `--- {kind}` is refused; assert the plan with `--- expect plan`"
-                        )).into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::StepKind,
+                                format!(
+                                    "an `explain` statement under `--- {kind}` is refused; assert the plan with `--- expect plan`"
+                                ),
+                            )
+                            .fix("write the query itself and add `--- expect plan` after its `--- expect shape`"));
                         }
                     };
                     let [decl] = decls.as_slice() else {
-                        return Err((format!(
-                            "a `--- {kind}` section must hold exactly one declaration, got {}",
-                            decls.len()
-                        ))
-                        .into());
+                        return Err(CaseError::new(
+                            CaseErrorCode::StepKind,
+                            format!(
+                                "a `--- {kind}` section must hold exactly one declaration, got {}",
+                                decls.len()
+                            ),
+                        )
+                        .fix("split the declarations into one section each"));
                     };
                     let is_mutation = !decl.mutations.is_empty();
                     if kind == "query" && is_mutation {
-                        return Err(
-                            "a mutation declaration under `--- query` is refused; use `--- mutate`"
-                                .into(),
-                        );
+                        return Err(CaseError::new(
+                            CaseErrorCode::StepKind,
+                            "a mutation declaration under `--- query` is refused; use `--- mutate`",
+                        )
+                        .fix("write `--- mutate` as the section header"));
                     }
                     if kind == "mutate" && !is_mutation {
-                        return Err(
-                            "a read declaration under `--- mutate` is refused; use `--- query`"
-                                .into(),
-                        );
+                        return Err(CaseError::new(
+                            CaseErrorCode::StepKind,
+                            "a read declaration under `--- mutate` is refused; use `--- query`",
+                        )
+                        .fix("write `--- query` as the section header"));
                     }
                     inspect_decl(decl, &mut needs_indices)?;
                     let base_binding = match &decl.write_mode {
@@ -2687,9 +3001,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                     };
                     if let Some(name) = base_binding {
                         if !bound_names.contains(name) {
-                            return Err((format!(
-                            "`${{{name}}}` is not bound; `--- bind commit ${name}` must precede this step"
-                        )).into());
+                            return Err(unbound(name));
                         }
                         if source.matches("${").count() == 1 {
                             substitutable_lines.extend(
@@ -2702,7 +3014,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         }
                     }
                     ordinal += 1;
-                    pending = Some(Pending::Decl(PendingStep {
+                    cursor.pending = Some(Pending::Decl(PendingStep {
                         is_mutation,
                         ordinal,
                         source: source.clone(),
@@ -2720,62 +3032,78 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                 "concurrent" => {
                     let line = section.header_line + 1;
                     if !rest.is_empty() {
-                        return Err(
-                            (format!("line {line}: `--- concurrent` takes no arguments")).into(),
-                        );
+                        return Err(CaseError::new(
+                            CaseErrorCode::StepKind,
+                            "`--- concurrent` takes no arguments",
+                        ));
                     }
-                    if open_loop.is_some() {
-                        return Err((format!(
-                        "line {line}: invalid_case: a concurrent block inside a loop is not supported"
-                    )).into());
+                    if loops.open.is_some() {
+                        return Err(CaseError::new(
+                            CaseErrorCode::LoopStructure,
+                            "a concurrent block inside a loop is not supported",
+                        )
+                        .fix(
+                            "close the loop with `--- endloop` before the `--- concurrent` block",
+                        ));
                     }
-                    if pending.is_some() {
-                        return Err((format!(
-                            "line {line}: the previous step is missing its `--- expect`"
-                        ))
-                        .into());
+                    if cursor.pending.is_some() {
+                        return Err(missing_previous_expect());
                     }
                     let (lines, order) = concurrent::parse_block(&section.body).map_err(|e| {
-                        if e.starts_with("line ") {
-                            e
-                        } else {
-                            format!("line {line}: {e}")
-                        }
+                        CaseError::from(e)
+                            .code(CaseErrorCode::BodyShape)
+                            .line_or(line)
                     })?;
                     let mut sessions = Vec::with_capacity(lines.len());
                     for session in lines {
                         let file = parse_query(&session.text).map_err(|e| {
-                            format!(
-                                "line {}: session `{}` does not parse: {e}",
-                                session.line, session.label
+                            CaseError::new(
+                                CaseErrorCode::QueryParse,
+                                format!("session `{}` does not parse: {e}", session.label),
                             )
+                            .fix("rewrite the session's statement so it parses; the message names where the grammar stopped")
+                            .at_line(session.line)
                         })?;
                         if !file.settings.is_empty() {
-                            return Err((format!(
-                            "line {}: session `{}` carries `set` or `reset` lines; a block session is one statement",
-                            session.line, session.label
-                        )).into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::StepKind,
+                                format!(
+                                    "session `{}` carries `set` or `reset` lines; a block session is one statement",
+                                    session.label
+                                ),
+                            )
+                            .at_line(session.line));
                         }
                         let FileBody::Queries(decls) = file.body else {
-                            return Err((format!(
-                            "line {}: session `{}` must be a query or mutation declaration; show, branch and explain statements are not admitted in a block",
-                            session.line, session.label
-                        )).into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::StepKind,
+                                format!(
+                                    "session `{}` must be a query or mutation declaration; show, branch and explain statements are not admitted in a block",
+                                    session.label
+                                ),
+                            )
+                            .at_line(session.line));
                         };
                         let [decl] = decls.as_slice() else {
-                            return Err((format!(
-                                "line {}: session `{}` holds exactly one declaration, got {}",
-                                session.line,
-                                session.label,
-                                decls.len()
-                            ))
-                            .into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::StepKind,
+                                format!(
+                                    "session `{}` holds exactly one declaration, got {}",
+                                    session.label,
+                                    decls.len()
+                                ),
+                            )
+                            .at_line(session.line));
                         };
                         if !decl.params.is_empty() {
-                            return Err((format!(
-                            "line {}: session `{}` declares parameters; a block session takes none",
-                            session.line, session.label
-                        )).into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::StepKind,
+                                format!(
+                                    "session `{}` declares parameters; a block session takes none",
+                                    session.label
+                                ),
+                            )
+                            .at_line(session.line));
                         }
                         inspect_decl(decl, &mut needs_indices)?;
                         let kind = if decl.mutations.is_empty() {
@@ -2793,7 +3121,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                         });
                     }
                     ordinal += 1;
-                    pending = Some(Pending::Concurrent(ConcurrentStep {
+                    cursor.pending = Some(Pending::Concurrent(ConcurrentStep {
                         ordinal,
                         sessions,
                         order,
@@ -2801,39 +3129,60 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                 }
                 "params" => {
                     if !rest.is_empty() && !rest.starts_with("generate:") {
-                        return Err((format!("unknown section `--- {}`", section.name)).into());
+                        return Err(CaseError::new(
+                            CaseErrorCode::UnknownSection,
+                            format!("unknown section `--- {}`", section.name),
+                        )
+                        .fix("write `--- params` bare, or `--- params generate: <seed>`"));
                     }
-                    let step = match pending.as_mut() {
+                    let step = match cursor.pending.as_mut() {
                         Some(Pending::Decl(step)) => step,
                         Some(
                             Pending::List { .. }
                             | Pending::Control { .. }
                             | Pending::BranchRead { .. },
                         ) => {
-                            return Err("a branch statement takes no params".into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::ParamsPlacement,
+                                "a branch statement takes no params",
+                            )
+                            .fix("drop the `--- params` section; a branch statement carries its arguments on its own line"));
                         }
                         Some(Pending::Settings { .. } | Pending::Show { .. }) => {
-                            return Err("a settings statement takes no params".into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::ParamsPlacement,
+                                "a settings statement takes no params",
+                            )
+                            .fix("drop the `--- params` section; `set`, `reset` and `show` carry their values inline"));
                         }
                         Some(Pending::Concurrent(_)) => {
-                            return Err("a concurrent block takes no params; its sessions are literal statements".into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::ParamsPlacement,
+                                "a concurrent block takes no params; its sessions are literal statements",
+                            )
+                            .fix("drop the `--- params` section; write each session's values in its statement"));
                         }
                         Some(Pending::Load { .. }) => {
-                            return Err("a generated load takes no params".into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::ParamsPlacement,
+                                "a generated load takes no params",
+                            )
+                            .fix("drop the `--- params` section; a generated load takes its values from the recipe"));
                         }
                         None => {
-                            return Err((format!(
-                            "line {}: `--- params` must directly follow a query or mutate section",
-                            section.header_line + 1
-                        )).into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::ParamsPlacement,
+                                "`--- params` must directly follow a query or mutate section",
+                            )
+                            .fix("move `--- params` directly under the query or mutate section it feeds"));
                         }
                     };
                     if step.params_raw.is_some() {
-                        return Err((format!(
-                            "line {}: a second `--- params` for one step is refused",
-                            section.header_line + 1
-                        ))
-                        .into());
+                        return Err(CaseError::new(
+                            CaseErrorCode::ParamsPlacement,
+                            "a second `--- params` for one step is refused",
+                        )
+                        .fix("fold the values into the step's one `--- params` body"));
                     }
                     if rest.is_empty() {
                         let body: String = section
@@ -2842,66 +3191,62 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                             .map(|(_, l)| *l)
                             .collect::<Vec<_>>()
                             .join("\n");
-                        validate_subst_tokens(
-                            &body,
-                            open_loop.as_ref().map(|(v, _, _)| v.as_str()),
-                            &bound_names,
-                        )?;
+                        validate_subst_tokens(&body, loops.var(), &bound_names)?;
                         substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
                         step.params_raw = Some(ParamsInput::Literal(body));
                     } else {
-                        step.params_raw = Some(ParamsInput::Generated(
-                            GeneratedParams::parse(rest, &yaml_body(&section.body))
-                                .map_err(|e| format!("line {}: {e}", section.header_line + 1))?,
-                        ));
+                        step.params_raw = Some(ParamsInput::Generated(GeneratedParams::parse(
+                            rest,
+                            &yaml_body(&section.body),
+                        )?));
                     }
                 }
                 "expect" => {
-                    if let Some(Pending::Concurrent(mut step)) =
-                        pending.take_if(|p| matches!(p, Pending::Concurrent(_)))
+                    if let Some(Pending::Concurrent(mut step)) = cursor
+                        .pending
+                        .take_if(|p| matches!(p, Pending::Concurrent(_)))
                     {
                         let line = section.header_line + 1;
                         if !rest.trim().is_empty() {
-                            return Err((format!(
-                            "line {line}: after a concurrent block, `--- expect` is bare and its body names each session: `<label>: ok` or `<label>: error: <needle>`"
-                        )).into());
+                            return Err(mode_for_step(
+                                "after a concurrent block, `--- expect` is bare and its body names each session: `<label>: ok` or `<label>: error: <needle>`",
+                            )
+                            .fix("write `--- expect` with no mode word, then one `<label>: ok` or `<label>: error: <needle>` line per session"));
                         }
                         refuse_comment_lines(&section.body, "expect")?;
                         let labels: Vec<&str> =
                             step.sessions.iter().map(|s| s.label.as_str()).collect();
                         let expects = concurrent::parse_expect_body(&section.body, &labels)
                             .map_err(|e| {
-                                if e.starts_with("line ") {
-                                    e
-                                } else {
-                                    format!("line {line}: {e}")
-                                }
+                                CaseError::from(e)
+                                    .code(CaseErrorCode::BodyShape)
+                                    .line_or(line)
                             })?;
                         for (op, expect) in step.sessions.iter_mut().zip(expects) {
                             op.expect = expect;
                         }
-                        push_step(&mut items, &mut open_loop, Step::Concurrent(step));
+                        push_step(&mut items, &mut loops, Step::Concurrent(step));
                         return Ok(());
                     }
                     if rest.trim() == "shape" {
-                        let Some(mut step) = awaiting_shape.take() else {
-                            return Err((format!(
-                            "line {}: `--- expect shape` must directly follow a query step's unordered or ordered expect",
-                            section.header_line + 1
-                        )).into());
+                        let Some(mut step) = cursor.awaiting_shape.take() else {
+                            return Err(CaseError::new(
+                                CaseErrorCode::ExpectWithoutStep,
+                                "`--- expect shape` must directly follow a query step's unordered or ordered expect",
+                            )
+                            .fix("move `--- expect shape` directly under the rows expect it describes"));
                         };
                         let lines = parse_shape_body(&section.body)?;
                         if matches!(step, Step::Show(_)) {
                             refuse_unequal_show_shape(&lines, section.header_line + 1)?;
-                            push_step(&mut items, &mut open_loop, step);
+                            push_step(&mut items, &mut loops, step);
                             return Ok(());
                         }
                         if let Step::BranchRead(read) = &step {
-                            return Err((format!(
-                            "line {}: `{}` answers its own columns; drop the `--- expect shape` section",
-                            section.header_line + 1,
-                            read.read.statement_name()
-                        )).into());
+                            return Err(mode_for_step(format!(
+                                "`{}` answers its own columns; drop the `--- expect shape` section",
+                                read.read.statement_name()
+                            )));
                         }
                         let Some(QueryExpect::Rows { shape, .. }) = step.read_expect_mut() else {
                             return Err((format!(
@@ -2916,21 +3261,21 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                                 len: section.body.len(),
                             },
                         };
-                        awaiting_plan = Some(step);
+                        cursor.awaiting_plan = Some(step);
                         return Ok(());
                     }
                     if rest.trim() == "plan" {
-                        let Some(mut step) = awaiting_plan.take() else {
-                            if !awaiting_load_plan {
-                                return Err((format!(
-                                "line {}: `--- expect plan` must directly follow a query step's `--- expect shape`, or the `--- expect` of a `load csv`, `branch merge` or mutate step that succeeds",
-                                section.header_line + 1
-                            )).into());
+                        let Some(mut step) = cursor.awaiting_plan.take() else {
+                            if !cursor.awaiting_load_plan {
+                                return Err(CaseError::new(
+                                    CaseErrorCode::ExpectWithoutStep,
+                                    "`--- expect plan` must directly follow a query step's `--- expect shape`, or the `--- expect` of a `load csv`, `branch merge` or mutate step that succeeds",
+                                )
+                                .fix("move `--- expect plan` directly under the expect it extends"));
                             }
-                            awaiting_load_plan = false;
-                            let lines = parse_load_plan_body(&section.body)
-                                .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
-                            let last = match open_loop.as_mut() {
+                            cursor.awaiting_load_plan = false;
+                            let lines = parse_load_plan_body(&section.body)?;
+                            let last = match loops.open.as_mut() {
                                 Some((_, _, steps)) => steps.last_mut(),
                                 None => match items.last_mut() {
                                     Some(Item::Step(step)) => Some(step),
@@ -2955,45 +3300,41 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                             *slot = Some(LoadPlanExpect { lines });
                             return Ok(());
                         };
-                        let lines = parse_plan_body(&section.body)
-                            .map_err(|e| format!("line {}: {e}", section.header_line + 1))?;
+                        let lines = parse_plan_body(&section.body)?;
                         let Step::Query(query) = &mut step else {
-                            return Err((format!(
-                                "line {}: `--- expect plan` is supported only on query steps",
-                                section.header_line + 1
-                            ))
-                            .into());
+                            return Err(mode_for_step(
+                                "`--- expect plan` is supported only on query steps",
+                            ));
                         };
                         query.plan = Some(PlanExpect { lines });
-                        awaiting_same_as_v1 = Some(step);
+                        cursor.awaiting_same_as_v1 = Some(step);
                         return Ok(());
                     }
                     if rest.trim() == SAME_AS_V1 {
-                        let line = section.header_line + 1;
                         refuse_nonempty_body(&section.body, "an `expect same as v1` section")?;
-                        let Some(mut step) =
-                            awaiting_plan.take().or_else(|| awaiting_same_as_v1.take())
+                        let Some(mut step) = cursor
+                            .awaiting_plan
+                            .take()
+                            .or_else(|| cursor.awaiting_same_as_v1.take())
                         else {
-                            return Err((same_as_v1_misplaced(
-                                line,
-                                pending.as_ref(),
+                            return Err(same_as_v1_misplaced(
+                                cursor.pending.as_ref(),
                                 &items,
-                                open_loop.as_ref(),
-                            ))
-                            .into());
+                                loops.open.as_ref(),
+                            ));
                         };
                         let Step::Query(query) = &mut step else {
-                            return Err((format!(
-                            "line {line}: `--- expect same as v1` is supported only on a query declaration step"
-                        )).into());
+                            return Err(mode_for_step(
+                                "`--- expect same as v1` is supported only on a query declaration step",
+                            ));
                         };
                         query.same_as_v1 = true;
-                        push_step(&mut items, &mut open_loop, step);
+                        push_step(&mut items, &mut loops, step);
                         return Ok(());
                     }
                     let mode = parse_expect_header(rest)?;
-                    let loop_var = open_loop.as_ref().map(|(v, _, _)| v.as_str());
-                    let completed = match pending.take() {
+                    let loop_var = loops.var();
+                    let completed = match cursor.pending.take() {
                         Some(Pending::Load {
                             ordinal,
                             branch,
@@ -3033,7 +3374,7 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                             ordinal, id, prefix, &mode, section, loop_var,
                         )?),
                         Some(Pending::Concurrent(_)) => {
-                            unreachable!("a pending concurrent block is completed above")
+                            unreachable!("a cursor.pending concurrent block is completed above")
                         }
                         Some(Pending::BranchRead {
                             ordinal,
@@ -3049,14 +3390,14 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                             &bound_names,
                         )?),
                         None => {
-                            return Err((format!(
-                                "line {}: `--- expect` has no query or mutate step to bind to",
-                                section.header_line + 1
-                            ))
-                            .into());
+                            return Err(CaseError::new(
+                                CaseErrorCode::ExpectWithoutStep,
+                                "`--- expect` has no query or mutate step to bind to",
+                            )
+                            .fix("write the `--- query` or `--- mutate` section this expect completes above it"));
                         }
                     };
-                    awaiting_load_plan = match &completed {
+                    cursor.awaiting_load_plan = match &completed {
                         Step::Control(ControlStep {
                             write:
                                 ControlWrite::Load {
@@ -3077,92 +3418,118 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
                     };
                     if matches!(completed.read_expect(), Some(QueryExpect::Rows { .. })) {
                         substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
-                        awaiting_shape = Some(completed);
+                        cursor.awaiting_shape = Some(completed);
                     } else {
-                        push_step(&mut items, &mut open_loop, completed);
+                        push_step(&mut items, &mut loops, completed);
                     }
                 }
                 "bind" => {
-                    if pending.is_some() {
-                        return Err((format!(
-                            "line {}: the previous step is missing its `--- expect`",
-                            section.header_line + 1
-                        ))
-                        .into());
+                    if cursor.pending.is_some() {
+                        return Err(missing_previous_expect());
                     }
                     refuse_nonempty_body(&section.body, "`--- bind`")?;
-                    if open_loop.is_some() {
-                        return Err(
-                        "invalid_case: `--- bind` inside a loop is refused; a binding is one id for the case"
-                            .into()
-                    );
+                    if loops.open.is_some() {
+                        return Err(CaseError::new(
+                            CaseErrorCode::LoopStructure,
+                            "`--- bind` inside a loop is refused; a binding is one id for the case",
+                        )
+                        .fix("write the bound step and its `--- bind commit $name` before `--- loop`, or after `--- endloop`"));
                     }
-                    let name = parse_bind_header(rest)?;
+                    let name = parse_bind_header(rest).map_err(|e| {
+                        coded(CaseErrorCode::BindShape)(e)
+                            .fix("write `--- bind commit $name` with a `$[a-z][a-z0-9_]*` name")
+                    })?;
                     if bound_names.contains(&name) {
-                        return Err((format!(
-                            "`--- bind commit ${name}` is declared twice; one binding per name"
-                        ))
-                        .into());
+                        return Err(CaseError::new(
+                            CaseErrorCode::BindShape,
+                            format!(
+                                "`--- bind commit ${name}` is declared twice; one binding per name"
+                            ),
+                        )
+                        .fix("bind this write under a new name, or drop the second `--- bind`"));
                     }
                     let Some(Item::Step(step)) = items.last_mut() else {
-                        return Err("`--- bind commit` has no write step to follow".into());
+                        return Err(CaseError::new(
+                            CaseErrorCode::BindShape,
+                            "`--- bind commit` has no write step to follow",
+                        )
+                        .fix("write `--- bind commit $name` directly under the `--- expect` of the write it names"));
                     };
-                    bind_commit(step, &name)?;
+                    bind_commit(step, &name).map_err(|e| {
+                        coded(CaseErrorCode::BindShape)(e).fix(
+                            "move `--- bind commit $name` under the `--- expect` of a mutation, `branch merge` or `commit publish` expected to succeed",
+                        )
+                    })?;
                     bound_names.insert(name);
                 }
                 "restart" => {
                     if !rest.is_empty() {
-                        return Err("`--- restart` takes no arguments".into());
+                        return Err(CaseError::new(
+                            CaseErrorCode::BodyShape,
+                            "`--- restart` takes no arguments",
+                        )
+                        .fix("write `--- restart` bare"));
                     }
-                    if pending.is_some() {
-                        return Err((format!(
-                            "line {}: the previous step is missing its `--- expect`",
-                            section.header_line + 1
-                        ))
-                        .into());
+                    if cursor.pending.is_some() {
+                        return Err(missing_previous_expect());
                     }
                     refuse_nonempty_body(&section.body, "`--- restart`")?;
                     ordinal += 1;
-                    push_step(&mut items, &mut open_loop, Step::Restart { ordinal });
+                    push_step(&mut items, &mut loops, Step::Restart { ordinal });
                 }
                 "loop" | "foreach" => {
-                    if pending.is_some() {
-                        return Err((format!(
-                            "line {}: the previous step is missing its `--- expect`",
-                            section.header_line + 1
-                        ))
-                        .into());
+                    if cursor.pending.is_some() {
+                        return Err(missing_previous_expect());
                     }
-                    if open_loop.is_some() {
-                        return Err("loops may not nest".into());
+                    if loops.open.is_some() {
+                        return Err(CaseError::new(
+                            CaseErrorCode::LoopStructure,
+                            "loops may not nest",
+                        )
+                        .fix("close the open loop with `--- endloop` before this header"));
                     }
                     refuse_nonempty_body(&section.body, "a loop header")?;
                     let (var, values) = if kind == "loop" {
-                        parse_loop_header(rest)?
+                        parse_loop_header(rest).map_err(|e| {
+                            coded(CaseErrorCode::LoopHeader)(e)
+                                .fix("write `--- loop $var <start> <end>`")
+                        })?
                     } else {
-                        parse_foreach_header(rest)?
+                        parse_foreach_header(rest).map_err(|e| {
+                            coded(CaseErrorCode::LoopHeader)(e)
+                                .fix("write `--- foreach $var <v1> [<v2> ...]`")
+                        })?
                     };
-                    open_loop = Some((var, values, Vec::new()));
+                    loops.open = Some((var, values, Vec::new()));
+                    loops.header_line = section.header_line + 1;
                 }
                 "endloop" => {
                     if !rest.is_empty() {
-                        return Err("`--- endloop` takes no arguments".into());
+                        return Err(CaseError::new(
+                            CaseErrorCode::LoopStructure,
+                            "`--- endloop` takes no arguments",
+                        )
+                        .fix("write `--- endloop` bare"));
                     }
-                    if pending.is_some() {
-                        return Err((format!(
-                            "line {}: the previous step is missing its `--- expect`",
-                            section.header_line + 1
-                        ))
-                        .into());
+                    if cursor.pending.is_some() {
+                        return Err(missing_previous_expect());
                     }
                     refuse_nonempty_body(&section.body, "`--- endloop`")?;
-                    let Some((var, values, steps)) = open_loop.take() else {
-                        return Err("`--- endloop` without an open loop".into());
+                    let Some((var, values, steps)) = loops.close() else {
+                        return Err(CaseError::new(
+                            CaseErrorCode::LoopStructure,
+                            "`--- endloop` without an open loop",
+                        )
+                        .fix("open the loop with `--- loop $var <start> <end>` above its steps, or drop this `--- endloop`"));
                     };
-                    if steps.is_empty() && !refused_in_loop {
-                        return Err("a loop enclosing no steps is refused".into());
+                    if steps.is_empty() && !loops.refused_inside {
+                        return Err(CaseError::new(
+                            CaseErrorCode::LoopStructure,
+                            "a loop enclosing no steps is refused",
+                        )
+                        .fix("write at least one `--- query` or `--- mutate` step between the loop header and `--- endloop`"));
                     }
-                    refused_in_loop = false;
+                    loops.refused_inside = false;
                     items.push(Item::Loop { var, values, steps });
                 }
                 _ => {
@@ -3178,28 +3545,22 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
         if let Err(error) = outcome {
             errors.push(error.located(section.header_line + 1, &lines));
             substitutable_lines.extend(section.body.iter().map(|(i, _)| *i));
-            pending = None;
-            awaiting_shape = None;
-            awaiting_plan = None;
-            awaiting_same_as_v1 = None;
-            awaiting_load_plan = false;
-            awaiting_seam_step = false;
-            skip_continuations = true;
-            refused_in_loop |= open_loop.is_some() && !placeholder_loop;
-            if matches!(kind, "loop" | "foreach") {
-                skip_endloop = true;
-                if open_loop.is_none() {
-                    open_loop = Some((placeholder_loop_var(rest), Vec::new(), Vec::new()));
-                    placeholder_loop = true;
-                }
-            }
+            cursor.abandon();
+            loops.abandon(kind, rest, section.header_line + 1);
         }
     }
     let last_line = lines.len().max(1);
-    if awaiting_seam_step {
-        errors.push(CaseError::from("seam has no following operation").located(last_line, &lines));
+    if cursor.awaiting_seam_step {
+        errors.push(
+            CaseError::new(
+                CaseErrorCode::SectionOrder,
+                "seam has no following operation",
+            )
+            .fix("write the `--- query` or `--- mutate` step the seam arms under it")
+            .located(last_line, &lines),
+        );
     }
-    if pending.is_some() {
+    if cursor.pending.is_some() {
         errors.push(
             CaseError::new(
                 CaseErrorCode::MissingExpect,
@@ -3209,24 +3570,35 @@ pub fn parse_case(stem: &str, text: &str) -> Result<Case, CaseErrors> {
             .located(last_line, &lines),
         );
     }
-    if let Err(error) = settle_shape(&mut items, &mut open_loop, awaiting_shape.take()) {
-        errors.push(CaseError::from(error).located(last_line, &lines));
+    if let Err(error) = settle_shape(&mut items, &mut loops, cursor.awaiting_shape.take()) {
+        errors.push(error.located(last_line, &lines));
     }
-    if let Some(step) = awaiting_plan.take().or_else(|| awaiting_same_as_v1.take()) {
-        push_step(&mut items, &mut open_loop, step);
+    if let Some(step) = cursor
+        .awaiting_plan
+        .take()
+        .or_else(|| cursor.awaiting_same_as_v1.take())
+    {
+        push_step(&mut items, &mut loops, step);
     }
-    if open_loop.is_some() {
+    if loops.open.is_some() {
         errors.push(
-            CaseError::from("a loop is not closed with `--- endloop`")
-                .fix("write `--- endloop` after the loop's last step")
-                .located(last_line, &lines),
+            CaseError::new(
+                CaseErrorCode::LoopStructure,
+                "a loop is not closed with `--- endloop`",
+            )
+            .fix("write `--- endloop` after the loop's last step")
+            .located(loops.header_line, &lines),
         );
     }
     for (idx, line) in lines.iter().enumerate() {
         if line.contains("${") && !substitutable_lines.contains(&idx) {
             errors.push(
-                CaseError::from("`${` may appear only inside a params or expect body")
-                    .located(idx + 1, &lines),
+                CaseError::new(
+                    CaseErrorCode::SubstitutionPlacement,
+                    "`${` may appear only inside a params or expect body",
+                )
+                .fix("move the `${...}` into the step's `--- params` or `--- expect` body")
+                .located(idx + 1, &lines),
             );
         }
     }

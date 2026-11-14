@@ -1918,7 +1918,7 @@ name: String
     for line in [
         format!("{0}: invalid_case: no .gqt case under {0}", empty.display()),
         format!("ok {}", clean.display()),
-        format!("{}:2: invalid_case: ", refused_twice.display()),
+        format!("{}:2: runner_config: ", refused_twice.display()),
         format!("{}:10: unknown_expect_mode: ", refused_twice.display()),
     ] {
         assert!(text.contains(&line), "{line}: {text}");
@@ -1943,7 +1943,7 @@ name: String
         [
             vec!["invalid_case"],
             vec![],
-            vec!["invalid_case", "unknown_expect_mode"]
+            vec!["runner_config", "unknown_expect_mode"]
         ]
     );
     assert_eq!(objects[0]["path"], empty.display().to_string());

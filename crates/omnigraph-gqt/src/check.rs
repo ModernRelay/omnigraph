@@ -4,12 +4,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use omnigraph_gqt_core::{CaseError, CaseErrorCode, parse_case};
+use omnigraph_gqt_core::{CaseError, CaseErrorCode, check_text};
 use serde_json::json;
-
-/// The `timeout_ms` the required corpus admits (`run_corpus_case` refuses
-/// above it at run time; `--check` reports it before).
-pub const CORPUS_TIMEOUT_MS: u64 = 10_000;
 
 /// One checked file and every error found in it, in source order.
 pub struct CheckedFile {
@@ -20,13 +16,17 @@ pub struct CheckedFile {
 impl CheckedFile {
     pub fn to_json(&self) -> serde_json::Value {
         json!({
+            "gqt_format": omnigraph_gqt_core::GQT_FORMAT_VERSION,
             "path": self.path.display().to_string(),
             "errors": self.errors.iter().map(CaseError::to_json).collect::<Vec<_>>(),
         })
     }
 }
 
-pub fn check_file(path: &Path) -> CheckedFile {
+/// The file's refusals; `corpus` reads it as a member of the required
+/// corpus wherever it lives, as a file named or resolved under the corpus
+/// is read anyway.
+pub fn check_file(path: &Path, corpus: bool) -> CheckedFile {
     let text = match crate::dst_runner::read_case_text(path) {
         Ok(text) => text,
         Err(error) => {
@@ -45,48 +45,15 @@ pub fn check_file(path: &Path) -> CheckedFile {
             };
         }
     };
-    let mut errors = match parse_case(&crate::stem_of(path), &text) {
-        Ok(_) => Vec::new(),
-        Err(errors) => errors.into_vec(),
-    };
-    errors.extend(corpus_timeout(path, &text));
-    errors.sort_by_key(|error| error.line.unwrap_or(usize::MAX));
+    let corpus = corpus || under_required_corpus(path);
     CheckedFile {
         path: path.to_path_buf(),
-        errors,
+        errors: check_text(&crate::stem_of(path), &text, corpus),
     }
 }
 
-/// The corpus cap, for a file named or resolved under the required corpus
-/// (`…/crates/omnigraph-gqt/cases/…`, never `cases_slow`), read off the
-/// `timeout_ms:` line itself so a case the parser refused still hears it.
-fn corpus_timeout(path: &Path, text: &str) -> Option<CaseError> {
-    if !under_required_corpus(path) {
-        return None;
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    let (idx, timeout_ms) = lines.iter().enumerate().find_map(|(idx, line)| {
-        let value = line.trim_start().strip_prefix("timeout_ms:")?.trim();
-        Some((idx, value.parse::<u64>().ok()?))
-    })?;
-    if timeout_ms <= CORPUS_TIMEOUT_MS {
-        return None;
-    }
-    let line = idx + 1;
-    Some(
-        CaseError::new(
-            CaseErrorCode::CorpusTimeout,
-            format!(
-                "the required corpus admits timeout_ms at most {CORPUS_TIMEOUT_MS}; this case declares {timeout_ms}"
-            ),
-        )
-        .fix(format!(
-            "set `timeout_ms: {CORPUS_TIMEOUT_MS}` or lower, or move the case under `cases_slow/`"
-        ))
-        .located(line, &lines),
-    )
-}
-
+/// Whether the file is named or resolved under the required corpus
+/// (`…/crates/omnigraph-gqt/cases/…`, never `cases_slow`).
 fn under_required_corpus(path: &Path) -> bool {
     let named = std::path::absolute(path).ok();
     let resolved = path.canonicalize().ok();
@@ -133,6 +100,7 @@ pub fn render_text(checked: &CheckedFile) -> String {
 pub fn check_cases(
     named: &[(PathBuf, Result<Vec<PathBuf>, String>)],
     as_json: bool,
+    corpus: bool,
 ) -> Result<(), String> {
     let mut errors = 0usize;
     let mut failed = 0usize;
@@ -152,7 +120,7 @@ pub fn check_cases(
             }
         };
         for case in cases {
-            let checked = check_file(case);
+            let checked = check_file(case, corpus);
             print_checked(&checked, as_json);
             files += 1;
             if !checked.errors.is_empty() {
@@ -181,6 +149,59 @@ pub fn check_cases(
     }
 }
 
+/// `--explain <code>`: the rule under the code, and the negative-corpus
+/// case that demonstrates it when the source tree is beside the binary.
+pub fn explain(code: &str) -> Result<String, String> {
+    let code = CaseErrorCode::from_name(code).ok_or_else(|| {
+        format!(
+            "unknown error code `{code}`; codes: {}",
+            CaseErrorCode::ALL
+                .iter()
+                .map(|code| code.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let mut out = format!("{}: {}\n", code.name(), code.rule());
+    let invalid = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("omnigraph-gqt-core")
+        .join("tests")
+        .join("invalid");
+    let prefix = format!("{}_", code.name());
+    let mut examples: Vec<PathBuf> = std::fs::read_dir(&invalid)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension().is_some_and(|ext| ext == "gqt")
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with(&prefix))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    examples.sort();
+    match examples.first() {
+        Some(example) => {
+            let checked = check_file(example, true);
+            out.push_str(&format!("\nexample {}:\n", example.display()));
+            if let Ok(text) = std::fs::read_to_string(example) {
+                for (idx, line) in text.lines().enumerate() {
+                    out.push_str(&format!("{:>4}  {line}\n", idx + 1));
+                }
+            }
+            out.push('\n');
+            out.push_str(&render_text(&checked));
+        }
+        None => out.push_str("(no example case beside this binary)\n"),
+    }
+    Ok(out)
+}
+
 fn print_checked(checked: &CheckedFile, as_json: bool) {
     if as_json {
         println!("{}", checked.to_json());
@@ -195,12 +216,14 @@ fn print_checked(checked: &CheckedFile, as_json: bool) {
 mod tests {
     use super::*;
 
-    const SLOW: &str = "# issue: none\n--- runner\ntimeout_ms: 20000\n";
+    /// A runner the parser accepts whose budget the corpus does not, the
+    /// value followed by a YAML comment, as a scan of the line would miss.
+    const SLOW: &str = "# issue: none\n--- runner\ntimeout_ms: 20000 # budget\nenvironments:\n  - target: omnigraph-engine-dst\n    storage: in-memory-object-store\n    seeds: [0]\n";
 
     #[test]
     fn a_file_the_run_refuses_to_read_is_one_error_under_its_path() {
         let dir = tempfile::tempdir().unwrap();
-        let not_a_file = check_file(dir.path());
+        let not_a_file = check_file(dir.path(), false);
         assert_eq!(not_a_file.errors.len(), 1);
         assert_eq!(
             not_a_file.errors[0].message,
@@ -208,7 +231,7 @@ mod tests {
         );
         let binary = dir.path().join("binary.gqt");
         std::fs::write(&binary, b"\xff\xfe").unwrap();
-        let not_utf8 = check_file(&binary);
+        let not_utf8 = check_file(&binary, false);
         assert_eq!(not_utf8.errors.len(), 1);
         assert!(
             not_utf8.errors[0].message.starts_with("UTF-8: "),
@@ -232,15 +255,43 @@ mod tests {
         std::os::unix::fs::symlink(slow.join("slow.gqt"), corpus.join("linked_out.gqt")).unwrap();
         std::os::unix::fs::symlink(corpus.join("held.gqt"), elsewhere.join("linked_in.gqt"))
             .unwrap();
-        let capped = |path: PathBuf| corpus_timeout(&path, SLOW).is_some();
-        assert!(capped(corpus.join("held.gqt")));
-        assert!(capped(corpus.join("linked_out.gqt")), "named under it");
-        assert!(capped(elsewhere.join("linked_in.gqt")), "resolved under it");
-        assert!(capped(slow.join("../cases/linked_out.gqt")), "`..` into it");
-        assert!(!capped(slow.join("slow.gqt")));
-        assert!(
-            !capped(corpus.join("../cases_slow/slow.gqt")),
+        let capped = |path: PathBuf, corpus: bool| {
+            let checked = check_file(&path, corpus);
+            let lines: Vec<_> = checked
+                .errors
+                .iter()
+                .filter(|error| error.code == CaseErrorCode::CorpusTimeout)
+                .map(|error| error.line)
+                .collect();
+            assert!(lines.len() <= 1, "{lines:?}");
+            lines.first().map(|line| line.unwrap())
+        };
+        assert_eq!(capped(corpus.join("held.gqt"), false), Some(3));
+        assert_eq!(
+            capped(corpus.join("linked_out.gqt"), false),
+            Some(3),
+            "named under it"
+        );
+        assert_eq!(
+            capped(elsewhere.join("linked_in.gqt"), false),
+            Some(3),
+            "resolved under it"
+        );
+        assert_eq!(
+            capped(slow.join("../cases/linked_out.gqt"), false),
+            Some(3),
+            "`..` into it"
+        );
+        assert_eq!(capped(slow.join("slow.gqt"), false), None);
+        assert_eq!(
+            capped(corpus.join("../cases_slow/slow.gqt"), false),
+            None,
             "`..` out of it"
+        );
+        assert_eq!(
+            capped(slow.join("slow.gqt"), true),
+            Some(3),
+            "`--corpus` reads it as a member"
         );
     }
 }
