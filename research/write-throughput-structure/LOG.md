@@ -87,3 +87,56 @@ Reading:
   slot (`merge_authority_cache: Mutex<Option<(String, GraphCoordinator)>>`) and the mutex is held
   across the freshness probe and refresh; branches evict each other, so each write reopens its
   branch coordinator at capture and again at publication.
+
+## Phase breakdown of the baseline (wt-timers = baseline + phase timers), S3 +30 ms
+
+Same branch, 1 writer, 372 ms/commit: capture 33 (HEAD v / v+1), stage 72 (key-check GET + data
+PUT), gate wait 0, revalidate 0.3 (the beside-staging probe served), detached commit 68 (txn PUT +
+manifest PUT), publish 163 (publisher load 54 = `_versions` LIST; overwrite 106 = data PUT, txn
+PUT, CAS PUT). Gate hold 232 ms ~ 7 round trips.
+Same branch, 4/16 writers: 2.0 attempts per commit; the re-prepared attempt holds the writer gates
+through capture, stage, detached, publish, plus the failed attempt's under-gate revalidation:
+~450-500 ms gated per commit, hence ~2/s.
+Separate branches: named-branch publisher load 215 ms (the held-dataset fast path is main-only:
+`current_control_dataset` refuses a branch manifest, so each publish reopens main + branch
+`__manifest`), under-gate revalidation 65 ms (not served by the early probe off the bound branch),
+and with 4+ branches a 317 ms coordinator open on 0.75-1 of the commits (the shared slot).
+
+## E: per-branch authority cache (results/E-s3.jsonl)
+
+`merge_authority_cache` becomes a bounded map (64) of per-branch slots, each its own async mutex;
+publication clones the slot's coordinator instead of taking it. S3 separate: 4w 4.27 -> 5.87,
+16w 12.66 -> 22.47, 64w 26.67 -> 46.8 commits/s; requests/commit flat at ~21 (was 28-35). Same
+branch unchanged. Verdict: keep (pure data-structure fix; memory bound by entries).
+At 64 branches the publisher load still grows 220 -> 846 ms (each named publish reopens
+`__manifest` from the root); addressed later by extending the held dataset to named branches.
+
+## A: commutative carry-over (results/EA-s3.jsonl, EA2-s3.jsonl)
+
+Insert-only mutation, written tables = node types w/o non-key @unique -> revalidation carries the
+attempt over publications that touched other tables or only inserted into its tables
+(`table_store::commuting_chain`), and `rebase_staged_write` (Lance `TransactionRebase`, key filter
+intersection) moves the staged insert onto the current pin.
+- EA (chain walk from storage): re-prepares 1.0 -> 0, but revalidation walks k links (HEAD+GET
+  each) under the gate: 234 ms at 4w, 806 ms at 16w -> 16w throughput 2.0 -> 1.0. Discard as is.
+- EA2 (+ in-process log of detached commits this process made, `table_store::detached_links`,
+  immutable facts): 4w 2.0 -> 3.0, 16w 2.0 -> 3.0 (p99 8.0 s -> 5.5 s). 64w 1.67: lag > 32 links
+  overflowed the storage-walk cap; raised the in-memory walk to the log size (1024).
+- Local URI key bug: `file://` vs bare path made every local walk miss; normalized (EAB3).
+
+## B: trusted in-process tip (results/EAB-s3.jsonl, EAB2-*.jsonl)
+
+Bound branch: capture and revalidation use the installed coordinator (no probe; the early probe
+removed), publisher first attempt starts from its own acknowledged dataset (no `_versions` LIST);
+the CAS stays the authority, a stale tip costs one failed CAS and a retry with a fresh load.
+- EAB S3 same: 1w 2.73 -> 3.47 (p50 369 -> 290 ms, 12.9 -> 8.0 requests), 4/16/64w -> 4.0.
+- EAB2 (+ open the carried table through the read-handle cache, `open_pinned_for_write`):
+  same 4/16w -> 4.6 commits/s, 7.9 requests/commit (the minimum: 3 manifest PUTs, 2 table PUTs,
+  1 table PUT-create, 2 table GETs), gate hold 217 ms = detached 103 + publish 114.
+- EAB2 local: same 4w 13.9 -> 25.1, 16w 14.5 -> 25.6; separate 16w 85 -> 118, 64w 98 -> 155.
+  Same 64w regressed to 12.2 (0.39 re-prepares) = the URI bug; EAB3 64w -> 24.5.
+- Local gate hold is now ~38 ms of CPU (O0 engine code): publish 33 (load 7.5 decode, overwrite
+  16, ~9 building rows), detached 3.
+
+Open question: detached commit under the gate went 68 -> 103 ms when rebased (no extra request
+counted). Possibly store contention from concurrent ungated staging; not yet explained.
