@@ -134,9 +134,13 @@ fn exact_sum(values: &[Value]) -> f64 {
     }
 }
 
-/// The total value order: null first, then by kind, numbers by value.
+/// The total value order: null first, then by kind, numbers by value; two
+/// floats by the total order, so `-0.0` sorts before `0.0`.
 fn cmp_values(a: &Value, b: &Value) -> Ordering {
     use Value::*;
+    if let (Float(x), Float(y)) = (a, b) {
+        return x.total_cmp(y);
+    }
     let rank = |v: &Value| match v {
         Null => 0,
         Bool(_) => 1,
@@ -1411,13 +1415,24 @@ fn l2(a: &[f64], b: &[f64]) -> f64 {
     f64::from(d)
 }
 
+/// The order a comparison reads: the value order, except that two numbers
+/// compare as IEEE 754 does, `-0.0` equal to `0.0`.
+fn cmp_compared(a: &Value, b: &Value) -> Ordering {
+    match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) if !matches!((a, b), (Value::Int(_), Value::Int(_))) => {
+            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+        }
+        _ => cmp_values(a, b),
+    }
+}
+
 fn compare(op: CompOp, l: Value, r: Value) -> Value {
     match op {
         CompOp::Contains => match l {
             Value::List(items) if r != Value::Null => Value::Bool(
                 items
                     .iter()
-                    .any(|i| cmp_values(i, &r) == Ordering::Equal && *i != Value::Null),
+                    .any(|i| cmp_compared(i, &r) == Ordering::Equal && *i != Value::Null),
             ),
             Value::Str(s) => match r {
                 Value::Str(n) => Value::Bool(s.contains(&n)),
@@ -1435,7 +1450,7 @@ fn compare(op: CompOp, l: Value, r: Value) -> Value {
         },
         _ if l == Value::Null || r == Value::Null => Value::Null,
         _ => {
-            let o = cmp_values(&l, &r);
+            let o = cmp_compared(&l, &r);
             Value::Bool(match op {
                 CompOp::Eq => o == Ordering::Equal,
                 CompOp::Ne => o != Ordering::Equal,

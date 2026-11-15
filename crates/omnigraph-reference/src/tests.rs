@@ -451,6 +451,28 @@ fn expand_returns_its_source_only_through_a_self_loop_of_the_single_hop() {
 }
 
 #[test]
+fn a_comparison_treats_the_two_zeros_as_equal_and_the_value_order_does_not() {
+    let schema = "node P { name: String @key score: F64? }";
+    let data = r#"{"type":"P","data":{"name":"a","score":0.0}}
+{"type":"P","data":{"name":"b","score":-0.0}}"#;
+    let (out, _) = rows_over(
+        schema,
+        data,
+        "query q() { match { $p: P } where $p.score = 0.0 return { $p.name } }",
+    );
+    assert_eq!(
+        sorted(out),
+        vec![json!({"p.name": "a"}), json!({"p.name": "b"})]
+    );
+    let (out, _) = rows_over(
+        schema,
+        data,
+        "query q() { match { $p: P } return { $p.name } order { $p.score, $p.name } }",
+    );
+    assert_eq!(out, vec![json!({"p.name": "b"}), json!({"p.name": "a"})]);
+}
+
+#[test]
 fn an_integer_mean_divides_the_exact_total_once() {
     // In F64 the two weights cancel to 0; exactly they sum to 1, over 2.
     let (out, _) = rows_over(
