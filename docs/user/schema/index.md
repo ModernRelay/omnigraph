@@ -50,7 +50,7 @@ letter (`worksAt` for `WorksAt`); lookup is otherwise case-insensitive.
 | `F32`, `F64` | Floating-point numbers |
 | `Date` | Calendar date |
 | `DateTime` | Timestamp with millisecond precision |
-| `Vector(N)` | `N` 32-bit floating-point values |
+| `Vector(N)` | `N` 32-bit floating-point values; `Vector(N, distance = "cosine")` declares the [distance](../search/distances.md) (`l2`, the default, `cosine` or `dot`) that `distance` and `nearest` read |
 | `Blob` | Managed bytes or an external reference; see [Blobs](../blobs.md) |
 | `enum(a, b, ...)` | One of the declared strings |
 | `[T]` | A list of scalar `T` values |
@@ -218,7 +218,8 @@ Supported changes include adding types, adding nullable properties, renaming
 nodes, edges, or properties with `@rename_from`, adding index declarations,
 widening an enum with new values, making a nullable property required, adding
 `@unique` to a node type, declaring, changing or removing a full-text
-analyzer or scorer, updating descriptions or instructions, and
+analyzer or scorer, changing a vector's distance, updating descriptions or
+instructions, and
 dropping node, edge, or property declarations. Dropping a property also drops
 every constraint that names only dropped properties: its own `@index`,
 `@unique`, `@range` or `@check`, and a composite constraint whose members are
@@ -227,7 +228,10 @@ all dropped.
 A changed full-text analyzer replaces the property's index in the same
 publication with one built for the new analysis; `omnigraph index build`
 builds its postings, and searches scan with the new analysis meanwhile (see
-[Analyzers and scorers](../search/analyzers.md)).
+[Analyzers and scorers](../search/analyzers.md)). A changed vector distance
+writes no table: the index built for the old distance is no longer used, reads
+answer from the exact scan, and `omnigraph index build` replaces the index (see
+[Vector distances](../search/distances.md#changing-a-distance)).
 
 None of these changes rewrites existing rows. Adding a nullable property,
 renaming a property, or dropping a property changes only the table's metadata:

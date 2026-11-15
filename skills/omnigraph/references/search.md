@@ -20,7 +20,10 @@ node Chunk {
 }
 ```
 
-- `Vector(N)` — fixed-size float vector
+- `Vector(N)` — fixed-size float vector; `Vector(N, distance = "cosine")`
+  declares its distance (`l2`, the default, `cosine` or `dot`), which
+  `distance` and `nearest` read. A `cosine` field refuses a zero vector:
+  writing one fails validation and a zero query vector is refused
 - `@embed("source_prop", model="model-id")` — associates the vector with its
   String source and, optionally, the exact model space
 - `@index` — declares derived index intent and can accelerate vector search;
@@ -115,8 +118,10 @@ model, the resolved provider model must match it exactly.
 
 `nearest` is the answer to an unqualified request for the most similar
 targets. `distance(rel, $c.embedding, $q)` is for an exact answer or a radius,
-and it scans the population: every row of `rel` with its exact squared L2
-distance to `$q`, whatever the index covers; a row whose vector is null is
+and it scans the population: every row of `rel` with its exact distance to
+`$q` under the field's declared distance (`l2`: sum of squared differences;
+`cosine`: `1 - cos`; `dot`: `1 - dot`, can be negative), whatever the index
+covers; a row whose vector is null (or a zero vector on a `cosine` field) is
 dropped, and a non-finite component or distance is refused (`E3`).
 `order { $distance }` with `limit n` is the exact window, ties to the smaller
 ID; `where $distance < $r` is a radius. It is not an `rrf` arm (`T86`).
@@ -179,8 +184,8 @@ query scored_titles($q: String) {
 }
 ```
 
-A distance drawn `as $distance` works the same way and returns squared L2
-distance, and an `rrf` score is the fused score as `F64`. No score column has
+A distance drawn `as $distance` works the same way and returns the exact
+distance under the field's distance, ascending, and an `rrf` score is the fused score as `F64`. No score column has
 a fixed name: it is the name the `from`'s `as` writes (`as $relevance`
 returns the column `relevance`), and an alias in `return` renames it like any
 column. A `let` name bound to a ranking carries an unnamed score too, so its
@@ -310,9 +315,12 @@ no vector contribution, so filtering through a traversal can shorten or change
 the fused answer. Full-text arms in `rrf` remain unbounded over their eligible
 matches.
 
-A `nearest` scan uses only the IVF_FLAT, L2 vector index Omnigraph builds; an
-index written another way (another metric, quantized vectors, HNSW) is
-skipped and every row is ranked flat.
+A `nearest` scan uses only the IVF_FLAT vector index Omnigraph builds for the
+field's declared distance; an index built for another distance or written
+another way (quantized vectors, HNSW) is skipped and every row is ranked flat.
+Changing a field's distance is an in-place `schema apply` with no reload:
+reads answer exactly at once, and `omnigraph index build` (or `optimize`)
+rebuilds the index for the new distance.
 
 An indexed `nearest` scan reads a bounded number of partitions per index delta
 (`OMNIGRAPH_ANN_NPROBES`, default 20; `0` removes the cap) and widens only to

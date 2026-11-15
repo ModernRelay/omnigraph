@@ -9,8 +9,8 @@ with `as`.
 
 | Function | Meaning |
 |---|---|
-| `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by L2 distance, with the distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
-| `distance(rel, $d.embedding, $q)` | Every row of `rel` with the exact squared L2 distance of its vector to `$q` as the score; a row whose vector is null is dropped. `$q` may be a vector or text, as for `nearest`. |
+| `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by the field's declared [distance](distances.md) (`l2` unless declared), with the exact distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
+| `distance(rel, $d.embedding, $q)` | Every row of `rel` with the exact distance of its vector to `$q`, under the field's declared [distance](distances.md), as the score; a row whose vector is null is dropped. `$q` may be a vector or text, as for `nearest`. |
 | `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their BM25 relevance as the score. `$q` is a String, which matches any of its terms, or a `terms(…)` value. On a field whose index declares an [analyzer](analyzers.md#exact-matching-and-scoring), the score is `bm25_v1`, an `F64`, over the whole field, and `terms(…)` may ask for every term and an edit budget. On a field without one, the score is Lance's BM25, an `F32`, and only `terms($q, mode: any)` is lowered (`T86`). |
 | `rrf(ranking, ranking, k: 60, weights: [w, w])` | Two rankings of one population fused with Reciprocal Rank Fusion: the result has the ranked node column and the fused score, named by the `as` of the `from` that draws it, and nothing else. The default `k` is 60 and every weight defaults to 1.0. |
 | `search($d.body, $q)` | Full-text token search. |
@@ -119,16 +119,15 @@ query within($q: Vector(4), $r: F64) {
 
 `distance` is not an `rrf` arm in this release (`T86`).
 
-Raw vectors are ranked with L2 distance. Vectors produced by OmniGraph's
-embedding client are normalized, so L2 and cosine similarity produce the same
-ordering for those generated vectors. See [Embeddings](embeddings.md) for text
-queries and provider configuration.
+Vectors are ranked by the field's declared distance, `l2`, `cosine` or `dot`
+([Vector distances](distances.md)); `cosine` refuses a zero vector, stored or
+queried. See [Embeddings](embeddings.md) for text queries and providers.
 
-A `nearest` scan uses a vector index only when the index ranks exactly by L2:
-the IVF_FLAT index with the L2 metric that Omnigraph builds. A vector index
-written another way, for example by another tool (another metric, quantized
-vectors or HNSW), is not used: the scan ranks every row flat, which is exact
-and reads the whole column.
+A `nearest` scan uses a vector index only when the index ranks exactly by the
+field's distance: the IVF_FLAT index Omnigraph builds for it. A vector index
+built for another distance, or written another way (quantized vectors or
+HNSW), is not used: the scan ranks every row flat, which is exact and reads
+the whole column.
 
 IVF vector searches keep Lance's adaptive one-partition minimum and cap the
 partitions a `nearest` scan reads at 20 per index delta by default. The cap
@@ -206,7 +205,7 @@ query relevant($q: String) {
 ```
 
 The column `as` names, `$score` here, holds the relevance the ranking used.
-`nearest` and `distance` give the squared L2 distance Lance ranks by, and
+`nearest` and `distance` give the exact distance under the field's distance, and
 `rrf` gives the fused score as an `F64`. Without an alias the result column
 takes the name `as` gave the score (`as $relevance`, returned as
 `$relevance`, is the column `relevance`); an alias in `return` renames it like

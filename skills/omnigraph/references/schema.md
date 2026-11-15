@@ -175,7 +175,11 @@ Adding `@index` is metadata only. Declaring, changing or removing a full-text
 full-text analysis`): the apply replaces the property's index with one built
 for the new analysis, `omnigraph index build` then builds its postings, and
 searches scan with the new analysis meanwhile. A rename keeps the analysis
-and the index. Adding `@unique` to a node type, and making a
+and the index. Changing a vector's `distance` is in place too (`schema plan`
+shows `change vector distance`) and writes no table: `distance` and `nearest`
+answer from the exact scan with the new distance until `omnigraph index build`
+(or `optimize`) replaces the index; stored zero vectors are not rechecked and
+drop from a field that becomes `cosine`. Adding `@unique` to a node type, and making a
 nullable property required (`T?` → `T`, node or edge), first read the stored
 rows under the apply's locks: a live row holding a null (OG-MF-104) or two rows
 sharing a key (OG-MF-108) refuse the apply and change nothing. To add a required
@@ -193,7 +197,8 @@ property drops every constraint that names only dropped properties (its own
 `@index`, `@unique`, `@range` or `@check`); a drop that would remove a `@key`,
 or a constraint that also names a field that stays, is refused. In-place
 migrations are additions of nullable properties and types, `@index` and node
-`@unique` additions, full-text analyzer and scorer changes, nullable-to-required
+`@unique` additions, full-text analyzer and scorer changes, vector distance
+changes, nullable-to-required
 promotion, enum widening, renames, and drops; any other tightening means a
 rebuild.
 
@@ -204,7 +209,7 @@ No concurrent mutations during an apply. Plan for a short read-only window.
 ## Supported Types
 
 - **Scalars:** `String`, `Bool`, `I32`, `I64`, `U32`, `U64`, `F32`, `F64`, `Date`, `DateTime`, `Blob`
-- **Collections:** `Vector(N)` (fixed-size float vector), `[ScalarType]` (list of a non-Blob scalar; `[Blob]` is refused)
+- **Collections:** `Vector(N)` (fixed-size float vector; `Vector(N, distance = "l2" | "cosine" | "dot")` declares the distance `distance` and `nearest` read, `l2` when omitted; a `cosine` field refuses a zero vector), `[ScalarType]` (list of a non-Blob scalar; `[Blob]` is refused)
 - **Enums:** `enum(value1, value2, ...)` — inline only, values can contain alphanumerics, underscores, hyphens
 - **Optional:** any type + `?` suffix (`String?`, `[I32]?`, `Vector(4)?`)
 
