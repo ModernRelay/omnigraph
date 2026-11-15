@@ -181,10 +181,10 @@ async fn execute_fixture_request(request: FixtureRequestV1) -> FixtureResultV1 {
                 frozen.metadata_digest().clone(),
             )
         }
-        ResetMode::None | ResetMode::S3Versioning => {
+        ResetMode::None | ResetMode::S3Versioning | ResetMode::Clone => {
             return failure(
                 "unsupported_runner_axis",
-                "local fixture worker cannot freeze an S3 reset template",
+                "the legacy fixture worker freezes a restore level's template only",
             );
         }
     };
@@ -1132,8 +1132,8 @@ mod tests {
                     .unwrap()
                     .restore_active()
                     .unwrap(),
-                    ResetMode::None | ResetMode::S3Versioning => {
-                        panic!("test helper does not support S3 reset")
+                    ResetMode::None | ResetMode::S3Versioning | ResetMode::Clone => {
+                        panic!("test helper restores a restore level only")
                     }
                 };
                 assert_eq!(restored.root(), active);

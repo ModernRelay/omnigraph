@@ -180,7 +180,7 @@ async fn execute_fixture_request(request: FixtureRequestV1) -> FixtureResultV1 {
                 frozen.metadata_digest().clone(),
             )
         }
-        ResetMode::PlainCopy => {
+        ResetMode::PlainCopy | ResetMode::Clone => {
             let frozen = match freeze_plain_copy_template(
                 &request.active_root,
                 &request.template_root,

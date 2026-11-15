@@ -1371,6 +1371,15 @@ jobs:
             clone_cases_run_against_a_bucket \
             -- --exact --nocapture 2>&1 | tee -a "$test_log"
 
+          # The benchmark store over a bucket prefix (RFC 0039 §The store):
+          # the base built in place and hit by its listing, clones leaving it
+          # unchanged, records and binaries. Its own build, as the runner's.
+          cargo test --locked \
+            -p omnigraph-bench \
+            --lib \
+            store::tests::rustfs_integration_a_bucket_store_keeps_bases_clones_records_and_builds \
+            -- --exact --nocapture 2>&1 | tee -a "$test_log"
+
           if grep -Eiq \
             "SKIP public_physical_ref_token_rejects_s3_same_version_aba|skipping s3 " \
             "$test_log"
@@ -1400,6 +1409,7 @@ jobs:
             s3_storage::s3_read_through_adapter_masks_the_base_and_leaves_its_listing_as_it_was \
             s3_storage::s3_open_clone_reads_the_base_and_writes_only_its_own_prefix \
             clone_cases_run_against_a_bucket \
+            store::tests::rustfs_integration_a_bucket_store_keeps_bases_clones_records_and_builds \
             public_physical_ref_token_rejects_s3_same_version_aba \
             s3::server_opens_s3_graph_directly_and_serves_snapshot_and_read \
             s3::server_boots_cluster_from_bare_storage_uri_and_serves_query \

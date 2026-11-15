@@ -508,7 +508,15 @@ Direct graph/root targets use local files, except an inline `s3://` cluster root
 for stopped-writer `cluster plan/apply/status/force-unlock/upgrade-ledger` and
 `optimize`/`index build`/`index rebuild`/`cleanup --graph`, with region
 and endpoint captured from the environment
-([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)).
+([S3 cluster roots](../../../docs/user/operations/s3-cluster-roots.md)),
+and a graph shallow clone: `--base URI` opens a direct graph target over the
+graph at `URI` (reads fall through to the base, writes land in the target, the
+base is never written) for `query`, `mutate`, `load`, `branch`, `commit`,
+`changes`, `diff`, `snapshot`, `export`, `blob` and `schema show`; an inline
+`s3://` clone root with an `s3://` base is admitted there. Nothing in the target
+records its base, so every reopen passes the same `--base`; a clone root opened
+without it is refused. `--stats PATH` writes one JSON document per invocation
+with the logical object-store calls, the exit code and the peak resident set.
 Each direct writer keeps its admission lock; `cluster force-unlock` it before
 starting the server. Inline local paths and `file://`
 URIs are accepted; remote endpoints must be registered. Server targets own auth;
