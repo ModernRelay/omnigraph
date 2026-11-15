@@ -11,12 +11,12 @@ with `as`.
 |---|---|
 | `nearest(rel, $d.embedding, $q, k: n)` | The `n` targets of `rel` nearest `$q` by L2 distance, with the distance as the score. `$q` may be a vector or text that the configured embedding provider converts to a vector. |
 | `distance(rel, $d.embedding, $q)` | Every row of `rel` with the exact squared L2 distance of its vector to `$q` as the score; a row whose vector is null is dropped. `$q` may be a vector or text, as for `nearest`. |
-| `bm25(rel, $d.body, $q)` | The targets of `rel` that match any term of `$q`, with their BM25 relevance as the score. `$q` is a String or `terms($q, mode: any)`; `mode: all` (the `terms` default) and an edit budget are not lowered in this release (`T86`). |
+| `bm25(rel, $d.body, $q)` | The targets of `rel` that match `$q`, with their BM25 relevance as the score. `$q` is a String, which matches any of its terms, or a `terms(…)` value. On a field whose index declares an [analyzer](analyzers.md#exact-matching-and-scoring), the score is `bm25_v1`, an `F64`, over the whole field, and `terms(…)` may ask for every term and an edit budget. On a field without one, the score is Lance's BM25, an `F32`, and only `terms($q, mode: any)` is lowered (`T86`). |
 | `rrf(ranking, ranking, k: 60, weights: [w, w])` | Two rankings of one population fused with Reciprocal Rank Fusion: the result has the ranked node column and the fused score, named by the `as` of the `from` that draws it, and nothing else. The default `k` is 60 and every weight defaults to 1.0. |
 | `search($d.body, $q)` | Full-text token search. |
-| `fuzzy($d.body, $q, max_edits: n)` | Full-text search with edit-distance tolerance. |
+| `fuzzy($d.body, $q, max_edits: n)` | Full-text search with edit-distance tolerance; on a field that declares an analyzer, `match_terms($d.body, terms($q, mode: any, max_edits: n))`. |
 | `match_text($d.body, $q)` | Match a full-text query in a `match` block. |
-| `match_terms($d.body, terms($q, mode: all))` | True where the property holds every analyzed term of `$q` (`mode: all`, the default) or one of them (`mode: any`). |
+| `match_terms($d.body, terms($q, mode: all, max_edits: n))` | True where the property holds every analyzed term of `$q` (`mode: all`, the default) or one of them (`mode: any`), each within `n` edits (0 to 2, default 0; an edit budget needs a declared analyzer). |
 
 The first argument of a ranking is the population it ranks: a relation a `let`
 names before the ranking, `let $pop = { match { ... } return { $d } }`, whose
@@ -47,8 +47,8 @@ nearest targets of the population with every row each has, and the read's
 `limit`, which may be larger, smaller or absent, cuts the rows after that. A
 window read from a parameter takes the count the parameter is bound to when
 the read runs, in an `rrf` arm too; a count below 1 is refused. `fuzzy`
-defaults `max_edits` to 2 when omitted; a literal must be 0 to 2 (`T71`) and a
-parameter an integer from 0 to 4,294,967,295. `rrf` takes `k` as an integer
+defaults `max_edits` to 2 when omitted; a literal must be 0 to 2 (`T71`), a
+parameter 0 to 2 on a declared analyzer, else up to 4,294,967,295. `rrf` takes `k` as an integer
 literal from 1 to 1,000,000 or an integer parameter, and `weights` as a list
 literal of one number per arm, each above 0 and at most 1,000,000; a list of
 another length is refused (`T75`) and a weight out of range (`T71`). Options
@@ -189,8 +189,8 @@ rows the call's matches decide: a call standing alone is answered by its
 binding's scan, and any other use by the same full-text query over the whole
 table, so a row an index has not covered yet answers as an indexed one does. A
 full-text call read as a value, in `return`, `order` or a block's aggregate,
-is not lowered in this release (`T86`), nor is `match_terms` with an edit
-budget other than `max_edits: 0`: only an exact scan answers it.
+is not lowered in this release (`T86`), nor, on a field with no declared
+[analyzer](analyzers.md#exact-matching-and-scoring), is `match_terms` with an edit budget.
 
 Separate `not` blocks may reuse a local variable name for different node
 types. Each full-text call uses the index on the type and property bound
@@ -332,8 +332,8 @@ correct by scanning missing or uncovered data: full-text functions match the
 scanned rows with the index's analyzer, and vector search falls back to an
 exact scan when needed. Every write records a declared full-text index's
 analyzer before its postings are built. A table version written by an older
-release may hold rows and no part of the index at all; a full-text call on
-it is refused before any scan with HTTP `409` and a
+release may hold rows and no part of the index at all; on a field with no
+declared analyzer a full-text call on it is refused before any scan with HTTP `409` and a
 `full_text_index_required` detail naming `Type.property`, never answered
 with a case-sensitive scan. Build the index to lift it:
 `omnigraph index build --target <target> --branch <branch>`, on any branch.

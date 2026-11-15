@@ -73,7 +73,8 @@ replacement vectors; neither `merge` nor `overwrite` does that automatically.
 A ranking is a relation drawn into `match` with `from`, which names its score
 with `as`: `from nearest(rel, $c.embedding, $q, k: n) as $distance`,
 `from bm25(rel, $d.title, $q) as $score` (any term of the String `$q`; `terms($q)`
-asks for every term, which `bm25` does not lower yet, `T86`),
+asks for every term, which only a field that declares an analyzer lowers,
+`T86` elsewhere),
 `from rrf(arm, arm, k: 60, weights: [1.0, 1.0]) as $score`. `rel` is the population, a relation
 named with `let` before the ranking, `let $pop = { match { … } where … return { $c } }`,
 whose `return` lists every binding the rest of the query reads (an inline read
@@ -232,7 +233,8 @@ row is among the call's matches, false elsewhere, never null. Write
 `not search($d.title, $q)`, `search(...) or ...` or `search(...) = false`;
 the rows are the same whether or not the index covers them yet. Read as a
 value in `return`, `order` or a block's aggregate, a call is `T86`, and so is
-`match_terms` with an edit budget other than `max_edits: 0`.
+`match_terms` with an edit budget other than `max_edits: 0` on a field that
+declares no analyzer.
 
 ### Analyzers
 
@@ -252,12 +254,26 @@ matches `"Café"` under `standard_folded_v1` and `english_v1`. A field written
 (stemming, stop words, folding and a 40-byte token filter); `lint` reports it
 as `L202` and names `english_v1`. `scorer = "none"` keeps the field matchable
 and makes `bm25` over it `T87`, alone or as an `rrf` arm; use a `where`
-filter there. No call takes an analyzer (`terms(…)` with one is `T71`). The
-native index applies no Unicode normalization, so write values and queries in
-NFC (precomposed accents). Changing a field's analyzer is a schema apply that
-replaces its index; run `omnigraph index build` afterwards, and expect a
-search of a snapshot from before the change to be refused with
-`full_text_index_rebuild_required`.
+filter there. No call takes an analyzer (`terms(…)` with one is `T71`).
+
+On a field that declares an analyzer, every full-text call is exact and reads
+no index: an exact scan normalizes each value to NFC, analyzes it with the
+profile and decides each row, so built, partly built and unbuilt indexes give
+the same rows and none is refused with `full_text_index_required`.
+`match_terms($d.f, terms($q, mode: all | any, max_edits: 0..=2))` matches a
+query term to a stored term within the budget (one edit per inserted, deleted
+or substituted character; a swap costs two); `search` and `match_text` mean
+`mode: any`, and `fuzzy` adds its budget (2 when unwritten). `bm25` there is
+`bm25_v1`, an `F64` scored against the whole field (every entity with a
+non-empty value, before filters), so a filter never changes a surviving
+row's score; the plan shows a `Score` node, not a ranked scan. `rrf` with such
+a `bm25` arm is `T86` in this release. A query over 64 KiB or 1,024 distinct
+terms, or a value over 16 MiB, fails with `resource_limit_exceeded`; the
+scan's terms and comparisons count against `read_work_limit`. On a field
+without an analyzer the calls read the index as before (`bm25` an `F32`).
+Changing a field's analyzer is a schema apply that replaces its index; on a
+field without a profile, a search of a snapshot whose index was built for
+another analysis is refused with `full_text_index_rebuild_required`.
 
 ## The Key Pattern: Scope First, Rank Second
 
@@ -340,7 +356,8 @@ For a served graph, declare a named provider under `providers.embedding` in
 be `${ENV_VAR}` references and are resolved by the server at startup. Generated
 vectors are finite, nonzero, and L2-normalized.
 
-A full-text call can fail with HTTP `409` before any scan.
+A full-text call over a field that declares no analyzer can fail with HTTP
+`409` before any scan.
 `full_text_index_required` (a table version holds rows but no part of the
 index) clears with
 `omnigraph index build --target <target> --branch <branch>`.

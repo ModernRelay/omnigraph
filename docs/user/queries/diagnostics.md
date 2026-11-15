@@ -299,7 +299,7 @@ that calls itself.
 | A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope; an inline read returning an outer name under another name; a called read's `limit $k` bound to a computed argument | B |
 | A node an `optional` introduces, or an edge reference, returned whole; a `let` inside an `optional` that binds no node of its own | B |
 | A full-text call (`search`, `fuzzy`, `match_text`, `match_terms`) read as a value in `return`, `order` or a block's aggregate | B |
-| `match_terms` with an edit budget other than `max_edits: 0` (only the exact lexical scan answers the edit relation exactly); `bm25` over `terms(…)` with `mode: all` or an edit budget | B |
+| On a field whose index declares no analyzer: `match_terms` with an edit budget other than `max_edits: 0`, or `bm25` over `terms(…)` with `mode: all` or an edit budget (the exact lexical scan answers the edit relation for a declared analyzer only); an `rrf` arm over `bm25` on a field that declares one | B |
 | A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B |
 | A read that calls itself (`Fix`) | Rec |
 
