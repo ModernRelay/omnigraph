@@ -244,8 +244,11 @@ element (`T84` names the triple and inserts `$p: Pattern`, the edge's end
 type), read an outer name unbound to correlate on it, and refuse a binding of
 an outer name (`T68`): `not exists { $p: Person where $p.name = "bob" }` is
 `not ($p.name = "bob")`. An anonymous end `$_` needs no binding.
-The right side is any scalar of the outer row (`count { … } >= $p.quota`);
-another block's value is `T86`. `not { ... }` is refused
+The right side is any scalar of the outer row (`count { … } >= $p.quota`)
+or another block's value, and under `or` or `not` a block is a Boolean
+operand like any other. A block is also a value, one per outer row:
+`let $n = count { … }`, or `count { … } as n` in `return`; with no match a
+`count` is 0 and the other aggregates null. `not { ... }` is refused
 with `not exists { ... }` as the fix (`Q012`).
 
 ```gq

@@ -1835,13 +1835,6 @@ impl<'a> Shaper<'a> {
                     if holds_edit_tolerant_match(value) {
                         return Err(self.refuse_at(EDIT_TOLERANT_MATCH, at));
                     }
-                    let mut cols = Vec::new();
-                    value.columns(&mut cols);
-                    if cols.iter().any(|c| is_block_column(c)) {
-                        return Err(ShapeError::Internal(format!(
-                            "`let ${name}` reads a block value its own input did not refuse: the block's `Correlate` is under the `let`"
-                        )));
-                    }
                     let mut value = value.clone();
                     substitute(&mut value, &facts.lets);
                     if value.can_fail() {
@@ -1876,11 +1869,14 @@ impl<'a> Shaper<'a> {
                     return self.optional(outer, pattern, facts);
                 }
                 self.facts(outer, facts)?;
-                if let Term::Group { .. } = inner.as_ref() {
-                    return Err(self.refuse_at(
-                        "a correlated block read without its filter",
-                        Construct::Block,
-                    ));
+                // A block read as a value in a `let` or a return item.
+                if let Term::Group { input, keys, aggs } = inner.as_ref() {
+                    let ([(column, agg)], []) = (aggs.as_slice(), keys.as_slice()) else {
+                        return Err(ShapeError::Internal(
+                            "a block that is not one aggregate without keys".into(),
+                        ));
+                    };
+                    return self.block_value(input, column, agg, facts);
                 }
                 if let Some((input, items, bindings)) = read_parts(inner) {
                     return self.inline_read(input, items, bindings, facts);
@@ -1905,9 +1901,13 @@ impl<'a> Shaper<'a> {
         facts.inlined = inner.inlined;
         // A `let` inside an `optional` is a column of its matches, null on
         // an outer row with none; read in place, its value would not be.
-        if !inner.lets.is_empty() {
+        // A block's value read in the optional's own `where` is a column
+        // of its matches nothing outside it reads.
+        if inner.lets.keys().any(|name| !is_block_column(name)) {
             return Err(self.refuse_at("a `let` inside an `optional`", at()));
         }
+        let inner_lets = std::mem::take(&mut inner.lets);
+        inner.substitute(&inner_lets);
         // The names the scope binds before it are the outer columns; a
         // rebinding of one inside is `T68`.
         let outer_columns: HashSet<String> = facts.names().into_iter().collect();
@@ -2679,7 +2679,12 @@ impl<'a> Shaper<'a> {
         Ok(())
     }
 
-    /// `pred` over the aggregates of the correlated blocks under it.
+    /// `pred` over the aggregates of the correlated blocks under it. A
+    /// block compared in a top-level conjunct with a value of the outer row
+    /// is a semi-join that keeps the rows its aggregate passes; any other
+    /// filter over block values (a block under `or` or `not`, or compared
+    /// with another block's value) reads each block's value as a column of
+    /// its own correlated read, and the filter runs over those columns.
     fn blocks(&self, input: &Term, pred: &IRExpr, facts: &mut Facts) -> Result<(), ShapeError> {
         let mut groups: Vec<(&Term, &str, &Agg, Vec<Col>)> = Vec::new();
         let mut below = input;
@@ -2693,57 +2698,33 @@ impl<'a> Shaper<'a> {
                     "a block that is not one aggregate without keys".into(),
                 ));
             };
-            let mut leaf = input.as_ref();
-            loop {
-                match leaf {
-                    Term::Env(cols) => {
-                        groups.push((input, column, agg, cols.clone()));
-                        break;
-                    }
-                    other => match other.children().first() {
-                        Some(child) => leaf = child,
-                        None => {
-                            groups.push((input, column, agg, Vec::new()));
-                            break;
-                        }
-                    },
-                }
-            }
+            groups.push((input, column, agg, env_cols(input)));
             below = outer;
         }
         self.facts(below, facts)?;
-        // One block per comparison; `not (c > 0)` is the row-count zero test.
         groups.reverse();
-        for (inner, column, agg, env) in groups {
-            let (op, right) = match block_comparison(pred, column) {
-                Some(found) => found,
-                None => return Err(self.refuse_at("a filter over block values", Construct::Block)),
-            };
-            // The right side is evaluated over the outer rows: it may read
-            // their columns, not another block's value.
-            let mut read = Vec::new();
-            right.columns(&mut read);
-            if read.iter().any(|c| is_block_column(c)) {
-                return Err(self.refuse_at(
-                    "a block value compared with another block's value",
-                    Construct::Block,
-                ));
+        // One semi-join per comparison; `not (c > 0)` is the row-count zero
+        // test. The right side is evaluated over the outer rows: it reads
+        // their columns, not another block's value nor a full-text call.
+        let comparisons: Option<Vec<(CompOp, IRExpr)>> = groups
+            .iter()
+            .map(|(_, column, _, _)| {
+                block_comparison(pred, column).filter(|(_, right)| {
+                    let mut read = Vec::new();
+                    right.columns(&mut read);
+                    !read.iter().any(|c| is_block_column(c)) && !holds_lexical_call(right)
+                })
+            })
+            .collect();
+        let Some(comparisons) = comparisons else {
+            for (inner, column, agg, _) in groups {
+                self.block_value(inner, column, agg, facts)?;
             }
-            let mut inner_facts = Facts::default();
-            self.facts(inner, &mut inner_facts)?;
-            let inner_lets = std::mem::take(&mut inner_facts.lets);
-            inner_facts.substitute(&inner_lets);
-            let mut agg = agg.clone();
-            if let Some(arg) = &mut agg.arg {
-                substitute(arg, &inner_lets);
-            }
-            let agg = &agg;
-            if agg.arg.as_ref().is_some_and(holds_lexical_call) || holds_lexical_call(&right) {
-                return Err(self.refuse_at(
-                    "a full-text call read as a value in a block's aggregate or comparison",
-                    Construct::Block,
-                ));
-            }
+            facts.filters.push(pred.clone());
+            return Ok(());
+        };
+        for ((inner, _, agg, env), (op, right)) in groups.into_iter().zip(comparisons) {
+            let (inner_facts, agg) = self.block_inner(inner, agg)?;
             let left = match &agg.arg {
                 // Counting a node binding counts its rows.
                 None => BlockAggregateExpr::count_rows(),
@@ -2757,7 +2738,7 @@ impl<'a> Shaper<'a> {
                     arg: Box::new(arg.clone()),
                     signature: AggSignature {
                         arg: arg.ty().clone(),
-                        result: nullable_result(agg),
+                        result: nullable_result(&agg),
                     },
                 },
             };
@@ -2769,6 +2750,137 @@ impl<'a> Shaper<'a> {
                 right,
             });
         }
+        Ok(())
+    }
+
+    /// A block's pattern facts, its `let` values read in, and its aggregate
+    /// over them.
+    fn block_inner(&self, inner: &Term, agg: &Agg) -> Result<(Facts, Agg), ShapeError> {
+        let mut inner_facts = Facts::default();
+        self.facts(inner, &mut inner_facts)?;
+        let inner_lets = std::mem::take(&mut inner_facts.lets);
+        inner_facts.substitute(&inner_lets);
+        let mut agg = agg.clone();
+        if let Some(arg) = &mut agg.arg {
+            substitute(arg, &inner_lets);
+        }
+        if agg.arg.as_ref().is_some_and(holds_lexical_call) {
+            return Err(self.refuse_at(
+                "a full-text call read as a value in a block's aggregate",
+                Construct::Block,
+            ));
+        }
+        Ok((inner_facts, agg))
+    }
+
+    /// A block read as a value (`count { p }` in a `let`, a return item or
+    /// a filter over block values): the core's `Correlate(R, Group(p, [],
+    /// [agg]))`, one row per outer row whatever `p` matches, so a `count` over
+    /// no rows is 0 and another aggregate null. It is a correlated read
+    /// grouped by no key whose one value column the block's column names,
+    /// every name the block binds renamed apart.
+    fn block_value(
+        &self,
+        inner: &Term,
+        column: &str,
+        agg: &Agg,
+        facts: &mut Facts,
+    ) -> Result<(), ShapeError> {
+        let outer: HashSet<String> = env_columns(inner).into_iter().collect();
+        let (mut inner_facts, agg) = self.block_inner(inner, agg)?;
+        inner_facts.inlined = facts.inlined;
+        let mut hidden: Vec<String> = inner_facts
+            .names()
+            .into_iter()
+            .filter(|name| !outer.contains(name) && !is_anon(name))
+            .collect();
+        hidden.sort();
+        hidden.dedup();
+        let mut renames = HashMap::new();
+        for name in hidden {
+            let fresh = format!("{FRESH_PREFIX}f{}_{name}", inner_facts.inlined);
+            inner_facts.inlined += 1;
+            renames.insert(name, fresh);
+        }
+        inner_facts.rename(&renames);
+        let rename = |variable: &mut String| {
+            if let Some(name) = renames.get(variable) {
+                *variable = name.clone();
+            }
+        };
+        let values = format!("{FRESH_PREFIX}r{}", inner_facts.inlined);
+        inner_facts.inlined += 1;
+        facts.inlined = inner_facts.inlined;
+        // Counting a node binding, or a block's rows, counts the rows: a
+        // count of a value every row holds.
+        let counts_rows = match &agg.arg {
+            None => true,
+            Some(IRExpr::Variable(_, ExprType::Node { .. } | ExprType::Edge { .. })) => {
+                agg.func == AggFunc::Count && !agg.distinct
+            }
+            Some(_) => false,
+        };
+        let (func, distinct, mut arg) = if counts_rows {
+            (
+                AggFunc::Count,
+                false,
+                IRExpr::Literal(Literal::Bool(true), scalar(ScalarType::Bool)),
+            )
+        } else {
+            let arg = agg.arg.clone().ok_or_else(|| {
+                ShapeError::Internal("an aggregate block without its argument".into())
+            })?;
+            (agg.func, agg.distinct, arg)
+        };
+        rename_expr(&mut arg, &rename);
+        let aggregate = IRExpr::Aggregate {
+            func,
+            distinct,
+            signature: AggSignature {
+                arg: arg.ty().clone(),
+                result: nullable_result(&agg),
+            },
+            arg: Box::new(arg),
+        };
+        // The block's value has the type the type checker gave it: a count
+        // is never null.
+        let ty = agg.ty.expr_type();
+        let grouped = format!("^{column}");
+        let value = IRExpr::PropAccess {
+            variable: values.clone(),
+            property: column.to_string(),
+            ty: ty.clone(),
+        };
+        let aggregated = aggregate.ty().clone();
+        let read = InnerRead {
+            values: values.clone(),
+            group: Some(vec![IRProjection {
+                ty: aggregated.clone(),
+                expr: aggregate,
+                alias: None,
+                column: grouped.clone(),
+            }]),
+            columns: vec![IRProjection {
+                expr: IRExpr::PropAccess {
+                    variable: values,
+                    property: grouped,
+                    ty: aggregated,
+                },
+                alias: None,
+                column: column.to_string(),
+                ty,
+            }],
+            order_by: Vec::new(),
+            limit: None,
+            limit_param: None,
+        };
+        facts.lets.insert(column.to_string(), value);
+        facts.correlates.push(CorrelateFact {
+            inner: inner_facts,
+            outer,
+            read,
+            optionals_before: facts.optionals.len(),
+        });
         Ok(())
     }
 
@@ -3217,7 +3329,23 @@ impl<'a> Shaper<'a> {
                 inner,
             });
         }
-        for correlate in correlates {
+        // A read returning only values that reads a name the traversals
+        // from an `optional`'s names bind runs after them; nothing they
+        // expand from reads its columns.
+        let late: HashSet<&str> = after_optional
+            .iter()
+            .flat_map(|t| [t.src.as_str(), t.dst.as_str()])
+            .filter(|name| *name != "_" && !bound_vars.contains(*name))
+            .collect();
+        let (deferred, now): (Vec<&CorrelateFact>, Vec<&CorrelateFact>) =
+            correlates.partition(|correlate| {
+                correlate.read.references().next().is_none()
+                    && correlate
+                        .outer
+                        .iter()
+                        .any(|name| late.contains(name.as_str()))
+            });
+        for correlate in now {
             self.place_correlate(correlate, pipeline, bound_vars, outer_physical_names, fresh)?;
         }
         self.expand_traversals(
@@ -3227,6 +3355,9 @@ impl<'a> Shaper<'a> {
             &mut deferred_filters,
             fresh,
         )?;
+        for correlate in deferred {
+            self.place_correlate(correlate, pipeline, bound_vars, outer_physical_names, fresh)?;
+        }
         for filter in &facts.filters {
             pipeline.push(PatternStep::Filter(filter.clone()));
         }
@@ -3475,20 +3606,25 @@ fn groups_or_cuts(term: &Term) -> bool {
     }
 }
 
-/// The outer columns a correlated pattern reads: the `Env` leaf it starts
-/// from, along its first inputs. A nested scope's own `Env` (a block's, an
-/// `optional`'s, an inline read's) is off that path.
-fn env_columns(term: &Term) -> Vec<String> {
+/// The `Env` leaf a correlated pattern starts from, along its first
+/// inputs: the outer columns it reads. A nested scope's own `Env` (a
+/// block's, an `optional`'s, an inline read's) is off that path.
+fn env_cols(term: &Term) -> Vec<Col> {
     let mut leaf = term;
     loop {
         match leaf {
-            Term::Env(cols) => return cols.iter().map(|c| c.name.clone()).collect(),
+            Term::Env(cols) => return cols.clone(),
             other => match other.children().first() {
                 Some(child) => leaf = child,
                 None => return Vec::new(),
             },
         }
     }
+}
+
+/// The names of the outer columns a correlated pattern reads.
+fn env_columns(term: &Term) -> Vec<String> {
+    env_cols(term).into_iter().map(|c| c.name).collect()
 }
 
 /// `p` of an `optional { p }`, from the inner term the type checker writes

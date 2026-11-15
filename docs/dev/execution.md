@@ -65,6 +65,15 @@ A query runs against one resolved `ReadTarget`:
    before it. Filter placement treats its inner tree as a scope of its own,
    and plan acceptance requires one `Correlate` per such read, returning the
    same read and testing its pattern's conjuncts inside its inner tree.
+   A block read as a value (in a `let`, as a return item, compared with
+   another block's value, or under `or` or `not`) is the same step: the
+   core's `Correlate(R, Group(p, [], [agg]))` as a read grouped by no key,
+   its names renamed apart, whose one value column the block's column names
+   (a row count is `count(true)`), so a `count` over no match is `0`; a
+   filter over block values reads those columns. A block compared in a
+   top-level conjunct with a value of the outer row stays an `AntiJoin`.
+   A read returning only values that reads a name a traversal from an
+   `optional`'s names binds is placed after that traversal.
    A `from name(args)` (`Call`) is its body read as an inline read: the
    body's own names are renamed apart first and only then each parameter is
    replaced by its argument, so an argument reading a caller's variable is

@@ -161,16 +161,6 @@ const B_IN_PROGRESS: &[InProgress] = &[
         text: "query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 1)) return { $d.title } }",
     },
     InProgress {
-        construct: "a block's value in a `let`",
-        site: "a correlated block read without its filter",
-        text: "query q() { match { $c: Company, let $n = count { $p: Person, $p worksAt $c } } where $c.slug = \"c0\" return { $c.slug, $n } }",
-    },
-    InProgress {
-        construct: "a block's value as a return item",
-        site: "a correlated block read without its filter",
-        text: "query q() { match { $p: Person } return { $p.handle, count { $f: Person, $p knows $f } as n } }",
-    },
-    InProgress {
         construct: "a `let` inside an `optional`",
         site: "a `let` inside an `optional`",
         text: "query q() { match { $p: Person, optional { $q: Person, $p knows $q, let $h = $q.handle } } return { $p.handle, $h } }",
@@ -208,23 +198,8 @@ const B_IN_PROGRESS: &[InProgress] = &[
     },
     // `ReadShape`: the blocks of a `where`.
     InProgress {
-        construct: "a block under `or`",
-        site: "a filter over block values",
-        text: "query q() { match { $p: Person } where exists { $f: Person, $p knows $f } or $p.age > 1000 return { $p.handle } }",
-    },
-    InProgress {
-        construct: "a block under `not (… and …)`",
-        site: "a filter over block values",
-        text: "query q() { match { $p: Person } where not (exists { $f: Person, $p knows $f } and $p.age > 1000) return { $p.handle } }",
-    },
-    InProgress {
-        construct: "a block compared with another block's value",
-        site: "a block value compared with another block's value",
-        text: "query q() { match { $p: Person } where count { $f: Person, $p knows $f } > count { $c: Company, $p worksAt $c } return { $p.name } }",
-    },
-    InProgress {
         construct: "a full-text call in a block's aggregate",
-        site: "a full-text call read as a value in a block's aggregate or comparison",
+        site: "a full-text call read as a value in a block's aggregate",
         text: "query q($s: String) { match { $p: Person } where sum(if(search($d.body, $s), 1, 0)) { $d: Doc, $p authored $d } > 0 return { $p.name } }",
     },
     // `WriteShape`.
@@ -297,10 +272,19 @@ const CLOSURE: &[Row] = &[
                 "query q() { match { $p: Person } where count { $f: Person, $p knows $f } >= $p.age return { $p.name } }",
                 Lowers,
             ),
-            // "a block compared with another block's value"
             (
                 "query q() { match { $p: Person } where count { $f: Person, $p knows $f } > count { $c: Company, $p worksAt $c } return { $p.name } }",
-                Refused("B"),
+                Lowers,
+            ),
+            // A block's value in a `let`, as a return item, and under `or`
+            // and `not`.
+            (
+                "query q() { match { $c: Company, let $n = count { $p: Person, $p worksAt $c } } where $n < 2 return { $c.name, $n, sum($p.age) { $p: Person, $p worksAt $c } as ages } }",
+                Lowers,
+            ),
+            (
+                "query q() { match { $p: Person } where exists { $f: Person, $p knows $f } or not (count { $c: Company, $p worksAt $c } > 0 and $p.age > 30) return { $p.name } }",
+                Lowers,
             ),
             (
                 "query q() { match { $k: Knows } return { $k.@src } }",
@@ -866,12 +850,12 @@ fn every_refusal_of_the_shapers_is_pinned() {
 #[test]
 fn t86_is_at_the_construct() {
     let refused = |text: &str| outcome(text).expect_err("refused");
-    // A block compared with another block's value is refused at the
-    // comparison.
+    // A block whose aggregate reads a full-text call is refused at the
+    // block.
     let d = refused(
-        "query q() { match { $p: Person } where count { $f: Person, $p knows $f } > count { $c: Company, $p worksAt $c } return { $p.name } }",
+        "query q($s: String) { match { $p: Person } where sum(if(search($d.body, $s), 1, 0)) { $d: Doc, $p authored $d } > 0 return { $p.name } }",
     );
-    assert_eq!(d.position.map(|p| p.column), Some(40), "{d}");
+    assert_eq!(d.position.map(|p| p.column), Some(50), "{d}");
     // A write group whose selection reads a table an earlier group changes
     // is refused at that group's `match`.
     let d = refused(

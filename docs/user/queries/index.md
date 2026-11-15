@@ -101,19 +101,19 @@ wrong side); a [write](../mutations/index.md) selects the same way.
 ### Correlated blocks
 
 `exists { ... }`, `not exists { ... }`, `count { ... } op value` and
-`sum(expr) { ... } op value` (also `min`, `max`, `avg`) are operands of
-`where` that match a pattern once per outer row; a block holds elements and
-its own `where`, `count { $q: Person, $p knows $q where $q.age > 30 }`, reads
-an outer variable (`T39`, `T9` under `not`) and binds every name new to it
-(`T84`, [inner scopes](traversal.md#inner-scopes)). The row is kept when the
-aggregate comparison is true: `not exists` means `count = 0`, and `exists`
-means `count > 0`. The right side is any scalar of the outer row, evaluated
-for each row (`count { … } >= $p.quota`; another block's value is `T86`), its
-bounds by the [comparison rules](#boolean-expressions-and-nulls) for the
-aggregate's result type. Its argument is a scalar expression in the block's scope: numeric for
+`sum(expr) { ... } op value` (also `min`, `max`, `avg`) match a pattern once
+per outer row; a block holds elements and its own `where`, `count { $q:
+Person, $p knows $q where $q.age > 30 }`, reads an outer variable (`T39`, `T9`
+under `not`) and binds every name new to it (`T84`, [inner
+scopes](traversal.md#inner-scopes)). In `where` the row is kept when the
+comparison is true (`not exists` is `count = 0`, `exists` `count > 0`) against
+any scalar of the outer row or another block's value (`count { … } >=
+$p.quota`), by the [comparison rules](#boolean-expressions-and-nulls), and
+under `or` or `not` a block is a Boolean operand like any other. A block is
+also a value, `let $n = count { … }` or `count { … } as n` in `return`, one
+per outer row. Its argument is a scalar expression in the block's scope: numeric for
 `sum` and `avg`; numeric, `String`, `Bool`, `Date` or `DateTime` for `min` and
-`max`, as in `return`. With no matches, `sum`, `min`, `max` and `avg` satisfy
-no comparison; `count` is `0`.
+`max`, as in `return`. With no matches `count` is `0` and the others are null.
 
 Integer block `sum` accumulates exactly in 128 bits, refuses overflow of that
 range, and rounds the total once to `F64` before comparison: `9007199254740993`
