@@ -321,10 +321,9 @@ position or stage, the expectation and one fix ([Diagnostics](diagnostics.md)):
 omnigraph lint --query queries.gq --schema schema.pg --json
 ```
 
-`Q000` identifies a file the parser refused, at `line <n>, column <c>`; a
-[branch statement](../branching/index.md) where declarations were expected
-and a [settings line](#session-settings) naming an unknown setting or a value
-outside its row report the same way; `T83` reports there with its code.
+A refused file reports its refusal's code at `line <n>, column <c>`: a
+[branch statement](../branching/index.md) where declarations were expected is
+`Q004`, a refused [settings line](#session-settings) `Q003`, and `T83` too.
 `L201` warns of a nullable property no inspected update query sets; `L202` names
 the [analyzer](../search/analyzers.md) to declare on a full-text index. A refused
 query reports every refusal with its code and line, and exits nonzero on an error.

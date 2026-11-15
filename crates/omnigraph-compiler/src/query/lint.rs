@@ -4,12 +4,12 @@ use serde::Serialize;
 
 use crate::catalog::Catalog;
 use crate::ir::core::{CoreDecl, MutationTarget, Sink};
+use crate::query::codes::Q004;
 use crate::query::descriptor::{QueryOperationDescriptor, describe_query_operation};
 use crate::query::diagnostic::{QueryDiagnostic, QueryDiagnosticKind};
 use crate::query::file::QueryDecl;
 use crate::query::parser::parse_query_diagnostic;
 
-const PARSE_ERROR_CODE: &str = "Q000";
 const L201_CODE: &str = "L201";
 const L202_CODE: &str = "L202";
 const HARDCODED_MUTATION_WARNING: &str =
@@ -131,7 +131,7 @@ pub fn lint_query_file(
         Ok(file) => file
             .body
             .into_read_declarations()
-            .map_err(|message| vec![(PARSE_ERROR_CODE.to_string(), message)]),
+            .map_err(|message| vec![(Q004.as_str().to_string(), message)]),
         Err(diagnostic) => Err(diagnostic
             .all()
             .into_iter()
@@ -245,12 +245,15 @@ pub fn lint_query_file(
 /// The finding of a refusal of the front door: its code and its message
 /// with the position, `line <n>, column <c>: <message>`, so a refused `set`
 /// line is reported where it stands; a spanless diagnostic keeps its
-/// message. A parse refusal is `Q000`; a refusal the front door raises for
-/// the whole source unit (`T83`, one per repeated name) keeps its code and
-/// its rendered form.
+/// message. A parse refusal keeps its code and its message; a refusal the
+/// front door raises for the whole source unit (`T83`, one per repeated
+/// name) keeps its code and its rendered form.
 fn front_door_finding(diagnostic: QueryDiagnostic) -> (String, String) {
     let (code, message) = match diagnostic.kind {
-        QueryDiagnosticKind::Parse => (PARSE_ERROR_CODE.to_string(), diagnostic.message.clone()),
+        QueryDiagnosticKind::Parse => (
+            diagnostic.code.as_str().to_string(),
+            diagnostic.message.clone(),
+        ),
         _ => (diagnostic.code.as_str().to_string(), diagnostic.to_string()),
     };
     let message = match diagnostic.position {

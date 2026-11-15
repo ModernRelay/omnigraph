@@ -144,8 +144,8 @@ expected format instead, without an edit.
 - **HTTP**: a `400` that refuses a query carries the additive `diagnostic`
   object in its error body. See
   [HTTP errors](../operations/troubleshooting.md#http-errors).
-- **`omnigraph lint`**: a `Q000` finding whose message is the expectation at
-  `line <n>, column <c>`; `T83` (two declarations of one name) is a finding
+- **`omnigraph lint`**: a parse refusal is a finding with its own code
+  (`Q001` and up) whose message is the expectation at `line <n>, column <c>`; `T83` (two declarations of one name) is a finding
   for the whole file at each later declaration's `line <n>, column <c>`. A
   refused query prints every refusal of its pass, each at its position with
   its fix, and `--json` lists them in its `diagnostics`. See

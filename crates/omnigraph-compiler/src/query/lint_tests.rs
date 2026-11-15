@@ -25,12 +25,12 @@ fn parse_failure_returns_structured_error_output() {
     assert!(output.results.is_empty());
     assert_eq!(output.findings.len(), 1);
     assert_eq!(output.findings[0].severity, QueryLintSeverity::Error);
-    assert_eq!(output.findings[0].code, PARSE_ERROR_CODE);
+    assert_eq!(output.findings[0].code, "Q001");
 }
 
 /// A file declaring one name twice is refused whole, and the finding keeps
-/// the code `T83` at the later declaration rather than the parse family's
-/// `Q000`, one finding for each later declaration.
+/// the code `T83` at the later declaration, one finding for each later
+/// declaration.
 #[test]
 fn a_repeated_declaration_name_is_a_t83_finding() {
     let output = lint_query_file(
@@ -72,7 +72,7 @@ fn branch_statement_is_refused_as_a_parse_family_finding() {
     assert_eq!(output.errors, 1);
     assert!(output.results.is_empty());
     assert_eq!(output.findings.len(), 1);
-    assert_eq!(output.findings[0].code, PARSE_ERROR_CODE);
+    assert_eq!(output.findings[0].code, "Q004");
     assert_eq!(
         output.findings[0].message,
         "`branch merge` is a branch statement, not a query declaration"
@@ -117,7 +117,7 @@ fn refused_set_line_is_reported_with_its_position() {
     assert_eq!(output.status, QueryLintStatus::Error);
     assert_eq!(output.queries_processed, 0);
     assert_eq!(output.findings.len(), 1);
-    assert_eq!(output.findings[0].code, PARSE_ERROR_CODE);
+    assert_eq!(output.findings[0].code, "Q003");
     let message = &output.findings[0].message;
     assert!(message.starts_with("line 1, column "), "{message}");
     assert!(message.contains("unknown value `v3`"), "{message}");
