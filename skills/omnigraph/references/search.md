@@ -245,7 +245,9 @@ matches `"Café"` under `standard_folded_v1` and `english_v1`. A field written
 (stemming, stop words, folding and a 40-byte token filter); `lint` reports it
 as `L202` and names `english_v1`. `scorer = "none"` keeps the field matchable
 and makes `bm25` over it `T87`, alone or as an `rrf` arm; use a `where`
-filter there. No call takes an analyzer (`terms(…)` with one is `T71`). The
+filter there. No call takes an analyzer (`terms(…)` with one is `T71`).
+`match_terms`, and `bm25` over `terms(…)` with `mode: all` or `max_edits`, are
+`T86` in this release: pass `bm25` a String (any term, no edits). The
 native index applies no Unicode normalization, so write values and queries in
 NFC (precomposed accents). Changing a field's analyzer is a schema apply that
 replaces its index; run `omnigraph index build` afterwards, and expect a

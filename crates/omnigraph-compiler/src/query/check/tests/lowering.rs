@@ -49,6 +49,8 @@ const B_IN_PROGRESS: &[&str] = &[
     "a block compared with another block's value",
     "a write group selecting over a table an earlier group changes",
     "a full-text call read as a value",
+    "a bm25 over terms with every term required",
+    "a match_terms predicate",
 ];
 
 const CLOSURE: &[Row] = &[
@@ -211,8 +213,17 @@ const CLOSURE: &[Row] = &[
                 Lowers,
             ),
             (
-                "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s)) as $score } return { $d.title } order { $score desc } limit 3 }",
+                "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s, mode: any)) as $score } return { $d.title } order { $score desc } limit 3 }",
                 Lowers,
+            ),
+            // `terms` defaults to `mode: all`, which the scan does not run.
+            (
+                "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s)) as $score } return { $d.title } order { $score desc } limit 3 }",
+                Refused("B"),
+            ),
+            (
+                "query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any)) return { $d.title } }",
+                Refused("B"),
             ),
             (
                 "query q($s: String, $v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",

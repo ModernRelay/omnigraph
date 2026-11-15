@@ -151,6 +151,9 @@ impl WriteShape {
         // The tables the groups before the current one write.
         let mut written = BTreeSet::new();
         for (g, group) in write.groups.iter().enumerate() {
+            if super::holds_match_terms(&group.input) {
+                return Err(super::match_terms_unlowered(name, Construct::Group(g)));
+            }
             match staged(group) {
                 Some(selection) => lower_staged(name, g, group, selection, &mut ops)?,
                 None => {

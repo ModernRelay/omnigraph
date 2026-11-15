@@ -877,6 +877,9 @@ impl<'a> Shaper<'a> {
     }
 
     fn read(&self, read: &CoreRead) -> Result<ReadShape, ShapeError> {
+        if super::holds_match_terms(&read.term) {
+            return Err(super::match_terms_unlowered(self.name, Construct::Read));
+        }
         // A recursive read types to `Fix`, which stage Rec evaluates.
         let mut nodes = Vec::new();
         read.term.nodes(&mut nodes);
@@ -1516,28 +1519,45 @@ impl<'a> Shaper<'a> {
                 column,
                 property,
                 kind: ScoreKind::Bm25,
-                query: ScoreQuery::Lexical(LexicalQuery { text, .. }),
+                query:
+                    ScoreQuery::Lexical(LexicalQuery {
+                        text,
+                        mode_all,
+                        max_edits,
+                    }),
                 out,
-            } => Ok((
-                self.population(input)?,
-                Some(Ranking {
-                    key: IRExpr::Bm25 {
-                        field: Box::new(IRExpr::PropAccess {
-                            variable: column.clone(),
-                            property: property.clone(),
-                            ty: scalar(ScalarType::String),
-                        }),
-                        query: Box::new(text.clone()),
-                        ty: scalar(ScalarType::F32),
-                    },
-                    out: out.clone(),
-                    column: column.clone(),
-                    score: (SCORE_COLUMN, scalar(ScalarType::F32)),
-                    descending: true,
-                    windows: Vec::new(),
-                    exact: None,
-                }),
-            )),
+            } => {
+                // The engine's `bm25` matches any term with no edits; a
+                // `terms(…)` that asks for every term or an edit budget is
+                // a query the scan would answer as `mode: any` with none.
+                let zero_edits = matches!(max_edits, IRExpr::Literal(Literal::Integer(0), _));
+                if *mode_all || !zero_edits {
+                    return Err(self.refuse_at(
+                        "a `bm25` over `terms(…)` with `mode: all` or an edit budget",
+                        Construct::Element(FROM, None),
+                    ));
+                }
+                Ok((
+                    self.population(input)?,
+                    Some(Ranking {
+                        key: IRExpr::Bm25 {
+                            field: Box::new(IRExpr::PropAccess {
+                                variable: column.clone(),
+                                property: property.clone(),
+                                ty: scalar(ScalarType::String),
+                            }),
+                            query: Box::new(text.clone()),
+                            ty: scalar(ScalarType::F32),
+                        },
+                        out: out.clone(),
+                        column: column.clone(),
+                        score: (SCORE_COLUMN, scalar(ScalarType::F32)),
+                        descending: true,
+                        windows: Vec::new(),
+                        exact: None,
+                    }),
+                ))
+            }
             Term::Score {
                 input,
                 column,

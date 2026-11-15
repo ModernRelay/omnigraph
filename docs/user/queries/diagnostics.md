@@ -300,6 +300,7 @@ that calls itself.
 | A ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit` | B |
 | A block compared with another block's value, a block of several aggregates | B |
 | A full-text call (`search`, `fuzzy`, `match_text`) read as a value in `return`, `order` or a block's aggregate | B |
+| A `match_terms` predicate, and a `bm25` (alone or as an `rrf` arm) over `terms(…)` with `mode: all` or an edit budget: no evaluator of this release runs the exact lexical scan; `search`, `fuzzy` and `match_text` match today's way, and a bare String query is `bm25`'s any-term, zero-edit form | B |
 | A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B |
 | A read that calls itself (`Fix`) | Rec |
 

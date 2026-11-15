@@ -29,11 +29,13 @@ matches `"Café"` under `standard_folded_v1` and `english_v1`, and every
 profile matches `"RUNNING"` in either case.
 
 `scorer` is `bm25_v1`, the default, or `none`. A `none` field matches
-(`search`, `match_text`, `fuzzy`, `match_terms`) but does not rank: `bm25`
+(`search`, `match_text`, `fuzzy`) but does not rank: `bm25`
 over it, alone or as an `rrf` arm, is refused at type checking (`T87`). An
 unknown profile, scorer or option is a schema error that lists the admitted
 names. No query names an analyzer: `terms(…)` admits `mode` and `max_edits`
-only (`T71`).
+only (`T71`). This release runs neither `match_terms` nor a `bm25` over
+`terms(…)` with `mode: all` or an edit budget, and refuses both at type check
+(`T86`): `bm25` takes a String, which matches any term with no edits.
 
 `@index(fulltext)` without `analyzer`, and a bare `@index`, keep the analysis
 earlier releases used: Lance's default, which lowercases, stems, removes

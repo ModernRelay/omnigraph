@@ -14,6 +14,74 @@
 pub mod read;
 pub mod write;
 
+use crate::ir::IRExpr;
+use crate::ir::core::{ScoreQuery, Term};
+use crate::ir::expr::ScalarFunc;
+
+/// Whether `term` holds a `match_terms` predicate, which no evaluator of
+/// this release runs: the lexical predicate's exact scan is the break's
+/// (section 4, Exact execution), and `search`, `match_text` and `fuzzy` keep
+/// today's index matching meanwhile.
+pub(crate) fn holds_match_terms(term: &Term) -> bool {
+    let mut exprs: Vec<&IRExpr> = Vec::new();
+    let mut terms = vec![term];
+    while let Some(t) = terms.pop() {
+        match t {
+            Term::Filter { pred, .. } => exprs.push(pred),
+            Term::Project { items, .. } => exprs.extend(items.iter().map(|(_, e)| e)),
+            Term::Group { keys, aggs, .. } => {
+                exprs.extend(keys.iter().map(|(_, e)| e));
+                exprs.extend(aggs.iter().filter_map(|(_, a)| a.arg.as_ref()));
+            }
+            Term::Order { keys, .. } => exprs.extend(keys.iter().map(|(e, _)| e)),
+            Term::Score { query, .. } => match query {
+                ScoreQuery::Vector(q) => exprs.push(q),
+                ScoreQuery::Lexical(q) => exprs.extend([&q.text, &q.max_edits]),
+            },
+            Term::ApproxTopK { query, .. } => exprs.push(query),
+            Term::Call { bindings, .. } => exprs.extend(bindings.iter().map(|(_, e)| e)),
+            _ => {}
+        }
+        terms.extend(t.children());
+    }
+    while let Some(e) = exprs.pop() {
+        match e {
+            IRExpr::Call {
+                func: ScalarFunc::MatchTerms { .. },
+                ..
+            } => return true,
+            IRExpr::Call { args, .. } => exprs.extend(args),
+            IRExpr::Not(inner, _)
+            | IRExpr::IsNull { expr: inner, .. }
+            | IRExpr::Cast { expr: inner, .. }
+            | IRExpr::Neg { expr: inner, .. }
+            | IRExpr::Aggregate { arg: inner, .. } => exprs.push(inner),
+            IRExpr::Binary { left, right, .. } => exprs.extend([left.as_ref(), right.as_ref()]),
+            IRExpr::Search { .. }
+            | IRExpr::MatchText { .. }
+            | IRExpr::Fuzzy { .. }
+            | IRExpr::Nearest { .. }
+            | IRExpr::Bm25 { .. }
+            | IRExpr::Rrf { .. }
+            | IRExpr::PropAccess { .. }
+            | IRExpr::Variable(_, _)
+            | IRExpr::AliasRef(_, _)
+            | IRExpr::Param(_, _)
+            | IRExpr::Literal(_, _) => {}
+        }
+    }
+    false
+}
+
+/// `T86` for a `match_terms` predicate in the term at `construct`.
+pub(crate) fn match_terms_unlowered(name: &str, construct: Construct) -> ShapeError {
+    ShapeError::unlowered(Unlowered::new(
+        name,
+        "a `match_terms` predicate (the exact lexical scan)",
+        construct,
+    ))
+}
+
 /// The stage of the programme (docs/rfcs/2026-11-07-gq-3.md, section 11,
 /// "Sequence") that adds the lowering of a term this release's planner
 /// refuses. A relation parameter (stage RP) and a path (stage Path) start at
