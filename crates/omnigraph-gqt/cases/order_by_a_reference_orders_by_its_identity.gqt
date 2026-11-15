@@ -3,7 +3,8 @@
 # notes: (docs/rfcs/2026-11-07-gq-3.md, section 2, the Order operator: "the identity (type, id) of every
 # notes: reference column"): a node by its `@id`, an edge by its `@id`, and an edge over several
 # notes: types by its type, then its `@id`. Names sort the other way from handles, so ordering by a
-# notes: property would show. Over `distinct` rows a returned node orders by its identity too.
+# notes: property would show. Over `distinct` rows a returned node orders by its identity too, and so
+# notes: does a reference key of an inline read's own `order`, grouped or not.
 
 --- runner
 timeout_ms: 10000
@@ -122,3 +123,42 @@ query by_distinct_node() {
 
 --- expect shape
 a: Person
+
+--- query
+query inline_read_by_node() {
+    match { from { match { $p: Person } return { $p } order { $p desc } limit 2 } }
+    return { $p.name }
+}
+
+--- expect unordered
+{"p.name": "Xia"}
+{"p.name": "Yan"}
+
+--- expect shape
+p.name: String
+
+--- query
+query inline_read_by_edge() {
+    match { from { match { $a: Person, $b: Person, $a $k:knows $b } return { $a, $b } order { $k desc } limit 1 } }
+    return { $a.handle, $b.handle }
+}
+
+--- expect unordered
+{"a.handle": "a", "b.handle": "c"}
+
+--- expect shape
+a.handle: String
+b.handle: String
+
+--- query
+query inline_read_by_grouped_node() {
+    match { from { match { $a: Person, $b: Person, $a knows $b } return { $a, count($b) as n } order { $a desc } limit 1 } }
+    return { $a.handle, $n }
+}
+
+--- expect unordered
+{"a.handle": "b", "n": 1}
+
+--- expect shape
+a.handle: String
+n: I64

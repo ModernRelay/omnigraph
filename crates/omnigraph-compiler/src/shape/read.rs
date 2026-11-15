@@ -883,21 +883,7 @@ impl<'a> Shaper<'a> {
                 )]
             });
         }
-        let string = ExprType::from_prop(&PropType::scalar(ScalarType::String, false));
-        let property = |property: &str| IRExpr::PropAccess {
-            variable: variable.clone(),
-            property: property.to_string(),
-            ty: string.clone(),
-        };
-        let id = property(self.catalog.system_columns.id);
-        match ty {
-            ExprType::Node { .. } => Some(vec![id]),
-            ExprType::Edge { type_name } if type_name.contains('|') => {
-                Some(vec![property(EDGE_TYPE_COLUMN), id])
-            }
-            ExprType::Edge { .. } => Some(vec![id]),
-            ExprType::Value { .. } | ExprType::ExactInteger { .. } => None,
-        }
+        reference_identity(variable, ty, self.catalog.system_columns.id)
     }
 
     /// A refusal at `construct`.
@@ -2557,15 +2543,22 @@ impl<'a> Shaper<'a> {
                 *variable = name.clone();
             }
         };
+        // A reference key orders the read's own rows by its identity, as a
+        // read's `order` does; a grouped reference keeps its binding's
+        // identity column.
+        let id = self.catalog.system_columns.id;
         let order_by = order_keys
             .into_iter()
-            .map(|(key, descending)| {
+            .flat_map(|(key, descending)| {
                 let mut key = read_lets(key);
                 substitute(&mut key, &rows);
-                IROrdering {
-                    expr: key,
-                    descending,
-                }
+                let keys = match &key {
+                    IRExpr::Variable(variable, ty) => reference_identity(variable, ty, id),
+                    _ => None,
+                };
+                keys.unwrap_or_else(|| vec![key])
+                    .into_iter()
+                    .map(move |expr| IROrdering { expr, descending })
             })
             .collect();
         let mut read = InnerRead {
@@ -3386,6 +3379,26 @@ fn holds_lexical_call(expr: &IRExpr) -> bool {
         }
     }
     found
+}
+
+/// The identity keys of the reference `variable` of type `ty`: its id
+/// column `id`, after its edge type for an edge whose selector has several
+/// types (one type: the type is constant). `None` for a value.
+fn reference_identity(variable: &str, ty: &ExprType, id: &str) -> Option<Vec<IRExpr>> {
+    let string = ExprType::from_prop(&PropType::scalar(ScalarType::String, false));
+    let property = |property: &str| IRExpr::PropAccess {
+        variable: variable.to_string(),
+        property: property.to_string(),
+        ty: string.clone(),
+    };
+    match ty {
+        ExprType::Node { .. } => Some(vec![property(id)]),
+        ExprType::Edge { type_name } if type_name.contains('|') => {
+            Some(vec![property(EDGE_TYPE_COLUMN), property(id)])
+        }
+        ExprType::Edge { .. } => Some(vec![property(id)]),
+        ExprType::Value { .. } | ExprType::ExactInteger { .. } => None,
+    }
 }
 
 /// `match_terms` whose edit budget is not the literal `0`. Membership runs
