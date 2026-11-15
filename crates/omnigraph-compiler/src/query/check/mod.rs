@@ -91,7 +91,7 @@ pub fn check_file(
 ) -> Vec<(String, Result<CheckedDecl, QueryDiagnostic>)> {
     let decls: Vec<&Decl> = match &file.body {
         Body::Decls(d) => d.iter().collect(),
-        Body::Explain(d) => vec![d.as_ref()],
+        Body::Explain { before, decl } => before.iter().chain([decl.as_ref()]).collect(),
         Body::Statement(_) => Vec::new(),
     };
     let unit = source_unit(&decls);
@@ -110,7 +110,7 @@ pub fn check_syntax_decl(
     let file = syntax.file();
     let decls: Vec<&Decl> = match &file.body {
         Body::Decls(d) => d.iter().collect(),
-        Body::Explain(d) => vec![d.as_ref()],
+        Body::Explain { before, decl } => before.iter().chain([decl.as_ref()]).collect(),
         Body::Statement(_) => Vec::new(),
     };
     let unit = source_unit(&decls);
@@ -186,7 +186,7 @@ pub(crate) fn type_source(
     let file = crate::query::syntax::parse::parse_source(source)?;
     let decls: Vec<&Decl> = match &file.body {
         Body::Decls(d) => d.iter().collect(),
-        Body::Explain(d) => vec![d.as_ref()],
+        Body::Explain { before, decl } => before.iter().chain([decl.as_ref()]).collect(),
         Body::Statement(_) => Vec::new(),
     };
     let unit = source_unit(&decls);

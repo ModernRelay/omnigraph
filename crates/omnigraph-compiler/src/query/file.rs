@@ -537,7 +537,7 @@ impl SyntaxDecl {
     pub fn decl(&self) -> &super::syntax::Decl {
         match &self.file.body {
             super::syntax::Body::Decls(decls) => &decls[self.index],
-            super::syntax::Body::Explain(decl) => decl,
+            super::syntax::Body::Explain { decl, .. } => decl,
             super::syntax::Body::Statement(_) => {
                 unreachable!("a statement carries no declaration")
             }

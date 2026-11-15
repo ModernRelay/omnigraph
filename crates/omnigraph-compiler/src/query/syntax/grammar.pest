@@ -164,7 +164,7 @@ bool_lit = @{ ("true" | "false") ~ !(ASCII_ALPHANUMERIC | "_") }
 // `syntax::tests::the_rule_set_is_pinned` (section 11, rule 1).
 // ===========================================================================
 
-query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_stmt ~ ";"? ~ statement_trailer? | commit_stmt ~ ";"? ~ statement_trailer? | load_stmt ~ ";"? ~ statement_trailer? | explain_stmt ~ statement_trailer? | declaration* ~ missing_param_list?) ~ EOI }
+query_file = { SOI ~ setting_stmt* ~ (show_stmt ~ statement_trailer? | branch_stmt ~ ";"? ~ statement_trailer? | commit_stmt ~ ";"? ~ statement_trailer? | load_stmt ~ ";"? ~ statement_trailer? | declaration* ~ explain_stmt ~ statement_trailer? | declaration* ~ missing_param_list?) ~ EOI }
 explain_stmt = { kw_explain ~ (query_decl | load_stmt) }
 statement_trailer = { (setting_stmt | show_stmt | branch_stmt | commit_stmt | load_stmt | explain_stmt | declaration)+ }
 missing_param_list = { (kw_query | kw_mutation | kw_view) ~ ident ~ !"(" ~ ANY* }

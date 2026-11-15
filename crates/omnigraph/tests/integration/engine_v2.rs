@@ -492,6 +492,33 @@ async fn explain_resolves_omitted_nullable_parameters_before_planning() {
     assert_eq!(omitted_rows.batches(), explicit_rows.batches());
 }
 
+/// An `explain` after declarations explains a read that calls one of them:
+/// its plan rows are the plan of the read with the call inlined, the same as
+/// the explain of that read written without the call.
+#[tokio::test]
+async fn explain_follows_the_declarations_its_read_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = session(
+        Omnigraph::init(
+            dir.path().to_str().unwrap(),
+            "node Person { name: String @key age: I64 }",
+        )
+        .await
+        .unwrap(),
+    );
+    let params = omnigraph_compiler::ir::ParamMap::new();
+    let composed = "query adults($min: I64) { match { $p: Person } where $p.age > $min return { $p } }\n\
+                    explain query names() { match { from adults(30) } return { $p.name } }";
+    let rows = db.query("main", composed, "names", &params).await.unwrap();
+    assert!(rows.num_rows() > 0, "an explain answers its plan rows");
+    // The declaration before `explain` is not itself explained or run.
+    let refused = db.query("main", composed, "adults", &params).await;
+    assert!(
+        refused.is_err(),
+        "only the read after `explain` is selectable"
+    );
+}
+
 /// GQT cannot inspect scan versions when a current type is absent from an old snapshot.
 #[tokio::test]
 async fn explain_omits_a_dataset_version_absent_from_the_snapshot() {

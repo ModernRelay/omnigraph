@@ -316,7 +316,7 @@ pub(crate) fn into_query_file(file: SourceFile) -> QueryFile {
     };
     let body = match &file.body {
         Body::Decls(decls) => FileBody::Queries((0..decls.len()).map(header).collect()),
-        Body::Explain(_) => FileBody::Explain(header(0)),
+        Body::Explain { before, .. } => FileBody::Explain(header(before.len())),
         Body::Statement(statement) => statement.0.clone(),
     };
     QueryFile { settings, body }
@@ -580,7 +580,19 @@ fn build_file(input: &str, file: Pair<Rule>) -> R<(SourceFile, Vec<DeclName>)> {
                     Rule::load_stmt => Body::Statement(Box::new(StatementBody(
                         FileBody::ExplainLoad(parse_load_stmt(wrapped)?),
                     ))),
-                    _ => Body::Explain(Box::new(decl(wrapped)?)),
+                    _ => {
+                        if let Some(name) = wrapped
+                            .clone()
+                            .into_inner()
+                            .find(|p| p.as_rule() == Rule::ident)
+                        {
+                            names.push((name.as_str().to_string(), span_of(&name)));
+                        }
+                        Body::Explain {
+                            before: Vec::new(),
+                            decl: Box::new(decl(wrapped)?),
+                        }
+                    }
                 });
             }
             Rule::statement_trailer => {
@@ -637,7 +649,16 @@ fn build_file(input: &str, file: Pair<Rule>) -> R<(SourceFile, Vec<DeclName>)> {
     Ok((
         SourceFile {
             settings,
-            body: statement.unwrap_or(Body::Decls(decls)),
+            body: match statement {
+                // The declarations before `explain` are the source unit its
+                // read's calls resolve in.
+                Some(Body::Explain { decl, .. }) => Body::Explain {
+                    before: decls,
+                    decl,
+                },
+                Some(statement) => statement,
+                None => Body::Decls(decls),
+            },
         },
         names,
     ))

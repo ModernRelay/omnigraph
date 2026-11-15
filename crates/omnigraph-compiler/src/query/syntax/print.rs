@@ -23,9 +23,13 @@ pub fn print_file(file: &SourceFile) -> String {
                 out.push('\n');
             }
         }
-        Body::Explain(d) => {
+        Body::Explain { before, decl } => {
+            for d in before {
+                out.push_str(&print_decl(d));
+                out.push('\n');
+            }
             out.push_str("explain ");
-            out.push_str(&print_decl(d));
+            out.push_str(&print_decl(decl));
         }
         Body::Statement(_) => out.push_str("/* statement */"),
     }

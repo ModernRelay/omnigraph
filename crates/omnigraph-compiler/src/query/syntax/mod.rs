@@ -39,8 +39,12 @@ pub enum Body {
     Decls(Vec<Decl>),
     /// `show`, `branch`, `commit` or `load`: one statement.
     Statement(Box<StatementBody>),
-    /// `explain` over one declaration.
-    Explain(Box<Decl>),
+    /// `explain` over one declaration, after the declarations its read may
+    /// call.
+    Explain {
+        before: Vec<Decl>,
+        decl: Box<Decl>,
+    },
 }
 
 /// A statement body compared by its debug form: the statement nodes do not

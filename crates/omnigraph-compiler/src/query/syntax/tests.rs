@@ -1031,7 +1031,12 @@ fn one_keyword_and_the_body_shape_is_the_kind() {
     // `explain` over a declaration.
     assert!(matches!(
         parsed("explain query a() { match { from $r } return { $p } }").body,
-        Body::Explain(_)
+        Body::Explain { ref before, .. } if before.is_empty()
+    ));
+    // `explain` after the declarations its read may call.
+    assert!(matches!(
+        parsed("query h() { match { $p: P } return { $p } }\nexplain query a() { match { from h() } return { $p } }").body,
+        Body::Explain { ref before, ref decl } if before.len() == 1 && decl.name == "a"
     ));
     // The missing parameter list keeps its fix.
     let e = refusal_of("query a { match { $p: P } return { $p } }");

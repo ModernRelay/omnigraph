@@ -3,8 +3,8 @@
 `explain` before a read declaration returns the query's v2 plan instead of
 its rows, regardless of the selected execution engine; before a `load csv`
 statement it returns the load's plan ([explaining a load statement](explain-load.md)).
-It is a statement:
-one per file, never beside a declaration. The query is compiled and planned
+It is a statement, one per file, after any declarations: the read it
+explains may call the reads declared before it, and nothing follows it. The query is compiled and planned
 against the target's schema and snapshot without executing it. Planning
 may read metadata for byte estimates and index planning, including row-ID
 and deletion metadata for overlays or index-detail discovery on legacy tables;
