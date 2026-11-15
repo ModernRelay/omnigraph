@@ -635,6 +635,19 @@ pub fn spawn_server_with_cluster(cluster_dir: &Path) -> TestServer {
     spawn_server_process(command)
 }
 
+/// Cluster boot with `RUST_MIN_STACK` removed from the server's environment,
+/// so its runtime threads get the stack the binary itself chooses rather
+/// than the test runner's.
+pub fn spawn_server_with_cluster_default_stack(cluster_dir: &Path) -> TestServer {
+    let mut command = server_process();
+    command
+        .arg("--cluster")
+        .arg(cluster_dir)
+        .arg("--unauthenticated")
+        .env_remove("RUST_MIN_STACK");
+    spawn_server_process(command)
+}
+
 /// Cluster boot with the server process's cwd set explicitly — used to prove
 /// rule 0 never touches the cwd omnigraph.yaml search.
 pub fn spawn_server_with_cluster_in(cluster_dir: &Path, cwd: &Path) -> TestServer {

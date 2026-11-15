@@ -25,6 +25,14 @@ pub const MAX_QUERY_NESTING: usize = 64;
 /// whatever its length.
 pub const MAX_QUERY_EXPRESSION_DEPTH: usize = 256;
 
+/// The stack of a thread that compiles, plans or runs a query. The bounds
+/// above keep the recursion finite; this keeps a source at them within the
+/// thread, in a debug build too, where each level's frames are largest. The
+/// server's and the CLI's runtimes give every worker and blocking thread
+/// this stack, since Tokio's default (2 MiB) overflowed on an `or` chain of
+/// sixty terms.
+pub const QUERY_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Default)]
 struct Level {
     /// The `not` run directly before this level's opening bracket.

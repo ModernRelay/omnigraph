@@ -446,6 +446,43 @@ query ordered_person($name: String) {
     assert_eq!(lines.next().unwrap(), "30,Alice");
 }
 
+/// A read at the expression depth bound compiles and runs on the server's
+/// runtime threads: an `or` chain of 200 terms overflowed Tokio's default
+/// worker stack in a debug server and aborted the process.
+#[test]
+fn remote_read_at_the_expression_depth_bound_keeps_the_server_serving() {
+    let cluster = converged_loaded_cluster(GRAPH_ID, None);
+    let server = spawn_server_with_cluster_default_stack(cluster.path());
+    let temp = tempfile::tempdir().unwrap();
+    let chain = (0..200)
+        .map(|i| format!("$p.name = \"n{i}\""))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let deep = temp.path().join("deep.gq");
+    fs::write(
+        &deep,
+        format!(
+            "query deep() {{ match {{ $p: Person }} where {chain} or $p.name = \"Alice\" return {{ count($p) as n }} }}"
+        ),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let payload = parse_stdout_json(&output_success(
+            cli()
+                .arg("query")
+                .arg("--target")
+                .fixture_target(&server.base_url)
+                .arg("--graph")
+                .arg(GRAPH_ID)
+                .arg("--query")
+                .arg(&deep)
+                .arg("deep")
+                .arg("--json"),
+        ));
+        assert_eq!(payload["rows"][0]["n"], 1, "{payload}");
+    }
+}
+
 #[test]
 fn remote_branch_create_list_merge_flow() {
     let cluster = converged_loaded_cluster(GRAPH_ID, None);

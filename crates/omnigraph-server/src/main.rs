@@ -63,8 +63,17 @@ struct Cli {
     mcp_allowed_hosts: Vec<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Every worker and blocking thread compiles and runs queries, so each
+    // gets the stack a query at the depth bounds needs.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(omnigraph_compiler::query::depth::QUERY_THREAD_STACK_BYTES)
+        .build()?
+        .block_on(serve())
+}
+
+async fn serve() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
     let telemetry = tokio::task::spawn_blocking(omnigraph_server::telemetry::init).await??;

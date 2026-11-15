@@ -6,7 +6,12 @@ use color_eyre::eyre::Result;
 use tokio::runtime::Runtime;
 
 fn main() -> Result<std::process::ExitCode> {
-    let runtime = Runtime::new()?;
+    // A query compiles and runs on these threads; each gets the stack a
+    // query at the depth bounds needs.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(omnigraph_compiler::query::depth::QUERY_THREAD_STACK_BYTES)
+        .build()?;
     // A refusal explains its fix without environment or source-location footers.
     color_eyre::config::HookBuilder::default()
         .display_env_section(false)
