@@ -131,6 +131,7 @@ async fn generated_params_supply_a_step_and_are_refused_outside_their_contract()
     assert!(
         GeneratedParams::parse("generate: v1 seed: 0", &format!("params:\n{wide}"))
             .unwrap_err()
+            .message
             .contains("zipf tables exceed 8000000 entries")
     );
 
@@ -3500,4 +3501,191 @@ fn a_plan_section_follows_a_load_or_mutate_steps_expect_only() {
     assert_eq!(step.plan.as_ref().map(|plan| plan.lines.len()), Some(2));
     let before_the_expect = format!("{HDR}{SCHEMA}{SEED}{MUTATE}{PARAMS}{PLAN}{EXPECT_OK}");
     assert!(parse_case("load_plan", &before_the_expect).is_err());
+}
+
+/// The negative corpus, `tests/invalid/<code>_<name>.gqt`: one case per
+/// rule, broken on purpose at a known line, and the (code, line) pairs
+/// `--check` must report for it, written here from the rule, not recorded.
+#[test]
+fn every_invalid_case_reports_the_code_and_line_its_author_wrote() {
+    use CaseErrorCode::*;
+    const INVALID: &[(&str, &[(CaseErrorCode, usize)])] = &[
+        ("batch_bound_commits_above_rows", &[(BatchBound, 12)]),
+        ("batch_bound_commits_with_zero_rows", &[(BatchBound, 12)]),
+        (
+            "batch_bound_one_commit_over_the_batch_cap",
+            &[(BatchBound, 12)],
+        ),
+        ("bind_shape_bind_before_any_write", &[(BindShape, 14)]),
+        ("body_shape_recipe_rows_above_the_limit", &[(BodyShape, 12)]),
+        ("body_shape_restart_with_an_argument", &[(BodyShape, 20)]),
+        (
+            "body_shape_row_above_the_batch_byte_bound",
+            &[(BodyShape, 12)],
+        ),
+        ("corpus_timeout_budget_above_the_cap", &[(CorpusTimeout, 3)]),
+        (
+            "corpus_timeout_quoted_key_above_the_cap",
+            &[(CorpusTimeout, 3)],
+        ),
+        ("duplicate_header_issue_twice", &[(DuplicateHeader, 2)]),
+        (
+            "expect_mode_for_step_ok_on_a_query",
+            &[(ExpectModeForStep, 16)],
+        ),
+        (
+            "expect_mode_missing_bare_expect",
+            &[(ExpectModeMissing, 16)],
+        ),
+        (
+            "expect_without_step_expect_before_any_step",
+            &[(ExpectWithoutStep, 14)],
+        ),
+        ("file_name_issue_case_misnamed", &[(FileName, 1)]),
+        ("header_shape_issue_without_value", &[(HeaderShape, 1)]),
+        ("loop_header_loop_without_bounds", &[(LoopHeader, 14)]),
+        ("loop_structure_loop_never_closed", &[(LoopStructure, 14)]),
+        (
+            "missing_expect_before_endloop_leaves_the_next_loop_clean",
+            &[(MissingExpect, 19)],
+        ),
+        ("missing_expect_query_after_query", &[(MissingExpect, 16)]),
+        ("missing_issue_issue_as_a_word", &[(MissingIssue, 1)]),
+        ("missing_issue_no_header", &[(MissingIssue, 1)]),
+        (
+            "missing_red_on_issue_case_without_red_on",
+            &[(MissingRedOn, 1), (FileName, 1)],
+        ),
+        ("missing_runner_schema_first", &[(MissingRunner, 2)]),
+        ("missing_shape_rows_without_shape", &[(MissingShape, 16)]),
+        (
+            "params_placement_params_before_any_step",
+            &[(ParamsPlacement, 14)],
+        ),
+        (
+            "query_parse_bound_operand_beside_a_syntax_error",
+            &[(QueryParse, 19)],
+        ),
+        (
+            "query_parse_schema_beside_a_seed_comment",
+            &[(QueryParse, 7), (BodyShape, 13)],
+        ),
+        ("query_parse_unclosed_brace", &[(QueryParse, 14)]),
+        ("runner_config_timeout_as_a_word", &[(RunnerConfig, 2)]),
+        (
+            "section_order_schema_after_a_step",
+            &[(SectionOrder, 12), (SectionOrder, 17)],
+        ),
+        ("section_order_seam_before_an_expect", &[(SectionOrder, 16)]),
+        ("step_kind_mutation_under_query", &[(StepKind, 14)]),
+        (
+            "substitution_placement_in_a_step_body",
+            &[(SubstitutionPlacement, 16)],
+        ),
+        (
+            "substitution_placement_outside_a_loop",
+            &[(SubstitutionPlacement, 16)],
+        ),
+        ("unbound_name_snapshot_never_bound", &[(UnboundName, 14)]),
+        ("unknown_expect_mode_sorted", &[(UnknownExpectMode, 16)]),
+        (
+            "unknown_header_key_note_for_notes",
+            &[(UnknownHeaderKey, 2)],
+        ),
+        ("unknown_section_misspelled_mutate", &[(UnknownSection, 14)]),
+    ];
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/invalid");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "gqt"))
+        .map(|path| path.file_stem().unwrap().to_str().unwrap().to_string())
+        .collect();
+    on_disk.sort();
+    let listed: Vec<&str> = INVALID.iter().map(|(stem, _)| *stem).collect();
+    assert_eq!(
+        on_disk, listed,
+        "the directory and the table name the same cases"
+    );
+    let mut covered = HashSet::new();
+    for (stem, expected) in INVALID {
+        let text = std::fs::read_to_string(dir.join(format!("{stem}.gqt"))).unwrap();
+        let errors = check_text(stem, &text, true);
+        let reported: Vec<(CaseErrorCode, usize)> = errors
+            .iter()
+            .map(|error| (error.code, error.line.unwrap_or(0)))
+            .collect();
+        assert_eq!(&reported, expected, "{stem}:\n{}", render(&errors));
+        assert!(
+            stem.starts_with(&format!("{}_", expected[0].0.name())),
+            "{stem}: the file name starts with the code of its first error"
+        );
+        for error in &errors {
+            assert!(
+                error.fix.is_some(),
+                "{stem}: `{}` names no fix",
+                error.message
+            );
+        }
+        covered.extend(expected.iter().map(|(code, _)| *code));
+    }
+    let uncovered: Vec<&str> = CaseErrorCode::ALL
+        .iter()
+        .filter(|code| !matches!(code, Other | LineEndings))
+        .filter(|code| !covered.contains(code))
+        .map(|code| code.name())
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "codes with no invalid case: {uncovered:?}"
+    );
+
+    fn render(errors: &[CaseError]) -> String {
+        errors
+            .iter()
+            .map(|error| format!("  {}\n", error.to_json()))
+            .collect()
+    }
+}
+
+/// `tests/grammar/v<N>.txt` is the format's surface at version N, the text
+/// `--grammar` prints. A change to a table or a rule shows here as a diff;
+/// an incompatible one is a new version and a new file.
+#[test]
+fn the_grammar_file_is_the_surface_of_the_current_format_version() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("tests/grammar/v{GQT_FORMAT_VERSION}.txt"));
+    let pinned = std::fs::read_to_string(&path).unwrap_or_default();
+    let derived = grammar_text();
+    assert!(
+        pinned == derived,
+        "{} differs from the derived grammar; the derived text is:\n{derived}",
+        path.display()
+    );
+}
+
+/// The near-miss tables name what the dispatch accepts: every word in them
+/// is parsed under its own rules, never as unknown.
+#[test]
+fn every_near_miss_word_is_a_dispatched_spelling() {
+    for kind in SECTION_KINDS {
+        let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}{EXPECT}--- {kind}\n");
+        let errors = check_text("words", &text, false);
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.message.starts_with("unknown section")),
+            "`--- {kind}` is a section kind: {errors:?}"
+        );
+    }
+    for word in EXPECT_MODE_WORDS {
+        let text = format!("{HDR}{SCHEMA}{SEED}{QUERY}--- expect {word}\n");
+        let errors = check_text("words", &text, false);
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.message.starts_with("unknown expect mode")),
+            "`--- expect {word}` is a mode: {errors:?}"
+        );
+    }
 }

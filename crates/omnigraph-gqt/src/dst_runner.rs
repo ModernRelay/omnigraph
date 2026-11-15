@@ -1619,8 +1619,10 @@ fn run_invocation(
     }
     .into();
     let plan_digest = digest(&json(&summary.planned)?);
-    if selection.fast_tier && case.runner.timeout_ms > 10_000 {
-        return Err("invalid_case: the required corpus admits timeout_ms at most 10000; use a standalone heavy reproduction".into());
+    if selection.fast_tier
+        && let Err(error) = omnigraph_gqt_core::corpus_admission(&case.runner)
+    {
+        return Err(error.to_string());
     }
     if selected_seed.is_some() && selected.is_none() && selected_storage.is_none() {
         return Err("invalid_case: --seed requires --target or --storage".into());

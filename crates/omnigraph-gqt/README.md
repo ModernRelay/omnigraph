@@ -870,6 +870,9 @@ cargo run --bin omnigraph-gqt -- cases/dst_restart_preserves_rows.gqt --trace
 cargo run --bin omnigraph-gqt -- --store file:///path/to/graph /path/to/queries.gqt
 cargo run --bin omnigraph-gqt -- --check cases/dst_restart_preserves_rows.gqt
 cargo run --bin omnigraph-gqt -- --check --json cases/
+cargo run --bin omnigraph-gqt -- --explain missing_expect
+cargo run --bin omnigraph-gqt -- --grammar
+cargo run --bin omnigraph-gqt -- --version
 ```
 
 `--check <case.gqt|dir>...` parses every case named and runs nothing: it
@@ -883,9 +886,29 @@ refuses to read (not a regular file, over 256 MiB, not UTF-8) is one error
 under its path. A directory that holds no case is one error under its own
 path; the other paths are still checked, and the exit is 1. `--json` prints
 one JSON object per file or refused path,
-`{"path", "errors": [{"code", "line", "source", "message", "fix"}]}`, for
-tools. The refusal of a run (`refused: …`) carries the same text, one
-`invalid_case:` line per error.
+`{"gqt_format", "path", "errors": [{"code", "line", "source", "message", "fix"}]}`,
+for tools. The refusal of a run (`refused: …`) carries the same text, one
+`invalid_case:` line per error. `--corpus` reads every named case as a
+member of the required corpus wherever it lives, so a case drafted outside
+`cases/` hears the corpus cap before it moves in.
+
+Every error carries a code, the stable name of the rule it breaks, and a
+fix, the line to write. `--explain <code>` prints the rule and, beside a
+source tree, the case under `crates/omnigraph-gqt-core/tests/invalid/` that
+demonstrates it with the errors `--check` reports for it. That directory is
+the negative corpus: one case per rule, broken on purpose at a known line,
+and a library test holds the (code, line) pairs each one must report, so a
+rule that moves, drops or misnames its error is a red test, and a new code
+without a case is one too.
+
+`--grammar` prints the surface of the case format: its version, the header
+keys, the section kinds, the expect modes, the corpus cap and every rule
+under its code. `crates/omnigraph-gqt-core/tests/grammar/v<N>.txt` pins that
+text, so a change to the surface is a diff in review; a change a case
+written for the previous version would not survive is a new version.
+`--version` names the binary's crate version and the format version it
+reads, and every `--check --json` object carries the latter as
+`gqt_format`.
 
 `--store` may precede or follow the case paths. External-store reports retain
 the URI and step evidence, but cannot replay: the report does not freeze the
