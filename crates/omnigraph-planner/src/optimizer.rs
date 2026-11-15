@@ -2501,6 +2501,10 @@ fn place_query_filters(
         }
         filters.sort_unstable();
         coalesce_filters(plan, &filters);
+        // A `where`'s conjuncts filter in written order, each on the rows the
+        // ones before it keep: a conjunct that can fail, and every conjunct
+        // after it, stays where it was written (A3).
+        let mut failing = false;
         for filter_id in filters {
             let Some(LogicalNode::Filter { input, conjuncts }) = plan.node(filter_id).cloned()
             else {
@@ -2509,6 +2513,11 @@ fn place_query_filters(
             let mut residual = Vec::with_capacity(conjuncts.len());
             let mut moved: Vec<(LogicalId, Vec<IRExpr>)> = Vec::new();
             for conjunct in conjuncts {
+                if failing || conjunct.can_fail() {
+                    failing = true;
+                    residual.push(conjunct);
+                    continue;
+                }
                 let target = placement_target(&conjunct, &scans, &dependent_scans, source);
                 match target.and_then(|target| plan.node_mut(target)) {
                     Some(LogicalNode::TableScan { spec, .. }) => {

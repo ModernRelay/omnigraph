@@ -445,6 +445,10 @@ struct Facts {
     /// the elements before it stated: the steps place those first, then the
     /// value's evaluation, then the rest.
     checks: Vec<LetCheck>,
+    /// Whether a `where` conjunct that can fail was stated: it and every
+    /// conjunct after it are evaluated after the elements, in written order,
+    /// never in a scan below them.
+    failing_filter: bool,
 }
 
 /// How many facts of each kind a scope had stated at one point.
@@ -505,6 +509,8 @@ impl Facts {
             lets: HashMap::new(),
             inlined: self.inlined,
             checks: Vec::new(),
+            // The segment's filters keep their written order.
+            failing_filter: false,
         }
     }
 
@@ -535,6 +541,7 @@ impl Facts {
         self.bindings.extend(other.bindings);
         self.traversals.extend(other.traversals);
         self.filters.extend(other.filters);
+        self.failing_filter |= other.failing_filter;
         self.blocks.extend(other.blocks);
         self.types.extend(other.types);
     }
@@ -2713,6 +2720,14 @@ impl<'a> Shaper<'a> {
             return self.blocks(input, pred, facts);
         }
         self.facts(input, facts)?;
+        // `where`'s conjuncts filter in written order, each on the rows the
+        // ones before it keep: a conjunct that can fail runs after every
+        // element, and no conjunct after it is pushed below it.
+        if facts.failing_filter || pred.can_fail() {
+            facts.failing_filter = true;
+            facts.filters.push(pred.clone());
+            return Ok(());
+        }
         // A filter over one binding's variable, written right after it, is
         // that binding's filter.
         let mut below = input;

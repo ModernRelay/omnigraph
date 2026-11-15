@@ -33,7 +33,9 @@ The elements are bindings `$x: Type`, triples, `optional { ... }`, `let` and
 separator. `where` sees every variable the elements bind and is evaluated
 after all of them, `let` included, so a `let` whose expression can fail runs
 on rows `where` then removes; guard it with `if(...)` or compute it in
-`return`. A filter, a `where` or a
+`return`. `and` and `or` guard left to right: `where`'s conjuncts filter in
+written order, each on the rows the ones before it keep, so `$n != 0 and
+$t / $n > 1` never divides by zero. A filter, a `where` or a
 comparison inside the braces is refused (`Q017`), and so is a missing comma
 (`Q016`); a property map `$p: Person { handle: $h }` is refused (`Q010`) with
 the binding and the conjunct `$p.handle = $h`, and `not { ... }` with

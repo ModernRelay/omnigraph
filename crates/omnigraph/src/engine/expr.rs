@@ -208,7 +208,7 @@ pub(super) fn kept_rows(mask: &BooleanArray) -> BooleanArray {
 /// most [`PRE_SELECTION_SHARE`] of the rows are selected, only those rows are
 /// evaluated, over just the columns `filter` reads, so an expensive operand
 /// skips the rows a cheaper one already removed. Above that share every row
-/// is evaluated, the unselected ones included.
+/// is evaluated, the unselected ones included, unless `filter` can fail.
 ///
 /// So the result never depends on the unselected rows, but whether they are
 /// evaluated does, through how many rows of the same batch are selected. That
@@ -231,7 +231,9 @@ pub(super) fn evaluate_filter_where(
     if kept == 0 {
         return Ok(BooleanArray::new_null(rows));
     }
-    if kept == rows || kept as f64 > rows as f64 * PRE_SELECTION_SHARE {
+    // A term that can fail is evaluated on the selected rows alone: `and`
+    // and `or` are guards, so an unselected row must not fail it.
+    if kept == rows || (!filter.can_fail() && kept as f64 > rows as f64 * PRE_SELECTION_SHARE) {
         return evaluate_filter(batch, filter, params);
     }
     let reads = columns_read(batch, filter).unwrap_or_else(|| batch.clone());
