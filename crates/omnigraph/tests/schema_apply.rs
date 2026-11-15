@@ -13,6 +13,7 @@ use omnigraph::db::{
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::LoadMode;
 use omnigraph::{BlobContent, ExternalBlobBase, ExternalBlobExecutionScope, ExternalBlobPolicy};
+use omnigraph_compiler::schema::ast::Cardinality;
 use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
 use omnigraph_core::graph_commit_id::intent_nonce;
 use sha2::{Digest, Sha256};
@@ -2496,6 +2497,178 @@ async fn apply_schema_rejects_a_card_minimum_edge_from_an_existing_node_type() {
             .contains("@card violation on edge LedBy: source 'core' has 0 edges (min 1)"),
         "got: {err}"
     );
+}
+
+/// One `Chunk` type with a source edge per source kind (#1403). Declared
+/// `@card(1..1)` each, every chunk needs one edge of EVERY kind, so a chunk
+/// with only its real source is refused. Relaxing the bounds to `@card(0..1)`
+/// is a metadata-only apply: every stored edge count that met the old range
+/// meets the wider one, so no table is written and the new bounds hold from
+/// the next write. A tighter range would need a scan of the stored counts,
+/// so it still plans as unsupported.
+#[tokio::test]
+#[cfg_attr(feature = "failpoints", serial_test::parallel)]
+async fn relaxing_edge_cardinality_applies_as_metadata_issue_1403() {
+    const SOURCES: &str = "node Transcript {\n    slug: String @key\n}\n\
+        node WebPage {\n    slug: String @key\n}\n\
+        node LinkedInPost {\n    slug: String @key\n}\n\
+        node Chunk {\n    slug: String @key\n    source_kind: enum(transcript, webpage, other)?\n}\n";
+    let schema = |card: &str| {
+        format!(
+            "{SOURCES}edge ChunkFromTranscript: Chunk -> Transcript @card({card})\n\
+             edge ChunkFromWebPage: Chunk -> WebPage @card({card})\n\
+             edge ChunkFromLinkedInPost: Chunk -> LinkedInPost @card({card})\n"
+        )
+    };
+    let web_page_chunk = |chunk: &str, page: &str| {
+        format!(
+            "{{\"type\":\"WebPage\",\"data\":{{\"slug\":\"{page}\"}}}}\n\
+             {{\"type\":\"Chunk\",\"data\":{{\"slug\":\"{chunk}\",\"source_kind\":\"webpage\"}}}}\n\
+             {{\"edge\":\"ChunkFromWebPage\",\"from\":\"{chunk}\",\"to\":\"{page}\",\"data\":{{}}}}"
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = helpers::session(Omnigraph::init(uri, &schema("1..1")).await.unwrap());
+    // A chunk carrying one edge of every kind is valid under `1..1`.
+    db.load_jsonl(
+        "{\"type\":\"Transcript\",\"data\":{\"slug\":\"t1\"}}\n\
+         {\"type\":\"WebPage\",\"data\":{\"slug\":\"w1\"}}\n\
+         {\"type\":\"LinkedInPost\",\"data\":{\"slug\":\"l1\"}}\n\
+         {\"type\":\"Chunk\",\"data\":{\"slug\":\"c-all\",\"source_kind\":\"other\"}}\n\
+         {\"edge\":\"ChunkFromTranscript\",\"from\":\"c-all\",\"to\":\"t1\",\"data\":{}}\n\
+         {\"edge\":\"ChunkFromWebPage\",\"from\":\"c-all\",\"to\":\"w1\",\"data\":{}}\n\
+         {\"edge\":\"ChunkFromLinkedInPost\",\"from\":\"c-all\",\"to\":\"l1\",\"data\":{}}",
+        LoadMode::Append,
+    )
+    .await
+    .expect("a chunk with one edge of every source kind meets @card(1..1)");
+
+    // The reported refusal: a web-page chunk lacks the other two sources.
+    let err = db
+        .load_jsonl(&web_page_chunk("c-web", "w2"), LoadMode::Append)
+        .await
+        .expect_err("@card(1..1) on every source edge needs all three");
+    assert!(
+        err.to_string()
+            .contains("@card violation on edge ChunkFrom")
+            && err
+                .to_string()
+                .contains("source 'c-web' has 0 edges (min 1)"),
+        "got: {err}"
+    );
+
+    let relaxed = schema("0..1");
+    let plan = db.plan_schema(&relaxed).await.unwrap();
+    assert!(plan.supported, "relaxing @card must plan: {:?}", plan.steps);
+    for edge in [
+        "ChunkFromTranscript",
+        "ChunkFromWebPage",
+        "ChunkFromLinkedInPost",
+    ] {
+        assert!(
+            plan.steps.contains(&SchemaMigrationStep::RelaxCardinality {
+                type_name: edge.to_string(),
+                from: Cardinality {
+                    min: 1,
+                    max: Some(1)
+                },
+                to: Cardinality {
+                    min: 0,
+                    max: Some(1)
+                },
+            }),
+            "expected a RelaxCardinality step for {edge}: {:?}",
+            plan.steps
+        );
+    }
+
+    let edge_versions = |snapshot: &omnigraph::db::Snapshot| {
+        [
+            "edge:ChunkFromTranscript",
+            "edge:ChunkFromWebPage",
+            "edge:ChunkFromLinkedInPost",
+        ]
+        .map(|key| snapshot.dataset(key).unwrap().published_dataset_version)
+    };
+    let before = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let applied = db
+        .apply_schema(&relaxed)
+        .await
+        .expect("relaxing @card applies");
+    assert!(applied.applied);
+    let after = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert_eq!(
+        edge_versions(&before),
+        edge_versions(&after),
+        "relaxing @card writes no edge table"
+    );
+    assert!(after.graph_manifest_version() > before.graph_manifest_version());
+
+    db.load_jsonl(&web_page_chunk("c-web", "w2"), LoadMode::Append)
+        .await
+        .expect("a chunk with only its real source loads under @card(0..1)");
+    let qr = query_main(
+        &db,
+        "query sources() { match { $c: Chunk { slug: \"c-web\" } $c chunkFromWebPage $w } \
+         return { $c.source_kind, $w.slug } }",
+        "sources",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+
+    // The relaxed maximum still holds, and one bad chunk refuses its whole
+    // batch: the valid chunk beside it is not published.
+    let commits = db.list_commits(None).await.unwrap().len();
+    let err = db
+        .load_jsonl(
+            &format!(
+                "{}\n{}\n{{\"edge\":\"ChunkFromWebPage\",\"from\":\"c-two\",\"to\":\"w1\",\"data\":{{}}}}",
+                web_page_chunk("c-ok", "w3"),
+                web_page_chunk("c-two", "w4")
+            ),
+            LoadMode::Append,
+        )
+        .await
+        .expect_err("two web-page sources exceed @card(0..1)");
+    assert!(
+        err.to_string().contains(
+            "@card violation on edge ChunkFromWebPage: source 'c-two' has 2 edges (max 1)"
+        ),
+        "got: {err}"
+    );
+    assert_eq!(db.list_commits(None).await.unwrap().len(), commits);
+    let qr = query_main(
+        &db,
+        "query ok() { match { $c: Chunk { slug: \"c-ok\" } } return { $c.slug } }",
+        "ok",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(qr.num_rows(), 0, "the refused batch publishes nothing");
+
+    // Lifting the maximum is a relaxation too.
+    db.apply_schema(&schema("0.."))
+        .await
+        .expect("lifting the @card maximum applies");
+    // Raising a minimum or lowering a maximum needs the stored counts checked,
+    // which apply does not do: both still plan as unsupported.
+    for tighter in [schema("1.."), schema("0..1")] {
+        let plan = db.plan_schema(&tighter).await.unwrap();
+        assert!(!plan.supported, "tightening @card must not plan");
+        assert!(
+            plan.steps.iter().any(|step| matches!(
+                step,
+                SchemaMigrationStep::UnsupportedChange { reason, .. }
+                    if reason.contains("tightening cardinality on edge 'ChunkFromWebPage'")
+            )),
+            "got: {:?}",
+            plan.steps
+        );
+    }
 }
 
 #[tokio::test]
