@@ -1,0 +1,40 @@
+# issue: none
+# notes: `scorer = "none"` on a full-text index allows matching and makes a ranking call on the field
+# notes: a type error (docs/rfcs/2026-11-07-gq-3.md section 4, Errors): `bm25` over it is `T87` and
+# notes: nothing executes, while a matching predicate over the same field runs.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    body: String @index(fulltext, analyzer = "english_v1", scorer = "none")
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","body":"running shoes"}}
+{"type":"Doc","data":{"slug":"d2","body":"walking boots"}}
+
+--- query
+query ranked($q: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $q) as $score } return { $d.slug, $score } order { $score desc } limit 2 }
+
+--- params
+{"q": "run"}
+
+--- expect error: type error: T87:
+
+--- query
+query matched($q: String) { match { $d: Doc } where search($d.body, $q) return { $d.slug } }
+
+--- params
+{"q": "run"}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String

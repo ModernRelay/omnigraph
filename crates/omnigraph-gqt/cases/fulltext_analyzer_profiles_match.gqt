@@ -1,0 +1,280 @@
+# issue: none
+# notes: the three analyzer profiles of `@index(fulltext, analyzer = ...)` (docs/rfcs/2026-11-07-gq-3.md
+# notes: section 4, Schema: Text) match one corpus differently, and an index declaring no analyzer keeps
+# notes: edition 2's analysis (Lance's default). Every profile lowercases (`RUNNING`); only `english_v1`
+# notes: and edition 2 stem (`run` finds `Runners were RUNNING`); `standard_folded_v1`, `english_v1` and
+# notes: edition 2 fold accents (`cafe` finds `Café`); only edition 2 drops a token over 40 bytes.
+# notes: The rows come from Lance's native path, the profile's parameters on the column's declared
+# notes: segment; that path applies no NFC, so every seeded value is already NFC.
+
+--- runner
+timeout_ms: 10000
+environments:
+  - target: omnigraph-engine
+    storage: local-filesystem
+
+--- schema
+node Doc {
+    slug: String @key
+    standard: String @index(fulltext, analyzer = "standard_v1")
+    folded: String @index(fulltext, analyzer = "standard_folded_v1")
+    english: String @index(fulltext, analyzer = "english_v1")
+    legacy: String @index(fulltext)
+}
+
+--- seed
+{"type":"Doc","data":{"slug":"d1","standard":"Runners were RUNNING","folded":"Runners were RUNNING","english":"Runners were RUNNING","legacy":"Runners were RUNNING"}}
+{"type":"Doc","data":{"slug":"d2","standard":"Café crème","folded":"Café crème","english":"Café crème","legacy":"Café crème"}}
+{"type":"Doc","data":{"slug":"d3","standard":"pneumonoultramicroscopicsilicovolcanoconiosis diagnosis","folded":"pneumonoultramicroscopicsilicovolcanoconiosis diagnosis","english":"pneumonoultramicroscopicsilicovolcanoconiosis diagnosis","legacy":"pneumonoultramicroscopicsilicovolcanoconiosis diagnosis"}}
+
+--- query
+query hits_standard($q: String) {
+    match { $d: Doc }
+    where search($d.standard, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "RUNNING"}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_folded($q: String) {
+    match { $d: Doc }
+    where search($d.folded, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "RUNNING"}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_english($q: String) {
+    match { $d: Doc }
+    where search($d.english, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "RUNNING"}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_legacy($q: String) {
+    match { $d: Doc }
+    where search($d.legacy, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "RUNNING"}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_standard($q: String) {
+    match { $d: Doc }
+    where search($d.standard, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "run"}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_folded($q: String) {
+    match { $d: Doc }
+    where search($d.folded, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "run"}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_english($q: String) {
+    match { $d: Doc }
+    where search($d.english, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "run"}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_legacy($q: String) {
+    match { $d: Doc }
+    where search($d.legacy, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "run"}
+
+--- expect unordered
+{"d.slug": "d1"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_standard($q: String) {
+    match { $d: Doc }
+    where search($d.standard, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "cafe"}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_folded($q: String) {
+    match { $d: Doc }
+    where search($d.folded, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "cafe"}
+
+--- expect unordered
+{"d.slug": "d2"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_english($q: String) {
+    match { $d: Doc }
+    where search($d.english, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "cafe"}
+
+--- expect unordered
+{"d.slug": "d2"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_legacy($q: String) {
+    match { $d: Doc }
+    where search($d.legacy, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "cafe"}
+
+--- expect unordered
+{"d.slug": "d2"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_standard($q: String) {
+    match { $d: Doc }
+    where search($d.standard, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "pneumonoultramicroscopicsilicovolcanoconiosis"}
+
+--- expect unordered
+{"d.slug": "d3"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_folded($q: String) {
+    match { $d: Doc }
+    where search($d.folded, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "pneumonoultramicroscopicsilicovolcanoconiosis"}
+
+--- expect unordered
+{"d.slug": "d3"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_english($q: String) {
+    match { $d: Doc }
+    where search($d.english, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "pneumonoultramicroscopicsilicovolcanoconiosis"}
+
+--- expect unordered
+{"d.slug": "d3"}
+
+--- expect shape
+d.slug: String
+
+--- query
+query hits_legacy($q: String) {
+    match { $d: Doc }
+    where search($d.legacy, $q)
+    return { $d.slug }
+}
+
+--- params
+{"q": "pneumonoultramicroscopicsilicovolcanoconiosis"}
+
+--- expect unordered
+
+--- expect shape
+d.slug: String
