@@ -20,9 +20,13 @@ use crate::schema::parser::parse_schema;
 use crate::types::{Direction, PropType, ScalarType};
 
 /// The checker tests' schema plus a second Person → Person edge, so that an
-/// alternation has two members of one orientation.
+/// alternation has two members of one orientation, and a node whose
+/// full-text index declares an analyzer.
 fn catalog() -> Catalog {
-    let schema = format!("{}\nedge Likes: Person -> Person\n", super::SCHEMA);
+    let schema = format!(
+        "{}\nedge Likes: Person -> Person\nnode Note {{ slug: String @key  text: String @index(fulltext, analyzer = \"english_v1\") }}\n",
+        super::SCHEMA
+    );
     build_catalog(&parse_schema(&schema).unwrap()).unwrap()
 }
 
@@ -636,6 +640,22 @@ const FORMS: &[(&str, &str)] = &[
         "query f() { match { $p: Person, $q <knows> $p } return { $q } }",
     ),
     (
+        "undirected_both_bound",
+        "query f() { match { $p: Person, $q: Person, $p <knows> $q } return { $q } }",
+    ),
+    (
+        "undirected_both_bound_swapped",
+        "query f() { match { $p: Person, $q: Person, $q <knows> $p } return { $q } }",
+    ),
+    (
+        "undirected_alternation",
+        "query f() { match { $p <knows | likes> $q } return { $q } }",
+    ),
+    (
+        "undirected_alternation_swapped",
+        "query f() { match { $q <likes | knows> $p } return { $q } }",
+    ),
+    (
         "order_asc",
         "query f() { match { $p: Person } return { $p } order { $p.age asc } }",
     ),
@@ -711,6 +731,28 @@ const FORMS: &[(&str, &str)] = &[
         "fuzzy_two_edits",
         "query f($s: String) { match { $d: Doc } where fuzzy($d.body, $s, max_edits: 2) return { $d } }",
     ),
+    // Over a field whose index declares an analyzer the three older lexical
+    // calls are the `match_terms` they mean (section 4, Migration).
+    (
+        "search_declared",
+        "query f($s: String) { match { $n: Note } where search($n.text, $s) return { $n } }",
+    ),
+    (
+        "match_text_declared",
+        "query f($s: String) { match { $n: Note } where match_text($n.text, $s) return { $n } }",
+    ),
+    (
+        "match_terms_any",
+        "query f($s: String) { match { $n: Note } where match_terms($n.text, terms($s, mode: any)) return { $n } }",
+    ),
+    (
+        "fuzzy_declared",
+        "query f($s: String) { match { $n: Note } where fuzzy($n.text, $s) return { $n } }",
+    ),
+    (
+        "match_terms_any_two_edits",
+        "query f($s: String) { match { $n: Note } where match_terms($n.text, terms($s, mode: any, max_edits: 2)) return { $n } }",
+    ),
 ];
 
 /// The formatter's list (section 6): each pair is (non-canonical form,
@@ -725,6 +767,11 @@ const FORMATTER: &[(&str, &str)] = &[
     ("union_nested", "union_flat"),
     ("alternation_reordered", "alternation"),
     ("undirected_ends_swapped", "undirected"),
+    ("undirected_both_bound_swapped", "undirected_both_bound"),
+    ("undirected_alternation_swapped", "undirected_alternation"),
+    ("search_declared", "match_terms_any"),
+    ("match_text_declared", "match_terms_any"),
+    ("fuzzy_declared", "match_terms_any_two_edits"),
     ("order_asc", "order_default"),
     ("alias_same_name", "no_alias"),
     ("bm25_terms_any", "bm25_string"),

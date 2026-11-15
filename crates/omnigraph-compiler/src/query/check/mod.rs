@@ -2787,6 +2787,13 @@ impl Ctx<'_> {
                 *end = self.fresh("a");
             }
         }
+        // `<e>` matches either direction, so its ends are read in one order,
+        // the smaller written name first, whichever end is bound: the typed
+        // term never depends on the order they were written in, which is
+        // the order `queries fmt` writes (section 6).
+        if t.undirected && written.dst < written.src {
+            std::mem::swap(&mut t.src, &mut t.dst);
+        }
         for end in [&t.src, &t.dst] {
             if let Some(c) = sc.local(end).or_else(|| sc.outer_col(end))
                 && matches!(c.ty, Ty::Value(_))
@@ -5292,14 +5299,42 @@ impl Ctx<'_> {
                     // `fuzzy(f, q)` with no budget is two edits, as today.
                     options.push(("max_edits".into(), int_lit(2)));
                 }
-                SExpr::new(
-                    SKind::Call {
-                        func: name.into(),
-                        args,
-                        options,
-                    },
-                    bool_ty(false),
-                )
+                if declares_analyzer(self, sc, &args) {
+                    // Over a field whose index declares an analyzer the three
+                    // calls are `match_terms(f, terms(q, mode: any))`, with
+                    // `fuzzy`'s edit budget (section 4, Migration): one typed
+                    // term for the two spellings, so `queries fmt` writes
+                    // the canonical one without changing the term.
+                    let max_edits = options
+                        .pop()
+                        .map_or_else(|| int_lit(0), |(_, budget)| budget);
+                    SExpr::new(
+                        SKind::Call {
+                            func: "match_terms".into(),
+                            args,
+                            options: vec![
+                                (
+                                    "mode".into(),
+                                    SExpr::new(
+                                        SKind::Lit(Literal::String("any".into())),
+                                        Ty::scalar(ScalarType::String, false),
+                                    ),
+                                ),
+                                ("max_edits".into(), max_edits),
+                            ],
+                        },
+                        bool_ty(false),
+                    )
+                } else {
+                    SExpr::new(
+                        SKind::Call {
+                            func: name.into(),
+                            args,
+                            options,
+                        },
+                        bool_ty(false),
+                    )
+                }
             }
             "match_terms" => {
                 no_options(c)?;
@@ -6055,6 +6090,25 @@ fn is_integer(s: ScalarType) -> bool {
         s,
         ScalarType::I32 | ScalarType::I64 | ScalarType::U32 | ScalarType::U64
     )
+}
+
+/// Whether a lexical call's field, its first typed argument, is a property
+/// of a stored node type whose full-text index declares an analyzer.
+fn declares_analyzer(checker: &Ctx<'_>, sc: &Scope, args: &[SExpr]) -> bool {
+    let Some(SExpr {
+        kind: SKind::Prop { col, prop },
+        ..
+    }) = args.first()
+    else {
+        return false;
+    };
+    let ty = sc.local(col).or_else(|| sc.outer_col(col)).map(|c| &c.ty);
+    matches!(ty, Some(Ty::Node { type_name, .. })
+        if checker
+            .catalog
+            .node_types
+            .get(type_name)
+            .is_some_and(|n| n.full_text_profile(prop).is_some()))
 }
 
 fn int_lit(n: i128) -> SExpr {
