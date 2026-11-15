@@ -26,6 +26,7 @@ use omnigraph_compiler::ir::core::{
 use omnigraph_compiler::ir::expr::{ScalarFunc, TermsMode};
 use omnigraph_compiler::query::syntax::ArithOp;
 use omnigraph_compiler::query::value::{AggFunc, BinaryOp, CompOp, Literal, NOW_PARAM_NAME};
+use omnigraph_compiler::schema::vector::{VectorDistance, is_zero_vector};
 use omnigraph_compiler::traversal::EDGE_TYPE_COLUMN;
 use omnigraph_compiler::types::{Direction, ExprType, ScalarType};
 use serde_json::{Map, Value as Json};
@@ -775,10 +776,10 @@ impl<'a> Interpreter<'a> {
                     (ScoreKind::Distance, ScoreQuery::Vector(q)) => {
                         let q = self.vector(q, env)?;
                         for mut row in input.rows {
-                            let Some(v) = self.field_vector(&row, column, property) else {
+                            let Some(d) = self.field_distance(&row, column, property, &q)? else {
                                 continue;
                             };
-                            row.push((out.clone(), Value::Float(l2(&v, &q))));
+                            row.push((out.clone(), Value::Float(d)));
                             rows.push(row);
                         }
                     }
@@ -819,8 +820,8 @@ impl<'a> Interpreter<'a> {
                     if best.iter().any(|(_, t)| t == &target) {
                         continue;
                     }
-                    if let Some(v) = self.field_vector(row, column, property) {
-                        best.push((l2(&v, &q), target));
+                    if let Some(d) = self.field_distance(row, column, property, &q)? {
+                        best.push((d, target));
                     }
                 }
                 best.sort_by(|a, b| {
@@ -1018,6 +1019,37 @@ impl<'a> Interpreter<'a> {
             Json::Array(items) => items.iter().map(Json::as_f64).collect(),
             _ => None,
         }
+    }
+
+    /// The distance of the row's vector `property` to `q` under the
+    /// field's declared distance, rounded to `F32` as the engine reports it:
+    /// `None` for a null vector and, under `cosine`, a zero vector, which
+    /// drops the row; a zero `q` on a `cosine` field is refused.
+    fn field_distance(&self, row: &Row, column: &str, property: &str, q: &[f64]) -> R<Option<f64>> {
+        let distance = match get(row, column) {
+            Some(Value::Ref {
+                edge: false,
+                type_name,
+                ..
+            }) => self
+                .catalog
+                .node_types
+                .get(type_name)
+                .map(|node_type| node_type.vector_distance(property))
+                .unwrap_or_default(),
+            _ => VectorDistance::L2,
+        };
+        let q: Vec<f32> = q.iter().map(|x| *x as f32).collect();
+        if distance.refuses_zero_vector() && is_zero_vector(&q) {
+            return Err(Refusal::Input(format!(
+                "a zero query vector on a {distance} field"
+            )));
+        }
+        let Some(v) = self.field_vector(row, column, property) else {
+            return Ok(None);
+        };
+        let v: Vec<f32> = v.iter().map(|x| *x as f32).collect();
+        Ok(distance.evaluate(&v, &q).map(f64::from))
     }
 
     fn field_text(&self, row: &Row, column: &str, property: &str) -> Option<String> {
@@ -1400,19 +1432,6 @@ fn tie(a: &Row, b: &Row) -> Ordering {
 
 fn same_row(a: &Row, b: &Row) -> bool {
     a.len() == b.len() && a.iter().all(|(n, v)| get(b, n) == Some(v))
-}
-
-/// Squared Euclidean distance, rounded to `F32` as the engine reports it.
-fn l2(a: &[f64], b: &[f64]) -> f64 {
-    let d: f32 = a
-        .iter()
-        .zip(b)
-        .map(|(x, y)| {
-            let d = *x as f32 - *y as f32;
-            d * d
-        })
-        .sum();
-    f64::from(d)
 }
 
 /// The order a comparison reads: the value order, except that two numbers

@@ -368,9 +368,37 @@ fn resolve_nearest_query(expr: &IRExpr, params: &ParamMap) -> Result<NearestQuer
     Ok(NearestQuery::Vector(values.values().to_vec()))
 }
 
-/// Resolve a nearest query vector, embedding string inputs with the property's
-/// recorded model. Explicit vectors do not require an embedding client.
+/// Resolve the query vector of a `distance` or `nearest`, embedding string
+/// inputs with the property's recorded model. Explicit vectors do not
+/// require an embedding client. A zero vector is refused on a `cosine` field,
+/// whose distance it leaves undefined, here, before the read runs.
 pub(super) async fn resolve_nearest_query_vec(
+    catalog: &Catalog,
+    type_name: &str,
+    property: &str,
+    expr: &IRExpr,
+    params: &ParamMap,
+    embedding: &EmbeddingResolver<'_>,
+) -> Result<Vec<f32>> {
+    let vector =
+        resolve_query_vector(catalog, type_name, property, expr, params, embedding).await?;
+    let distance = catalog
+        .node_types
+        .get(type_name)
+        .map(|node_type| node_type.vector_distance(property))
+        .unwrap_or_default();
+    if distance.refuses_zero_vector() && omnigraph_compiler::schema::vector::is_zero_vector(&vector)
+    {
+        return Err(OmniError::manifest(format!(
+            "the query vector for '{type_name}.{property}' is a zero vector, which its \
+             {distance} distance leaves undefined; a {distance} field ranks only a vector \
+             with a component that is not zero"
+        )));
+    }
+    Ok(vector)
+}
+
+async fn resolve_query_vector(
     catalog: &Catalog,
     type_name: &str,
     property: &str,

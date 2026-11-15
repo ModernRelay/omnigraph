@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod ast;
 pub mod parser;
+pub mod vector;
 
 /// Names owned by Lance's virtual row-address and row-version columns.
 ///

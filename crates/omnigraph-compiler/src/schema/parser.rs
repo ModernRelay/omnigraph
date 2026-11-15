@@ -617,14 +617,16 @@ fn resolve_interfaces(node: &mut NodeDecl, interfaces: &[&InterfaceDecl]) -> Res
             });
             if let Some(existing) = node.properties.iter().find(|p| p.name == iface_prop.name) {
                 // Property exists — verify type compatibility
-                if existing.prop_type != iface_prop.prop_type {
+                if existing.prop_type != iface_prop.prop_type
+                    || existing.distance != iface_prop.distance
+                {
                     return Err(CompilerError::Parse(format!(
                         "node {} property '{}' has type {} but interface {} declares it as {}",
                         node.name,
                         iface_prop.name,
-                        existing.prop_type.display_name(),
+                        declared_type_name(existing),
                         iface_name,
-                        iface_prop.prop_type.display_name()
+                        declared_type_name(iface_prop)
                     )));
                 }
             } else {
@@ -657,7 +659,7 @@ fn parse_prop_decl(pair: pest::iterators::Pair<Rule>) -> Result<PropDecl> {
         )));
     }
     let type_ref = inner.next().unwrap();
-    let prop_type = parse_type_ref(type_ref)?;
+    let (prop_type, distance) = parse_type_ref(type_ref)?;
 
     let mut annotations = Vec::new();
     for item in inner {
@@ -672,10 +674,15 @@ fn parse_prop_decl(pair: pest::iterators::Pair<Rule>) -> Result<PropDecl> {
         name,
         prop_type,
         annotations,
+        distance,
     })
 }
 
-fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
+/// A property's type and, for a vector, the distance its options declare
+/// (`None` for `l2`, written or omitted).
+fn parse_type_ref(
+    pair: pest::iterators::Pair<Rule>,
+) -> Result<(PropType, Option<super::vector::VectorDistance>)> {
     let text = pair.as_str();
     let nullable = text.ends_with('?');
 
@@ -693,14 +700,15 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
         Rule::base_type => {
             let scalar = ScalarType::from_str_name(inner.as_str())
                 .ok_or_else(|| CompilerError::Parse(format!("unknown type: {}", inner.as_str())))?;
-            Ok(PropType::scalar(scalar, nullable))
+            Ok((PropType::scalar(scalar, nullable), None))
         }
         Rule::vector_type => {
-            let dim_text = inner
-                .into_inner()
+            let mut parts = inner.into_inner();
+            let dim_text = parts
                 .next()
                 .ok_or_else(|| CompilerError::Parse("Vector type missing dimension".to_string()))?
                 .as_str();
+            let distance = parse_vector_options(dim_text, parts)?;
             let dim = dim_text
                 .parse::<u32>()
                 .map_err(|e| CompilerError::Parse(format!("invalid Vector dimension: {}", e)))?;
@@ -716,7 +724,10 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
                     i32::MAX
                 )));
             }
-            Ok(PropType::scalar(ScalarType::Vector(dim), nullable))
+            Ok((
+                PropType::scalar(ScalarType::Vector(dim), nullable),
+                distance,
+            ))
         }
         Rule::list_type => {
             let element = inner.into_inner().next().ok_or_else(|| {
@@ -730,7 +741,7 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
                     "list of Blob is not supported".to_string(),
                 ));
             }
-            Ok(PropType::list_of(scalar, nullable))
+            Ok((PropType::list_of(scalar, nullable), None))
         }
         Rule::enum_type => {
             let mut values = Vec::new();
@@ -752,13 +763,74 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
                     "enum type cannot include duplicate values".to_string(),
                 ));
             }
-            Ok(PropType::enum_type(values, nullable))
+            Ok((PropType::enum_type(values, nullable), None))
         }
         other => Err(CompilerError::Parse(format!(
             "unexpected type rule: {:?}",
             other
         ))),
     }
+}
+
+/// A property's type as a refusal names it, its declared distance included.
+fn declared_type_name(property: &PropDecl) -> String {
+    match property.distance {
+        Some(distance) => format!(
+            "{} with distance \"{distance}\"",
+            property.prop_type.display_name()
+        ),
+        None => property.prop_type.display_name(),
+    }
+}
+
+/// The options of `Vector(<dim>, ...)`: `distance = "l2" | "cosine" | "dot"`
+/// and nothing else. Returns the declared distance as a shape records it,
+/// `None` for `l2`, written or omitted.
+fn parse_vector_options(
+    dim: &str,
+    options: pest::iterators::Pairs<Rule>,
+) -> Result<Option<super::vector::VectorDistance>> {
+    use super::vector::{DISTANCE_OPTION, VectorDistance};
+    let mut distance = None;
+    for option in options {
+        if option.as_rule() != Rule::annotation_kwarg {
+            continue;
+        }
+        let mut kw = option.into_inner();
+        let key = kw.next().unwrap().as_str();
+        let raw = kw.next().unwrap().as_str();
+        if key != DISTANCE_OPTION {
+            return Err(CompilerError::Parse(format!(
+                "Vector({dim}) has unknown option '{key} ='; it admits {DISTANCE_OPTION}"
+            )));
+        }
+        if distance.is_some() {
+            return Err(CompilerError::Parse(format!(
+                "Vector({dim}) repeats the option '{DISTANCE_OPTION}'"
+            )));
+        }
+        let names = VectorDistance::NAMES
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let name = raw
+            .starts_with('"')
+            .then(|| decode_string_literal(raw))
+            .transpose()?
+            .ok_or_else(|| {
+                CompilerError::Parse(format!(
+                    "Vector({dim}) {DISTANCE_OPTION} takes a quoted name: {names}"
+                ))
+            })?;
+        let parsed = VectorDistance::parse(&name).ok_or_else(|| {
+            CompilerError::Parse(format!(
+                "Vector({dim}) names the unknown distance \"{name}\"; the distances are {names}"
+            ))
+        })?;
+        distance = Some(parsed);
+    }
+    Ok(distance.and_then(VectorDistance::declared))
 }
 
 fn parse_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {

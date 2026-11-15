@@ -19,6 +19,7 @@ use crate::schema::ast::{
     Annotation, Cardinality, Constraint, InterfacePropertyOrigin, PropDecl, SchemaDecl, SchemaFile,
     rename_from_annotation,
 };
+use crate::schema::vector::VectorDistance;
 use crate::types::PropType;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -142,6 +143,11 @@ pub struct PropertyShape {
     /// schema keeps its shape hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text: Option<FullTextAnalysis>,
+    /// The distance a vector declares beyond `l2`. Absent from the
+    /// serialized shape for `l2`, written or omitted, so an edition 2 schema
+    /// keeps its shape hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance: Option<VectorDistance>,
     /// True only when this effective property was written in the node body.
     /// Interface and edge properties are declarations and therefore true.
     pub declared_directly: bool,
@@ -440,6 +446,7 @@ fn property_shape(property: &PropDecl, declared_directly: bool) -> Result<Proper
         property_constraints,
         embed_source,
         full_text: crate::schema::analysis::declared_analysis(&property.annotations),
+        distance: property.distance.and_then(VectorDistance::declared),
         declared_directly,
         satisfies_interface_properties: Vec::new(),
     })

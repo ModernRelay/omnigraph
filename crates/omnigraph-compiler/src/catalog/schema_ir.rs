@@ -19,6 +19,7 @@ use crate::error::{CompilerError, Result, SchemaIdentityError};
 use crate::schema::analysis::FullTextAnalysis;
 use crate::schema::ast::{Annotation, Cardinality, Constraint, ConstraintBound};
 use crate::schema::is_reserved_storage_system_column;
+use crate::schema::vector::VectorDistance;
 use crate::types::PropType;
 
 use super::schema_shape::{
@@ -60,6 +61,13 @@ pub const FEATURE_EDGE_KEYS: &str = "edge-keys";
 /// field's index with edition 2's analysis and rank a `scorer = "none"` field,
 /// so it refuses the IR instead.
 pub const FEATURE_FULL_TEXT_ANALYSIS: &str = "full-text-analysis";
+
+/// Feature name: a vector property declares a distance other than `l2`
+/// (`Vector(n, distance = "cosine" | "dot")`, docs/rfcs/2026-11-07-gq-3.md
+/// section 4). Derived from the declarations at every accept; a binary that
+/// does not know it would score, rank and index the field by `l2` and admit
+/// a zero vector into a `cosine` field, so it refuses the IR instead.
+pub const FEATURE_VECTOR_DISTANCE: &str = "vector-distance";
 
 /// The per-graph spellings of the implicit stored columns. Resolved from the
 /// accepted IR's feature set; no other code path may assume a spelling
@@ -113,6 +121,7 @@ pub fn is_known_feature(name: &str) -> bool {
     name == FEATURE_SYSTEM_COLUMNS
         || name == FEATURE_EDGE_KEYS
         || name == FEATURE_FULL_TEXT_ANALYSIS
+        || name == FEATURE_VECTOR_DISTANCE
 }
 
 /// The feature set an accepted schema must carry: the names its declarations
@@ -140,6 +149,16 @@ pub fn required_features(ir: &SchemaIR) -> BTreeSet<String> {
         .any(|property| property.full_text.is_some());
     if declares_analysis {
         features.insert(FEATURE_FULL_TEXT_ANALYSIS.to_string());
+    }
+    let declares_distance = ir
+        .interfaces
+        .iter()
+        .flat_map(|interface| &interface.properties)
+        .chain(ir.nodes.iter().flat_map(|node| &node.properties))
+        .chain(ir.edges.iter().flat_map(|edge| &edge.properties))
+        .any(|property| property.distance.is_some());
+    if declares_distance {
+        features.insert(FEATURE_VECTOR_DISTANCE.to_string());
     }
     features
 }
@@ -449,11 +468,21 @@ pub struct PropertyIR {
     /// anew. Absent, and absent from the serialized IR, when edition 2's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text: Option<FullTextAnalysis>,
+    /// The distance a vector declares beyond `l2`: the resolved distance as
+    /// accepted, where absent, here and in the serialized IR, is `l2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance: Option<VectorDistance>,
     pub declared_directly: bool,
     pub satisfies_interface_properties: Vec<PropertyRefIR>,
 }
 
 impl PropertyIR {
+    /// The resolved distance of this property's vectors: the declared one,
+    /// `l2` when none is recorded.
+    pub fn vector_distance(&self) -> VectorDistance {
+        self.distance.unwrap_or_default()
+    }
+
     /// The analyzer fingerprint of this property's declared profile, `None`
     /// when its full-text index keeps edition 2's analysis.
     pub fn full_text_fingerprint(&self) -> Option<String> {
@@ -1110,6 +1139,7 @@ fn build_properties(
                 property_constraints: property.property_constraints.clone(),
                 embed_source,
                 full_text: property.full_text,
+                distance: property.distance,
                 declared_directly: property.declared_directly,
                 satisfies_interface_properties,
             })
@@ -1374,6 +1404,7 @@ fn property_shape_from_ir(property: &PropertyIR) -> PropertyShape {
                 model: embed.model.clone(),
             }),
         full_text: property.full_text,
+        distance: property.distance,
         declared_directly: property.declared_directly,
         satisfies_interface_properties,
     }
@@ -1590,6 +1621,24 @@ pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
                     ));
                 }
             }
+            if let Some(distance) = property.distance {
+                if distance == VectorDistance::L2 {
+                    return invalid_ir(format!(
+                        "property '{}.{}' records the distance l2, which accepted IR records as absent",
+                        entry.name, property.name
+                    ));
+                }
+                if !matches!(
+                    property.prop_type.scalar,
+                    crate::types::ScalarType::Vector(_)
+                ) || property.prop_type.list
+                {
+                    return invalid_ir(format!(
+                        "property '{}.{}' declares a vector distance but is not a Vector",
+                        entry.name, property.name
+                    ));
+                }
+            }
             if property
                 .property_constraints
                 .windows(2)
@@ -1696,7 +1745,9 @@ pub fn validate_schema_ir(ir: &SchemaIR) -> Result<()> {
                     ));
                 }
                 let (_, interface_property) = property_by_id[&reference.property_id];
-                if interface_property.prop_type != property.prop_type {
+                if interface_property.prop_type != property.prop_type
+                    || interface_property.distance != property.distance
+                {
                     return invalid_ir(format!(
                         "node property '{}.{}' is incompatible with satisfied interface property '{}.{}'",
                         node.name,
@@ -2160,6 +2211,92 @@ mod tests {
             .property_constraints
             .clear();
         assert!(validate_schema_ir(&unindexed).is_err());
+    }
+
+    /// A declared distance is persisted on the property and stamps the
+    /// `vector-distance` feature an older binary refuses; `l2`, written or
+    /// omitted, is recorded absent, so an edition 2 schema keeps its bytes.
+    /// A rename keeps the distance.
+    #[test]
+    fn vector_distance_is_persisted_and_l2_is_recorded_absent() {
+        use crate::schema::vector::VectorDistance;
+        let property = |ir: &SchemaIR, name: &str| {
+            ir.nodes[0]
+                .properties
+                .iter()
+                .find(|property| property.name == name)
+                .unwrap()
+                .clone()
+        };
+        let accepted = initialize(
+            r#"node Doc { slug: String @key e: Vector(3, distance = "cosine") @index }"#,
+        );
+        assert!(accepted.features.contains(FEATURE_VECTOR_DISTANCE));
+        assert_eq!(
+            property(&accepted, "e").distance,
+            Some(VectorDistance::Cosine)
+        );
+        assert_eq!(
+            property(&accepted, "e").vector_distance(),
+            VectorDistance::Cosine
+        );
+        assert!(
+            schema_ir_json(&accepted)
+                .unwrap()
+                .contains(r#""distance":"cosine""#)
+        );
+        assert_eq!(
+            build_catalog_from_ir(&accepted).unwrap().node_types["Doc"].vector_distance("e"),
+            VectorDistance::Cosine
+        );
+
+        let evolve = |source: &str| {
+            let shape = compile_schema_shape(&parse_schema(source).unwrap()).unwrap();
+            resolve_schema_ir(&accepted, &shape).unwrap().schema_ir
+        };
+        let renamed = evolve(
+            r#"node Doc { slug: String @key f: Vector(3, distance = "cosine") @rename_from("e") @index }"#,
+        );
+        assert_eq!(
+            property(&renamed, "f").distance,
+            Some(VectorDistance::Cosine)
+        );
+
+        let omitted = initialize(r#"node Doc { slug: String @key e: Vector(3) }"#);
+        let written = initialize(r#"node Doc { slug: String @key e: Vector(3, distance = "l2") }"#);
+        assert!(!omitted.features.contains(FEATURE_VECTOR_DISTANCE));
+        assert!(!schema_ir_json(&omitted).unwrap().contains("distance"));
+        assert_eq!(
+            schema_ir_json(&omitted).unwrap(),
+            schema_ir_json(&written).unwrap()
+        );
+        assert_eq!(
+            property(&omitted, "e").vector_distance(),
+            VectorDistance::L2
+        );
+
+        // The feature set is derived and the record canonical: a stripped
+        // feature, an explicit `l2` and a distance on a non-vector refuse.
+        let mut stripped = accepted.clone();
+        stripped.features.remove(FEATURE_VECTOR_DISTANCE);
+        assert!(validate_schema_ir(&stripped).is_err());
+        let mut explicit_l2 = accepted.clone();
+        explicit_l2.features.remove(FEATURE_VECTOR_DISTANCE);
+        explicit_l2.nodes[0]
+            .properties
+            .iter_mut()
+            .find(|property| property.name == "e")
+            .unwrap()
+            .distance = Some(VectorDistance::L2);
+        assert!(validate_schema_ir(&explicit_l2).is_err());
+        let mut on_text = accepted.clone();
+        on_text.nodes[0]
+            .properties
+            .iter_mut()
+            .find(|property| property.name == "slug")
+            .unwrap()
+            .distance = Some(VectorDistance::Dot);
+        assert!(validate_schema_ir(&on_text).is_err());
     }
 
     #[test]

@@ -4002,6 +4002,56 @@ pub(crate) fn enum_constraint_failures(
         .collect()
 }
 
+/// Every vector property of `distances` whose declared distance leaves a
+/// zero vector undefined (`cosine`) with a zero vector in `batch`: one entry
+/// per property, the properties ordered by name, the property's index in that
+/// order, its first offending row and the refusal. A null is not a vector and
+/// passes.
+pub(crate) fn zero_vector_failures(
+    batch: &RecordBatch,
+    distances: &HashMap<String, omnigraph_compiler::schema::vector::VectorDistance>,
+    type_name: &str,
+) -> Vec<(usize, usize, OmniError)> {
+    use arrow_array::{Array, FixedSizeListArray, Float32Array};
+
+    let mut refusing: Vec<_> = distances
+        .iter()
+        .filter(|(_, distance)| distance.refuses_zero_vector())
+        .collect();
+    refusing.sort_by(|a, b| a.0.cmp(b.0));
+    refusing
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (property, distance))| {
+            let vectors = batch
+                .column_by_name(property)?
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()?;
+            let values = vectors.values().as_any().downcast_ref::<Float32Array>()?;
+            let width = usize::try_from(vectors.value_length()).ok()?;
+            (0..vectors.len())
+                .filter(|&row| !vectors.is_null(row))
+                .find(|&row| {
+                    let start = vectors.value_offset(row) as usize;
+                    omnigraph_compiler::schema::vector::is_zero_vector(
+                        &values.values()[start..start + width],
+                    )
+                })
+                .map(|row| {
+                    (
+                        index,
+                        row,
+                        OmniError::manifest(format!(
+                            "{type_name}.{property} declares the {distance} distance, which \
+                             a zero vector leaves undefined; store a vector with a component \
+                             that is not zero, or null"
+                        )),
+                    )
+                })
+        })
+        .collect()
+}
+
 /// Build the composite uniqueness key for `row` over a constraint group's
 /// already-resolved columns (in declaration order).
 ///
@@ -5569,6 +5619,7 @@ node Doc {
             embed_sources: Default::default(),
             full_text_analysis: Default::default(),
             full_text_fingerprints: Default::default(),
+            vector_distances: Default::default(),
             blob_properties: Default::default(),
             arrow_schema: schema,
         };

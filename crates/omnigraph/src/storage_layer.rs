@@ -243,8 +243,11 @@ pub enum IndexBuildSpec {
         column: String,
         analysis: FullTextBuild,
     },
+    /// An IVF_FLAT index built for the column's declared distance; it
+    /// replaces every vector index on the column.
     Vector {
         column: String,
+        distance: omnigraph_compiler::schema::vector::VectorDistance,
     },
 }
 
@@ -1022,7 +1025,14 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     /// Whether a full-text segment on `column` holds postings; an untrained
     /// declaration segment does not.
     async fn has_fts_postings(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
-    async fn has_vector_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
+    /// Whether `column` has a vector index and every vector index on it is
+    /// built for `distance`, the field's declared distance.
+    async fn has_vector_index_for(
+        &self,
+        snapshot: &SnapshotHandle,
+        column: &str,
+        distance: omnigraph_compiler::schema::vector::VectorDistance,
+    ) -> Result<bool>;
 
     // ── URI helpers ────────────────────────────────────────────────────
     //
@@ -1753,8 +1763,13 @@ impl TableStorage for TableStore {
         TableStore::has_fts_postings(self, snapshot.dataset(), column).await
     }
 
-    async fn has_vector_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool> {
-        TableStore::has_vector_index(self, snapshot.dataset(), column).await
+    async fn has_vector_index_for(
+        &self,
+        snapshot: &SnapshotHandle,
+        column: &str,
+        distance: omnigraph_compiler::schema::vector::VectorDistance,
+    ) -> Result<bool> {
+        TableStore::has_vector_index_for(self, snapshot.dataset(), column, distance).await
     }
 
     fn root_uri(&self) -> &str {

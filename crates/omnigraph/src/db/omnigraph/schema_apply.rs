@@ -466,7 +466,13 @@ where
                         .insert(property_name.clone());
                 }
             }
-            SchemaMigrationStep::AddConstraint { .. }
+            // A changed distance is metadata-only: no stored vector
+            // changes, and an index built for the old distance is never
+            // used for the new one (the scan checks the index's metric
+            // against the field's), so reads take the exact path until
+            // `ensure_indices`/`optimize` rebuilds it with the new distance.
+            SchemaMigrationStep::ChangeVectorDistance { .. }
+            | SchemaMigrationStep::AddConstraint { .. }
             | SchemaMigrationStep::ExtendEnum { .. }
             | SchemaMigrationStep::UpdateTypeMetadata { .. }
             | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}

@@ -898,7 +898,24 @@ impl Lower for Walk<'_, '_> {
             "{binding}.{}",
             omnigraph_compiler::query::value::DISTANCE_COLUMN
         );
-        let exec = ScoreExec::try_new(input, column, score, Arc::new(vector.clone()))?;
+        let PhysicalNode::Score { type_name, .. } = self.lowering.node(id)? else {
+            return Err(OmniError::manifest_internal(format!(
+                "the score {id} of `${binding}.{property}` is not a Score node"
+            ))
+            .into());
+        };
+        let distance = self
+            .lowering
+            .catalog
+            .node_types
+            .get(type_name)
+            .map(|node_type| node_type.vector_distance(property))
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "the score {id} reads `{type_name}.{property}`, which the catalog does not declare"
+                ))
+            })?;
+        let exec = ScoreExec::try_new(input, column, score, Arc::new(vector.clone()), distance)?;
         self.built(id, exec)
     }
 

@@ -903,6 +903,21 @@ pub(crate) fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             render_full_text_analysis(from.as_ref()),
             render_full_text_analysis(to.as_ref())
         ),
+        SchemaMigrationStep::ChangeVectorDistance {
+            type_kind,
+            type_name,
+            property_name,
+            from,
+            to,
+        } => format!(
+            "change vector distance of '{}.{}' on {} '{}' ({} -> {}); its index is rebuilt by `index build` or `optimize`",
+            type_name,
+            property_name,
+            schema_type_kind_label(*type_kind),
+            type_name,
+            from,
+            to
+        ),
         SchemaMigrationStep::RequireProperty {
             type_kind,
             type_name,

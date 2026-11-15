@@ -1349,6 +1349,85 @@ embedding: Vector(3)
     }
 }
 
+/// `Vector(n, distance = "l2" | "cosine" | "dot")` declares the distance
+/// `distance` and `nearest` read; an omitted or written `l2` is recorded
+/// absent, so it means what `Vector(n)` means.
+#[test]
+fn vector_type_declares_its_distance() {
+    use crate::schema::vector::VectorDistance;
+    let input = r#"
+interface Embedded {
+    embedding: Vector(4, distance = "cosine")?
+}
+node Doc implements Embedded {
+    slug: String @key
+    plain: Vector(4)
+    l2: Vector(4, distance = "l2")
+    dot: Vector(4, distance = "dot") @index
+}
+edge Similar: Doc -> Doc {
+    signal: Vector(2, distance = "cosine")
+}
+"#;
+    let schema = parse_schema(input).unwrap();
+    let node = schema
+        .declarations
+        .iter()
+        .find_map(|decl| match decl {
+            SchemaDecl::Node(node) => Some(node),
+            _ => None,
+        })
+        .unwrap();
+    let distance = |name: &str| {
+        node.properties
+            .iter()
+            .find(|property| property.name == name)
+            .unwrap()
+            .distance
+    };
+    assert_eq!(distance("plain"), None);
+    assert_eq!(distance("l2"), None);
+    assert_eq!(distance("dot"), Some(VectorDistance::Dot));
+    assert_eq!(distance("embedding"), Some(VectorDistance::Cosine));
+    let catalog = crate::catalog::build_catalog(&schema).unwrap();
+    let doc = &catalog.node_types["Doc"];
+    assert_eq!(doc.vector_distance("plain"), VectorDistance::L2);
+    assert_eq!(doc.vector_distance("l2"), VectorDistance::L2);
+    assert_eq!(doc.vector_distance("dot"), VectorDistance::Dot);
+    assert_eq!(doc.vector_distance("embedding"), VectorDistance::Cosine);
+    assert_eq!(
+        catalog.edge_types["Similar"].vector_distance("signal"),
+        VectorDistance::Cosine
+    );
+
+    for (source, needle) in [
+        (
+            r#"node Doc { e: Vector(3, distance = "euclidean") }"#,
+            r#"unknown distance "euclidean"; the distances are "l2", "cosine", "dot""#,
+        ),
+        (
+            r#"node Doc { e: Vector(3, metric = "cosine") }"#,
+            "unknown option 'metric ='; it admits distance",
+        ),
+        (
+            r#"node Doc { e: Vector(3, distance = "dot", distance = "dot") }"#,
+            "repeats the option 'distance'",
+        ),
+        (
+            r#"node Doc { e: Vector(3, distance = 2) }"#,
+            "distance takes a quoted name",
+        ),
+        (
+            r#"interface I { e: Vector(3, distance = "cosine") }
+node Doc implements I { e: Vector(3) }"#,
+            r#"interface I declares it as Vector(3) with distance "cosine""#,
+        ),
+    ] {
+        let error = parse_schema(source).unwrap_err().to_string();
+        assert!(error.contains(needle), "{source}: {error}");
+    }
+}
+
 #[test]
 fn test_reject_zero_vector_dimension() {
     let input = r#"

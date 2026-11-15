@@ -5,10 +5,12 @@
 //! `distance(rel, $x.f, q)`: every input row leaves with the distance of its
 //! vector to the query vector appended under the scored binding's
 //! `_distance` column, `F32`; a row whose vector is null drops. The distance
-//! is the field's declared one, `l2` (the sum of squared component
-//! differences, no square root), the only one a schema declares in this
-//! release. A non-finite stored component, query component or result is
-//! refused with `E3`.
+//! is the field's declared one (`l2`, `cosine` or `dot`,
+//! [`VectorDistance::evaluate`]); under `cosine` a stored zero vector drops
+//! its row as a null does, the row `nearest` leaves out too, and a zero
+//! query vector is refused when the plan is bound, before the read runs. A
+//! non-finite stored component, query component or result is refused with
+//! `E3`.
 //!
 //! `bm25` on a field whose index declares an analyzer: every input row whose
 //! identity is among the exact lexical scan's matches leaves with its
@@ -33,6 +35,7 @@ use datafusion::physical_plan::{
 };
 use omnigraph_compiler::query::codes::E3;
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
+use omnigraph_compiler::schema::vector::VectorDistance;
 
 use super::external;
 use super::memory::WorkMemory;
@@ -57,7 +60,7 @@ pub(crate) struct ScoreExec {
 /// lexical scan's `bm25_v1` scores by identity.
 #[derive(Clone)]
 enum ScoreSource {
-    Distance(Arc<Vec<f32>>),
+    Distance(Arc<Vec<f32>>, VectorDistance),
     Bm25(Arc<HashMap<String, f64>>),
 }
 
@@ -96,11 +99,14 @@ impl ScoreExec {
         })
     }
 
+    /// `distance` of `column` to `query` under `distance`, the field's
+    /// declared distance, appended as `score`.
     pub(crate) fn try_new(
         input: Arc<dyn ExecutionPlan>,
         column: String,
         score: String,
         query: Arc<Vec<f32>>,
+        distance: VectorDistance,
     ) -> Result<Self> {
         if let Some(position) = query.iter().position(|value| !value.is_finite()) {
             return Err(non_finite(format!(
@@ -131,7 +137,7 @@ impl ScoreExec {
             input,
             column,
             score,
-            source: ScoreSource::Distance(query),
+            source: ScoreSource::Distance(query, distance),
             shape,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -186,9 +192,14 @@ fn non_finite(message: String) -> OmniError {
     ))
 }
 
-/// The squared `l2` distance of each row's vector to `query`, and the mask
-/// of the rows whose vector is not null.
-fn distances(vectors: &FixedSizeListArray, query: &[f32]) -> Result<(Float32Array, BooleanArray)> {
+/// The `distance` of each row's vector to `query`, and the mask of the rows
+/// whose vector is not null and inside the distance's domain (a `cosine`
+/// zero vector is not).
+fn distances(
+    vectors: &FixedSizeListArray,
+    query: &[f32],
+    distance: VectorDistance,
+) -> Result<(Float32Array, BooleanArray)> {
     let values = vectors
         .values()
         .as_any()
@@ -204,23 +215,25 @@ fn distances(vectors: &FixedSizeListArray, query: &[f32]) -> Result<(Float32Arra
             continue;
         }
         let start = vectors.value_offset(row) as usize;
-        let mut sum = 0.0f32;
-        for (i, q) in query.iter().enumerate() {
-            let value = values.value(start + i);
-            if !value.is_finite() || values.is_null(start + i) {
+        for i in 0..width {
+            if values.is_null(start + i) || !values.value(start + i).is_finite() {
                 return Err(non_finite(format!(
                     "a stored vector scored by `distance` holds a non-finite component at {i}"
                 )));
             }
-            let difference = value - q;
-            sum += difference * difference;
         }
-        if !sum.is_finite() {
+        let vector = &values.values()[start..start + width];
+        let Some(value) = distance.evaluate(vector, query) else {
+            out.push(0.0);
+            keep.push(false);
+            continue;
+        };
+        if !value.is_finite() {
             return Err(non_finite(format!(
-                "`distance` over {width} components is not finite"
+                "`distance` ({distance}) over {width} components is not finite"
             )));
         }
-        out.push(sum);
+        out.push(value);
         keep.push(true);
     }
     Ok((Float32Array::from(out), BooleanArray::from(keep)))
@@ -232,6 +245,7 @@ fn scored(
     batch: &RecordBatch,
     column: usize,
     query: &[f32],
+    distance: VectorDistance,
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
     let vectors = batch
@@ -239,7 +253,7 @@ fn scored(
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
         .ok_or_else(|| OmniError::manifest_internal("the scored column is not a vector"))?;
-    let (scores, keep) = distances(vectors, query)?;
+    let (scores, keep) = distances(vectors, query, distance)?;
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     columns.push(Arc::new(scores));
     let whole =
@@ -262,9 +276,9 @@ impl fmt::Debug for ScoreExec {
 impl DisplayAs for ScoreExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.source {
-            ScoreSource::Distance(query) => write!(
+            ScoreSource::Distance(query, distance) => write!(
                 f,
-                "ScoreExec: {}=l2({}, query of {})",
+                "ScoreExec: {}={distance}({}, query of {})",
                 self.score,
                 self.column,
                 query.len()
@@ -305,11 +319,12 @@ impl ExecutionPlan for ScoreExec {
         let child = children.pop().expect("one child");
         Ok(Arc::new(
             match &self.source {
-                ScoreSource::Distance(query) => Self::try_new(
+                ScoreSource::Distance(query, distance) => Self::try_new(
                     child,
                     self.column.clone(),
                     self.score.clone(),
                     Arc::clone(query),
+                    *distance,
                 ),
                 ScoreSource::Bm25(scores) => Self::bm25(
                     child,
@@ -335,7 +350,9 @@ impl ExecutionPlan for ScoreExec {
         let schema = self.schema();
         Ok(self.shape.map(&self.metrics, input, move |batch| {
             let out = match &source {
-                ScoreSource::Distance(query) => scored(&batch, column, query, &schema),
+                ScoreSource::Distance(query, distance) => {
+                    scored(&batch, column, query, *distance, &schema)
+                }
                 ScoreSource::Bm25(scores) => lexically_scored(&batch, column, scores, &schema),
             }
             .map_err(external)?;
@@ -365,19 +382,49 @@ mod tests {
             None,
             Some(vec![Some(0.0), Some(3.0)]),
         ]);
-        let (scores, keep) = distances(&rows, &[0.0, 1.0]).unwrap();
+        let (scores, keep) = distances(&rows, &[0.0, 1.0], VectorDistance::L2).unwrap();
         assert_eq!(keep, BooleanArray::from(vec![true, false, true]));
         assert_eq!(scores.value(0), 2.0);
         assert_eq!(scores.value(2), 4.0);
     }
 
+    /// The field's declared distance decides the value: `cosine` is one
+    /// minus the cosine and drops a stored zero vector as a null, `dot` is
+    /// one minus the dot product and can be negative.
+    #[test]
+    fn a_distance_is_the_fields_declared_distance_and_cosine_drops_a_zero_vector() {
+        let rows = vectors(vec![
+            Some(vec![Some(2.0), Some(0.0)]),
+            Some(vec![Some(0.0), Some(-0.0)]),
+            Some(vec![Some(0.0), Some(4.0)]),
+            None,
+        ]);
+        let (scores, keep) = distances(&rows, &[1.0, 0.0], VectorDistance::Cosine).unwrap();
+        assert_eq!(keep, BooleanArray::from(vec![true, false, true, false]));
+        assert_eq!(scores.value(0), 0.0);
+        assert_eq!(scores.value(2), 1.0);
+        let (scores, keep) = distances(&rows, &[1.0, 0.0], VectorDistance::Dot).unwrap();
+        assert_eq!(keep, BooleanArray::from(vec![true, true, true, false]));
+        assert_eq!(scores.value(0), -1.0);
+        assert_eq!(scores.value(1), 1.0);
+        assert_eq!(scores.value(2), 1.0);
+    }
+
     #[test]
     fn a_non_finite_component_is_e3() {
-        let rows = vectors(vec![Some(vec![Some(f32::NAN), Some(0.0)])]);
-        let error = distances(&rows, &[0.0, 1.0]).unwrap_err();
-        assert!(error.to_string().contains("E3"), "{error}");
+        for distance in [
+            VectorDistance::L2,
+            VectorDistance::Cosine,
+            VectorDistance::Dot,
+        ] {
+            let rows = vectors(vec![Some(vec![Some(f32::NAN), Some(0.0)])]);
+            let error = distances(&rows, &[0.0, 1.0], distance).unwrap_err();
+            assert!(error.to_string().contains("E3"), "{error}");
+        }
         let huge = vectors(vec![Some(vec![Some(f32::MAX), Some(0.0)])]);
-        let error = distances(&huge, &[-f32::MAX, 0.0]).unwrap_err();
+        let error = distances(&huge, &[-f32::MAX, 0.0], VectorDistance::L2).unwrap_err();
+        assert!(error.to_string().contains("E3"), "{error}");
+        let error = distances(&huge, &[f32::MAX, 0.0], VectorDistance::Dot).unwrap_err();
         assert!(error.to_string().contains("E3"), "{error}");
     }
 }

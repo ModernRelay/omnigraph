@@ -670,7 +670,7 @@ async fn maintain_indices_for_branch(
                     crate::storage_layer::IndexBuildSpec::FullText { column, .. } => {
                         (column, BuiltIndexKind::FullText)
                     }
-                    crate::storage_layer::IndexBuildSpec::Vector { column } => {
+                    crate::storage_layer::IndexBuildSpec::Vector { column, .. } => {
                         (column, BuiltIndexKind::Vector)
                     }
                 };
@@ -1057,11 +1057,20 @@ async fn plan_index_work_node(
                     });
                 }
             }
+            // A vector index is built for the field's declared distance; one
+            // built for another distance (the field's distance changed) is
+            // never used, so it is built anew, replacing the old one.
             Some(PropIndexKind::Vector) => {
-                if !db.storage().has_vector_index(ds, prop_name).await? {
+                let distance = node_type.vector_distance(prop_name);
+                if !db
+                    .storage()
+                    .has_vector_index_for(ds, prop_name, distance)
+                    .await?
+                {
                     if vector_column_trainable(db, ds, prop_name).await? {
                         work.push_spec(crate::storage_layer::IndexBuildSpec::Vector {
                             column: prop_name.clone(),
+                            distance,
                         });
                     } else {
                         work.pending.push(PendingIndex {

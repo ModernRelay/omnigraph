@@ -61,6 +61,7 @@ use lance_select::mask::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use omnigraph_compiler::SystemColumns;
+use omnigraph_compiler::schema::vector::VectorDistance;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::{num::NonZero, sync::Arc};
 
@@ -389,18 +390,21 @@ impl ScanTuning<'_> {
         Ok(self)
     }
 
-    /// A kNN over `column` by squared L2, the metric `nearest` promises.
-    /// Without an explicit metric Lance ranks by the metric of whatever
-    /// vector index covers the column; with one it searches an index of
-    /// another metric flat instead (Lance 13 `Scanner::create_plan`).
+    /// A kNN over `column` by `distance`, the field's declared distance,
+    /// which `nearest` promises. Without an explicit metric Lance ranks by
+    /// the metric of whatever vector index covers the column; with one it
+    /// searches an index of another metric flat instead (Lance 13
+    /// `Scanner::create_plan`), so an index built for another distance is
+    /// never used.
     pub(crate) fn nearest(
         &mut self,
         column: &str,
         query: &dyn Array,
         limit: usize,
+        distance: VectorDistance,
     ) -> std::result::Result<&mut Self, lance::Error> {
         self.scanner.nearest(column, query, limit)?;
-        self.scanner.distance_metric(MetricType::L2);
+        self.scanner.distance_metric(metric_type(distance));
         Ok(self)
     }
 
@@ -1055,6 +1059,9 @@ struct IndexLag {
     name: String,
     fields: Vec<i32>,
     vector: bool,
+    /// The distance a vector index ranks by exactly, which its fold keeps;
+    /// `None` for any other index.
+    distance: Option<VectorDistance>,
 }
 
 /// A staged index fold: the `CreateIndex` to commit detached, if any index
@@ -1082,6 +1089,79 @@ pub struct StagedIndexReconciliation {
 pub struct RefreshedIndex {
     pub column: String,
     pub vector: bool,
+}
+
+/// The Lance metric a field's declared distance names: Lance's `l2` is the
+/// sum of squared differences, its `cosine` is `1 - cos` and its `dot` is
+/// `1 - dot` (`lance_linalg::distance`), the values the RFC's table states.
+pub(crate) fn metric_type(distance: VectorDistance) -> MetricType {
+    match distance {
+        VectorDistance::L2 => MetricType::L2,
+        VectorDistance::Cosine => MetricType::Cosine,
+        VectorDistance::Dot => MetricType::Dot,
+    }
+}
+
+/// The distance a vector index segment scores every row of each partition
+/// it searches by exactly: IVF with unquantized vectors (IVF_FLAT) and the
+/// L2, cosine or dot metric, the only vector index the engine builds. `None`
+/// for a segment with quantized vectors (PQ, SQ, RQ), an HNSW graph or
+/// another metric, which approximate or rank differently, and for one whose
+/// details are empty: Lance infers missing details when it loads indices,
+/// and an empty value left after that is unknown, not the proto defaults
+/// (L2, no compression) it would decode to. Details carrying a field this
+/// Lance does not know are not exact either: the decoder drops the field,
+/// which may be a newer sub-index (an IVF_VAMANA_FLAT index adds
+/// `vamana_index_config`, lance#10318), so the re-encoded details must be
+/// as long as the stored ones.
+pub(crate) fn exact_vector_index_distance(index: &IndexMetadata) -> Option<VectorDistance> {
+    use lance_index::pb::{
+        VectorIndexDetails, VectorMetricType, vector_index_details::Compression,
+    };
+    let details = index.index_details.as_ref()?;
+    if details.value.is_empty() || !IndexDetails(details.clone()).is_vector() {
+        return None;
+    }
+    let decoded = details.to_msg::<VectorIndexDetails>().ok()?;
+    if prost::Message::encoded_len(&decoded) != details.value.len() {
+        return None;
+    }
+    if decoded.hnsw_index_config.is_some()
+        || !matches!(decoded.compression, None | Some(Compression::Flat(_)))
+    {
+        return None;
+    }
+    match VectorMetricType::try_from(decoded.metric_type).ok()? {
+        VectorMetricType::L2 => Some(VectorDistance::L2),
+        VectorMetricType::Cosine => Some(VectorDistance::Cosine),
+        VectorMetricType::Dot => Some(VectorDistance::Dot),
+        _ => None,
+    }
+}
+
+/// Whether every vector index segment keyed on `column` of `dataset` ranks
+/// exactly by `distance` ([`exact_vector_index_distance`]); true when no
+/// vector index covers the column, since Lance then scores every row flat.
+pub(crate) async fn vector_indexes_rank_exactly(
+    dataset: &Dataset,
+    column: &str,
+    distance: VectorDistance,
+) -> Result<bool> {
+    let Some(field) = dataset.schema().field(column) else {
+        return Ok(true);
+    };
+    let indices = dataset.load_indices().await.map_err(OmniError::storage)?;
+    Ok(indices
+        .iter()
+        .filter(|index| !is_system_index(index))
+        .filter(|index| index.fields.first() == Some(&field.id))
+        .filter(|index| {
+            index
+                .index_details
+                .as_ref()
+                .is_none_or(|details| IndexDetails(details.clone()).is_vector())
+        })
+        .all(|index| exact_vector_index_distance(index) == Some(distance)))
 }
 
 /// The segments one index batch adds and the segments they replace, all
@@ -3356,6 +3436,7 @@ impl TableStore {
                 name,
                 fields: segments[0].fields.clone(),
                 vector,
+                distance: exact_vector_index_distance(segments[0]),
             });
         }
         Ok(lag)
@@ -3387,7 +3468,17 @@ impl TableStore {
         ds: &Dataset,
         specs: &[IndexBuildSpec],
     ) -> Result<StagedIndexReconciliation> {
-        let (mut batch, refreshed, skipped) = Self::index_fold_batch(ds).await?;
+        // A vector column a spec builds anew (its index is missing or was
+        // built for another distance) is not also folded: the spec's index
+        // replaces every vector index on the column.
+        let rebuilt: HashSet<&str> = specs
+            .iter()
+            .filter_map(|spec| match spec {
+                IndexBuildSpec::Vector { column, .. } => Some(column.as_str()),
+                _ => None,
+            })
+            .collect();
+        let (mut batch, refreshed, skipped) = Self::index_fold_batch_except(ds, &rebuilt).await?;
         let mut vector_builds = 0;
         if !specs.is_empty() {
             let (created, builds) = Self::create_index_batch(ds, specs).await?;
@@ -3412,7 +3503,24 @@ impl TableStore {
     async fn index_fold_batch(
         ds: &Dataset,
     ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
-        let lag = Self::foldable_index_lag(ds).await?;
+        Self::index_fold_batch_except(ds, &HashSet::new()).await
+    }
+
+    /// [`Self::index_fold_batch`] leaving out the indexes on `columns`.
+    async fn index_fold_batch_except(
+        ds: &Dataset,
+        columns: &HashSet<&str>,
+    ) -> Result<(IndexBatch, Vec<RefreshedIndex>, Vec<(String, String)>)> {
+        let lag: Vec<IndexLag> = Self::foldable_index_lag(ds)
+            .await?
+            .into_iter()
+            .filter(|item| {
+                item.fields
+                    .first()
+                    .and_then(|id| ds.schema().field_by_id(*id))
+                    .is_none_or(|field| !columns.contains(field.name.as_str()))
+            })
+            .collect();
         if lag.is_empty() {
             return Ok((IndexBatch::default(), Vec::new(), Vec::new()));
         }
@@ -3437,9 +3545,15 @@ impl TableStore {
                 // Keep the index's partition count: the engine builds one
                 // partition, but a partitioned index (Lance's split, or an
                 // explicit build) keeps its shape across folds.
+                // The fold keeps the index's distance; an index that is not
+                // an exact IVF_FLAT (one the engine never builds) is rebuilt
+                // by `l2`, and the reconciler replaces any index whose
+                // distance is not its field's.
                 let partitions = Self::vector_partition_count(ds, &item.name).await?;
-                let params =
-                    lance::index::vector::VectorIndexParams::ivf_flat(partitions, MetricType::L2);
+                let params = lance::index::vector::VectorIndexParams::ivf_flat(
+                    partitions,
+                    metric_type(item.distance.unwrap_or_default()),
+                );
                 ds_clone
                     .create_index_builder(&columns, IndexType::Vector, &params)
                     .name(item.name.clone())
@@ -6046,12 +6160,13 @@ impl TableStore {
         let mut new_names = std::collections::HashSet::with_capacity(specs.len());
         let mut vector_builds = 0usize;
         let mut full_text_fields = HashSet::new();
+        let mut vector_fields = HashSet::new();
 
         for spec in specs {
             let (column, index_type) = match spec {
                 IndexBuildSpec::BTree { column, .. } => (column, "BTREE"),
                 IndexBuildSpec::FullText { column, .. } => (column, "FTS"),
-                IndexBuildSpec::Vector { column } => (column, "Vector"),
+                IndexBuildSpec::Vector { column, .. } => (column, "Vector"),
             };
             if column.is_empty() {
                 return Err(OmniError::manifest_internal(format!(
@@ -6082,9 +6197,11 @@ impl TableStore {
                         .execute_uncommitted()
                         .await
                 }
-                IndexBuildSpec::Vector { column } => {
-                    let params =
-                        lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
+                IndexBuildSpec::Vector { column, distance } => {
+                    let params = lance::index::vector::VectorIndexParams::ivf_flat(
+                        1,
+                        metric_type(*distance),
+                    );
                     let new_idx = ds_clone
                         .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
                         .replace(true)
@@ -6114,6 +6231,9 @@ impl TableStore {
                     .await?;
                 full_text_fields.extend(new_idx.fields.iter().copied());
             }
+            if let IndexBuildSpec::Vector { .. } = spec {
+                vector_fields.extend(new_idx.fields.iter().copied());
+            }
             if !new_names.insert(new_idx.name.clone()) {
                 return Err(OmniError::manifest_internal(format!(
                     "stage_create_indices produced duplicate index name '{}'",
@@ -6123,6 +6243,9 @@ impl TableStore {
             new_indices.push(new_idx);
         }
 
+        // A new vector index replaces every vector index on its column,
+        // whatever its name, so an index built for another distance is
+        // removed with it.
         let removed_indices: Vec<IndexMetadata> = existing_indices
             .iter()
             .filter(|idx| {
@@ -6132,6 +6255,9 @@ impl TableStore {
                             .fields
                             .iter()
                             .any(|field| full_text_fields.contains(field)))
+                    || (!is_system_index(idx)
+                        && Self::index_is_vector(idx)
+                        && idx.fields.iter().any(|field| vector_fields.contains(field)))
             })
             .cloned()
             .collect();
@@ -7041,8 +7167,19 @@ impl TableStore {
         has_fts_postings_on(ds, column).await
     }
 
-    pub async fn has_vector_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
-        has_vector_index_on(ds, column).await
+    /// Whether every vector index on `column` is an exact IVF_FLAT built
+    /// for `distance` and at least one exists: an index built for another
+    /// distance is never used, so the reconciler builds one anew.
+    pub async fn has_vector_index_for(
+        &self,
+        ds: &Dataset,
+        column: &str,
+        distance: VectorDistance,
+    ) -> Result<bool> {
+        if !has_vector_index_on(ds, column).await? {
+            return Ok(false);
+        }
+        vector_indexes_rank_exactly(ds, column, distance).await
     }
 
     pub async fn create_empty_dataset(dataset_uri: &str, schema: &SchemaRef) -> Result<Dataset> {

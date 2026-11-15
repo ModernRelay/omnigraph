@@ -155,6 +155,7 @@ fn test_edge_lookup_handles_non_ascii_leading_character() {
                     name: "name".to_string(),
                     prop_type: PropType::scalar(ScalarType::String, false),
                     annotations: vec![],
+                    distance: None,
                 }],
                 constraints: vec![],
                 source_constraints: vec![],

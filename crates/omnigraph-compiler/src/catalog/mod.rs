@@ -10,7 +10,10 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::{CompilerError, Result};
 use crate::schema::analysis::{AnalyzerProfile, FullTextAnalysis, FullTextScorer};
-use crate::schema::ast::{Cardinality, Constraint, ConstraintBound, SchemaDecl, SchemaFile};
+use crate::schema::ast::{
+    Cardinality, Constraint, ConstraintBound, PropDecl, SchemaDecl, SchemaFile,
+};
+use crate::schema::vector::VectorDistance;
 use crate::types::{PropType, ScalarType};
 
 #[derive(Debug, Clone)]
@@ -94,11 +97,23 @@ pub struct NodeType {
     /// a catalog built from accepted IR carries them, since the fingerprint
     /// binds the property's stable identity.
     pub full_text_fingerprints: HashMap<String, String>,
+    /// The distance each vector property declares beyond `l2`; a vector
+    /// property absent here is `l2` ([`Self::vector_distance`]).
+    pub vector_distances: HashMap<String, VectorDistance>,
     pub blob_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
 }
 
 impl NodeType {
+    /// The distance `property`'s vectors are scored, ranked and indexed by:
+    /// the declared one, `l2` when it declares none.
+    pub fn vector_distance(&self, property: &str) -> VectorDistance {
+        self.vector_distances
+            .get(property)
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// The profile `property`'s full-text index declares, `None` for edition
     /// 2's index analysis.
     pub fn full_text_profile(&self, property: &str) -> Option<AnalyzerProfile> {
@@ -210,8 +225,21 @@ pub struct EdgeType {
     pub unique_constraints: Vec<Vec<String>>,
     /// Index declarations on edge properties
     pub indices: Vec<Vec<String>>,
+    /// The distance each vector property declares beyond `l2`.
+    pub vector_distances: HashMap<String, VectorDistance>,
     pub blob_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
+}
+
+impl EdgeType {
+    /// The distance `property`'s vectors are measured by: the declared one,
+    /// `l2` when it declares none.
+    pub fn vector_distance(&self, property: &str) -> VectorDistance {
+        self.vector_distances
+            .get(property)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 impl Catalog {
@@ -378,6 +406,31 @@ fn normalize_edge_name(name: &str) -> String {
     name.to_lowercase()
 }
 
+/// The distances `properties` declare beyond `l2`, by property name.
+fn declared_distances(properties: &[PropDecl]) -> HashMap<String, VectorDistance> {
+    properties
+        .iter()
+        .filter_map(|property| {
+            property
+                .distance
+                .and_then(VectorDistance::declared)
+                .map(|distance| (property.name.clone(), distance))
+        })
+        .collect()
+}
+
+/// The distances accepted `properties` record, by property name.
+fn ir_distances(properties: &[schema_ir::PropertyIR]) -> HashMap<String, VectorDistance> {
+    properties
+        .iter()
+        .filter_map(|property| {
+            property
+                .distance
+                .map(|distance| (property.name.clone(), distance))
+        })
+        .collect()
+}
+
 fn bound_to_literal(b: &ConstraintBound) -> LiteralValue {
     match b {
         ConstraintBound::Integer(n) => LiteralValue::Integer(*n),
@@ -512,6 +565,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                         })
                         .collect(),
                     full_text_fingerprints: HashMap::new(),
+                    vector_distances: declared_distances(&node.properties),
                     blob_properties,
                     arrow_schema,
                 },
@@ -600,6 +654,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     key,
                     unique_constraints,
                     indices: edge_indices,
+                    vector_distances: declared_distances(&edge.properties),
                     blob_properties,
                     arrow_schema: Arc::new(Schema::new(fields)),
                 },
@@ -769,6 +824,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                             .map(|fingerprint| (property.name.clone(), fingerprint))
                     })
                     .collect(),
+                vector_distances: ir_distances(&node.properties),
                 blob_properties,
                 arrow_schema: Arc::new(Schema::new(fields)),
             },
@@ -899,6 +955,7 @@ pub fn build_catalog_from_ir(ir: &schema_ir::SchemaIR) -> Result<Catalog> {
                 key,
                 unique_constraints,
                 indices,
+                vector_distances: ir_distances(&edge.properties),
                 blob_properties,
                 arrow_schema: Arc::new(Schema::new(fields)),
             },

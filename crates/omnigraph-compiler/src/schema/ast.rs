@@ -75,6 +75,10 @@ pub struct PropDecl {
     pub name: String,
     pub prop_type: PropType,
     pub annotations: Vec<Annotation>,
+    /// The distance `Vector(n, distance = ...)` declares, `None` when it is
+    /// `l2`, written or omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance: Option<super::vector::VectorDistance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

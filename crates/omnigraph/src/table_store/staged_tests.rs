@@ -29,6 +29,7 @@ use lance::dataset::write::merge_insert::inserted_rows::KeyExistenceFilterBuilde
 use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
 use lance_table::format::Fragment;
 use omnigraph_compiler::SYSTEM_COLUMNS_LEGACY;
+use omnigraph_compiler::schema::vector::VectorDistance;
 
 /// A standalone Lance `Session` per test store (this binary is primitive-level
 /// and deliberately does not include the shared `helpers` module).
@@ -3260,6 +3261,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
                 },
                 IndexBuildSpec::Vector {
                     column: "embedding".to_string(),
+                    distance: VectorDistance::Cosine,
                 },
             ],
         )
@@ -3281,7 +3283,7 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
     assert!(!store.has_fts_index(&reopened, "body").await.unwrap());
     assert!(
         !store
-            .has_vector_index(&reopened, "embedding")
+            .has_vector_index_for(&reopened, "embedding", VectorDistance::Cosine)
             .await
             .unwrap()
     );
@@ -3302,7 +3304,20 @@ async fn stage_create_indices_batches_mixed_types_into_one_exact_commit() {
         store.has_btree_index(&new_ds, "body").await.unwrap(),
         "the explicitly-named companion BTREE must land beside the FTS index"
     );
-    assert!(store.has_vector_index(&new_ds, "embedding").await.unwrap());
+    // The vector index is built for the spec's distance, and an index built
+    // for another distance does not count as the field's index.
+    assert!(
+        store
+            .has_vector_index_for(&new_ds, "embedding", VectorDistance::Cosine)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .has_vector_index_for(&new_ds, "embedding", VectorDistance::L2)
+            .await
+            .unwrap()
+    );
 
     // Metadata-only coverage cases, reusing this fixture's typed index
     // inventory. The synthetic empty segment borrows another index UUID;

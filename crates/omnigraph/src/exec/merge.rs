@@ -3742,11 +3742,11 @@ fn proven_fast_forward_needs_no_validation(
 }
 
 /// Whether new rows of `type_name` alone can break no constraint: no value,
-/// enum or non-key uniqueness constraint, and no edge type with a non-zero
-/// `@card` minimum from it. A source node inserted with no edge of such a type
-/// is below the minimum; a branch written by this binary cannot hold one, but
-/// a branch written before the minimum counted inserted nodes can, so the
-/// evaluator counts them.
+/// enum, `cosine` vector or non-key uniqueness constraint, and no edge type
+/// with a non-zero `@card` minimum from it. A source node inserted with no
+/// edge of such a type is below the minimum; a branch written by this binary
+/// cannot hold one, but a branch written before the minimum counted inserted
+/// nodes can, so the evaluator counts them.
 fn node_inserts_need_no_validation(catalog: &Catalog, type_name: &str) -> bool {
     let Some(node_type) = catalog.node_types.get(type_name) else {
         return false;
@@ -3758,6 +3758,10 @@ fn node_inserts_need_no_validation(catalog: &Catalog, type_name: &str) -> bool {
             .properties
             .values()
             .all(|property| property.enum_values.is_none())
+        && !node_type
+            .vector_distances
+            .values()
+            .any(|distance| distance.refuses_zero_vector())
         && !catalog
             .edge_types
             .values()

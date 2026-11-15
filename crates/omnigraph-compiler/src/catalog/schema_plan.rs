@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::schema::analysis::FullTextAnalysis;
 use crate::schema::ast::{Annotation, Constraint};
+use crate::schema::vector::VectorDistance;
 use crate::types::PropType;
 
 use super::schema_ir::{
@@ -102,6 +103,22 @@ pub enum SchemaMigrationStep {
         property_name: String,
         from: Option<FullTextAnalysis>,
         to: Option<FullTextAnalysis>,
+    },
+    /// Change the distance a vector property declares
+    /// (`Vector(n, distance = ...)`); `property_name` is the DESIRED
+    /// (post-rename) name. Applied in place and metadata-only: no stored
+    /// vector changes, and an index built for the old distance is never used
+    /// for the new one, so reads score and rank from the exact scan until
+    /// `ensure_indices`/`optimize` rebuilds the index with the new distance.
+    /// Vectors already stored are not revalidated: a zero vector in a field
+    /// that becomes `cosine` drops its row from `distance` and `nearest`, as
+    /// a null does.
+    ChangeVectorDistance {
+        type_kind: SchemaTypeKind,
+        type_name: String,
+        property_name: String,
+        from: VectorDistance,
+        to: VectorDistance,
     },
     UpdateTypeMetadata {
         type_kind: SchemaTypeKind,
@@ -745,6 +762,16 @@ fn plan_properties(
                 property_name: property.name.clone(),
                 from: existing.full_text,
                 to: property.full_text,
+            });
+        }
+
+        if existing.distance != property.distance && existing.prop_type == property.prop_type {
+            steps.push(SchemaMigrationStep::ChangeVectorDistance {
+                type_kind,
+                type_name: type_name.to_string(),
+                property_name: property.name.clone(),
+                from: existing.distance.unwrap_or_default(),
+                to: property.distance.unwrap_or_default(),
             });
         }
 
@@ -1974,6 +2001,80 @@ node Person @description("new") {
                 .unwrap()
                 .steps
                 .is_empty()
+        );
+    }
+
+    /// Changing a vector's distance is a supported in-place step; writing
+    /// `l2` where it was omitted changes nothing, and a rename keeps the
+    /// distance.
+    #[test]
+    fn plan_changes_vector_distance_in_place() {
+        use crate::schema::vector::VectorDistance;
+        let source =
+            |ty: &str| format!("node Doc {{\n    slug: String @key\n    e: {ty} @index\n}}\n");
+        let step = |from, to| SchemaMigrationStep::ChangeVectorDistance {
+            type_kind: SchemaTypeKind::Node,
+            type_name: "Doc".to_string(),
+            property_name: "e".to_string(),
+            from,
+            to,
+        };
+        let accepted = ir(&source("Vector(3)"));
+        let cosine = evolve(&accepted, &source(r#"Vector(3, distance = "cosine")"#));
+        let plan = plan_schema_migration(&accepted, &cosine).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert_eq!(
+            plan.steps,
+            vec![step(VectorDistance::L2, VectorDistance::Cosine)]
+        );
+
+        let dot = evolve(&cosine, &source(r#"Vector(3, distance = "dot")"#));
+        let plan = plan_schema_migration(&cosine, &dot).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert_eq!(
+            plan.steps,
+            vec![step(VectorDistance::Cosine, VectorDistance::Dot)]
+        );
+
+        let back = evolve(&dot, &source(r#"Vector(3, distance = "l2")"#));
+        let plan = plan_schema_migration(&dot, &back).unwrap();
+        assert_eq!(
+            plan.steps,
+            vec![step(VectorDistance::Dot, VectorDistance::L2)]
+        );
+
+        let written = evolve(&accepted, &source(r#"Vector(3, distance = "l2")"#));
+        assert!(
+            plan_schema_migration(&accepted, &written)
+                .unwrap()
+                .steps
+                .is_empty()
+        );
+
+        let renamed = evolve(
+            &cosine,
+            "node Doc {\n    slug: String @key\n    f: Vector(3, distance = \"cosine\") @rename_from(\"e\") @index\n}\n",
+        );
+        let plan = plan_schema_migration(&cosine, &renamed).unwrap();
+        assert!(plan.supported, "{plan:?}");
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, SchemaMigrationStep::ChangeVectorDistance { .. })),
+            "{plan:?}"
+        );
+
+        // A dimension change stays an unsupported type change, distance or not.
+        let wider = evolve(&accepted, &source(r#"Vector(4, distance = "cosine")"#));
+        let plan = plan_schema_migration(&accepted, &wider).unwrap();
+        assert!(!plan.supported, "{plan:?}");
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, SchemaMigrationStep::ChangeVectorDistance { .. })),
+            "{plan:?}"
         );
     }
 
