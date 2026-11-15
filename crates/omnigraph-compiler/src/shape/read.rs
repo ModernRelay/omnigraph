@@ -891,30 +891,19 @@ impl<'a> Shaper<'a> {
         unsupported(self.name, what, construct)
     }
 
-    /// A core node with no plan node in a pattern, at the element it was
-    /// written as: a `Union` is an `optional` or a `from union(…)`, the
-    /// others a `from`.
+    /// A core node with no plan node in a pattern, at the `from` it was
+    /// written as: a ranking that is not the read's own, or a ranking's
+    /// population that groups, orders or cuts.
     fn unlowered_node(&self, node: &Term) -> ShapeError {
-        let (what, kinds): (String, &'static [ElementKind]) = match node {
-            Term::Call { name, .. } => (
-                format!("a declared read's call in a pattern (`{name}`)"),
-                FROM,
-            ),
-            Term::Group { .. } => (
-                "an inline read with an aggregate or `distinct` (a `Group` in a pattern)".into(),
-                FROM,
-            ),
-            Term::Order { .. } => (
-                "an inline read with an `order` (an `Order` in a pattern)".into(),
-                FROM,
-            ),
-            Term::Cut { .. } => (
-                "an inline read with a `limit` (a `Cut` in a pattern)".into(),
-                FROM,
-            ),
-            other => (format!("a `{}` node in a pattern", other.operator()), FROM),
+        let what = match node {
+            Term::Group { .. } => {
+                "an inline read with an aggregate or `distinct` (a `Group` in a pattern)".into()
+            }
+            Term::Order { .. } => "an inline read with an `order` (an `Order` in a pattern)".into(),
+            Term::Cut { .. } => "an inline read with a `limit` (a `Cut` in a pattern)".into(),
+            other => format!("a `{}` node in a pattern", other.operator()),
         };
-        self.refuse_at(what, Construct::Element(kinds, None))
+        self.refuse_at(what, Construct::Element(FROM, None))
     }
 
     fn read(&self, read: &CoreRead) -> Result<ReadShape, ShapeError> {
@@ -941,7 +930,9 @@ impl<'a> Shaper<'a> {
             keep: false,
         } = &read.term
         else {
-            return Err(self.refuse("a read without its final projection"));
+            return Err(ShapeError::Internal(
+                "a read without its final projection, which the type checker always writes".into(),
+            ));
         };
         let mut term: &Term = input;
         let mut limit = None;
@@ -993,7 +984,11 @@ impl<'a> Shaper<'a> {
                 aggs.extend(grouped.iter().cloned());
                 input.as_ref()
             }
-            _ => return Err(self.refuse("a read whose returns are not a projection")),
+            _ => {
+                return Err(ShapeError::Internal(
+                    "a read whose returns are not a projection: the type checker writes a `Group` or an extending `Project` under the final projection".into(),
+                ));
+            }
         };
         let Split {
             population: body,
@@ -1049,10 +1044,9 @@ impl<'a> Shaper<'a> {
         let mut return_exprs = Vec::new();
         for (i, (column, expr)) in finals.iter().enumerate() {
             let (IRExpr::AliasRef(hidden, ty) | IRExpr::Variable(hidden, ty)) = expr else {
-                return Err(self.refuse_at(
-                    "a final projection that is not a column",
-                    Construct::ReturnItem(i),
-                ));
+                return Err(ShapeError::Internal(format!(
+                    "result column `{column}` is not a column of the extended rows, which the type checker's final projection always reads"
+                )));
             };
             // A node object has no null in this release's result types, and
             // an `optional`'s name is null on a row it kept without a match.
@@ -1117,9 +1111,7 @@ impl<'a> Shaper<'a> {
             after.is_some()
                 || ranking.exact.is_some()
                 || limit_param.is_some()
-                || self
-                    .check_ranking(ranking, order_keys, limit, grouped)
-                    .is_err()
+                || !self.ranked_scan_runs(ranking, order_keys, limit, grouped)
         });
         let mut order_by = Vec::new();
         let mut keys = order_keys.iter().enumerate().peekable();
@@ -1419,58 +1411,50 @@ impl<'a> Shaper<'a> {
         })
     }
 
-    /// What today's ranked scans run: the score leads the `order` in its
-    /// ranking's direction (absent over groups, which it does not order),
-    /// and each `nearest` window is the read's `limit` (`100` under `rrf`
-    /// without one). Any other combination is a different relation, not
-    /// lowered yet.
-    fn check_ranking(
+    /// Whether today's ranked scan runs the ranking as the read's leading
+    /// `order` key cut by the read's `limit`: the score leads the `order` in
+    /// its ranking's direction (absent over groups, which it does not
+    /// order), and each `nearest` window is the read's `limit` (`100` under
+    /// `rrf` without one). Any other ranking is a `Rank` step over its
+    /// population.
+    fn ranked_scan_runs(
         &self,
         ranking: &Ranking,
         order_keys: &[(IRExpr, bool)],
         limit: Option<u64>,
         grouped: bool,
-    ) -> Result<(), ShapeError> {
+    ) -> bool {
         let reads_score =
             |e: &IRExpr| matches!(e, IRExpr::AliasRef(name, _) if *name == ranking.out);
-        match order_keys.first() {
-            Some((key, descending)) if reads_score(key) => {
-                if *descending != ranking.descending {
-                    return Err(self.refuse("a score ordered against its ranking's direction"));
-                }
-            }
-            _ if order_keys.iter().any(|(k, _)| reads_score(k)) => {
-                return Err(self.refuse("a score that is not the leading `order` key"));
-            }
-            Some(_) if !grouped => {
-                return Err(
-                    self.refuse("an `order` over a ranking that does not lead with its score")
-                );
-            }
-            None if !grouped && limit.is_some() => {
-                return Err(self.refuse("a `limit` over a ranking with no `order` by its score"));
-            }
-            _ => {}
-        }
+        let leads = match order_keys.first() {
+            // The score leads, in its ranking's direction.
+            Some((key, descending)) if reads_score(key) => *descending == ranking.descending,
+            // The score is a later key.
+            _ if order_keys.iter().any(|(k, _)| reads_score(k)) => false,
+            // Another key leads.
+            Some(_) => grouped,
+            // No `order`: the cut takes the ranking's own order.
+            None => grouped || limit.is_none(),
+        };
         let fused = matches!(ranking.key, IRExpr::Rrf { .. });
         let expected = match (limit, fused) {
             (Some(n), _) => Some(n),
             (None, true) => Some(RRF_NEAREST_ARM_WINDOW),
             (None, false) => None,
         };
-        if ranking.windows.iter().any(|w| match w {
-            Count::Literal(k) => Some(*k) != expected,
-            Count::Param(_) => true,
-        }) {
-            return Err(self.refuse("a `nearest` window `k` other than the read's `limit`"));
-        }
-        Ok(())
+        leads
+            && ranking.windows.iter().all(|w| match w {
+                Count::Literal(k) => Some(*k) == expected,
+                Count::Param(_) => false,
+            })
     }
 
     /// A `Group` aggregate as the aggregate expression a return item holds.
     fn aggregate(&self, agg: &Agg, ranking: Option<&Ranking>) -> Result<IRExpr, ShapeError> {
         let Some(arg) = &agg.arg else {
-            return Err(self.refuse("a row count without an argument in `return`"));
+            return Err(ShapeError::Internal(
+                "a row count without an argument in a read's aggregates: `count` takes one argument (T8)".into(),
+            ));
         };
         let mut read = Vec::new();
         arg.columns(&mut read);
@@ -1643,7 +1627,9 @@ impl<'a> Shaper<'a> {
                     exact: Some((property.clone(), query.clone())),
                 }),
             )),
-            Term::Score { .. } => Err(self.refuse("a `Score` whose kind and query disagree")),
+            Term::Score { .. } => Err(ShapeError::Internal(
+                "a `Score` whose kind and query disagree, which the type checker never writes".into(),
+            )),
             Term::Fuse { .. } => Ok((self.fused_population(body)?, Some(self.fused(body)?))),
             other => Ok((other, None)),
         }
@@ -1656,6 +1642,19 @@ impl<'a> Shaper<'a> {
         let Term::Fuse { arms, .. } = fuse else {
             unreachable!("called on a Fuse")
         };
+        // An arm that is not a ranking function's relation is a read whose
+        // own `order` ranks its targets (the type checker refuses any other
+        // arm, `T75`).
+        if arms.iter().any(|arm| {
+            !matches!(
+                arm,
+                Term::ApproxTopK { .. } | Term::Score { .. } | Term::Fuse { .. }
+            )
+        }) {
+            return Err(self.refuse(
+                "an `rrf` arm ranked by its read's own `order` rather than by a ranking function",
+            ));
+        }
         let mut populations = arms.iter().map(ranked_input);
         let first = populations
             .next()
@@ -1689,7 +1688,10 @@ impl<'a> Shaper<'a> {
                     windows.extend(r.windows);
                     Ok(r.key)
                 }
-                (_, None) => Err(self.refuse("an `rrf` arm that is not a ranking")),
+                (_, None) => Err(ShapeError::Internal(
+                    "an `rrf` arm that is not a ranking, which `fused_population` refuses first"
+                        .into(),
+                )),
             }
         };
         let [primary, secondary] = arms.as_slice() else {
@@ -1785,10 +1787,9 @@ impl<'a> Shaper<'a> {
                 );
                 Ok(())
             }
-            Term::Scan { var, .. } => Err(self.refuse_at(
-                "a scan of this type in a read",
-                Construct::Element(&[ElementKind::Binding], Some(var.clone())),
-            )),
+            Term::Scan { var, .. } => Err(ShapeError::Internal(format!(
+                "`${var}` scans a value type, which the type checker never writes"
+            ))),
             Term::Expand {
                 input,
                 src,
@@ -1837,7 +1838,9 @@ impl<'a> Shaper<'a> {
                     let mut cols = Vec::new();
                     value.columns(&mut cols);
                     if cols.iter().any(|c| is_block_column(c)) {
-                        return Err(self.refuse_at("a `let` over a block value", at));
+                        return Err(ShapeError::Internal(format!(
+                            "`let ${name}` reads a block value its own input did not refuse: the block's `Correlate` is under the `let`"
+                        )));
                     }
                     let mut value = value.clone();
                     substitute(&mut value, &facts.lets);
@@ -1860,9 +1863,12 @@ impl<'a> Shaper<'a> {
             } => self.inline_read(input, items, &[], facts),
             // `from name(args)`: the declared read's body, read as an inline
             // read with its parameters bound to the arguments.
-            Term::Call { .. } => {
-                let (input, items, bindings) =
-                    read_parts(term).ok_or_else(|| self.unlowered_node(term))?;
+            Term::Call { name, .. } => {
+                let (input, items, bindings) = read_parts(term).ok_or_else(|| {
+                    ShapeError::Internal(format!(
+                        "the body of `{name}` is not a read's final projection, which the type checker always writes"
+                    ))
+                })?;
                 self.inline_read(input, items, bindings, facts)
             }
             Term::Correlate { outer, inner } => {
@@ -1991,10 +1997,9 @@ impl<'a> Shaper<'a> {
                     ));
                 };
                 if declared != type_name {
-                    return Err(self.refuse_at(
-                        "a `union` whose arms return one column as different node types",
-                        at(),
-                    ));
+                    return Err(ShapeError::Internal(format!(
+                        "union column `{name}` is node {declared} and node {type_name}, which the type checker refuses (T73)"
+                    )));
                 }
                 exposed.insert(variable.clone());
                 if variable != name {
@@ -2130,10 +2135,10 @@ impl<'a> Shaper<'a> {
                     (IRExpr::Variable(_, _), ExprType::Node { type_name }) => {
                         match nodes.iter().find(|(name, _)| *name == column.column) {
                             Some((_, declared)) if *declared != type_name => {
-                                return Err(self.refuse_at(
-                                    "a `union` whose arms return one column as different node types",
-                                    at(),
-                                ));
+                                return Err(ShapeError::Internal(format!(
+                                    "union column `{}` is node {declared} and node {type_name}, which the type checker refuses (T73)",
+                                    column.column
+                                )));
                             }
                             Some(_) => {}
                             None if index == 0 => nodes.push((column.column.clone(), type_name)),
@@ -2145,7 +2150,9 @@ impl<'a> Shaper<'a> {
                         }
                     }
                     (IRExpr::Variable(_, _), _) => {
-                        return Err(self.refuse_at("a `union` arm returning an edge", at()));
+                        return Err(ShapeError::Internal(
+                            "a union arm returning an edge reached the value arms, which `union` refuses first".into(),
+                        ));
                     }
                     (_, ty) => match value_types
                         .iter_mut()
@@ -2680,12 +2687,12 @@ impl<'a> Shaper<'a> {
             let Term::Group { input, keys, aggs } = inner.as_ref() else {
                 break;
             };
-            let [(column, agg)] = aggs.as_slice() else {
-                return Err(self.refuse_at("a block of more than one aggregate", Construct::Block));
+            // The type checker writes a block as `Group(p, [], [agg])`.
+            let ([(column, agg)], []) = (aggs.as_slice(), keys.as_slice()) else {
+                return Err(ShapeError::Internal(
+                    "a block that is not one aggregate without keys".into(),
+                ));
             };
-            if !keys.is_empty() {
-                return Err(self.refuse_at("a block with grouping keys", Construct::Block));
-            }
             let mut leaf = input.as_ref();
             loop {
                 match leaf {
@@ -3102,9 +3109,8 @@ impl<'a> Shaper<'a> {
                     declared
                 }
                 _ => {
-                    return Err(self.refuse_at(
-                        "a ranking over two bindings one traversal connects",
-                        Construct::Element(FROM, None),
+                    return Err(ShapeError::Internal(
+                        "two ranked columns in one scope: a read ranks one column".into(),
                     ));
                 }
             };

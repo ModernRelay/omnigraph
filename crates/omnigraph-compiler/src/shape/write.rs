@@ -350,11 +350,11 @@ fn lower_staged(
                 selection: Selection::Predicate(predicate.clone()),
             },
             (Sink::Update { .. } | Sink::Delete { .. }, Staged::Unit) => {
-                return Err(unsupported(
-                    name,
-                    "a statement over a variable its group does not bind",
-                    Construct::Statement(g, i),
-                ));
+                return Err(ShapeError::Internal(format!(
+                    "statement {} of group {} of `{name}` names a variable its group does not bind, which the type checker refuses (T77)",
+                    i + 1,
+                    g + 1
+                )));
             }
         };
         ops.push(op);

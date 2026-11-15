@@ -6,10 +6,12 @@
 //! check and shape; a construct of a row this release does not lower yet is
 //! `T86` naming its stage.
 
-use super::{SCHEMA, catalog};
+use super::SCHEMA;
+use crate::catalog::{Catalog, build_catalog};
 use crate::ir::core::CoreDecl;
 use crate::query::check::check_source;
 use crate::query::diagnostic::QueryDiagnostic;
+use crate::schema::parser::parse_schema;
 use crate::shape::read::ReadShape;
 use crate::shape::write::WriteShape;
 
@@ -32,27 +34,216 @@ struct Row {
     texts: &'static [(&'static str, Outcome)],
 }
 
-/// Texts of a row the RFC marks as working that this build does not lower
-/// yet. Stage B ships in part: each is `T86` naming B, and the set must
-/// shrink to empty before the release ships B whole. A `Blob` read from a
-/// row in an assignment is also `T86` naming B (the write shaper's test
-/// owns it; this table's schema has no `Blob`).
-const B_IN_PROGRESS: &[&str] = &[
-    "a node an optional introduces returned whole",
-    "an edge reference returned whole",
-    "a ranking inside an inline read with its own order and limit",
-    "a union arm returning an edge",
-    "a union arm returning a value that reads the enclosing scope",
-    "distance as an rrf arm",
-    "two rrf arm windows that differ",
-    "an rrf of three arms",
-    "rrf arms over different populations",
-    "a block compared with another block's value",
-    "a write group selecting over a table an earlier group changes",
-    "a full-text call read as a value",
-    "match_terms with an edit budget",
-    "bm25 over terms with mode: all or an edit budget",
+/// A construct of a row the RFC marks as working that this build does not
+/// lower yet: `T86` naming B, at the shaper's refusal whose term is
+/// `site` (its text, a `format!` string's literal parts in order).
+struct InProgress {
+    construct: &'static str,
+    site: &'static str,
+    text: &'static str,
+}
+
+/// Every construct the RFC marks as working that this build refuses with
+/// `T86` naming B. Stage B ships in part: the list must shrink to empty
+/// before the release ships B whole. Every refusal of the shapers that
+/// names B has an entry here, one per call site at least
+/// ([`every_refusal_of_the_shapers_is_pinned`]); a term the type checker
+/// never writes is a [`crate::shape::ShapeError::Internal`] defect, not a
+/// refusal, and has none.
+const B_IN_PROGRESS: &[InProgress] = &[
+    // `ReadShape`: a pattern's core node with no plan node.
+    InProgress {
+        construct: "a ranking over an inline read with an aggregate or `distinct`",
+        site: "an inline read with an aggregate or `distinct` (a `Group` in a pattern)",
+        text: "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return distinct { $d } }, $d.embedding, $v, k: 1) as $x } return { $d.id } }",
+    },
+    InProgress {
+        construct: "a ranking over an inline read with an `order`",
+        site: "an inline read with an `order` (an `Order` in a pattern)",
+        text: "query q($v: Vector(3)) { match { from nearest({ match { $d: Doc } return { $d } order { $d.id } }, $d.embedding, $v, k: 1) as $x } return { $d.id } }",
+    },
+    InProgress {
+        construct: "a ranking over an inline read with a `limit`",
+        site: "an inline read with a `limit` (a `Cut` in a pattern)",
+        text: "query q($v: Vector(3)) { match { from distance({ match { $d: Doc } return { $d } limit 3 }, $d.embedding, $v) as $x } return { $d.id } }",
+    },
+    InProgress {
+        construct: "a ranking beside another pattern component",
+        site: "a `{}` node in a pattern",
+        text: "query q($s: String) { match { $p: Person, let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score } where $p.handle = \"p1\" return { $p.name, $d.title, $score } }",
+    },
+    InProgress {
+        construct: "a ranking correlated on an outer variable",
+        site: "a `{}` node in a pattern",
+        text: "query q($v: Vector(3)) { match { $p: Person, from nearest({ match { $d: Doc, $p authored $d } return { $d } }, $d.embedding, $v, k: 3) as $s } return { $p.name, $d.title } }",
+    },
+    InProgress {
+        construct: "two rankings in one pattern",
+        site: "a `{}` node in a pattern",
+        text: "query q($s: String, $v: Vector(3)) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, $s) as $score, let $pop2 = { match { $e: Doc } return { $e } }, from nearest($pop2, $e.embedding, $v, k: 2) as $dist } return { $d.title, $e.title } }",
+    },
+    InProgress {
+        construct: "a ranking inside an inline read without its own order",
+        site: "a `{}` node in a pattern",
+        text: "query q($v: Vector(3)) { match { from { match { let $all = { match { $d: Doc } return { $d } }, from nearest($all, $d.embedding, $v, k: 3) as $s } return { $d, $s } } } return { $d.title, $s } }",
+    },
+    InProgress {
+        construct: "a ranking inside an `optional`",
+        site: "a `{}` node in a pattern",
+        text: "query q($v: Vector(3)) { match { $p: Person, optional { let $all = { match { $d: Doc } return { $d } }, from nearest($all, $d.embedding, $v, k: 3) as $s } } where $p.handle = \"a\" return { $p.name } }",
+    },
+    InProgress {
+        construct: "a ranking as a `union` arm",
+        site: "a `{}` node in a pattern",
+        text: "query q($v: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from union(nearest($all, $d.embedding, $v, k: 3), { match { $d: Doc } return { $d } }) } return { $d.title } }",
+    },
+    // `ReadShape`: return items and order keys.
+    InProgress {
+        construct: "a node an optional introduces returned whole",
+        site: "a node an `optional` introduces returned whole (a nullable node object)",
+        text: "query q() { match { $p: Person, optional { $c: Company, $p worksAt $c } } return { $p.name, $c } }",
+    },
+    InProgress {
+        construct: "an edge reference returned whole",
+        site: "an edge reference returned whole (the result has no edge object)",
+        text: "query q() { match { $p: Person, $q: Person, $p $k:knows $q } return { $p.name, $k } }",
+    },
+    InProgress {
+        construct: "a full-text call read as a value",
+        site: "a full-text call read as a value in `return`",
+        text: "query q($s: String) { match { $d: Doc } return { $d.title, search($d.body, $s) as hit } }",
+    },
+    InProgress {
+        construct: "a full-text call as an order key",
+        site: "a full-text call read as a value in `order`",
+        text: "query q($s: String) { match { $d: Doc } return { $d.title } order { search($d.body, $s) } }",
+    },
+    // `ReadShape`: rankings and fusion.
+    InProgress {
+        construct: "two rrf arm windows that differ",
+        site: "two `rrf` arm windows that differ",
+        text: "query q($v: Vector(3), $w: Vector(3)) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), nearest($all, $d.embedding, $w, k: 5)) as $score } return { $d.title } order { $d.title } }",
+    },
+    InProgress {
+        construct: "bm25 over terms with mode: all or an edit budget",
+        site: "`bm25` over a `terms(…)` value with `mode: all` or an edit budget other than 0",
+        text: "query q($s: String) { match { let $pop = { match { $d: Doc } return { $d } }, from bm25($pop, $d.body, terms($s)) as $score } return { $d.title } order { $score desc } limit 3 }",
+    },
+    InProgress {
+        construct: "an rrf arm that is an inline read with an `order`",
+        site: "an `rrf` arm ranked by its read's own `order` rather than by a ranking function",
+        text: "query q($s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(bm25($all, $d.body, $s), { match { $d: Doc } return { $d } order { $d.id } }) as $score } return { $d.title, $score } }",
+    },
+    InProgress {
+        construct: "rrf arms over different populations",
+        site: "`rrf` arms over different populations",
+        text: "query q($s: String, $v: Vector(3)) { match { let $old = { match { $d: Doc, $p: Person, $p authored $d } where $p.age > 30 return { $d } }, let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($old, $d.embedding, $v, k: 3), bm25($all, $d.body, $s)) as $score } return { $d.title } order { $score desc } limit 3 }",
+    },
+    InProgress {
+        construct: "distance as an rrf arm",
+        site: "an `rrf` arm over `distance`",
+        text: "query q($v: Vector(3), $s: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(distance($all, $d.embedding, $v), bm25($all, $d.body, $s), k: 60) as $score } return { $d.title } order { $score desc } limit 3 }",
+    },
+    InProgress {
+        construct: "an rrf of three arms",
+        site: "an `rrf` of other than two arms",
+        text: "query q($v: Vector(3), $s: String, $t: String) { match { let $all = { match { $d: Doc } return { $d } }, from rrf(nearest($all, $d.embedding, $v, k: 3), bm25($all, $d.body, $s), bm25($all, $d.body, $t)) as $score } return { $d.title } order { $score desc } limit 3 }",
+    },
+    // `ReadShape`: the elements of a pattern.
+    InProgress {
+        construct: "match_terms with an edit budget in a `let`",
+        site: "`match_terms` with an edit budget other than `max_edits: 0`",
+        text: "query q($s: String) { match { $d: Doc, let $m = match_terms($d.body, terms($s, mode: any, max_edits: 1)) } return { $d.title, $m } }",
+    },
+    InProgress {
+        construct: "match_terms with an edit budget",
+        site: "`match_terms` with an edit budget other than `max_edits: 0`",
+        text: "query q($s: String) { match { $d: Doc } where match_terms($d.body, terms($s, mode: any, max_edits: 1)) return { $d.title } }",
+    },
+    InProgress {
+        construct: "a block's value in a `let`",
+        site: "a correlated block read without its filter",
+        text: "query q() { match { $c: Company, let $n = count { $p: Person, $p worksAt $c } } where $c.slug = \"c0\" return { $c.slug, $n } }",
+    },
+    InProgress {
+        construct: "a block's value as a return item",
+        site: "a correlated block read without its filter",
+        text: "query q() { match { $p: Person } return { $p.handle, count { $f: Person, $p knows $f } as n } }",
+    },
+    InProgress {
+        construct: "a `let` inside an `optional`",
+        site: "a `let` inside an `optional`",
+        text: "query q() { match { $p: Person, optional { $q: Person, $p knows $q, let $h = $q.handle } } return { $p.handle, $h } }",
+    },
+    InProgress {
+        construct: "a union arm returning an edge",
+        site: "a `union` arm returning an edge",
+        text: "query q() { match { from union({ match { $p: Person, $q: Person, $p $k:knows $q } return { $k } }, { match { $a: Person, $b: Person, $a $e:knows $b } return { $e as k } }) } return { $k.@src } }",
+    },
+    InProgress {
+        construct: "a union arm returning a value that reads the enclosing scope",
+        site: "a `union` arm that returns a value or keeps its own cut and reads the enclosing scope",
+        text: "query q() { match { $c: Company, from union({ match { $p: Person, $p worksAt $c } return { $p, 1 as d } }, { match { $q: Person } return { $q as p, 2 as d } }) } return { $p.name, $d } }",
+    },
+    InProgress {
+        construct: "an inline read returning an outer variable under another name",
+        site: "a `from` returning an outer variable under another name",
+        text: "query q() { match { $p: Person, from { match { $q: Person, $p knows $q } return { $p as r } } } return { $r.name } }",
+    },
+    InProgress {
+        construct: "an inline read with an aggregate returning an outer variable under another name",
+        site: "a `from` returning an outer variable under another name",
+        text: "query q() { match { $p: Person, from { match { $q: Person, $p knows $q } return { $p as r, count($q) as n } } } return { $r.name, $n } }",
+    },
+    InProgress {
+        construct: "a called read's `limit $k` bound to a computed argument",
+        site: "a called read's `limit` over an argument that is not a literal or a parameter",
+        text: "query top($k: I64) { match { $q: Person } return { $q } order { $q.age } limit $k }
+               query q() { match { $p: Person, from top(3 + 1) } return { $p.name, $q.name } }",
+    },
+    InProgress {
+        construct: "a ranking inside an inline read with its own order and limit",
+        site: "a ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit`",
+        text: "query q($s: String) { match { from { match { let $all = { match { $d: Doc } return { $d } }, from bm25($all, $d.body, $s) as $score } return { $d } order { $score desc } limit 2 } } return { $d.title } }",
+    },
+    // `ReadShape`: the blocks of a `where`.
+    InProgress {
+        construct: "a block under `or`",
+        site: "a filter over block values",
+        text: "query q() { match { $p: Person } where exists { $f: Person, $p knows $f } or $p.age > 1000 return { $p.handle } }",
+    },
+    InProgress {
+        construct: "a block under `not (… and …)`",
+        site: "a filter over block values",
+        text: "query q() { match { $p: Person } where not (exists { $f: Person, $p knows $f } and $p.age > 1000) return { $p.handle } }",
+    },
+    InProgress {
+        construct: "a block compared with another block's value",
+        site: "a block value compared with another block's value",
+        text: "query q() { match { $p: Person } where count { $f: Person, $p knows $f } > count { $c: Company, $p worksAt $c } return { $p.name } }",
+    },
+    InProgress {
+        construct: "a full-text call in a block's aggregate",
+        site: "a full-text call read as a value in a block's aggregate or comparison",
+        text: "query q($s: String) { match { $p: Person } where sum(if(search($d.body, $s), 1, 0)) { $d: Doc, $p authored $d } > 0 return { $p.name } }",
+    },
+    // `WriteShape`.
+    InProgress {
+        construct: "a write group selecting over a table an earlier group changes",
+        site: "a write group whose selection reads a table an earlier group of the write changes (`{table}`)",
+        text: "query q() { match { $p: Person } where $p.name = \"ada\" update $p set { city: \"x\" } match { $q: Person, $q worksAt $c } update $c set { name: $q.name } }",
+    },
+    InProgress {
+        construct: "an assignment reading a Blob from a row",
+        site: "an assignment that reads a Blob from a row (`{property}`)",
+        text: "query q() { match { $f: File, $g: File } where $f.name = \"a\" and $g.name = \"b\" update $g set { data: $f.data } }",
+    },
 ];
+
+/// The shapers' refusals that name a later stage, each with a text that
+/// reaches it.
+const LATER: &[(&str, &str, &str)] =
+    &[("Rec", "a read that calls itself (`Fix`)", super::REACHABLE)];
 
 const CLOSURE: &[Row] = &[
     Row {
@@ -418,6 +609,13 @@ const CLOSURE: &[Row] = &[
     },
 ];
 
+/// The tests' schema with a node holding a `Blob`, which a write's
+/// assignment may read from a row.
+fn catalog() -> Catalog {
+    let schema = format!("{SCHEMA}\nnode File {{ name: String @key  data: Blob? }}\n");
+    build_catalog(&parse_schema(&schema).expect("the schema parses")).unwrap()
+}
+
 /// Every declaration of `text` checked through the release's front door, and
 /// each accepted one shaped as the planner shapes it.
 fn outcome(text: &str) -> Result<(), QueryDiagnostic> {
@@ -438,7 +636,6 @@ fn outcome(text: &str) -> Result<(), QueryDiagnostic> {
 
 #[test]
 fn every_row_marked_works_lowers_and_every_other_construct_names_its_stage() {
-    let _ = SCHEMA;
     let mut pending = Vec::new();
     for row in CLOSURE {
         for (text, want) in row.texts {
@@ -468,8 +665,201 @@ fn every_row_marked_works_lowers_and_every_other_construct_names_its_stage() {
         }
     }
     // A row the RFC marks as working that this build refuses is stage B in
-    // progress, and only the listed constructs are.
-    assert_eq!(pending.len(), B_IN_PROGRESS.len(), "{pending:#?}");
+    // progress: a listed construct.
+    for text in pending {
+        assert!(
+            B_IN_PROGRESS.iter().any(|entry| entry.text == text),
+            "a refusal naming B that `B_IN_PROGRESS` does not list:\n{text}"
+        );
+    }
+}
+
+/// The term each refusal call of a shaper's source refuses, as written: a
+/// string literal, a `format!` string or a `const` naming one. The calls
+/// are `self.refuse(what)`, `self.refuse_at(what, …)`, `unsupported(name,
+/// what, …)` and `Unlowered::new(name, what, …)`; `unlowered_node`'s terms
+/// are the literals of its arms.
+fn refusal_sites(source: &str) -> Vec<String> {
+    // A Rust string literal starting at `text`'s first byte, unescaped.
+    fn literal(text: &str) -> (String, usize) {
+        assert!(
+            text.starts_with('"'),
+            "not a literal: {}",
+            &text[..40.min(text.len())]
+        );
+        let mut out = String::new();
+        let mut chars = text.char_indices().skip(1).peekable();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '"' => return (out, i + 1),
+                '\\' => match chars.next() {
+                    Some((_, '\n')) => while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {},
+                    Some((_, 'n')) => out.push('\n'),
+                    Some((_, other)) => out.push(other),
+                    None => break,
+                },
+                other => out.push(other),
+            }
+        }
+        panic!("an unterminated literal");
+    }
+    let constant = |name: &str| -> String {
+        let decl = format!("const {name}: &str = ");
+        let at = source
+            .find(&decl)
+            .unwrap_or_else(|| panic!("no `const {name}` in the shaper"));
+        literal(&source[at + decl.len()..]).0
+    };
+    let mut sites = Vec::new();
+    for (call, skip_first) in [
+        ("self.refuse(", false),
+        ("self.refuse_at(", false),
+        ("unsupported(", true),
+        ("Unlowered::new(", true),
+    ] {
+        for (at, _) in source.match_indices(call) {
+            let line_start = source[..at].rfind('\n').map_or(0, |i| i + 1);
+            let line = source[line_start..at].trim_start();
+            if line.starts_with("//") || line.ends_with("fn ") {
+                continue;
+            }
+            let mut rest = source[at + call.len()..].trim_start();
+            if skip_first {
+                rest = rest[rest.find(',').expect("a second argument") + 1..].trim_start();
+            }
+            let what = if let Some(fmt) = rest.strip_prefix("format!(") {
+                literal(fmt.trim_start()).0
+            } else if rest.starts_with('"') {
+                literal(rest).0
+            } else {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                match name.as_str() {
+                    // A helper passing its own argument through.
+                    "what" => continue,
+                    _ if name.chars().all(|c| c.is_ascii_uppercase() || c == '_') => {
+                        constant(&name)
+                    }
+                    _ => panic!("a refusal whose term is not written at its call: `{call}{name}…`"),
+                }
+            };
+            sites.push(what);
+        }
+    }
+    // `unlowered_node`: one term per arm.
+    if let Some(at) = source.find("fn unlowered_node(") {
+        let body = &source[at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map_or(body.len(), |end| end + 1)];
+        let mut rest = body;
+        while let Some(quote) = rest.find('"') {
+            let (what, len) = literal(&rest[quote..]);
+            sites.push(what);
+            rest = &rest[quote + len..];
+        }
+    }
+    sites
+}
+
+/// Whether the refusal message `message` states the term `site`: every
+/// literal part of the `format!` string, in order.
+fn names_site(message: &str, site: &str) -> bool {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut chars = site.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                part.push('{');
+            }
+            '{' => {
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                }
+                parts.push(std::mem::take(&mut part));
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                part.push('}');
+            }
+            other => part.push(other),
+        }
+    }
+    parts.push(part);
+    let mut rest = message;
+    parts
+        .iter()
+        .filter(|p| !p.is_empty())
+        .all(|part| match rest.find(part.as_str()) {
+            Some(at) => {
+                rest = &rest[at + part.len()..];
+                true
+            }
+            None => false,
+        })
+}
+
+/// Every refusal the shapers can make is pinned: a refusal naming B by
+/// the constructs of [`B_IN_PROGRESS`] that reach it, at least one per
+/// call site, and one naming a later stage by [`LATER`]. Each text type
+/// checks to `T86` stating the site's term and naming its stage, so a new
+/// refusal without an entry, an entry whose refusal is gone, or a text that
+/// no longer reaches its refusal fails here.
+#[test]
+fn every_refusal_of_the_shapers_is_pinned() {
+    let mut sites = refusal_sites(include_str!("../../../shape/read.rs"));
+    sites.extend(refusal_sites(include_str!("../../../shape/write.rs")));
+    assert!(sites.len() > 20, "the site reader found {sites:#?}");
+    let stage = |text: &str| -> (String, &'static str) {
+        let d = outcome(text).expect_err(text);
+        assert_eq!(d.code.as_str(), "T86", "{d}\n{text}");
+        let stage = ["B", "Rec"]
+            .into_iter()
+            .find(|s| d.message.contains(&format!("stage {s} ")))
+            .unwrap_or_else(|| panic!("no stage named: {d}"));
+        (d.message, stage)
+    };
+    let mut unpinned = Vec::new();
+    let mut distinct: Vec<&String> = sites.iter().collect();
+    distinct.sort();
+    distinct.dedup();
+    for site in distinct {
+        let calls = sites.iter().filter(|s| *s == site).count();
+        let later = LATER.iter().filter(|(_, s, _)| s == site).count();
+        let in_progress = B_IN_PROGRESS.iter().filter(|e| e.site == site).count();
+        if later + in_progress < calls {
+            unpinned.push(format!("{site} ({calls} calls)"));
+        }
+    }
+    assert!(unpinned.is_empty(), "refusals with no entry: {unpinned:#?}");
+    for entry in B_IN_PROGRESS {
+        assert!(
+            sites.iter().any(|s| s == entry.site),
+            "`{}` names a refusal no shaper makes: {}",
+            entry.construct,
+            entry.site
+        );
+        let (message, named) = stage(entry.text);
+        assert_eq!(named, "B", "{}: {message}", entry.construct);
+        assert!(
+            names_site(&message, entry.site),
+            "{}: the refusal is not `{}`: {message}",
+            entry.construct,
+            entry.site
+        );
+    }
+    for (want, site, text) in LATER {
+        assert!(sites.iter().any(|s| s == site), "no shaper refuses {site}");
+        let (message, named) = stage(text);
+        assert_eq!(named, *want, "{message}");
+        assert!(names_site(&message, site), "{message}");
+    }
 }
 
 /// `T86` points at the construct it refuses.

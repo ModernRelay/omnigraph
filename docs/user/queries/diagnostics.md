@@ -294,11 +294,11 @@ that calls itself.
 
 | Refused | Stage |
 |---|---|
-| `distance` as an `rrf` arm, two `rrf` arm windows that differ, `rrf` arms over two different populations | B |
-| A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope | B |
-| A node an `optional` introduces, or an edge reference, returned whole | B |
-| A ranking inside an inline read with its own aggregate, `distinct`, `order` or `limit` | B |
-| A block compared with another block's value, a block of several aggregates | B |
+| `rrf` with `distance` as an arm, an arm that is a read ranked by its own `order`, arm windows that differ, arms over two different populations, or other than two arms | B |
+| A ranking beside another pattern component or correlated on an outer name, two rankings in one pattern, a ranking inside an `optional`, a `union` arm or an inline read, a ranking over a read with its own aggregate, `distinct`, `order` or `limit` | B |
+| A `union` arm returning an edge, or one returning a value or keeping its own cut that reads a name of the enclosing scope; an inline read returning an outer name under another name; a called read's `limit $k` bound to a computed argument | B |
+| A node an `optional` introduces, or an edge reference, returned whole; a `let` inside an `optional` | B |
+| A block's value in a `let` or as a return item, a block under `or` or under `not` of a conjunction, a block compared with another block's value | B |
 | A full-text call (`search`, `fuzzy`, `match_text`, `match_terms`) read as a value in `return`, `order` or a block's aggregate | B |
 | `match_terms` with an edit budget other than `max_edits: 0` (only the exact lexical scan answers the edit relation exactly); `bm25` over `terms(…)` with `mode: all` or an edit budget | B |
 | A write group whose selection reads a type an earlier group of the write changes; a `Blob` read from a row in an assignment | B |
